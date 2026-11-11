@@ -751,6 +751,72 @@ async fn trace_position_round_trips_through_a_checkpoint() {
     );
 }
 
+#[tokio::test]
+async fn workflow_trace_position_round_trips_through_a_checkpoint() {
+    // ports the Python trace-state resume contract (`TraceState` restored from
+    // a checkpoint) through the concrete session and its `StreamTraceSink`.
+    let checkpointer: Arc<dyn Checkpointer> = Arc::new(MemoryCheckpointer::new());
+    let session = WorkflowSession::with_options(WorkflowSessionOptions {
+        session_id: Some("wf-trace-cp".to_string()),
+        checkpointer: Some(Arc::clone(&checkpointer)),
+        ..WorkflowSessionOptions::default()
+    });
+
+    let tracer = session.tracer().expect("concrete sessions own a tracer");
+    let trace_id = tracer.trace_id().to_string();
+    let span = tracer.start_span("answer", InvokeType::Llm);
+    span.set_inputs(json!({ "q": "hi" }));
+    let span_id = span.id();
+    span.finish(json!({ "text": "hi" }));
+
+    let snapshot = session.snapshot().await.unwrap();
+    let position = snapshot
+        .trace
+        .expect("a finished span yields a session trace position");
+    assert_eq!(position.trace_id, trace_id);
+    assert_eq!(position.frame_count, 1);
+    assert_eq!(position.last_invoke_id, Some(span_id.clone()));
+
+    session.update_state(json!({ "step": 1 })).await.unwrap();
+    session
+        .update_component_state("node", json!({ "value": 2 }))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.save_checkpoint(Some("cp-trace-wf")).await.unwrap(),
+        "cp-trace-wf"
+    );
+
+    let restored = WorkflowSession::with_options(WorkflowSessionOptions {
+        session_id: Some("wf-trace-cp".to_string()),
+        checkpointer: Some(Arc::clone(&checkpointer)),
+        ..WorkflowSessionOptions::default()
+    });
+    assert!(
+        restored.snapshot().await.unwrap().trace.is_none(),
+        "a fresh session's sink starts with no trace position"
+    );
+    assert!(restored.resume("cp-trace-wf").await.unwrap());
+    assert_eq!(restored.get_state("step").await.unwrap(), Some(json!(1)));
+    assert_eq!(
+        restored.get_component_state("node").await.unwrap(),
+        Some(json!({ "value": 2 }))
+    );
+    let restored_position = restored
+        .snapshot()
+        .await
+        .unwrap()
+        .trace
+        .expect("resume installs the checkpointed trace position");
+    assert_eq!(restored_position.trace_id, trace_id);
+    assert_eq!(restored_position.frame_count, 1);
+    assert_eq!(restored_position.last_invoke_id, Some(span_id));
+    assert!(
+        !restored.resume("no-such-checkpoint").await.unwrap(),
+        "a missing checkpoint resumes to false, not an error"
+    );
+}
+
 // --- the `Session` trait through `Arc<dyn Session>` ---
 
 #[tokio::test]
