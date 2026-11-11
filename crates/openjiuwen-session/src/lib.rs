@@ -19,6 +19,8 @@
 //! - [`session`] — the [`session::Session`] contract every graph node,
 //!   workflow component, agent, team, and runner receives as `Arc<dyn Session>`:
 //!   state scopes, streaming, human-in-the-loop, tracing, and snapshot/restore.
+//! - [`sessions`] — concrete sessions ([`sessions::WorkflowSession`],
+//!   [`sessions::NodeSession`]) and their construction factories.
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
 //!   [`checkpoint::Checkpoint`] model, and the memory, file, and feature-gated
 //!   SQLite backends.
@@ -52,6 +54,7 @@ pub mod config;
 pub mod constants;
 pub mod interaction;
 pub mod session;
+pub mod sessions;
 pub mod state;
 pub mod stream;
 pub mod tracer;
@@ -75,6 +78,8 @@ pub use interaction::{
 };
 
 pub use session::{Session, SessionMetadata, SessionSnapshot, SessionType};
+
+pub use sessions::{create_workflow_session, NodeSession, WorkflowSession, WorkflowSessionOptions};
 
 pub use state::{AgentState, StateLane, StateStore, WorkflowState};
 pub use state::{

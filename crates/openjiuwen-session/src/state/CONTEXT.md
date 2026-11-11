@@ -7,7 +7,8 @@ Ports `openjiuwen/core/session/state/` (v0.1.20): `CommitState` lanes with per-n
 
 ## API Surface
 
-- `StateStore` trait — the storage seam every session uses: `get_global(key)`, `update_global(patch)`, `get_component(id)`, `update_component(id, patch)`, `components()`, `dump()`, `restore(global, components)`, `trace_state()`, `update_trace(patch)`.
+- `StateStore` trait — the storage seam every session uses: `get_global(key)`, `update_global(patch)`, `write_global(patch)`, `get_component(id)`, `update_component(id, patch)`, `components()`, `dump()`, `restore(global, components)`, `trace_state()`, `update_trace(patch)`.
+- `write_global` merges into the committed global lane; `update_global` may stage. `WorkflowState` overrides `write_global` (direct lane merge) and stages in `update_global`; `AgentState` writes the committed lane for both.
 - `WorkflowState` — Python `CommitState`: lanes `io_state`, `global_state`, `comp_state`, `workflow_state`, `trace_state`; staging per node id (`update`, `update_global`, `update_workflow`, `update_component`), `commit(Option<&str>)`, `rollback(node_id)`, `updates()`, `set_updates()`, `inputs()`, `outputs(node_id)`, `set_outputs`, `commit_user_inputs(inputs)`, `get_by_schema(schema)`, `node(node_id, parent_id)` (shares lanes), `dump()`, `workflow_only()`.
 - `AgentState` — Python agent/team `StateCollection`: `global_state` + `agent_state` lanes, no staging; `dump()` = `{"global_state": …, "agent_state": …}`.
 - `paths` — `get_value`, `set_value`, `remove_value`, `get_by_prefix`, `apply_patch` (Python `update_dict`: object-vs-object recurse, `null` deletes after writes, everything else replaces), `is_ref_path`, `extract_origin_key`.

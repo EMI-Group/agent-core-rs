@@ -579,6 +579,10 @@ impl StateStore for WorkflowState {
         self.stage_global(patch)
     }
 
+    fn write_global(&self, patch: Value) -> Result<()> {
+        self.apply_to_lane(crate::state::StateLane::Global, &patch)
+    }
+
     fn get_component(&self, component_id: &str) -> Option<Value> {
         if component_id.is_empty() {
             return None;

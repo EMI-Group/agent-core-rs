@@ -90,6 +90,20 @@ pub trait StateStore: Send + Sync + std::fmt::Debug {
     /// not a JSON object or a key is not a valid nested path.
     fn update_global(&self, patch: Value) -> Result<()>;
 
+    /// Merges an object `patch` into the committed global lane, bypassing any
+    /// staging queue.
+    ///
+    /// The default forwards to [`StateStore::update_global`]; stores with a
+    /// staging lane ([`WorkflowState`]) override it so a session-level update
+    /// is immediately visible to [`StateStore::get_global`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`StateStore::update_global`].
+    fn write_global(&self, patch: Value) -> Result<()> {
+        self.update_global(patch)
+    }
+
     /// Reads component state by nested component id.
     ///
     /// Returns `None` for an empty id or a missing component.
