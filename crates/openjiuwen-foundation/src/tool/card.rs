@@ -8,7 +8,7 @@
 //! The struct is flat instead of embedding `openjiuwen_common::card::CardBase`
 //! (the deliberate deviation documented in `src/tool/CONTEXT.md`), so consumers
 //! read `card.name`/`card.id` directly while the card still implements the
-//! shared [`Card`] trait and stays registry-safe.
+//! shared [`Card`](openjiuwen_common::card::Card) trait and stays registry-safe.
 //!
 //! ```
 //! use openjiuwen_foundation::tool::card::{ToolCard, ToolExposure};

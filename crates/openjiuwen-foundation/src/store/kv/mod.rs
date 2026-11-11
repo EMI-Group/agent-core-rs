@@ -8,7 +8,7 @@
 //!
 //! - [`InMemoryKvStore`] — the behavioral reference (a `BTreeMap` behind a lock).
 //! - [`LocalFileKvStore`] — one JSON envelope per key below a caller-provided root.
-//! - [`SqliteKvStore`] — `SQLite` behind the `sqlite` feature.
+//! - `SqliteKvStore` — `SQLite` behind the `sqlite` feature.
 //!
 //! All three share the same [`StorePipeline`], so pipeline ordering and results
 //! cannot drift between backends.

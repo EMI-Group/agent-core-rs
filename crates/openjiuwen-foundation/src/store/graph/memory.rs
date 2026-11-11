@@ -1,6 +1,6 @@
 //! In-memory graph store and the graph engine shared by both backends.
 //!
-//! [`GraphIndex`] holds every behavior of the [`GraphStore`] contract: id-keyed
+//! `GraphIndex` holds every behavior of the [`GraphStore`] contract: id-keyed
 //! replacement, traversal, filtering, and cascading deletion. It is
 //! `pub(crate)` so [`LocalFileGraphStore`](super::LocalFileGraphStore) can reuse
 //! it verbatim and the two backends cannot drift apart. [`InMemoryGraphStore`]

@@ -34,7 +34,7 @@ const SNAPSHOT_EXTENSION: &str = "json";
 
 /// A [`VectorStore`] that persists one JSON snapshot per collection.
 ///
-/// The store keeps the shared [`VectorIndex`] in memory and rewrites the
+/// The store keeps the shared `VectorIndex` in memory and rewrites the
 /// snapshot of the collection a mutation touched, which makes behavior identical
 /// to [`super::InMemoryVectorStore`] while surviving a reopen.
 #[derive(Debug)]

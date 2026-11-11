@@ -10,7 +10,7 @@
 //! - [`function`] — `FunctionTool` and its builder (closure and typed handlers).
 //! - [`schema`] — JSON-Schema derivation, default filling, and validation.
 //! - [`restful`] — `RestfulApiTool` (OpenAPI/REST invocation).
-//! - [`mcp`] — MCP client transports and `McpTool` (feature `mcp`).
+//! - `mcp` — MCP client transports and `McpTool` (feature `mcp`).
 
 /// Tool cards and the OpenAI tool projection.
 pub mod card;

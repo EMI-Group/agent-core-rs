@@ -1,10 +1,10 @@
 //! MCP client support (feature `mcp`).
 //!
-//! [`client`] owns the provider-neutral [`client::McpClient`] trait and the
-//! `rmcp`-backed stdio transport plus the SSE / streamable-HTTP transports with
-//! reconnect;
-//! [`tool`] wraps a remote tool as an [`crate::tool::traits::Tool`]; [`result`]
-//! normalizes MCP call results.
+//! [`client`](crate::tool::mcp::client) owns the provider-neutral [`McpClient`]
+//! trait and the `rmcp`-backed stdio transport plus the SSE / streamable-HTTP
+//! transports with reconnect; [`tool`](crate::tool::mcp::tool) wraps a remote
+//! tool in a [`Tool`]; [`result`](crate::tool::mcp::result) normalizes MCP call
+//! results.
 //!
 //! Only stdio and streamable-HTTP/SSE transports are in scope; the Python
 //! `openapi`/`playwright` transports are deliberately not ported.
@@ -14,7 +14,7 @@
 //! without its `transport-*-reqwest` features, so `rmcp`'s own HTTP clients are
 //! not compiled in. Everything above the transport (JSON-RPC framing, the
 //! initialize handshake, request ids, cancellation) still comes from `rmcp`
-//! through [`client::RmcpClient`].
+//! through [`RmcpClient`].
 pub mod client;
 mod http;
 pub mod result;

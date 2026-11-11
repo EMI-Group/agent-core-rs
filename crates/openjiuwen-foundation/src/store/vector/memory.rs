@@ -1,6 +1,6 @@
 //! In-memory vector store and the shared index engine.
 //!
-//! [`VectorIndex`] is the reference implementation of the vector contract:
+//! `VectorIndex` is the reference implementation of the vector contract:
 //! schemas, documents, and their embeddings live in [`BTreeMap`]s, so every
 //! listing is sorted and every result order is deterministic (score descending,
 //! primary key ascending for ties).

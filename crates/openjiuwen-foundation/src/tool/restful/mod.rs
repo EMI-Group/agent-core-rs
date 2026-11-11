@@ -5,7 +5,7 @@
 //! `APIParamLocation`) and the JSON/text half of `response_parser.py`.
 //!
 //! The card keeps the model-facing shape, so there is no `RestfulApiCard` type
-//! here: a [`ToolCard`](super::card::ToolCard) plus a [`RestfulApiConfig`]
+//! here: a [`ToolCard`] plus a [`RestfulApiConfig`]
 //! carries the same data, and [`RestfulApiTool`] joins them with a parameter
 //! mapper and the shared
 //! [`HttpClient`](openjiuwen_common::http::HttpClient).

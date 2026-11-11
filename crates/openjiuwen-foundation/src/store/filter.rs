@@ -1,6 +1,6 @@
 //! The shared filter language used by the document and graph storage backends.
 //!
-//! A filter is a JSON value and a document is any JSON value. [`matches`]
+//! A filter is a JSON value and a document is any JSON value. [`matches`](fn@matches)
 //! resolves field paths with [`openjiuwen_common::utils::json::get_path`], so
 //! dotted keys (`meta.owner`) and array indices (`items[1].kind`) work the same
 //! way in every backend.
@@ -45,7 +45,7 @@
 //!
 //! Unknown operators and malformed conditions (`$and` that is not an array,
 //! `$in` without an array, `$contains` of a number, ...) make their condition
-//! false; [`matches`] never panics, whatever the input shape.
+//! false; [`matches`](fn@matches) never panics, whatever the input shape.
 
 use std::cmp::Ordering;
 
@@ -87,7 +87,7 @@ pub fn matches(filter: &Value, document: &Value) -> bool {
 /// Returns `true` when every filter in `filters` matches `document`.
 ///
 /// An empty slice matches everything. Each filter is evaluated independently
-/// with [`matches`], so combining filters is equivalent to `$and`.
+/// with [`matches`](fn@matches), so combining filters is equivalent to `$and`.
 ///
 /// ```
 /// use serde_json::json;

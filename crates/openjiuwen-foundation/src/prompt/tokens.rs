@@ -4,7 +4,7 @@
 //! [`TokenCounter`] seam the rest of the SDK uses instead of hard-coding one
 //! tokenizer: [`ApproxTokenCounter`] is the dependency-free estimate
 //! (≈[`DEFAULT_CHARS_PER_TOKEN`] characters per token), and
-//! [`TiktokenCounter`] (feature `tiktoken`) uses the `OpenAI` `cl100k_base` BPE
+//! `TiktokenCounter` (feature `tiktoken`) uses the `OpenAI` `cl100k_base` BPE
 //! with the approximation as a fallback when the BPE cannot be built.
 //!
 //! Python keeps its real counters in `context_engine`; this module only offers

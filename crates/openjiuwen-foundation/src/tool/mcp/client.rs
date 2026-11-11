@@ -6,8 +6,8 @@
 //!
 //! [`McpClient`] is the seam every tool uses: [`RmcpClient`] implements it on
 //! top of `rmcp` (stdio through `rmcp`'s child-process transport, HTTP and SSE
-//! through the transports in [`super::http`]), while tests substitute
-//! [`FakeMcpClient`]. Connections are lazy — the first operation connects — and
+//! through the transports in `super::http`), while tests substitute
+//! `FakeMcpClient`. Connections are lazy — the first operation connects — and
 //! transport failures are retried with the reconnect policy below.
 
 use std::collections::BTreeMap;

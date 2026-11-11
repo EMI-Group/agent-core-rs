@@ -12,7 +12,7 @@
 //!
 //! - [`InMemoryDocumentStore`] — the behavioral reference (a `BTreeMap` behind a lock).
 //! - [`LocalFileDocumentStore`] — one JSON snapshot per collection below a root.
-//! - [`SqliteDocumentStore`] — `SQLite` behind the `sqlite` feature.
+//! - `SqliteDocumentStore` — `SQLite` behind the `sqlite` feature.
 //!
 //! # Shared semantics
 //!
@@ -24,7 +24,7 @@
 //! - `upsert` replaces documents by id and reports how many documents it wrote.
 //! - `query` filters, orders, then applies `offset` and `limit`, in that order;
 //!   `count` and `delete` use only the filter.
-//! - All ordering, filtering, and paging is implemented once in [`run_query`],
+//! - All ordering, filtering, and paging is implemented once in `run_query`,
 //!   which every backend calls, so rankings cannot drift between backends.
 
 use std::cmp::Ordering;

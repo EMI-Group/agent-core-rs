@@ -5,9 +5,10 @@
 //! cancellation, and timeout a tool needs while it runs.
 //!
 //! [`ToolContext`] is runtime-only: it deliberately does **not** implement
-//! `serde`. A [`CancellationToken`] has no wire form, and the Python context is
-//! never serialized either — it exists only for the duration of a call, so a
-//! JSON representation would be lossy and misleading.
+//! `serde`. A [`CancellationToken`](tokio_util::sync::CancellationToken) has no
+//! wire form, and the Python context is never serialized either — it exists only
+//! for the duration of a call, so a JSON representation would be lossy and
+//! misleading.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
