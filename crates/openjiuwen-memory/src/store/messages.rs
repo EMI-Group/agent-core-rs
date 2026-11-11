@@ -75,7 +75,7 @@ pub(crate) struct MessageStore {
     document: Arc<dyn DocumentStore>,
 }
 
-#[allow(unreachable_pub)] // the type is crate-internal; `pub` keeps the spec's signature
+#[allow(unreachable_pub)] // crate-internal type with the spec's `pub` method signatures
 impl MessageStore {
     /// Builds a message store over `document`.
     pub fn new(document: Arc<dyn DocumentStore>) -> Self {

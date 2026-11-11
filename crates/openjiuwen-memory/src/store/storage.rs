@@ -41,7 +41,7 @@ pub(crate) struct MemoryStorage {
     stores: MemoryStores,
 }
 
-#[allow(unreachable_pub)] // the type is crate-internal; `pub` keeps the spec's signature
+#[allow(unreachable_pub)] // crate-internal type with the spec's `pub` method signatures
 impl MemoryStorage {
     /// Builds storage over `stores`.
     pub fn new(stores: MemoryStores) -> Self {

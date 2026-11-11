@@ -27,12 +27,10 @@ use openjiuwen_foundation::store::{
 #[cfg(feature = "sqlite")]
 use openjiuwen_foundation::store::{SqliteDocumentStore, SqliteKvStore};
 
-// `keys.rs` asserts on `is_empty()` in its committed tests; keep the module lint-clean.
-#[allow(clippy::assert_is_empty)]
 pub mod keys;
 
-// These modules are consumed by the engine and facade modules as they land; until
-// then the crate-internal seam is exercised only by this module's own tests.
+// The engine and facade modules are not implemented yet, so the crate-internal seam
+// is reached only from this module's tests.
 #[allow(dead_code)]
 mod json;
 #[allow(dead_code)]
@@ -40,10 +38,10 @@ mod messages;
 #[allow(dead_code)]
 mod storage;
 
-#[allow(unused_imports)] // used by the engine and facade modules as they land
+#[allow(unused_imports)] // reached by the engine and facade seams
 pub(crate) use messages::MessageStore;
 pub use messages::StoredMessage;
-#[allow(unused_imports)] // used by the engine and facade modules as they land
+#[allow(unused_imports)] // reached by the engine and facade seams
 pub(crate) use storage::MemoryStorage;
 
 /// The concrete backends shared by the engine, facade, graph memory, and lite memory.

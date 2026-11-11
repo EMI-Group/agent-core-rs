@@ -39,10 +39,7 @@ const FNV1A_32_PRIME: u32 = 0x0100_0193;
 /// Key of one record: `UMD/{user_id}/{scope_id}/{id}`.
 #[must_use]
 pub fn record_key(scope: &MemoryScope, id: &str) -> String {
-    format!(
-        "{RECORD_PREFIX}/{}/{}/{id}",
-        scope.user_id, scope.scope_id
-    )
+    format!("{RECORD_PREFIX}/{}/{}/{id}", scope.user_id, scope.scope_id)
 }
 
 /// Key prefix of every record in `scope`: `UMD/{user_id}/{scope_id}/`.
@@ -148,10 +145,7 @@ pub fn sanitize_segment(value: &str) -> String {
 
 /// Whether `value` is a non-empty safe segment that needs no rewriting.
 fn is_safe_segment(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value.chars().all(is_segment_char)
+    !value.is_empty() && value != "." && value != ".." && value.chars().all(is_segment_char)
 }
 
 /// Whether `c` belongs to the accepted segment alphabet `[A-Za-z0-9._-]`.
@@ -262,12 +256,12 @@ mod tests {
             let sanitized = sanitize_segment(value);
             assert_ne!(sanitized, ".");
             assert_ne!(sanitized, "..");
-            assert!(!sanitized.is_empty());
+            assert_ne!(sanitized, "");
             assert!(sanitized.chars().all(is_segment_char));
         }
         assert_eq!(sanitize_segment("").len(), 1 + 1 + 8);
         assert!(sanitize_segment(".").starts_with('.'));
-        assert!(!sanitize_segment("..").is_empty());
+        assert_ne!(sanitize_segment(".."), "");
     }
 
     #[test]
