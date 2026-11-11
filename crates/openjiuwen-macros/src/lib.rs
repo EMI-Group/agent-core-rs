@@ -7,9 +7,9 @@
 //!
 //! # Supported forms
 //!
-//! ```ignore
+//! ```
 //! use openjiuwen_common::error::Result;
-//! use openjiuwen_foundation::tool::ToolContext;
+//! use openjiuwen_foundation::tool::{Tool, ToolContext};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -27,6 +27,21 @@
 //!
 //! // Optional second parameter: `ctx: &ToolContext` or `ctx: ToolContext`.
 //! // The return type may also be a plain `T` instead of `Result<T>`.
+//!
+//! // The expansion keeps `add` callable and adds `AddTool` + `add_tool()`.
+//! let tool = add_tool();
+//! assert_eq!(tool.card().name, "add");
+//! assert_eq!(tool.card().description, "Add two integers.");
+//! assert!(tool.card().input_params["properties"]["a"].is_object());
+//!
+//! # let runtime = tokio::runtime::Builder::new_current_thread()
+//! #     .enable_all()
+//! #     .build()
+//! #     .unwrap();
+//! let output = runtime
+//!     .block_on(tool.invoke(serde_json::json!({"a": 2, "b": 3}), &ToolContext::new()))
+//!     .unwrap();
+//! assert_eq!(output, serde_json::json!(5));
 //! ```
 //!
 //! The expansion keeps the annotated function unchanged and adds `AddTool`
