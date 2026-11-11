@@ -1,6 +1,7 @@
 //! JSON aliases and conversion helpers.
 //!
-//! [`JsonValue`] is [`serde_json::Value`]; [`JsonObject`] is a [`BTreeMap`] so key order is
+//! [`JsonValue`] is [`serde_json::Value`]; [`JsonObject`] is a
+//! [`std::collections::BTreeMap`] so key order is
 //! deterministic (the workspace builds `serde_json` with `preserve_order`, so conversions go
 //! through an explicit `collect` rather than reusing serde's map type).
 //!
