@@ -237,18 +237,33 @@ Code (`local/test_code_operation.py`):
   codecs.
 - Cross-process file locks (Python's SQLite lock manager) are not ported; only in-process locks
   are provided.
+- POSIX streaming does not apply Python's `stdbuf`/`script` buffering wrappers: output arrives
+  in pipe-sized blocks and never through a PTY.
+- Background early-exit detection uses a 100 ms grace window (Python defaults to 3 s and
+  exposes `grace=`), so a command failing later than that is reported as started, with a pid.
+- Cancellation kills the direct child only (`start_kill`): Python's `killpg` process-group kill
+  and `kill_session_tree`/`consume_cancelled` are not ported (`cancel_all` covers teardown).
+- `execute_argv` applies the allowlist to `argv[0]` but not `dangerous_patterns`: arguments are
+  data, never shell text.
+- Windows `Auto` uses `cmd /C`; Python's POSIX/PowerShell command classification heuristics and
+  `-lc` path normalization are not ported.
+- Shell and code output capture is bounded by `max_output_bytes` (Python captures unbounded);
+  timeout and cancellation failures keep partial output in `data`.
 
 ## Test Strategy
 
 - `#[cfg(test)]` modules next to the code cover unit behavior: parameter defaults, slicing,
   encoding detection, allowlist parsing, path containment, truncation, result mapping.
-- `tests/` holds behavior ports, each citing the Python test it ports:
+- Shell and code behavior ports live in `#[cfg(test)]` modules beside the backends:
+  allowlist acceptance/rejection, deny patterns, timeout with partial output, bounded capture,
+  env overlay/scrubbing, `execute_argv` without a shell, background early exit, stream chunk
+  shape, session/instance cancellation, code language metadata and temp-file strategy.
+- `tests/` holds cross-module behavior ports, each citing the Python test it ports:
   `card_json.rs` (card/config JSON parity), `local_fs.rs` (read/write/list/search/upload/
   download against `tempfile` dirs), `fs_edges.rs` (conditional write, binary policy, max size,
-  line ranges), `traversal.rs` (escape attempts incl. symlinks), `shell_local.rs` (allow/deny,
-  timeout, truncation, env overlay, argv form), `code_local.rs` (Python/JavaScript, skipped when
-  the runtime is absent), `tool_specs.rs` (13 specs, ids, schemas), `sandbox_stub.rs`
-  (feature `sandbox`: unsupported remote calls, isolation keys, provider dispatch).
+  line ranges), `traversal.rs` (escape attempts incl. symlinks), `tool_specs.rs` (13 specs, ids,
+  schemas), `sandbox_stub.rs` (feature `sandbox`: unsupported remote calls, isolation keys,
+  provider dispatch).
 - Every test is offline and deterministic: `tempfile` workspaces, no network, and runtime
   lookups (`python3`, `node`, `bash`) skip with an explanatory message when missing.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
@@ -271,8 +286,13 @@ Code (`local/test_code_operation.py`):
 - `./src/tool.rs` → `OperationToolSpec` generation from parameter schemas
 - `./src/constants.rs` → defaults shared by the backends
 - `./src/fs/` → filesystem types and the local backend (`local`, `slice`, `list`, `search`, `ext`)
-- `./src/shell/` → shell types, allowlist/deny filter, execution plan, local backend, process registry
-- `./src/code/` → code types and the local snippet runner
+- `./src/shell/types.rs` → `ShellType`, `ShellExecParams`, `ShellArgvParams`, `ShellOutput`, `ShellChunk`, `ShellBackgroundOutput`
+- `./src/shell/allowlist.rs` → `CommandFilter`: first-token allowlist (quote-aware splitter) and dangerous-pattern deny list
+- `./src/shell/plan.rs` → `resolve_plan` per `ShellType` and OS, absolute-path literal extraction
+- `./src/shell/registry.rs` → `ShellProcessRegistry`: per-session cancellation tokens, RAII registration, `global()`
+- `./src/shell/local.rs` → `LocalShellOperation` and the shared bounded-capture/timeout engine (`pub(crate) mod process`)
+- `./src/code/types.rs` → `Language`, `CodeExecParams`, `CodeOutput`, `CodeChunk`
+- `./src/code/local.rs` → `LocalCodeOperation`: runtime lookup, inline/temp-file strategy, forced env
 - `./src/sandbox/` → gateway config, provider registry, sandbox dispatch, HTTP stub (feature `sandbox`)
 - `./tests/` → behavior ports (see Test Strategy)
 
@@ -289,3 +309,12 @@ Code (`local/test_code_operation.py`):
   mismatch cannot occur.
 - Streams must be `'static`; use `self: Arc<Self>` receivers and `async_stream::try_stream!`,
   yielding a single error chunk on failure instead of returning `Err`.
+- The local shell and code backends share `crate::shell::local::process` (`spawn_child`,
+  `apply_environment`, `run_captured`, `stream_child`); never re-implement bounded capture,
+  timeout, or cancellation inside `code/local.rs`.
+- Shell gate order is blank command → deny list → allowlist → cwd/sandbox → shell plan, so a
+  rejected command never spawns a child; `CommandFilter::check` reports the deny list first.
+- `<lang> is not supported` is unrepresentable here (`Language` is a closed enum), and
+  `CodeExecParams::encoding` is accepted but ignored: decoding is UTF-8 lossy.
+- `src/shell/local.rs` carries the facade plus the shared engine (~1000 lines of code plus
+  ~350 lines of tests); if it grows further, extract `process` into `src/shell/process.rs`.
