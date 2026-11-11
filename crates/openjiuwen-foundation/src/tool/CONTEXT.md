@@ -76,9 +76,8 @@ Root re-exports from `crate::tool` (for call sites that should not care about mo
   `typed_handler<I, O, F, Fut>` deserializes `I` (`Error::Validation` on failure) and serializes `O` (`Error::Tool` on failure); it requires `I: JsonSchema` and, when no schema was set explicitly, `build` derives it with `schema_for::<I>()` so the two builder paths never diverge.
   `build()` returns `Result<FunctionTool>` (`Error::Validation` when no handler was set).
   The builder's `render` override wins over the trait default; the private `default_render` helper mirrors the trait default body and must be kept in sync with it.
-- **`#[tool]` macro contract** (`openjiuwen-macros`, later): the macro expands to
-  `FunctionTool::builder().name(<fn name>).description(<doc comment>).input_schema(schema_for::<Args>()).typed_handler::<Args, _, _, _>(<fn>).build()`
-  where `Args` derives `serde::Deserialize` + `schemars::JsonSchema`, so `schema_for::<T>()` is the single schema entry point the macro targets.
+- **`#[tool]` macro contract** (`openjiuwen-macros`, implemented): the macro expands an `async fn Args -> Result<O>` into a wrapper struct plus a `{fn}_tool() -> Arc<dyn Tool>` constructor around `FunctionTool::new(ToolCard::new(name, description, input_params), ToolHandler)`, where `input_params` defaults to `schema_for::<Args>()` and `Args` needs `serde::Deserialize` + `schemars::JsonSchema`; `schema_for::<T>()` is the single schema entry point it targets.
+  `FunctionTool` itself is a plain struct (not macro-generated); `openjiuwen-foundation` does not re-export the `openjiuwen_macros::tool` attribute, so a consumer crate must depend on `openjiuwen-macros` directly to use it, while those that only need `FunctionTool::builder` do not.
 - **Schema generation** uses `schemars` (typed handlers) or a literal JSON Schema (closures/remote tools). `schema_for` removes `$schema`, keeps `$defs`, and normalizes non-object schemas to `{"type":"object"}`.
   `additionalProperties` is left untouched (permissive), a documented deviation from Python's reject-all-empty-schema behavior, because closures with `Value` input must accept arbitrary objects.
   `validate_inputs` reports the failing instance path (root rendered as `/`) in the `Error::Validation` message.
