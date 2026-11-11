@@ -3,7 +3,7 @@
 //! Python binds guardrails to callback events and never produces a combined
 //! verdict; this pipeline is the addition that runs the registered guardrails
 //! for one scan, aggregates their verdicts, and applies a
-//! [`SecurityPolicy`](crate::SecurityPolicy).
+//! [`SecurityPolicy`].
 //!
 //! Runs are **infallible by design**: a guardrail failure is data (recorded in
 //! [`GuardrailOutcome::errors`](crate::GuardrailOutcome::errors) and logged),

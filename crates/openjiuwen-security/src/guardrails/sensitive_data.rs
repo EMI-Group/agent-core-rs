@@ -1,7 +1,7 @@
 //! Sensitive-data/PII detection with redaction.
 //!
 //! Detection patterns, validators, and the [`SensitiveDataGuardrail`] live here;
-//! the guardrail is a [`Guardrail`](crate::Guardrail) implementation whose
+//! the guardrail is a [`Guardrail`] implementation whose
 //! redaction primitive [`SensitiveDataGuardrail::redact_text`] is reused by
 //! tool-argument validation.
 //!
@@ -17,7 +17,7 @@
 //! Patterns are compiled once, in table order, with
 //! [`CompiledRule::compile`](crate::rules::CompiledRule::compile) in
 //! case-sensitive mode. Within one pattern the non-overlapping matches come from
-//! [`find_all`](crate::rules::find_all); across patterns the earliest pattern in
+//! [`find_all`]; across patterns the earliest pattern in
 //! the table wins, so a number matched by both `credit_card` and another pattern
 //! is reported and redacted once. A candidate is dropped, never reported, when
 //! its [`SensitiveValidator`] rejects it, when the exact matched substring is in

@@ -9,7 +9,7 @@
 //! Parsing is pure and synchronous: it performs no I/O, never panics, and
 //! [`ModelOutputParser::parse`] is total. Any input that matches none of the
 //! documented shapes (malformed JSON, an unrelated string, `null`, ...)
-//! degrades to a [`RiskLevel::Safe`] assessment with zero confidence instead
+//! degrades to a `RiskLevel::Safe` assessment with zero confidence instead
 //! of returning an error.
 
 use serde::{Deserialize, Serialize};

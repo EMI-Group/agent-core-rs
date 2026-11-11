@@ -24,7 +24,7 @@ pub struct RedactedOutcome {
     pub risk_level: RiskLevel,
     /// Findings with every `details` and `modified_data` value redacted.
     pub findings: Vec<Finding>,
-    /// Failures, shortened to [`MAX_ERROR_CHARS`] characters.
+    /// Failures, shortened to 200 characters.
     pub errors: Vec<String>,
     /// Names of the guardrails that ran, in run order.
     pub guardrails: Vec<String>,
