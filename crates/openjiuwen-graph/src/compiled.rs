@@ -52,6 +52,19 @@ pub struct HaltInfo {
     pub value: Option<Value>,
 }
 
+/// Aborts a spawned run when its event stream is dropped.
+///
+/// Held in the stream generator across its `yield` points: dropping the stream
+/// drops the generator future, which drops this guard and aborts the in-flight
+/// run instead of leaking it as an untracked background task.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Everything a compiled graph needs at run time.
 pub(crate) struct CompiledInner {
     pub(crate) graph_id: String,
@@ -149,6 +162,9 @@ impl CompiledGraph {
     }
 
     /// Streams the run's events with the default execution options.
+    ///
+    /// See [`CompiledGraph::stream_with`] for the completion and cancellation
+    /// contract.
     pub fn stream(
         &self,
         input: Value,
@@ -160,7 +176,14 @@ impl CompiledGraph {
     /// Streams the run's events.
     ///
     /// The stream yields events in execution order and, when the run fails,
-    /// exactly one [`Err`] after the failure's events.
+    /// exactly one [`Err`] after the failure's events. A normally consumed
+    /// stream therefore ends with [`crate::GraphEventKind::GraphCompleted`], or
+    /// with the single error of a failed run.
+    ///
+    /// The run executes as a spawned task while the stream is alive. Abandoning
+    /// the stream (dropping it before it terminates) aborts that task, so an
+    /// early consumer exit cancels the in-flight run instead of leaking an
+    /// untracked background run.
     pub fn stream_with(
         &self,
         input: Value,
@@ -174,6 +197,8 @@ impl CompiledGraph {
             let handle = tokio::spawn(async move {
                 crate::pregel::executor::execute(inner, input, session, options).await
             });
+            // Held across every `yield`, so dropping the stream aborts the run.
+            let guard = AbortOnDrop(handle.abort_handle());
             while let Some(event) = receiver.recv().await {
                 yield Ok(event);
             }
@@ -182,6 +207,8 @@ impl CompiledGraph {
                 Ok(Err(error)) => yield Err(error),
                 Err(join_error) => yield Err(Error::external(join_error)),
             }
+            // Normal completion: aborting a finished task is a no-op.
+            drop(guard);
         };
         Box::pin(stream)
     }

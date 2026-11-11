@@ -4,13 +4,16 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
 
-use openjiuwen_graph::{ExecutionOptions, GraphBuilder, GraphEventKind};
+use openjiuwen_graph::{
+    ExecutionOptions, FnNode, GraphBuilder, GraphContext, GraphEventKind, GraphState, NodeOutcome,
+};
 use openjiuwen_session::{Session, StreamEvent};
 
 fn two_step_graph() -> openjiuwen_graph::CompiledGraph {
@@ -154,4 +157,68 @@ async fn execution_options_sender_receives_events() {
     assert_eq!(kinds.len(), 10);
     assert_eq!(kinds[0], GraphEventKind::SuperstepStarted);
     assert_eq!(kinds[9], GraphEventKind::GraphCompleted);
+}
+
+#[tokio::test]
+async fn dropping_the_stream_aborts_the_run() {
+    const MAX_SUPERSTEPS: usize = 20;
+    let executed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&executed);
+    let graph = GraphBuilder::new("abandoned")
+        .node(
+            "a",
+            FnNode::new("a", move |state: &mut GraphState, _ctx: &GraphContext| {
+                let count = state
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                state.set("count", json!(count + 1));
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    // A full run takes `MAX_SUPERSTEPS * 5 ms`, so the consumer
+                    // below drops the stream long before the run can finish.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(NodeOutcome::Continue)
+                })
+            }),
+        )
+        .edge("a", "a")
+        .entry("a")
+        .compile()
+        .unwrap();
+
+    let mut stream = graph.stream_with(
+        json!({}),
+        common::session(),
+        ExecutionOptions {
+            max_supersteps: Some(MAX_SUPERSTEPS),
+            ..ExecutionOptions::default()
+        },
+    );
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.kind, GraphEventKind::SuperstepStarted);
+    drop(stream);
+
+    // Without the abort guard the abandoned run keeps executing all
+    // `MAX_SUPERSTEPS` node runs; with it the run dies almost immediately.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if executed.load(Ordering::SeqCst) >= MAX_SUPERSTEPS {
+            break;
+        }
+    }
+    let runs = executed.load(Ordering::SeqCst);
+    assert!(
+        runs < MAX_SUPERSTEPS,
+        "the abandoned run kept executing: {runs} of {MAX_SUPERSTEPS} node runs"
+    );
+
+    // A normally consumed stream still ends with the completion event.
+    let kinds: Vec<GraphEventKind> = two_step_graph()
+        .stream(json!({}), common::session())
+        .map(|item| item.unwrap().kind)
+        .collect()
+        .await;
+    assert_eq!(kinds.last(), Some(&GraphEventKind::GraphCompleted));
 }
