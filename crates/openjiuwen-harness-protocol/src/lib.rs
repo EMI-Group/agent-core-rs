@@ -19,14 +19,18 @@ pub mod events;
 pub mod json;
 pub mod models;
 pub mod results;
+pub mod serialization;
 pub mod state;
 pub mod validation;
 
 pub use errors::{HarnessError, HarnessErrorKind, HarnessResult};
 pub use events::{
-    DiagnosticLevel, EventBufferConfig, EventOverflowPolicy, EventRetention, HookEventPhase,
-    ItemEventKind, ModelRequestStatus, OutputChannel, OutputKind, OutputOperation, TurnEventKind,
-    UsageUpdateMode, TERMINAL_TURN_EVENT_KINDS,
+    event_retention, DiagnosticEvent, DiagnosticLevel, EventBufferConfig, EventOverflowPolicy,
+    EventRetention, HarnessEventPayload, HookEventPhase, HookObservedEvent, ItemEventKind,
+    ItemLifecycleEvent, ModelRequestEvent, ModelRequestStatus, OutputChannel, OutputEvent,
+    OutputKind, OutputOperation, ProviderEvent, StateChangedEvent, TurnEventKind,
+    TurnLifecycleEvent, UnknownEvent, UsageUpdateMode, UsageUpdatedEvent,
+    TERMINAL_TURN_EVENT_KINDS,
 };
 pub use json::{
     empty_json_object, from_str_validated, from_value_validated, json_object_from_value,
@@ -41,6 +45,7 @@ pub use results::{
     ContentBlock, MessageRole, MonetaryAmount, TurnError, TurnMessage, TurnResult, TurnStatus,
     TurnTermination, TurnTerminationKind, TurnUsage,
 };
+pub use serialization::EVENT_WIRE_SCHEMA_VERSION;
 pub use state::HarnessState;
 pub use validation::{
     join_sorted, require_finite_non_negative, require_finite_timestamp, require_non_empty,
