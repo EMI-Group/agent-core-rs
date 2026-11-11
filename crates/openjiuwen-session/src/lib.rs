@@ -3,8 +3,8 @@
 //! Maps to the Python package `openjiuwen.core.session` in the openJiuwen
 //! reference implementation. The crate is the kernel's stable seam for
 //! per-run execution context: state lanes, stream frames, and interaction
-//! requests/responses. Checkpointing, tracing, and the concrete session types
-//! live in sibling modules introduced by later phases.
+//! requests/responses, checkpoint persistence, and trace positions. The concrete
+//! session types and the full tracer land in later phases.
 //!
 //! Modules:
 //!
@@ -16,6 +16,10 @@
 //!   ([`stream::StreamHub`], [`stream::StreamWriterManager`]).
 //! - [`interaction`] — human-in-the-loop requests, responses, and the
 //!   [`interaction::InteractionBroker`].
+//! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
+//!   [`checkpoint::Checkpoint`] model, and the memory/file persistence backends.
+//! - [`tracer`] — trace positions persisted with checkpoints (the full tracer
+//!   lands in a later phase).
 //!
 //! The types most consumers need are re-exported at the crate root:
 //! [`SessionConfig`], the default ids and stream constants ([`DEFAULT_NODE_ID`],
@@ -26,15 +30,26 @@
 //! [`InteractionKind`], [`InteractionDecision`], [`InteractionOption`],
 //! [`InteractionOutput`], [`InteractiveInput`]), and the stream frames
 //! ([`StreamItem`], [`StreamEvent`], [`StreamMode`], [`StreamHub`],
-//! [`StreamWriterManager`]).
+//! [`StreamWriterManager`]), and checkpointing ([`Checkpointer`], [`Checkpoint`],
+//! [`CheckpointMeta`], [`CheckpointNamespace`], [`CheckpointerConfig`],
+//! [`CheckpointerKind`], [`MemoryCheckpointer`], [`FileCheckpointer`],
+//! [`build_key`], [`build_key_with_namespace`], and the namespace constants).
 #![forbid(unsafe_code)]
 
+pub mod checkpoint;
 pub mod config;
 pub mod constants;
 pub mod interaction;
 pub mod state;
 pub mod stream;
+pub mod tracer;
 
+pub use checkpoint::{
+    build_key, build_key_with_namespace, create_checkpointer, Checkpoint, CheckpointMeta,
+    CheckpointNamespace, Checkpointer, CheckpointerConfig, CheckpointerKind, FileCheckpointer,
+    MemoryCheckpointer, SESSION_NAMESPACE_AGENT, SESSION_NAMESPACE_AGENT_TEAM,
+    SESSION_NAMESPACE_WORKFLOW, WORKFLOW_NAMESPACE_GRAPH,
+};
 pub use config::SessionConfig;
 pub use constants::{DEFAULT_NODE_ID, DEFAULT_STREAM_CAPACITY, DEFAULT_WORKFLOW_ID, END_FRAME};
 pub use interaction::{
