@@ -49,7 +49,7 @@ const MAX_ERROR_BODY_BYTES: usize = 8192;
 ///
 /// ```no_run
 /// use openjiuwen_foundation::llm::anthropic::AnthropicClient;
-/// use openjiuwen_foundation::llm::{ModelClientConfig, ModelRequestConfig};
+/// use openjiuwen_foundation::llm::{Model, ModelClientConfig, ModelRequestConfig};
 ///
 /// # async fn example() -> openjiuwen_common::error::Result<()> {
 /// let client = AnthropicClient::new(
