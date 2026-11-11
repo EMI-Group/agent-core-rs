@@ -218,6 +218,15 @@ impl GuardrailContext {
         self.metadata.get("tool_name").and_then(Value::as_str)
     }
 
+    /// The scanning stage implied by `event`.
+    ///
+    /// The stage is not stored separately: the event name is the single source
+    /// of truth, so a context rebuilt from a wire callback keeps its stage.
+    #[must_use]
+    pub fn stage(&self) -> ScanStage {
+        ScanStage::from_event(&self.event)
+    }
+
     /// The text projection every built-in guardrail scans.
     ///
     /// Text content is returned borrowed. Message arrays contribute every
@@ -419,6 +428,14 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expected a scan-stage event string"));
+    }
+
+    #[test]
+    fn stage_is_derived_from_event() {
+        assert_eq!(
+            GuardrailContext::text("x", ScanStage::UserInput).stage(),
+            ScanStage::UserInput
+        );
     }
 
     #[test]

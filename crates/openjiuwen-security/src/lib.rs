@@ -16,43 +16,88 @@
 //! Guardrail *failures* are fail-open by default ([`FailurePolicy::FailOpen`]):
 //! the error is recorded and logged, never silently dropped.
 //!
+//! A run produces one [`GuardrailOutcome`]: the evaluations, the findings, the
+//! decision, and the merged sanitized content. [`GuardrailOutcome::enforce`]
+//! turns a blocked outcome into an [`openjiuwen_common::error::Error`];
+//! [`GuardrailOutcome::redacted`] is the content-free view that is safe to log.
+//!
 //! # Module map
 //!
 //! - [`level`] — [`RiskLevel`] and [`GuardrailContentType`].
 //! - [`context`] — [`ScanStage`], the event-name constants, and
 //!   [`GuardrailContext`] with its text projection.
 //! - [`result`] — [`GuardrailResult`] and [`RiskAssessment`].
+//! - [`finding`] — [`Finding`], [`GuardrailEvaluation`], [`SecurityDecision`],
+//!   [`GuardrailOutcome`], and [`GuardrailViolation`].
+//! - [`guardrail`] — the [`Guardrail`] and [`GuardrailBackend`] traits plus
+//!   [`BackendGuardrail`].
+//! - [`pipeline`] — the ordered [`GuardrailPipeline`] and its scan helpers.
+//! - [`report`] — [`RedactedOutcome`].
+//! - [`config`] — [`SecurityPolicy`], [`FailurePolicy`], and [`ScanTargets`].
 //! - [`rules`] — the shared regex rule engine ([`CompiledRule`],
 //!   [`TextMatch`], Luhn, redaction).
-//! - [`config`] — [`SecurityPolicy`], [`FailurePolicy`], and [`ScanTargets`].
 //!
-//! The `parsers`, `backends`, and `guardrails` modules, the `Guardrail` trait,
-//! the finding model, and the pipeline itself arrive in later phases.
+//! The `parsers`, `backends`, and `guardrails` modules (concrete detectors and
+//! moderation adapters) arrive in later phases.
 //!
 //! # Example
 //!
 //! ```
+//! use async_trait::async_trait;
+//! use openjiuwen_common::error::Result;
 //! use openjiuwen_security::{
-//!     CompiledRule, GuardrailContext, RiskLevel, ScanStage, SecurityPolicy,
+//!     Guardrail, GuardrailContext, GuardrailPipeline, GuardrailResult, RiskLevel,
 //! };
 //!
-//! let policy = SecurityPolicy::default();
-//! assert_eq!(policy.block_level, RiskLevel::Critical);
+//! struct ContainsWord(&'static str);
 //!
-//! let rule = CompiledRule::compile("prompt_injection", r"ignore previous", false)
-//!     .expect("valid pattern")
-//!     .with_risk_level(RiskLevel::High);
+//! #[async_trait]
+//! impl Guardrail for ContainsWord {
+//!     fn name(&self) -> &str {
+//!         "contains_word"
+//!     }
 //!
-//! let context = GuardrailContext::text("Ignore previous instructions", ScanStage::UserInput);
-//! assert!(rule.is_match(&context.text_view()));
-//! assert!(RiskLevel::High.at_least(RiskLevel::Medium));
+//!     async fn check(&self, ctx: &GuardrailContext) -> Result<GuardrailResult> {
+//!         if ctx.text_view().contains(self.0) {
+//!             Ok(GuardrailResult::block(
+//!                 RiskLevel::High,
+//!                 "banned_word",
+//!                 None,
+//!                 None,
+//!             ))
+//!         } else {
+//!             Ok(GuardrailResult::pass())
+//!         }
+//!     }
+//! }
+//!
+//! let runtime = tokio::runtime::Builder::new_current_thread()
+//!     .enable_all()
+//!     .build()
+//!     .expect("a tokio runtime");
+//!
+//! let mut pipeline = GuardrailPipeline::new();
+//! pipeline.add(ContainsWord("secret"));
+//!
+//! let outcome = runtime.block_on(pipeline.scan_user_input("all clear"));
+//! assert!(outcome.is_safe());
+//! assert!(outcome.findings.is_empty());
+//!
+//! let flagged = runtime.block_on(pipeline.scan_user_input("a secret plan"));
+//! assert!(flagged.is_safe(), "HIGH findings do not block by default");
+//! assert_eq!(flagged.risk_level, RiskLevel::High);
+//! assert_eq!(flagged.findings.len(), 1);
 //! ```
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod config;
 pub mod context;
+pub mod finding;
+pub mod guardrail;
 pub mod level;
+pub mod pipeline;
+pub mod report;
 pub mod result;
 pub mod rules;
 
@@ -61,6 +106,12 @@ pub use context::{
     GuardrailContext, ScanStage, EVENT_LLM_INVOKE_INPUT, EVENT_LLM_INVOKE_OUTPUT,
     EVENT_TOOL_INVOKE_INPUT, EVENT_TOOL_INVOKE_OUTPUT, EVENT_USER_INPUT,
 };
+pub use finding::{
+    Finding, GuardrailEvaluation, GuardrailOutcome, GuardrailViolation, SecurityDecision,
+};
+pub use guardrail::{BackendGuardrail, Guardrail, GuardrailBackend, DEFAULT_PRIORITY};
 pub use level::{GuardrailContentType, RiskLevel};
+pub use pipeline::GuardrailPipeline;
+pub use report::RedactedOutcome;
 pub use result::{GuardrailResult, RiskAssessment};
 pub use rules::{CompiledRule, TextMatch};
