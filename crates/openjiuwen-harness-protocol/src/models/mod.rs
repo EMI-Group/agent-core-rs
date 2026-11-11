@@ -7,6 +7,8 @@
 //! - [`delivery`] — [`DeliveryMode`], [`AbortMode`], [`HarnessInput`], and [`SendReceipt`].
 //! - [`model_control`] — [`ModelSelection`], [`ModelEndpoint`], [`ModelChoice`],
 //!   [`ModelOption`], and the auth-fallback request/event type constants.
+//! - [`context`] — [`ResumePolicy`], [`HarnessTelemetry`], and [`HarnessContext`] (the live
+//!   per-agent host context, deliberately not serde-serializable).
 //!
 //! Everything is re-exported from the crate root as well, mirroring Python's eager
 //! `__init__.__all__`.
@@ -20,6 +22,7 @@ pub use card::{
     default_compatible_protocol_versions, HarnessCapability, HarnessCard, HostCapability,
     PROTOCOL_VERSION,
 };
+pub use context::{HarnessContext, HarnessTelemetry, ResumePolicy};
 pub use delivery::{AbortMode, DeliveryMode, HarnessInput, SendReceipt};
 pub use model_control::{
     ModelChoice, ModelEndpoint, ModelOption, ModelSelection, AUTH_FALLBACK_EVENT_TYPE,
