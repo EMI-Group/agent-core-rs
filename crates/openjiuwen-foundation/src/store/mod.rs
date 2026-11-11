@@ -12,6 +12,10 @@
 //! - [`graph`] — `GraphStore` (+ `GraphNode`, `GraphEdge`).
 //! - [`object`] — `ObjectStore` (buckets and opaque objects).
 //! - [`filter`] — the shared equality/operator filter matcher used by every backend.
+//!
+//! The crate-level seams are re-exported here so consumers (memory, retrieval,
+//! session, harness) can depend on `openjiuwen_foundation::store::{KvStore, ...}`
+//! without importing the module paths.
 
 pub mod document;
 pub mod filter;
@@ -19,3 +23,19 @@ pub mod graph;
 pub mod kv;
 pub mod object;
 pub mod vector;
+
+#[cfg(feature = "sqlite")]
+pub use document::SqliteDocumentStore;
+pub use document::{Document, DocumentStore, Query, SortOrder};
+pub use document::{InMemoryDocumentStore, LocalFileDocumentStore};
+pub use filter::{matches, matches_all};
+pub use graph::{Direction, GraphEdge, GraphNode, GraphQuery, GraphStore};
+pub use graph::{InMemoryGraphStore, LocalFileGraphStore};
+#[cfg(feature = "sqlite")]
+pub use kv::SqliteKvStore;
+pub use kv::{InMemoryKvStore, KvPipeline, KvStore, KvValue, LocalFileKvStore};
+pub use object::{InMemoryObjectStore, LocalObjectStore, ObjectMeta, ObjectStore};
+pub use vector::{
+    CollectionSchema, FieldSchema, InMemoryVectorStore, LocalFileVectorStore, Metric,
+    VectorDataType, VectorQuery, VectorSearchResult, VectorStore,
+};
