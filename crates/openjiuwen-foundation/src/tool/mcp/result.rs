@@ -96,7 +96,10 @@ impl McpToolResult {
 /// the joined text blocks (never the normalized payload, which may instead hold
 /// images or resources).
 #[must_use]
-pub fn normalize_call_tool_result(result: &CallToolResult, include_image_content: bool) -> McpToolResult {
+pub fn normalize_call_tool_result(
+    result: &CallToolResult,
+    include_image_content: bool,
+) -> McpToolResult {
     let mut normalized = extract_content(&result.content, include_image_content);
     if result.is_error != Some(true) {
         return normalized;

@@ -24,13 +24,13 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use openjiuwen_common::error::{Error, Result};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use reqwest::{Response, StatusCode};
 use rmcp::model::ServerJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
-use rmcp::{RoleClient, transport::Transport};
+use rmcp::{transport::Transport, RoleClient};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -76,8 +76,9 @@ impl HttpTransportError {
 /// Returns [`Error::Validation`] when the URL is relative, uses another scheme,
 /// or has no host.
 pub(crate) fn validate_endpoint(endpoint: &str) -> Result<()> {
-    let parsed = Url::parse(endpoint.trim())
-        .map_err(|error| Error::validation(format!("invalid MCP endpoint `{endpoint}`: {error}")))?;
+    let parsed = Url::parse(endpoint.trim()).map_err(|error| {
+        Error::validation(format!("invalid MCP endpoint `{endpoint}`: {error}"))
+    })?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(Error::validation(format!(
             "MCP endpoint `{endpoint}` must use http or https"
@@ -207,7 +208,10 @@ impl Transport<RoleClient> for StreamableHttpTransport {
             let mut request = endpoint
                 .client
                 .post(&endpoint.url)
-                .header(ACCEPT, format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"))
+                .header(
+                    ACCEPT,
+                    format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+                )
                 .header(CONTENT_TYPE, JSON_MIME_TYPE)
                 .headers(endpoint.headers.clone())
                 .body(body);
@@ -230,7 +234,8 @@ impl Transport<RoleClient> for StreamableHttpTransport {
             match content_type(&response) {
                 Some(mime) if mime == EVENT_STREAM_MIME_TYPE => {
                     tokio::spawn(async move {
-                        if let Err(error) = read_message_stream(response, outbound, cancellation).await
+                        if let Err(error) =
+                            read_message_stream(response, outbound, cancellation).await
                         {
                             tracing::debug!(%error, "MCP streamable HTTP stream ended");
                         }
@@ -380,6 +385,7 @@ impl Transport<RoleClient> for SseTransport {
                     endpoint.clone(),
                     post_endpoint.clone(),
                     endpoint_ready.clone(),
+                    started.clone(),
                     outbound,
                     cancellation.clone(),
                 );
@@ -408,6 +414,8 @@ impl Transport<RoleClient> for SseTransport {
         self.inbound.recv().await
     }
 
+    // No `.await` is needed here, but the transport contract is async.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
         self.cancellation.cancel();
         Ok(())
@@ -446,6 +454,7 @@ fn spawn_sse_stream(
     endpoint: Endpoint,
     post_endpoint: Arc<Mutex<Option<String>>>,
     endpoint_ready: Arc<Notify>,
+    started: Arc<AtomicBool>,
     outbound: UnboundedSender<ServerJsonRpcMessage>,
     cancellation: CancellationToken,
 ) {
@@ -493,6 +502,7 @@ fn spawn_sse_stream(
         if let Ok(mut slot) = post_endpoint.lock() {
             *slot = None;
         }
+        started.store(false, Ordering::SeqCst);
     });
 }
 

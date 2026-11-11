@@ -14,8 +14,8 @@
 //! not compiled in. Everything above the transport (JSON-RPC framing, the
 //! initialize handshake, request ids, cancellation) still comes from `rmcp`
 //! through [`client::RmcpClient`].
-mod http;
 pub mod client;
+mod http;
 pub mod result;
 pub mod tool;
 

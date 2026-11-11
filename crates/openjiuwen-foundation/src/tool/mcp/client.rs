@@ -54,7 +54,7 @@ pub enum McpClientType {
 }
 
 impl McpClientType {
-    /// Returns the canonical snake_case spelling of this transport.
+    /// Returns the canonical `snake_case` spelling of this transport.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -268,7 +268,11 @@ pub struct McpRemoteTool {
 impl McpRemoteTool {
     /// Creates a remote tool description.
     #[must_use]
-    pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -288,6 +292,7 @@ pub trait McpClient: Send + Sync + 'static {
     fn server_name(&self) -> &str;
 
     /// Returns the configured server id (`""` when the implementation has none).
+    #[allow(clippy::unnecessary_literal_bound)]
     fn server_id(&self) -> &str {
         ""
     }
@@ -338,13 +343,8 @@ pub trait McpClient: Send + Sync + 'static {
         arguments: Value,
         timeout: Option<Duration>,
     ) -> Result<McpToolResult> {
-        self.call_tool_with(
-            tool_name,
-            arguments,
-            timeout,
-            self.include_image_content(),
-        )
-        .await
+        self.call_tool_with(tool_name, arguments, timeout, self.include_image_content())
+            .await
     }
 
     /// Calls `tool_name`, choosing whether image blocks become multimodal data.
@@ -631,7 +631,10 @@ impl McpClient for RmcpClient {
                 .into_iter()
                 .map(|tool| McpRemoteTool {
                     name: tool.name.to_string(),
-                    description: tool.description.map(|text| text.to_string()).unwrap_or_default(),
+                    description: tool
+                        .description
+                        .map(|text| text.to_string())
+                        .unwrap_or_default(),
                     input_schema: Value::Object((*tool.input_schema).clone()),
                 })
                 .collect())
@@ -660,9 +663,7 @@ impl McpClient for RmcpClient {
                     Some(limit) => tokio::time::timeout(limit, request)
                         .await
                         .map_err(|_| {
-                            Error::timeout(format!(
-                                "MCP call_tool `{name}` exceeded {limit:?}"
-                            ))
+                            Error::timeout(format!("MCP call_tool `{name}` exceeded {limit:?}"))
                         })?
                         .map_err(map_service_error)?,
                     None => request.await.map_err(map_service_error)?,

@@ -123,7 +123,11 @@ impl Tool for McpTool {
 
     async fn invoke(&self, inputs: Value, ctx: &ToolContext) -> Result<Value> {
         let schema = ensure_object_schema(self.card.input_params.clone());
-        let mut arguments = if inputs.is_object() { inputs } else { json!({}) };
+        let mut arguments = if inputs.is_object() {
+            inputs
+        } else {
+            json!({})
+        };
         apply_defaults(&schema, &mut arguments);
         validate_inputs(&schema, &arguments)?;
         ctx.check_cancelled()?;
@@ -146,7 +150,9 @@ impl Tool for McpTool {
 
         if !result.success {
             return Err(Error::mcp(
-                result.error.unwrap_or_else(|| DEFAULT_MCP_ERROR_TEXT.to_owned()),
+                result
+                    .error
+                    .unwrap_or_else(|| DEFAULT_MCP_ERROR_TEXT.to_owned()),
             ));
         }
         serde_json::to_value(&result)
