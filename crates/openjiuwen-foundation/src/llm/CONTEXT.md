@@ -65,8 +65,56 @@ Ports `openjiuwen/core/foundation/llm/` (`model.py`, `schema/config.py`, `model_
 - Response: `content` blocks → text concatenated into `message.content`, `tool_use` → `ToolCall` with `arguments = json.dumps(input)`; `stop_reason` mapping `tool_use` → `ToolCalls`, `end_turn`/`stop_sequence`/`max_tokens` → `Stop`/`Length`, `max_tokens` also → `Length`; usage `input_tokens` includes `cache_read_input_tokens` + `cache_creation_input_tokens`, `cache_tokens` = cache read, `reasoning_tokens` = thinking blocks ignored for now.
 - Stream: `message_start` (role + input usage), `content_block_start` (text or `tool_use` with id/name), `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta` buffered per index), `content_block_stop` (emit the accumulated `ToolCall` for `tool_use`), `message_delta` (`stop_reason`, usage), `message_stop`, `ping` (ignored).
 
+## Rust Seams (binding signatures)
+
+Every item below is public unless marked `pub(crate)`; parallel work in this module targets these exact names and shapes.
+
+`config.rs`:
+- `pub struct ModelClientConfig { pub client_id: String, pub provider: String, pub api_key: Option<SecretString>, pub api_base: Option<String>, pub verify_ssl: bool, pub timeout: Option<Duration>, pub stream_first_chunk_timeout: Option<Duration>, pub stream_idle_timeout: Option<Duration>, pub max_retries: u32, pub headers: BTreeMap<String, String>, pub extra: Value }`.
+  `Default` generates a UUID v4 `client_id` (as Python's `default_factory`), sets `verify_ssl: true`, `timeout`/first-chunk/idle to 360/300/60 s and `max_retries: 0`.
+- Builders: `new(impl Into<String>)`, `with_client_id`, `with_api_key(impl Into<String>)`, `with_secret(SecretString)`, `with_api_base`, `with_timeout(Duration)`, `with_stream_timeouts(Option<Duration>, Option<Duration>)`, `with_max_retries(u32)`, `with_header`, `with_headers`, `with_verify_ssl(bool)`, `with_extra(Value)`.
+- `from_env() -> Self`, `resolve_for(&self, provider: &str) -> Result<Self>`, `sanitized_headers(&self) -> BTreeMap<String, String>`, `http_client_config(&self) -> HttpClientConfig`.
+- `pub struct ModelRequestConfig { pub model_name: String, pub temperature: Option<f32>, pub top_p: Option<f32>, pub max_tokens: Option<u32>, pub stop: Vec<String>, pub tools: Option<Value>, pub tool_choice: Option<Value>, pub stream: bool, pub extra: Value }` plus the builders listed in API Surface and `from_env() -> Self`.
+
+`model.rs`:
+- `#[async_trait] pub trait Model: Send + Sync { fn provider(&self) -> &str; fn model_name(&self) -> &str; async fn invoke(&self, messages: &[BaseMessage], request: &ModelRequestConfig) -> Result<ChatResponse>; fn stream(&self, messages: Vec<BaseMessage>, request: ModelRequestConfig) -> BoxStream<'static, Result<StreamChunk>>; }`.
+- `pub struct ChatResponse`, `pub struct Choice`, `pub enum FinishReason`, `pub enum StreamChunk`, `pub struct AssistantTurn` exactly as in API Surface.
+- `pub struct StreamAccumulator` with `new()`, `push(&mut self, chunk: &StreamChunk)`, `finish(self) -> AssistantTurn`.
+- `impl Model for Arc<dyn Model>` forwards to the inner model, so `ModelExt` applies to `Arc<dyn Model>`.
+- `pub trait ModelExt: Model` with `async fn complete(&self, messages: &[BaseMessage], request: &ModelRequestConfig) -> Result<AssistantTurn>` (default body: force `stream = true` on a clone of the request, drive `Model::stream`, feed a `StreamAccumulator`) and a blanket `impl<T: Model + ?Sized> ModelExt for T`.
+
+`provider.rs`:
+- `pub enum ProviderFlavor { OpenAiCompatible, Anthropic }` (serde snake_case).
+- `pub struct ProviderProfile { pub name: &'static str, pub flavor: ProviderFlavor, pub default_api_base: Option<&'static str>, pub chat_path: &'static str, pub extra_headers: &'static [(&'static str, &'static str)] }`.
+- `pub fn normalize_provider_name(name: &str) -> String`, `pub fn provider_profile(name: &str) -> Option<ProviderProfile>`, `pub const ANTHROPIC_VERSION: &str = "2023-06-01";`.
+
+`registry.rs`:
+- `pub trait ModelProvider: Send + Sync { fn name(&self) -> &str; fn aliases(&self) -> &[&str]; fn default_api_base(&self) -> Option<&str>; fn create(&self, client: &ModelClientConfig, request: &ModelRequestConfig) -> Result<Arc<dyn Model>>; }` (the last three have default bodies).
+- `pub struct ModelProviderRegistry` with `new()`, `register(Arc<dyn ModelProvider>) -> Option<Arc<dyn ModelProvider>>` (replaces a same-name entry and returns the old one), `get(&str)`, `resolve(&str)`, `names() -> Vec<String>`, `global() -> &'static Self`.
+- `pub fn register_model_provider(provider: Arc<dyn ModelProvider>)`, `pub fn register_builtin_providers()`.
+
+`sse.rs`:
+- `pub struct SseEvent { pub event: Option<String>, pub data: String }`; `pub struct SseDecoder` with `new()`, `push(&mut self, chunk: &[u8]) -> Vec<SseEvent>`, `finish(&mut self) -> Option<SseEvent>`.
+
+`transport.rs` (`pub(crate)`, shared by both clients):
+- `pub(crate) fn join_url(base: &str, path: &str) -> String`, `pub(crate) fn error_for_status(status: u16, url: &str, body: &str) -> Error`, `pub(crate) fn redacted_body(body: &str) -> String` (redact + truncate to 1000 chars).
+
+`openai/mod.rs`:
+- `pub struct OpenAiCompatibleClient` with `new(ModelClientConfig, ModelRequestConfig) -> Result<Self>`, `with_http_client(HttpClient) -> Self`, `client_config() -> &ModelClientConfig`, `request_config() -> &ModelRequestConfig`, `base_url() -> &str`, and `impl Model`.
+- Re-exports: `pub use request::{build_chat_completion_body, normalize_api_base, convert_message, convert_messages, convert_tool_choice, convert_tools};`, `pub use response::{parse_chat_completion, parse_finish_reason, parse_usage};`, `pub use stream::{parse_stream_chunk, OpenAiStreamState};`.
+
+`anthropic/mod.rs`:
+- `pub struct AnthropicClient` with the same inherent surface as `OpenAiCompatibleClient` plus `impl Model`.
+- Re-exports: `pub use request::{build_messages_body, normalize_api_base};`, `pub use response::{parse_anthropic_usage, parse_messages_response};`, `pub use stream::AnthropicStreamState;`.
+
+`factory.rs`:
+- `pub async fn init_model(client: ModelClientConfig, request: ModelRequestConfig) -> Result<Arc<dyn Model>>`, `pub async fn init_model_with(provider: impl Into<String>, model_name: impl Into<String>) -> Result<Arc<dyn Model>>`.
+
+`mod.rs` re-exports (in addition to the module list): `AssistantTurn`, `ChatResponse`, `Choice`, `FinishReason`, `Model`, `ModelExt`, `ModelClientConfig`, `ModelRequestConfig`, `StreamAccumulator`, `StreamChunk`, `ProviderFlavor`, `ProviderProfile`, `ANTHROPIC_VERSION`, `normalize_provider_name`, `provider_profile`, `ModelProvider`, `ModelProviderRegistry`, `register_builtin_providers`, `register_model_provider`, `SseDecoder`, `SseEvent`, `init_model`, `init_model_with`, `OpenAiCompatibleClient`, `AnthropicClient`.
+
 ## Routing Table
 
+- `./transport.rs` → shared URL joining, status→error mapping, redacted/truncated provider error bodies
 - `./config.rs` → `ModelClientConfig`, `ModelRequestConfig`, env resolution, header sanitization
 - `./model.rs` → `Model`, `ChatResponse`, `Choice`, `FinishReason`, `StreamChunk`, `AssistantTurn`, `StreamAccumulator`, `ModelExt`
 - `./provider.rs` → provider table, profile lookup, name normalization
