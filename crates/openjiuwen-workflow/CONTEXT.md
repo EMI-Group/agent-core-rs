@@ -260,6 +260,10 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 ## Notes for Agents
 
 - Use `openjiuwen_graph::{GraphBuilder, ExecutionOptions, Router, RouterContext, Node, NodeOutcome, NodeOptions, GraphState, CheckpointerStore}`; do not add new graph APIs.
+- Stage 1 is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context`, `output`, `interrupt`, `registry`, and all built-in components under `src/components/`.
+- `src/engine/` (`CompiledWorkflow`) and `src/workflow.rs` (`Workflow` builder) are still to be implemented; stage 2 appends those modules to `src/lib.rs`.
+- The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
+- The crate-root re-exports every stage-1 public item, so stage 2 can reach them as `crate::{Component, ComponentContext, ...}`.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
 - Checkpointing is opt-in through `session.checkpointer()`; when present the engine compiles with `CheckpointerStore` (namespace = workflow card id) and deletes the snapshot when a run completes.
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
@@ -269,5 +273,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 
 - Deferred components: `SubWorkflowComponent`, `QuestionerComponent`, `IntentDetectionComponent`, `ReActAgentComp`, `HTTPRequestComponent`, and the Python streaming actor network (live interleaving of concurrent producers).
 - Deferred semantics: Python's `wait_for_all=False` first-arrival fan-in, `draw()` PNG/SVG rendering, per-run `async` graph mutation, `WORKFLOW_DRAWABLE` gating.
+- Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, and memory components return `memories`/record results instead of Python's fragment/summary split.
+- LLM `response_format` instruction injection and `enable_history` history insertion are carried in config but not applied.
 - Unknown-component ids and capability mismatches are reported as one compile error rather than Python's split between build-time and run-start checks.
 - `ExceptionConfig::default_outputs` recovery is not wired into the graph executor; only `handle_type="interrupt"` semantics (error propagation) are implemented.
