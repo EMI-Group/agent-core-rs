@@ -13,7 +13,7 @@ One integration test crate per concern:
 - `checkpoint.rs` — memory and file backends: save/load/list/latest/delete/release/exists, resume restores global + component state + trace position.
 - `checkpoint_sqlite.rs` — the same contract under `--features sqlite` (file guarded with `#![cfg(feature = "sqlite")]`).
 - `tracer.rs` — span lifecycle frames, recording sink, stream sink, trace position.
-- `sessions.rs` — factories, metadata, parent delegation, agent/team/workflow specifics, config env resolution.
+- `sessions.rs` — the `Session` contract through `Arc<dyn Session>` (state merge/`null` deletion, stream frames, HITL timeout, provided `snapshot`/`restore`/`subscribe`/`resume` defaults exercised through a minimal fake) and the four concrete sessions (workflow lanes and factories, node executable-id nesting and delegation, agent env/metadata/`post_run`, team ids and child source metadata), plus workflow/agent checkpoint round-trips and a trace-position round-trip.
 
 ## Constraints
 
