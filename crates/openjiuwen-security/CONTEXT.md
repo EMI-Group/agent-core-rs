@@ -37,10 +37,10 @@ level:      RiskLevel { Safe, Low, Medium, High, Critical } (as_str/name/is_risk
 context:    ScanStage { LlmInvokeInput, LlmInvokeOutput, ToolInvokeInput, ToolInvokeOutput, UserInput, Other(String) } with event()/from_event()/content_type()
             constants EVENT_LLM_INVOKE_INPUT "_framework:llm_invoke_input", EVENT_LLM_INVOKE_OUTPUT, EVENT_TOOL_INVOKE_INPUT, EVENT_TOOL_INVOKE_OUTPUT, EVENT_USER_INPUT "user_input"
             GuardrailContext { content_type, content: Value, event: String, metadata: BTreeMap<String, Value> } + text()/messages()/tool_call()/raw() constructors,
-            get_text()/get_messages()/get_tool_name()/text_view()/with_metadata(); manual redacting Debug
+            get_text()/get_messages()/get_tool_name()/text_view()/with_metadata()/stage(); manual redacting Debug
 result:     GuardrailResult { is_safe, risk_level, risk_type, details, modified_data } with pass()/pass_with(details)/block(level, risk_type, details, modified_data)/message()
             RiskAssessment { has_risk, risk_level, risk_type, confidence, details } with into_result()
-finding:    Finding { guardrail, risk_level, risk_type, message, blocking, details, modified_data }
+finding:    Finding { guardrail, risk_level, risk_type, message, blocking, details, modified_data } + finding_message(risk_type, risk_level, blocking) shared wording builder
             GuardrailEvaluation { guardrail, result: Option<GuardrailResult>, error: Option<String> }
             SecurityDecision { Allow, Block }
             GuardrailOutcome { stage, evaluations, findings, errors, risk_level, decision, blocked_by } with is_safe()/is_blocked()/enforce()/violation()/modified_data()/redacted()
@@ -117,6 +117,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 
 ## Known Gaps and Deferred Adapters
 
+- Phase 1 ships `level`, `context`, `result`, `rules`, `config`, `guardrail`, `finding`, `pipeline`, `report`; the `parsers`, `backends` and `guardrails` modules described above are not implemented yet.
 - `ApiModelBackend` performs no HTTP: it requires an injected `ModerationTransport`; without one, `analyze` returns `Error::Unsupported`. The Python `httpx` call to `{"text": ...}` is the transport's job.
 - `LocalModelBackend` has no inference runtime: constructor and config are preserved (parity of fields/defaults), `analyze` returns `Error::Unsupported`. Python needs `torch`/`transformers`.
 - `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
