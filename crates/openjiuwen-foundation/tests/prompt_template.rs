@@ -129,14 +129,14 @@ fn whitespace_inside_delimiters_is_trimmed() {
 #[test]
 fn empty_and_single_brace_placeholders_stay_literal() {
     let empty = PromptTemplate::new("a{{}}b{{ }}c");
-    assert!(empty.placeholders().is_empty());
+    assert_eq!(empty.placeholders(), Vec::<String>::new());
     assert_eq!(
         text_of(&empty.format(&values(&[("", json!("x"))]))),
         "a{{}}b{{ }}c"
     );
 
     let single = PromptTemplate::new("{name} and {a.b}");
-    assert!(single.placeholders().is_empty());
+    assert_eq!(single.placeholders(), Vec::<String>::new());
     assert_eq!(
         text_of(&single.format(&values(&[("name", json!("bob")), ("a", json!({"b": 1}))]))),
         "{name} and {a.b}"
