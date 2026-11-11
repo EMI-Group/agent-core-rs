@@ -100,7 +100,8 @@ pub struct StreamHub;                                // bounded broadcast transp
 pub struct StreamWriterManager;                      // mode routing over one hub
 ```
 
-- `StreamItem::output(item_type, index, payload)`, `::trace(item_type, payload)`, `::custom(payload)`, `is_end()`, `to_wire() -> Value` (`{"type","index","payload"}`, mode dropped for wire parity).
+- `StreamItem::output(item_type, index, payload)`, `::output_at(item_type, index: i64, payload)`, `::trace(item_type, payload)`, `::custom(payload)` (frame type `"custom"`), `with_mode(mode)`, `is_end()`, `to_wire() -> Value` (`{"type","index","payload"}`, mode dropped for wire parity, `index` omitted when `None`).
+- `StreamMode::as_str() -> &'static str` returns `"output"`/`"trace"`/`"custom"`; `StreamMode` is `Copy` and `Default = Output`.
 - `StreamHub::new()` (capacity `DEFAULT_STREAM_CAPACITY = 1024`), `with_capacity`, `send_now`, `send`, `subscribe() -> BoxStream<'static, Result<StreamEvent>>`, `close`, `is_closed`, `capacity`.
 - `send_now` is the canonical publish path: a synchronous `tokio::sync::broadcast` send with no I/O and no await, usable from synchronous trace sinks and from any thread; `send` is an `async` wrapper that never awaits internally (kept for API symmetry with Python).
 - `StreamWriterManager::new(hub)` (all modes), `with_modes(hub, modes)`, `write_now`, `write`, `subscribe`, `close`, `is_closed`, `modes`, `enables`, `hub`.
