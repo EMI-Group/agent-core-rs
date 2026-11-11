@@ -1785,10 +1785,13 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "dotenvy",
+ "futures",
  "indexmap",
  "once_cell",
  "parking_lot",
  "regex",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
@@ -1798,8 +1801,10 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
