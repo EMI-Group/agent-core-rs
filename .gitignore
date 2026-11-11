@@ -1,1 +1,14 @@
 /.genesis
+/target
+**/*.rs.bk
+*.pdb
+*.profraw
+.DS_Store
+.idea/
+.vscode/
+/report/
+/logs/
+*.log
+.env
+.env.*
+!.env.example
