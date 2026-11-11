@@ -55,7 +55,7 @@ pub trait Chunker: Send + Sync {
 pub fn html_to_text(html: &str) -> String;
 ```
 Concrete: `TextLoader` (`.txt`), `MarkdownLoader` (`.md`, `.markdown`), `JsonLoader` (`.json`; valid JSON is pretty-printed, malformed JSON keeps raw text), `CsvLoader` (`.csv`, `.tsv`; row docs `"H: v, H2: v2"` with ids `{base}_s{sheet}_r{row}` 1-based including the header, column docs `"Column name: X. Values: a, b"` with ids `{base}_s{sheet}_c{col}` 0-based), `HtmlLoader` (`.html`, `.htm`; tag/script/style stripping, entity decoding, `<title>`/`og:title` extraction), `UrlLoader` (HTTP(S) GET via `openjiuwen_common::http`, HTML→text or plain text), `AutoLoader` (URL → `UrlLoader`, extension → registered loader, stamps `doc_id`, `title`, `file_path`, `file_ext` on every document; missing file → `Error::NotFound`; unknown/PDF/DOCX/XLSX → `Error::Unsupported`), `LoaderRegistry` (lowercase extension map, first registration wins; `register`, `get_for_path`).
-`AutoLoader::load_as(source, doc_id: Option<&str>, title: Option<&str>)` mirrors Python `parser.parse(path, doc_id, file_name=...)`.
+`AutoLoader::load_as(source, doc_id: Option<&str>, title: Option<&str>)` mirrors Python `parser.parse(path, doc_id, file_name=...)`: `doc_id` replaces a single-document loader's id verbatim and acts as the id base prefix for multi-document CSV/TSV sources (`{doc_id}_s0_r2`), keeping every generated id distinct.
 URL loading sets `metadata["source_url"]` and `source_type="web_page"`; HTML files also set `source_type="web_page"`.
 Missing path → `Error::NotFound`; unsupported format → `Error::Unsupported("Unsupported format: ...")` (deviates from Python's silent `[]` for text parsers; documented).
 
@@ -144,7 +144,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 
 ## Constraints
 
-- Depends only on `openjiuwen-common` (shared `Error`/`Result`, `http`, `security::SecretString`, `logging`). `openjiuwen-foundation` stays a declared dependency but is not used until its model layer lands; embeddings use `openjiuwen_common::http` with a local `EmbeddingConfig` (documented deviation).
+- Depends only on `openjiuwen-common` (shared `Error`/`Result`, `http`, `security::SecretString`, `logging`); `openjiuwen-foundation` is not a dependency, and embeddings use `openjiuwen_common::http` with a local `EmbeddingConfig` (documented deviation).
 - `#![forbid(unsafe_code)]`; async via `async_trait`/tokio; no blocking I/O inside async methods (`tokio::fs` for persistence).
 - Every public data type: serde snake_case, defaults for missing collection fields, unknown fields tolerated; `Document`/`TextChunk`/results round-trip with Python field names.
 - Errors: `openjiuwen_common::error::{Error, Result}`; no panics on user input; invalid sizes/overlaps/inputs → `Error::Validation`; missing files → `Error::NotFound`; unsupported formats/providers → `Error::Unsupported`; store/embedding/network failures → `Error::Retrieval`/`Error::Transport`/`Error::Timeout`.
@@ -186,10 +186,10 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 
 ## Notes for Agents
 
-- Implemented today: `common`, `chunking`, `embedding`, `vector_store`, `reranker`, re-exported from the crate root; `src/loaders/` and `src/knowledge_base/` contain only their CONTEXT.md and are the next wave's work.
-- `tests/` currently holds `document_json.rs`, `chunking.rs`, `vector_store.rs`, and `embedding.rs`; `loaders.rs` and `knowledge_base.rs` arrive with those modules.
-- The in-crate OpenAI client and `HashEmbedding` do not use `openjiuwen-foundation`; its model layer is still scaffold code.
-- `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` lints path dependencies too, and the scaffolded `openjiuwen-foundation` stub fails it (`crate_name` lacks `#[must_use]`); lint this crate with `--no-deps` until that sibling is implemented.
+- All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
+- `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
+- The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
+- `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` is clean now that the scaffolded foundation dependency is gone; no `--no-deps` workaround is needed.
 
 ## Routing Table
 
