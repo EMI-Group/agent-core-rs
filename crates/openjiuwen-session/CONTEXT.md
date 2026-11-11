@@ -99,8 +99,10 @@ pub struct StreamWriterManager;                      // mode routing over one hu
 ```
 
 - `StreamItem::output(item_type, index, payload)`, `::trace(item_type, payload)`, `::custom(payload)`, `is_end()`, `to_wire() -> Value` (`{"type","index","payload"}`, mode dropped for wire parity).
-- `StreamHub::new()` (capacity `DEFAULT_STREAM_CAPACITY = 1024`), `with_capacity`, `send`, `subscribe() -> BoxStream<'static, Result<StreamEvent>>`, `close`, `is_closed`, `capacity`.
-- `StreamWriterManager::new(hub)` (all modes), `with_modes(hub, modes)`, `write`, `subscribe`, `close`, `is_closed`, `modes`, `enables`.
+- `StreamHub::new()` (capacity `DEFAULT_STREAM_CAPACITY = 1024`), `with_capacity`, `send_now`, `send`, `subscribe() -> BoxStream<'static, Result<StreamEvent>>`, `close`, `is_closed`, `capacity`.
+- `send_now` is the canonical publish path: a synchronous `tokio::sync::broadcast` send with no I/O and no await, usable from synchronous trace sinks and from any thread; `send` is an `async` wrapper that never awaits internally (kept for API symmetry with Python).
+- `StreamWriterManager::new(hub)` (all modes), `with_modes(hub, modes)`, `write_now`, `write`, `subscribe`, `close`, `is_closed`, `modes`, `enables`, `hub`.
+- `write_now` is the canonical write path (mode check, then `StreamHub::send_now`); `write` is its `async` wrapper, also without an internal await.
 - Ordered delivery per subscriber, multiple subscribers, bounded buffering (a lagging subscriber logs a warning and skips frames rather than blocking producers), and a terminal `End` event visible to late subscribers.
 - Frame `type` vocabulary is open: `__interaction__`, `tracer_agent`, `tracer_workflow`, `workflow_final`, `llm_output`, …
 
@@ -160,9 +162,10 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 ```
 
 - `build_key(parts: &[&str]) -> String` (`:`-joined) and `build_key_with_namespace(session_id, namespace, entity_id, suffixes)` preserve Python's key layout.
-- Backends: `MemoryCheckpointer` (`new()`, `shared()`), `FileCheckpointer` (`new(root)`, `<root>/<session_id>/<checkpoint_id>.json`, atomic write), `SqliteCheckpointer` (feature `sqlite`, `open(path)` async, one `session_checkpoints` table).
-- `CheckpointerConfig { kind, path, extra }`, `CheckpointerKind { InMemory, File, Sqlite }`, `create_checkpointer(&config) -> Result<Arc<dyn Checkpointer>>`.
-- `Checkpoint` derives serde with snake_case field names; checkpoint ids are generated (`uuid_hex()`) when empty; `latest` orders by `created_at` then `checkpoint_id`; session ids are validated (no path separators, no `..`).
+- Backends: `MemoryCheckpointer` (`new()`, `shared()` process-wide singleton, `len()`, `is_empty()`, `clear()`), `FileCheckpointer` (`new(root)`, `<root>/<session_id>/<checkpoint_id>.json`, atomic write through a `.<uuid>.tmp` file plus rename, corrupt JSON is `Error::Session`), `SqliteCheckpointer` (feature `sqlite`, `open(path).await` / `in_memory().await`, one `session_checkpoints` table, a single upsert statement per save, corrupt payload is `Error::Session`).
+- `CheckpointerConfig { kind, path, extra }`, `CheckpointerKind { InMemory, File, Sqlite }`, `create_checkpointer(&config).await -> Result<Arc<dyn Checkpointer>>`; `file` and `sqlite` require a `path` (`Error::Validation` otherwise), and `sqlite` additionally requires the `sqlite` feature (`Error::Unsupported` without it).
+- `Checkpoint` derives serde with snake_case field names; checkpoint ids are generated (`uuid_hex()`) when empty; `latest` sorts `(created_at, checkpoint_id)` descending itself, so it does not depend on backend list order; session and checkpoint ids are validated (no path separators, no `..`).
+- `list` order is backend-defined: `MemoryCheckpointer` and `FileCheckpointer` return `(created_at, checkpoint_id)` ascending, `SqliteCheckpointer` newest first; callers that need a specific order must sort the result.
 - Resume restores global state, component state, updates, and the trace position.
 
 ### `tracer` — spans and frames (`src/tracer.rs`)
@@ -170,24 +173,32 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 ```rust
 pub enum InvokeType { Prompt, Llm, Plugin, Workflow, Chain, Retriever, Evaluator }
 pub enum SpanStatus { Start, Running, Finish, Interrupted, Error }
-pub struct TraceSpan { /* camelCase wire keys: traceId, invokeId, parentInvokeId,
-    childInvokes, startTime, endTime, elapsedTime, invokeType, sessionId, name,
-    status, inputs, outputs, error, metaData */ pub kind: TraceSpanKind }
+pub enum TraceSpanKind { Agent, Workflow, Component }
+pub enum TraceFrameType { Agent /* tracer_agent */, Workflow /* tracer_workflow */ }
+pub struct TraceSpan { /* camelCase wire keys: traceId, sessionId, invokeId, parentInvokeId,
+    childInvokes, name, spanKind, invokeType, status, startTime, endTime, elapsedTime,
+    inputs, outputs, error, metaData, componentId, componentName, componentType, workflowId */
+    pub kind: TraceSpanKind }
 pub struct TraceFrame { pub item_type: String /* tracer_agent | tracer_workflow */, pub payload: TraceSpan }
 pub struct TracePosition { pub trace_id: String, pub last_invoke_id: Option<String>, pub frame_count: u64 }
 
 pub trait TraceSink: Send + Sync + std::fmt::Debug {
-    fn emit(&self, frame: TraceFrame);
+    fn emit(&self, frame: TraceFrame);                        // synchronous; never awaits
     fn position(&self) -> Option<TracePosition> { None }
     fn set_position(&self, position: TracePosition) {}
 }
 pub struct Tracer;     // span factory bound to a session id + trace id + sink
-pub struct SpanHandle; // set_inputs / set_outputs / set_status / finish / fail / snapshot / id
+pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadata / set_status /
+                       // finish / fail / interrupted / snapshot — all take &self
 ```
 
-- Sinks: `NoopTraceSink`, `MemoryTraceSink` (records frames, `frames()`, `take()`), `StreamTraceSink` (writes trace-mode frames to the session hub).
-- `Tracer::new(session_id, trace_id)`, `with_sink`, `set_sink`, `start_span(name, invoke_type)`, `start_child(&parent, name, invoke_type)`, `sink()`, `trace_id()`, `session_id()`.
-- `TraceFrame::agent(span, session_id)` / `::workflow(...)` / `to_stream_item()`; Python's two span classes collapse into one `TraceSpan` with a `kind` discriminator and optional fields.
+- Sinks: `NoopTraceSink` (the default), `MemoryTraceSink` (records frames; `frames()`, `take()`, `len()`, `is_empty()`, `clear()`), `StreamTraceSink` (publishes through an `Arc<StreamWriterManager>` with `write_now` and only logs at debug level, dropping the frame, when the write or the JSON serialization fails).
+- `Tracer::new(session_id, trace_id)`, `with_sink`, `set_sink`, `start_span(name, invoke_type)` (an agent span), `start_workflow_span(component_id, name)`, `start_child(&parent, name, invoke_type)`, `sink() -> Arc<dyn TraceSink>` (a cloned handle, because the sink slot lives behind an `RwLock`), `trace_id()`, `session_id()`.
+- `start_workflow_span` mints a `Component` span with `component_id` set, `workflow_id == component_id` and `invoke_type = Workflow`; `start_child` inherits the parent's `TraceSpanKind`, records `parentInvokeId`, and appends the child id to the parent's `childInvokes`.
+- `SpanHandle` takes `&self` everywhere (interior mutability through `Arc<Mutex<SpanState>>`); clones share one span, `finish`/`fail`/`interrupted` emit exactly one frame and later terminal transitions are no-ops, and the lock is released before the sink runs.
+- Agent spans emit as `tracer_agent` frames; workflow and component spans emit as `tracer_workflow`; `TraceFrame::agent(span)` / `TraceFrame::workflow(span)` take only the span because `session_id`/`trace_id` live on `TraceSpan`, and `to_stream_item()` projects a frame onto a trace-mode `StreamItem`.
+- Empty span names default to the kind name (`agent`, `workflow`, `component`); an empty trace id is replaced by a generated uuid; `TracePosition` stays snake_case because it is the checkpoint JSON shape.
+- `MemoryTraceSink::position` derives `(trace_id, last_invoke_id, frame_count)` from the emitted frames; `set_position` installs the frame-count baseline and resets the emitted counter, and `clear()` resets both the frames and the derived position.
 
 ### `config`, `constants`
 
@@ -260,8 +271,9 @@ pub struct SpanHandle; // set_inputs / set_outputs / set_status / finish / fail 
 
 ## Test Strategy
 
-- Unit tests beside modules for pure helpers (`state::paths`, config env resolution, checkpoint key building); integration tests under `./tests/` for cross-module behavior.
-- Required suites: state isolation/merge/`null` deletion/dotted paths, child-session scoping, concurrent updates (N tasks incrementing keys), stream ordering + multiple subscribers + end marker + late subscribers + mode filtering, interaction approve/reject/answer/timeout/cancellation/seeded answers, checkpoint save/load/list/delete/release/exists round-trips on memory/file/sqlite, resume restoring global + component state + trace position, tracer frame lifecycle and sink recording, session factory metadata and parent delegation.
+- Unit tests beside modules for pure helpers (`state::paths`, config env resolution, checkpoint key building, tracer times); integration tests under `./tests/` for cross-module behavior.
+- Integration files: `tests/state.rs`, `tests/stream.rs`, `tests/interaction.rs`, `tests/checkpoint.rs`, `tests/tracer.rs`, `tests/config.rs`, and `tests/checkpoint_sqlite.rs` (feature-gated), with the shared backend contract in `tests/support/mod.rs`.
+- Covered suites: state paths/merge/`null` deletion/dotted paths, nested component ids, staging commit/rollback, concurrent updates, stream ordering + multiple subscribers + end marker + late subscribers + mode filtering, interaction approve/reject/answer/timeout/cancellation/seeded answers, checkpoint save/load/list/latest/delete/release/exists round-trips on memory/file/sqlite, the backend contract (ordering, overwrite, invalid ids), tracer span lifecycle, child linking, kind/frame mapping, sink recording and position, config env resolution and defaults.
 - Deterministic and offline: no network, no sleeps except short `tokio::time::timeout` guards, `tempfile` for file/sqlite backends, monotonic assertions instead of timing assertions.
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/session/state/test_...`).
 - Gates: `cargo fmt -p openjiuwen-session`, `cargo test -p openjiuwen-session`, `cargo test -p openjiuwen-session --features sqlite`, `cargo clippy -p openjiuwen-session --all-targets -- -D warnings`, all clean.
