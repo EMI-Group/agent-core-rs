@@ -17,6 +17,7 @@ use crate::operation::ShellOperation;
 pub mod allowlist;
 pub mod local;
 pub mod plan;
+pub(crate) mod process;
 pub mod registry;
 pub mod types;
 
