@@ -13,6 +13,28 @@ It sits in layer 0 and depends on nothing in the workspace; `openjiuwen-foundati
 - Nothing else is exported. `#[derive(ToolArgs)]` is deliberately *not* provided: `#[derive(serde::Deserialize, schemars::JsonSchema)]` on the argument struct already supplies deserialization and the schema, and a second derive would only restate `schemars` with weaker expressiveness.
 - The macro exports no items of its own beyond the wrapper struct/constructor; the generated names are `PascalCase(fn) + "Tool"` and `{fn}_tool()`.
 
+## Usage
+
+```rust
+use openjiuwen_common::error::Result;
+use openjiuwen_foundation::tool::{Tool, ToolContext};
+use openjiuwen_macros::tool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchArgs { pub query: String, pub limit: Option<u32> }
+
+/// Search the web.
+#[tool(name = "search")]
+pub async fn search(args: SearchArgs, ctx: &ToolContext) -> Result<serde_json::Value> { .. }
+
+let tool: std::sync::Arc<dyn Tool> = search_tool();
+```
+
+Agent, workflow, and harness crates register the `Arc<dyn Tool>` from `{fn}_tool()` in `ResourceMgr` or an agent's ability list; they never hand-build a `FunctionTool` for a local Rust function.
+`search(args, &ctx)` stays directly callable, so the tool logic is unit-testable without a tool card.
+
 ## Macro Contract
 
 ### Accepted forms
@@ -55,8 +77,10 @@ pub async fn ping(args: PingArgs, ctx: ToolContext) -> PingOut { .. }           
 | `idempotent = <bool>` | `true`/`false` | `false` | `ToolCard.idempotent` |
 | `exposure = "direct" \| "deferred"` | `&str` | `"direct"` | `ToolCard.exposure` |
 | `execution = "server" \| "client"` | `&str` | `"server"` | `ToolCard.execution` |
-| `crate = "path"` (aliases `crate_path`, `krate`) | path string | `::openjiuwen_foundation` | root path of the foundation surface the generated code calls |
-| `common_crate = "path"` | path string | `::openjiuwen_common` | root path of the common surface (`Error`, `Result`) |
+| `crate = "path"` (aliases `crate_path`, `krate`) | string literal or bare path | `::openjiuwen_foundation` | root path of the foundation surface the generated code calls |
+| `common_crate = "path"` | string literal or bare path | `::openjiuwen_common` | root path of the common surface (`Error`, `Result`) |
+
+Aliases collapse to one key for duplicate detection (`crate` + `crate_path` is a duplicate).
 
 Unknown keys, duplicate keys, and wrong literal kinds are `compile_error!`s naming the offending key and the accepted set.
 `name`/`description`/`input_params` mirror the Python decorator; the policy keys cover what Python sets through a pre-built `card=`; `crate`/`common_crate` are the escape hatch for crates that re-export the foundation surface under a different path (the generated code also needs `::serde_json` and `::async_trait` resolvable in the user crate).
@@ -113,19 +137,21 @@ impl ::openjiuwen_foundation::tool::Tool for AddTool {
 pub fn add_tool() -> ::std::sync::Arc<dyn ::openjiuwen_foundation::tool::Tool> { ::std::sync::Arc::new(AddTool::new()) }
 ```
 
-- Every generated item carries the visibility of the annotated function (`pub`, `pub(crate)`, or inherited/private); `NAME`, `DESCRIPTION`, and `new` take the same visibility so `unreachable_pub`/`missing_docs` stay quiet.
+- The struct, `NAME`, `DESCRIPTION`, `new`, and `{fn}_tool` carry the visibility of the annotated function (`pub`, `pub(crate)`, or inherited/private) so `unreachable_pub`/`missing_docs` stay quiet; the inherent, `Default`, and `Tool` impls are bare `impl` blocks because Rust forbids a visibility qualifier on an impl (E0449).
+- `#[cfg(...)]`/`#[cfg_attr(...)]` attributes written *after* `#[tool]` are copied to every generated item, so a feature-gated tool does not leave orphan items behind (attributes before `#[tool]` are consumed by `cfg` expansion and never reach the macro).
 - `stream`, `render_for_llm`, and `is_parallel_safe` are inherited from `Tool`'s defaults through the delegation, so the generated tool behaves exactly like a hand-built `FunctionTool`.
 - The constructor is infallible: `FunctionTool::new` takes the card and handler directly, so no `Result`, no `unwrap`, and no `must_use`-ignoring fallback path exists. The tool validates inputs, fills schema defaults, and honours cancellation through `FunctionTool::invoke`, so the macro never re-implements foundation's validation.
 
 ## Constraints
 
-- `proc-macro = true`; dependencies are exactly `proc-macro2`, `quote`, `syn` (workspace versions, `syn` with `full`). No runtime dependency may be added.
+- `proc-macro = true`; runtime dependencies are exactly `proc-macro2`, `quote`, `syn` (workspace versions, `syn` with `full`). No runtime dependency may be added.
+- Dev-dependencies exist only for this crate's tests: `openjiuwen-common` + `openjiuwen-foundation` (the generated code's targets; the cycle runs through dev-dependencies only), `async-trait`, `schemars`, `serde`, `serde_json`, `tokio`, `futures` (`StreamExt` for the `Tool::stream` test), and the pinned `trybuild` (`=1.0.119`, matching the workspace MSRV because `.stderr` output is compiler-version sensitive).
 - No `unsafe`; workspace lints are inherited and `cargo clippy -p openjiuwen-macros --all-targets -- -D warnings` must pass.
 - Generated code must be lint-clean in *downstream* crates: doc comments on every generated public item, no `unwrap`/`expect`/`panic!`, no unused imports, no `println!`.
 - Every error path goes through `syn::Error` → `compile_error!`; the macro must never panic (no `unwrap`/`expect` in the library either), and it must report at the most specific span available (`name = ...` literal, the offending parameter, the return type).
-- Files stay around ≤1000 lines; parsing, signature validation, description extraction, and code generation live in separate modules (`src/tool/`).
+- Files stay around ≤1000 lines (largest module is ~280 lines); parsing, signature validation, description extraction, and code generation live in separate modules (`src/tool/`).
 - `cargo fmt -p openjiuwen-macros`, `cargo test -p openjiuwen-macros`, and the clippy gate above must all be green offline once `trybuild` is cached.
-- User crates applying `#[tool]` need `openjiuwen-foundation`, `openjiuwen-common`, `serde_json` (generated code), `async-trait` (generated `impl Tool`), `serde` + `schemars` (argument struct).
+- User crates applying `#[tool]` need `openjiuwen-foundation`, `openjiuwen-common`, `serde_json` (generated code), `async-trait` (generated `impl Tool`), `serde` + `schemars` (argument struct, unless `input_params` supplies the schema).
 
 ## Design Decisions
 
@@ -156,15 +182,17 @@ pub fn add_tool() -> ::std::sync::Arc<dyn ::openjiuwen_foundation::tool::Tool> {
 - The macro accepts a single argument struct instead of Python's flat keyword parameters, so `Args` must be a named struct (or `Value` with `input_params`) — Python's `*args` positional expansion has no Rust equivalent.
 - Sync and generator handlers are not supported (foundation documents async-only handlers); streaming tools must implement `Tool::stream` by hand.
 - An alias of `Result` (e.g. `type MyResult<T> = Result<T>`) is not detected as fallible: only a return type whose last path segment is `Result` propagates errors; anything else is wrapped in `Ok`, which surfaces as a `Serialize` bound error on the alias.
+- Generated names are mechanical, so a function already named `read_write_tool` yields the struct `ReadWriteToolTool` and the constructor `read_write_tool_tool()`; the constructor never collides with the function itself because the suffix is always appended.
 
 ## Test Strategy
 
-- `tests/tool_macro.rs` — runtime tests on generated tools (`#[tokio::test]`): unary and context forms, owned vs borrowed `ToolContext`, `card()` shape (`name`, `description`, `input_params` properties/required), `NAME`/`DESCRIPTION`, policy keys, `input_params` override, plain-`T` and unit returns, error propagation from the handler, `Error::Validation` on invalid input, cancellation short-circuit, `Arc<dyn Tool>` coercion, `Default`, `stream` yielding one item, and `render_for_llm` of a `ToolOutput`.
-- `tests/compile.rs` — `trybuild` driver: `pass("tests/ui/pass/*.rs")` and `compile_fail("tests/ui/fail/*.rs")`.
-- `tests/ui/pass/` — every supported form: unary, borrowed context, owned context, infallible return, unit return, all attribute keys, doc-comment description, `input_params` override, `pub(crate)` visibility, and the `crate`/`common_crate` escape hatch.
-- `tests/ui/fail/` — non-async fn, method receiver/impl placement, three parameters, `&Args` first parameter, `ToolContext` first parameter, generic fn, non-`Result` error confusion (a fallible `E` without `From`), unknown/duplicate/wrong-kind attribute keys, and bad `exposure`/`execution` values; each has a committed `.stderr` (regenerate with `TRYBUILD=overwrite cargo test -p openjiuwen-macros --test compile`, then re-run without the variable).
-- Gates: `cargo fmt -p openjiuwen-macros --check`, `cargo test -p openjiuwen-macros`, `cargo clippy -p openjiuwen-macros --all-targets -- -D warnings`, all offline.
-- Test crates start with `#![allow(clippy::unwrap_used, clippy::expect_used)]`; the library itself keeps both lints enabled.
+- `tests/tool_macro.rs` — 28 runtime tests on generated tools (`#[tokio::test]`): unary and context forms, owned vs borrowed `ToolContext`, `card()` shape (`name`, `description`, `input_params` properties/required), `NAME`/`DESCRIPTION`, policy keys, `input_params` override, plain-`T` and unit returns, error propagation from the handler, `Error::Validation` on invalid input, cancellation short-circuit, `Arc<dyn Tool>` coercion, `Default`, `stream` yielding one item, `render_for_llm` of a `ToolOutput`, and that the annotated function stays callable.
+- `tests/compile.rs` — `trybuild` driver: `pass("tests/ui/pass/*.rs")` (12 fixtures) and `compile_fail("tests/ui/fail/*.rs")` (12 fixtures).
+- `tests/ui/pass/` — every supported form: unary, borrowed context, owned context, infallible return, unit return, all attribute keys, doc-comment description, `input_params` override, private and `pub(crate)` visibility, raw identifier, and the `crate`/`common_crate` escape hatch.
+- `tests/ui/fail/` — non-async fn, method (impl-block placement), zero/three parameters, `&Args` first parameter, `ToolContext` first parameter, generic fn, unknown key, duplicate key, non-string `name`, bad `exposure`, bad `execution`; each pins a message the macro itself emits (never compiler trait-resolution output, which changes with dependency and toolchain versions) and has a committed `.stderr` (regenerate with `TRYBUILD=overwrite cargo test -p openjiuwen-macros --test compile`, inspect, then re-run without the variable).
+- The crate-level doctest in `src/lib.rs` is a real, running example (defines a tool, asserts the card shape and one `invoke` round-trip), so the documented usage cannot rot.
+- Gates: `cargo fmt -p openjiuwen-macros --check`, `cargo test -p openjiuwen-macros` (8 unit + 28 runtime + 1 trybuild + 1 doctest), `cargo clippy -p openjiuwen-macros --all-targets -- -D warnings`, all offline.
+- Test crates start with `#![allow(clippy::unwrap_used, clippy::expect_used)]`; `tests/tool_macro.rs` also allows `clippy::unused_async` (the macro requires `async fn`, and thin test handlers have nothing to await). The library itself keeps every lint enabled.
 
 ## Routing Table
 
