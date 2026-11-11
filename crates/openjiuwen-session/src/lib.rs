@@ -86,7 +86,7 @@ pub use session::{Session, SessionMetadata, SessionSnapshot, SessionType};
 pub use sessions::{
     create_agent_session, create_agent_team_session, create_workflow_session, AgentSession,
     AgentSessionOptions, AgentTeamSession, AgentTeamSessionOptions, NodeSession, WorkflowSession,
-    WorkflowSessionOptions,
+    WorkflowSessionOptions, DEFAULT_TEAM_ID,
 };
 
 pub use state::{AgentState, StateLane, StateStore, WorkflowState};
