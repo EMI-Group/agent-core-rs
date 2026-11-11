@@ -12,6 +12,7 @@
 //! `__init__.__all__`.
 
 pub mod card;
+pub mod context;
 pub mod delivery;
 pub mod model_control;
 

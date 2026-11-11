@@ -14,13 +14,19 @@
 //! directory is the normative field-by-field contract; `CONTEXT.md` records the deliberate
 //! deviations from Python.
 
+pub mod checkpoints;
 pub mod errors;
 pub mod events;
+pub mod hooks;
+pub mod interactions;
 pub mod json;
 pub mod models;
+pub mod protocol;
 pub mod results;
 pub mod serialization;
 pub mod state;
+pub mod stream;
+pub mod tools;
 pub mod validation;
 
 pub use errors::{HarnessError, HarnessErrorKind, HarnessResult};
