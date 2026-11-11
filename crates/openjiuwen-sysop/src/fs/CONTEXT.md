@@ -99,12 +99,13 @@ checklist; this file records only what is specific to this subtree.
   conflicts with a byte-identical file), `transfer.rs` (upload/download paths, parent creation,
   overwrite refusal, permissions, empty-source and multi-chunk stream shapes), `list.rs`,
   `search.rs` and `ext.rs` cover their own modules.
-- `local.rs` keeps the delegation tests (`list_files`/`search_files`/ext ops) and the constructor
-  tests, plus `#[cfg(test)] pub(crate) mod test_util` with the fixtures the sibling test modules
-  import (`backend`, `restricted`, `canonical`, `read_back`); it holds no behavior tests of its own.
+- `local.rs` keeps only the delegation tests (`list_files`/`search_files`/ext ops) and the
+  constructor tests, plus `#[cfg(test)] pub(crate) mod test_util` with the fixtures the sibling test
+  modules import (`backend`, `restricted`, `canonical`, `read_back`).
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop --offline`,
   `cargo clippy -p openjiuwen-sysop --all-targets --offline -- -D warnings`,
-  `cargo test -p openjiuwen-sysop --features sandbox --offline`.
+  `cargo test -p openjiuwen-sysop --features sandbox --offline`,
+  `cargo clippy -p openjiuwen-sysop --all-targets --features sandbox --offline -- -D warnings`.
 
 ## Routing Table
 
