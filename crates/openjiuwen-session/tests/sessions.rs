@@ -353,7 +353,7 @@ async fn node_component_state_nests_under_the_executable_id() {
     node.update_component_state("", json!({ "x": 1 }))
         .await
         .unwrap();
-    assert_eq!(node.executable_id(), "workflow.node1");
+    assert_eq!(node.executable_id(), "node1");
     assert_eq!(
         node.get_component_state("").await.unwrap(),
         Some(json!({ "x": 1 })),
@@ -368,8 +368,9 @@ async fn node_component_state_nests_under_the_executable_id() {
         "a component-scoped write is visible from the parent"
     );
     assert_eq!(
-        workflow.get_component_state("workflow").await.unwrap(),
-        Some(json!({ "node1": { "x": 1 } }))
+        workflow.get_component_state("node1").await.unwrap(),
+        Some(json!({ "x": 1 })),
+        "the node's executable id is the bare component id"
     );
 }
 
@@ -383,9 +384,9 @@ async fn node_executable_ids_chain_through_nested_nodes() {
     let first = Arc::new(workflow.create_node_session("a"));
     let second = first.create_node_session("b");
 
-    assert_eq!(first.executable_id(), "wf.a");
-    assert_eq!(second.executable_id(), "wf.a.b");
-    assert_eq!(second.metadata().entity_id.as_deref(), Some("wf.a.b"));
+    assert_eq!(first.executable_id(), "a");
+    assert_eq!(second.executable_id(), "a.b");
+    assert_eq!(second.metadata().entity_id.as_deref(), Some("a.b"));
     assert_eq!(second.parent_id(), Some("wf-chain"));
     assert_eq!(second.session_type(), SessionType::Node);
 }

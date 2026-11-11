@@ -34,7 +34,10 @@ use crate::tracer::{TraceSink, Tracer};
 pub struct WorkflowSessionOptions {
     /// Session identifier; generated when absent and there is no parent.
     pub session_id: Option<String>,
-    /// Workflow id used for the entity metadata and node executable ids.
+    /// Workflow id used for the entity metadata only.
+    ///
+    /// Node executable ids no longer derive from it: they follow Python's
+    /// `create_executable_id`.
     pub workflow_id: Option<String>,
     /// Environment entries applied to a freshly created config.
     pub envs: BTreeMap<String, Value>,
@@ -266,11 +269,14 @@ impl Session for WorkflowSession {
 
 /// A component-scoped child view of a parent session.
 ///
-/// The executable id is `parent executable id + "." + component_id`, and
-/// component state read/written through this view nests under that id, matching
-/// Python's `NodeSession`. Streaming, tracing, interactions, and checkpoints are
-/// delegated, and [`Session::end_stream`]/[`Session::close`] are no-ops so a node
-/// never closes the shared hub.
+/// The executable id follows Python's `create_executable_id`: it is the bare
+/// `component_id` when the parent is not itself a node (a workflow or agent
+/// session), and `parent executable id + "." + component_id` when nesting node
+/// sessions (`a`, `a.b`, `a.b.c`). Component state read/written through this
+/// view nests under that id, matching Python's `NodeSession`. Streaming,
+/// tracing, interactions, and checkpoints are delegated, and
+/// [`Session::end_stream`]/[`Session::close`] are no-ops so a node never closes
+/// the shared hub.
 #[derive(Clone)]
 pub struct NodeSession {
     parent: Arc<dyn Session>,
@@ -305,7 +311,7 @@ impl NodeSession {
         Self::build(parent, component_id.into(), Some(node_type.into()))
     }
 
-    /// Returns the nested executable id (`workflow.node` and deeper).
+    /// Returns the executable id (`node` for a workflow's node, `a.b` deeper).
     #[must_use]
     pub fn executable_id(&self) -> &str {
         &self.executable_id
@@ -330,12 +336,20 @@ impl NodeSession {
     }
 
     /// Builds the view, deriving the executable id from the parent.
+    ///
+    /// Ports Python's `create_executable_id`: only a node parent contributes a
+    /// prefix, so the first node level is the bare component id.
     fn build(parent: Arc<dyn Session>, component_id: String, node_type: Option<String>) -> Self {
-        let base = parent
-            .metadata()
-            .entity_id
-            .unwrap_or_else(|| parent.id().to_string());
-        let executable_id = format!("{base}.{component_id}");
+        let base = if parent.session_type() == SessionType::Node {
+            parent.metadata().entity_id.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let executable_id = if base.is_empty() {
+            component_id.clone()
+        } else {
+            format!("{base}.{component_id}")
+        };
         Self {
             parent,
             component_id,
@@ -512,13 +526,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(node.executable_id(), "workflow.a");
+        assert_eq!(node.executable_id(), "a");
         assert_eq!(
             node.get_component_state("b").await.unwrap(),
             Some(json!({ "value": 1 }))
         );
         assert_eq!(
-            workflow.get_component_state("workflow.a.b").await.unwrap(),
+            workflow.get_component_state("a.b").await.unwrap(),
             Some(json!({ "value": 1 }))
         );
     }
@@ -530,15 +544,25 @@ mod tests {
         let second = Arc::new(first.create_node_session("b"));
         let third = second.create_node_session("c");
 
-        assert_eq!(third.executable_id(), "workflow.a.b.c");
+        assert_eq!(
+            first.executable_id(),
+            "a",
+            "a workflow's node has no prefix"
+        );
+        assert_eq!(
+            second.executable_id(),
+            "a.b",
+            "a nested node extends its node parent's executable id"
+        );
+        assert_eq!(third.executable_id(), "a.b.c");
         assert_eq!(third.id(), "s1");
         assert_eq!(third.parent_id(), Some("s1"));
         assert_eq!(third.session_type(), SessionType::Node);
         let metadata = third.metadata();
-        assert_eq!(metadata.entity_id.as_deref(), Some("workflow.a.b.c"));
+        assert_eq!(metadata.entity_id.as_deref(), Some("a.b.c"));
         assert_eq!(metadata.entity_name.as_deref(), Some("c"));
         assert_eq!(metadata.parent_session_id.as_deref(), Some("s1"));
-        assert_eq!(metadata.metadata["executable_id"], json!("workflow.a.b.c"));
+        assert_eq!(metadata.metadata["executable_id"], json!("a.b.c"));
     }
 
     #[tokio::test]
@@ -570,7 +594,7 @@ mod tests {
         };
         assert_eq!(item.item_type, "__interaction__");
         let output: InteractionOutput = serde_json::from_value(item.payload).unwrap();
-        assert_eq!(output.id, "workflow.n1");
+        assert_eq!(output.id, "n1");
 
         node.resolve_interaction(InteractionResponse::approve(request_id))
             .await

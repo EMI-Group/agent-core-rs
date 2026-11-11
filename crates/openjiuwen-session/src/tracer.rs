@@ -508,39 +508,97 @@ impl TraceSink for MemoryTraceSink {
 /// trace-mode [`StreamItem`] written through
 /// [`StreamWriterManager::write_now`]. Publishing failures are logged at debug
 /// level and dropped: observability must never fail the traced run.
+///
+/// The sink also tracks the position of the frames it publishes, so a session
+/// snapshot (and therefore a session checkpoint) carries the trace position.
+/// Clones share the position state; a frame only advances it when the stream
+/// write succeeded.
 #[derive(Debug, Clone)]
 pub struct StreamTraceSink {
     writer: Arc<StreamWriterManager>,
+    state: Arc<Mutex<StreamPositionState>>,
+}
+
+/// The position state behind a [`StreamTraceSink`].
+#[derive(Debug, Default)]
+struct StreamPositionState {
+    /// Trace id of the most recently published frame (or from `set_position`).
+    trace_id: Option<String>,
+    /// Frame count already accounted for by `set_position`.
+    baseline: u64,
+    /// Frames published since the baseline was captured.
+    emitted: u64,
+    /// Invoke id of the most recently published frame.
+    last_invoke_id: Option<String>,
 }
 
 impl StreamTraceSink {
     /// Create a sink publishing through `writer`.
     #[must_use]
     pub fn new(writer: Arc<StreamWriterManager>) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            state: Arc::new(Mutex::new(StreamPositionState::default())),
+        }
     }
 }
 
 impl TraceSink for StreamTraceSink {
     fn emit(&self, frame: TraceFrame) {
         let item_type = frame.item_type.clone();
-        match frame.to_stream_item() {
-            Ok(item) => {
-                if let Err(error) = self.writer.write_now(item) {
-                    tracing::debug!(
-                        item_type = item_type.as_str(),
-                        %error,
-                        "dropping trace frame: stream write failed"
-                    );
-                }
-            }
+        let trace_id = frame.payload.trace_id.clone();
+        let invoke_id = frame.payload.invoke_id.clone();
+        let item = match frame.to_stream_item() {
+            Ok(item) => item,
             Err(error) => {
                 tracing::debug!(
                     item_type = item_type.as_str(),
                     %error,
                     "dropping trace frame: serialization failed"
                 );
+                return;
             }
+        };
+        if let Err(error) = self.writer.write_now(item) {
+            tracing::debug!(
+                item_type = item_type.as_str(),
+                %error,
+                "dropping trace frame: stream write failed"
+            );
+            return;
+        }
+        let mut state = self.state.lock();
+        if !trace_id.is_empty() {
+            state.trace_id = Some(trace_id);
+        }
+        state.last_invoke_id = Some(invoke_id);
+        state.emitted = state.emitted.saturating_add(1);
+    }
+
+    fn position(&self) -> Option<TracePosition> {
+        let state = self.state.lock();
+        let tracks_position = state.emitted > 0
+            || state.baseline > 0
+            || state.trace_id.is_some()
+            || state.last_invoke_id.is_some();
+        if !tracks_position {
+            return None;
+        }
+        Some(TracePosition {
+            trace_id: state.trace_id.clone().unwrap_or_default(),
+            last_invoke_id: state.last_invoke_id.clone(),
+            frame_count: state.baseline.saturating_add(state.emitted),
+        })
+    }
+
+    fn set_position(&self, position: TracePosition) {
+        let mut state = self.state.lock();
+        state.baseline = position.frame_count;
+        state.emitted = 0;
+        state.last_invoke_id = position.last_invoke_id;
+        // A rebase must not wipe a known trace id with an empty one.
+        if !position.trace_id.is_empty() {
+            state.trace_id = Some(position.trace_id);
         }
     }
 }
@@ -881,7 +939,16 @@ fn now_millis() -> u64 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{SpanStatus, TracePosition, TraceSpan, TraceSpanKind};
+    use std::sync::Arc;
+
+    use super::{
+        InvokeType, SpanStatus, StreamTraceSink, TracePosition, TraceSink, TraceSpan,
+        TraceSpanKind, Tracer,
+    };
+    use crate::checkpoint::MemoryCheckpointer;
+    use crate::session::Session;
+    use crate::sessions::{WorkflowSession, WorkflowSessionOptions};
+    use crate::stream::{StreamHub, StreamWriterManager};
 
     #[test]
     fn elapsed_is_none_without_a_start_time() {
@@ -939,5 +1006,92 @@ mod tests {
     #[test]
     fn span_kind_defaults_to_agent() {
         assert_eq!(TraceSpanKind::default(), TraceSpanKind::Agent);
+    }
+
+    fn stream_sink() -> Arc<StreamTraceSink> {
+        Arc::new(StreamTraceSink::new(StreamWriterManager::new(
+            StreamHub::new(),
+        )))
+    }
+
+    #[test]
+    fn stream_sink_reports_no_position_before_any_frame() {
+        assert_eq!(stream_sink().position(), None);
+    }
+
+    #[test]
+    fn stream_sink_counts_emitted_frames_and_the_last_invoke_id() {
+        let sink = stream_sink();
+        let tracer = Tracer::with_sink("s-stream", "trace-stream", sink.clone());
+
+        let first = tracer.start_span("first", InvokeType::Llm);
+        first.finish(serde_json::json!({ "n": 1 }));
+        let second = tracer.start_span("second", InvokeType::Llm);
+        second.finish(serde_json::json!({ "n": 2 }));
+
+        let position = sink.position().expect("a position after two frames");
+        assert_eq!(position.frame_count, 2);
+        assert_eq!(position.trace_id, "trace-stream");
+        assert_eq!(position.last_invoke_id, Some(second.id()));
+    }
+
+    #[test]
+    fn stream_sink_set_position_rebases_the_frame_count() {
+        let sink = stream_sink();
+        sink.set_position(TracePosition {
+            trace_id: "trace-rebase".to_owned(),
+            last_invoke_id: Some("inv-prev".to_owned()),
+            frame_count: 7,
+        });
+
+        let position = sink.position().expect("a position after a rebase");
+        assert_eq!(position.frame_count, 7);
+        assert_eq!(position.trace_id, "trace-rebase");
+        assert_eq!(position.last_invoke_id.as_deref(), Some("inv-prev"));
+
+        let tracer = Tracer::with_sink("s-stream", "trace-rebase", sink.clone());
+        let span = tracer.start_span("after-rebase", InvokeType::Llm);
+        span.finish(serde_json::json!({}));
+
+        let position = sink.position().expect("a position after one frame");
+        assert_eq!(position.frame_count, 8);
+        assert_eq!(position.trace_id, "trace-rebase");
+        assert_eq!(position.last_invoke_id, Some(span.id()));
+
+        sink.set_position(TracePosition {
+            trace_id: String::new(),
+            last_invoke_id: None,
+            frame_count: 9,
+        });
+        assert_eq!(
+            sink.position().map(|position| position.trace_id),
+            Some("trace-rebase".to_owned()),
+            "a rebase with an empty trace id keeps the known one"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_level_stream_sink_reports_a_position() {
+        let session = WorkflowSession::with_options(WorkflowSessionOptions {
+            session_id: Some("s-stream-position".to_owned()),
+            checkpointer: Some(Arc::new(MemoryCheckpointer::new())),
+            ..WorkflowSessionOptions::default()
+        });
+        let span = session
+            .tracer()
+            .expect("a concrete session owns a tracer")
+            .start_span("session-span", InvokeType::Llm);
+        span.finish(serde_json::json!({ "ok": true }));
+
+        let position = session
+            .trace()
+            .position()
+            .expect("the session sink tracks the frames it published");
+        assert!(position.frame_count >= 1);
+        assert_eq!(position.last_invoke_id, Some(span.id()));
+        assert!(
+            session.snapshot().await.unwrap().trace.is_some(),
+            "a session snapshot carries the trace position"
+        );
     }
 }
