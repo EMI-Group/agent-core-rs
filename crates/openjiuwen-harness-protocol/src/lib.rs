@@ -16,6 +16,7 @@
 
 pub mod errors;
 pub mod json;
+pub mod results;
 pub mod state;
 pub mod validation;
 
@@ -23,6 +24,10 @@ pub use errors::{HarnessError, HarnessErrorKind, HarnessResult};
 pub use json::{
     empty_json_object, from_str_validated, from_value_validated, json_object_from_value,
     json_object_to_value, JsonObject, JsonValue,
+};
+pub use results::{
+    ContentBlock, MessageRole, MonetaryAmount, TurnError, TurnMessage, TurnResult, TurnStatus,
+    TurnTermination, TurnTerminationKind, TurnUsage,
 };
 pub use state::HarnessState;
 pub use validation::{
