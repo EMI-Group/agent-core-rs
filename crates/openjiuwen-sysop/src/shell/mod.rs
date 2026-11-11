@@ -14,6 +14,9 @@ use openjiuwen_common::error::{Error, Result};
 use crate::config::LocalWorkConfig;
 use crate::operation::ShellOperation;
 
+pub mod allowlist;
+pub mod plan;
+pub mod registry;
 pub mod types;
 
 /// Builds the local shell backend for `config`.
