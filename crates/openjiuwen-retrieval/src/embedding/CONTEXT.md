@@ -46,3 +46,4 @@ Hash embedding determinism/dimension/normalisation and empty text; OpenAI reques
 - `./mod.rs` → `Embedding` trait, validation helpers, re-exports
 - `./fake.rs` → `HashEmbedding` deterministic fake
 - `./openai.rs` → OpenAI-compatible embedding client
+- `./openai/tests.rs` → wiremock tests for endpoint, request body, auth, batching, response shapes, and failures
