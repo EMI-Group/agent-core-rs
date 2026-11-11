@@ -17,3 +17,4 @@ pub mod openai;
 pub mod provider;
 pub mod registry;
 pub mod sse;
+pub(crate) mod transport;
