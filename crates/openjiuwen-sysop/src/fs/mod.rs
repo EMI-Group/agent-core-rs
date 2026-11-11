@@ -1,0 +1,34 @@
+//! Filesystem operations: parameter types, the local backend, and the extension ops.
+//!
+//! [`local_fs`] is the seam the [`crate::SysOperation`] facade uses to obtain a local
+//! filesystem backend; the sandbox backend is built by
+//! [`crate::sandbox::operation::sandbox_operations`].
+//!
+//! ```
+//! use openjiuwen_sysop::fs::types::ReadFileParams;
+//!
+//! let params = ReadFileParams::text("notes.txt").with_head(20);
+//! assert_eq!(params.head, Some(20));
+//! ```
+
+use std::sync::Arc;
+
+use openjiuwen_common::error::{Error, Result};
+
+use crate::config::LocalWorkConfig;
+use crate::operation::FsOperation;
+
+pub mod types;
+
+/// Builds the local filesystem backend for `config`.
+///
+/// # Errors
+///
+/// Returns `ErrorKind::Validation` when the configuration is invalid.
+#[allow(clippy::needless_pass_by_value)] // the backend takes ownership of its configuration
+pub fn local_fs(config: LocalWorkConfig) -> Result<Arc<dyn FsOperation>> {
+    config.validate()?;
+    Err(Error::unsupported(
+        "the local filesystem backend is not implemented in this build",
+    ))
+}

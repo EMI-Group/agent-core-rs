@@ -10,24 +10,30 @@ publish = false
 
 [dependencies]
 openjiuwen-common.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+glob.workspace = true
+regex.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
-async-trait.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-futures.workspace = true
 tracing.workspace = true
-regex.workspace = true
-glob.workspace = true
 walkdir.workspace = true
 which.workspace = true
-tempfile.workspace = true
 reqwest = { workspace = true, optional = true }
 
 [features]
 default = []
 sandbox = ["dep:reqwest"]
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
