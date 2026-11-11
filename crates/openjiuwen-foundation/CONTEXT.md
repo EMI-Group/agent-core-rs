@@ -59,16 +59,22 @@ Storage (`store`):
 - `./src/llm/` → `Model` trait, configs, providers, OpenAI-compatible and Anthropic clients, `init_model` (`src/llm/CONTEXT.md`)
 - `./src/tool/` → `ToolCard`, `Tool` trait, `FunctionTool`, REST tool, MCP (`src/tool/CONTEXT.md`)
 - `./src/store/` → kv/document/vector/graph/object traits and backends (`src/store/CONTEXT.md`)
-- `./tests/` → wiremock-backed integration tests for clients and tools, storage behavior tests (see Test Strategy)
+- `./src/llm/openai/` → OpenAI-compatible client and its pure request/response/stream conversion + wiremock tests
+- `./src/llm/anthropic/` → Anthropic Messages client, message projection, event stream
+- `./src/tool/restful/` → REST tool config, parameter mapper, request/envelope building
+- `./src/tool/mcp/` → MCP server config, `McpClient` + rmcp transports, `McpTool` (`src/tool/mcp/CONTEXT.md`)
+- `./src/store/{kv,document,vector,graph,object}/` → one directory per storage contract (memory / local-file / sqlite backends)
+- `./src/store/tests/` → cross-backend contract suites compiled under `#[cfg(test)]`
+- `./tests/` → crate-level integration tests (`messages.rs`, `prompt_template.rs`); every other test lives in module-level `#[cfg(test)]` trees next to the code it exercises
 
 ## Test Strategy
 
-- Unit tests live beside the module they test (`#[cfg(test)] mod tests`), one behavior per test, no network.
-- Integration tests live in `tests/`: `wiremock` mocks every HTTP call (`llm_openai.rs`, `llm_openai_stream.rs`, `llm_anthropic.rs`, `tool_restful.rs`); pure conversion/rendering tests need no server (`messages.rs`, `prompt_template.rs`, `tool_function.rs`, `store_*.rs`).
+- Tests live beside the code they exercise, mostly as module-level `#[cfg(test)]` trees (`src/llm/openai/tests.rs`, `src/llm/anthropic/tests.rs`, `src/tool/tests/…`, `src/tool/mcp/tests.rs`, `src/store/tests/…`); only `tests/messages.rs` and `tests/prompt_template.rs` are standalone integration crates.
+- `wiremock` mocks every HTTP call (both clients and the REST tool); no test needs the network, an API key, or a spawned MCP server — MCP uses `FakeMcpClient`.
+- Storage behavior is covered by one contract suite per trait (`assert_kv_contract`, `assert_document_contract`, `assert_vector_contract`, `assert_graph_contract`, `assert_object_contract`) instantiated for every backend, so backends cannot drift.
 - Behavior-port tests name the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/foundation/prompt/test_template_assemble.py`).
-- Integration test crates start with `#![allow(clippy::unwrap_used, clippy::expect_used)]`.
-- `cargo test -p openjiuwen-foundation` and `cargo test -p openjiuwen-foundation --no-default-features` must both pass offline; `--features sqlite` is exercised separately.
-- MCP tests are compile-gated: trait-level tests use a fake `McpClient`; no test spawns a real server or connects to a URL.
+- Integration test crates start with `#![allow(clippy::unwrap_used, clippy::expect_used)]`; the lib-level test cfg allows them too.
+- Gates: `cargo test -p openjiuwen-foundation`, `--no-default-features`, and `--features sqlite` all pass offline; `cargo clippy -p openjiuwen-foundation --all-targets -- -D warnings` is clean in every feature combination.
 
 ## Python Mapping
 
@@ -89,4 +95,19 @@ Storage (`store`):
 | `foundation/store/base_vector_store.py` | `store::vector` |
 | `foundation/store/{graph,object}/*` | `store::graph`, `store::object` |
 
-Not ported (documented in `docs/PARITY.md`): IntelliRouter routing, OpenAI account/OAuth transport, DashScope media generation, reasoning-profile resolution, `client.py` client-side tools, Chroma/Milvus/Gauss/ES/pgvector/S3/Redis backends, OpenAPI and Playwright MCP transports.
+## Deviations from `docs/ARCHITECTURE.md`
+
+- §2.2 message block: `BaseMessage` is one struct (no role subclasses) and lives in `prompt`, not `llm`; `prompt` is the crate's lowest module.
+- §2.2 `StreamChunk::Delta` additionally carries `finish_reason` so consumers learn the terminal reason mid-stream.
+- §2.3 `ToolCard` is flat (`id`/`name`/`description`/`input_params` + policy fields) and implements `openjiuwen_common::card::Card` instead of nesting `CardBase`; transport details live in `RestfulApiConfig`/`McpServerConfig`.
+- §2.3 `Tool` adds `stream(self: Arc<Self>) -> BoxStream<'static, Result<Value>>`, `render_for_llm`, and `is_parallel_safe`, all with defaults so external impls stay cheap.
+- `ModelExt`/`AssistantTurn`/`StreamAccumulator` are additions (Python accumulates chunks in `AssistantMessageChunk.__add__`).
+- `init_model` and `init_model_with` are `async` without awaiting, per §2.2; the Python positional `init_model(provider, model_name, api_key, api_base, ...)` maps to `ModelClientConfig` builders or `init_model_with`.
+- MCP HTTP transports are implemented directly on `reqwest` (POST/SSE framing, `Mcp-Session-Id` replay) because the workspace `rmcp` features do not include its reqwest transports; the `McpClient` seam is unaffected.
+- Storage replaces Python's SQLAlchemy-engine `BaseDbStore` with a `DocumentStore` contract; there is no `KvStore`/`VectorStore` factory registry (Python's `create_vector_store` plugin discovery is not ported).
+
+## Known Issues and Gaps
+
+- MCP streamable HTTP opens no separate server-initiated `GET` stream; server requests arrive only on a POST's SSE stream.
+- Not ported (tracked in `docs/PARITY.md`): reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, DashScope media generation, `client.py` client-side tools, Anthropic `cache_control` breakpoints and mid-conversation `system` turns, Chroma/Milvus/Gauss/ES/pgvector/S3/Redis backends, OpenAPI and Playwright MCP transports.
+- `FunctionTool` handlers are async-only (`spawn_blocking` inside a handler for blocking work); Python's sync handlers and generator-based tool streams are not reproduced.
