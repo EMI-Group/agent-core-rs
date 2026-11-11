@@ -17,10 +17,6 @@
 //!   original text verbatim — including interior whitespace — and logs a warning
 //!   naming the placeholder only, never its value.
 
-// Consumed by `template.rs` (`PromptTemplate::format`); until that module lands,
-// nothing outside the tests reaches these items.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use serde_json::Value;
