@@ -16,8 +16,12 @@
 //!   ([`stream::StreamHub`], [`stream::StreamWriterManager`]).
 //! - [`interaction`] — human-in-the-loop requests, responses, and the
 //!   [`interaction::InteractionBroker`].
+//! - [`session`] — the [`session::Session`] contract every graph node,
+//!   workflow component, agent, team, and runner receives as `Arc<dyn Session>`:
+//!   state scopes, streaming, human-in-the-loop, tracing, and snapshot/restore.
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
-//!   [`checkpoint::Checkpoint`] model, and the memory/file persistence backends.
+//!   [`checkpoint::Checkpoint`] model, and the memory, file, and feature-gated
+//!   SQLite backends.
 //! - [`tracer`] — trace spans ([`tracer::TraceSpan`]), frames
 //!   ([`tracer::TraceFrame`]), sinks ([`tracer::TraceSink`],
 //!   [`tracer::MemoryTraceSink`], [`tracer::StreamTraceSink`]), the
@@ -47,6 +51,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod constants;
 pub mod interaction;
+pub mod session;
 pub mod state;
 pub mod stream;
 pub mod tracer;
@@ -68,6 +73,8 @@ pub use interaction::{
     InteractionBroker, InteractionDecision, InteractionKind, InteractionOption, InteractionOutput,
     InteractionRequest, InteractionResponse, InteractiveInput,
 };
+
+pub use session::{Session, SessionMetadata, SessionSnapshot, SessionType};
 
 pub use state::{AgentState, StateLane, StateStore, WorkflowState};
 pub use state::{
