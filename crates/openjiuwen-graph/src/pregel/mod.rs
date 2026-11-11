@@ -6,3 +6,7 @@
 //!   target resolver.
 //! - [`executor`] — the superstep loop: scheduling, merging, retries, timeouts,
 //!   cancellation, and checkpointing.
+
+pub(crate) mod channel;
+pub(crate) mod dispatch;
+pub(crate) mod executor;

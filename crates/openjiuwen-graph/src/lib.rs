@@ -24,8 +24,24 @@
 //! The executor internals (`pregel`) are crate-private; use the builder and
 //! [`compiled::CompiledGraph`] instead.
 //!
-//! The crate root re-exports the types most consumers need; the exact public
-//! surface is documented in this crate's `CONTEXT.md`.
+//! ```
+//! use openjiuwen_common::error::Result;
+//! use openjiuwen_graph::{GraphBuilder, GraphContext, GraphState, NodeOutcome, SyncNode};
+//!
+//! # fn main() -> Result<()> {
+//! let graph = GraphBuilder::new("example")
+//!     .node(
+//!         "answer",
+//!         SyncNode::new("answer", |state: &mut GraphState, _ctx: &GraphContext| {
+//!             state.set("answer", serde_json::json!(42));
+//!             Ok(NodeOutcome::Continue)
+//!         }),
+//!     )
+//!     .compile()?;
+//! assert_eq!(graph.node_ids().collect::<Vec<_>>(), vec!["answer"]);
+//! # Ok(())
+//! # }
+//! ```
 #![forbid(unsafe_code)]
 
 pub mod builder;
@@ -40,6 +56,20 @@ pub mod store;
 pub mod visualize;
 
 pub(crate) mod pregel;
+
+pub use builder::{CompileOptions, GraphBuilder};
+pub use compiled::{CompiledGraph, GraphRunResult, HaltInfo};
+pub use event::{GraphEvent, GraphEventKind};
+pub use execution::ExecutionOptions;
+pub use node::{BoxNodeFuture, FnNode, GraphContext, Node, NodeOptions, NodeOutcome, SyncNode};
+pub use router::{BoxRouterFuture, FnRouter, Router, RouterContext};
+pub use spec::{EdgeKind, EdgeSpec, GraphSpec, NodeSpec};
+pub use state::GraphState;
+pub use store::{
+    ChannelMessage, ChannelSnapshot, CheckpointerStore, GraphSnapshot, GraphStore,
+    InMemoryGraphStore,
+};
+pub use visualize::{render_mermaid, MermaidDirection, MermaidOptions};
 
 /// The default superstep budget of a run (Python `MAX_RECURSIVE_LIMIT`).
 pub const DEFAULT_MAX_SUPERSTEPS: usize = 10_000;
