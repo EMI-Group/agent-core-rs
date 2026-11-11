@@ -1,12 +1,12 @@
 //! Documents, chunking, loaders, embeddings, vector stores, rerankers, and
-//! knowledge base.
+//! knowledge bases.
 //!
 //! Maps to the Python package `openjiuwen.core.retrieval` in the openJiuwen
 //! reference implementation. The crate is split into independent layers:
 //! [`common`] (shared data model, configs, metadata filters), [`chunking`],
 //! [`loaders`] (text/Markdown/JSON/CSV/HTML/URL sources plus auto dispatch),
-//! [`embedding`], [`vector_store`], [`reranker`], and the upcoming
-//! `knowledge_base` pipeline that composes them.
+//! [`embedding`], [`vector_store`], [`reranker`], and [`knowledge_base`], the
+//! pipeline that composes them.
 #![forbid(unsafe_code)]
 #![allow(
     clippy::module_name_repetitions,
@@ -24,6 +24,7 @@
 pub mod chunking;
 pub mod common;
 pub mod embedding;
+pub mod knowledge_base;
 pub mod loaders;
 pub mod reranker;
 pub mod vector_store;
@@ -40,6 +41,9 @@ pub use common::{
     DEFAULT_TOP_K, INDEX_TYPE_BM25, INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
 };
 pub use embedding::{validate_query, validate_texts, Embedding, HashEmbedding, OpenAiEmbedding};
+pub use knowledge_base::{
+    retrieve_multi_kb, retrieve_multi_kb_with_source, KnowledgeBaseStatistics, SimpleKnowledgeBase,
+};
 pub use loaders::{
     extract_title, html_to_text, AutoLoader, CsvLoader, DocumentLoader, HtmlLoader, JsonLoader,
     LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
