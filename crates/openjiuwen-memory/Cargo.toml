@@ -11,23 +11,26 @@ publish = false
 [dependencies]
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
-openjiuwen-session.workspace = true
 openjiuwen-retrieval.workspace = true
-openjiuwen-context.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
 sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []
-sqlite = ["dep:sqlx"]
+sqlite = ["dep:sqlx", "openjiuwen-foundation/sqlite"]
 
 [lints]
 workspace = true
