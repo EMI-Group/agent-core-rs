@@ -32,7 +32,7 @@ No external SDK: requests go through `openjiuwen_common::http`.
 
 ## Constraints
 
-- No `openjiuwen_foundation` dependency yet (its model layer is not implemented); the `EmbeddingConfig` in `common::config` mirrors Python `EmbeddingConfig` fields.
+- The crate has no `openjiuwen-foundation` dependency; the `EmbeddingConfig` in `common::config` mirrors Python `EmbeddingConfig` fields and the client uses `openjiuwen_common::http`.
 - No credentials in errors/logs; use `SecretString::expose_secret` only at header construction.
 - Batching must preserve input order exactly.
 - Unit tests for the OpenAI client use `wiremock`; no live network.
