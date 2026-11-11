@@ -55,6 +55,7 @@ pub trait Card: Serialize + DeserializeOwned + JsonSchema + Clone + Send + Sync 
 /// serde default, so `{}` deserializes to a card with a freshly generated id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
+#[schemars(transform = strip_generated_id_default)]
 pub struct CardBase {
     /// Unique identifier; Python's `uuid.uuid4().hex` form by default.
     pub id: String,
@@ -219,6 +220,25 @@ impl From<String> for CardId {
 impl From<CardId> for String {
     fn from(value: CardId) -> Self {
         value.0
+    }
+}
+
+/// Removes the generated `id` default from a [`CardBase`] schema.
+///
+/// The struct-level serde default makes `schemars` derive a field default from
+/// `Default::default()`, which would bake a freshly generated UUID into every
+/// generated schema and make [`card_schema`] non-deterministic. Python's
+/// `BaseCard` uses `default_factory`, which emits no `default` at all, so the
+/// property is stripped after schema generation.
+fn strip_generated_id_default(schema: &mut schemars::Schema) {
+    let Some(id) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("id"))
+    else {
+        return;
+    };
+    if let Some(object) = id.as_object_mut() {
+        object.remove("default");
     }
 }
 
@@ -431,6 +451,15 @@ mod tests {
             schema.get("additionalProperties"),
             Some(&Value::Bool(false)),
             "unknown fields must stay allowed"
+        );
+        assert!(
+            properties["id"].get("default").is_none(),
+            "a generated id must not become a schema default"
+        );
+        assert_eq!(
+            card_base_schema().unwrap(),
+            schema,
+            "schema generation must be deterministic"
         );
 
         let generic = card_schema::<TestCard>().unwrap();

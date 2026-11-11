@@ -236,13 +236,26 @@ fn card_base_schema_exposes_core_properties() {
         "unknown fields must stay allowed"
     );
 
-    // `card_schema` is the generic form of `card_base_schema`; note that the derived
-    // schema embeds a freshly generated `id` default, so only the shape is compared.
+    // `card_schema` is the generic form of `card_base_schema`, and schema
+    // generation is deterministic: no call may bake a generated id into the schema.
     let generic = card_schema::<CardBase>().unwrap();
     let generic_properties = generic["properties"].as_object().unwrap();
     assert!(generic_properties.contains_key("id"));
     assert!(generic_properties.contains_key("name"));
     assert_eq!(generic["type"], "object");
+    assert_eq!(
+        generic, schema,
+        "the generic and convenience forms must produce the identical schema"
+    );
+    assert_eq!(
+        card_base_schema().unwrap(),
+        schema,
+        "repeated schema generation must be byte-identical"
+    );
+    assert!(
+        schema["properties"]["id"].get("default").is_none(),
+        "a generated id must never appear as a schema default (Python `default_factory` parity)"
+    );
 }
 
 #[test]
@@ -257,6 +270,15 @@ fn downstream_card_schema_includes_extra_properties() {
     assert_ne!(
         schema.get("additionalProperties"),
         Some(&Value::Bool(false))
+    );
+    assert!(
+        properties["id"].get("default").is_none(),
+        "a flattened base card must not leak a generated id default either"
+    );
+    assert_eq!(
+        card_schema::<ToolLikeCard>().unwrap(),
+        schema,
+        "downstream card schemas must be deterministic"
     );
 }
 
