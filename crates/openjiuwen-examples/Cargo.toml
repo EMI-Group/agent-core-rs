@@ -1,0 +1,23 @@
+[package]
+name = "openjiuwen-examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+openjiuwen.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+futures.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

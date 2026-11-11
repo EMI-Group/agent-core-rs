@@ -1,0 +1,39 @@
+[package]
+name = "openjiuwen-agent-teams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+openjiuwen-harness.workspace = true
+openjiuwen-harness-protocol.workspace = true
+openjiuwen-core.workspace = true
+openjiuwen-common.workspace = true
+openjiuwen-foundation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+regex.workspace = true
+glob.workspace = true
+tempfile.workspace = true
+rmcp.workspace = true
+clap.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = []
+distributed = []
+live-tests = []
+
+[lints]
+workspace = true

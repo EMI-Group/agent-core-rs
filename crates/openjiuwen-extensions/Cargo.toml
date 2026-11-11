@@ -1,0 +1,44 @@
+[package]
+name = "openjiuwen-extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+openjiuwen-core.workspace = true
+openjiuwen-common.workspace = true
+openjiuwen-foundation.workspace = true
+openjiuwen-harness-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+axum = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+
+[features]
+default = []
+a2a = ["dep:axum"]
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry", "dep:opentelemetry_sdk"]
+mcp = ["dep:rmcp", "dep:tokio-stream"]
+sqlite = ["dep:sqlx"]
+redis = []
+pulsar = []
+
+[lints]
+workspace = true

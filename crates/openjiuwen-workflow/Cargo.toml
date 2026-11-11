@@ -1,0 +1,33 @@
+[package]
+name = "openjiuwen-workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+openjiuwen-common.workspace = true
+openjiuwen-foundation.workspace = true
+openjiuwen-session.workspace = true
+openjiuwen-graph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror = "2"
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+regex.workspace = true
+indexmap.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

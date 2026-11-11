@@ -1,0 +1,48 @@
+[package]
+name = "openjiuwen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+openjiuwen-common.workspace = true
+openjiuwen-foundation.workspace = true
+openjiuwen-session.workspace = true
+openjiuwen-graph.workspace = true
+openjiuwen-workflow.workspace = true
+openjiuwen-context.workspace = true
+openjiuwen-memory.workspace = true
+openjiuwen-retrieval.workspace = true
+openjiuwen-sysop.workspace = true
+openjiuwen-security.workspace = true
+openjiuwen-agent.workspace = true
+openjiuwen-multiagent.workspace = true
+openjiuwen-runner.workspace = true
+openjiuwen-core.workspace = true
+openjiuwen-harness-protocol.workspace = true
+openjiuwen-harness.workspace = true
+openjiuwen-harness-providers.workspace = true
+openjiuwen-agent-teams.workspace = true
+openjiuwen-extensions.workspace = true
+openjiuwen-dev-tools.workspace = true
+openjiuwen-symphony.workspace = true
+openjiuwen-rsi.workspace = true
+openjiuwen-agent-evolving.workspace = true
+openjiuwen-auto-harness.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+
+[features]
+default = ["native"]
+native = ["openjiuwen-harness/native", "openjiuwen-harness-providers/native"]
+otel = ["openjiuwen-extensions/otel"]
+a2a = ["openjiuwen-extensions/a2a"]
+live-tests = []
+
+[lints]
+workspace = true
