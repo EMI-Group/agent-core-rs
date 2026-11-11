@@ -1,0 +1,709 @@
+//! `Qwen3Guard` model-output parser.
+//!
+//! Ports `QwenGuardParser` from
+//! `openjiuwen/core/security/guardrail/context.py`. The model answers in one of
+//! several dialects: a standard `Safety:`/`Categories:` text (optionally wrapped
+//! in JSON), a rich `analysis` JSON object, a simple `judgment` object, an API
+//! `severity_level` object, or an arbitrary `risk_level` object. All of them
+//! collapse onto the same three-level map: `safe`, `controversial`, `unsafe`.
+
+use std::sync::LazyLock;
+
+use regex::Regex;
+use serde_json::{json, Map, Value};
+
+use super::ModelOutputParser;
+use crate::{RiskAssessment, RiskLevel};
+
+/// Matches Python's `safety\s*:\s*(\w+)` extraction (case-insensitive).
+#[allow(clippy::expect_used)]
+static SAFETY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)safety\s*:\s*(\w+)").expect("the safety pattern is a valid regex")
+});
+
+/// Matches Python's `categories?\s*:\s*(.+?)(?:\n|$)` extraction
+/// (case-insensitive).
+#[allow(clippy::expect_used)]
+static CATEGORIES_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)categories?\s*:\s*(.+?)(?:\n|$)")
+        .expect("the categories pattern is a valid regex")
+});
+
+/// Parser for `Qwen3Guard` moderation output.
+///
+/// The default configuration reproduces the Python constructor
+/// (`risk_type = "content_risk"`, `default_risk_level = Safe`).
+#[derive(Debug, Clone)]
+pub struct QwenGuardParser {
+    /// Risk name reported when the model flags content but names no category
+    /// (`"content_risk"` by default).
+    pub risk_type: String,
+    /// Level used when the model's verdict cannot be mapped onto the
+    /// `safe`/`controversial`/`unsafe` table.
+    pub default_risk_level: RiskLevel,
+}
+
+impl Default for QwenGuardParser {
+    /// The Python default configuration.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QwenGuardParser {
+    /// A parser with the Python defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            risk_type: "content_risk".to_owned(),
+            default_risk_level: RiskLevel::Safe,
+        }
+    }
+
+    /// Uses `risk_type` instead of the default `"content_risk"`.
+    #[must_use]
+    pub fn with_risk_type(mut self, risk_type: impl Into<String>) -> Self {
+        self.risk_type = risk_type.into();
+        self
+    }
+
+    /// Uses `default_risk_level` for verdicts outside the risk map.
+    #[must_use]
+    pub fn with_default_risk_level(mut self, default_risk_level: RiskLevel) -> Self {
+        self.default_risk_level = default_risk_level;
+        self
+    }
+
+    /// Maps a model verdict onto a risk level.
+    ///
+    /// Lowercases and trims the verdict; an exact table key wins, otherwise the
+    /// first keyword contained in the verdict (checked longest first, so
+    /// `"unsafe"` beats `"safe"`), otherwise [`Self::default_risk_level`].
+    fn map_risk_level(&self, value: &str) -> RiskLevel {
+        let normalized = value.trim().to_lowercase();
+        let exact = match normalized.as_str() {
+            "safe" => Some(RiskLevel::Safe),
+            "controversial" => Some(RiskLevel::Medium),
+            "unsafe" => Some(RiskLevel::High),
+            _ => None,
+        };
+        if let Some(level) = exact {
+            return level;
+        }
+        for (keyword, level) in [
+            ("controversial", RiskLevel::Medium),
+            ("unsafe", RiskLevel::High),
+            ("safe", RiskLevel::Safe),
+        ] {
+            if normalized.contains(keyword) {
+                return level;
+            }
+        }
+        self.default_risk_level
+    }
+
+    /// Builds the assessment shared by every dialect.
+    #[allow(clippy::unused_self)]
+    fn assess(&self, risk_level: RiskLevel, risk_type: String, details: Value) -> RiskAssessment {
+        let has_risk = risk_level.is_risky();
+        RiskAssessment {
+            has_risk,
+            risk_level,
+            risk_type: has_risk.then_some(risk_type),
+            confidence: 0.0,
+            details: Some(details),
+        }
+    }
+
+    /// Dispatches an object to the dialect its fields identify.
+    fn parse_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        if data.contains_key("safety") {
+            return self.parse_standard_object(data);
+        }
+        if data.contains_key("analysis") {
+            return self.parse_full_object(data);
+        }
+        if data.contains_key("judgment") {
+            return self.parse_simple_object(data);
+        }
+        if data.contains_key("severity_level") {
+            return self.parse_api_object(data);
+        }
+        self.parse_generic_object(data)
+    }
+
+    /// Standard `safety` / `categories` object dialect.
+    fn parse_standard_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        let safety = string_or(data.get("safety"), "safe");
+        let categories = categories_of(data.get("categories"));
+        let risk_level = self.map_risk_level(&safety);
+        let risk_type = categories
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.risk_type.clone());
+        self.assess(
+            risk_level,
+            risk_type,
+            json!({"safety": safety, "categories": categories}),
+        )
+    }
+
+    /// Rich `analysis` object dialect.
+    fn parse_full_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        let analysis = data.get("analysis").and_then(Value::as_object);
+        let field = |key: &str| analysis.and_then(|map| map.get(key));
+
+        let risk_level = self.map_risk_level(&string_or(field("risk_level"), "safe"));
+        let risk_categories = categories_of(field("risk_categories"));
+        let risk_type = risk_categories
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.risk_type.clone());
+        let evidence = field("evidence").cloned().unwrap_or(Value::Null);
+        let language = string_or(field("language"), "unknown");
+        let decision = string_or(data.get("decision"), "unknown");
+        let version = string_or(data.get("version"), "unknown");
+        self.assess(
+            risk_level,
+            risk_type,
+            json!({
+                "risk_categories": risk_categories,
+                "evidence": evidence,
+                "language": language,
+                "decision": decision,
+                "version": version,
+            }),
+        )
+    }
+
+    /// Legacy simple `judgment` object dialect.
+    fn parse_simple_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        let judgment = string_or(data.get("judgment"), "Safe");
+        let risk_level = self.map_risk_level(&judgment);
+        let reason = data.get("reason").cloned().unwrap_or(Value::Null);
+        let language = string_or(data.get("language"), "unknown");
+        self.assess(
+            risk_level,
+            self.risk_type.clone(),
+            json!({"reason": reason, "language": language, "judgment": judgment}),
+        )
+    }
+
+    /// Legacy API `severity_level` object dialect.
+    fn parse_api_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        let severity = string_or(data.get("severity_level"), "safe");
+        let risk_level = self.map_risk_level(&severity);
+        let reason = data.get("reason").cloned().unwrap_or(Value::Null);
+        let language = string_or(data.get("language"), "unknown");
+        self.assess(
+            risk_level,
+            self.risk_type.clone(),
+            json!({"reason": reason, "language": language, "severity_level": severity}),
+        )
+    }
+
+    /// Fallback object dialect: `risk_level` (or `level`) plus `risk_type`.
+    fn parse_generic_object(&self, data: &Map<String, Value>) -> RiskAssessment {
+        let level_value = data.get("risk_level").or_else(|| data.get("level"));
+        let risk_level = self.map_risk_level(&string_or(level_value, "safe"));
+        let risk_type = data
+            .get("risk_type")
+            .map_or_else(|| self.risk_type.clone(), string_value);
+        self.assess(risk_level, risk_type, Value::Object(data.clone()))
+    }
+
+    /// Parses the standard `Safety:`/`Categories:` text format.
+    fn parse_standard_text(&self, text: &str) -> RiskAssessment {
+        let safety = extract_safety(text);
+        let categories = extract_categories(text);
+        let risk_level = self.map_risk_level(&safety);
+        let risk_type = categories
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.risk_type.clone());
+        self.assess(
+            risk_level,
+            risk_type,
+            json!({"safety": safety, "categories": categories}),
+        )
+    }
+
+    /// Parses a string, first as a JSON object when one is embedded.
+    fn parse_string(&self, text: &str) -> RiskAssessment {
+        if let Some(data) = json_object_in(text) {
+            return self.parse_object(&data);
+        }
+        self.parse_standard_text(text)
+    }
+}
+
+impl ModelOutputParser for QwenGuardParser {
+    // The trait fixes the return type at `&str`; the name is a literal.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "qwen_guard"
+    }
+
+    fn parse(&self, output: &Value) -> RiskAssessment {
+        match output {
+            Value::Object(data) => self.parse_object(data),
+            Value::String(text) => self.parse_string(text),
+            // Python calls `str()` on every other value and reads the text
+            // format, so JSON scalars and arrays degrade to a safe assessment.
+            other => self.parse_standard_text(&other.to_string()),
+        }
+    }
+}
+
+/// Finds and parses a JSON object embedded in `text`.
+///
+/// Tries the whole trimmed string when it looks like an object, then the
+/// substring between the first `{` and the last `}`.
+fn json_object_in(text: &str) -> Option<Map<String, Value>> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.ends_with('}') {
+        if let Ok(Value::Object(data)) = serde_json::from_str::<Value>(trimmed) {
+            return Some(data);
+        }
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end > start {
+        if let Ok(Value::Object(data)) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Extracts the `Safety:` verdict from the standard text format.
+///
+/// Mirrors Python: the regex first, then a line keyed `safety:`, then the first
+/// of `unsafe`/`controversial`/`safe` contained in the lowercase text, else
+/// `"unknown"`.
+fn extract_safety(text: &str) -> String {
+    let captures = SAFETY_PATTERN.captures(text);
+    if let Some(found) = captures.as_ref().and_then(|captures| captures.get(1)) {
+        return found.as_str().to_owned();
+    }
+    if let Some(found) = safety_from_lines(text) {
+        return found;
+    }
+    let lower = text.to_lowercase();
+    for keyword in ["unsafe", "controversial", "safe"] {
+        if lower.contains(keyword) {
+            return keyword.to_owned();
+        }
+    }
+    "unknown".to_owned()
+}
+
+/// Fallback for [`extract_safety`]: the first word after a `safety:` key.
+fn safety_from_lines(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(index) = lower.find("safety:") {
+            let value = &trimmed[(index + "safety:".len())..];
+            if let Some(token) = value.split_whitespace().next() {
+                return Some(token.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Extracts the category list from the standard text format.
+///
+/// Mirrors Python: the `categories?` regex first, then a line keyed
+/// `categories` or `category`; values are split on commas and whitespace.
+fn extract_categories(text: &str) -> Vec<String> {
+    let captures = CATEGORIES_PATTERN.captures(text);
+    if let Some(found) = captures.as_ref().and_then(|captures| captures.get(1)) {
+        let categories = split_categories(found.as_str());
+        if !categories.is_empty() {
+            return categories;
+        }
+    }
+    categories_from_lines(text)
+}
+
+/// Fallback for [`extract_categories`]: a line keyed `categories`/`category`.
+fn categories_from_lines(text: &str) -> Vec<String> {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key == "categories" || key == "category" {
+            let categories = split_categories(value);
+            if !categories.is_empty() {
+                return categories;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Splits a comma- or whitespace-separated category list.
+fn split_categories(text: &str) -> Vec<String> {
+    text.split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Reads a category list that is either a JSON array or a delimited string.
+fn categories_of(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(string_value)
+            .filter(|item| !item.is_empty())
+            .collect(),
+        Some(Value::String(text)) => split_categories(text),
+        _ => Vec::new(),
+    }
+}
+
+/// Renders a JSON value as a string without failing.
+fn string_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// [`string_value`] for an optional value, falling back to `default`.
+fn string_or(value: Option<&Value>, default: &str) -> String {
+    value.map_or(default.to_owned(), string_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn parse(parser: &QwenGuardParser, output: Value) -> RiskAssessment {
+        parser.parse(&output)
+    }
+
+    fn details(assessment: &RiskAssessment) -> Value {
+        assessment.details.clone().unwrap()
+    }
+
+    #[test]
+    fn standard_text_unsafe() {
+        // ports tests/unit_tests/core/security/guardrail/test_parsers_and_backends.py
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!("Safety: Unsafe\nCategories: Violent"));
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Violent"));
+        let details = details(&assessment);
+        assert_eq!(details["safety"], json!("Unsafe"));
+        assert_eq!(details["categories"], json!(["Violent"]));
+    }
+
+    #[test]
+    fn standard_text_safe() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!("Safety: Safe\nCategories:"));
+        assert!(!assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Safe);
+        assert_eq!(assessment.risk_type, None);
+        let details = details(&assessment);
+        assert_eq!(details["safety"], json!("Safe"));
+        assert_eq!(details["categories"], json!([]));
+    }
+
+    #[test]
+    fn standard_text_controversial_is_medium() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!("Safety: Controversial\nCategories: Political"),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Medium);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Political"));
+    }
+
+    #[test]
+    fn standard_text_multiple_categories() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!("Safety: Unsafe\nCategories: Violent, Sexual, Hate"),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Violent"));
+        assert_eq!(
+            details(&assessment)["categories"],
+            json!(["Violent", "Sexual", "Hate"])
+        );
+    }
+
+    #[test]
+    fn standard_text_is_case_insensitive() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!("safety: unsafe\ncategories: violent"));
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(details(&assessment)["categories"], json!(["violent"]));
+    }
+
+    #[test]
+    fn standard_text_keyword_fallback() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!("This content is unsafe and should be blocked"),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(details(&assessment)["safety"], json!("unsafe"));
+        assert_eq!(assessment.risk_type.as_deref(), Some("content_risk"));
+    }
+
+    #[test]
+    fn standard_text_without_markers_is_safe() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!("Unknown format without keywords"));
+        assert!(!assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Safe);
+        assert_eq!(assessment.risk_type, None);
+        assert_eq!(details(&assessment)["safety"], json!("unknown"));
+        assert_eq!(details(&assessment)["categories"], json!([]));
+    }
+
+    #[test]
+    fn standard_text_category_only() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!("category: violence, hate"));
+        assert!(!assessment.has_risk);
+        assert_eq!(
+            details(&assessment)["categories"],
+            json!(["violence", "hate"])
+        );
+        assert_eq!(details(&assessment)["safety"], json!("unknown"));
+    }
+
+    #[test]
+    fn standard_object_dialect() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!({"safety": "Unsafe", "categories": ["Violent", "Hate"]}),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Violent"));
+        assert_eq!(
+            details(&assessment)["categories"],
+            json!(["Violent", "Hate"])
+        );
+    }
+
+    #[test]
+    fn standard_object_accepts_string_categories() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!({"safety": "Unsafe", "categories": "Violent, Sexual"}),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Violent"));
+        assert_eq!(
+            details(&assessment)["categories"],
+            json!(["Violent", "Sexual"])
+        );
+    }
+
+    #[test]
+    fn standard_object_risky_without_categories_falls_back_to_risk_type() {
+        let parser = QwenGuardParser::new().with_risk_type("content_moderation");
+        let assessment = parse(&parser, json!({"safety": "Unsafe", "categories": []}));
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_type.as_deref(), Some("content_moderation"));
+    }
+
+    #[test]
+    fn full_object_dialect() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!({
+                "analysis": {
+                    "risk_level": "unsafe",
+                    "risk_categories": ["hate_speech"],
+                    "evidence": "Test evidence",
+                    "language": "zh",
+                },
+                "decision": "block",
+                "version": "qwen3guard-gen-8b-v1.0",
+            }),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("hate_speech"));
+        let details = details(&assessment);
+        assert_eq!(details["risk_categories"], json!(["hate_speech"]));
+        assert_eq!(details["evidence"], json!("Test evidence"));
+        assert_eq!(details["language"], json!("zh"));
+        assert_eq!(details["decision"], json!("block"));
+        assert_eq!(details["version"], json!("qwen3guard-gen-8b-v1.0"));
+        assert!((assessment.confidence - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn full_object_defaults_missing_fields() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(&parser, json!({"analysis": {}}));
+        assert!(!assessment.has_risk);
+        let details = details(&assessment);
+        assert_eq!(details["evidence"], Value::Null);
+        assert_eq!(details["language"], json!("unknown"));
+        assert_eq!(details["decision"], json!("unknown"));
+        assert_eq!(details["version"], json!("unknown"));
+    }
+
+    #[test]
+    fn simple_object_dialect() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!({"judgment": "Unsafe", "reason": "Test reason", "language": "zh"}),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("content_risk"));
+        let details = details(&assessment);
+        assert_eq!(details["reason"], json!("Test reason"));
+        assert_eq!(details["language"], json!("zh"));
+        assert_eq!(details["judgment"], json!("Unsafe"));
+    }
+
+    #[test]
+    fn api_object_dialect() {
+        let parser = QwenGuardParser::new();
+        let unsafe_assessment = parse(
+            &parser,
+            json!({"severity_level": "unsafe", "reason": "Test reason", "language": "zh"}),
+        );
+        assert!(unsafe_assessment.has_risk);
+        assert_eq!(unsafe_assessment.risk_level, RiskLevel::High);
+        assert_eq!(
+            details(&unsafe_assessment)["severity_level"],
+            json!("unsafe")
+        );
+
+        // `"HIGH"` is not one of the three model verdicts, so Python's map
+        // falls back to the configured default.
+        let high = parse(&parser, json!({"severity_level": "HIGH"}));
+        assert!(!high.has_risk);
+        assert_eq!(high.risk_level, RiskLevel::Safe);
+        assert_eq!(details(&high)["severity_level"], json!("HIGH"));
+    }
+
+    #[test]
+    fn generic_object_dialect() {
+        let parser = QwenGuardParser::new();
+        let assessment = parse(
+            &parser,
+            json!({"risk_level": "unsafe", "risk_type": "jailbreak", "score": 0.9}),
+        );
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("jailbreak"));
+        assert_eq!(
+            details(&assessment),
+            json!({
+                "risk_level": "unsafe",
+                "risk_type": "jailbreak",
+                "score": 0.9,
+            })
+        );
+
+        let level_alias = parse(&parser, json!({"level": "controversial"}));
+        assert_eq!(level_alias.risk_level, RiskLevel::Medium);
+        assert_eq!(level_alias.risk_type.as_deref(), Some("content_risk"));
+
+        let empty = parse(&parser, json!({}));
+        assert!(!empty.has_risk);
+        assert_eq!(details(&empty), json!({}));
+    }
+
+    #[test]
+    fn json_string_wrapping_a_standard_object() {
+        let parser = QwenGuardParser::new();
+        let whole = json!(r#"{"safety": "Unsafe", "categories": ["Violent"]}"#);
+        let assessment = parse(&parser, whole);
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::High);
+        assert_eq!(assessment.risk_type.as_deref(), Some("Violent"));
+
+        let embedded = json!(
+            r#"The model said: {"safety": "Controversial", "categories": ["Political"]} -- done"#
+        );
+        let embedded_assessment = parse(&parser, embedded);
+        assert!(embedded_assessment.has_risk);
+        assert_eq!(embedded_assessment.risk_level, RiskLevel::Medium);
+        assert_eq!(embedded_assessment.risk_type.as_deref(), Some("Political"));
+    }
+
+    #[test]
+    fn json_scalars_and_arrays_are_safe() {
+        let parser = QwenGuardParser::new();
+        for output in [
+            json!(0.99),
+            json!(42),
+            json!([1, 2, 3]),
+            json!(true),
+            Value::Null,
+        ] {
+            let assessment = parse(&parser, output.clone());
+            assert!(!assessment.has_risk, "{output}");
+            assert_eq!(assessment.risk_level, RiskLevel::Safe);
+            assert_eq!(assessment.risk_type, None);
+        }
+    }
+
+    #[test]
+    fn custom_default_risk_level_handles_unknown_verdicts() {
+        let parser = QwenGuardParser::new().with_default_risk_level(RiskLevel::Medium);
+        let assessment = parse(&parser, json!("no markers here"));
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Medium);
+        assert_eq!(assessment.risk_type.as_deref(), Some("content_risk"));
+
+        let explicit = parse(&parser, json!({"risk_level": "high"}));
+        assert_eq!(explicit.risk_level, RiskLevel::Medium);
+    }
+
+    #[test]
+    fn risk_level_mapping_prefers_longest_keyword() {
+        let parser = QwenGuardParser::new();
+        assert_eq!(parser.map_risk_level(" safe "), RiskLevel::Safe);
+        assert_eq!(parser.map_risk_level("UNSAFE"), RiskLevel::High);
+        assert_eq!(parser.map_risk_level("Controversial"), RiskLevel::Medium);
+        // `"unsafe"` contains `"safe"`; the longer keyword must win.
+        assert_eq!(parser.map_risk_level("this is unsafe"), RiskLevel::High);
+        assert_eq!(
+            parser.map_risk_level("controversial content"),
+            RiskLevel::Medium
+        );
+        assert_eq!(parser.map_risk_level("perfectly fine"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn constructor_defaults_match_python() {
+        let parser = QwenGuardParser::default();
+        assert_eq!(parser.risk_type, "content_risk");
+        assert_eq!(parser.default_risk_level, RiskLevel::Safe);
+    }
+}
