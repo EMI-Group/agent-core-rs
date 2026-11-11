@@ -1,0 +1,461 @@
+//! Checkpoint persistence: the [`Checkpointer`] contract, the checkpoint data
+//! model, Python-compatible key layout, and the backend factory.
+//!
+//! Ports `openjiuwen/core/session/checkpointer/` (v0.1.20): `base.py` (the
+//! abstract contract, namespace constants, and key builders), `inmemory.py`
+//! ([`MemoryCheckpointer`]), and `persistence.py` ([`FileCheckpointer`]; the
+//! sqlite backend lives in [`crate::checkpoint::sqlite`] behind the `sqlite`
+//! feature).
+//!
+//! Deviations from Python (intentional, documented in the crate `CONTEXT.md`):
+//!
+//! - Checkpoints are JSON documents, not pickles; only JSON-compatible state is
+//!   preserved.
+//! - There is no process-global checkpointer singleton and no ambient session
+//!   `ContextVar`: callers inject `Arc<dyn Checkpointer>` explicitly.
+//! - The workflow/agent lifecycle hooks (`pre_workflow_execute`,
+//!   `post_agent_execute`, …) are not part of this seam; backends implement only
+//!   the storage contract below.
+//!
+//! ```
+//! use openjiuwen_session::CheckpointNamespace;
+//!
+//! assert_eq!(CheckpointNamespace::Agent.as_str(), "agent");
+//! assert_eq!(CheckpointNamespace::AgentTeam.as_str(), "agent-team");
+//! ```
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::utils::id::now_rfc3339;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::tracer::TracePosition;
+
+pub mod file;
+pub mod memory;
+// The sqlite backend lands in a later phase; `rustfmt::skip` keeps `cargo fmt`
+// from resolving the not-yet-existing module while the declaration stays gated.
+#[cfg(feature = "sqlite")]
+#[rustfmt::skip]
+pub mod sqlite;
+
+pub use file::FileCheckpointer;
+pub use memory::MemoryCheckpointer;
+
+/// Namespace for agent state under a session (`agent`).
+pub const SESSION_NAMESPACE_AGENT: &str = "agent";
+/// Namespace for agent-team state under a session (`agent-team`).
+pub const SESSION_NAMESPACE_AGENT_TEAM: &str = "agent-team";
+/// Namespace for a workflow's own state under a session (`workflow`).
+pub const SESSION_NAMESPACE_WORKFLOW: &str = "workflow";
+/// Namespace for graph state under a workflow (`workflow-graph`).
+pub const WORKFLOW_NAMESPACE_GRAPH: &str = "workflow-graph";
+
+/// The Python key namespace a checkpoint belongs to.
+///
+/// Wire values are `agent`, `agent-team`, `workflow`, and `workflow-graph`;
+/// these are the second segment of every checkpoint key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointNamespace {
+    /// Agent state (`agent`).
+    #[default]
+    Agent,
+    /// Agent-team state (`agent-team`).
+    #[serde(rename = "agent-team")]
+    AgentTeam,
+    /// A workflow's own state (`workflow`).
+    Workflow,
+    /// Graph state under a workflow (`workflow-graph`).
+    #[serde(rename = "workflow-graph")]
+    WorkflowGraph,
+}
+
+impl CheckpointNamespace {
+    /// Returns the namespace's wire value, as stored in keys and JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => SESSION_NAMESPACE_AGENT,
+            Self::AgentTeam => SESSION_NAMESPACE_AGENT_TEAM,
+            Self::Workflow => SESSION_NAMESPACE_WORKFLOW,
+            Self::WorkflowGraph => WORKFLOW_NAMESPACE_GRAPH,
+        }
+    }
+}
+
+/// Joins key `parts` with the colon separator (Python `build_key`).
+///
+/// ```
+/// use openjiuwen_session::build_key;
+///
+/// assert_eq!(build_key(&["session", "agent", "a1"]), "session:agent:a1");
+/// ```
+#[must_use]
+pub fn build_key(parts: &[&str]) -> String {
+    parts.join(":")
+}
+
+/// Builds a namespaced checkpoint key:
+/// `session_id:namespace:entity_id:suffix...` (Python
+/// `build_key_with_namespace`).
+///
+/// Empty segments are dropped, so a missing suffix or entity id never produces
+/// a dangling `:` separator.
+///
+/// ```
+/// use openjiuwen_session::build_key_with_namespace;
+///
+/// assert_eq!(
+///     build_key_with_namespace("s1", "agent", "a1", &["state", "blob"]),
+///     "s1:agent:a1:state:blob",
+/// );
+/// assert_eq!(
+///     build_key_with_namespace("s1", "agent", "", &[]),
+///     "s1:agent",
+/// );
+/// ```
+#[must_use]
+pub fn build_key_with_namespace(
+    session_id: &str,
+    namespace: &str,
+    entity_id: &str,
+    suffixes: &[&str],
+) -> String {
+    let parts: Vec<&str> = [session_id, namespace, entity_id]
+        .into_iter()
+        .chain(suffixes.iter().copied())
+        .filter(|part| !part.is_empty())
+        .collect();
+    build_key(&parts)
+}
+
+/// One persisted checkpoint.
+///
+/// Field names are the JSON contract (`snake_case`); the struct tolerates unknown
+/// fields and missing ones so persisted documents can grow without breaking
+/// older readers. A checkpoint id is generated by the backend on
+/// [`Checkpointer::save`] when empty, and [`Checkpoint::new`] stamps
+/// `created_at` with the current RFC 3339 time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct Checkpoint {
+    /// The session this checkpoint belongs to.
+    pub session_id: String,
+    /// The checkpoint identifier; empty until the backend saves it.
+    pub checkpoint_id: String,
+    /// The key namespace this checkpoint belongs to.
+    pub namespace: CheckpointNamespace,
+    /// The entity the checkpoint was taken for (agent id, workflow id, …).
+    pub entity_id: String,
+    /// Creation time as RFC 3339 with a `Z` suffix.
+    pub created_at: String,
+    /// The session's committed global state.
+    pub global_state: Value,
+    /// The session's committed component state.
+    pub component_state: Value,
+    /// Staged (uncommitted) updates captured with the checkpoint.
+    pub updates: Value,
+    /// The trace position at the time the checkpoint was taken.
+    pub trace: Option<TracePosition>,
+    /// Opaque additional metadata.
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl Checkpoint {
+    /// Creates a checkpoint for `entity_id` in `namespace`, stamped with the
+    /// current time and an empty checkpoint id.
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        namespace: CheckpointNamespace,
+        entity_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            checkpoint_id: String::new(),
+            namespace,
+            entity_id: entity_id.into(),
+            created_at: now_rfc3339(),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the checkpoint id explicitly (overriding backend generation).
+    #[must_use]
+    pub fn with_checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
+        self.checkpoint_id = checkpoint_id.into();
+        self
+    }
+
+    /// Sets the committed global state.
+    #[must_use]
+    pub fn with_global_state(mut self, global_state: Value) -> Self {
+        self.global_state = global_state;
+        self
+    }
+
+    /// Sets the committed component state.
+    #[must_use]
+    pub fn with_component_state(mut self, component_state: Value) -> Self {
+        self.component_state = component_state;
+        self
+    }
+
+    /// Sets the staged updates captured with the checkpoint.
+    #[must_use]
+    pub fn with_updates(mut self, updates: Value) -> Self {
+        self.updates = updates;
+        self
+    }
+
+    /// Sets (or clears) the trace position.
+    #[must_use]
+    pub fn with_trace(mut self, trace: Option<TracePosition>) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// Replaces the checkpoint metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// The summary of one checkpoint, as returned by [`Checkpointer::list`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct CheckpointMeta {
+    /// The session this checkpoint belongs to.
+    pub session_id: String,
+    /// The checkpoint identifier.
+    pub checkpoint_id: String,
+    /// The key namespace this checkpoint belongs to.
+    pub namespace: CheckpointNamespace,
+    /// The entity the checkpoint was taken for.
+    pub entity_id: String,
+    /// Creation time as RFC 3339 with a `Z` suffix.
+    pub created_at: String,
+}
+
+impl From<&Checkpoint> for CheckpointMeta {
+    fn from(checkpoint: &Checkpoint) -> Self {
+        Self {
+            session_id: checkpoint.session_id.clone(),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            namespace: checkpoint.namespace,
+            entity_id: checkpoint.entity_id.clone(),
+            created_at: checkpoint.created_at.clone(),
+        }
+    }
+}
+
+/// The storage seam for checkpoint persistence.
+///
+/// Implementors are async and internally synchronized. `save` generates an id
+/// when [`Checkpoint::checkpoint_id`] is empty and returns the effective id;
+/// ids are validated before they are used in keys or paths, so a malformed id
+/// is [`openjiuwen_common::error::ErrorKind::Validation`].
+#[async_trait]
+pub trait Checkpointer: Send + Sync + std::fmt::Debug {
+    /// Persists `checkpoint` and returns its checkpoint id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when the
+    /// session or checkpoint id is invalid, and
+    /// [`openjiuwen_common::error::ErrorKind::Session`] when the backend cannot
+    /// write the checkpoint.
+    async fn save(&self, checkpoint: Checkpoint) -> Result<String>;
+
+    /// Loads a checkpoint, or `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for invalid
+    /// ids and [`openjiuwen_common::error::ErrorKind::Session`] when stored
+    /// data cannot be read or decoded.
+    async fn load(&self, session_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>>;
+
+    /// Returns the newest checkpoint of a session, or `None` when the session
+    /// has no checkpoints.
+    ///
+    /// The default implementation lists the session's checkpoints, orders them
+    /// by `(created_at, checkpoint_id)` descending, and loads the first one.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Checkpointer::list`] and [`Checkpointer::load`] failures.
+    async fn latest(&self, session_id: &str) -> Result<Option<Checkpoint>> {
+        let mut metas = self.list(session_id).await?;
+        metas.sort_by(|left, right| {
+            (&right.created_at, &right.checkpoint_id).cmp(&(&left.created_at, &left.checkpoint_id))
+        });
+        match metas.first() {
+            Some(meta) => self.load(session_id, &meta.checkpoint_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Lists a session's checkpoints ordered by `(created_at, checkpoint_id)`
+    /// ascending; an unknown session yields an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an
+    /// invalid session id and [`openjiuwen_common::error::ErrorKind::Session`]
+    /// when the backend cannot read the session's checkpoints.
+    async fn list(&self, session_id: &str) -> Result<Vec<CheckpointMeta>>;
+
+    /// Deletes one checkpoint; deleting a missing checkpoint is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for invalid
+    /// ids and [`openjiuwen_common::error::ErrorKind::Session`] when the
+    /// backend cannot remove the checkpoint.
+    async fn delete(&self, session_id: &str, checkpoint_id: &str) -> Result<()>;
+
+    /// Deletes every checkpoint of a session; releasing an unknown session is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an
+    /// invalid session id and [`openjiuwen_common::error::ErrorKind::Session`]
+    /// when the backend cannot remove the session's data.
+    async fn release(&self, session_id: &str) -> Result<()>;
+
+    /// Reports whether the session has at least one stored checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an
+    /// invalid session id and [`openjiuwen_common::error::ErrorKind::Session`]
+    /// when the backend cannot inspect the session's data.
+    async fn session_exists(&self, session_id: &str) -> Result<bool>;
+}
+
+/// Validates an identifier before it is used in a key or a filesystem path.
+///
+/// `kind` labels the identifier in error messages (for example `"session"`).
+///
+/// # Errors
+///
+/// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `value` is
+/// empty, contains `/`, `\`, a NUL byte, or a `..` path segment.
+pub fn validate_id(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::validation(format!("{kind} id must not be empty")));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(Error::validation(format!(
+            "{kind} id must not contain path separators: {value:?}"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(Error::validation(format!(
+            "{kind} id must not contain NUL bytes"
+        )));
+    }
+    if value.contains("..") {
+        return Err(Error::validation(format!(
+            "{kind} id must not contain `..`: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates a session id; see [`validate_id`].
+///
+/// # Errors
+///
+/// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a malformed
+/// session id.
+pub fn validate_session_id(session_id: &str) -> Result<()> {
+    validate_id("session", session_id)
+}
+
+/// Validates a checkpoint id; see [`validate_id`].
+///
+/// # Errors
+///
+/// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for a malformed
+/// checkpoint id.
+pub fn validate_checkpoint_id(checkpoint_id: &str) -> Result<()> {
+    validate_id("checkpoint", checkpoint_id)
+}
+
+/// The backend a [`CheckpointerConfig`] asks [`create_checkpointer`] to build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointerKind {
+    /// An in-process, lock-guarded store ([`MemoryCheckpointer`]).
+    #[default]
+    InMemory,
+    /// A JSON file per checkpoint on the local filesystem
+    /// ([`FileCheckpointer`]).
+    File,
+    /// A sqlite database (feature `sqlite`).
+    Sqlite,
+}
+
+/// Declarative backend selection for [`create_checkpointer`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct CheckpointerConfig {
+    /// The backend to construct.
+    pub kind: CheckpointerKind,
+    /// The filesystem root (`file`) or database file (`sqlite`); ignored by
+    /// `in_memory`.
+    pub path: Option<PathBuf>,
+    /// Backend-specific options, unused by the built-in backends.
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Builds a checkpointer from `config`.
+///
+/// # Errors
+///
+/// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `file` or
+/// `sqlite` is requested without a `path`, and
+/// [`openjiuwen_common::error::ErrorKind::Unsupported`] when `sqlite` is
+/// requested but the crate was built without the `sqlite` feature.
+pub async fn create_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
+    match config.kind {
+        CheckpointerKind::InMemory => Ok(Arc::new(MemoryCheckpointer::new())),
+        CheckpointerKind::File => {
+            let path = config.path.clone().ok_or_else(|| {
+                Error::validation("file checkpointer requires a `path` in the configuration")
+            })?;
+            Ok(Arc::new(FileCheckpointer::new(path)))
+        }
+        CheckpointerKind::Sqlite => {
+            #[cfg(feature = "sqlite")]
+            {
+                create_sqlite_checkpointer(config).await
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                Err(Error::unsupported(
+                    "sqlite checkpointer requires the `sqlite` feature",
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn create_sqlite_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
+    let path = config.path.clone().ok_or_else(|| {
+        Error::validation("sqlite checkpointer requires a `path` in the configuration")
+    })?;
+    let checkpointer = sqlite::SqliteCheckpointer::open(path).await?;
+    Ok(Arc::new(checkpointer))
+}
