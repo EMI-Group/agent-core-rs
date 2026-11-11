@@ -48,19 +48,11 @@ mod fixtures;
 mod mock_llm;
 mod responses;
 mod scripted_model;
-// `assert_json`, `eventually`, `fixtures`, `mock_llm`, and `scripted_model` are
-// placeholders filled by parallel work; a glob re-export of an empty module
-// trips `unused_imports`/`unreachable_pub`, so the allows stay until they land.
-#[allow(unused_imports, unreachable_pub)]
 pub use assert_json::*;
-#[allow(unused_imports, unreachable_pub)]
 pub use eventually::*;
-#[allow(unused_imports, unreachable_pub)]
 pub use fixtures::*;
-#[allow(unused_imports, unreachable_pub)]
 pub use mock_llm::*;
 pub use responses::*;
-#[allow(unused_imports, unreachable_pub)]
 pub use scripted_model::*;
 pub use wiremock;
 /// The crate name, useful in diagnostics and documentation.
