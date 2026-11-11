@@ -4,8 +4,9 @@
 //! order, consume their channels, run them concurrently, apply their outcomes in
 //! declaration order, route, flush the accept-then-activate buffer, and
 //! checkpoint. Node state mutations are functional per node and merged in
-//! declaration order, so the outcome of a superstep never depends on which node
-//! finished first.
+//! declaration order as a top-level delta against the pre-superstep state, so
+//! the outcome of a superstep never depends on which node finished first and a
+//! node's top-level key removals propagate to the run state.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -376,6 +377,11 @@ async fn run_node(
 }
 
 /// Applies node outcomes in declaration order.
+///
+/// Each node receives a clone of the pre-superstep state, so its result is
+/// merged as a delta relative to that baseline: top-level keys the node changed
+/// are deep-merged and top-level keys the node removed are deleted from the run
+/// state ([`GraphState::merge_node_delta`]).
 #[allow(clippy::too_many_arguments)]
 async fn apply_outcomes(
     inner: &Arc<CompiledInner>,
@@ -388,6 +394,7 @@ async fn apply_outcomes(
     channels: &mut ChannelManager,
     visited: &mut Vec<String>,
 ) -> Result<Option<HaltInfo>> {
+    let base = state.clone();
     let mut halted: Option<HaltInfo> = None;
     for (_, id, result) in results {
         let (node_state, outcome) = match result {
@@ -406,7 +413,7 @@ async fn apply_outcomes(
             }
         };
 
-        state.merge(node_state);
+        state.merge_node_delta(&base, node_state);
         visited.push(id.clone());
         sink.emit(GraphEvent::new(
             GraphEventKind::NodeCompleted,

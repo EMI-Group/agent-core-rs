@@ -158,6 +158,39 @@ impl GraphState {
             self.0 = map;
         }
     }
+
+    /// Applies one node's state back onto the run state as a delta relative to
+    /// `base`, the state the node was given when the superstep started.
+    ///
+    /// Every top-level key of `node_state` whose value differs from (or is
+    /// absent in) `base` is deep-merged into `self`, so nested object writes
+    /// still merge deeply and two parallel nodes touching different fields of
+    /// one nested object both survive. Every top-level key present in `base` but
+    /// absent from `node_state` is then removed from `self`: the node deleted
+    /// it.
+    ///
+    /// Keys the node never saw, such as keys added by an earlier node in the
+    /// same superstep, are left alone because the node could not have deleted
+    /// them. Only top-level keys are diffed; a nested removal (removing `b`
+    /// inside top-level `a`) does not propagate. Such a nested delete shows up
+    /// as a changed top-level value and is re-merged from `base`.
+    #[allow(clippy::needless_pass_by_value)] // by-value matches `merge` and lets callers hand over the node result
+    pub fn merge_node_delta(&mut self, base: &Self, node_state: Self) {
+        let mut delta = Map::new();
+        for (key, value) in &node_state.0 {
+            if base.0.get(key) != Some(value) {
+                delta.insert(key.clone(), value.clone());
+            }
+        }
+        if !delta.is_empty() {
+            self.merge(Self(delta));
+        }
+        for key in base.0.keys() {
+            if !node_state.0.contains_key(key) {
+                self.0.remove(key);
+            }
+        }
+    }
 }
 
 impl From<Map<String, Value>> for GraphState {
@@ -282,6 +315,94 @@ mod tests {
         assert_eq!(text, r#"{"a":{"b":[1,2]},"c":null}"#);
         let decoded: GraphState = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn merge_node_delta_propagates_top_level_removals() {
+        let base = GraphState::from_value(json!({"a": 1, "b": 2})).unwrap();
+        let mut state = base.clone();
+        let mut node = base.clone();
+        node.remove("a");
+        state.merge_node_delta(&base, node);
+        assert_eq!(state.as_value(), json!({"b": 2}));
+    }
+
+    #[test]
+    fn merge_node_delta_lets_a_later_node_win_over_an_earlier_deletion() {
+        let base = GraphState::from_value(json!({"a": 1})).unwrap();
+        let mut state = base.clone();
+
+        let mut remover = base.clone();
+        remover.remove("a");
+        state.merge_node_delta(&base, remover);
+        assert_eq!(state.as_value(), json!({}));
+
+        let mut setter = base.clone();
+        setter.set("a", json!(99));
+        state.merge_node_delta(&base, setter);
+        assert_eq!(state.as_value(), json!({"a": 99}));
+    }
+
+    #[test]
+    fn merge_node_delta_does_not_resurrect_an_untouched_key() {
+        let base = GraphState::from_value(json!({"a": 1, "b": 2})).unwrap();
+        let mut state = base.clone();
+
+        let mut remover = base.clone();
+        remover.remove("a");
+        state.merge_node_delta(&base, remover);
+
+        // The later node still carried `a` from its clone of `base`, but it did
+        // not touch it, so the earlier deletion stands.
+        let later = base.clone();
+        state.merge_node_delta(&base, later);
+        assert_eq!(state.as_value(), json!({"b": 2}));
+    }
+
+    #[test]
+    fn merge_node_delta_keeps_keys_added_by_earlier_nodes() {
+        let base = GraphState::from_value(json!({"a": 1})).unwrap();
+        let mut state = base.clone();
+
+        let mut adder = base.clone();
+        adder.set("new", json!(7));
+        state.merge_node_delta(&base, adder);
+
+        let later = base.clone();
+        state.merge_node_delta(&base, later);
+        assert_eq!(state.as_value(), json!({"a": 1, "new": 7}));
+    }
+
+    #[test]
+    fn merge_node_delta_deep_merges_partial_nested_updates() {
+        let base = GraphState::from_value(json!({"o": {"x": 0}})).unwrap();
+        let mut state = base.clone();
+
+        let mut first = base.clone();
+        first.set_path("o.p", json!(1)).unwrap();
+        state.merge_node_delta(&base, first);
+
+        let mut second = base.clone();
+        second.set_path("o.q", json!(2)).unwrap();
+        state.merge_node_delta(&base, second);
+
+        assert_eq!(state.as_value(), json!({"o": {"x": 0, "p": 1, "q": 2}}));
+    }
+
+    #[test]
+    fn merge_node_delta_does_not_propagate_nested_removals() {
+        let base = GraphState::from_value(json!({"a": {"b": 1, "c": 2}})).unwrap();
+        let mut state = base.clone();
+
+        let mut node = base.clone();
+        if let Some(Value::Object(map)) = node.0.get_mut("a") {
+            map.remove("b");
+        }
+        state.merge_node_delta(&base, node);
+
+        // Documented behavior: only top-level keys are diffed, so the nested
+        // delete is re-merged from `base`.
+        assert_eq!(state.as_value(), json!({"a": {"b": 1, "c": 2}}));
     }
 
     #[test]

@@ -118,6 +118,102 @@ async fn parallel_runs_are_deterministic() {
 }
 
 #[tokio::test]
+async fn a_node_removal_drops_the_key_from_input_and_result() {
+    let graph = GraphBuilder::new("removal")
+        .node(
+            "drop",
+            SyncNode::new("drop", |state: &mut GraphState, _ctx: &GraphContext| {
+                state.remove("scratch");
+                Ok(NodeOutcome::Continue)
+            }),
+        )
+        .compile()
+        .unwrap();
+    let input = json!({"keep": 1, "scratch": "gone"});
+
+    let result = graph
+        .run(
+            input.clone(),
+            common::session(),
+            ExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!result.state.contains_key("scratch"));
+    assert_eq!(result.state.get("keep"), Some(&json!(1)));
+
+    let value = graph.invoke(input, common::session()).await.unwrap();
+    assert!(value.get("scratch").is_none());
+    assert_eq!(value.get("keep"), Some(&json!(1)));
+}
+
+#[tokio::test]
+async fn later_declaration_readds_a_key_removed_by_an_earlier_node() {
+    let graph = GraphBuilder::new("remove_then_set")
+        .node(
+            "remover",
+            SyncNode::new("remover", |state: &mut GraphState, _ctx: &GraphContext| {
+                state.remove("who");
+                Ok(NodeOutcome::Continue)
+            }),
+        )
+        .node(
+            "setter",
+            SyncNode::new("setter", |state: &mut GraphState, _ctx: &GraphContext| {
+                state.set("who", json!("setter"));
+                Ok(NodeOutcome::Continue)
+            }),
+        )
+        .barrier_edge(["remover", "setter"], "join")
+        .node("join", common::noop("join"))
+        .compile()
+        .unwrap();
+
+    let result = graph
+        .run(
+            json!({"who": "input"}),
+            common::session(),
+            ExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.state.get("who"), Some(&json!("setter")));
+}
+
+#[tokio::test]
+async fn nested_removals_do_not_propagate_by_design() {
+    // Only top-level keys are diffed, so removing `a.b` inside top-level `a`
+    // shows up as a changed top-level value that is re-merged from the
+    // pre-superstep baseline.
+    let graph = GraphBuilder::new("nested_removal")
+        .node(
+            "drop_nested",
+            SyncNode::new(
+                "drop_nested",
+                |state: &mut GraphState, _ctx: &GraphContext| {
+                    if let Some(serde_json::Value::Object(map)) = state.0.get_mut("a") {
+                        map.remove("b");
+                    }
+                    Ok(NodeOutcome::Continue)
+                },
+            ),
+        )
+        .compile()
+        .unwrap();
+
+    let result = graph
+        .run(
+            json!({"a": {"b": 1, "c": 2}}),
+            common::session(),
+            ExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.state.get_path("a.b"), Some(&json!(1)));
+    assert_eq!(result.state.get_path("a.c"), Some(&json!(2)));
+}
+
+#[tokio::test]
 async fn fan_out_to_several_targets_from_one_node() {
     let graph = GraphBuilder::new("fan")
         .node("start", common::noop("start"))
