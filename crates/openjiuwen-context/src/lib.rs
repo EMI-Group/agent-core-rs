@@ -5,6 +5,8 @@
 //! accumulates and the payload sent to a model:
 //!
 //! - [`ContextConfig`] — budgets, compression threshold, token counter, pipeline.
+//! - [`context`] — `ModelContext`, the conversation history, `save_state`.
+//! - [`engine`] — the per-session context pool, compression, and recovery.
 //! - [`window`] — dialogue rounds, window assembly, tool-pair repair.
 //! - [`tokens`] and [`stats`] — counting and per-role statistics.
 //! - [`processor`] — truncation, tool-result trimming/offload, summarisation.
@@ -56,6 +58,8 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod config;
+pub mod context;
+pub mod engine;
 pub mod events;
 pub mod offload;
 pub mod processor;
@@ -68,6 +72,8 @@ pub use config::{
     CompressionRecallConfig, ContextConfig, TokenCounterConfig, TokenCounterKind,
     DEFAULT_CONTEXT_TOKENS,
 };
+pub use context::{ContextState, ConversationContext, ModelContext};
+pub use engine::{ContextEngine, ContextOptions, PrepareOptions};
 pub use events::{
     CompressReport, CompressionStatus, ContextEvent, ContextEventKind, ObserveOutcome,
     RecoveryOutcome,
