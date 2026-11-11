@@ -36,9 +36,11 @@
 //! - [`config`] — [`SecurityPolicy`], [`FailurePolicy`], and [`ScanTargets`].
 //! - [`rules`] — the shared regex rule engine ([`CompiledRule`],
 //!   [`TextMatch`], Luhn, redaction).
+//! - [`parsers`] — [`ModelOutputParser`] and the built-in
+//!   [`BertBinaryParser`] and [`QwenGuardParser`] with their [`Thresholds`].
 //!
-//! The `parsers`, `backends`, and `guardrails` modules (concrete detectors and
-//! moderation adapters) arrive in later phases.
+//! The `backends` and `guardrails` modules (concrete detectors and moderation
+//! adapters) arrive in the next phase.
 //!
 //! # Example
 //!
@@ -96,6 +98,7 @@ pub mod context;
 pub mod finding;
 pub mod guardrail;
 pub mod level;
+pub mod parsers;
 pub mod pipeline;
 pub mod report;
 pub mod result;
@@ -111,6 +114,7 @@ pub use finding::{
 };
 pub use guardrail::{BackendGuardrail, Guardrail, GuardrailBackend, DEFAULT_PRIORITY};
 pub use level::{GuardrailContentType, RiskLevel};
+pub use parsers::{BertBinaryParser, ModelOutputParser, QwenGuardParser, Thresholds};
 pub use pipeline::GuardrailPipeline;
 pub use report::RedactedOutcome;
 pub use result::{GuardrailResult, RiskAssessment};
