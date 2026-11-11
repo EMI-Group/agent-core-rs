@@ -1,10 +1,10 @@
-//! Workflow builder, components, and `` data flow.
+//! Workflow builder, components, and reference-based data flow.
 //!
 //! Maps to the Python package `core.workflow` in the openJiuwen reference implementation.
 //! A workflow is a directed graph of components with one start and one end; the builder
 //! records component configs and edges and compiling maps them onto `openjiuwen-graph`.
 //! Data flow is textual: a component's `inputs_schema` is a JSON template whose pure
-//! `""` strings resolve against workflow state before the component runs.
+//! reference strings resolve against workflow state before the component runs.
 
 pub mod ability;
 pub mod card;
