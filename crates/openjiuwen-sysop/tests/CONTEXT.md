@@ -23,8 +23,11 @@ module beside the code.
 
 ## Constraints
 
-- Every file starts with a module doc comment naming the Python test it ports, e.g.
-  `//! Ports tests/unit_tests/core/sys_operation/local/test_fs_operation.py`.
+- Every file starts with a module doc comment naming the Python test it ports: a line
+  beginning `//! Ports` followed by the backticked Python test path, e.g.
+  ``tests/unit_tests/core/sys_operation/local/test_fs_operation.py``.
+  The path must be backticked: a bare path trips `clippy::doc_markdown`, which is an error
+  under `-D warnings`.
 - Only files in this directory are test targets; helper code is duplicated per file rather
   than shared through a module, so each suite stays independently readable.
 - Offline and deterministic: `tempfile` workspaces, no network, no fixed absolute paths, no
