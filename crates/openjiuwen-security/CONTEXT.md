@@ -141,4 +141,4 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 | `guardrail.py` `BaseGuardrail` | `guardrail::Guardrail` (trait) + `guardrail::BackendGuardrail` |
 | `builtin.py` `PromptInjectionGuardrail`, `PromptInjectionGuardrailConfig` | `guardrails::prompt_injection::{PromptInjectionGuardrail, PromptInjectionGuardrailConfig}` |
 | `__init__.py` `register_guardrail`/`unregister_guardrail` | out of scope (runner callback wiring) |
-| — (no Python equivalent) | `pipeline`, `config`, `report`, `guardrails::{sensitive_data, content_rules, tool_arguments, moderation}`, `rules` |
+| — (no Python equivalent) | `pipeline`, `config`, `report`, `guardrails::{sensitive_data, content_rules, tool_arguments}`, `rules` |
