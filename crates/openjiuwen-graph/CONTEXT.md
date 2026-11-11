@@ -199,8 +199,11 @@ impl CompiledGraph {
     SuperstepStarted, NodeStarted, NodeCompleted, NodeFailed, EdgeTraversed, SuperstepCompleted, GraphCompleted, GraphHalted, GraphFailed,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct GraphEvent { pub kind: GraphEventKind, pub node_id: Option<String>, pub superstep: u32, pub payload: Value }
-impl GraphEvent { pub fn to_wire(&self) -> Value; }   // {"kind", "node_id"?, "superstep", "payload"} — payload is always an object
+impl GraphEvent { pub fn new(kind: GraphEventKind, node_id: Option<String>, superstep: u32, payload: Value) -> Self; pub fn to_wire(&self) -> Value; }   // {"kind", "node_id"?, "superstep", "payload"} — payload is always an object
+impl GraphEventKind { pub const fn as_str(self) -> &'static str; }   // `as_str`/`Display` yield `superstep_started` … `graph_failed`
 ```
+
+Crate-root constants: `DEFAULT_MAX_SUPERSTEPS: usize = 10_000` and `START_NODE: &str = "__start__"` (`src/lib.rs`).
 
 ### Store and checkpoints (`src/store.rs`)
 
