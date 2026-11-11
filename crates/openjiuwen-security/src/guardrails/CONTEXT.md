@@ -36,7 +36,7 @@ pub struct SensitiveDataGuardrailConfig { pub enabled: bool /* true */, pub risk
     pub extra_patterns: Vec<SensitivePattern>, pub allowlist: Vec<String> /* matched substrings to skip */ }
 pub struct SensitiveDataGuardrail { /* compiled */ }
 pub struct RedactionOutcome { pub redacted: String, pub matches: Vec<SensitiveMatch> }
-pub struct SensitiveMatch { pub pattern: String, pub risk_level: RiskLevel, pub range: Range<usize> }
+pub struct SensitiveMatch { pub pattern: String, pub risk_level: RiskLevel, pub start: usize, pub end: usize }
 impl SensitiveDataGuardrail {
     pub fn new() -> Self;
     pub fn with_config(config: SensitiveDataGuardrailConfig) -> Result<Self>;
@@ -65,7 +65,7 @@ Stage defaults: prompt injection `[LlmInvokeInput, ToolInvokeOutput]` (Python `D
 - All regexes run against `GuardrailContext::text_view()`; matches are found with `find_iter` and redaction is applied on the original text by byte range, last-to-first, so ranges stay valid.
 - Findings never embed matched text: `details` carries pattern/rule names, `match_count`, and, for tool arguments, `tool_name`. Redacted text is exposed only through `modified_data` (`{"sanitized_text": ...}` for text, `{"sanitized_arguments": ...}` for tool arguments).
 - An empty/whitespace text (or empty arguments) is always `GuardrailResult::pass()`; detectors do no work without content.
-- `SensitiveDataGuardrail` matches are de-duplicated by (pattern, start) so a number matched by both `credit_card` and `phone` is redacted once; the first overlapping match wins.
+- `SensitiveDataGuardrail` claims byte ranges in table order (patterns then `extra_patterns`), so the earliest pattern wins and an overlapping match of a later pattern is dropped; each claimed range is redacted exactly once.
 - `allowlist` entries are compared to the full matched substring (exact match, case-sensitive) and skip that match.
 
 ## Default sensitive-data table
@@ -102,7 +102,8 @@ Denied tool names and allowlist violations use `denied_tool_risk_level` (`Critic
 Mode `rules` → `RuleBasedPromptInjectionBackend` with `custom_patterns` and `risk_level`; `api`/`local` → `ApiModelBackend`/`LocalModelBackend` with the default parser (`BertBinaryParser { risk_type: "prompt_injection", confidence_thresholds, attack_class_id }` for `bert`, `QwenGuardParser { risk_type: qwen_risk_type }` for `qwen` or a custom parser).
 Python's `config.parser` is deliberately not a serde field (a parser is a runtime collaborator); `with_config_and_parser` is its exact counterpart and makes `model_type` optional.
 `check` returns the backend's assessment as a `GuardrailResult`: `is_safe = !has_risk`, level and type verbatim (`risk_type` stays `None` for safe results), `details` from the assessment; `modified_data` is `None`.
-`SensitiveDataGuardrail::check` blocks with `risk_type = "sensitive_data"`, `risk_level = config.risk_level`, `details = {"matched_patterns": [..], "match_count": n}`, and `modified_data = {"sanitized_text": redacted}` when `redact` is true.
+`SensitiveDataGuardrail::check` blocks with `risk_type = "sensitive_data"`, `risk_level` = the maximum of the matched patterns' levels (`SensitivePattern::risk_level` falling back to `config.risk_level`), `details = {"matched_patterns": [..], "match_count": n}`, and `modified_data = {"sanitized_text": redacted}` when `redact` is true.
+`SensitiveDataGuardrailConfig::enabled` is consumed by `SecurityConfig::pipeline()`, not by `check`: a guardrail instance always scans.
 `ContentRuleGuardrail::check`: first matching rule yields `risk_type = rule.risk_type`, `risk_level = rule.risk_level`, `details = {"rule": name, "matched_pattern": pattern}` and `modified_data = {"sanitized_text": ...}` when `redact`; other rules still run for reporting when no match has been found yet is not attempted — one result per scan (first match wins, Python rule-backend semantics).
 `ToolArgumentGuardrail::check`: reads `ctx.get_tool_name()` and the argument JSON; order = allow/deny list, `max_argument_bytes`, deny patterns, sensitive data. It returns the first failure as the `GuardrailResult`; otherwise `pass()`. When sensitive data is redacted it returns the finding with `modified_data = {"sanitized_arguments": <arguments with redacted strings>}`.
 
