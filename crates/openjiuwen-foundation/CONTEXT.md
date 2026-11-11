@@ -19,6 +19,7 @@ Models (`llm`):
 - `Model` trait: `provider()`, `model_name()`, `invoke(&[BaseMessage], &ModelRequestConfig) -> Result<ChatResponse>`, `stream(Vec<BaseMessage>, ModelRequestConfig) -> BoxStream<'static, Result<StreamChunk>>`.
 - `ModelClientConfig`, `ModelRequestConfig` with builders and `from_env()`; `ChatResponse`, `Choice`, `FinishReason`, `StreamChunk`, `AssistantTurn`, `StreamAccumulator`, `ModelExt`.
 - `init_model(ModelClientConfig, ModelRequestConfig)`, `init_model_with(provider, model_name)`, `ModelProvider`, `ModelProviderRegistry` (`global()` plus local instances), `register_model_provider`, `provider_profile`, `normalize_provider_name`.
+- Flat crate-root re-exports (`src/lib.rs`) for call sites that skip the module path: `openjiuwen_foundation::{Model, ModelExt, ChatResponse, Choice, StreamChunk, FinishReason, AssistantTurn, StreamAccumulator, ModelClientConfig, ModelRequestConfig, BaseMessage, MessageContent, Role, Usage, ToolCall, ToolCallDelta, ToolCallAccumulator}`; the module paths (`openjiuwen_foundation::llm::*`, `::prompt::*`) remain the canonical form.
 
 Tools (`tool`):
 - `ToolCard` (flat, implements `openjiuwen_common::card::Card`), `ToolInfo`, `ToolExposure`, `ToolExecution`.
