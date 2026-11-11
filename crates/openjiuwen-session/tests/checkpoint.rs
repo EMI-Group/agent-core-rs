@@ -7,299 +7,26 @@
 //! are JSON documents, so these tests assert the JSON field names rather than
 //! pickle payloads.
 //!
-//! The shared contract is one generic async suite run against every backend;
-//! backend-specific behavior (on-disk layout, factory selection) is tested
-//! separately.
+//! The shared contract is one generic async suite run against every backend
+//! (`./support/mod.rs`); backend-specific behavior (on-disk layout, factory
+//! selection) is tested here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openjiuwen_common::error::{Error, ErrorKind};
+use openjiuwen_common::error::ErrorKind;
 use openjiuwen_session::checkpoint::{
-    build_key, build_key_with_namespace, create_checkpointer, Checkpoint, CheckpointMeta,
-    CheckpointNamespace, Checkpointer, CheckpointerConfig, CheckpointerKind, FileCheckpointer,
-    MemoryCheckpointer, SESSION_NAMESPACE_AGENT, SESSION_NAMESPACE_AGENT_TEAM,
-    SESSION_NAMESPACE_WORKFLOW, WORKFLOW_NAMESPACE_GRAPH,
+    build_key, build_key_with_namespace, create_checkpointer, Checkpoint, CheckpointNamespace,
+    Checkpointer, CheckpointerConfig, CheckpointerKind, FileCheckpointer, MemoryCheckpointer,
+    SESSION_NAMESPACE_AGENT, SESSION_NAMESPACE_AGENT_TEAM, SESSION_NAMESPACE_WORKFLOW,
+    WORKFLOW_NAMESPACE_GRAPH,
 };
-use openjiuwen_session::tracer::TracePosition;
 use serde_json::{json, Value};
 
-/// Returns the metadata map used by round-trip assertions.
-fn metadata() -> BTreeMap<String, Value> {
-    BTreeMap::from([
-        ("reason".to_string(), json!("interrupt")),
-        ("attempt".to_string(), json!(3)),
-    ])
-}
-
-/// Returns the trace position used by round-trip assertions.
-fn trace_position() -> TracePosition {
-    TracePosition {
-        trace_id: "trace-1".to_string(),
-        last_invoke_id: Some("invoke-2".to_string()),
-        frame_count: 7,
-    }
-}
-
-/// Builds a checkpoint with an explicit id and creation time.
-fn checkpoint_at(session_id: &str, checkpoint_id: &str, created_at: &str) -> Checkpoint {
-    let mut checkpoint = Checkpoint::new(session_id, CheckpointNamespace::Workflow, "flow-1")
-        .with_checkpoint_id(checkpoint_id)
-        .with_global_state(json!({ "counter": 1 }));
-    checkpoint.created_at = created_at.to_string();
-    checkpoint
-}
-
-/// Asserts that `result` failed with [`ErrorKind::Validation`].
-fn assert_validation<T>(result: openjiuwen_common::error::Result<T>) {
-    let error = result.err().expect("the call must fail");
-    assert_eq!(error.kind(), ErrorKind::Validation, "unexpected: {error}");
-    assert!(matches!(error, Error::Validation(_)));
-}
-
-/// Collects the checkpoint ids of a metadata list, preserving order.
-fn ids(metas: &[CheckpointMeta]) -> Vec<String> {
-    metas
-        .iter()
-        .map(|meta| meta.checkpoint_id.clone())
-        .collect()
-}
-
-/// The storage contract every backend must satisfy.
-async fn exercise_storage_contract(checkpointer: Arc<dyn Checkpointer>) {
-    let checkpointer = checkpointer.as_ref();
-    exercise_save_and_load(checkpointer).await;
-    exercise_ordering(checkpointer).await;
-    exercise_delete(checkpointer).await;
-    exercise_release(checkpointer).await;
-    exercise_invalid_ids(checkpointer).await;
-}
-
-/// Saves a generated id, loads it back, and checks missing lookups.
-async fn exercise_save_and_load(checkpointer: &dyn Checkpointer) {
-    let session_id = "session-1";
-    assert!(
-        !checkpointer.session_exists(session_id).await.unwrap(),
-        "a fresh session has no checkpoints"
-    );
-    assert_eq!(
-        checkpointer.list(session_id).await.unwrap(),
-        Vec::<CheckpointMeta>::new()
-    );
-
-    // save fills a generated id and returns it.
-    let checkpoint = Checkpoint::new(session_id, CheckpointNamespace::Workflow, "flow-1")
-        .with_global_state(json!({ "counter": 1 }))
-        .with_component_state(json!({ "node_a": { "value": 2 } }))
-        .with_updates(json!({ "staged": [1, 2] }))
-        .with_trace(Some(trace_position()))
-        .with_metadata(metadata());
-    assert_eq!(checkpoint.checkpoint_id, "");
-    assert_ne!(checkpoint.created_at, "");
-    let generated = checkpointer.save(checkpoint).await.unwrap();
-    assert_ne!(generated, "", "save generates a checkpoint id");
-    assert!(checkpointer.session_exists(session_id).await.unwrap());
-
-    // load round-trips the whole document.
-    let loaded = checkpointer
-        .load(session_id, &generated)
-        .await
-        .unwrap()
-        .expect("the saved checkpoint is loadable");
-    assert_eq!(loaded.session_id, session_id);
-    assert_eq!(loaded.checkpoint_id, generated);
-    assert_eq!(loaded.namespace, CheckpointNamespace::Workflow);
-    assert_eq!(loaded.entity_id, "flow-1");
-    assert_eq!(loaded.global_state, json!({ "counter": 1 }));
-    assert_eq!(loaded.component_state, json!({ "node_a": { "value": 2 } }));
-    assert_eq!(loaded.updates, json!({ "staged": [1, 2] }));
-    assert_eq!(loaded.trace, Some(trace_position()));
-    assert_eq!(loaded.metadata, metadata());
-
-    // missing checkpoints and sessions load as None.
-    assert!(checkpointer
-        .load(session_id, "does-not-exist")
-        .await
-        .unwrap()
-        .is_none());
-    assert!(checkpointer
-        .load("unknown-session", &generated)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(checkpointer
-        .latest("unknown-session")
-        .await
-        .unwrap()
-        .is_none());
-}
-
-/// Orders by `(created_at, checkpoint_id)` ascending and resolves `latest`.
-async fn exercise_ordering(checkpointer: &dyn Checkpointer) {
-    let session_id = "session-order";
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-older",
-            "2024-01-01T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-newer",
-            "2025-01-01T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    let metas = checkpointer.list(session_id).await.unwrap();
-    assert_eq!(ids(&metas), vec!["cp-older", "cp-newer"]);
-    assert_eq!(metas[1].namespace, CheckpointNamespace::Workflow);
-    assert_eq!(metas[1].entity_id, "flow-1");
-    assert_eq!(metas[1].created_at, "2025-01-01T00:00:00.000Z");
-    let latest = checkpointer
-        .latest(session_id)
-        .await
-        .unwrap()
-        .expect("the session has checkpoints");
-    assert_eq!(latest.checkpoint_id, "cp-newer");
-
-    // overwriting the same id is allowed.
-    let replaced = checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-newer",
-            "2025-01-01T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(replaced, "cp-newer");
-    assert_eq!(checkpointer.list(session_id).await.unwrap().len(), 2);
-}
-
-/// Deletes one checkpoint and clears session existence with the last one.
-async fn exercise_delete(checkpointer: &dyn Checkpointer) {
-    let session_id = "session-delete";
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-a",
-            "2024-01-01T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-b",
-            "2024-01-02T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    checkpointer.delete(session_id, "cp-a").await.unwrap();
-    assert!(checkpointer
-        .load(session_id, "cp-a")
-        .await
-        .unwrap()
-        .is_none());
-    assert!(checkpointer.session_exists(session_id).await.unwrap());
-    checkpointer.delete(session_id, "cp-a").await.unwrap();
-    checkpointer.delete(session_id, "missing").await.unwrap();
-    checkpointer.delete(session_id, "cp-b").await.unwrap();
-    assert!(
-        !checkpointer.session_exists(session_id).await.unwrap(),
-        "deleting the last checkpoint clears session existence"
-    );
-}
-
-/// Releases every checkpoint of a session; releasing twice is a no-op.
-async fn exercise_release(checkpointer: &dyn Checkpointer) {
-    let session_id = "session-release";
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-1",
-            "2024-01-01T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    checkpointer
-        .save(checkpoint_at(
-            session_id,
-            "cp-2",
-            "2024-01-02T00:00:00.000Z",
-        ))
-        .await
-        .unwrap();
-    checkpointer.release(session_id).await.unwrap();
-    assert!(!checkpointer.session_exists(session_id).await.unwrap());
-    assert_eq!(
-        checkpointer.list(session_id).await.unwrap(),
-        Vec::<CheckpointMeta>::new()
-    );
-    assert!(checkpointer
-        .load(session_id, "cp-1")
-        .await
-        .unwrap()
-        .is_none());
-    checkpointer.release(session_id).await.unwrap();
-}
-
-/// Rejects malformed ids with validation errors, never panics.
-async fn exercise_invalid_ids(checkpointer: &dyn Checkpointer) {
-    let session_id = "invalid-session";
-    assert_validation(
-        checkpointer
-            .save(Checkpoint::new(
-                "../escape",
-                CheckpointNamespace::Agent,
-                "agent-1",
-            ))
-            .await,
-    );
-    assert_validation(
-        checkpointer
-            .save(Checkpoint::new(
-                "a/b",
-                CheckpointNamespace::Agent,
-                "agent-1",
-            ))
-            .await,
-    );
-    assert_validation(
-        checkpointer
-            .save(Checkpoint::new(
-                String::new(),
-                CheckpointNamespace::Agent,
-                "agent-1",
-            ))
-            .await,
-    );
-    assert_validation(
-        checkpointer
-            .save(
-                Checkpoint::new(session_id, CheckpointNamespace::Agent, "agent-1")
-                    .with_checkpoint_id("../escape"),
-            )
-            .await,
-    );
-    assert_validation(
-        checkpointer
-            .save(
-                Checkpoint::new(session_id, CheckpointNamespace::Agent, "agent-1")
-                    .with_checkpoint_id("a/b"),
-            )
-            .await,
-    );
-    assert_validation(checkpointer.load(session_id, "a/b").await);
-    assert_validation(checkpointer.load(session_id, "").await);
-    assert_validation(checkpointer.delete(session_id, "").await);
-    assert_validation(checkpointer.list("../escape").await);
-    assert_validation(checkpointer.release("../escape").await);
-    assert_validation(checkpointer.session_exists("a/b").await);
-}
+use support::{run_backend_contract, ListOrder};
 
 #[tokio::test]
 async fn memory_backend_satisfies_the_contract() {
@@ -307,7 +34,7 @@ async fn memory_backend_satisfies_the_contract() {
     let backend = MemoryCheckpointer::new();
     assert_eq!(backend.len("session-1"), 0);
     assert!(backend.is_empty());
-    exercise_storage_contract(Arc::new(backend.clone())).await;
+    run_backend_contract("memory", Arc::new(backend.clone()), ListOrder::OldestFirst).await;
     assert_eq!(backend.len("session-1"), 1);
     backend.clear();
     assert!(backend.is_empty());
@@ -333,7 +60,12 @@ async fn shared_memory_checkpointer_is_process_wide() {
 async fn file_backend_satisfies_the_contract() {
     // ports tests/unit_tests/core/session/checkpointer/test_persistence_storage.py
     let directory = tempfile::tempdir().unwrap();
-    exercise_storage_contract(Arc::new(FileCheckpointer::new(directory.path()))).await;
+    run_backend_contract(
+        "file",
+        Arc::new(FileCheckpointer::new(directory.path())),
+        ListOrder::OldestFirst,
+    )
+    .await;
     assert!(!directory.path().join("session-release").exists());
 }
 

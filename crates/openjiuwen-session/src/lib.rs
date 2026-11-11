@@ -44,6 +44,8 @@ pub mod state;
 pub mod stream;
 pub mod tracer;
 
+#[cfg(feature = "sqlite")]
+pub use checkpoint::SqliteCheckpointer;
 pub use checkpoint::{
     build_key, build_key_with_namespace, create_checkpointer, Checkpoint, CheckpointMeta,
     CheckpointNamespace, Checkpointer, CheckpointerConfig, CheckpointerKind, FileCheckpointer,

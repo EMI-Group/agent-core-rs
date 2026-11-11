@@ -37,14 +37,13 @@ use crate::tracer::TracePosition;
 
 pub mod file;
 pub mod memory;
-// The sqlite backend lands in a later phase; `rustfmt::skip` keeps `cargo fmt`
-// from resolving the not-yet-existing module while the declaration stays gated.
 #[cfg(feature = "sqlite")]
-#[rustfmt::skip]
 pub mod sqlite;
 
 pub use file::FileCheckpointer;
 pub use memory::MemoryCheckpointer;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteCheckpointer;
 
 /// Namespace for agent state under a session (`agent`).
 pub const SESSION_NAMESPACE_AGENT: &str = "agent";
@@ -303,8 +302,12 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
         }
     }
 
-    /// Lists a session's checkpoints ordered by `(created_at, checkpoint_id)`
-    /// ascending; an unknown session yields an empty list.
+    /// Lists a session's checkpoints; an unknown session yields an empty list.
+    ///
+    /// The order is backend-defined: [`MemoryCheckpointer`] and
+    /// [`FileCheckpointer`] return `(created_at, checkpoint_id)` ascending, the
+    /// sqlite backend newest first. [`Checkpointer::latest`] sorts on its own, so
+    /// callers that need a specific order must sort the result themselves.
     ///
     /// # Errors
     ///
