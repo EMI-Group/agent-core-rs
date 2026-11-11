@@ -7,13 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-
+description = "Shared kernel types (errors, cards, logging, config, secrets, HTTP, tasks) for the openJiuwen Rust SDK"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 thiserror = "2"
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
@@ -21,18 +22,19 @@ once_cell.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures.workspace = true
+reqwest.workspace = true
 regex.workspace = true
 bytes.workspace = true
 url.workspace = true
 indexmap.workspace = true
 sha2.workspace = true
 base64.workspace = true
-
+dotenvy.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
-
+wiremock.workspace = true
 [features]
 default = []
-
 [lints]
 workspace = true
