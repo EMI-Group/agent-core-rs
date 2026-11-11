@@ -101,14 +101,15 @@ impl GraphContext {
     pub fn metadata(&self) -> &BTreeMap<String, Value>;
 }
 
-// closure adapters
-pub struct FnNode<F>;   // F: for<'a> AsyncFn(&'a mut GraphState, &'a GraphContext) -> Result<NodeOutcome>
+// closure adapters (boxed futures; see Design Decisions)
+pub type BoxNodeFuture<'a> = Pin<Box<dyn Future<Output = Result<NodeOutcome>> + Send + 'a>>;
+pub struct FnNode<F>;   // F: for<'a> Fn(&'a mut GraphState, &'a GraphContext) -> BoxNodeFuture<'a>
 impl<F> FnNode<F> { pub fn new(id: impl Into<String>, f: F) -> Self; }
 pub struct SyncNode<F>; // F: Fn(&mut GraphState, &GraphContext) -> Result<NodeOutcome> + Send + Sync
 impl<F> SyncNode<F> { pub fn new(id: impl Into<String>, f: F) -> Self; }
 ```
 
-`FnNode` accepts `async fn` items and `async |state, ctx| { … }` closures (Rust 1.85 `AsyncFn`).
+`FnNode` callbacks return `Box::pin(async move { … })`; the boxed future is the stable-Rust spelling of the `AsyncFn` bound (see Design Decisions).
 Sync nodes run inline on the executor task, so they must be cheap and non-blocking.
 
 ### Routers (`src/router.rs`)
@@ -123,7 +124,8 @@ pub trait Router: Send + Sync {
     async fn route(&self, ctx: &RouterContext) -> Result<Vec<String>>;   // target node ids
 }
 
-pub struct FnRouter<F>; // F: for<'a> AsyncFn(&'a RouterContext) -> Result<Vec<String>>
+pub type BoxRouterFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>>;
+pub struct FnRouter<F>; // F: for<'a> Fn(&'a RouterContext) -> BoxRouterFuture<'a>
 impl<F> FnRouter<F> { pub fn new(name: impl Into<String>, f: F) -> Self; }
 ```
 
@@ -142,6 +144,7 @@ Static edges are compiled into dedicated static routers; conditional routers are
     pub nodes: Vec<NodeSpec>, pub edges: Vec<EdgeSpec>, pub metadata: BTreeMap<String, Value>,
 }
 impl GraphSpec { pub fn node(&self, id: &str) -> Option<&NodeSpec>; pub fn outgoing(&self, id: &str) -> Vec<&EdgeSpec>; pub fn validate(&self) -> Result<()>; }
+pub const DYNAMIC_TARGET: &str = "*";   // target of a router whose targets are only known at run time
 ```
 
 `GraphSpec` is the serializable description (`snake_case`, tolerates unknown fields, defaults to empty collections); node runnables live only in the compiled graph.
@@ -266,6 +269,9 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 - **Snapshots are JSON, not pickles.** `GraphSnapshot` is a serde model, so `InMemoryGraphStore`, `CheckpointerStore`, and any external backend share one format.
 - **Python's `stream_actor` graph-streaming machinery is not ported.** It exists to feed `${...}` stream references into nodes; in this rewrite workflow components consume session streams directly and the graph emits ordered `GraphEvent`s plus session trace frames.
 - **Mermaid only.** DOT/PNG/SVG (network round-trip in Python) are omitted.
+- **Closure adapters use boxed futures.** A `for<'a> AsyncFn(&'a …) -> …` bound cannot prove the returned future is `Send` on stable Rust (the `async_fn_traits` workaround is nightly-only), so `FnNode` and `FnRouter` take `Fn` callbacks returning [`node::BoxNodeFuture`] / [`router::BoxRouterFuture`]; call sites write `Box::pin(async move { … })`.
+- **Dynamic conditional edges name no target.** `conditional_edges` records an edge whose target is [`spec::DYNAMIC_TARGET`] (`*`); it contributes no channel group, and nodes reachable only through such a router still look like implicit entries, so they need an explicit `entry(…)` (or `conditional_edges_to`, which declares the targets for introspection and visualization).
+- **Entry seeding is unconditional.** `START_NODE` bypasses a node's CNF groups, so a declared entry runs in superstep 1 even when it also has incoming edges (required for loops).
 
 ## Routing Table
 
@@ -287,6 +293,8 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 
 Unit tests live beside the modules (`state`, `node`, `router`, `spec`, `store`, `visualize`, `pregel::channel`, `pregel::dispatch`).
 Integration tests in `./tests/` use `openjiuwen_session::WorkflowSession` as `Arc<dyn Session>` and cover:
+
+- `common/mod.rs` — shared helpers (`session()`, counting/marker/noop nodes).
 
 - `linear.rs` — linear chain, state seeded from input, final value.
 - `fan_out_fan_in.rs` — parallel fan-out, barrier fan-in, declaration-order merge determinism, visited order.
