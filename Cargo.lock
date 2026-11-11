@@ -2016,14 +2016,11 @@ name = "openjiuwen-harness-protocol"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chrono",
  "futures",
  "schemars",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
- "uuid",
 ]
 
 [[package]]
