@@ -21,9 +21,12 @@ use crate::operation::FsOperation;
 pub mod ext;
 pub mod list;
 pub mod local;
+mod read;
 pub mod search;
 pub mod slice;
+mod transfer;
 pub mod types;
+mod write;
 
 /// Builds the local filesystem backend for `config`.
 ///
