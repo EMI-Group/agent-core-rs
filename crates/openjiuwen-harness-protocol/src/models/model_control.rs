@@ -182,14 +182,9 @@ impl Validate for ModelEndpoint {
 }
 
 impl Validate for ModelChoice {
-    /// Requires at least one of `model`/`effort`, any provided value to be non-blank, and a valid
-    /// `endpoint` when one is set.
+    /// Requires any provided `model`/`effort` to be non-blank and a valid `endpoint` when one is
+    /// set. An all-`None` choice asks the provider for its default and is valid.
     fn validate(&self) -> HarnessResult<()> {
-        if self.model.is_none() && self.effort.is_none() {
-            return Err(HarnessError::validation(
-                "model choice must set a model, an effort, or both",
-            ));
-        }
         for (field, value) in [("model", &self.model), ("effort", &self.effort)] {
             require_trimmed_when_provided("model choice", field, value.as_deref())?;
         }
@@ -296,11 +291,8 @@ mod tests {
             effort: None,
             endpoint: None,
         };
-        // DESIGN §5.4 deliberately rejects both-`None`; Python's `ModelChoice` allows it.
-        assert_eq!(
-            validation_message(both_none.validate()),
-            "model choice must set a model, an effort, or both"
-        );
+        // An all-`None` choice asks the provider for its default and is valid.
+        assert!(both_none.validate().is_ok());
 
         let builtin = ModelChoice {
             model: Some("claude-sonnet".to_owned()),

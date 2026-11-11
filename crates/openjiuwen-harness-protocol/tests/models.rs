@@ -329,13 +329,22 @@ fn model_choice_reports_builtin_and_validates_its_endpoint() {
         effort: None,
         endpoint: None,
     };
-    assert_eq!(
-        neither
-            .validate()
-            .expect_err("neither model nor effort")
-            .message(),
-        "model choice must set a model, an effort, or both"
-    );
+    neither
+        .validate()
+        .expect("all-None asks for the provider default");
+    assert!(neither.is_builtin());
+
+    let decoded: ModelChoice = from_value_validated(json!({
+        "model": null,
+        "effort": null,
+        "endpoint": null,
+    }))
+    .expect("decoded all-None choice is valid");
+    assert!(decoded.is_builtin());
+    let decoded: ModelChoice =
+        from_str_validated(r#"{"model": null, "effort": null, "endpoint": null}"#)
+            .expect("decoded all-None choice is valid");
+    assert!(decoded.is_builtin());
 
     for model in [" ".to_owned(), String::new()] {
         let choice = ModelChoice {
