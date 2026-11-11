@@ -191,6 +191,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 
 - All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
 - `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
+- Minimal offline knowledge base: `SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new("kb"), Arc::new(InMemoryVectorStore::new()), Arc::new(HashEmbedding::new(64)))?` then `.add_documents(...)`/`.add_texts(...)` and `.retrieve_with_config(query, &RetrievalConfig::default())`; `InMemoryVectorStore::new()` is sync (only `open`/`open_with_collection` are async).
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
 - `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` is clean now that the scaffolded foundation dependency is gone; no `--no-deps` workaround is needed.
 
