@@ -15,7 +15,7 @@ Reference: the Python suites `tests/unit_tests/core/security/guardrail/{test_gua
 
 - `./models.rs` → severity/model serde, `GuardrailResult`, redacting `Debug`
 - `./pipeline.rs` → ordering, stage filtering, aggregation, severity/blocking matrix, failure policy
-- `./prompt_injection.rs` → default patterns, config validation, parsers, backend adapters
+- `./prompt_injection.rs` → the six default patterns, blocking policy, config defaults/validation/serde, `BERT`/`Qwen` parser tables, LLM/API/local backend adapters, stage binding
 - `./sensitive_data.rs` → PII detection, Luhn, redaction, `modified_data`
 - `./tool_arguments.rs` → tool allow/deny lists, argument patterns, nested JSON redaction
 - `./config.rs` → defaults, `SecurityConfig` construction/serde
