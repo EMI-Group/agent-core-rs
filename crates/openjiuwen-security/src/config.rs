@@ -1,13 +1,21 @@
-//! Security policy and scan-target configuration.
+//! Security policy, scan-target, and pipeline configuration.
 //!
 //! The policy decides which findings block a call and how guardrail failures are
 //! handled; [`ScanTargets`] decides which call stages are scanned at all.
-//! [`SecurityConfig`](crate::config) itself arrives with the pipeline in a later
-//! phase.
+//! [`SecurityConfig`] combines those with every built-in detector's
+//! configuration and builds the ordered [`GuardrailPipeline`].
+#![allow(clippy::module_name_repetitions)]
 
+use openjiuwen_common::error::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::{RiskLevel, ScanStage};
+use crate::guardrails::content_rules::{ContentRuleGuardrail, ContentRuleGuardrailConfig};
+use crate::guardrails::prompt_injection::{
+    PromptInjectionGuardrail, PromptInjectionGuardrailConfig,
+};
+use crate::guardrails::sensitive_data::{SensitiveDataGuardrail, SensitiveDataGuardrailConfig};
+use crate::guardrails::tool_arguments::{ToolArgumentGuardrail, ToolArgumentGuardrailConfig};
+use crate::{GuardrailPipeline, RiskLevel, ScanStage};
 
 /// How guardrail failures (errors, not findings) are treated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -106,11 +114,175 @@ impl ScanTargets {
     }
 }
 
+/// The umbrella configuration of the content-safety pipeline.
+///
+/// [`SecurityConfig::default`] disables security entirely (`enabled` is `false`),
+/// so a caller opts in with [`SecurityConfig::protected`] or by enabling it and
+/// supplying its own sub-configs. [`SecurityConfig::pipeline`] turns the record
+/// into an ordered [`GuardrailPipeline`].
+///
+/// The detector configs `prompt_injection`, `sensitive_data`, `content_rules`,
+/// and `tool_arguments` are only consulted when [`Self::enabled`] is `true`;
+/// with security disabled they still round-trip through JSON unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct SecurityConfig {
+    /// Whether security is enabled at all; `false` means "security disabled".
+    ///
+    /// A disabled config still carries its [`SecurityConfig::policy`] into
+    /// [`SecurityConfig::pipeline`], but no guardrail is registered, so the
+    /// resulting pipeline never produces a finding.
+    pub enabled: bool,
+    /// Thresholds and failure handling applied to every scan.
+    pub policy: SecurityPolicy,
+    /// The call stages that are scanned.
+    pub targets: ScanTargets,
+    /// Prompt-injection detector configuration, consulted only when
+    /// [`Self::enabled`] is `true`.
+    pub prompt_injection: PromptInjectionGuardrailConfig,
+    /// Sensitive-data/PII detector configuration, consulted only when
+    /// [`Self::enabled`] is `true` and its own `enabled` flag is set.
+    pub sensitive_data: SensitiveDataGuardrailConfig,
+    /// User-supplied content-rule configuration, consulted only when
+    /// [`Self::enabled`] is `true` and its rule table is non-empty.
+    pub content_rules: ContentRuleGuardrailConfig,
+    /// Tool-argument validator configuration, consulted only when
+    /// [`Self::enabled`] is `true`, [`ScanTargets::tool_inputs`] is set, and the
+    /// config carries at least one rule.
+    pub tool_arguments: ToolArgumentGuardrailConfig,
+}
+
+impl Default for SecurityConfig {
+    /// Security disabled, with every policy, target, and detector at its
+    /// documented default.
+    ///
+    /// A missing or partial JSON payload therefore reconstitutes exactly these
+    /// values instead of enabling detection by accident.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policy: SecurityPolicy::default(),
+            targets: ScanTargets::default(),
+            prompt_injection: PromptInjectionGuardrailConfig::default(),
+            sensitive_data: SensitiveDataGuardrailConfig::default(),
+            content_rules: ContentRuleGuardrailConfig::default(),
+            tool_arguments: ToolArgumentGuardrailConfig::default(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// The default config with security enabled, stock detectors included.
+    ///
+    /// This is the conventional opt-in (`DEFAULT_ENABLED` in Python terms): the
+    /// policy, the scan targets, and every detector config keep their defaults,
+    /// so [`Self::pipeline`] registers prompt-injection, sensitive-data, and
+    /// tool-argument detection (content rules stay out until a rule is added).
+    #[must_use]
+    pub fn protected() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// Builds the ordered pipeline this config describes.
+    ///
+    /// Guardrails are registered in a fixed order — prompt injection, sensitive
+    /// data, content rules, tool arguments — and every built-in uses the same
+    /// priority, so registration order is the run order for equal priorities.
+    ///
+    /// Detector selection:
+    ///
+    /// - disabled config: no guardrails, policy preserved;
+    /// - no enabled [`ScanTargets`]: no guardrails (an empty stage list would
+    ///   otherwise mean "every stage");
+    /// - prompt injection only at the configured intersection of
+    ///   [`PromptInjectionGuardrail::DEFAULT_STAGES`] and the enabled stages;
+    /// - sensitive data only when its own `enabled` flag is set, at every
+    ///   enabled stage;
+    /// - content rules only when the rule table is non-empty, at every enabled
+    ///   stage;
+    /// - tool arguments only when tool inputs are scanned and the config has a
+    ///   rule to apply, at [`ScanStage::ToolInvokeInput`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`openjiuwen_common::error::ErrorKind::Validation`] error
+    /// unchanged when a detector rejects its configuration: an unknown
+    /// prompt-injection mode, a missing endpoint for `api` mode, or an invalid
+    /// regular expression.
+    pub fn pipeline(&self) -> Result<GuardrailPipeline> {
+        let mut pipeline = GuardrailPipeline::new().with_policy(self.policy);
+        if !self.enabled {
+            return Ok(pipeline);
+        }
+        let stages = self.targets.stages();
+        if stages.is_empty() {
+            return Ok(pipeline);
+        }
+
+        let prompt_stages = intersect_stages(PromptInjectionGuardrail::DEFAULT_STAGES, &stages);
+        if !prompt_stages.is_empty() {
+            pipeline.add(
+                PromptInjectionGuardrail::with_config(self.prompt_injection.clone())?
+                    .with_stages(prompt_stages),
+            );
+        }
+
+        if self.sensitive_data.enabled {
+            pipeline.add(
+                SensitiveDataGuardrail::with_config(self.sensitive_data.clone())?
+                    .with_stages(stages.clone()),
+            );
+        }
+
+        if !self.content_rules.rules.is_empty() {
+            pipeline.add(
+                ContentRuleGuardrail::new(self.content_rules.clone())?.with_stages(stages.clone()),
+            );
+        }
+
+        if self.targets.tool_inputs && has_tool_argument_rules(&self.tool_arguments) {
+            pipeline.add(
+                ToolArgumentGuardrail::with_config(self.tool_arguments.clone())?
+                    .with_stages([ScanStage::ToolInvokeInput]),
+            );
+        }
+
+        Ok(pipeline)
+    }
+}
+
+/// `reference` stages that also appear in `enabled`, in `reference` order.
+fn intersect_stages(reference: &[ScanStage], enabled: &[ScanStage]) -> Vec<ScanStage> {
+    reference
+        .iter()
+        .filter(|stage| enabled.contains(stage))
+        .cloned()
+        .collect()
+}
+
+/// Whether a tool-argument config has anything to enforce.
+///
+/// The guardrail itself always applies its (possibly empty) rule set; the
+/// builder only installs it when at least one rule, list, or limit is set, so a
+/// stock config does not add a no-op guardrail to the pipeline.
+fn has_tool_argument_rules(config: &ToolArgumentGuardrailConfig) -> bool {
+    !config.allowed_tools.is_empty()
+        || !config.denied_tools.is_empty()
+        || !config.deny_patterns.is_empty()
+        || config.sensitive_data.is_some()
+        || config.max_argument_bytes.is_some()
+}
+
 #[cfg(test)]
 mod tests {
+    use openjiuwen_common::error::ErrorKind;
     use serde_json::json;
 
     use super::*;
+    use crate::guardrails::content_rules::ContentRule;
 
     #[test]
     fn policy_defaults_match_python() {
@@ -204,5 +376,127 @@ mod tests {
         assert!(partial.prompts);
         assert!(partial.tool_inputs);
         assert!(!partial.tool_outputs);
+    }
+
+    #[test]
+    fn default_security_config_is_disabled() {
+        let config = SecurityConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.policy, SecurityPolicy::default());
+        assert_eq!(config.targets, ScanTargets::default());
+        assert_eq!(
+            config.prompt_injection,
+            PromptInjectionGuardrailConfig::default()
+        );
+        assert_eq!(
+            config.sensitive_data,
+            SensitiveDataGuardrailConfig::default()
+        );
+        assert_eq!(config.content_rules, ContentRuleGuardrailConfig::default());
+        assert_eq!(
+            config.tool_arguments,
+            ToolArgumentGuardrailConfig::default()
+        );
+
+        let pipeline = config.pipeline().unwrap();
+        assert!(pipeline.guardrails().is_empty());
+        assert_eq!(pipeline.policy(), &SecurityPolicy::default());
+
+        let policy = SecurityPolicy {
+            block_level: RiskLevel::Medium,
+            failure_policy: FailurePolicy::FailClosed,
+            stop_on_block: false,
+        };
+        let pipeline = SecurityConfig {
+            policy,
+            ..SecurityConfig::default()
+        }
+        .pipeline()
+        .unwrap();
+        assert!(
+            pipeline.guardrails().is_empty(),
+            "a disabled config registers no guardrails"
+        );
+        assert_eq!(pipeline.policy(), &policy, "the policy is still preserved");
+    }
+
+    #[test]
+    fn disabled_targets_register_no_guardrails() {
+        let config = SecurityConfig {
+            targets: ScanTargets {
+                prompts: false,
+                user_input: false,
+                model_outputs: false,
+                tool_inputs: false,
+                tool_outputs: false,
+            },
+            ..SecurityConfig::protected()
+        };
+        assert_eq!(config.targets.stages(), Vec::<ScanStage>::new());
+        let pipeline = config.pipeline().unwrap();
+        assert!(pipeline.guardrails().is_empty());
+        assert_eq!(pipeline.policy(), &SecurityPolicy::default());
+    }
+
+    #[test]
+    fn protected_registers_the_built_in_guardrails_in_order() {
+        let stock = SecurityConfig::protected().pipeline().unwrap();
+        let names: Vec<&str> = stock.guardrails().iter().map(|g| g.name()).collect();
+        assert_eq!(
+            names,
+            vec!["prompt_injection", "sensitive_data", "tool_arguments"],
+            "an empty content-rule table registers no content guardrail"
+        );
+
+        let config = SecurityConfig {
+            content_rules: ContentRuleGuardrailConfig {
+                rules: vec![ContentRule {
+                    name: "banned".to_owned(),
+                    pattern: "forbidden".to_owned(),
+                    risk_type: "banned_word".to_owned(),
+                    ..ContentRule::default()
+                }],
+                ..ContentRuleGuardrailConfig::default()
+            },
+            ..SecurityConfig::protected()
+        };
+        let pipeline = config.pipeline().unwrap();
+        let guardrails = pipeline.guardrails();
+        let names: Vec<&str> = guardrails.iter().map(|g| g.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "prompt_injection",
+                "sensitive_data",
+                "content_rules",
+                "tool_arguments"
+            ],
+            "registration order is the documented run order"
+        );
+
+        let all_stages = config.targets.stages();
+        assert_eq!(
+            guardrails[0].stages(),
+            &[ScanStage::LlmInvokeInput, ScanStage::ToolInvokeOutput],
+            "prompt injection keeps DEFAULT_STAGES order"
+        );
+        assert_eq!(guardrails[1].stages(), all_stages.as_slice());
+        assert_eq!(guardrails[2].stages(), all_stages.as_slice());
+        assert_eq!(guardrails[3].stages(), &[ScanStage::ToolInvokeInput]);
+    }
+
+    #[test]
+    fn invalid_prompt_injection_mode_is_a_validation_error() {
+        let config = SecurityConfig {
+            prompt_injection: PromptInjectionGuardrailConfig {
+                mode: "bogus".to_owned(),
+                ..PromptInjectionGuardrailConfig::default()
+            },
+            ..SecurityConfig::protected()
+        };
+        let Err(error) = config.pipeline() else {
+            panic!("an invalid prompt-injection mode must fail construction");
+        };
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 }

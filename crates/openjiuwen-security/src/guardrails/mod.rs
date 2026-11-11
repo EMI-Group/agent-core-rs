@@ -22,4 +22,10 @@ pub mod prompt_injection;
 pub mod sensitive_data;
 pub mod tool_arguments;
 
+pub use content_rules::{ContentRule, ContentRuleGuardrail, ContentRuleGuardrailConfig};
 pub use prompt_injection::{PromptInjectionGuardrail, PromptInjectionGuardrailConfig};
+pub use sensitive_data::{
+    RedactionOutcome, SensitiveDataGuardrail, SensitiveDataGuardrailConfig, SensitiveMatch,
+    SensitivePattern, SensitiveValidator,
+};
+pub use tool_arguments::{ToolArgumentGuardrail, ToolArgumentGuardrailConfig};

@@ -33,7 +33,8 @@
 //!   [`BackendGuardrail`].
 //! - [`pipeline`] — the ordered [`GuardrailPipeline`] and its scan helpers.
 //! - [`report`] — [`RedactedOutcome`].
-//! - [`config`] — [`SecurityPolicy`], [`FailurePolicy`], and [`ScanTargets`].
+//! - [`config`] — [`SecurityConfig`], [`SecurityPolicy`], [`FailurePolicy`], and
+//!   [`ScanTargets`].
 //! - [`rules`] — the shared regex rule engine ([`CompiledRule`],
 //!   [`TextMatch`], Luhn, redaction).
 //! - [`parsers`] — [`ModelOutputParser`] and the built-in
@@ -42,8 +43,9 @@
 //!   ([`RuleBasedPromptInjectionBackend`], [`LlmPromptInjectionBackend`],
 //!   [`ApiModelBackend`], [`LocalModelBackend`]) with their configs and the
 //!   [`ModerationTransport`] seam.
-//! - [`guardrails`] — the built-in detectors ([`PromptInjectionGuardrail`] and
-//!   its config) that bind a backend to the stages it scans.
+//! - [`guardrails`] — the built-in detectors ([`PromptInjectionGuardrail`],
+//!   [`SensitiveDataGuardrail`], [`ContentRuleGuardrail`],
+//!   [`ToolArgumentGuardrail`]) with their configs.
 //!
 //! # Example
 //!
@@ -115,7 +117,7 @@ pub use backends::{
     ModerationRequest, ModerationTransport, RuleBasedBackendConfig,
     RuleBasedPromptInjectionBackend,
 };
-pub use config::{FailurePolicy, ScanTargets, SecurityPolicy};
+pub use config::{FailurePolicy, ScanTargets, SecurityConfig, SecurityPolicy};
 pub use context::{
     GuardrailContext, ScanStage, EVENT_LLM_INVOKE_INPUT, EVENT_LLM_INVOKE_OUTPUT,
     EVENT_TOOL_INVOKE_INPUT, EVENT_TOOL_INVOKE_OUTPUT, EVENT_USER_INPUT,
@@ -124,7 +126,12 @@ pub use finding::{
     Finding, GuardrailEvaluation, GuardrailOutcome, GuardrailViolation, SecurityDecision,
 };
 pub use guardrail::{BackendGuardrail, Guardrail, GuardrailBackend, DEFAULT_PRIORITY};
-pub use guardrails::{PromptInjectionGuardrail, PromptInjectionGuardrailConfig};
+pub use guardrails::{
+    ContentRule, ContentRuleGuardrail, ContentRuleGuardrailConfig, PromptInjectionGuardrail,
+    PromptInjectionGuardrailConfig, RedactionOutcome, SensitiveDataGuardrail,
+    SensitiveDataGuardrailConfig, SensitiveMatch, SensitivePattern, SensitiveValidator,
+    ToolArgumentGuardrail, ToolArgumentGuardrailConfig,
+};
 pub use level::{GuardrailContentType, RiskLevel};
 pub use parsers::{BertBinaryParser, ModelOutputParser, QwenGuardParser, Thresholds};
 pub use pipeline::GuardrailPipeline;
