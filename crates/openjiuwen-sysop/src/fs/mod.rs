@@ -13,11 +13,16 @@
 
 use std::sync::Arc;
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 
 use crate::config::LocalWorkConfig;
 use crate::operation::FsOperation;
 
+pub mod ext;
+pub mod list;
+pub mod local;
+pub mod search;
+pub mod slice;
 pub mod types;
 
 /// Builds the local filesystem backend for `config`.
@@ -27,8 +32,6 @@ pub mod types;
 /// Returns `ErrorKind::Validation` when the configuration is invalid.
 #[allow(clippy::needless_pass_by_value)] // the backend takes ownership of its configuration
 pub fn local_fs(config: LocalWorkConfig) -> Result<Arc<dyn FsOperation>> {
-    config.validate()?;
-    Err(Error::unsupported(
-        "the local filesystem backend is not implemented in this build",
-    ))
+    let backend = local::LocalFsOperation::new(config)?;
+    Ok(Arc::new(backend))
 }
