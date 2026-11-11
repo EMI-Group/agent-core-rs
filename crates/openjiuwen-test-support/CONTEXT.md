@@ -10,6 +10,8 @@ Never depended on by a library crate; only `[dev-dependencies]` and `openjiuwen-
 ## API Surface
 
 Crate root re-exports every public item listed below, so downstream tests use `openjiuwen_test_support::MockLlmServer` without module paths.
+Every module is public (`mock_llm`, `fixtures`, `responses`, `scripted_model`, `assert_json`, `eventually`), so each item is also reachable at its module path (`openjiuwen_test_support::mock_llm::MockLlmServer`, `openjiuwen_test_support::fixtures::TempWorkspace`).
+Every public item is additionally re-exported at the crate root; `internal` stays private.
 The only other crate-root items are `CRATE_NAME`, `CRATE_VERSION`, and `TEST_API_KEY` (`"test-api-key"`, the key `client_config()` uses).
 `pub use wiremock;` is re-exported (with its `MockServer`, `ResponseTemplate`, `matchers`) so test crates can mock non-LLM endpoints without adding their own dependency; the mock server here is NOT built on wiremock and does not duplicate it.
 
@@ -322,6 +324,7 @@ let model = ScriptedModel::builder()
 - Session factory helpers are deliberately omitted: `openjiuwen-session` is still a stub with no `Session` implementation, so there is nothing to construct.
   When it lands, add `src/fixtures/session.rs` with `workflow_session()` / `agent_session()` helpers mirroring Python `create_agent_session`, and re-export them from `fixtures` and `lib.rs`.
 - `EnvGuard` is reentrant on one thread (nesting allowed) but serializes across threads/parallel tests through one process-global lock; guards are `!Send` so they stay on the test's runtime thread.
+- Modules are public for navigable rustdoc and for path-stable `use` statements; the crate root also glob-re-exports them so tests can import flat.
 
 ## Routing Table
 

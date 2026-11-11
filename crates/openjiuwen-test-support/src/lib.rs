@@ -22,6 +22,11 @@
 //!   assertions with readable diffs.
 //! - `eventually` and friends — bounded async polling helpers.
 //!
+//! Every module is public, so each item is also reachable at its module path
+//! (`openjiuwen_test_support::mock_llm::MockLlmServer`,
+//! `openjiuwen_test_support::fixtures::TempWorkspace`) while the crate root
+//! glob-re-exports the same items for flat imports.
+//!
 //! The crate is dev-only: it may appear in `[dev-dependencies]` and is used by
 //! the `openjiuwen-e2e` scenarios, never by a library crate. Every helper is
 //! deterministic (counter-based ids, fixed timestamps, no wall-clock reads) and
@@ -54,15 +59,15 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-mod assert_json;
-mod eventually;
-mod fixtures;
+pub mod assert_json;
+pub mod eventually;
+pub mod fixtures;
 // Crate-private shared constants and the poison-recovering mutex helper; its
 // items are `pub(crate)` and intentionally not re-exported as public API.
 mod internal;
-mod mock_llm;
-mod responses;
-mod scripted_model;
+pub mod mock_llm;
+pub mod responses;
+pub mod scripted_model;
 pub use assert_json::*;
 pub use eventually::*;
 pub use fixtures::*;
