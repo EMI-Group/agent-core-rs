@@ -11,7 +11,7 @@ Ports `openjiuwen/core/session/internal/` (v0.1.20): `WorkflowSession`, `NodeSes
 - `WorkflowSession` — `new(session_id)`, `with_config`, `with_parent`, `state() -> Arc<WorkflowState>`, `create_node_session(component_id) -> NodeSession`, `dump_state()`, `save_checkpoint`, `resume`.
 - `NodeSession` — component-scoped view over a parent session: executable id, nested component state, delegated streaming/tracing/interaction; `end_stream`/`close` are no-ops that never close the parent.
   The executable id follows Python's `create_executable_id`: a node of a workflow/agent session is the bare component id (`a`), and nesting node sessions dot-joins them (`a.b`, `a.b.c`).
-  `WorkflowSessionOptions::workflow_id` is entity metadata only and no longer prefixes node ids.
+  `WorkflowSessionOptions::workflow_id` is entity metadata only; node executable ids follow `create_executable_id`.
 - `AgentSession` — agent state (`global_state` + `agent_state` lanes), `agent_id`/`agent_name`/`description` metadata, `env(key) -> Option<Value>`, `envs()`, `state()`, `dump_state()`, `create_workflow_session()` sharing the agent hub/config/trace id but owning an independent workflow state, `commit() -> Result<Option<String>>`, idempotent `post_run()`, and the trait's `save_checkpoint`/`resume`.
 - `AgentTeamSession` — `team_id` (default `DEFAULT_TEAM_ID = "agent_team"`), `global_state`/`agent_state` lanes, `create_agent_session(agent_id)` child tagged with `source_agent_id`/`source_team_id` and sharing the team hub/config/trace id, `commit()`, `flush_checkpoint()`, idempotent `post_run()`.
 - Factories and options: `create_workflow_session(WorkflowSessionOptions)`, `create_agent_session(AgentSessionOptions)`, `create_agent_team_session(AgentTeamSessionOptions)`.
