@@ -10,20 +10,22 @@ Each one is a `Guardrail` implementation: stateless after construction, async `c
 ```rust
 // prompt_injection.rs — port of builtin.py
 pub struct PromptInjectionGuardrailConfig { pub mode: String /* "rules" */, pub model_type: Option<String>,
-    pub api_url: Option<String>, pub api_key: Option<String>, pub timeout: Duration /* 30s */,
+    pub api_url: Option<String>, pub api_key: Option<SecretString>, pub timeout: f64 /* 30.0 s */,
     pub model_path: Option<String>, pub device: String /* "auto" */, pub custom_patterns: Option<Vec<String>>,
     pub risk_level: RiskLevel /* High */, pub bert_thresholds: Option<Thresholds>, pub attack_class_id: i64 /* 1 */,
     pub qwen_risk_type: String /* "content_risk" */ }
-pub struct PromptInjectionGuardrail { /* backend, priority, stages */ }
+pub struct PromptInjectionGuardrail { /* backend, config, priority, stages */ }
 impl PromptInjectionGuardrail {
     pub const DEFAULT_STAGES: &'static [ScanStage];         // [LlmInvokeInput, ToolInvokeOutput]
     pub fn new() -> Self;                                   // rule backend, six Python patterns, HIGH
     pub fn with_config(config: PromptInjectionGuardrailConfig) -> Result<Self>;
+    pub fn with_config_and_parser(config: PromptInjectionGuardrailConfig, parser: Arc<dyn ModelOutputParser>) -> Result<Self>;  // Python's config.parser
     pub fn with_backend(backend: Arc<dyn GuardrailBackend>) -> Self;
-    pub fn with_parser(/* config builder counterpart */) -> Result<Self>;   // parser injected for api/local mode
     pub fn with_stages(self, stages: impl IntoIterator<Item = ScanStage>) -> Self;
     pub fn with_priority(self, priority: i32) -> Self;
     pub fn backend_name(&self) -> &str;
+    pub fn backend(&self) -> &Arc<dyn GuardrailBackend>;
+    pub fn config(&self) -> &PromptInjectionGuardrailConfig;
 }
 
 // sensitive_data.rs (addition)
@@ -98,6 +100,7 @@ Denied tool names and allowlist violations use `denied_tool_risk_level` (`Critic
 `PromptInjectionGuardrail::with_config` reproduces Python's construction validation and message strings:
 `"invalid mode: {mode}, must be 'rules', 'api' or 'local'"`, `"api_url is required for api mode"`, `"model_path is required for local mode"`, `"either model_type or parser must be specified for api/local mode"`, `"unknown model_type: {model_type}"`, checked in that order.
 Mode `rules` → `RuleBasedPromptInjectionBackend` with `custom_patterns` and `risk_level`; `api`/`local` → `ApiModelBackend`/`LocalModelBackend` with the default parser (`BertBinaryParser { risk_type: "prompt_injection", confidence_thresholds, attack_class_id }` for `bert`, `QwenGuardParser { risk_type: qwen_risk_type }` for `qwen` or a custom parser).
+Python's `config.parser` is deliberately not a serde field (a parser is a runtime collaborator); `with_config_and_parser` is its exact counterpart and makes `model_type` optional.
 `check` returns the backend's assessment as a `GuardrailResult`: `is_safe = !has_risk`, level and type verbatim (`risk_type` stays `None` for safe results), `details` from the assessment; `modified_data` is `None`.
 `SensitiveDataGuardrail::check` blocks with `risk_type = "sensitive_data"`, `risk_level = config.risk_level`, `details = {"matched_patterns": [..], "match_count": n}`, and `modified_data = {"sanitized_text": redacted}` when `redact` is true.
 `ContentRuleGuardrail::check`: first matching rule yields `risk_type = rule.risk_type`, `risk_level = rule.risk_level`, `details = {"rule": name, "matched_pattern": pattern}` and `modified_data = {"sanitized_text": ...}` when `redact`; other rules still run for reporting when no match has been found yet is not attempted — one result per scan (first match wins, Python rule-backend semantics).

@@ -42,9 +42,8 @@
 //!   ([`RuleBasedPromptInjectionBackend`], [`LlmPromptInjectionBackend`],
 //!   [`ApiModelBackend`], [`LocalModelBackend`]) with their configs and the
 //!   [`ModerationTransport`] seam.
-//!
-//! The `guardrails` module (the built-in detectors that bind backends to scan
-//! stages) arrives in the next phase.
+//! - [`guardrails`] — the built-in detectors ([`PromptInjectionGuardrail`] and
+//!   its config) that bind a backend to the stages it scans.
 //!
 //! # Example
 //!
@@ -102,6 +101,7 @@ pub mod config;
 pub mod context;
 pub mod finding;
 pub mod guardrail;
+pub mod guardrails;
 pub mod level;
 pub mod parsers;
 pub mod pipeline;
@@ -124,6 +124,7 @@ pub use finding::{
     Finding, GuardrailEvaluation, GuardrailOutcome, GuardrailViolation, SecurityDecision,
 };
 pub use guardrail::{BackendGuardrail, Guardrail, GuardrailBackend, DEFAULT_PRIORITY};
+pub use guardrails::{PromptInjectionGuardrail, PromptInjectionGuardrailConfig};
 pub use level::{GuardrailContentType, RiskLevel};
 pub use parsers::{BertBinaryParser, ModelOutputParser, QwenGuardParser, Thresholds};
 pub use pipeline::GuardrailPipeline;
