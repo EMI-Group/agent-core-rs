@@ -478,8 +478,8 @@ impl Validate for ModelRequestEvent {
     /// [`HarnessError::Validation`] with the exact Python message for the first violated rule.
     fn validate(&self) -> HarnessResult<()> {
         require_non_empty("model request_id", &self.request_id)?;
-        require_finite_timestamp("model started_at", self.started_at)?;
-        require_finite_timestamp("model ended_at", self.ended_at)?;
+        require_finite_timestamp("model request started_at", self.started_at)?;
+        require_finite_timestamp("model request ended_at", self.ended_at)?;
         if self.ended_at < self.started_at {
             return Err(HarnessError::validation(
                 "model request ended_at must not precede started_at",

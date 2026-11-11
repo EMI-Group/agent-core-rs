@@ -301,16 +301,12 @@ fn item_lifecycle_requires_item_type() {
 
 /// Asserts the model-request timestamp message for `field` (`started_at`/`ended_at`).
 ///
-/// Python (and `DESIGN.md` §5.8) read `"model request {field} must be a finite Unix timestamp"`;
-/// the current Rust source passes the field name `"model {field}"`, so both spellings are
-/// accepted here — see the group 4a report for the deviation.
+/// Python (`events.py`) requires
+/// `"model request {field} must be a finite Unix timestamp"`.
 fn assert_model_timestamp_message(result: HarnessResult<()>, field: &str) {
-    let message = validation_message(result);
-    let python = format!("model request {field} must be a finite Unix timestamp");
-    let observed = format!("model {field} must be a finite Unix timestamp");
-    assert!(
-        message == python || message == observed,
-        "expected {python:?} (Python wording), got {message:?}"
+    assert_eq!(
+        validation_message(result),
+        format!("model request {field} must be a finite Unix timestamp")
     );
 }
 
