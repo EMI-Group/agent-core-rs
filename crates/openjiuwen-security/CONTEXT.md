@@ -60,7 +60,7 @@ backends:   RuleBasedPromptInjectionBackend + RuleBasedBackendConfig (six Python
             LlmPromptInjectionBackend + LlmPromptInjectionBackendConfig (Python stub semantics: delegates to the rule backend),
             ApiModelBackend + ApiModelBackendConfig (transport seam), LocalModelBackend + LocalModelBackendConfig (unsupported seam)
 guardrails: PromptInjectionGuardrail + PromptInjectionGuardrailConfig (Python parity, mode rules/api/local),
-            SensitiveDataGuardrail + config + SensitivePattern (PII detect + redact),
+            SensitiveDataGuardrail + config + SensitivePattern/SensitiveValidator (PII detect + redact) with SensitiveMatch/RedactionOutcome,
             ContentRuleGuardrail + ContentRule + config, ToolArgumentGuardrail + config
 ```
 
@@ -100,7 +100,8 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - `tests/sensitive_data.rs` — email/phone/card/id/secret detection, Luhn rejection, redaction output (`<REDACTED>`), `modified_data.sanitized_text`, no false positives on benign text, custom patterns/extra patterns, marker override.
 - `tests/tool_arguments.rs` — denied/allowed tool names, shell-injection patterns in arguments, nested JSON argument traversal, sensitive-data redaction inside arguments, stage binding (tool input only).
 - `tests/config.rs` — every default preserved (Python `PromptInjectionGuardrailConfig`/`RuleBasedBackendConfig` fields and values), `SecurityConfig::default()` scans nothing, `protected()` enables the default set, `pipeline()` validation errors, full serde round-trip.
-- `tests/helpers.rs` — `scan_prompt`/`scan_model_output`/`scan_tool_input`/`scan_tool_output` context shapes (stages, metadata `tool_name`/`message_count`), `enforce()` on blocked outcomes, `RedactedOutcome` contains no original secrets, and an `ApiModelBackend` over a fake `ModerationTransport` feeding `BertBinaryParser`.
+- `tests/helpers.rs` — `scan_prompt`/`scan_user_input`/`scan_model_output`/`scan_tool_input`/`scan_tool_output` context shapes (stages, events, metadata `tool_name`/`message_count`), all-message scanning (a secret in an earlier turn is still found), `enforce()` on blocked vs finding-only outcomes, `RedactedOutcome`/`Debug` containing no original secrets, and `modified_data()` merge order.
+- The `ApiModelBackend`-over-a-fake-`ModerationTransport` case (feeding `BertBinaryParser`) lives in `tests/prompt_injection.rs`.
 - Behavior-port tests cite the Python test they mirror in a comment (`// ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py`).
 - Gates: `cargo fmt -p openjiuwen-security`, `cargo test -p openjiuwen-security`, `cargo clippy -p openjiuwen-security --all-targets -- -D warnings` all clean offline.
 
@@ -119,7 +120,8 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 
 ## Known Gaps and Deferred Adapters
 
-- `parsers`, `backends`, and `guardrails::prompt_injection` are implemented; the `sensitive_data`, `content_rules`, and `tool_arguments` guardrails described above are not implemented yet.
+- Every built-in detector is implemented (`guardrails::{prompt_injection, sensitive_data, content_rules, tool_arguments}`) and `SecurityConfig::pipeline()` assembles them from configuration.
+- The remaining gaps are the transport and model-runtime seams below, not missing detectors.
 - `ApiModelBackend` performs no HTTP: it requires an injected `ModerationTransport`; without one, `analyze` returns `Error::Unsupported`. The Python `httpx` call to `{"text": ...}` is the transport's job.
 - `LocalModelBackend` has no inference runtime: constructor and config are preserved (parity of fields/defaults), `analyze` returns `Error::Unsupported`. Python needs `torch`/`transformers`.
 - `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; `DEFAULT_SYSTEM_PROMPT` is a reconstructed Chinese JSON-contract prompt because Python never reads its constant; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
