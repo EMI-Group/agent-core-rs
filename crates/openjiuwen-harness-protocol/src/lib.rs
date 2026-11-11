@@ -16,6 +16,7 @@
 
 pub mod errors;
 pub mod json;
+pub mod models;
 pub mod results;
 pub mod state;
 pub mod validation;
@@ -24,6 +25,11 @@ pub use errors::{HarnessError, HarnessErrorKind, HarnessResult};
 pub use json::{
     empty_json_object, from_str_validated, from_value_validated, json_object_from_value,
     json_object_to_value, JsonObject, JsonValue,
+};
+pub use models::{
+    default_compatible_protocol_versions, AbortMode, DeliveryMode, HarnessCapability, HarnessCard,
+    HarnessInput, HostCapability, ModelChoice, ModelEndpoint, ModelOption, ModelSelection,
+    SendReceipt, AUTH_FALLBACK_EVENT_TYPE, AUTH_FALLBACK_REQUEST_TYPE, PROTOCOL_VERSION,
 };
 pub use results::{
     ContentBlock, MessageRole, MonetaryAmount, TurnError, TurnMessage, TurnResult, TurnStatus,
