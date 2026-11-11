@@ -8,11 +8,6 @@
 //! Everything here is `pub(crate)`: it is an implementation seam between
 //! [`crate::llm::openai`], [`crate::llm::anthropic`], and their tests.
 
-// The two clients consume these helpers; while they are still stubs the crate
-// cannot see the call sites, so the dead-code lint is silenced here rather than
-// by duplicating the helpers into each client.
-#![allow(dead_code)]
-
 use openjiuwen_common::error::Error;
 use openjiuwen_common::security::redact_str;
 
