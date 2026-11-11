@@ -127,6 +127,13 @@ Built-ins (all offline-testable):
 ```rust
 pub struct ComponentContext { /* session + component/workflow ids + interaction state + cancellation */ }
 impl ComponentContext {
+    pub fn new(session: Arc<dyn Session>, component_id: impl Into<String>, workflow_id: impl Into<String>) -> Self;
+    // chainable for direct component tests and engine wiring:
+    pub fn with_interactions(self, Arc<InteractionState>) -> Self;
+    pub fn with_writer(self, Arc<FrameWriter>) -> Self;
+    pub fn with_cancellation(self, CancellationToken) -> Self;
+    pub fn with_metadata(self, BTreeMap<String, Value>) -> Self;
+    pub fn with_executable_id(self, impl Into<String>) -> Self;
     pub fn session(&self) -> &Arc<dyn Session>;
     pub fn component_id(&self) -> &str;  pub fn workflow_id(&self) -> &str;  pub fn executable_id(&self) -> &str;
     pub async fn get_state(&self, key: &str) -> Result<Option<Value>>;        // session global lane, `${...}` aware
