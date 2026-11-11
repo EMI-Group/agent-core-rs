@@ -117,10 +117,10 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 
 ## Known Gaps and Deferred Adapters
 
-- Phase 1 ships `level`, `context`, `result`, `rules`, `config`, `guardrail`, `finding`, `pipeline`, `report`; the `parsers`, `backends` and `guardrails` modules described above are not implemented yet.
+- Phase 1 ships `level`, `context`, `result`, `rules`, `config`, `guardrail`, `finding`, `pipeline`, `report`; Phase 2 adds `parsers` and `backends`; the `guardrails` module described above is not implemented yet.
 - `ApiModelBackend` performs no HTTP: it requires an injected `ModerationTransport`; without one, `analyze` returns `Error::Unsupported`. The Python `httpx` call to `{"text": ...}` is the transport's job.
 - `LocalModelBackend` has no inference runtime: constructor and config are preserved (parity of fields/defaults), `analyze` returns `Error::Unsupported`. Python needs `torch`/`transformers`.
-- `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
+- `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; `DEFAULT_SYSTEM_PROMPT` is a reconstructed Chinese JSON-contract prompt because Python never reads its constant; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
 - No process-global registration helper: Python's `register_guardrail`/`unregister_guardrail` bind to `Runner.callback_framework`; the runner crate owns that wiring (see `docs/PARITY.md` security row).
 - No vendor moderation adapters (OpenAI/阿里云/Azure content safety); `GuardrailBackend` + `backends::ModerationTransport` are the seam (`ApiModelBackend` plus a parser is the adapter shape).
 - Python quirks deliberately not reproduced: `PromptInjectionGuardrail.with_rules()` (documented but never defined), double-registration bookkeeping bug, and `GuardrailContext(content_type=type(None))` fallback.
