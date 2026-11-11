@@ -5,7 +5,7 @@
 Guardrails and the content-safety pipeline for the openJiuwen runtime.
 Ports the Python package `openjiuwen/core/security/guardrail/` (v0.1.20) and extends it with the detectors the Python package advertises but never shipped: sensitive-data/PII redaction, configurable content rules, and tool-call argument validation.
 The crate is self-contained (layer 2): it owns the models, the guardrail abstraction, the ordered pipeline, the parsers, and the rule engine; it never imports `openjiuwen-runner`, so any caller (agent, workflow, tool, CLI, harness) can run a scan synchronously in-process.
-Vendor/cloud moderation services are a trait seam only (`ModerationClient`); no HTTP transport and no local model runtime live here.
+Vendor/cloud moderation services are a trait seam only (`GuardrailBackend` + `ModerationTransport`); no HTTP transport and no local model runtime live here.
 
 ## Security Model
 
@@ -24,7 +24,8 @@ Rules:
 - Failures are never silent: every failure is stored in `GuardrailOutcome::errors` and logged at `warn` (target `openjiuwen_security::pipeline`); the fail-open default is chosen for parity and is documented, not hidden.
 - A guardrail never panics on untrusted content; a malformed user-supplied regex is a construction error (`Error::Validation`), not a panic.
 - Findings and reports never carry raw matched text: `details` holds pattern names, rule names, counts, and scores only; `GuardrailOutcome::redacted()` additionally runs every `details` value through `openjiuwen_common::security::redact_json`.
-- Debated/unknown risk types degrade to the literal `"unknown"` in messages (Python parity).
+- Unknown/missing risk types degrade to the literal `"unknown"` in messages (Python parity).
+- Finding messages: blocking at `CRITICAL` → `"Critical security risk detected: <risk_type>"` (Python `AbortError` reason); blocking at a lowered `block_level` → `"Guardrail blocked: <risk_type> risk detected"` (Python `GuardrailError` message); non-blocking findings → `"Security finding: <risk_type> (level=<LEVEL>)"`. `GuardrailOutcome::enforce()` returns `Error::Security(<message>)` for the first blocking finding.
 
 ## API Surface
 
@@ -51,7 +52,7 @@ pipeline:   GuardrailPipeline { add/add_arc/extend/guardrails/policy } running g
             run(&GuardrailContext) -> GuardrailOutcome; scan_text/scan_user_input/scan_prompt/scan_model_output/scan_tool_input/scan_tool_output helpers
 config:     SecurityConfig { enabled, policy, targets, prompt_injection, sensitive_data, content_rules, tool_arguments } with default()/protected()/pipeline() -> Result<GuardrailPipeline>
             SecurityPolicy { block_level = Critical, failure_policy = FailOpen, stop_on_block = true }, FailurePolicy { FailOpen, FailClosed },
-            ScanTargets { user_input, model_output, tool_input, tool_output } (all true)
+            ScanTargets { prompts, user_input, model_outputs, tool_inputs, tool_outputs } (all true; stages() maps them to ScanStage)
 report:     RedactedOutcome { decision, risk_level, findings, errors, guardrails, stage } (serde + Display summary)
 rules:      shared regex engine (compiled rules, case-insensitive search, marker redaction) used by every built-in detector
 parsers:    ModelOutputParser trait; BertBinaryParser, QwenGuardParser (see ./src/parsers/CONTEXT.md)
@@ -88,7 +89,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - `./src/rules.rs` → shared regex rule engine and redaction primitives
 - `./src/parsers/` → model-output parsers (`BertBinaryParser`, `QwenGuardParser`) (`src/parsers/CONTEXT.md`)
 - `./src/backends/` → prompt-injection/moderation backends and their configs (`src/backends/CONTEXT.md`)
-- `./src/guardrails/` → built-in guardrails: prompt injection, sensitive data, content rules, tool arguments, moderation seam (`src/guardrails/CONTEXT.md`)
+- `./src/guardrails/` → built-in guardrails: prompt injection, sensitive data, content rules, tool arguments (`src/guardrails/CONTEXT.md`)
 - `./tests/` → crate-level behavior suites (models, pipeline, prompt injection, sensitive data, tool arguments, config, integration helpers)
 
 ## Test Strategy
@@ -99,7 +100,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - `tests/sensitive_data.rs` — email/phone/card/id/secret detection, Luhn rejection, redaction output (`<REDACTED>`), `modified_data.sanitized_text`, no false positives on benign text, custom patterns/extra patterns, marker override.
 - `tests/tool_arguments.rs` — denied/allowed tool names, shell-injection patterns in arguments, nested JSON argument traversal, sensitive-data redaction inside arguments, stage binding (tool input only).
 - `tests/config.rs` — every default preserved (Python `PromptInjectionGuardrailConfig`/`RuleBasedBackendConfig` fields and values), `SecurityConfig::default()` scans nothing, `protected()` enables the default set, `pipeline()` validation errors, full serde round-trip.
-- `tests/helpers.rs` — `scan_prompt`/`scan_model_output`/`scan_tool_input`/`scan_tool_output` context shapes (stages, metadata `tool_name`/`message_count`), `enforce()` on blocked outcomes, `RedactedOutcome` contains no original secrets, `ModerationGuardrail` with a fake client.
+- `tests/helpers.rs` — `scan_prompt`/`scan_model_output`/`scan_tool_input`/`scan_tool_output` context shapes (stages, metadata `tool_name`/`message_count`), `enforce()` on blocked outcomes, `RedactedOutcome` contains no original secrets, and an `ApiModelBackend` over a fake `ModerationTransport` feeding `BertBinaryParser`.
 - Behavior-port tests cite the Python test they mirror in a comment (`// ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py`).
 - Gates: `cargo fmt -p openjiuwen-security`, `cargo test -p openjiuwen-security`, `cargo clippy -p openjiuwen-security --all-targets -- -D warnings` all clean offline.
 
@@ -120,7 +121,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - `LocalModelBackend` has no inference runtime: constructor and config are preserved (parity of fields/defaults), `analyze` returns `Error::Unsupported`. Python needs `torch`/`transformers`.
 - `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
 - No process-global registration helper: Python's `register_guardrail`/`unregister_guardrail` bind to `Runner.callback_framework`; the runner crate owns that wiring (see `docs/PARITY.md` security row).
-- No vendor moderation adapters (OpenAI/阿里云/Azure content safety); `ModerationClient` is the seam.
+- No vendor moderation adapters (OpenAI/阿里云/Azure content safety); `GuardrailBackend` + `backends::ModerationTransport` are the seam (`ApiModelBackend` plus a parser is the adapter shape).
 - Python quirks deliberately not reproduced: `PromptInjectionGuardrail.with_rules()` (documented but never defined), double-registration bookkeeping bug, and `GuardrailContext(content_type=type(None))` fallback.
 
 ## Python Mapping
