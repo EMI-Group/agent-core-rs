@@ -26,7 +26,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -37,22 +37,13 @@ use openjiuwen_foundation::llm::{
 };
 use openjiuwen_foundation::prompt::BaseMessage;
 
+use crate::internal::{lock, DEFAULT_FALLBACK_TEXT};
 use crate::responses::{text_chunks, MockCompletion};
 
-/// The Python default fallback text of `MockLLMModel`.
-const DEFAULT_FALLBACK_TEXT: &str = "Default mock response";
 /// The default provider name, chosen so a scripted model is obvious in logs.
 const DEFAULT_PROVIDER: &str = "scripted";
 /// The default model name; also what an unfilled [`ChatResponse::model`] gets.
 const DEFAULT_MODEL_NAME: &str = "scripted-model";
-
-/// Locks a mutex, recovering the guard from a poisoned lock instead of panicking.
-///
-/// Test infrastructure must never turn one failing test into a poisoned-lock
-/// panic for every later test in the same process.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// A failure a scripted turn can produce, with the error category to raise.
 ///
