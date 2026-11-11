@@ -74,8 +74,8 @@ State semantics (contract for every implementor):
 
 - `WorkflowSession::new(session_id)` / `with_config` / `with_parent`, `create_workflow_session(WorkflowSessionOptions)`, `state() -> Arc<WorkflowState>`, `dump_state()`, `create_node_session(component_id) -> NodeSession`, `save_checkpoint`, `resume`.
 - `NodeSession` — a component-scoped child view: executable id `parent.executable + "." + component_id`; global reads pass through, component reads/writes nest under its executable id, streaming/tracing delegate, `end_stream`/`close` are no-ops.
-- `AgentSession::new` / `create_agent_session(AgentSessionOptions)` — agent/team state (`global` + `agent` lanes), agent id/name metadata, env access, `create_workflow_session()` sharing the agent session id and hub, `commit(checkpoint_id)`, `resume`.
-- `AgentTeamSession::new` / `create_agent_team_session(AgentTeamSessionOptions)` — team id, global lane, `create_agent_session(agent_id)` child carrying `source_agent_id`/`source_team_id`.
+- `AgentSession::new` / `create_agent_session(AgentSessionOptions)` — agent/team state (`global` + `agent` lanes), agent id/name metadata, env access, `create_workflow_session()` sharing the agent session id and hub, `commit()`, idempotent `post_run()`, `resume`.
+- `AgentTeamSession::new` / `create_agent_team_session(AgentTeamSessionOptions)` — team id (default `DEFAULT_TEAM_ID = "agent_team"`), global lane, `create_agent_session(agent_id)` child carrying `source_agent_id`/`source_team_id`, `commit()`/`flush_checkpoint()`, idempotent `post_run()`.
 - Every session shares `Arc<StreamHub>` + `Arc<StreamWriterManager>` down to children; config and tracer are shared by reference; each session tracks its own interaction broker.
 
 ### `state` — state stores (`src/state/`)
