@@ -22,3 +22,13 @@ pub mod template;
 pub mod tokens;
 pub mod tool_call;
 pub mod usage;
+
+pub use content::{AudioPart, ContentPart, FilePart, ImageUrl, MessageContent};
+pub use message::BaseMessage;
+pub use role::Role;
+pub use template::{PromptTemplate, TemplateContent};
+#[cfg(feature = "tiktoken")]
+pub use tokens::TiktokenCounter;
+pub use tokens::{count_message_tokens, truncate_messages, ApproxTokenCounter, TokenCounter};
+pub use tool_call::{ToolCall, ToolCallAccumulator, ToolCallDelta};
+pub use usage::Usage;
