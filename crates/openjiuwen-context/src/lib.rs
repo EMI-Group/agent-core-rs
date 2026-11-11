@@ -73,7 +73,7 @@ pub use config::{
     DEFAULT_CONTEXT_TOKENS,
 };
 pub use context::{ContextState, ConversationContext, ModelContext};
-pub use engine::{ContextEngine, ContextOptions, PrepareOptions};
+pub use engine::{ContextEngine, ContextOptions, PrepareOptions, DEFAULT_SESSION_ID};
 pub use events::{
     CompressReport, CompressionStatus, ContextEvent, ContextEventKind, ObserveOutcome,
     RecoveryOutcome,
