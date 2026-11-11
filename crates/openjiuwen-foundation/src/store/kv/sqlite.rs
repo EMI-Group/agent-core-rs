@@ -38,8 +38,14 @@ const KIND_TEXT: &str = "text";
 /// `kind` tag for a byte value.
 const KIND_BYTES: &str = "bytes";
 
-/// SQL predicate selecting only live rows, given the bound "now" parameter.
-const LIVE: &str = "(expiry_ms IS NULL OR expiry_ms > ?)";
+/// SQL predicate selecting only live rows, with the "now" placeholder explicit.
+///
+/// The placeholder index is spelled out (`?N`): `SQLite` numbers a bare `?`
+/// relative to the numbered placeholders around it, so mixing `?1` with a bare
+/// `?` makes the positional binding of "now" land on the key parameter.
+fn live_at(index: usize) -> String {
+    format!("(expiry_ms IS NULL OR expiry_ms > ?{index})")
+}
 
 /// A key-value store backed by a `SQLite` database.
 ///
@@ -93,11 +99,14 @@ impl SqliteKvStore {
 
     /// Number of live rows.
     pub async fn len(&self) -> Result<usize> {
-        let row = sqlx::query(&format!("SELECT COUNT(*) AS n FROM kv_store WHERE {LIVE}"))
-            .bind(now_epoch_ms())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(Error::external)?;
+        let row = sqlx::query(&format!(
+            "SELECT COUNT(*) AS n FROM kv_store WHERE {}",
+            live_at(1)
+        ))
+        .bind(now_epoch_ms())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Error::external)?;
         let count: i64 = row.try_get("n").map_err(Error::external)?;
         Ok(usize::try_from(count).unwrap_or(0))
     }
@@ -127,7 +136,8 @@ impl KvStore for SqliteKvStore {
 
     async fn get(&self, key: &str) -> Result<Option<KvValue>> {
         let row = sqlx::query(&format!(
-            "SELECT value, kind FROM kv_store WHERE k = ?1 AND {LIVE}"
+            "SELECT value, kind FROM kv_store WHERE k = ?1 AND {}",
+            live_at(2)
         ))
         .bind(key)
         .bind(now_epoch_ms())
@@ -139,7 +149,8 @@ impl KvStore for SqliteKvStore {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         let row = sqlx::query(&format!(
-            "SELECT 1 AS found FROM kv_store WHERE k = ?1 AND {LIVE}"
+            "SELECT 1 AS found FROM kv_store WHERE k = ?1 AND {}",
+            live_at(2)
         ))
         .bind(key)
         .bind(now_epoch_ms())
@@ -189,8 +200,9 @@ impl KvStore for SqliteKvStore {
     async fn get_by_prefix(&self, prefix: &str) -> Result<BTreeMap<String, KvValue>> {
         let rows = sqlx::query(&format!(
             "SELECT k, value, kind FROM kv_store
-             WHERE substr(k, 1, length(?1)) = ?1 AND {LIVE}
-             ORDER BY k"
+             WHERE substr(k, 1, length(?1)) = ?1 AND {}
+             ORDER BY k",
+            live_at(2)
         ))
         .bind(prefix)
         .bind(now_epoch_ms())
@@ -207,7 +219,8 @@ impl KvStore for SqliteKvStore {
 
     async fn delete_by_prefix(&self, prefix: &str) -> Result<usize> {
         let result = sqlx::query(&format!(
-            "DELETE FROM kv_store WHERE substr(k, 1, length(?1)) = ?1 AND {LIVE}"
+            "DELETE FROM kv_store WHERE substr(k, 1, length(?1)) = ?1 AND {}",
+            live_at(2)
         ))
         .bind(prefix)
         .bind(now_epoch_ms())

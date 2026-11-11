@@ -24,6 +24,9 @@ pub mod kv;
 pub mod object;
 pub mod vector;
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(feature = "sqlite")]
 pub use document::SqliteDocumentStore;
 pub use document::{Document, DocumentStore, Query, SortOrder};
