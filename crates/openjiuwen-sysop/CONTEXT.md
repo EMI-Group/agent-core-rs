@@ -111,11 +111,11 @@ binary sniffing, decode/encode), `env` (`ExecutionEnvironment`, `resolve_environ
 | `config.py` (`LocalWorkConfig`, sandbox models) | `config.rs`, `sandbox/config.rs` |
 | `fs.py`, `shell.py`, `code.py` (ABCs) | `operation.rs` traits |
 | `result/{fs,shell,code}_operation_result.py`, `result/base_result.py` | `fs::types`, `shell::types`, `code::types`, `result.rs` |
-| `local/fs_operation.py` (1755 lines) | `fs/local.rs`, `fs/slice.rs`, `fs/list.rs`, `fs/search.rs`, `fs/ext.rs` |
+| `local/fs_operation.py` (1755 lines) | `fs/local.rs`, `fs/read.rs`, `fs/write.rs`, `fs/transfer.rs`, `fs/slice.rs`, `fs/list.rs`, `fs/search.rs`, `fs/ext.rs` |
 | `local/shell_operation.py` (1049 lines) | `shell/local.rs`, `shell/allowlist.rs`, `shell/plan.rs` |
 | `local/code_operation.py` | `code/local.rs` |
-| `local/utils.py` (`OperationUtils`, streaming decoding) | `env.rs`, `shell/local.rs`, `code/local.rs` |
-| `local/_text_encoding.py`, `_rw_lock_manager.py` | `encoding.rs`, `fs/local.rs` (in-process per-path locks) |
+| `local/utils.py` (`OperationUtils`, streaming decoding) | `env.rs`, `shell/process.rs`, `code/local.rs` |
+| `local/_text_encoding.py`, `_rw_lock_manager.py` | `encoding.rs`, `fs/local.rs` (in-process per-path locks, shared by `fs/read.rs`/`fs/write.rs`/`fs/transfer.rs`) |
 | `cwd.py` (`get_cwd`/`get_workspace`) | `workspace::PathPolicy` |
 | `execution_environment.py` | `env.rs` |
 | `shell_process_registry.py` | `shell/registry.rs` |
@@ -279,7 +279,10 @@ Code (`local/test_code_operation.py`):
   lookups (`python3`, `node`, `bash`) skip with an explanatory message when missing.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
   `cargo test -p openjiuwen-sysop --features sandbox`,
-  `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings`.
+  `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings`,
+  `cargo clippy -p openjiuwen-sysop --all-targets --features sandbox -- -D warnings`.
+- Current counts: 245 unit tests (1 `#[ignore]`d live sandbox probe), 113 integration tests
+  (99 without the feature), 29 doc tests.
 
 ## Routing Table
 
@@ -296,12 +299,13 @@ Code (`local/test_code_operation.py`):
 - `./src/util.rs` → timestamp formatting, octal permissions, SHA-256, UTF-8-safe truncation
 - `./src/tool.rs` → `OperationToolSpec` generation from parameter schemas
 - `./src/constants.rs` → defaults shared by the backends
-- `./src/fs/` → filesystem types and the local backend (`local`, `slice`, `list`, `search`, `ext`)
+- `./src/fs/` → filesystem types and the local backend (`local`, `read`, `write`, `transfer`, `slice`, `list`, `search`, `ext`); module layout in `src/fs/CONTEXT.md`
 - `./src/shell/types.rs` → `ShellType`, `ShellExecParams`, `ShellArgvParams`, `ShellOutput`, `ShellChunk`, `ShellBackgroundOutput`
 - `./src/shell/allowlist.rs` → `CommandFilter`: first-token allowlist (quote-aware splitter) and dangerous-pattern deny list
 - `./src/shell/plan.rs` → `resolve_plan` per `ShellType` and OS, absolute-path literal extraction
 - `./src/shell/registry.rs` → `ShellProcessRegistry`: per-session cancellation tokens, RAII registration, `global()`
-- `./src/shell/local.rs` → `LocalShellOperation` and the shared bounded-capture/timeout engine (`pub(crate) mod process`)
+- `./src/shell/local.rs` → `LocalShellOperation`: policy gates, spawn plan, trait impls, facade tests
+- `./src/shell/process.rs` → shared child-process engine: hardened spawn, bounded capture + truncation, timeout/cancellation, streaming, background stderr
 - `./src/code/types.rs` → `Language`, `CodeExecParams`, `CodeOutput`, `CodeChunk`
 - `./src/code/local.rs` → `LocalCodeOperation`: runtime lookup, inline/temp-file strategy, forced env
 - `./src/sandbox/` → gateway config, provider registry, sandbox dispatch + forwarding backends, HTTP gateway client (feature `sandbox`)
@@ -330,12 +334,13 @@ Code (`local/test_code_operation.py`):
   claim is exposed separately as `configured_conditional_write`.
 - Streams must be `'static`; use `self: Arc<Self>` receivers and `async_stream::try_stream!`,
   yielding a single error chunk on failure instead of returning `Err`.
-- The local shell and code backends share `crate::shell::local::process` (`spawn_child`,
+- The local shell and code backends share `crate::shell::process` (`spawn_child`,
   `apply_environment`, `run_captured`, `stream_child`); never re-implement bounded capture,
-  timeout, or cancellation inside `code/local.rs`.
+  timeout, or cancellation inside `code/local.rs`. (`shell/local.rs` keeps a `pub(crate)` alias
+  so `crate::shell::local::process` still resolves.)
+- fs `read_file`/`write_file`/upload/download live in `src/fs/{read,write,transfer}.rs`; keep the
+  trait impls in `fs/local.rs` one-line delegations and share the single per-path lock map.
 - Shell gate order is blank command → deny list → allowlist → cwd/sandbox → shell plan, so a
   rejected command never spawns a child; `CommandFilter::check` reports the deny list first.
 - `<lang> is not supported` is unrepresentable here (`Language` is a closed enum), and
   `CodeExecParams::encoding` is accepted but ignored: decoding is UTF-8 lossy.
-- `src/shell/local.rs` carries the facade plus the shared engine (~1000 lines of code plus
-  ~350 lines of tests); if it grows further, extract `process` into `src/shell/process.rs`.
