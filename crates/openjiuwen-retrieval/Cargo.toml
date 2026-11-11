@@ -10,18 +10,21 @@ publish = false
 
 [dependencies]
 openjiuwen-common.workspace = true
-openjiuwen-foundation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
 async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true
-tracing.workspace = true
 uuid.workspace = true
 regex.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
+url.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
 
 [features]
 default = []

@@ -23,6 +23,7 @@ futures.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
 reqwest.workspace = true
+bytes.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
@@ -37,6 +38,7 @@ sha2.workspace = true
 indexmap.workspace = true
 rmcp = { workspace = true, optional = true }
 tiktoken-rs = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock.workspace = true
@@ -46,6 +48,7 @@ tempfile.workspace = true
 default = ["mcp", "tiktoken"]
 mcp = ["dep:rmcp"]
 tiktoken = ["dep:tiktoken-rs"]
+sqlite = ["dep:sqlx"]
 live-tests = []
 
 [lints]
