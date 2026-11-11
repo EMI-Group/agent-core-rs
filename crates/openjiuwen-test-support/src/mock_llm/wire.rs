@@ -16,10 +16,8 @@ use openjiuwen_foundation::prompt::{ToolCall, ToolCallDelta, Usage};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use crate::internal::FUNCTION_KIND;
 use crate::responses::{MockCompletion, MockToolCall};
-
-/// The wire kind every built-in provider uses for tool calls.
-const FUNCTION_KIND: &str = "function";
 
 /// The assistant role name in an `OpenAI` message.
 const ROLE_ASSISTANT: &str = "assistant";

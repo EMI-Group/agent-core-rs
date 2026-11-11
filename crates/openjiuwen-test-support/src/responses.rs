@@ -24,8 +24,7 @@ use openjiuwen_foundation::prompt::{
 };
 use serde_json::Value;
 
-/// The wire kind every built-in provider uses for tool calls.
-const FUNCTION_KIND: &str = "function";
+use crate::internal::FUNCTION_KIND;
 
 /// Returns `Some(value)` when the string is non-empty.
 fn non_empty(value: String) -> Option<String> {
@@ -571,6 +570,108 @@ mod tests {
                 },
                 StreamChunk::Done,
             ]
+        );
+    }
+
+    #[test]
+    fn content_and_tool_calls_keep_their_positional_order() {
+        let mut completion = MockCompletion::text("hello")
+            .with_reasoning("thinking")
+            .with_usage(Usage::new(3, 2))
+            .with_finish_reason(FinishReason::ToolCalls);
+        completion.push_tool_call(MockToolCall::new("add", json!({"a": 1})));
+        completion.push_tool_call(MockToolCall::new("lookup", json!({"city": "Paris"})));
+
+        // role, content+reasoning, tool delta, tool delta, usage, finish, done
+        assert_eq!(
+            completion.to_chunks(),
+            vec![
+                StreamChunk::Delta {
+                    index: 0,
+                    role: Some(Role::Assistant),
+                    content: None,
+                    reasoning: None,
+                    tool_call: None,
+                    finish_reason: None,
+                },
+                StreamChunk::Delta {
+                    index: 0,
+                    role: None,
+                    content: Some("hello".to_owned()),
+                    reasoning: Some("thinking".to_owned()),
+                    tool_call: None,
+                    finish_reason: None,
+                },
+                StreamChunk::Delta {
+                    index: 0,
+                    role: None,
+                    content: None,
+                    reasoning: None,
+                    tool_call: Some(ToolCallDelta {
+                        index: Some(0),
+                        id: Some("call_add".to_owned()),
+                        name: Some("add".to_owned()),
+                        arguments: Some("{\"a\":1}".to_owned()),
+                    }),
+                    finish_reason: None,
+                },
+                StreamChunk::Delta {
+                    index: 0,
+                    role: None,
+                    content: None,
+                    reasoning: None,
+                    tool_call: Some(ToolCallDelta {
+                        index: Some(1),
+                        id: Some("call_lookup".to_owned()),
+                        name: Some("lookup".to_owned()),
+                        arguments: Some("{\"city\":\"Paris\"}".to_owned()),
+                    }),
+                    finish_reason: None,
+                },
+                StreamChunk::Usage(Usage::new(3, 2)),
+                StreamChunk::Delta {
+                    index: 0,
+                    role: None,
+                    content: None,
+                    reasoning: None,
+                    tool_call: None,
+                    finish_reason: Some(FinishReason::ToolCalls),
+                },
+                StreamChunk::Done,
+            ]
+        );
+
+        let chunks = completion.to_chunks();
+        assert_eq!(chunks.len(), 7);
+        match &chunks[1] {
+            StreamChunk::Delta {
+                content,
+                reasoning,
+                tool_call,
+                ..
+            } => {
+                assert_eq!(content.as_deref(), Some("hello"));
+                assert_eq!(reasoning.as_deref(), Some("thinking"));
+                assert!(
+                    tool_call.is_none(),
+                    "the content delta must not carry a tool call"
+                );
+            }
+            other => panic!("frame 1 must be the content delta, got {other:?}"),
+        }
+        assert!(
+            chunks[..2].iter().all(|chunk| !matches!(
+                chunk,
+                StreamChunk::Delta {
+                    tool_call: Some(_),
+                    ..
+                }
+            )),
+            "no tool-call fragment may precede the content delta"
+        );
+        assert!(
+            chunks[2..4].iter().all(|chunk| chunk.content().is_none()),
+            "tool-call deltas must not repeat the text content"
         );
     }
 

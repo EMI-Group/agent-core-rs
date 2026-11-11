@@ -6,9 +6,11 @@
 //! `tests/unit_tests/fixtures/mock_llm.py`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{header, HeaderMap, HeaderValue, Method, Uri};
+use openjiuwen_common::error::ErrorKind;
 use openjiuwen_foundation::llm::{FinishReason, StreamChunk};
 use openjiuwen_foundation::prompt::Usage;
 use serde_json::{json, Value};
@@ -648,4 +650,65 @@ fn recorded_request_accessors_read_the_body() {
     };
     assert_eq!(empty.messages(), Vec::<Value>::new());
     assert_eq!(empty.user_texts(), Vec::<String>::new());
+}
+
+// --- waiting ----------------------------------------------------------------
+
+/// A minimal recording: enough to bump the counter and wake a waiter.
+fn recorded(model: Option<&str>) -> RecordedRequest {
+    RecordedRequest {
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
+        query: None,
+        headers: BTreeMap::new(),
+        body: json!({"messages": []}),
+        raw_body: String::new(),
+        stream: false,
+        model: model.map(str::to_owned),
+        response_id: None,
+    }
+}
+
+/// Ports the waiter contract of `MockLLMServer.wait_for_request`: a waiter
+/// registered before the recording must still observe it, and a count that is
+/// already satisfied returns without awaiting.
+#[tokio::test]
+async fn wait_for_requests_registers_before_rechecking_the_count() {
+    let state = Arc::new(default_state());
+
+    tokio::time::timeout(Duration::from_millis(50), state.wait_for_requests(0))
+        .await
+        .expect("count 0 returns immediately");
+
+    let recorder = Arc::clone(&state);
+    let record_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        recorder.record(recorded(Some("gpt-4o")));
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), state.wait_for_requests(1))
+        .await
+        .expect("the waiter wakes on the first recording");
+    record_task.await.expect("the recorder task finishes");
+
+    assert_eq!(state.request_count(), 1);
+    assert_eq!(
+        state
+            .last_request()
+            .and_then(|request| request.model)
+            .as_deref(),
+        Some("gpt-4o")
+    );
+
+    // No second request ever arrives, so waiting for two must expire.
+    let error = state
+        .wait_for_requests_timeout(2, Duration::from_millis(20))
+        .await
+        .expect_err("a second request never arrives");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(
+        error.message().contains("wait_for_requests(2)"),
+        "{}",
+        error.message()
+    );
 }

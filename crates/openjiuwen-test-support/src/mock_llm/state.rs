@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use openjiuwen_common::error::{Error, Result};
@@ -20,29 +20,20 @@ use openjiuwen_foundation::llm::StreamChunk;
 use serde_json::Value;
 use tokio::sync::Notify;
 
+use crate::internal::DEFAULT_FALLBACK_TEXT;
 use crate::responses::MockCompletion;
 
 use super::wire::MockHttpError;
 
-/// Text served when the script queue is exhausted.
-///
-/// Python parity: `tests/unit_tests/fixtures/mock_llm.py` answers every
-/// unmatched call with `"Default mock response"`.
-pub(crate) const DEFAULT_FALLBACK_TEXT: &str = "Default mock response";
+/// Re-exported so [`MockLlmServer`](super::MockLlmServer) can keep using
+/// `state::lock` for its task handle without a second mutex helper.
+pub(crate) use crate::internal::lock;
 
 /// Prefix of the deterministic response ids (`chatcmpl-<prefix><seq>`).
 pub(crate) const DEFAULT_ID_PREFIX: &str = "mock-";
 
 /// Model name reported when a scripted turn names no model.
 pub(crate) const DEFAULT_MODEL_NAME: &str = "mock-model";
-
-/// Locks `mutex`, recovering from a poisoned guard instead of panicking.
-///
-/// Test infrastructure must not turn one panicking test into a cascade of
-/// failures, so a poisoned lock is treated as "the data is still usable".
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// One entry of the script queue: a whole completion, a frame sequence, or an
 /// HTTP error.
@@ -343,9 +334,13 @@ impl ServerState {
         loop {
             // Register for the wake-up before checking the counter, so a
             // recording that lands between the check and the await is not lost.
+            // `enable()`'s result only says whether a wake-up was consumed; it
+            // must never short-circuit the count check, because that would
+            // return before `count` requests have arrived.
             let notified = self.notify.notified();
             tokio::pin!(notified);
-            if notified.as_mut().enable() || self.request_count() >= count {
+            let _ = notified.as_mut().enable();
+            if self.request_count() >= count {
                 return;
             }
             notified.await;

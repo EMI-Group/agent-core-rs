@@ -28,6 +28,18 @@
 //! binds loopback only.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+// Dev-only test infrastructure, so the ergonomic allowances below are inherited
+// from the sibling library crates (`crates/openjiuwen-foundation/src/lib.rs`)
+// rather than paid for with ceremony no test author benefits from:
+// - `missing_errors_doc`/`missing_panics_doc`: every helper that can fail returns
+//   a documented `Result` on a short signature; the docs live on the module.
+// - `must_use_candidate`/`module_name_repetitions`/`too_many_arguments`/
+//   `items_after_statements`/`unused_async`/`significant_drop_tightening`/
+//   `manual_let_else`/`needless_pass_by_value`: wire projection and fixture
+//   ergonomics — builder chains, short synchronous lock sections, and by-value
+//   `impl Into<String>` parameters stay readable without extra annotations.
+// - `cast_possible_truncation`/`cast_sign_loss`: deterministic counter and
+//   wire-index casts bounded by the number of scripted turns.
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -45,6 +57,9 @@
 mod assert_json;
 mod eventually;
 mod fixtures;
+// Crate-private shared constants and the poison-recovering mutex helper; its
+// items are `pub(crate)` and intentionally not re-exported as public API.
+mod internal;
 mod mock_llm;
 mod responses;
 mod scripted_model;

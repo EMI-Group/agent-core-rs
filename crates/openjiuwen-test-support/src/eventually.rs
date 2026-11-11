@@ -22,6 +22,48 @@ pub const DEFAULT_EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default pause between two predicate evaluations (10 ms).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Failure wording of [`eventually`] and its interval/default-timeout variants.
+const EVENTUALLY_FAILURE: &str = "eventually: predicate did not become true";
+
+/// Failure wording of [`eventually_some`].
+const EVENTUALLY_SOME_FAILURE: &str = "eventually_some: no value became available";
+
+/// Polls `probe` every `interval` until it yields `Some` or `timeout` elapses.
+///
+/// `failure` is the message stem shared by every timeout error of one public
+/// helper, so `eventually` and `eventually_some` keep their distinct (and
+/// documented) wording while running the same loop.
+///
+/// The probe is evaluated at least once. Between attempts the task sleeps
+/// `interval.min(remaining)`, so a failing wait neither busy-spins nor
+/// oversleeps its deadline; no clock other than [`Instant`] is read.
+async fn poll_until<F, Fut, T>(
+    interval: Duration,
+    timeout: Duration,
+    failure: &str,
+    mut probe: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut polled = false;
+    loop {
+        if polled {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::timeout(format!("{failure} within {timeout:?}")));
+            }
+            sleep(interval.min(remaining)).await;
+        }
+        polled = true;
+        if let Some(value) = probe().await {
+            return Ok(value);
+        }
+    }
+}
+
 /// Polls `predicate` until it returns `true` or `timeout` elapses.
 ///
 /// The predicate is evaluated at least once. Between attempts the task sleeps
@@ -59,23 +101,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + timeout;
-    let mut polled = false;
-    loop {
-        if polled {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::timeout(format!(
-                    "eventually: predicate did not become true within {timeout:?}"
-                )));
-            }
-            sleep(interval.min(remaining)).await;
-        }
-        polled = true;
-        if predicate().await {
-            return Ok(());
-        }
-    }
+    poll_until(interval, timeout, EVENTUALLY_FAILURE, move || {
+        // The predicate future is created before the async block so the block
+        // owns it and never borrows the closure's captured state.
+        let evaluated = predicate();
+        async move { evaluated.await.then_some(()) }
+    })
+    .await
 }
 
 /// Polls `predicate` until it yields `Some` or `timeout` elapses.
@@ -89,28 +121,18 @@ where
 ///
 /// Returns [`Error::timeout`] once the budget is exhausted:
 /// `eventually_some: no value became available within <timeout>`.
-pub async fn eventually_some<F, Fut, T>(timeout: Duration, mut predicate: F) -> Result<T>
+pub async fn eventually_some<F, Fut, T>(timeout: Duration, predicate: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + timeout;
-    let mut polled = false;
-    loop {
-        if polled {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::timeout(format!(
-                    "eventually_some: no value became available within {timeout:?}"
-                )));
-            }
-            sleep(DEFAULT_POLL_INTERVAL.min(remaining)).await;
-        }
-        polled = true;
-        if let Some(value) = predicate().await {
-            return Ok(value);
-        }
-    }
+    poll_until(
+        DEFAULT_POLL_INTERVAL,
+        timeout,
+        EVENTUALLY_SOME_FAILURE,
+        predicate,
+    )
+    .await
 }
 
 /// [`eventually`] with [`DEFAULT_EVENTUALLY_TIMEOUT`].
@@ -210,6 +232,63 @@ mod tests {
 
         assert_eq!(value, 42);
         assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn timeout_messages_are_exact() {
+        let error = eventually(Duration::from_millis(10), || ready(false))
+            .await
+            .expect_err("never true");
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(
+            error.message(),
+            "eventually: predicate did not become true within 10ms"
+        );
+
+        let error =
+            eventually_with_interval(Duration::from_millis(5), Duration::from_millis(10), || {
+                ready(false)
+            })
+            .await
+            .expect_err("never true");
+        assert_eq!(
+            error.message(),
+            "eventually: predicate did not become true within 10ms"
+        );
+
+        let error = eventually_some(Duration::from_millis(10), || ready(None::<u32>))
+            .await
+            .expect_err("no value");
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(
+            error.message(),
+            "eventually_some: no value became available within 10ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn some_stops_at_the_first_value_within_a_short_budget() {
+        let polls = AtomicUsize::new(0);
+
+        let value = eventually_some(Duration::from_millis(30), || {
+            let poll = polls.fetch_add(1, Ordering::SeqCst);
+            ready((poll >= 1).then_some("first"))
+        })
+        .await
+        .expect("a value becomes available");
+
+        assert_eq!(value, "first");
+        assert_eq!(polls.load(Ordering::SeqCst), 2, "stops at the first `Some`");
+
+        let polls = AtomicUsize::new(0);
+        let value = eventually_some(Duration::from_millis(30), || {
+            polls.fetch_add(1, Ordering::SeqCst);
+            ready(Some(7_u32))
+        })
+        .await
+        .expect("the first poll already yields a value");
+        assert_eq!(value, 7);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
