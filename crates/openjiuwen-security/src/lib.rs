@@ -38,9 +38,13 @@
 //!   [`TextMatch`], Luhn, redaction).
 //! - [`parsers`] — [`ModelOutputParser`] and the built-in
 //!   [`BertBinaryParser`] and [`QwenGuardParser`] with their [`Thresholds`].
+//! - [`backends`] — detection backends
+//!   ([`RuleBasedPromptInjectionBackend`], [`LlmPromptInjectionBackend`],
+//!   [`ApiModelBackend`], [`LocalModelBackend`]) with their configs and the
+//!   [`ModerationTransport`] seam.
 //!
-//! The `backends` and `guardrails` modules (concrete detectors and moderation
-//! adapters) arrive in the next phase.
+//! The `guardrails` module (the built-in detectors that bind backends to scan
+//! stages) arrives in the next phase.
 //!
 //! # Example
 //!
@@ -93,6 +97,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod backends;
 pub mod config;
 pub mod context;
 pub mod finding;
@@ -104,6 +109,12 @@ pub mod report;
 pub mod result;
 pub mod rules;
 
+pub use backends::{
+    ApiModelBackend, ApiModelBackendConfig, LlmPromptInjectionBackend,
+    LlmPromptInjectionBackendConfig, LocalModelBackend, LocalModelBackendConfig, ModelInfo,
+    ModerationRequest, ModerationTransport, RuleBasedBackendConfig,
+    RuleBasedPromptInjectionBackend,
+};
 pub use config::{FailurePolicy, ScanTargets, SecurityPolicy};
 pub use context::{
     GuardrailContext, ScanStage, EVENT_LLM_INVOKE_INPUT, EVENT_LLM_INVOKE_OUTPUT,
