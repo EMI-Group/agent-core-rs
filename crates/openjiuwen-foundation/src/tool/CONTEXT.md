@@ -52,5 +52,5 @@ Ports `openjiuwen/core/foundation/tool/` (`base.py`, `function/function.py`, `se
 - `./traits.rs` → `Tool` trait, `ToolOutput`, render helpers
 - `./function.rs` → `FunctionTool`, `FunctionToolBuilder`, `ToolHandler`
 - `./schema.rs` → schema derivation, default filling, validation, OpenAI tool arrays
-- `./restful.rs` → `RestfulApiTool`, `RestfulApiConfig`, `ApiParamMapper`, response envelope
+- `./restful/` → `RestfulApiTool`, `RestfulApiConfig`, `ApiParamMapper`, response envelope (`restful/mod.rs`, `config.rs`, `mapper.rs`, `tool.rs`)
 - `./mcp/` → `McpServerConfig`, `McpClient` transports, `McpTool`, `McpToolResult` (`mcp/CONTEXT.md`)
