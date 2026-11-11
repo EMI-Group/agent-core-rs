@@ -210,7 +210,7 @@ Provider-neutral SPI with no workspace dependencies: `HarnessProtocol`, `Harness
 - No central config file, matching Python. Configs are typed structs at call sites; YAML is only for packaged resources (prompts, templates, skills).
 - Environment variables: `OPENJIUWEN_HOME`, `OPENJIUWEN_API_KEY`, `OPENJIUWEN_SERVER_URL`, `OPENJIUWEN_BASH_STRICT`, `OPENJIUWEN_MCP_RECONNECT_ATTEMPTS`, `OPENJIUWEN_OTEL_GLOBAL_INSTRUMENT_ENABLE`, plus `API_KEY`, `API_BASE`, `MODEL_PROVIDER`, `MODEL_NAME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`.
 - `.env` loading is opt-in (`dotenvy`) at binary entry points only, never in library constructors.
-- Secrets use a `SecretString` wrapper that redacts in `Debug` and serialization; never log API keys.
+- Secrets use a `SecretString` wrapper that redacts in `Debug` and logging; serialization preserves the value so configuration round-trips, and credentials are never logged.
 
 ## 5. Feature flags
 

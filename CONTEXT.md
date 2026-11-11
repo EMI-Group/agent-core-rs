@@ -31,6 +31,6 @@ Python package `openjiuwen.<pkg>` maps to crate `openjiuwen-<pkg>`; `openjiuwen-
 
 - `./crates/` → workspace crates, dependency layers, and per-crate responsibilities (`crates/CONTEXT.md`)
 - `./docs/` → architecture and parity documentation (`docs/CONTEXT.md`)
-- `./examples/` → runnable examples mirroring Python `examples/` (`examples/CONTEXT.md`)
+- `./crates/openjiuwen-examples/` → runnable examples mirroring Python `examples/` (`crates/CONTEXT.md`)
 - `./Cargo.toml` → workspace manifest, shared dependency versions, lints
 - `./Makefile` → build/test/lint entry points
