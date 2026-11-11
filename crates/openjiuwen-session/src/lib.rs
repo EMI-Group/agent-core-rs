@@ -3,8 +3,8 @@
 //! Maps to the Python package `openjiuwen.core.session` in the openJiuwen
 //! reference implementation. The crate is the kernel's stable seam for
 //! per-run execution context: state lanes, stream frames, and interaction
-//! requests/responses, checkpoint persistence, and trace positions. The concrete
-//! session types and the full tracer land in later phases.
+//! requests/responses, checkpoint persistence, and trace spans and frames. The
+//! concrete session types land in later phases.
 //!
 //! Modules:
 //!
@@ -18,8 +18,11 @@
 //!   [`interaction::InteractionBroker`].
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
 //!   [`checkpoint::Checkpoint`] model, and the memory/file persistence backends.
-//! - [`tracer`] — trace positions persisted with checkpoints (the full tracer
-//!   lands in a later phase).
+//! - [`tracer`] — trace spans ([`tracer::TraceSpan`]), frames
+//!   ([`tracer::TraceFrame`]), sinks ([`tracer::TraceSink`],
+//!   [`tracer::MemoryTraceSink`], [`tracer::StreamTraceSink`]), the
+//!   [`tracer::Tracer`] span factory, and the [`tracer::TracePosition`]
+//!   persisted with checkpoints.
 //!
 //! The types most consumers need are re-exported at the crate root:
 //! [`SessionConfig`], the default ids and stream constants ([`DEFAULT_NODE_ID`],
@@ -33,7 +36,11 @@
 //! [`StreamWriterManager`]), and checkpointing ([`Checkpointer`], [`Checkpoint`],
 //! [`CheckpointMeta`], [`CheckpointNamespace`], [`CheckpointerConfig`],
 //! [`CheckpointerKind`], [`MemoryCheckpointer`], [`FileCheckpointer`],
-//! [`build_key`], [`build_key_with_namespace`], and the namespace constants).
+//! [`build_key`], [`build_key_with_namespace`], and the namespace constants),
+//! and tracing ([`Tracer`], [`TraceSpan`], [`TraceFrame`], [`TraceSink`],
+//! [`MemoryTraceSink`], [`StreamTraceSink`], [`NoopTraceSink`],
+//! [`TraceSpanKind`], [`TraceFrameType`], [`TracePosition`], [`SpanHandle`],
+//! [`InvokeType`], [`SpanStatus`]).
 #![forbid(unsafe_code)]
 
 pub mod checkpoint;
@@ -63,3 +70,7 @@ pub use state::{
     WORKFLOW_STATE_KEY, WORKFLOW_STATE_UPDATES_KEY,
 };
 pub use stream::{StreamEvent, StreamHub, StreamItem, StreamMode, StreamWriterManager};
+pub use tracer::{
+    InvokeType, MemoryTraceSink, NoopTraceSink, SpanHandle, SpanStatus, StreamTraceSink,
+    TraceFrame, TraceFrameType, TracePosition, TraceSink, TraceSpan, TraceSpanKind, Tracer,
+};
