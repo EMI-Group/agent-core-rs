@@ -44,10 +44,6 @@ pub struct MemoryEngine {
     stores: MemoryStores,
     /// Typed record/embedding persistence over `stores`.
     storage: MemoryStorage,
-    /// Conversation history on the document store; the facade reaches it through
-    /// [`MemoryEngine::message_store`].
-    #[allow(dead_code)] // read through the crate-internal `message_store` seam
-    messages: MessageStore,
     /// Optional embedding model; absent means keyword-only recall.
     embedding: Option<Arc<dyn Embedding>>,
     /// Optional LLM kept for message-history extraction.
@@ -128,12 +124,10 @@ impl MemoryEngineBuilder {
     pub fn build(self) -> Result<Arc<MemoryEngine>> {
         self.config.validate()?;
         let storage = MemoryStorage::new(self.stores.clone());
-        let messages = MessageStore::new(self.stores.document.clone());
         Ok(Arc::new(MemoryEngine {
             config: self.config,
             stores: self.stores,
             storage,
-            messages,
             embedding: self.embedding,
             model: self.model,
             token_counter: self.token_counter,
