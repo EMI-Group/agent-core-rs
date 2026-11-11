@@ -16,7 +16,6 @@ openjiuwen-graph.workspace = true
 openjiuwen-retrieval.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-schemars.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -26,7 +25,6 @@ parking_lot.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 regex.workspace = true
-indexmap.workspace = true
 
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
