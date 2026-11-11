@@ -14,10 +14,7 @@ serde_json.workspace = true
 schemars.workspace = true
 thiserror = "2"
 async-trait.workspace = true
-tokio.workspace = true
 futures.workspace = true
-uuid.workspace = true
-chrono.workspace = true
 
 [features]
 default = []
