@@ -14,6 +14,15 @@ checklist; this file records only what is specific to this subtree.
 - `local::LocalFsOperation` — `new(config)`, `policy()`, `config()`, `impl FsOperation` (all ten
   Python methods, `supports_conditional_write() == true`) and `impl FsExtOperation`
   (`stat`, `exists`, `mkdir`, `delete`, `copy`, `move_path`, `search_files_with`).
+- `read::{read_file, read_file_stream}` — `pub(crate)` entry points behind the two read trait
+  methods; `prepare_read_stream`, `load_for_read`, `read_bytes_locked` are the private steps.
+- `write::write_file` — `pub(crate)` entry point behind the write trait method;
+  `validate_write`, `write_locked`, `version_conflict`, `apply_permissions` are private.
+- `transfer::{upload_file, upload_file_stream, download_file, download_file_stream}` —
+  `pub(crate)` entry points behind the four transfer trait methods; `prepare_upload`,
+  `prepare_download`, `transfer`, `transfer_stream`, `copy_file`, `copy_chunks` are private.
+- `local::{read_guard, write_guard, acquire_ordered}` are `pub(crate)` so the sibling modules
+  can take locks; `local::{LockMode, PathGuard, len_u64}` are the shared lock/byte helpers.
 - `list::{list_files, list_directories, file_system_item}` — directory listing with recursion,
   depth, suffix filter and sorting; `file_system_item` is the single `FileSystemItem` constructor
   shared with search.
@@ -29,6 +38,12 @@ checklist; this file records only what is specific to this subtree.
 - Every caller-supplied path goes through `PathPolicy`; the only exceptions are the HOST side of a
   transfer (upload source, download destination), which Python never sandbox-checks and which are
   only tilde-expanded and canonicalized.
+- `local.rs` is the facade and the only place the lock map lives: the trait impls there are
+  one-line delegations (`read::read_file(self, params).await`, `transfer::upload_file_stream(self,
+  params)`, …), so behavior changes belong in the sibling module, never in the delegation.
+- The sibling modules never touch the lock map directly: they call
+  `LocalFsOperation::{read_guard, write_guard, acquire_ordered}`, which keep the ordering,
+  poisoning-recovery, and mode-merge rules in one place.
 - Failures are `OpResult` values (`fs_failure(execution, reason)`, code 199003; code 199011 with
   message `file version conflict` for a rejected conditional write). Nothing panics.
 - Blocking work stays off the async task: `walkdir` walks run in `spawn_blocking`; file I/O is
@@ -60,9 +75,8 @@ checklist; this file records only what is specific to this subtree.
 
 ## Known Issues / Deviations
 
-- `local.rs` is ~1065 implementation lines plus a ~850-line test module: the assigned file set makes
-  it the only home for the facade, lock map, read/write and the transfer/stream machinery (the
-  rationale is in its module docs). Splitting it would need a new `read.rs`/`transfer.rs` module.
+- `local.rs` holds the facade, the lock map, and the shared fixtures only (~420 lines); read,
+  write, and transfer logic each live in their own module next to their tests.
 - `stat` on a LIVE symlink reports the resolved target (`is_symlink == false`) because `PathPolicy`
   canonicalizes the longest existing prefix; only a dangling link is reported as a symlink.
 - `split_lines_keep_ends` does not split exotic Unicode line separators (`\v`, `\f`, `\u{1c}`–`\u{1e}`,
@@ -76,21 +90,30 @@ checklist; this file records only what is specific to this subtree.
 
 ## Test Strategy
 
-- 45 module-level unit tests plus the slice helper tests, all offline and deterministic
-  (`tempfile` workspaces, no network, no host locale): `slice.rs` (validation order, line splitting,
-  selection, chunk math, write-content composition), `local.rs` (read text/bytes/slicing/max-size/
-  binary policy/traversal denial/symlink escape, write newline + conditional semantics with a
-  byte-identical file, transfers incl. permissions, stream shapes), `list.rs`, `search.rs` and
-  `ext.rs` cover their own modules.
+- 45 module-level unit tests live beside the code they exercise, all offline and deterministic
+  (`tempfile` workspaces, no network, no host locale):
+  `slice.rs` (validation order, line splitting, selection, chunk math, write-content composition),
+  `read.rs` (read text/bytes/slicing/max-size/binary policy/traversal denial/symlink escape, text
+  and byte stream shapes, the empty-file and tail terminal-chunk cases), `write.rs` (newline
+  defaults, append semantics, flag-combination rejection, stale-digest and `create_if_absent`
+  conflicts with a byte-identical file), `transfer.rs` (upload/download paths, parent creation,
+  overwrite refusal, permissions, empty-source and multi-chunk stream shapes), `list.rs`,
+  `search.rs` and `ext.rs` cover their own modules.
+- `local.rs` keeps the delegation tests (`list_files`/`search_files`/ext ops) and the constructor
+  tests, plus `#[cfg(test)] pub(crate) mod test_util` with the fixtures the sibling test modules
+  import (`backend`, `restricted`, `canonical`, `read_back`); it holds no behavior tests of its own.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop --offline`,
   `cargo clippy -p openjiuwen-sysop --all-targets --offline -- -D warnings`,
   `cargo test -p openjiuwen-sysop --features sandbox --offline`.
 
 ## Routing Table
 
-- `./mod.rs` → `local_fs` factory, module declarations
+- `./mod.rs` → `local_fs` factory, module declarations (public types/list/search/ext/slice, crate-private read/write/transfer)
 - `./types.rs` → frozen parameter/data types (`ReadFileParams`, `WriteFileParams`, `FileSystemItem`, ext types)
-- `./local.rs` → `LocalFsOperation`, lock map, read/write/upload/download and their streams, trait impls
+- `./local.rs` → `LocalFsOperation` facade, `new`/`policy`/`config`, per-path lock map (`read_guard`, `write_guard`, `acquire_ordered`, `LockMode`, `PathGuard`), `len_u64`, delegating trait impls, shared `test_util` fixtures
+- `./read.rs` → `read_file`, `read_file_stream`, `prepare_read_stream`, `load_for_read`, `read_bytes_locked`, read stream plan types
+- `./write.rs` → `write_file`, `validate_write`, `write_locked`, conditional compare-and-swap, permission application
+- `./transfer.rs` → `upload_file`/`download_file` (+ streams), `prepare_upload`/`prepare_download`, ordered-lock copy engine, chunk streaming, host-path expansion
 - `./slice.rs` → pure read validation/slicing, chunk sizes, write-content composition
 - `./list.rs` → `list_files`, `list_directories`, directory walker, `file_system_item`, sorting
 - `./search.rs` → `search_files` (glob + regex), exclude patterns
