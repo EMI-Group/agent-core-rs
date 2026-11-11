@@ -13,13 +13,15 @@ openjiuwen-common.workspace = true
 openjiuwen-session.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
 async-trait.workspace = true
+async-stream.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
-uuid.workspace = true
-indexmap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
