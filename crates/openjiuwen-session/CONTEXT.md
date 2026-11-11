@@ -11,9 +11,9 @@ Every graph node, workflow component, agent, team, and runner receives `Arc<dyn 
 ### `session` — the contract (`src/session.rs`)
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionType { Agent, AgentTeam, Workflow, Node }
+pub enum SessionType { #[default] Workflow, Agent, AgentTeam, Node }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -49,6 +49,8 @@ pub trait Session: Send + Sync {
     fn metadata(&self) -> SessionMetadata;                       // derived from id/parent/kind
     fn checkpointer(&self) -> Option<Arc<dyn Checkpointer>> { None }
     fn tracer(&self) -> Option<&Tracer> { None }
+    fn config(&self) -> Option<Arc<RwLock<SessionConfig>>> { None }      // parking_lot::RwLock
+    fn writers(&self) -> Option<Arc<StreamWriterManager>> { None }
     fn subscribe(&self) -> BoxStream<'static, Result<StreamEvent>>;   // empty by default
     async fn resolve_interaction(&self, response: InteractionResponse) -> Result<()>;
     async fn end_stream(&self) -> Result<()> { Ok(()) }
@@ -72,15 +74,15 @@ State semantics (contract for every implementor):
 
 ### `sessions` — concrete sessions (`src/sessions/`)
 
-- `WorkflowSession::new(session_id)` / `with_config` / `with_parent`, `create_workflow_session(WorkflowSessionOptions)`, `state() -> Arc<WorkflowState>`, `dump_state()`, `create_node_session(component_id) -> NodeSession`, `save_checkpoint`, `resume`.
-- `NodeSession` — a component-scoped child view: executable id `parent.executable + "." + component_id`; global reads pass through, component reads/writes nest under its executable id, streaming/tracing delegate, `end_stream`/`close` are no-ops.
-- `AgentSession::new` / `create_agent_session(AgentSessionOptions)` — agent/team state (`global` + `agent` lanes), agent id/name metadata, env access, `create_workflow_session()` sharing the agent session id and hub, `commit()`, idempotent `post_run()`, `resume`.
-- `AgentTeamSession::new` / `create_agent_team_session(AgentTeamSessionOptions)` — team id (default `DEFAULT_TEAM_ID = "agent_team"`), global lane, `create_agent_session(agent_id)` child carrying `source_agent_id`/`source_team_id`, `commit()`/`flush_checkpoint()`, idempotent `post_run()`.
+- `WorkflowSession::new(session_id)` / `with_options(WorkflowSessionOptions)`, `create_workflow_session(WorkflowSessionOptions)`, `workflow_id()`, `state() -> Arc<WorkflowState>`, `dump_state()`, `commit_user_inputs(inputs)`, `create_node_session(component_id) -> NodeSession`, `save_checkpoint`, `resume`; a parentless session without an id generates a `uuid_hex()`, a parented one defaults to the parent id.
+- `NodeSession` — a component-scoped child view: executable id `parent.executable + "." + component_id` (the base is the parent's `metadata().entity_id`, else its id); global reads pass through, component reads/writes nest under its executable id, streaming/tracing/interaction/snapshot delegate, `end_stream`/`close` are no-ops; its checkpoint entity id is the executable id.
+- `AgentSession::new` / `create_agent_session(AgentSessionOptions)` — agent state (`global_state` + `agent_state` lanes), agent id/name/description metadata, `env(key) -> Option<Value>` / `envs()`, `create_workflow_session()` sharing the agent session id, config, hub and trace id but owning an independent workflow state, `commit() -> Result<Option<String>>`, idempotent `post_run()` (`end_stream` when `close_stream_on_post_run`, then commit), `resume`.
+- `AgentTeamSession::new` / `create_agent_team_session(AgentTeamSessionOptions)` — team id (default `DEFAULT_TEAM_ID = "agent_team"`), `global_state`/`agent_state` lanes, `create_agent_session(agent_id)` child with `parent_session_id` = team session id, own session id, `source_agent_id`/`source_team_id` metadata when `source_metadata_enabled`, and the team's hub/config/checkpointer/trace id, `commit()`/`flush_checkpoint()`, idempotent `post_run()`.
 - Every session shares `Arc<StreamHub>` + `Arc<StreamWriterManager>` down to children; config and tracer are shared by reference; each session tracks its own interaction broker.
 
 ### `state` — state stores (`src/state/`)
 
-- `StateStore` trait (used by every session): `get_global`, `update_global`, `get_component`, `update_component`, `components`, `dump`, `restore`, `trace_state`, `update_trace`.
+- `StateStore` trait (used by every session): `get_global`, `update_global`, `write_global`, `get_component`, `update_component`, `components`, `dump`, `restore`, `trace_state`, `update_trace`; `write_global` is the committed-lane write sessions use (the default forwards to `update_global`, which may stage).
 - `WorkflowState` — Python `CommitState`: lanes `io_state`, `global_state`, `comp_state`, `workflow_state`, `trace_state`; per-node staging (`update`/`update_global`/`update_workflow`/`update_component`), `commit(node_id: Option<&str>)`, `rollback(node_id)`, `updates()`, `set_updates()`, `inputs()`, `outputs(node_id)`, `set_outputs`, `commit_user_inputs`, `get_by_schema`, `node(node_id, parent_id)` sharing lanes, `dump()`.
 - `AgentState` — Python agent/team `StateCollection`: `global_state` + `agent_state` lanes, no staging, `dump()` = `{"global_state":…, "agent_state":…}`.
 - `paths` helpers: `get_value`, `set_value`, `remove_value`, `get_by_prefix`, `apply_patch` (Python `update_dict`), `is_ref_path`/`extract_origin_key` for `${node.field}`.
@@ -226,6 +228,9 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - **One `TraceSpan`** with a `kind` discriminator replaces Python's `TraceAgentSpan`/`TraceWorkflowSpan` class pair; wire keys stay camelCase, and the two frame types (`tracer_agent`, `tracer_workflow`) are preserved.
 - **No process-global checkpointer singleton.** Python's `CheckpointerFactory` default singleton is replaced by explicit `Arc<dyn Checkpointer>` injection at construction; facades above own the instance, which keeps tests isolated and avoids undocumented global mutable state.
 - **No ambient session ContextVar.** Python's `get_current_session`/`with_session` decorators exist to smuggle a session into components; Rust passes `Arc<dyn Session>` explicitly, so the ambient mechanism is not ported.
+- **Session state writes bypass staging.** `Session::update_state` must be immediately visible to `Session::get_state`, so sessions call `StateStore::write_global` (a committed-lane merge) rather than `update_global`, which `WorkflowState` stages for the graph/workflow commit cycle.
+- **Workflow sessions expose a visible global lane.** `WorkflowSession` builds `WorkflowState::with_global_lane(false)` (not the workflow-only `WorkflowState::new()`), so the documented `Session` semantics — an empty `get_state("")` key returns the whole global object — hold for a parentless workflow too.
+- **A team's child agent session owns its own session id** and records `parent_session_id`; Python instead reuses the team's session id for every member. Sharing one id would make member checkpoints collide, so the Rust port separates them while keeping the shared hub/config/trace id.
 - **`InteractionDecision` wire values follow Python's approval vocabulary** (`allow`, `allow_always`, `deny`) rather than the harness protocol's (`allow_for_session`, `abort`); the mapping table below is the only coupling.
 
 ## Python Mapping
@@ -272,7 +277,8 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 ## Test Strategy
 
 - Unit tests beside modules for pure helpers (`state::paths`, config env resolution, checkpoint key building, tracer times); integration tests under `./tests/` for cross-module behavior.
-- Integration files: `tests/state.rs`, `tests/stream.rs`, `tests/interaction.rs`, `tests/checkpoint.rs`, `tests/tracer.rs`, `tests/config.rs`, and `tests/checkpoint_sqlite.rs` (feature-gated), with the shared backend contract in `tests/support/mod.rs`.
+- Integration files: `tests/state.rs`, `tests/stream.rs`, `tests/interaction.rs`, `tests/checkpoint.rs`, `tests/tracer.rs`, `tests/config.rs`, `tests/sessions.rs`, and `tests/checkpoint_sqlite.rs` (feature-gated), with the shared backend contract in `tests/support/mod.rs`.
+- `tests/sessions.rs` pins the contract through `Arc<dyn Session>` with a minimal inline fake (so the provided `metadata`/`snapshot`/`restore`/`save_checkpoint`/`resume`/`subscribe` defaults are what runs) and covers all four concrete sessions, the workflow child of an agent, team source metadata, checkpoint round-trips, and concurrent updates.
 - Covered suites: state paths/merge/`null` deletion/dotted paths, nested component ids, staging commit/rollback, concurrent updates, stream ordering + multiple subscribers + end marker + late subscribers + mode filtering, interaction approve/reject/answer/timeout/cancellation/seeded answers, checkpoint save/load/list/latest/delete/release/exists round-trips on memory/file/sqlite, the backend contract (ordering, overwrite, invalid ids), tracer span lifecycle, child linking, kind/frame mapping, sink recording and position, config env resolution and defaults.
 - Deterministic and offline: no network, no sleeps except short `tokio::time::timeout` guards, `tempfile` for file/sqlite backends, monotonic assertions instead of timing assertions.
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/session/state/test_...`).
@@ -284,3 +290,6 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - Python's checkpoint payloads are pickles; only JSON-compatible state is preserved, so Python-produced pickles cannot be read.
 - Tracer extensions: no OTel (that lives in `openjiuwen-extensions`), no process-global handler registry — sinks are injected per session.
 - `SubWorkflowSession`'s id-flattening quirk and `RouterSession`'s selective no-ops are not ported; nested workflows use a plain child `WorkflowSession`.
+- Concrete sessions install a `StreamTraceSink`, which does not track a `TracePosition`, so their checkpoints carry `trace: None`; a trace position round-trips only through sinks that implement `position`/`set_position` (for example `MemoryTraceSink`).
+- `AgentSession::dump_state`/`AgentTeamSession::dump_state` expose exactly `global_state` + `agent_state`; Python's agent dump also includes `trace_state`. The trace lane is reachable through `state().trace_state()`.
+- Python's `SubWorkflowSession`/team-session state sharing (members writing into the team's global lane) is not reproduced: every child session owns an independent state store.
