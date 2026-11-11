@@ -197,7 +197,8 @@ pub struct ModelOption {
   pub extensions: JsonObject,     // {}
 }
 ```
-- `ModelSelection` / `ModelChoice` `Validate`: both `model` and `effort` `None` → `"model selection must set a model, an effort, or both"` / `"model choice must set a model, an effort, or both"`; a provided value must be non-empty after trim → `"{kind} {field} must be a non-empty string when provided"` (`kind` = `"model selection"` / `"model choice"`).
+- `ModelSelection` `Validate`: both `model` and `effort` `None` → `"model selection must set a model, an effort, or both"`; a provided value must be non-empty after trim → `"model selection {field} must be a non-empty string when provided"`.
+- `ModelChoice` `Validate` (Python parity): an all-`None` choice is **valid** (it asks the provider for its default); provided `model`/`effort` must be non-empty after trim → `"model choice {field} must be a non-empty string when provided"`; a present `endpoint` is validated.
 - `ModelChoice::is_builtin(&self) -> bool` = `endpoint.is_none()`.
 - `ModelEndpoint` `Validate`: `api_base`/`provider` both `None` → `"model endpoint must set an api_base, a provider, or both"`; provided values non-empty → `"model endpoint {field} must be a non-empty string when provided"`. Manual `Debug` redacts `api_key`.
 - `ModelOption` `Validate`: `model_id` non-empty (`"model option model_id must not be empty"`); every effort non-empty (`"model option efforts must be non-empty strings"`); when `efforts` non-empty, `default_effort` (if set) must be a member (`"model option default_effort must be one of its efforts"`).
@@ -658,6 +659,8 @@ Decode:
 8. `HarnessContext` is not serde-serializable (holds live host services) — Python did not serialize it either.
 9. `HarnessModelControl` convenience methods `send_auto`/`abort_graceful` replace Python keyword defaults.
 10. No runtime `isinstance` protocol checks (Python `@runtime_checkable`); Rust trait bounds provide the guarantee at compile time.
+11. Capability enums expose `as_str()` (the Python `.value`) so error messages can be sorted by wire value exactly like Python's `sorted(c.value …)`.
+12. `ModelSelection` rejects an all-`None` selection (Python rule, ported); `ModelChoice` accepts it (Python parity — the provider chooses), while still rejecting blank strings.
 
 ## 8. Public surface checklist (must exist and be re-exported from `lib.rs`)
 
