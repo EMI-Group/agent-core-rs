@@ -19,6 +19,13 @@
 //! - Python's `END_FRAME` sentinel is filtered out of user-visible output there;
 //!   here the completion marker is a distinct event and frames matching
 //!   [`END_FRAME`] can still be recognised through [`StreamItem::is_end`].
+//! - Publishing is synchronous at heart: [`StreamHub::send_now`] and
+//!   [`StreamWriterManager::write_now`] never await, so synchronous producers
+//!   (trace sinks, plain callbacks) can emit frames. [`StreamHub::send`] and
+//!   [`StreamWriterManager::write`] are `async` wrappers that await nothing;
+//!   they exist for API symmetry with Python's `await writer.write(...)` and so
+//!   future backends can become genuinely asynchronous without a breaking
+//!   change.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -182,10 +189,10 @@ pub enum StreamEvent {
 /// Bounded, multi-subscriber transport for [`StreamItem`] frames.
 ///
 /// A hub owns a `tokio` broadcast channel plus a closed flag. Producers call
-/// [`StreamHub::send`]; consumers call [`StreamHub::subscribe`] and receive
-/// ordered events. Sends never block: a full per-subscriber buffer makes that
-/// subscriber skip its oldest frames with a warning, so a slow consumer cannot
-/// stall the workflow.
+/// [`StreamHub::send_now`] (or the `async` [`StreamHub::send`] wrapper);
+/// consumers call [`StreamHub::subscribe`] and receive ordered events. Sends
+/// never block: a full per-subscriber buffer makes that subscriber skip its
+/// oldest frames with a warning, so a slow consumer cannot stall the workflow.
 ///
 /// A hub without subscribers accepts and drops frames; that is the normal case
 /// for workflows that are not being observed.
@@ -229,7 +236,13 @@ impl StreamHub {
         self.capacity
     }
 
-    /// Publish a frame to every current subscriber.
+    /// Publish a frame to every current subscriber, without awaiting.
+    ///
+    /// This is the canonical send path. It performs no I/O and never awaits, so
+    /// it is safe to call from synchronous code (a trace sink emitting frames
+    /// from a plain function, for example) as well as from async tasks. The
+    /// underlying transport is `tokio::sync::broadcast::Sender::send`, which is
+    /// itself synchronous.
     ///
     /// # Errors
     ///
@@ -237,7 +250,7 @@ impl StreamHub {
     /// (Python error 111132). Sending to a closed hub, or to a hub without
     /// subscribers, is not an error: the frame is dropped and `Ok(())` is
     /// returned.
-    pub fn send(&self, item: StreamItem) -> Result<()> {
+    pub fn send_now(&self, item: StreamItem) -> Result<()> {
         if item.payload.is_null() {
             return Err(Error::validation("stream payload is null"));
         }
@@ -255,6 +268,25 @@ impl StreamHub {
             Ok(_receivers) => Ok(()),
             Err(broadcast::error::SendError(_)) => Ok(()),
         }
+    }
+
+    /// Publish a frame to every current subscriber.
+    ///
+    /// Async wrapper around [`StreamHub::send_now`]: nothing is awaited
+    /// internally, so it completes on the first poll. It is kept `async` for
+    /// API symmetry with Python's `await writer.write(...)` and so a future
+    /// backend can introduce real await points without a breaking change.
+    /// Synchronous producers should call [`StreamHub::send_now`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`StreamHub::send_now`]: [`Error::Validation`] for a `Null`
+    /// payload; a closed hub or a hub without subscribers drops the frame and
+    /// returns `Ok(())`.
+    // The missing `.await` is intentional: the wrapper exists for API symmetry.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn send(&self, item: StreamItem) -> Result<()> {
+        self.send_now(item)
     }
 
     /// Subscribe to this hub.
@@ -366,14 +398,17 @@ impl StreamWriterManager {
         &self.hub
     }
 
-    /// Write `item` to the hub when its mode is enabled.
+    /// Write `item` to the hub when its mode is enabled, without awaiting.
+    ///
+    /// This is the canonical write path; see [`StreamHub::send_now`] for why it
+    /// is safe to call from synchronous code.
     ///
     /// # Errors
     ///
-    /// Propagates [`StreamHub::send`] errors (a `Null` payload is
+    /// Propagates [`StreamHub::send_now`] errors (a `Null` payload is
     /// [`Error::Validation`]). Writing a disabled mode is not an error: the
     /// frame is dropped and `Ok(())` is returned.
-    pub fn write(&self, item: StreamItem) -> Result<()> {
+    pub fn write_now(&self, item: StreamItem) -> Result<()> {
         if !self.enables(item.mode) {
             tracing::debug!(
                 mode = item.mode.as_str(),
@@ -381,7 +416,27 @@ impl StreamWriterManager {
             );
             return Ok(());
         }
-        self.hub.send(item)
+        self.hub.send_now(item)
+    }
+
+    /// Write `item` to the hub when its mode is enabled.
+    ///
+    /// Async wrapper around [`StreamWriterManager::write_now`]: nothing is
+    /// awaited internally, so it completes on the first poll. It is kept
+    /// `async` for API symmetry with Python's `await writer.write(...)` and so
+    /// a future backend can introduce real await points without a breaking
+    /// change. Synchronous producers should call
+    /// [`StreamWriterManager::write_now`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`StreamWriterManager::write_now`]: [`Error::Validation`] for a
+    /// `Null` payload; a disabled mode, a closed hub, or a hub without
+    /// subscribers drops the frame and returns `Ok(())`.
+    // The missing `.await` is intentional: the wrapper exists for API symmetry.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn write(&self, item: StreamItem) -> Result<()> {
+        self.write_now(item)
     }
 
     /// Subscribe to the underlying hub; see [`StreamHub::subscribe`].
@@ -399,5 +454,103 @@ impl StreamWriterManager {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.hub.is_closed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+
+    use openjiuwen_common::error::{ErrorKind, Result};
+
+    use super::{StreamEvent, StreamHub, StreamItem, StreamMode, StreamWriterManager};
+
+    /// Upper bound on how long a deterministic in-memory receive may take.
+    const RECV_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Receive one event, failing the test instead of hanging when none arrives.
+    async fn recv(stream: &mut BoxStream<'static, Result<StreamEvent>>) -> StreamEvent {
+        tokio::time::timeout(RECV_TIMEOUT, stream.next())
+            .await
+            .expect("a stream event arrives before the timeout")
+            .expect("the stream is still open")
+            .expect("the stream yields Ok events")
+    }
+
+    #[tokio::test]
+    async fn send_now_delivers_from_a_synchronous_context() {
+        let hub = StreamHub::new();
+        let mut stream = hub.subscribe();
+
+        // Publishing from a plain OS thread proves the synchronous path needs no
+        // async context at all.
+        let sender = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            sender
+                .send_now(StreamItem::output_at(
+                    "llm_output",
+                    0,
+                    json!({ "delta": "a" }),
+                ))
+                .expect("the synchronous send path accepts the frame");
+        })
+        .join()
+        .expect("the sending thread finishes");
+
+        match recv(&mut stream).await {
+            StreamEvent::Item(item) => {
+                assert_eq!(item.mode, StreamMode::Output);
+                assert_eq!(item.item_type, "llm_output");
+                assert_eq!(item.index, Some(0));
+                assert_eq!(item.payload, json!({ "delta": "a" }));
+            }
+            StreamEvent::End => panic!("the end marker must not precede the frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_now_drops_disabled_modes_and_rejects_null_payloads() {
+        let hub = StreamHub::new();
+        let manager = StreamWriterManager::with_modes(hub.clone(), vec![StreamMode::Output]);
+        let mut stream = manager.subscribe();
+
+        manager
+            .write_now(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
+            .expect("a disabled trace mode is a no-op");
+        manager
+            .write_now(StreamItem::custom(json!({ "k": "v" })))
+            .expect("a disabled custom mode is a no-op");
+        manager
+            .write_now(StreamItem::output_at(
+                "llm_output",
+                0,
+                json!({ "delta": "hi" }),
+            ))
+            .expect("the enabled mode is written");
+        manager.close();
+
+        // The disabled frames never reach the hub: the output frame is first.
+        match recv(&mut stream).await {
+            StreamEvent::Item(item) => {
+                assert_eq!(item.mode, StreamMode::Output);
+                assert_eq!(item.item_type, "llm_output");
+                assert_eq!(item.payload, json!({ "delta": "hi" }));
+            }
+            StreamEvent::End => panic!("the enabled output frame must be delivered"),
+        }
+        assert_eq!(recv(&mut stream).await, StreamEvent::End);
+
+        let error = hub
+            .send_now(StreamItem::output("llm_output", None, Value::Null))
+            .expect_err("a null payload is rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert_eq!(error.to_string(), "validation: stream payload is null");
     }
 }

@@ -639,7 +639,7 @@ impl InteractionBroker {
         }
 
         let index = self.inner.index.fetch_add(1, Ordering::SeqCst);
-        if let Err(error) = writer.write(request.to_stream_item(index)) {
+        if let Err(error) = writer.write(request.to_stream_item(index)).await {
             self.remove_pending(&request.id);
             return Err(error);
         }

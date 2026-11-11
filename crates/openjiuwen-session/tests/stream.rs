@@ -31,13 +31,14 @@ async fn recv(stream: &mut BoxStream<'static, Result<StreamEvent>>) -> StreamEve
 }
 
 /// Send five numbered output frames through `hub`.
-fn send_five(hub: &StreamHub) {
+async fn send_five(hub: &StreamHub) {
     for index in 0..5 {
         hub.send(StreamItem::output_at(
             "llm_output",
             index,
             json!({ "delta": index.to_string() }),
         ))
+        .await
         .unwrap();
     }
 }
@@ -67,7 +68,7 @@ async fn outputs_are_delivered_in_order_then_end() {
     let hub = StreamHub::new();
     let mut stream = hub.subscribe();
 
-    send_five(&hub);
+    send_five(&hub).await;
     hub.close();
 
     let payloads = collect_payloads(&mut stream, 5).await;
@@ -90,7 +91,7 @@ async fn two_subscribers_observe_the_same_sequence() {
     let mut first = hub.subscribe();
     let mut second = hub.subscribe();
 
-    send_five(&hub);
+    send_five(&hub).await;
     hub.close();
 
     let first_payloads = collect_payloads(&mut first, 5).await;
@@ -110,6 +111,7 @@ async fn null_payload_is_a_validation_error() {
 
     let error = hub
         .send(StreamItem::output("llm_output", None, Value::Null))
+        .await
         .expect_err("a null payload is rejected");
 
     assert_eq!(error.kind(), ErrorKind::Validation);
@@ -139,6 +141,7 @@ async fn disabled_modes_are_dropped() {
 
     manager
         .write(StreamItem::trace("tracer_agent", json!({ "invoke": 1 })))
+        .await
         .unwrap();
     manager
         .write(StreamItem::output_at(
@@ -146,9 +149,11 @@ async fn disabled_modes_are_dropped() {
             0,
             json!({ "delta": "hi" }),
         ))
+        .await
         .unwrap();
     manager
         .write(StreamItem::custom(json!({ "k": "v" })))
+        .await
         .unwrap();
     manager.close();
 
@@ -247,6 +252,7 @@ async fn send_without_subscribers_and_after_close_is_ok() {
         Some(0),
         json!({ "delta": "x" }),
     ))
+    .await
     .expect("an unobserved stream accepts frames");
 
     hub.close();
@@ -256,6 +262,7 @@ async fn send_without_subscribers_and_after_close_is_ok() {
         Some(1),
         json!({ "delta": "y" }),
     ))
+    .await
     .expect("sending after close is a no-op");
     hub.close();
     assert!(hub.is_closed(), "close is idempotent");
