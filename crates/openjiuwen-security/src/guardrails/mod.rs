@@ -12,10 +12,14 @@
 //! - [`prompt_injection`] — Python's `PromptInjectionGuardrail`: rule-based,
 //!   remote-model, or local-model prompt-injection detection bound to the model
 //!   input and tool-output stages.
-//!
-//! Detectors that are not implemented yet are declared by their own files when
-//! they land; this module only re-exports what exists.
+//! - [`sensitive_data`] — PII/secret detection with redaction.
+//! - [`content_rules`] — ordered user-supplied regex rules.
+//! - [`tool_arguments`] — tool allow/deny lists, argument patterns, and PII in
+//!   tool-call arguments.
 
+pub mod content_rules;
 pub mod prompt_injection;
+pub mod sensitive_data;
+pub mod tool_arguments;
 
 pub use prompt_injection::{PromptInjectionGuardrail, PromptInjectionGuardrailConfig};
