@@ -1,0 +1,5 @@
+error: `#[tool]` supports at most two parameters: the argument struct and an optional `&ToolContext`
+  --> tests/ui/fail/three_params.rs:13:50
+   |
+13 | async fn too_many(args: Args, ctx: &ToolContext, extra: i64) -> i64 {
+   |                                                  ^^^^^

@@ -2052,6 +2052,7 @@ name = "openjiuwen-macros"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "proc-macro2",

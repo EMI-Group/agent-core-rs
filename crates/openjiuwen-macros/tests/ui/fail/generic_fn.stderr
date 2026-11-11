@@ -1,0 +1,5 @@
+error: `#[tool]` does not support generic functions
+ --> tests/ui/fail/generic_fn.rs:5:10
+  |
+5 | async fn generic<T: Default>(_args: T) -> i64 {
+  |          ^^^^^^^

@@ -1,0 +1,5 @@
+error: `#[tool]` can only be applied to a free `async fn`
+ --> tests/ui/fail/non_async.rs:5:4
+  |
+5 | fn sync_tool() {}
+  |    ^^^^^^^^^

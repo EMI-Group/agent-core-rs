@@ -1,0 +1,5 @@
+error: `exposure` must be `"direct"` or `"deferred"`
+ --> tests/ui/fail/bad_exposure.rs:4:19
+  |
+4 | #[tool(exposure = "always")]
+  |                   ^^^^^^^^

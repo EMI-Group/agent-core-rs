@@ -1,0 +1,5 @@
+error: `execution` must be `"server"` or `"client"`
+ --> tests/ui/fail/bad_execution.rs:4:20
+  |
+4 | #[tool(execution = "local")]
+  |                    ^^^^^^^

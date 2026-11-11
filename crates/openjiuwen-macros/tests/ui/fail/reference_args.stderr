@@ -1,0 +1,5 @@
+error: the argument parameter must be taken by value
+  --> tests/ui/fail/reference_args.rs:12:25
+   |
+12 | async fn borrowed(args: &Args) -> i64 {
+   |                         ^

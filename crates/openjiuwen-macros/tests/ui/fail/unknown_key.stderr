@@ -1,0 +1,5 @@
+error: unknown `#[tool]` attribute `nme`; expected one of: name, description, input_params, stateless, parallel_safe, idempotent, exposure, execution, crate, common_crate
+ --> tests/ui/fail/unknown_key.rs:4:8
+  |
+4 | #[tool(nme = "typo")]
+  |        ^^^

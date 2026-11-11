@@ -1,0 +1,5 @@
+error: `name` must be a string literal
+ --> tests/ui/fail/non_string_name.rs:4:15
+  |
+4 | #[tool(name = 42)]
+  |               ^^

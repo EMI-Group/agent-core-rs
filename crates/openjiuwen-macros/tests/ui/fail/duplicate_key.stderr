@@ -1,0 +1,5 @@
+error: duplicate `#[tool]` attribute `name`
+ --> tests/ui/fail/duplicate_key.rs:4:24
+  |
+4 | #[tool(name = "first", name = "second")]
+  |                        ^^^^

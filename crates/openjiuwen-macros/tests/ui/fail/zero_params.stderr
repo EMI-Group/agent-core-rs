@@ -1,0 +1,5 @@
+error: `#[tool]` requires an argument parameter: `async fn f(args: Args)` or `async fn f(args: Args, ctx: &ToolContext)`
+ --> tests/ui/fail/zero_params.rs:5:10
+  |
+5 | async fn no_arguments() -> i64 {
+  |          ^^^^^^^^^^^^

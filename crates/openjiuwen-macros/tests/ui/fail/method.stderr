@@ -1,0 +1,5 @@
+error: `#[tool]` can only be applied to a free `async fn`
+  --> tests/ui/fail/method.rs:15:21
+   |
+15 |     async fn method(&self, args: Args) -> i64 {
+   |                     ^

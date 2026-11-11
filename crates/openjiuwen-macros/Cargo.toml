@@ -27,6 +27,8 @@ tokio.workspace = true
 # fixture harness version must be deterministic. 1.0.119 matches the workspace
 # MSRV (1.85).
 trybuild = "=1.0.119"
+# `StreamExt` is required to poll the `Tool::stream` default in the runtime tests.
+futures.workspace = true
 [features]
 default = []
 [lints]

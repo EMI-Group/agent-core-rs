@@ -1,0 +1,24 @@
+error[E0277]: `?` couldn't convert the error to `openjiuwen_common::error::Error`
+  --> tests/ui/fail/non_result_error.rs:24:7
+   |
+24 | #[tool]
+   | ------^
+   | |     |
+   | |     the trait `From<CustomError>` is not implemented for `openjiuwen_common::error::Error`
+   | this has type `Result<_, serde_json::Error>`
+   | this has type `Result<_, openjiuwen_common::error::Error>`
+   |
+note: `CustomError` needs to implement `Into<openjiuwen_common::error::Error>`
+  --> tests/ui/fail/non_result_error.rs:9:1
+   |
+ 9 | struct CustomError;
+   | ^^^^^^^^^^^^^^^^^^
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+   = help: `openjiuwen_common::error::Error` implements trait `From<T>`:
+             From<Box<dyn StdError + Send + Sync>>
+             From<reqwest::error::Error>
+             From<serde_json::Error>
+             From<std::io::Error>
+             From<tokio::runtime::task::error::JoinError>
+             From<url::parser::ParseError>
+   = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)
