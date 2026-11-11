@@ -45,9 +45,9 @@
 //! sibling modules and are reused here as one-line delegations, so the trait impls stay
 //! readable:
 //!
-//! - [`crate::fs::read`] — `read_file`, `read_file_stream`, and the read preconditions
-//! - [`crate::fs::write`] — `write_file`, the conditional compare-and-swap, permissions
-//! - [`crate::fs::transfer`] — `upload_file`, `download_file`, their streams, and copying
+//! - `fs::read` — `read_file`, `read_file_stream`, and the read preconditions
+//! - `fs::write` — `write_file`, the conditional compare-and-swap, permissions
+//! - `fs::transfer` — `upload_file`, `download_file`, their streams, and copying
 //! - [`crate::fs::slice`] — pure read validation/slicing and write-content composition
 //! - [`crate::fs::list`], [`crate::fs::search`], [`crate::fs::ext`] — listing, searching,
 //!   and the extension operations
