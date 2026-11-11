@@ -61,16 +61,18 @@ impl GraphState {
     pub fn get_path(&self, path: &str) -> Option<&Value>;  // dotted / indexed path
     pub fn set(&mut self, key: impl Into<String>, value: Value);
     pub fn set_path(&mut self, path: &str, value: Value) -> Result<()>;
-    pub fn remove(&mut self, key: &str) -> Option<Value>;
+    pub fn remove(&mut self, key: &str) -> Option<Value>;  // a node's top-level removal propagates to the run state
     pub fn contains_key(&self, key: &str) -> bool;
     pub fn keys(&self) -> impl Iterator<Item = &String>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn merge(&mut self, other: GraphState);            // deep merge, overlay wins
+    pub fn merge_node_delta(&mut self, base: &GraphState, node_state: GraphState); // executor per-node delta
 }
 ```
 
 Path access and merging delegate to `openjiuwen_common::utils::json` (`get_path`, `set_path`, `merge`), so graph state has exactly the session state's path and merge semantics.
+`merge_node_delta` is what the executor applies per node: changed top-level keys are deep-merged and top-level keys the node removed are deleted; only top-level keys are diffed, so nested removals do not propagate.
 
 ### Nodes (`src/node.rs`)
 
@@ -175,6 +177,7 @@ impl CompiledGraph {
 
 `invoke` returns the final state as a JSON object (`GraphState::into_value`).
 `stream` yields [`GraphEvent`]s in execution order and terminates with the run; a failed run yields exactly one `Err` after its `NodeFailed`/`GraphFailed` events.
+`stream_with` runs the graph as a spawned task guarded by an `AbortOnDrop`: dropping the stream before it terminates aborts that task, so an abandoned stream cancels the run instead of leaking a background run.
 
 ### Execution options (`src/execution.rs`)
 
@@ -242,7 +245,7 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 - **Channels.** Every node owns a CNF barrier channel: `groups: Vec<Set<source>>`, ready when every group contains at least one source that fired. Groups come from incoming edges: a single-source edge contributes `{source}`; a barrier edge `{A,B} → T` contributes `{A}` and `{B}`; a conditional edge contributes `{router source}`. A node with no incoming channel is a trigger channel: ready once any source fires it (entry seeding uses the reserved source `__start__`).
 - **Entry.** Explicit `entry(…)` ids are seeded with `__start__` at superstep 1; without explicit entries, nodes with no incoming edges are the entries. A graph with no entry is a compile error.
 - **Accept-then-activate barrier.** Routing messages produced in a superstep become visible only in the next superstep (`flush` after all nodes of the superstep complete).
-- **Determinism.** Nodes that are ready are executed concurrently (`JoinSet`) but their outcomes are applied in declaration order; state merges, router dispatch, and emitted events therefore follow a fixed order regardless of completion order. Within a superstep, node state mutations are merged with `GraphState::merge` (later declaration wins on scalar conflicts).
+- **Determinism.** Nodes that are ready are executed concurrently (`JoinSet`) but their outcomes are applied in declaration order; state merges, router dispatch, and emitted events therefore follow a fixed order regardless of completion order. Within a superstep, node state is applied as a delta against the pre-superstep state (`GraphState::merge_node_delta`): changed top-level keys are deep-merged in declaration order (later declaration wins on scalar conflicts) and a node's top-level key removals propagate; only top-level keys are diffed, so nested removals do not propagate.
 - **Routing.** A node's targets are: `NodeOutcome::Route { targets }` when non-empty (replacing routers), otherwise the union of static-edge targets and every conditional router's result, in declaration order and de-duplicated.
 - **Halt.** `NodeOutcome::Halt { value }` ends the run after the current superstep (siblings already running complete, matching Python's interrupt-as-data behavior). The result carries `halted: Some(HaltInfo)`.
 - **Limits and failures.** At most `max_supersteps` supersteps (default `10_000`, Python `MAX_RECURSIVE_LIMIT`) — exceeding it is [`Error::graph`]. Node errors propagate the original [`Error`] with the node id and superstep added as context; timeouts are [`ErrorKind::Timeout`]; cancellation is [`ErrorKind::Cancelled`]. Node `max_retries` re-runs an errored node (`max_retries + 1` attempts), never a halt and never a cancellation.
@@ -261,7 +264,8 @@ Python emits Mermaid only (`visualization/Drawable.to_mermaid`); DOT is intentio
 
 ## Design Decisions
 
-- **State is functional per node.** Parallel nodes cannot share `&mut GraphState`, so each node receives a clone and the engine merges the result in declaration order. Python passed `state=None` and discarded node return values, so this is an extension, not a compatibility break.
+- **State is functional per node.** Parallel nodes cannot share `&mut GraphState`, so each node receives a clone and the engine applies the result in declaration order as a delta against the pre-superstep state. Python passed `state=None` and discarded node return values, so this is an extension, not a compatibility break.
+- **Node state is merged as a top-level delta.** A node's returned state is compared with the state it was given: changed top-level keys are deep-merged and top-level keys the node dropped are removed, so `GraphState::remove` works from a node. Keys added by an earlier node in the same superstep survive because a later node never saw them; nested removals do not propagate (only top-level keys are diffed).
 - **Python's router-shadowing quirks are not reproduced.** Python keys routers by callable `__name__` and silently overwrites same-named routers; Rust stores every router in a `Vec`, so same-named routers all run. Conditional targets are declared explicitly (`conditional_edges_to`) instead of Python's `register_branch_targets` side channel.
 - **Cross-branch CNF hoisting is omitted.** Python's `_resolve_barrier_groups` merges groups reachable from one branch into an OR group; the Rust engine uses the literal per-edge groups. This is simpler and predictable; branch fan-in still needs one explicit edge group per incoming path.
 - **Validation is stricter than Python.** Python defers unknown endpoints to a `KeyError` at compile time and accepts duplicate node ids silently in places; Rust reports unknown endpoints, duplicate ids, unknown router sources, and a missing entry as one compile error.
@@ -297,13 +301,13 @@ Integration tests in `./tests/` use `openjiuwen_session::WorkflowSession` as `Ar
 - `common/mod.rs` — shared helpers (`session()`, counting/marker/noop nodes).
 
 - `linear.rs` — linear chain, state seeded from input, final value.
-- `fan_out_fan_in.rs` — parallel fan-out, barrier fan-in, declaration-order merge determinism, visited order.
+- `fan_out_fan_in.rs` — parallel fan-out, barrier fan-in, declaration-order merge determinism, top-level key removal propagation (and re-add by a later node), nested-removal non-propagation, visited order.
 - `conditional.rs` — router branching on state, multiple conditionals, routing to a subset, empty route.
 - `cycles.rs` — bounded loop with a counter, max-superstep failure.
 - `halt.rs` — halt ends the run, siblings complete, `HaltInfo` preserved.
 - `errors.rs` — node error carries node id/superstep, retry counts (`max_retries + 1` attempts), timeout is `ErrorKind::Timeout`.
 - `cancel.rs` — cancellation before and during a superstep, `ErrorKind::Cancelled`.
-- `streaming.rs` — event order (`SuperstepStarted` → `NodeStarted`/`NodeCompleted` → `EdgeTraversed` → … → `GraphCompleted`), superstep numbers, session trace frames observed through `Session::subscribe`/`StreamHub`.
+- `streaming.rs` — event order (`SuperstepStarted` → `NodeStarted`/`NodeCompleted` → `EdgeTraversed` → … → `GraphCompleted`), superstep numbers, session trace frames observed through `Session::subscribe`/`StreamHub`, and abort-on-drop (an abandoned stream stops the run).
 - `checkpoint.rs` — snapshot saved per superstep, failing run resumes without repeating completed supersteps, `InMemoryGraphStore` and `CheckpointerStore` round-trips.
 - `spec_serde.rs` — `GraphSpec` JSON round-trip, unknown fields tolerated, defaults.
 - `mermaid.rs` — flowchart header, node shapes, conditional edge labels, entry/exit markers.
