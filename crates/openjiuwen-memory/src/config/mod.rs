@@ -5,7 +5,7 @@
 //! names, tolerate unknown fields, and validate their invariants with
 //! `openjiuwen_common::error::Error::Config`.
 pub mod coding;
-pub mod dedupe;
+mod dedupe;
 pub mod engine;
 pub mod extraction;
 pub mod graph;

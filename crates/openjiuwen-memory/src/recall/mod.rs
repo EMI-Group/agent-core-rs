@@ -19,7 +19,7 @@
 //!            / (w_sem + w_imp + w_rec)
 //! recency  = 0.5 ^ (age_secs / half_life_secs)
 //! ```
-pub mod dedupe;
+mod dedupe;
 pub mod keyword;
 pub mod pipeline;
 pub mod scoring;
