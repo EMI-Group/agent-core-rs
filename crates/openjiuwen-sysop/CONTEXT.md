@@ -228,9 +228,15 @@ Code (`local/test_code_operation.py`):
 
 - Remote sandbox protocol: the Python package speaks no HTTP in `core/`; its providers live in
   `extensions/sys_operation/sandbox/providers` and talk to an external AIO container service
-  whose wire contract is unspecified here. `sandbox::http` provides the envelope and returns
-  `Error::Unsupported`; launcher lifecycle (create/pause/resume/delete), endpoint discovery,
-  and idle eviction are not implemented.
+  whose wire contract is unspecified here. `sandbox::http` (feature `sandbox`) carries the
+  request/response envelope, registers forwarding backends through `install`, and exposes
+  `HttpSandboxGateway::probe` as the **only** network call (a `GET` on the endpoint
+  `base_url`); `invoke` — and therefore every sandbox operation — returns `Error::Unsupported`
+  and is surfaced as `OpResult` 199007 with `sandbox_gateway_message("<method>", <reason>)`.
+  Still deferred: launcher lifecycle (create/pause/resume/delete), endpoint discovery and
+  `sandbox_id` assignment, isolation-key → container mapping, provider-specific payload
+  schemas, the streaming wire format (streams call `"<method>_stream"` and expect a JSON chunk
+  array, so in practice they yield one error chunk), and auth-header/auth-query injection.
 - Legacy CJK encodings (GBK, Big5, Shift-JIS) are not decodable; `encoding` reports
   `Error::Unsupported` instead of producing mojibake. UTF-8/UTF-16/Latin-1 are supported.
 - Writes are always UTF-8 (or UTF-16 when explicitly requested); Python can write arbitrary
@@ -249,6 +255,10 @@ Code (`local/test_code_operation.py`):
   timeout, truncation, env overlay, argv form), `code_local.rs` (Python/JavaScript, skipped when
   the runtime is absent), `tool_specs.rs` (13 specs, ids, schemas), `sandbox_stub.rs`
   (feature `sandbox`: unsupported remote calls, isolation keys, provider dispatch).
+- `src/sandbox/http.rs` and `src/sandbox/operation.rs` keep their tests inline: fake-provider
+  forwarding (exact `OpResult` and stream passthrough), dispatch + per-session isolation-key
+  resolution, missing provider (`ErrorKind::Unsupported`) and missing gateway/launcher config
+  (199002) paths, `install` idempotency, and one `#[ignore]`d live `probe` test.
 - Every test is offline and deterministic: `tempfile` workspaces, no network, and runtime
   lookups (`python3`, `node`, `bash`) skip with an explanatory message when missing.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
@@ -273,7 +283,7 @@ Code (`local/test_code_operation.py`):
 - `./src/fs/` → filesystem types and the local backend (`local`, `slice`, `list`, `search`, `ext`)
 - `./src/shell/` → shell types, allowlist/deny filter, execution plan, local backend, process registry
 - `./src/code/` → code types and the local snippet runner
-- `./src/sandbox/` → gateway config, provider registry, sandbox dispatch, HTTP stub (feature `sandbox`)
+- `./src/sandbox/` → gateway config, provider registry, sandbox dispatch + forwarding backends, HTTP gateway client (feature `sandbox`)
 - `./tests/` → behavior ports (see Test Strategy)
 
 ## Notes for Agents
@@ -287,5 +297,15 @@ Code (`local/test_code_operation.py`):
   caller-supplied path is a security bug.
 - `FileContent` decides text vs bytes on write; there is no separate `mode` field, so a
   mismatch cannot occur.
+- `sandbox::operation` resolves everything in a private core that takes a
+  `&SandboxProviderRegistry`: tests exercise dispatch against a local registry and never
+  register mocks in `sandbox::provider::global()` (only `SysOperation` uses the global one).
+- `sandbox::operation::register_builtin_providers` is idempotent: it is inert without the
+  `sandbox` feature or without a launcher `base_url`, and duplicate registrations are treated
+  as success, so repeated `SysOperation::new` calls never fail.
+- Sandbox forwarding backends (`SandboxFsOperation`, `SandboxShellOperation`,
+  `SandboxCodeOperation`) never serialize, inspect, or re-map provider results: the provider
+  owns the wire format. `supports_conditional_write` returns the provider's answer; the card's
+  claim is exposed separately as `configured_conditional_write`.
 - Streams must be `'static`; use `self: Arc<Self>` receivers and `async_stream::try_stream!`,
   yielding a single error chunk on failure instead of returning `Err`.
