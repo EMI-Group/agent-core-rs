@@ -36,8 +36,7 @@ pub struct WorkflowSessionOptions {
     pub session_id: Option<String>,
     /// Workflow id used for the entity metadata only.
     ///
-    /// Node executable ids no longer derive from it: they follow Python's
-    /// `create_executable_id`.
+    /// Node executable ids follow Python's `create_executable_id`, not this id.
     pub workflow_id: Option<String>,
     /// Environment entries applied to a freshly created config.
     pub envs: BTreeMap<String, Value>,
