@@ -5,7 +5,7 @@
 Tools as data plus behavior: a serializable, LLM-facing `ToolCard` and a `Tool` trait whose implementation may hold transport details that never serialize.
 Ports `openjiuwen/core/foundation/tool/` (`base.py`, `function/function.py`, `service_api/*`, `mcp/*`, the `@tool` decorator).
 Every crate above `openjiuwen-foundation` invokes tools only through `Tool`, so its surface is a stable contract.
-The `card`, `context`, `traits`, `schema`, `function`, and `restful` subtrees are implemented; `mcp/` is still empty stubs owned by a later agent.
+The `card`, `context`, `traits`, `schema`, `function`, `restful`, and `mcp` subtrees are implemented.
 
 ## API Surface
 
@@ -45,8 +45,10 @@ Root re-exports from `crate::tool` (for call sites that should not care about mo
 - `ApiParamMapper::{new(schema), with_defaults(schema, queries, headers, paths), schema(), defaults_for(location), map(&Value) -> Result<ParamMap>, render_url(&str, &ParamMap) -> Result<String>}`.
 - `RestfulApiTool::{new(card: ToolCard, config: RestfulApiConfig) -> Result<Self>, config()}` plus `impl Tool` (validating `invoke`; `stream` yields a single `Error::Unsupported`).
 
-`mcp` (feature `mcp`, not yet implemented):
-- `McpServerConfig { server_id, server_name, server_path, client_type: McpClientType (Stdio | Sse | StreamableHttp), params: Value, auth_headers, auth_query_params }`, `McpClient` trait, `connect_mcp_server`, `load_mcp_tools`, `McpTool`, `McpToolResult { success, data, error }`.
+`mcp` (feature `mcp`):
+- `McpServerConfig { server_id, server_name, server_path, client_type: McpClientType (Stdio | Sse | StreamableHttp), params, auth_headers, auth_query_params, include_image_content }`, `McpRemoteTool { name, description, input_schema }`.
+- `McpClient` trait (`server_name`, `server_id`, `connect`, `disconnect`, `is_connected`, `list_tools`, `call_tool`, `call_tool_with`, `list_resources`, `read_resource`), `RmcpClient`, `connect_mcp_server`, `reconnect_attempt_budget`, `reconnect_delay`.
+- `McpTool::new(card, client, tool_name)` + `with_options`, `load_mcp_tools(client, &McpToolOptions)`, `McpToolResult { success, data, error }`.
 
 ## Constraints
 
@@ -91,11 +93,10 @@ Root re-exports from `crate::tool` (for call sites that should not care about mo
 
 ## Notes for Agents
 
-- **MCP hook points**: implement `McpTool` with `ToolCard::new(...)` + the server config in the struct, validate/patch inputs with `schema::ensure_object_schema` / `apply_defaults` / `validate_inputs`, return `Error::Mcp` from `invoke`, keep the default `render_for_llm`, and override `stream` with the `self: Arc<Self>` receiver if incremental results are supported.
+- **MCP**: `McpTool` validates inputs through `schema::ensure_object_schema` / `apply_defaults` / `validate_inputs`, maps a `success: false` result to `Error::Mcp`, and keeps the default `render_for_llm`; HTTP transports are hand-written on `reqwest` because the workspace `rmcp` features do not include the reqwest transports.
 - `ToolCard.input_params` is stored as given (possibly `{}`); only the projection/validation paths normalize it, so tests that assert raw JSON must account for that.
 - `FunctionTool::default_render` duplicates the `Tool::render_for_llm` default body (Rust cannot call a trait default from an override); change both together.
 - `Tool` is object-safe with an `Arc<Self>` `stream`; adding a `&self` streaming method instead would break `'static` streams.
-- `cargo fmt` at crate level appends newlines to the empty `llm`/`mcp` stubs; format only the files you touch.
 
 ## Test Strategy
 
@@ -117,4 +118,4 @@ Root re-exports from `crate::tool` (for call sites that should not care about mo
 - `./restful/config.rs` → `HttpMethod`, `RestfulApiConfig`, duration/byte defaults
 - `./restful/mapper.rs` → `ParamLocation`, `ParamMap`, `ApiParamMapper`, url templating
 - `./restful/tool.rs` → `RestfulApiTool` construction, request building, envelope, wiremock tests
-- `./mcp/` → `McpServerConfig`, `McpClient` transports, `McpTool`, `McpToolResult` (`mcp/CONTEXT.md`; still empty stubs)
+- `./mcp/` → `McpServerConfig`, `McpClient` transports, `McpTool`, `McpToolResult` (`mcp/CONTEXT.md`)

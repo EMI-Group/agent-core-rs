@@ -31,6 +31,11 @@ pub mod traits;
 pub use card::{ToolCard, ToolExecution, ToolExposure, ToolFunctionInfo, ToolInfo};
 pub use context::ToolContext;
 pub use function::{FunctionTool, FunctionToolBuilder, ToolHandler};
+#[cfg(feature = "mcp")]
+pub use mcp::{
+    connect_mcp_server, load_mcp_tools, McpClient, McpClientType, McpRemoteTool, McpServerConfig,
+    McpTool, McpToolOptions, McpToolResult, RmcpClient,
+};
 pub use restful::{
     ApiParamMapper, HttpMethod, ParamLocation, ParamMap, RestfulApiConfig, RestfulApiTool,
     DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT,
