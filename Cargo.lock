@@ -1816,11 +1816,12 @@ dependencies = [
  "openjiuwen-common",
  "openjiuwen-foundation",
  "openjiuwen-session",
+ "openjiuwen-test-support",
  "serde",
  "serde_json",
- "thiserror",
  "tiktoken-rs",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
