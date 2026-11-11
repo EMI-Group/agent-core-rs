@@ -107,7 +107,8 @@ pub trait Validate {
 
 ### 4.4 Serde
 
-- Every serializable type: `#[derive(Serialize, Deserialize, JsonSchema)]` with `#[serde(rename_all = "snake_case", default)]` on structs, unknown fields tolerated (serde default — never `deny_unknown_fields`).
+- Every serializable type: `#[derive(Serialize, Deserialize, JsonSchema)]` with `#[serde(rename_all = "snake_case")]` on structs, unknown fields tolerated (serde default — never `deny_unknown_fields`).
+- Field-level `#[serde(default)]` on exactly those fields that carry a Python default; a field Python requires must error when absent (never a container-level `#[serde(default)]` on a struct with required fields — that would silently invent values). All-default structs (`EventBufferConfig`, `TurnUsage`, `AfterToolResult`, …) may derive `Default` and use container-level defaults.
 - No `skip_serializing_if` anywhere: the wire shape is "all keys always present", `null` for `None`, `[]` for empty sequences — exactly like the Python codec.
 - Enums: `#[serde(rename_all = "snake_case")]`, variant values equal to the Python `.value` strings. Derive `Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema` for value enums (needed for `BTreeSet` membership and sorting).
 - Sets: `BTreeSet<…>` for Python `frozenset` (serializes as a sorted JSON array). Sequences: `Vec<…>` for Python `tuple`.
@@ -328,12 +329,13 @@ pub struct DiagnosticEvent { pub level: DiagnosticLevel, pub message: String, pu
 pub struct ProviderEvent { pub provider: String, pub event_type: String, pub schema_version: String, pub payload: JsonObject }
 pub struct UnknownEvent { pub event_type: String, pub schema_version: String, pub payload: JsonObject }
 
-#[serde(tag = "event_type", rename_all = "snake_case")]   // only used by the crate's own serde of the enum
+#[derive(Debug, Clone, PartialEq, JsonSchema)]   // NO derived serde: the wire shape is produced by serialization.rs (§6)
 pub enum HarnessEventPayload { Output(OutputEvent), ItemLifecycle(ItemLifecycleEvent), UsageUpdated(UsageUpdatedEvent),
   ModelRequest(ModelRequestEvent), StateChanged(StateChangedEvent), TurnLifecycle(TurnLifecycleEvent),
   HookObserved(HookObservedEvent), Diagnostic(DiagnosticEvent), Provider(ProviderEvent), Unknown(UnknownEvent) }
 ```
-Note: `HarnessEventPayload`'s derived serde is an *internal* convenience; the wire shape is produced by `serialization.rs` (§6) and the tag names there are `output`, `item_lifecycle`, `usage_updated`, `model_request`, `state_changed`, `turn_lifecycle`, `hook_observed`, `diagnostic`, `provider` (and `Unknown` uses the unknown event's own `event_type`).
+`HarnessEventPayload` is deliberately **not** serde-derived: an internally tagged enum would collide with `ProviderEvent::event_type`, and the Python wire shape keeps `event_type` at envelope level with the payload nested. `serialization.rs` is the only codec.
+Required helpers: `wire_event_type(&self) -> &str` (`"output"`, `"item_lifecycle"`, `"usage_updated"`, `"model_request"`, `"state_changed"`, `"turn_lifecycle"`, `"hook_observed"`, `"diagnostic"`, `"provider"`, and verbatim `event_type` for `Unknown`), `wire_schema_version(&self) -> &str` (`EVENT_WIRE_SCHEMA_VERSION` except `Unknown`), `Validate`, `From<OutputEvent> for HarnessEventPayload` (and one `From` per payload type).
 
 Validation rules (verbatim messages):
 - `OutputEvent`: `output_id` non-empty (`"output_id must not be empty"`); `content_index` unsigned (subsumes Python's non-negative check).
