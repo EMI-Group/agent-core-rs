@@ -20,7 +20,11 @@
 //!   workflow component, agent, team, and runner receives as `Arc<dyn Session>`:
 //!   state scopes, streaming, human-in-the-loop, tracing, and snapshot/restore.
 //! - [`sessions`] — concrete sessions ([`sessions::WorkflowSession`],
-//!   [`sessions::NodeSession`]) and their construction factories.
+//!   [`sessions::NodeSession`], [`sessions::AgentSession`],
+//!   [`sessions::AgentTeamSession`]) and their construction factories
+//!   ([`sessions::create_workflow_session`],
+//!   [`sessions::create_agent_session`],
+//!   [`sessions::create_agent_team_session`]).
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
 //!   [`checkpoint::Checkpoint`] model, and the memory, file, and feature-gated
 //!   SQLite backends.
@@ -79,7 +83,11 @@ pub use interaction::{
 
 pub use session::{Session, SessionMetadata, SessionSnapshot, SessionType};
 
-pub use sessions::{create_workflow_session, NodeSession, WorkflowSession, WorkflowSessionOptions};
+pub use sessions::{
+    create_agent_session, create_agent_team_session, create_workflow_session, AgentSession,
+    AgentSessionOptions, AgentTeamSession, AgentTeamSessionOptions, NodeSession, WorkflowSession,
+    WorkflowSessionOptions,
+};
 
 pub use state::{AgentState, StateLane, StateStore, WorkflowState};
 pub use state::{
