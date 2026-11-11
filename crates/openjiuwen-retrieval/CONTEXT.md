@@ -184,6 +184,13 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - Tests must be deterministic: fake embeddings are hash-based, search ties are insertion-ordered, and no wall-clock or random order is asserted.
 - Commands: `cargo fmt -p openjiuwen-retrieval`, `cargo test -p openjiuwen-retrieval`, `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings`.
 
+## Notes for Agents
+
+- Implemented today: `common`, `chunking`, `embedding`, `vector_store`, `reranker`, re-exported from the crate root; `src/loaders/` and `src/knowledge_base/` contain only their CONTEXT.md and are the next wave's work.
+- `tests/` currently holds `document_json.rs`, `chunking.rs`, `vector_store.rs`, and `embedding.rs`; `loaders.rs` and `knowledge_base.rs` arrive with those modules.
+- The in-crate OpenAI client and `HashEmbedding` do not use `openjiuwen-foundation`; its model layer is still scaffold code.
+- `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` lints path dependencies too, and the scaffolded `openjiuwen-foundation` stub fails it (`crate_name` lacks `#[must_use]`); lint this crate with `--no-deps` until that sibling is implemented.
+
 ## Routing Table
 
 - `./src/common/` → `Document`/`TextChunk`, results, configs, `MetadataFilter` (`common/CONTEXT.md`)
