@@ -45,9 +45,33 @@ Each iteration starts from the input object overlaid with `{"index": <u64>, "ite
 `Condition` parses `bool_expression` once, re-evaluates it before every iteration against that iteration's inputs, stops on the first `false`, and fails with the exceeded-limit error when it would run past the cap.
 The body runs sequentially per iteration, each later component receives the previous component's output, and the last output becomes both the iteration result and the next `previous`; an empty body echoes the iteration inputs.
 
-### Leaf components
+### `llm.rs` — `LlmComponent`
 
-`llm.rs`, `tool.rs`, `retrieval.rs`, and `memory.rs` provide the LLM, tool, knowledge-retrieval, and memory leaf components and are written in parallel.
+`LlmResponseFormat { Text, Markdown, Json }` is serde snake_case with `Default = Text`.
+`LlmCompConfig` carries `model`, `model_id`, `request` (`ModelRequestConfig`), the two prompt templates, `template_content`, `response_format`, `output_config`, and `enable_history`; all fields are reachable through chainable builders.
+`LlmComponent::new(LlmCompConfig) -> Result<Self>` returns `Error::Validation("llm component requires a model")` when no model is configured; `component_type()` = `"llm"`; abilities `[Invoke, Stream]`.
+Prompt assembly: system-only yields `[system(rendered), user("")]`, user-only yields one rendered user message, both yield `[system, user]`, and otherwise `template_content` is rendered message by message (empty content falls back to one empty user message).
+Rendering substitutes `{{var}}` placeholders from a map of the input object's top-level keys plus the whole input under `"inputs"`; single braces stay literal.
+`invoke` returns `{<output_key>: <assistant text>}` where `output_key()` is the first key of `output_config` or `"result"`.
+`stream` yields one `{<output_key>: <delta>}` frame per non-empty content delta and one wrapped `101003` error on provider failure; `response_format` instruction injection and `enable_history` history insertion are deferred.
+
+### `tool.rs` — `ToolComponent`
+
+`ToolComponent::new(Arc<dyn Tool>)` derives its card from `Tool::card`; `component_type()` = `"tool"`; abilities `[Invoke]`.
+`invoke` builds a `ToolContext` (session id, metadata, cancellation) and always returns a batch result: `{"error_code": 0, "error_message": "", "data": <value>}` on success.
+Tool failures are captured, never propagated: `{"error_code": 102000, "error_message": <msg>, "data": null}` for `Tool`/`Validation` errors and `182012` for any other error kind.
+
+### `retrieval.rs` — `KnowledgeRetrievalComponent`
+
+`KnowledgeRetrievalComponent::new(Arc<SimpleKnowledgeBase>)` defaults to the `"query"` input key and `RetrievalConfig::default()`; `with_retrieval_config`/`with_query_key` adjust it; `component_type()` = `"knowledge_retrieval"`; abilities `[Invoke]`.
+`invoke` returns `{"query": <q>, "documents": [{"text", "score", "metadata"}]}`; a missing/blank query is `101102`, a retrieval failure is wrapped as `101100`.
+`pub(crate) fn resolve_query` (object key, else whole string input, else `None`) is shared with the memory component.
+
+### `memory.rs` — `MemoryRetrievalComponent` / `MemoryWriteComponent`
+
+Local seams `MemoryRecall { async fn recall(&self, query, scope_id, user_id) -> Result<Vec<Value>> }` and `MemoryRecord { async fn record(&self, messages, scope_id, user_id) -> Result<Value> }`; adapters over the real long-term memory land in `openjiuwen-memory`.
+`MemoryRetrievalComponent::new(Arc<dyn MemoryRecall>, scope_id, user_id)` returns `{"memories": [...]}`; a blank query is `101200`, a recall failure `101201`.
+`MemoryWriteComponent::new(Arc<dyn MemoryRecord>, scope_id, user_id)` reads `"messages"` (`Vec<BaseMessage>`), requires a non-empty array (`101150`), and returns the record result verbatim; failures are `101151`.
 
 ## Constraints
 
