@@ -273,6 +273,15 @@ impl VectorStore for InMemoryVectorStore {
         Ok(self.records.read().get(id).cloned())
     }
 
+    async fn get_many(&self, ids: &[String]) -> Result<Vec<VectorRecord>> {
+        // A single read lock serves the whole batch; unknown ids are skipped.
+        let stored = self.records.read();
+        Ok(ids
+            .iter()
+            .filter_map(|id| stored.get(id.as_str()).cloned())
+            .collect())
+    }
+
     async fn list(&self, limit: Option<usize>) -> Result<Vec<VectorRecord>> {
         let limit = limit.unwrap_or(usize::MAX);
         Ok(self.records.read().values().take(limit).cloned().collect())

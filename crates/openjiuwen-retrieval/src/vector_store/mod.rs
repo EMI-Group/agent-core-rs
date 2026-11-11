@@ -129,6 +129,23 @@ pub trait VectorStore: Send + Sync {
     /// Fetches a record by id; `None` when the id is unknown.
     async fn get(&self, id: &str) -> Result<Option<VectorRecord>>;
 
+    /// Fetches several records by id, preserving the requested order.
+    ///
+    /// Ids that do not exist are skipped, so the result may be shorter than
+    /// `ids`; the relative order of the returned records follows `ids`.
+    /// The default implementation calls [`Self::get`] once per id, which keeps
+    /// stores without a native batch read correct; stores that can serve a
+    /// batch more cheaply should override it.
+    async fn get_many(&self, ids: &[String]) -> Result<Vec<VectorRecord>> {
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.get(id).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Lists records in store order, optionally truncated to `limit`.
     async fn list(&self, limit: Option<usize>) -> Result<Vec<VectorRecord>>;
 

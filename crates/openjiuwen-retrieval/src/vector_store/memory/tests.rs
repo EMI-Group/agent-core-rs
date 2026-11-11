@@ -367,3 +367,42 @@ async fn open_rejects_malformed_and_unknown_version_snapshots() {
     let error = InMemoryVectorStore::open(&future).await.unwrap_err();
     assert!(matches!(&error, Error::Retrieval(message) if message.contains("version 2")));
 }
+#[tokio::test]
+async fn get_many_preserves_requested_order() {
+    let store = store_with(vec![
+        record("a", vec![1.0, 0.0]),
+        record("b", vec![0.0, 1.0]),
+        record("c", vec![1.0, 1.0]),
+    ])
+    .await;
+    let requested = vec!["c".to_owned(), "a".to_owned(), "b".to_owned()];
+    let records = store.get_many(&requested).await.unwrap();
+    let got: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+    assert_eq!(got, vec!["c", "a", "b"]);
+    assert_eq!(records[0].text, "text-c");
+    assert_eq!(records[1].text, "text-a");
+}
+
+#[tokio::test]
+async fn get_many_skips_unknown_ids() {
+    let store = store_with(vec![record("a", vec![1.0, 0.0])]).await;
+    let requested = vec![
+        "missing".to_owned(),
+        "a".to_owned(),
+        "also-missing".to_owned(),
+    ];
+    let records = store.get_many(&requested).await.unwrap();
+    let got: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+    assert_eq!(got, vec!["a"]);
+    assert_eq!(store.get_many(&["nope".to_owned()]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn get_many_with_empty_input_is_empty() {
+    let store = store_with(vec![record("a", vec![1.0, 0.0])]).await;
+    assert_eq!(store.get_many(&[]).await.unwrap(), vec![]);
+    assert_eq!(
+        InMemoryVectorStore::new().get_many(&[]).await.unwrap(),
+        vec![]
+    );
+}

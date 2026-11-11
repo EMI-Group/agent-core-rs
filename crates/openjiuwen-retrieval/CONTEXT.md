@@ -82,6 +82,7 @@ pub struct VectorQuery { pub vector: Vec<f32>, pub top_k: usize /*5*/,
     fn name(&self) -> &str;
     async fn upsert(&self, records: Vec<VectorRecord>) -> Result<usize>;
     async fn get(&self, id: &str) -> Result<Option<VectorRecord>>;
+    async fn get_many(&self, ids: &[String]) -> Result<Vec<VectorRecord>>; // default: sequential `get`, skips missing, id order
     async fn list(&self, limit: Option<usize>) -> Result<Vec<VectorRecord>>;
     async fn delete(&self, ids: &[String]) -> Result<usize>;
     async fn delete_by_filter(&self, filter: &MetadataFilter) -> Result<usize>;
