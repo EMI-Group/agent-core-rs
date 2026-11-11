@@ -10,6 +10,7 @@ Never depended on by a library crate; only `[dev-dependencies]` and `openjiuwen-
 ## API Surface
 
 Crate root re-exports every public item listed below, so downstream tests use `openjiuwen_test_support::MockLlmServer` without module paths.
+The only other crate-root items are `CRATE_NAME`, `CRATE_VERSION`, and `TEST_API_KEY` (`"test-api-key"`, the key `client_config()` uses).
 `pub use wiremock;` is re-exported (with its `MockServer`, `ResponseTemplate`, `matchers`) so test crates can mock non-LLM endpoints without adding their own dependency; the mock server here is NOT built on wiremock and does not duplicate it.
 
 ### Scripted completions — `src/responses.rs`
@@ -43,7 +44,7 @@ impl MockCompletion {
     pub fn push_tool_call(&mut self, call: MockToolCall);
     pub fn has_tool_calls(&self) -> bool;
     pub fn to_chat_response(&self, default_model: &str) -> ChatResponse;
-    pub fn to_chunks(&self) -> Vec<StreamChunk>;                        // role delta, content/reasoning delta, tool deltas, usage, finish, Done
+    pub fn to_chunks(&self) -> Vec<StreamChunk>;                        // role delta, one content/reasoning delta when either is set, one delta per tool call, usage when non-empty, finish, Done
     pub fn from_chunks(chunks: &[StreamChunk]) -> ChatResponse;         // folds with StreamAccumulator; model/id empty
 }
 impl From<ChatResponse> for MockCompletion;
@@ -129,9 +130,14 @@ HTTP surface: `POST /v1/chat/completions` and `POST /chat/completions` (alias), 
 Loopback only (`127.0.0.1:0`, OS-assigned port).
 Non-streaming requests receive an OpenAI chat-completion object (`id`, `object`, `created`, `model`, `choices[].message`, `usage` with `prompt_tokens`/`completion_tokens`/`total_tokens`, `reasoning_content`, `tool_calls[].function`).
 Streaming requests receive `text/event-stream` frames `data: <json>\n\n` ending with `data: [DONE]\n\n`; frames carry role deltas, `content`, `reasoning_content`, `tool_calls` deltas, a usage-only frame (`choices: []`) when usage is non-empty, and a finish-reason frame, matching `openjiuwen-foundation`'s `parse_stream_chunk` expectations.
-Each request pops exactly one scripted response (`Completion` is serialized for non-streaming and expanded to frames for streaming; `Chunks` is emitted as SSE and folded for non-streaming; `Error` short-circuits with its status/body).
+Each well-formed chat request pops exactly one scripted response (`Completion` is serialized for non-streaming and expanded to frames for streaming; `Chunks` is emitted as SSE and folded for non-streaming; `Error` short-circuits with its status/body).
+A malformed body is answered 400 before anything is popped, and is still recorded (`body: Value::Null`, no response id); a wrong method on a known route is a JSON 404 (not 405) and is not recorded.
 When the queue is empty the fallback response is served without consuming anything (Python parity: `"Default mock response"`).
 Response ids are deterministic: `chatcmpl-{id_prefix}{seq:04}`, `seq` counting popped responses from 1; a `MockCompletion::id` overrides it, and the id is also stamped on the request recording.
+A fallback answer reuses the current `seq` without advancing it: an empty script answers `chatcmpl-{id_prefix}0000`, and a fallback after N pops repeats the N-th id.
+Recordings describe chat-completion traffic only; `/health` and the JSON 404s never appear in `requests()`/`request_count()`.
+`client_config()` uses `TEST_API_KEY` (`"test-api-key"`) and `max_retries = 0`, so a scripted 5xx fails on the first request.
+`shutdown` drives the graceful-shutdown future and awaits the server task with a 5 s bound, aborting it if a connection refuses to drain; `Drop` notifies and aborts.
 
 ### Scripted model — `src/scripted_model.rs`
 
@@ -261,7 +267,7 @@ pub async fn eventually_some<F, Fut, T>(timeout: Duration, predicate: F) -> Resu
 pub async fn eventually_with_default_timeout<F, Fut>(predicate: F) -> Result<()>;
 ```
 
-Each polls the (possibly async) predicate at least once, sleeps `interval` between attempts, and returns `Error::timeout("eventually: predicate did not become true within {timeout:?}")` at the deadline.
+Each polls the (possibly async) predicate at least once, sleeps the smaller of `interval` and the remaining budget between attempts, and returns `Error::timeout` at the deadline: `"eventually: predicate did not become true within {timeout:?}"` for the boolean helpers, `"eventually_some: no value became available within {timeout:?}"` for `eventually_some`.
 
 ## Usage
 
@@ -296,7 +302,7 @@ let model = ScriptedModel::builder()
 - Dev-only (`publish = false`); a library crate must never depend on this crate.
 - No `unsafe` (workspace lint denies it); the server binds `127.0.0.1:0` only and the port is OS-assigned.
 - No hidden global mutable state: the only process-global lock is the environment lock held by `EnvGuard`/`TempHomeGuard`.
-- `unwrap`/`expect`/`panic` are forbidden in library code except in assertion helpers (`assert_json_*`) and documented test-oriented entry points (`MockLlmServer::start`, `ScriptedModel` infallible constructors).
+- `unwrap`/`expect`/`panic` are forbidden in library code except in assertion helpers (`assert_json_*`) and documented test-oriented entry points (`MockLlmServer::{start, with_script}`, `MockLlmServerBuilder::start`, `ScriptedModel` infallible constructors), each of which carries a `# Panics` section.
 - Errors use `openjiuwen_common::error::{Error, Result}`; `io::Result` only for raw filesystem operations on `TempWorkspace`.
 - Files stay well under 1000 lines; each module owns one concern and re-exports through `lib.rs`.
 - Do not hold a `std::sync::MutexGuard` across `.await`; recordings and script queues are mutated in short synchronous sections.
@@ -310,6 +316,8 @@ let model = ScriptedModel::builder()
 - Python parity kept where observable: default fallback text `"Default mock response"`, ordered queue with no prompt matching, `call_count`/`call_history` recorded at call time, and one assistant chunk per streamed turn unless the test scripts explicit chunks.
 - `ScriptedModel` and `MockLlmServer` cover different layers: `ScriptedModel` fakes the `Model` trait (agent/workflow tests), `MockLlmServer` fakes the provider (client/transport/e2e tests).
 - `MockLlmServer::builder()` exposes only what tests need; the server has no auth enforcement (any `Authorization` header is accepted and recorded).
+- The builder's `script` replaces the queued script while `item` appends, so `.script([a, b]).item(c)` serves `a`, `b`, `c`; the fallback is served only when the queue is empty.
+- `src/internal.rs` holds the three helpers both fakes need (`lock`, `FUNCTION_KIND`, `DEFAULT_FALLBACK_TEXT`), so the Python-parity fallback string exists once; the module is private and carries no public API.
 - `wiremock` is re-exported rather than wrapped: wrapping it would duplicate a mature mock server and couple us to its version.
 - Session factory helpers are deliberately omitted: `openjiuwen-session` is still a stub with no `Session` implementation, so there is nothing to construct.
   When it lands, add `src/fixtures/session.rs` with `workflow_session()` / `agent_session()` helpers mirroring Python `create_agent_session`, and re-export them from `fixtures` and `lib.rs`.
@@ -318,19 +326,20 @@ let model = ScriptedModel::builder()
 ## Routing Table
 
 - `./src/mock_llm/` → loopback OpenAI-compatible server: routing, request recording, script queue, wire (JSON/SSE) projection (`src/mock_llm/CONTEXT.md`)
-- `./src/fixtures/` → temp workspace, `EnvironmentGuard`, `TempHomeGuard` (`src/fixtures/CONTEXT.md`)
+- `./src/fixtures/` → temp workspace, `EnvGuard`, `TempHomeGuard` (`src/fixtures/CONTEXT.md`)
+- `./src/internal.rs` → crate-private shared helpers (`lock`, `FUNCTION_KIND`, `DEFAULT_FALLBACK_TEXT`); no public API
 - `./src/responses.rs` → `MockCompletion`/`MockToolCall` and `ChatResponse` ↔ `StreamChunk` conversions shared by both fakes
 - `./src/scripted_model.rs` → `ScriptedModel`, script turns, call recording, `Model` implementation
 - `./src/assert_json.rs` → JSON equality/subset/round-trip assertions and diff paths
 - `./src/eventually.rs` → async eventual-consistency polling helpers
-- `./tests/` → crate-level integration tests driving the fakes through `OpenAiCompatibleClient` and `Model`
+- `./tests/` → the three crate-level integration binaries: client end-to-end, scripted-model trait behavior, fixture isolation (`tests/CONTEXT.md`)
 - `./Cargo.toml` → dev-only manifest (`publish = false`), no external services, no extra features
 
 ## Test Strategy
 
-- Unit tests beside each module: conversion round-trips (`MockCompletion` ↔ `ChatResponse` ↔ chunks), wire frames (JSON body, SSE frame sequence, tool-call deltas, usage frame, `[DONE]`), queue/fallback behavior, deterministic ids, recordings, scripted-model invoke/stream/failure, env guard save/restore, workspace paths, JSON assertions (matching and failing cases), `eventually` success and timeout (`tokio::time::pause` where useful).
-- `tests/mock_server.rs`: end-to-end through `OpenAiCompatibleClient` (non-streaming, streaming, tool calls, reasoning, error status, queue exhaustion, request recording, `wait_for_requests`, shutdown).
+- Unit tests beside each module: conversion round-trips (`MockCompletion` ↔ `ChatResponse` ↔ chunks), wire frames (JSON body, SSE frame sequence, tool-call deltas, usage frame, `[DONE]`), queue/fallback behavior, deterministic ids, recordings, scripted-model invoke/stream/failure, env guard save/restore, workspace paths, JSON assertions (matching and failing cases), `eventually` success and timeout with short real durations (tokio's `test-util` feature is not enabled, so `tokio::time::pause` is unavailable).
+- `tests/mock_server.rs`: end-to-end through `OpenAiCompatibleClient` (non-streaming, streaming, tool calls, reasoning, error status, queue exhaustion, request recording, the `/chat/completions` alias, wrong-method 404, fallback ids, a waiter parked before the request arrives, `shutdown`).
 - `tests/scripted_model.rs`: trait-level behavior through `Arc<dyn Model>` and `ModelExt::complete`.
-- `tests/fixtures.rs`: `TempWorkspace` + `TempHomeGuard` isolation and cleanup.
+- `tests/fixtures.rs`: `TempWorkspace` drop cleanup, `TempHomeGuard` + `OpenJiuwenHome::resolve`, `EnvGuard` restore and cross-thread serialization.
 - All tests are offline, deterministic, and bind only loopback; timeouts use short fixed durations (≤2 s) so a regression fails fast instead of hanging.
 - Ported tests cite the Python source they mirror in a comment (for example `tests/unit_tests/fixtures/mock_llm.py`).
