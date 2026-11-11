@@ -15,6 +15,7 @@
 //! deviations from Python.
 
 pub mod errors;
+pub mod events;
 pub mod json;
 pub mod models;
 pub mod results;
@@ -22,6 +23,11 @@ pub mod state;
 pub mod validation;
 
 pub use errors::{HarnessError, HarnessErrorKind, HarnessResult};
+pub use events::{
+    DiagnosticLevel, EventBufferConfig, EventOverflowPolicy, EventRetention, HookEventPhase,
+    ItemEventKind, ModelRequestStatus, OutputChannel, OutputKind, OutputOperation, TurnEventKind,
+    UsageUpdateMode, TERMINAL_TURN_EVENT_KINDS,
+};
 pub use json::{
     empty_json_object, from_str_validated, from_value_validated, json_object_from_value,
     json_object_to_value, JsonObject, JsonValue,
