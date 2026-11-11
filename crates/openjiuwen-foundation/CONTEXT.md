@@ -31,6 +31,7 @@ Tools (`tool`):
 Storage (`store`):
 - Traits `KvStore`, `DocumentStore`, `VectorStore`, `GraphStore`, `ObjectStore` and their data types (`KvValue`, `Document`, `Query`, `CollectionSchema`, `FieldSchema`, `VectorQuery`, `VectorSearchResult`, `GraphNode`, `GraphEdge`, `ObjectMeta`).
 - Implementations: `InMemory*` and `LocalFile*`/`Local*` for every contract; `SqliteKvStore`/`SqliteDocumentStore` behind feature `sqlite`.
+- There is no `KnowledgeBase`, embedding, chunking, or reranker type in this crate; those live in `openjiuwen-retrieval`, which consumes the `store::VectorStore` contract here.
 
 ## Constraints
 
