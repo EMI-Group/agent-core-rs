@@ -133,6 +133,8 @@ pub struct KnowledgeBaseStatistics { pub kb_id: String, pub index_type: String, 
                                      pub document_count: usize, pub has_reranker: bool, pub has_loader: bool }
 pub async fn retrieve_multi_kb(kbs: &[Arc<SimpleKnowledgeBase>], query: &str, top_k: Option<usize>)
     -> Vec<RetrievalResult>; // dedupe by text, keep max score, descending
+pub async fn retrieve_multi_kb_with_source(kbs: &[Arc<SimpleKnowledgeBase>], query: &str, top_k: Option<usize>)
+    -> Vec<MultiKBRetrievalResult>; // adds sorted, deduped kb_ids plus raw_score/raw_score_scaled metadata
 ```
 `add_documents` fills empty ids, chunks, embeds all chunk texts in batches, upserts `VectorRecord`s (chunk id, doc_id, chunk metadata), returns document ids in input order.
 `retrieve_with_config` embeds the query, searches with `top_k`/`score_threshold`/`filters`, optionally reranks, returns `RetrievalResult`s (`chunk_id` from the hit id, `doc_id` from result metadata) truncated to `top_k`.
