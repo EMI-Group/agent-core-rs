@@ -30,7 +30,7 @@ pub use chunking::{
 };
 pub use common::{
     Document, EmbeddingConfig, IndexConfig, KnowledgeBaseConfig, Metadata, MetadataFilter,
-    MultiKBRetrievalResult, RetrievalConfig, RetrievalResult, RerankerConfig, SearchResult,
+    MultiKBRetrievalResult, RerankerConfig, RetrievalConfig, RetrievalResult, SearchResult,
     TextChunk, VectorStoreConfig, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE,
     DEFAULT_DISTANCE_METRIC, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_TOP_K, INDEX_TYPE_BM25, INDEX_TYPE_HYBRID, INDEX_TYPE_VECTOR,
