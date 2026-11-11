@@ -2211,16 +2211,19 @@ dependencies = [
 name = "openjiuwen-sysop"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
+ "chrono",
  "futures",
  "glob",
  "openjiuwen-common",
  "regex",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
