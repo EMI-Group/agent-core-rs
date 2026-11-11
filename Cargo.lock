@@ -2102,7 +2102,6 @@ dependencies = [
  "futures",
  "indexmap",
  "openjiuwen-common",
- "openjiuwen-foundation",
  "parking_lot",
  "regex",
  "serde",
