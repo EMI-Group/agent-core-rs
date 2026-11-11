@@ -30,7 +30,7 @@ use openjiuwen_foundation::llm::{
 };
 use openjiuwen_foundation::prompt::{BaseMessage, ToolCall, Usage};
 use openjiuwen_test_support::{MockCompletion, MockHttpError, MockLlmServer, ScriptedResponse};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -412,6 +412,51 @@ async fn queue_exhaustion_serves_the_untouched_fallback() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn fallback_answers_reuse_the_current_sequence_id() {
+    // The documented id rule: `seq` counts popped script entries from 1, and an
+    // answer served from the fallback reuses the current counter value without
+    // advancing it. The counter therefore starts at 0, so a fresh server's first
+    // fallback answer is `0000` and stays there until a script entry is popped.
+    let server = MockLlmServer::start().await;
+    let client = client_for(&server);
+
+    let first = client
+        .invoke(&conversation("hi"), &request_for(&server))
+        .await
+        .expect("the fallback answers");
+    assert_eq!(first.id, "chatcmpl-mock-0000");
+    assert_eq!(
+        first.message().expect("one choice").text().as_ref(),
+        "Default mock response"
+    );
+    assert_eq!(server.queued(), 0);
+
+    // One popped entry advances the counter to 1 for its own answer...
+    server.push(ScriptedResponse::text("one"));
+    let second = client
+        .invoke(&conversation("hi"), &request_for(&server))
+        .await
+        .expect("the scripted turn answers");
+    assert_eq!(second.id, "chatcmpl-mock-0001");
+    assert_eq!(second.message().expect("one choice").text().as_ref(), "one");
+    assert_eq!(server.queued(), 0);
+
+    // ...and the fallback answer that follows reuses it instead of advancing it.
+    let third = client
+        .invoke(&conversation("hi"), &request_for(&server))
+        .await
+        .expect("the fallback answers again");
+    assert_eq!(third.id, "chatcmpl-mock-0001");
+    assert_eq!(
+        third.message().expect("one choice").text().as_ref(),
+        "Default mock response"
+    );
+    assert_eq!(server.queued(), 0, "the fallback is never consumed");
+
+    server.shutdown().await;
+}
+
 // --- recordings and addressing --------------------------------------------
 
 #[tokio::test]
@@ -502,6 +547,39 @@ async fn wait_for_requests_timeout_reports_a_timeout_until_a_call_lands() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn wait_for_requests_wakes_when_the_request_arrives_later() {
+    // Every other test waits *after* the request completed. Here the waiter is
+    // already parked when the request lands, so only the recording's notification
+    // can wake it. The outer bound turns a lost wake-up into a failure instead of
+    // a hung test.
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        let server = MockLlmServer::with_script([ScriptedResponse::text("late")]).await;
+        let client = client_for(&server);
+        let request = request_for(&server);
+
+        let responder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            client
+                .invoke(&conversation("late?"), &request)
+                .await
+                .expect("the mock server answers the late request")
+        });
+
+        server.wait_for_requests(1).await;
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(
+            server.last_request().expect("one recording").user_texts(),
+            vec!["late?".to_owned()]
+        );
+
+        responder.await.expect("the responder task completes");
+        server.shutdown().await;
+    })
+    .await;
+    completed.expect("wait_for_requests woke up within the bound");
+}
+
 // --- builder ---------------------------------------------------------------
 
 #[tokio::test]
@@ -534,6 +612,47 @@ async fn builder_configures_ids_model_and_chunk_delay() {
         .expect("delayed frames decode");
     assert_eq!(turn.message.text().as_ref(), "delayed");
     assert_eq!(turn.finish_reason, Some(FinishReason::Stop));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn builder_script_replaces_the_queue_and_item_appends_to_it() {
+    // `MockLlmServerBuilder::script` REPLACES the script, while `item` appends to
+    // it. Calling `script` after an `item` therefore discards that item, and any
+    // `item` after `script` is appended behind it — the order below pins that.
+    let server = MockLlmServer::builder()
+        .item(ScriptedResponse::text("dropped"))
+        .script([
+            ScriptedResponse::text("first"),
+            ScriptedResponse::text("second"),
+        ])
+        .item(ScriptedResponse::text("third"))
+        .start()
+        .await;
+    let client = client_for(&server);
+    assert_eq!(
+        server.queued(),
+        3,
+        "script replaced the earlier item; item appended after it"
+    );
+
+    for (expected, expected_id) in [
+        ("first", "chatcmpl-mock-0001"),
+        ("second", "chatcmpl-mock-0002"),
+        ("third", "chatcmpl-mock-0003"),
+    ] {
+        let response = client
+            .invoke(&conversation("hi"), &request_for(&server))
+            .await
+            .expect("the mock server answers");
+        assert_eq!(response.id, expected_id);
+        assert_eq!(
+            response.message().expect("one choice").text().as_ref(),
+            expected
+        );
+    }
+    assert_eq!(server.queued(), 0);
 
     server.shutdown().await;
 }
@@ -647,6 +766,26 @@ async fn several_servers_are_alive_without_cross_talk() {
     second.shutdown().await;
 }
 
+#[tokio::test]
+async fn shutdown_completes_gracefully_after_a_finished_stream() {
+    let server = MockLlmServer::with_script([ScriptedResponse::text("streamed")]).await;
+    let client = client_for(&server);
+
+    let chunks = collect_stream(
+        &client,
+        conversation("hi"),
+        request_for(&server).with_stream(true),
+    )
+    .await;
+    assert_eq!(streamed_text(&chunks), "streamed", "the stream completed");
+
+    // A drained connection winds the server down through the graceful signal,
+    // which is far inside the 5 s abort bound `shutdown` uses as a fallback; a
+    // `timeout` here therefore fails if shutdown ever falls back to aborting.
+    let stopped = tokio::time::timeout(Duration::from_secs(2), server.shutdown()).await;
+    assert!(stopped.is_ok(), "shutdown drained within the bound");
+}
+
 // --- raw HTTP surface ------------------------------------------------------
 
 /// Sends one raw HTTP/1.1 request and returns the whole response text.
@@ -669,6 +808,25 @@ async fn raw_http(addr: SocketAddr, request: &str) -> String {
 /// A `GET` that asks the server to close the connection after the response.
 fn get_request(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+}
+
+/// A JSON `POST` that asks the server to close the connection after the response.
+fn post_request(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Splits a raw HTTP response into its status line and its body.
+fn split_response(response: &str) -> (&str, &str) {
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("a response separates headers from body");
+    (
+        head.lines().next().expect("a response has a status line"),
+        body,
+    )
 }
 
 #[tokio::test]
@@ -709,6 +867,69 @@ async fn raw_http_surface_answers_health_404_and_a_malformed_body() {
         recorded.response_id.is_none(),
         "a 400 stamps no response id"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn chat_completions_alias_answers_exactly_like_the_versioned_path() {
+    // The script is empty, so both requests are answered by the same fallback and
+    // reuse the same id: the two bodies must therefore be byte-identical, which
+    // proves the alias is a real route rather than a differently-shaped reply.
+    let server = MockLlmServer::builder()
+        .fallback(ScriptedResponse::text("aliased"))
+        .start()
+        .await;
+    let body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    .to_string();
+
+    let versioned = raw_http(server.addr(), &post_request("/v1/chat/completions", &body)).await;
+    let alias = raw_http(server.addr(), &post_request("/chat/completions", &body)).await;
+
+    let (versioned_status, versioned_body) = split_response(&versioned);
+    let (alias_status, alias_body) = split_response(&alias);
+    assert!(versioned_status.starts_with("HTTP/1.1 200"), "{versioned}");
+    assert!(alias_status.starts_with("HTTP/1.1 200"), "{alias}");
+    assert!(
+        alias_body.contains(r#""content":"aliased""#),
+        "the alias serves the scripted content: {alias}"
+    );
+    assert_eq!(
+        alias_body, versioned_body,
+        "both paths serialize the same chat-completion JSON"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/chat/completions");
+    assert_eq!(requests[1].path, "/chat/completions");
+    assert_eq!(requests[1].method, "POST");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wrong_method_is_a_json_404_that_consumes_nothing() {
+    let server = MockLlmServer::with_script([ScriptedResponse::text("unused")]).await;
+    let response = raw_http(server.addr(), &get_request("/v1/chat/completions")).await;
+    let (status, body) = split_response(&response);
+
+    assert!(status.starts_with("HTTP/1.1 404"), "{response}");
+    let body: Value = serde_json::from_str(body).expect("the 404 body is JSON");
+    assert!(
+        body["error"]["message"].is_string(),
+        "the envelope carries a message: {body}"
+    );
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // A rejected method is not a model call: no script entry was popped and no
+    // recording was appended.
+    assert_eq!(server.queued(), 1);
+    assert_eq!(server.request_count(), 0);
+    assert!(server.last_request().is_none());
 
     server.shutdown().await;
 }

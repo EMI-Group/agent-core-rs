@@ -238,7 +238,6 @@ impl fmt::Debug for TempHomeGuard {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -308,40 +307,57 @@ mod tests {
 
     #[test]
     fn guards_serialize_across_threads() {
-        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        let (started_tx, started_rx) = mpsc::channel();
+        /// Two managed names, so the child's guard is a real guard (the lock is
+        /// taken on construction, not on the first `set`).
+        const NAMES: &[&str] = &[env::MODEL_NAME, env::OPENJIUWEN_LOG_LEVEL];
 
-        let first = {
-            let events = Arc::clone(&events);
-            std::thread::spawn(move || {
-                let guard = EnvGuard::new(&[env::OPENJIUWEN_LOG_LEVEL]);
-                guard.set(env::OPENJIUWEN_LOG_LEVEL, "first");
-                events.lock().expect("events lock").push("first");
-                started_tx.send(()).expect("signal start");
-                std::thread::sleep(Duration::from_millis(20));
-                drop(guard);
-            })
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first guard acquired");
+        let main_guard = EnvGuard::new(NAMES);
+        main_guard.set(env::MODEL_NAME, "main-thread");
 
-        let second = {
-            let events = Arc::clone(&events);
-            std::thread::spawn(move || {
-                // Blocks until the first thread drops its guard.
-                let guard = EnvGuard::new(&[env::OPENJIUWEN_LOG_LEVEL]);
-                events.lock().expect("events lock").push("second");
-                drop(guard);
-            })
-        };
+        let (tx, rx) = mpsc::channel();
+        let child = std::thread::spawn(move || {
+            // Sent *before* constructing the guard, so the main thread knows the
+            // child reached (and is about to block on) the acquisition.
+            tx.send("starting").expect("signal start");
 
-        first.join().expect("first thread");
-        second.join().expect("second thread");
+            // Blocked here while the main guard owns the process-global lock.
+            let guard = EnvGuard::new(NAMES);
+            assert_eq!(
+                guard.get(env::MODEL_NAME),
+                None,
+                "the child's guard cleared the names itself"
+            );
+            guard.set(env::OPENJIUWEN_LOG_LEVEL, "child");
+            tx.send("acquired").expect("signal acquisition");
+
+            // `EnvGuard` is `!Send`, so it must be dropped on this thread.
+            drop(guard);
+        });
+
         assert_eq!(
-            *events.lock().expect("events lock"),
-            vec!["first", "second"]
+            rx.recv_timeout(Duration::from_millis(100)),
+            Ok("starting"),
+            "the child started and is about to block"
         );
+        // Mutual exclusion: the main guard is still alive, so the child cannot
+        // get past `EnvGuard::new` and nothing may arrive on the channel. Were
+        // the global mutex gone, "acquired" (or a panic) would land here.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the child acquired the lock while the main guard was alive"
+        );
+
+        drop(main_guard);
+
+        // Releasing the lock lets the blocked child finish its construction and
+        // report, which also proves the lock is released on drop.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(1000)),
+            Ok("acquired"),
+            "the child acquired the lock once the main guard dropped"
+        );
+        child.join().expect("the child thread finishes");
     }
 
     #[test]
