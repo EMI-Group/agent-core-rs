@@ -114,10 +114,12 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - **Message scanning is strictly stronger than Python**: Python's `PromptInjectionGuardrail` scans only the last message of `messages`; here `text_view()` joins every message's text and tool-call arguments with `\n`, so a malicious earlier turn is caught too. Single-message prompts behave identically.
 - **`SensitivePattern` matching is regex + optional validator** (Luhn for card numbers), never a bare substring, and redaction is applied left-to-right on the original text so overlapping matches cannot corrupt each other.
 - **Guardrails do not chain sanitized content between each other** (Python does not either): each sees the original context, and `GuardrailOutcome::modified_data()` merges their `modified_data` objects in evaluation order (later keys win).
+- **The parser is injected, not serialized**: Python's `PromptInjectionGuardrailConfig` holds a parser object; here the serde config carries only data and `PromptInjectionGuardrail::with_config_and_parser` injects an `Arc<dyn ModelOutputParser>`, while `bert`/`qwen` defaults are built from `bert_thresholds`, `attack_class_id`, and `qwen_risk_type`.
+- **Backend configs keep secrets as `SecretString` and never hold trait objects in serde**: `ApiModelBackend`/`LocalModelBackend` parsers arrive through `with_parser`, transports through `with_transport`, so every config round-trips through JSON.
 
 ## Known Gaps and Deferred Adapters
 
-- Phase 1 ships `level`, `context`, `result`, `rules`, `config`, `guardrail`, `finding`, `pipeline`, `report`; Phase 2 adds `parsers` and `backends`; the `guardrails` module described above is not implemented yet.
+- `parsers`, `backends`, and `guardrails::prompt_injection` are implemented; the `sensitive_data`, `content_rules`, and `tool_arguments` guardrails described above are not implemented yet.
 - `ApiModelBackend` performs no HTTP: it requires an injected `ModerationTransport`; without one, `analyze` returns `Error::Unsupported`. The Python `httpx` call to `{"text": ...}` is the transport's job.
 - `LocalModelBackend` has no inference runtime: constructor and config are preserved (parity of fields/defaults), `analyze` returns `Error::Unsupported`. Python needs `torch`/`transformers`.
 - `LlmPromptInjectionBackend` keeps Python's stub semantics (delegates to the rule backend, config fields unused) instead of inventing an LLM judge; `DEFAULT_SYSTEM_PROMPT` is a reconstructed Chinese JSON-contract prompt because Python never reads its constant; a real judge is a `Guardrail` implementation over `openjiuwen_foundation::llm::Model`.
