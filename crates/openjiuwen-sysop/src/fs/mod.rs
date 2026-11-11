@@ -18,6 +18,8 @@ use openjiuwen_common::error::{Error, Result};
 use crate::config::LocalWorkConfig;
 use crate::operation::FsOperation;
 
+pub mod list;
+pub mod search;
 pub mod types;
 
 /// Builds the local filesystem backend for `config`.
