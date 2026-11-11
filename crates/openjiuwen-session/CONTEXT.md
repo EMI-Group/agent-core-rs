@@ -284,6 +284,16 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/session/state/test_...`).
 - Gates: `cargo fmt -p openjiuwen-session`, `cargo test -p openjiuwen-session`, `cargo test -p openjiuwen-session --features sqlite`, `cargo clippy -p openjiuwen-session --all-targets -- -D warnings`, all clean.
 
+## Notes for Agents
+
+- `graph`/`workflow` should take `Arc<WorkflowState>` from `WorkflowSession::state()` for the io/workflow lanes and staging; the `Session` trait intentionally exposes only global + component state.
+- Sessions write the committed global lane through `StateStore::write_global`; `update_global` keeps Python's staging behavior for graph/workflow commit cycles — do not swap the two.
+- Use `StreamWriterManager::write_now` (and `StreamHub::send_now`) from synchronous code such as trace sinks and callbacks; use `write`/`send` in async code. Both are non-blocking.
+- `request_interaction` only completes when another task calls `resolve_interaction` (normally the host transport reading `__interaction__` frames); seeded `InteractiveInput::interrupt_answers` short-circuit it on resume.
+- Facades above own the `Arc<dyn Checkpointer>` and inject it through the options structs; there is no process-global default checkpointer.
+- Interaction vocabulary maps to `openjiuwen-harness-protocol` by table only (see the mapping above); this crate must not depend on the protocol crate (layer rule, `docs/ARCHITECTURE.md` §1).
+- `src/tracer.rs` is ~1100 lines because it holds the span model, frame type, three sinks, the tracer, and their inline tests; split it when another sink or span family lands.
+
 ## Known Gaps and Deferred Work
 
 - No Redis/remote checkpointer (trait seam only), no `session_controller/` disk-backed product sessions, no `vcs/` version history, no `store.py` (unused in Python; `MemoryStore` is not public API), no ambient-session ContextVar.
