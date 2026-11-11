@@ -22,6 +22,12 @@ uuid.workspace = true
 regex.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
+url.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
 
 [features]
 default = []

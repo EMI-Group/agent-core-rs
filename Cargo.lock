@@ -2100,6 +2100,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "indexmap",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "parking_lot",
@@ -2107,10 +2108,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
