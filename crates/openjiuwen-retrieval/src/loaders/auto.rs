@@ -164,9 +164,16 @@ impl AutoLoader {
     /// Loads `source`, optionally overriding the document id and title.
     ///
     /// Mirrors Python's `parser.parse(path, doc_id, file_name=...)`: `doc_id`
-    /// overrides the id the child loader generated (every document of a
-    /// multi-document source reuses it), and `title` overrides the file-stem
-    /// title stamped on documents loaded from a file. URLs are returned untouched.
+    /// overrides the id the child loader generated, and `title` overrides the
+    /// file-stem title stamped on documents loaded from a file. URLs are returned
+    /// untouched.
+    ///
+    /// Single-document sources (text, Markdown, JSON, HTML) take `doc_id`
+    /// verbatim, while multi-document file loaders (CSV/TSV) use it as the id
+    /// base prefix — the generated ids are `"<source>_s0_r2"`/`"<source>_s0_c0"`,
+    /// and the leading `source` is replaced by `doc_id`, mirroring Python's
+    /// `base_id = doc_id or doc`. Every document therefore keeps a distinct id,
+    /// and `metadata["doc_id"]` always equals the final id.
     ///
     /// # Errors
     ///
@@ -201,7 +208,7 @@ impl AutoLoader {
         let title = title.map_or_else(|| file_stem(source), str::to_owned);
         for document in &mut documents {
             if let Some(doc_id) = doc_id {
-                doc_id.clone_into(&mut document.id);
+                apply_doc_id(source, doc_id, &mut document.id);
             }
             if document.id.trim().is_empty() {
                 document.id = generate_document_id();
@@ -221,6 +228,18 @@ impl AutoLoader {
                 .insert("file_ext".to_owned(), Value::String(extension.clone()));
         }
         Ok(documents)
+    }
+}
+
+/// Applies the caller-supplied `doc_id` to one document id.
+///
+/// Multi-document file loaders (CSV/TSV) generate ids prefixed with the `source`
+/// string, so `doc_id` becomes the base prefix (`format!("{doc_id}{rest}")`).
+/// Every other loader's id is replaced verbatim.
+fn apply_doc_id(source: &str, doc_id: &str, id: &mut String) {
+    match id.strip_prefix(source) {
+        Some(rest) => *id = format!("{doc_id}{rest}"),
+        None => doc_id.clone_into(id),
     }
 }
 
@@ -384,6 +403,36 @@ mod tests {
             documents[0].metadata.get("title"),
             Some(&Value::String("Custom".to_owned()))
         );
+    }
+
+    #[tokio::test]
+    async fn load_as_uses_the_doc_id_as_the_base_prefix_for_multi_document_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("people.csv");
+        std::fs::write(&path, "Name,Age\nAlice,30\n").unwrap();
+
+        let documents = AutoLoader::new()
+            .load_as(path.to_str().unwrap(), Some("doc-base"), None)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["doc-base_s0_r2", "doc-base_s0_c0", "doc-base_s0_c1"]
+        );
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "ids must be unique: {ids:?}");
+        for document in &documents {
+            assert_eq!(
+                document.metadata.get("doc_id"),
+                Some(&Value::String(document.id.clone()))
+            );
+        }
     }
 
     #[tokio::test]
