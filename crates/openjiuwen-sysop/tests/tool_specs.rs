@@ -1,7 +1,5 @@
-//! Ports tests/unit_tests/core/sys_operation/test_tool_adapter.py (generated tool specs).
-
+//! Ports `tests/unit_tests/core/sys_operation/test_tool_adapter.py` (generated tool specs).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-#![allow(clippy::doc_markdown)] // The required module doc names a Python test path verbatim.
 
 use openjiuwen_sysop::{
     mode::{OperationKind, OperationMode},
