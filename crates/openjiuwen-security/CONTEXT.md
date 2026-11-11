@@ -60,7 +60,7 @@ backends:   RuleBasedPromptInjectionBackend + RuleBasedBackendConfig (six Python
             ApiModelBackend + ApiModelBackendConfig (transport seam), LocalModelBackend + LocalModelBackendConfig (unsupported seam)
 guardrails: PromptInjectionGuardrail + PromptInjectionGuardrailConfig (Python parity, mode rules/api/local),
             SensitiveDataGuardrail + config + SensitivePattern (PII detect + redact),
-            ContentRuleGuardrail + ContentRule + config, ToolArgumentGuardrail + config, ModerationGuardrail + ModerationClient/ModerationVerdict seam
+            ContentRuleGuardrail + ContentRule + config, ToolArgumentGuardrail + config
 ```
 
 Crate root re-exports every item above flat (`openjiuwen_security::GuardrailPipeline`, `openjiuwen_security::RiskLevel`, ...); modules stay public for qualified paths.
