@@ -53,28 +53,26 @@ impl MemoryStores {
 ```rust
 pub(crate) struct MemoryStorage { /* kv, vector, document, providers */ }
 impl MemoryStorage {
-    pub fn new(stores: MemoryStores) -> Self;
-    pub fn stores(&self) -> &MemoryStores;
+    pub(crate) fn new(stores: MemoryStores) -> Self;
 
-    pub async fn put_record(&self, record: &MemoryRecord) -> Result<()>;
-    pub async fn get_record(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>>;
-    pub async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;
-    pub async fn delete_record(&self, record: &MemoryRecord) -> Result<bool>; // record + embedding
+    pub(crate) async fn put_record(&self, record: &MemoryRecord) -> Result<()>;
+    pub(crate) async fn get_record(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>>;
+    pub(crate) async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;
+    pub(crate) async fn delete_record(&self, record: &MemoryRecord) -> Result<bool>; // record + embedding
 
-    pub async fn index_embedding(&self, record: &MemoryRecord, embedding: &[f32]) -> Result<()>;
-    pub async fn delete_embedding(&self, record: &MemoryRecord) -> Result<()>;
-    pub async fn delete_embeddings_for(&self, filter: &MemoryFilter) -> Result<usize>;
-    pub async fn search_embeddings(&self, scope: &MemoryScope, kind: MemoryType,
-                                   vector: &[f32], top_k: usize) -> Result<Vec<(String, f32)>>;
+    pub(crate) async fn index_embedding(&self, record: &MemoryRecord, embedding: &[f32]) -> Result<()>;
+    pub(crate) async fn delete_embedding(&self, record: &MemoryRecord) -> Result<()>;
+    pub(crate) async fn search_embeddings(&self, scope: &MemoryScope, kind: MemoryType,
+                                          vector: &[f32], top_k: usize) -> Result<Vec<(String, f32)>>;
 
-    pub async fn set_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str, value: &str) -> Result<()>;
-    pub async fn get_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str) -> Result<Option<String>>;
-    pub async fn list_variables(&self, scope: &MemoryScope, session_id: Option<&str>) -> Result<BTreeMap<String, String>>;
-    pub async fn delete_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str) -> Result<bool>;
+    pub(crate) async fn set_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str, value: &str) -> Result<()>;
+    pub(crate) async fn get_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str) -> Result<Option<String>>;
+    pub(crate) async fn list_variables(&self, scope: &MemoryScope, session_id: Option<&str>) -> Result<BTreeMap<String, String>>;
+    pub(crate) async fn delete_variable(&self, scope: &MemoryScope, session_id: Option<&str>, name: &str) -> Result<bool>;
 
-    pub async fn set_scope_config(&self, scope_id: &str, config: &MemoryScopeConfig) -> Result<bool>;
-    pub async fn get_scope_config(&self, scope_id: &str) -> Result<Option<MemoryScopeConfig>>;
-    pub async fn delete_scope_config(&self, scope_id: &str) -> Result<bool>;
+    pub(crate) async fn set_scope_config(&self, scope_id: &str, config: &MemoryScopeConfig) -> Result<bool>;
+    pub(crate) async fn get_scope_config(&self, scope_id: &str) -> Result<Option<MemoryScopeConfig>>;
+    pub(crate) async fn delete_scope_config(&self, scope_id: &str) -> Result<bool>;
 }
 ```
 Semantics:
@@ -85,7 +83,7 @@ Semantics:
 - `search_embeddings` checks `collection_exists`; a missing collection yields an empty vector. Scores are foundation-normalized `[0,1]`.
 - Variables are stored as JSON strings? No: store the raw string as `KvValue::Text` for Python-compatible inspection; `get_variable` returns text only.
 - `set_scope_config` serializes the config JSON under `memory_scope_config/{scope_id}`; malformed stored JSON returns `Error::Validation` (never silently dropped).
-- Graph access is exposed through `stores().graph`; this module does not implement graph semantics.
+- Graph storage is carried by `MemoryStores::graph` and used by the `graph` module; this module does not implement graph semantics.
 
 ### `messages.rs`
 ```rust
@@ -97,11 +95,10 @@ pub struct StoredMessage {
 }
 pub(crate) struct MessageStore { /* document */ }
 impl MessageStore {
-    pub fn new(document: Arc<dyn DocumentStore>) -> Self;
-    pub async fn append(&self, scope: &MemoryScope, messages: &[BaseMessage], timestamp: DateTime<Utc>) -> Result<Vec<StoredMessage>>;
-    pub async fn recent(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<StoredMessage>>; // newest first, then reversed to chronological
-    pub async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize>;
-    pub async fn count(&self, scope: &MemoryScope) -> Result<usize>;
+    pub(crate) fn new(document: Arc<dyn DocumentStore>) -> Self;
+    pub(crate) async fn append(&self, scope: &MemoryScope, messages: &[BaseMessage], timestamp: DateTime<Utc>) -> Result<Vec<StoredMessage>>;
+    pub(crate) async fn recent(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<StoredMessage>>; // newest first, then reversed to chronological
+    pub(crate) async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize>;
 }
 ```
 `id` is deterministic: `msg_{fnv64(content + role + millis):016x}_{millis}` (Python's `msg_{sha256(...)}_{ms}` shape, no crypto dependency). Collection `messages`; documents are the flat `StoredMessage` JSON. `recent` queries `user_id`/`scope_id`/optional `session_id`, orders by `timestamp` desc, limit, then reverses. `content` is the plain-text view of `BaseMessage::content`; non-text parts are JSON-rendered into content. `role` uses the `Role` serde name (`system`/`user`/`assistant`/`tool`).

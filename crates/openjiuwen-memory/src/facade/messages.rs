@@ -26,7 +26,8 @@ use serde_json::{Map, Value};
 
 use crate::config::AgentMemoryConfig;
 use crate::record::{
-    AddMemResult, AddOptions, AddOutcome, MemoryRecord, MemoryScope, MemoryType, NewMemory,
+    AddMemResult, AddOptions, AddOutcome, CallOptions, MemoryFilter, MemoryRecord, MemoryScope,
+    MemoryType, NewMemory,
 };
 use crate::store::StoredMessage;
 
@@ -129,6 +130,30 @@ impl LongTermMemory {
         let limit = num.min(self.config().message_history_limit);
         let stored = self.engine.message_store().recent(scope, limit).await?;
         Ok(stored.into_iter().map(message_from_stored).collect())
+    }
+
+    /// Deletes the conversation history rows matching `filter`, returning how many were
+    /// removed.
+    ///
+    /// Only message history is cleared; memory records and variables are untouched (use
+    /// [`LongTermMemory::clear`] for those). Scope clauses, `ids`, and the
+    /// `created_after`/`created_before` bounds select the rows; kind, importance, and
+    /// text clauses do not apply to messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Cancelled`] when the call is cancelled before the delete and the
+    /// storage error when the delete fails.
+    pub async fn clear_messages(
+        &self,
+        filter: &MemoryFilter,
+        options: &CallOptions,
+    ) -> Result<usize> {
+        options.check()?;
+        let deleted = options
+            .run(self.engine.message_store().delete_for(filter))
+            .await??;
+        Ok(deleted)
     }
 
     /// Runs one extraction prompt, retrying on model or parse failures.

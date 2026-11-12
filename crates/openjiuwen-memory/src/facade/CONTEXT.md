@@ -50,6 +50,7 @@ impl LongTermMemory {
     pub async fn add_messages(&self, scope: &MemoryScope, messages: &[BaseMessage],
                               agent_config: &AgentMemoryConfig, options: &AddOptions) -> Result<AddMemResult>;
     pub async fn get_recent_messages(&self, scope: &MemoryScope, num: usize) -> Result<Vec<BaseMessage>>;
+    pub async fn clear_messages(&self, filter: &MemoryFilter, options: &CallOptions) -> Result<usize>;
 
     // --- variables ---
     pub async fn set_variable(&self, scope: &MemoryScope, name: &str, value: &str) -> Result<()>;
@@ -96,6 +97,7 @@ impl LongTermMemory {
   5. Return `AddMemResult` grouped by kind (records actually added/merged, `coding` normally empty).
   A model failure never fails `add_messages`; it degrades to the heuristic path. Cancellation returns `Error::Cancelled` and leaves already-added records.
 - `get_recent_messages` uses the message store (scope's `session_id`, else all sessions) with `num` clamped to `message_history_limit` and returns chronological `BaseMessage`s; `Role` maps from the stored role name (unknown roles default to `User` with a warning).
+- `clear_messages` deletes conversation history rows matching the filter (records and variables are untouched); cancellation is checked before the delete.
 - Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` lists all user-scope variables (not session variables); session variables are addressed by `scope.session_id`.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
 
@@ -112,7 +114,7 @@ impl LongTermMemory {
 - `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports
 - `./records.rs` → CRUD/listing/stats methods and Python parity aliases
 - `./recall.rs` → `search`, `recall`, `search_all`
-- `./messages.rs` → `add_messages`, `get_recent_messages`, extraction/fallback
+- `./messages.rs` → `add_messages`, `get_recent_messages`, `clear_messages`, extraction/fallback
 - `./variables.rs` → variable and scope-config methods
 
 ## Test Strategy
