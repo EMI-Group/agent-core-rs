@@ -148,10 +148,9 @@ async fn stream_forwards_the_final_frame_and_one_terminal_answer() {
         json!("COMPLETED")
     );
 
-    // The engine writes its own frames to the session hub (shared with the
-    // child workflow session) as it runs. The terminal `workflow_final` frame
-    // is synthesized by the compiled workflow's stream and is not re-written to
-    // the hub, so the drain below looks for the engine's graph frames instead.
+    // The agent mirrors its synthesized `workflow_final` and terminal `answer`
+    // chunks into the supplied session's hub; the engine's own frames reach the
+    // same hub through the child workflow session.
     let mut kinds = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     loop {
@@ -161,19 +160,19 @@ async fn stream_forwards_the_final_frame_and_one_terminal_answer() {
         }
         match tokio::time::timeout(remaining, events.next()).await {
             Ok(Some(Ok(StreamEvent::Item(item)))) => {
-                let engine_frame = item.item_type == "graph_event";
                 kinds.push(item.item_type);
-                if engine_frame {
-                    break;
-                }
             }
             Ok(Some(Ok(StreamEvent::End)) | None) | Err(_) => break,
             Ok(Some(Err(error))) => panic!("session stream failed: {error}"),
         }
     }
     assert!(
-        kinds.iter().any(|kind| kind == "graph_event"),
-        "the engine's frames never reached the session hub: {kinds:?}"
+        kinds.iter().any(|kind| kind == WORKFLOW_FINAL),
+        "the forwarded final frame never reached the session hub: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| kind == ANSWER),
+        "the terminal answer never reached the session hub: {kinds:?}"
     );
 }
 
@@ -311,13 +310,7 @@ async fn an_interrupt_reports_input_required_and_resumes_with_the_answer() {
     assert_eq!(frames[0].index, 0);
     assert_eq!(frames[0].payload["id"], "ask");
     assert_eq!(paused.interrupt_ids, ["ask"]);
-    // The workflow projection reports the interaction id as the interrupt id;
-    // `AgentOutput::interrupt` leaves the component-id list empty.
-    assert!(
-        paused.component_ids.is_empty(),
-        "{:?}",
-        paused.component_ids
-    );
+    assert_eq!(paused.component_ids, ["ask"]);
 
     let resumed = agent
         .invoke(
