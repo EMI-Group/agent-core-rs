@@ -53,6 +53,7 @@ pub mod prompt_builder;
 pub mod skill_creator;
 pub mod skill_evaluator;
 pub mod tune;
+pub mod util;
 /// The crate name, useful in diagnostics and documentation.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// The crate version.
