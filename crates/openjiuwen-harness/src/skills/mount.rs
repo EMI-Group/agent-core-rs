@@ -380,8 +380,6 @@ pub(crate) async fn read_head_lines(path: &Path, lines: usize) -> io::Result<Str
 /// # Errors
 ///
 /// Returns the IO error when the file cannot be opened or read.
-// Used by `discovery` once that module is ported.
-#[allow(dead_code)]
 pub(crate) async fn read_front_matter_text(path: &Path) -> io::Result<String> {
     let head = read_head_lines(path, FRONT_MATTER_PROBE_LINES).await?;
     if !head.starts_with("---") {
@@ -414,7 +412,7 @@ fn parse_validated_metadata(name: &str, content: &str, path: &Path) -> Result<Sk
 }
 
 /// Normalizes a path to an absolute, lexically cleaned form when possible.
-fn normalize_path(path: PathBuf) -> PathBuf {
+pub(crate) fn normalize_path(path: PathBuf) -> PathBuf {
     std::path::absolute(&path).unwrap_or(path)
 }
 
