@@ -23,6 +23,8 @@ Ports `openjiuwen/core/session/internal/` (v0.1.20): `WorkflowSession`, `NodeSes
 - Checkpoint save/resume builds a `Checkpoint` from `SessionSnapshot` (global + components + trace position) and restores through `StateStore::restore`.
 - Session ids: caller-supplied or `uuid_hex()` (parentless workflow) / `uuid_v4()` (agent/team facades), matching Python id shapes.
 - `save_checkpoint` without a configured checkpointer is `Error::Session`; `resume` with a missing checkpoint returns `Ok(false)`.
+- State is in-process and per session object: constructing a second session with the same `session_id` starts with empty lanes, and construction never auto-restores — a caller resumes only by calling `Session::resume(checkpoint_id)` on a session built with a checkpointer over the same storage (and the same session id, since `resume` loads by `self.id()`); `Checkpointer::latest(session_id)` discovers the newest id.
+- `Clone` on a concrete session shares the same `SessionInner`/state store, so reusing the clone (rather than constructing a new session) sees prior state; `post_run` closes that shared hub by default (`close_stream_on_post_run`), so a reused session's next run emits frames into a closed stream unless the option is disabled.
 - No `unsafe`, no stdout logging, files ≤ ~1000 lines.
 
 ## Routing Table

@@ -28,7 +28,7 @@ Test files (one concern each, 79 tests total):
 
 ## Routing Table
 
-- `./deep_agent_loop.rs` → loop, tools, interrupts
+- `./deep_agent_loop.rs` → tool round, permission-denied bash, max-iteration, follow-up, abort
 - `./workspace_safety.rs` → workspace and path safety
 - `./permissions.rs` → permission engine and rail
 - `./state_persistence.rs` → session state round-trip
@@ -51,6 +51,41 @@ Test files (one concern each, 79 tests total):
 Verified against HEAD `af1e0b0` by reading source; line numbers are current.
 `openjiuwen_harness` has **no crate-root flat re-exports** (`src/lib.rs:12-26` is `pub mod` only), so always import `openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`.
 Crate `dev-dependencies`: `openjiuwen-test-support`, `anyhow`, `tempfile`; normal deps usable from tests include `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-foundation`, `openjiuwen-sysop`, `openjiuwen-common`, `openjiuwen-harness-protocol`, `tokio`, `futures`, `async-trait`, `parking_lot`, `serde_json`.
+
+### 0. Shared fixtures already in this directory (copy these)
+
+`deep_agent_loop.rs`:
+```rust
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use openjiuwen_agent::{Agent, AgentCard, ResultType};
+use openjiuwen_foundation::tool::{FunctionTool, Tool};
+use openjiuwen_foundation::Role;
+use openjiuwen_harness::agent::{DeepAgent, DeepAgentBuilder};
+use openjiuwen_harness::permission::{PermissionLevel, PermissionsSection, DENIED_PREFIX};
+use openjiuwen_harness::schema::{DeepAgentConfig, InteractionPhase};
+use openjiuwen_harness::tools::{BuiltinTool, ToolRegistry};
+use openjiuwen_harness::workspace::Workspace;
+use openjiuwen_session::{AgentSession, Session};
+use openjiuwen_test_support::{MockCompletion, ScriptedModel, ScriptedTurn};
+use serde_json::{json, Value};
+use tempfile::TempDir;
+
+fn temp_workspace() -> (TempDir, Workspace) {
+    let temp = TempDir::new().expect("temp workspace directory");
+    let workspace = Workspace::for_language(temp.path(), "en");
+    (temp, workspace)
+}
+fn base_config(workspace: &Workspace) -> DeepAgentConfig {
+    DeepAgentConfig::default().with_language("en".to_string()).with_workspace(workspace.clone())
+}
+```
+`recording_echo()` builds `FunctionTool::builder().name("echo").description(..).input_schema(json!({...})).handler(|inputs: Value, _ctx| async move { Ok(json!({"success": true, "data": {"content": inputs}})) }).build()?.boxed()` and returns `(Arc<dyn Tool>, Arc<Mutex<Vec<Value>>>)`.
+`cli.rs` doubles: `ScriptedReader { lines: VecDeque<String> }` implements `LineReader::read_line`; `SharedWriter { buffer: Arc<Mutex<String>> }` implements `Writer::write/flush`; `terminal(lines, interactive)` returns `(CliIo, Arc<Mutex<String>>)` via `CliIo::new` / `CliIo::with_interactive`; `rendered(&buffer)` clones the text.
+`cli.rs::test_options(root) -> CliOptions { model: DEFAULT_MODEL.to_owned(), provider: DEFAULT_PROVIDER.to_owned(), api_key: None, api_base: None, workspace: root.join("workspace"), max_iterations: DEFAULT_MAX_ITERATIONS, max_tokens: DEFAULT_MAX_TOKENS, verbose: false, home: OpenJiuwenHome::from_root(root) }` then `options.ensure_workspace()`.
+Headless run: `run_with_model(&options, &RunArgs { prompt: Some("hello".into()), output_format: OutputFormat::Text }, &io, model)` → `RunOutcome { answer, result_type: "answer", usage, session_id (starts_with "cli-"), chunks > 0 }`.
 
 ### 1. ScriptedModel (`crates/openjiuwen-test-support/src/scripted_model.rs`)
 
@@ -404,3 +439,5 @@ Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — a
 - `cargo build -p openjiuwen-harness --tests` was **not** run here: this investigator is read-only and must not execute builds; `tests/` currently contains only `CONTEXT.md`, so `--tests` would compile the crate's internal `#[cfg(test)]` modules plus future files (unverified).
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.
+- No suite drives a `DeepAgent` interrupt/resume cycle (no `ResultType::Interrupt`, no `interrupt_ids`, no answer to a raised interrupt); `permissions.rs` raises `InterruptKind::Permission` only by calling `PermissionInterruptRail::before_tool_call` directly, and `subagents_skills.rs`'s "resume" is `SubAgentRuntime::resume`.
+- The answer-an-interrupt seam for an agent-level test is unverified: no existing test supplies a response to `AgentOutput::interrupt_ids` or re-invokes a session holding one.

@@ -19,6 +19,10 @@ Suites (run with `cargo test -p openjiuwen-agent`):
 
 - Every test is offline and deterministic; no wall-clock assertions beyond short timeouts and no external services.
 - Shared fixtures live in `common/mod.rs` (`SESSION_ID`, session/agent builders, recording and failing tools, the input log); suites that need bespoke rails, stores, or workflows keep those helpers local to the file.
+- A suite pulls the shared fixtures in with a plain `mod common;` (no `#[path]` attribute — `tests/common/mod.rs` is auto-discovered); `interrupt.rs` and `rails.rs` instead carry local `log`/`recording_tool` helpers and do not declare it.
+- Every suite file opens with `#![allow(clippy::unwrap_used, clippy::expect_used)]` (plus `clippy::assert_is_empty` in most) so `unwrap`/`expect` in tests stay lint-clean; `common/mod.rs` adds `#![allow(dead_code, unreachable_pub)]` because each suite is a separate crate and only uses some helpers.
+- All async tests are plain `#[tokio::test]` (current-thread runtime); no `flavor = "multi_thread"`, no `#[serial]`, and no `TempHomeGuard`/`EnvGuard`/global `Runner` — isolation comes from in-process sessions and `ScriptedModel`.
+- Shared state in tests is `parking_lot::Mutex<Vec<_>>` held in an `Arc` (clone the `Arc` inside `Fn` tool handlers, then `lock()` inside the async block); the guard is never held across an `await`.
 - Tests assert Python-compatible serialized names (`result_type`, `termination_reason`, `interrupt_kind`/`interrupt_owner`, `__interaction__`, `llm_output`, `workflow_final`).
 
 ## Routing Table

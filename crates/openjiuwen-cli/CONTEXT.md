@@ -26,6 +26,14 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - Async-first: the process runs on the tokio multi-thread runtime provided by `#[tokio::main]`; no blocking calls are added at the boundary.
 - Do not add sibling binaries here.
 
+## Gotchas
+
+- `-h` and `--help` differ: `-h` prints the explicit `about = "openJiuwen agent CLI"`, `--help` prints the long help synthesized from the `Cli` struct doc comment; assert on `Usage:`, `Commands:`, `run`/`chat` rows instead of the banner.
+- `version` is set only on the top-level `Cli` (no `propagate_version`), so `openjiuwen --version` / `-V` prints `openjiuwen <workspace version>` while `openjiuwen run --version` is a usage error (exit `2`).
+- `dotenvy::dotenv()` in `main` loads `.env` from the working directory **and its ancestors**, so a spawned-process test must run the child in a temp cwd (or clear inherited `API_KEY`/`OPENAI_*`) or ambient state leaks in.
+- `env!("CARGO_BIN_EXE_openjiuwen")` exists only for integration tests of this package (Cargo defines it per binary-owning package); tests in other crates cannot use it, and this crate has no lib target to depend on.
+- Runtime failures print `error: <kind>: <cause>` (the `Error` display adds the kind prefix) and exit `1`; the run may already have created the workspace directory by then.
+
 ## Routing Table
 
 - `./src/main.rs` → the whole binary: startup order, logging installation, clap parse, `run_cli` dispatch, exit-code mapping.
