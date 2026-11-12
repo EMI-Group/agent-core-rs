@@ -7,6 +7,7 @@
 //! same order and the crate needs no random-number dependency.
 
 use openjiuwen_common::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::tune::base::Case;
 
@@ -58,7 +59,13 @@ impl Rng64 {
 ///
 /// Python: `openjiuwen.dev_tools.tune.CaseLoader`. Construction is infallible;
 /// ratio arguments are validated by [`CaseLoader::split`].
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// Serializes to a single-key object holding the cases in their current order,
+/// for example `{"cases": [{...}, {...}]}`. Deserialization is permissive: the
+/// `cases` key may be omitted (yielding an empty loader) and unknown keys are
+/// ignored.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
 pub struct CaseLoader {
     /// The contained cases, in their current order.
     cases: Vec<Case>,
@@ -316,5 +323,37 @@ mod tests {
 
         let by_value: Vec<String> = loader.into_iter().map(|c| c.case_id).collect();
         assert_eq!(by_value, ["0", "1", "2"]);
+    }
+
+    #[test]
+    fn serialization_round_trips_through_the_cases_key() {
+        let loader = loader(3);
+
+        let value = serde_json::to_value(&loader).unwrap();
+        let cases = value
+            .get("cases")
+            .and_then(Value::as_array)
+            .expect("the JSON object must hold a `cases` array");
+        assert_eq!(cases.len(), 3);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(1));
+
+        let restored: CaseLoader = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, loader);
+        assert_eq!(ids(&restored), ["0", "1", "2"]);
+        assert_eq!(ids(&restored), ids(&loader));
+    }
+
+    #[test]
+    fn deserialization_defaults_an_empty_loader_and_ignores_unknown_keys() {
+        let empty: CaseLoader = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty, CaseLoader::default());
+
+        let with_extra: CaseLoader = serde_json::from_value(serde_json::json!({
+            "cases": [serde_json::to_value(case("0")).unwrap()],
+            "unknown_key": {"nested": true},
+        }))
+        .unwrap();
+        assert_eq!(ids(&with_extra), ["0"]);
     }
 }
