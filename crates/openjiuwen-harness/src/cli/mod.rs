@@ -33,24 +33,26 @@ mod session_store;
 #[cfg(test)]
 mod tests;
 
-// Placeholder modules are still empty: their glob re-exports carry nothing yet,
-// which `unused_imports` and `unreachable_pub` would flag. The attributes go
-// away together with the globs once each module exposes its items.
-#[allow(unused_imports, unreachable_pub)]
-pub use config::*;
-pub use io::*;
-#[allow(unused_imports, unreachable_pub)]
-pub use permissions::*;
-#[allow(unused_imports, unreachable_pub)]
-pub use render::*;
-#[allow(unused_imports, unreachable_pub)]
-pub use repl::*;
-#[allow(unused_imports, unreachable_pub)]
-pub use run::*;
-pub use session_store::*;
+pub use config::{
+    CliOptions, EnvSource, MapEnv, ProcessEnv, Settings, DEFAULT_LANGUAGE, DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER, MIN_MAX_TOKENS, OPENJIUWEN_API_BASE,
+    OPENJIUWEN_API_KEY, OPENJIUWEN_HOME, OPENJIUWEN_MAX_ITERATIONS, OPENJIUWEN_MAX_TOKENS,
+    OPENJIUWEN_MODEL, OPENJIUWEN_PROVIDER, OPENJIUWEN_WORKSPACE, SESSION_PREFIX,
+};
+pub use io::{CliIo, LineReader, StdioReader, StdoutWriter, Writer};
+pub use permissions::{render_prompt, CliPermissionHost, PermissionAnswer};
+pub use render::RenderState;
+pub use repl::{InterruptAction, InterruptCounter, Repl, ReplCommand, TurnOutcome};
+pub use run::{
+    build_agent, new_session, result_json_line, run_once, run_with_model, session_id,
+    stream_json_line, RunOutcome,
+};
+pub use session_store::{MessageRecord, SessionRecord, SessionStore};
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+
+use openjiuwen_common::error::Result;
 
 /// Parsed command line of the `openjiuwen` binary.
 ///
@@ -182,4 +184,47 @@ impl Cli {
 #[must_use]
 pub fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
+}
+
+/// Runs the CLI end to end: resolve options, dispatch, then run or chat.
+///
+/// This is the canonical entry point of the `openjiuwen` binary. The workspace
+/// directory is created only once a command is going to run, so `--help` and
+/// parse errors never touch the disk.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`](openjiuwen_common::error::Error::Config) when the
+/// options cannot be resolved or the workspace cannot be created, and whatever
+/// the one-shot run or the REPL reports.
+pub async fn run_cli(cli: Cli) -> Result<()> {
+    let options = CliOptions::resolve(&cli)?;
+    let dispatch = cli.dispatch(stdin_is_tty());
+    tracing::debug!(?dispatch, "dispatching CLI command");
+    match dispatch {
+        Dispatch::Run(args) => {
+            options.ensure_workspace()?;
+            let io = CliIo::stdio();
+            run::run_once(&options, &args, &io).await.map(|_| ())
+        }
+        Dispatch::Chat => {
+            options.ensure_workspace()?;
+            let io = CliIo::stdio();
+            let model = options.build_model().await?;
+            let agent = run::build_agent(model, &options, &io).await?;
+            Repl::new(agent, options).run().await
+        }
+    }
+}
+
+/// Alias of [`run_cli`] under the name the binary calls.
+///
+/// `run` is also a private module (one-shot execution); the two live in
+/// different namespaces, so the spelling is unambiguous.
+///
+/// # Errors
+///
+/// See [`run_cli`].
+pub async fn run(cli: Cli) -> Result<()> {
+    run_cli(cli).await
 }
