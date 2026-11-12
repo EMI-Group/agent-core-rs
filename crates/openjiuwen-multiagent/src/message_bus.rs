@@ -299,6 +299,14 @@ impl MessageBus {
         self.subscriptions.subscribers(topic_id)
     }
 
+    /// Returns the topics `agent_id` is subscribed to (sorted).
+    ///
+    /// Used by the runtime to drop every subscription of an unregistered agent.
+    #[must_use]
+    pub fn agent_topics(&self, agent_id: &str) -> Vec<String> {
+        self.subscriptions.topics_of(agent_id)
+    }
+
     /// Sends a point-to-point envelope and waits for the reply.
     ///
     /// The envelope's [`session_id`](MessageEnvelope::session_id) selects the
