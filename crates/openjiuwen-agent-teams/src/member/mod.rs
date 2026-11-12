@@ -13,6 +13,10 @@
 //! | [`activity`] | [`MemberActivityRegistry`], [`IdleDebounce`], [`DEFAULT_IDLE_DEBOUNCE`] |
 //! | [`spawn`] | [`MemberSpawner`], [`MemberSpawnRequest`], [`InProcessSpawnHandle`], [`SpawnRegistry`] |
 //!
+//! The schema types this module's own signatures expose ([`RoundOutcome`], [`MemberStatus`],
+//! [`ExecutionStatus`], [`TeamRole`], [`MemberLifetime`]) are re-exported here so callers can drive
+//! the member seam through this module alone; `crate::schema` remains their owner.
+//!
 //! The split follows Python's roles rather than its files: a runtime is the seam the coordination
 //! layer drives, a `TeamMember` is the persisted row plus its transition rules, the activity
 //! registry is the leader's projection of the whole roster, and the spawn handle owns the task
@@ -53,3 +57,6 @@ pub use activity::{IdleDebounce, MemberActivityRegistry, DEFAULT_IDLE_DEBOUNCE};
 pub use lifecycle::TeamMember;
 pub use runtime::{MemberObserver, MemberRuntime, ObserverEvent, ObserverSet, RecordingObserver};
 pub use spawn::{InProcessSpawnHandle, MemberSpawnRequest, MemberSpawner, SpawnRegistry};
+
+// Re-exports of the `schema` types this module's signatures use — the schema module owns them.
+pub use crate::schema::{ExecutionStatus, MemberLifetime, MemberStatus, RoundOutcome, TeamRole};

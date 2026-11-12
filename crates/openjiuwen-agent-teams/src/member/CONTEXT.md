@@ -37,8 +37,9 @@ impl TeamMember {
     pub fn new(store: Arc<dyn TeamStore>, record: MemberRecord) -> Self;
     pub fn record(&self) -> MemberRecord;
     pub fn team_name(&self) -> &str;   pub fn member_name(&self) -> &str;
-    pub fn role(&self) -> TeamRole;    pub fn status(&self) -> MemberStatus;
+    pub fn role(&self) -> TeamRole;    pub fn status(&self) -> MemberStatus;      // cached projection
     pub fn execution(&self) -> ExecutionStatus;
+    pub async fn stored_status(&self) -> Result<MemberStatus>;                  // store read + cache refresh
     pub fn runtime(&self) -> Option<Arc<dyn MemberRuntime>>;
     pub fn attach_runtime(&self, runtime: Arc<dyn MemberRuntime>);
     pub fn observe(&self, observer: Arc<dyn MemberObserver>);
@@ -83,6 +84,7 @@ pub struct SpawnRegistry;          // insert(handle) -> Option<handle>, contains
 ```
 
 `mod.rs` re-exports the surface flat, mirroring `agent_teams/__init__.py`'s member exports.
+It also re-exports the schema types its own signatures use — `RoundOutcome`, `MemberStatus`, `ExecutionStatus`, `TeamRole`, `MemberLifetime` — so callers can drive the member seam through this module alone; `../schema/` remains their owner and this node never redefines them.
 `openjiuwen_harness_protocol::HarnessState` is re-exported by `../schema/`; this node imports it and never defines a second state enum.
 
 ## Lifecycle rules
@@ -130,10 +132,11 @@ The status machine never stops the runtime: `shutdown` only settles the row, and
 
 ## Test Strategy
 
-Unit tests live beside each file; `cargo test -p openjiuwen-agent-teams --lib` runs them offline and deterministically (313 crate tests, 55 of them in this node).
+Unit tests live beside each file; `cargo test -p openjiuwen-agent-teams --lib` runs them offline and deterministically (665 crate tests, 57 of them in this node).
 The status-machine suite is `lifecycle_tests.rs`: start happy path (`starting` then `ready`, runtime started once), start failure rollback with the original error propagated, start without a runtime and start on a non-`unstarted` member, idempotent re-assert, illegal edge untouched, lost CAS refreshes the cache, execution validation and persistence, all four `note_round` walks with the `busy`/`ready` mirror, repeated round notes and the duplicate-note-does-not-revive guard, retire targets (`shutdown`/`dormant`/forced/direct-to-`shut_down`/unreachable dormant/idempotent), `error()`, observer queuing and forwarding, `refresh` after a peer write, and the "status machine never stops the runtime" invariant.
 `runtime.rs` covers recording order/drain and observer-set fan-out; `activity.rs` covers `is_moving`, `settled_members`, `idle_since`/`last_activity`, re-registration, removal, sorted snapshots and the `IdleDebounce` boundary (inclusive window, `None`, backwards clock, zero window); `spawn.rs` covers cancel+join, abort→`Cancelled`, task error propagation, panic→`External`, `is_finished`, registry insert-replace/remove/take/cancel-all bookkeeping, request serde and spawner object safety.
-Every file has a doctest; all four pass. The crate still reports two pre-existing doctest failures (`lib.rs`, `constants.rs`) that reference crate-root re-exports not yet declared — those belong to the crate root node, not here.
+Every file has a doctest; all pass.
+The accessor suite covers identity/role/execution getters, the cached `status()` and `stored_status()` on an unstarted member, `stored_status()` picking up a peer's write and then a local transition, and `stored_status()` on an unknown member reporting `ErrorKind::NotFound`.
 Definition of done for this node: `rustfmt --check` clean on every `src/member/*.rs`, `cargo test -p openjiuwen-agent-teams --lib` and `--no-default-features --lib` green, and no clippy diagnostic pointing at `src/member/`.
 Crate-wide `cargo clippy -- -D warnings` still reports `missing_docs` on the five still-empty sibling modules (`harness`, `mcp`, `runtime`, `skill`, `taskboard`), declared in `../lib.rs`; those belong to the crate root node.
 
@@ -156,3 +159,8 @@ Crate-wide `cargo clippy -- -D warnings` still reports `missing_docs` on the fiv
 - Deferred here and surfaced as `Error::Unsupported` by the spawner implementation: OS-process members (`spawn_mode="process"`), external-CLI members, SSH transport, fork/compact injection and swarmflow sharing (`inprocess_spawn.py`'s context injection has no Rust counterpart yet).
 - Python's rail/memory/background-controller helpers on `MemberRuntime` (`find_rails`, `register_member_tools`, `inject_member_memory`, `set_background_task_controller`, `workspace`, `sys_operation`) are not part of the Rust seam; the harness adapter reaches its own agent directly.
 - `TeamMember` implements `Debug` non-exhaustively (identity, cached statuses, whether a runtime is attached); `ObserverSet` prints its observer count.
+- `status()` stays the synchronous cached projection, so the store-reading accessor is `stored_status()` rather than an async `status()` — Rust cannot overload the existing getter, and every caller in `../runtime/` and `../harness/` relies on the sync form.
+
+## Known gaps
+
+- `MemberRuntime::send` returns `Result<()>` and therefore drops any transport-level `SendReceipt`: harness-level receipts are not surfaced through the member seam, and a consumer that needs one must wrap the runtime in its own `MemberRuntime`. Carrying a receipt through the seam would change `../harness/` and `../runtime/`, both outside this node.

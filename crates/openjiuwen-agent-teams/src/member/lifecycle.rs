@@ -105,9 +105,25 @@ impl TeamMember {
     }
 
     /// Returns the cached lifecycle status.
+    ///
+    /// This is the synchronous view this handle last wrote or refreshed; use
+    /// [`Self::stored_status`] to read the row another writer may have moved.
     #[must_use]
     pub fn status(&self) -> MemberStatus {
         self.record.read().status
+    }
+
+    /// Reads the member's lifecycle status from the store and refreshes the cache.
+    ///
+    /// The async counterpart of [`Self::status`]: it sees writes made through other handles (the
+    /// leader sweep, a peer's retire) without the caller touching the [`TeamStore`] itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::not_found`] when the member row does not exist and propagates store
+    /// failures.
+    pub async fn stored_status(&self) -> Result<MemberStatus> {
+        Ok(self.refresh().await?.status)
     }
 
     /// Returns the cached execution status.

@@ -123,7 +123,7 @@ async fn fixture(role: TeamRole) -> (Arc<dyn TeamStore>, TeamMember) {
     (store, member)
 }
 
-async fn stored_status(store: &Arc<dyn TeamStore>) -> MemberStatus {
+async fn row_status(store: &Arc<dyn TeamStore>) -> MemberStatus {
     store
         .member("alpha", "dev-1")
         .await
@@ -143,7 +143,7 @@ async fn start_transitions_unstarted_to_ready_and_starts_the_runtime_once() {
     assert_eq!(runtime.start_count(), 1);
     assert_eq!(*runtime.team_session_present.read(), Some(false));
     assert_eq!(member.status(), MemberStatus::Ready);
-    assert_eq!(stored_status(&store).await, MemberStatus::Ready);
+    assert_eq!(row_status(&store).await, MemberStatus::Ready);
 }
 
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn start_failure_rolls_the_row_back_to_unstarted() {
     assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Config);
     assert!(error.message().contains("harness could not start"));
     assert_eq!(member.status(), MemberStatus::Unstarted);
-    assert_eq!(stored_status(&store).await, MemberStatus::Unstarted);
+    assert_eq!(row_status(&store).await, MemberStatus::Unstarted);
 }
 
 #[tokio::test]
@@ -185,14 +185,14 @@ async fn start_on_a_non_unstarted_member_is_rejected() {
         .message()
         .contains("member 'dev-1' is not in unstarted state"));
     assert_eq!(runtime.start_count(), 0);
-    assert_eq!(stored_status(&store).await, MemberStatus::Starting);
+    assert_eq!(row_status(&store).await, MemberStatus::Starting);
 }
 
 #[tokio::test]
 async fn marking_the_current_status_is_an_idempotent_success() {
     let (store, member) = fixture(TeamRole::Teammate).await;
     assert!(member.mark(MemberStatus::Unstarted).await.unwrap());
-    assert_eq!(stored_status(&store).await, MemberStatus::Unstarted);
+    assert_eq!(row_status(&store).await, MemberStatus::Unstarted);
 }
 
 #[tokio::test]
@@ -200,7 +200,7 @@ async fn an_illegal_transition_returns_false_and_leaves_the_store_untouched() {
     let (store, member) = fixture(TeamRole::Teammate).await;
     assert!(!member.mark(MemberStatus::Dormant).await.unwrap());
     assert_eq!(member.status(), MemberStatus::Unstarted);
-    assert_eq!(stored_status(&store).await, MemberStatus::Unstarted);
+    assert_eq!(row_status(&store).await, MemberStatus::Unstarted);
 }
 
 #[tokio::test]
@@ -338,7 +338,7 @@ async fn shutdown_settles_shutdown_lifetime_to_shut_down() {
 
     assert_eq!(settled, MemberStatus::ShutDown);
     assert_eq!(member.status(), MemberStatus::ShutDown);
-    assert_eq!(stored_status(&store).await, MemberStatus::ShutDown);
+    assert_eq!(row_status(&store).await, MemberStatus::ShutDown);
 }
 
 #[tokio::test]
@@ -392,7 +392,7 @@ async fn shutdown_of_an_unstarted_member_cannot_reach_dormant() {
         openjiuwen_common::error::ErrorKind::Validation
     );
     assert!(error.message().contains("cannot shut down from status"));
-    assert_eq!(stored_status(&store).await, MemberStatus::Unstarted);
+    assert_eq!(row_status(&store).await, MemberStatus::Unstarted);
 }
 
 #[tokio::test]
@@ -481,6 +481,39 @@ async fn getters_expose_identity_and_role() {
     assert_eq!(member.role(), TeamRole::Leader);
     assert!(member.runtime().is_none());
     assert_eq!(member.execution(), ExecutionStatus::Idle);
+    assert_eq!(member.status(), MemberStatus::Unstarted);
+    assert_eq!(
+        member.stored_status().await.unwrap(),
+        MemberStatus::Unstarted
+    );
+}
+
+#[tokio::test]
+async fn stored_status_reads_the_row_and_reports_missing_members() {
+    let (store, member) = fixture(TeamRole::Teammate).await;
+    let peer = TeamMember::new(
+        Arc::clone(&store),
+        MemberRecord::new("alpha", "dev-1", TeamRole::Teammate),
+    );
+    peer.mark(MemberStatus::Starting).await.unwrap();
+    assert_eq!(member.status(), MemberStatus::Unstarted);
+
+    // The store-reading accessor sees the peer's write and refreshes the cache.
+    assert_eq!(
+        member.stored_status().await.unwrap(),
+        MemberStatus::Starting
+    );
+    assert_eq!(member.status(), MemberStatus::Starting);
+
+    member.mark(MemberStatus::Ready).await.unwrap();
+    assert_eq!(member.stored_status().await.unwrap(), MemberStatus::Ready);
+
+    let ghost = TeamMember::new(
+        store,
+        MemberRecord::new("alpha", "ghost", TeamRole::Teammate),
+    );
+    let error = ghost.stored_status().await.unwrap_err();
+    assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::NotFound);
 }
 
 #[tokio::test]
