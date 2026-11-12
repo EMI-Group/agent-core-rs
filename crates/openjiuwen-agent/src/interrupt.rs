@@ -345,20 +345,44 @@ pub fn answer_text(value: &Value) -> String {
 
 /// Returns the rejection feedback carried by `value`, or
 /// [`DEFAULT_REJECT_FEEDBACK`] when it carries no non-empty text.
+///
+/// A JSON string yields itself; an object yields its `feedback`, then its
+/// `reason`/`text`, then recurses into `value`. Anything else (including
+/// `null`, `{}` and `{"approved": false}`) falls back to the default.
 #[must_use]
 pub fn reject_feedback(value: &Value) -> String {
-    if value.as_object().is_some_and(serde_json::Map::is_empty) {
-        return DEFAULT_REJECT_FEEDBACK.to_owned();
+    carried_feedback(value).unwrap_or_else(|| DEFAULT_REJECT_FEEDBACK.to_owned())
+}
+
+/// Returns the first non-empty text carried by `value`, if any.
+fn carried_feedback(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => non_empty_text(text),
+        Value::Object(map) => {
+            if let Some(feedback) = map.get("feedback").and_then(Value::as_str) {
+                if let Some(feedback) = non_empty_text(feedback) {
+                    return Some(feedback);
+                }
+            }
+            let reason = ["reason", "text"]
+                .iter()
+                .filter_map(|key| map.get(*key).and_then(Value::as_str))
+                .find_map(non_empty_text);
+            if reason.is_some() {
+                return reason;
+            }
+            map.get("value").and_then(carried_feedback)
+        }
+        _ => None,
     }
-    let carried = value
-        .as_object()
-        .and_then(|map| map.get("feedback").or_else(|| map.get("reason")))
-        .and_then(Value::as_str)
-        .map_or_else(|| answer_text(value), str::to_owned);
-    if carried.is_empty() {
-        DEFAULT_REJECT_FEEDBACK.to_owned()
+}
+
+/// Returns `text` as owned when it holds non-whitespace characters.
+fn non_empty_text(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        None
     } else {
-        carried
+        Some(text.to_owned())
     }
 }
 
@@ -622,14 +646,93 @@ mod tests {
     fn reject_feedback_prefers_reason() {
         assert_eq!(reject_feedback(&json!({"feedback": "nope"})), "nope");
         assert_eq!(reject_feedback(&json!({"reason": "bad"})), "bad");
+        assert_eq!(reject_feedback(&json!({"text": "nah"})), "nah");
         assert_eq!(
             reject_feedback(&json!({"feedback": ""})),
             DEFAULT_REJECT_FEEDBACK
         );
         assert_eq!(reject_feedback(&json!({})), DEFAULT_REJECT_FEEDBACK);
         assert_eq!(reject_feedback(&json!("text")), "text");
-        assert_eq!(reject_feedback(&json!({"other": 1})), r#"{"other":1}"#);
+        assert_eq!(
+            reject_feedback(&json!({"other": 1})),
+            DEFAULT_REJECT_FEEDBACK
+        );
         assert_eq!(reject_feedback(&Value::Null), DEFAULT_REJECT_FEEDBACK);
+    }
+    #[test]
+    fn reject_feedback_cases() {
+        // (1) JSON string: used when non-empty after trim.
+        assert_eq!(reject_feedback(&json!("  spaced  ")), "  spaced  ");
+        assert_eq!(
+            reject_feedback(&json!("   ")),
+            DEFAULT_REJECT_FEEDBACK,
+            "blank strings fall back"
+        );
+        assert_eq!(reject_feedback(&json!("")), DEFAULT_REJECT_FEEDBACK);
+
+        // (2) `feedback` wins over `reason`/`text`, blank feedback does not.
+        assert_eq!(
+            reject_feedback(&json!({"feedback": "first", "reason": "second"})),
+            "first"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"feedback": "", "reason": "second"})),
+            "second"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"feedback": "  ", "text": "third"})),
+            "third"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"feedback": "   ", "reason": ""})),
+            DEFAULT_REJECT_FEEDBACK
+        );
+
+        // (3) `reason` before `text`; non-string members are ignored.
+        assert_eq!(
+            reject_feedback(&json!({"reason": "why", "text": "what"})),
+            "why"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"feedback": 7})),
+            DEFAULT_REJECT_FEEDBACK
+        );
+
+        // (4) `value` recurses.
+        assert_eq!(reject_feedback(&json!({"value": "inner"})), "inner");
+        assert_eq!(
+            reject_feedback(&json!({"value": {"feedback": "deep"}})),
+            "deep"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"value": {"value": "deeper"}})),
+            "deeper"
+        );
+        assert_eq!(
+            reject_feedback(&json!({"value": {}})),
+            DEFAULT_REJECT_FEEDBACK
+        );
+
+        // (5) Anything else falls back to the default.
+        assert_eq!(
+            reject_feedback(&json!({"approved": false})),
+            DEFAULT_REJECT_FEEDBACK
+        );
+        assert_eq!(
+            reject_feedback(&json!({"approved": true})),
+            DEFAULT_REJECT_FEEDBACK
+        );
+        assert_eq!(reject_feedback(&json!([1, 2])), DEFAULT_REJECT_FEEDBACK);
+        assert_eq!(reject_feedback(&json!(false)), DEFAULT_REJECT_FEEDBACK);
+        assert_eq!(reject_feedback(&json!(0)), DEFAULT_REJECT_FEEDBACK);
+        assert_eq!(
+            reject_feedback(&approval_value(false, "", false)),
+            DEFAULT_REJECT_FEEDBACK
+        );
+        assert_eq!(
+            reject_feedback(&approval_value(false, "no way", false)),
+            "no way"
+        );
     }
     #[test]
     fn match_answers_prefers_interrupt_id() {
