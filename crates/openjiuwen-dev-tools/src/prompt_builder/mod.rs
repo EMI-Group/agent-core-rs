@@ -31,6 +31,12 @@ pub mod meta;
 pub mod templates;
 pub mod utils;
 
+pub use bad_case::{BadCasePromptBuilder, MAX_CASES_LIMIT};
+pub use feedback::{FeedbackMode, FeedbackOptions, FeedbackPromptBuilder};
+pub use language::Language;
+pub use meta::{IntoMetaTemplate, MetaBuildOptions, MetaTemplateBuilder, TemplateType};
+pub use templates::{bank, PromptBank};
+
 /// The marker spliced into the prompt by insert-mode feedback.
 ///
 /// Ports Python's `INSERT_STR`; the marker is fixed Chinese text because the

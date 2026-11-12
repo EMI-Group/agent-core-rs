@@ -65,7 +65,7 @@ pub struct PromptBank {
 ///
 /// Python's `select_template` resolves the same two dictionaries; the fallback to
 /// `zh-CN` for an unknown tag happens earlier here, in
-/// [`Language`](super::language::Language), which rejects unknown tags instead of
+/// [`Language`], which rejects unknown tags instead of
 /// defaulting.
 #[must_use]
 pub fn bank(language: Language) -> &'static PromptBank {
