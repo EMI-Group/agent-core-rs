@@ -39,7 +39,10 @@ pub use components::{
 };
 pub use condition::{Branch, BranchRouter, Condition};
 pub use context::ComponentContext;
-pub use engine::{ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition};
+pub use engine::{
+    CompiledWorkflow, ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition,
+    WorkflowRunOptions,
+};
 pub use error::{
     branch_execution_error, branch_param_invalid, compile_error, component_ability_invalid,
     component_execution_error, component_id_invalid, component_schema_invalid,

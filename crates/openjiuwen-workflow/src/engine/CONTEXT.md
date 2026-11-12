@@ -82,10 +82,12 @@ is produced by the matching `error::*` builder so the Python code prefix survive
 ### `node.rs`
 
 ```rust
+pub(crate) struct RunScope { pub interactions: Arc<InteractionState>, pub writer: Arc<FrameWriter> }
 pub(crate) struct NodeRuntime {
     pub id: String, pub component: Arc<dyn Component>, pub node: NodeConfig,
     pub ability: ComponentAbility, pub is_end: bool,
-    pub workflow_id: String, pub interactions: Arc<InteractionState>, pub writer: Arc<FrameWriter>,
+    pub workflow_id: String,
+    pub scope: Option<Arc<RunScope>>,   // None only when compiling for `to_mermaid` (never executed)
 }
 pub(crate) struct ComponentNode { /* Arc<NodeRuntime> */ }
 impl Node for ComponentNode { /* run(...) */ }
@@ -97,8 +99,9 @@ impl Node for ComponentNode { /* run(...) */ }
    inputs, so both `${query}` (root) and `${start.query}` resolve.
 2. `inputs = resolve_schema(inputs_schema, &source)` when a schema exists, else the whole source object; for
    `Collect` / `Transform`, resolve `stream_inputs_schema` too and merge the objects (`stream` keys win).
-3. `ComponentContext::new(session, id, workflow_id)` + `.with_interactions(...)` + `.with_writer(...)` +
-   `.with_cancellation(ctx.cancellation().clone())`.
+3. `ComponentContext::new(session, id, workflow_id)` + `.with_interactions(scope.interactions)` +
+   `.with_writer(scope.writer)` + `.with_cancellation(ctx.cancellation().clone())`; `run` errors with
+   `Error::workflow` when `scope` is `None` (only `to_mermaid` compiles without one).
 4. trace, when `session.tracer()` is `Some`: `start_workflow_span(id, name)`, `set_inputs(inputs)`, then
    `finish(output)` / `interrupted(reason)` / `fail(error)`.
 5. dispatch: `component.route(&source)` first — `Ok(Some(targets))` returns `NodeOutcome::Route { targets }`
@@ -172,8 +175,9 @@ and seeds `interactive`.
 
 - `./definition.rs` → `WorkflowDefinition`, `NodeConfig`, `Edge`, `ConditionalSource`, ability selection, `spec()`
 - `./validate.rs` → compile-time validation and coded problem messages
-- `./node.rs` → `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt halting)
-- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, graph compilation, run/stream/resume
+- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt halting); crate-visible only (`pub(crate)`)
+- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation, `test_support` fakes
+- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, seed/timeout helpers, `AbortOnDrop`
 
 ## Test Strategy
 
