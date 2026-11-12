@@ -64,6 +64,14 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 
 ## Notes for Agents
 
+- `HarnessProtocol` (`#[async_trait]`, `Send + Sync`, all `&self`): sync `card`, `state`, `provider_session_id`, `event_buffer_config`, `events() -> Box<dyn HarnessEventCursor>`, `turn_events(Option<&str>)`; async `start(HarnessContext)`, `stop`, `send(HarnessInput, DeliveryMode)`, `abort(AbortMode)`, `pause`, `resume(Option<HarnessInput>)`, `export_checkpoint`; provided defaults `send_auto`, `abort_graceful`.
+- There is no `import_checkpoint` (restore flows through `HarnessContext::checkpoint` + `ResumePolicy`) and no `send_steer` (steering is `DeliveryMode::Steer`).
+- `HarnessProvider` is synchronous (no `#[async_trait]`): `fn card(&self) -> &HarnessCard` and `fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>>`; `ModelConfigProvider::model_config(&self, &ModelChoice, Option<&ModelChoice>) -> HarnessResult<JsonObject>` is sync too.
+- `HarnessModelControl` (`#[async_trait]`): `list_models() -> HarnessResult<Vec<ModelOption>>`, `set_model(ModelSelection) -> HarnessResult<()>`.
+- The provider model-catalog type is `ModelOption`; there is no `ModelInfo`.
+- `ModelSelection`/`ModelChoice`/`ModelEndpoint`/`ModelOption` derive no `Default`: build them with struct literals naming every field (or deserialize).
+- `HarnessEventCursor` (`src/stream.rs`): `#[async_trait]`, `Send` but not `Sync`, `&mut self`; `next_event() -> HarnessResult<Option<HarnessEvent>>`, `close() -> HarnessResult<()>`.
+- The crate declares no cargo features (`[features] default = []`); nothing in the public surface is feature-gated.
 - `openjiuwen-harness` implements the native `HarnessProtocol`/`HarnessProvider`; `openjiuwen-harness-providers` registers providers (`native` implemented, vendor providers deferred).
 - Implementor obligations: all harness methods take `&self` (synchronize internally); `create` returns an unstarted harness; `start` validates through `HarnessCard::validate_host`; `send` never waits for a turn; `stop` is idempotent; only one active event cursor (a second must yield `HarnessError::State`); capability-gated operations return `HarnessError::UnsupportedCapability`.
 - Checkpoint sinks must keep `sequence` monotonic per provider/agent/host-session, treat a repeated `checkpoint_id` as idempotent, and answer stale sequences or failed compare-and-set with `HarnessError::CheckpointConflict`.
