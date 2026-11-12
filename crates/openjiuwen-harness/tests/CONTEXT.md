@@ -11,7 +11,7 @@ Test files (one concern each, 79 tests total):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
-- `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, `todo.json` location and item keys.
+- `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, repeated-save null-key preservation, `todo.json` location and item keys.
 - `subagents_skills.rs` (15) — built-in presets, fake factory spawn/wait/close/capacity, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
 - `cli.rs` (20) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
