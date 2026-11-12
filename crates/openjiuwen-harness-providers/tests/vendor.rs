@@ -1,5 +1,3 @@
-#![cfg(feature = "vendor")]
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 //! Offline integration suite for the deferred vendor providers (`claudecode`, `codex`, `dsh`).
 //!
 //! Python counterparts live under `tests/unit_tests/harness_providers/<provider>/test_config.py`
@@ -8,6 +6,9 @@
 //! cases in `dsh/test_harness.py`, but the split is the same.
 //!
 //! Every case is a pure data transform: no network, no external CLI, no SDK, no process spawning.
+
+#![cfg(feature = "vendor")]
+#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use std::collections::BTreeSet;
 
