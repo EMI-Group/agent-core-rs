@@ -67,6 +67,13 @@ pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn
 - `tracing` target `openjiuwen_runner::mq`; never log payload contents above `debug`.
 - Tests: inline unit tests for per-topic ordering, no-handler behavior, timeouts and lifecycle, plus `../tests/message_queue.rs`.
 
+## Notes for Agents
+
+- A handler panic ends that topic's worker (contained by `tokio::spawn`) while the topic stays in the table: later `publish`es become logged no-ops, later `request`s fail with `Error::Transport`, and `unsubscribe`/`subscribe` on the topic is the way back.
+- `publish` to a subscribed topic with no handler returns before enqueueing, so it consumes no capacity in the bounded channel (same logged-no-op contract).
+- `deliveries()` counts the deliveries a worker actually started (handler present), including ones whose handler returned `Err`; requests rejected before enqueueing are not counted.
+- A handler that calls `request` on its own topic deadlocks (the worker awaits that handler); this is the price of strict per-topic FIFO and is not worked around.
+
 ## Routing Table
 
 - `./src/mq/message.rs` → `QueueMessage`, `MessageHandler`, `SUCCESS`
