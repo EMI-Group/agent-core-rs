@@ -11,17 +11,26 @@ publish = false
 [dependencies]
 openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
+openjiuwen-foundation.workspace = true
+openjiuwen-graph.workspace = true
+openjiuwen-retrieval.workspace = true
+openjiuwen-session.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
+schemars.workspace = true
+sha2.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-futures.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
-uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 default = []
+# Enables the SQLite-backed capability-asset store (`store::KvAssetStore::sqlite`).
+sqlite = ["openjiuwen-foundation/sqlite"]
 
 [lints]
 workspace = true
