@@ -1,6 +1,6 @@
 //! Permission model, engine, file/shell guards, session decisions, and HITL interrupt rail.
 //!
-//! A DeepAgent tool call passes one tiered policy pipeline plus two targeted guards
+//! A `DeepAgent` tool call passes one tiered policy pipeline plus two targeted guards
 //! before it runs:
 //!
 //! 1. [`tiered`] — builtin command rules, user rules, approval overrides, tool
