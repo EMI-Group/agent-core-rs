@@ -74,7 +74,14 @@ async fn a_conflicting_checkpoint_sink_never_fails_the_turn() {
     wait_for_checkpoint(&sink, CheckpointReason::TurnCompleted).await;
 
     assert_eq!(fixture.harness.state(), HarnessState::Idle);
-    let checkpoint = export_settled(&fixture.harness).await;
+    // The checkpoint is recorded before the (conflicting) sink write, so it is
+    // exportable as soon as the sink has seen it.
+    let checkpoint = fixture
+        .harness
+        .export_checkpoint()
+        .await
+        .unwrap()
+        .expect("the checkpoint is exportable while the sink write is in flight");
     assert_eq!(checkpoint.provider, HARNESS_NAME);
     let state = decoded(&checkpoint);
     assert_eq!(state.turn_counter, 1, "the turn still advanced the counter");
@@ -187,6 +194,9 @@ async fn require_resume_accepts_an_exported_checkpoint() {
         .await
         .expect("the input is accepted");
     wait_for_checkpoint(&sink, CheckpointReason::TurnCompleted).await;
+    // `export_settled` still lives in the parent test module; the checkpoint is
+    // already recorded when the sink write completes, so it returns on the
+    // first pass.
     let exported = export_settled(&source.harness).await;
     assert_eq!(decoded(&exported).turn_counter, 1);
 

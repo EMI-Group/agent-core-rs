@@ -18,14 +18,17 @@
 //! at `warn` and keeps the previous storage revision, because a turn must never
 //! fail only because the host could not persist progress.
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openjiuwen_harness_protocol::{
-    json_object_from_value, json_object_to_value, CheckpointReason, HarnessCheckpoint,
-    HarnessCheckpointSink, HarnessError, HarnessEvent, HarnessEventPayload, HarnessResult,
-    JsonObject, JsonValue,
+    json_object_from_value, json_object_to_value, CheckpointSaveReceipt, HarnessCheckpoint,
+    HarnessError, HarnessEvent, HarnessEventPayload, HarnessResult, JsonObject, JsonValue,
 };
+#[cfg(test)]
+use openjiuwen_harness_protocol::{CheckpointReason, HarnessCheckpointSink};
+
 use serde::{Deserialize, Serialize};
 
 /// Schema version of [`NativeCheckpointState`].
@@ -249,21 +252,18 @@ impl CheckpointWriter {
         self.sequence = sequence;
     }
 
-    /// Builds the next checkpoint for `state` and hands it to `sink`.
+    /// Builds the next checkpoint for `state` and records it as [`latest`].
     ///
     /// The sequence is incremented before the checkpoint is built, and the
     /// checkpoint carries the current storage revision as its own revision and
-    /// as the sink's compare-and-set expectation. Persistence is best effort: a
-    /// sink failure is logged at `warn` and keeps the previous revision. The
-    /// built checkpoint is always recorded as [`latest`](Self::latest) and
-    /// returned.
-    pub(crate) async fn emit(
+    /// as the next sink write's compare-and-set expectation. Recording happens
+    /// here, before any persistence, so [`latest`](Self::latest) is visible to
+    /// `export_checkpoint` even while the host sink is still writing.
+    pub(crate) fn begin(
         &mut self,
-        sink: Option<&Arc<dyn HarnessCheckpointSink>>,
         state: &NativeCheckpointState,
         provider_session_id: Option<&str>,
-        reason: CheckpointReason,
-    ) -> Option<HarnessCheckpoint> {
+    ) -> HarnessCheckpoint {
         self.sequence = self.sequence.saturating_add(1);
         let checkpoint = HarnessCheckpoint {
             provider: self.provider.clone(),
@@ -276,18 +276,67 @@ impl CheckpointWriter {
             provider_session_id: provider_session_id.map(str::to_owned),
             revision: self.revision.clone(),
         };
-        if let Some(sink) = sink {
-            match sink
-                .save(&checkpoint, reason, self.revision.as_deref())
-                .await
-            {
-                Ok(receipt) => self.revision = Some(receipt.storage_revision),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to persist native checkpoint");
-                }
+        self.latest = Some(checkpoint.clone());
+        checkpoint
+    }
+
+    /// Persists an already built `checkpoint` and records the outcome.
+    ///
+    /// The protocol layer drives [`begin`](Self::begin) and
+    /// [`record`](Self::record) separately so no lock is held across the sink
+    /// `await`; this composition is the convenience wrapper of
+    /// [`emit`](Self::emit) and its unit tests.
+    ///
+    /// Persistence is best effort: the outcome is applied through
+    /// [`record`](Self::record), which logs a sink failure at `warn` and keeps
+    /// the previous storage revision instead of failing the caller.
+    #[cfg(test)]
+    pub(crate) async fn finish(
+        &mut self,
+        sink: Option<&Arc<dyn HarnessCheckpointSink>>,
+        checkpoint: &HarnessCheckpoint,
+        reason: CheckpointReason,
+    ) {
+        let Some(sink) = sink else {
+            return;
+        };
+        let outcome = sink
+            .save(checkpoint, reason, checkpoint.revision.as_deref())
+            .await;
+        self.record(outcome);
+    }
+
+    /// Applies the outcome of a sink write to the tracked storage revision.
+    ///
+    /// A successful write adopts the returned storage revision; a failure is
+    /// logged at `warn` and keeps the previous revision, because a turn must
+    /// never fail only because the host could not persist progress.
+    pub(crate) fn record(&mut self, outcome: HarnessResult<CheckpointSaveReceipt>) {
+        match outcome {
+            Ok(receipt) => self.revision = Some(receipt.storage_revision),
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist native checkpoint");
             }
         }
-        self.latest = Some(checkpoint.clone());
+    }
+
+    /// Builds the next checkpoint for `state` and hands it to `sink`.
+    ///
+    /// This is [`begin`](Self::begin) plus [`finish`](Self::finish): the
+    /// checkpoint is recorded as [`latest`](Self::latest) before the sink is
+    /// awaited and returned afterwards. It is used by the unit tests; the
+    /// protocol layer calls `begin` and records the sink outcome separately so
+    /// the latest checkpoint is exported while the write is in flight.
+    #[cfg(test)]
+    pub(crate) async fn emit(
+        &mut self,
+        sink: Option<&Arc<dyn HarnessCheckpointSink>>,
+        state: &NativeCheckpointState,
+        provider_session_id: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Option<HarnessCheckpoint> {
+        let checkpoint = self.begin(state, provider_session_id);
+        self.finish(sink, &checkpoint, reason).await;
         Some(checkpoint)
     }
 }
@@ -603,6 +652,60 @@ mod tests {
         assert!(
             next.revision.is_none(),
             "a failed write must not invent a storage revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_records_the_checkpoint_before_the_sink_write() {
+        let sink = RecordingSink::new();
+        let dyn_sink: Arc<dyn HarnessCheckpointSink> = sink.clone();
+        let mut writer = CheckpointWriter::new("openjiuwen-native");
+
+        let checkpoint = writer.begin(&state(), Some("provider-1"));
+        assert_eq!(
+            writer.latest(),
+            Some(&checkpoint),
+            "the checkpoint is exportable before the sink is awaited"
+        );
+        assert_eq!(checkpoint.sequence, 1);
+        assert_eq!(
+            checkpoint.provider_session_id.as_deref(),
+            Some("provider-1")
+        );
+        assert!(
+            checkpoint.revision.is_none(),
+            "the first write has no expectation"
+        );
+        assert_eq!(writer.checkpoint_sequence(), 1);
+
+        // The sink write only updates the storage revision; the recorded
+        // checkpoint (and its sequence) must not change.
+        writer
+            .finish(
+                Some(&dyn_sink),
+                &checkpoint,
+                CheckpointReason::SessionActivated,
+            )
+            .await;
+        assert_eq!(writer.latest(), Some(&checkpoint));
+        assert_eq!(writer.checkpoint_sequence(), 1);
+
+        let next = writer.begin(&state(), None);
+        assert_eq!(next.sequence, 2);
+        assert_eq!(
+            next.revision.as_deref(),
+            Some("rev-1"),
+            "finish records the revision returned by the sink"
+        );
+        assert_eq!(writer.latest(), Some(&next));
+
+        writer.record(Err(HarnessError::checkpoint_conflict("stale")));
+        let third = writer.begin(&state(), None);
+        assert_eq!(third.sequence, 3);
+        assert_eq!(
+            third.revision.as_deref(),
+            Some("rev-1"),
+            "a failed write keeps the previous revision"
         );
     }
 }

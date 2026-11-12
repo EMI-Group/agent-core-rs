@@ -8,8 +8,9 @@
 //! Every helper keeps its `parking_lot` guard in a tight scope and never holds
 //! it across an `await`: [`emit`](NativeHarnessInner::emit) builds the envelope
 //! under the lock and awaits the channel afterwards, and
-//! [`emit_checkpoint`](NativeHarnessInner::emit_checkpoint) takes the
-//! checkpoint writer out of the state before awaiting the host sink.
+//! [`emit_checkpoint`](NativeHarnessInner::emit_checkpoint) records the
+//! checkpoint under the lock before awaiting the host sink, so the latest
+//! checkpoint is always exported even while a write is in flight.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -357,33 +358,33 @@ impl NativeHarnessInner {
 
     /// Publishes a checkpoint for the current state through the host sink.
     ///
-    /// The writer is temporarily taken out of the protocol state so the
-    /// `parking_lot` guard is never held across the sink `await`; checkpoint
-    /// emission is best effort, so a concurrent `export_checkpoint` observing
-    /// the taken writer simply reports no checkpoint yet.
+    /// The checkpoint is built and recorded under a short lock, so it is
+    /// visible to `export_checkpoint` before the host sink is asked to persist
+    /// it; the `parking_lot` guard is never held across the sink `await`.
+    /// Persistence is best effort: a sink failure is logged at `warn` and keeps
+    /// the previous storage revision.
     pub(crate) async fn emit_checkpoint(&self, reason: CheckpointReason) {
         let snapshot = self.snapshot_checkpoint_state();
-        let (mut writer, sink, provider_session) = {
+        let (checkpoint, sink, sequence) = {
             let mut state = self.state.lock();
-            let writer =
-                std::mem::replace(&mut state.checkpoints, CheckpointWriter::new(HARNESS_NAME));
-            let sink = state.sink.clone();
             let provider_session = self.provider_session.get().cloned();
-            (writer, sink, provider_session)
+            let checkpoint = state
+                .checkpoints
+                .begin(&snapshot, provider_session.as_deref());
+            let sequence = state.checkpoints.checkpoint_sequence();
+            (checkpoint, state.sink.clone(), sequence)
         };
-        let checkpoint = writer
-            .emit(
-                sink.as_ref(),
-                &snapshot,
-                provider_session.as_deref(),
-                reason,
-            )
-            .await;
+        let persisted = sink.is_some();
+        if let Some(sink) = sink {
+            let outcome = sink
+                .save(&checkpoint, reason, checkpoint.revision.as_deref())
+                .await;
+            self.state.lock().checkpoints.record(outcome);
+        }
         tracing::debug!(
-            sequence = writer.checkpoint_sequence(),
-            persisted = checkpoint.is_some(),
+            sequence = sequence,
+            persisted = persisted,
             "native harness checkpoint published"
         );
-        self.state.lock().checkpoints = writer;
     }
 }
