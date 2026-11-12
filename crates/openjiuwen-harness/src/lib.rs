@@ -1,7 +1,7 @@
-//! DeepAgent harness of the openJiuwen SDK — a port of the Python `openjiuwen.harness` package.
+//! `DeepAgent` harness of the openJiuwen SDK — a port of the Python `openjiuwen.harness` package.
 //!
 //! This crate composes the `openjiuwen_core` kernel (agent runtime, sessions, sysop, security,
-//! memory, context engine) into the DeepAgent task-loop framework with its workspace, permission
+//! memory, context engine) into the `DeepAgent` task-loop framework with its workspace, permission
 //! engine, coding tools, rails, prompts, skills and subagents.
 //! It also implements the native provider for the provider-neutral SPI defined by
 //! `openjiuwen_harness_protocol`.
@@ -25,6 +25,7 @@ pub mod tools;
 pub mod workspace;
 
 /// Returns the crate name.
+#[must_use]
 pub fn crate_name() -> &'static str {
     "openjiuwen-harness"
 }
