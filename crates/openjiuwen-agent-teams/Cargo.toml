@@ -41,5 +41,14 @@ mcp = ["dep:rmcp"]
 distributed = []
 live-tests = []
 
+[[bin]]
+name = "team-member"
+path = "src/bin/team-member.rs"
+
+[[bin]]
+name = "openjiuwen-team-mcp"
+path = "src/bin/openjiuwen-team-mcp.rs"
+required-features = ["mcp"]
+
 [lints]
 workspace = true
