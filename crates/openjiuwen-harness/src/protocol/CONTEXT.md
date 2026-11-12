@@ -79,6 +79,8 @@ The provider's `model_config` returns the create-config fragment (`model`, `temp
 Known keys, all optional: `model`, `provider`, `api_key`, `api_base`, `temperature` (`0.0..=2.0` → `ModelRequestConfig::temperature`), `workspace` (root + cwd), `enable_task_loop`, `max_iterations` (positive), `system_prompt`, `permissions` (`PermissionsSection`), `language`.
 Unknown keys → `Validation("unknown native harness configuration fields: <sorted, ', '>")`; wrong types → `Validation("<key> must be a ...")`; blank string options → `Validation("native harness string options must be non-empty strings")`.
 `create` builds `DeepAgent` synchronously with `DeepAgentBuilder` (card `AgentCard::new("deep_agent")`, no model → lazily resolved by `ensure_initialized`) and returns an unstarted `NativeHarness`.
+`create` cannot take a pre-built `Model`/`DeepAgent`: a caller that already holds one skips the provider and calls `NativeHarness::new(Arc<DeepAgent>, NativeHarnessOptions)` directly, building the agent with `DeepAgentBuilder::model(Arc<dyn Model>)`.
+`temperature` is written to `ModelRequestConfig::temperature` only when `model` is also set; without a model name it is dropped with a `warn!` (a `ModelRequestConfig` always needs a model name).
 
 ## Constraints
 
