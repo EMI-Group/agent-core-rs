@@ -56,6 +56,13 @@ impl SpawnMessage {
 - Errors are `Error::Unsupported` (no spawner / deferred feature) or `Error::Validation` (malformed protocol line).
 - Tests: inline unit tests for spec defaults, line round-trips, and the unsupported spawner message; no process spawning.
 
+## Notes for Agents
+
+- `SpawnMessageKind` wire names are `snake_case` (`health_check_response`), not Python's upper-case `MessageType` values: nothing in this build talks to a Python child, and the workspace serialization convention wins. A future real child-process backend that must interop with Python maps the names at its boundary.
+- `SpawnMessage::timestamp` is an `f64` of unix seconds; compare round-tripped frames with a small tolerance (`~1e-6`) because `serde_json`'s float parser is not correctly rounded.
+- `to_line` rejects serialized text containing a raw `\n`/`\r` (`Error::Validation`) as a framing guard; serde already escapes newlines inside string payloads, so the guard is belt-and-braces.
+- `SpawnMessage.payload` has no serde default, so a wire object missing it is `Error::Validation` rather than a silently null payload.
+
 ## Routing Table
 
 - `./src/spawn/mod.rs` → `SpawnAgentKind`, `SpawnSpec`, `SpawnedAgent`, `AgentSpawner`, `UnsupportedSpawner`
