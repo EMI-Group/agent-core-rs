@@ -134,6 +134,7 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 
 ## Known Gaps
 
+- There is no `ModelInputs`/`ChatParams`/`ModelIo`-style wrapper or inbound/outbound conversion trait: callers pass `&[BaseMessage]` to `invoke`/`ModelExt::complete` and an owned `Vec<BaseMessage>` to `stream`.
 - Reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, and DashScope media generation are not ported (see `docs/PARITY.md`).
 - OpenAI-compatible: Python drops one of `temperature`/`top_p` for `openai.com` bases; this module sends both when the caller sets both.
 - Anthropic: no `cache_control` breakpoints, no mid-conversation `system` turns, and thinking blocks are ignored in non-streaming responses.

@@ -13,17 +13,21 @@ openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
 openjiuwen-agent.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+regex.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 thiserror = "2"
-async-trait.workspace = true
 tokio.workspace = true
-futures.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-regex.workspace = true
-serde_yaml_ng.workspace = true
-schemars.workspace = true
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
 
 [features]
 default = []
