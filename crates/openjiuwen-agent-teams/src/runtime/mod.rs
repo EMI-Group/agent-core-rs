@@ -21,7 +21,7 @@
 //! | [`pool`] | [`TeamRuntimePool`]: session → team runtime map |
 //! | [`manager`] | [`TeamRuntimeManager`] and the process-global registry |
 //! | [`adapter`] | the `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` seams |
-/// Injected build inputs of one team runtime.
+/// Model-pool selection: round-robin or by model name.
 pub mod allocator;
 /// The `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` seams over [`team_agent::TeamAgent`].
 pub mod adapter;
