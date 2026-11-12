@@ -291,10 +291,9 @@ impl TaskPlan {
     /// `- [x] {content}` line per task in list order, with the em-dash summary
     /// suffix when a non-empty `result_summary` exists.
     ///
-    /// Deviation from Python: Python joins the lines and therefore omits the
-    /// final newline after the last task; this implementation always ends the
-    /// string with a newline (for an empty plan the result is exactly
-    /// `## Goal: {goal}\n`).
+    /// Python parity: the lines are joined, so the string does not end with a
+    /// newline once tasks exist; an empty plan still yields exactly
+    /// `## Goal: {goal}\n` because of the trailing blank line element.
     #[must_use]
     pub fn to_markdown(&self) -> String {
         let mut lines = vec![format!("## Goal: {}", self.goal), String::new()];
@@ -309,11 +308,7 @@ impl TaskPlan {
                 task.content
             ));
         }
-        let mut markdown = lines.join("\n");
-        if !self.tasks.is_empty() {
-            markdown.push('\n');
-        }
-        markdown
+        lines.join("\n")
     }
 
     /// Converts to a JSON-friendly value for session persistence
@@ -768,7 +763,7 @@ mod tests {
              - [ ] task a\n\
              - [>] task b\n\
              - [√] task c — finished\n\
-             - [×] task d — dropped\n"
+             - [×] task d — dropped"
         );
     }
 
@@ -782,7 +777,7 @@ mod tests {
             }],
             ..TaskPlan::default()
         };
-        assert_eq!(plan.to_markdown(), "## Goal: g\n\n- [√] task a\n");
+        assert_eq!(plan.to_markdown(), "## Goal: g\n\n- [√] task a");
     }
 
     #[test]

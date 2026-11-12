@@ -12,7 +12,7 @@
 //! - [`TaskLoopNoProgressGuardConfig`] — the repeated-empty-answer guard.
 //! - [`OnMaxIterations`] — re-exported exhaustion policy.
 //!
-//! The public paths are stable (`crate::schema::config::<item>`), independent of
+//! The public paths are stable (`crate::schema::<item>`), independent of
 //! the file split.
 
 mod agent;
