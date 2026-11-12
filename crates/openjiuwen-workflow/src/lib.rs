@@ -12,6 +12,7 @@ pub mod component;
 pub mod components;
 pub mod condition;
 pub mod context;
+pub mod engine;
 pub mod error;
 pub mod interrupt;
 pub mod output;
@@ -38,6 +39,7 @@ pub use components::{
 };
 pub use condition::{Branch, BranchRouter, Condition};
 pub use context::ComponentContext;
+pub use engine::{ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition};
 pub use error::{
     branch_execution_error, branch_param_invalid, compile_error, component_ability_invalid,
     component_execution_error, component_id_invalid, component_schema_invalid,
