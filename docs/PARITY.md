@@ -189,7 +189,8 @@ Each entry below is either absent or an API-shaped stub returning `Error::Unsupp
 - `cargo test --workspace --offline` — 8164 passed, 0 failed, 5 ignored across 252 unit/integration/doc runners (exit 0).
 - `cargo test -p openjiuwen-e2e --features a2a --offline` — 34 passed, 0 failed, 1 ignored across 10 runners (exit 0); the default-feature e2e run contributes 30 passed and 1 ignored.
 - `cargo fmt --all -- --check` — clean.
-- `cargo clippy --workspace --all-targets --no-deps --offline -- -D warnings` — clean, zero warnings (exit 0); `--no-deps` avoids pre-existing sibling `must_use_candidate` noise on `crate_name`.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, zero warnings (exit 0); `--no-deps` is not needed.
+- `cargo clippy --workspace --all-targets --no-deps --offline -- -D warnings` — also clean (kept as a faster CI variant).
 - Feature suites: `cargo test -p openjiuwen-harness-providers --features vendor`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo test -p openjiuwen-extensions --features a2a`, `--features otel`, `--features sqlite`, `cargo test -p openjiuwen-sysop --features sandbox`, and `cargo test -p openjiuwen-symphony --features sqlite`.
 - Examples: `cargo build -p openjiuwen-examples --examples` and `--features a2a,mcp` compile all 12 examples; `cargo test -p openjiuwen-examples` runs the shared-helper unit tests.
 - A bare `cargo test` uses the workspace `default-members` and skips `openjiuwen-e2e` and `openjiuwen-examples`; use `--workspace` or name those packages explicitly.
