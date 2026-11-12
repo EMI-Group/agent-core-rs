@@ -273,6 +273,8 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - `stream`/`stream_with` deliver a build error as the stream's single `Err` item instead of returning it.
 - Every suite listed under Test Strategy exists in `./tests/`; `tests/common/mod.rs` provides the shared fakes (`session`, `session_with_checkpointer`, `EchoComponent`, `FixedComponent`, `CounterComponent`, `StreamingProducer`, `TransformProducer`, `CollectorComponent`, `InteractingComponent`, `FailingComponent`, `WaitOnCancellationComponent`, `b_of_a_tool`, `llm_component`, `end_with_template`).
 - The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
+- `src/condition.rs` is ~1100 lines on purpose: the lexer, parser, evaluator, `Condition`, `Branch`, `BranchRouter` and their inline tests form one cohesive grammar unit and lose coherence if split (split only when a second expression family appears).
+- `src/engine/definition.rs` (~1000 lines) likewise keeps the builder's recorded definition, ability selection, and `WorkflowSpec` projection together so the builder and validator share one source of truth.
 - The crate root re-exports every public item, so downstream code (and the engine) can reach them as `crate::{Component, ComponentContext, ...}`.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
 - Checkpointing is opt-in through `session.checkpointer()`; when present the engine compiles with `CheckpointerStore` (namespace = workflow card id) and deletes the snapshot when a run completes.
