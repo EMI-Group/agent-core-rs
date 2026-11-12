@@ -1,8 +1,18 @@
 //! Agent specifications, the platform DSL, and the bridge into `openjiuwen-agent`.
 //!
-//! Ports `openjiuwen/dev_tools/agent_builder/`: programmatic specs, the
-//! serialized LLM-agent/workflow DSL, session history, and the model-driven
-//! builder that either yields DSL or asks a clarifying question.
+//! Ports `openjiuwen/dev_tools/agent_builder/` across six files: programmatic
+//! specs, the serialized LLM-agent DSL, the serialized workflow DSL, the bounded
+//! dialogue history, the model-driven builder, and the bridge into
+//! `openjiuwen-agent`.
+//!
+//! The Python builder runs a multi-stage state machine — intention detection,
+//! an LLM clarifier, an agent/workflow designer, a DSL generator and reflector,
+//! an LLM cycle checker, and Mermaid rendering. This port keeps Python's
+//! observable response shape (`status`, `session_id`, `agent_type`, plus one of
+//! `dsl`/`workflow`/`response`) but makes **one** model round trip per request:
+//! the model answers with a single fenced JSON document, and any answer that
+//! does not parse becomes a plain-text clarifying response (a documented
+//! deviation).
 //!
 //! Module layout:
 //!
@@ -10,23 +20,30 @@
 //!   plugin, workflow, and dependency blocks.
 //! - `workflow_dsl` — the serialized workflow document ([`WorkflowDsl`]) and its
 //!   structural validation.
-//! - `history` — the bounded builder dialogue history ([`HistoryManager`]).
 //! - `spec` — programmatic agent and workflow specifications
 //!   ([`LlmAgentSpec`], [`WorkflowSpec`]) that convert into the DSL.
 //! - `bridge` — the DSL-to-kernel bridge ([`AgentCard`], [`LlmAgentConfig`], and
 //!   [`LlmAgent`]) implemented as inherent methods on [`LlmAgentDsl`].
-//! - `builder` is added in a later step.
+//! - `history` — the bounded builder dialogue history ([`HistoryManager`]).
+//! - `builder` — the session-based builder ([`AgentBuilder`]), its result and
+//!   status models ([`BuildResult`], [`BuildStatus`]), and the artifact/state
+//!   enums ([`AgentType`], [`BuildState`]).
 //!
 //! [`AgentCard`]: openjiuwen_agent::AgentCard
 //! [`LlmAgentConfig`]: openjiuwen_agent::LlmAgentConfig
 //! [`LlmAgent`]: openjiuwen_agent::LlmAgent
 
 pub mod bridge;
+pub mod builder;
 pub mod dsl;
 pub mod history;
 pub mod spec;
 pub mod workflow_dsl;
 
+pub use builder::{
+    map_state_to_status, now_millis, AgentBuilder, AgentType, BuildOutput, BuildResult, BuildState,
+    BuildStatus,
+};
 pub use dsl::{
     DslConfigs, DslDependencies, DslModel, DslModelInfo, LlmAgentDsl, PluginRef, WorkflowRef,
 };
