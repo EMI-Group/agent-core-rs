@@ -1,5 +1,5 @@
 #![cfg(feature = "vendor")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 //! Offline integration suite for the deferred vendor providers (`claudecode`, `codex`, `dsh`).
 //!
 //! Python counterparts live under `tests/unit_tests/harness_providers/<provider>/test_config.py`
