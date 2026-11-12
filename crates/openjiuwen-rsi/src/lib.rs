@@ -14,6 +14,9 @@
 //! git execution, or distributed evolution live in [`deferred`] as
 //! API-shaped stubs returning `Error::Unsupported`.
 #![forbid(unsafe_code)]
+// Type names deliberately repeat their module name to mirror the Python `rsi` module
+// paths (`auto_harness::AutoHarnessConfig`, `program_opt::ProgramOptConfig`, …).
+#![allow(clippy::module_name_repetitions)]
 #![cfg_attr(
     test,
     allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
