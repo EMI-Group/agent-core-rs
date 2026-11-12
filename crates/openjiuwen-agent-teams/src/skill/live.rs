@@ -1,0 +1,217 @@
+//! Live-team resolution: the bridge from a join descriptor to the team this process hosts.
+//!
+//! This is the single wiring point for **both** the `team-member` skill CLI and the
+//! `openjiuwen-team-mcp` server: each of them holds a [`TeamJoinDescriptor`] naming a team and asks
+//! [`connect_live_client`] for a client over that team's own store, task board and event bus.
+//!
+//! The team must be hosted in *this* process: the client is built from the team's
+//! [`TeamBackend`](crate::runtime::TeamBackend), which the process-global runtime registry
+//! ([`crate::runtime::try_global_registry`]) hands out for the name. Cross-process attach — an
+//! external process reaching a team hosted elsewhere through a shared sqlite database or a
+//! transport — is deferred, so a team that this process does not host simply does not resolve and
+//! the caller reports the missing team (the CLI exits `1`).
+
+use std::sync::Arc;
+
+use crate::runtime::TeamRuntimeManager;
+
+use super::client::TeamClient;
+use super::descriptor::TeamJoinDescriptor;
+use super::store_client::StoreTeamClient;
+
+/// Returns a client over the team `descriptor` names, when this process hosts it.
+///
+/// Resolution is `try_global_registry()` → [`TeamRuntimeManager::live`] → the live
+/// [`TeamAgent`](crate::runtime::TeamAgent)'s backend → a [`StoreTeamClient`] over that backend's
+/// store, task board and messager (see [`resolve_live_client`] for the registry-free half). The
+/// returned client therefore drives the *live* team: a task it creates is claimable on the team's
+/// own board and a message it sends lands in the team's own mailbox.
+///
+/// `None` means "no such team in this process" — either nothing was installed behind the registry
+/// or the installed manager hosts no team under that name.
+#[must_use]
+pub fn connect_live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
+    let manager = crate::runtime::try_global_registry()?;
+    resolve_live_client(&manager, descriptor)
+}
+
+/// Builds the client for `descriptor` out of the live team `manager` hosts, if any.
+///
+/// Split from [`connect_live_client`] so the resolution is unit-testable against a local manager
+/// without touching the process-global registry.
+#[must_use]
+pub(crate) fn resolve_live_client(
+    manager: &TeamRuntimeManager,
+    descriptor: &TeamJoinDescriptor,
+) -> Option<Arc<dyn TeamClient>> {
+    let agent = manager.live(&descriptor.team_name)?;
+    let backend = agent.backend();
+    let client = StoreTeamClient::new(
+        descriptor.clone(),
+        backend.store(),
+        Arc::clone(backend.tasks()),
+        Arc::clone(backend.messager()),
+    );
+    Some(Arc::new(client))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use serde_json::Value;
+
+    use crate::runtime::manager::{
+        clear_global_registry, set_global_registry, try_global_registry, TeamRuntimeManager,
+    };
+    use crate::runtime::team_agent::test_support::{
+        blueprint, deps, RecordingWorkspaceProvider, ScriptedFactory,
+    };
+    use crate::schema::TeamRole;
+    use crate::storage::{InMemoryTeamStore, TeamStore};
+
+    use super::super::descriptor::ClientScope;
+    use super::*;
+
+    /// Serializes the cases that install into the process-global runtime registry.
+    ///
+    /// The registry is a process-global also exercised by `crate::runtime::tests`
+    /// (`src/runtime/tests/end_to_end.rs`), which holds no lock of its own, so a lock here only
+    /// orders *this* module's cases; [`RegistryRestore`] is what actually keeps the shared slot
+    /// intact for everyone else (it puts back whatever was there before the case ran). Distinctive
+    /// team names keep the remaining interleavings harmless.
+    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Puts the process-global registry slot back the way the case found it, panics included.
+    struct RegistryRestore {
+        /// The manager installed before the case ran, `None` when the slot was empty.
+        previous: Option<Arc<TeamRuntimeManager>>,
+    }
+
+    impl Drop for RegistryRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(manager) => set_global_registry(manager),
+                None => clear_global_registry(),
+            }
+        }
+    }
+
+    /// Takes [`REGISTRY_LOCK`] and captures the slot to restore.
+    ///
+    /// The lock is poison-tolerant: a panicking case must not turn every later case into a panic.
+    fn registry_guard() -> (MutexGuard<'static, ()>, RegistryRestore) {
+        let lock = REGISTRY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = try_global_registry();
+        (lock, RegistryRestore { previous })
+    }
+
+    #[test]
+    fn unknown_team_does_not_resolve() {
+        let manager = TeamRuntimeManager::with_defaults();
+        let descriptor = TeamJoinDescriptor {
+            team_name: "skill-live-missing".to_string(),
+            ..TeamJoinDescriptor::default()
+        };
+        assert!(resolve_live_client(&manager, &descriptor).is_none());
+    }
+
+    #[test]
+    fn global_registry_resolution_and_clear() {
+        let (_lock, _restore) = registry_guard();
+        set_global_registry(Arc::new(TeamRuntimeManager::with_defaults()));
+        assert!(try_global_registry().is_some(), "the manager is installed");
+
+        let descriptor = TeamJoinDescriptor {
+            team_name: "skill-live-not-hosted".to_string(),
+            ..TeamJoinDescriptor::default()
+        };
+        assert!(connect_live_client(&descriptor).is_none());
+
+        clear_global_registry();
+        assert!(try_global_registry().is_none(), "the slot is cleared");
+    }
+
+    // The registry lock is held for the whole case so its install and its restore cannot be
+    // interleaved by another case of this module; no other holder exists, so the awaits below
+    // cannot deadlock, and each `#[tokio::test]` runs its own current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_live_team_resolves_through_the_global_registry() {
+        let (_lock, _restore) = registry_guard();
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        let store: Arc<InMemoryTeamStore> = Arc::new(InMemoryTeamStore::new());
+        let build_deps =
+            deps(&factory, &workspace).with_store(Arc::clone(&store) as Arc<dyn TeamStore>);
+        let manager = Arc::new(TeamRuntimeManager::new(build_deps));
+        let team = manager
+            .activate(
+                &blueprint("skill-live", "boss", &["dev-1"]),
+                "session-live",
+                &Value::Null,
+            )
+            .await
+            .expect("the team activates over the scripted fakes");
+        set_global_registry(Arc::clone(&manager));
+
+        let descriptor = TeamJoinDescriptor {
+            team_name: "skill-live".to_string(),
+            member_name: "user".to_string(),
+            scope: ClientScope::Operator,
+            ..TeamJoinDescriptor::default()
+        };
+        let client = connect_live_client(&descriptor).expect("the live team resolves");
+        assert_eq!(client.scope(), ClientScope::Operator);
+
+        let members = client.list_members().await.expect("the roster is readable");
+        let rows: Vec<(&str, TeamRole)> = members
+            .iter()
+            .map(|member| (member.member_name.as_str(), member.role))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("boss", TeamRole::Leader), ("dev-1", TeamRole::Teammate)],
+            "the live roster, sorted by name"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|member| member.status != crate::schema::MemberStatus::ShutDown),
+            "{members:?}"
+        );
+        assert_eq!(
+            client.read_inbox().await.expect("the inbox is readable"),
+            "(inbox empty)"
+        );
+
+        let created = client
+            .create_task("wire live client", "body", None, &[])
+            .await
+            .expect("the board accepts the task");
+        assert!(created.ok, "{:?}", created.reason);
+        let task_id = created.task_id.expect("the created task has an id");
+
+        let claimable = client.claimable_tasks().await.expect("claimable tasks");
+        assert!(
+            claimable.iter().any(|task| task.task_id == task_id),
+            "{claimable:?}"
+        );
+
+        // The client wrote through the live team's own board, not a copy of it.
+        assert!(Arc::ptr_eq(&manager.live("skill-live").unwrap(), &team));
+        let live_claimable = team
+            .backend()
+            .tasks()
+            .claimable()
+            .await
+            .expect("the live board answers");
+        assert!(
+            live_claimable.iter().any(|task| task.task_id == task_id),
+            "{live_claimable:?}"
+        );
+    }
+}
