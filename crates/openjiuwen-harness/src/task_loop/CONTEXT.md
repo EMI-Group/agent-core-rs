@@ -15,7 +15,7 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 
 - `QueuedInput { content: String, task_id: Option<String>, metadata: BTreeMap<String, Value> }` — serde, `PartialEq`; `new(content)`, `with_task_id(Option<String>)`, `with_metadata(BTreeMap<String, Value>)`, accessors `content()`, `task_id()`, `metadata()`, `From<String>`/`From<&str>`.
 - `LoopQueues` — FIFO follow-up and steering queues behind `Arc<parking_lot::Mutex<VecDeque<QueuedInput>>>`; `Clone` shares the queues (`Default` = empty, unrelated queues).
-  Methods (`&self`): `push_follow_up(input)`, `push_steer(input)`, `pop_follow_up() -> Option<QueuedInput>`, `pop_steer()`, `drain_follow_up() -> Vec<QueuedInput>`, `drain_steering() -> Vec<QueuedInput>`, `has_follow_up()`, `has_steering()`, `is_empty()`, `follow_up_len()`, `steering_len()`, `clear()`.
+  Methods (`&self`): `push_follow_up(input)`, `push_steer(input)`, `pop_follow_up() -> Option<QueuedInput>`, `pop_steer()`, `drain_follow_up() -> Vec<QueuedInput>`, `drain_steering() -> Vec<QueuedInput>`, `follow_up_contents() -> Vec<String>` (non-destructive snapshot used for `DeepAgentState::pending_follow_ups`), `has_follow_up()`, `has_steering()`, `is_empty()`, `follow_up_len()`, `steering_len()`, `clear()`.
 
 ### `coordinator.rs`
 
@@ -37,7 +37,7 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 
 ### `handler.rs`
 
-- `#[async_trait] TaskLoopEventHandler: Send + Sync` — every hook has a default `Ok(())` body:
+- `#[async_trait] TaskLoopEventHandler: Send + Sync` — every hook takes `&self`, returns `Result<()>` and has a default `Ok(())` body (a handler with mutable state uses interior mutability):
   `prepare_round(round_id, round: &ActiveInteractionRound) -> Result<()>`,
   `handle_input(round_id, round: &ActiveInteractionRound) -> Result<()>`,
   `handle_interaction(round_id, input: QueuedInput) -> Result<()>`,
@@ -82,6 +82,7 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 - The Python loop is a single `_run_task_loop` generator in `deep_agent.py`; the Rust port splits it into an explicit `TaskLoopController` driver plus the agent-supplied `RoundExecutor`, keeping the controller free of agent dependencies.
 - Python's `TaskLoopController` has no parameters; `completion_timeout` (600 s) comes from `DeepAgentConfig` and the 50-round cap is a local in `_run_task_loop`. Both live in `TaskLoopConfig`, and `new` pushes `max_outer_rounds` into the coordinator so `stop_reason = "MaxOuterRounds"` is produced by the single budget authority.
 - `LoopQueues` uses shared interior mutability (`Arc<Mutex<VecDeque>>`) instead of public `VecDeque` fields, because the handler/agent pushes steering while a round is running (Python shares one `asyncio.Queue` object by identity).
+- `LoopCoordinator::should_continue` checks the abort flag, then the `max_outer_rounds` hard cap, then the evaluator chain: a cap or abort at the same iteration wins over an evaluator verdict, and the winning reason is recorded once.
 - `LoopCoordinator::should_continue` refreshes the caller's `StopEvaluationContext` from its own counters (iteration, token usage, elapsed, last result) before evaluating, so `extra` supplied by the caller survives while loop bookkeeping stays authoritative. `evaluate` is the evaluator-chain half of the same pass; call one per pass, never both (evaluators are stateful).
 - The abort flag is a shared `AtomicBool` so a supervisor task can `request_abort()` through `&self`; abort is observed at the top of `should_continue` (stop reason `Aborted`) and applied after the active round.
 - `EventManager` is a priority queue over `DeepLoopEvent` per the schema's dormant Python design (`schema/loop_event.py` has no Python consumer). Python's `harness/interaction/event_manager.py` (user/goal work queues with goal dedup) is a different component and is deliberately not ported here; work-item scheduling lives in the interaction supervisor, not in this module.
@@ -92,6 +93,12 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 - `resume_continuation` stamps `context["resume_continuation"] = true` on every round after the first in one `run_until_idle` call, mirroring Python's continuation metadata for post-interrupt rounds.
 - Steering has two planes: `queues.steering` is the data plane the executor drains before each model call (identity-shared, never drained by this module), and `push_steer` also logs the input so the handler's `handle_interaction` hook fires exactly once per steering input.
 - `stop_condition_state` in `DeepAgentState` is written after each round from `coordinator.state().get_state()`; restoring it remains the caller's choice (Python's task loop resets rather than resumes it).
+- `run_round` allocates a fresh round id and runs the full hook/executor sequence, but only `run_until_idle` feeds the coordinator (`observe_round`) and persists state; a direct `run_round` leaves the iteration counter and the persisted state untouched.
+- `cancel()` and an abort observed by the loop move the phase to `Terminated`, so `pause`/`resume` then return `Error::validation`; a round that latches the abort itself (timeout, pre-round cancel) ends `Terminated` as well, while a clean round ends `Idle`.
+- `wait_round_completion` clears a stale notification permit before waiting, and on timeout cancels the token, terminates the phase and returns `RoundOutcome::timeout()`.
+- `LoopReport.stop_reason` carries `paused`, `Aborted`, `MaxOuterRounds`, an evaluator name, or the failing outcome's error code (`completion_timeout`, `handler_error`, `round_execution_error`).
+- `TaskLoopConfig`'s `with_*` builders are `const fn`; `run_until_idle` re-applies `config.max_outer_rounds` to the coordinator (so `config_mut` edits take effect on the next call).
+- A terminal-hook error converts a *successful* round into `handler_error` but never overwrites a round that already failed: the primary error code is preserved and the hook failure is logged only.
 
 ## Routing Table
 
@@ -99,6 +106,7 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 - `./coordinator.rs` → `LoopCoordinator`, `default_evaluators`, `DEFAULT_MAX_OUTER_ROUNDS`
 - `./events.rs` → `EventManager`, `DEFAULT_EVENT_CAPACITY`
 - `./controller.rs` → `TaskLoopController`, `TaskLoopConfig`, `LoopReport`, `RoundExecutor`, `RoundId`, `StateSink`
+- `./controller_tests.rs` → controller/hook/executor test suite (included from `controller.rs` via `#[path]`)
 - `./handler.rs` → `TaskLoopEventHandler` trait, `DefaultTaskLoopEventHandler`
 - `./mod.rs` → module docs and flat re-exports
 - `../agent/` → owner of the `RoundExecutor` implementation and the only caller of `run_until_idle` (sibling — read-only, escalate writes to parent)
