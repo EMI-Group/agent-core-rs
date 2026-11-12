@@ -41,8 +41,12 @@ pub fn set_process_expert_catalog(c: Arc<dyn ExpertCatalog>);  pub fn get_proces
 pub trait TeamClient;  pub struct TeamJoinDescriptor;  pub fn run_skill_cli(argv: Vec<String>) -> i32;
 pub fn connect_live_client(d: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>;  // in-process attach: global registry
 pub struct SkillCli;   pub enum CliCommand { Member(MemberCommand), Operator(OperatorCommand) }  // clap tree, publicly matchable
+pub fn run_skill_cli(argv: Vec<String>) -> i32;      // exit 0 success/--help, 1 refused or unhosted, 2 CLI-side, 130 cancelled
 pub struct TeamMcpServer;  pub fn build_mcp_server(client: Arc<dyn TeamClient>) -> TeamMcpServer;
 ```
+
+Binaries (mirroring the Python console script and MCP entry point): `team-member` → `run_skill_cli`;
+`openjiuwen-team-mcp` (`mcp` feature) → `mcp::run_mcp_server_from_env` over stdio.
 
 Modules are documented by their own `CONTEXT.md`; the list is in the Routing Table.
 
@@ -235,6 +239,7 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - `./src/runtime/` → `TeamAgent` (leader/teammate loop), `TeamBackend`, dispatch decision, runtime manager/pool, model allocator, `Team` adapter (`src/runtime/CONTEXT.md`)
 - `./src/harness/` → harness-protocol adapter: `MemberHarnessFactory`, `HarnessMemberRuntime`, native factory, checkpoints (`src/harness/CONTEXT.md`)
 - `./src/skill/` → `team-member` clap CLI, join descriptor, `TeamClient` implementations, live-team attach via the runtime registry (`src/skill/CONTEXT.md`)
+- `./src/bin/` → the two binaries: `team-member` (skill CLI, exit `0/1/2/130`) and `openjiuwen-team-mcp` (stdio MCP server, `mcp` feature)
 - `./src/mcp/` → `openjiuwen-team-mcp` server: tool catalogue + dispatch, stdio serve (`src/mcp/CONTEXT.md`)
 - `./src/constants.rs` → reserved names, defaults, mention parsing
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
@@ -242,7 +247,7 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 ## Test Strategy
 
 - Unit tests live beside their module (`#[cfg(test)]` in each file), ~666 of them, and cover the internals of `schema`, `storage`, `taskboard`, `messager`, `workspace`, `member`, `interaction`, `runtime`, `harness`, `skill` and `mcp`.
-- Integration suites in `./tests/` drive the public API only and pin cross-module behaviour (182 tests): `spec_build.rs` (JSON parse/defaults/unknown fields, `validate`, `build_with`, activate admission), `team_run.rs` (full in-process run, single `team.completed` marker, open-task run, `interact` outcomes, snapshot/stop), `member_and_mail.rs` (spawn, factory failure, shutdown matrix, workspace isolation, direct/broadcast/multicast mail, leader-only tasks), `task_flow.rs` (dependency graph, cycles, claims, review gate, votes, subtasks), `hitl.rs` (mention grammar, targets, gate, approval bridge), `protocol_adapter.rs` (command forwarding, observer order, mapping tables, checkpoint round-trip), `cli.rs` (full clap tree, output lines, exit codes 0/1/2), `mcp.rs` (tool tables per scope, exact `call_tool` text), `expert_catalog.rs` (agent-group packages, template composition).
+- Integration suites in `./tests/` drive the public API only and pin cross-module behaviour (182 tests): `spec_build.rs` (JSON parse/defaults/unknown fields, `validate`, `build_with`, activate admission), `team_run.rs` (full in-process run, single `team.completed` marker, open-task run, `interact` outcomes, snapshot/stop), `member_and_mail.rs` (spawn, factory failure, shutdown matrix, workspace isolation, direct/broadcast/multicast mail, leader-only tasks), `task_flow.rs` (dependency graph, cycles, claims, review gate, votes, subtasks), `hitl.rs` (mention grammar, targets, gate, approval bridge), `protocol_adapter.rs` (command forwarding, observer order, mapping tables, checkpoint round-trip), `cli.rs` (full clap tree, output lines, exit codes 0/1/2), `mcp.rs` (tool tables per scope, exact `call_tool` text), `expert_catalog.rs` (agent-group packages, template composition), and `bins.rs` (the two binaries' process contract through `CARGO_BIN_EXE_*`: help, missing descriptor, unhosted team, MCP stderr diagnostic).
 - Fakes live in `./tests/support/` (scripted harness factory, recording workspace provider, in-memory store, bounded `wait_until`) and in `openjiuwen-test-support` as a dev-dependency. Everything offline and deterministic: no network, no `#[ignore]`, no sleeps beyond short bounded waits.
 - Definition of done (all four green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`.
 
