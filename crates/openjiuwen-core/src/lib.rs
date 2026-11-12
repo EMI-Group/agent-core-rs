@@ -66,7 +66,8 @@ pub use openjiuwen_runner as runner;
 /// agent loop and its configuration, the ability manager, rails, and interrupts.
 ///
 /// This is a blanket re-export of [`openjiuwen_agent`]'s public surface; the
-/// application agents ([`LlmAgent`], [`WorkflowAgent`]) live in [`application`]
+/// application agents ([`LLMAgent`](application::LLMAgent),
+/// [`WorkflowAgent`](application::WorkflowAgent)) live in [`application`]
 /// to match the Python split.
 pub mod single_agent {
     pub use openjiuwen_agent::*;
