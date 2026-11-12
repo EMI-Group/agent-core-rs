@@ -251,8 +251,8 @@ async fn invocation_then_follow_up_and_plan_mode_survive_save_and_load() {
         json!("normal"),
         "entering plan mode remembers the previous mode"
     );
-    // The exact key set after repeated writes is covered by the ignored
-    // `repeated_saves_keep_python_null_keys` (see the harness bug noted there).
+    // The exact key set after repeated writes is covered by
+    // `repeated_saves_keep_python_null_keys`.
 }
 
 #[tokio::test]
@@ -482,12 +482,11 @@ async fn todos_persist_beside_the_state_in_the_workspace_not_inside_it() {
 }
 
 /// Python's `DeepAgentState.to_session_dict` writes all five keys (absent values
-/// as `null`) and `PlanModeState.to_session_dict` writes all four keys. The
-/// session state store treats a `null` patch value as "delete this path", so a
-/// second write over an existing `deepagent` object drops every null-valued key
-/// and the persisted payload no longer matches Python.
+/// as `null`) and `PlanModeState.to_session_dict` writes all four keys.
+/// `save_state` reproduces Python's `update_dict` replace semantics, so a second
+/// write over an existing `deepagent` object keeps every key, explicit nulls
+/// included.
 #[tokio::test]
-#[ignore = "blocked on harness bug: session update_state deletes null paths, so a repeated save drops `task_plan` and the null `plan_mode` keys from the `deepagent` payload"]
 async fn repeated_saves_keep_python_null_keys() {
     let session = AgentSession::new("state-null-keys");
     save_state(&session, &sample_state())
