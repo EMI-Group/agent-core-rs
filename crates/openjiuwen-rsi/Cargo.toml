@@ -14,12 +14,19 @@ openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 thiserror = "2"
 async-trait.workspace = true
+async-stream.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+openjiuwen-test-support.workspace = true
 
 [features]
 default = []
