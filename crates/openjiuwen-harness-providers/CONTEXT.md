@@ -30,7 +30,7 @@ IO adapter (module `io_adapter`):
 - Chunk kinds: `llm_output`, `llm_reasoning`, `tool_call`, `tool_result`, `__interaction__`, `turn_lifecycle`, `task_failed` — projected as `openjiuwen_agent::AgentChunk`.
 
 Helpers (flat re-exports):
-- `harness_input_text(&HarnessInput) -> String`, `to_harness_input(JsonValue) -> HarnessInput`, `INTERACTIVE_INPUT_KIND` (`"interactive_input"`), `INTERACTION_KIND` (`"__interaction__"`), `TURN_LIFECYCLE_KIND` (`"turn_lifecycle"`).
+- `harness_input_text(&HarnessInput) -> String`, `to_harness_input(JsonValue) -> HarnessInput`, `INTERACTIVE_INPUT_KIND` (`"interactive_input"`), `INTERACTION_KIND` (`"__interaction__"`), `TURN_LIFECYCLE_KIND` (`"turn_lifecycle"`), `TASK_FAILED_KIND` (`"task_failed"`).
 - `to_json_object(&JsonValue) -> JsonObject`, `to_json_safe(&JsonValue) -> JsonValue`.
 - `mcp_tool_naming_preamble(&BTreeMap<String, String>) -> String`, `TOOL_PLACEHOLDER` (`"{tool}"`).
 - Skills: `SkillSource`, `SkillMode` (`all`/`auto_list`), `SkillConflict` (`skip`/`replace`/`append`), `normalize_skills`, `install_skills`, `skill_scan_dir(provider)`.
@@ -92,6 +92,11 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - Registry names are unique per test because the registry is process-global; `src/factory/tests.rs` uses `uuid`-derived names and never resets the map.
 - `to_json_safe` is an identity in Rust (values are already JSON-safe); `to_json_object` wraps non-objects as `{"value": …}`. Documented deviation.
 - `install_skills` keeps Python's safety rules (reject escaping paths, reject non-regular files, atomic stage-then-rename) but materializes internal symlinks by copying through them instead of recreating them.
+- `install_skills` discovers bundles recursively like Python `_discover` (a source root that is itself a bundle stops the walk; symlinked directories are not traversed) and rewrites the appended copy's front-matter `name:` line in place instead of round-tripping YAML.
+- Portable skill names accept `[A-Za-z0-9._-]+`, reject empty and `..` (Python's regex is stricter: it requires a leading alphanumeric and at most 128 bytes).
+- `mcp_tool_naming_preamble` emits only the `<mcp-tools>` block; Python's trailing explanatory sentence is not appended (documented deviation from `mcp_naming.py`).
+- `harness_input_text` joins an array when every element carries a string `text` field; Python additionally requires each block's `type` to equal `"text"`.
+- Vendor `from_json` type errors use the shared `decode` wording (`{key} must be …`); Python's `TypeError` text is kept for the cross-field rules and every unknown-key message keeps the Python prefix.
 
 ## Deferred Integrations
 
