@@ -1,8 +1,8 @@
 //! `rmcp` adapter: exposes [`TeamMcpServer`] as a low-level MCP server.
 //!
 //! Python parity source: `openjiuwen/agent_teams/mcp/server.py`, built on the low-level MCP server
-//! (not `FastMCP`) so member tools advertise their own card schema and every result is the rendered
-//! text verbatim. The adapter is deliberately thin: tool listing and dispatch live in
+//! (not `FastMCP`) so member tools advertise their own card schema and every result is a single
+//! plain-text block (failures included). The adapter is deliberately thin: tool listing and dispatch live in
 //! [`super::TeamMcpServer`], and no `rmcp` type leaks out of this module.
 use super::{TeamMcpServer, SERVER_NAME};
 use rmcp::model::{
@@ -14,7 +14,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
-/// The MCP server handler over an [`TeamMcpServer`] facade.
+/// The MCP server handler over a [`TeamMcpServer`] facade.
 pub struct TeamServerHandler {
     server: TeamMcpServer,
 }

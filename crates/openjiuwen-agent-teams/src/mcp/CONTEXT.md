@@ -4,7 +4,7 @@
 
 Project the team collaboration surface over MCP (stdio) to an agent that lives outside the team process.
 
-Parity source: `openjiuwen/agent_teams/mcp/server.py` (309 lines), built on the low-level MCP server rather than FastMCP so member tools advertise their own card schema and return their rendered text verbatim.
+Parity source: `openjiuwen/agent_teams/mcp/server.py` (309 lines), built on the low-level MCP server rather than FastMCP so member tools advertise their own card schema and every result is a single plain-text block.
 
 The scenario is chosen by the join descriptor's `scope`: `member` (an external CLI acting as a first-class teammate, driven by the real teammate tool set) or `operator` (default; an outside team-control surface over the task board, messaging and roster).
 
