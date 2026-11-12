@@ -15,6 +15,7 @@ All tests are offline and deterministic.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
 - `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
 - `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
+- `parsing_zip.rs` → the ZIP container reader against archives assembled byte by byte (stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
 
 ## Constraints
 
@@ -33,3 +34,4 @@ All tests are offline and deterministic.
 - `./embedding.rs` → OpenAI-compatible embedding client
 - `./graph.rs` → triple extraction and graph store
 - `./multimodal.rs` → multimodal documents, image loading, table conversion
+- `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)
