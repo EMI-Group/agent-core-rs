@@ -8,6 +8,8 @@ Pick this node for "register a sandbox provider" or "where is AIO/JiuwenBox/Yuan
 
 ## API Surface
 
+The seam is defined in `openjiuwen-sysop` (`sandbox/provider.rs`, `sandbox/config.rs`) and reaches this crate through the kernel umbrella path `openjiuwen_core::sys_operation::sandbox::{provider, config}` — the path is re-exported unchanged.
+
 ```rust
 pub use openjiuwen_core::sys_operation::sandbox::provider::{
     CodeProviderFactory, FsProviderFactory, SandboxProviderRegistry, ShellProviderFactory,
@@ -39,6 +41,8 @@ pub async fn register_deferred(registry: &SandboxProviderRegistry) -> Result<()>
 pub const DEFERRED_SANDBOX_TYPES: [&str; 3] = ["aio", "jiuwenbox", "yuanrong"];
 
 /// The sandbox types with at least one registered provider, sorted.
+/// Enumerates the kernel's `sandbox_types()`, which is keyed on the filesystem map:
+/// a set registered with only shell/code factories is not listed.
 pub fn registered_types(registry: &SandboxProviderRegistry) -> Vec<String>;
 
 /// Whether the sandbox type is deferred (documented, not implemented) rather than available.
@@ -60,6 +64,9 @@ pub fn register_gateway_provider(
 - Deferred providers keep Python's names so configuration written for Python keeps working: `aio` (agent-sandbox SDK), `jiuwenbox` (HTTP/UDS gateway, `JIUWENBOX_*` env vars), `yuanrong` (ADX HTTP API) — every factory returns `Error::Unsupported("sandbox provider '<type>' is deferred; register a provider with sys_operation::register")`.
 - `supports_conditional_write` is the deferred provider's `false` (Python providers all report `False`); no launcher (`pre_deploy`) is registered — launchers belong to the kernel's sandbox config.
 - `register_gateway_provider` exists so a host can plug its own transport (or a mock in tests) without this crate shipping a protocol.
+- `register_gateway_provider` binds the supplied `SandboxGatewayConfig` into every registered factory, so the configuration a caller passes to `create_fs`/`create_shell`/`create_code` is ignored for those registrations.
+- `register_deferred` is `async` only for parity with the Python async setup path; it performs no I/O and is the Rust equivalent of importing the Python `providers` package (hosts call it explicitly; there is no import-time side effect).
+- Registration is not transactional: a set that fails part-way (duplicate or kernel error) leaves the factories registered before the failure in place.
 
 ## Constraints
 
@@ -71,7 +78,7 @@ pub fn register_gateway_provider(
 
 ## Test Strategy
 
-- Unit tests beside `mod.rs`: `SandboxProviderSet::deferred("aio")` registers three factory types whose `create_*` calls return `ErrorKind::Unsupported` naming `aio`; `register_deferred` makes `registered_types` contain all three and `is_deferred` true; duplicate registration → `ErrorKind::SysOp`; a mock provider set registers and `create_fs` returns the mock.
+- Unit tests live inside `mod.rs`: `SandboxProviderSet::deferred("aio")` registers three factory types whose `create_*` calls return `ErrorKind::Unsupported` naming `aio`; `register_deferred` makes `registered_types` contain all three and `is_deferred` true; duplicate registration → `ErrorKind::SysOp`; a mock provider set registers and `create_fs` returns the mock; `register_gateway_provider` binds its shared configuration.
 - Python counterparts named in comments: `tests/unit_tests/extensions/sys_operation/sandbox/test_aio_*.py` (registration only; behavior is integration-gated in Python and not ported).
 
 ## Routing Table
