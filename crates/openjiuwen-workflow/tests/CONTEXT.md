@@ -1,0 +1,54 @@
+# tests (openjiuwen-workflow)
+
+## Intent
+
+Crate-level behavior tests for `openjiuwen-workflow`, driven only through the public API (`Workflow`, `ComponentOptions`, `WorkflowRunOptions`, built-in components) plus `openjiuwen_session::WorkflowSession` and `openjiuwen_test_support::ScriptedModel`.
+Each file ports a Python unit test suite and cites the mirrored test in a comment (e.g. `// port of tests/unit_tests/core/workflow/test_workflow.py::test_simple_workflow`).
+Everything is offline and deterministic: no network, no sleeps for ordering, no stdout.
+
+## API Surface
+
+Shared fixtures live in `common/mod.rs` (`mod common;` in every suite, `#![allow(dead_code)]` because no suite uses all of them):
+
+- `session(id) -> Arc<dyn Session>` — `WorkflowSession::new(id)`, in-process, no checkpointer.
+- `session_with_checkpointer(id, Arc<dyn Checkpointer>) -> Arc<dyn Session>` — via `WorkflowSessionOptions`.
+- `card(id) -> WorkflowCard` — `WorkflowCard::new(id)`.
+- Components: `EchoComponent` (`{"echo": inputs}`), `FixedComponent::new(output)` (records `calls()`/`call_count()`), `CounterComponent` (`{"count": n}`, one-based), `StreamingProducer::new(frames)` (`Stream`), `TransformProducer::new(frames)` (`Transform`), `CollectorComponent` (`{"collected": inputs}`), `InteractingComponent::new(question)` (HITL), `FailingComponent::new(reason)`, `WaitOnCancellationComponent`.
+- `b_of_a_tool()` — `FunctionTool` fixture; `llm_component(model, user_template)` — `LlmComponent` with only a user prompt; `end_with_template(template)` — `EndComponent` with `EndConfig`.
+- `assistant_text(&[Value]) -> String` — joins `result`/`response`/bare-string chunk text.
+
+Per-file suites:
+
+- `linear.rs` — `start → llm → end` with `ScriptedModel`: result shape, session global lane, cancellation, build failure, concurrent `invoke` on one `Workflow`.
+- `references.rs` — `${node.field}` grammar (dotted, `[i]`, `[-1]`, `['k']`), whole-node refs, missing → `null`, literal rule, `outputs_schema` projection, root/`${inputs.x}` refs.
+- `llm_component.rs` — prompt assembly from resolved inputs, `output_config` key, default `result` key, streaming deltas as buffered frames, two LLM nodes chaining.
+- `streaming.rs` — indexed `end node stream` frames plus terminal `workflow_final`, `invoke` returning collected wires, custom frames, mode filtering, single `Err` on failure, `Collect` over a buffered producer, early drop, empty producer.
+- `end_template.rs` — `{{path}}` templates: batch rendering, missing segments, array templates streaming one frame per element, producer projection, end node's own inputs.
+- `branch.rs` — `BranchComponent`/`BranchRouter` selected-target routing, Rust-only default target, `101021` no-match, custom graph router, undeclared target, agreeing routers, empty route.
+- `builder_validation.rs` — all build-time problems joined into one `ErrorKind::Workflow` error; codes `100010`–`100015`; `ComponentOptions` reflected in the spec.
+- `checkpoint_resume.rs` — `MemoryCheckpointer` resume after failure, HITL `INPUT_REQUIRED` + `resume`, snapshot lifecycle, seeded answers, superstep replay.
+- `session_state.rs` — component vs global session lanes, `dump_state`, trace spans, cancellation via `CancellationToken` + `Notify`, session stream publication.
+- `card_spec.rs` — `WorkflowCard`/`WorkflowSpec` JSON round-trip, unknown-field tolerance, `spec()` vs `config().spec`, `to_mermaid`; mostly sync tests (no runtime).
+- `retrieval_component.rs` — `SimpleKnowledgeBase` + `HashEmbedding` + `InMemoryVectorStore`; `documents` output; `101102` on blank query.
+- `tool_component.rs` — `ToolComponent` maps failures to `error_code` data (`0`, `102000`, `182012`) and resolves the tool input schema.
+- `loop_component.rs` — number/array/condition loops, session limit cap, `101040` when the bound is missing.
+
+## Constraints
+
+- Every test file starts with `#![allow(clippy::unwrap_used, clippy::expect_used)]` (library lints stay strict); several also blanket-allow `dead_code`/doc/clippy style lints because `mod common;` pulls unused fixtures.
+- Tests only use public APIs — no `crate::` internals; `common/mod.rs` re-implements the fakes it needs on top of the `Component` trait.
+- Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, `cargo clippy -p openjiuwen-workflow --all-targets -- -D warnings`, all offline.
+- `common::session` is the only session factory; the engine only needs the `Session` trait, so any implementation would work.
+- Tests never mutate process-global state: no `EnvGuard`/`TempHomeGuard`, and no `#[serial]` anywhere in the workspace (`serial_test` is not a dependency).
+
+## Routing Table
+
+No child directories; every file is a top-level integration test target, listed above.
+
+## Gotchas for Reuse Outside This Crate
+
+- `common/mod.rs` is not importable from another crate's tests: copy `session`/`card`/`EchoComponent`/`FixedComponent` into the new crate (or use `openjiuwen-test-support` fixtures) rather than `#[path = ...]`-including it.
+- From the `openjiuwen-e2e` crate (which depends only on the `openjiuwen` umbrella + test-support) the same items are reachable as `openjiuwen::core::workflow::*`, `openjiuwen::core::session::{WorkflowSession, Session, MemoryCheckpointer}`, and `openjiuwen::core::foundation::Model`.
+- `invoke` needs a tokio runtime; the default `#[tokio::test]` (current_thread) is enough except for cancellation tests, which use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` (`session_state.rs:390`).
+- Output extraction: `EndComponent::new()` wraps non-null inputs as `{"output": …}`, so assertions read `output.result["output"]["answer"]`; a streaming end or an interrupted run makes `result` the JSON array of chunk wires.
+- `invoke` merges object inputs into the session global lane, so both `${query}` and `${start.query}` resolve, but a bare `${field}` inside `outputs_schema` is `null`.
