@@ -30,7 +30,7 @@ IO adapter (module `io_adapter`):
 - Chunk kinds: `llm_output`, `llm_reasoning`, `tool_call`, `tool_result`, `__interaction__`, `turn_lifecycle`, `task_failed` — projected as `openjiuwen_agent::AgentChunk`.
 
 Helpers (flat re-exports):
-- `harness_input_text(&HarnessInput) -> String`, `to_harness_input(JsonValue) -> HarnessInput`, `INTERACTIVE_INPUT_KIND` (`"interactive_input"`), `INTERACTION_KIND` (`"__interaction__"`), `TURN_LIFECYCLE_KIND` (`"turn_lifecycle"`).
+- `harness_input_text(&HarnessInput) -> String`, `to_harness_input(JsonValue) -> HarnessInput`, `INTERACTIVE_INPUT_KIND` (`"interactive_input"`), `INTERACTION_KIND` (`"__interaction__"`), `TURN_LIFECYCLE_KIND` (`"turn_lifecycle"`), `TASK_FAILED_KIND` (`"task_failed"`).
 - `to_json_object(&JsonValue) -> JsonObject`, `to_json_safe(&JsonValue) -> JsonValue`.
 - `mcp_tool_naming_preamble(&BTreeMap<String, String>) -> String`, `TOOL_PLACEHOLDER` (`"{tool}"`).
 - Skills: `SkillSource`, `SkillMode` (`all`/`auto_list`), `SkillConflict` (`skip`/`replace`/`append`), `normalize_skills`, `install_skills`, `skill_scan_dir(provider)`.
@@ -65,7 +65,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 
 - `./src/lib.rs` → crate docs, module declarations, feature flags, flat re-exports
 - `./src/provider.rs` → `ProviderSpec`, wrappers, `ProviderDescriptor`, provider-name constants
-- `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `build_harness_context`
+- `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter.rs` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `ProviderInteractionHandler`, event→chunk projection, interaction routing
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
@@ -87,8 +87,16 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - The registry is global (like Python's module dict) to keep CLI/agent-teams call sites identical; tests use unique provider names instead of a reset hook.
 - `HarnessIOAdapter::outputs` is single-consumer and returns `HarnessError::State` on a second call — the Rust equivalent of Python's one async generator fed by the pump task.
 - Approval answers are ported as data: `"yes"`/`"always"`/`"no"` words, `{"action": …}`, `{"approved": …, "feedback": …}`, `{"updated_arguments": …}` and `{"remember": true}`; every unrecognized shape becomes `Deny`.
+- `build_harness_context` **drops** `options.mcp_servers` for the `native` provider and never injects `HostCapability::McpServers` there (the native harness owns its tools, Python raises); every other provider gets the servers copied plus the capability when the list is non-empty, and a checkpoint sink always injects `HostCapability::CheckpointSink`.
+- Declared provider descriptors are static metadata: vendor names stay `implemented: false` even with the `vendor` feature, and feature flags never rewrite an entry (`resolve_provider` reports the missing feature instead).
+- Registry names are unique per test because the registry is process-global; `src/factory/tests.rs` uses `uuid`-derived names and never resets the map.
 - `to_json_safe` is an identity in Rust (values are already JSON-safe); `to_json_object` wraps non-objects as `{"value": …}`. Documented deviation.
 - `install_skills` keeps Python's safety rules (reject escaping paths, reject non-regular files, atomic stage-then-rename) but materializes internal symlinks by copying through them instead of recreating them.
+- `install_skills` discovers bundles recursively like Python `_discover` (a source root that is itself a bundle stops the walk; symlinked directories are not traversed) and rewrites the appended copy's front-matter `name:` line in place instead of round-tripping YAML.
+- Portable skill names accept `[A-Za-z0-9._-]+`, reject empty and `..` (Python's regex is stricter: it requires a leading alphanumeric and at most 128 bytes).
+- `mcp_tool_naming_preamble` emits only the `<mcp-tools>` block; Python's trailing explanatory sentence is not appended (documented deviation from `mcp_naming.py`).
+- `harness_input_text` joins an array when every element carries a string `text` field; Python additionally requires each block's `type` to equal `"text"`.
+- Vendor `from_json` type errors use the shared `decode` wording (`{key} must be …`); Python's `TypeError` text is kept for the cross-field rules and every unknown-key message keeps the Python prefix.
 
 ## Deferred Integrations
 

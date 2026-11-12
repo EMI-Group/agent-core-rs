@@ -7,10 +7,10 @@ The compile-time provider table: one module per registry name in `PROVIDER_NAMES
 
 ## API Surface
 
-- `mod.rs` — `builtin_provider(name) -> Option<Result<Arc<dyn ProviderSpec>>>` (the resolution table), re-exports of `native` and the `vendor`-gated modules, `is_builtin(name)`.
+- `mod.rs` — `builtin_provider(name) -> Option<Result<Arc<dyn ProviderSpec>>>` (the resolution table), the `native` module, and the `vendor`-gated modules; the name predicate is `crate::is_builtin_provider` in `../provider.rs`.
 - `native` — `PROVIDER_NAME`, `CARD_NAME`, `provider()`, `card()`, and re-exports of `NativeHarness*`.
 - `claudecode` / `codex` / `dsh` (feature `vendor`) — `PROVIDER_NAME`, `CARD_NAME`, `card()`, `provider()`, `model_config(...)`, and the provider config data types.
-- `vendor.rs` (feature `vendor`) — shared helpers: the per-provider `Unsupported` message, JSON mapping helpers for the `{"model": {…}}` / flat fragments, and vendor card construction.
+- `vendor.rs` (feature `vendor`) — shared helpers: the per-provider SDK-required message, configuration-error translation, `unsupported_create`, JSON mapping helpers for the `{"model": {…}}` / flat fragments, and vendor card construction.
 
 ## Constraints
 
