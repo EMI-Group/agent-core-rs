@@ -657,6 +657,14 @@ impl SubAgentRuntime {
         &self.shared.parent_session_id
     }
 
+    /// Returns the registry the runtime resolves sub-agent types from.
+    ///
+    /// The model-facing tools use it to reject an unavailable type before spawning.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<SubAgentRegistry> {
+        &self.shared.registry
+    }
+
     fn outcome_for(&self, id: &str) -> SubAgentOutcome {
         let state = self.shared.state.lock();
         state.instances.get(id).map_or_else(
