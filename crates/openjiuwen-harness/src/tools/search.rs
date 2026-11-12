@@ -38,7 +38,9 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::tool::{
     render_payload_text, render_tool_output, Tool, ToolCard, ToolContext, ToolOutput,
 };
-use openjiuwen_sysop::fs::types::{ListDirsParams, ListFilesParams, SearchFilesParams};
+use openjiuwen_sysop::fs::types::{
+    ListDirsParams, ListFilesData, ListFilesParams, SearchFilesParams,
+};
 use openjiuwen_sysop::operation::FsOperation;
 
 use super::descriptions::description;
@@ -404,10 +406,7 @@ impl Tool for ListDirTool {
 }
 
 /// Maps a listing to entry names, dropping dotted entries unless `show_hidden`.
-fn entry_names(
-    data: Option<openjiuwen_sysop::fs::types::ListFilesData>,
-    show_hidden: bool,
-) -> Vec<String> {
+fn entry_names(data: Option<ListFilesData>, show_hidden: bool) -> Vec<String> {
     let Some(data) = data else {
         return Vec::new();
     };
@@ -524,10 +523,10 @@ pub struct GrepArgs {
     )]
     #[schemars(with = "bool")]
     pub line_numbers: bool,
-    /// Shorthand for `ignore_case` (`-i`); either being set makes the search insensitive.
-    #[serde(rename = "-i", default, deserialize_with = "deserialize_flag")]
+    /// Shorthand for `ignore_case` (`-i`), overriding it whenever the key is present.
+    #[serde(rename = "-i", default, deserialize_with = "deserialize_opt_flag")]
     #[schemars(with = "bool")]
-    pub short_ignore_case: bool,
+    pub short_ignore_case: Option<bool>,
     /// ripgrep `--type` filter; unsupported without rg.
     #[serde(rename = "type", default)]
     #[schemars(with = "String")]
@@ -723,7 +722,9 @@ fn prepare_grep(
         return Err(ToolPayload::fail(MULTILINE_NEEDS_RIPGREP));
     }
     let regex = regex::RegexBuilder::new(&args.pattern)
-        .case_insensitive(args.ignore_case || args.short_ignore_case)
+        // Python `_as_bool(inputs.get("-i", inputs.get("ignore_case", False)))`: the short
+        // flag wins whenever it is present, even when it is false.
+        .case_insensitive(args.short_ignore_case.unwrap_or(args.ignore_case))
         .build()
         .map_err(|error| ToolPayload::fail(format!("invalid pattern: {error}")))?;
     let filters = compile_glob_filters(args.glob.as_deref())?;
@@ -1080,17 +1081,19 @@ fn apply_head_limit(
 
 /// Renders `path` relative to `root` with `/` separators, falling back to the absolute path.
 fn relative_name(root: &Path, path: &Path) -> String {
-    let relative = path.strip_prefix(root).map(std::path::Path::to_path_buf);
-    let relative = relative.or_else(|_| {
-        std::fs::canonicalize(root)
-            .ok()
-            .and_then(|root| path.strip_prefix(&root).ok().map(Path::to_path_buf))
-            .ok_or(())
-    });
-    match relative {
-        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-        Err(()) => path.to_string_lossy().replace('\\', "/"),
-    }
+    let relative = path
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::fs::canonicalize(root)
+                .ok()
+                .and_then(|root| path.strip_prefix(&root).ok().map(Path::to_path_buf))
+        });
+    relative.map_or_else(
+        || path.to_string_lossy().replace('\\', "/"),
+        |relative| relative.to_string_lossy().replace('\\', "/"),
+    )
 }
 
 /// Joins a model-supplied relative path onto `root` without touching the filesystem.
@@ -1147,6 +1150,20 @@ where
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value.as_ref().and_then(json_flag).unwrap_or(false))
+}
+
+/// Deserializes an optional flag: absent stays `None`, `null` becomes `Some(false)`.
+///
+/// Python reads `-i` with `inputs.get("-i", inputs.get("ignore_case", False))`, so a present
+/// key wins over `ignore_case` even when its value is null.
+fn deserialize_opt_flag<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .map(|value| json_flag(value).unwrap_or(false)))
 }
 
 /// Deserializes a flag like [`deserialize_flag`], defaulting to `true` (the `-n` flag).
@@ -1504,13 +1521,20 @@ mod tests {
         assert_eq!(insensitive["data"]["exit_code"], json!(0));
         assert_eq!(insensitive["data"]["stdout"], json!("shout.txt:1:HELLO"));
 
-        // `-i` wins even when `ignore_case` is explicitly false.
+        // `-i` wins whenever it is present, in either direction.
         let short = invoke(
             &tool,
             json!({"pattern": "hello", "ignore_case": false, "-i": true}),
         )
         .await;
         assert_eq!(short["data"]["stdout"], json!("shout.txt:1:HELLO"));
+
+        let overridden = invoke(
+            &tool,
+            json!({"pattern": "hello", "ignore_case": true, "-i": false}),
+        )
+        .await;
+        assert_eq!(overridden["data"]["exit_code"], json!(1));
     }
 
     #[tokio::test]
