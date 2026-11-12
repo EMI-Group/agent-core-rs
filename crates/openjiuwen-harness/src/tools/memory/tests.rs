@@ -1,3 +1,4 @@
+//! Unit tests of the eight memory tools and their backend seam.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::{Arc, Mutex};
