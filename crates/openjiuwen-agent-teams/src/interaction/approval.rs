@@ -4,7 +4,7 @@
 //! `openjiuwen/harness/rails/interrupt/confirm_rail.py` (v0.1.20). A teammate's tool call is
 //! interrupted with [`InteractionKind::TeamToolApproval`]; the leader answers with a
 //! [`ConfirmPayload`]; the runtime turns that answer into a
-//! [`ToolApprovalResultEvent`](crate::schema::ToolApprovalResultEvent) so the waiting teammate
+//! [`ToolApprovalResultEvent`] so the waiting teammate
 //! can resume or reject the call.
 //!
 //! The request id is derived from the tool-call id rather than minted randomly, so asking twice
