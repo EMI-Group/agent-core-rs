@@ -427,6 +427,153 @@ async fn filter_only_search_scores_zero_and_orders_by_qualified_id() {
     assert_eq!(filtered[0].descriptor.qualified_id(), "workflow:weather");
 }
 
+// ---------------------------------------------------------------------------
+// Catalog revision
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn revision_starts_at_zero_and_tracks_every_content_change() {
+    let registry = CapabilityRegistry::new();
+    assert_eq!(registry.revision(), 0, "a fresh catalog is revision 0");
+
+    registry
+        .register(descriptor("tool", "sum", "Sum", "adds"))
+        .await
+        .expect("register");
+    assert_eq!(registry.revision(), 1);
+
+    let batch = vec![
+        descriptor("tool", "translate", "Translate", "translates"),
+        descriptor("workflow", "weather", "Weather", "forecasts"),
+        descriptor("agent", "planner", "Planner", "plans"),
+    ];
+    assert_eq!(registry.register_all(batch).await.expect("batch"), 3);
+    assert_eq!(registry.revision(), 2, "a batch of 3 advances by exactly 1");
+
+    assert!(registry
+        .remove(&CapabilityKey::new("tool", "sum"))
+        .await
+        .expect("remove"));
+    assert_eq!(registry.revision(), 3);
+
+    assert!(!registry
+        .remove(&CapabilityKey::new("tool", "sum"))
+        .await
+        .expect("no-op remove"));
+    assert_eq!(
+        registry.revision(),
+        3,
+        "a no-op remove must not advance the revision"
+    );
+
+    registry.clear().await.expect("clear");
+    assert_eq!(registry.revision(), 4);
+
+    registry.clear().await.expect("clear empty catalog");
+    assert_eq!(
+        registry.revision(),
+        4,
+        "clearing an empty catalog must not advance the revision"
+    );
+}
+
+#[tokio::test]
+async fn revision_is_untouched_by_rejected_writes_and_reload_without_a_store() {
+    let registry = CapabilityRegistry::new();
+    let error = registry
+        .register(descriptor("tool", "  ", "Sum", "adds"))
+        .await
+        .expect_err("must reject");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+
+    let error = registry
+        .register_all(vec![
+            descriptor("tool", "sum", "Sum", "adds"),
+            descriptor("tool", "", "Broken", "no id"),
+        ])
+        .await
+        .expect_err("must reject");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert_eq!(registry.revision(), 0, "rejected writes must not count");
+
+    registry
+        .register(descriptor("tool", "sum", "Sum", "adds"))
+        .await
+        .expect("register");
+    assert_eq!(registry.revision(), 1);
+    assert_eq!(registry.reload().await.expect("reload"), 1);
+    assert_eq!(
+        registry.revision(),
+        1,
+        "reload without a store is a no-op and must not bump"
+    );
+}
+
+#[tokio::test]
+async fn a_store_backed_lifecycle_advances_the_revision_as_documented() {
+    let store = Arc::new(KvAssetStore::in_memory());
+    store
+        .put(&descriptor("tool", "sum", "Sum", "adds"))
+        .await
+        .expect("seed store");
+
+    let loaded = CapabilityRegistry::load(store.clone()).await.expect("load");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded.revision(),
+        0,
+        "hydration during construction is not an observed mutation"
+    );
+
+    let registry = CapabilityRegistry::with_store(store.clone());
+    assert_eq!(registry.revision(), 0);
+    assert_eq!(registry.reload().await.expect("first reload"), 1);
+    assert_eq!(registry.revision(), 1);
+    assert_eq!(registry.reload().await.expect("second reload"), 1);
+    assert_eq!(
+        registry.revision(),
+        2,
+        "a store-backed reload bumps even for identical contents"
+    );
+
+    registry
+        .register(descriptor("tool", "translate", "Translate", "translates"))
+        .await
+        .expect("register");
+    assert_eq!(registry.revision(), 3);
+    assert_eq!(stored_ids(&store).await, ["tool:sum", "tool:translate"]);
+
+    // A key that only exists in the store is deleted there but does not change the
+    // in-memory catalog, so the revision must stay put.
+    store
+        .put(&descriptor("tool", "orphan", "Orphan", "store only"))
+        .await
+        .expect("seed orphan");
+    assert!(
+        !registry
+            .remove(&CapabilityKey::new("tool", "orphan"))
+            .await
+            .expect("store-only remove"),
+        "the key was never in the in-memory catalog"
+    );
+    assert_eq!(
+        registry.revision(),
+        3,
+        "a store-only delete leaves the in-memory catalog unchanged"
+    );
+    assert_eq!(stored_ids(&store).await, ["tool:sum", "tool:translate"]);
+
+    assert!(registry
+        .remove(&CapabilityKey::new("tool", "translate"))
+        .await
+        .expect("remove"));
+    assert_eq!(registry.revision(), 4);
+
+    registry.clear().await.expect("clear");
+    assert_eq!(registry.revision(), 5);
+    assert_eq!(stored_ids(&store).await, Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn search_on_an_empty_registry_returns_nothing() {
     let registry = CapabilityRegistry::new();

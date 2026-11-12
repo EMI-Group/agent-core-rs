@@ -14,6 +14,13 @@
 //! lock: writes persist first and only then become visible in memory, so a store
 //! failure leaves the in-memory catalog untouched.
 //!
+//! The catalog revision ([`CapabilityRegistry::revision`]) is a separate
+//! [`std::sync::atomic::AtomicU64`] that is read and written *outside* the lock with
+//! [`std::sync::atomic::Ordering::SeqCst`], so a reader can never observe a torn or
+//! stale-cheap value. A mutation bumps it only after the map write is visible (the
+//! write guard is dropped first), so a reader that observes a new revision and then
+//! reads the catalog is guaranteed to see the corresponding contents.
+//!
 //! A poisoned lock is recovered with [`std::sync::PoisonError::into_inner`] instead of
 //! panicking: every critical section is a single map operation, so the map itself is
 //! still coherent, and a panicking sibling task must not take the whole catalog down.
@@ -28,6 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::error::Result;
@@ -44,6 +52,10 @@ type Entries = BTreeMap<CapabilityKey, CapabilityDescriptor>;
 /// store and then to the map, so persistence failures never desynchronize the
 /// in-memory catalog (see [`Self::register`] and [`Self::remove`]).
 ///
+/// Every successful mutation that changes the catalog's contents advances the
+/// [`Self::revision`] counter, which lets an observer (for example a semantic index)
+/// detect staleness without copying the whole catalog on every call.
+///
 /// `Clone` is intentionally not implemented: the store is a shared trait object, and
 /// cloning a registry would silently create a second writable view of one catalog.
 pub struct CapabilityRegistry {
@@ -51,6 +63,8 @@ pub struct CapabilityRegistry {
     entries: RwLock<Entries>,
     /// The optional persistence backend; writes are forwarded to it.
     store: Option<Arc<dyn AssetStore>>,
+    /// The number of catalog mutations observed so far; see [`Self::revision`].
+    revision: AtomicU64,
 }
 
 impl CapabilityRegistry {
@@ -60,6 +74,7 @@ impl CapabilityRegistry {
         Self {
             entries: RwLock::new(Entries::new()),
             store: None,
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -72,10 +87,15 @@ impl CapabilityRegistry {
         Self {
             entries: RwLock::new(Entries::new()),
             store: Some(store),
+            revision: AtomicU64::new(0),
         }
     }
 
     /// Builds a registry over `store` and hydrates it from the store's contents.
+    ///
+    /// The resulting registry starts with [`Self::revision`] `0`: the hydration happens
+    /// during construction, before any caller can observe the catalog, so it is not a
+    /// mutation observed by that instance's users.
     ///
     /// # Errors
     ///
@@ -83,13 +103,18 @@ impl CapabilityRegistry {
     pub async fn load(store: Arc<dyn AssetStore>) -> Result<Self> {
         let registry = Self::with_store(store);
         registry.reload().await?;
+        registry.revision.store(0, Ordering::SeqCst);
         Ok(registry)
     }
 
     /// Replaces the in-memory catalog with the store's contents and returns the count.
     ///
-    /// Without a store this is a no-op that reports the current catalog size. With a
-    /// store, entries that disappeared from the backend disappear from memory too.
+    /// Without a store this is a no-op that reports the current catalog size and leaves
+    /// [`Self::revision`] untouched. With a store, entries that disappeared from the
+    /// backend disappear from memory too, and the revision advances unconditionally
+    /// once the replacement is installed — even when the contents are identical —
+    /// because the catalog was re-derived from the backend and any observer must
+    /// re-examine it.
     ///
     /// # Errors
     ///
@@ -105,6 +130,7 @@ impl CapabilityRegistry {
         }
         let count = replacement.len();
         *self.write_entries() = replacement;
+        self.bump_revision();
         Ok(count)
     }
 
@@ -112,6 +138,22 @@ impl CapabilityRegistry {
     #[must_use]
     pub fn store(&self) -> Option<&Arc<dyn AssetStore>> {
         self.store.as_ref()
+    }
+
+    /// The number of catalog mutations observed so far.
+    ///
+    /// The counter is strictly monotonic and starts at `0`. It is read with
+    /// [`Ordering::SeqCst`] and changes exactly when the catalog's contents change:
+    /// a successful [`Self::register`], a non-empty [`Self::register_all`] batch, a
+    /// [`Self::remove`] that actually removed a key, a [`Self::clear`] of a non-empty
+    /// catalog, and a store-backed [`Self::reload`] (which always counts, even when the
+    /// replacement is identical, because the catalog was re-derived from the backend).
+    /// A no-op mutation and a [`Self::reload`] without a store leave it untouched.
+    /// A registry built by [`Self::load`] also starts at `0`: its construction-time
+    /// hydration is not a mutation observed by callers.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
     }
 
     /// The number of descriptors in the catalog.
@@ -130,6 +172,7 @@ impl CapabilityRegistry {
     ///
     /// The descriptor is validated first, then persisted, then inserted into memory, so
     /// neither a validation error nor a store failure mutates the in-memory catalog.
+    /// A successful insert advances [`Self::revision`].
     ///
     /// # Errors
     ///
@@ -141,6 +184,7 @@ impl CapabilityRegistry {
             store.put(&descriptor).await?;
         }
         self.write_entries().insert(descriptor.key(), descriptor);
+        self.bump_revision();
         Ok(())
     }
 
@@ -150,6 +194,10 @@ impl CapabilityRegistry {
     /// rejects the whole batch without touching the store or the catalog. A store
     /// failure part-way through can leave earlier descriptors persisted, but the
     /// in-memory catalog is not updated at all in that case.
+    ///
+    /// A successful non-empty batch advances [`Self::revision`] exactly once: a batch of
+    /// `N` descriptors moves the counter by `1`, not by `N`. An empty batch changes
+    /// nothing and leaves the counter untouched.
     ///
     /// # Errors
     ///
@@ -165,9 +213,14 @@ impl CapabilityRegistry {
             }
         }
         let count = descriptors.len();
-        let mut entries = self.write_entries();
-        for descriptor in descriptors {
-            entries.insert(descriptor.key(), descriptor);
+        {
+            let mut entries = self.write_entries();
+            for descriptor in descriptors {
+                entries.insert(descriptor.key(), descriptor);
+            }
+        }
+        if count > 0 {
+            self.bump_revision();
         }
         Ok(count)
     }
@@ -185,7 +238,10 @@ impl CapabilityRegistry {
     /// Removes `key` from the store and the catalog.
     ///
     /// Returns `true` only when the key was present in the in-memory catalog; a key that
-    /// exists only in the store still gets deleted and reports `false`.
+    /// exists only in the store still gets deleted and reports `false`. [`Self::revision`]
+    /// advances only when the in-memory catalog actually lost an entry, so a store-only
+    /// deletion leaves it untouched because the catalog the counter describes is
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -194,10 +250,18 @@ impl CapabilityRegistry {
         if let Some(store) = &self.store {
             store.remove(key).await?;
         }
-        Ok(self.write_entries().remove(key).is_some())
+        let removed = self.write_entries().remove(key).is_some();
+        if removed {
+            self.bump_revision();
+        }
+        Ok(removed)
     }
 
     /// Removes every descriptor from the store and the catalog.
+    ///
+    /// [`Self::revision`] advances only when the in-memory catalog was non-empty before
+    /// the clear: emptying an already empty catalog changes nothing, so observers have
+    /// nothing to re-examine.
     ///
     /// # Errors
     ///
@@ -206,7 +270,15 @@ impl CapabilityRegistry {
         if let Some(store) = &self.store {
             store.clear().await?;
         }
-        self.write_entries().clear();
+        let was_empty = {
+            let mut entries = self.write_entries();
+            let was_empty = entries.is_empty();
+            entries.clear();
+            was_empty
+        };
+        if !was_empty {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -239,6 +311,11 @@ impl CapabilityRegistry {
         self.entries.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Advances [`Self::revision`] by one after a visible map mutation.
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Clones the catalog's descriptors, sorted by qualified id, with the lock released.
     fn snapshot(&self) -> Vec<CapabilityDescriptor> {
         let entries = self.read_entries();
@@ -263,6 +340,7 @@ impl fmt::Debug for CapabilityRegistry {
             .debug_struct("CapabilityRegistry")
             .field("entries", &*entries)
             .field("persistent", &self.store.is_some())
+            .field("revision", &self.revision())
             .finish()
     }
 }
@@ -306,5 +384,140 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
         assert!(registry.store().is_none());
+    }
+
+    #[tokio::test]
+    async fn revision_starts_at_zero() {
+        assert_eq!(CapabilityRegistry::new().revision(), 0);
+        assert_eq!(CapabilityRegistry::default().revision(), 0);
+        let store = Arc::new(crate::store::KvAssetStore::in_memory());
+        assert_eq!(CapabilityRegistry::with_store(store).revision(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_advances_the_revision_once_per_successful_insert() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(descriptor("tool", "sum", "Sum"))
+            .await
+            .expect("register");
+        assert_eq!(registry.revision(), 1);
+        registry
+            .register(descriptor("tool", "sum", "Sum v2"))
+            .await
+            .expect("re-register");
+        assert_eq!(registry.revision(), 2, "a replacement is still a mutation");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_register_does_not_advance_the_revision() {
+        let registry = CapabilityRegistry::new();
+        let error = registry
+            .register(descriptor("tool", "  ", "Sum"))
+            .await
+            .expect_err("must reject");
+        assert_eq!(error.kind(), crate::error::ErrorKind::Validation);
+        assert_eq!(registry.revision(), 0);
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_all_advances_the_revision_once_per_batch() {
+        let registry = CapabilityRegistry::new();
+        let batch = vec![
+            descriptor("tool", "sum", "Sum"),
+            descriptor("tool", "translate", "Translate"),
+            descriptor("workflow", "weather", "Weather"),
+        ];
+        assert_eq!(registry.register_all(batch).await.expect("batch"), 3);
+        assert_eq!(
+            registry.revision(),
+            1,
+            "a batch of 3 advances the counter by 1"
+        );
+
+        assert_eq!(registry.register_all(Vec::new()).await.expect("empty"), 0);
+        assert_eq!(registry.revision(), 1, "an empty batch changes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_register_all_does_not_advance_the_revision() {
+        let registry = CapabilityRegistry::new();
+        let batch = vec![
+            descriptor("tool", "sum", "Sum"),
+            descriptor("tool", "", "Broken"),
+        ];
+        assert!(registry.register_all(batch).await.is_err());
+        assert_eq!(registry.revision(), 0);
+    }
+
+    #[tokio::test]
+    async fn remove_advances_the_revision_only_for_a_present_key() {
+        let registry = CapabilityRegistry::new();
+        let key = CapabilityKey::new("tool", "sum");
+        registry
+            .register(descriptor("tool", "sum", "Sum"))
+            .await
+            .expect("register");
+        assert_eq!(registry.revision(), 1);
+
+        assert!(registry.remove(&key).await.expect("remove"));
+        assert_eq!(registry.revision(), 2);
+
+        assert!(!registry.remove(&key).await.expect("no-op remove"));
+        assert_eq!(registry.revision(), 2, "a no-op remove must not bump");
+    }
+
+    #[tokio::test]
+    async fn clear_advances_the_revision_only_for_a_non_empty_catalog() {
+        let registry = CapabilityRegistry::new();
+        registry.clear().await.expect("clear empty");
+        assert_eq!(
+            registry.revision(),
+            0,
+            "an empty catalog has nothing to clear"
+        );
+
+        registry
+            .register_all(vec![descriptor("tool", "sum", "Sum")])
+            .await
+            .expect("register");
+        assert_eq!(registry.revision(), 1);
+
+        registry.clear().await.expect("clear");
+        assert_eq!(registry.revision(), 2);
+
+        registry.clear().await.expect("clear again");
+        assert_eq!(registry.revision(), 2, "clearing nothing must not bump");
+    }
+
+    #[tokio::test]
+    async fn reload_without_a_store_does_not_advance_the_revision() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(descriptor("tool", "sum", "Sum"))
+            .await
+            .expect("register");
+        assert_eq!(registry.reload().await.expect("reload"), 1);
+        assert_eq!(registry.revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_backed_reload_advances_the_revision_unconditionally() {
+        let store = Arc::new(crate::store::KvAssetStore::in_memory());
+        store
+            .put(&descriptor("tool", "sum", "Sum"))
+            .await
+            .expect("seed");
+        let registry = CapabilityRegistry::with_store(store);
+
+        assert_eq!(registry.reload().await.expect("first reload"), 1);
+        assert_eq!(registry.revision(), 1);
+        assert_eq!(registry.reload().await.expect("second reload"), 1);
+        assert_eq!(
+            registry.revision(),
+            2,
+            "replacement counts even when the contents are identical"
+        );
     }
 }
