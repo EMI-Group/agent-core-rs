@@ -1,5 +1,11 @@
 //! [`TaskBoard`]: every task-board operation over one team's persisted state.
 //!
+//! This file is long on purpose (~1200 lines): the board is one object and the lifecycle rules only
+//! read as a whole — claim rules reference blocking, completion references the review gate, the gate
+//! references the tally — so splitting the `impl` across files would scatter a single contract.
+//! The pure decisions are already out of it ([`super::graph`], [`super::review`]) and the tests live
+//! in `board_tests.rs`.
+//!
 //! Python parity source: `TeamTaskManager` of `openjiuwen/agent_teams/tools/task_manager.py` and
 //! the atomic mutations of `tools/database/task_dao.py`. The Python class is also the tool surface
 //! (`create_task`, `claim_task`, `complete_task`, …); here the board is the domain layer and the
