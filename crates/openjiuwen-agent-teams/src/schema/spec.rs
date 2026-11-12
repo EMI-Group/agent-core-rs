@@ -12,6 +12,8 @@
 //! defaults to `inprocess` because this port has no OS-process members, and [`TeamAgentSpec`]'s
 //! validation additionally rejects a predefined member name outside `^[a-z][a-z0-9_-]*$`.
 
+// NOTE: this file is intentionally long: it holds the whole team blueprint — every spec enum, the
+// member-facing leaf types' wiring and the validation rules pinned to Python messages.
 use std::collections::BTreeMap;
 
 use openjiuwen_common::error::{Error, Result};

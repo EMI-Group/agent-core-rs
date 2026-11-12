@@ -11,7 +11,7 @@
 //! | [`deep_agent`] | [`DeepAgentSpec`], [`ModelRef`], [`ToolSpec`], [`RailSpec`], [`McpServerSpec`], [`SubAgentSpec`], [`WorkspaceSpec`] |
 //! | [`events`] | [`EventMessage`], [`TeamTopic`], [`EventPayload`] and every payload struct |
 //! | [`member_spec`] | [`LeaderSpec`], [`MemberSpecBase`], [`TeamMemberSpec`], [`PredefinedMemberSpec`], [`TinyAgentSpec`], [`ModelPoolEntry`] |
-//! | [`spec`] | [`TeamAgentSpec`], [`LeaderSpec`], member specs, transport/storage/workspace specs and spec enums |
+//! | [`spec`] | [`TeamAgentSpec`], [`TransportSpec`], [`StorageSpec`], [`TeamWorkspaceSpec`] and the spec enums |
 //! | [`status`] | [`MemberStatus`], [`ExecutionStatus`], [`TaskStatus`], transition tables |
 //! | [`stream`] | [`TeamOutputSchema`] and the stream frame markers |
 //! | [`task`] | [`TaskRecord`], [`TaskSummary`], [`TaskDetail`], [`TaskGraphSpec`], [`ReviewVote`], [`TaskPatch`] |

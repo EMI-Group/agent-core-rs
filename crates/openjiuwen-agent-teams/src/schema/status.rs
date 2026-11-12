@@ -9,6 +9,8 @@
 //! `Default` matches the Python default. Python parity source:
 //! `openjiuwen/agent_teams/schema/status.py`.
 
+// NOTE: this file is intentionally long: the pinned transition tables plus an exhaustive
+// per-status/per-table test suite that re-pins every legal and illegal edge.
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle status of a team member.
