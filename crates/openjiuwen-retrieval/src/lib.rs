@@ -28,6 +28,7 @@ pub mod graph;
 pub mod knowledge_base;
 pub mod loaders;
 pub mod model;
+pub mod multimodal;
 pub mod reranker;
 pub mod retriever;
 pub mod rewrite;

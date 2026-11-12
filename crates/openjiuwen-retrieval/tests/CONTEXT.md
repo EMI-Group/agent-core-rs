@@ -14,6 +14,7 @@ All tests are offline and deterministic.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
 - `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
+- `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
 
 ## Constraints
 
@@ -31,3 +32,4 @@ All tests are offline and deterministic.
 - `./knowledge_base.rs` → pipeline end to end
 - `./embedding.rs` → OpenAI-compatible embedding client
 - `./graph.rs` → triple extraction and graph store
+- `./multimodal.rs` → multimodal documents, image loading, table conversion
