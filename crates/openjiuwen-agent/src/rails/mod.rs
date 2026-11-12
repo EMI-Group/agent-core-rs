@@ -403,20 +403,29 @@ impl RailRegistry {
         self.rails.is_empty()
     }
 
-    /// Fires the hook matching `ctx.event`, in descending-priority order.
+    /// Fires the hook matching `ctx.event` on each rail, in stored order
+    /// (stable descending priority, ties in insertion order).
     ///
-    /// TODO: dispatch by `ctx.event` (stable descending priority) and stop at
-    /// the first `Err`; the current body is a no-op so the loop can be wired
-    /// against the seam before the dispatch exists.
+    /// Dispatch stops at the first rail returning `Err`: later rails do not
+    /// run and the error propagates to the caller, which aborts the run.
     ///
     /// # Errors
     ///
-    /// Returns the first error a rail raises; that error aborts the run.
-    // The dispatch becomes a loop awaiting the rails in the next round; the
-    // placeholder body is synchronous on purpose.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    /// Returns the first error a rail raises.
     pub async fn fire(&self, ctx: &mut RailContext) -> Result<()> {
-        let _ = ctx;
+        for rail in &self.rails {
+            match ctx.event {
+                RailEvent::BeforeInvoke => rail.before_invoke(ctx).await?,
+                RailEvent::AfterInvoke => rail.after_invoke(ctx).await?,
+                RailEvent::BeforeModelCall => rail.before_model_call(ctx).await?,
+                RailEvent::AfterModelCall => rail.after_model_call(ctx).await?,
+                RailEvent::OnModelException => rail.on_model_exception(ctx).await?,
+                RailEvent::BeforeToolCall => rail.before_tool_call(ctx).await?,
+                RailEvent::AfterToolCall => rail.after_tool_call(ctx).await?,
+                RailEvent::OnToolException => rail.on_tool_exception(ctx).await?,
+                RailEvent::AfterReactIteration => rail.after_react_iteration(ctx).await?,
+            }
+        }
         Ok(())
     }
 }
@@ -440,6 +449,7 @@ impl fmt::Debug for RailRegistry {
 mod tests {
     use super::*;
     use openjiuwen_foundation::ToolCall;
+    use std::sync::Mutex;
 
     /// A rail that only reports a name and priority.
     struct TestRail {
@@ -460,6 +470,127 @@ mod tests {
 
     fn rail(name: &'static str, priority: i32) -> Arc<dyn AgentRail> {
         Arc::new(TestRail { name, priority })
+    }
+
+    /// A rail that logs the hook it was called for.
+    ///
+    /// Every hook records `"<name>:<wire event>"` into `log` so a test can
+    /// check which rails ran and in which order. A `fail` rail returns
+    /// [`openjiuwen_common::error::Error::config`] after recording.
+    struct RecordingRail {
+        name: &'static str,
+        priority: i32,
+        log: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl RecordingRail {
+        fn record(&self, hook: &str) -> Result<()> {
+            if let Ok(mut log) = self.log.lock() {
+                log.push(format!("{}:{hook}", self.name));
+            }
+            if self.fail {
+                Err(openjiuwen_common::error::Error::config("boom"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRail for RecordingRail {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_invoke(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("before_invoke")
+        }
+
+        async fn after_invoke(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("after_invoke")
+        }
+
+        async fn before_model_call(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("before_model_call")
+        }
+
+        async fn after_model_call(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("after_model_call")
+        }
+
+        async fn on_model_exception(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("on_model_exception")
+        }
+
+        async fn before_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("before_tool_call")
+        }
+
+        async fn after_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("after_tool_call")
+        }
+
+        async fn on_tool_exception(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("on_tool_exception")
+        }
+
+        async fn after_react_iteration(&self, _ctx: &mut RailContext) -> Result<()> {
+            self.record("after_react_iteration")
+        }
+    }
+
+    fn recorder(
+        name: &'static str,
+        priority: i32,
+        log: &Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn AgentRail> {
+        Arc::new(RecordingRail {
+            name,
+            priority,
+            log: Arc::clone(log),
+            fail: false,
+        })
+    }
+
+    fn failing_recorder(
+        name: &'static str,
+        priority: i32,
+        log: &Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn AgentRail> {
+        Arc::new(RecordingRail {
+            name,
+            priority,
+            log: Arc::clone(log),
+            fail: true,
+        })
+    }
+
+    fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().map(|log| log.clone()).unwrap_or_default()
+    }
+
+    /// A rail that only implements `before_tool_call`.
+    struct OnlyToolRail {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRail for OnlyToolRail {
+        fn name(&self) -> &'static str {
+            "only_tool"
+        }
+
+        async fn before_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+            if let Ok(mut log) = self.log.lock() {
+                log.push("only_tool:before_tool_call".to_owned());
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -513,12 +644,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_is_a_placeholder_that_allows_the_run() {
+    async fn fire_dispatches_in_priority_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut registry = RailRegistry::new();
-        registry.register(rail("a", 10));
+        registry.register(recorder("low", 10, &log));
+        registry.register(recorder("high", 90, &log));
+        registry.register(recorder("tie_a", 50, &log));
+        registry.register(recorder("tie_b", 50, &log));
+
         let mut ctx = RailContext::new(RailEvent::BeforeInvoke);
         registry.fire(&mut ctx).await.unwrap();
+        assert_eq!(
+            entries(&log),
+            vec![
+                "high:before_invoke",
+                "tie_a:before_invoke",
+                "tie_b:before_invoke",
+                "low:before_invoke",
+            ]
+        );
+        // The hooks only observe; they do not mutate the context.
         assert!(ctx.extra.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fire_stops_at_the_first_error() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(failing_recorder("boom", 90, &log));
+        registry.register(recorder("later", 10, &log));
+
+        let mut ctx = RailContext::new(RailEvent::BeforeInvoke);
+        let err = registry.fire(&mut ctx).await.unwrap_err();
+        assert!(
+            matches!(err, openjiuwen_common::error::Error::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(entries(&log), vec!["boom:before_invoke"]);
+    }
+
+    #[tokio::test]
+    async fn fire_dispatches_only_the_hook_matching_the_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(recorder("rec", 10, &log));
+
+        let cases = [
+            (RailEvent::BeforeInvoke, "before_invoke"),
+            (RailEvent::AfterInvoke, "after_invoke"),
+            (RailEvent::BeforeModelCall, "before_model_call"),
+            (RailEvent::AfterModelCall, "after_model_call"),
+            (RailEvent::OnModelException, "on_model_exception"),
+            (RailEvent::BeforeToolCall, "before_tool_call"),
+            (RailEvent::AfterToolCall, "after_tool_call"),
+            (RailEvent::OnToolException, "on_tool_exception"),
+            (RailEvent::AfterReactIteration, "after_react_iteration"),
+        ];
+        for (index, (event, _wire)) in cases.iter().enumerate() {
+            let mut ctx = RailContext::new(*event);
+            registry.fire(&mut ctx).await.unwrap();
+            assert_eq!(
+                entries(&log),
+                (0..=index)
+                    .map(|i| format!("rec:{}", cases[i].1))
+                    .collect::<Vec<_>>(),
+                "unexpected log after firing {}",
+                cases[index].1
+            );
+        }
+        assert_eq!(entries(&log).len(), cases.len());
+    }
+
+    #[tokio::test]
+    async fn fire_does_not_call_a_rail_for_another_event() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(Arc::new(OnlyToolRail {
+            log: Arc::clone(&log),
+        }));
+
+        let mut ctx = RailContext::new(RailEvent::BeforeInvoke);
+        registry.fire(&mut ctx).await.unwrap();
+        assert_eq!(entries(&log), Vec::<String>::new());
+
+        let mut ctx = RailContext::new(RailEvent::BeforeToolCall);
+        registry.fire(&mut ctx).await.unwrap();
+        assert_eq!(entries(&log), vec!["only_tool:before_tool_call"]);
+    }
+
+    #[tokio::test]
+    async fn fire_with_no_rails_is_a_no_op() {
+        let registry = RailRegistry::new();
+        let mut ctx = RailContext::new(RailEvent::AfterInvoke);
+        registry.fire(&mut ctx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fire_skips_an_unregistered_rail() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = RailRegistry::new();
+        registry.register(recorder("gone", 10, &log));
+        registry.unregister("gone");
+
+        let mut ctx = RailContext::new(RailEvent::BeforeInvoke);
+        registry.fire(&mut ctx).await.unwrap();
+        assert_eq!(entries(&log), Vec::<String>::new());
     }
 
     #[test]
