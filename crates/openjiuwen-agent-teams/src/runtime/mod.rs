@@ -15,16 +15,18 @@
 //! | [`dispatch`] | [`decide_run_action`]: whether a run creates, attaches, resumes or is rejected |
 //! | [`initial_input`] | [`parse_initial_input`]: caller request → leader query + deliveries |
 //! | [`backend`] | [`TeamBackend`]: members, mail, events, task board and snapshot facade |
+//! | [`build`] | the blueprint → runtime build path (`SpecBuild::build` / `build_with`) |
 //! | [`spawner`] | [`TeamMemberSpawner`]: the harness-backed `MemberSpawner` |
-//! | [`team_agent`] | [`TeamAgent`], [`SpecBuild`] and the build path |
+//! | [`team_agent`] | [`TeamAgent`] and [`SpecBuild`] |
 //! | [`leader`] | the coordination loop (`select!` over chunks, events, cancellation, settle tick) |
 //! | [`pool`] | [`TeamRuntimePool`]: session → team runtime map |
 //! | [`manager`] | [`TeamRuntimeManager`] and the process-global registry |
 //! | [`adapter`] | the `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` seams |
-/// Model-pool selection: round-robin or by model name.
-pub mod allocator;
+//! | `tests` | the crossed-seam integration suite |
 /// The `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` seams over [`team_agent::TeamAgent`].
 pub mod adapter;
+/// Model-pool selection: round-robin or by model name.
+pub mod allocator;
 /// The organisation facade a running team exposes: members, mail, events, tasks and snapshots.
 pub mod backend;
 /// The blueprint → runtime build path (`TeamAgentSpec::build` / `build_with`).
@@ -48,3 +50,17 @@ pub mod team_agent;
 
 #[cfg(test)]
 mod tests;
+
+pub use allocator::{ModelAllocator, TeamModelAllocation};
+pub use backend::TeamBackend;
+pub use deps::TeamBuildDeps;
+pub use dispatch::{decide_run_action, LiveTeamState, RunAction, RunActionKind};
+pub use initial_input::{parse_initial_input, InitialInput};
+pub use leader::SETTLE_POLL_INTERVAL;
+pub use manager::{
+    clear_global_registry, global_registry, set_global_registry, try_global_registry,
+    TeamRuntimeManager,
+};
+pub use pool::TeamRuntimePool;
+pub use spawner::TeamMemberSpawner;
+pub use team_agent::{SpecBuild, TeamAgent};
