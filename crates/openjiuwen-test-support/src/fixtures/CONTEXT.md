@@ -1,9 +1,10 @@
-# fixtures — temp directories and environment isolation
+# fixtures — temp directories, environment isolation, and ready-made sessions
 
 ## Intent
 
-Pytest-equivalent fixtures for Rust tests: `tmp_path` becomes `TempWorkspace`, `monkeypatch.setenv("OPENJIUWEN_HOME", ...)` becomes `TempHomeGuard`, and `monkeypatch` env cleanup becomes `EnvGuard`.
-All helpers are drop-scoped (temporary directory removed, environment restored) and never leak state between tests.
+Pytest-equivalent fixtures for Rust tests: `tmp_path` becomes `TempWorkspace`, `monkeypatch.setenv("OPENJIUWEN_HOME", ...)` becomes `TempHomeGuard`, `monkeypatch` env cleanup becomes `EnvGuard`, and Python's `create_workflow_session`/`create_agent_session` test helpers become the `session.rs` session and checkpointer fixtures.
+The filesystem and environment helpers are drop-scoped (temporary directory removed, environment restored) and never leak state between tests.
+The session fixtures build on the implemented `openjiuwen-session` factories, so a test gets a real `Arc<dyn Session>` without repeating an options struct.
 
 ## API Surface
 

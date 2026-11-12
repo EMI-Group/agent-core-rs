@@ -310,6 +310,24 @@ let model = ScriptedModel::builder()
     .build();
 ```
 
+```rust
+use openjiuwen_session::WorkflowSessionOptions;
+use openjiuwen_test_support::{memory_checkpointer, workflow_session, workflow_session_with};
+
+let session = workflow_session("wf-1");                    // id + default options, Arc<dyn Session>
+let store = memory_checkpointer();                         // fresh store, never MemoryCheckpointer::shared
+
+// Resume: two sessions share one store and one session id, because the checkpointer is
+// attached at construction only (`Session::checkpointer` is a read-only getter).
+let options = WorkflowSessionOptions {
+    session_id: Some("wf-1".to_string()),
+    checkpointer: Some(store),
+    ..WorkflowSessionOptions::default()
+};
+let first = workflow_session_with(options.clone());
+let resumed = workflow_session_with(options);
+```
+
 ## Constraints
 
 - Dev-only (`publish = false`); a library crate must never depend on this crate.
