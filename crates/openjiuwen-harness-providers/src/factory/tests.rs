@@ -30,6 +30,21 @@ use super::{
 };
 use crate::provider::{provider_names, ProviderSpec};
 
+/// Serializes registry-mutating tests.
+///
+/// The registry is process-global, so a test that registers or unregisters a provider while
+/// another test reads [`available_providers`] positions would shift the indices that test asserts
+/// on. Every mutating test holds this lock for its whole body.
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires [`REGISTRY_LOCK`], recovering from a poisoned mutex so one failed test does not
+/// wedge the whole suite.
+fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Returns a registry name no other test (or earlier run) can collide with.
 fn unique_name(prefix: &str) -> String {
     format!("factory-test-{prefix}-{}", uuid::Uuid::new_v4())
@@ -151,6 +166,7 @@ fn mcp_server(name: &str) -> McpServerConfig {
 
 #[test]
 fn empty_and_builtin_names_are_rejected() {
+    let _guard = registry_guard();
     for name in ["", provider_names::NATIVE, provider_names::DSH] {
         let error = register_harness_provider(name, fake_factory(Arc::new(FakeSpec::new("x"))))
             .expect_err("empty and built-in names are not registrable");
@@ -169,6 +185,7 @@ fn empty_and_builtin_names_are_rejected() {
 
 #[test]
 fn registered_names_follow_the_builtins_in_insertion_order() {
+    let _guard = registry_guard();
     let first = register_fake(Arc::new(FakeSpec::new("first-harness")));
     let second = register_fake(Arc::new(FakeSpec::new("second-harness")));
 
@@ -189,6 +206,7 @@ fn registered_names_follow_the_builtins_in_insertion_order() {
 
 #[test]
 fn re_registration_replaces_in_place() {
+    let _guard = registry_guard();
     let name = unique_name("replace");
     register_harness_provider(&name, fake_factory(Arc::new(FakeSpec::new("before"))))
         .expect("the first registration succeeds");
@@ -213,6 +231,7 @@ fn re_registration_replaces_in_place() {
 
 #[test]
 fn unregistering_unknown_names_is_ignored() {
+    let _guard = registry_guard();
     unregister_harness_provider(&unique_name("missing"));
     unregister_harness_provider("");
     unregister_harness_provider(provider_names::NATIVE);
@@ -251,6 +270,7 @@ fn unknown_names_report_the_available_providers() {
 
 #[test]
 fn a_failing_factory_reports_instantiation_failure() {
+    let _guard = registry_guard();
     let name = unique_name("failing");
     register_harness_provider(
         &name,
@@ -328,6 +348,7 @@ fn describe_provider_reports_unknown_names_as_not_found() {
 
 #[test]
 fn describe_provider_derives_registered_descriptors() {
+    let _guard = registry_guard();
     let spec = Arc::new(FakeSpec::new("fake-harness").with_capabilities(&[]));
     let name = register_fake(spec);
     let descriptor = describe_provider(&name).expect("the registered provider is described");
@@ -377,6 +398,7 @@ fn create_harness_rejects_an_invalid_native_config() {
 
 #[test]
 fn context_defaults_follow_the_provider_card() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("fake-harness")));
     let context =
         build_harness_context(&name, HarnessContextOptions::new("session-1", "be helpful"))
@@ -400,6 +422,7 @@ fn context_defaults_follow_the_provider_card() {
 
 #[test]
 fn context_keeps_explicit_identity_and_an_empty_prompt() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("fake-harness")));
     let mut options = HarnessContextOptions::new("session-2", "");
     options.agent_name = Some("planner".to_owned());
@@ -412,6 +435,7 @@ fn context_keeps_explicit_identity_and_an_empty_prompt() {
 
 #[test]
 fn a_checkpoint_sink_injects_the_host_capability() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("fake-harness")));
     let mut options = HarnessContextOptions::new("session-3", "prompt");
     options.checkpoint_sink = Some(Arc::new(FakeSink));
@@ -427,6 +451,7 @@ fn a_checkpoint_sink_injects_the_host_capability() {
 
 #[test]
 fn non_native_providers_receive_the_mcp_servers() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("fake-harness")));
     let mut options = HarnessContextOptions::new("session-4", "prompt");
     options.mcp_servers = vec![mcp_server("filesystem")];
@@ -463,6 +488,7 @@ fn native_drops_the_mcp_servers() {
 
 #[test]
 fn a_provider_without_the_model_hook_is_rejected() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("fake-harness").without_models()));
     let choice = ModelChoice {
         model: Some("gpt-5".to_owned()),
@@ -480,6 +506,7 @@ fn a_provider_without_the_model_hook_is_rejected() {
 
 #[test]
 fn model_configuration_gates_on_the_card_capabilities() {
+    let _guard = registry_guard();
     let plain = register_fake(Arc::new(FakeSpec::new("fake-harness")));
     let choice = ModelChoice {
         model: Some("gpt-5".to_owned()),
@@ -518,6 +545,7 @@ fn model_configuration_gates_on_the_card_capabilities() {
 
 #[test]
 fn model_configuration_forwards_to_a_capable_provider() {
+    let _guard = registry_guard();
     let capable = register_fake(Arc::new(FakeSpec::new("fake-harness").with_capabilities(
         &[
             HarnessCapability::AuthFallback,

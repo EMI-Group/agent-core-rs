@@ -36,6 +36,21 @@ use openjiuwen_harness_providers::{
 #[cfg(any(feature = "native", feature = "vendor"))]
 use serde_json::json;
 
+/// Serializes registry-mutating tests.
+///
+/// The registry is process-global, so a test that registers or unregisters a provider while
+/// another test reads [`available_providers`] positions would shift the indices that test asserts
+/// on. Every mutating test holds this lock for its whole body.
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires [`REGISTRY_LOCK`], recovering from a poisoned mutex so one failed test does not
+/// wedge the whole suite.
+fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Converts a JSON literal into a provider create mapping (`JsonObject` is a `BTreeMap`, so
 /// `json!({...})` does not coerce).
 #[cfg(any(feature = "native", feature = "vendor"))]
@@ -294,6 +309,7 @@ fn unknown_names_are_not_found_and_list_the_providers() {
 // Python: `test_factory.py` registration/resolution round trip.
 #[test]
 fn registration_appends_after_the_builtins_and_resolves() {
+    let _guard = registry_guard();
     let name = register_fake(Arc::new(FakeSpec::new("registered-harness")), "registered");
     let names = available_providers();
     let builtins: Vec<String> = names.iter().take(PROVIDER_NAMES.len()).cloned().collect();
@@ -317,6 +333,7 @@ fn registration_appends_after_the_builtins_and_resolves() {
 
 #[test]
 fn re_registration_replaces_in_place_without_duplicating() {
+    let _guard = registry_guard();
     let first = register_fake(Arc::new(FakeSpec::new("first-harness")), "replace-a");
     let second = register_fake(Arc::new(FakeSpec::new("second-harness")), "replace-b");
     let first_before = position(&first).expect("the first name is listed");
@@ -358,6 +375,7 @@ fn re_registration_replaces_in_place_without_duplicating() {
 // Python: `test_factory.py` rejects empty and built-in registration keys.
 #[test]
 fn empty_and_builtin_names_cannot_be_registered() {
+    let _guard = registry_guard();
     let error = register_harness_provider("", fake_factory(Arc::new(FakeSpec::new("x"))))
         .expect_err("the empty name is not registrable");
     assert_validation(
@@ -382,6 +400,7 @@ fn empty_and_builtin_names_cannot_be_registered() {
 // Python: a failing provider factory surfaces as a `ValueError` naming the provider.
 #[test]
 fn a_failing_factory_reports_a_validation_error() {
+    let _guard = registry_guard();
     let name = unique_name("failing");
     let failing: ProviderFactory = Arc::new(|| Err(Error::validation("boom")));
     register_harness_provider(&name, failing).expect("a unique non-built-in name is registrable");
@@ -503,6 +522,7 @@ fn describe_provider_rejects_unknown_names() {
 
 #[test]
 fn registered_descriptors_report_the_card_and_no_requirement() {
+    let _guard = registry_guard();
     let name = register_fake(
         Arc::new(FakeSpec::new("fake-descriptor-harness")),
         "descriptor",
@@ -597,6 +617,7 @@ fn native_model_configuration_rejects_invalid_choices() {
 
 #[test]
 fn a_plain_provider_does_not_configure_models() {
+    let _guard = registry_guard();
     let name = unique_name("plain");
     register_harness_provider(
         &name,
@@ -748,6 +769,7 @@ fn create_harness_rejects_invalid_configuration_and_unknown_providers() {
 // Python: `test_factory.py::test_build_harness_context` defaults.
 #[test]
 fn context_defaults_come_from_the_provider_card() {
+    let _guard = registry_guard();
     let name = register_fake(
         Arc::new(FakeSpec::new("context-harness")),
         "context-defaults",
@@ -768,6 +790,7 @@ fn context_defaults_come_from_the_provider_card() {
 
 #[test]
 fn explicit_identity_cwd_env_and_resume_policy_are_copied() {
+    let _guard = registry_guard();
     let name = register_fake(
         Arc::new(FakeSpec::new("context-explicit-harness")),
         "context-explicit",
@@ -791,6 +814,7 @@ fn explicit_identity_cwd_env_and_resume_policy_are_copied() {
 
 #[test]
 fn a_checkpoint_sink_adds_the_host_capability() {
+    let _guard = registry_guard();
     let name = register_fake(
         Arc::new(FakeSpec::new("context-sink-harness")),
         "context-sink",
@@ -813,6 +837,7 @@ fn a_checkpoint_sink_adds_the_host_capability() {
 
 #[test]
 fn non_native_providers_receive_mcp_servers() {
+    let _guard = registry_guard();
     let name = register_fake(
         Arc::new(FakeSpec::new("context-mcp-harness")),
         "context-mcp",
