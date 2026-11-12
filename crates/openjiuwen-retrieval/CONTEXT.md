@@ -5,7 +5,8 @@
 Documents, chunking, embeddings, vector stores, rerankers, and knowledge base for the Rust rewrite.
 Maps to the Python package `openjiuwen.core.retrieval` (public surface in `openjiuwen/core/retrieval/__init__.py`), with the document/result/config models from `retrieval/common/` and the foundation store ABCs (`Document`, `Embedding`, `Reranker`, `VectorStore`).
 Scope is the offline-capable core: text/JSON/Markdown/CSV/HTML/URL loading, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic fake, an in-memory vector store with optional JSON persistence, score/LLM reranking seams, and a knowledge base that runs load → chunk → embed → store → retrieve → rerank.
-External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, triple/graph extraction, multimodal documents, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, triple/graph extraction, model-backed image captioning, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+Multimodal document representation, the offline image loader, and Markdown/row/column table conversion live in `multimodal` (see `src/multimodal/CONTEXT.md`).
 
 ## API Surface
 
@@ -143,17 +144,18 @@ pub async fn retrieve_multi_kb_with_source(kbs: &[Arc<SimpleKnowledgeBase>], que
 No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non-streaming).
 
 ### Re-exports (`lib.rs`)
-`pub mod common; pub mod chunking; pub mod loaders; pub mod embedding; pub mod vector_store; pub mod reranker; pub mod knowledge_base;` plus the public types/traits listed above.
+`pub mod common; pub mod chunking; pub mod loaders; pub mod multimodal; pub mod embedding; pub mod vector_store; pub mod reranker; pub mod knowledge_base;` plus the public types/traits listed above.
 
 ## Constraints
 
 - Depends only on `openjiuwen-common` (shared `Error`/`Result`, `http`, `security::SecretString`, `logging`); `openjiuwen-foundation` is not a dependency, and embeddings use `openjiuwen_common::http` with a local `EmbeddingConfig` (documented deviation).
+- `base64` (workspace) is used only for the multimodal data URIs.
 - `#![forbid(unsafe_code)]`; async via `async_trait`/tokio; no blocking I/O inside async methods (`tokio::fs` for persistence).
 - Every public data type: serde snake_case, defaults for missing collection fields, unknown fields tolerated; `Document`/`TextChunk`/results round-trip with Python field names.
 - Errors: `openjiuwen_common::error::{Error, Result}`; no panics on user input; invalid sizes/overlaps/inputs → `Error::Validation`; missing files → `Error::NotFound`; unsupported formats/providers → `Error::Unsupported`; store/embedding/network failures → `Error::Retrieval`/`Error::Transport`/`Error::Timeout`.
 - Logging: `tracing` (`openjiuwen_common::logging` re-exports); libraries never use `println!`/`eprintln!`.
 - Files ≤1000 lines; one responsibility per file; shared helpers live in the lowest module that needs them.
-- No new workspace dependencies: use the crates already in the workspace manifest (`regex`, `uuid`, `sha2`, `parking_lot`, `indexmap`, `futures`, `url`, `tempfile`, `wiremock`).
+- No new workspace dependencies: use the crates already in the workspace manifest (`regex`, `uuid`, `sha2`, `parking_lot`, `indexmap`, `futures`, `url`, `base64`, `tempfile`, `wiremock`).
 - Tests are offline and deterministic; `openjiuwen-test-support` is not required.
 - Crate-level clippy allowances are limited to `module_name_repetitions`, `must_use_candidate`, `missing_errors_doc`, `missing_panics_doc`, and numeric-cast lints; everything else must be clean under `-D warnings`.
 
@@ -189,7 +191,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 
 ## Notes for Agents
 
-- All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
+- All eight modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, and `multimodal` (path-routed, not in the crate-root `pub use` block); the first seven are re-exported from the crate root.
 - `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
 - Minimal offline knowledge base: `SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new("kb"), Arc::new(InMemoryVectorStore::new()), Arc::new(HashEmbedding::new(64)))?` then `.add_documents(...)`/`.add_texts(...)` and `.retrieve_with_config(query, &RetrievalConfig::default())`; `InMemoryVectorStore::new()` is sync (only `open`/`open_with_collection` are async).
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
@@ -204,5 +206,6 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - `./src/vector_store/` → `VectorStore` trait, records/queries, in-memory store, JSON persistence, provider registry (`vector_store/CONTEXT.md`)
 - `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam (`reranker/CONTEXT.md`)
 - `./src/knowledge_base/` → `SimpleKnowledgeBase` pipeline, statistics, multi-KB retrieval (`knowledge_base/CONTEXT.md`)
+- `./src/multimodal/` → `MultimodalDocument`/`ContentPart`, offline image loader + caption seam, `TableData` (`multimodal/CONTEXT.md`)
 - `./tests/` → cross-module integration tests (`tests/CONTEXT.md`)
 - `./Cargo.toml` → crate manifest and dependencies

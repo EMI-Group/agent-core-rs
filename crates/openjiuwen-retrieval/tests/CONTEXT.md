@@ -13,6 +13,7 @@ All tests are offline and deterministic.
 - `loaders.rs` → text/JSON/CSV/HTML file loaders with `tempfile`, URL loader with `wiremock`, `AutoLoader` dispatch/stamping/errors.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
+- `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
 
 ## Constraints
 
@@ -29,3 +30,4 @@ All tests are offline and deterministic.
 - `./loaders.rs` → loader behavior
 - `./knowledge_base.rs` → pipeline end to end
 - `./embedding.rs` → OpenAI-compatible embedding client
+- `./multimodal.rs` → multimodal documents, image loading, table conversion
