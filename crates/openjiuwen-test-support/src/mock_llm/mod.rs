@@ -220,7 +220,7 @@ impl MockLlmServer {
     }
 
     /// Stops the server gracefully, aborting the task if it does not wind down
-    /// within [`SHUTDOWN_TIMEOUT`].
+    /// within `SHUTDOWN_TIMEOUT`.
     pub async fn shutdown(self) {
         self.shutdown_signal.notify_one();
         let handle = state::lock(&self.task).take();
