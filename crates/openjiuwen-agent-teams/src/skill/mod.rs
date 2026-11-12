@@ -9,14 +9,14 @@
 //! | [`descriptor`] | [`TeamJoinDescriptor`]: identity, [`ClientScope`] and team settings |
 //! | [`client`] | [`TeamClient`] seam, outcome types and the tool catalogue per scope |
 //! | [`store_client`] | [`StoreTeamClient`]: the store/task-board/messager implementation |
-//!
-//! The clap command tree (`cli`) is added in a later stage; this module currently exposes what it
-//! builds upon.
+//! | `cli` | the `team-member` command tree, its two-stage parse and the process entry point |
 
+pub mod cli;
 pub mod client;
 pub mod descriptor;
 pub mod store_client;
 
+pub use cli::{run_skill_cli, DescriptorArgs, SkillCli};
 pub use client::{
     member_tools_for, operator_tools, CreateOutcome, MemberSummary, OpOutcome, SendOutcome,
     TeamClient, TeamToolDef,
