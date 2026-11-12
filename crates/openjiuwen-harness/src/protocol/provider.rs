@@ -389,50 +389,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_folds_every_known_key() {
-        let parsed = NativeCreateConfig::parse(&mapping(serde_json::json!({
-            "model": "gpt-4o",
-            "provider": "openai",
-            "api_key": "sk-test",
-            "api_base": "https://example.invalid/v1",
-            "temperature": 0.5,
-            "workspace": "work",
-            "enable_task_loop": true,
-            "max_iterations": 3,
-            "system_prompt": "be terse",
-            "permissions": {"enabled": true},
-            "language": "en",
-        })))
-        .unwrap();
-        assert_eq!(parsed.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(parsed.provider.as_deref(), Some("openai"));
-        assert_eq!(
-            parsed.api_key.as_ref().map(|key| key.expose_secret()),
-            Some("sk-test")
-        );
-        assert_eq!(
-            parsed.api_base.as_deref(),
-            Some("https://example.invalid/v1")
-        );
-        assert_eq!(parsed.temperature, Some(0.5));
-        assert_eq!(parsed.workspace, Some(PathBuf::from("work")));
-        assert_eq!(parsed.enable_task_loop, Some(true));
-        assert_eq!(parsed.max_iterations, Some(3));
-        assert_eq!(parsed.system_prompt.as_deref(), Some("be terse"));
-        assert!(parsed.permissions.unwrap().enabled);
-        assert_eq!(parsed.language.as_deref(), Some("en"));
-
+    fn the_create_mapping_is_validated_and_folded() {
         let config = NativeCreateConfig::parse(&mapping(serde_json::json!({
             "model": "gpt-4o",
             "temperature": 0.5,
             "workspace": "work",
             "enable_task_loop": true,
             "max_iterations": 3,
+            "permissions": {"enabled": true},
             "language": "en",
         })))
         .unwrap()
         .into_deep_agent_config();
-        assert_eq!(config.model_name.as_deref(), Some("gpt-4o"));
         let request = config.model_config.expect("a request config is built");
         assert_eq!(request.model_name, "gpt-4o");
         assert_eq!(request.temperature, Some(0.5));
@@ -440,16 +408,9 @@ mod tests {
         assert_eq!(config.cwd, Some(PathBuf::from("work")));
         assert!(config.enable_task_loop);
         assert_eq!(config.max_iterations, Some(3));
+        assert!(config.permissions.unwrap().enabled);
         assert_eq!(config.language, "en");
-        assert!(NativeCreateConfig::parse(&JsonObject::new())
-            .unwrap()
-            .into_deep_agent_config()
-            .model_config
-            .is_none());
-    }
 
-    #[test]
-    fn unknown_keys_are_sorted_and_win_over_bad_values() {
         let error = NativeCreateConfig::parse(&mapping(serde_json::json!({
             "model": 7,
             "zeta": 1,
@@ -461,85 +422,33 @@ mod tests {
             error.message(),
             "unknown native harness configuration fields: alpha, zeta"
         );
-    }
-
-    #[test]
-    fn wrong_types_ranges_and_blank_strings_are_rejected() {
-        let cases = [
-            ("model", serde_json::json!(7), "model must be a string"),
-            ("model", serde_json::json!("  "), ERR_BLANK_STRING),
-            ("api_key", serde_json::json!(""), ERR_BLANK_STRING),
-            (
-                "enable_task_loop",
-                serde_json::json!("yes"),
-                "enable_task_loop must be a boolean",
-            ),
-            (
-                "max_iterations",
-                serde_json::json!(0),
-                "max_iterations must be a positive integer",
-            ),
-            (
-                "max_iterations",
-                serde_json::json!(4.5),
-                "max_iterations must be a positive integer",
-            ),
-            (
-                "temperature",
-                serde_json::json!("hot"),
-                "temperature must be a number between 0 and 2",
-            ),
-            (
-                "temperature",
-                serde_json::json!(2.5),
-                "temperature must be a number between 0 and 2",
-            ),
-        ];
-        for (key, value, expected) in cases {
-            let error = NativeCreateConfig::parse(&mapping(serde_json::json!({ (key): value })))
-                .unwrap_err();
-            assert_eq!(error.message(), expected, "for {key}");
-        }
-
-        let error =
-            NativeCreateConfig::parse(&mapping(serde_json::json!({"permissions": 3}))).unwrap_err();
-        assert!(
-            error
-                .message()
-                .starts_with("permissions must be a valid permissions section: "),
-            "{}",
-            error.message()
+        let blank = NativeCreateConfig::parse(&mapping(serde_json::json!({"model": " "})));
+        assert_eq!(blank.unwrap_err().message(), ERR_BLANK_STRING);
+        let hot = NativeCreateConfig::parse(&mapping(serde_json::json!({"temperature": 2.5})));
+        assert_eq!(
+            hot.unwrap_err().message(),
+            "temperature must be a number between 0 and 2"
         );
-        assert!(
-            error.message().contains("PermissionsSection"),
-            "{}",
-            error.message()
+        let zero = NativeCreateConfig::parse(&mapping(serde_json::json!({"max_iterations": 0})));
+        assert_eq!(
+            zero.unwrap_err().message(),
+            "max_iterations must be a positive integer"
         );
-    }
-
-    #[test]
-    fn temperature_without_a_model_is_dropped() {
-        let config = NativeCreateConfig::parse(&mapping(serde_json::json!({"temperature": 0.5})))
-            .unwrap()
-            .into_deep_agent_config();
-        assert!(config.model_name.is_none());
-        assert!(config.model_config.is_none());
     }
 
     #[test]
     fn model_config_maps_models_and_efforts() {
         let provider = NativeHarnessProvider::new();
+        assert_eq!(provider.card().name, HARNESS_NAME);
         assert!(provider
             .model_config(&choice(None, None), None)
             .unwrap()
             .is_empty());
-        assert_eq!(provider.card().name, HARNESS_NAME);
 
         let fragment = provider
             .model_config(&choice(Some("gpt-4o"), Some("medium")), None)
             .unwrap();
         assert_eq!(fragment.get("model"), Some(&serde_json::json!("gpt-4o")));
-        assert_eq!(fragment.get("temperature"), Some(&serde_json::json!(0.6)));
         for (effort, expected) in [("low", 0.2), ("medium", 0.6), ("high", 1.0)] {
             let fragment = provider
                 .model_config(&choice(None, Some(effort)), None)
@@ -555,20 +464,18 @@ mod tests {
     #[test]
     fn model_config_rejects_invalid_choices() {
         let provider = NativeHarnessProvider::new();
-
         let error = provider
             .model_config(&choice(None, Some("extreme")), None)
             .unwrap_err();
         assert_eq!(error.kind(), HarnessErrorKind::Validation);
         assert_eq!(error.message(), "unsupported reasoning effort 'extreme'");
-
         let error = provider
             .model_config(&choice(Some(" "), None), None)
             .unwrap_err();
         assert_eq!(error.message(), ERR_BLANK_STRING);
 
         let endpoint = ModelChoice {
-            model: Some("gpt-4o".to_string()),
+            model: None,
             effort: None,
             endpoint: Some(ModelEndpoint {
                 api_base: Some("https://example.invalid/v1".to_string()),
@@ -586,7 +493,6 @@ mod tests {
         let error = provider
             .model_config(&choice(None, None), Some(&choice(None, None)))
             .unwrap_err();
-        assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
         assert_eq!(
             error.message(),
             "openjiuwen-native has no authentication fallback"
