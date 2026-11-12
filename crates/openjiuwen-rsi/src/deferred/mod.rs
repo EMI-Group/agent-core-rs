@@ -8,8 +8,8 @@
 //! the gap programmatically by matching
 //! [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported).
 //!
-//! Every entry point returns [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
-//! built by [`not_implemented`], whose message reads
+//! Every entry point returns [`Error::Unsupported`]
+//! built by `not_implemented`, whose message reads
 //! `<surface> is not implemented in the Rust port: <reason>` and names the
 //! crate `CONTEXT.md` `## Deferred Scope` table. The documented constructors
 //! always fail, so a caller cannot build one of these types by accident and

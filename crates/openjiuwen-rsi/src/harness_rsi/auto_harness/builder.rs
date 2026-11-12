@@ -19,7 +19,7 @@
 //! ## Evaluator defaulting
 //!
 //! Supplying `with_evaluator` wins over `with_runner`. Supplying only a runner
-//! wraps it in a [`SessionIterationEvaluator`], which delegates to
+//! wraps it in a `SessionIterationEvaluator`, which delegates to
 //! [`HarnessEvaluator`] once per call and stamps the orchestrator's session id
 //! and the iteration currently running. The shared [`Evaluator`] protocol only
 //! receives the candidate and the cases (no iteration), so this is how the
