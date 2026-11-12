@@ -46,7 +46,9 @@ where
         match tokio::time::timeout(BOUND, stream.next()).await {
             Ok(Some(item)) => out.push(item),
             Ok(None) => break,
-            Err(elapsed) => panic!("stream produced fewer than {max} items within {BOUND:?}: {elapsed}"),
+            Err(elapsed) => {
+                panic!("stream produced fewer than {max} items within {BOUND:?}: {elapsed}")
+            }
         }
     }
     out
