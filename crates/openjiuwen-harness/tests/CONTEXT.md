@@ -7,14 +7,14 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each, 79 tests total):
+Test files (one concern each, 80 tests total):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
 - `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, repeated-save null-key preservation, `todo.json` location and item keys.
 - `subagents_skills.rs` (15) — built-in presets, fake factory spawn/wait/close/capacity, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
-- `cli.rs` (20) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
+- `cli.rs` (21) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
 
 ## Constraints
 
@@ -48,8 +48,9 @@ Test files (one concern each, 79 tests total):
 
 ## Test Harness Recipes
 
-Verified against HEAD `1f8a64d` by reading source; line numbers are current.
-`openjiuwen_harness` re-exports every primary item flat from the crate root (`src/lib.rs`, after the `pub mod` block), but these recipes import module paths (`openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`) because those are canonical.
+The `// :123` line numbers in the snippets below are indicative only; the files keep growing, so verify a signature against the source rather than trusting a number.
+`openjiuwen_harness` re-exports the primary items flat from the crate root (`src/lib.rs`, the `pub use` block after `pub mod`), but these recipes import module paths (`openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`) because those are canonical.
+`openjiuwen_harness::clap` re-exports the exact clap version `Cli` derives from, so `tests/cli.rs` names clap only through it (`use openjiuwen_harness::clap::{CommandFactory, Parser};`) and the crate needs no clap dev-dependency.
 Crate `dev-dependencies`: `openjiuwen-test-support`, `anyhow`, `tempfile`; normal deps usable from tests include `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-foundation`, `openjiuwen-sysop`, `openjiuwen-common`, `openjiuwen-harness-protocol`, `tokio`, `futures`, `async-trait`, `parking_lot`, `serde_json`.
 
 ### 1. ScriptedModel (`crates/openjiuwen-test-support/src/scripted_model.rs`)
@@ -401,6 +402,6 @@ Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — a
 ### 11. Commands and known state
 
 - `cargo fmt -p openjiuwen-harness`; `cargo test -p openjiuwen-harness`; `cargo test -p openjiuwen-harness --no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`.
-- The seven `*.rs` files above are the complete `tests/` tree; `cargo build -p openjiuwen-harness --tests` has not been observed here, so compile status of the integration suites is unverified against the current HEAD.
+- The seven `*.rs` files above are the complete `tests/` tree; all seven compile and pass (`cargo test -p openjiuwen-harness`: 1088 unit + 80 integration + 8 doc tests).
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.

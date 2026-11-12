@@ -148,4 +148,4 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `tests.rs` also asserts the exact model-facing names, per-tool `required` lists, `parallel_safe` flags and `input_params` shape.
 - All tests are offline and deterministic: `tempfile` workspaces, fake `UserAsker`/`MemoryToolBackend` implementations, no network, no reliance on `rg`/`git` binaries.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
-- Current counts: 613 unit tests plus 6 doc tests, all four gates clean; every file in this subtree is under the 1000-line baseline.
+- Current counts: 1088 unit tests plus 80 integration and 8 doc tests crate-wide, all four gates clean; every file in this subtree is under the 1000-line baseline.

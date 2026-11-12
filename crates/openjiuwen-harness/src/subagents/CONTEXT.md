@@ -66,7 +66,6 @@ Re-exports (`mod.rs`): `SubAgentConfig` (from `crate::schema`), `SubAgentSpec`, 
 ## Known Issues
 
 - `crate::tools::descriptions` has no rows for `task_tool` or the six `subagent_*` names, so their descriptions fall back to the `crate::prompts::tool_descriptions` table; adding the rows belongs to `crate::tools` (sibling module).
-- `lib.rs` does not yet flatten this module's public items into the crate root, although the crate-level contract says every public item is re-exported flat; `lib.rs` is owned outside this node.
 
 ## Deferred Python areas
 
@@ -95,5 +94,5 @@ Re-exports (`mod.rs`): `SubAgentConfig` (from `crate::schema`), `SubAgentSpec`, 
 - Presets: max_iterations 50, `restrict_to_work_dir` per preset, `factory_name` for code/research, bilingual selection (`en` vs anything else → `cn`), verdict contract text in the verification prompt, feature-gated presets return `Error::Unsupported`.
 - Runtime: spawn → PendingInit/Running → Completed with output; wait timeout leaves non-final; close refuses running; close/resume on completed instance; capacity rejection at `max_subagents`; rollback leaves capacity free after a factory failure; duplicate live spawn rejected; child session id format and sticky verification id; FIFO queued inputs; interrupt; `cancel_all`; `describe_list` shape.
 - Tools: exact names, exact `required` lists and property keys; `task_tool` success payload shape, unknown-type failure, env-var timeout resolution via a pure helper; `subagent_wait` validation and clamp helper; every expected failure returns `success=false` (never `Err`).
-- Current suite: 55 unit tests under `subagents` (crate total 724 unit + 8 doc tests), green with default, `--no-default-features` and `--all-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
+- Current suite: 55 unit tests under `subagents` (crate total 1088 unit + 80 integration + 8 doc tests), green with default, `--no-default-features` and `--all-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
 - Parity references: `tests/unit_tests/harness/test_plan_agent.py`, `test_explore_agent.py`, `test_deep_agent.py`, `subagent_runtime/test_control.py`, `tools/subagent/test_task_tool.py`.

@@ -30,7 +30,7 @@ Re-exported flat from `openjiuwen_harness::workspace`:
 - Errors are `openjiuwen_common::error::{Error, Result}`; no panics, no `unwrap` outside tests. `tracing` only, no stdout.
 - Link methods are synchronous filesystem setup helpers (Python parity): symlink on Unix, directory symlink on Windows, recursive copy when symlinking is denied; listing is sorted by name and canonicalizes targets.
 - Files ≤1000 lines; `Workspace` is `Clone + Debug + Eq + PartialEq + Serialize + Deserialize + Default + JsonSchema`; `schemars` uses `#[schemars(with = "String")]` for `PathBuf` fields.
-- Items are reachable only as `openjiuwen_harness::workspace::*` (plus `Workspace` methods); the crate root declares `pub mod workspace` and no flat re-exports, so integration tests must use the qualified path.
+- Module paths are canonical: use `openjiuwen_harness::workspace::*` (plus `Workspace` methods). The crate root also flat-re-exports `Workspace`, `WorkspaceNode`, `DirectoryNode`, `DirectoryBuilder` and `is_safe_relative_path`, so `openjiuwen_harness::Workspace` and `openjiuwen_harness::workspace::Workspace` are the same type.
 - The submodules (`node`, `workspace`, `resolve`, `links`, `directory_builder`, `schema`) and the free fns `find_node`/`path_to_string`/`file_exists` are private; only the names in `./mod.rs` are re-exported.
 - `DirectoryBuilder`'s `sys_operation` and `root_path` fields are public and `build` needs a filesystem backend (`SysOperation::local(LocalWorkConfig::unrestricted(root))?`); `Workspace::new`/`for_language` accept `impl Into<PathBuf>` and perform no I/O, so a `TempDir` must be passed as `temp.workspace()` / `temp.root().to_path_buf()`.
 
@@ -78,5 +78,5 @@ Re-exported flat from `openjiuwen_harness::workspace`:
 
 ## Known Issues
 
-- Crate-level `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` still fails on three pre-existing scaffold lints in `../lib.rs` (outside this node): `doc_markdown` on `DeepAgent` (lines 1 and 4) and `must_use_candidate` on `crate_name` (line 28). This module itself is clippy-clean; the fix belongs to the crate root.
+- None: `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` is clean crate-wide, this module included.
 
