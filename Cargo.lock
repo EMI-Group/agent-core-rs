@@ -1881,10 +1881,20 @@ dependencies = [
  "async-trait",
  "futures",
  "openjiuwen",
+ "openjiuwen-agent-evolving",
+ "openjiuwen-agent-teams",
+ "openjiuwen-extensions",
+ "openjiuwen-harness",
+ "openjiuwen-harness-protocol",
+ "openjiuwen-harness-providers",
+ "openjiuwen-rsi",
+ "openjiuwen-symphony",
  "openjiuwen-test-support",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
