@@ -12,8 +12,10 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 
 - `BuiltinTool` enum: `Bash`, `ReadFile`, `WriteFile`, `EditFile`, `Glob`, `ListFiles`, `Grep`, `TodoCreate`, `TodoList`, `TodoGet`, `TodoModify`, `AskUser`, `MemorySearch`, `MemoryGet`, `WriteMemory`, `ReadMemory`, `EditMemory`, `CodingMemoryRead`, `CodingMemoryWrite`, `CodingMemoryEdit`; `ALL`, `name()`, `from_name()`, `parallel_safe()`.
 - `tool_names() -> &'static [&'static str]` — the model-facing names in registry order.
-- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `todo_dir()`, `tools()`.
-- `build`, `cards` and the tool modules `shell`/`read`/`write`/`search`/`todo`/`ask_user`/`memory` are doc-comment-only skeletons: they return empty results until the tool implementations land.
+- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `user_asker()`, `memory_backend()`, `todo_dir()`, `tools()`.
+- `build()` yields one `Arc<dyn Tool>` per selected variant in `self.tools` order; the four todo tools share one `Arc<TodoStore>` created lazily once per call (`todo_dir` when set, else `TodoStore::for_workspace`), and the filesystem tools share the registry's `ReadStateRegistry`.
+- `cards(language)` maps `self.tools` through `card(tool, language)`, which returns the owning module's real `card_for` (full `schemars` schema), never a placeholder.
+- The public API of every tool module is re-exported here (`AskUserTool`/`UserAsker`, `MemoryTool`/`MemoryToolBackend`/`MemoryToolKind`, `BashTool`, the read/write/edit/glob/list/grep tools and their arg structs, the todo store/tools); `support` and `read_state` helpers are re-exported as well, so upper layers import from `crate::tools` only.
 - The registry never builds `task`/subagent tools (they live in `crate::subagents`).
 
 ### Shared helpers — `support.rs`
@@ -105,6 +107,14 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - **Deviation — edit_file fidelity**: LF/CRLF round-trip, quote-style and read-state rules are ported; `html.unescape`, the `_DESANITIZATIONS` table, `.ipynb` protection and operation-history files are not.
 - Never resolved here (owned elsewhere): skill/subagent/web/LSP/MCP tools, `task`/`subagent_*`, tool discovery, mode switching, cron, goal, compression recall, worktree and multimodal tools.
 
+## Notes for Agents
+
+- Upper layers (`agent`, `rails`, `protocol`, `cli`) construct tools only through `ToolRegistry::build`; live seams are wired with `with_user_asker`, `with_memory`, `with_permissions` and the sys-operation setters.
+- A registry's `ReadStateRegistry` is per-instance, so build the tool set once per agent (or per session) rather than per call, otherwise the read-before-write gate resets.
+- `ask_user` reports `ask_user is not available: no user interaction handler is configured` until an asker is wired; the eight memory tools report `memory tool backend is not configured` until a backend is wired.
+- The todo store defaults to `<workspace>/todo/<session>/todo.json`; the session id comes from `ToolContext::session_id` and falls back to `default`, so a session-less caller shares one list.
+- `grep` reports `success=true` with empty output on no matches (exit-code 1 lives in `data`), which is what makes it render `No matches found.`.
+
 ## Deferred Python behavior
 
 - `read_file`: PDF/Office/notebook/image readers, the token budget estimate, `multimodal` data, device-file refusal and the strict-decode retry; only text files are read.
@@ -117,7 +127,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 
 ## Routing Table
 
-- `./mod.rs` → `ToolRegistry`, `BuiltinTool`, `tool_names`, module declarations
+- `./mod.rs` → `ToolRegistry` (builder, `build`, `cards`, `card`), `BuiltinTool`, `tool_names`, flat re-exports of every tool module, module declarations
 - `./support.rs` → `ToolPayload`, `render_fields`, truncation, `schema_for`, `tool_card`, `ToolEnv` (path resolution + permission gate), arg parsing
 - `./read_state.rs` → read-before-write registry, fingerprints, range coverage, per-path locks
 - `./descriptions.rs` → model-facing description text (en/cn) and language fallback
@@ -128,12 +138,12 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `./todo.rs` → `TodoStore` and the four todo tools
 - `./ask_user.rs` → `UserAsker` seam and `AskUserTool`
 - `./memory.rs` → `MemoryToolBackend` seam and the eight memory tools
-- `./tests.rs` → cross-module parity tests (names, cards, registry, render strings)
-- `./tests/` → offline integration suite driving the registry over a temp workspace (`tests/CONTEXT.md`)
+- `./tests.rs` → cross-module parity suite: name order, card schemas/languages, `required` lists, `parallel_safe`, end-to-end registry calls over a temp workspace, `render_for_llm` strings
 
 ## Test Strategy
 
 - Unit tests live beside each module: `support` (truncation, render_fields, schema normalization, path confinement, deny gate), `read_state` (coverage merges, partial/stale gates), `shell` (clamping, rendering, timeout, background, blank command), `read` (line numbering, offset/limit, 256 KiB limit, empty file), `write` (read-before-write, create/update, edit uniqueness, `replace_all`, identical strings, CAS conflict), `search` (glob cap 100, brace patterns, list hidden filter, grep modes/context/head_limit/VCS skip), `todo` (create→list→get→modify round-trip, first item in_progress, validation messages, session fallback), `ask_user` (no asker), `memory` (no backend, payload shapes for each of the eight tools).
-- `tests.rs` asserts the exact model-facing names, per-tool card key sets (`properties`/`required`), `parallel_safe` flags, and `render_for_llm` strings.
+- `tests.rs` drives one `build()` per temp workspace so the filesystem tools share read state: `read_file`→`edit_file`, `write_file` create, `glob`/`list_files`/`grep` discovery, a `todo_create`→`todo_list` round-trip read back through a second registry over the same workspace, `bash echo`, the missing-asker and missing-memory-backend failures, and the exact `render_for_llm` strings.
+- `tests.rs` also asserts the exact model-facing names, per-tool `required` lists, `parallel_safe` flags and `input_params` shape.
 - All tests are offline and deterministic: `tempfile` workspaces, fake `UserAsker`/`MemoryToolBackend` implementations, no network, no reliance on `rg`/`git` binaries.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
