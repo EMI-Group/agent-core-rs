@@ -7,7 +7,7 @@
 //! ([`Component::abilities`]) and how to do it ([`Component::invoke`] and friends).
 //!
 //! An ability that a component does not override fails with
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) rendered by
+//! [`Error::Unsupported`] rendered by
 //! [`unsupported_ability`], preserving Python's message shape
 //! `Component '<type>' is missing required method: <ability>()`.
 //!

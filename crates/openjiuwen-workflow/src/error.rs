@@ -36,7 +36,7 @@ pub const WORKFLOW_CONDITION_EDGE_INVALID: u32 = 100_013;
 pub const WORKFLOW_COMPONENT_SCHEMA_INVALID: u32 = 100_014;
 /// The Python status code of [`stream_edge_invalid`].
 pub const WORKFLOW_STREAM_EDGE_INVALID: u32 = 100_015;
-/// The Python status code of [`compile_error`].
+/// The Python status code of [`macro@compile_error`].
 pub const WORKFLOW_COMPILE_ERROR: u32 = 100_100;
 /// The Python status code of [`component_execution_error`].
 pub const WORKFLOW_COMPONENT_EXECUTION_ERROR: u32 = 100_054;
