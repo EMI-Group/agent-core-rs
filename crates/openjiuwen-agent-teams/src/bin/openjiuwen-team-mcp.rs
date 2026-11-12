@@ -19,7 +19,7 @@ use openjiuwen_common::logging::{LogWriter, LoggingConfig};
 
 #[tokio::main]
 async fn main() {
-    let _logging = openjiuwen_common::logging::init_with(
+    let _log_init = openjiuwen_common::logging::init_with(
         &LoggingConfig::from_env().with_writer(LogWriter::Stderr),
     );
     let code = openjiuwen_agent_teams::mcp::stdio::run_mcp_server_from_env().await;
