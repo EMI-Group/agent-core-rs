@@ -51,7 +51,7 @@ const EXPECTED_REQUIRED: [(&str, &[&str]); 20] = [
     ("todo_create", &["todos"]),
     ("todo_list", &[]),
     ("todo_get", &["id"]),
-    ("todo_modify", &[]),
+    ("todo_modify", &["action"]),
     ("ask_user", &["questions"]),
     ("memory_search", &["query"]),
     ("memory_get", &["path"]),
@@ -201,6 +201,48 @@ fn required_lists_match_the_python_cards() {
                 "{name} has no required key; expected {expected:?}"
             ),
             Some(other) => panic!("{name} has an unexpected required value: {other}"),
+        }
+    }
+}
+
+#[test]
+fn no_card_schema_has_a_dangling_reference() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = registry(&dir);
+
+    for tool in BuiltinTool::ALL {
+        let card = registry.card(tool, "en");
+        let serialized = serde_json::to_string(&card.input_params).expect("schema json");
+        // A reference can only appear as a `"$ref"` key; the quoted form keeps prose that
+        // merely mentions `$ref` (the `bash` description) from matching.
+        assert!(
+            !serialized.contains("\"$ref\""),
+            "{} keeps a dangling $ref: {serialized}",
+            tool.name()
+        );
+        assert!(
+            !serialized.contains("\"$defs\"") && !serialized.contains("\"definitions\""),
+            "{} keeps its definition map: {serialized}",
+            tool.name()
+        );
+
+        let properties = card.input_params["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{} properties is not an object", tool.name()));
+        if let Some(required) = card.input_params.get("required") {
+            let required = required
+                .as_array()
+                .unwrap_or_else(|| panic!("{} required is not an array", tool.name()));
+            for field in required {
+                let field = field
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{} required entry is not a string", tool.name()));
+                assert!(
+                    properties.contains_key(field),
+                    "{} requires unknown field {field}",
+                    tool.name()
+                );
+            }
         }
     }
 }
