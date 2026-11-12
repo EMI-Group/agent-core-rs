@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 //! Symphony scenario: the capability-asset engine driven as a whole.
 //!
 //! This binary is the cross-crate seam above `openjiuwen-symphony`: a
@@ -242,7 +242,11 @@ async fn register_plan_and_execute_against_a_compiled_graph() {
         "the entry capability needs no caller input: {:?}",
         plan.message
     );
-    let step_ids: Vec<&str> = plan.steps.iter().map(|step| step.step_id.as_str()).collect();
+    let step_ids: Vec<&str> = plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.as_str())
+        .collect();
     assert_eq!(step_ids, vec![FETCH, TRANSFORM, SUMMARIZE]);
     assert_eq!(
         plan.stages().expect("the plan is acyclic"),
@@ -304,11 +308,22 @@ async fn register_plan_and_execute_against_a_compiled_graph() {
     .expect("execute");
     assert_eq!(execution.plan_id, plan.plan_id);
     assert_eq!(execution.graph_id, plan.plan_id);
-    assert!(execution.succeeded(), "failed steps: {:?}", execution.failed_steps());
-    assert_eq!(
-        execution.steps.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec![FETCH, TRANSFORM, SUMMARIZE]
+    assert!(
+        execution.succeeded(),
+        "failed steps: {:?}",
+        execution.failed_steps()
     );
+    // `PlanExecution::steps` is a `BTreeMap`, so its keys read back sorted rather than in
+    // plan order; every planned step must still have exactly one recorded outcome.
+    let mut executed: Vec<&str> = execution.steps.keys().map(String::as_str).collect();
+    let mut planned: Vec<&str> = plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.as_str())
+        .collect();
+    executed.sort_unstable();
+    planned.sort_unstable();
+    assert_eq!(executed, planned);
     for (step_id, outcome) in &execution.steps {
         assert!(outcome.success, "step `{step_id}` must be successful");
         assert_eq!(outcome.step_id, *step_id);
@@ -319,7 +334,10 @@ async fn register_plan_and_execute_against_a_compiled_graph() {
     }
     let expected_outputs: BTreeMap<String, Value> = BTreeMap::from([
         (FETCH.to_string(), json!({"data": "raw data"})),
-        (TRANSFORM.to_string(), json!({"result": "transformed result"})),
+        (
+            TRANSFORM.to_string(),
+            json!({"result": "transformed result"}),
+        ),
         (SUMMARIZE.to_string(), json!({"summary": "final summary"})),
     ]);
     assert_eq!(execution.outputs, expected_outputs);
@@ -332,7 +350,11 @@ async fn register_plan_and_execute_against_a_compiled_graph() {
     invoked.sort();
     assert_eq!(
         invoked,
-        vec![FETCH.to_string(), SUMMARIZE.to_string(), TRANSFORM.to_string()]
+        vec![
+            FETCH.to_string(),
+            SUMMARIZE.to_string(),
+            TRANSFORM.to_string()
+        ]
     );
     assert!(
         calls.iter().all(|call| call.session_id.is_some()),
@@ -364,7 +386,9 @@ async fn plan_is_deterministic_and_reports_when_inputs_are_missing() {
         .register(
             CapabilityDescriptor::new("tool", "search", "Search Documentation")
                 .with_description("searches the documentation index")
-                .with_inputs(vec![CapabilityIo::new("prompt", "string").with_required(true)]),
+                .with_inputs(vec![
+                    CapabilityIo::new("prompt", "string").with_required(true)
+                ]),
         )
         .await
         .expect("register the search capability");
@@ -379,7 +403,10 @@ async fn plan_is_deterministic_and_reports_when_inputs_are_missing() {
     assert_eq!(first.steps.len(), 1);
     assert_eq!(first.steps[0].step_id, "tool:search");
     assert_eq!(first.steps[0].missing_inputs, vec!["prompt".to_string()]);
-    assert!(first.steps[0].filled_inputs.is_empty());
+    assert!(
+        first.steps[0].filled_inputs.is_empty(),
+        "the caller supplied no inputs, so none are filled"
+    );
     assert_eq!(first.message.as_deref(), Some("missing inputs: prompt"));
 
     // The same request planned twice yields the same plan; `plan_id` is a fresh uuid per
@@ -409,8 +436,11 @@ async fn plan_is_deterministic_and_reports_when_inputs_are_missing() {
         .await
         .expect("plan");
     assert_eq!(none.status, PlanStatus::NoPlan);
-    assert!(none.steps.is_empty());
-    assert!(none.edges.is_empty());
+    assert!(none.steps.is_empty(), "an unmatched request plans no steps");
+    assert!(
+        none.edges.is_empty(),
+        "an unmatched request derives no edges"
+    );
     assert!(none.message.is_none());
 
     // Supplying the input the caller promised turns the unfed request into a ready plan.
@@ -420,7 +450,10 @@ async fn plan_is_deterministic_and_reports_when_inputs_are_missing() {
         .await
         .expect("plan");
     assert_eq!(ready.status, PlanStatus::Ready);
-    assert!(ready.steps[0].missing_inputs.is_empty());
+    assert!(
+        ready.steps[0].missing_inputs.is_empty(),
+        "supplying `prompt` fills the only input"
+    );
     assert_eq!(ready.steps[0].filled_inputs, vec!["prompt".to_string()]);
     assert!(ready.message.is_none());
 }
@@ -433,9 +466,12 @@ async fn graph_snapshot_reloads_into_a_fresh_runtime() {
         ..SymphonyConfig::default()
     };
 
-    let first = within("the first runtime opens", SymphonyRuntime::open(config.clone()))
-        .await
-        .expect("open the first runtime");
+    let first = within(
+        "the first runtime opens",
+        SymphonyRuntime::open(config.clone()),
+    )
+    .await
+    .expect("open the first runtime");
     within("the first runtime starts", first.start())
         .await
         .expect("start");
@@ -445,7 +481,10 @@ async fn graph_snapshot_reloads_into_a_fresh_runtime() {
     )
     .await
     .expect("add capabilities");
-    assert_eq!(added.revision, "v2", "starting publishes v1, the add publishes v2");
+    assert_eq!(
+        added.revision, "v2",
+        "starting publishes v1, the add publishes v2"
+    );
     assert_eq!(added.changed.len(), 3);
 
     let published = within("the published revision reads back", first.read_graph(None))
@@ -484,12 +523,9 @@ async fn graph_snapshot_reloads_into_a_fresh_runtime() {
     assert_eq!(status.current_version, published_status.current_version);
     assert_eq!(status.node_count, published_status.node_count);
     assert_eq!(status.edge_count, published_status.edge_count);
-    let reloaded = within(
-        "the reloaded revision reads back",
-        second.read_graph(None),
-    )
-    .await
-    .expect("read graph")
-    .expect("the snapshot survives the restart");
+    let reloaded = within("the reloaded revision reads back", second.read_graph(None))
+        .await
+        .expect("read graph")
+        .expect("the snapshot survives the restart");
     assert_eq!(reloaded, published);
 }
