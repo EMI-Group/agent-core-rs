@@ -23,3 +23,9 @@ pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};
 pub use runtime::{RuntimeConfig, TeamRuntime};
 pub use strategy::{MemberOptions, StrategyContext, TeamStrategy};
 pub use subscription::{topic_matches, SubscriptionManager};
+
+mod agent_tool;
+mod team;
+
+pub use agent_tool::AgentTool;
+pub use team::{BaseTeam, Team};
