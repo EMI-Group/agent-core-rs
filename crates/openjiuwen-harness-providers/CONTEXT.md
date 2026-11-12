@@ -26,7 +26,7 @@ Providers (module `providers`):
 
 IO adapter (module `io_adapter`):
 - `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler`.
-- `HarnessIOAdapter::{new, harness, state, session_id, pending_interrupt_ids, has_pending_interrupt, is_pending_interrupt_resume_valid, prepare_context, start, stop, outputs, delivery_mode, send, abort, pause, resume}` and `impl HarnessInteractionHandler` (`handle`, `cancel`).
+- `HarnessIOAdapter::{new, harness, config, state, session_id, pending_interrupt_ids, has_pending_interrupt, is_pending_interrupt_resume_valid, prepare_context, start, stop, outputs, delivery_mode, send, abort, pause, resume}` and `impl HarnessInteractionHandler` (`handle`, `cancel`); `start`/`outputs`/`prepare_context` take `self: &Arc<Self>` because the adapter installs itself as the context's interaction handler and owns its pump task.
 - Chunk kinds: `llm_output`, `llm_reasoning`, `tool_call`, `tool_result`, `__interaction__`, `turn_lifecycle`, `task_failed` — projected as `openjiuwen_agent::AgentChunk`.
 
 Helpers (flat re-exports):
@@ -118,8 +118,10 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `tests/io_adapter.rs` — chunk projection order and kinds, turn-lifecycle projection off by default, interactive-input round trip, unmatched input forwarding, auto-approve vs host approval, dynamic tool call routed through `ToolGateway`, delivery-mode selection, abort fallback, failed start cleanup; driven by an in-test `FakeHarness`.
 - `tests/vendor.rs` (`#![cfg(feature = "vendor")]`) — vendor cards/capabilities, config `from_json` strictness and defaults, `model_config` fragments and rejections, `create` returns `Error::Unsupported` with the SDK-required message, serde round-trip snapshots.
 - `tests/skills.rs` — normalize modes/errors, skip/replace/append conflict policies, `enabled_skills` selection, traversal rejection, non-regular-file rejection.
-- Unit tests beside modules for pure helpers (`input`, `json`, `mcp_naming`, `decode`, `error`).
+- Unit tests beside modules for pure helpers (`input`, `json`, `mcp_naming`, `decode`, `error`, plus factory and projection/answer unit tests).
 - All tests are offline and deterministic: no network, no sleeps beyond bounded timeouts, temporary directories for filesystem work, Python behavior tests named after their counterpart in `tests/unit_tests/harness_providers/`.
+- Registry-mutating tests share a per-binary `Mutex` guard (`registry_guard()`) because the registry is process-global; without it, positional `available_providers()` assertions race with a concurrent `unregister_harness_provider`.
+- Current suites: lib 109 unit tests, `tests/io_adapter.rs` 20, `tests/native.rs` 9, `tests/registry.rs` 23 (18 without `native`), `tests/skills.rs` 26, `tests/vendor.rs` 36.
 - Definition of done: `cargo fmt -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers --features vendor`, `cargo test -p openjiuwen-harness-providers --no-default-features`, `cargo clippy -p openjiuwen-harness-providers --all-targets --features vendor -- -D warnings` all clean.
 
 ## Notes for Agents
