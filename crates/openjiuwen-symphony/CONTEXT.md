@@ -503,6 +503,15 @@ Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`;
 `invoke` requires `Running`; it plans, optionally executes when `execute` is set (with the configured runner), and returns both.
 `submit_evolution` applies successful step transitions as an exponential moving average on the corresponding graph edge weights (`w' = (w + 1.0) / 2`), publishes the new revision, and reports accepted/rejected edge counts.
 `capture_graph_snapshot` returns `{"current_version", "graph_id", "graph_scope_id"}` with `null` values when no revision exists.
+`invoke` and the three mutations require `Running` (`Error::Validation` naming `runtime.state` otherwise); planning, graph reads, search, build, evolution and the plain accessors work in every state.
+`start` publishes the first revision before flipping the state to `Running`, so a failed build leaves the runtime untouched, and it also restarts a `Stopped` runtime.
+A blank `request_id` is `Error::Validation` naming `request_id`; a replayed `request_id` publishes nothing.
+`update` requires every key to already exist (otherwise `Error::NotFound` naming the qualified id, with the whole batch rejected), while `remove` skips absent keys.
+`graph()` is infallible: when the artifact read fails it logs a warning and answers with the catalog-derived, node-only graph.
+`capture_graph_snapshot` is synchronous, so it reads a materialized pointer refreshed on open, publish, and `graph_status`.
+`submit_evolution` publishes only when at least one edge weight changed; otherwise it reports the current version.
+`invoke` with `execute` set on a `NoPlan` result returns `execution: None` rather than an error.
+`SymphonyRuntimeBuilder::with_asset_store` hydrates the registry from the store (`CapabilityRegistry::load`), so a preconfigured asset store survives restarts.
 
 ### `deferred` (`src/deferred.rs`)
 
@@ -547,6 +556,12 @@ Each stub documents the Python class it mirrors and the reason it is deferred.
 - **Revisions are immutable and atomically published** (`tmp` + `rename`, `current.json` pointer), matching Python's artifact store; no file locks are needed because only one writer (the runtime) exists per root.
 - **Evolution feedback is an EMA on observed edge weight**; Python's append-only evidence store, merged revisions, and revision pinning are reduced to a single observable weight update.
 - **Python's `close()` raising when a flow engine is configured does not apply**: this crate has no flow engine, so `close` is always idempotent.
+- **The file artifact store persists a `{"revision", "graph"}` envelope** (`current.json` points at the current revision's envelope) so a reopened store reproduces revisions byte-for-byte, including `created_at`, without clock-based ordering.
+- **A generated version bumps past pinned ids**: `None` publishes `v{n+1}` with `n` = revision count, skipping forward when a caller already pinned that id, so an explicit `v2` never makes a later generated publish fail.
+- **An illegal version is a validation error on read as well as write** (`read(Some("../evil"))`), because it would otherwise escape the store root; a legal-but-unknown version returns `Ok(None)`.
+- **The planner follows the Python scoring constants exactly** (`SEED_BASELINE_SCORE = 0.5` for an unscored path, `1.0` edge confidence for an edgeless path) while using this contract's distinct-input coverage definition, which counts every declared input rather than Python's required-flag count.
+- **`src/runtime.rs` is ~1050 lines by design**: it is the single composition root, and splitting it would contradict this routing table; every other module stays well under the ~1000-line guideline.
+- **Static evaluation is a documented rubric** (four equal completeness checks, three equal schema-validity checks) because Python's metrics are LLM-judged; the LLM metric stays available as a fail-soft no-op.
 
 ## Deferred Scope
 
@@ -579,7 +594,8 @@ These Python areas are not implemented; each keeps an API-shaped stub in [`defer
 - `tests/models.rs` — serde round-trips (`type` key, unknown-field tolerance, skipped `semantic_content`), `Card` impl, derived JSON schemas, content hash stability, datatype `can_feed` matrix, `normalize_name_key`/`fuzzy_name_distance`.
 - `tests/registry.rs` — CRUD, validation errors, deterministic ordering, JSON-file/KV persistence and `load`/`reload`, remove/clear.
 - `tests/search.rs` — BM25 ranking and matching, metadata/tag/type/available filters, `top_k` semantics, filter-only ordering, `HashEmbedding` semantic index add/remove/search.
-- `tests/graph.rs` — graph from descriptors, edge validation/upsert, incident-edge removal, roots/leaves, JGF round-trip, memory + file artifact stores (versions, immutability, `current` pointer, missing status).
+- `tests/graph.rs` — graph from descriptors, edge validation/upsert, incident-edge removal, roots/leaves, JGF round-trip, malformed-document rejections.
+- `tests/artifact.rs` — memory + file artifact stores (versions, immutability, `current` pointer, missing status, `tmp`+`rename` atomicity, illegal versions, reopen hydration).
 - `tests/planner.rs` — candidate strategies/ordering, plan selection, disabled/candidate filters, `max_depth`, scoring/rank tie-breaks, `Ready`/`NeedsInput`/`NoPlan`, language normalization, plan serialization and `stages`.
 - `tests/executor.rs` — compile + execute with a fake runner, per-step state keys, input overlay, `max_steps` rejection, `fail_fast=false` failure reporting, `UnsupportedRunner`.
 - `tests/runtime.rs` — open/start/stop/close idempotency, invoke (plan-only and execute), build revisions, mutation idempotency by `request_id`, evolution EMA, semantic search, stopped-runtime errors, snapshot.
