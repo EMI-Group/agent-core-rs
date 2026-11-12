@@ -2153,6 +2153,7 @@ dependencies = [
 name = "openjiuwen-runner"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "futures",
  "once_cell",
@@ -2160,11 +2161,14 @@ dependencies = [
  "openjiuwen-common",
  "openjiuwen-foundation",
  "openjiuwen-multiagent",
+ "openjiuwen-security",
  "openjiuwen-session",
+ "openjiuwen-test-support",
  "openjiuwen-workflow",
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
