@@ -22,11 +22,13 @@
 //! per-subcommand evaluation, so a remembered compound command can never relax a
 //! subcommand denial.
 //!
-//! Two deviations from the Python reference are deliberate:
+//! Once the ladder, the subcommand aggregate and the floors have produced a
+//! decision, a remembered full-command `approval_overrides` allow relaxes an ASK
+//! to an ALLOW (Python `_allow_overrides_unless_denied`); a DENY is returned
+//! unchanged, so a remembered allow never lifts a denial.
 //!
-//! - the legacy literal-shell fast path (`_literal_policy_result`) is not ported;
-//! - the final full-command relaxation (`_allow_overrides_unless_denied`) is not
-//!   applied: overrides live in the ladder and shell floors never relax.
+//! One deviation from the Python reference is deliberate: the legacy literal-shell
+//! fast path (`_literal_policy_result`) is not ported.
 
 use std::collections::BTreeSet;
 
@@ -104,47 +106,114 @@ pub fn evaluate_tiered_policy(
     }
 
     let (mut level, mut label) = evaluate_ladder(section, &tool, &shell_tools, mode, args);
-    if !is_shell {
-        return (level, label);
-    }
 
     let raw_command = rules::command_text(args);
-    let command = shell::canonicalize_shell_command(&raw_command);
-    if command.is_empty() {
+    let command = if is_shell {
+        shell::canonicalize_shell_command(&raw_command)
+    } else {
+        String::new()
+    };
+
+    if !command.is_empty() {
+        // Python parity: shell tools are evaluated on the raw arguments *and* on the
+        // canonicalized command (`canon_args`), so a launcher wrapper such as
+        // `bash -c "rm -v x"` cannot hide the command being run. The stricter result wins.
+        if command != raw_command {
+            let canonical_args = command_args(&command);
+            let (canonical_level, canonical_label) =
+                evaluate_ladder(section, &tool, &shell_tools, mode, &canonical_args);
+            if rank(canonical_level) < rank(level) {
+                level = canonical_level;
+                label = canonical_label;
+            }
+        }
+
+        let ast = shell::analyze_shell(&command);
+        if ast.kind == ShellKind::Simple && ast.subcommands.len() > 1 {
+            let (subcommand_level, subcommand_label) =
+                aggregate_subcommands(section, &tool, &shell_tools, mode, &ast.subcommands);
+            if rank(subcommand_level) < rank(level) {
+                level = subcommand_level;
+                label = subcommand_label;
+            }
+        }
+
+        for (floor_level, floor_label) in shell_floors(section, &ast, &command) {
+            // Floors never relax: only a stricter floor replaces the current decision.
+            if rank(floor_level) < rank(level) {
+                level = floor_level;
+                label = format!("{floor_label}|{label}");
+            }
+        }
+    }
+
+    relax_with_approval_overrides(section, &tool, &shell_tools, args, &command, level, label)
+}
+
+/// Python `_allow_overrides_unless_denied`: a remembered full-command allow relaxes
+/// an ASK produced by the ladder, the subcommand aggregate or a shell floor.
+///
+/// A DENY (including a subcommand denial) is returned unchanged, so a remembered
+/// allow never lifts a denial; an ALLOW is already final and keeps its label.
+/// `canonical_command` is retried as `{"command": …}` so a remembered quoted or
+/// canonicalized command still matches, mirroring the override rung.
+fn relax_with_approval_overrides(
+    section: &PermissionsSection,
+    tool: &str,
+    shell_tools: &BTreeSet<String>,
+    args: &Value,
+    canonical_command: &str,
+    level: PermissionLevel,
+    label: String,
+) -> (PermissionLevel, String) {
+    if level != PermissionLevel::Ask {
         return (level, label);
     }
-
-    // Python parity: shell tools are evaluated on the raw arguments *and* on the
-    // canonicalized command (`canon_args`), so a launcher wrapper such as
-    // `bash -c "rm -v x"` cannot hide the command being run. The stricter result wins.
-    if command != raw_command {
-        let canonical_args = command_args(&command);
-        let (canonical_level, canonical_label) =
-            evaluate_ladder(section, &tool, &shell_tools, mode, &canonical_args);
-        if rank(canonical_level) < rank(level) {
-            level = canonical_level;
-            label = canonical_label;
-        }
+    let mut ids = matching_override_ids(section, tool, shell_tools, args);
+    if ids.is_empty() && !canonical_command.is_empty() {
+        ids = matching_override_ids(section, tool, shell_tools, &command_args(canonical_command));
     }
-
-    let ast = shell::analyze_shell(&command);
-    if ast.kind == ShellKind::Simple && ast.subcommands.len() > 1 {
-        let (subcommand_level, subcommand_label) =
-            aggregate_subcommands(section, &tool, &shell_tools, mode, &ast.subcommands);
-        if rank(subcommand_level) < rank(level) {
-            level = subcommand_level;
-            label = subcommand_label;
-        }
+    if ids.is_empty() {
+        return (level, label);
     }
+    (PermissionLevel::Allow, override_label(&ids))
+}
 
-    for (floor_level, floor_label) in shell_floors(section, &ast, &command) {
-        // Floors never relax: only a stricter floor replaces the current decision.
-        if rank(floor_level) < rank(level) {
-            level = floor_level;
-            label = format!("{floor_label}|{label}");
-        }
+/// Ids of the `allow` overrides matching `args`.
+fn matching_override_ids(
+    section: &PermissionsSection,
+    tool: &str,
+    shell_tools: &BTreeSet<String>,
+    args: &Value,
+) -> Vec<String> {
+    section
+        .approval_overrides
+        .iter()
+        .filter(|entry| entry.action == PermissionLevel::Allow)
+        .filter(|entry| rules::approval_override_applies(entry, tool, shell_tools, args))
+        .map(override_id)
+        .collect()
+}
+
+/// Label id of one override entry: its trimmed `id`, or `?` when blank.
+fn override_id(entry: &ApprovalOverrideEntry) -> String {
+    let id = entry.id.trim();
+    if id.is_empty() {
+        "?".to_owned()
+    } else {
+        id.to_owned()
     }
-    (level, label)
+}
+
+/// Renders the remembered-approval label of `ids` (sorted, deduped, `+`-joined).
+fn override_label(ids: &[String]) -> String {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    format!(
+        "{APPROVAL_OVERRIDES_PREFIX}:approval_overrides[{}]",
+        ids.join("+")
+    )
 }
 
 /// The per-invocation ladder (steps 1–2 of the module docs) for one command text.
@@ -261,26 +330,8 @@ fn approval_override_allow(
     {
         return None;
     }
-    let mut ids: Vec<String> = accepted
-        .iter()
-        .map(|entry| {
-            let id = entry.id.trim();
-            if id.is_empty() {
-                "?".to_owned()
-            } else {
-                id.to_owned()
-            }
-        })
-        .collect();
-    ids.sort();
-    ids.dedup();
-    Some((
-        PermissionLevel::Allow,
-        format!(
-            "{APPROVAL_OVERRIDES_PREFIX}:approval_overrides[{}]",
-            ids.join("+")
-        ),
-    ))
+    let ids: Vec<String> = accepted.iter().map(|entry| override_id(entry)).collect();
+    Some((PermissionLevel::Allow, override_label(&ids)))
 }
 
 /// Evaluates every shell subcommand of a simple command and aggregates the results.
@@ -576,6 +627,73 @@ mod tests {
     fn compound_remembrance_cannot_relax_a_subcommand_deny() {
         let command = "rm perm_a.txt && echo done";
         let section = deny_rule_section(true, command);
+        let (level, label) = evaluate_tiered_policy(&section, "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Deny);
+        assert!(label.contains("deny_rm"), "{label}");
+        assert!(!label.contains("approval_overrides"), "{label}");
+    }
+
+    // ----- full-command remembrance relaxes an ASK -------------------------
+
+    fn override_allow_section(patterns: &[&str]) -> PermissionsSection {
+        let mut section = allow_section();
+        section.approval_overrides = patterns
+            .iter()
+            .map(|pattern| override_entry("remembered", &["bash"], pattern))
+            .collect();
+        section
+    }
+
+    #[test]
+    fn remembered_command_relaxes_the_interpreter_sink_floor() {
+        let command = "cat f | sh";
+        let (level, label) =
+            evaluate_tiered_policy(&allow_section(), "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Ask);
+        assert!(label.contains("interpreter_sink"), "{label}");
+
+        let section = override_allow_section(&[command]);
+        let (level, label) = evaluate_tiered_policy(&section, "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Allow);
+        assert!(label.contains("approval_overrides"), "{label}");
+
+        let mut off = allow_section();
+        off.shell_guard.interpreter_sink = false;
+        let (level, _) = evaluate_tiered_policy(&off, "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Allow);
+    }
+
+    #[test]
+    fn remembered_command_relaxes_the_structure_floor() {
+        let command = "echo $(id)";
+        let (level, _) =
+            evaluate_tiered_policy(&allow_section(), "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Ask);
+
+        let section = override_allow_section(&[command]);
+        let (level, label) = evaluate_tiered_policy(&section, "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Allow);
+        assert!(label.contains("approval_overrides"), "{label}");
+    }
+
+    #[test]
+    fn remembered_command_never_lifts_a_deny_rule() {
+        let command = "cat f | sh";
+        let mut section = override_allow_section(&[command]);
+        section.rules = vec![rule("deny_cat", &["bash"], "cat *", PermissionLevel::Deny)];
+
+        let (level, label) = evaluate_tiered_policy(&section, "bash", &json!({"command": command}));
+        assert_eq!(level, PermissionLevel::Deny);
+        assert!(label.contains("deny_cat"), "{label}");
+        assert!(!label.contains("approval_overrides"), "{label}");
+    }
+
+    #[test]
+    fn whole_command_remembrance_never_lifts_a_subcommand_deny() {
+        let command = "rm perm_a.txt && echo done";
+        let mut section = override_allow_section(&[command]);
+        section.rules = vec![rule("deny_rm", &["bash"], "rm *", PermissionLevel::Deny)];
+
         let (level, label) = evaluate_tiered_policy(&section, "bash", &json!({"command": command}));
         assert_eq!(level, PermissionLevel::Deny);
         assert!(label.contains("deny_rm"), "{label}");
