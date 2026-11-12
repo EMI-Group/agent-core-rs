@@ -1,28 +1,43 @@
-//! Unified retriever interface, sparse retrieval, and rank fusion.
+//! Unified retriever interface, the four retriever implementations, and rank
+//! fusion.
 //!
 //! Port of the Python `openjiuwen/core/retrieval/retriever/` package and
 //! `openjiuwen/core/retrieval/utils/fusion.py`:
 //!
 //! - [`Retriever`] is the abstract base: `retrieve`, `retrieve_search_results`,
 //!   `batch_retrieve`, and `close`.
+//! - [`VectorRetriever`] is the dense channel over a vector store and an
+//!   embedding model.
 //! - [`SparseRetriever`] is the BM25-backed sparse implementation. Python's
 //!   version delegates to `VectorStore.sparse_search`; this crate owns the index,
 //!   so the retriever wraps a [`std::sync::Arc`] of [`crate::sparse::Bm25Index`].
+//! - [`HybridRetriever`] runs both channels and fuses them with reciprocal rank
+//!   fusion.
+//! - [`GraphRetriever`] expands chunk hits through a triple store.
+//! - [`AgenticRetriever`] loops retrieve → read triples → rewrite and fuses every
+//!   iteration, working offline with deterministic heuristics unless a model is
+//!   supplied.
 //! - [`rrf_fusion`] and [`deduplicate`] merge result lists the way Python's
 //!   `rrf_fusion` does.
-//!
-//! Vector, hybrid, agentic, and graph retrievers are not implemented here.
 
+pub mod agentic;
 pub mod fusion;
+pub mod graph;
+pub mod hybrid;
 pub mod sparse;
+pub mod vector;
 
+pub use agentic::{AgenticConfig, AgenticRetriever, AgenticStopReason, AgenticTrace};
 pub use fusion::{deduplicate, rrf_fusion, rrf_fusion_default, DEFAULT_RRF_K};
+pub use graph::GraphRetriever;
+pub use hybrid::HybridRetriever;
 pub use sparse::SparseRetriever;
+pub use vector::VectorRetriever;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 
 use crate::common::{MetadataFilter, RetrievalResult, SearchResult};
 use crate::vector_store::DOC_ID_FIELD;
@@ -129,6 +144,36 @@ pub fn search_result_to_retrieval(result: SearchResult) -> RetrievalResult {
         metadata: result.metadata,
         doc_id,
         chunk_id: Some(result.id),
+    }
+}
+
+/// Rejects a blank retrieval query with [`Error::Validation`].
+///
+/// Shared by the concrete retrievers so an empty query fails deterministically
+/// instead of reaching an index that would answer it with an empty result list.
+pub(crate) fn ensure_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(Error::validation("retrieval query must not be empty"));
+    }
+    Ok(())
+}
+
+/// Projects a [`RetrievalResult`] back onto a [`SearchResult`].
+///
+/// The chunk id is the identity when it is known, otherwise the text is used:
+/// results produced by fusion keep Python's `text` identity, so this round trip
+/// never loses a hit.
+pub(crate) fn retrieval_to_search(result: RetrievalResult) -> SearchResult {
+    let id = result
+        .chunk_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| result.text.clone());
+    SearchResult {
+        id,
+        text: result.text,
+        score: result.score,
+        metadata: result.metadata,
     }
 }
 
