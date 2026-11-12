@@ -13,6 +13,8 @@ Available to test binaries: `openjiuwen` (umbrella, default features incl. `nati
 `openjiuwen-runner` is **not** a direct dependency: reach it as `openjiuwen::core::runner` (kernel umbrella re-export) or add `openjiuwen-runner.workspace = true` for the `openjiuwen_runner::` spelling.
 `openjiuwen-test-support` supplies the offline pieces: `MockLlmServer`, `ScriptedModel`, `ScriptedResponse`, `TempWorkspace`, `TempHomeGuard`, `EnvGuard`, `agent_session*`/`workflow_session*`, `memory_checkpointer`, `eventually*`, `assert_json_*`.
 Shared helper modules (`tests/common/mod.rs`, declared as `mod common;`) exist in sibling crates (`openjiuwen-runner`, `openjiuwen-agent`, `openjiuwen-graph`, `openjiuwen-workflow`, `openjiuwen-multiagent`) but are private to their own test binaries and cannot be imported here.
+Not dependencies here — do not import them without adding the workspace dep: `parking_lot` (use `std::sync::Mutex`), `tokio-util` (no `CancellationToken`), `serial_test`, any `openjiuwen-<layer>` crate.
+Each `tests/*.rs` file is auto-discovered as its own test binary; there are no `[[test]]`/`required-features` entries, and a `tests/common/mod.rs` helper would need `#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]` because each binary uses only part of it.
 
 ## Constraints
 
@@ -26,3 +28,9 @@ Use `Runner::new()` in tests, never `Runner::global()`; `Runner::reset_global()`
 
 - `./tests/` → cross-crate integration scenarios (currently empty apart from `.gitkeep`)
 - `./src/` → crate root `lib.rs` (`crate_name()` only)
+
+## Reference Patterns
+
+Copy the shape of sibling suites rather than inventing fixtures: `../openjiuwen-agent/tests/react_agent.rs` (`tool_round_feeds_the_tool_message_back_to_the_model` — scripted tool round) and `streaming.rs` (`collect_frames`/`content_of` — frame assertions).
+`../openjiuwen-workflow/tests/linear.rs` (`linear_workflow` — `start → llm → end` with `${start.query}` references) and `checkpoint_resume.rs` (`a_resumed_run_does_not_re_execute_completed_nodes` — resume via `MemoryCheckpointer`).
+`../openjiuwen-runner/tests/runner_lifecycle.rs` (`run_agent_through_the_facade_without_start` — local `Runner::new()` + `register_agent` + `run_agent`) is the facade template; workflow output is `WorkflowOutput.result` (`{"output": {...}}`) streamed end frames become a JSON array.
