@@ -85,6 +85,9 @@ pub fn serialize_param_payload(value: &Value) -> String;    // json.dumps sort_k
 
 // client.rs
 pub struct A2aClientConfig { pub rpc_url: String, pub timeout: Option<Duration>, pub headers: BTreeMap<String, String> }
+// A2aClientConfig: Default (empty rpc_url, timeout None = 60 s, no headers) + builders
+//   new(rpc_url: impl Into<String>) -> Self, with_timeout(Duration) -> Self, with_header(name, value) -> Self
+// rpc_url is the FULL JSON-RPC endpoint, POSTed verbatim (no base-URL joining by the client)
 pub struct A2aClient { /* reqwest::Client + request-id counter */ }
 impl A2aClient {
     pub fn new(config: A2aClientConfig) -> Result<Self>;       // empty rpc_url -> Error::Config
@@ -97,6 +100,7 @@ impl A2aClient {
 pub struct RemoteClientConfig { pub id, version, name, description, protocol: String,
                                 pub card: Option<AgentCard>, pub url: String,
                                 pub timeout: Option<Duration>, pub kwargs: Map<String, Value> }
+// RemoteClientConfig: Default sets protocol "A2A"; new(id, url) sets both and defaults the rest
 pub struct A2aRemoteClient { .. }
 impl A2aRemoteClient {
     pub fn new(config: RemoteClientConfig) -> Result<Self>;     // protocol "A2A" + card required -> Validation
@@ -175,6 +179,7 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - No `unsafe`; no blocking I/O; `reqwest` with rustls; SSE parsing is incremental over `bytes_stream` (no whole-body buffering).
 - Timeouts: per-request via `A2aClientConfig.timeout` (default 60 s); `A2aRemoteClient::invoke/stream` wrap the call in the caller timeout and stop the client on timeout/error exactly like Python (`stop()` before re-raising; `Cancelled` propagates without calling `stop`). Stream deadlines are applied per chunk against a single total budget.
 - gRPC and REST (`HTTP+JSON`) transports are **not** implemented; a gRPC `protocol_binding` yields `Error::Unsupported("gRPC transport is not supported")`; a REST/`HTTP+JSON` binding is tolerated but the REST route is not mounted.
+- Endpoint derivation is private (`resolve_rpc_url`, `derive_interface_url`): no public base-URL→JSON-RPC-URL helper is exported, so a plain `A2aClient` caller must pass the full endpoint in `rpc_url`; only `A2aRemoteClient::new` derives it (card JSON-RPC interface, else `trim_end_matches('/')` + `/a2a/jsonrpc/`).
 - The JSON-RPC route is mounted at the literal `rpc_path` (default trailing slash), matching Python's normalization; the well-known card route serves the configured card.
 - Errors map to `Error::Transport` (HTTP/SSE), `Error::Timeout`, `Error::Validation` (card/inputs/JSON-RPC params), `Error::NotFound` (JSON-RPC `TASK_NOT_FOUND`), `Error::Unsupported` (`METHOD_NOT_FOUND`/gRPC), `Error::Config` (client construction).
 - Serde: wire structs are camelCase with unknown fields tolerated and unset `Option`s omitted; enums serialize proto strings (`ROLE_USER`, `TASK_STATE_WORKING`) and decode tolerantly (bare suffix, snake_case, camelCase, `cancelled`, unknown → `Unspecified`). Empty maps serialize as `{}`.
