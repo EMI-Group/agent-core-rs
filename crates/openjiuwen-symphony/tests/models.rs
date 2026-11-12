@@ -64,6 +64,37 @@ fn descriptor_round_trips_with_type_keys() {
 }
 
 #[test]
+fn available_defaults_to_true_for_python_parity() {
+    let built = CapabilityDescriptor::new("tool", "sum", "Sum");
+    assert!(built.available, "`new` must default `available` to true");
+    assert!(CapabilityDescriptor::default().available);
+
+    let decoded: CapabilityDescriptor = serde_json::from_value(json!({
+        "capability_id": "sum",
+        "capability_type": "tool",
+        "name": "Sum",
+    }))
+    .expect("deserializes without an `available` key");
+    assert!(
+        decoded.available,
+        "a missing `available` key must deserialize to true"
+    );
+
+    let explicit: CapabilityDescriptor = serde_json::from_value(json!({
+        "capability_id": "sum",
+        "capability_type": "tool",
+        "name": "Sum",
+        "available": false,
+    }))
+    .expect("deserializes an explicit `available`");
+    assert!(!explicit.available);
+
+    let withdrawn = built.with_available(false);
+    assert!(!withdrawn.available);
+    assert!(withdrawn.with_available(true).available);
+}
+
+#[test]
 fn semantic_content_is_skipped_but_accepted() {
     let descriptor = sample();
     let value = serde_json::to_value(&descriptor).expect("serializes");

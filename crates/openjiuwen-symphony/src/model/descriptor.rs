@@ -190,7 +190,7 @@ impl CapabilityIo {
 /// Unknown JSON fields are ignored on deserialization, and every field has a default.
 /// `semantic_content` is accepted on input but excluded from output (Python marks it
 /// `exclude=True` because it is a private retrieval aid, not public metadata).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct CapabilityDescriptor {
     /// Provider-assigned identifier, unique inside `capability_type`.
@@ -204,6 +204,9 @@ pub struct CapabilityDescriptor {
     /// Where the capability came from (provider name or artifact path).
     pub source: String,
     /// Whether the capability can currently be planned and executed.
+    ///
+    /// Defaults to `true`, matching Python's `available: bool = True`; clear it with
+    /// [`CapabilityDescriptor::with_available`] to withdraw the capability from planning.
     pub available: bool,
     /// Typed inputs consumed by the capability.
     pub inputs: Vec<CapabilityIo>,
@@ -223,9 +226,31 @@ pub struct CapabilityDescriptor {
     pub metadata: BTreeMap<String, Value>,
 }
 
+impl Default for CapabilityDescriptor {
+    /// Returns a descriptor with all fields empty except `available`, which is `true`
+    /// for parity with Python's `available: bool = True` default.
+    fn default() -> Self {
+        Self {
+            capability_id: String::new(),
+            capability_type: String::new(),
+            name: String::new(),
+            description: String::new(),
+            source: String::new(),
+            available: true,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            classification: String::new(),
+            tags: Vec::new(),
+            content_hash: String::new(),
+            semantic_content: String::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
 impl CapabilityDescriptor {
     /// Builds a descriptor with the required identity fields and everything else
-    /// defaulted (`available` is `false` until [`Self::with_available`] is called).
+    /// defaulted; `available` defaults to `true` for Python parity.
     #[must_use]
     pub fn new(
         capability_type: impl Into<String>,
