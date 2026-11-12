@@ -51,7 +51,7 @@ impl MemoryStores {
 
 ### `storage.rs` (crate-internal)
 ```rust
-pub(crate) struct MemoryStorage { /* kv, vector, document, providers */ }
+pub(crate) struct MemoryStorage { /* stores: MemoryStores */ }
 impl MemoryStorage {
     pub(crate) fn new(stores: MemoryStores) -> Self;
 
