@@ -24,7 +24,11 @@ Suites (one file per area):
 - No network, no sleeps for ordering, no wall-clock assertions; timeouts are short and prove a deadline only.
 - The execution suites drive the `openjiuwen_runner::run` free functions over a `RunServices` fixture; only lifecycle suites construct `Runner`, and never `Runner::global()` without `reset_global()`.
 - Behavior ports cite the Python test file they mirror in a comment.
-- `common/mod.rs` holds shared fixtures: `services()`/`services_with_checkpointer`, a local `ScriptedAgent` (delay/gate/failure/stream chunks/call counters), a start→echo→end workflow and a failing one, a real two-member handoff `BaseTeam` with a `TeamCalls` log, `RecordingSession`, `RecordingCheckpointer`, and a recording callback helper.
+- `common/mod.rs` holds shared fixtures: `services()`, `services_with_checkpointer`, `services_with_default_session`, `services_with_checkpointer_and_default_session`, a local `ScriptedAgent` (delay/gate/failure/stream chunks/call counters) plus `scripted_agent(id, answer)` and `answer_frames()`, `EchoComponent`/`FailingComponent`, `passthrough_workflow(id)`/`failing_workflow(id)`, a real two-member handoff `BaseTeam` with a `TeamCalls` log (`handoff_team_fixture`, `team_calls`, `provider`), `RecordingSession`, `RecordingCheckpointer`, and the recording callback helpers (`recorder`, `record_at`, `record_all`, `recorded*`, `agent_events`, `workflow_events`).
+- `common/mod.rs` is included per test binary with `mod common;`; it is private to this crate's test targets, so another crate (e.g. `openjiuwen-e2e`) cannot import it and must inline its own fakes or add its own `tests/common/mod.rs`.
+- Only `runner_lifecycle.rs` exercises the `Runner` facade for execution (`run_agent_through_the_facade_without_start`); every execution-path suite drives the `openjiuwen_runner::run` free functions over `RunServices`, and there is no facade `run_workflow` example (workflow coverage is `invoke_workflow`/`stream_workflow` only).
+- No suite reads or mutates the process environment: there is no `TempHomeGuard`, `EnvGuard`, `#[serial]`, or env mutex here, and none is needed because the runner never reads `OPENJIUWEN_*`.
+- Tokio tests are plain `#[tokio::test]` (current-thread) except the two concurrency cases in `resources.rs`, which use `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`; waits are `Notify` handshakes or short `RunOptions::with_timeout` deadlines, never sleeps for ordering.
 
 ## Routing Table
 
