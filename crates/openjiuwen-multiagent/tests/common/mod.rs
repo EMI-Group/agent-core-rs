@@ -8,11 +8,16 @@
 #![allow(unreachable_pub, clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::new_ret_no_self)]
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::StreamExt;
-use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput};
+use futures::{FutureExt, StreamExt};
+use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput, Observation};
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_multiagent::{MessageEnvelope, MessageHandler};
+use openjiuwen_foundation::tool::Tool;
+use openjiuwen_multiagent::{
+    AgentProvider, MessageEnvelope, MessageHandler, TeamAgent, ToolHost, HANDOFF_MESSAGE_KEY,
+    HANDOFF_REASON_KEY, HANDOFF_TARGET_KEY,
+};
 use openjiuwen_session::Session;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -177,5 +182,163 @@ impl MessageHandler for RecordingHandler {
             .lock()
             .push((subscriber.to_owned(), envelope.clone()));
         Ok(())
+    }
+}
+
+/// An [`Agent`] whose handler may await, for delays and timeout cases.
+///
+/// [`FakeAgent`] takes a synchronous closure, so a suite that needs a slow
+/// member (a handoff chain deadline, a blocked bus worker) uses this instead.
+pub struct AsyncFakeAgent {
+    card: AgentCard,
+    handler: Box<AsyncFakeHandler>,
+}
+
+/// The asynchronous invocation handler of an [`AsyncFakeAgent`].
+pub type AsyncFakeHandler = dyn Fn(Value, Option<Arc<dyn Session>>) -> BoxFuture<'static, Result<AgentOutput>>
+    + Send
+    + Sync;
+
+impl AsyncFakeAgent {
+    /// Builds a fake agent named by `card` that awaits `handler`.
+    #[must_use]
+    pub fn new(
+        card: AgentCard,
+        handler: impl Fn(Value, Option<Arc<dyn Session>>) -> BoxFuture<'static, Result<AgentOutput>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            card,
+            handler: Box::new(handler),
+        })
+    }
+
+    /// Builds an agent that sleeps `delay` and then answers `text`.
+    #[must_use]
+    pub fn delayed(name: &str, delay: Duration, text: &str) -> Arc<Self> {
+        let card = agent_card(name);
+        let text = text.to_owned();
+        Self::new(card, move |_inputs, _session| {
+            let text = text.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                Ok(AgentOutput::answer(text))
+            }
+            .boxed()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for AsyncFakeAgent {
+    fn card(&self) -> &AgentCard {
+        &self.card
+    }
+
+    async fn invoke(
+        &self,
+        inputs: Value,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<AgentOutput> {
+        (self.handler)(inputs, session).await
+    }
+
+    fn stream(
+        &self,
+        _inputs: Value,
+        _session: Option<Arc<dyn Session>>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        futures::stream::empty::<Result<AgentChunk>>().boxed()
+    }
+}
+
+/// Builds an [`AgentOutput`] that carries a handoff directive.
+///
+/// The directive travels as a tool [`Observation`] because a plain
+/// [`AgentOutput::answer`] has no top-level signal key; `None` message/reason
+/// omit that key, and `message`/`reason` are forwarded verbatim.
+#[must_use]
+pub fn handoff_output(
+    text: impl Into<String>,
+    target: &str,
+    message: Option<&str>,
+    reason: Option<&str>,
+) -> AgentOutput {
+    let mut signal = serde_json::Map::new();
+    signal.insert(
+        HANDOFF_TARGET_KEY.to_owned(),
+        Value::String(target.to_owned()),
+    );
+    if let Some(message) = message {
+        signal.insert(
+            HANDOFF_MESSAGE_KEY.to_owned(),
+            Value::String(message.to_owned()),
+        );
+    }
+    if let Some(reason) = reason {
+        signal.insert(
+            HANDOFF_REASON_KEY.to_owned(),
+            Value::String(reason.to_owned()),
+        );
+    }
+    AgentOutput {
+        output: text.into(),
+        observations: vec![Observation {
+            content: Value::Object(signal).to_string(),
+            ..Observation::default()
+        }],
+        ..AgentOutput::default()
+    }
+}
+
+/// Builds a member provider that hands out `agent` per resolution.
+#[must_use]
+pub fn provider(agent: Arc<dyn Agent>) -> AgentProvider {
+    Arc::new(move || TeamAgent::new(Arc::clone(&agent)))
+}
+
+/// Builds a member provider whose member also exposes `host` as its tool surface.
+#[must_use]
+pub fn host_provider(agent: Arc<dyn Agent>, host: Arc<dyn ToolHost>) -> AgentProvider {
+    Arc::new(move || TeamAgent::with_tool_host(Arc::clone(&agent), Arc::clone(&host)))
+}
+
+/// A [`ToolHost`] that records the name of every tool mounted on it.
+///
+/// Strategies inject tools without returning them to the caller, so a suite
+/// observes the injection through this host: [`RecordingToolHost::mounts`] is the
+/// mount log in call order and [`RecordingToolHost::card_count`] counts calls.
+#[derive(Debug, Default)]
+pub struct RecordingToolHost {
+    /// Names of the mounted tool cards, in mount order.
+    mounts: Mutex<Vec<String>>,
+}
+
+impl RecordingToolHost {
+    /// Builds an empty recording host.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Returns the mounted tool names, in mount order.
+    #[must_use]
+    pub fn mounts(&self) -> Vec<String> {
+        self.mounts.lock().clone()
+    }
+
+    /// Returns how many `mount_tool` calls the host accepted.
+    #[must_use]
+    pub fn card_count(&self) -> usize {
+        self.mounts.lock().len()
+    }
+}
+
+impl ToolHost for RecordingToolHost {
+    fn mount_tool(&self, tool: Arc<dyn Tool>) -> bool {
+        self.mounts.lock().push(tool.card().name.clone());
+        true
     }
 }
