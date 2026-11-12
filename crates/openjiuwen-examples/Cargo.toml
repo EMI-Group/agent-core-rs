@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+# Auto-discovery is off: every runnable example is declared explicitly below so the
+# curated set is visible in one place and optional examples can carry
+# `required-features`. Adding an example means adding a `[[example]]` entry.
+autoexamples = false
 
 [dependencies]
 openjiuwen.workspace = true
@@ -15,9 +19,79 @@ serde_json.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
 futures.workspace = true
+tracing.workspace = true
+
+# Example targets are dev targets, so they may use dev-dependencies. Kept out of
+# `[dependencies]` so the library in `src/` cannot reach the test-only crate.
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
+openjiuwen-macros.workspace = true
+serde.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []
+# Compiles `openjiuwen-extensions/a2a`; example 11 requires it.
+a2a = ["openjiuwen/a2a"]
+# Marker feature only: MCP support is always compiled in because
+# `openjiuwen-foundation` enables its default `mcp` feature, so this adds nothing.
+# It exists so the documented gate `--features a2a,mcp` reads naturally.
+mcp = []
+
+# --- examples --------------------------------------------------------------
+# 01-06: kernel tour (offline by default, live with OPENJIUWEN_LIVE=1).
+[[example]]
+name = "01_hello_agent"
+path = "examples/01_hello_agent.rs"
+
+[[example]]
+name = "02_react_with_tools"
+path = "examples/02_react_with_tools.rs"
+
+[[example]]
+name = "03_sessions_and_resume"
+path = "examples/03_sessions_and_resume.rs"
+
+[[example]]
+name = "04_workflow_pipeline"
+path = "examples/04_workflow_pipeline.rs"
+
+[[example]]
+name = "05_context_and_memory"
+path = "examples/05_context_and_memory.rs"
+
+[[example]]
+name = "06_retrieval"
+path = "examples/06_retrieval.rs"
+
+# 07-10: harness tier (offline; 07 can talk to a real MCP server when configured).
+[[example]]
+name = "07_mcp_tool"
+path = "examples/07_mcp_tool.rs"
+
+[[example]]
+name = "08_deep_agent"
+path = "examples/08_deep_agent.rs"
+
+[[example]]
+name = "09_harness_provider"
+path = "examples/09_harness_provider.rs"
+
+[[example]]
+name = "10_agent_team"
+path = "examples/10_agent_team.rs"
+
+# 11-12: optional / self-improvement.
+[[example]]
+name = "11_a2a_server_client"
+path = "examples/11_a2a_server_client.rs"
+required-features = ["a2a"]
+
+[[example]]
+name = "12_self_improvement"
+path = "examples/12_self_improvement.rs"
 
 [lints]
 workspace = true
