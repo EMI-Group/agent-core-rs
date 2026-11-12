@@ -269,3 +269,5 @@ API-shaped stubs, all documented and all returning
 - Evaluation scores are `Option<f64>` per case so "ungraded" is representable and never folded into an average (Python `test_evaluator.py` behavior).
 - Deferred surfaces are one-module-per-family stubs with typed constructors and a single `Result<Value>` method, so call-site shape exists without inventing fake type graphs; the table above is the authoritative gap list.
 - `SessionState` is the single checkpoint unit (candidates + history + counters), which makes resume a full state restore instead of a separate replay protocol.
+- The only injected traits are `HarnessRunner`, `Evaluator`, `MutationStrategy`, `SelectionStrategy`, `CheckpointStore`; there is no task-source or scoring trait.
+- `task.rs` is data-only: the loop consumes `IterationRecord`, `SessionSummary`, `StopConditions`, `StopDecision`; `OptimizationTask`, `Gap`, `StageResult`, `TaskStatus`, `StageStatus` are unused by the orchestrator (kept for Python interface parity).
