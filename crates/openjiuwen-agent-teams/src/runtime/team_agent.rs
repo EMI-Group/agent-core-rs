@@ -7,20 +7,8 @@
 //!
 //! The struct is a *cheap handle*: every field lives inside one `Arc<TeamAgentInner>`, so cloning
 //! it (the run loop does, on every `invoke`) copies one pointer. Building is the only fallible,
-//! `await`-heavy step and it is pinned by `src/runtime/CONTEXT.md` §"Build path".
-//!
-//! # Build order
-//!
-//! 1. [`TeamAgentSpec::validate`] — reserved names and the dispatch/bootstrap pairing.
-//! 2. The runtime mirror ([`TeamSpec`]) and the resolved language.
-//! 3. One store (injected, never a second one), one in-process transport, one activity registry.
-//! 4. [`TeamBackend`] over the store, board, transport, spawner and workspace provider; the team
-//!    row is written before any member row.
-//! 5. The leader row, its workspace and its harness, then the observer that feeds the chunk
-//!    fan-out and the activity registry.
-//! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
-//! 7. One bus subscription for the leader (drained only by [`super::leader`]) and the interaction
-//!    gate/inbox.
+//! `await`-heavy step; it lives in [`super::build`], which owns the blueprint → runtime path and is
+//! pinned by `src/runtime/CONTEXT.md` §"Build path".
 //!
 //! # Roles
 //!
@@ -42,9 +30,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use openjiuwen_agent::{AgentCard, AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::utils::id::uuid_hex;
 use openjiuwen_harness_protocol::HarnessState;
-use openjiuwen_multiagent::{RuntimeConfig, TeamCard, TeamRuntime};
+use openjiuwen_multiagent::{TeamCard, TeamRuntime};
 use openjiuwen_session::Session;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -54,43 +41,28 @@ use tracing::{debug, warn};
 
 use super::allocator::ModelAllocator;
 use super::backend::TeamBackend;
+use super::build::{teammate_record, MemberStreamObserver};
 use super::deps::TeamBuildDeps;
 use super::initial_input::parse_initial_input;
 use super::leader;
 use super::spawner::TeamMemberSpawner;
 use crate::constants::USER_PSEUDO_MEMBER_NAME;
-use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
 use crate::interaction::{
     DeliverResult, HumanAgentInbox, HumanAgentMessage, InteractGate, InteractPayload,
 };
 use crate::member::{
-    MemberActivityRegistry, MemberObserver, MemberRuntime, MemberSpawnRequest, MemberSpawner,
-    TeamMember,
+    MemberActivityRegistry, MemberRuntime, MemberSpawnRequest, MemberSpawner, TeamMember,
 };
-use crate::messager::create_messager;
 use crate::schema::{
-    DeepAgentSpec, EventMessage, EventPayload, Language, MemberLifetime, MemberStatus,
-    MemberStatusChangedEvent, RoundOutcome, TaskGraphSpec, TaskRecord, TeamAgentSpec,
-    TeamMemberSpec, TeamRole, TeamSnapshot, TeamSpec, TeamTopic,
+    EventMessage, EventPayload, MemberLifetime, MemberStatus, MemberStatusChangedEvent,
+    TaskGraphSpec, TaskRecord, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSnapshot, TeamSpec,
+    TeamTopic,
 };
-use crate::storage::{MemberRecord, TeamInfoRecord, TeamStore};
-use crate::taskboard::{TaskBoard, TaskBoardLimits};
+use crate::storage::TeamStore;
 use crate::workspace::{IsolationMode, WorkspaceRequest};
-
-/// Key of the leader's blueprint in [`TeamAgentSpec::agents`].
-const LEADER_KEY: &str = "leader";
-
-/// Error text of a blueprint that has no `agents["leader"]` entry.
-///
-/// Pinned by the spec validator, so the build path reports the same message a caller sees from
-/// [`TeamAgentSpec::validate`].
-const LEADER_MISSING_MESSAGE: &str = "agents dict must contain a 'leader' key";
 
 /// Error text of a `create_task` call on a non-leader handle.
 const LEADER_ONLY_TASKS_MESSAGE: &str = "only the leader can create tasks";
-
-/// Prefix of the session id a built team mints for itself.
-const SESSION_PREFIX: &str = "session_";
 
 /// Builds a [`TeamAgent`] from a team blueprint.
 ///
@@ -150,314 +122,53 @@ impl fmt::Debug for TeamAgent {
 }
 
 /// Everything one `TeamAgent` handle owns.
-struct TeamAgentInner {
+pub(crate) struct TeamAgentInner {
     /// The cold blueprint the team was built from.
-    blueprint: TeamAgentSpec,
+    pub(crate) blueprint: TeamAgentSpec,
     /// The runtime mirror the running team carries ([`TeamSpec::from_spec`]).
-    spec: TeamSpec,
+    pub(crate) spec: TeamSpec,
     /// Role of this handle (always [`TeamRole::Leader`] from [`SpecBuild`]).
-    role: TeamRole,
+    pub(crate) role: TeamRole,
     /// Wire name of this handle's member.
-    member_name: String,
+    pub(crate) member_name: String,
     /// Session id every harness of the team is opened under.
-    session_id: String,
+    pub(crate) session_id: String,
     /// Resolved prompt language (`cn` / `cf` / `en`).
-    language: String,
+    pub(crate) language: String,
     /// Card of this handle's member, named `<team>_<member>`.
-    card: AgentCard,
+    pub(crate) card: AgentCard,
     /// Member name of the leader, resolved from the blueprint.
-    leader_member_name: String,
+    pub(crate) leader_member_name: String,
     /// Persisted state of the team.
-    store: Arc<dyn TeamStore>,
+    pub(crate) store: Arc<dyn TeamStore>,
     /// Organisation facade: members, mail, events, tasks and snapshots.
-    backend: Arc<TeamBackend>,
+    pub(crate) backend: Arc<TeamBackend>,
     /// This handle's member row and lifecycle machine.
-    member: Arc<TeamMember>,
+    pub(crate) member: Arc<TeamMember>,
     /// The harness-backed runtime attached to [`Self::member`] (the same `Arc`).
-    runtime: Arc<dyn MemberRuntime>,
+    pub(crate) runtime: Arc<dyn MemberRuntime>,
     /// Materializes teammate runtimes from the blueprint.
-    spawner: Arc<TeamMemberSpawner>,
+    pub(crate) spawner: Arc<TeamMemberSpawner>,
     /// Admission control for external payloads.
-    gate: Arc<InteractGate>,
+    pub(crate) gate: Arc<InteractGate>,
     /// Leader-side activity projection.
-    activity: Arc<MemberActivityRegistry>,
+    pub(crate) activity: Arc<MemberActivityRegistry>,
     /// Human-agent inbox (disabled unless `enable_hitt`).
-    inbox: Arc<HumanAgentInbox>,
+    pub(crate) inbox: Arc<HumanAgentInbox>,
     /// The `openjiuwen_multiagent` session/registry seam.
-    team_runtime: Arc<TeamRuntime>,
+    pub(crate) team_runtime: Arc<TeamRuntime>,
     /// Model-pool allocator; the cursor advances per allocated member.
-    allocator: ModelAllocator,
+    pub(crate) allocator: ModelAllocator,
     /// Whether [`TeamAgent::start`] completed and no [`TeamAgent::stop`] followed.
-    started: AtomicBool,
+    pub(crate) started: AtomicBool,
     /// Token of the current run; replaced by every `start`, cancelled by `stop`.
-    cancel: Mutex<CancellationToken>,
+    pub(crate) cancel: Mutex<CancellationToken>,
     /// Fan-out of this handle's runtime chunks to [`TeamAgent::subscribe_chunks`] callers.
-    chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
+    pub(crate) chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
     /// Single-consumer bus receiver, taken once by [`super::leader::run`].
-    events: Mutex<Option<UnboundedReceiver<EventMessage>>>,
+    pub(crate) events: Mutex<Option<UnboundedReceiver<EventMessage>>>,
     /// Queued steering messages the leader takes per model call.
-    steer_batch_size: usize,
-}
-
-#[async_trait]
-impl SpecBuild for TeamAgentSpec {
-    /// Builds a leader agent over [`TeamBuildDeps::default`].
-    async fn build(&self) -> Result<Arc<TeamAgent>> {
-        self.build_with(TeamBuildDeps::default()).await
-    }
-
-    /// Builds a leader agent over `deps`, in the order pinned by the node contract.
-    ///
-    /// # Errors
-    ///
-    /// See [`SpecBuild::build_with`].
-    // The build path is one documented linear sequence; splitting it would hide the order that
-    // `src/runtime/CONTEXT.md` pins.
-    #[allow(clippy::too_many_lines)]
-    async fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>> {
-        self.validate()?;
-        let leader_spec = self
-            .agents
-            .get(LEADER_KEY)
-            .cloned()
-            .ok_or_else(|| Error::validation(LEADER_MISSING_MESSAGE))?;
-
-        let team_name = self.team_name.clone();
-        let leader_name = self.leader_member_name().to_owned();
-        let language = resolve_language(&deps, self.language.as_deref());
-        let mut team_spec = TeamSpec::from_spec(self);
-        team_spec.language = Some(language.clone());
-        let session_id = format!("{SESSION_PREFIX}{}", uuid_hex());
-
-        let messager = create_messager(&self.transport)?;
-        let store = Arc::clone(&deps.store);
-        let activity = Arc::new(MemberActivityRegistry::new());
-        let spawner = TeamMemberSpawner::new(self.clone(), deps.clone(), session_id.clone());
-        let limits = TaskBoardLimits::new()
-            .with_default_max_review_rounds(
-                u32::try_from(self.default_max_review_rounds).unwrap_or(u32::MAX),
-            )
-            .with_max_subtask_depth(self.max_subtask_depth);
-        let taskboard = Arc::new(TaskBoard::new(store.clone(), team_name.clone(), limits));
-        let backend = Arc::new(TeamBackend::new(
-            team_spec.clone(),
-            store.clone(),
-            taskboard,
-            messager.clone(),
-            Arc::clone(&spawner) as Arc<dyn MemberSpawner>,
-            deps.workspace.clone(),
-            activity.clone(),
-        ));
-        backend
-            .upsert_team_info(team_info(self, &team_spec, &leader_name, &leader_spec))
-            .await?;
-
-        let allocator = ModelAllocator::new(&self.model_pool, self.model_pool_strategy);
-        let leader_record = leader_record(self, &leader_name, &leader_spec, &allocator);
-        store.insert_member(leader_record.clone()).await?;
-        let leader_member = Arc::new(TeamMember::new(store.clone(), leader_record));
-
-        let workspace = deps
-            .workspace
-            .allocate(&WorkspaceRequest {
-                team_name: team_name.clone(),
-                session_id: session_id.clone(),
-                member_name: leader_name.clone(),
-                spec: self.workspace.clone(),
-                member_spec: leader_spec.workspace.clone(),
-                isolation: IsolationMode::None,
-            })
-            .await?;
-        let harness = deps
-            .harness_factory
-            .create(
-                &leader_spec,
-                &MemberHarnessContext::new(
-                    team_name.clone(),
-                    leader_name.clone(),
-                    session_id.clone(),
-                    workspace.root.clone(),
-                    language.clone(),
-                    self.teammate_mode,
-                ),
-            )
-            .await?;
-        let runtime: Arc<dyn MemberRuntime> =
-            Arc::new(HarnessMemberRuntime::new(harness, session_id.clone()));
-        leader_member.attach_runtime(Arc::clone(&runtime));
-
-        let chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>> = Arc::new(Mutex::new(Vec::new()));
-        leader_member.observe(Arc::new(MemberStreamObserver::new(
-            activity.clone(),
-            leader_name.clone(),
-            Arc::clone(&chunk_sinks),
-        )));
-        backend.add_member(Arc::clone(&leader_member));
-
-        insert_teammate_rows(&store, &backend, &spawner, &allocator, &leader_name).await?;
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        messager.subscribe(
-            &leader_name,
-            &[TeamTopic::Team, TeamTopic::Task, TeamTopic::Message],
-            Arc::new(move |event| {
-                let _ = tx.send(event);
-            }),
-        )?;
-
-        let gate = Arc::new(InteractGate::new());
-        let inbox = Arc::new(HumanAgentInbox::new());
-        inbox.set_enabled(self.enable_hitt);
-
-        let card = AgentCard::new(format!("{team_name}_{leader_name}")).with_description(
-            self.team_desc
-                .clone()
-                .unwrap_or_else(|| self.leader.desc_or_default().to_owned()),
-        );
-        let team_runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id(team_name));
-
-        Ok(Arc::new(TeamAgent {
-            inner: Arc::new(TeamAgentInner {
-                blueprint: self.clone(),
-                spec: team_spec,
-                role: TeamRole::Leader,
-                member_name: leader_name,
-                session_id,
-                language,
-                card,
-                leader_member_name: self.leader_member_name().to_owned(),
-                store,
-                backend,
-                member: leader_member,
-                runtime,
-                spawner,
-                gate,
-                activity,
-                inbox,
-                team_runtime,
-                allocator,
-                started: AtomicBool::new(false),
-                cancel: Mutex::new(CancellationToken::new()),
-                chunk_sinks,
-                events: Mutex::new(Some(rx)),
-                steer_batch_size: self.steer_batch_size,
-            }),
-        }))
-    }
-}
-
-/// Resolves the effective language: the dependency override, else the blueprint's declaration.
-fn resolve_language(deps: &TeamBuildDeps, declared: Option<&str>) -> String {
-    let value = deps.language.as_deref().or(declared);
-    Language::resolve(value).to_owned()
-}
-
-/// Builds the persisted team row from the blueprint and its runtime mirror.
-fn team_info(
-    blueprint: &TeamAgentSpec,
-    team_spec: &TeamSpec,
-    leader_name: &str,
-    leader_spec: &DeepAgentSpec,
-) -> TeamInfoRecord {
-    TeamInfoRecord {
-        team_name: team_spec.team_name.clone(),
-        display_name: team_spec.display_name.clone(),
-        leader_member_name: leader_name.to_owned(),
-        desc: blueprint.team_desc.clone().unwrap_or_default(),
-        prompt: leader_spec.system_prompt.clone().unwrap_or_default(),
-        dispatch_mode: blueprint.dispatch_mode,
-        enable_task_verification: blueprint.enable_task_verification,
-        created: 0,
-        updated_at: 0,
-    }
-}
-
-/// Builds the leader's roster row.
-fn leader_record(
-    blueprint: &TeamAgentSpec,
-    leader_name: &str,
-    leader_spec: &DeepAgentSpec,
-    allocator: &ModelAllocator,
-) -> MemberRecord {
-    MemberRecord {
-        display_name: blueprint.leader.display_name.clone(),
-        desc: blueprint.leader.desc_or_default().to_owned(),
-        prompt: leader_spec.system_prompt.clone().unwrap_or_default(),
-        mode: blueprint.teammate_mode,
-        model_ref: allocate_model(allocator, leader_spec.model_name()),
-        ..MemberRecord::new(&blueprint.team_name, leader_name, TeamRole::Leader)
-    }
-}
-
-/// Builds one teammate's roster row from its resolved member spec and blueprint.
-fn teammate_record(
-    spawner: &TeamMemberSpawner,
-    name: &str,
-    allocator: &ModelAllocator,
-) -> MemberRecord {
-    let member_spec = spawner.member_spec(name);
-    let blueprint = spawner.deep_agent_spec(name);
-    let mut record = MemberRecord::new(
-        spawner.team_name(),
-        name,
-        member_spec
-            .as_ref()
-            .map_or(TeamRole::Teammate, |spec| spec.role_type),
-    );
-    record.mode = spawner.spec().teammate_mode;
-    record.model_ref = allocate_model(allocator, requested_model(member_spec.as_ref(), blueprint));
-    if let Some(spec) = &member_spec {
-        record.display_name.clone_from(&spec.base.display_name);
-        record.desc.clone_from(&spec.base.desc);
-        record.prompt.clone_from(&spec.base.prompt);
-    }
-    record
-}
-
-/// Returns the model a member asked for: its member spec first, then its blueprint.
-fn requested_model<'a>(
-    spec: Option<&'a TeamMemberSpec>,
-    blueprint: Option<&'a DeepAgentSpec>,
-) -> Option<&'a str> {
-    spec.and_then(|spec| spec.base.model_name.as_deref())
-        .or_else(|| blueprint.and_then(DeepAgentSpec::model_name))
-}
-
-/// Allocates a model reference, logging (never failing) when the pool cannot answer.
-///
-/// Python parity: the allocation fills `member.model_ref`; the factory's environment resolver owns
-/// the default when the pool is empty and the member names no model.
-fn allocate_model(allocator: &ModelAllocator, model_name: Option<&str>) -> Option<String> {
-    match allocator.allocate(model_name) {
-        Ok(allocation) => Some(allocation.model_name),
-        Err(error) => {
-            debug!(
-                strategy = ?allocator.strategy(),
-                error = %error,
-                "no model reference allocated for the member; the factory resolver owns the default"
-            );
-            None
-        }
-    }
-}
-
-/// Materializes one `unstarted` row per roster teammate.
-async fn insert_teammate_rows(
-    store: &Arc<dyn TeamStore>,
-    backend: &Arc<TeamBackend>,
-    spawner: &Arc<TeamMemberSpawner>,
-    allocator: &ModelAllocator,
-    leader_name: &str,
-) -> Result<()> {
-    for name in spawner.member_names() {
-        if name == leader_name || backend.member(&name).is_some() {
-            continue;
-        }
-        let record = teammate_record(spawner, &name, allocator);
-        store.insert_member(record.clone()).await?;
-        backend.add_member(Arc::new(TeamMember::new(store.clone(), record)));
-    }
-    Ok(())
+    pub(crate) steer_batch_size: usize,
 }
 
 /// Rejects a `create_task` call made by any role but the leader.
@@ -469,59 +180,17 @@ fn ensure_leader_role(role: TeamRole) -> Result<()> {
     }
 }
 
-/// Forwards one member runtime's phases, rounds and chunks into the team.
-struct MemberStreamObserver {
-    /// Leader-side activity projection.
-    activity: Arc<MemberActivityRegistry>,
-    /// Member whose observations this instance carries.
-    member_name: String,
-    /// Chunk fan-out of the handle that registered this observer.
-    chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
-}
-
-impl MemberStreamObserver {
-    /// Builds the observer for `member_name`.
-    fn new(
-        activity: Arc<MemberActivityRegistry>,
-        member_name: String,
-        chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
-    ) -> Self {
-        Self {
-            activity,
-            member_name,
-            chunk_sinks,
-        }
-    }
-}
-
-impl MemberObserver for MemberStreamObserver {
-    /// Marks the member busy while a round runs and idle otherwise.
-    fn on_state(&self, state: HarnessState) {
-        match state {
-            HarnessState::Running | HarnessState::Pausing => {
-                self.activity.mark_busy(&self.member_name);
-            }
-            _ => self.activity.mark_idle(&self.member_name),
-        }
-    }
-
-    /// Logs the round outcome; status transitions are the lifecycle machine's job.
-    fn on_round(&self, outcome: RoundOutcome) {
-        debug!(
-            member = %self.member_name,
-            outcome = ?outcome,
-            "member round outcome"
-        );
-    }
-
-    /// Fans one chunk out to every live subscriber, dropping dead ones.
-    fn on_chunk(&self, chunk: Value) {
-        let mut sinks = self.chunk_sinks.lock();
-        sinks.retain(|sink| sink.send(chunk.clone()).is_ok());
-    }
-}
-
 impl TeamAgent {
+    /// Assembles a handle from its parts; [`super::build`] is the only caller.
+    ///
+    /// Keeping the constructor here leaves the inner fields crate-visible without adding a second
+    /// public way to build a team.
+    pub(crate) fn assemble(inner: TeamAgentInner) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
     /// Returns this member's card, named `<team>_<member>`.
     #[must_use]
     pub fn card(&self) -> &AgentCard {
