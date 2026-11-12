@@ -3,7 +3,8 @@
 //! The dependency arrow points `openjiuwen-agent-evolving -> openjiuwen-harness`,
 //! never the other way: the harness only knows the
 //! [`openjiuwen_harness::EvolutionRail`] seam and its
-//! [`evolution_adapter`], and this crate is the upper layer that implements it.
+//! [`evolution_adapter`](openjiuwen_harness::rails::evolution_adapter), and this
+//! crate is the upper layer that implements it.
 //! Keeping the translation here means the harness stays free of evolution types,
 //! while a harness run can still report what happened to any
 //! [`EvolutionObserver`] — a metrics sink, an experience store, or a test
