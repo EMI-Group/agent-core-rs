@@ -271,7 +271,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - Every module is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context`, `output`, `interrupt`, `registry`, `components/`, `engine/`, and `workflow`.
 - `src/workflow.rs` exposes `Workflow` (builder + `build`/`invoke`/`invoke_with`/`resume`/`stream`/`stream_with`/`to_mermaid`) and `ComponentOptions`; both are re-exported from the crate root.
 - `stream`/`stream_with` deliver a build error as the stream's single `Err` item instead of returning it.
-- Integration tests exist for `common/mod.rs` (shared fakes), `linear.rs`, `references.rs`, and `card_spec.rs`; the remaining suites listed under Test Strategy are not written yet.
+- Every suite listed under Test Strategy exists in `./tests/`; `tests/common/mod.rs` provides the shared fakes (`session`, `session_with_checkpointer`, `EchoComponent`, `FixedComponent`, `CounterComponent`, `StreamingProducer`, `TransformProducer`, `CollectorComponent`, `InteractingComponent`, `FailingComponent`, `WaitOnCancellationComponent`, `b_of_a_tool`, `llm_component`, `end_with_template`).
 - The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
 - The crate root re-exports every public item, so downstream code (and the engine) can reach them as `crate::{Component, ComponentContext, ...}`.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
@@ -283,6 +283,10 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 
 - Deferred components: `SubWorkflowComponent`, `QuestionerComponent`, `IntentDetectionComponent`, `ReActAgentComp`, `HTTPRequestComponent`, and the Python streaming actor network (live interleaving of concurrent producers).
 - Deferred semantics: Python's `wait_for_all=False` first-arrival fan-in, `draw()` PNG/SVG rendering, per-run `async` graph mutation, `WORKFLOW_DRAWABLE` gating.
+- Alternative branch targets that merge into one node do not work as in Python: fan-in is CNF, so a node with edges from `a` and `b` waits for both and never runs when only one branch is taken; wire each alternative path to its own successor instead.
+- `outputs_schema` resolves against workflow state plus the node's own id and an `output` key (`${<id>.field}` / `${output.field}`); there is no `self` shorthand, and a bare `${field}` resolves to `null`.
+- A loop missing its bound parameter reports `[101040]` at invoke time rather than Python's build-time `[101030]` (the builder-time check lives in the registry config parser).
+- `ComponentOptions::streaming()` declares `[Invoke, Stream]` (plus `Transform` when a stream input schema is set), so it cannot be used on a component that implements only `Stream`, and a streaming end is not a valid `add_stream_connection` target unless it declares `Transform`.
 - Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, and memory components return `memories`/record results instead of Python's fragment/summary split.
 - LLM `response_format` instruction injection and `enable_history` history insertion are carried in config but not applied.
 - Unknown-component ids and capability mismatches are reported as one compile error rather than Python's split between build-time and run-start checks.
