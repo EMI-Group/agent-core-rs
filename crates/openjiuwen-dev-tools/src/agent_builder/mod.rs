@@ -11,14 +11,25 @@
 //! - `workflow_dsl` — the serialized workflow document ([`WorkflowDsl`]) and its
 //!   structural validation.
 //! - `history` — the bounded builder dialogue history ([`HistoryManager`]).
-//! - `spec`, `bridge`, and `builder` are added in a later step.
+//! - `spec` — programmatic agent and workflow specifications
+//!   ([`LlmAgentSpec`], [`WorkflowSpec`]) that convert into the DSL.
+//! - `bridge` — the DSL-to-kernel bridge ([`AgentCard`], [`LlmAgentConfig`], and
+//!   [`LlmAgent`]) implemented as inherent methods on [`LlmAgentDsl`].
+//! - `builder` is added in a later step.
+//!
+//! [`AgentCard`]: openjiuwen_agent::AgentCard
+//! [`LlmAgentConfig`]: openjiuwen_agent::LlmAgentConfig
+//! [`LlmAgent`]: openjiuwen_agent::LlmAgent
 
+pub mod bridge;
 pub mod dsl;
 pub mod history;
+pub mod spec;
 pub mod workflow_dsl;
 
 pub use dsl::{
     DslConfigs, DslDependencies, DslModel, DslModelInfo, LlmAgentDsl, PluginRef, WorkflowRef,
 };
 pub use history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
+pub use spec::{LlmAgentSpec, WorkflowSpec};
 pub use workflow_dsl::{DslEdge, DslNode, WorkflowDsl};
