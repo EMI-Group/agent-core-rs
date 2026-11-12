@@ -323,8 +323,8 @@ let model = ScriptedModel::builder()
 - The builder's `script` replaces the queued script while `item` appends, so `.script([a, b]).item(c)` serves `a`, `b`, `c`; the fallback is served only when the queue is empty.
 - `src/internal.rs` holds the three helpers both fakes need (`lock`, `FUNCTION_KIND`, `DEFAULT_FALLBACK_TEXT`), so the Python-parity fallback string exists once; the module is private and carries no public API.
 - `wiremock` is re-exported rather than wrapped: wrapping it would duplicate a mature mock server and couple us to its version.
-- Session factory helpers are deliberately omitted: `openjiuwen-session` is still a stub with no `Session` implementation, so there is nothing to construct.
-  When it lands, add `src/fixtures/session.rs` with `workflow_session()` / `agent_session()` helpers mirroring Python `create_agent_session`, and re-export them from `fixtures` and `lib.rs`.
+- Session factory helpers are deliberately omitted: tests construct `AgentSession::new(id)` / `WorkflowSession::new(id)` (or `with_options`) from `openjiuwen-session` and coerce to `Arc<dyn Session>` locally; see `openjiuwen-workflow/tests/common/mod.rs::session`.
+  Adding `src/fixtures/session.rs` with `workflow_session()` / `agent_session()` helpers mirroring Python `create_agent_session` is optional convenience, not a blocked dependency.
 - `EnvGuard` is reentrant on one thread (nesting allowed) but serializes across threads/parallel tests through one process-global lock; guards are `!Send` so they stay on the test's runtime thread.
 - Modules are public for navigable rustdoc and for path-stable `use` statements; the crate root also glob-re-exports them so tests can import flat.
 
