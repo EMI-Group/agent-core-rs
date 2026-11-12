@@ -18,6 +18,7 @@ pub mod interrupt;
 pub mod output;
 pub mod reference;
 pub mod registry;
+pub mod workflow;
 
 /// Returns the crate name.
 #[must_use]
@@ -80,3 +81,4 @@ pub use reference::{
     extract_origin_key, is_ref_path, project, resolve_path, resolve_schema, split_path, PathSegment,
 };
 pub use registry::{ComponentFactory, ComponentRegistry};
+pub use workflow::{ComponentOptions, Workflow};
