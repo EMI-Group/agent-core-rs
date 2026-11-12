@@ -192,6 +192,12 @@ impl LexicalIndex {
 pub struct LexicalHit { pub qualified_id: String, pub score: f32, pub matched_terms: Vec<String> }
 pub fn tokenize(text: &str) -> Vec<String>;
 
+pub fn search_descriptors(descriptors: &[CapabilityDescriptor], request: &SearchRequest) -> Result<Vec<SearchHit>>; // filter -> rank -> min_score -> top_k; `CapabilityRegistry::search` delegates here after dropping its lock
+pub const DEFAULT_TOP_K: usize;                     // 10
+pub const CAPABILITY_TYPE_FIELD: &str;              // "capability_type" (semantic metadata key)
+pub const CAPABILITY_ID_FIELD: &str;                // "capability_id"
+pub const DESCRIPTOR_FIELD: &str;                   // "descriptor" (full descriptor JSON)
+
 pub struct SemanticIndex { /* Arc<dyn Embedding> + InMemoryVectorStore */ }
 impl SemanticIndex {
     pub fn new(embedding: Arc<dyn Embedding>) -> Self;
@@ -509,6 +515,8 @@ Each stub documents the Python class it mirrors and the reason it is deferred.
 ## Design Decisions
 
 - **A real registry exists in Rust.** Python inverts discovery to the host (`CapabilityProvider` protocol) and has no registry type; the objective requires CRUD/search, so `CapabilityRegistry` is the host-side provider plus a write-through [`AssetStore`]. It also satisfies `CapabilityProvider`-shaped access via `list`/`get`.
+- **`CapabilityDescriptor::available` defaults to `true`** (Python parity: `available: bool = True` in `models/capability.py`), and the planner's start set filters on it, so a capability is plannable unless it is explicitly withdrawn with `with_available(false)`.
+- **`top_k == 0` means unlimited** in search requests, a Rust-only sentinel; Python clamps every retrieval `top_k` to `max(1, ...)` and has no unlimited mode. The sentinel is explicit in [`SearchRequest`] and `SemanticIndex::search`.
 - **Keyword search instead of LLM tree traversal for the default path.** Python's `retrieval.Retriever` is LLM-guided progressive tree disclosure (no vectors). BM25 is deterministic, offline, and covers the same selection job for a capability catalog; the LLM retriever keeps its API shape in [`deferred`].
 - **Semantic search uses embeddings**, via `openjiuwen_retrieval::{Embedding, InMemoryVectorStore}` (with `HashEmbedding` for deterministic tests). This is additive: Python symphony has no embedding path, and the search result type is shared with keyword search.
 - **Deterministic scoring replaces LLM semantic scoring.** `SemanticScorer` is the seam; `LexicalSemanticScorer` (query-term coverage) is the default, so planning is reproducible offline. An LLM-backed scorer is a drop-in implementation of the same trait and is deferred.
