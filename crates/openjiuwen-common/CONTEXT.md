@@ -26,6 +26,7 @@ No panics on user input: all fallible paths return `Result`.
 `CardBase` implements `Card`, `Default`, `JsonSchema`, `PartialEq`.
 `pub struct CardId(String)` is a transparent serde/schemars newtype with `Display`, `From<&str>`, `From<String>`, `as_str()`, `CardId::generate()` (Python `uuid4().hex`, 32 lowercase hex chars), and `Default` = generated.
 Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared fields; round-trips through `serde_json` and rejects no unknown keys.
+`AgentCard` and the other concrete cards are NOT defined here: `AgentCard` lives in `openjiuwen-agent` (`src/card.rs`) and embeds its fields directly instead of flattening `CardBase`.
 `card_schema::<C: Card>() -> Result<Value>` and `card_base_schema() -> Result<Value>` emit deterministic JSON Schemas (generated-id defaults stripped).
 
 ### `logging` — `crate::logging`
