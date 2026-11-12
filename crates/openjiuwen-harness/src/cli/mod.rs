@@ -192,6 +192,11 @@ pub fn stdin_is_tty() -> bool {
 /// directory is created only once a command is going to run, so `--help` and
 /// parse errors never touch the disk.
 ///
+/// The one-shot `run` uses [`CliIo::stdio_non_interactive`], so permission
+/// prompts fail closed; the REPL builds one [`CliIo::stdio`] handle, gives it to
+/// the agent (permission host) and reuses it for rendering through
+/// [`Repl::with_io_and_signals`].
+///
 /// # Errors
 ///
 /// Returns [`Error::Config`](openjiuwen_common::error::Error::Config) when the
@@ -204,7 +209,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     match dispatch {
         Dispatch::Run(args) => {
             options.ensure_workspace()?;
-            let io = CliIo::stdio();
+            let io = CliIo::stdio_non_interactive();
             run::run_once(&options, &args, &io).await.map(|_| ())
         }
         Dispatch::Chat => {
@@ -212,7 +217,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let io = CliIo::stdio();
             let model = options.build_model().await?;
             let agent = run::build_agent(model, &options, &io).await?;
-            Repl::new(agent, options).run().await
+            Repl::with_io_and_signals(agent, options, io).run().await
         }
     }
 }

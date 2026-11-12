@@ -100,6 +100,19 @@ impl CliIo {
         }
     }
 
+    /// Builds the non-interactive stdio handle used by the one-shot `run` command.
+    ///
+    /// Reads stdin and writes stdout, but reports `is_interactive() == false`, so
+    /// permission prompts fail closed exactly like Python's non-interactive `run`
+    /// (no prompt is printed, the tool call is rejected).
+    #[must_use]
+    pub fn stdio_non_interactive() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new((Box::new(StdioReader), Box::new(StdoutWriter)))),
+            interactive: false,
+        }
+    }
+
     /// Writes `prompt`, flushes it, then reads and trims one line.
     ///
     /// Returns `Ok(None)` at end of input.

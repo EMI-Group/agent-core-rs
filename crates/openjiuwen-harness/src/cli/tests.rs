@@ -167,6 +167,15 @@ async fn build_repl(options: &CliOptions, inputs: &[&str]) -> (Repl, Arc<Mutex<S
     (Repl::with_io(agent, options.clone(), io), buffer)
 }
 
+// --- IO handles -----------------------------------------------------------
+
+#[test]
+fn stdio_handle_interactivity_flags() {
+    // Constructing a stdio handle performs no IO; only the flags are observed.
+    assert!(!CliIo::stdio_non_interactive().is_interactive());
+    assert!(CliIo::stdio().is_interactive());
+}
+
 // --- clap parsing ---------------------------------------------------------
 
 #[test]

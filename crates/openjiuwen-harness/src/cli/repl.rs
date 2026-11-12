@@ -154,10 +154,22 @@ impl Repl {
     /// Builds the terminal-backed REPL (the binary path).
     ///
     /// The session is new and the Ctrl-C watcher is enabled; use
-    /// [`Repl::with_io`] to drive a scripted terminal instead.
+    /// [`Repl::with_io_and_signals`] to share one stdio handle between the
+    /// renderer and the permission host, or [`Repl::with_io`] to drive a
+    /// scripted terminal instead.
     #[must_use]
     pub fn new(agent: Arc<DeepAgent>, options: CliOptions) -> Self {
-        Self::build(agent, options, CliIo::stdio(), true)
+        Self::with_io_and_signals(agent, options, CliIo::stdio())
+    }
+
+    /// Builds the terminal-backed REPL over an existing stdio handle, with the
+    /// Ctrl-C watcher enabled (the binary path).
+    ///
+    /// The caller passes the same [`CliIo`] handle it gave the agent, so the
+    /// renderer and the agent's permission host share one terminal.
+    #[must_use]
+    pub fn with_io_and_signals(agent: Arc<DeepAgent>, options: CliOptions, io: CliIo) -> Self {
+        Self::build(agent, options, io, true)
     }
 
     /// Builds a REPL over an injected terminal, without a signal watcher.
