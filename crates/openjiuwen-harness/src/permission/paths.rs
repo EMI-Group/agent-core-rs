@@ -29,6 +29,8 @@
 //! Every function is pure, never panics and never returns an error: an unparseable
 //! token simply yields no access.
 
+// Size note: ~800 lines of implementation plus an inline test module; the tests stay here so the module contract and its verification live together.
+
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
