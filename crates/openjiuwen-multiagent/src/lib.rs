@@ -23,3 +23,7 @@ pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};
 pub use runtime::{RuntimeConfig, TeamRuntime};
 pub use strategy::{MemberOptions, StrategyContext, TeamStrategy};
 pub use subscription::{topic_matches, SubscriptionManager};
+
+mod session;
+
+pub use session::{make_team_session, team_stream, SessionLease};
