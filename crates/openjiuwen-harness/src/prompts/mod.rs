@@ -23,11 +23,11 @@
 //!
 //! Module layout:
 //!
-//! - [`builder`] — [`PromptSection`], [`PromptCategory`], [`SectionName`], [`HarnessPromptBuilder`]
-//! - [`sections`] — one factory per standard section, all bilingual
-//! - [`tool_descriptions`] — the bilingual tool description table and [`build_tool_card`]
-//! - [`report`] — [`PromptReport`] size/token accounting
-//! - [`sanitize`] — [`sanitize_path`] and [`sanitize_user_content`]
+//! - `builder` — [`PromptSection`], [`PromptCategory`], [`SectionName`], [`HarnessPromptBuilder`]
+//! - `sections` — one factory per standard section, all bilingual
+//! - `tool_descriptions` — the bilingual tool description table and [`build_tool_card`]
+//! - `report` — [`PromptReport`] size/token accounting
+//! - `sanitize` — [`sanitize_path`] and [`sanitize_user_content`]
 
 mod builder;
 mod report;
