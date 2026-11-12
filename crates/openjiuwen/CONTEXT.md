@@ -69,11 +69,21 @@ The default build needs no network and no external service: every feature above 
 ## Constraints
 
 - Re-exports only: no logic, no new public data types, no `unsafe` (`#![forbid(unsafe_code)]`); the `thiserror`/`serde` stack is not a dependency of this crate.
-- `publish = false` until the SDK API stabilizes, and no Sibling or `docs/` edits are made from here.
+- `publish = false` until the SDK API stabilizes; sibling crates and `docs/` are never edited from here.
 - Feature names in this crate map to existing sibling features; adding a feature requires verifying the sibling's feature name first and keeping the default build offline.
 - Python package spelling (`harness_protocol`, `agent_teams`, `sys_operation`) is mirrored even where it repeats the crate suffix, so `clippy::module_name_repetitions` is allowed crate-wide.
 - The crate-level doc example is the "getting started" block: it must compile as a doctest and touch no network.
 - Concrete crates are canonical: documentation lives there; this file documents only the facade.
+
+## Notes for Agents
+
+- `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
+- Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
+- The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
+
+## Known Issues
+
+- `cargo clippy -p openjiuwen --all-targets -- -D warnings` also lints path dependencies in this workspace and currently fails on pre-existing `clippy::must_use_candidate` errors in sibling `crate_name` functions (`openjiuwen-auto-harness`, `openjiuwen-memory`, `openjiuwen-e2e`, `openjiuwen-examples`), so the definition of done is run with `--no-deps` until those siblings add `#[must_use]`.
 
 ## Routing Table
 
@@ -87,4 +97,4 @@ The default build needs no network and no external service: every feature above 
 - `tests/module_paths.rs` asserts `TypeId` identity (and `std::ptr::eq` for functions) between each alias and the concrete crate, so a mis-pointed alias fails loudly; `a2a` and `otel` items are behind `#[cfg(feature = ...)]`.
 - The crate-level getting-started example is the doctest that guards the primary public paths (`cargo test -p openjiuwen`).
 - No unit tests: the facade has no behavior; behavior is tested in the concrete crates.
-- Definition of done: `cargo fmt -p openjiuwen`, `cargo test -p openjiuwen`, `cargo test -p openjiuwen --features otel,a2a`, `cargo clippy -p openjiuwen --all-targets -- -D warnings` all clean.
+- Definition of done: `cargo fmt -p openjiuwen`, `cargo test -p openjiuwen`, `cargo test -p openjiuwen --features otel,a2a`, and `cargo clippy -p openjiuwen --all-targets -- -D warnings` all clean (add `--no-deps` while the sibling `crate_name` lint in `## Known Issues` is open).
