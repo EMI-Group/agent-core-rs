@@ -31,16 +31,18 @@ Deliberately not ported: the research drops `examples/MANGO/` and `examples/PerS
 `src/support/` (library, unit-tested, no dev-only dependencies):
 
 - `support::setup() -> Result<RunMode>` — loads `.env` when present, installs stderr `tracing`, prints the run mode banner, returns the mode.
-- `support::mode::{RunMode, detect, detect_with}` — `RunMode::{Offline, Live}`; live requires `OPENJIUWEN_LIVE` truthy **and** a model name **and** a credential, otherwise it degrades to offline with a warning and never panics.
+- `support::mode::{RunMode, Evaluation, detect, detect_with}` — `RunMode::{Offline, Live { provider, model }}`; live requires `OPENJIUWEN_LIVE` (`LIVE_FLAG`) truthy **and** a model name **and** a credential, otherwise `Evaluation::missing` names the absent variables and the mode degrades to offline — never panics.
 - `support::logging::init()` — idempotent stderr subscriber honoring `OPENJIUWEN_LOG_LEVEL`.
-- `support::banner::{title, note, answer}` — the only stdout narrative helpers; stdout stays clean of logs.
+- `support::banner::{title, step, note, answer}` — the only stdout narrative helpers; stdout stays clean of logs.
 
-`examples/common/mod.rs` (example-only helpers, may use dev-dependencies):
+`examples/common/mod.rs` (example-only helpers, may use dev-dependencies, reached with `mod common;`):
 
-- `scripted_text`, `scripted_tool_round`, `scripted(turns)` — build `Arc<dyn Model>` scripted fakes.
-- `mock_server(responses)` — start a loopback `MockLlmServer` for examples that must exercise the real HTTP path.
-- `live_model()` — `init_model` from environment, used only on the live branch.
-- `temp_workspace()` — a `TempDir` the example must keep alive for its whole run.
+- `setup() -> anyhow::Result<RunMode>` — the `anyhow`-flavored wrapper every example calls first.
+- `scripted(answer)`, `scripted_tool_round(tool, args, answer)`, `arc_model(ScriptedModel)` — build `Arc<dyn Model>` scripted fakes.
+- `mock_server(items)` + `text_response(text)` — start a loopback `MockLlmServer` for examples that must exercise the real HTTP path.
+- `live_model()` — async `init_model` from environment, used only on the live branch.
+- `tempdir()` — a `TempDir` the example must keep alive for its whole run.
+- `skip(reason, hint)` — prints why an optional path is off and returns `Ok(())` for a clean exit 0.
 
 ## Constraints
 
