@@ -30,6 +30,8 @@
 //! # Tracer integration
 //!
 //! ```
+//! # #[cfg(feature = "otel")]
+//! # {
 //! use std::sync::Arc;
 //!
 //! use openjiuwen_core::session::tracer::{InvokeType, TraceSink, Tracer};
@@ -49,11 +51,11 @@
 //! span.finish(serde_json::json!({"content": "hello"}));
 //! handle.force_flush();
 //!
-//! if let Some(exporter) = handle.capture() {
-//!     // The session tracer emits one terminal frame per span; the sink opens the
-//!     // OTel span from that frame, so a finished span is still exported.
-//!     assert_eq!(exporter.names(), vec!["chat Model".to_owned()]);
-//! }
+//! // The session tracer emits one terminal frame per span; the sink opens the
+//! // OTel span from that frame, so a finished span is still exported.
+//! let exporter = handle.capture().expect("the memory exporter is attached");
+//! assert_eq!(exporter.names(), vec!["chat Model".to_owned()]);
+//! # }
 //! ```
 //!
 //! [`TraceSink`]: openjiuwen_core::session::tracer::TraceSink
