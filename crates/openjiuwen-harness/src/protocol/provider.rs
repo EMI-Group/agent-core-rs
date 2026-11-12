@@ -392,10 +392,14 @@ mod tests {
     fn the_create_mapping_is_validated_and_folded() {
         let config = NativeCreateConfig::parse(&mapping(serde_json::json!({
             "model": "gpt-4o",
+            "provider": "openai",
+            "api_key": "test-key",
+            "api_base": "https://example.invalid/v1",
             "temperature": 0.5,
             "workspace": "work",
             "enable_task_loop": true,
             "max_iterations": 3,
+            "system_prompt": "You are a test agent.",
             "permissions": {"enabled": true},
             "language": "en",
         })))
@@ -404,6 +408,20 @@ mod tests {
         let request = config.model_config.expect("a request config is built");
         assert_eq!(request.model_name, "gpt-4o");
         assert_eq!(request.temperature, Some(0.5));
+        assert_eq!(config.model_provider.as_deref(), Some("openai"));
+        // The credential is compared without ever being formatted into an assertion message.
+        assert!(config
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.expose_secret() == "test-key"));
+        assert_eq!(
+            config.api_base.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("You are a test agent.")
+        );
         assert_eq!(config.workspace.root_path, PathBuf::from("work"));
         assert_eq!(config.cwd, Some(PathBuf::from("work")));
         assert!(config.enable_task_loop);
