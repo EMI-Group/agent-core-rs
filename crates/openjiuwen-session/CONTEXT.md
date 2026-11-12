@@ -287,6 +287,8 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 
 ## Notes for Agents
 
+- `openjiuwen::core::session` is this crate's root (`openjiuwen_core/src/lib.rs` does `pub use openjiuwen_session as session;`), so every `lib.rs` crate-root `pub use` is reachable as `openjiuwen::core::session::X`; the inner `session` module still exists at `openjiuwen::core::session::session::{Session, SessionType, SessionMetadata, SessionSnapshot}`.
+- Checkpointer types are reachable both as `openjiuwen::core::session::{Checkpointer, Checkpoint, CheckpointMeta, CheckpointerConfig, CheckpointerKind, create_checkpointer, MemoryCheckpointer, FileCheckpointer, build_key, build_key_with_namespace}` (crate-root re-exports, `src/lib.rs:69-74`) and nested at `openjiuwen::core::session::checkpoint::*`.
 - `graph`/`workflow` should take `Arc<WorkflowState>` from `WorkflowSession::state()` for the io/workflow lanes and staging; the `Session` trait intentionally exposes only global + component state.
 - `AgentSession` is a state/stream/trace container only: it stores no conversation history or message list, and this crate has no `AgentStreamMode`, `StreamData`, or agent-chunk type — agent crates push chunks as `StreamItem::output`/`output_at`/`custom` frames.
 - `AgentSessionOptions` has no `config` field: a fresh session gets `SessionConfig::new()` (env-seeded, then `options.envs` applied) or inherits the parent's config; afterwards it is mutable only through `Session::config()` (`Arc<parking_lot::RwLock<SessionConfig>>`).
@@ -294,6 +296,8 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - Use `StreamWriterManager::write_now` (and `StreamHub::send_now`) from synchronous code such as trace sinks and callbacks; use `write`/`send` in async code. Both are non-blocking.
 - `request_interaction` only completes when another task calls `resolve_interaction` (normally the host transport reading `__interaction__` frames); seeded `InteractiveInput::interrupt_answers` short-circuit it on resume.
 - Facades above own the `Arc<dyn Checkpointer>` and inject it through the options structs; there is no process-global default checkpointer.
+- `save_checkpoint`/`resume`/`get_state`/`update_state` are `Session` trait methods, so calling them on an `AgentSession` requires importing the trait (`use openjiuwen::core::session::{AgentSession, Session};`); only `new`/`with_options`/`state`/`commit`/`post_run` are inherent.
+- `FileCheckpointer::new(root)` is infallible and creates the directory lazily on the first save; a memory and a file backend passed to two sessions must be the *same* instance (or same root) to resume across sessions.
 - `Session::trace()` on a concrete session returns its `StreamTraceSink` (the checkpointed trace position); to record spans in a test install a `MemoryTraceSink` with `session.tracer().expect("tracer").set_sink(sink.clone())` — `set_sink` affects only spans started afterwards and does not change `trace()` or its position, and `WorkflowSessionOptions` has no sink field.
 - Interaction vocabulary maps to `openjiuwen-harness-protocol` by table only (see the mapping above); this crate must not depend on the protocol crate (layer rule, `docs/ARCHITECTURE.md` §1).
 - `src/tracer.rs` is ~1100 lines because it holds the span model, frame type, three sinks, the tracer, and their inline tests; split it when another sink or span family lands.

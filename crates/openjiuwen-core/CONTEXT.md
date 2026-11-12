@@ -37,6 +37,7 @@ it deliberately does not glob the whole agent crate.
 - Concrete crates must not depend on this umbrella, except the product/harness layers and above; the crate stays acyclic.
 - Item identity is guaranteed: each alias is the same type as the concrete crate's item, verified by `TypeId` in tests.
 - Naming follows the Python tree even where it diverges from the crate name (`context_engine` → `openjiuwen-context`, `sys_operation` → `openjiuwen-sysop`, `multi_agent` → `openjiuwen-multiagent`).
+- Every dependency is taken with default features only: the crate declares just `[features] default = []` and forwards no optional capability (e.g. `openjiuwen-session/sqlite`).
 
 ## Routing Table
 

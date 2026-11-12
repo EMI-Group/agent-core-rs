@@ -5,6 +5,8 @@
 The runnable example set of the Rust rewrite: a curated tour of the SDK that a newcomer can read top to bottom.
 Mirrors the Python reference tree `examples/` (read-only foreign repo), reduced to twelve files that compile, run offline, and each teach one seam of the API.
 Every example is a `cargo example` binary; the crate's library in `./src/` only holds the shared setup helpers the binaries use, so the helpers are unit-testable.
+The twelve files in `./examples/` are currently placeholders (`//! ...` doc line, a `TODO(example)` line, `fn main() {}`); the matrix below describes their intended content, not shipped behavior.
+There is no `tests/` directory: the only tests are the library unit tests under `./src/`.
 All examples are offline-capable: the six kernel examples and the harness examples run against `ScriptedModel` or the loopback `MockLlmServer`, and switch to a real provider only when `OPENJIUWEN_LIVE` and credentials are present.
 
 ## Example Matrix
@@ -73,6 +75,7 @@ Deliberately not ported: the research drops `examples/MANGO/` and `examples/PerS
 ## Notes for Agents
 
 - Offline recipe: scripted model → `ScriptedModel`; real wire path → `MockLlmServer` with `client_config()`/`request_config()`; workspace → `tempfile::TempDir`.
+- Session/checkpoint seam lives in `openjiuwen::core::session`: `AgentSession::new(id)` (no checkpointer, `save_checkpoint` fails with `ErrorKind::Session`) or `AgentSession::with_options(AgentSessionOptions { session_id, checkpointer: Some(Arc::clone(&store) as Arc<dyn Checkpointer>), ..Default::default() })`; `use openjiuwen::core::session::{Checkpointer, Session}` for the trait methods `save_checkpoint(Some(id))`, `resume(id)` (returns `Ok(false)` when absent), `checkpointer()`; two same-id sessions sharing one `Arc<dyn Checkpointer>` (e.g. `MemoryCheckpointer::new()` or `FileCheckpointer::new(dir)`) are how resume is demonstrated.
 - API gaps this set works around (do not "fix" them inside an example): `create_harness` has no fake-model injection, so `09` points `api_base` at a loopback server; `TeamAgentSpec::build()` resolves models from the environment, so `10` injects `NativeMemberFactory` with an `EnvModelResolver` override; there is no in-process MCP server and `FakeMcpClient` is `#[cfg(test)]`-only, so `07` implements a small `McpClient`; there is no `Interrupt` type — an interrupt is `AgentOutput::result_type == Interrupt` and resume is re-invoking the same agent with the same session and an interactive payload; `openjiuwen::prelude` omits `ReActAgent`/configs, so examples import from `openjiuwen::core::single_agent`.
 - `openjiuwen-foundation` compiles MCP unconditionally, so the crate's `mcp` feature is a documented marker; `a2a` is a real passthrough and gates example 11.
 - Adding an example means: a `[[example]]` entry in `Cargo.toml`, a row in the matrix above and in `README.md`, and a shared helper rather than duplicated setup code.
