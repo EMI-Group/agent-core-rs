@@ -447,6 +447,8 @@ async fn run_inner(
         if let Some(output) = ctx.take_force_finish() {
             return Ok(with_progress(output, used, &observations));
         }
+        // Capture the possibly rail-mutated window before the retry loop clears `ctx.messages`.
+        let messages = ctx.messages.clone();
         let mut model = ctx
             .model_override
             .take()
@@ -458,8 +460,7 @@ async fn run_inner(
         let reply = loop {
             attempt += 1;
             let mut sink = DeltaSink::new(publisher, Some(session));
-            match call_model_streaming(&model, &prepared.messages, request.clone(), &mut sink).await
-            {
+            match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
                 Ok(reply) => break reply,
                 Err(error) => {
                     reset_ctx(ctx, RailEvent::OnModelException);
