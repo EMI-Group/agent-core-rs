@@ -64,6 +64,8 @@ static GLOBAL: OnceLock<RwLock<Option<Arc<Runner>>>> = OnceLock::new();
 /// # Ok(())
 /// # }
 /// ```
+// `runner_id` mirrors Python's public attribute name.
+#[allow(clippy::struct_field_names)]
 pub struct Runner {
     /// The instance identity, fixed at construction (`RunnerConfig::runner_id`).
     runner_id: Box<str>,
@@ -194,7 +196,7 @@ impl Runner {
                 requested = %config.runner_id,
                 "ignoring runner_id in set_config; the instance id is fixed"
             );
-            config.runner_id = self.runner_id().to_owned();
+            self.runner_id().clone_into(&mut config.runner_id);
         }
         *self.config.write() = config;
         tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner config updated");
@@ -289,19 +291,16 @@ impl Runner {
         let timeout = self.config().shutdown_timeout();
         let stopped = if timeout.is_zero() {
             queue.stop().await
+        } else if let Ok(result) = tokio::time::timeout(timeout, queue.stop()).await {
+            result
         } else {
-            match tokio::time::timeout(timeout, queue.stop()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        runner_id = %self.runner_id,
-                        timeout_ms = timeout.as_millis(),
-                        "message queue did not stop within the shutdown grace period"
-                    );
-                    Ok(())
-                }
-            }
+            tracing::warn!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id,
+                timeout_ms = timeout.as_millis(),
+                "message queue did not stop within the shutdown grace period"
+            );
+            Ok(())
         };
         *self.checkpointer.write() = None;
         self.resources.release();
@@ -318,17 +317,16 @@ impl Runner {
     ///
     /// Returns the checkpointer's error when the release fails.
     pub async fn release(&self, session_id: &str) -> Result<()> {
-        match self.checkpointer() {
-            Some(checkpointer) => checkpointer.release(session_id).await,
-            None => {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    runner_id = %self.runner_id,
-                    session_id,
-                    "release without a checkpointer is a no-op"
-                );
-                Ok(())
-            }
+        if let Some(checkpointer) = self.checkpointer() {
+            checkpointer.release(session_id).await
+        } else {
+            tracing::debug!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id,
+                session_id,
+                "release without a checkpointer is a no-op"
+            );
+            Ok(())
         }
     }
 
@@ -438,7 +436,7 @@ impl Runner {
         }
         *self.guardrails.write() = Some(Arc::clone(&pipeline));
         let ids = bind_guardrails(&self.callbacks, pipeline);
-        *self.guardrail_ids.write() = ids.clone();
+        self.guardrail_ids.write().clone_from(&ids);
         ids
     }
 
