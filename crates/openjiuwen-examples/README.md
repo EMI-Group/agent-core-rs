@@ -73,9 +73,8 @@ one's stdout is deterministic so runs can be diffed.
 - **07** runs against a local `McpClient`; set `OPENJIUWEN_MCP_SERVER_CMD="<program> [args]"`
   to point it at a real stdio MCP server instead. A server that fails to answer is
   reported as a note (bounded by a timeout) and the example still exits 0.
-- **10** wraps its model resolver so the resolved model name reaches the member's
-  config. That is a workaround for a defect in `openjiuwen-agent-teams`
-  (`NativeMemberFactory` does not propagate the name); once it is fixed in that
-  crate the wrapper here can go.
+- **10** injects `NativeMemberFactory` with an `EnvModelResolver` pointed at the loopback
+  server; the factory copies the resolved model's name and provider onto the member's
+  `DeepAgentConfig`, so no wrapper model is needed.
 - **11** logs the ephemeral loopback port to stderr, so its stdout stays stable
   across runs.

@@ -27,8 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use openjiuwen::core::foundation::Model;
-use openjiuwen::core::single_agent::{Agent, AgentCard, ReActAgent, ReActAgentConfig, ResultType};
+use openjiuwen::prelude::{Agent, AgentCard, Model, ReActAgent, ReActAgentConfig, ResultType};
 use serde_json::json;
 
 /// Model name written into the agent config (the live model comes from the env).

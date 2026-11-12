@@ -34,12 +34,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use openjiuwen::core::foundation::Model;
-use openjiuwen::core::session::{AgentSession, Session};
-use openjiuwen::core::single_agent::{Agent, AgentCard, ResultType};
-use openjiuwen::harness::agent::{DeepAgent, DeepAgentBuilder};
-use openjiuwen::harness::schema::DeepAgentConfig;
 use openjiuwen::harness::workspace::Workspace;
+use openjiuwen::prelude::{
+    Agent, AgentCard, AgentSession, DeepAgent, DeepAgentBuilder, DeepAgentConfig, Model,
+    ResultType, Session,
+};
 use openjiuwen_test_support::{MockCompletion, ScriptedModel};
 use serde_json::json;
 

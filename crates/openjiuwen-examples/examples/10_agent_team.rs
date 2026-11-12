@@ -12,11 +12,9 @@
 //! of a provider. The run therefore makes real OpenAI-compatible HTTP calls, but only to the
 //! mock, and a placeholder API key is used (it is never printed).
 //!
-//! One workaround worth naming: `NativeMemberFactory` hands the resolved model to the
-//! `DeepAgent` builder but does not copy the model name into the `DeepAgentConfig`, so the kernel
-//! sends chat requests with an empty `model_name` and the provider client rejects them. This
-//! example's resolver therefore wraps the client in [`NamedModel`], which supplies the name the
-//! kernel left blank. Remove the wrapper once the factory propagates the resolved name.
+//! `NativeMemberFactory` copies the resolved model's name and provider onto the member's
+//! `DeepAgentConfig`, so the kernel's chat requests carry the model name without any wrapper; the
+//! resolver only supplies the client (`api_base`/`api_key`).
 //!
 //! The leader blueprint sets `enable_task_loop: false`, a deviation from the Python default of
 //! `true`: the member then runs exactly one `ReAct` turn instead of the task-loop protocol, so a
@@ -40,11 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use futures::stream::BoxStream;
-use openjiuwen::agent_teams::harness::native::{
-    EnvModelResolver, ModelResolver, NativeMemberFactory,
-};
+use openjiuwen::agent_teams::harness::native::{EnvModelResolver, NativeMemberFactory};
 use openjiuwen::agent_teams::harness::MemberHarnessFactory;
 use openjiuwen::agent_teams::runtime::{TeamBuildDeps, TeamRuntimeManager};
 use openjiuwen::agent_teams::schema::{
@@ -53,9 +47,6 @@ use openjiuwen::agent_teams::schema::{
 use openjiuwen::agent_teams::workspace::{
     LocalWorkspaceProvider, MemberWorkspaceLayout, WorkspaceProvider,
 };
-use openjiuwen::core::common::error::Result as SdkResult;
-use openjiuwen::core::foundation::llm::{ChatResponse, Model, ModelRequestConfig, StreamChunk};
-use openjiuwen::core::foundation::BaseMessage;
 use openjiuwen::core::single_agent::{AgentCard, ResultType};
 use serde_json::json;
 
@@ -90,78 +81,6 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the snapshot and the teardown.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Forwards the model name the kernel left blank on a chat request.
-///
-/// See the module header: `NativeMemberFactory` resolves a model but does not carry its name into
-/// the `DeepAgentConfig`, so the kernel's per-call request has an empty `model_name`. Filling it
-/// here keeps the rest of the example on the plain resolver path.
-fn named(request: &ModelRequestConfig, name: &str) -> ModelRequestConfig {
-    let mut request = request.clone();
-    if request.model_name.trim().is_empty() {
-        name.clone_into(&mut request.model_name);
-    }
-    request
-}
-
-/// A resolved model that supplies the kernel's missing model name on every call.
-struct NamedModel {
-    /// The client built by the resolver.
-    inner: Arc<dyn Model>,
-    /// Provider-facing model name, taken from the client.
-    name: String,
-}
-
-#[async_trait]
-impl Model for NamedModel {
-    fn provider(&self) -> &str {
-        self.inner.provider()
-    }
-
-    fn model_name(&self) -> &str {
-        &self.name
-    }
-
-    async fn invoke(
-        &self,
-        messages: &[BaseMessage],
-        request: &ModelRequestConfig,
-    ) -> SdkResult<ChatResponse> {
-        self.inner
-            .invoke(messages, &named(request, &self.name))
-            .await
-    }
-
-    fn stream(
-        &self,
-        messages: Vec<BaseMessage>,
-        request: ModelRequestConfig,
-    ) -> BoxStream<'static, SdkResult<StreamChunk>> {
-        self.inner.stream(messages, named(&request, &self.name))
-    }
-}
-
-/// Resolves members' models from the loopback mock server.
-struct LoopbackResolver {
-    /// Environment-driven resolver, pinned to the mock by its builder.
-    env: EnvModelResolver,
-}
-
-impl LoopbackResolver {
-    /// Wraps an already configured [`EnvModelResolver`].
-    fn new(env: EnvModelResolver) -> Self {
-        Self { env }
-    }
-}
-
-#[async_trait]
-impl ModelResolver for LoopbackResolver {
-    async fn resolve(&self, model_name: Option<&str>) -> SdkResult<Arc<dyn Model>> {
-        let model = self.env.resolve(model_name).await?;
-        let name = model.model_name().to_owned();
-        Ok(Arc::new(NamedModel { inner: model, name }))
-    }
-}
 
 /// Builds the team blueprint: one leader blueprint and one predefined teammate.
 fn blueprint() -> TeamAgentSpec {
@@ -244,9 +163,8 @@ async fn main() -> Result<()> {
     let workspace: Arc<dyn WorkspaceProvider> = Arc::new(LocalWorkspaceProvider::new(
         MemberWorkspaceLayout::new(workspace_root.path()),
     ));
-    let factory: Arc<dyn MemberHarnessFactory> = Arc::new(NativeMemberFactory::new(Arc::new(
-        LoopbackResolver::new(resolver),
-    )));
+    let factory: Arc<dyn MemberHarnessFactory> =
+        Arc::new(NativeMemberFactory::new(Arc::new(resolver)));
     let deps = TeamBuildDeps::default()
         .with_harness_factory(factory)
         .with_workspace(workspace);
