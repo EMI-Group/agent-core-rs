@@ -288,7 +288,6 @@ fn clamped_importance(value: &Value) -> Option<f32> {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use super::*;

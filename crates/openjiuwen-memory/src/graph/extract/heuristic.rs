@@ -538,7 +538,6 @@ fn normalize(text: &str) -> String {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use super::*;
