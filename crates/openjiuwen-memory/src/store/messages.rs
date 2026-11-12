@@ -75,10 +75,9 @@ pub(crate) struct MessageStore {
     document: Arc<dyn DocumentStore>,
 }
 
-#[allow(unreachable_pub)] // crate-internal type with the spec's `pub` method signatures
 impl MessageStore {
     /// Builds a message store over `document`.
-    pub fn new(document: Arc<dyn DocumentStore>) -> Self {
+    pub(crate) fn new(document: Arc<dyn DocumentStore>) -> Self {
         Self { document }
     }
 
@@ -86,7 +85,7 @@ impl MessageStore {
     ///
     /// Each row is upserted into [`keys::MESSAGES_COLLECTION`] and the built
     /// [`StoredMessage`]s are returned in input order. An empty input writes nothing.
-    pub async fn append(
+    pub(crate) async fn append(
         &self,
         scope: &MemoryScope,
         messages: &[BaseMessage],
@@ -135,7 +134,11 @@ impl MessageStore {
     /// The newest rows are selected by timestamp descending, then reversed so the
     /// caller always replays oldest-first. `limit == 0` returns an empty vector; a
     /// missing collection is empty history, not an error.
-    pub async fn recent(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<StoredMessage>> {
+    pub(crate) async fn recent(
+        &self,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -170,7 +173,7 @@ impl MessageStore {
     /// Scope clauses, `ids`, and the exclusive `created_after`/`created_before` bounds
     /// are translated into the document filter language; the other record clauses
     /// (kinds, importance, text) do not apply to message rows.
-    pub async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize> {
+    pub(crate) async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize> {
         let query = Query {
             filter: message_filter(filter),
             ..Query::default()
@@ -178,15 +181,6 @@ impl MessageStore {
         self.document
             .delete(keys::MESSAGES_COLLECTION, &query)
             .await
-    }
-
-    /// Counts the messages of `scope`.
-    pub async fn count(&self, scope: &MemoryScope) -> Result<usize> {
-        let query = Query {
-            filter: scope_filter(scope),
-            ..Query::default()
-        };
-        self.document.count(keys::MESSAGES_COLLECTION, &query).await
     }
 }
 
@@ -403,8 +397,11 @@ mod tests {
         let unbound = MemoryScope::new("alice", "ws");
         let hits = store.recent(&unbound, 10).await.expect("recent");
         assert_eq!(hits.len(), 3);
-        assert_eq!(store.count(&first).await.expect("count"), 2);
-        assert_eq!(store.count(&unbound).await.expect("count"), 3);
+        assert_eq!(store.recent(&first, 1_000).await.expect("recent").len(), 2);
+        assert_eq!(
+            store.recent(&unbound, 1_000).await.expect("recent").len(),
+            3
+        );
     }
 
     #[tokio::test]
@@ -416,13 +413,13 @@ mod tests {
         let mut by_id = MemoryFilter::new();
         by_id.ids = vec![first.id.clone()];
         assert_eq!(store.delete_for(&by_id).await.expect("delete id"), 1);
-        assert_eq!(store.count(&scope).await.expect("count"), 1);
+        assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 1);
         let other = MemoryFilter::for_scope(&MemoryScope::new("bob", "ws"));
         assert_eq!(store.delete_for(&other).await.expect("delete other"), 0);
         let mut bounded = MemoryFilter::for_scope(&scope);
         bounded.created_after = Some(time(0));
         assert_eq!(store.delete_for(&bounded).await.expect("delete bound"), 1);
-        assert_eq!(store.count(&scope).await.expect("count"), 0);
+        assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 0);
         append_user(&store, &scope, "third", 2).await;
         assert_eq!(
             store
@@ -431,7 +428,7 @@ mod tests {
                 .expect("delete scope"),
             1
         );
-        assert_eq!(store.count(&scope).await.expect("count"), 0);
+        assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 0);
     }
 
     #[tokio::test]
@@ -439,7 +436,7 @@ mod tests {
         let store = store();
         let scope = scope();
         assert!(store.recent(&scope, 5).await.expect("recent").is_empty());
-        assert_eq!(store.count(&scope).await.expect("count"), 0);
+        assert_eq!(store.recent(&scope, 1_000).await.expect("recent").len(), 0);
         assert_eq!(
             store
                 .delete_for(&MemoryFilter::for_scope(&scope))

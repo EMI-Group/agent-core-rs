@@ -41,20 +41,14 @@ pub(crate) struct MemoryStorage {
     stores: MemoryStores,
 }
 
-#[allow(unreachable_pub)] // crate-internal type with the spec's `pub` method signatures
 impl MemoryStorage {
     /// Builds storage over `stores`.
-    pub fn new(stores: MemoryStores) -> Self {
+    pub(crate) fn new(stores: MemoryStores) -> Self {
         Self { stores }
     }
 
-    /// The underlying store bundle, for callers that need graph or document access.
-    pub fn stores(&self) -> &MemoryStores {
-        &self.stores
-    }
-
     /// Persists `record` under its scope/id key, without its embedding.
-    pub async fn put_record(&self, record: &MemoryRecord) -> Result<()> {
+    pub(crate) async fn put_record(&self, record: &MemoryRecord) -> Result<()> {
         let text = json::record_to_text(record)?;
         let key = keys::record_key(&record.scope, &record.id);
         self.stores.kv.set(&key, KvValue::text(text)).await
@@ -64,7 +58,11 @@ impl MemoryStorage {
     ///
     /// A stored value that is not UTF-8 text or not a valid record JSON is reported as
     /// `Error::Validation`: unlike a listing, a point read must not hide corruption.
-    pub async fn get_record(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>> {
+    pub(crate) async fn get_record(
+        &self,
+        scope: &MemoryScope,
+        id: &str,
+    ) -> Result<Option<MemoryRecord>> {
         let key = keys::record_key(scope, id);
         let Some(value) = self.stores.kv.get(&key).await? else {
             return Ok(None);
@@ -81,7 +79,7 @@ impl MemoryStorage {
     ///
     /// The scan uses the narrowest key prefix the filter allows. Malformed entries are
     /// logged and skipped: one corrupt record must not fail a whole listing.
-    pub async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
+    pub(crate) async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
         let prefix = match (&filter.user_id, &filter.scope_id) {
             (Some(user_id), Some(scope_id)) => {
                 keys::record_prefix(&MemoryScope::new(user_id.clone(), scope_id.clone()))
@@ -125,7 +123,7 @@ impl MemoryStorage {
     }
 
     /// Deletes `record` and its embedding, returning whether the record row existed.
-    pub async fn delete_record(&self, record: &MemoryRecord) -> Result<bool> {
+    pub(crate) async fn delete_record(&self, record: &MemoryRecord) -> Result<bool> {
         let key = keys::record_key(&record.scope, &record.id);
         let existed = self.stores.kv.exists(&key).await?;
         self.stores.kv.delete(&key).await?;
@@ -139,7 +137,11 @@ impl MemoryStorage {
     /// foundation vector store is insert-only, so an existing entry for the record id is
     /// deleted before the new vector is added. A dimension mismatch against an existing
     /// collection propagates the foundation validation error unchanged.
-    pub async fn index_embedding(&self, record: &MemoryRecord, embedding: &[f32]) -> Result<()> {
+    pub(crate) async fn index_embedding(
+        &self,
+        record: &MemoryRecord,
+        embedding: &[f32],
+    ) -> Result<()> {
         let collection = keys::vector_collection(&record.scope, record.kind);
         ensure_collection(self.stores.vector.as_ref(), &collection, embedding.len()).await?;
         let ids = std::slice::from_ref(&record.id);
@@ -164,7 +166,7 @@ impl MemoryStorage {
     }
 
     /// Removes the embedding of `record`; a missing collection is a no-op.
-    pub async fn delete_embedding(&self, record: &MemoryRecord) -> Result<()> {
+    pub(crate) async fn delete_embedding(&self, record: &MemoryRecord) -> Result<()> {
         let collection = keys::vector_collection(&record.scope, record.kind);
         if !self.stores.vector.collection_exists(&collection).await? {
             return Ok(());
@@ -176,36 +178,11 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Removes the embeddings of every record matching `filter`, returning how many
-    /// vector rows were deleted.
-    pub async fn delete_embeddings_for(&self, filter: &MemoryFilter) -> Result<usize> {
-        let records = self.list_records(filter).await?;
-        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for record in records {
-            grouped
-                .entry(keys::vector_collection(&record.scope, record.kind))
-                .or_default()
-                .push(record.id);
-        }
-        let mut removed = 0;
-        for (collection, ids) in grouped {
-            if !self.stores.vector.collection_exists(&collection).await? {
-                continue;
-            }
-            removed += self
-                .stores
-                .vector
-                .delete_docs_by_ids(&collection, &ids)
-                .await?;
-        }
-        Ok(removed)
-    }
-
     /// Searches the `(scope, kind)` collection for the nearest vectors to `vector`.
     ///
     /// Returns `(record_id, score)` pairs in the foundation's score order. A missing
     /// collection, or `top_k == 0`, yields an empty result rather than an error.
-    pub async fn search_embeddings(
+    pub(crate) async fn search_embeddings(
         &self,
         scope: &MemoryScope,
         kind: MemoryType,
@@ -238,7 +215,7 @@ impl MemoryStorage {
     }
 
     /// Stores `value` as the text variable `name` (user- or session-scoped).
-    pub async fn set_variable(
+    pub(crate) async fn set_variable(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
@@ -250,7 +227,7 @@ impl MemoryStorage {
     }
 
     /// Reads a text variable, or `None` when it is absent or not stored as text.
-    pub async fn get_variable(
+    pub(crate) async fn get_variable(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
@@ -264,7 +241,7 @@ impl MemoryStorage {
     }
 
     /// Lists every variable of the scope namespace, keyed by variable name.
-    pub async fn list_variables(
+    pub(crate) async fn list_variables(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
@@ -290,7 +267,7 @@ impl MemoryStorage {
     }
 
     /// Deletes a variable, returning whether the key existed.
-    pub async fn delete_variable(
+    pub(crate) async fn delete_variable(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
@@ -303,7 +280,7 @@ impl MemoryStorage {
     }
 
     /// Stores the configuration of `scope_id`, returning whether it replaced one.
-    pub async fn set_scope_config(
+    pub(crate) async fn set_scope_config(
         &self,
         scope_id: &str,
         config: &MemoryScopeConfig,
@@ -322,7 +299,10 @@ impl MemoryStorage {
     ///
     /// Stored JSON that is not a valid [`MemoryScopeConfig`] is `Error::Validation`,
     /// never a silent default.
-    pub async fn get_scope_config(&self, scope_id: &str) -> Result<Option<MemoryScopeConfig>> {
+    pub(crate) async fn get_scope_config(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<MemoryScopeConfig>> {
         let key = keys::scope_config_key(scope_id);
         let Some(value) = self.stores.kv.get(&key).await? else {
             return Ok(None);
@@ -341,7 +321,7 @@ impl MemoryStorage {
     }
 
     /// Deletes the configuration of `scope_id`, returning whether it existed.
-    pub async fn delete_scope_config(&self, scope_id: &str) -> Result<bool> {
+    pub(crate) async fn delete_scope_config(&self, scope_id: &str) -> Result<bool> {
         let key = keys::scope_config_key(scope_id);
         let existed = self.stores.kv.exists(&key).await?;
         self.stores.kv.delete(&key).await?;
@@ -447,7 +427,7 @@ mod tests {
         assert_eq!(restored.scope, record.scope);
         assert_eq!(restored.embedding, None);
         let stored = storage
-            .stores()
+            .stores
             .kv
             .get(&keys::record_key(&scope(), "rec-1"))
             .await
@@ -527,14 +507,14 @@ mod tests {
         storage.put_record(&good).await.expect("put");
         let broken_key = keys::record_key(&scope(), "broken");
         storage
-            .stores()
+            .stores
             .kv
             .set(&broken_key, KvValue::text("{not json"))
             .await
             .expect("write corrupt");
         let bytes_key = keys::record_key(&scope(), "bytes");
         storage
-            .stores()
+            .stores
             .kv
             .set(&bytes_key, KvValue::bytes(vec![0_u8, 1, 2]))
             .await
@@ -628,13 +608,16 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "b");
-        assert_eq!(
+        let remaining = storage
+            .list_records(&MemoryFilter::for_scope(&scope()))
+            .await
+            .expect("list remaining");
+        for record in remaining {
             storage
-                .delete_embeddings_for(&MemoryFilter::for_scope(&scope()))
+                .delete_embedding(&record)
                 .await
-                .expect("delete embeddings"),
-            1
-        );
+                .expect("delete embedding");
+        }
         assert!(storage
             .search_embeddings(&scope(), MemoryType::SemanticMemory, &[1.0, 0.0], 5)
             .await
@@ -770,7 +753,7 @@ mod tests {
             None
         );
         storage
-            .stores()
+            .stores
             .kv
             .set(&keys::scope_config_key("bad"), KvValue::text("not json"))
             .await
@@ -802,7 +785,7 @@ mod tests {
             let storage =
                 MemoryStorage::new(MemoryStores::sqlite(&path).await.expect("open sqlite"));
             storage.put_record(&record).await.expect("put record");
-            let messages = MessageStore::new(storage.stores().document.clone());
+            let messages = MessageStore::new(storage.stores.document.clone());
             messages
                 .append(&scope(), &[BaseMessage::user("hello")], message_time)
                 .await
@@ -815,7 +798,7 @@ mod tests {
             .expect("get record")
             .expect("record persisted");
         assert_eq!(restored.content, "sqlite record");
-        let messages = MessageStore::new(storage.stores().document.clone());
+        let messages = MessageStore::new(storage.stores.document.clone());
         let history = messages.recent(&scope(), 10).await.expect("recent");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");

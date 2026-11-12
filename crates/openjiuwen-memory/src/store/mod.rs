@@ -29,16 +29,12 @@ use openjiuwen_foundation::store::{SqliteDocumentStore, SqliteKvStore};
 
 pub mod keys;
 
-// The engine and facade modules are not implemented yet, so the crate-internal seam
-// is reached only from this module's tests.
 mod json;
 mod messages;
 mod storage;
 
-#[allow(unused_imports)] // reached by the engine and facade seams
 pub(crate) use messages::MessageStore;
 pub use messages::StoredMessage;
-#[allow(unused_imports)] // reached by the engine and facade seams
 pub(crate) use storage::MemoryStorage;
 
 /// The concrete backends shared by the engine, facade, graph memory, and lite memory.

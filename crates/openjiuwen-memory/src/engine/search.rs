@@ -545,7 +545,6 @@ mod tests {
         let scope = scope();
         let id = add(&engine, &scope, "vector row without kv row").await;
         engine
-            .storage()
             .stores()
             .kv
             .delete(&keys::record_key(&scope, &id))
