@@ -189,7 +189,6 @@ impl MemoryEngine {
     }
 
     /// A message store over the engine's document backend, for the facade.
-    #[allow(dead_code)] // crate-internal seam reached by the (future) facade
     pub(crate) fn message_store(&self) -> MessageStore {
         MessageStore::new(self.stores.document.clone())
     }

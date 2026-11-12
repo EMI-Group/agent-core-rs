@@ -7,7 +7,7 @@
 use crate::config::DedupeConfig;
 use crate::recall::keyword::jaccard;
 use crate::recall::scoring::normalized_similarity;
-pub use crate::record::normalize_text;
+use crate::record::normalize_text;
 use crate::record::{MemoryRecord, MemoryType};
 use chrono::{DateTime, Utc};
 /// A record recalled as a dedupe candidate, with the semantic similarity that produced

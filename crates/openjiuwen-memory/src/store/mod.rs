@@ -31,11 +31,8 @@ pub mod keys;
 
 // The engine and facade modules are not implemented yet, so the crate-internal seam
 // is reached only from this module's tests.
-#[allow(dead_code)]
 mod json;
-#[allow(dead_code)]
 mod messages;
-#[allow(dead_code)]
 mod storage;
 
 #[allow(unused_imports)] // reached by the engine and facade seams
