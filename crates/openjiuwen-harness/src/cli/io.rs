@@ -74,6 +74,20 @@ impl CliIo {
         }
     }
 
+    /// Builds an interactive handle from an explicit reader and writer.
+    ///
+    /// Identical to [`CliIo::new`] except that the handle is marked interactive,
+    /// so `CliPermissionHost` writes approval prompts and reads the answer from
+    /// the injected streams instead of failing closed. This is the test path for
+    /// permission-prompt behaviour.
+    #[must_use]
+    pub fn with_interactive(reader: Box<dyn LineReader>, writer: Box<dyn Writer>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new((reader, writer))),
+            interactive: true,
+        }
+    }
+
     /// Builds the interactive handle backed by the process stdio streams.
     ///
     /// The `interactive` flag is what later makes permission prompts
