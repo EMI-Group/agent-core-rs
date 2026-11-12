@@ -10,9 +10,9 @@ Ports Python `core/single_agent/agents/react_agent.py` (`ReActAgent`, `ReActAgen
 - `mod.rs` — `ReActAgent` (card + interior-mutable config/model/abilities/rails/prompt builder/context engine), `ReActAgent::configure/set_model/model/add_tool/add_tools/remove_tool/tools/register_rail/unregister_rail/rails/prompt_builder`, `impl Agent`.
 - `config.rs` — `ReActAgentConfig` with Python field names/defaults plus `MaxIterationsPolicy` (`Error | FinalAnswer | ReturnObservations`, wire `error|final_answer|return_observations`).
 - `agent_loop.rs` — one invoke: session resolution, interruption load/resume, iteration loop, rails firing, max-iteration/token-budget termination, context persistence, span tracing.
-- `model_step.rs` — a single model call: window preparation, `invoke` vs `stream` (accumulate `StreamAccumulator`, emit `llm_reasoning`/`llm_output`/`llm_usage` chunks), `ModelReply { message, finish_reason, usage, reasoning_present }`, model-error recovery hook.
-- `resume.rs` — replay of interrupted tool calls with `InteractiveInput` answers, producing `RESUME_START_ITERATION`.
-- `prompt.rs` — identity section rendering from `prompt_template` and the run input variables.
+- `model_step.rs` — a single model call: `call_model` (non-streaming) and `call_model_streaming` driving `Model::stream` through a `StreamAccumulator`, emitting `llm_reasoning`/`llm_output`/`llm_usage` frames through `DeltaSink`, and building `ModelReply { message, finish_reason, usage, reasoning_present }`.
+- `resume.rs` — `replay_interrupted(state, interactive, abilities, options)` replays interrupted tool calls: approvals re-execute via `AbilityManager`, rejections carry `reject_feedback`, ask-user answers become the result text, and unmatched requests are returned for re-pausing.
+- `prompt.rs` — `build_identity` renders the system-role template; `build_system` wraps it in one system message.
 
 ## Constraints
 
