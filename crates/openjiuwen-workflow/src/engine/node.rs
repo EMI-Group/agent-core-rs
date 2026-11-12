@@ -18,8 +18,10 @@
 //!   `{"type", "index", "payload"}` wires, which is exactly what `invoke` returns.
 //!
 //! Interrupts are data: a component that asks a question without a seeded answer returns
-//! an interrupt error, the adapter converts that into [`NodeOutcome::halt`] carrying the
-//! pending interaction wires, and the run finishes as `INPUT_REQUIRED`.
+//! an interrupt error, and the adapter propagates it (keeping the tracing `interrupted`
+//! marker) instead of swallowing it. The run fails at that node, so the graph engine
+//! stores the *pre-superstep* boundary and `resume` re-runs the interrupted superstep
+//! with the seeded answers.
 
 use std::sync::Arc;
 
@@ -29,9 +31,8 @@ use futures::StreamExt;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::json as json_utils;
 use openjiuwen_graph::{GraphContext, GraphState, Node, NodeOutcome};
-use openjiuwen_session::interaction::INTERACTION_FRAME_TYPE;
 use openjiuwen_session::tracer::SpanHandle;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::ability::ComponentAbility;
 use crate::component::Component;
@@ -262,9 +263,10 @@ impl Node for ComponentNode {
                         span.interrupted(INTERRUPTED_REASON);
                     }
                     // The `__interaction__` frames were already written by
-                    // `ComponentContext::interact`; the halt carries their wires.
-                    let wires = interaction_wires(&scope.interactions);
-                    return Ok(NodeOutcome::halt(Some(Value::Array(wires))));
+                    // `ComponentContext::interact`. Propagating the interrupt (instead of
+                    // halting) makes the graph save the *pre-superstep* boundary, so
+                    // `resume` re-runs this superstep with the seeded answers.
+                    return Err(failure);
                 }
                 let failure = error::component_execution_error(
                     self.rt.component.component_type(),
@@ -338,27 +340,6 @@ fn project_output(schema: Option<&Value>, source: &Value, id: &str, raw: &Value)
         map.insert("output".to_owned(), raw.clone());
     }
     reference::resolve_schema(schema, &scope)
-}
-
-/// The interaction wires a halted run reports: `{"type", "index", "payload"}` frames.
-fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
-    interactions
-        .drain_pending()
-        .into_iter()
-        .map(|interaction| {
-            let payload = json!({
-                "id": interaction.id,
-                "index": interaction.index,
-                "question": interaction.value,
-            });
-            OutputFrame {
-                item_type: INTERACTION_FRAME_TYPE.to_owned(),
-                index: interaction.index,
-                payload,
-            }
-            .to_wire()
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -466,26 +447,6 @@ mod tests {
             ),
             json!({"value": 7})
         );
-    }
-
-    #[test]
-    fn interaction_wires_match_the_python_frame_shape() {
-        let interactions = InteractionState::new();
-        interactions.push_pending(crate::interrupt::WorkflowInteraction::new(
-            "ask",
-            3,
-            json!({"question": "continue?"}),
-        ));
-        assert_eq!(
-            interaction_wires(&interactions),
-            vec![json!({
-                "type": INTERACTION_FRAME_TYPE,
-                "index": 3,
-                "payload": {"id": "ask", "index": 3, "question": {"question": "continue?"}}
-            })]
-        );
-        assert!(interactions.pending().is_empty());
-        assert!(interaction_wires(&interactions).is_empty());
     }
 
     #[test]

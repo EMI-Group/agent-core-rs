@@ -112,9 +112,9 @@ impl Node for ComponentNode { /* run(...) */ }
    holds `{"type": "end node stream", "index", "payload"}` wires so `invoke` can return them verbatim.
 7. `outputs_schema` projects the raw output against `state + {"<id>": raw, "output": raw}`;
    `state.set(id, output)`.
-8. an error carrying `find_interrupt` drains `InteractionState::pending` into `{"type", "index", "payload"}`
-   interaction wires and returns `NodeOutcome::Halt { value: Some(array) }` (the interaction frame itself was
-   already written by `ComponentContext::interact`).
+8. an error carrying `find_interrupt` keeps the tracing `interrupted(reason)` marker and is propagated
+   unchanged (the interaction frame itself was already written by `ComponentContext::interact`), so the graph's
+   *failure* path stores the pre-superstep boundary and `resume` re-runs the interrupted superstep.
 9. any other error becomes `error::component_execution_error(component_type, ability, reason, workflow_id)`.
 
 `wait_for_all` cannot change scheduler semantics: graph channels are CNF barriers, so every fan-in waits.
@@ -147,12 +147,18 @@ Run wiring: when `session.checkpointer()` is `Some`, compile with
 `CompileOptions { store: Some(Arc::new(CheckpointerStore::new(cp, card.id))), namespace: Some(card.id), checkpoint_every_superstep: true }`
 and delete the namespace after a successful completed run. `invoke` merges object inputs into the session
 global lane (unless resuming), seeds `InteractionState` from `options.interactive`, and runs inside a timeout
-(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero). Halt → `InputRequired` with the
-interaction wires; success → the end output value, or the collected `end node stream` wires when the end
-streams. `stream` forwards frames through an unbounded channel, filters by `stream_modes` when set, yields one
-`workflow_final` frame on success when the end output is non-null, and yields exactly one `Err` on failure; a
-guard aborts the run task when the stream is dropped. `resume` requires a checkpointer, sets `resume = true`
-and seeds `interactive`.
+(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero). An interrupt error drains
+`InteractionState::pending` into `{"type", "index", "payload"}` wires and reports `InputRequired`, keeping the
+pre-superstep snapshot; a graph that halts via `NodeOutcome::Halt` reports the same state with its halt value;
+success → the end output value, or the collected `end node stream` wires when the end streams. `stream` forwards
+frames through an unbounded channel, filters by `stream_modes` when set, yields one `workflow_final` frame on
+success when the end output is non-null, ends quietly after the interaction frames of an interrupted run, and
+yields exactly one `Err` on any other failure; a guard aborts the run task when the stream is dropped.
+`resume` requires a checkpointer, sets `resume = true` and seeds `interactive`; continuing from the failure
+boundary re-runs the interrupted superstep, so the component's question is answered by the seeded answer
+instead of halting again. The stream generator drops its `RunScope` right after compiling the graph (only the
+graph's nodes keep a frame-sink clone) and before it starts reading frames; keeping the scope alive would keep
+the sink open and stall the frame loop.
 
 ## Constraints
 
@@ -175,12 +181,16 @@ and seeds `interactive`.
 
 - `./definition.rs` → `WorkflowDefinition`, `NodeConfig`, `Edge`, `ConditionalSource`, ability selection, `spec()`
 - `./validate.rs` → compile-time validation and coded problem messages
-- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt halting); crate-visible only (`pub(crate)`)
+- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation); crate-visible only (`pub(crate)`)
 - `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation, `test_support` fakes
-- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, seed/timeout helpers, `AbortOnDrop`
+- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection, seed/timeout helpers, `AbortOnDrop`
+- `./tests.rs` → engine unit tests (stream termination, buffered frames, snapshot lifecycle, interrupt and failure resume, facade accessors)
 
 ## Test Strategy
 
 Validation is covered through `tests/builder_validation.rs`; run semantics through `tests/linear.rs`,
 `references.rs`, `branch.rs`, `streaming.rs`, `end_template.rs`, `llm_component.rs`, `tool_component.rs`,
 `retrieval_component.rs`, `loop_component.rs`, `session_state.rs`, `checkpoint_resume.rs`, and `card_spec.rs`.
+The engine's own unit tests cover termination of a stream whose run emits no frames, buffered producer frames
+versus end wires, snapshot lifecycle (deleted on completion, kept on interruption), and resume semantics for
+both an interrupted superstep and a plain node failure.

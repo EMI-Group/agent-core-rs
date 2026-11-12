@@ -5,9 +5,10 @@
 //! [`WorkflowRunOptions::interactive`], compile one graph for the run, and execute it
 //! with a cancellation token, a superstep budget, and a timeout.
 //!
-//! - **invoke** waits for the run and projects it into a [`WorkflowOutput`]. A halt
-//!   becomes `INPUT_REQUIRED` carrying the interaction wires and keeps the snapshot for
-//!   `resume`; a completed run deletes the snapshot and returns the end component's value.
+//! - **invoke** waits for the run and projects it into a [`WorkflowOutput`]. An interrupt
+//!   becomes `INPUT_REQUIRED` carrying the interaction wires and keeps the pre-superstep
+//!   snapshot for `resume`; a completed run deletes the snapshot and returns the end
+//!   component's value.
 //! - **stream** publishes frames through the run's [`FrameWriter`] into an unbounded
 //!   channel while the run executes in a spawned task, and aborts that task when the
 //!   stream is dropped.
@@ -20,16 +21,17 @@ use std::time::Duration;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_graph::{CheckpointerStore, ExecutionOptions, GraphStore};
+use openjiuwen_session::interaction::INTERACTION_FRAME_TYPE;
 use openjiuwen_session::stream::StreamMode;
 use openjiuwen_session::Session;
 use parking_lot::Mutex;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::engine::node::RunScope;
 use crate::engine::{CompiledWorkflow, WorkflowRunOptions};
-use crate::interrupt::InteractionState;
+use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{
-    output_chunk, FrameCollector, FrameWriter, WorkflowChunk, WorkflowExecutionState,
+    output_chunk, FrameCollector, FrameWriter, OutputFrame, WorkflowChunk, WorkflowExecutionState,
     WorkflowOutput, WORKFLOW_FINAL,
 };
 
@@ -41,9 +43,10 @@ impl CompiledWorkflow {
     ///
     /// Object inputs are deep-merged into the session's global state lane before the run
     /// (Python's `commit_user_inputs`), so `${query}` resolves alongside
-    /// `${start.query}`. A run that halts for human input returns
+    /// `${start.query}`. A run interrupted for human input returns
     /// [`WorkflowExecutionState::InputRequired`] with the interaction wires as `result`
-    /// and leaves the graph snapshot in place for [`CompiledWorkflow::resume`].
+    /// and leaves the pre-superstep graph snapshot in place so
+    /// [`CompiledWorkflow::resume`] re-runs the interrupted superstep.
     ///
     /// # Errors
     ///
@@ -63,9 +66,10 @@ impl CompiledWorkflow {
     /// [`WorkflowRunOptions::stream_modes`] when it is set (the terminal `workflow_final`
     /// frame is an output-mode frame and obeys the same filter). A successful run ends
     /// with one `workflow_final` frame carrying the end component's output (omitted when
-    /// that output is `null`); a failed run yields exactly one [`Err`]. Dropping the
-    /// stream aborts the in-flight run and keeps the graph snapshot when a checkpointer
-    /// is configured.
+    /// that output is `null`); a run interrupted for human input ends quietly after the
+    /// interaction frames it already yielded; any other failure yields exactly one
+    /// [`Err`]. Dropping the stream aborts the in-flight run and keeps the graph snapshot
+    /// when a checkpointer is configured.
     #[allow(clippy::too_many_lines)] // one linear pipeline reads better than fragments
     pub fn stream(
         &self,
@@ -90,14 +94,14 @@ impl CompiledWorkflow {
             }
 
             let store = store_for(&session, &workflow_id);
-            let scope = Arc::new(RunScope::new(interactions, Arc::clone(&writer)));
-            let graph = workflow.build_graph(
-                Some(&scope),
-                store.clone(),
-                options.max_supersteps,
-            )?;
-            // Only the graph's node runtimes keep the writer now, so the receiver ends
-            // when the spawned run finishes.
+            // The scope is scoped to the compile: the graph's node runtimes keep the only
+            // remaining writer clone, so the receiver ends when the spawned run finishes.
+            // Keeping the scope alive in this generator would keep the sink open and
+            // deadlock the loop below.
+            let graph = {
+                let scope = Arc::new(RunScope::new(interactions, Arc::clone(&writer)));
+                workflow.build_graph(Some(&scope), store.clone(), options.max_supersteps)?
+            };
             drop(writer);
 
             let execution = ExecutionOptions {
@@ -124,12 +128,22 @@ impl CompiledWorkflow {
                 Ok(result) => result,
                 Err(join_error) => Err(Error::external(join_error)
                     .with_context("a workflow run task failed")),
-            }?;
+            };
             drop(guard);
 
+            let result = match result {
+                Ok(result) => result,
+                Err(failure) if find_interrupt(&failure).is_some() => {
+                    // The interaction frames were already yielded by the run's writer and
+                    // the pre-superstep snapshot stays in place for `resume`.
+                    return;
+                }
+                Err(failure) => Err(failure)?,
+            };
+
             if result.halted.is_some() {
-                // The interaction frames were already yielded by the run's writer and
-                // the snapshot stays in place for `resume`.
+                // Defensive: a graph node that halts instead of failing; the snapshot
+                // stays in place for `resume` too.
                 return;
             }
             if let Some(store) = store {
@@ -199,7 +213,7 @@ async fn run_blocking(
     writer.collect_into(collector);
 
     let store = store_for(&session, &inner.card.id);
-    let scope = Arc::new(RunScope::new(interactions, writer));
+    let scope = Arc::new(RunScope::new(Arc::clone(&interactions), writer));
     let graph = workflow.build_graph(Some(&scope), store.clone(), options.max_supersteps)?;
     let execution = ExecutionOptions {
         cancellation: options.cancellation.clone(),
@@ -211,18 +225,35 @@ async fn run_blocking(
     let seed = seed_value(inputs);
 
     let timeout = resolve_timeout(&session, options.timeout);
-    let run = match timeout {
+    let outcome = match timeout {
         Some(limit) => {
             tokio::time::timeout(limit, graph.run(seed, Arc::clone(&session), execution))
                 .await
                 .map_err(|_| {
                     Error::timeout(format!("workflow '{}' execution timed out", inner.card.id))
-                })??
+                })?
         }
-        None => graph.run(seed, Arc::clone(&session), execution).await?,
+        None => graph.run(seed, Arc::clone(&session), execution).await,
+    };
+    let run = match outcome {
+        Ok(run) => run,
+        Err(failure) => {
+            if find_interrupt(&failure).is_some() {
+                // The `__interaction__` frames were written by
+                // `ComponentContext::interact`. The graph saved the pre-superstep
+                // boundary on failure, so `resume` re-runs the interrupted superstep
+                // with the seeded answers; the snapshot is deliberately kept.
+                return Ok(WorkflowOutput {
+                    result: Value::Array(interaction_wires(&interactions)),
+                    state: WorkflowExecutionState::InputRequired,
+                });
+            }
+            return Err(failure);
+        }
     };
 
     if let Some(halt) = run.halted {
+        // Defensive: a graph node that halts instead of failing keeps the snapshot too.
         return Ok(WorkflowOutput {
             result: halt.value.unwrap_or_else(|| Value::Array(Vec::new())),
             state: WorkflowExecutionState::InputRequired,
@@ -238,6 +269,30 @@ async fn run_blocking(
         result,
         state: WorkflowExecutionState::Completed,
     })
+}
+
+/// The interaction wires an interrupted run reports: `{"type", "index", "payload"}` frames.
+///
+/// Draining here (instead of in the node adapter) keeps the interrupt in the graph's
+/// failure path, which is what stores the pre-superstep boundary `resume` needs.
+fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
+    interactions
+        .drain_pending()
+        .into_iter()
+        .map(|interaction| {
+            let payload = json!({
+                "id": interaction.id,
+                "index": interaction.index,
+                "question": interaction.value,
+            });
+            OutputFrame {
+                item_type: INTERACTION_FRAME_TYPE.to_owned(),
+                index: interaction.index,
+                payload,
+            }
+            .to_wire()
+        })
+        .collect()
 }
 
 /// The graph store backing this run, when the session is checkpointed.
@@ -315,5 +370,25 @@ mod tests {
     fn abort_guard_tolerates_being_dropped_twice() {
         let guard = AbortOnDrop(None);
         drop(guard);
+    }
+
+    #[test]
+    fn interaction_wires_match_the_python_frame_shape() {
+        let interactions = InteractionState::new();
+        interactions.push_pending(crate::interrupt::WorkflowInteraction::new(
+            "ask",
+            3,
+            json!({"question": "continue?"}),
+        ));
+        assert_eq!(
+            interaction_wires(&interactions),
+            vec![json!({
+                "type": INTERACTION_FRAME_TYPE,
+                "index": 3,
+                "payload": {"id": "ask", "index": 3, "question": {"question": "continue?"}}
+            })]
+        );
+        assert!(interactions.pending().is_empty());
+        assert!(interaction_wires(&interactions).is_empty());
     }
 }
