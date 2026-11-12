@@ -71,12 +71,16 @@ The default build needs no network and no external service: every feature above 
 - Re-exports only: no logic, no new public data types, no `unsafe` (`#![forbid(unsafe_code)]`); the `thiserror`/`serde` stack is not a dependency of this crate.
 - `publish = false` until the SDK API stabilizes; sibling crates and `docs/` are never edited from here.
 - Feature names in this crate map to existing sibling features; adding a feature requires verifying the sibling's feature name first and keeping the default build offline.
+- `openjiuwen-harness-providers` is a non-optional dependency (`Cargo.toml:28`; workspace entry `../Cargo.toml:64` sets no `default-features = false`), so that crate's own `default = ["native"]` always applies and the umbrella's `native` feature cannot actually disable the providers' native provider (same for `openjiuwen-harness`, workspace `../Cargo.toml:63`).
+- No feature of this crate enables `openjiuwen-harness-providers/vendor`, so the vendor providers (`claudecode`, `codex`, `dsh`) are unreachable through the umbrella; a consumer must depend on `openjiuwen-harness-providers` directly with `features = ["vendor"]`.
 - Python package spelling (`harness_protocol`, `agent_teams`, `sys_operation`) is mirrored even where it repeats the crate suffix, so `clippy::module_name_repetitions` is allowed crate-wide.
 - The crate-level doc example is the "getting started" block: it must compile as a doctest and touch no network.
 - Concrete crates are canonical: documentation lives there; this file documents only the facade.
 
 ## Notes for Agents
 
+- `harness_providers` (`src/lib.rs:67`) and `harness` (`src/lib.rs:65`) are unconditional `pub use` aliases with no `#[cfg]`; only the prelude's `a2a` / `otel` items and the corresponding `tests/module_paths.rs` cases are feature-gated.
+- The provider registry is reached as `openjiuwen::harness_providers::{create_harness, resolve_provider, ...}`; `create_harness` is `openjiuwen_harness_providers::factory::create_harness` (proved by `tests/module_paths.rs:44-48`) and the prelude forwards it ungated (`src/prelude.rs:30`).
 - `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
 - Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
 - The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
