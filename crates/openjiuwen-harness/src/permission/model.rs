@@ -19,6 +19,8 @@
 //!   (`bash: ask`) and the legacy mapping form (`bash: { "*": ask }`), and always
 //!   serializes as the scalar form.
 
+// Size note: ~720 lines of implementation plus an inline test module; the tests stay here so the module contract and its verification live together.
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
