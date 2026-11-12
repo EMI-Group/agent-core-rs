@@ -14,12 +14,20 @@ openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 thiserror = "2"
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = []
