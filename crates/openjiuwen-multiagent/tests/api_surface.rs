@@ -22,12 +22,16 @@ use futures::{FutureExt, StreamExt};
 use openjiuwen_agent::{Agent, AgentCard, ReActAgent};
 use openjiuwen_common::card::Card;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
+use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::tool::Tool;
 use openjiuwen_multiagent::{
-    make_team_session, team_stream, topic_matches, AgentProvider, AgentTool, BaseTeam, BindHook,
-    EventDrivenTeamCard, MemberOptions, MessageBus, MessageBusConfig, MessageEnvelope,
-    MessageHandler, RuntimeConfig, SessionLease, StrategyContext, SubscriptionManager, Team,
-    TeamAgent, TeamCard, TeamConfig, TeamError, TeamRuntime, TeamStrategy, ToolHost,
+    create_supervisor, hierarchical_msgbus_team, hierarchical_tools_team, make_team_session,
+    team_stream, topic_matches, AgentProvider, AgentTool, BaseTeam, BindHook, EventDrivenTeamCard,
+    HierarchicalMsgbusConfig, HierarchicalMsgbusStrategy, HierarchicalToolsConfig,
+    HierarchicalToolsStrategy, MemberOptions, MessageBus, MessageBusConfig, MessageEnvelope,
+    MessageHandler, RuntimeConfig, SessionLease, StrategyContext, SubscriptionManager,
+    SupervisorAgent, SupervisorConfig, Team, TeamAgent, TeamCard, TeamConfig, TeamError,
+    TeamRuntime, TeamStrategy, ToolHost,
 };
 use openjiuwen_session::{AgentTeamSession, Session, StreamItem};
 use serde::de::DeserializeOwned;
@@ -196,6 +200,45 @@ fn crate_root_reexports_are_pinned_by_signature() {
     assert_eq!(context.runtime.team_id(), "default");
 }
 
+// --- hierarchical strategies ---
+
+#[test]
+fn hierarchical_surface_is_pinned() {
+    // Inherent constructors and free functions.
+    let _: fn(AgentCard) -> HierarchicalMsgbusConfig = HierarchicalMsgbusConfig::new;
+    let _: fn(AgentCard) -> HierarchicalToolsConfig = HierarchicalToolsConfig::new;
+    let _: fn(HierarchicalMsgbusConfig) -> Arc<HierarchicalMsgbusStrategy> =
+        HierarchicalMsgbusStrategy::new;
+    let _: fn(HierarchicalToolsConfig) -> Arc<HierarchicalToolsStrategy> =
+        HierarchicalToolsStrategy::new;
+    let _: fn(AgentCard, Arc<dyn Model>, String) -> SupervisorConfig = SupervisorConfig::new;
+    let _: fn(Vec<AgentCard>, SupervisorConfig) -> Result<(AgentCard, AgentProvider)> =
+        SupervisorAgent::create;
+    let _: fn(Vec<AgentCard>, SupervisorConfig) -> Result<(AgentCard, AgentProvider)> =
+        create_supervisor;
+    let _: fn(TeamCard, HierarchicalMsgbusConfig) -> BaseTeam = hierarchical_msgbus_team;
+    let _: fn(TeamCard, HierarchicalToolsConfig) -> BaseTeam = hierarchical_tools_team;
+    // `SupervisorAgent` is a unit-struct factory; its `Debug` shape is pinned too.
+    let supervisor_agent: SupervisorAgent = SupervisorAgent;
+    assert_eq!(format!("{supervisor_agent:?}"), "SupervisorAgent");
+
+    // Both strategies coerce to the documented trait object and report their kind.
+    let msgbus_config = HierarchicalMsgbusConfig::new(AgentCard::new("boss").with_id("boss"));
+    let tools_config = HierarchicalToolsConfig::new(AgentCard::new("root").with_id("root"));
+    let msgbus: Arc<dyn TeamStrategy> = HierarchicalMsgbusStrategy::new(msgbus_config.clone());
+    let tools: Arc<dyn TeamStrategy> = HierarchicalToolsStrategy::new(tools_config.clone());
+    assert_eq!(msgbus.kind(), "hierarchical_msgbus");
+    assert_eq!(tools.kind(), "hierarchical_tools");
+
+    // Each builder returns the single team type with the strategy attached.
+    let msgbus_team = hierarchical_msgbus_team(TeamCard::new("pin-msg"), msgbus_config);
+    assert_eq!(msgbus_team.kind(), "hierarchical_msgbus");
+    assert_eq!(msgbus_team.team_id(), "pin-msg");
+    let tools_team = hierarchical_tools_team(TeamCard::new("pin-tools"), tools_config);
+    assert_eq!(tools_team.kind(), "hierarchical_tools");
+    assert_eq!(tools_team.team_id(), "pin-tools");
+}
+
 #[test]
 fn card_trait_and_builders_are_exposed() {
     let card = TeamCard::new("team")
@@ -246,6 +289,13 @@ fn serde_round_trips_and_schemas_cover_public_data() {
     round_trip(&MemberOptions {
         parent_agent_id: Some("boss".to_owned()),
     });
+    // --- hierarchical strategies ---
+    round_trip(&HierarchicalMsgbusConfig::new(
+        AgentCard::new("boss").with_id("boss"),
+    ));
+    round_trip(&HierarchicalToolsConfig::new(
+        AgentCard::new("root").with_id("root"),
+    ));
 
     let card = serde_json::to_value(schemars::schema_for!(TeamCard)).expect("schema serializes");
     assert_eq!(
@@ -300,6 +350,32 @@ fn serde_round_trips_and_schemas_cover_public_data() {
     let options =
         serde_json::to_value(schemars::schema_for!(MemberOptions)).expect("schema serializes");
     assert_eq!(schema_properties(&options), ["parent_agent_id"]);
+
+    // Hierarchical configs keep their team limits flat and name the entry agent.
+    let msgbus = serde_json::to_value(schemars::schema_for!(HierarchicalMsgbusConfig))
+        .expect("schema serializes");
+    assert_eq!(
+        schema_properties(&msgbus),
+        [
+            "max_agents",
+            "max_concurrent_messages",
+            "message_timeout",
+            "supervisor_agent",
+            "timeout"
+        ]
+    );
+
+    let tools = serde_json::to_value(schemars::schema_for!(HierarchicalToolsConfig))
+        .expect("schema serializes");
+    assert_eq!(
+        schema_properties(&tools),
+        [
+            "max_agents",
+            "max_concurrent_messages",
+            "message_timeout",
+            "root_agent"
+        ]
+    );
 
     // The flattened card keeps its team fields and adds the subscriptions map.
     let event_driven = serde_json::to_value(schemars::schema_for!(EventDrivenTeamCard))

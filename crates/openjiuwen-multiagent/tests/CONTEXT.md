@@ -37,7 +37,7 @@ Everything is offline and deterministic: members are in-process closures, sessio
 - `./agent_tool.rs` → `AgentTool` card shape, dispatch, failures, concurrency limiter.
 - `./handoff.rs` → handoff strategy: route graph, coordinator semantics, save/restore, signal locators, `HandoffTool`, request wire form, end-to-end chains, streaming, resume.
 - `./hierarchical.rs` → hierarchical strategies: msgbus supervision (readiness, single hop, deadline, one-frame stream), agents-as-tools wiring and pinning (`RecordingToolHost` mounts, mounted-tool dispatch, root stream shaping, error frame), and the `SupervisorAgent` factory (validation, card, end-to-end dispatch, model-visible tool cards, parallel budget).
-- `./api_surface.rs` → compile-time pinning of every crate-root re-export and trait-object coercion.
+- `./api_surface.rs` → compile-time pinning of every crate-root re-export and trait-object coercion, including the hierarchical configs, strategies, team builders, and supervisor factory, their serde round-trip and `schemars` property names, and the two strategy `kind()` strings.
 
 ## Test Strategy
 
