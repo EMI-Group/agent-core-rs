@@ -1,0 +1,283 @@
+# Packaged builtin permission floors for the DeepAgent permission engine.
+#
+# Port of the Python package resource `openjiuwen/harness/resources/builtin_rules.yaml`
+# (v0.1.20). The Rust engine embeds this file with `include_str!` and inlines the
+# entries at ingest time (`engine::prepare_permissions_for_engine`), so a host
+# configuration never needs to touch the filesystem at check time.
+#
+# `rules` are parameter rules applied to shell commands (`tools: [shell]` expands
+# to every configured shell tool). `severity` is a label only; `action` is what the
+# engine enforces (ask or deny — the packaged floors never allow).
+#
+# Deviations from the Python file: `regex`-crate syntax only. Python used
+# lookahead assertions (`(?=...)`, `(?!...)`) in three rules; those predicates are
+# expressed here as alternations of the accepted shapes instead. Semantics are
+# intentionally equivalent-or-stricter (never weaker): a rule may over-match a
+# dangerous command but must never miss one it used to catch.
+
+rules:
+  - id: shell_fs_recursive_or_forced_delete
+    description: "Recursive, forced or bulk delete that can destroy data"
+    tools: [shell]
+    match_type: command
+    pattern: >-
+      re:(?i)(?:^|[\s;&|()])(?:
+      (?:rm\s+(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)\b[^;&|]*(?:-[A-Za-z]*[fF][A-Za-z]*|--force)\b)
+      |(?:rm\s+(?:-[A-Za-z]*[fF][A-Za-z]*|--force)\b[^;&|]*(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)\b)
+      |(?:rm\s+-(?:[A-Za-z]*[rR][A-Za-z]*[fF]|[A-Za-z]*[fF][A-Za-z]*[rR])\b)
+      |(?:rm\s+(?:/\*|~/|\$HOME/|\.\.?/|\.\.?)(?:\s|$|[;&|]))
+      |(?:find\s+[^;&|]*-delete\b)
+      |(?:shred\s+[^;&|]*(?:/\*|~|\.\.?))
+      |(?:del\s+[^;&|]*/[fqs]+\b)
+      |(?:(?:rd|rmdir)\s+[^;&|]*/[qf]*s[qf]*\b)
+      )
+    severity: HIGH
+    action: ask
+
+  - id: shell_ps_recursive_or_forced_delete
+    description: "PowerShell recursive or forced delete that can destroy data"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])(((Remove-Item|\bri\b|\berase\b|\brmdir\b|\bdel\b)\b[^\n\r;|&]*-(Recurse|Force|R|F)\b)|(\brm\b[^\n\r;|&]*-(Recurse|Force)\b))'
+    severity: HIGH
+    action: ask
+
+  - id: shell_registry_delete
+    description: "Delete Windows registry keys (reg delete or Remove-Item on a registry drive)"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(?:^|[\s;&|()])(?:(?:reg\s+delete\b)|(?:(?:Remove-Item|Remove-ItemProperty|\bri\b)\b(?:\s[^\n\r;|&]*?)+?(?:HK(?:LM|CU|CR|U|CC):|Registry::)))'
+    severity: CRITICAL
+    action: deny
+
+  - id: shell_disk_partition_or_raw_device_write
+    description: "Format, partition or write a block device directly"
+    tools: [shell]
+    match_type: command
+    pattern: >-
+      re:(?i)(?:^|[\s;&|()])(?:
+      (?:mkfs(?:\.[A-Za-z0-9_]+)?|mke2fs|diskpart|Format-Volume|Clear-Disk)\b
+      |(?:fdisk\s+(?:-[^-l][^\s;&|]*|[^-][^\s;&|]*|--[A-Za-z][^\s;&|]*))
+      |(?:parted\s+(?:-[^-l][^\s;&|]*|[^-][^\s;&|]*|--[A-Za-z][^\s;&|]*))
+      |(?:format(?:\.com)?\s+(?:/[A-Za-z]+\s+)*[A-Za-z]:)
+      |(?:dd\b[^;&|]*?(?:\bof\s*=\/dev\/|\\\\\.\\PhysicalDrive))
+      |(?:>>?\s*\/dev\/(?:sd[a-z][0-9]*|vd[a-z][0-9]*|xvd[a-z][0-9]*|nvme[0-9]+n[0-9]+(?:p[0-9]+)?|disk[0-9]+))
+      )
+    severity: CRITICAL
+    action: deny
+
+  - id: shell_download_and_execute
+    description: "Download remote content and pipe it straight into a shell or interpreter"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])(((curl|wget|fetch|ftp)\b[^;&]*\|\s*(?:(?:sudo|doas)\s+)?(bash|sh|zsh|dash|ash|source|pwsh|powershell)\b)|(iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^;&|]*\|\s*(iex|Invoke-Expression)\b|((bash|sh|zsh|pwsh|powershell)\b[^;&|]*<\s*<\s*\(?\s*(curl|wget)\b))'
+    severity: HIGH
+    action: ask
+
+  - id: shell_obfuscated_or_dynamic_execution
+    description: "Encoded payloads, decode-then-execute, eval/iex or inline interpreter execution"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((base64\s+(-d|--decode)\b[^;&|]*\|\s*(bash|sh|zsh|dash|ash)\b)|(certutil\s+-decode\b)|((?:powershell|pwsh)\b[^;&|]*-(?:[Ee]nc(?:oded[Cc]ommand)?|[Ee]ncoded[Cc]ommand)\b)|(\[Convert\]::FromBase64String\()|(eval\s+[`$])|(\b(iex|Invoke-Expression)\b)|((python3?|perl|ruby|node)\s+(-c|-e)\b[^;&|]*(socket|subprocess|exec|eval|child_process)))'
+    severity: HIGH
+    action: ask
+
+  - id: shell_reverse_shell_or_bind_shell
+    description: "Reverse shell, bind shell or suspicious network execution channel"
+    tools: [shell]
+    match_type: command
+    # Rewritten for the `regex` crate (no lookahead). Python asserted the shape
+    # after `python3 -c/-e` with `(?=\$?["'])` and then matched the quote inside
+    # the payload branches. Here each accepted shape is spelled out as an
+    # alternation (whitespace-separated payload, `"…"` payload, `'…'` payload);
+    # the whitespace branch scans to end of line, so it can only over-match a
+    # python one-liner that mentions `socket`/`pty.spawn`, never miss one.
+    pattern: >-
+      re:(?i)(/dev/(tcp|udp)/|(^|[\s;&|()])(nc|ncat)\b[^;&|]*\s(-e|--exec)\s|\bsocat\b[^;&|]*(EXEC:|SYSTEM:|PTY)|\bbash\s+-i\b[^;&|]*/dev/tcp/|\bpython3?\s+-[ce](?:\s+[^\r\n]*(?:\bsocket\b|pty\.spawn)|\$?"[^"\r\n]*(?:\bsocket\b|pty\.spawn)|\$?'[^'\r\n]*(?:\bsocket\b|pty\.spawn))|\bperl\s+-[ce]\b[^;&|]*Socket)
+    severity: CRITICAL
+    action: deny
+
+  - id: shell_privilege_escalation
+    description: "Raise privileges via sudo, su, doas, pkexec, runas or an elevated launch"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((sudo|doas|pkexec)\s+|su\s+(-|root|\w)|runas\b|Start-Process\b[^;&|]*-Verb\s+RunAs\b|psexec\b|schtasks\b[^;&|]*/ru\s+SYSTEM\b)'
+    severity: HIGH
+    action: ask
+
+  - id: shell_data_exfiltration
+    description: "Send local files out through curl, wget or PowerShell"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(?:^|[\s;&|\n()])(?:curl\b[^;&|\n]*?(?:--upload-file\b|(?:--data(?:-binary|-raw|-urlencode)?|-d)(?:\s+|=)?@|(?:-F|--form)(?:\s+|=)(?:@[^\s;&|\n]+|[^\s;&|\n]+=@)|-T\s+\S+)|wget\b[^;&|\n]*?--post-file\b|(?:Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^;&|\n]*?-InFile\b)'
+    severity: HIGH
+    action: ask
+
+  - id: shell_remote_execution_or_lateral_movement
+    description: "Remote session, remote process creation or lateral movement"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((Invoke-Command|Enter-PSSession|New-PSSession)\b|winrs\b|wmic\b[^;&|]*process\s+call\s+create|psexec\b|ssh\b[^;&|]*\s\S+\s+["''][^"'']+["''])'
+    severity: HIGH
+    action: ask
+
+  - id: shell_fork_bomb_or_resource_abuse
+    description: "Fork bomb, removal of process limits or bulk killing of critical processes"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:|(^|[\s;&|()])kill\s+-9\s+(-1|1)\b|(^|[\s;&|()])ulimit\s+-u\s+unlimited\b)'
+    severity: CRITICAL
+    action: deny
+
+  - id: shell_system_shutdown_or_reboot
+    description: "Shut down, reboot or switch to a shutdown/reboot runlevel"
+    tools: [shell]
+    match_type: command
+    pattern: >-
+      re:(?i)(?:^|&&|\|\||[;\n]|&)\s*(?:(?:(?:sudo|doas)\s+)?(?:shutdown|reboot|halt|poweroff)\b(?:\s+(?:-[^-][^\s;&|]*|[^-][^\s;&|]*|--h[^e][^\s;&|]*))
+      |systemctl\s+(?:reboot|poweroff|halt)|(?:Stop-Computer|Restart-Computer)\b
+      |(?:init|telinit)\s+(0|6)\b)
+    severity: CRITICAL
+    action: deny
+
+  - id: shell_chmod_world_writable
+    description: "Widen file or directory permissions to world-writable"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(?:^|[\s;&|()])chmod\s+(?:(?:-R|--recursive)\s+)?(?:0?[0-7]{2}[2367]\b|[0-7]{3}[2367]\b|a\+rwx\b|[ao]\+[a-z]*w[a-z]*)'
+    severity: HIGH
+    action: ask
+
+  - id: shell_ld_preload_hijack
+    description: "Hijack the dynamic linker through LD_PRELOAD / DYLD_INSERT_LIBRARIES"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((LD_PRELOAD|DYLD_INSERT_LIBRARIES)\s*=)'
+    severity: HIGH
+    action: ask
+
+  - id: shell_clear_audit_history
+    description: "Erase shell history or audit traces"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((history\s+-c\b)|(HISTFILE\s*=\s*/dev/null)|((rm|shred)\b[^;&|]*\.(bash_history|zsh_history|python_history)\b)|Set-PSReadLineOption\b[^;&|]*HistorySaveStyle\b[^;&|]*SaveNothing)'
+    severity: HIGH
+    action: ask
+
+  - id: shell_disable_firewall
+    description: "Disable or flush firewall rules"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])((ufw\b[^;&|]*\bdisable\b)|(iptables\s+(?:-t\s+\S+\s+)?(?:-F|--flush)\b)|(firewall-cmd\b[^;&|]*--set-default-zone=trusted)|(Set-NetFirewallProfile\b[^;&|]*-Enabled\s+False\b))'
+    severity: HIGH
+    action: ask
+
+  - id: shell_docker_privileged
+    description: "Start a container with excessive privileges (privileged / SYS_ADMIN / pid=host)"
+    tools: [shell]
+    match_type: command
+    pattern: 're:(?i)(^|[\s;&|()])docker\s+run\b[^;&|]*(--privileged\b|--cap-add(=|\s+)SYS_ADMIN\b|--pid(=|\s+)host\b)'
+    severity: HIGH
+    action: ask
+
+# Path floors for the file guard: the action is written into all three axes
+# (read/write/exec) and the entries are injected when `file_guard.enabled` is true.
+sensitive_paths:
+  - id: home_ssh
+    path: "~/.ssh/**"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_ssh
+    path: "**/.ssh/**"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_env
+    path: "**/.env"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_env_ext
+    path: "**/.env.*"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_id_rsa
+    path: "**/id_rsa"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_id_rsa_ext
+    path: "**/id_rsa.*"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_id_ed25519
+    path: "**/id_ed25519"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_id_ed25519_ext
+    path: "**/id_ed25519.*"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_pem
+    path: "**/*.pem"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_pfx
+    path: "**/*.pfx"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: any_key
+    path: "**/*.key"
+    match: glob
+    severity: CRITICAL
+    action: deny
+  - id: home_aws
+    path: "~/.aws/**"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_gnupg
+    path: "~/.gnupg/**"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_kube
+    path: "~/.kube/**"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_docker_config
+    path: "~/.docker/config.json"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_netrc
+    path: "~/.netrc"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_npmrc
+    path: "~/.npmrc"
+    match: glob
+    severity: HIGH
+    action: ask
+  - id: home_gcloud
+    path: "~/.config/gcloud/**"
+    match: glob
+    severity: HIGH
+    action: ask
+
+# Metadata and loopback floors for the net guard. Injected when `net_guard.enabled`
+# is true. A host overlay can never widen these to `allow`.
+net_urls:
+  "169.254.169.254": deny
+  "metadata.google.internal": deny
+  "localhost": deny
+  "127.0.0.1": deny
