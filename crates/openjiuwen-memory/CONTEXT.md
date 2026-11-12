@@ -34,6 +34,7 @@ Configuration (`config`):
 
 Storage (`store`):
 - `MemoryStores { kv, vector, document, graph }` with async constructors `in_memory()`, `local_file(root)`, `sqlite(path)` (feature `sqlite`), and `from_parts`.
+- `in_memory`/`local_file`/`sqlite` bundle a graph backend; `from_parts(kv, vector, document)` leaves `graph = None`, so graph memory stays absent until `.with_graph(store)`.
 - Python-compatible key layout: records `UMD/{user_id}/{scope_id}/{id}`, variables `user_var/{user}/{scope}/{name}`, session variables `session_var/{user}/{scope}/{session}/{name}`, scope config `memory_scope_config/{scope_id}`, vector collections `uid_{user}_gid_{scope}_mtype_{kind}`, message history in document collection `messages`.
 
 Facade (`facade`):
