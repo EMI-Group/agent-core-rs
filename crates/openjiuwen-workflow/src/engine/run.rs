@@ -99,7 +99,11 @@ impl CompiledWorkflow {
             // Keeping the scope alive in this generator would keep the sink open and
             // deadlock the loop below.
             let graph = {
-                let scope = Arc::new(RunScope::new(interactions, Arc::clone(&writer)));
+                let scope = Arc::new(RunScope::new(
+                    interactions,
+                    Arc::clone(&writer),
+                    options.depth,
+                ));
                 workflow.build_graph(Some(&scope), store.clone(), options.max_supersteps)?
             };
             drop(writer);
@@ -213,7 +217,11 @@ async fn run_blocking(
     writer.collect_into(collector);
 
     let store = store_for(&session, &inner.card.id);
-    let scope = Arc::new(RunScope::new(Arc::clone(&interactions), writer));
+    let scope = Arc::new(RunScope::new(
+        Arc::clone(&interactions),
+        writer,
+        options.depth,
+    ));
     let graph = workflow.build_graph(Some(&scope), store.clone(), options.max_supersteps)?;
     let execution = ExecutionOptions {
         cancellation: options.cancellation.clone(),

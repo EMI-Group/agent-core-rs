@@ -55,15 +55,22 @@ pub(crate) struct RunScope {
     pub(crate) interactions: Arc<InteractionState>,
     /// The frame writer every component of this run publishes through.
     pub(crate) writer: Arc<FrameWriter>,
+    /// Nesting level of this run (`0` for a top-level run).
+    pub(crate) depth: usize,
 }
 
 impl RunScope {
-    /// Builds a scope from a run's interaction state and frame writer.
+    /// Builds a scope from a run's interaction state, frame writer, and nesting level.
     #[must_use]
-    pub(crate) fn new(interactions: Arc<InteractionState>, writer: Arc<FrameWriter>) -> Self {
+    pub(crate) fn new(
+        interactions: Arc<InteractionState>,
+        writer: Arc<FrameWriter>,
+        depth: usize,
+    ) -> Self {
         Self {
             interactions,
             writer,
+            depth,
         }
     }
 }
@@ -232,7 +239,8 @@ impl Node for ComponentNode {
         )
         .with_interactions(Arc::clone(&scope.interactions))
         .with_writer(Arc::clone(&scope.writer))
-        .with_cancellation(ctx.cancellation().clone());
+        .with_cancellation(ctx.cancellation().clone())
+        .with_depth(scope.depth);
 
         let span = self.start_span(ctx, inputs.clone());
 

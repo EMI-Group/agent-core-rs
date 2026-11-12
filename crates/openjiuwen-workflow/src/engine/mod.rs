@@ -79,6 +79,10 @@ pub struct WorkflowRunOptions {
     pub stream_modes: Option<Vec<StreamMode>>,
     /// Maximum number of supersteps; `None` uses the graph default.
     pub max_supersteps: Option<usize>,
+    /// Nesting level of this run: `0` for a top-level run, `1` for a sub-workflow, and
+    /// so on. A [`crate::components::sub_workflow::SubWorkflowComponent`] sets it on the
+    /// child run; every other caller leaves it at the default.
+    pub depth: usize,
 }
 
 impl Default for WorkflowRunOptions {
@@ -90,6 +94,7 @@ impl Default for WorkflowRunOptions {
             resume: false,
             stream_modes: None,
             max_supersteps: None,
+            depth: 0,
         }
     }
 }
@@ -140,6 +145,13 @@ impl WorkflowRunOptions {
     #[must_use]
     pub fn with_max_supersteps(mut self, max_supersteps: usize) -> Self {
         self.max_supersteps = Some(max_supersteps);
+        self
+    }
+
+    /// Declare this run as the `depth`-th nested level (`0` is a top-level run).
+    #[must_use]
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
         self
     }
 }

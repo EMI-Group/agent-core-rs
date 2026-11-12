@@ -40,6 +40,7 @@ pub struct ComponentContext {
     writer: Arc<FrameWriter>,
     cancellation: CancellationToken,
     metadata: BTreeMap<String, Value>,
+    depth: usize,
     frame_index: Arc<AtomicU64>,
 }
 
@@ -51,6 +52,7 @@ impl fmt::Debug for ComponentContext {
             .field("executable_id", &self.executable_id)
             .field("cancelled", &self.cancellation.is_cancelled())
             .field("metadata", &self.metadata)
+            .field("depth", &self.depth)
             .field("frame_index", &self.frame_index.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -77,6 +79,7 @@ impl ComponentContext {
             interactions: Arc::new(InteractionState::new()),
             cancellation: CancellationToken::new(),
             metadata: BTreeMap::new(),
+            depth: 0,
             frame_index: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -106,6 +109,17 @@ impl ComponentContext {
     #[must_use]
     pub fn with_metadata(mut self, metadata: BTreeMap<String, Value>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Declare the nesting level of the run executing this component.
+    ///
+    /// A top-level run is depth `0`; a run started by a
+    /// [`crate::components::sub_workflow::SubWorkflowComponent`] is its parent's depth
+    /// plus one. Nested components use it to enforce the nesting limit.
+    #[must_use]
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
         self
     }
 
@@ -146,6 +160,12 @@ impl ComponentContext {
     #[must_use]
     pub fn metadata(&self) -> &BTreeMap<String, Value> {
         &self.metadata
+    }
+
+    /// The nesting level of the run executing this component (`0` at top level).
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.depth
     }
 
     /// Reads the workflow's global state lane.
@@ -285,17 +305,44 @@ impl ComponentContext {
             return Ok(answer);
         }
         let index = self.interactions.next_index(&id);
-        let interaction = WorkflowInteraction::new(id.clone(), index, question.clone());
-        self.interactions.push_pending(interaction.clone());
-        let frame = json!({"id": id, "index": index, "question": question});
+        let interaction = WorkflowInteraction::new(id, index, question);
+        self.relay_interaction(interaction.clone()).await?;
+        Err(interrupt_error(interaction))
+    }
+
+    /// Records `interaction` as pending without publishing a frame.
+    ///
+    /// This is the record-only half of [`ComponentContext::relay_interaction`], used by
+    /// nested components (see
+    /// [`crate::components::sub_workflow::SubWorkflowComponent`]) whose child run has
+    /// already emitted the `__interaction__` frame the parent forwards verbatim.
+    pub(crate) fn record_interaction(&self, interaction: WorkflowInteraction) {
+        self.interactions.push_pending(interaction);
+    }
+
+    /// Records `interaction` and writes its `__interaction__` output frame.
+    ///
+    /// The frame carries `{"id", "index", "question"}` with the interaction's own index,
+    /// which is what a run interrupted on this component reports and what Python's
+    /// `SubWorkflowComponent` relays upwards from the child workflow's session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates frame-writer failures.
+    pub(crate) async fn relay_interaction(&self, interaction: WorkflowInteraction) -> Result<()> {
+        self.record_interaction(interaction.clone());
+        let frame = json!({
+            "id": interaction.id,
+            "index": interaction.index,
+            "question": interaction.value,
+        });
         self.writer
             .write(StreamItem::output(
                 INTERACTION_FRAME_TYPE,
-                Some(i64::from(index)),
+                Some(i64::from(interaction.index)),
                 frame,
             ))
-            .await?;
-        Err(interrupt_error(interaction))
+            .await
     }
 
     /// The run's cancellation token.
