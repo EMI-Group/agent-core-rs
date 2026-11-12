@@ -415,12 +415,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_without_a_model_reports_an_error() {
+    async fn invoke_without_a_model_reports_a_config_error() {
         let agent = LlmAgent::new(LlmAgentConfig::new("a")).unwrap();
         let error = agent
             .invoke(Value::String("hi".to_owned()), None)
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.kind(), ErrorKind::Config);
     }
 }
