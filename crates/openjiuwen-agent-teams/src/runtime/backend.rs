@@ -16,8 +16,9 @@
 //! This port keeps one facade for both, because the runtime, the tool wrappers, the CLI and the MCP
 //! server all need the same four seams in hand and splitting them would only duplicate the wiring.
 //!
-//! The facade is shared, not copied: it lives behind an [`Arc`], every dependency it holds is
-//! already shared, and the roster is one [`RwLock`] over name → handle. That lock is never held
+//! The facade is shared, not copied: it lives behind an [`Arc`](std::sync::Arc), every dependency it
+//! holds is already shared, and the roster is one [`RwLock`](parking_lot::RwLock) over name → handle.
+//! That lock is never held
 //! across an `.await`.
 //!
 //! ```text
@@ -247,7 +248,7 @@ impl TeamBackend {
     /// # Errors
     ///
     /// * [`Error::Validation`] when `content` is longer than
-    ///   [`MAX_MESSAGE_CONTENT_CHARS`](crate::constants::MAX_MESSAGE_CONTENT_CHARS) characters, or
+    ///   [`MAX_MESSAGE_CONTENT_CHARS`] characters, or
     ///   when a direct target list is empty after trimming and filtering.
     /// * Whatever the store or the transport fails with; nothing after the failing row is written
     ///   or published.

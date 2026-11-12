@@ -2,20 +2,21 @@
 //!
 //! Python parity source: `openjiuwen/agent_teams/agent/team_agent.py` (`TeamAgent`) and
 //! `agent/agent_configurator.py` (the wiring `TeamAgent.__init__` performs). Python has one class
-//! for both roles; this port keeps that: [`TeamAgent`] carries a [`TeamRole`], a leader dispatches
-//! and steers while a teammate polls the board and answers mail.
+//! for both roles; this port keeps that: [`TeamAgent`] carries a
+//! [`TeamRole`](crate::schema::TeamRole), a leader dispatches and steers while a teammate polls the
+//! board and answers mail.
 //!
 //! The struct is a *cheap handle*: every field lives inside one `Arc<TeamAgentInner>`, so cloning
 //! it (the run loop does, on every `invoke`) copies one pointer. Building is the only fallible,
-//! `await`-heavy step; it lives in [`super::build`], which owns the blueprint → runtime path and is
-//! pinned by `src/runtime/CONTEXT.md` §"Build path".
+//! `await`-heavy step; it lives in [`build`](crate::runtime::build), which owns the blueprint →
+//! runtime path and is pinned by `src/runtime/CONTEXT.md` §"Build path".
 //!
 //! # Roles
 //!
 //! [`SpecBuild::build`] always produces the *leader* handle: a teammate is not a second public
-//! constructor but a [`TeamMember`] whose runtime is materialized by [`TeamAgent::spawn_member`]
-//! through the same harness-factory seam. The role field exists because the shared run loop and
-//! the adapter must know which half of the contract they are executing.
+//! constructor but a [`TeamMember`](crate::member::TeamMember) whose runtime is materialized by
+//! [`TeamAgent::spawn_member`] through the same harness-factory seam. The role field exists because
+//! the shared run loop and the adapter must know which half of the contract they are executing.
 //!
 //! # Async build
 //!

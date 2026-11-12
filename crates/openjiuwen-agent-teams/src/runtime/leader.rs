@@ -23,7 +23,7 @@
 //! ```
 //!
 //! One run per team is supported: the bus receiver is a single-consumer value
-//! ([`TeamAgent::take_events`]), so a second concurrent run sees chunks and the settle tick only.
+//! (`TeamAgent::take_events`), so a second concurrent run sees chunks and the settle tick only.
 use std::time::Duration;
 
 use openjiuwen_agent::{AgentChunk, AgentOutput};

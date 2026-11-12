@@ -13,7 +13,7 @@
 //! Every mutating call returns a [`TaskMutation`]: the persisted task row, the [`EventPayload`]s the
 //! runtime publishes on the team task topic, and the ids of tasks that unblocked as a side effect
 //! (the wake list for idle members). Every read returns the crate's plain view types
-//! ([`TaskSummary`], [`TaskDetail`]) with their graph-derived fields filled.
+//! ([`crate::schema::TaskSummary`], [`crate::schema::TaskDetail`]) with their graph-derived fields filled.
 //!
 //! # Lifecycle
 //!

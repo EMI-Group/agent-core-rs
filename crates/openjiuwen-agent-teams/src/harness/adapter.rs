@@ -11,7 +11,7 @@
 //!
 //! [`HarnessMemberRuntime::start`] opens the cycle, publishes the settled state, and owns one
 //! background *pump* task that drains `harness.events()` into the registered observers. The pump
-//! is owned by a [`PumpHandle`]: it ends when the cancellation token fires (`stop` or drop of the
+//! is owned by a `PumpHandle`: it ends when the cancellation token fires (`stop` or drop of the
 //! runtime), when the cursor is exhausted, on a cursor error (logged), or when the harness reports
 //! [`HarnessState::Terminated`]. The cursor itself is the cycle-long single-consumer view, so a
 //! finished turn does not end the pump.

@@ -1,9 +1,9 @@
 //! Run-time decision: create a team, attach to it, resume it, or refuse the request.
 //!
 //! When a caller runs a team by name the runtime has to reconcile the caller's session and the
-//! requested [`TeamLifecycle`] with whatever is already live under that name. The decision is a
-//! pure function of that state — [`decide_run_action`] — so the rules are testable without a
-//! runtime and the runtime itself stays free of the branching.
+//! requested [`TeamLifecycle`](crate::schema::TeamLifecycle) with whatever is already live under
+//! that name. The decision is a pure function of that state — [`decide_run_action`] — so the rules
+//! are testable without a runtime and the runtime itself stays free of the branching.
 //!
 //! Python parity source: `openjiuwen/agent_teams/runtime/` team run entry (the "existing team"
 //! checks around `TeamRuntimeManager.activate`).

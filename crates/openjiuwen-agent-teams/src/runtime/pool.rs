@@ -3,9 +3,9 @@
 //! Python parity source: `openjiuwen/agent_teams/runtime/pool.py` (`TeamRuntimePool`,
 //! `ActiveTeam`).
 //!
-//! One pool belongs to one [`TeamRuntimeManager`](super::manager::TeamRuntimeManager) and answers
-//! the single question the run entry points ask: *which team, if any, is live right now and in
-//! which session?* The Python pool is keyed by `team_name` only and stores a [`ActiveTeam`] record
+//! One pool belongs to one [`TeamRuntimeManager`](crate::runtime::manager::TeamRuntimeManager) and
+//! answers the single question the run entry points ask: *which team, if any, is live right now and
+//! in which session?* The Python pool is keyed by `team_name` only and stores an `ActiveTeam` record
 //! whose `current_session_id` is a field; this port keys the pool by session first and team second
 //! (`session_id -> team_name -> handle`), so the session binding is the key and can never disagree
 //! with the stored record. That also makes the two questions the manager needs — "every team of a
