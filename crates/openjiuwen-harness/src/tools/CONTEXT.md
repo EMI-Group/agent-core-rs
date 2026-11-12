@@ -12,7 +12,8 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 
 - `BuiltinTool` enum: `Bash`, `ReadFile`, `WriteFile`, `EditFile`, `Glob`, `ListFiles`, `Grep`, `TodoCreate`, `TodoList`, `TodoGet`, `TodoModify`, `AskUser`, `MemorySearch`, `MemoryGet`, `WriteMemory`, `ReadMemory`, `EditMemory`, `CodingMemoryRead`, `CodingMemoryWrite`, `CodingMemoryEdit`; `ALL`, `name()`, `from_name()`, `parallel_safe()`.
 - `tool_names() -> &'static [&'static str]` — the model-facing names in registry order.
-- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`.
+- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `todo_dir()`, `tools()`.
+- `build`, `cards` and the tool modules `shell`/`read`/`write`/`search`/`todo`/`ask_user`/`memory` are doc-comment-only skeletons: they return empty results until the tool implementations land.
 - The registry never builds `task`/subagent tools (they live in `crate::subagents`).
 
 ### Shared helpers — `support.rs`
@@ -28,6 +29,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 ### Read-before-write state — `read_state.rs`
 
 - `FileFingerprint { mtime_ns, size_bytes }` + `file_fingerprint(&Metadata)`.
+- `ReadCoverage { start, end }` — a 1-based inclusive line window reported by `read_file`.
 - `FileReadState { fingerprint, total_lines, read_ranges: Option<Vec<(usize, usize)>>, content: Option<String> }`.
 - `ReadStateRegistry` (`new() -> Arc<Self>`): `record_read(path, fingerprint, coverage, content)`, `record_written(path, fingerprint, content)`, `write_gate(path, fingerprint, current) -> WriteGate`, `edit_gate(path, fingerprint, current) -> EditGate`, `lock(path) -> OwnedMutexGuard`, `invalidate(path)`, `clear()`.
 - `WriteGate { Ok, NotRead, Partial { lines_read, total_lines, resume_offset }, Stale }`; `EditGate { Ok, NotRead, Stale }`.
