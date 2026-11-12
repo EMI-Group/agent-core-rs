@@ -169,7 +169,7 @@ Expansion is gated by `include_relations && max_depth > 0 && max_neighbors > 0`,
 
 - `./mod.rs` → `GraphMemory`, `GraphAddOptions`/`GraphSearchOptions`, `GraphMemoryStats`, `CombinedRecall`, re-exports
 - `./entity.rs` → `Entity`, `Relation`, labels, node/edge conversion, merge
-- `./extract.rs` → `EntityExtractor`, `HeuristicExtractor`, `LlmExtractor`, JSON parsing/prompt
+- `./extract/` → extraction seam: extraction data types, `EntityExtractor` trait, `HeuristicExtractor`, `LlmExtractor`, prompt and tolerant JSON parsing (`extract/CONTEXT.md`)
 - `./recall.rs` → seed scoring, BFS expansion, hit ordering
 - `./store.rs` → id derivation, `scope_query`, graph-store CRUD/stats helpers scoped by user/scope
 
