@@ -52,10 +52,11 @@ pub mod pulsar {
     pub struct PulsarMessageQueue { .. }
     impl PulsarMessageQueue {
         pub fn new(config: PulsarConfig) -> Result<Self>;                       // validates max_workers > 0
-        pub async fn connect(config: PulsarConfig) -> Result<Arc<dyn MessageQueue>>; // Error::Unsupported
-        pub async fn start_with_retry(config: PulsarConfig, max_retries: u32, retry_delay: Duration)
-            -> Result<Arc<dyn MessageQueue>>;                                   // Error::Unsupported
     }
+    // Module-level functions (Python's provider entry points).
+    pub async fn connect(config: PulsarConfig) -> Result<Arc<dyn MessageQueue>>; // Error::Unsupported
+    pub async fn start_with_retry(config: PulsarConfig, max_retries: u32, retry_delay: Duration)
+        -> Result<Arc<dyn MessageQueue>>;                                        // Error::Unsupported
 }
 ```
 
