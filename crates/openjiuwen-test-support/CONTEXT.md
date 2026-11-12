@@ -13,7 +13,7 @@ Crate root re-exports every public item listed below, so downstream tests use `o
 Every module is public (`mock_llm`, `fixtures`, `responses`, `scripted_model`, `assert_json`, `eventually`), so each item is also reachable at its module path (`openjiuwen_test_support::mock_llm::MockLlmServer`, `openjiuwen_test_support::fixtures::TempWorkspace`).
 Every public item is additionally re-exported at the crate root; `internal` stays private.
 The only other crate-root items are `CRATE_NAME`, `CRATE_VERSION`, and `TEST_API_KEY` (`"test-api-key"`, the key `client_config()` uses).
-`pub use wiremock;` is re-exported (with its `MockServer`, `ResponseTemplate`, `matchers`) so test crates can mock non-LLM endpoints without adding their own dependency; the mock server here is NOT built on wiremock and does not duplicate it.
+`pub use wiremock;` is re-exported at `src/lib.rs:80` (with its `MockServer`, `Mock`, `ResponseTemplate`, `matchers`) so test crates can mock non-LLM JSON endpoints via `openjiuwen_test_support::wiremock` without adding their own dependency; `wiremock` is a normal `[dependencies]` entry (`Cargo.toml:25`) and is otherwise unused inside the crate — the mock server here is NOT built on wiremock and does not duplicate it.
 
 ### Scripted completions — `src/responses.rs`
 
@@ -343,6 +343,8 @@ let resumed = workflow_session_with(options);
 ## Design Decisions
 
 - One loopback HTTP server instead of `httpx.MockTransport`: the Rust client owns retries, SSE decode, and error mapping, so only a real socket proves the wire format end to end.
+- The server is an axum `Router` (`src/mock_llm/routes.rs:39`) served by `axum::serve` over a `tokio::net::TcpListener` bound to `(Ipv4Addr::LOCALHOST, 0)` (`src/mock_llm/mod.rs:327`, `:347`); there is no hand-written HTTP parsing and no hyper layer used directly.
+- There is no generic HTTP-endpoint fake in this crate: the only routes are `/v1/chat/completions`, the `/chat/completions` alias, `GET /health`, and a JSON 404 fallback (`src/mock_llm/routes.rs:39-47`); non-LLM JSON endpoints are mocked through the `wiremock` re-export.
 - The script queue is mode-agnostic (one entry per request, regardless of `stream`): scripted turns are stated once as a neutral `MockCompletion` and projected to JSON or SSE, which avoids keeping two scripts in sync.
 - Python parity kept where observable: default fallback text `"Default mock response"`, ordered queue with no prompt matching, `call_count`/`call_history` recorded at call time, and one assistant chunk per streamed turn unless the test scripts explicit chunks.
 - `ScriptedModel` and `MockLlmServer` cover different layers: `ScriptedModel` fakes the `Model` trait (agent/workflow tests), `MockLlmServer` fakes the provider (client/transport/e2e tests).
