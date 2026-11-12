@@ -14,7 +14,8 @@ Internal structure is idiomatic Rust (serde models, typed errors, one async roun
 - `LlmAgentDsl::{to_agent_card, to_llm_agent_config, build_llm_agent}` (`bridge.rs`) map a document into `openjiuwen_agent::{AgentCard, LlmAgentConfig, LlmAgent}`.
 - `HistoryManager` and `DialogueMessage` (`history.rs`) with `new(max)`, `add_message`, `add_user_message`, `add_assistant_message`, `get_history`, `get_latest_k(k)`, `len`, `is_empty`, `clear`, `max_history_size`; `DEFAULT_MAX_HISTORY_SIZE` is `20`.
 - `AgentBuilder` (`builder.rs`) with `new(Arc<dyn Model>)`, `build_agent`, `build_agent_at`, `history(session_id, k)`, `clear_session`, `status`, `model`.
-- `AgentType` (`llm_agent`/`workflow`), `BuildState` (`initial`/`clarifying`/`requesting`/`processing`/`completed`), `BuildStatus`, `BuildOutput`, `BuildResult`, `map_state_to_status`, `now_millis`.
+- `AgentType` (`llm_agent`/`workflow`) and `now_millis` (`builder.rs`).
+- `BuildState` (`initial`/`clarifying`/`requesting`/`processing`/`completed`), `BuildStatus`, `BuildOutput`, `BuildResult`, and `map_state_to_status` (`outcome.rs`), re-exported from `mod.rs`.
 - `BuildResult::to_json` emits `status`, `session_id`, `agent_type`, and exactly one of `dsl`, `workflow`, `response`; there is no nested `output` key.
 - `BuildOutput` serializes externally tagged, so its JSON is exactly `{"dsl": {...}}`, `{"workflow": {...}}`, or `{"response": "..."}`.
 
@@ -49,7 +50,7 @@ Either way the assistant text is appended to the session history, so `status().r
 - Time is a parameter everywhere except `now_millis`, and randomness is used only for a missing DSL `agent_id`, so tests never depend on the wall clock or on generated ids.
 - No `unsafe`, no `unwrap`/`expect`/`panic!` in library code, no printing; diagnostics go through `tracing::debug`.
 - Async-first: `build_agent`/`build_agent_at` are `async fn` and compose inside an existing tokio runtime; no blocking calls and no environment reads.
-- Files stay around ~1000 lines with one responsibility each; `builder.rs` sits just above that because its test module covers the full state/status matrix, and splitting it would separate the builder from its only consumers.
+- Files stay under 1000 lines with one responsibility each: `builder.rs` (~730) holds the session builder and stays within budget by delegating the result vocabulary to `outcome.rs` (~315), whose test module covers the full state/status matrix.
 
 ## Design Decisions
 
@@ -73,8 +74,9 @@ Either way the assistant text is appended to the session history, so `status().r
 
 ## Test Strategy
 
-- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, and `builder` each own a `#[cfg(test)] mod tests`.
-- `builder` tests cover all five `BuildState` values against both `AgentType`s, `Display`/`FromStr`/serde wire names, all three `BuildOutput` variants, and the flattened `BuildResult::to_json` keys.
+- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, `builder`, and `outcome` each own a `#[cfg(test)] mod tests`.
+- `builder` tests cover `AgentType`'s `Display`/`FromStr` wire names plus the session, prompt-assembly, and parse-fallback flows.
+- `outcome` tests cover all five `BuildState` values against both `AgentType`s, the `BuildState`/`BuildStatus` serde wire names, all three `BuildOutput` variants, and the flattened `BuildResult::to_json` keys.
 - Model-driven paths use `openjiuwen_test_support::ScriptedModel` with queued turns or a single failing turn; `call_count`/`calls` assert that exactly one round trip happens per request.
 - Sessions are exercised for isolation, `clear_session`, `history(sid, Some(k))` limits, and `status().resource_count` transitions.
 - Timestamps are asserted against an explicit `build_agent_at(.., 1_700_000_000_000)` value; only the clock-entry-point test asserts a positive `create_time`.
@@ -87,7 +89,8 @@ Either way the assistant text is appended to the session history, so `status().r
 - `./spec.rs` → programmatic `LlmAgentSpec`/`WorkflowSpec` and their DSL conversion
 - `./bridge.rs` → DSL-to-kernel mapping: `AgentCard`, `LlmAgentConfig`, `build_llm_agent`
 - `./history.rs` → bounded `HistoryManager` and `DialogueMessage`
-- `./builder.rs` → session-based `AgentBuilder`, `AgentType`/`BuildState`, `BuildStatus`/`BuildOutput`/`BuildResult`, and `now_millis`
+- `./builder.rs` → session-based `AgentBuilder`, `AgentType`, prompt assembly, artifact parsing, and `now_millis`
+- `./outcome.rs` → `BuildState`, `BuildStatus`, `BuildOutput`, `BuildResult`, and `map_state_to_status`, the result vocabulary re-exported from `mod.rs`
 - `./mod.rs` → module tree and crate-level re-exports for this directory
 - `../util.rs` → shared `extract_json_fence` and text helpers (sibling, read-only — escalate writes to the parent)
 - `../../openjiuwen-agent/` → `AgentCard`, `LlmAgentConfig`, `LlmAgent`, `ReActAgent` consumed by the bridge (sibling crate, read-only — escalate writes to the parent)

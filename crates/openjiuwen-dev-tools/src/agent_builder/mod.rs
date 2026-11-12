@@ -1,9 +1,9 @@
 //! Agent specifications, the platform DSL, and the bridge into `openjiuwen-agent`.
 //!
-//! Ports `openjiuwen/dev_tools/agent_builder/` across six files: programmatic
+//! Ports `openjiuwen/dev_tools/agent_builder/` across seven files: programmatic
 //! specs, the serialized LLM-agent DSL, the serialized workflow DSL, the bounded
-//! dialogue history, the model-driven builder, and the bridge into
-//! `openjiuwen-agent`.
+//! dialogue history, the model-driven builder, its result vocabulary, and the
+//! bridge into `openjiuwen-agent`.
 //!
 //! The Python builder runs a multi-stage state machine — intention detection,
 //! an LLM clarifier, an agent/workflow designer, a DSL generator and reflector,
@@ -25,9 +25,10 @@
 //! - `bridge` — the DSL-to-kernel bridge ([`AgentCard`], [`LlmAgentConfig`], and
 //!   [`LlmAgent`]) implemented as inherent methods on [`LlmAgentDsl`].
 //! - `history` — the bounded builder dialogue history ([`HistoryManager`]).
-//! - `builder` — the session-based builder ([`AgentBuilder`]), its result and
-//!   status models ([`BuildResult`], [`BuildStatus`]), and the artifact/state
-//!   enums ([`AgentType`], [`BuildState`]).
+//! - `builder` — the session-based builder ([`AgentBuilder`]), the artifact enum
+//!   ([`AgentType`]), and the `now_millis` clock entry point.
+//! - `outcome` — the result and state vocabulary ([`BuildResult`],
+//!   [`BuildStatus`], [`BuildOutput`], [`BuildState`], [`map_state_to_status`]).
 //!
 //! [`AgentCard`]: openjiuwen_agent::AgentCard
 //! [`LlmAgentConfig`]: openjiuwen_agent::LlmAgentConfig
@@ -37,16 +38,15 @@ pub mod bridge;
 pub mod builder;
 pub mod dsl;
 pub mod history;
+pub mod outcome;
 pub mod spec;
 pub mod workflow_dsl;
 
-pub use builder::{
-    map_state_to_status, now_millis, AgentBuilder, AgentType, BuildOutput, BuildResult, BuildState,
-    BuildStatus,
-};
+pub use builder::{now_millis, AgentBuilder, AgentType};
 pub use dsl::{
     DslConfigs, DslDependencies, DslModel, DslModelInfo, LlmAgentDsl, PluginRef, WorkflowRef,
 };
 pub use history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
+pub use outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
 pub use spec::{LlmAgentSpec, WorkflowSpec};
 pub use workflow_dsl::{DslEdge, DslNode, WorkflowDsl};
