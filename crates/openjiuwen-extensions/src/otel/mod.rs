@@ -1,9 +1,9 @@
 //! OpenTelemetry tracing over the session [`TraceSink`] SPI.
 //!
 //! Ports `openjiuwen/extensions/tracer_otel/` (v0.1.20). Sessions emit
-//! synchronous trace frames, so the primary seam is a sink ([`OtelTraceSink`])
-//! plus typed handlers ([`OtelAgentHandler`], [`OtelWorkflowHandler`]) for
-//! callers that already hold a [`TraceSpan`].
+//! synchronous trace frames, so the primary seam is a sink (`OtelTraceSink`,
+//! `otel` feature) plus typed handlers (`OtelAgentHandler`, `OtelWorkflowHandler`)
+//! for callers that already hold a [`TraceSpan`].
 //!
 //! Everything that decides *what a span looks like* — configuration, semantic
 //! conventions, redaction, span names — compiles with or without the `otel`

@@ -5,12 +5,12 @@
 //! - [`Evaluator`] — turns a `(case, prediction)` pair into an
 //!   [`EvaluatedCase`]; the provided [`batch_evaluate`](Evaluator::batch_evaluate)
 //!   runs it with bounded concurrency.
-//! - [`CaseRunner`] — produces the prediction for a case (see [`runner`] for the
+//! - [`CaseRunner`] — produces the prediction for a case (see `runner` for the
 //!   agent and map adapters).
 //! - [`EvaluationReport`] — aggregate statistics over the evaluated cases.
 //! - [`evaluate_cases`] — the end-to-end driver: run, score, and report.
 //!
-//! Metrics and their aggregation live in [`metrics`].
+//! Metrics and their aggregation live in `metrics`.
 //!
 //! # Determinism
 //!

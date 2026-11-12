@@ -13,7 +13,7 @@
 //! message naming the sandbox type.
 //!
 //! The provider seam itself is the kernel's
-//! ([`openjiuwen_sysop::sandbox::provider`], reachable as
+//! (`openjiuwen_sysop::sandbox::provider`, reachable as
 //! `openjiuwen_core::sys_operation::sandbox::provider`), so a backend registered here is
 //! the same one a `SysOperation` card resolves.
 //!

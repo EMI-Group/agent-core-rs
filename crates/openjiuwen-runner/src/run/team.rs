@@ -100,7 +100,7 @@ pub async fn invoke_team(
 /// The stream is returned immediately, so a resolution or transport-start
 /// failure is delivered as a one-element stream yielding that error. On success
 /// the strategy's frames are forwarded verbatim (nothing is re-wrapped) and the
-/// [`SessionLease`] is finished by the [`Teardown`] after the last frame or when
+/// [`SessionLease`] is finished by the `Teardown` after the last frame or when
 /// the consumer drops the stream early.
 ///
 /// As with [`invoke_team`], no callback events are fired and a caller-provided

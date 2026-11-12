@@ -9,7 +9,8 @@
 //!
 //! # Frame-model adaptation
 //!
-//! A frame carries a full [`TraceSpan`] snapshot plus its [`SpanStatus`], so the
+//! A frame carries a full [`TraceSpan`](openjiuwen_core::session::tracer::TraceSpan)
+//! snapshot plus its [`SpanStatus`](openjiuwen_core::session::tracer::SpanStatus), so the
 //! sink derives the Python callback from the frame rather than from a method
 //! name:
 //!
@@ -89,7 +90,7 @@
 //! - Frame spans carry no exception object, so a failure carries only the
 //!   textual `error` field; the error code falls back to the shared
 //!   `DEFAULT_ERROR_CODE` and `error.type` repeats it.
-//! - Workflow spans reuse [`attrs::apply_start_attributes`], so they also carry
+//! - Workflow spans reuse `attrs::apply_start_attributes`, so they also carry
 //!   `gen_ai.provider.name` and `openjiuwen.parent_invoke_id`, which Python's
 //!   workflow handler does not write (it uses `openjiuwen.parent_node_id` only).
 //! - The environment variable fallback for the session id is not needed: a
@@ -215,7 +216,7 @@ impl TraceSink for OtelTraceSink {
     /// Maps one frame onto the span lifecycle of its invoke id.
     ///
     /// Dispatch is on the payload's
-    /// [`TraceSpanKind`](openjiuwen_core::session::tracer::TraceSpanKind) (agent
+    /// [`TraceSpanKind`] (agent
     /// versus workflow/component); `frame.item_type` is informational and
     /// ignored. Failures are logged and dropped, never propagated.
     fn emit(&self, frame: TraceFrame) {

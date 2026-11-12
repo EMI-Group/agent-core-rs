@@ -139,7 +139,7 @@ impl MemoryVectorStore {
     /// Keys are exact dotted paths: `"workspace.id"` walks the nested object
     /// `{"workspace": {"id": ...}}`. A missing path, or a non-object value in
     /// the middle of a path, is a non-match. Values compare with `==` on
-    /// [`Value`](serde_json::Value), and an empty filter matches every node.
+    /// [`Value`], and an empty filter matches every node.
     ///
     /// # Errors
     ///

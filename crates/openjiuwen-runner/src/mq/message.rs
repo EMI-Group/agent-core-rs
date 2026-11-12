@@ -4,7 +4,7 @@
 //! `openjiuwen/core/runner/message_queue_base.py`. The Python subclasses
 //! `InvokeQueueMessage` / `StreamQueueMessage` carried a live `asyncio.Future`;
 //! in this port the reply channel belongs to the transport
-//! ([`crate::mq::InMemoryMessageQueue::request`]) and the envelope stays plain
+//! ([`crate::mq::MessageQueue::request`]) and the envelope stays plain
 //! serializable data, so a broker backend can ship it over the wire unchanged.
 
 use openjiuwen_common::error::Result;

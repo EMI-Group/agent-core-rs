@@ -1,7 +1,7 @@
 //! `#[tool]` — the Rust equivalent of the Python `@tool` decorator.
 //!
 //! One attribute turns an `async fn` plus a typed argument struct into a
-//! model-facing [`ToolCard`], a [`Tool`] implementation, and an
+//! model-facing `ToolCard`, a `Tool` implementation, and an
 //! `Arc<dyn Tool>` constructor, so a tool author writes a plain async function
 //! and never hand-builds a card or a JSON Schema.
 //!

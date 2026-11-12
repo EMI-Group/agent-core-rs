@@ -23,7 +23,7 @@ use super::store_client::StoreTeamClient;
 ///
 /// Resolution is `try_global_registry()` → [`TeamRuntimeManager::live`] → the live
 /// [`TeamAgent`](crate::runtime::TeamAgent)'s backend → a [`StoreTeamClient`] over that backend's
-/// store, task board and messager (see [`resolve_live_client`] for the registry-free half). The
+/// store, task board and messager (see `resolve_live_client` for the registry-free half). The
 /// returned client therefore drives the *live* team: a task it creates is claimable on the team's
 /// own board and a message it sends lands in the team's own mailbox.
 ///

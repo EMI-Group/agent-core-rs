@@ -1,7 +1,7 @@
 //! Native harness protocol/provider implementation, event bridge, and cursors.
 //!
 //! [`NativeHarness`] is the provider-neutral
-//! [`HarnessProtocol`](openjiuwen_harness_protocol::HarnessProtocol) implementation
+//! [`HarnessProtocol`] implementation
 //! over the kernel [`DeepAgent`]: one harness handle owns one `start`/`stop`
 //! cycle, publishes an ordered observation stream, and accepts turns,
 //! steering, aborts, pause/resume, checkpoints, and model selection.
@@ -9,12 +9,12 @@
 //! The module tree:
 //!
 //! - `mod.rs` — public surface, creation, lifecycle, and model control;
-//! - [`inner`] — shared mutable protocol state and lifecycle helpers;
-//! - [`turn`] — the turn task that drives `DeepAgent::stream`;
-//! - [`events`] — kernel frame/output → protocol payload mapping;
-//! - [`bridge`] — envelopes, id counters, and checkpoint persistence;
-//! - [`cursor`] — the bounded observation channel and its cursors;
-//! - [`provider`] — `NativeHarnessProvider`, the JSON-driven factory.
+//! - `inner` — shared mutable protocol state and lifecycle helpers;
+//! - `turn` — the turn task that drives `DeepAgent::stream`;
+//! - `events` — kernel frame/output → protocol payload mapping;
+//! - `bridge` — envelopes, id counters, and checkpoint persistence;
+//! - `cursor` — the bounded observation channel and its cursors;
+//! - `provider` — `NativeHarnessProvider`, the JSON-driven factory.
 //!
 //! Documented deviations from the Python provider: turn ids are the
 //! deterministic `turn-<n>` and message ids `message-<n>` instead of uuid hexes,

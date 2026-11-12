@@ -27,7 +27,7 @@
 //! A streaming response is a sequence of SSE frames, each terminated by a blank
 //! line and carrying one `data:` payload that is a complete [`JsonRpcResponse`].
 //! Frames may be split at any byte across HTTP chunks, so the parser
-//! ([`SseFramer`]) is incremental over `bytes_stream()`: it never buffers the
+//! (`SseFramer`) is incremental over `bytes_stream()`: it never buffers the
 //! whole body, accepts `\n`, `\r`, and `\r\n` line endings (including a `\r\n`
 //! pair split across two chunks), joins multiple `data:` lines of one frame
 //! with `\n`, and ignores comment lines (`:`), `event:`, `id:`, and `retry:`

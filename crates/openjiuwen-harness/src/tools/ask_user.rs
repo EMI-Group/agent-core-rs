@@ -69,7 +69,7 @@ pub trait UserAsker: Send + Sync {
 /// Arguments of the `ask_user` tool.
 ///
 /// Python parity: the `questions` parameter of the Python `ask_user` schema. The card renders
-/// the bounds and the nested question/option shape inline (see [`install_ask_questions`]).
+/// the bounds and the nested question/option shape inline (see `install_ask_questions`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AskUserArgs {
     /// The questions to raise with the user; between one and four per call.

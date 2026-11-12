@@ -59,7 +59,7 @@ async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
 }
 /// Resolves the join descriptor from `OPENJIUWEN_TEAM_JOIN` and serves over stdio.
 ///
-/// The server attaches only to a team hosted in *this* process: [`resolve_from_registry`] goes
+/// The server attaches only to a team hosted in *this* process: `resolve_from_registry` goes
 /// through [`crate::skill::connect_live_client`], the process-global runtime registry. A team this
 /// process does not host is [`Error::config`] and exits `1`; cross-process attach (a shared sqlite
 /// store or a distributed transport) is deferred.
@@ -82,7 +82,7 @@ pub async fn run_mcp_server_from_env() -> i32 {
 /// Resolves the join descriptor from the environment and serves the client `resolver` returns.
 ///
 /// `resolver` is the seam used by the CLI and by tests to inject a pre-built client. The default
-/// [`resolve_from_registry`] only finds teams hosted in this process.
+/// `resolve_from_registry` only finds teams hosted in this process.
 ///
 /// Returns the process exit code: `0` on success, `1` on a descriptor/resolver/session failure.
 pub async fn run_mcp_server_with<F>(resolver: F) -> i32

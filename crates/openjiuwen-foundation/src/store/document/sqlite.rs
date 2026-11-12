@@ -15,7 +15,7 @@
 //! and one index serves every collection.
 //!
 //! Filtering, ordering, and paging happen in Rust on the collection's rows via
-//! [`super::run_query`], so `SQLite` rankings cannot differ from the other
+//! `super::run_query`, so `SQLite` rankings cannot differ from the other
 //! backends. Rows are read in `id` order to match the in-memory and file
 //! backends' iteration order, which makes ties stable across backends too.
 

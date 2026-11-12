@@ -1,6 +1,6 @@
 //! The graph adapter: one [`Component`] driven as an [`openjiuwen_graph::Node`].
 //!
-//! [`ComponentNode`] is the only place where a workflow component meets the graph
+//! `ComponentNode` is the only place where a workflow component meets the graph
 //! executor. It resolves the node's input templates against workflow state, hands the
 //! component a [`ComponentContext`], dispatches exactly one ability, projects the result
 //! through `outputs_schema`, and writes it back under the node's id. Everything about
@@ -8,7 +8,7 @@
 //!
 //! Two behaviours deserve a note:
 //!
-//! - **The root seed carries the run inputs.** [`super::run`] seeds the graph with the
+//! - **The root seed carries the run inputs.** `super::run` seeds the graph with the
 //!   workflow inputs plus a reserved `"inputs"` key holding the original value, so both
 //!   `${query}` (root reference) and `${start.query}` (node reference) resolve.
 //! - **Streaming is buffered.** A `Stream`/`Transform` node drains its component stream

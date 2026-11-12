@@ -175,7 +175,7 @@ impl<'a> IntoIterator for &'a CaseLoader {
 
 /// Returns the cases in a deterministic shuffled order.
 ///
-/// The shuffle is a Fisher-Yates pass driven by [`Rng64`]; the same seed always
+/// The shuffle is a Fisher-Yates pass driven by `Rng64`; the same seed always
 /// yields the same permutation.
 #[must_use]
 pub fn shuffle_cases(mut cases: Vec<Case>, seed: u64) -> Vec<Case> {

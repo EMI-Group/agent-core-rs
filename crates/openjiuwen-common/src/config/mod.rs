@@ -3,7 +3,7 @@
 //! The Rust SDK keeps the Python SDK's "no central config file" model
 //! (`docs/ARCHITECTURE.md` §4): typed configuration structs live at their call
 //! sites, and every runtime knob is read from an environment variable through
-//! [`env`]. Filesystem locations for runtime state live in [`home`].
+//! [`env`](mod@env). Filesystem locations for runtime state live in [`home`].
 //!
 //! [`load_dotenv`] is the only place a `.env` file is read. It exists for
 //! binaries and examples; library constructors never call it, so embedding an

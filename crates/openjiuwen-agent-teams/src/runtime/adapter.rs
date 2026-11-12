@@ -129,7 +129,7 @@ impl Team for TeamAgent {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for an empty card name, and [`Error::Config`](Error::Config) when no
+    /// [`Error::Validation`] for an empty card name, and [`Error::Config`] when no
     /// tokio runtime is available to persist the roster row.
     fn add_agent(&self, card: AgentCard, provider: AgentProvider) -> Result<()> {
         debug!(
@@ -203,7 +203,7 @@ impl Team for TeamAgent {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`](Error::Config) when the leader row or its runtime is missing (a team
+    /// [`Error::Config`] when the leader row or its runtime is missing (a team
     /// always builds with both, so this only fires on a corrupted roster).
     fn check_ready(&self) -> Result<()> {
         let backend = self.backend();

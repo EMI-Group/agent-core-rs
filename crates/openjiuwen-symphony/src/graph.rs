@@ -1,23 +1,28 @@
 //! The `can_feed` capability relationship graph and its JGF v2 document form.
 //!
 //! Ports the deterministic half of Python `openjiuwen.symphony.orchestration.graph`:
-//! a [`CapabilityGraph`] holds one [`CapabilityNode`] per capability and
-//! [`CapabilityEdge`]s describing directed relations between them. The relation the
-//! planner consumes is [`CAN_FEED`], derived from the data-type vocabulary.
+//! a [`CapabilityGraph`](crate::graph::CapabilityGraph) holds one
+//! [`CapabilityNode`](crate::graph::CapabilityNode) per capability and
+//! [`CapabilityEdge`](crate::graph::CapabilityEdge)s describing directed relations
+//! between them. The relation the planner consumes is
+//! [`CAN_FEED`](crate::graph::CAN_FEED), derived from the data-type vocabulary.
 //!
 //! # Determinism
 //!
-//! Nodes live in a [`BTreeMap`], so iteration is always sorted by node id. Edges keep
+//! Nodes live in a `BTreeMap`, so iteration is always sorted by node id. Edges keep
 //! their insertion order in `edges` (an upsert replaces in place) but every read —
-//! [`CapabilityGraph::outgoing`], [`CapabilityGraph::incoming`], and the JSON produced
-//! by [`CapabilityGraph::to_value`] — sorts by `(source, target, relation)`. No output
-//! depends on hash order or on the clock.
+//! [`CapabilityGraph::outgoing`](crate::graph::CapabilityGraph::outgoing),
+//! [`CapabilityGraph::incoming`](crate::graph::CapabilityGraph::incoming), and the JSON
+//! produced by [`CapabilityGraph::to_value`](crate::graph::CapabilityGraph::to_value) —
+//! sorts by `(source, target, relation)`. No output depends on hash order or on the
+//! clock.
 //!
 //! # Errors
 //!
 //! Malformed input is rejected with [`crate::error::validation`], naming the offending
-//! field: [`CapabilityGraph::add_edge`] names `edge.source`, `edge.target`,
-//! `edge.relation`, or `edge.weight`, and [`CapabilityGraph::from_value`] names the
+//! field: [`CapabilityGraph::add_edge`](crate::graph::CapabilityGraph::add_edge) names
+//! `edge.source`, `edge.target`, `edge.relation`, or `edge.weight`, and
+//! [`CapabilityGraph::from_value`](crate::graph::CapabilityGraph::from_value) names the
 //! document path (for example `graph.nodes[2]`).
 
 use std::collections::{BTreeMap, BTreeSet};

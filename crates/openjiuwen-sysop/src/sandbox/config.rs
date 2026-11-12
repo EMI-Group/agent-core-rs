@@ -3,7 +3,7 @@
 //! These types are always compiled: they are part of [`crate::card::SysOperationCard`]'s
 //! serialized shape, so a card written for the sandbox must round-trip even when the
 //! remote backend is not built in. The gateway client itself lives in
-//! [`crate::sandbox::http`] behind the `sandbox` feature.
+//! `crate::sandbox::http` behind the `sandbox` feature.
 //!
 //! ```
 //! use openjiuwen_sysop::sandbox::config::{

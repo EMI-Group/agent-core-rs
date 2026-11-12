@@ -25,6 +25,7 @@ Binary `openjiuwen` (`src/main.rs`, `[[bin]] name = "openjiuwen"`); the crate ha
 - `println!`/`eprintln!` are allowed here (binary crate) but limited to the user-facing diagnostic and logging fallback; other binaries follow the same boundary rule.
 - Async-first: the process runs on the tokio multi-thread runtime provided by `#[tokio::main]`; no blocking calls are added at the boundary.
 - Do not add sibling binaries here.
+- The `[[bin]]` target declares `doc = false`: the binary is named `openjiuwen`, so documenting it would write `target/doc/openjiuwen/index.html` and collide with the `openjiuwen` umbrella crate's lib docs.
 
 ## Gotchas
 

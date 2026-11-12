@@ -6,7 +6,7 @@
 //! configuration surface but adds no Elasticsearch client dependency: the
 //! backend is deferred, so [`ElasticsearchVectorStore::new`] validates the
 //! configuration and [`ElasticsearchVectorStore::connect`] answers
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported).
+//! [`Error::Unsupported`].
 //!
 //! # Documented behavior of the deferred backend
 //!
@@ -56,7 +56,7 @@ impl Default for ElasticsearchVectorStoreConfig {
 ///
 /// Construction validates the configuration and names indices like Python's
 /// backend; connecting returns
-/// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+/// [`Error::Unsupported`]
 /// instead of a live [`VectorStore`].
 #[derive(Debug, Clone)]
 pub struct ElasticsearchVectorStore {

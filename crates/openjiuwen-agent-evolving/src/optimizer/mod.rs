@@ -6,7 +6,7 @@
 //! out of scope: [`GridSearchOptimizer`] provides a deterministic baseline that never
 //! calls a model, so the trainer can run offline.
 //!
-//! Checkpoint persistence lives in [`checkpoint`] and is re-exported here.
+//! Checkpoint persistence lives in `checkpoint` and is re-exported here.
 //!
 //! # Example
 //!

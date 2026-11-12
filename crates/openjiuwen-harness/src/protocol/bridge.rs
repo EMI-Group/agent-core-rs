@@ -46,7 +46,7 @@ const DEFAULT_PLAN_MODE: &str = "normal";
 /// plan mode, the turn counter, and the active model/effort selection.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NativeCheckpointState {
-    /// Schema version of this payload; always [`CHECKPOINT_SCHEMA_VERSION`].
+    /// Schema version of this payload; always `CHECKPOINT_SCHEMA_VERSION`.
     pub schema_version: String,
     /// Kernel session id the checkpoint was taken from.
     pub session_id: String,
@@ -71,7 +71,7 @@ pub struct NativeCheckpointState {
 impl NativeCheckpointState {
     /// Builds an empty checkpoint state for the given scope.
     ///
-    /// `schema_version` is set to [`CHECKPOINT_SCHEMA_VERSION`], `plan_mode` to
+    /// `schema_version` is set to `CHECKPOINT_SCHEMA_VERSION`, `plan_mode` to
     /// `normal`, and every counter/collection starts empty.
     pub fn new(
         session_id: impl Into<String>,
@@ -110,7 +110,7 @@ impl NativeCheckpointState {
     /// [`HarnessError::Validation`] with `invalid native checkpoint` when
     /// `data` does not match this type, or with
     /// `unsupported native checkpoint version` when the decoded
-    /// `schema_version` is not [`CHECKPOINT_SCHEMA_VERSION`].
+    /// `schema_version` is not `CHECKPOINT_SCHEMA_VERSION`.
     pub fn from_json(data: &JsonObject) -> HarnessResult<Self> {
         let state: Self = serde_json::from_value(json_object_to_value(data))
             .map_err(|_| HarnessError::validation("invalid native checkpoint"))?;

@@ -137,7 +137,7 @@ impl TeamRuntimeManager {
     ///
     /// [`Error::Validation`] for an invalid blueprint, a blank team name or session, and every
     /// rejection [`decide_run_action`] produces; the build errors of
-    /// [`SpecBuild::build_with`](super::team_agent::SpecBuild::build_with) (unsupported transport,
+    /// [`SpecBuild::build_with`] (unsupported transport,
     /// store, workspace, harness factory) and the leader runtime's start error on creation.
     pub async fn activate(
         &self,

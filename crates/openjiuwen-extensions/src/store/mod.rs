@@ -4,10 +4,10 @@
 //! package: the memory, local-file, and SQLite backends live in the kernel
 //! ([`openjiuwen_core::foundation::store`]) and this module only dispatches to
 //! them from a [`StoreBackend`] value. Vendor backends keep their deferred
-//! surfaces in child modules: [`redis`] (feature `redis`) for key-value and
+//! surfaces in child modules: `redis` (feature `redis`) for key-value and
 //! [`elasticsearch`] for vectors. A deferred backend validates its
 //! configuration and then answers
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported); the
+//! [`Error::Unsupported`]; the
 //! Python `GaussDbStore` has no Rust analogue because the kernel's document
 //! contract replaces the `SQLAlchemy` engine (see `docs/PARITY.md`).
 //!

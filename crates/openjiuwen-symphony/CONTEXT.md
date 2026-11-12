@@ -538,6 +538,12 @@ pub struct SkillFolderScanner;       // Python `shared.fingerprint.SkillFolderSc
 
 Each stub documents the Python class it mirrors and the reason it is deferred.
 
+## Notes for Agents
+
+- Intra-doc links in a module-level (`//!`) doc block do not resolve names that are defined or re-exported in that same file module (rustdoc answers `no item named X in scope`, with no file span); write them as labeled links to absolute paths, e.g. `[`AssetStore`](crate::store::AssetStore)`.
+- Items in sibling modules and dependency types are linkable the same way (`crate::model::CapabilityDescriptor`, `openjiuwen_foundation::store::KvStore`); std generics used in prose and private items stay plain code spans.
+- `cargo doc -p openjiuwen-symphony --no-deps` is the definition of done for doc links: it must print no warnings.
+
 ## Constraints
 
 - Cargo: `edition 2021`, `rust-version 1.85`, `publish = false`, `#![forbid(unsafe_code)]`; `default = []` and the sole feature `sqlite` only enables `store::KvAssetStore::sqlite` via `openjiuwen-foundation/sqlite`, so a default build and `--no-default-features` are identical.

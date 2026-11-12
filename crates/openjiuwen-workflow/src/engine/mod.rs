@@ -10,7 +10,7 @@
 //! Everything about supersteps, channels, retries, checkpoints, and Mermaid rendering
 //! belongs to `openjiuwen-graph`; this module compiles a graph per run (node instances
 //! carry per-run interaction state and frame writers) and projects the result into a
-//! [`WorkflowOutput`] or a frame stream.
+//! [`WorkflowOutput`](crate::output::WorkflowOutput) or a frame stream.
 //!
 //! ```no_run
 //! use std::sync::Arc;

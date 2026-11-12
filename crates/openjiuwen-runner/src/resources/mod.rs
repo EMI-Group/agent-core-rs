@@ -3,7 +3,7 @@
 //!
 //! Ports Python `openjiuwen/core/runner/resources_manager/resource_manager.py`
 //! reduced to the four public resource kinds hosts depend on. Each kind owns one
-//! [`Registry`] (see [`registry`]) keyed on the resource card id, with the
+//! [`Registry`] (see `registry`) keyed on the resource card id, with the
 //! provider invoked on every lookup (Python parity: a fresh instance per
 //! `get_*`).
 //!

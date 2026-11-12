@@ -3,7 +3,7 @@
 //! Ports `openjiuwen/core/session/internal/` (v0.1.20). All four concrete
 //! sessions live here: the workflow-side [`WorkflowSession`] and
 //! [`NodeSession`], and the agent-side [`AgentSession`] and
-//! [`AgentTeamSession`]. They share the crate-private [`shared`] plumbing, so a
+//! [`AgentTeamSession`]. They share the crate-private `shared` plumbing, so a
 //! child session reuses its parent's config, stream hub, and trace id instead
 //! of opening a second stream.
 //!

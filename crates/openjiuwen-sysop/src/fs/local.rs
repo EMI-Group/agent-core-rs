@@ -17,7 +17,7 @@
 //!
 //! # In-process locks
 //!
-//! [`LocalFsOperation::locks`] maps a resolved path to a [`tokio::sync::RwLock`]. Readers
+//! `LocalFsOperation::locks` maps a resolved path to a [`tokio::sync::RwLock`]. Readers
 //! take the shared lock, writers the exclusive one, and a transfer locks both paths in a
 //! deterministic order (sorted by path, `Write` winning over `Read`) so two transfers can
 //! never deadlock. These are **in-process** locks: Python's `ReadWriteLockManager` uses
