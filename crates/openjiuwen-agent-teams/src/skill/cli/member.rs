@@ -19,7 +19,7 @@ use crate::constants::BROADCAST_TARGET;
 use super::super::client::TeamClient;
 use super::output::{broadcast_line, claimed_line, completed_line, render_view_task, sent_line};
 use super::{
-    emit_line, fail, refuse, ClaimStatus, MemberCommand, ScopeCommand, SkillCli, ViewAction,
+    emit_line, fail, refuse, ClaimStatus, CliCommand, MemberCommand, SkillCli, ViewAction,
 };
 
 /// Dispatches one member-scope command, returning the process exit code.
@@ -29,7 +29,7 @@ pub(crate) async fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let ScopeCommand::Member(command) = cli.command() else {
+    let CliCommand::Member(command) = cli.command() else {
         let _ = writeln!(err, "internal: the member command tree was not selected");
         return 2;
     };

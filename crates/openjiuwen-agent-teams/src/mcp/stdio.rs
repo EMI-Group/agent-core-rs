@@ -59,15 +59,30 @@ async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
 }
 /// Resolves the join descriptor from `OPENJIUWEN_TEAM_JOIN` and serves over stdio.
 ///
+/// The server attaches only to a team hosted in *this* process: [`resolve_from_registry`] goes
+/// through [`crate::skill::connect_live_client`], the process-global runtime registry. A team this
+/// process does not host is [`Error::config`] and exits `1`; cross-process attach (a shared sqlite
+/// store or a distributed transport) is deferred.
+///
 /// Returns the process exit code: `0` after a clean session, `1` when the descriptor or the client
-/// cannot be resolved or the session fails. Live client resolution is deferred to the runtime
-/// node's team registry; until it lands the default resolver reports [`Error::unsupported`].
+/// cannot be resolved or the session fails.
 pub async fn run_mcp_server_from_env() -> i32 {
-    run_mcp_server_with(resolve_from_registry).await
+    let descriptor = match TeamJoinDescriptor::from_env() {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "openjiuwen-team-mcp: invalid team join descriptor"
+            );
+            return 1;
+        }
+    };
+    run_mcp_server_with_descriptor(descriptor, resolve_from_registry).await
 }
 /// Resolves the join descriptor from the environment and serves the client `resolver` returns.
 ///
-/// `resolver` is the seam used by the CLI and by tests to inject a pre-built client.
+/// `resolver` is the seam used by the CLI and by tests to inject a pre-built client. The default
+/// [`resolve_from_registry`] only finds teams hosted in this process.
 ///
 /// Returns the process exit code: `0` on success, `1` on a descriptor/resolver/session failure.
 pub async fn run_mcp_server_with<F>(resolver: F) -> i32
@@ -84,6 +99,21 @@ where
             return 1;
         }
     };
+    run_mcp_server_with_descriptor(descriptor, resolver).await
+}
+/// Serves the client `resolver` returns for an already loaded `descriptor`.
+///
+/// The environment-free seam behind [`run_mcp_server_from_env`] and [`run_mcp_server_with`], so the
+/// resolver-`Err` exit path is testable without mutating the process environment.
+///
+/// Returns the process exit code: `0` on success, `1` on a resolver or session failure.
+pub(crate) async fn run_mcp_server_with_descriptor<F>(
+    descriptor: TeamJoinDescriptor,
+    resolver: F,
+) -> i32
+where
+    F: FnOnce(&TeamJoinDescriptor) -> Result<Arc<dyn TeamClient>>,
+{
     let client = match resolver(&descriptor) {
         Ok(client) => client,
         Err(error) => {
@@ -108,11 +138,16 @@ where
         }
     }
 }
-/// Default client resolver: the runtime node's process-global team registry is not ported yet.
-fn resolve_from_registry(_descriptor: &TeamJoinDescriptor) -> Result<Arc<dyn TeamClient>> {
-    Err(Error::unsupported(
-        "live team client resolution; the runtime team registry lands with the runtime node",
-    ))
+/// Default client resolver: the team `descriptor` names, when this process hosts it.
+pub(crate) fn resolve_from_registry(
+    descriptor: &TeamJoinDescriptor,
+) -> Result<Arc<dyn TeamClient>> {
+    crate::skill::connect_live_client(descriptor).ok_or_else(|| {
+        Error::config(format!(
+            "no live team '{}' hosted in this process",
+            descriptor.team_name
+        ))
+    })
 }
 /// Returns the descriptor wire name of `scope`, for logs.
 fn scope_label(scope: ClientScope) -> &'static str {

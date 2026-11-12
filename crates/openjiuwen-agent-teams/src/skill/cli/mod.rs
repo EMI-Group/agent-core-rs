@@ -34,10 +34,8 @@ pub(crate) mod member;
 pub(crate) mod operator;
 pub(crate) mod output;
 
-pub(crate) use command::{
-    parse_member, parse_operator, ClaimStatus, MemberCommand, OperatorCommand, TaskCommand,
-    ViewAction,
-};
+pub(crate) use command::{parse_member, parse_operator};
+pub use command::{ClaimStatus, MemberCommand, OperatorCommand, TaskCommand, ViewAction};
 
 /// Diagnostic written when an operation is refused without a reason.
 const DEFAULT_REFUSAL: &str = "operation refused";
@@ -64,12 +62,12 @@ pub struct SkillCli {
     /// Connection source the invocation was given.
     descriptor: DescriptorArgs,
     /// The subcommand, in the tree selected by the descriptor's scope.
-    command: ScopeCommand,
+    command: CliCommand,
 }
 
 /// The scope-specific command word.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeCommand {
+pub enum CliCommand {
     /// Member-scope command (the teammate tool set).
     Member(MemberCommand),
     /// Operator-scope command (the outside team-control surface).
@@ -107,14 +105,14 @@ impl SkillCli {
                 let (descriptor, command) = parse_member(argv)?;
                 Ok(Self {
                     descriptor,
-                    command: ScopeCommand::Member(command),
+                    command: CliCommand::Member(command),
                 })
             }
             ClientScope::Operator => {
                 let (descriptor, command) = parse_operator(argv)?;
                 Ok(Self {
                     descriptor,
-                    command: ScopeCommand::Operator(command),
+                    command: CliCommand::Operator(command),
                 })
             }
         }
@@ -134,9 +132,16 @@ impl SkillCli {
         load_descriptor_from(&self.descriptor)
     }
 
-    /// Returns the parsed command.
-    pub(crate) const fn command(&self) -> &ScopeCommand {
+    /// Returns the parsed subcommand, in the tree selected by the descriptor's scope.
+    #[must_use]
+    pub const fn command(&self) -> &CliCommand {
         &self.command
+    }
+
+    /// Returns the connection flags this invocation carried.
+    #[must_use]
+    pub const fn descriptor_args(&self) -> &DescriptorArgs {
+        &self.descriptor
     }
 
     /// Runs the parsed command, writing every failure reason into the same writer as the output.
@@ -527,7 +532,7 @@ mod tests {
         );
         assert_eq!(
             cli.command(),
-            &ScopeCommand::Operator(OperatorCommand::Members)
+            &CliCommand::Operator(OperatorCommand::Members)
         );
 
         let member = SkillCli::try_parse_from(
@@ -541,7 +546,75 @@ mod tests {
         );
         assert_eq!(
             member.command(),
-            &ScopeCommand::Member(MemberCommand::Inbox { watch: false })
+            &CliCommand::Member(MemberCommand::Inbox { watch: false })
+        );
+    }
+
+    #[test]
+    fn parsed_shapes_are_publicly_inspectable() {
+        let operator_task = SkillCli::try_parse_from(
+            argv(&[
+                "--descriptor-json",
+                "{\"team_name\":\"alpha\"}",
+                "task",
+                "get",
+                "t-1",
+            ]),
+            ClientScope::Operator,
+        )
+        .unwrap();
+        assert_eq!(
+            operator_task.descriptor_args().descriptor_json.as_deref(),
+            Some("{\"team_name\":\"alpha\"}")
+        );
+        assert_eq!(
+            operator_task.command(),
+            &CliCommand::Operator(OperatorCommand::Task {
+                action: TaskCommand::Get {
+                    task_id: "t-1".to_string(),
+                },
+            })
+        );
+
+        let operator_update = SkillCli::try_parse_from(
+            argv(&["update", "t-1", "--title", "new"]),
+            ClientScope::Operator,
+        )
+        .unwrap();
+        assert_eq!(
+            operator_update.command(),
+            &CliCommand::Operator(OperatorCommand::Update {
+                task_id: "t-1".into(),
+                title: Some("new".into()),
+                content: None,
+            })
+        );
+
+        let member_inbox = SkillCli::try_parse_from(
+            argv(&["inbox", "--watch", "--descriptor-file", "join.json"]),
+            ClientScope::Member,
+        )
+        .unwrap();
+        assert_eq!(
+            member_inbox.descriptor_args().descriptor_file.as_deref(),
+            Some("join.json")
+        );
+        assert_eq!(
+            member_inbox.command(),
+            &CliCommand::Member(MemberCommand::Inbox { watch: true })
+        );
+
+        let member_claim = SkillCli::try_parse_from(
+            argv(&["claim_task", "t-1", "completed"]),
+            ClientScope::Member,
+        )
+        .unwrap();
+        assert_eq!(
+            member_claim.command(),
+            &CliCommand::Member(MemberCommand::ClaimTask {
+                task_id: "t-1".into(),
+                status: ClaimStatus::Completed,
+            })
         );
     }
 
@@ -559,7 +632,7 @@ mod tests {
                 descriptor_file: Some(file.path().display().to_string()),
                 descriptor_json: Some("{\"team_name\":\"from-json\"}".to_string()),
             },
-            command: ScopeCommand::Operator(OperatorCommand::Members),
+            command: CliCommand::Operator(OperatorCommand::Members),
         };
         assert_eq!(both.load_descriptor().unwrap().team_name, "from-json");
 
@@ -568,7 +641,7 @@ mod tests {
                 descriptor_file: Some(file.path().display().to_string()),
                 descriptor_json: None,
             },
-            command: ScopeCommand::Operator(OperatorCommand::Members),
+            command: CliCommand::Operator(OperatorCommand::Members),
         };
         assert_eq!(only_file.load_descriptor().unwrap().team_name, "from-file");
 
@@ -577,7 +650,7 @@ mod tests {
                 descriptor_file: Some("does-not-exist/join.json".to_string()),
                 descriptor_json: None,
             },
-            command: ScopeCommand::Operator(OperatorCommand::Members),
+            command: CliCommand::Operator(OperatorCommand::Members),
         };
         assert!(missing.load_descriptor().is_err());
     }

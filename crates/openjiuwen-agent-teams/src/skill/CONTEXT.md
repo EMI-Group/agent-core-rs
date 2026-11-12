@@ -48,12 +48,24 @@ pub struct SkillCli;
 impl SkillCli {
     pub fn parse_descriptor_args(argv: &[String]) -> Result<DescriptorArgs>;
     pub fn try_parse_from(argv: Vec<String>, scope: ClientScope) -> Result<Self>;
+    pub fn descriptor_args(&self) -> &DescriptorArgs;   // connection flags the invocation carried
+    pub fn command(&self) -> &CliCommand;              // the parsed subcommand, scope tree included
     pub async fn run(&self, client: Arc<dyn TeamClient>, out: &mut dyn Write) -> i32;
     pub async fn run_with(&self, client: Arc<dyn TeamClient>, out: &mut dyn Write, err: &mut dyn Write) -> i32;
 }
 pub struct DescriptorArgs { pub descriptor_file: Option<String>, pub descriptor_json: Option<String> }
 pub fn run_skill_cli(argv: Vec<String>) -> i32;
+
+// the parsed command tree, publicly matchable (exhaustive, clap internals stay private)
+pub enum CliCommand { Member(MemberCommand), Operator(OperatorCommand) }
+pub enum MemberCommand { Inbox { watch: bool }, ViewTask { action: ViewAction, task_id: Option<String>, status: Option<String> }, ClaimTask { task_id: String, status: ClaimStatus }, SendMessage { to: String, content: String } }
+pub enum OperatorCommand { Inbox { watch: bool }, Send { to: String, content: String }, Broadcast { content: String }, CreateTask { title: String, content: String, task_id: Option<String> }, Task { action: TaskCommand }, Claim { task_id: String }, Complete { task_id: String }, Update { task_id: String, title: Option<String>, content: Option<String> }, Members }
+pub enum TaskCommand { List { status: Option<String> }, Claimable, Get { task_id: String } }
+pub enum ViewAction { List, Get, Claimable }        // const fn as_str(self) -> &'static str
+pub enum ClaimStatus { Claimed, Completed }         // const fn as_str(self) -> &'static str
 ```
+
+The command enums are re-exported from `src/skill/mod.rs`; the clap root structs (`MemberCli`/`OperatorCli`), `PROG`, `parse_member` and `parse_operator` stay crate-private.
 
 `TeamJoinDescriptor` (serde snake_case, `#[serde(default)]`, unknown fields ignored):
 
@@ -152,7 +164,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `client.rs`: tool names and required schema properties for every dispatch/teammate-mode combination; operator tool order and schemas.
 - `store_client.rs`: persisted message/task rows, published event topics and sender, inbox rendering + read cursor, over-limit rejection, member-scope claim/complete, `invoke_tool` shapes.
 - `live.rs`: unknown team → `None` without touching the registry; registry install/clear through a local lock plus a restore guard; end-to-end attach to a team activated over the scripted fakes (roster, empty inbox, a created task claimable on the live team's own board).
-- `cli/`: parsing of every subcommand, `--descriptor-json` before and after the subcommand, unknown command → 2, refusal → 1 with the reason, happy-path output lines for every operator command, member `inbox`/`view_task`/`claim_task`/`send_message`, roster ordering.
+- `cli/`: parsing of every subcommand, `--descriptor-json` before and after the subcommand, unknown command → 2, refusal → 1 with the reason, happy-path output lines for every operator command, member `inbox`/`view_task`/`claim_task`/`send_message`, roster ordering; `parsed_shapes_are_publicly_inspectable` pins one operator and one member invocation through `SkillCli::command()`/`descriptor_args()`.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for these files.
 
 ## Deferred

@@ -572,3 +572,43 @@ async fn member_scope_client_error_answers_internal_error() {
     let text = server.call_tool("view_task", json!({})).await;
     assert_eq!(text, "Internal error: validation: down");
 }
+// ---------------------------------------------------------------------------
+// Live-team attach (stdio entry points, `mcp` feature only)
+// ---------------------------------------------------------------------------
+// These drive the descriptor-level seam `run_mcp_server_with_descriptor` rather than
+// `run_mcp_server_with`: the latter loads `OPENJIUWEN_TEAM_JOIN`, and mutating the process
+// environment inside a unit test races against every other test in this binary that reads it.
+// The descriptor-level seam exercises exactly the same resolver + exit-code plumbing.
+#[cfg(feature = "mcp")]
+mod live_attach {
+    use crate::mcp::stdio;
+    use crate::skill::TeamJoinDescriptor;
+    use openjiuwen_common::error::ErrorKind;
+    fn unhosted_descriptor() -> TeamJoinDescriptor {
+        TeamJoinDescriptor {
+            team_name: "mcp-unhosted".to_string(),
+            ..TeamJoinDescriptor::default()
+        }
+    }
+    #[tokio::test]
+    async fn resolve_from_registry_reports_unhosted_team() {
+        let descriptor = unhosted_descriptor();
+        // `Arc<dyn TeamClient>` is not `Debug`, so `Result::expect_err` is unavailable here.
+        let error = stdio::resolve_from_registry(&descriptor)
+            .err()
+            .expect("an unhosted team does not resolve");
+        assert_eq!(error.kind(), ErrorKind::Config);
+        // `Error` renders as `<kind>: <message>`, so the pinned text carries the `config:` prefix.
+        assert_eq!(
+            error.to_string(),
+            "config: no live team 'mcp-unhosted' hosted in this process"
+        );
+    }
+    #[tokio::test]
+    async fn run_mcp_server_with_descriptor_propagates_resolver_error() {
+        let descriptor = unhosted_descriptor();
+        let code =
+            stdio::run_mcp_server_with_descriptor(descriptor, stdio::resolve_from_registry).await;
+        assert_eq!(code, 1, "a resolver error exits 1 without opening stdio");
+    }
+}
