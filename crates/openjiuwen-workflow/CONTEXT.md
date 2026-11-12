@@ -13,7 +13,7 @@ Components declare capabilities (`invoke`, `stream`, `collect`, `transform`) tha
 ### Builder (`src/workflow.rs`)
 
 ```rust
-pub struct Workflow { /* card + config + components + edges + recorded problems */ }
+pub struct Workflow { /* WorkflowDefinition: card + config + components + edges + recorded problems */ }
 impl Workflow {
     pub fn new(card: WorkflowCard) -> Self;
     pub fn with_config(config: WorkflowConfig) -> Self;
@@ -41,7 +41,8 @@ impl Workflow {
 ```
 
 - Builder methods never return `Err`; they record problems and `build`/`invoke`/`stream` report them (same policy as `openjiuwen-graph`).
-- Setter options: `ComponentOptions` (schema mapping, ability override, `wait_for_all`, `max_retries`, `timeout_ms`, `name`) with chainable methods; `ComponentOptions::streaming()` marks a streaming end (`response_mode="streaming"`).
+- Setter options: `ComponentOptions` (schema mapping, ability override, `wait_for_all`, `max_retries`, `timeout_ms`, `name`) — public fields plus chainable `with_*` methods and `into_node_config`; `ComponentOptions::streaming()` marks a streaming end (`response_mode="streaming"`: abilities `[Invoke, Stream]`, plus `Transform` when a stream input schema is set, which also forces `wait_for_all = Some(true)`).
+- Recorded problems: a duplicate component id (first registration wins), a second start/end (first wins), and a barrier edge without sources; `build`/`invoke`/`stream`/`to_mermaid` report them through `validate`.
 - `invoke`/`stream` compile on the fly; a `Workflow` is immutable during a run, so one instance runs concurrently.
 
 ### Compiled engine (`src/engine/`)
@@ -237,7 +238,7 @@ Field names, defaults, and card keys match Python (`id`, `name`, `description`, 
 - `./src/output.rs` → `WorkflowOutput`, `WorkflowExecutionState`, chunk/frame helpers
 - `./src/components/` → built-in components: start, end, llm, tool, branch, loop, retrieval, memory (`components/CONTEXT.md`)
 - `./src/engine/` → `CompiledWorkflow`, compile/validation, run/stream, node adapter (`engine/CONTEXT.md`)
-- `./src/workflow.rs` → `Workflow` builder and its invoke/stream/resume entry points
+- `./src/workflow.rs` → `Workflow` builder, `ComponentOptions`, `build`/`to_mermaid` and the `invoke`/`resume`/`stream` entry points
 - `./tests/` → behavior tests (see Test Strategy)
 
 ## Test Strategy
@@ -267,10 +268,12 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 ## Notes for Agents
 
 - Use `openjiuwen_graph::{GraphBuilder, ExecutionOptions, Router, RouterContext, Node, NodeOutcome, NodeOptions, GraphState, CheckpointerStore}`; do not add new graph APIs.
-- Stage 1 is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context`, `output`, `interrupt`, `registry`, and all built-in components under `src/components/`.
-- `src/engine/` (`CompiledWorkflow`) and `src/workflow.rs` (`Workflow` builder) are still to be implemented; stage 2 appends those modules to `src/lib.rs`.
+- Every module is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context`, `output`, `interrupt`, `registry`, `components/`, `engine/`, and `workflow`.
+- `src/workflow.rs` exposes `Workflow` (builder + `build`/`invoke`/`invoke_with`/`resume`/`stream`/`stream_with`/`to_mermaid`) and `ComponentOptions`; both are re-exported from the crate root.
+- `stream`/`stream_with` deliver a build error as the stream's single `Err` item instead of returning it.
+- Integration tests (`./tests/`) are not written yet.
 - The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
-- The crate-root re-exports every stage-1 public item, so stage 2 can reach them as `crate::{Component, ComponentContext, ...}`.
+- The crate root re-exports every public item, so downstream code (and the engine) can reach them as `crate::{Component, ComponentContext, ...}`.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
 - Checkpointing is opt-in through `session.checkpointer()`; when present the engine compiles with `CheckpointerStore` (namespace = workflow card id) and deletes the snapshot when a run completes.
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
