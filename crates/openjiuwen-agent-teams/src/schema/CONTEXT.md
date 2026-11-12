@@ -438,7 +438,9 @@ Unit tests live in `#[cfg(test)] mod tests` beside the definitions (`#[allow(cli
 - `ToolSpec` acceptance of all three input shapes and its canonical output shape.
 - `EventPayload` ↔ `EventMessage` conversion for every known event type plus `Unknown`.
 - `TeamAgentSpec::validate` acceptance/rejection cases with the pinned message fragments; `member_spec` derivation from `predefined_members`, `agents[name]`, `agents["teammate"]`.
-Optional: `cargo test -p openjiuwen-agent-teams`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, `cargo fmt -p openjiuwen-agent-teams` all green.
+`status.rs` and `spec.rs` exceed 1000 lines by design (the pinned transition tables and the whole blueprint, each with its exhaustive test suite) and carry a top-of-file note saying so.
+Definition of done for this node: `cargo test -p openjiuwen-agent-teams --lib` (116 tests), `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, no clippy diagnostics pointing at `src/schema/`, and `rustfmt --check` clean on every `src/schema/*.rs` file.
+Crate-wide `cargo fmt`/`-D warnings` also cover `constants.rs` and the still-empty sibling modules; their diagnostics belong to the crate root node, not here.
 
 ## Notes for Agents
 
@@ -453,3 +455,11 @@ Optional: `cargo test -p openjiuwen-agent-teams`, `cargo clippy -p openjiuwen-ag
 - `PredefinedMemberSpec` is internally tagged by `role_type`; a missing tag is a deserialization error (documented Python-default of `teammate` is not emulated).
 - Payload field names follow this crate's contract, not Python's: for example Python `MemberStatusChangedEvent` carries `old_status`/`new_status` while Rust carries `status`/`previous`.
 - `change_notes` holds rendered note strings (`TaskRevision::to_note`); `TaskRevision` is the structured form used at call sites.
+- `validate` exempts `PredefinedMemberSpec::HumanAgent` entries from the reserved-name and pattern checks (Python `_validate_reserved_names` does the same, because the framework injects the `human_agent` avatar under that reserved name).
+- `member_spec(name)` only derives a `TeamRole::Leader` spec when the leader is keyed in `agents` under its member name; the normal blueprint keys it as `agents["leader"]`, so the runtime builds the leader context from `LeaderSpec` plus `agents["leader"]` instead.
+- `TeamRole::default()` is `Leader` while `TeamMemberSpec::default().role_type` is `Teammate` (Python's member default); `TeamMemberSpec` therefore has a hand-written `Default`.
+- `TeamSpec::default().display_name` is `DEFAULT_TEAM_NAME`, and `TeamSpec::from_spec` mirrors `workspace` only when `workspace.root_path` is set (`stable_base: false`, language from `resolved_language()`).
+- `TaskSummary`/`TaskDetail` only fill `max_review_rounds` from the record in `from_record`; a bare JSON `TaskDetail` decodes it as `0` (Python's view model defaults to `None`).
+- `RailSpec` accepts Python's `"type"` key only; unlike `TransportSpec`/`StorageSpec` there is no `"kind"` alias.
+- `EventMessage` derives `Deserialize` with struct defaults, so serde's sequence form (`"[]"`) yields the all-default envelope; malformed-event tests must use a non-deserializable shape.
+- `is_team_event_marker` expects the frame produced by `tag_chunk` (payload nested under `chunk`); the bare `team_idle_frame()`/`team_completed_frame()` payloads are not markers on their own.
