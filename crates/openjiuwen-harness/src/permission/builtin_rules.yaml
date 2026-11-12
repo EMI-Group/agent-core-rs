@@ -86,8 +86,14 @@ rules:
     description: "Reverse shell, bind shell or suspicious network execution channel"
     tools: [shell]
     match_type: command
+    # Rewritten for the `regex` crate (no lookahead). Python asserted the shape
+    # after `python3 -c/-e` with `(?=\$?["'])` and then matched the quote inside
+    # the payload branches. Here each accepted shape is spelled out as an
+    # alternation (whitespace-separated payload, `"…"` payload, `'…'` payload);
+    # the whitespace branch scans to end of line, so it can only over-match a
+    # python one-liner that mentions `socket`/`pty.spawn`, never miss one.
     pattern: >-
-      re:(?i)(/dev/(tcp|udp)/|(^|[\s;&|()])(nc|ncat)\b[^;&|]*\s(-e|--exec)\s|\bsocat\b[^;&|]*(EXEC:|SYSTEM:|PTY)|\bbash\s+-i\b[^;&|]*/dev/tcp/|\bpython3?\s+-[ce](?:\s+|(?=\$?["']))(?:\$?"[^"\r\n]*(?:\bsocket\b|pty\.spawn)|\$?'[^'\r\n]*(?:\bsocket\b|pty\.spawn)|[^"';&|\r\n]*(?:\bsocket\b|pty\.spawn))|\bperl\s+-[ce]\b[^;&|]*Socket)
+      re:(?i)(/dev/(tcp|udp)/|(^|[\s;&|()])(nc|ncat)\b[^;&|]*\s(-e|--exec)\s|\bsocat\b[^;&|]*(EXEC:|SYSTEM:|PTY)|\bbash\s+-i\b[^;&|]*/dev/tcp/|\bpython3?\s+-[ce](?:\s+[^\r\n]*(?:\bsocket\b|pty\.spawn)|\$?"[^"\r\n]*(?:\bsocket\b|pty\.spawn)|\$?'[^'\r\n]*(?:\bsocket\b|pty\.spawn))|\bperl\s+-[ce]\b[^;&|]*Socket)
     severity: CRITICAL
     action: deny
 
