@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use openjiuwen_common::utils::id::uuid_v4;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,7 +17,7 @@ use serde_json::Value;
 /// The type round-trips through JSON, tolerates unknown fields, and treats every field as
 /// optional on input. A missing field is filled from [`Default`], which allocates a fresh
 /// message id, so an empty JSON object still yields a usable envelope.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct MessageEnvelope {
     /// Unique message id, a hyphenated UUID v4.

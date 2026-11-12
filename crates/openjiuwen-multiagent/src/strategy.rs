@@ -18,6 +18,7 @@ use futures::stream::BoxStream;
 use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::Result;
 use openjiuwen_session::AgentTeamSession;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,7 +27,7 @@ use crate::config::TeamConfig;
 use crate::runtime::TeamRuntime;
 
 /// Per-member wiring options passed when a member is added.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct MemberOptions {
     /// Parent member id for hierarchical strategies (the supervisor or root).

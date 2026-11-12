@@ -216,6 +216,27 @@ async fn duplicate_subscribe_and_cleanup() {
 }
 
 #[tokio::test]
+async fn unknown_unsubscribe_is_a_noop() {
+    let handler = RecordingHandler::new();
+    let bus = started_bus("unsubscribe", &handler).await;
+
+    // Dropping a topic that was never subscribed is a no-op, not an error.
+    bus.unsubscribe("never-subscribed").await.unwrap();
+
+    // Unsubscribing is idempotent, and it only clears the bookkeeping entry, so
+    // the topic can be subscribed again afterwards.
+    bus.subscribe("t").await.unwrap();
+    bus.unsubscribe("t").await.unwrap();
+    bus.unsubscribe("t").await.unwrap();
+    bus.subscribe("t").await.unwrap();
+
+    let error = bus.subscribe("t").await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert_eq!(error.message(), "Topic 't' is already subscribed.");
+    bus.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn start_stop_idempotent() {
     let handler = RecordingHandler::new();
     let config = MessageBusConfig::new().with_team_id("lifecycle");

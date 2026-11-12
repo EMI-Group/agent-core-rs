@@ -365,6 +365,7 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/handoff.rs` covers the full chain with scripted member agents: direct handoff, routed handoff, blocked hop completes, max-handoffs, timeout, interrupt forwarding, history resume, and streaming frames.
 - `tests/hierarchical.rs` covers supervisor-over-bus single hop + single stream frame, sub-agent tool cards and ordered parallel dispatch with the limiter, agents-as-tools wiring (`ToolHost` mount + pinned instance), and the error chunk.
 - `tests/streaming.rs` covers `team_stream` frame order, caller-owned vs standalone teardown, and producer-error-after-drain.
+- `tests/api_surface.rs` pins the public contract at compile time: every crate-root re-export, inherent constructor and free-function signature, trait-object coercion (`Team`, `TeamStrategy`, `MessageHandler`, `ToolHost`, `Tool`), `Team` method reachability, the `Card` impl, serde round-trips and `schemars` property names, and the `TeamError` → `ErrorKind::External` mapping.
 - All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only.
 
 ## Deferred Python Behavior
