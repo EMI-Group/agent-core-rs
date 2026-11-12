@@ -21,7 +21,11 @@
 //! `subagent`, and `evolution` (the [`EvolutionRail`] seam and its adapter).
 mod context;
 mod evolution;
+mod memory;
 mod registry;
+mod security;
+mod skills;
+mod subagent;
 
 pub use context::{
     last_user_text, prompt_sections, publish_prompt_section, HarnessRailContext, TaskIterationInfo,
@@ -29,7 +33,16 @@ pub use context::{
     PROMPT_SECTIONS_EXTRA_KEY,
 };
 pub use evolution::{evolution_adapter, EvolutionRail, EvolutionRailAdapter, NoopEvolutionRail};
+pub use memory::{
+    LongTermMemoryAdapter, MemoryRail, MemoryRailConfig, MemoryRecall, MemoryWriteBack,
+    RecalledMemory, TurnRecord, DEFAULT_MEMORY_SOURCE,
+};
 pub use registry::{HarnessRailAdapter, HarnessRailRegistry};
+pub use security::SecurityRail;
+pub use skills::{SkillsRail, SkillsRailConfig};
+pub use subagent::{
+    SpawnRequest, SubAgentHandle, SubAgentSpawner, SubAgentState, SubAgentStatus, SubagentRail,
+};
 
 /// Dispatch priorities of the built-in rails.
 ///
