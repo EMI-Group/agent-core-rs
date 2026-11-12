@@ -102,6 +102,16 @@ Ignored at factory level (logged once at `debug` when present): `tools`, `mcps`,
 Mounting live tools/MCP servers/rails belongs to the runtime wiring that owns those handles.
 Model resolution is always required: a missing provider/model is `Error::config`.
 
+## Injection seam for tests and embedders
+
+`MemberHarnessFactory` is the only way a member's brain is replaced: `TeamBuildDeps::with_harness_factory` swaps the default `NativeMemberFactory::from_env()` for any `Arc<dyn MemberHarnessFactory>`, and `TeamAgentSpec::build_with` creates the leader through it while `TeamMemberSpawner::spawn` creates every teammate through it.
+Both calls pass a `&DeepAgentSpec` (leader: `agents["leader"]`; teammate: `agents[name]` else `agents["teammate"]`) plus a `MemberHarnessContext`.
+`MemberHarnessContext::session_id` is the **team** session id for every member (leader and teammate alike), so a scripted factory must key its per-member answers on `member_name`, not on `session_id`.
+No public fake harness exists: `tests/support/mod.rs::ScriptedHarness`/`FakeHarnessFactory` are crate-private test helpers, so an out-of-crate integration test copies a `HarnessProtocol` impl (13 required methods; `send_auto` and `abort_graceful` have defaults).
+The minimum viable fake: `state()` returns `Idle` after `start`, `events()` returns `VecEventCursor::new(Vec::new())` (an empty cursor ends the pump cleanly) or a scripted one, and `send` emits `turn_lifecycle` started → `output` (channel `answer`) → `turn_lifecycle` finished before settling back to `Idle`.
+All protocol types used by such a fake are reachable from an out-of-crate test through `openjiuwen::harness_protocol`; the crate itself is `openjiuwen::agent_teams`.
+A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory::new(Arc<dyn ModelResolver>)` accepts a resolver returning any `Arc<dyn Model>` (for example `openjiuwen_test_support::ScriptedModel`), because the spec only carries a `ModelRef` name and `DeepAgentBuilder::model` takes the trait object.
+
 ## Constraints
 
 - Only `crates/openjiuwen-agent-teams/src/harness/**` is edited here; the `member` seam, `lib.rs`, manifests and sibling modules are out of scope.
