@@ -231,10 +231,7 @@ API-shaped stubs, all documented and all returning
   - `./src/evolution/selection.rs` → `SelectionStrategy`, `ElitistSelection`, `rank_score`, `ranked`
 - `./src/harness_rsi/` → harness-side RSI
   - `./src/harness_rsi/auto_harness/` → bounded self-optimisation session loop
-    - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`
-    - `builder.rs` → `AutoHarnessOrchestratorBuilder` (config validation, defaults, budget limits, session/iteration stamping)
-    - `orchestrator.rs` → `AutoHarnessOrchestrator` (start/resume/run_iteration/finish/stop/run/stream)
-    - `orchestrator_tests.rs` → the orchestrator's unit suite (child module of `orchestrator.rs`)
+    - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `orchestrator.rs`
 - `./src/artifact_rsi/` → artifact-side RSI
   - `./src/artifact_rsi/program_opt/` → `ProgramOptConfig` and the PUCT tree (`config.rs`, `tree.rs`)
 - `./src/deferred/` → documented `Error::Unsupported` stubs for ML/vendor surfaces (`agentdescent.rs`, `runtime.rs`, `evaluators.rs`, `paper_opt.rs`, `member_optimizer.rs`)
@@ -249,7 +246,6 @@ API-shaped stubs, all documented and all returning
 - `tests/program_opt.rs` — hand-computed PUCT scores (`c_puct = 1.0`, uniform priors), rank-score edges (`N = 1 → 0.5`, unscored `-inf`), ancestor visit increments, candidate limit rejection, `best()` tie-break, config validation, serde round-trip.
 - `tests/deferred.rs` — every stub returns `ErrorKind::Unsupported` with a non-empty message; `EvolutionPolicy` parsing round-trips.
 - Unit tests beside modules for budget warning thresholds and stop-condition ordering.
-- The orchestrator suite (`src/harness_rsi/auto_harness/orchestrator_tests.rs`) and the builder suite (`builder.rs`) drive a scripted fake `HarnessRunner`; no `tests/` integration directory exists yet, so every suite is a `#[cfg(test)]` module.
 - All tests offline and deterministic; no network, no `#[ignore]`.
 - Definition of done: `cargo fmt -p openjiuwen-rsi`, `cargo test -p openjiuwen-rsi`, `cargo clippy -p openjiuwen-rsi --all-targets -- -D warnings` all clean.
 
