@@ -8,9 +8,10 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 ## API Surface
 
 - `mod.rs` — `RailEvent`, `RailContext` (per-event data + control flags: `force_finish`, `model_continue`, `retry`, `skip_tool`, `interrupts`, `model_override`), `AgentRail` (name, priority=50, async hooks `before_invoke`, `after_invoke`, `before_model_call`, `after_model_call`, `on_model_exception`, `before_tool_call`, `after_tool_call`, `on_tool_exception`, `after_react_iteration`), `RailRegistry` (`register`, `unregister`, `rails`, `fire`), `RetryRequest`, `DEFAULT_RAIL_PRIORITY`.
-- `guardrail.rs` — `GuardrailRail` over `openjiuwen_security::GuardrailPipeline`: user input on `BeforeInvoke`, model output on `AfterModelCall`, tool input/output on `BeforeToolCall`/`AfterToolCall`; blocking returns `Error::Security` (from `GuardrailOutcome::enforce`).
-- `memory.rs` — `MemoryRail` over `openjiuwen_memory::LongTermMemory`: recall injected as a system message before the model call, message write on `AfterInvoke`; failures are logged only.
-- `model_backup.rs` — `ModelBackupRail`: on `OnModelException`, advance to the next backup model via `ctx.model_override` and `ctx.request_retry`.
+- `guardrail.rs` — `GuardrailRail` over `openjiuwen_security::GuardrailPipeline`: user input on `BeforeInvoke`, model output on `AfterModelCall`, tool input/output on `BeforeToolCall`/`AfterToolCall`, gated by `ScanTargets` flags; blocking returns `Error::Security` naming the stage, risk type, and level (from `GuardrailOutcome::enforce` + `violation`).
+- `guardrail.rs` keeps the `prompts` flag for `ScanTargets` parity but never scans the prepared window; user and tool content are scanned at their own stages.
+- `memory.rs` — `MemoryRail` over `openjiuwen_memory::LongTermMemory`: recall injected as a system message after the leading system messages before the model call (at most once per invoke, flagged in `ctx.extra`), message write on `AfterInvoke`; `with_top_k`/`top_k` control recall size (default 5); failures are logged only.
+- `model_backup.rs` — `ModelBackupRail`: on `OnModelException`, advance a per-rail cursor to the next backup model via `ctx.model_override` and `ctx.request_retry(None)`; exhausted cursor leaves the context untouched.
 - `interrupt/mod.rs` — `ToolFilter`, `BaseInterruptRail`, `ConfirmInterruptRail`, `AskUserRail` (see `interrupt/CONTEXT.md`).
 
 ## Constraints
@@ -22,7 +23,8 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 
 ## Test Strategy
 
-`../../tests/rails.rs`: registration order (priority desc, ties keep insertion order), force-finish short-circuit on model and tool phases, model retry via `ModelBackupRail`, guardrail blocking, memory rail injection, skip-tool replacement.
+Unit tests beside each module: registry dispatch order, first-error stop, per-event hook targeting, guardrail stage blocking, memory recall injection/write-back, model-backup ordering and exhaustion, interrupt pause/approve/reject/ask-user/auto-confirm.
+`../../tests/rails.rs` is reserved for integration coverage once the ReAct loop fires the hooks.
 
 ## Routing Table
 
