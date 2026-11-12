@@ -33,16 +33,19 @@ openjiuwen-symphony.workspace = true
 openjiuwen-rsi.workspace = true
 openjiuwen-agent-evolving.workspace = true
 openjiuwen-auto-harness.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror = "2"
 
 [features]
 default = ["native"]
 native = ["openjiuwen-harness/native", "openjiuwen-harness-providers/native"]
 otel = ["openjiuwen-extensions/otel"]
 a2a = ["openjiuwen-extensions/a2a"]
-live-tests = []
+sqlite = ["openjiuwen-extensions/sqlite", "openjiuwen-symphony/sqlite"]
+live-tests = [
+    "openjiuwen-harness/live-tests",
+    "openjiuwen-harness-providers/live-tests",
+    "openjiuwen-agent-teams/live-tests",
+    "openjiuwen-extensions/live-tests",
+]
 
 [lints]
 workspace = true
