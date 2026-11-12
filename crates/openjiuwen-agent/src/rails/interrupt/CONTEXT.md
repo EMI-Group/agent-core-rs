@@ -12,6 +12,7 @@ Ports the kernel-side behavior of Python `harness/rails/interrupt/` (`BaseInterr
 - `ConfirmInterruptRail` — kind `confirm`, owner `openjiuwen.agent.rails.interrupt.ConfirmInterruptRail`, message `"Please approve or reject?"`, payload schema `{approved, feedback, auto_confirm, persist_allow}` with `required: ["approved"]`, `auto_confirm_key = tool name`; `::new()`, `::for_tools(names)`.
 - `AskUserRail` — kind `ask_user`, owner `openjiuwen.agent.rails.interrupt.AskUserRail`, default message `"Please provide your input."`; `::new()`, `::for_tools(names)`.
 - An `InterruptRequest` serializes with Python wire names `interrupt_kind`/`interrupt_owner` (the Rust fields stay `kind`/`owner`, and deserialization accepts either), so an `__interaction__` frame payload is `{id, value}` whose `value` is the Python-shaped request object.
+- `AgentRail::name()` is `"interrupt"` (`BaseInterruptRail`), `"confirm_interrupt"` (`ConfirmInterruptRail`), `"ask_user"` (`AskUserRail`); mount with `ReActAgent::register_rail(Arc::new(rail))` and remove with `unregister_rail(<that name>)`.
 
 ## Semantics of `before_tool_call`
 
