@@ -11,10 +11,10 @@ Pick this node for "register a sandbox provider" or "where is AIO/JiuwenBox/Yuan
 The seam is defined in `openjiuwen-sysop` (`sandbox/provider.rs`, `sandbox/config.rs`) and reaches this crate through the kernel umbrella path `openjiuwen_core::sys_operation::sandbox::{provider, config}` — the path is re-exported unchanged.
 
 ```rust
-pub use openjiuwen_core::sys_operation::sandbox::provider::{
-    CodeProviderFactory, FsProviderFactory, SandboxProviderRegistry, ShellProviderFactory,
-};
 pub use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
+// The provider seam types (`FsProviderFactory`, `ShellProviderFactory`, `CodeProviderFactory`,
+// and `SandboxProviderRegistry`) are named through the kernel path
+// `openjiuwen_core::sys_operation::sandbox::provider`; the `SandboxProviderSet` fields use them.
 
 /// The three factories Python registers per sandbox type; any subset may be present.
 pub struct SandboxProviderSet {
