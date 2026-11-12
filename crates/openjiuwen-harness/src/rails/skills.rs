@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 
 use openjiuwen_common::error::Result;
 
-use crate::prompts::{self, PromptSection};
+use crate::prompts;
 use crate::skills::{Skill, SkillBudget, SkillLibrary};
 
 use super::{publish_prompt_section, rail_priority, HarnessRail, HarnessRailContext};
@@ -127,7 +127,7 @@ impl SkillsRail {
         {
             Ok(discovered) => {
                 let selection = self.library.select(&discovered, self.config.budget);
-                *self.selected.write() = selection.clone();
+                self.selected.write().clone_from(&selection);
                 self.stale.store(false, Ordering::SeqCst);
                 Ok(selection)
             }
@@ -187,7 +187,7 @@ impl HarnessRail for SkillsRail {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
     use std::fs;
     use std::path::Path;
@@ -196,7 +196,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::prompts::{prompt_sections, SectionName};
+    use crate::prompts::SectionName;
+    use crate::rails::prompt_sections;
 
     fn write_skill(root: &Path, name: &str, description: &str) {
         let directory = root.join(name);
@@ -234,7 +235,11 @@ mod tests {
         let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeModelCall);
         rail.before_model_call(&mut ctx).await.unwrap();
 
-        let names: Vec<String> = rail.skills().iter().map(|skill| skill.name.clone()).collect();
+        let names: Vec<String> = rail
+            .skills()
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
         assert_eq!(names, vec!["alpha", "beta"]);
 
         let sections = prompt_sections(&ctx);
@@ -256,7 +261,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         write_skill(root.path(), "alpha", "Alpha does A");
         write_skill(root.path(), "beta", "Beta does B");
-        let rail = rail_with_root(root.path()).with_budget(SkillBudget::unlimited().with_max_skills(1));
+        let rail =
+            rail_with_root(root.path()).with_budget(SkillBudget::unlimited().with_max_skills(1));
 
         let selected = rail.refresh().await.unwrap();
         assert_eq!(selected.len(), 1);
@@ -296,7 +302,11 @@ mod tests {
         rail.after_invoke(&mut ctx).await.unwrap();
         rail.before_model_call(&mut ctx).await.unwrap();
         assert_eq!(rail.skills().len(), 2);
-        let names: Vec<String> = rail.skills().iter().map(|skill| skill.name.clone()).collect();
+        let names: Vec<String> = rail
+            .skills()
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
         assert_eq!(names, vec!["alpha", "beta"]);
     }
 

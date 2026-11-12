@@ -16,7 +16,7 @@ use std::time::Duration;
 use openjiuwen_common::error::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::prompts::{self, PromptSection};
+use crate::prompts;
 
 use super::{publish_prompt_section, rail_priority, HarnessRail, HarnessRailContext};
 
@@ -244,14 +244,15 @@ impl HarnessRail for SubagentRail {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
     use std::sync::Mutex;
 
     use openjiuwen_agent::RailEvent;
 
     use super::*;
-    use crate::prompts::{prompt_sections, SectionName};
+    use crate::prompts::SectionName;
+    use crate::rails::prompt_sections;
 
     /// An in-memory [`SubAgentSpawner`] that records every call.
     #[derive(Default)]
@@ -272,10 +273,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("spawn:{}", request.prompt));
-            Ok(SubAgentHandle::new(
-                "agent-1",
-                request.preset.clone(),
-            ))
+            Ok(SubAgentHandle::new("agent-1", request.preset.clone()))
         }
 
         async fn wait(&self, id: &str, timeout: Option<Duration>) -> Result<SubAgentStatus> {
@@ -395,7 +393,9 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].is_terminal());
 
-        seam.send_input("agent-1", "more".to_string()).await.unwrap();
+        seam.send_input("agent-1", "more".to_string())
+            .await
+            .unwrap();
         seam.close("agent-1").await.unwrap();
 
         assert_eq!(

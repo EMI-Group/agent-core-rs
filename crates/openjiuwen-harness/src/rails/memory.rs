@@ -28,7 +28,7 @@ use openjiuwen_memory::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::prompts::{self, PromptSection};
+use crate::prompts;
 
 use super::{
     last_user_text, publish_prompt_section, rail_priority, HarnessRail, HarnessRailContext,
@@ -234,10 +234,13 @@ impl MemoryRail {
         if let Some(text) = last_user_text(&ctx.base.messages) {
             return Some(text);
         }
-        ctx.base.input.as_ref().and_then(|input| match &input.query {
-            InputQuery::Text(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
-            _ => None,
-        })
+        ctx.base
+            .input
+            .as_ref()
+            .and_then(|input| match &input.query {
+                InputQuery::Text(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            })
     }
 
     /// Formats the recalled memories as one `<memory-context>` block, dropping
@@ -272,7 +275,9 @@ impl MemoryRail {
             .iter()
             .take_while(|message| message.role == Role::System)
             .count();
-        ctx.base.messages.insert(position, BaseMessage::system(block));
+        ctx.base
+            .messages
+            .insert(position, BaseMessage::system(block));
     }
 }
 
@@ -311,8 +316,10 @@ impl HarnessRail for MemoryRail {
         let Some(query) = Self::current_query(ctx) else {
             return Ok(());
         };
-        ctx.extra_mut()
-            .insert(MEMORY_QUERY_EXTRA_KEY.to_string(), Value::String(query.clone()));
+        ctx.extra_mut().insert(
+            MEMORY_QUERY_EXTRA_KEY.to_string(),
+            Value::String(query.clone()),
+        );
 
         let Some(recall) = &self.recall else {
             return Ok(());
@@ -497,7 +504,7 @@ fn adapter_is_object_safe(adapter: Arc<LongTermMemoryAdapter>) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
     use std::sync::Mutex;
 
@@ -507,7 +514,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::prompts::prompt_sections;
+    use crate::rails::prompt_sections;
 
     /// A recall seam returning a scripted result.
     struct FakeRecall {
@@ -755,15 +762,15 @@ mod tests {
         let writer = FakeWriteBack::new();
         let rail = MemoryRail::new().with_write_back(writer.clone());
         let mut ctx = HarnessRailContext::for_event(RailEvent::AfterInvoke);
-        ctx.extra_mut()
-            .insert(MEMORY_QUERY_EXTRA_KEY.to_string(), json!("what time is it?"));
+        ctx.extra_mut().insert(
+            MEMORY_QUERY_EXTRA_KEY.to_string(),
+            json!("what time is it?"),
+        );
         ctx.base.output = Some(AgentOutput::answer("noon"));
         ctx.base.messages = vec![
             BaseMessage::user("what time is it?"),
-            BaseMessage::assistant("").with_tool_calls(vec![
-                ToolCall::new("bash"),
-                ToolCall::new("read_file"),
-            ]),
+            BaseMessage::assistant("")
+                .with_tool_calls(vec![ToolCall::new("bash"), ToolCall::new("read_file")]),
             BaseMessage::tool("call-1", "12:00"),
         ];
 
@@ -838,10 +845,7 @@ mod tests {
         assert!(recalled
             .iter()
             .any(|memory| memory.content.contains("Assistant: blue")));
-        assert_eq!(
-            recalled[0].source.as_deref(),
-            Some("long_term_memory")
-        );
+        assert_eq!(recalled[0].source.as_deref(), Some("long_term_memory"));
     }
 
     #[tokio::test]

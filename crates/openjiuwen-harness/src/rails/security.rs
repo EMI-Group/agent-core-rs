@@ -146,10 +146,15 @@ impl HarnessRail for SecurityRail {
         if !self.targets.user_input {
             return Ok(());
         }
-        let Some(text) = ctx.base.input.as_ref().and_then(|input| match &input.query {
-            InputQuery::Text(text) if !text.trim().is_empty() => Some(text.clone()),
-            _ => None,
-        }) else {
+        let Some(text) = ctx
+            .base
+            .input
+            .as_ref()
+            .and_then(|input| match &input.query {
+                InputQuery::Text(text) if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            })
+        else {
             return Ok(());
         };
         let outcome = self.pipeline.scan_user_input(text).await;
@@ -224,18 +229,15 @@ impl HarnessRail for SecurityRail {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openjiuwen_agent::{
-        AgentInput, ModelReply, RailEvent, ToolCall, ToolCallResult,
-    };
+    use openjiuwen_agent::react::model_step::ModelReply;
+    use openjiuwen_agent::{AgentInput, RailEvent, ToolCallResult};
     use openjiuwen_common::error::{Error, ErrorKind};
-    use openjiuwen_foundation::BaseMessage;
-    use openjiuwen_security::{
-        Guardrail, GuardrailContext, GuardrailResult, RiskLevel, ScanStage,
-    };
+    use openjiuwen_foundation::{BaseMessage, ToolCall};
+    use openjiuwen_security::{Guardrail, GuardrailContext, GuardrailResult, RiskLevel, ScanStage};
     use serde_json::json;
 
     use super::*;
@@ -256,7 +258,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Guardrail for ScriptedGuardrail {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "scripted"
         }
 
@@ -395,9 +397,8 @@ mod tests {
             Verdict::Block("dangerous_tool"),
         );
         let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeToolCall);
-        ctx.base.tool_call = Some(
-            ToolCall::new("bash").with_arguments(json!({"command": "scanned arguments"})),
-        );
+        ctx.base.tool_call =
+            Some(ToolCall::new("bash").with_arguments(json!({"command": "scanned arguments"})));
 
         rail.before_tool_call(&mut ctx).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -452,17 +453,20 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_targets_never_call_the_pipeline() {
-        let (rail, calls) = scripted(
-            vec![
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = GuardrailPipeline::new();
+        pipeline.add(ScriptedGuardrail {
+            stages: vec![
                 ScanStage::UserInput,
                 ScanStage::LlmInvokeInput,
                 ScanStage::LlmInvokeOutput,
                 ScanStage::ToolInvokeInput,
                 ScanStage::ToolInvokeOutput,
             ],
-            Verdict::Block("whatever"),
-        );
-        let rail = rail.with_targets(ScanTargets {
+            verdict: Verdict::Block("whatever"),
+            calls: calls.clone(),
+        });
+        let rail = SecurityRail::new(pipeline).with_targets(ScanTargets {
             prompts: false,
             user_input: false,
             model_outputs: false,
