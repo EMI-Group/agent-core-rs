@@ -21,15 +21,6 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
-pub use runtime::{
-    ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
-    SubAgentSpawnRequest, SubagentMetadata, SubagentStatus,
-};
-pub use subagent_tools::{
-    subagent_tools, SubagentCloseTool, SubagentListTool, SubagentResumeTool,
-    SubagentSendInputTool, SubagentSpawnTool, SubagentWaitTool,
-};
-pub use task_tool::TaskTool;
 
 /// One registered sub-agent definition: its configuration plus the preset it came from.
 ///
