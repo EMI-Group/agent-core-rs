@@ -16,7 +16,7 @@ Task loop (`openjiuwen_harness::task_loop`): `TaskLoopController`, `TaskLoopEven
 Schema (`openjiuwen_harness::schema`): config/state/task/stop-condition/interaction/loop-event types.
 Workspace (`openjiuwen_harness::workspace`): `Workspace`, `WorkspaceNode`, `DirectoryNode`, `DirectoryBuilder`.
 Permissions (`openjiuwen_harness::permission`): `PermissionEngine`, `PermissionLevel`, `PermissionResult`, `PermissionConfirmResponse`, `PermissionsSection`, `PermissionInterruptRail`.
-Tools (`openjiuwen_harness::tools`): the model-facing tool set — `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `list_files`, `grep`, `todo_create`/`todo_list`/`todo_get`/`todo_modify`, `ask_user`, `memory_search`/`memory_get`/`write_memory`/`read_memory` — plus `BuiltinTool`/`ToolRegistry`.
+Tools (`openjiuwen_harness::tools`): the model-facing tool set — `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `list_files`, `grep`, `todo_create`/`todo_list`/`todo_get`/`todo_modify`, `ask_user`, `memory_search`/`memory_get`/`write_memory`/`read_memory`/`edit_memory`, `coding_memory_read`/`coding_memory_write`/`coding_memory_edit` — plus `BuiltinTool`/`ToolRegistry`; `task_tool` and the `subagent_*` tools are mounted by `subagents`.
 Rails (`openjiuwen_harness::rails`): `HarnessRail`, `HarnessRailContext`, `HarnessRailRegistry`, `SecurityRail`, `MemoryRail`, `SkillsRail`, `SubagentRail`, `EvolutionRail`.
 Prompts (`openjiuwen_harness::prompts`): `HarnessPromptBuilder`, `PromptSection`, `SectionName`, `PromptMode`, `PromptReport`.
 Subagents (`openjiuwen_harness::subagents`): `SubAgentConfig`, `SubAgentRegistry`, `SubAgentPreset`, `SubAgentRuntime`, `TaskTool`.
@@ -36,8 +36,9 @@ Every public item is also re-exported flat from the crate root.
 - Serde: snake_case, tolerant of unknown fields; persisted session JSON keeps Python keys (`deepagent`, `iteration`, `task_plan`, `pending_follow_ups`, `plan_mode`, `todos`, `skills_state`).
 - Secrets are never logged; `api_key` is `SecretString`; `Debug` of configs redacts credentials.
 - Logging via `tracing` only; no stdout in library code (CLI owns stdout).
-- Files ≤1000 lines; shared helpers live in the lowest owning module.
+- Files ≤1000 lines; shared helpers live in the lowest owning module. `permission/model.rs` and `permission/paths.rs` exceed it only through inline test modules and carry a top-of-file size note.
 - Tests: integration tests in `./tests/`, unit tests beside modules; `ScriptedModel` from `openjiuwen-test-support`; offline, deterministic.
+- Features: `native` (default), `browser`, `cua`, `mobile` (deferred preset stubs), `notify` (workspace watcher), `live-tests` (opt-in network tests); the crate must also build with `--no-default-features`.
 
 ## Module dependency contract
 
