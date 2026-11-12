@@ -283,7 +283,7 @@ fn execution_functions_and_bindings_are_exported() {
 
 #[test]
 fn callback_events_round_trip_through_their_wire_names() {
-    assert!(!CallbackEvent::ALL.is_empty());
+    assert_ne!(CallbackEvent::ALL.len(), 0);
     for event in CallbackEvent::ALL {
         assert_eq!(
             CallbackEvent::from_name(event.as_str()),

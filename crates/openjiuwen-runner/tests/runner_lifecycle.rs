@@ -75,6 +75,7 @@ struct FakeSpawnedAgent;
 
 #[async_trait::async_trait]
 impl SpawnedAgent for FakeSpawnedAgent {
+    #[allow(clippy::unnecessary_literal_bound)]
     fn id(&self) -> &str {
         "fake-child"
     }
