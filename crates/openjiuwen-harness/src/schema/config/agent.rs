@@ -46,7 +46,7 @@ const ERR_ITERATIONS_NOT_POSITIVE: &str = "max_iterations must be a positive int
 /// # Examples
 ///
 /// ```
-/// use openjiuwen_harness::schema::config::DeepAgentConfig;
+/// use openjiuwen_harness::schema::DeepAgentConfig;
 ///
 /// let config = DeepAgentConfig::default().with_language("en".to_string());
 /// assert_eq!(config.language, "en");
