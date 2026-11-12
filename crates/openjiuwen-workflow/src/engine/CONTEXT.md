@@ -173,7 +173,7 @@ the sink open and stall the frame loop.
 - Streaming is buffered: a `Stream` / `Transform` producer's frames are stored under its id rather than fed to
   live consumers, and end-node frames are replayed in template order — observable text and order match for
   finite streams, live interleaving does not.
-- `wait_for_all=False` first-arrival fan-in has no equivalent (CNF barriers only).
+- `wait_for_all=False` first-arrival fan-in has no equivalent (CNF barriers only), so alternative branch targets merging into one node wait for every predecessor; wire each alternative path separately.
 - Interaction indices and pending frames are tracked by `InteractionState`, not a session broker.
 - `response_format` injection and `enable_history` are carried in LLM config but not applied.
 
