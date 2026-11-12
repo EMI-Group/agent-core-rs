@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use clap::error::ErrorKind;
-use clap::Parser;
 use openjiuwen_common::config::OpenJiuwenHome;
 use openjiuwen_common::error::Result as OJResult;
 use openjiuwen_foundation::llm::Model;
+use openjiuwen_harness::clap::error::ErrorKind;
+use openjiuwen_harness::clap::{CommandFactory, Parser};
 use openjiuwen_harness::cli::{
     build_agent, run_with_model, Cli, CliIo, CliOptions, Command, LineReader, OutputFormat,
     PermissionAnswer, Repl, RunArgs, RunOutcome, Writer, DEFAULT_MAX_ITERATIONS,
@@ -121,7 +121,7 @@ fn cli(args: &[&str]) -> Cli {
 }
 
 /// Parses `args` expecting a clap rejection.
-fn cli_error(args: &[&str]) -> clap::Error {
+fn cli_error(args: &[&str]) -> openjiuwen_harness::clap::Error {
     Cli::try_parse_from(std::iter::once("openjiuwen").chain(args.iter().copied()))
         .expect_err("arguments must be rejected")
 }
@@ -262,6 +262,47 @@ fn clap_help_and_version() {
         version.to_string().contains(env!("CARGO_PKG_VERSION")),
         "version output must carry the crate version"
     );
+}
+#[test]
+fn clap_grammar_and_exit_codes_are_inspectable_through_the_harness_reexport() {
+    // This suite names clap only through `openjiuwen_harness::clap`, proving a
+    // downstream crate can assert the CLI grammar without its own clap
+    // dependency. `--version` is a *successful* outcome for clap, so it
+    // surfaces as a `DisplayVersion` error with exit code 0 — never as a
+    // process exit — because the parser is driven with `try_parse_from`.
+    let version = Cli::try_parse_from(["openjiuwen", "--version"])
+        .expect_err("--version is reported as a DisplayVersion error");
+    assert_eq!(version.kind(), ErrorKind::DisplayVersion);
+    assert_eq!(version.exit_code(), 0, "--version must exit successfully");
+    assert!(version.to_string().contains(env!("CARGO_PKG_VERSION")));
+    // A genuine parse failure exits non-zero, so hosts can forward the code.
+    let unknown = Cli::try_parse_from(["openjiuwen", "bogus"])
+        .expect_err("an unknown subcommand must be rejected");
+    assert_eq!(unknown.kind(), ErrorKind::InvalidSubcommand);
+    assert_ne!(unknown.exit_code(), 0);
+    // The grammar itself is inspectable: name, recognized subcommands and the
+    // `run` options a caller may rely on.
+    let mut grammar = Cli::command();
+    assert_eq!(grammar.get_name(), "openjiuwen");
+    for name in ["run", "chat"] {
+        assert!(
+            grammar.find_subcommand(name).is_some(),
+            "the grammar must declare the `{name}` subcommand"
+        );
+    }
+    assert!(
+        grammar.find_subcommand_mut("run").is_some_and(|run| run
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("output-format"))),
+        "the `run` subcommand must declare `--output-format`"
+    );
+    // Both documented subcommands parse, with global flags before or after.
+    assert!(matches!(cli(&["run", "hi"]).command, Some(Command::Run(_))));
+    assert!(matches!(cli(&["chat"]).command, Some(Command::Chat(_))));
+    assert!(matches!(
+        cli(&["--verbose", "chat"]).command,
+        Some(Command::Chat(_))
+    ));
 }
 
 // --- one-shot runner ------------------------------------------------------
