@@ -80,7 +80,8 @@ pub struct AgentInput {
     pub max_iterations: Option<usize>,     // Python "_host_max_iterations"
     pub extra: BTreeMap<String, Value>,    // unreserved keys, usable as prompt template variables
 }
-impl AgentInput { pub fn parse(inputs: &Value) -> Result<Self>; pub fn query_text(&self) -> Option<&str>; }
+impl AgentInput { pub fn parse(inputs: &Value) -> Result<Self>; pub fn query_text(&self) -> Option<&str>;
+                  pub fn interactive(&self) -> Option<&InteractiveInput>; pub fn from_text(text: impl Into<String>) -> Self; }
 ```
 `AgentOutput` serializes to the Python result dict: `output`, `result_type`, `finish_reason`, `reasoning_present`, `termination_reason`, `iterations_used`, `truncated_by_max_iterations`, `observations[{content,name,tool_call_id}]`, `finalization_error`, `state`, `interrupt_ids`, `component_ids`, `workflow_execution_state`, `data`, `extra`; `None`/empty fields are skipped, and `reasoning_present`/`truncated_by_max_iterations` are omitted unless `true`.
 `AgentChunk::to_stream_item`/`from_stream_item` bridge to `openjiuwen_session::stream::StreamItem` (`mode = Output`).
@@ -318,6 +319,8 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 - Auto-confirm is seeded from the session's `__interrupt_auto_confirm__` into `ctx.extra["_interrupt_auto_confirm"]` on every invoke — fresh and resumed alike — matching Python's per-turn session read.
 - `InterruptRequest` serializes with Python wire names `interrupt_kind`/`interrupt_owner` (deserialization also accepts the Rust `kind`/`owner`), so an `__interaction__` frame payload is `{id, value}` with a Python-shaped `value`.
 - `AgentOutput::truncated_by_max_iterations` is omitted from the wire object unless it is `true`.
+- `AgentOutput::termination_reason` is a free-form `Option<String>`, not an enum: `"max_iterations"` / `"token_budget"` / `"cancelled"` from the ReAct loop and `"workflow_error"` from `WorkflowAgent`.
+- The `AgentChunk` frame-kind constants (`LLM_OUTPUT`, `LLM_REASONING`, `LLM_USAGE`, `ANSWER`, `INTERACTION`, `WORKFLOW_FINAL`, `CONTEXT_USAGE`) live in the `output` module but are not re-exported from the crate root; refer to them as `openjiuwen_agent::output::*`.
 - `abilities::AbilityManager::execute` batches runs of consecutive `parallel_safe` tools (capped by `MAX_PARALLEL_BATCH`), treats any other call as a barrier, and applies `ToolExecutionOptions::timeout` per call.
 - `parse_tool_arguments` strips a Markdown fence and repairs trailing commas and truncation before reporting an error.
 - `WorkflowAgent` implements `invoke`/`stream`; `workflow_agent::select::select` asks the model to pick among several workflows from `description or name` and falls back to `default_response` and then the first workflow.
