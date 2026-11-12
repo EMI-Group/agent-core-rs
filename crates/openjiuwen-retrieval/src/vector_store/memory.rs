@@ -57,7 +57,7 @@ impl Default for InMemoryVectorStore {
 }
 
 impl InMemoryVectorStore {
-    /// Creates an empty store named [`DEFAULT_COLLECTION_NAME`] with no persistence.
+    /// Creates an empty store named `DEFAULT_COLLECTION_NAME` with no persistence.
     pub fn new() -> Self {
         Self {
             name: DEFAULT_COLLECTION_NAME.to_owned(),
