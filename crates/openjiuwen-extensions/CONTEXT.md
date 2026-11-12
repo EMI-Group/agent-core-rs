@@ -47,16 +47,20 @@ Deferred integrations (API-shaped, `Error::Unsupported`, documented in the modul
 
 ## Test Strategy
 
-- Unit tests live beside the code that owns the behavior (redaction, span names, status mapping, card/description embedding, normalisation, bridge conversion).
-- Integration suites live in `./tests/` and start with `#![cfg(feature = "...")]`, so the default `cargo test` compiles them to nothing.
+- Unit tests live beside the code that owns the behavior: `src/a2a/client/tests.rs`, `src/a2a/transform/tests.rs`, `src/a2a/harness_bridge/tests.rs`, `src/a2a/server/tests.rs` plus inline tests in `types.rs`, `jsonrpc.rs`, and `card.rs`.
+- OTel unit tests: `src/otel/sink/tests.rs`, `src/otel/sink/tests/lazy_open.rs`, `src/otel/agent_handler/tests.rs`, `src/otel/workflow_handler/tests.rs`, plus inline tests in `redaction.rs`, `span_names.rs`, `config.rs`, `handle.rs`, `attrs.rs`, and `llm_attrs.rs`.
+- Adapter unit tests live inline in `src/checkpointer/mod.rs`, `src/checkpointer/redis.rs`, `src/store/mod.rs`, `src/store/redis.rs`, `src/store/elasticsearch.rs`, `src/message_queue/mod.rs`, `src/message_queue/bridge.rs`, `src/message_queue/pulsar.rs`, `src/sys_operation/mod.rs`, `src/context_evolver/mod.rs`, `src/context_evolver/memory_store.rs`, and `src/vendor_specific/mod.rs`.
+- `src/a2a/e2e_tests.rs` keeps the in-crate public-path client/server suites; `./tests/a2a_client.rs` and `./tests/a2a_server.rs` mirror them as crate-boundary targets for external consumers.
+- Module doctests in `src/lib.rs` and `src/otel/mod.rs` compile as external crates and carry the public seam/handler assertions; the OTel handler doctests are `#[cfg(feature = "otel")]`-guarded so the default build stays green.
+- Crate-boundary suites under `./tests/` use only `openjiuwen_extensions::...` public paths: `a2a_client.rs` and `a2a_server.rs` (`#![cfg(feature = "a2a")]`), `otel.rs` (`#![cfg(feature = "otel")]`), `otel_seam.rs` (compiled in every build, with `#[cfg(feature = "otel")]` branches), and `adapters.rs` (compiled in every build, with `#[cfg(feature = "redis")]`/`#[cfg(feature = "pulsar")]` branches).
 - A2A: `wiremock` for the client (send, streaming SSE, cancel, error mapping) and `axum`'s `Router::oneshot` (via `tower::ServiceExt`) for the server routes; no real sockets unless a test binds `127.0.0.1:0`.
-- OTEL: an in-memory `SpanExporter` captures `SpanData` so attribute conventions, span names, statuses, and parenting are asserted without a collector.
+- OTel: the in-memory `CaptureExporter` records exported `SpanData`, so span names, attributes, statuses, dedup, and parenting are asserted without a collector; every capture test calls `force_flush()` first.
 - Adapters: kernel contract tests are reused through the factory (memory/file/sqlite), and deferred backends assert `ErrorKind::Unsupported` plus the message naming the backend.
 - Each ported behavior test names its Python counterpart (e.g. `tests/unit_tests/extensions/tracer_otel/test_redaction.py`) in a comment.
 
 ## Routing Table
 
-- `./src/a2a/` → A2A wire types, JSON-RPC, transformer, agent-card adapter, client, server, harness bridge (`a2a` feature)
+- `./src/a2a/` → A2A wire types, JSON-RPC, transformer, agent-card adapter, client, server, harness bridge, in-crate e2e suites (`a2a` feature)
 - `./src/otel/` → OTel config, semantic conventions, redaction, span names, tracer handle, SDK provider, `TraceSink` sink, agent/workflow handlers (`otel` feature for the live parts)
 - `./src/checkpointer/` → checkpointer factory over the kernel plus the deferred Redis backend (`redis` feature)
 - `./src/store/` → key-value/document/vector store factories over the kernel plus deferred Redis/Elasticsearch backends
@@ -64,4 +68,4 @@ Deferred integrations (API-shaped, `Error::Unsupported`, documented in the modul
 - `./src/sys_operation/` → sandbox provider registration facade and deferred provider sets
 - `./src/context_evolver/` → algorithm names, memory schema, in-memory cosine vector store, `TaskMemoryService` seam
 - `./src/vendor_specific/` → deprecated vendor aliases (`AliyunReranker`)
-- `./tests/` → feature-gated integration suites (`a2a_client`, `a2a_server`, `otel`, `adapters`)
+- `./tests/` → crate-boundary public-API suites (`a2a_client`, `a2a_server`, `otel`, `otel_seam`, `adapters`)
