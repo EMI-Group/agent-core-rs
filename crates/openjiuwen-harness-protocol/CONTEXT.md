@@ -68,6 +68,8 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - Implementor obligations: all harness methods take `&self` (synchronize internally); `create` returns an unstarted harness; `start` validates through `HarnessCard::validate_host`; `send` never waits for a turn; `stop` is idempotent; only one active event cursor (a second must yield `HarnessError::State`); capability-gated operations return `HarnessError::UnsupportedCapability`.
 - Checkpoint sinks must keep `sequence` monotonic per provider/agent/host-session, treat a repeated `checkpoint_id` as idempotent, and answer stale sequences or failed compare-and-set with `HarnessError::CheckpointConflict`.
 - Redaction: `ModelEndpoint::api_key` and `HarnessContext::{env, metadata}` are hidden in `Debug`; never log them.
+- `HarnessError` derives only `Debug` + `thiserror::Error` (no `Clone`, no `PartialEq`) and both it and `HarnessErrorKind` are `#[non_exhaustive]`: compare through `kind()`/`message()` and add a wildcard arm when matching on an error.
+- `HarnessEventCursor` is `Send` but not `Sync`, both methods take `&mut self`, and the cycle/turn cursors are returned as `Box<dyn HarnessEventCursor>` (`'static`).
 - `openjiuwen-agent-teams` re-exports `HarnessState` from here — never define a second copy.
 - Changing a field name, enum value, or validation message is a protocol break: update `DESIGN.md`, this file, and every dependent crate.
 - Additive changes within the `"1.0"` major version must keep the `EVENT_WIRE_SCHEMA_VERSION` `"1"` decode path backward compatible; bump the wire schema version for incompatible payload changes.

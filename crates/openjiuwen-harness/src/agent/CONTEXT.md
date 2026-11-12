@@ -51,7 +51,10 @@ Ports `openjiuwen/harness/deep_agent.py` and `factory.py`; `DeepAgent` composes 
 - `create_deep_agent`'s boolean keywords (`enable_task_loop`, `restrict_to_work_dir`) overwrite the base config unconditionally; empty lists and `None` keep the base value.
 - `wire_subagents` creates the runtime with an empty parent session id (`""`); the concrete session id arrives per spawn through `SubAgentFactory::create(config, session_id)`.
 - Nested `DeepAgent`s built by `DeepAgentSubAgentFactory` run a sub-worktree at `<workspace>/sub-agents/<session_id>` and never mount subagent tools again (depth 1).
-- The crate-root flat re-exports in `../lib.rs` are owned by the parent agent; this module re-exports everything from `crate::agent`.
+- `../lib.rs` declares only `pub mod` modules with no flat re-exports, so every item is reached through its module path (`openjiuwen_harness::agent::DeepAgent`, `openjiuwen_harness::schema::DeepAgentState`); the crate-root flat re-exports claimed by the crate `CONTEXT.md` do not exist.
+- The `DeepAgent` fields (`prompt`, `queues`, `tool_cards`, `plan_mode`, `inner`, `wired`) are module-private: the in-module `tests.rs` reads them directly, but integration tests under `tests/` must assert through `config()`, `rails().names()`, `phase()`, `load_state()` and the `ScriptedModel` call log instead.
+- `save_state`/`load_state`/`clear_state` operate on `last_session`, so they return `Error::validation("no session bound to this DeepAgent")` until an `invoke`/`stream` has run with either a supplied session or a resolvable `None` session.
+- Public construction paths: `DeepAgent::new` returns `Self` (not `Arc`), `DeepAgentBuilder::build` and `create_deep_agent` return `Result<Arc<DeepAgent>>`; there is no builder setter for a session (per-invocation argument) or for prompts (prompt text derives from `DeepAgentConfig::system_prompt`).
 
 ## Routing Table
 - `./mod.rs` → `DeepAgent` struct, `Agent` impl, follow-up/steer/abort, mode/state entry points, re-exports

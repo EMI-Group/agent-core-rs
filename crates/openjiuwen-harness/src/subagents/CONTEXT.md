@@ -88,6 +88,9 @@ Re-exports (`mod.rs`): `SubAgentConfig` (from `crate::schema`), `SubAgentSpec`, 
 ## Test Strategy
 
 - Unit tests with fakes: `test_support.rs` provides an echo `FakeAgent`, an error-result variant, a `Notify`-gated blocked variant, and a `FakeFactory` recording `(config, session_id)`; runtime tests keep their own local fakes in `runtime/tests.rs`.
+- `test_support` is `#[cfg(test)] mod` and every item is `pub(crate)`, so integration tests under `../../tests/` must define their own `Agent` + `SubAgentFactory` fakes.
+- `TaskTool::new` reads `OPENJIUWEN_SUBAGENT_TASK_TIMEOUT_S` from the process environment at construction, so tests needing the 720 s default must not set that variable; use `.with_timeout(..)` instead.
+- `subagent_wait` clamps `timeout_ms` to 10_000..=3_600_000, so a `timed_out: true` assertion waits at least 10 s; use `SubAgentRuntime::wait` with a short `Duration` for short-timeout tests.
 - Registry: replace by name, builtin preset names, `general_purpose` insertion, shared map across clones, name ordering.
 - Presets: max_iterations 50, `restrict_to_work_dir` per preset, `factory_name` for code/research, bilingual selection (`en` vs anything else → `cn`), verdict contract text in the verification prompt, feature-gated presets return `Error::Unsupported`.
 - Runtime: spawn → PendingInit/Running → Completed with output; wait timeout leaves non-final; close refuses running; close/resume on completed instance; capacity rejection at `max_subagents`; rollback leaves capacity free after a factory failure; duplicate live spawn rejected; child session id format and sticky verification id; FIFO queued inputs; interrupt; `cancel_all`; `describe_list` shape.
