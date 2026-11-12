@@ -160,8 +160,8 @@ async fn require_resume_restores_the_turn_counter_and_plan_mode() {
     assert_eq!(fixture.harness.state(), HarnessState::Idle);
     assert_eq!(fixture.harness.provider_session_id(), Some("host-1"));
 
-    // The activation checkpoint is built before the counters are restored, so it
-    // still reports a fresh turn counter but the already-restored plan mode.
+    // The activation checkpoint is published after the restore, so it already
+    // reports the restored counters and plan mode.
     let checkpoint = fixture
         .harness
         .export_checkpoint()
@@ -169,7 +169,7 @@ async fn require_resume_restores_the_turn_counter_and_plan_mode() {
         .unwrap()
         .expect("start publishes a checkpoint");
     let state = decoded(&checkpoint);
-    assert_eq!(state.turn_counter, 0);
+    assert_eq!(state.turn_counter, 4);
     assert_eq!(state.plan_mode, "plan");
     assert_eq!(fixture.agent.config().default_mode.as_str(), "plan");
 
@@ -181,6 +181,71 @@ async fn require_resume_restores_the_turn_counter_and_plan_mode() {
         .expect("the resumed harness accepts input");
     assert_eq!(receipt.turn_id, "turn-5");
     assert_eq!(receipt.message_id, "message-1");
+}
+
+#[tokio::test]
+async fn require_resume_applies_the_restored_state_before_the_activation_checkpoint() {
+    let fixture = fixture();
+    let mut checkpoint = checkpoint_for("agent-1", "host-1");
+    let mut restored = decoded(&checkpoint);
+    restored.turn_counter = 7;
+    restored.iteration = 3;
+    restored.plan_mode = "plan".to_owned();
+    restored.pending_follow_ups = vec!["restored".to_owned()];
+    checkpoint.data = restored.to_json();
+
+    fixture
+        .start_with(
+            context()
+                .with_resume_policy(ResumePolicy::RequireResume)
+                .with_checkpoint(checkpoint),
+        )
+        .await;
+
+    let activation = fixture
+        .harness
+        .export_checkpoint()
+        .await
+        .unwrap()
+        .expect("start publishes a checkpoint");
+    let state = decoded(&activation);
+    assert_eq!(state.iteration, 3, "the restored iteration is applied");
+    assert_eq!(state.plan_mode, "plan");
+    assert_eq!(state.pending_follow_ups, vec!["restored".to_owned()]);
+    assert!(
+        state.turn_counter >= 7,
+        "the activation checkpoint reports the restored turn counter, got {}",
+        state.turn_counter
+    );
+}
+
+#[tokio::test]
+async fn the_checkpoint_sequence_continues_across_a_restart() {
+    let fixture = fixture();
+    let checkpoint = HarnessCheckpoint {
+        sequence: 5,
+        ..checkpoint_for("agent-1", "host-1")
+    };
+
+    fixture
+        .start_with(
+            context()
+                .with_resume_policy(ResumePolicy::RequireResume)
+                .with_checkpoint(checkpoint),
+        )
+        .await;
+
+    let activation = fixture
+        .harness
+        .export_checkpoint()
+        .await
+        .unwrap()
+        .expect("start publishes a checkpoint");
+    assert!(
+        activation.sequence >= 6,
+        "the checkpoint sequence continues after the resumed checkpoint, got {}",
+        activation.sequence
+    );
 }
 
 #[tokio::test]

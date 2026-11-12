@@ -64,6 +64,7 @@ Usage: accumulated `llm_usage` frames (`None` when the model reported nothing). 
 
 `NativeCheckpointState` is the only checkpoint payload (schema version `"1"`): `session_id`, `agent_id`, `host_session_id`, `iteration`, `pending_follow_ups`, `plan_mode`, `turn_counter`, optional `model`/`effort`.
 Checkpoints are emitted best-effort (`SessionActivated` after start, `TurnCompleted` after each turn, `StateChanged` on pause) through `HarnessContext::checkpoint_sink` with monotonic `sequence` and the last successful `storage_revision` as the compare-and-set expectation; a `CheckpointConflict` is logged, never fatal, and does not replace the latest local checkpoint.
+`start` applies a resumed checkpoint before publishing `SessionActivated`, so that checkpoint already reports the restored state, and it raises the checkpoint writer to at least the resumed checkpoint's `sequence` so the sequence never restarts at 1 on the same host session (event sequencing still resets per cycle).
 `export_checkpoint` returns the latest locally built checkpoint (`None` before the first one).
 
 ## Model control

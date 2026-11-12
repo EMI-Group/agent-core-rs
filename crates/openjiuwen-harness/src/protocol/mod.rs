@@ -413,6 +413,11 @@ impl HarnessProtocol for NativeHarness {
 
     /// Validates the host context, starts a cycle, and settles in `Idle`.
     ///
+    /// A checkpoint accepted by the resume policy is applied before the
+    /// `SessionActivated` checkpoint is published, so that activation checkpoint
+    /// already describes the resumed state, and the checkpoint sequence
+    /// continues after the resumed checkpoint instead of restarting at 1.
+    ///
     /// # Errors
     ///
     /// [`HarnessError::State`] when a cycle already runs or the harness is
@@ -461,7 +466,6 @@ impl HarnessProtocol for NativeHarness {
             state.pending.clear();
             state.active_turn = None;
             state.task = None;
-            state.checkpoints.reset(0);
         }
         self.inner.stopped.store(false, Ordering::Release);
         self.inner.paused.store(false, Ordering::Release);
@@ -509,12 +513,20 @@ impl HarnessProtocol for NativeHarness {
         self.inner
             .emit_state_change(HarnessState::Terminated, HarnessState::Idle)
             .await;
+        if let Some(restored) = restored {
+            self.restore_state(&restored);
+            // The checkpoint sequence is monotonic per provider/agent/host
+            // session, so a resumed cycle continues after the checkpoint it was
+            // restored from instead of restarting at 1.
+            if let Some(checkpoint) = context.checkpoint.as_ref() {
+                let mut state = self.inner.state.lock();
+                let current = state.checkpoints.checkpoint_sequence();
+                state.checkpoints.reset(current.max(checkpoint.sequence));
+            }
+        }
         self.inner
             .emit_checkpoint(CheckpointReason::SessionActivated)
             .await;
-        if let Some(restored) = restored {
-            self.restore_state(&restored);
-        }
         Ok(())
     }
 
