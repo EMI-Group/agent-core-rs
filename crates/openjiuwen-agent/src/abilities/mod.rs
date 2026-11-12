@@ -291,9 +291,15 @@ impl AbilityManager {
 
     /// Executes `calls` in model order, one result per call.
     ///
-    /// See `execute_calls` for the failure contract: unknown tools,
-    /// malformed arguments, and tool errors are returned as failed results, not
-    /// as `Err`.
+    /// Concurrent runs of consecutive `parallel_safe` tools (at most eight) are
+    /// dispatched together when [`ToolExecutionOptions::parallel`] is set; a
+    /// tool that is not parallel-safe, or is unknown, is a barrier and runs on
+    /// its own. Each invocation honours [`ToolExecutionOptions::timeout`] and
+    /// [`ToolExecutionOptions::cancellation`].
+    ///
+    /// Failures never surface as `Err`: unknown tools, malformed arguments,
+    /// timeouts, cancellation, and tool errors are returned as failed results
+    /// via [`ToolCallResult::failure`].
     pub async fn execute(
         &self,
         calls: &[ToolCall],
@@ -450,7 +456,10 @@ mod tests {
         assert_eq!(results[0].message().tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(results[0].message().name.as_deref(), Some("echo"));
         assert!(!results[1].success);
-        assert_eq!(results[1].error.as_deref(), Some("unknown tool 'missing'"));
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("Tool 'missing' not found")
+        );
     }
 
     #[tokio::test]
@@ -458,7 +467,7 @@ mod tests {
         let mut manager = AbilityManager::new("agent-1");
         let _ = manager.add_tool(fake_tool("echo", "id-1"));
         let calls = vec![ToolCall {
-            arguments: "{".to_owned(),
+            arguments: "not json".to_owned(),
             ..ToolCall::new("echo")
         }];
         let results = manager
@@ -469,7 +478,7 @@ mod tests {
         assert!(results[0]
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("invalid tool arguments")));
+            .is_some_and(|error| error.contains("Invalid tool arguments JSON")));
     }
 
     #[tokio::test]
@@ -482,8 +491,7 @@ mod tests {
         let results = manager.execute(&calls, &options).await;
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| !result.success));
-        assert!(results
-            .iter()
-            .all(|result| result.error.as_deref() == Some("cancelled")));
+        assert!(results.iter().all(|result| result.error.as_deref()
+            == Some("Tool 'echo' execution was cancelled by user.")));
     }
 }

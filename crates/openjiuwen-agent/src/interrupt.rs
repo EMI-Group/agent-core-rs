@@ -202,16 +202,20 @@ impl InterruptRequest {
     }
     /// Projects the request to a session [`InteractionRequest`].
     ///
-    /// The loop wires answer seeding and resume handling around the returned
-    /// request, so this conversion only fills in the question payload.
+    /// The question carries the whole request as JSON, `component_id` is the
+    /// tool call id when the request concerns a tool call, and the request
+    /// metadata is copied verbatim so the host can route the answer.
     #[must_use]
     pub fn to_interaction_request(&self) -> InteractionRequest {
         let mut request = InteractionRequest::new(
-            InteractionKind::from(&self.kind),
+            self.kind.interaction_kind(),
             serde_json::to_value(self).unwrap_or(Value::Null),
         );
         request.id.clone_from(&self.interrupt_id);
-        request.component_id = Some(self.owner.clone());
+        if !self.tool_call_id.is_empty() {
+            request.component_id = Some(self.tool_call_id.clone());
+        }
+        request.metadata = self.metadata.clone();
         request
     }
 }
@@ -270,37 +274,97 @@ pub fn approval_value(approved: bool, feedback: &str, auto_confirm: bool) -> Val
         "approved": approved,
         "feedback": feedback,
         "auto_confirm": auto_confirm,
-        "persist_allow": false,
     })
 }
+
 /// Parses an approval answer.
 ///
 /// Accepts a JSON boolean, an object with a boolean `approved` field, or a
-/// case-insensitive approval/rejection word (`YES`, `allow`, `no`, `deny`, …).
-/// Returns `None` for anything else.
+/// case-insensitive approval/rejection word (`YES`, `allow`, `allow_once`,
+/// `allow_always`, `no`, `deny`, `rejected`, `0`, …). Returns `None` for
+/// anything else.
 #[must_use]
 pub fn parse_approval(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(approved) => Some(*approved),
         Value::Object(map) => map.get("approved").and_then(Value::as_bool),
-        Value::String(text) => match text.trim().to_lowercase().as_str() {
-            "y" | "yes" | "ok" | "approve" | "allow" | "a" | "always" => Some(true),
-            "n" | "no" | "reject" | "deny" | "cancel" | "never" => Some(false),
+        Value::String(text) => match normalized_word(text).as_str() {
+            "y" | "yes" | "ok" | "approve" | "approved" | "true" | "1" | "allow" | "allow_once"
+            | "a" | "always" | "allow_always" => Some(true),
+            "n" | "no" | "deny" | "reject" | "rejected" | "false" | "0" => Some(false),
             _ => None,
         },
         _ => None,
     }
 }
+
+/// Returns `true` when `value` grants a standing approval that covers later
+/// calls.
+///
+/// Standing approvals are the `a`/`always`/`allow_always` answer words and
+/// object payloads carrying `auto_confirm` or `persist_allow` set to `true`.
+#[must_use]
+pub fn is_always_approval(value: &Value) -> bool {
+    match value {
+        Value::String(text) => matches!(
+            normalized_word(text).as_str(),
+            "a" | "always" | "allow_always"
+        ),
+        Value::Object(map) => {
+            map.get("auto_confirm").and_then(Value::as_bool) == Some(true)
+                || map.get("persist_allow").and_then(Value::as_bool) == Some(true)
+        }
+        _ => false,
+    }
+}
+
+/// Returns the human-readable text carried by an answer value.
+///
+/// Strings are returned as-is; `{"feedback": s}` and `{"text": s}` yield `s`;
+/// `{"value": v}` recurses into `v`; anything else renders as compact JSON,
+/// and `null` renders as the empty string.
+#[must_use]
+pub fn answer_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Object(map) => {
+            if let Some(feedback) = map.get("feedback").and_then(Value::as_str) {
+                feedback.to_owned()
+            } else if let Some(text) = map.get("text").and_then(Value::as_str) {
+                text.to_owned()
+            } else if let Some(inner) = map.get("value") {
+                answer_text(inner)
+            } else {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+        }
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
 /// Returns the rejection feedback carried by `value`, or
-/// [`DEFAULT_REJECT_FEEDBACK`] when it has no non-empty `feedback`/`reason`.
+/// [`DEFAULT_REJECT_FEEDBACK`] when it carries no non-empty text.
 #[must_use]
 pub fn reject_feedback(value: &Value) -> String {
-    value
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return DEFAULT_REJECT_FEEDBACK.to_owned();
+    }
+    let carried = value
         .as_object()
         .and_then(|map| map.get("feedback").or_else(|| map.get("reason")))
         .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map_or_else(|| DEFAULT_REJECT_FEEDBACK.to_owned(), str::to_owned)
+        .map_or_else(|| answer_text(value), str::to_owned);
+    if carried.is_empty() {
+        DEFAULT_REJECT_FEEDBACK.to_owned()
+    } else {
+        carried
+    }
+}
+
+/// Lowercases `text` and trims surrounding whitespace.
+fn normalized_word(text: &str) -> String {
+    text.trim().to_lowercase()
 }
 /// Persisted state of a paused agent turn.
 ///
@@ -322,15 +386,26 @@ pub struct InterruptionState {
 impl InterruptionState {
     /// Loads the persisted state from `session`, if any.
     ///
+    /// The state lives under [`INTERRUPTION_STATE_KEY`]; a missing key or an
+    /// explicit `null` means there is no pending interruption.
+    ///
     /// # Errors
     ///
     /// Returns an error when the session state cannot be read or the stored
     /// value is not an [`InterruptionState`].
-    pub async fn from_session(session: &dyn Session) -> Result<Option<Self>> {
+    pub async fn load(session: &dyn Session) -> Result<Option<Self>> {
         match session.get_state(INTERRUPTION_STATE_KEY).await? {
+            None | Some(Value::Null) => Ok(None),
             Some(value) => Ok(Some(serde_json::from_value(value)?)),
-            None => Ok(None),
         }
+    }
+    /// Alias of [`InterruptionState::load`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`InterruptionState::load`].
+    pub async fn from_session(session: &dyn Session) -> Result<Option<Self>> {
+        Self::load(session).await
     }
     /// Persists the state to `session`.
     ///
@@ -460,7 +535,23 @@ mod tests {
         let interaction = request.to_interaction_request();
         assert_eq!(interaction.id, request.interrupt_id);
         assert_eq!(interaction.kind, InteractionKind::AskUser);
-        assert_eq!(interaction.component_id.as_deref(), Some("agent"));
+        assert_eq!(interaction.question["message"], json!("which?"));
+        assert_eq!(interaction.component_id, None);
+
+        let call = ToolCall {
+            id: Some("call-1".to_owned()),
+            name: "shell".to_owned(),
+            arguments: "{}".to_owned(),
+            ..ToolCall::default()
+        };
+        let mut request =
+            InterruptRequest::for_tool_call(InterruptKind::Permission, "agent", "run?", &call);
+        request.metadata.insert("source".to_owned(), json!("tests"));
+        let interaction = request.to_interaction_request();
+        assert_eq!(interaction.kind, InteractionKind::Permission);
+        assert_eq!(interaction.component_id.as_deref(), Some("call-1"));
+        assert_eq!(interaction.metadata["source"], json!("tests"));
+        assert_eq!(interaction.question["tool_name"], json!("shell"));
     }
     #[test]
     fn parse_approval_variants() {
@@ -468,14 +559,53 @@ mod tests {
         assert_eq!(parse_approval(&json!(false)), Some(false));
         assert_eq!(parse_approval(&json!({"approved": false})), Some(false));
         assert_eq!(parse_approval(&json!({"approved": true})), Some(true));
-        assert_eq!(parse_approval(&json!("YES")), Some(true));
-        assert_eq!(parse_approval(&json!(" Allow ")), Some(true));
-        assert_eq!(parse_approval(&json!("no")), Some(false));
-        assert_eq!(parse_approval(&json!("Deny")), Some(false));
+        for word in [
+            "YES",
+            " Allow ",
+            "y",
+            "ok",
+            "approve",
+            "approved",
+            "true",
+            "1",
+            "allow_once",
+            "a",
+            "always",
+            "allow_always",
+        ] {
+            assert_eq!(parse_approval(&json!(word)), Some(true), "word: {word}");
+        }
+        for word in ["no", "Deny", "n", "reject", "rejected", "false", "0"] {
+            assert_eq!(parse_approval(&json!(word)), Some(false), "word: {word}");
+        }
         assert_eq!(parse_approval(&json!("maybe")), None);
+        assert_eq!(parse_approval(&json!("cancel")), None);
         assert_eq!(parse_approval(&json!({"approved": "yes"})), None);
         assert_eq!(parse_approval(&json!(7)), None);
         assert_eq!(parse_approval(&Value::Null), None);
+    }
+    #[test]
+    fn always_approval_matrix() {
+        assert!(is_always_approval(&json!("A")));
+        assert!(is_always_approval(&json!(" always ")));
+        assert!(is_always_approval(&json!("allow_always")));
+        assert!(is_always_approval(&json!({"auto_confirm": true})));
+        assert!(is_always_approval(&json!({"persist_allow": true})));
+        assert!(!is_always_approval(&json!("yes")));
+        assert!(!is_always_approval(&json!({"auto_confirm": false})));
+        assert!(!is_always_approval(&json!(true)));
+        assert!(!is_always_approval(&Value::Null));
+    }
+    #[test]
+    fn answer_text_forms() {
+        assert_eq!(answer_text(&json!("plain")), "plain");
+        assert_eq!(answer_text(&json!({"feedback": "nope"})), "nope");
+        assert_eq!(answer_text(&json!({"text": "hello"})), "hello");
+        assert_eq!(answer_text(&json!({"value": "wrapped"})), "wrapped");
+        assert_eq!(answer_text(&json!({"value": {"feedback": "deep"}})), "deep");
+        assert_eq!(answer_text(&json!({"other": 1})), r#"{"other":1}"#);
+        assert_eq!(answer_text(&json!(3)), "3");
+        assert_eq!(answer_text(&Value::Null), "");
     }
     #[test]
     fn approval_value_shape() {
@@ -484,8 +614,7 @@ mod tests {
             json!({
                 "approved": true,
                 "feedback": "ok",
-                "auto_confirm": false,
-                "persist_allow": false
+                "auto_confirm": false
             })
         );
     }
@@ -498,7 +627,9 @@ mod tests {
             DEFAULT_REJECT_FEEDBACK
         );
         assert_eq!(reject_feedback(&json!({})), DEFAULT_REJECT_FEEDBACK);
-        assert_eq!(reject_feedback(&json!("text")), DEFAULT_REJECT_FEEDBACK);
+        assert_eq!(reject_feedback(&json!("text")), "text");
+        assert_eq!(reject_feedback(&json!({"other": 1})), r#"{"other":1}"#);
+        assert_eq!(reject_feedback(&Value::Null), DEFAULT_REJECT_FEEDBACK);
     }
     #[test]
     fn match_answers_prefers_interrupt_id() {
@@ -512,15 +643,23 @@ mod tests {
         interactive
             .user_inputs
             .insert("call-2".to_owned(), json!("hi"));
+        interactive
+            .user_inputs
+            .insert("call-extra".to_owned(), json!("ignored"));
+        interactive
+            .interrupt_answers
+            .insert("intr-extra".to_owned(), json!("ignored"));
         let pending = vec![
             ("call-1".to_owned(), "intr_1".to_owned()),
             ("call-2".to_owned(), "intr_2".to_owned()),
             ("call-3".to_owned(), "intr_3".to_owned()),
         ];
         let matched = match_answers(&interactive, &pending);
+        assert_eq!(matched.answers.len(), 2);
         assert_eq!(matched.answers["call-1"], json!({"approved": true}));
         assert_eq!(matched.answers["call-2"], json!("hi"));
         assert!(!matched.answers.contains_key("call-3"));
+        assert!(!matched.answers.contains_key("call-extra"));
         assert_eq!(matched.unmatched, vec!["intr_3".to_owned()]);
     }
     #[test]
@@ -541,10 +680,7 @@ mod tests {
     async fn interruption_state_save_load_clear() {
         use openjiuwen_session::AgentSession;
         let session = AgentSession::new("s1");
-        assert_eq!(
-            InterruptionState::from_session(&session).await.unwrap(),
-            None
-        );
+        assert_eq!(InterruptionState::load(&session).await.unwrap(), None);
         let state = InterruptionState {
             iteration: 1,
             original_query: "q".to_owned(),
@@ -552,12 +688,17 @@ mod tests {
         };
         state.save(&session).await.unwrap();
         assert_eq!(
+            InterruptionState::load(&session).await.unwrap(),
+            Some(state.clone())
+        );
+        assert_eq!(
             InterruptionState::from_session(&session).await.unwrap(),
             Some(state)
         );
         InterruptionState::clear(&session).await.unwrap();
+        assert_eq!(InterruptionState::load(&session).await.unwrap(), None);
         assert_eq!(
-            InterruptionState::from_session(&session).await.unwrap(),
+            session.get_state(INTERRUPTION_STATE_KEY).await.unwrap(),
             None
         );
     }
