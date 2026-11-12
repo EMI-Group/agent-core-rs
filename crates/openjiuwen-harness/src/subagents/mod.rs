@@ -13,7 +13,8 @@ mod presets;
 mod runtime;
 mod subagent_tools;
 mod task_tool;
-#[cfg(test)] mod test_support;
+#[cfg(test)]
+mod test_support;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -26,8 +27,8 @@ pub use runtime::{
     SubAgentSpawnRequest, SubagentMetadata, SubagentStatus,
 };
 pub use subagent_tools::{
-    subagent_tools, SubagentCloseTool, SubagentListTool, SubagentResumeTool,
-    SubagentSendInputTool, SubagentSpawnTool, SubagentWaitTool,
+    subagent_tools, SubagentCloseTool, SubagentListTool, SubagentResumeTool, SubagentSendInputTool,
+    SubagentSpawnTool, SubagentWaitTool,
 };
 pub use task_tool::TaskTool;
 
@@ -147,7 +148,10 @@ impl SubAgentRegistry {
     /// Returns every configuration, ordered by name.
     #[must_use]
     pub fn list(&self) -> Vec<SubAgentConfig> {
-        self.list_specs().into_iter().map(|spec| spec.config).collect()
+        self.list_specs()
+            .into_iter()
+            .map(|spec| spec.config)
+            .collect()
     }
 
     /// Returns every registered name, ordered.
@@ -224,7 +228,10 @@ mod tests {
                 "verification_agent".to_owned(),
             ]
         );
-        assert!(registry.get_spec("code_agent").and_then(|spec| spec.preset).is_some());
+        assert!(registry
+            .get_spec("code_agent")
+            .and_then(|spec| spec.preset)
+            .is_some());
         assert_eq!(
             registry
                 .get("code_agent")
