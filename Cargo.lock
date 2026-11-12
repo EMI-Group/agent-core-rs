@@ -1853,12 +1853,14 @@ dependencies = [
 name = "openjiuwen-dev-tools"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "futures",
  "openjiuwen-agent",
  "openjiuwen-common",
  "openjiuwen-core",
  "openjiuwen-foundation",
+ "openjiuwen-test-support",
  "regex",
  "schemars",
  "serde",
