@@ -11,10 +11,12 @@ mod card;
 mod config;
 mod envelope;
 mod error;
+mod message_bus;
 mod subscription;
 
 pub use card::{EventDrivenTeamCard, TeamCard};
 pub use config::TeamConfig;
 pub use envelope::MessageEnvelope;
 pub use error::TeamError;
-pub use subscription::{SubscriptionManager, topic_matches};
+pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};
+pub use subscription::{topic_matches, SubscriptionManager};
