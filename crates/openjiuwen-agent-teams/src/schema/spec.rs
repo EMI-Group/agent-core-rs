@@ -11,6 +11,10 @@
 //! Deliberate deviations from Python (documented in `src/schema/CONTEXT.md`): [`SpawnMode`]
 //! defaults to `inprocess` because this port has no OS-process members, and [`TeamAgentSpec`]'s
 //! validation additionally rejects a predefined member name outside `^[a-z][a-z0-9_-]*$`.
+//!
+//! This file is long on purpose — the blueprint is one cohesive model whose defaults are a
+//! cross-node seam, and its exhaustive default/serde/validate tests belong beside it — and its
+//! production code is ~600 lines, the remainder being that test suite.
 
 // NOTE: this file is intentionally long: it holds the whole team blueprint — every spec enum, the
 // member-facing leaf types' wiring and the validation rules pinned to Python messages.

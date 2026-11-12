@@ -8,6 +8,10 @@
 //! Wire-visible: every enum serializes to the Python string (`shut_down`, `in_progress`, …) and
 //! `Default` matches the Python default. Python parity source:
 //! `openjiuwen/agent_teams/schema/status.py`.
+//!
+//! This file is long on purpose — the pinned wire-value enums, the transition tables and their
+//! exhaustive table-driven tests belong together as the crate's single source of truth for
+//! lifecycle rules — and its production code is ~610 lines, the remainder being that test suite.
 
 // NOTE: this file is intentionally long: the pinned transition tables plus an exhaustive
 // per-status/per-table test suite that re-pins every legal and illegal edge.

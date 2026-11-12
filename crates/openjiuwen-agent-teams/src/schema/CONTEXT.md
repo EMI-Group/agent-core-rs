@@ -438,7 +438,7 @@ Unit tests live in `#[cfg(test)] mod tests` beside the definitions (`#[allow(cli
 - `ToolSpec` acceptance of all three input shapes and its canonical output shape.
 - `EventPayload` ↔ `EventMessage` conversion for every known event type plus `Unknown`.
 - `TeamAgentSpec::validate` acceptance/rejection cases with the pinned message fragments; `member_spec` derivation from `predefined_members`, `agents[name]`, `agents["teammate"]`.
-`status.rs` and `spec.rs` exceed 1000 lines by design (the pinned transition tables and the whole blueprint, each with its exhaustive test suite) and carry a top-of-file note saying so.
+`status.rs` and `spec.rs` keep their production code under the 1000-line baseline (about 610 and 600 lines respectively); their totals exceed it only because of the inline exhaustive test suites, and each file carries a top-of-file note recording that.
 Definition of done for this node: `cargo test -p openjiuwen-agent-teams --lib` (116 tests), `cargo test -p openjiuwen-agent-teams --no-default-features --lib`, no clippy diagnostics pointing at `src/schema/`, and `rustfmt --check` clean on every `src/schema/*.rs` file.
 Crate-wide `cargo fmt`/`-D warnings` also cover `constants.rs` and the still-empty sibling modules; their diagnostics belong to the crate root node, not here.
 
