@@ -15,7 +15,8 @@
 //! | --- | --- |
 //! | `card` | builder card, else `AgentCard::new(member_name)` |
 //! | `system_prompt` | `DeepAgentConfig::system_prompt` |
-//! | `model` | [`ModelResolver::resolve`] → `DeepAgentBuilder::model` |
+//! | `model` (`model_name`/`name`) | [`ModelResolver::resolve`] → `DeepAgentBuilder::model`, and the resolved name → `DeepAgentConfig::model_name` |
+//! | `model.provider` | `DeepAgentConfig::model_provider` (the pinned provider, else the resolved model's) |
 //! | `enable_task_loop` | `DeepAgentConfig::enable_task_loop` |
 //! | `max_iterations` | `DeepAgentConfig::max_iterations` |
 //! | `workspace.root_path` | runtime `workspace_root` → `Workspace` |
@@ -25,9 +26,20 @@
 //! | team `teammate_mode` | `default_mode`/`enable_plan_mode` (`plan_mode` ⇒ plan-first) |
 //!
 //! Fields without a factory-level counterpart (`tools`, `mcps`, `subagents`, `rails`,
-//! `approval_required_tools`, model `provider`/`params`) are ignored here and logged once at
-//! `debug`; mounting tools/MCP servers/rails belongs to the runtime wiring that owns live
-//! handles, not to this cold-blueprint factory.
+//! `approval_required_tools`, model `params`) are ignored here and logged once at `debug`;
+//! mounting tools/MCP servers/rails belongs to the runtime wiring that owns live handles, not to
+//! this cold-blueprint factory.
+//!
+//! ## Model identity
+//!
+//! The model name and provider are written onto [`DeepAgentConfig`] as well as onto the builder
+//! model: `DeepAgentBuilder` copies them to the inner `ReActAgentConfig`, and the agent loop
+//! inherits the config name into every `ModelRequestConfig` whose request name is empty — a
+//! config-level name is therefore what makes the provider requests and `list_models` non-blank
+//! (Python parity: `native_harness.py` reads `self._react_agent.config.model_name`).
+//! `api_base`/`api_key` deliberately stay unset: they belong to the resolver's
+//! [`ModelClientConfig`], and [`DeepAgentConfig`] needs them only on the lazy-model path, which
+//! never runs because this factory always supplies a live model.
 use super::adapter::{MemberHarnessContext, MemberHarnessFactory};
 use crate::schema::{DeepAgentSpec, MemberMode, ModelRef};
 use async_trait::async_trait;
@@ -112,6 +124,14 @@ fn non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Trims `value` and drops it when blank, so an unnamed model never blanks a configured name.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 #[async_trait]
 impl ModelResolver for EnvModelResolver {
@@ -214,6 +234,26 @@ fn build_config(spec: &DeepAgentSpec, ctx: &MemberHarnessContext) -> DeepAgentCo
     }
     config
 }
+
+/// Writes the effective model identity onto the configuration the inner `ReAct` agent inherits.
+///
+/// The spec wins when it names a model/provider; otherwise the identity carried by the resolved
+/// model fills the gap, so a resolver that supplies a default name (`MODEL_NAME`,
+/// `EnvModelResolver::with_model_name`, a scripted model) still reaches the request path.
+/// Blank values are never copied, so they cannot erase a configured identity, and a missing
+/// provider leaves the kernel default intact.
+fn apply_model_identity(config: &mut DeepAgentConfig, spec: &DeepAgentSpec, model: &dyn Model) {
+    let name = non_blank(spec.model.as_ref().and_then(ModelRef::resolved_name))
+        .or_else(|| non_blank(Some(model.model_name())));
+    let provider = non_blank(spec.model.as_ref().and_then(|m| m.provider.as_deref()))
+        .or_else(|| non_blank(Some(model.provider())));
+    if let Some(name) = name {
+        config.model_name = Some(name);
+    }
+    if let Some(provider) = provider {
+        config.model_provider = Some(provider);
+    }
+}
 /// Logs spec entries the factory deliberately does not mount.
 fn log_unmapped_spec_fields(spec: &DeepAgentSpec) {
     let unmapped = spec.tools.len()
@@ -232,6 +272,26 @@ fn log_unmapped_spec_fields(spec: &DeepAgentSpec) {
         );
     }
 }
+impl NativeMemberFactory {
+    /// Builds the concrete native harness; [`MemberHarnessFactory::create`] erases the type.
+    ///
+    /// The resolved model's identity is copied onto the configuration as well as the model slot,
+    /// because the inner `ReActAgentConfig` takes its model name from the configuration.
+    fn build(
+        spec: &DeepAgentSpec,
+        ctx: &MemberHarnessContext,
+        model: Arc<dyn Model>,
+    ) -> Result<NativeHarness> {
+        let mut config = build_config(spec, ctx);
+        apply_model_identity(&mut config, spec, model.as_ref());
+        let agent = DeepAgentBuilder::new(build_card(spec, ctx))
+            .config(config)
+            .model(model)
+            .workspace(Workspace::new(ctx.workspace_root.clone()))
+            .build()?;
+        Ok(NativeHarness::new(agent, NativeHarnessOptions::default()))
+    }
+}
 #[async_trait]
 impl MemberHarnessFactory for NativeMemberFactory {
     async fn create(
@@ -240,17 +300,9 @@ impl MemberHarnessFactory for NativeMemberFactory {
         ctx: &MemberHarnessContext,
     ) -> Result<Arc<dyn HarnessProtocol>> {
         log_unmapped_spec_fields(spec);
-        let card = build_card(spec, ctx);
         let model_name = spec.model.as_ref().and_then(ModelRef::resolved_name);
         let model = self.resolver.resolve(model_name).await?;
-        let config = build_config(spec, ctx);
-        let agent = DeepAgentBuilder::new(card)
-            .config(config)
-            .model(model)
-            .workspace(Workspace::new(ctx.workspace_root.clone()))
-            .build()?;
-        let harness: Arc<dyn HarnessProtocol> =
-            Arc::new(NativeHarness::new(agent, NativeHarnessOptions::default()));
+        let harness: Arc<dyn HarnessProtocol> = Arc::new(Self::build(spec, ctx, model)?);
         Ok(harness)
     }
     fn name(&self) -> &'static str {
@@ -264,6 +316,7 @@ mod tests {
     use crate::schema::{DeepAgentSpec, MemberMode, ToolSpec};
     use openjiuwen_common::error::ErrorKind;
     use openjiuwen_harness::AgentMode;
+    use openjiuwen_test_support::ScriptedModel;
     /// Resolver that always fails, for the error path.
     struct FailingResolver;
     #[async_trait]
@@ -288,6 +341,85 @@ mod tests {
         let factory = NativeMemberFactory::from_env();
         assert_eq!(factory.name(), NATIVE_FACTORY_NAME);
         assert_eq!(factory.name(), "native");
+    }
+    /// Resolver handing back one fixed model, for the model-identity tests.
+    struct StaticResolver(ScriptedModel);
+    #[async_trait]
+    impl ModelResolver for StaticResolver {
+        async fn resolve(&self, _model_name: Option<&str>) -> Result<Arc<dyn Model>> {
+            Ok(Arc::new(self.0.clone()))
+        }
+    }
+    /// A model carrying `provider`/`model_name` verbatim, including blanks.
+    fn scripted_model(provider: &str, model_name: &str) -> ScriptedModel {
+        ScriptedModel::builder()
+            .provider(provider)
+            .model_name(model_name)
+            .build()
+    }
+    #[tokio::test]
+    async fn spec_model_identity_wins_over_the_resolved_one() {
+        let spec = DeepAgentSpec {
+            model: Some(ModelRef {
+                model_name: Some("gpt-4o-mini".to_owned()),
+                provider: Some("anthropic".to_owned()),
+                ..ModelRef::default()
+            }),
+            ..DeepAgentSpec::default()
+        };
+        let model = scripted_model("openai", "resolved-model");
+        let mut config = build_config(&spec, &context());
+        apply_model_identity(&mut config, &spec, &model);
+        assert_eq!(config.model_name.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(config.model_provider.as_deref(), Some("anthropic"));
+
+        let harness = NativeMemberFactory::build(&spec, &context(), Arc::new(model))
+            .expect("a spec with a resolved model builds");
+        let config = harness.agent().config();
+        assert_eq!(config.model_name.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(config.model_provider.as_deref(), Some("anthropic"));
+    }
+    #[tokio::test]
+    async fn resolved_default_identity_reaches_the_harness_config() {
+        let resolver = StaticResolver(scripted_model("scripted", "default-model"));
+        let model = resolver
+            .resolve(None)
+            .await
+            .expect("the stub resolver always resolves");
+        let harness = NativeMemberFactory::build(&DeepAgentSpec::default(), &context(), model)
+            .expect("a spec with a resolved model builds");
+        let config = harness.agent().config();
+        assert_eq!(config.model_name.as_deref(), Some("default-model"));
+        assert_eq!(config.model_provider.as_deref(), Some("scripted"));
+    }
+    #[tokio::test]
+    async fn spec_model_name_survives_a_blank_resolved_identity() {
+        let spec = DeepAgentSpec {
+            model: Some(ModelRef {
+                model_name: Some("gpt-4o-mini".to_owned()),
+                ..ModelRef::default()
+            }),
+            ..DeepAgentSpec::default()
+        };
+        let factory = NativeMemberFactory::new(Arc::new(StaticResolver(scripted_model("", " "))));
+        let harness =
+            NativeMemberFactory::build(&spec, &context(), Arc::new(scripted_model("", " ")))
+                .expect("a spec with a resolved model builds");
+        let config = harness.agent().config();
+        assert_eq!(config.model_name.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(config.model_provider, None, "no provider is invented");
+        assert!(
+            factory.create(&spec, &context()).await.is_ok(),
+            "the factory builds the same configuration through the trait seam"
+        );
+    }
+    #[test]
+    fn blank_identities_leave_the_kernel_defaults_intact() {
+        let spec = DeepAgentSpec::default();
+        let mut config = build_config(&spec, &context());
+        apply_model_identity(&mut config, &spec, &scripted_model("", ""));
+        assert_eq!(config.model_name, None);
+        assert_eq!(config.model_provider, None);
     }
     #[tokio::test]
     async fn resolver_errors_are_propagated() {
