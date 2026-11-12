@@ -38,11 +38,6 @@ Test files (one concern each, 79 tests total):
 
 ## Known Issues
 
-- `deepagent` payload null keys are lost on repeated saves (parity bug, source-owned).
-  `state_store::save_state` writes Python's explicit nulls (`task_plan: null`, `stop_condition_state: null`, null `plan_slug`/`prompt_context`/`pre_plan_mode`), but `Session::update_state` deep-merges with "a null value deletes the path" (`openjiuwen-session/src/state/paths.rs`), so only the first write into a fresh lane keeps all five keys.
-  After an invocation (controller state-sink write + final `persist_state`) the payload drops `task_plan` and `stop_condition_state`; decoding still round-trips because `from_session_dict` is lenient, but the stored JSON no longer matches Python's shape.
-  `state_persistence::repeated_saves_keep_python_null_keys` is `#[ignore]`d on this bug (observed keys: `iteration`, `pending_follow_ups`, `plan_mode` only).
-  Fix belongs in `state_store` (replace-style write, or deliberately omit nulls and update the contract) or in session merge semantics.
 - `DeepAgent::load_state`/`save_state` need a session bound by an invocation; there is no setter, so cross-instance assertions must use the public `openjiuwen_harness::agent::{load_state, save_state}` free functions.
 - Permission denial keeps `result_type == Answer`; the observable surface is `[PERMISSION_DENIED]` in `AgentOutput::observations` and in the next model call's tool message.
 
