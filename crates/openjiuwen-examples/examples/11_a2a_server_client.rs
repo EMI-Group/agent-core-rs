@@ -20,11 +20,12 @@
 //! - an [`A2aClient`] — posts JSON-RPC (`SendMessage`) to the server's
 //!   `rpc_path` and folds the reply into one `AgentResult`.
 //!
-//! The lifecycle is [`A2aServerAdapter`] (Python's `A2AServerAdapter`):
-//! `start()` binds and serves in the background, `stop()` shuts it down and
-//! waits for the serving task. `A2aServer::serve_in_background` is the same
-//! thing one layer down and takes a `tokio_util::sync::CancellationToken`; this
-//! crate does not depend on `tokio-util`, so the adapter is the handle used here.
+//! The lifecycle is [`A2aServer::serve_in_background`] and the `ServerHandle` it
+//! returns: the call binds the socket and serves it in a background task, so the
+//! handle already knows the bound address (`port = 0` included); the handle's
+//! `shutdown` asks the serving task to stop and its `join` waits for it. Python's
+//! `A2AServerAdapter` (`start()` / `stop()`) wraps exactly this pair, which is
+//! all `A2aServerAdapter` is as well.
 //!
 //! Everything is loopback and offline — no model, no credential, no DNS — and
 //! every await that could block is under a timeout. Requires the `a2a` feature
@@ -50,12 +51,13 @@ use openjiuwen::core::single_agent::AgentCard;
 use openjiuwen::extensions::a2a::card::AgentCardAdapter;
 use openjiuwen::extensions::a2a::client::{A2aClient, A2aClientConfig};
 use openjiuwen::extensions::a2a::server::{
-    A2aExecutionContext, A2aExecutor, A2aServer, A2aServerAdapter, A2aServerConfig, EventSink,
+    A2aExecutionContext, A2aExecutor, A2aServer, A2aServerConfig, EventSink,
     DEFAULT_PROTOCOL_VERSION,
 };
 use openjiuwen::extensions::a2a::transform::AgentResult;
 use openjiuwen::extensions::a2a::types::{Artifact, Message, Part};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use common::banner;
 
@@ -160,17 +162,25 @@ async fn main() -> Result<()> {
     // moves into the server.
     let rpc_path = server.config().rpc_path.clone();
 
-    let mut adapter = A2aServerAdapter::new(server);
-    tokio::time::timeout(STEP_TIMEOUT, adapter.start())
-        .await
-        .context("the a2a server did not start in time")?
-        .context("the a2a server failed to bind 127.0.0.1")?;
-    let addr = adapter
-        .local_addr()
-        .context("the a2a server reported no bound address")?;
+    // `serve_in_background` binds before it returns, so the handle's address is
+    // the real one — no waiting for a listening socket to appear.
+    let handle = tokio::time::timeout(
+        STEP_TIMEOUT,
+        server.serve_in_background(CancellationToken::new()),
+    )
+    .await
+    .context("the a2a server did not bind in time")?
+    .context("the a2a server failed to bind 127.0.0.1")?;
+    let addr = handle.local_addr();
     let rpc_url = format!("http://{addr}{rpc_path}");
-    banner::step(&format!("a2a server listening on http://{addr}"));
-    banner::note(&format!("json-rpc endpoint: {rpc_url}"));
+    // The port is ephemeral, so the exact socket address goes to the log and stdout
+    // keeps only the host: the narrative stays byte-identical between two runs.
+    tracing::info!(%addr, %rpc_url, "the a2a server bound its socket");
+    banner::step(&format!(
+        "a2a server listening on {} (ephemeral port; the number is in the log)",
+        addr.ip()
+    ));
+    banner::note(&format!("json-rpc endpoint: {rpc_path} on that port"));
 
     // 3. The client. `invoke` posts one `SendMessage` and folds the reply into a
     //    single `AgentResult`; `stream` would yield one frame per SSE event.
@@ -198,9 +208,10 @@ async fn main() -> Result<()> {
     }
     banner::answer(&echoed);
 
-    // 4. Shutdown: stops the serving task and waits for it.
+    // 4. Shutdown: the handle cancels the serving task, and `join` waits for it.
     banner::step("stopping the a2a server");
-    tokio::time::timeout(STEP_TIMEOUT, adapter.stop())
+    handle.shutdown();
+    tokio::time::timeout(STEP_TIMEOUT, handle.join())
         .await
         .context("the a2a server did not stop in time")?
         .context("the a2a server did not stop cleanly")?;
