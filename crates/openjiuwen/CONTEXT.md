@@ -84,6 +84,9 @@ The default build needs no network and no external service: every feature above 
 - `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
 - Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
 - The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
+- `core` is `pub use openjiuwen_core as core` (`src/lib.rs:62`) and that crate aliases the whole foundation crate (`pub use openjiuwen_foundation as foundation`, `../openjiuwen-core/src/lib.rs:52`), so `openjiuwen::core::foundation::…` is the full `openjiuwen_foundation` module tree, not a hand-written shim.
+- Tools resolve at both depths: `openjiuwen::core::foundation::{Tool, ToolCard, ToolContext, ToolOutput, FunctionTool, FunctionToolBuilder, ToolHandler, schema_for, RestfulApiTool, openai_tools}` (flat, `../openjiuwen-foundation/src/lib.rs:102`) and `openjiuwen::core::foundation::tool::{…same items…}` (`../openjiuwen-foundation/src/tool/mod.rs:31`); `Tool`/`FunctionTool` are also in the prelude (`src/prelude.rs:19`).
+- The `#[tool]` proc macro is reachable through no alias of this crate: `openjiuwen` does not depend on `openjiuwen-macros` (`Cargo.toml:11-35`) and `openjiuwen-foundation` neither uses nor re-exports it, so a consumer adds `openjiuwen-macros` as its own dependency and writes `#[openjiuwen_macros::tool(...)]` (generated code also needs `async-trait` in the consumer).
 
 ## Known Issues
 
