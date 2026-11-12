@@ -7,7 +7,8 @@
 //! interrupt output; a rail only records an
 //! [`InterruptRequest`](crate::interrupt::InterruptRequest) on the context.
 use super::{AgentRail, RailContext};
-use crate::interrupt::InterruptKind;
+use crate::abilities::parse_tool_arguments;
+use crate::interrupt::{self, InterruptKind, InterruptRequest};
 use async_trait::async_trait;
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::ToolCall;
@@ -15,6 +16,15 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
+/// `ctx.extra` key holding the resume answers: `{ "<tool_call_id>": <answer> }`.
+const RESUME_ANSWERS_KEY: &str = "_resume_interrupt_answers";
+/// `ctx.extra` key holding the host's auto-confirm decision: a bool, or an
+/// object keyed by tool name with bool values.
+const AUTO_CONFIRM_KEY: &str = "_interrupt_auto_confirm";
+/// Text returned for an empty ask-user answer.
+const EMPTY_ANSWER_TEXT: &str = "User input: (empty)";
+/// Message used when neither the call nor the rail supplies a question.
+const FALLBACK_ASK_USER_MESSAGE: &str = "Please provide input to continue.";
 /// Selects the tool calls an interrupt rail applies to.
 #[derive(Clone, Default)]
 pub enum ToolFilter {
@@ -58,16 +68,16 @@ impl fmt::Debug for ToolFilter {
 }
 /// Intercepts a matching tool call and asks the user for a decision.
 ///
-/// Intended behaviour (hooked in a later round): `before_tool_call` ignores
-/// calls the [`ToolFilter`] rejects; for a matching call it consults the answers
-/// seeded in `ctx.extra` (`_resume_interrupt_answers`) and the auto-confirm flag
-/// (`_interrupt_auto_confirm`), then either approves (returns `Ok(())` so the
-/// tool runs), replaces the result with the rejection/answer text through
+/// `before_tool_call` ignores calls the [`ToolFilter`] rejects. For a matching
+/// call it consults the answers seeded in `ctx.extra`
+/// (`_resume_interrupt_answers`, an object keyed by tool-call id) and the
+/// auto-confirm flag (`_interrupt_auto_confirm`, a bool or an object keyed by
+/// tool name), then either approves (returns `Ok(())` so the tool runs),
+/// replaces the result with the rejection/answer text through
 /// [`RailContext::skip_tool_with`], or records
 /// [`InterruptRequest::for_tool_call`](crate::interrupt::InterruptRequest::for_tool_call)
-/// and pauses. An unanswered call only records the request; answers match by
-/// tool-call id first, then by interrupt id, and a malformed answer re-asks with
-/// a fresh id instead of approving.
+/// and pauses. An unanswered call only records the request; a malformed answer
+/// re-asks with a fresh id instead of approving.
 #[derive(Debug)]
 pub struct BaseInterruptRail {
     kind: InterruptKind,
@@ -144,27 +154,65 @@ impl BaseInterruptRail {
     pub fn auto_confirm_key(&self) -> Option<&str> {
         self.auto_confirm_key.as_deref()
     }
+
+    /// Runs the hook with `message` overriding the configured question.
+    fn before_tool_call_with(&self, ctx: &mut RailContext, message: Option<String>) {
+        let Some(call) = ctx.tool_call.clone() else {
+            return;
+        };
+        if !self.filter.matches(&call) {
+            return;
+        }
+        if let Some(answer) = resume_answer(ctx, &call) {
+            match interrupt::parse_approval(&answer) {
+                Some(true) => {}
+                Some(false) => ctx.skip_tool_with(interrupt::reject_feedback(&answer)),
+                None if matches!(self.kind, InterruptKind::AskUser) => {
+                    ctx.skip_tool_with(answer_text(&answer));
+                }
+                None => self.record_request(ctx, &call, message),
+            }
+            return;
+        }
+        if auto_confirmed(ctx, &call) {
+            return;
+        }
+        self.record_request(ctx, &call, message);
+    }
+
+    /// Records a fresh pause request for `call` on the context.
+    fn record_request(&self, ctx: &mut RailContext, call: &ToolCall, message: Option<String>) {
+        let message = message.unwrap_or_else(|| self.message.clone());
+        let auto_confirm_key = self
+            .auto_confirm_key
+            .clone()
+            .unwrap_or_else(|| call.name.clone());
+        let request =
+            InterruptRequest::for_tool_call(self.kind.clone(), self.owner.clone(), message, call)
+                .with_payload_schema(self.payload_schema.clone())
+                .with_auto_confirm_key(auto_confirm_key);
+        ctx.request_interrupt(request);
+    }
 }
 #[async_trait]
 impl AgentRail for BaseInterruptRail {
     fn name(&self) -> &'static str {
         "interrupt"
     }
-    /// TODO: consult the seeded answers and auto-confirm flag, then approve,
-    /// `skip_tool_with`, or record an [`InterruptRequest`](crate::interrupt::InterruptRequest) and
-    /// pause.
-    async fn before_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+
+    /// Approves, skips, or pauses the intercepted tool call.
+    async fn before_tool_call(&self, ctx: &mut RailContext) -> Result<()> {
+        self.before_tool_call_with(ctx, None);
         Ok(())
     }
 }
 /// The `confirm` rail: asks for approval before a matching tool runs.
 ///
-/// Intended behaviour (hooked in a later round): a matching call pauses with a
-/// [`InterruptKind::Confirm`] request carrying `{approved, feedback,
-/// auto_confirm, persist_allow}` as its answer schema. Approval lets the tool
-/// run, rejection replaces the tool result with the user's feedback, and an
-/// auto-confirm flag or a seeded approval skips the pause. The request carries
-/// the tool name as its auto-confirm key.
+/// A matching call pauses with a [`InterruptKind::Confirm`] request carrying
+/// `{approved, feedback, auto_confirm, persist_allow}` as its answer schema and
+/// the tool name as its auto-confirm key. Approval lets the tool run, rejection
+/// replaces the tool result with the user's feedback, and an auto-confirm flag
+/// or a seeded approval skips the pause.
 pub struct ConfirmInterruptRail {
     inner: BaseInterruptRail,
 }
@@ -214,17 +262,19 @@ impl AgentRail for ConfirmInterruptRail {
     fn name(&self) -> &'static str {
         "confirm_interrupt"
     }
-    /// TODO: pause matching calls for approval and consume the answer, as
-    /// described on [`BaseInterruptRail`].
-    async fn before_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+    /// Pauses matching calls for approval and consumes the answer, as described
+    /// on [`BaseInterruptRail`].
+    async fn before_tool_call(&self, ctx: &mut RailContext) -> Result<()> {
+        self.inner.before_tool_call_with(ctx, None);
         Ok(())
     }
 }
 /// The `ask_user` rail: the user's answer becomes the tool result.
 ///
-/// Intended behaviour (hooked in a later round): a matching call pauses with an
-/// [`InterruptKind::AskUser`] request; on resume the answer is returned as the
-/// tool result text without invoking the tool.
+/// A matching call pauses with an [`InterruptKind::AskUser`] request whose
+/// message is the call's `question` argument (falling back to the configured
+/// message); on resume the answer is returned as the tool result text without
+/// invoking the tool.
 pub struct AskUserRail {
     inner: BaseInterruptRail,
 }
@@ -273,15 +323,78 @@ impl AgentRail for AskUserRail {
     fn name(&self) -> &'static str {
         "ask_user"
     }
-    /// TODO: pause matching calls for user input and return the answer as the
-    /// tool result text.
-    async fn before_tool_call(&self, _ctx: &mut RailContext) -> Result<()> {
+    /// Pauses matching calls for user input and returns the answer as the tool
+    /// result text.
+    async fn before_tool_call(&self, ctx: &mut RailContext) -> Result<()> {
+        let message = ctx
+            .tool_call
+            .as_ref()
+            .map(|call| ask_user_message(call, self.inner.message()));
+        self.inner.before_tool_call_with(ctx, message);
         Ok(())
     }
 }
 /// Builds the shared base rail for a concrete interrupt rail.
 fn base_rail(kind: InterruptKind, owner: &str, message: &str) -> BaseInterruptRail {
     BaseInterruptRail::new(kind, owner, message)
+}
+/// Looks up the resume answer seeded for `call` (keyed by tool-call id).
+fn resume_answer(ctx: &RailContext, call: &ToolCall) -> Option<Value> {
+    let id = call.id.as_deref().filter(|id| !id.is_empty())?;
+    ctx.extra
+        .get(RESUME_ANSWERS_KEY)?
+        .as_object()?
+        .get(id)
+        .cloned()
+}
+/// Whether the host asked to auto-confirm `call`.
+fn auto_confirmed(ctx: &RailContext, call: &ToolCall) -> bool {
+    match ctx.extra.get(AUTO_CONFIRM_KEY) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Object(map)) => map
+            .get(&call.name)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+/// Renders an ask-user answer as the tool result text.
+fn answer_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => non_empty_text(text),
+        Value::Object(map) => ["text", "value", "answer", "feedback", "input"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            .map_or_else(|| non_empty_text(&value.to_string()), non_empty_text),
+        _ => non_empty_text(&value.to_string()),
+    }
+}
+/// Returns `text`, or [`EMPTY_ANSWER_TEXT`] when it is blank.
+fn non_empty_text(text: &str) -> String {
+    if text.trim().is_empty() {
+        EMPTY_ANSWER_TEXT.to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+/// Returns the question of an ask-user call, falling back to `message`.
+fn ask_user_message(call: &ToolCall, message: &str) -> String {
+    let question = parse_tool_arguments(&call.arguments)
+        .ok()
+        .and_then(|args| {
+            args.get("question")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if !question.trim().is_empty() {
+        return question;
+    }
+    if message.trim().is_empty() {
+        FALLBACK_ASK_USER_MESSAGE.to_owned()
+    } else {
+        message.to_owned()
+    }
 }
 /// The answer schema of [`ConfirmInterruptRail`].
 fn confirm_schema() -> Value {
@@ -292,11 +405,14 @@ fn confirm_schema() -> Value {
             "feedback": {"type": "string"},
             "auto_confirm": {"type": "boolean"},
             "persist_allow": {"type": "boolean"}
-        }
+        },
+        "required": ["approved"]
     })
 }
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use serde_json::json;
 
@@ -307,6 +423,19 @@ mod tests {
             arguments: "{}".to_owned(),
             ..ToolCall::default()
         }
+    }
+
+    fn call_with(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            arguments: arguments.to_owned(),
+            ..call(name)
+        }
+    }
+
+    fn ctx_for(call: ToolCall) -> RailContext {
+        let mut ctx = RailContext::new(crate::rails::RailEvent::BeforeToolCall);
+        ctx.tool_call = Some(call);
+        ctx
     }
     #[test]
     fn filter_all_matches_everything() {
@@ -413,18 +542,225 @@ mod tests {
         .contains("Confirm"));
     }
     #[tokio::test]
-    async fn hooks_are_placeholders_that_do_not_interrupt() {
-        let mut ctx = RailContext::new(crate::rails::RailEvent::BeforeToolCall);
-        ctx.tool_call = Some(call("bash"));
+    async fn confirm_pauses_with_one_canonical_request() {
+        let mut ctx = ctx_for(call_with("bash", "{}"));
         ConfirmInterruptRail::new()
             .before_tool_call(&mut ctx)
             .await
             .unwrap();
-        AskUserRail::new().before_tool_call(&mut ctx).await.unwrap();
-        BaseInterruptRail::new(InterruptKind::Permission, "o", "m")
+        assert!(ctx.is_interrupted());
+        assert!(ctx.take_skip_tool().is_none());
+        assert_eq!(ctx.interrupts.len(), 1);
+        let request = &ctx.interrupts[0];
+        assert_eq!(request.tool_call_id, "call-1");
+        assert_eq!(request.tool_name, "bash");
+        assert_eq!(request.kind, InterruptKind::Confirm);
+        assert_eq!(
+            request.owner,
+            "openjiuwen.agent.rails.interrupt.ConfirmInterruptRail"
+        );
+        assert_eq!(request.message, "Please approve or reject?");
+        assert_eq!(request.auto_confirm_key, "bash");
+        assert_eq!(request.payload_schema["required"], json!(["approved"]));
+        assert!(request.payload_schema["properties"]["approved"].is_object());
+        assert!(request.interrupt_id.starts_with("intr_"));
+    }
+
+    #[tokio::test]
+    async fn approve_answers_let_the_tool_run() {
+        let approved = [
+            json!({"call-1": true}),
+            json!({"call-1": {"approved": true, "feedback": "ok"}}),
+            json!({"call-1": "yes"}),
+        ];
+        for answers in approved {
+            let mut ctx = ctx_for(call("bash"));
+            ctx.extra
+                .insert(RESUME_ANSWERS_KEY.to_owned(), answers.clone());
+            ConfirmInterruptRail::new()
+                .before_tool_call(&mut ctx)
+                .await
+                .unwrap();
+            assert!(ctx.interrupts.is_empty(), "answers: {answers}");
+            assert!(ctx.take_skip_tool().is_none(), "answers: {answers}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_answers_skip_the_tool_with_feedback() {
+        let mut ctx = ctx_for(call("bash"));
+        ctx.extra.insert(
+            RESUME_ANSWERS_KEY.to_owned(),
+            json!({"call-1": {"approved": false}}),
+        );
+        ConfirmInterruptRail::new()
             .before_tool_call(&mut ctx)
             .await
             .unwrap();
-        assert!(!ctx.is_interrupted());
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+        assert_eq!(
+            ctx.take_skip_tool().as_deref(),
+            Some(crate::interrupt::DEFAULT_REJECT_FEEDBACK)
+        );
+
+        let mut ctx = ctx_for(call("bash"));
+        ctx.extra.insert(
+            RESUME_ANSWERS_KEY.to_owned(),
+            json!({"call-1": {"approved": false, "feedback": "no way"}}),
+        );
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+        assert!(ctx.take_skip_tool().unwrap().contains("no way"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_uses_the_question_argument_and_returns_the_answer() {
+        let mut ctx = ctx_for(call_with("ask", r#"{"question":"Which file?"}"#));
+        AskUserRail::new().before_tool_call(&mut ctx).await.unwrap();
+        assert_eq!(ctx.interrupts.len(), 1);
+        assert_eq!(ctx.interrupts[0].message, "Which file?");
+        assert_eq!(ctx.interrupts[0].kind, InterruptKind::AskUser);
+        assert!(ctx.take_skip_tool().is_none());
+
+        let mut ctx = ctx_for(call_with("ask", r#"{"question":"Which file?"}"#));
+        ctx.extra.insert(
+            RESUME_ANSWERS_KEY.to_owned(),
+            json!({"call-1": "src/main.rs"}),
+        );
+        AskUserRail::new().before_tool_call(&mut ctx).await.unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+        assert_eq!(ctx.take_skip_tool().as_deref(), Some("src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_falls_back_when_the_call_has_no_question() {
+        let mut ctx = ctx_for(call_with("ask", "{}"));
+        AskUserRail::new().before_tool_call(&mut ctx).await.unwrap();
+        assert_eq!(ctx.interrupts[0].message, "Please provide your input.");
+
+        let mut ctx = ctx_for(call_with("ask", "{}"));
+        AskUserRail::for_tools(["ask"])
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.interrupts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ask_user_answer_objects_render_text() {
+        let mut ctx = ctx_for(call_with("ask", r#"{"question":"q"}"#));
+        ctx.extra.insert(
+            RESUME_ANSWERS_KEY.to_owned(),
+            json!({"call-1": {"text": "the answer"}}),
+        );
+        AskUserRail::new().before_tool_call(&mut ctx).await.unwrap();
+        assert_eq!(ctx.take_skip_tool().as_deref(), Some("the answer"));
+    }
+
+    #[tokio::test]
+    async fn auto_confirm_approves_globally_and_per_tool() {
+        let mut ctx = ctx_for(call("bash"));
+        ctx.extra.insert(AUTO_CONFIRM_KEY.to_owned(), json!(true));
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+
+        let mut ctx = ctx_for(call("bash"));
+        ctx.extra
+            .insert(AUTO_CONFIRM_KEY.to_owned(), json!({"bash": true}));
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+
+        let mut ctx = ctx_for(call("edit"));
+        ctx.extra
+            .insert(AUTO_CONFIRM_KEY.to_owned(), json!({"bash": true}));
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.interrupts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn filter_rejects_unlisted_tools() {
+        let mut ctx = ctx_for(call("edit"));
+        ConfirmInterruptRail::for_tools(["bash"])
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+        assert!(ctx.take_skip_tool().is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_tool_call_is_ignored() {
+        let mut ctx = RailContext::new(crate::rails::RailEvent::BeforeToolCall);
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.interrupts.is_empty(), "no interrupt expected");
+    }
+
+    #[tokio::test]
+    async fn malformed_answer_re_asks_with_a_fresh_id() {
+        let seed = json!({"call-1": {"unexpected": 1}});
+        let mut ctx = ctx_for(call("bash"));
+        ctx.extra.insert(RESUME_ANSWERS_KEY.to_owned(), seed);
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.take_skip_tool().is_none());
+        assert_eq!(ctx.interrupts.len(), 1);
+
+        let mut fresh = ctx_for(call("bash"));
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(fresh.interrupts.len(), 1);
+        assert_ne!(
+            ctx.interrupts[0].interrupt_id,
+            fresh.interrupts[0].interrupt_id
+        );
+
+        // Firing twice on the same context appends another fresh request.
+        ConfirmInterruptRail::new()
+            .before_tool_call(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.interrupts.len(), 2);
+        assert_ne!(
+            ctx.interrupts[0].interrupt_id,
+            ctx.interrupts[1].interrupt_id
+        );
+    }
+
+    #[test]
+    fn answer_text_never_empty() {
+        assert_eq!(answer_text(&json!("hello")), "hello");
+        assert_eq!(answer_text(&json!("  ")), EMPTY_ANSWER_TEXT);
+        assert_eq!(answer_text(&json!({"value": "v"})), "v");
+        assert_eq!(
+            answer_text(&json!({"unexpected": 1})),
+            r#"{"unexpected":1}"#
+        );
+        assert_eq!(answer_text(&json!(42)), "42");
+    }
+
+    #[test]
+    fn confirm_schema_requires_approval() {
+        let schema = confirm_schema();
+        assert_eq!(schema["required"], json!(["approved"]));
+        assert_eq!(schema["type"], "object");
     }
 }
