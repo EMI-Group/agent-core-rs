@@ -109,6 +109,9 @@ The crate root re-exports the primary types from every module plus `CRATE_NAME`/
 - `evaluate_cases` owns a clone of the selected cases (bounded by `max_cases`) so its future is `Send`; the axum service and `tokio::spawn` callers can use it directly.
 - The service registers `POST /internal/v1/rl/tasks/{*operation}` as one catch-all because axum 0.8 cannot combine a path parameter and a literal `:finish`/`:abort` suffix in one segment.
 - `AgentCaseRunner` serializes the full `AgentOutput` (`{"output", "result_type"}`); callers pairing it with `ExactMatchMetric` should project `prediction["output"]`, since the metric only auto-projects `answer`-keyed or single-key predictions.
+- `Trainer::new` starts with `FileCheckpointStore::disabled()` (a silent no-op) and a `DefaultCheckpointManager`; nothing is written until `with_checkpoint` installs a real store.
+- `Trainer` exposes exactly `evaluate` and `train` (no `optimize`/single-step API); `Trainer` itself does not implement `Debug`.
+- A fake `openjiuwen_core::single_agent::Agent` must return `&AgentCard` from `card()` (`AgentCard::new(name).with_id(id)`) and a `BoxStream` from `stream()` (e.g. `futures::stream::empty().boxed()`).
 
 ## Deferred Scope
 
