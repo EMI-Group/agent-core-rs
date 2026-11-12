@@ -20,6 +20,8 @@ Suites (run with `cargo test -p openjiuwen-agent`):
 - Every test is offline and deterministic; no wall-clock assertions beyond short timeouts and no external services.
 - Shared fixtures live in `common/mod.rs` (`SESSION_ID`, session/agent builders, recording and failing tools, the input log); suites that need bespoke rails, stores, or workflows keep those helpers local to the file.
 - Tests assert Python-compatible serialized names (`result_type`, `termination_reason`, `interrupt_kind`/`interrupt_owner`, `__interaction__`, `llm_output`, `workflow_final`).
+- `interrupt.rs` and `rails.rs` keep their own local fixtures (`SESSION_ID`, `agent()`, `new_session()`, `recording_tool()`) instead of `mod common`, because they need bespoke rails/sessions.
+- The resume payload the interrupt suites send is `{"query": {"user_inputs": {"<tool_call_id>": <answer>}, "raw_inputs": null, "interrupt_answers": {}}, "conversation_id": SESSION_ID}`; `interrupt_answers` is keyed by interrupt id and wins over the `user_inputs` tool-call-id entry (`openjiuwen_agent::match_answers`).
 
 ## Routing Table
 
