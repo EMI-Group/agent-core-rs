@@ -27,7 +27,7 @@ pub const BOUND: Duration = Duration::from_secs(10);
 pub async fn within<F: Future>(what: &str, future: F) -> F::Output {
     match tokio::time::timeout(BOUND, future).await {
         Ok(value) => value,
-        Err(_) => panic!("{what} did not complete within {BOUND:?}"),
+        Err(elapsed) => panic!("{what} did not complete within {BOUND:?}: {elapsed}"),
     }
 }
 
@@ -46,7 +46,7 @@ where
         match tokio::time::timeout(BOUND, stream.next()).await {
             Ok(Some(item)) => out.push(item),
             Ok(None) => break,
-            Err(_) => panic!("stream produced fewer than {max} items within {BOUND:?}"),
+            Err(elapsed) => panic!("stream produced fewer than {max} items within {BOUND:?}: {elapsed}"),
         }
     }
     out
