@@ -99,7 +99,7 @@ impl std::fmt::Debug for AgentSessionOptions {
 /// A single agent invocation.
 ///
 /// Owns an [`AgentState`] store and delegates everything else to the
-/// crate-private [`SessionInner`]. A session created by a team shares that
+/// crate-private `SessionInner`. A session created by a team shares that
 /// team's config, stream hub, checkpointer, and trace id, but keeps its own
 /// session id and state.
 #[derive(Clone)]

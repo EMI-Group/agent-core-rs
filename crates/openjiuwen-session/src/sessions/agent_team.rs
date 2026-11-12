@@ -90,7 +90,7 @@ impl std::fmt::Debug for AgentTeamSessionOptions {
 /// An agent-team run.
 ///
 /// Owns an [`AgentState`] store and the team id, and delegates everything else
-/// to the crate-private [`SessionInner`]. Child agent sessions share the team's
+/// to the crate-private `SessionInner`. Child agent sessions share the team's
 /// config, stream hub, checkpointer, and trace id.
 #[derive(Clone)]
 pub struct AgentTeamSession {
