@@ -41,7 +41,7 @@ Ports `openjiuwen/harness/deep_agent.py` and `factory.py`; `DeepAgent` composes 
 ## Routing Table
 - `./mod.rs` → `DeepAgent` struct, `Agent` impl, follow-up/steer/abort, mode/state entry points, re-exports
 - `./builder.rs` → `DeepAgentBuilder`, tool/rail/permission/subagent wiring, lazy model resolution
-- `./factory.rs` → `create_deep_agent`, `DeepAgentParts`, `resolve_deep_agent_parts`, default rails
+- `./factory.rs` → `create_deep_agent`, `DeepAgentParts`, `resolve_deep_agent_parts`, `apply_deep_agent_parts`, default rails
 - `./round.rs` → input normalization, single-round execution, `RoundExecutorHandle`, phase/abort mapping, `stream`
 - `./prompt_rail.rs` → `PromptRail` (system-prompt assembly from builder + published sections, steering injection)
 - `./subagent_factory.rs` → `DeepAgentSubAgentFactory` (nested `DeepAgent` construction for the runtime)
