@@ -88,10 +88,11 @@ pub struct TeamMemberSpawner;
 impl TeamMemberSpawner { pub fn new(spec: TeamAgentSpec, deps: TeamBuildDeps, session_id: impl Into<String>) -> Arc<Self>; }
 #[async_trait] impl MemberSpawner for TeamMemberSpawner { /* spawn / despawn */ }
 
-// team_agent.rs — the agent itself
-pub trait SpecBuild { fn build(&self) -> Result<Arc<TeamAgent>>; fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
-impl SpecBuild for TeamAgentSpec;
-pub struct TeamAgent;       // Clone: cheap handle over Arc'd interior state
+// team_agent.rs + build.rs — the agent itself
+#[async_trait] pub trait SpecBuild { async fn build(&self) -> Result<Arc<TeamAgent>>;
+                                     async fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
+impl SpecBuild for TeamAgentSpec;                 // the impl lives in build.rs
+pub struct TeamAgent;       // Clone: cheap handle over one Arc'd interior state
 impl TeamAgent {
     pub fn card(&self) -> &AgentCard;      pub fn team_name(&self) -> &str;
     pub fn role(&self) -> TeamRole;        pub fn session_id(&self) -> &str;
@@ -246,12 +247,14 @@ a new session instead of being rebuilt.
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot)
+- `./build.rs` → the `SpecBuild` implementation and every build-only helper (leader record, harness, observer, roster rows, bus wiring)
 - `./spawner.rs` → `TeamMemberSpawner` (`MemberSpawner` over the harness factory)
-- `./team_agent.rs` → `TeamAgent`, `SpecBuild`, build path, lifecycle, `invoke`/`stream` entry
+- `./team_agent.rs` → `TeamAgent`, `SpecBuild`, lifecycle, run entry points, `#[cfg(test)] test_support`
 - `./leader.rs` → the coordination loop and its settle/batching rules
 - `./pool.rs` → `TeamRuntimePool`
 - `./manager.rs` → `TeamRuntimeManager`, `global_registry`/`set_global_registry`/`clear_global_registry`
 - `./adapter.rs` → `openjiuwen_agent::Agent` and `openjiuwen_multiagent::Team` implementations
+- `./tests/` → crossed-seam integration suite (`support.rs`, `end_to_end.rs`, `members.rs`, `mail.rs`)
 
 ## Test Strategy
 
@@ -280,8 +283,9 @@ Unit tests beside each file plus `tests/runtime.rs` for the crossed seams; all o
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
 Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`,
-`cargo test -p openjiuwen-agent-teams --no-default-features`,
-`cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for `src/runtime/**`.
+`cargo test -p openjiuwen-agent-teams --no-default-features` (549 crate lib tests green in both),
+`cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for `src/runtime/**`
+(the only crate-wide diagnostics are the still-empty `mcp`/`skill` module docs, owned by other nodes).
 
 ## Notes for Agents / Deviations from Python
 
@@ -304,4 +308,21 @@ Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openji
   `Option<Arc<dyn Session>>`; the adapter ignores the multiagent session (documented; `openjiuwen-session`'s
   `AgentTeamSession` is not a `dyn Session`).
 - `Team::add_agent` accepts a card + `AgentProvider`; the provider is ignored — a member's brain always
-  comes from the harness factory, and only an `unstarted` roster row is created.
+  comes from the harness factory, and only an `unstarted` roster row is created. Because that seam is
+  synchronous while `TeamStore::insert_member` is async, the row write is spawned on the current tokio
+  runtime (a missing runtime is `Error::config`).
+- `SpecBuild` is `#[async_trait]` (async `build`/`build_with`): the pinned build order awaits the store,
+  the workspace provider, the harness factory and the team-row upsert, so a synchronous trait cannot hold
+  it. The crate-level document still sketches synchronous signatures.
+- `leader::run` returns the `AgentOutput` directly; frames flow through a `ChunkSink`, so `stream` yields
+  them live and `invoke` ignores them.
+- One run at a time per team: the bus receiver is single-consumer (`TeamAgent::take_events`), so a second
+  concurrent `invoke`/`stream` on the same handle is unsupported (documented, not enforced).
+- Settle is two consecutive 25 ms ticks (`SETTLE_POLL_INTERVAL`, `REQUIRED_SETTLE_TICKS = 2`) rather than
+  Python's 2 s idle debounce: a run that answers immediately still emits exactly one completed marker.
+- `build` always produces the leader handle. Teammates are not a second public constructor: they are
+  `TeamMember` rows whose harness is materialized by `spawn_member` through the same factory seam.
+- `TeamRuntimeManager` keys a persistent team under the session that first activated it, even when a later
+  session resumes it; `shutdown()` never clears the global registry (the caller does).
+- `team_agent.rs` is 852 production lines plus its `test_support`/unit tests (the sanctioned long file of
+  this node); the build path is split into `build.rs`.
