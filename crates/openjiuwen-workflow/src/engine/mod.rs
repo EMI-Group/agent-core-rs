@@ -528,7 +528,6 @@ pub(crate) mod test_support {
         /// Yield `frames` from `stream`/`transform`.
         #[must_use]
         /// Ask `question` from `invoke`.
-        #[must_use]
         pub(crate) fn with_question(mut self, question: Value) -> Self {
             self.question = Some(question);
             self
@@ -635,9 +634,7 @@ mod tests {
     use futures::StreamExt;
     use openjiuwen_common::error::ErrorKind;
     use openjiuwen_session::stream::StreamMode;
-    use openjiuwen_session::{
-        InteractiveInput, MemoryCheckpointer, Session, WorkflowSession, WorkflowSessionOptions,
-    };
+    use openjiuwen_session::{InteractiveInput, Session, WorkflowSession};
     use serde_json::json;
 
     use super::test_support::TestComponent;
