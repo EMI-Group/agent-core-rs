@@ -142,3 +142,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - `RunOptions::default()` means: no caller session, no deadline, never cancelled, session id from `inputs["conversation_id"]` else `RunnerConfig::default_session_id`.
 - Callback events the runner itself fires: `AgentInvokeInput`/`AgentInvokeOutput`, `AgentStreamInput`/`AgentStreamOutput`, `WorkflowInvokeInput`/`WorkflowInvokeOutput`, `WorkflowError`, `WorkflowStreamInput`/`WorkflowStreamOutput`, and `AgentSessionCreated` when it creates a session. LLM/tool events are fired by whoever owns the model/tool call (agent rails or harness code); the runner ships the binding (`set_guardrails`) and the `scan` shortcut, not the invocation sites.
 - Never hold a `parking_lot` guard across `.await`; the resource registry and callback registry guard only synchronous lookups.
+- A runner's `runner_id` is fixed at construction: `set_config` keeps the instance id (logging a mismatch) so `runner_id()` can return `&str` and identity never changes mid-life.
+- `message_queue()` always returns a queue: before `start` it is the configured backend in the stopped state (operations fail with `Error::Config`), not `None`.
+- `stop` clears the built checkpointer and calls `resource_mgr().release()`; `release(session_id)` without a checkpointer is a no-op.
+- `set_guardrails` unregisters the previous binding first, so calling it twice replaces rather than double-scans.
