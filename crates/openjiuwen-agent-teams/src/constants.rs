@@ -80,7 +80,10 @@ mod tests {
             parse_mention("@dev-1 please start task 123"),
             Some(("dev-1", "please start task 123"))
         );
-        assert_eq!(parse_mention("@dev-1 line one\nline two"), Some(("dev-1", "line one\nline two")));
+        assert_eq!(
+            parse_mention("@dev-1 line one\nline two"),
+            Some(("dev-1", "line one\nline two"))
+        );
         assert_eq!(parse_mention("@dev-1"), None);
         assert_eq!(parse_mention("@ dev-1 body"), None);
         assert_eq!(parse_mention("dev-1 body"), None);
