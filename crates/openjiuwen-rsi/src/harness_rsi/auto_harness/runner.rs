@@ -13,7 +13,7 @@
 //! knowledge.
 //!
 //! [`HarnessEvaluator`] adapts a runner to the shared
-//! [`Evaluator`](crate::evolution::Evaluator) protocol, so the orchestrator can
+//! [`Evaluator`] protocol, so the orchestrator can
 //! score candidates without knowing whether the report came from a real
 //! harness, a fake, or a replay.
 

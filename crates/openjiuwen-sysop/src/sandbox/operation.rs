@@ -168,7 +168,7 @@ fn dispatch_in(
 /// need the external AIO container protocol.
 ///
 /// Registration is idempotent: it is skipped when the gateway has no launcher or no
-/// non-blank `base_url`, and [`crate::sandbox::http::install`] ignores kinds that are
+/// non-blank `base_url`, and `crate::sandbox::http::install` ignores kinds that are
 /// already registered, so repeated [`crate::SysOperation::new`] calls succeed.
 ///
 /// # Errors

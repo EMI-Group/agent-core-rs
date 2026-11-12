@@ -41,7 +41,7 @@ const DEFAULT_RESERVED_MAX_CHAT_ROUNDS: usize = 10;
 /// Build one with [`LlmAgentSpec::new`] and the `with_*` builders, then convert
 /// it into the platform document with [`LlmAgentSpec::to_dsl`]. Every field is
 /// optional on the wire: [`Default::default`] yields an empty specification
-/// whose `provider` is already the documented [`DEFAULT_PROVIDER`] (`"openai"`),
+/// whose `provider` is already the documented `DEFAULT_PROVIDER` (`"openai"`),
 /// so `new` and a deserialized document agree on the fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
@@ -54,7 +54,7 @@ pub struct LlmAgentSpec {
     pub system_prompt: String,
     /// The greeting the agent sends before the first user turn.
     pub opening_remarks: String,
-    /// The model provider name; defaults to [`DEFAULT_PROVIDER`].
+    /// The model provider name; defaults to `DEFAULT_PROVIDER`.
     pub provider: String,
     /// The model endpoint; `None` produces a DSL without a model block.
     pub model: Option<DslModelInfo>,

@@ -5,7 +5,7 @@
 //! inline (`python3 -u -c <code>` / `node -e <code>`); a long one, or one with
 //! `force_file`, is written to a temporary file (`python3 -u <path>` / `node <path>`),
 //! exactly like Python's `_build_subprocess_cmd`. The run uses the shared engine in
-//! [`crate::shell::local::process`], so bounded capture, timeout, and cancellation behave
+//! `crate::shell::process`, so bounded capture, timeout, and cancellation behave
 //! as they do for shell commands, and every failure is an [`OpResult`] value carrying
 //! status `199005`, never a panic. A non-zero exit status is **not** an error (Python
 //! parity): the run succeeded and reported that `exit_code`.

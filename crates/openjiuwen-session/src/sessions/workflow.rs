@@ -55,7 +55,7 @@ pub struct WorkflowSessionOptions {
 /// A workflow (or graph) execution context.
 ///
 /// Owns a [`WorkflowState`] store shared with its [`NodeSession`] children and
-/// delegates everything else to the crate-private [`SessionInner`].
+/// delegates everything else to the crate-private `SessionInner`.
 #[derive(Clone)]
 pub struct WorkflowSession {
     inner: Arc<SessionInner>,

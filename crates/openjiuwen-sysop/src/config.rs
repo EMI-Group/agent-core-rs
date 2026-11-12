@@ -140,7 +140,7 @@ pub struct LocalWorkConfig {
     pub sandbox_root: Option<Vec<String>>,
     /// Rejects reads and writes outside [`Self::sandbox_root`]. Default `false`.
     pub restrict_to_sandbox: bool,
-    /// Regexes (case-insensitive, see [`crate::shell::CommandFilter`]) that reject a
+    /// Regexes (case-insensitive, see [`crate::shell::allowlist::CommandFilter`]) that reject a
     /// shell command before execution. `None` = no deny list (Python default).
     pub dangerous_patterns: Option<Vec<String>>,
     /// Root used to resolve relative paths. `None` = the process working directory at

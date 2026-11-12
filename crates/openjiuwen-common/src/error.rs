@@ -73,7 +73,7 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// The `snake_case` name used in [`Display`] and serde output, Python-style.
+    /// The `snake_case` name used in [`Display`](std::fmt::Display) and serde output, Python-style.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

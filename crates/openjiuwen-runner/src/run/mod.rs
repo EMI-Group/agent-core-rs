@@ -9,12 +9,12 @@
 //! The module is deliberately split by responsibility so each file stays small
 //! and readable:
 //!
-//! - [`agent`] — [`invoke_agent`] / [`stream_agent`];
-//! - [`workflow`] — [`invoke_workflow`] / [`stream_workflow`];
-//! - [`team`] — [`invoke_team`] / [`stream_team`];
-//! - `span` — the crate-private [`RunSpan`] that mirrors a run onto the
+//! - `agent` — [`invoke_agent`] / [`stream_agent`];
+//! - `workflow` — [`invoke_workflow`] / [`stream_workflow`];
+//! - `team` — [`invoke_team`] / [`stream_team`];
+//! - `span` — the crate-private `RunSpan` that mirrors a run onto the
 //!   session tracer;
-//! - `teardown` — the crate-private [`Teardown`] that runs an owned teardown
+//! - `teardown` — the crate-private `Teardown` that runs an owned teardown
 //!   action exactly once, on completion or on drop.
 //!
 //! Reference resolution happens before anything else: an id that is not

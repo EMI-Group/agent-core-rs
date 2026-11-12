@@ -27,7 +27,8 @@
 //!   the format through a post-processing step that needs a JSON-schema
 //!   generator.
 //! - Stream frames are content deltas: each frame carries the
-//!   [`StreamChunk::Delta`] text, not the accumulated answer.
+//!   [`StreamChunk::Delta`](openjiuwen_foundation::StreamChunk::Delta) text, not the
+//!   accumulated answer.
 
 use std::collections::BTreeMap;
 use std::fmt;

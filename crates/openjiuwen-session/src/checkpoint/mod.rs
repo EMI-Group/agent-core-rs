@@ -4,7 +4,7 @@
 //! Ports `openjiuwen/core/session/checkpointer/` (v0.1.20): `base.py` (the
 //! abstract contract, namespace constants, and key builders), `inmemory.py`
 //! ([`MemoryCheckpointer`]), and `persistence.py` ([`FileCheckpointer`]; the
-//! sqlite backend lives in [`crate::checkpoint::sqlite`] behind the `sqlite`
+//! sqlite backend lives in `crate::checkpoint::sqlite` behind the `sqlite`
 //! feature).
 //!
 //! Deviations from Python (intentional, documented in the crate `CONTEXT.md`):
