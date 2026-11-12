@@ -13,6 +13,7 @@ All tests are offline and deterministic.
 - `loaders.rs` → text/JSON/CSV/HTML file loaders with `tempfile`, URL loader with `wiremock`, `AutoLoader` dispatch/stamping/errors.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
+- `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
 
 ## Constraints
 
@@ -29,3 +30,4 @@ All tests are offline and deterministic.
 - `./loaders.rs` → loader behavior
 - `./knowledge_base.rs` → pipeline end to end
 - `./embedding.rs` → OpenAI-compatible embedding client
+- `./graph.rs` → triple extraction and graph store

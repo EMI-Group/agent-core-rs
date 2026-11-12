@@ -4,8 +4,8 @@
 
 Documents, chunking, embeddings, vector stores, rerankers, and knowledge base for the Rust rewrite.
 Maps to the Python package `openjiuwen.core.retrieval` (public surface in `openjiuwen/core/retrieval/__init__.py`), with the document/result/config models from `retrieval/common/` and the foundation store ABCs (`Document`, `Embedding`, `Reranker`, `VectorStore`).
-Scope is the offline-capable core: text/JSON/Markdown/CSV/HTML/URL loading, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic fake, an in-memory vector store with optional JSON persistence, score/LLM reranking seams, and a knowledge base that runs load → chunk → embed → store → retrieve → rerank.
-External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, triple/graph extraction, multimodal documents, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+Scope is the offline-capable core: text/JSON/Markdown/CSV/HTML/URL loading, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic fake, an in-memory vector store with optional JSON persistence, score/LLM reranking seams, a knowledge base that runs load → chunk → embed → store → retrieve → rerank, and (Rust additions) deterministic rule-based triple extraction plus an in-memory graph store.
+External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, LLM-backed triple extraction, multimodal documents, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
 
 ## API Surface
 
@@ -142,8 +142,36 @@ pub async fn retrieve_multi_kb_with_source(kbs: &[Arc<SimpleKnowledgeBase>], que
 `parse_files`/`parse_urls` skip failing sources with a `warn` log (Python parity) and return the documents that loaded.
 No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non-streaming).
 
+### Graph (`graph`)
+```rust
+pub struct Triple { pub subject: String, pub predicate: String, pub object: String, pub metadata: Metadata }
+pub struct Entity { pub name: String, pub kind: Option<String>, pub metadata: Metadata }
+pub struct TripleMemory { /* insertion-ordered, deduped by normalized_key */ }
+pub struct TripleBeam { pub nodes: Vec<SearchResult>, pub score: f32 }
+#[async_trait] pub trait TripleExtractor: Send + Sync {
+    async fn extract(&self, chunks: &[TextChunk]) -> Result<Vec<Triple>>;
+}
+#[async_trait] pub trait GraphStore: Send + Sync {
+    async fn add_triples(&self, triples: Vec<Triple>) -> Result<usize>;
+    async fn triples_for_entity(&self, entity: &str) -> Result<Vec<Triple>>;
+    async fn neighbors(&self, entity: &str, hops: usize) -> Result<Vec<Triple>>;
+    async fn search(&self, query: &TripleQuery) -> Result<Vec<Triple>>;
+    async fn all_triples(&self) -> Result<Vec<Triple>>;
+    async fn len(&self) -> Result<usize>;
+    async fn is_empty(&self) -> Result<bool>;
+    async fn clear(&self) -> Result<()>;
+    async fn statistics(&self) -> Result<GraphStatistics>;
+}
+```
+`Triple` keeps Python's field names and adds `new`, `with_metadata`, `metadata_entry`, `text()` (`"s p o"`), `normalized_key()` (trimmed, lowercased `s|p|o`), `entities()`, `has_blank_component()`.
+`TripleMemory` mirrors Python (`extend`/`batch_extend`/`triples_str` with lowercase `"(s p o)"` lines, `contains`, `len`, `is_empty`, `clear`); `TripleBeam` wraps `SearchResult`s with `new`, `triples`, `texts`, `contains_text`, `From<(Vec<SearchResult>, f32)>`, `From<SearchResult>`, `Default`.
+`RuleTripleExtractor` (`new`, `with_config`, `config`, `extract_chunks`, `entities_in_text`) is the deterministic, model-free extractor configured by `RuleExtractionConfig` (`max_triples_per_chunk=16`, `min_entity_chars=2`, `max_entity_chars=80`, `predicates` = `BUILT_IN_PREDICATES`, `include_single_entity=false`).
+Pattern families emit `is_a`, `has`, `contains`, `includes`, `uses`, `with`, `created`, `acquired`, `owned_by`, `founded_by`, `describes`, and the opt-in `appears_in`; each triple carries `doc_id`, `chunk_id`, and a `confidence` in `[0, 1]`.
+`InMemoryGraphStore` (`new`, `with_triples`) keeps insertion order, indexes entities and predicates, and returns new-triple counts from `add_triples`; `TripleQuery` filters by exact component, subject-or-object `entity`, `MetadataFilter`, and `limit`.
+`GraphStatistics { triple_count, entity_count, predicate_count }` describes the store.
+
 ### Re-exports (`lib.rs`)
-`pub mod common; pub mod chunking; pub mod loaders; pub mod embedding; pub mod vector_store; pub mod reranker; pub mod knowledge_base;` plus the public types/traits listed above.
+`pub mod common; pub mod chunking; pub mod loaders; pub mod embedding; pub mod graph; pub mod vector_store; pub mod reranker; pub mod knowledge_base;` plus the public types/traits listed above.
 
 ## Constraints
 
@@ -190,7 +218,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 ## Notes for Agents
 
 - All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
-- `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
+- `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, `knowledge_base.rs`, and `graph.rs`; unit tests live beside their modules.
 - Minimal offline knowledge base: `SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new("kb"), Arc::new(InMemoryVectorStore::new()), Arc::new(HashEmbedding::new(64)))?` then `.add_documents(...)`/`.add_texts(...)` and `.retrieve_with_config(query, &RetrievalConfig::default())`; `InMemoryVectorStore::new()` is sync (only `open`/`open_with_collection` are async).
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
 - `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` is clean now that the scaffolded foundation dependency is gone; no `--no-deps` workaround is needed.
@@ -202,6 +230,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - `./src/loaders/` → document loader trait, text/JSON/Markdown/CSV/HTML/URL/auto loaders (`loaders/CONTEXT.md`)
 - `./src/embedding/` → `Embedding` trait, OpenAI-compatible client, deterministic hash fake (`embedding/CONTEXT.md`)
 - `./src/vector_store/` → `VectorStore` trait, records/queries, in-memory store, JSON persistence, provider registry (`vector_store/CONTEXT.md`)
+- `./src/graph/` → `Triple`/`TripleMemory`/`TripleBeam`, rule-based triple extraction, in-memory graph store (`graph/CONTEXT.md`)
 - `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam (`reranker/CONTEXT.md`)
 - `./src/knowledge_base/` → `SimpleKnowledgeBase` pipeline, statistics, multi-KB retrieval (`knowledge_base/CONTEXT.md`)
 - `./tests/` → cross-module integration tests (`tests/CONTEXT.md`)

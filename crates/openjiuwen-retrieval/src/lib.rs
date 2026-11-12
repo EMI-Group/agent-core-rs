@@ -24,6 +24,7 @@
 pub mod chunking;
 pub mod common;
 pub mod embedding;
+pub mod graph;
 pub mod knowledge_base;
 pub mod loaders;
 pub mod model;
