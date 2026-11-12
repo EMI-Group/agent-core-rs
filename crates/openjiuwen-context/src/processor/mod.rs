@@ -33,10 +33,17 @@ use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
 use crate::window::drop_orphan_tool_results;
 
+pub mod compressor;
 pub mod summarize;
 pub mod tool_result;
 pub mod truncate;
 
+pub use self::compressor::{
+    find_last_completed_round_end, group_completed_rounds, is_memory_block,
+    iter_summary_merge_ranges, summarize, summarize_offline, CurrentRoundCompressor,
+    CurrentRoundCompressorConfig, DialogueCompressor, DialogueCompressorConfig, MemoryBlockKind,
+    CURRENT_ROUND_MEMORY_BLOCK, DIALOGUE_MEMORY_BLOCK, ROUND_LEVEL_MEMORY_BLOCK,
+};
 pub use self::summarize::{SummarizationConfig, SummarizationProcessor, CONTEXT_SUMMARY_PREFIX};
 pub use self::tool_result::{
     ToolResultConfig, ToolResultProcessor, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
@@ -160,6 +167,20 @@ impl ContextPipeline {
                         model,
                     }));
                 }
+                ProcessorConfig::DialogueCompressor(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(DialogueCompressor::new(
+                        config.clone(),
+                        model.clone(),
+                    )));
+                }
+                ProcessorConfig::CurrentRoundCompressor(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(CurrentRoundCompressor::new(
+                        config.clone(),
+                        model.clone(),
+                    )));
+                }
             }
         }
         Ok(Self::new(processors))
@@ -219,6 +240,10 @@ pub enum ProcessorConfig {
     ToolResult(ToolResultConfig),
     /// Replace older rounds with an LLM summary.
     Summarization(SummarizationConfig),
+    /// Replace older complete rounds with historical memory blocks.
+    DialogueCompressor(DialogueCompressorConfig),
+    /// Compress the earlier part of the current round into a memory block.
+    CurrentRoundCompressor(CurrentRoundCompressorConfig),
 }
 
 #[cfg(test)]
