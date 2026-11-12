@@ -64,12 +64,12 @@ pub const CONTEXT_HISTORY_STATE_KEY: &str = "__handoff_ctx_history__";
 
 ## Constraints
 
-- Reuse the wave-1 modules (`config`, `request`, `signal`, `tool`, `interrupt`, `orchestrator`); do not change their public behaviour.
+- The `config`, `request`, `signal`, `tool`, `interrupt`, and `orchestrator` modules are the stable data/parse layer the endpoint and strategy build on; their public behaviour is fixed.
 - Files stay under ~1000 lines: `container.rs` holds the endpoint only, its unit tests live in `container_tests.rs` (declared with `#[cfg(test)] #[path = "container_tests.rs"] mod tests;`).
 - No `unsafe`, no stdout logging (`tracing` only), no `unwrap`/`expect`/`panic` outside `#[cfg(test)]`.
 - Locks are never held across `.await`; the registry uses `parking_lot::RwLock` for short sections and `HandoffStrategy::setup_lock` is a `tokio::sync::Mutex`.
 - Every public item and field is documented; the crate runs clippy with `-D warnings` including `missing_docs`.
-- `mod.rs` keeps a temporary `#![allow(dead_code, unreachable_pub, unused_imports)]` with an explanatory comment until the crate-root re-exports land in `lib.rs`.
+- The crate root re-exports the whole handoff surface, so every public item here is reachable from `openjiuwen_multiagent`.
 - Tests are offline and deterministic, only short durations (`message_timeout` ≈ 10 ms against a 50 ms member).
 
 ## Design Decisions
