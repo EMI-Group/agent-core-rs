@@ -6,10 +6,12 @@
 //! The iteration loop lives in `agent_loop`, one model call in [`model_step`],
 //! interrupt replay in `resume`, and identity prompt rendering in `prompt`.
 //!
-//! The intended loop semantics match Python's
+//! The implemented loop semantics match Python's
 //! `openjiuwen/core/single_agent/agents/react_agent.py::_inner_invoke`:
 //!
-//! 1. Iterate `1..=max_iterations`; a host limit may lower the configured
+//! 1. Iterate `start..=limit`, where `start` is `1` for a fresh turn and one
+//!    past the interrupted iteration for a resumed one; a host limit
+//!    (`_host_max_iterations`) and the configured hard limit may lower the
 //!    maximum.
 //! 2. Build the system prompt for the iteration and prepare the model window
 //!    through [`ContextEngine::prepare`](openjiuwen_context::ContextEngine).
@@ -21,15 +23,15 @@
 //! 5. Fire `AfterReactIteration`; with no tool calls the turn terminates with an
 //!    answer.
 //! 6. Exhausting the budget applies [`MaxIterationsPolicy`] and records
-//!    `termination_reason = "max_iterations"`.
-//! 7. Rails may `force_finish`, request a model `retry`, or `skip_tool`; an
-//!    interrupt pauses the loop into an output carrying state frames and
-//!    interrupt ids that a later invocation resumes.
-//! 8. Cancellation is observed through the session/tool `CancellationToken` and
-//!    yields `Error::Cancelled`.
+//!    `termination_reason = "max_iterations"`; exceeding
+//!    [`ReActAgentConfig::max_total_tokens`] records `"token_budget"`.
+//! 7. Rails may `force_finish`, request a model `retry`, `model_continue`, or
+//!    `skip_tool`; an interrupt pauses the loop into an output carrying state
+//!    frames and interrupt ids that a later invocation resumes.
 //!
-//! TODO: implement the loop in `agent_loop::run` and delegate to it from
-//! `ReActAgent::invoke`/`ReActAgent::stream`.
+//! [`Agent::stream`] runs the same loop in a spawned task and yields
+//! [`AgentChunk`] frames: model deltas, one usage frame per call, the
+//! `__interaction__` frames of a pause, and one final `answer` frame.
 pub(crate) mod agent_loop;
 pub mod config;
 pub mod model_step;
@@ -44,8 +46,9 @@ use crate::card::AgentCard;
 use crate::output::{AgentChunk, AgentOutput};
 use crate::prompt::{PromptSection, SystemPromptBuilder, IDENTITY_PRIORITY};
 use crate::rails::{AgentRail, RailRegistry};
+use agent_loop::AgentRuntime;
 use futures::stream::{BoxStream, StreamExt};
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_context::{ContextConfig, ContextEngine};
 use openjiuwen_foundation::{Model, ModelRequestConfig, Tool, ToolCard};
 use openjiuwen_session::Session;
@@ -62,28 +65,29 @@ use std::sync::Arc;
 ///
 /// # Loop contract
 ///
-/// The planned loop follows Python's `_inner_invoke`:
+/// The loop follows Python's `_inner_invoke`:
 ///
-/// - iterations run from `1` to the effective limit
-///   ([`ReActAgentConfig::max_iterations`], optionally lowered by a host limit);
+/// - iterations run from `1` (or one past the interrupted iteration of a
+///   resumed turn) to the effective limit ([`ReActAgentConfig::max_iterations`],
+///   optionally lowered by `_host_max_iterations` and
+///   [`ReActAgentConfig::max_iterations_hard_limit`]);
 /// - the system prompt is rebuilt each iteration and the model window comes
 ///   from [`ContextEngine::prepare`](openjiuwen_context::ContextEngine);
 /// - rails fire around the model step (`BeforeModelCall`/`AfterModelCall`),
 ///   every tool call (`BeforeToolCall`/`AfterToolCall`), and each iteration
 ///   (`AfterReactIteration`), and may `force_finish`, request a model `retry`,
-///   or `skip_tool`;
+///   `model_continue`, or `skip_tool`;
 /// - tool calls execute in model order; consecutive parallel-safe tools run as
 ///   one batch and a non-parallel-safe tool is a barrier;
 /// - exhaustion applies [`ReActAgentConfig::on_max_iterations`] and records
-///   `termination_reason = "max_iterations"`;
+///   `termination_reason = "max_iterations"`, while exceeding
+///   [`ReActAgentConfig::max_total_tokens`] records `"token_budget"`;
 /// - an interrupt is an output (`result_type = "interrupt"`) whose state is
 ///   persisted under `__react_agent_interruption__` and resumed by a later
-///   invocation;
-/// - cancellation observed through the session's `CancellationToken` yields
-///   `Error::Cancelled`.
-///
-/// Until the loop lands, [`Agent::invoke`] and [`Agent::stream`] report
-/// `Error::Unsupported`.
+///   invocation whose query is an interactive payload;
+/// - a model call always streams (a run is always session-scoped), so the
+///   session receives `llm_output`/`llm_reasoning`/`llm_usage` frames as the
+///   provider produces them.
 pub struct ReActAgent {
     card: AgentCard,
     config: parking_lot::RwLock<ReActAgentConfig>,
@@ -258,19 +262,101 @@ impl Agent for ReActAgent {
 
     async fn invoke(
         &self,
-        _inputs: Value,
-        _session: Option<Arc<dyn Session>>,
+        inputs: Value,
+        session: Option<Arc<dyn Session>>,
     ) -> Result<AgentOutput> {
-        Err(Error::unsupported("react loop not implemented"))
+        let input = crate::input::AgentInput::parse(&inputs)?;
+        let run = crate::run::resolve_session(
+            session,
+            &self.card.id,
+            Some(&self.card.name),
+            input.conversation_id.as_deref(),
+            input.parent_session_id.as_deref(),
+        )
+        .await?;
+        let result = agent_loop::run(self, input, Arc::clone(run.session()), None).await;
+        run.finish().await;
+        result
     }
 
+    /// Runs the loop in a spawned task and yields its frames.
+    ///
+    /// The agent is snapshotted synchronously (so the returned stream owns
+    /// everything it needs), the session is resolved inside the task, and every
+    /// frame is forwarded through an unbounded channel: model deltas, one
+    /// `llm_usage` frame per call, `__interaction__` frames when the run pauses,
+    /// and one final `answer` frame carrying the [`AgentOutput`].
+    ///
+    /// Errors surface two ways, matching Python's streaming contract: invalid
+    /// input, an unconfigured model, and cancellation yield one `Err` item,
+    /// while any other loop failure yields a final `answer` frame whose payload
+    /// has `result_type = "error"`.
     fn stream(
         &self,
-        _inputs: Value,
-        _session: Option<Arc<dyn Session>>,
+        inputs: Value,
+        session: Option<Arc<dyn Session>>,
     ) -> BoxStream<'static, Result<AgentChunk>> {
-        futures::stream::once(async { Err(Error::unsupported("react loop not implemented")) })
-            .boxed()
+        let input = match crate::input::AgentInput::parse(&inputs) {
+            Ok(input) => input,
+            Err(error) => return futures::stream::once(async move { Err(error) }).boxed(),
+        };
+        let runtime = match AgentRuntime::snapshot(self) {
+            Ok(runtime) => runtime,
+            Err(error) => return futures::stream::once(async move { Err(error) }).boxed(),
+        };
+        let agent_id = self.card.id.clone();
+        let agent_name = self.card.name.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentChunk>>();
+        tokio::spawn(async move {
+            // The loop publishes plain chunks; a forwarding task wraps each one
+            // in `Ok` so the returned stream can also carry terminal `Err` items.
+            let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<AgentChunk>();
+            let frames = tx.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(chunk) = frame_rx.recv().await {
+                    if frames.send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+            });
+            let run = match crate::run::resolve_session(
+                session,
+                &agent_id,
+                Some(&agent_name),
+                input.conversation_id.as_deref(),
+                input.parent_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    drop(frame_tx);
+                    let _ = forwarder.await;
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
+            let result =
+                agent_loop::run_with(&runtime, input, Arc::clone(run.session()), Some(frame_tx))
+                    .await;
+            // Every frame the loop produced reaches the caller before the
+            // terminal item: the forwarder ends once the loop dropped its sender.
+            let _ = forwarder.await;
+            if let Err(error) = result {
+                if error.kind() == ErrorKind::Cancelled {
+                    let _ = tx.send(Err(error));
+                } else {
+                    let failed = AgentOutput::error(error.to_string());
+                    let _ = tx.send(Ok(AgentChunk::answer(&failed)));
+                }
+            }
+            run.finish().await;
+            drop(tx);
+        });
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed()
     }
 }
 
@@ -393,20 +479,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_reports_unsupported() {
+    async fn invoke_rejects_invalid_input() {
         let agent = agent();
         let error = agent.invoke(Value::Null, None).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[tokio::test]
-    async fn stream_yields_exactly_one_error() {
+    async fn invoke_without_a_model_reports_a_configuration_error() {
         let agent = agent();
-        let frames: Vec<Result<AgentChunk>> = agent.stream(Value::Null, None).collect().await;
+        let error = agent
+            .invoke(serde_json::json!("hi"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn stream_without_a_model_yields_exactly_one_error() {
+        let agent = agent();
+        let frames: Vec<Result<AgentChunk>> =
+            agent.stream(serde_json::json!("hi"), None).collect().await;
         assert_eq!(frames.len(), 1);
-        assert_eq!(
-            frames[0].as_ref().unwrap_err().kind(),
-            ErrorKind::Unsupported
-        );
+        assert_eq!(frames[0].as_ref().unwrap_err().kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn invoke_answers_with_the_configured_model() {
+        let agent = agent();
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("hi back"));
+        agent.set_model(model);
+        let output = agent
+            .invoke(Value::String("hello".to_owned()), None)
+            .await
+            .unwrap();
+        assert_eq!(output.result_type, crate::output::ResultType::Answer);
+        assert_eq!(output.output, "hi back");
+    }
+
+    #[tokio::test]
+    async fn stream_yields_model_deltas_and_one_answer_frame() {
+        let agent = agent();
+        let model: Arc<dyn Model> =
+            Arc::new(ScriptedModel::builder().stream_text("hi back").build());
+        agent.set_model(model);
+        let frames: Vec<AgentChunk> = agent
+            .stream(Value::String("hello".to_owned()), None)
+            .map(|frame| frame.unwrap())
+            .collect()
+            .await;
+        let answers = frames
+            .iter()
+            .filter(|frame| frame.kind == crate::output::ANSWER)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].payload["output"], "hi back");
+        assert_eq!(answers[0].payload["result_type"], "answer");
+        assert!(frames
+            .iter()
+            .any(|frame| frame.kind == crate::output::LLM_OUTPUT));
     }
 }
