@@ -201,7 +201,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 - Unit tests beside `redaction.rs` (all `test_redaction.py` cases: exact truncation marker, hash formula, field override truth table, system-prompt non-truncation), `span_names.rs` (every naming rule), `config.rs` (sample-rate validation, env toggle precedence), `handle.rs` (no-op vs active), `attrs.rs`, `llm_attrs.rs`.
 - Every test module always calls `force_flush()` before reading captured `SpanData`; Python counterparts are named in comments.
 - `./mod.rs` module docs carry three doctests that compile as external crates: the seam (`init_otel_tracer` active/inactive), the `TraceSink` integration (one exported `chat {model}` span from a terminal frame), and the typed handlers (LLM span attributes + `bug #2046` tool dedup, and the workflow buffer flush); the handler examples are wrapped in `# #[cfg(feature = "otel")] # { .. # }` so the default build stays green.
-- The crate-level integration suites `crates/openjiuwen-extensions/tests/otel.rs` (`#![cfg(feature = "otel")]`) and `tests/otel_seam.rs` do not exist yet: `tests/` sits outside this node, so the three `mod.rs` doctests carry the same public-surface assertions from outside the crate until a crate-level agent adds them.
+- The crate-boundary integration suites `../tests/otel.rs` (`#![cfg(feature = "otel")]`) and `../tests/otel_seam.rs` assert the public surface from outside the crate: the seam (`init_otel_tracer`, `is_active`, deferred OTLP), one exported `chat {model}` span through a session `Tracer`, the default error-status path, and the `bug #2046` tool dedup.
 
 ## Routing Table
 

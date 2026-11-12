@@ -184,7 +184,8 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 ## Test Strategy
 
 - Unit tests live beside the code they own: `./types.rs`, `./jsonrpc.rs`, `./card.rs`, `./client/tests.rs`, `./transform/tests.rs`, `./harness_bridge/tests.rs`, `./server/tests.rs` (routing, dispatch, event order, store, lifecycle, plus a compile-time check that every public path resolves at `crate::a2a::server::`).
-- `./e2e_tests.rs` holds the crate-level integration suites as two in-module submodules (`client_suite` with `wiremock`, `server_suite` with `Router::oneshot` via `tower::ServiceExt` + `http_body_util::BodyExt` and one real ephemeral socket). They are written against public paths only so they can be promoted to `../tests/a2a_client.rs` and `../tests/a2a_server.rs` (add `#![cfg(feature = "a2a")]`, rewrite `crate::a2a::` to `openjiuwen_extensions::a2a::`).
+- `./e2e_tests.rs` holds the in-crate integration suites as two in-module submodules (`client_suite` with `wiremock`, `server_suite` with `Router::oneshot` via `tower::ServiceExt` + `http_body_util::BodyExt` and one real ephemeral socket).
+- `../tests/a2a_client.rs` and `../tests/a2a_server.rs` are the crate-boundary mirrors of those suites; they use only `openjiuwen_extensions::a2a::` public paths and are gated with `#![cfg(feature = "a2a")]`.
 - Coverage: send folds to `AgentResult`; SSE stream of three frames yields three results in order; `CancelTask` fields and `CANCELED`; JSON-RPC error → typed `Error`; non-2xx → `Transport`; remote-client protocol/card validation and card-interface invocation; card route; `message/send` + v0.3 alias; `tasks/get` unknown → `-32001`; `tasks/cancel` → `CANCELED` then `-32002`; `message/stream` frame order; executor error → `FAILED` + `-32603`; real-socket card/send round trip.
 - Python counterparts named in comments: `tests/unit_tests/extensions/a2a/test_a2a_transformer.py`, `test_a2a_agentcard_adapter.py`, `test_a2a_client.py`, `test_a2a_server.py`.
 - Definition of done: `cargo fmt -p openjiuwen-extensions`, `cargo test -p openjiuwen-extensions --features a2a --lib`, and `cargo clippy -p openjiuwen-extensions --all-targets --features a2a -- -D warnings` all clean for this subtree.
@@ -201,4 +202,4 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `./server/` → axum router, dispatch, executor SPI, event sink, task store, server handle, adapter (`server/CONTEXT.md`)
 - `./harness_bridge.rs` → conversions to/from `openjiuwen_harness_protocol`
 - `./harness_bridge/tests.rs` → bridge mapping-table and round-trip tests
-- `./e2e_tests.rs` → end-to-end client/server suites (public API only; candidates for `../tests/`)
+- `./e2e_tests.rs` → end-to-end client/server suites (in-crate, public paths only; mirrored by `../tests/a2a_client.rs` and `../tests/a2a_server.rs`)
