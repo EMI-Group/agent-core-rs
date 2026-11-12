@@ -21,10 +21,10 @@ pub fn is_reserved_name(name: &str) -> bool;
 pub fn parse_mention(text: &str) -> Option<(&str, &str)>;   // "^@(\S+)\s+([\s\S]+)$"
 
 // spec → runtime
-pub trait SpecBuild { fn build(&self) -> Result<Arc<TeamAgent>>; fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
+#[async_trait] pub trait SpecBuild { async fn build(&self) -> Result<Arc<TeamAgent>>; async fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
 pub struct TeamAgentSpec { /* Python blueprint.py: agents, leader, predefined_members, dispatch_mode, … */ }
 pub struct TeamAgent;            // impl openjiuwen_agent::Agent + openjiuwen_multiagent::Team
-pub struct TeamRuntimeManager;   // activate / interact / finalize_member / stop_team / snapshot
+pub struct TeamRuntimeManager;   // activate / live / interact / finalize_member / stop_team / snapshot
 pub struct TeamRuntimePool;
 
 // protocol
@@ -39,6 +39,8 @@ pub fn set_process_expert_catalog(c: Arc<dyn ExpertCatalog>);  pub fn get_proces
 
 // CLI / MCP
 pub trait TeamClient;  pub struct TeamJoinDescriptor;  pub fn run_skill_cli(argv: Vec<String>) -> i32;
+pub fn connect_live_client(d: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>;  // in-process attach: global registry
+pub struct SkillCli;   pub enum CliCommand { Member(MemberCommand), Operator(OperatorCommand) }  // clap tree, publicly matchable
 pub struct TeamMcpServer;  pub fn build_mcp_server(client: Arc<dyn TeamClient>) -> TeamMcpServer;
 ```
 
@@ -232,16 +234,17 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - `./src/interaction/` → HITL payloads, routing grammar, `InteractGate`, human inbox, tool-approval bridge (`src/interaction/CONTEXT.md`)
 - `./src/runtime/` → `TeamAgent` (leader/teammate loop), `TeamBackend`, dispatch decision, runtime manager/pool, model allocator, `Team` adapter (`src/runtime/CONTEXT.md`)
 - `./src/harness/` → harness-protocol adapter: `MemberHarnessFactory`, `HarnessMemberRuntime`, native factory, checkpoints (`src/harness/CONTEXT.md`)
-- `./src/skill/` → `team-member` clap CLI, join descriptor, `TeamClient` implementations (`src/skill/CONTEXT.md`)
+- `./src/skill/` → `team-member` clap CLI, join descriptor, `TeamClient` implementations, live-team attach via the runtime registry (`src/skill/CONTEXT.md`)
 - `./src/mcp/` → `openjiuwen-team-mcp` server: tool catalogue + dispatch, stdio serve (`src/mcp/CONTEXT.md`)
 - `./src/constants.rs` → reserved names, defaults, mention parsing
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
-- Unit tests beside each module; integration suites in `./tests/` grouped by behaviour: `spec_build.rs` (spec parse/validate/build, defaults, unknown fields), `experts.rs` (catalog, agent-group manifests, persona composition), `taskboard.rs` (dependency graph, blocked→pending, cycles, claims, review gate, votes, revisions, subtasks), `member_lifecycle.rs` (status CAS, transitions, retire targets, round mapping), `messaging.rs` (in-process publish/p2p ordering, sender stamping, sink isolation, topic escaping), `hitl.rs` (mention grammar, gate ok/not_active/gate_closed, approval forwarding), `protocol.rs` (HarnessState mapping, fake harness member runtime, checkpoint JSON), `cli.rs` (clap parsing, exit codes 0/1/2, descriptor env), `mcp.rs` (tool listing per scope, call dispatch, unknown tool).
-- Fakes live in `tests/support/` and `openjiuwen-test-support` as a dev-dependency: scripted harness factory, recording member runtime, recording messager. Everything offline and deterministic; no sleeps beyond short bounded waits.
-- Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` all green.
+- Unit tests live beside their module (`#[cfg(test)]` in each file), ~666 of them, and cover the internals of `schema`, `storage`, `taskboard`, `messager`, `workspace`, `member`, `interaction`, `runtime`, `harness`, `skill` and `mcp`.
+- Integration suites in `./tests/` drive the public API only and pin cross-module behaviour (182 tests): `spec_build.rs` (JSON parse/defaults/unknown fields, `validate`, `build_with`, activate admission), `team_run.rs` (full in-process run, single `team.completed` marker, open-task run, `interact` outcomes, snapshot/stop), `member_and_mail.rs` (spawn, factory failure, shutdown matrix, workspace isolation, direct/broadcast/multicast mail, leader-only tasks), `task_flow.rs` (dependency graph, cycles, claims, review gate, votes, subtasks), `hitl.rs` (mention grammar, targets, gate, approval bridge), `protocol_adapter.rs` (command forwarding, observer order, mapping tables, checkpoint round-trip), `cli.rs` (full clap tree, output lines, exit codes 0/1/2), `mcp.rs` (tool tables per scope, exact `call_tool` text), `expert_catalog.rs` (agent-group packages, template composition).
+- Fakes live in `./tests/support/` (scripted harness factory, recording workspace provider, in-memory store, bounded `wait_until`) and in `openjiuwen-test-support` as a dev-dependency. Everything offline and deterministic: no network, no `#[ignore]`, no sleeps beyond short bounded waits.
+- Definition of done (all four green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`.
 
 ## Notes for Agents
 
@@ -251,3 +254,6 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - The Python `_Bus` (in-process messager), `TeamDatabase` (sqlite) and `asyncio.Task` spawn handle map to `messager::InProcessMessager`, `storage::InMemoryTeamStore` and `member::InProcessSpawnHandle`.
 - `openjiuwen_multiagent` is used only for the `Team`/`AgentTeamSession` seam so `Runner::run_agent_team` can drive a `TeamAgent`; its message bus is not used (Python `agent_teams` has its own envelope).
 - Prefer `Error::validation` for user-supplied names/dispatch knobs, `Error::config` for missing build dependencies (model, factory), `Error::not_found` for unknown members/tasks.
+- Cross-node deviations from Python, each owned and explained by its child node: `SpecBuild` is `#[async_trait]` and `build_with` takes `&self` without mutating the spec (`./src/runtime/`); the worktree name suffix is a FNV-1a digest instead of `sha256(..)[:10]` and member state lives at `<base>/<team>/sessions/<sid>/members/<member>` (`./src/workspace/`); the multiagent `AgentTeamSession` is ignored by the adapter, `Team::add_agent` writes its row on the current runtime, and one run at a time per team (`./src/runtime/`); `HarnessMemberRuntime::send` drops transport-level `SendReceipt` (`./src/member/` Known gaps); `TaskStatus` transitions are narrower than Python's (no `in_progress→pending`, `planning→pending`) (`./src/taskboard/`).
+- Live attach is in-process only: `connect_live_client` reads the process-global runtime registry, so the CLI/MCP server can act on a team this process hosts; a team this process does not host is exit `1` (`Error::config`/CLI `1`), and cross-process attach via a shared store or distributed transport is deferred.
+- The crate is not yet re-exported from the `openjiuwen` umbrella (`agent_teams` module); wiring `openjiuwen::agent_teams` and an `openjiuwen-team-mcp` binary belong to the umbrella/CLI nodes.
