@@ -22,6 +22,7 @@ use openjiuwen_session::Session;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -305,15 +306,38 @@ pub fn host_provider(agent: Arc<dyn Agent>, host: Arc<dyn ToolHost>) -> AgentPro
     Arc::new(move || TeamAgent::with_tool_host(Arc::clone(&agent), Arc::clone(&host)))
 }
 
-/// A [`ToolHost`] that records the name of every tool mounted on it.
+/// Builds a provider that hands out `member` again and counts its resolutions.
+///
+/// Every call increments `calls`, so a suite can assert that a strategy resolved
+/// an instance once and then reused the pinned one.
+#[must_use]
+pub fn counting_provider(member: TeamAgent, calls: Arc<AtomicUsize>) -> AgentProvider {
+    Arc::new(move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        member.clone()
+    })
+}
+
+/// A [`ToolHost`] that records the tools mounted on it.
 ///
 /// Strategies inject tools without returning them to the caller, so a suite
 /// observes the injection through this host: [`RecordingToolHost::mounts`] is the
-/// mount log in call order and [`RecordingToolHost::card_count`] counts calls.
-#[derive(Debug, Default)]
+/// mount log in call order, [`RecordingToolHost::card_count`] counts calls, and
+/// [`RecordingToolHost::tool`] hands back a mounted tool so a suite can invoke it.
+#[derive(Default)]
 pub struct RecordingToolHost {
     /// Names of the mounted tool cards, in mount order.
     mounts: Mutex<Vec<String>>,
+    /// The mounted tool handles, in mount order.
+    tools: Mutex<Vec<Arc<dyn Tool>>>,
+}
+
+impl std::fmt::Debug for RecordingToolHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingToolHost")
+            .field("mounts", &self.mounts.lock().clone())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecordingToolHost {
@@ -334,11 +358,102 @@ impl RecordingToolHost {
     pub fn card_count(&self) -> usize {
         self.mounts.lock().len()
     }
+
+    /// Returns the mounted tool handles, in mount order.
+    #[must_use]
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.lock().clone()
+    }
+
+    /// Returns the mounted tool whose card is named `name`, if any.
+    #[must_use]
+    pub fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .lock()
+            .iter()
+            .find(|tool| tool.card().name == name)
+            .cloned()
+    }
 }
 
 impl ToolHost for RecordingToolHost {
     fn mount_tool(&self, tool: Arc<dyn Tool>) -> bool {
         self.mounts.lock().push(tool.card().name.clone());
+        self.tools.lock().push(tool);
         true
+    }
+}
+
+/// One frame a [`StreamAgent`] yields from [`Agent::stream`].
+#[derive(Clone)]
+pub enum StreamFrame {
+    /// A regular agent chunk, forwarded verbatim.
+    Chunk(AgentChunk),
+    /// A failure that ends the stream; yielded as `Error::external(message)`.
+    Fail(String),
+}
+
+/// An [`Agent`] with a scripted stream and a scripted answer.
+///
+/// [`FakeAgent`] streams nothing, so a suite exercising stream forwarding needs
+/// frames. The agent records the inputs of every `stream` call, which is how a
+/// suite observes `conversation_id`/`sender` shaping. Nothing touches the
+/// network and no timer runs.
+pub struct StreamAgent {
+    card: AgentCard,
+    frames: Vec<StreamFrame>,
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+impl StreamAgent {
+    /// Builds an agent named by `card` that yields `frames` and answers `""`.
+    #[must_use]
+    pub fn new(card: AgentCard, frames: Vec<StreamFrame>) -> Arc<Self> {
+        Arc::new(Self {
+            card,
+            frames,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// Builds an agent named `name` (`id == name`) that yields `frames`.
+    #[must_use]
+    pub fn streaming(name: &str, frames: Vec<StreamFrame>) -> Arc<Self> {
+        Self::new(agent_card(name), frames)
+    }
+
+    /// Returns the inputs of every `stream` call, in call order.
+    #[must_use]
+    pub fn seen(&self) -> Vec<Value> {
+        self.seen.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for StreamAgent {
+    fn card(&self) -> &AgentCard {
+        &self.card
+    }
+
+    async fn invoke(
+        &self,
+        _inputs: Value,
+        _session: Option<Arc<dyn Session>>,
+    ) -> Result<AgentOutput> {
+        Ok(AgentOutput::answer(""))
+    }
+
+    fn stream(
+        &self,
+        inputs: Value,
+        _session: Option<Arc<dyn Session>>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        self.seen.lock().push(inputs);
+        let frames = self.frames.clone();
+        futures::stream::iter(frames.into_iter().map(|frame| match frame {
+            StreamFrame::Chunk(chunk) => Ok(chunk),
+            StreamFrame::Fail(message) => Err(Error::external(std::io::Error::other(message))),
+        }))
+        .boxed()
     }
 }
