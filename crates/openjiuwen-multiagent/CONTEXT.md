@@ -12,7 +12,8 @@ The crate never depends on `openjiuwen-runner` (runner depends on it): members a
 ### Crate root (`lib.rs`)
 
 Re-exports: `TeamCard`, `EventDrivenTeamCard`, `TeamConfig`, `TeamError`; `Team`, `BaseTeam`, `TeamStrategy`, `StrategyContext`, `MemberOptions`; `TeamAgent`, `AgentProvider`, `ToolHost`, `BindHook`; `MessageEnvelope`, `MessageBus`, `MessageBusConfig`, `MessageHandler`, `SubscriptionManager`; `TeamRuntime`, `RuntimeConfig`, `SessionLease`, `make_team_session`; `AgentTool`.
-Strategy trees: `handoff::*` (`HandoffTeamConfig`, `HandoffConfig`, `HandoffRoute`, `HandoffSignal`, `HandoffRequest`, `HandoffHistoryEntry`, `HandoffTool`, `HandoffOrchestrator`, `ContainerAgent`, `TeamInterruptSignal`, `extract_interrupt_signal`, `flush_team_session`, `handoff_team`, `HandoffStrategy`, the `HANDOFF_*` constants) and `hierarchical::*` (`HierarchicalMsgbusConfig`, `hierarchical_msgbus_team`, `SupervisorAgent`, `SupervisorConfig`, `create_supervisor`, `HierarchicalToolsConfig`, `hierarchical_tools_team`).
+Strategy trees: `handoff::*` (`HandoffTeamConfig`, `HandoffConfig`, `HandoffRoute`, `HandoffSignal`, `HandoffRequest`, `HandoffHistoryEntry`, `HandoffTool`, `HandoffOrchestrator`, `ContainerAgent`, `TeamInterruptSignal`, `extract_interrupt_signal`, `flush_team_session`, `handoff_team`, `HandoffStrategy`, the `HANDOFF_*` constants) and `hierarchical::*` (`HierarchicalMsgbusConfig`, `HierarchicalMsgbusStrategy`, `hierarchical_msgbus_team`, `SupervisorAgent`, `SupervisorConfig`, `create_supervisor`, `HierarchicalToolsConfig`, `HierarchicalToolsStrategy`, `hierarchical_tools_team`).
+Both hierarchical configs expose `new(entry_agent_card)` and both strategies expose `new(config) -> Arc<Self>`.
 
 ### Cards and configs (`card.rs`, `config.rs`)
 
@@ -306,8 +307,9 @@ pub fn create_supervisor(agents: Vec<AgentCard>, config: SupervisorConfig) -> Re
 pub struct HierarchicalToolsConfig { #[serde(flatten)] pub team: TeamConfig, pub root_agent: AgentCard }
 pub fn hierarchical_tools_team(card: TeamCard, config: HierarchicalToolsConfig) -> BaseTeam;
 ```
-`hierarchical_msgbus_team` sends the input to the supervisor with one P2P `send` (timeout = config timeout, overridable per invoke), and streams exactly one `{"output": <result>}` frame. `add_agent` for the supervisor id sets the runtime P2P timeout. `SupervisorAgent::create` builds a `ReActAgent` (model, one system prompt message, `max_iterations`) with one `AgentTool` per sub-agent card sharing a `Semaphore(max_parallel_sub_agents)`; results stay in tool-call order.
-`hierarchical_tools_team` wires pending `(parent, child)` pairs by mounting an `AgentTool` for each child on the parent's `ToolHost`, pins the parent instance so later sends reach the wired instance, then sends the input verbatim to the root. Its stream bypasses the bus: it calls the root agent's `stream` with `{conversation_id, sender}` merged into the input, forwards each `AgentChunk::to_value()` as a team frame, and turns a failure into a single `{"output": <message>, "result_type": "error"}` frame.
+`hierarchical_msgbus_team` sends the input to the supervisor with one P2P `send` (timeout = config timeout, overridable per invoke), and streams exactly one frame `{"type": "message", "index": 0, "payload": {"output": <result>}}`. `add_agent` for the supervisor id sets the runtime P2P timeout. `SupervisorAgent::create` builds a `ReActAgent` (model, one system prompt message, `max_iterations`) with one `AgentTool` per sub-agent card sharing a `Semaphore(max(1, max_parallel_sub_agents))`; results stay in tool-call order.
+`hierarchical_tools_team` wires pending `(parent, child)` pairs by mounting an `AgentTool` for each child on the parent's `ToolHost`, pins the parent instance so later sends reach the wired instance, then sends the input verbatim to the root.
+Its stream bypasses the bus: it calls the root agent's `stream` with `{conversation_id, sender}` merged into the input, forwards each `AgentChunk::to_stream_item()` as a team frame, and turns an agent stream failure into a single `{"type": "message", "index": 0, "payload": {"output": <message>, "result_type": "error"}}` frame.
 
 ### Errors
 
