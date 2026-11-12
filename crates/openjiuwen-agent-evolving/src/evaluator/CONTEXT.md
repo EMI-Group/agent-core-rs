@@ -12,7 +12,7 @@ Ports Python `openjiuwen.agent_evolving.evaluator` (`BaseEvaluator`, `MetricEval
 - `Metric`, `MetricValue` (`Scalar`, `Named`), `ExactMatchMetric`, `LlmAsJudgeMetric` (stub), `MetricEvaluator`, `Aggregate`.
 - `DefaultEvaluator` — API-shaped stub returning `Error::Unsupported`.
 - `EvaluationReport` — `run_id`, `num_cases`, `mean_score`, `min_score`, `max_score`, `per_metric`, `cases`.
-- `EvaluationConfig`, `evaluate_cases` — bounded-parallel evaluation over a runner and evaluator.
+- `EvaluationConfig`, `evaluate_cases(run_id, ...)` — bounded-parallel evaluation over a runner and evaluator; the caller-supplied `run_id` keeps reports deterministic.
 
 ## Constraints
 

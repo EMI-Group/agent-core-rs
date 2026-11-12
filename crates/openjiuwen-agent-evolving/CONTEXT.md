@@ -30,7 +30,7 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 - `MetricEvaluator { metrics, aggregate: Aggregate }` — per-metric values merged into `per_metric`; `Aggregate { Mean, First }` over the ordered metric values; numeric coercion never raises (bad values become `0.0`).
 - `DefaultEvaluator` — API-shaped stub for the Python model-judge evaluator; `evaluate` returns `Error::Unsupported`.
 - `EvaluationReport { run_id, num_cases, mean_score, min_score, max_score, per_metric, cases: Vec<EvaluatedCase> }` with `from_evaluated`/`from_cases`; empty report has zero counts and scores.
-- `evaluate_cases(runner, evaluator, cases, cancel, config) -> EvaluationReport` — runs cases with bounded parallelism, `EvaluationConfig { num_parallel, max_cases }`.
+- `evaluate_cases(run_id, runner, evaluator, cases, cancel, config) -> EvaluationReport` — runs cases with bounded parallelism, `EvaluationConfig { num_parallel, max_cases }`; the explicit `run_id` keeps reports deterministic (no uuid or clock).
 
 ### `optimizer` (`src/optimizer/`)
 
@@ -53,6 +53,8 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 - `TrainableTarget` (async trait): `id()`, `run_case(case, cancel)`, `apply(candidate)`, `snapshot()` (default `Value::Null`), `restore(state)` (default no-op).
 - `Trainer` — `new(config)`, `with_checkpoint(store, manager)`, `with_callbacks(vec)`, `with_resume_from(name)`; `evaluate(target, evaluator, cases, cancel) -> EvaluationReport`; `train(target, optimizer, evaluator, train_cases, val_cases, cancel) -> TrainerReport`.
 - Loop semantics: optional resume, baseline validation, per-epoch `propose -> apply -> validate -> observe -> select best`, checkpoint save on improvement / every N epochs, early stop at `early_stop_score`, cancellation token checked at every await point, evaluation budget and wall-clock budget enforced before spending.
+- Resume restores `best_score` and `operators_state` and re-runs the checkpointed epoch (`start_epoch .. num_iterations`); a missing checkpoint file is ignored.
+- Best-so-far: the first candidate may tie the baseline, later candidates must strictly improve, so `best_score` never drops below the baseline and `best_candidate` is `None` when only the baseline scored best.
 - `Progress` — Python fields; `run_epoch()` clamps at `max_epoch`.
 - `Callbacks` trait with `on_train_begin`/`on_train_epoch_begin`/`on_train_epoch_end`/`on_train_end`; `NoopCallbacks`.
 - `EpochReport { epoch, score, best_score, improved, candidates, evaluations, checkpoint_saved }`, `StopReason { Completed, EarlyStop, Cancelled, BudgetExhausted, NoCandidates }`, `TrainerReport { run_id, epochs_run, best_score, best_candidate, steps, evaluations, cancelled, stopped_reason }`.
@@ -90,6 +92,7 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 - Serde: every public data type is `Debug + Clone + PartialEq + Serialize + Deserialize` with `snake_case` Python field names and unknown-field tolerance; `Case`/`EvaluatedCase` also derive `schemars::JsonSchema`.
 - No `unsafe`, no stdout logging; use `tracing` only where an operation genuinely needs diagnostics (service serving).
 - Files stay under ~1000 lines; tests may use `unwrap`/`expect` via the crate-level `cfg(test)` allowance.
+- `src/trainer.rs` carries its inline unit-test module and is the one accepted file above that guideline; its implementation proper stays under 1000 lines.
 - Determinism: no `SystemTime`/`Instant` in report contents; a wall-clock budget is the only clock use, and defaults to `None`.
 
 ## Design Decisions
@@ -101,6 +104,9 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 - Checkpoint files are written atomically (temp + rename), an improvement over Python's direct `json.dump`, without changing the JSON shape.
 - The service uses axum 0.8 and shared `AppState`; RL endpoints are declared so clients get a stable 501 contract instead of a 404 while the ML stack is deferred.
 - `HarnessEvolutionRail` lives here (upper layer) and implements the harness trait, so the dependency arrow stays `agent-evolving -> harness` and the harness keeps its seam-only knowledge.
+- `evaluate_cases` owns a clone of the selected cases (bounded by `max_cases`) so its future is `Send`; the axum service and `tokio::spawn` callers can use it directly.
+- The service registers `POST /internal/v1/rl/tasks/{*operation}` as one catch-all because axum 0.8 cannot combine a path parameter and a literal `:finish`/`:abort` suffix in one segment.
+- `AgentCaseRunner` serializes the full `AgentOutput` (`{"output", "result_type"}`); callers pairing it with `ExactMatchMetric` should project `prediction["output"]`, since the metric only auto-projects `answer`-keyed or single-key predictions.
 
 ## Deferred Scope
 

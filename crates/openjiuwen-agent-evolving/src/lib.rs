@@ -1,40 +1,25 @@
-//! Evaluation, optimisation, and training pipelines for openJiuwen.
+//! Port of the offline core of Python `openjiuwen.agent_evolving`.
 //!
-//! This crate ports the portable core of the Python package
-//! `openjiuwen.agent_evolving` (see `docs/PARITY.md`, Tier 2):
+//! This crate keeps the portable, non-ML parts of the Python area — case datasets,
+//! deterministic evaluation and scoring, optimizer/checkpoint management, a bounded
+//! trainer loop, evolution rails, and the RL service skeleton — and exposes
+//! API-shaped stubs (`Error::Unsupported`) for the ML/vendor/RL stack, which is
+//! documented as deferred in `docs/PARITY.md`.
 //!
-//! - [`dataset`] — `Case`, `EvaluatedCase`, `CaseLoader`, and JSON/JSONL
-//!   dataset loading.
-//! - [`evaluator`] — the [`evaluator::Evaluator`] seam, deterministic metrics
-//!   (`ExactMatchMetric`, `MetricEvaluator`), the offline `CaseRunner` seam,
-//!   and [`evaluator::EvaluationReport`].
-//! - [`optimizer`] — the [`optimizer::Optimizer`] seam, candidate records, a
-//!   deterministic grid-search baseline, best-so-far selection, evolve
-//!   checkpoints, and the file/memory checkpoint stores and manager.
-//! - [`trainer`] — the bounded train/evaluate loop with cancellation, budgets,
-//!   callbacks, checkpoint resume, and per-epoch reports.
-//! - [`rails`] — pure-data evolution events and an `EvolutionObserver` adapter
-//!   that plugs into the harness `EvolutionRail` seam without an upward
-//!   dependency from `openjiuwen-harness`.
-//! - [`service`] — an axum skeleton of the Python `agent_rl.online.service`
-//!   (health + deterministic evaluate); RL/RLOps endpoints are documented
-//!   `Error::Unsupported` responses.
-//! - [`rl`] — API-shaped records and stubs for the RL training stack.
-//! - [`deferred`] — the machine-readable deferred-feature table.
+//! # Module map
 //!
-//! Everything outside the RL stubs is offline and deterministic: no model calls,
-//! no environment reads, and no wall-clock dependence in tests.
+//! - [`dataset`] — `Case`, `EvaluatedCase`, `CaseLoader`, JSON/JSONL loading.
+//! - [`evaluator`] — `Evaluator`/`CaseRunner` seams, metrics, reports, offline scoring.
+//! - [`optimizer`] — candidates, grid-search baseline, checkpoints and stores.
+//! - [`trainer`] — bounded train/evaluate loop, progress, callbacks, reports.
+//! - [`rails`] — pure evolution events, observer trait, harness rail adapter.
+//! - [`service`] — axum RL service skeleton (health/evaluate, 501 RL endpoints).
+//! - [`rl`] — RL records and API-shaped ML stubs.
+//! - [`deferred`] — deferred-feature table and `Error::Unsupported` helper.
 //!
-//! # Design notes
-//!
-//! The Python package has two independent `Case` models (`dev_tools.tune` and
-//! `agent_evolving.dataset`); this crate mirrors the `agent_evolving` shape,
-//! including the `per_metric` field on `EvaluatedCase`, and converts through
-//! JSON if a caller needs the `dev_tools` projection.
-//!
-//! Agent execution enters through traits ([`evaluator::CaseRunner`],
-//! [`trainer::TrainableTarget`]) so the evaluation and training loops are
-//! testable with fake agents and never depend on a live model.
+//! Everything except the stubs is offline and deterministic: no model calls, no
+//! environment reads, and no wall-clock dependence in tests.
+
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![allow(
@@ -55,16 +40,19 @@
     clippy::missing_const_for_fn
 )]
 
+/// Case datasets: `Case`, `EvaluatedCase`, `CaseLoader`, JSON/JSONL loading.
 pub mod dataset;
+/// Deferred-feature table and `Error::Unsupported` helper.
 pub mod deferred;
+/// Evaluator/metric/runner seams, reports, and offline scoring.
 pub mod evaluator;
+/// Candidates, the optimizer baseline, and checkpoints/stores/manager.
 pub mod optimizer;
+/// Pure evolution events, observer trait, and harness rail adapter.
 pub mod rails;
+/// RL records and API-shaped ML stubs.
 pub mod rl;
+/// Axum RL service skeleton (health/evaluate, 501 RL endpoints).
 pub mod service;
+/// Bounded train/evaluate loop, progress, callbacks, and reports.
 pub mod trainer;
-
-/// The crate name, useful in diagnostics and documentation.
-pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
-/// The crate version.
-pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

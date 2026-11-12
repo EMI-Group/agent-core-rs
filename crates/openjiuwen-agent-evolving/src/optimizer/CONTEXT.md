@@ -25,7 +25,7 @@ Ports the portable parts of Python `openjiuwen.agent_evolving.optimizer` (optimi
 ## Design Decisions
 
 - `EvolveCheckpoint` is a plain serde struct rather than a dataclass mirror; all nine Python fields are required on read.
-- `GridSearchOptimizer` produces candidates lazily in chunks and tracks its own best, so the trainer can run without any ML dependency.
+- `GridSearchOptimizer` materializes at most 100,000 grid points, produces candidates lazily in chunks, and tracks its own best, so the trainer can run without any ML dependency.
 - `RestoredState` carries `operators_state` so the trainer can restore a target snapshot directly.
 
 ## Routing Table
