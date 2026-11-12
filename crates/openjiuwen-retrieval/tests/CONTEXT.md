@@ -13,6 +13,7 @@ All tests are offline and deterministic.
 - `loaders.rs` → text/JSON/CSV/HTML file loaders with `tempfile`, URL loader with `wiremock`, `AutoLoader` dispatch/stamping/errors.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
+- `parsing_zip.rs` → the ZIP container reader against archives assembled byte by byte (stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
 
 ## Constraints
 
@@ -29,3 +30,4 @@ All tests are offline and deterministic.
 - `./loaders.rs` → loader behavior
 - `./knowledge_base.rs` → pipeline end to end
 - `./embedding.rs` → OpenAI-compatible embedding client
+- `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)

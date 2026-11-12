@@ -26,6 +26,7 @@ pub mod common;
 pub mod embedding;
 pub mod knowledge_base;
 pub mod loaders;
+pub mod parsing;
 pub mod reranker;
 pub mod vector_store;
 

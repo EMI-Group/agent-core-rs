@@ -6,6 +6,7 @@ Documents, chunking, embeddings, vector stores, rerankers, and knowledge base fo
 Maps to the Python package `openjiuwen.core.retrieval` (public surface in `openjiuwen/core/retrieval/__init__.py`), with the document/result/config models from `retrieval/common/` and the foundation store ABCs (`Document`, `Embedding`, `Reranker`, `VectorStore`).
 Scope is the offline-capable core: text/JSON/Markdown/CSV/HTML/URL loading, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic fake, an in-memory vector store with optional JSON persistence, score/LLM reranking seams, and a knowledge base that runs load → chunk → embed → store → retrieve → rerank.
 External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, triple/graph extraction, multimodal documents, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+Binary documents need a container layer before they can be parsed, so the crate now ships an in-crate `DEFLATE`/`zlib` decoder and ZIP reader (`src/parsing/`) with no compression dependency; the DOCX/XLSX/PDF-to-`Document` parsers themselves are still deferred.
 
 ## API Surface
 
@@ -142,8 +143,38 @@ pub async fn retrieve_multi_kb_with_source(kbs: &[Arc<SimpleKnowledgeBase>], que
 `parse_files`/`parse_urls` skip failing sources with a `warn` log (Python parity) and return the documents that loaded.
 No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non-streaming).
 
+### Binary containers (`parsing`)
+```rust
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+pub fn inflate(data: &[u8], max_output: usize) -> Result<Vec<u8>>;
+pub fn zlib_decompress(data: &[u8], max_output: usize) -> Result<Vec<u8>>;
+pub fn adler32(data: &[u8]) -> u32;
+pub fn crc32(data: &[u8]) -> u32;
+
+pub struct ZipEntry { pub name: String, pub compression_method: u16, pub flags: u16,
+                      pub crc32: u32, pub compressed_size: u32,
+                      pub uncompressed_size: u32, pub local_header_offset: u32 }
+pub struct ZipArchive { /* archive bytes + entries */ }
+impl ZipArchive {
+    pub fn from_bytes(data: Vec<u8>) -> Result<ZipArchive>;
+    pub async fn open(path: impl AsRef<Path>) -> Result<ZipArchive>;
+    pub fn entries(&self) -> &[ZipEntry];
+    pub fn entry_names(&self) -> Vec<&str>;
+    pub fn entry(&self, name: &str) -> Option<&ZipEntry>;
+    pub fn has_entry(&self, name: &str) -> bool;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn archive_size(&self) -> usize;
+    pub fn read_entry(&self, name: &str) -> Result<Vec<u8>>;
+    pub fn read_entry_ignore_case(&self, name: &str) -> Result<Vec<u8>>;
+    pub fn read_text(&self, name: &str) -> Result<String>;
+}
+```
+`inflate` decodes raw `DEFLATE` (RFC 1951: stored, fixed and dynamic Huffman, code-length repeat codes, back-references); `zlib_decompress` validates the 2-byte header (CM=8, CINFO<=7, FCHECK, no FDICT) and the trailing `Adler-32`. Malformed streams are `Error::Validation`, short/corrupt payloads are `Error::Retrieval`, preset dictionaries are `Error::Unsupported`.
+`ZipArchive` scans backwards for the EOCD record, parses the central directory (stored + `deflate` only, ZIP64/split/encrypted → `Error::Unsupported`), and verifies `CRC-32` and decoded size on extraction. Entry names are byte-oriented: `/` separators, exact case-sensitive lookups, `read_entry_ignore_case` for ASCII-case-insensitive lookups. `open` reads through `tokio::fs`.
+
 ### Re-exports (`lib.rs`)
-`pub mod common; pub mod chunking; pub mod loaders; pub mod embedding; pub mod vector_store; pub mod reranker; pub mod knowledge_base;` plus the public types/traits listed above.
+`pub mod common; pub mod chunking; pub mod loaders; pub mod embedding; pub mod vector_store; pub mod reranker; pub mod knowledge_base; pub mod parsing;` plus the public types/traits listed above.
 
 ## Constraints
 
@@ -169,6 +200,8 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - The LLM reranker takes an `LlmScorer` trait rather than `openjiuwen_foundation::Model` so this crate never depends upward; the adapter lives in `openjiuwen-extensions` when the model layer exists.
 - Python's silent `[]` from text/JSON parsers for missing/empty inputs is replaced by explicit `NotFound`/`Validation` errors; `AutoLoader` still treats PDF/DOCX/XLSX as unsupported immediately.
 - `parse_files`/`parse_urls` intentionally keep Python's per-source error tolerance (log and skip) because batch ingestion should not fail on one bad file.
+- The `DEFLATE`/`zlib` decoder and the ZIP reader are written in-crate because the workspace must stay dependency-free for containers; they return typed errors instead of partial output and cap every allocation at `DEFAULT_MAX_OUTPUT_BYTES`.
+- ZIP lookups stay byte-oriented (exact, case-sensitive, `/` separators) because archives are not filesystems; the ASCII-case-insensitive variant is an explicit, documented helper.
 
 ## Error Strategy
 
@@ -182,15 +215,17 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 ## Test Strategy
 
 - Unit tests beside modules (`#[cfg(test)] mod tests`) and behavior ports cite the Python test file in a comment, e.g. `// port of tests/unit_tests/core/retrieval/indexing/chunker/test_char_chunker.py`.
-- Integration tests under `tests/`: `document_json.rs` (JSON field names/round-trip), `chunking.rs` (boundaries/overlap/metadata), `vector_store.rs` (ordering/filtering/upsert/delete/persistence), `loaders.rs` (txt/json/csv/html/url/auto + edge cases), `knowledge_base.rs` (end-to-end with `HashEmbedding`, filters, delete, rerank, statistics).
-- URL and OpenAI embedding tests use `wiremock`; file tests use `tempfile::tempdir`; everything runs offline.
+- Integration tests under `tests/`: `document_json.rs` (JSON field names/round-trip), `chunking.rs` (boundaries/overlap/metadata), `vector_store.rs` (ordering/filtering/upsert/delete/persistence), `loaders.rs` (txt/json/csv/html/url/auto + edge cases), `knowledge_base.rs` (end-to-end with `HashEmbedding`, filters, delete, rerank, statistics), `embedding.rs` (`wiremock`), `parsing_zip.rs` (hand-built ZIP archives: stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
+- URL and OpenAI embedding tests use `wiremock`; file tests use `tempfile::tempdir`; DEFLATE/ZIP tests use hand-built byte streams and archives; everything runs offline.
 - Tests must be deterministic: fake embeddings are hash-based, search ties are insertion-ordered, and no wall-clock or random order is asserted.
 - Commands: `cargo fmt -p openjiuwen-retrieval`, `cargo test -p openjiuwen-retrieval`, `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings`.
 
 ## Notes for Agents
 
-- All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
-- `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
+- All eight module trees are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, `parsing`, re-exported from the crate root.
+- `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, `knowledge_base.rs`, and `parsing_zip.rs`; unit tests live beside their modules (the DEFLATE suite and its stream writer live in `src/parsing/inflate/tests.rs`).
+- Minimal binary-container usage: `ZipArchive::open(path).await?` then `read_text("word/document.xml")?`; raw streams go through `parsing::zlib_decompress(bytes, DEFAULT_MAX_OUTPUT_BYTES)` or `parsing::inflate(...)`.
+- DOCX/XLSX/PDF parsers are not implemented yet: they belong on top of `src/parsing/` and stay listed as deferred in `docs/PARITY.md`.
 - Minimal offline knowledge base: `SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new("kb"), Arc::new(InMemoryVectorStore::new()), Arc::new(HashEmbedding::new(64)))?` then `.add_documents(...)`/`.add_texts(...)` and `.retrieve_with_config(query, &RetrievalConfig::default())`; `InMemoryVectorStore::new()` is sync (only `open`/`open_with_collection` are async).
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
 - `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` is clean now that the scaffolded foundation dependency is gone; no `--no-deps` workaround is needed.
@@ -204,5 +239,6 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - `./src/vector_store/` → `VectorStore` trait, records/queries, in-memory store, JSON persistence, provider registry (`vector_store/CONTEXT.md`)
 - `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam (`reranker/CONTEXT.md`)
 - `./src/knowledge_base/` → `SimpleKnowledgeBase` pipeline, statistics, multi-KB retrieval (`knowledge_base/CONTEXT.md`)
+- `./src/parsing/` → in-crate `DEFLATE`/`zlib` decoder and ZIP container reader (`parsing/CONTEXT.md`)
 - `./tests/` → cross-module integration tests (`tests/CONTEXT.md`)
 - `./Cargo.toml` → crate manifest and dependencies
