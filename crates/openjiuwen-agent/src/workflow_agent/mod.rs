@@ -256,7 +256,9 @@ fn map_workflow_output(output: WorkflowOutput) -> Result<AgentOutput> {
                         .map(str::to_owned)
                 })
                 .collect();
+            let components = component_ids(&frames);
             let mut result = AgentOutput::interrupt(frames, ids);
+            result.component_ids = components;
             result.workflow_output = Some(output);
             Ok(result)
         }
@@ -291,6 +293,23 @@ fn frame_from_wire(value: &Value) -> Option<OutputFrame> {
         index: value.get("index").and_then(Value::as_i64).unwrap_or(0),
         payload: value.get("payload").cloned().unwrap_or(Value::Null),
     })
+}
+
+/// The interaction payload ids in `frames`, in frame order, without duplicates.
+///
+/// These become [`AgentOutput::component_ids`]: the workflow components the run
+/// is waiting on. Frames whose payload has no string `id` contribute nothing.
+fn component_ids(frames: &[OutputFrame]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in frames
+        .iter()
+        .filter_map(|frame| frame.payload.get("id").and_then(Value::as_str))
+    {
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
 }
 
 /// Everything [`WorkflowAgent::stream`] snapshots before its task starts.
@@ -346,7 +365,9 @@ async fn stream_workflow(
     let workflow = match selection {
         Selection::Default(text) => {
             let output = default_response_output(&text);
-            let _ = tx.send(Ok(AgentChunk::answer(&output)));
+            let chunk = AgentChunk::answer(&output);
+            mirror_frame(session, &chunk).await;
+            let _ = tx.send(Ok(chunk));
             return Ok(());
         }
         Selection::Workflow(index) => snapshot
@@ -372,6 +393,7 @@ async fn stream_workflow(
     let mut stream = workflow.stream_with(payload, workflow_session, options);
     while let Some(item) = stream.next().await {
         let item = item?;
+        let forward_final = item.item_type == WORKFLOW_FINAL;
         if item.item_type == INTERACTION {
             saw_interaction = true;
             let index = item
@@ -388,7 +410,7 @@ async fn stream_workflow(
                 index,
                 payload: item.payload.clone(),
             });
-        } else if item.item_type == WORKFLOW_FINAL {
+        } else if forward_final {
             final_payload = Some(item.payload.clone());
         }
         let chunk = AgentChunk::new(
@@ -396,11 +418,35 @@ async fn stream_workflow(
             item.index.unwrap_or(0),
             item.payload.clone(),
         );
+        // The engine writes its own frames to the child session, which shares
+        // the agent session's hub; only the `workflow_final` frame is
+        // synthesized here and must be mirrored explicitly.
+        if forward_final {
+            mirror_frame(session, &chunk).await;
+        }
         let _ = tx.send(Ok(chunk));
     }
     let output = terminal_stream_output(frames, ids, saw_interaction, final_payload);
-    let _ = tx.send(Ok(AgentChunk::answer(&output)));
+    let chunk = AgentChunk::answer(&output);
+    mirror_frame(session, &chunk).await;
+    let _ = tx.send(Ok(chunk));
     Ok(())
+}
+
+/// Mirrors an agent-synthesized frame into the session's stream hub.
+///
+/// Engine-originated frames already reach the hub through the child session's
+/// shared writer and are therefore never passed here. A write failure is logged
+/// and does not change the caller-visible stream: the frame was already handed
+/// to the caller.
+async fn mirror_frame(session: &Arc<dyn Session>, chunk: &AgentChunk) {
+    if let Err(error) = session.write_stream(chunk.to_stream_item()).await {
+        tracing::debug!(
+            %error,
+            kind = %chunk.kind,
+            "failed to mirror an agent frame into the session stream"
+        );
+    }
 }
 
 /// The terminal output of a streaming run: an interrupt when the run paused
@@ -412,8 +458,10 @@ fn terminal_stream_output(
     final_payload: Option<Value>,
 ) -> AgentOutput {
     if saw_interaction && final_payload.is_none() {
+        let components = component_ids(&frames);
         let wire = frames.iter().map(OutputFrame::to_value).collect::<Vec<_>>();
         let mut output = AgentOutput::interrupt(frames, ids);
+        output.component_ids = components;
         output.workflow_output = Some(WorkflowOutput {
             result: Value::Array(wire),
             state: WorkflowExecutionState::InputRequired,
@@ -532,8 +580,10 @@ impl Agent for WorkflowAgent {
 mod tests {
     use super::*;
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_session::{AgentSession, StreamEvent};
     use openjiuwen_workflow::{ComponentOptions, EndComponent, StartComponent, WorkflowCard};
     use serde_json::json;
+    use std::time::Duration;
 
     fn workflow(id: &str) -> Arc<Workflow> {
         Arc::new(Workflow::new(WorkflowCard::new(id)))
@@ -640,6 +690,42 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_output_carries_the_interaction_component_ids() {
+        let output = WorkflowOutput {
+            result: json!([{
+                "type": INTERACTION,
+                "index": 0,
+                "payload": {"id": "ask", "index": 0, "question": "go?"}
+            }]),
+            state: WorkflowExecutionState::InputRequired,
+        };
+
+        let mapped = map_workflow_output(output).unwrap();
+
+        assert_eq!(mapped.result_type, crate::output::ResultType::Interrupt);
+        assert_eq!(mapped.state.len(), 1);
+        assert_eq!(mapped.interrupt_ids, ["ask"]);
+        assert_eq!(mapped.component_ids, ["ask"]);
+        assert_eq!(mapped.state[0].payload["question"], json!("go?"));
+    }
+
+    #[test]
+    fn component_ids_keep_order_and_drop_duplicates_and_non_strings() {
+        let frames = vec![
+            OutputFrame::interaction(0, "a", json!({})),
+            OutputFrame::interaction(1, "b", json!({})),
+            OutputFrame::interaction(2, "a", json!({})),
+            OutputFrame {
+                kind: INTERACTION.to_owned(),
+                index: 3,
+                payload: json!({"index": 3}),
+            },
+        ];
+
+        assert_eq!(component_ids(&frames), ["a", "b"]);
+    }
+
+    #[test]
     fn build_payload_merges_globals_extras_and_query() {
         let input = AgentInput::parse(&json!({"query": "hi", "city": "Paris", "keep": 1})).unwrap();
         let mut global = BTreeMap::new();
@@ -696,6 +782,59 @@ mod tests {
         assert_eq!(terminal.kind, crate::output::ANSWER);
         assert_eq!(terminal.payload["result_type"], "answer");
         assert_eq!(terminal.payload["data"]["answer"], json!("hi"));
+    }
+
+    /// Collects the frame kinds the supplied session's hub publishes, stopping
+    /// after the terminal `answer` frame. The bounded wait keeps the test
+    /// deterministic and offline.
+    async fn hub_frame_kinds(mut events: BoxStream<'static, Result<StreamEvent>>) -> Vec<String> {
+        let mut kinds: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, events.next()).await {
+                Ok(Some(Ok(StreamEvent::Item(item)))) => {
+                    let terminal = item.item_type == crate::output::ANSWER;
+                    kinds.push(item.item_type);
+                    if terminal {
+                        break;
+                    }
+                }
+                Ok(Some(Ok(StreamEvent::End)) | None) | Err(_) => break,
+                Ok(Some(Err(error))) => panic!("session stream failed: {error}"),
+            }
+        }
+        kinds
+    }
+
+    #[tokio::test]
+    async fn stream_mirrors_the_synthesized_frames_into_the_session_hub() {
+        let agent = agent();
+        agent.add_workflows([echo_workflow("echo")]);
+        let session: Arc<dyn Session> = Arc::new(AgentSession::new("mirror"));
+        // Subscribe before the run so no frame is produced before the subscriber.
+        let events = session.subscribe();
+
+        let frames = agent
+            .stream(json!({"query": "hi"}), Some(Arc::clone(&session)))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(frames.iter().all(Result::is_ok));
+        let kinds = hub_frame_kinds(events).await;
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| kind == crate::output::WORKFLOW_FINAL),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| kind == crate::output::ANSWER),
+            "{kinds:?}"
+        );
     }
 
     #[tokio::test]
