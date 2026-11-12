@@ -29,7 +29,7 @@ Every module is reachable from the crate root; feature-gated modules disappear e
 | `sqlite` | no | `sqlx`, `openjiuwen-foundation/sqlite`, `openjiuwen-session/sqlite` | a local file/in-memory database | `sqlite` backends answer `Error::Unsupported` |
 | `redis` | no | `checkpointer::redis`, `store::redis` surfaces | a Redis server (not implemented) | variants absent |
 | `pulsar` | no | `message_queue::pulsar` surface | a Pulsar broker (not implemented) | variant absent |
-| `mcp` | no | `rmcp` re-export seam for hosts | an MCP server | absent |
+| `mcp` | no | `rmcp` and `tokio-stream` dependencies only; MCP support itself is `openjiuwen_foundation::tool::mcp` (enabled by default in the kernel) | none | no module in this crate is gated on it |
 | `live-tests` | no | network/service-gated tests | live services | those tests do not exist |
 
 Deferred integrations (API-shaped, `Error::Unsupported`, documented in the module `CONTEXT.md`): Redis checkpoint/store backends, Elasticsearch vector store, Gauss/PostgreSQL document store, Pulsar message queue, ZeroMQ transports, OTLP span export, DashScope reranker transport, AIO/JiuwenBox/YuanRong sandbox providers, and the LLM-driven `context_evolver` algorithms.
