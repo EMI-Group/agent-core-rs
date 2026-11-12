@@ -1,3 +1,7 @@
+// `missing_docs` is allowed before the `cfg` gate: when the `sqlite` feature is off the
+// whole crate (including `//!` docs) is stripped, and a later `allow` would be stripped
+// with it, leaving the denied `missing_docs` lint to fire on the empty crate root.
+#![allow(missing_docs)]
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Integration coverage of the SQLite-backed stores.
