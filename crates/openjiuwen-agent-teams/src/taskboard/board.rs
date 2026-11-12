@@ -29,6 +29,7 @@
 //! intermediate state is never observable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
@@ -36,8 +37,8 @@ use openjiuwen_common::utils::id::uuid_hex;
 
 use crate::schema::{
     EventPayload, MemberMode, MemberStatus, ReviewVote, TaskCreatedEvent, TaskDetail, TaskFilter,
-    TaskGraphSpec, TaskRecord, TaskReviewVoteEvent, TaskRevision, TaskStatus, TaskStatusChangedEvent,
-    TaskSummary, TaskVerifiedEvent, Verdict,
+    TaskGraphSpec, TaskRecord, TaskReviewVoteEvent, TaskRevision, TaskStatus,
+    TaskStatusChangedEvent, TaskSummary, TaskVerifiedEvent, Verdict,
 };
 use crate::storage::TeamStore;
 
@@ -55,11 +56,23 @@ pub const REASON_STALE_CONTENT: &str = "content changed; re-read the task before
 /// The board is a thin, synchronous domain layer over [`TeamStore`]: construct it per runtime (it
 /// holds no cache and no lock) and share it behind an `Arc`. Two boards over the same
 /// `(store, team_name)` observe the same state — the store is the single source of truth.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TaskBoard {
     store: Arc<dyn TeamStore>,
     team_name: String,
     limits: TaskBoardLimits,
+}
+
+/// Renders the board's identity and limits; the store is shown by its backend kind because
+/// `dyn TeamStore` is not `Debug`.
+impl fmt::Debug for TaskBoard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskBoard")
+            .field("store", &self.store.name())
+            .field("team_name", &self.team_name)
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 impl TaskBoard {
@@ -127,7 +140,7 @@ impl TaskBoard {
     /// The new task carries `parent_task_id = parent_id` and, unless the spec sets one, the parent's
     /// current revision as `parent_revision` (the derivations a stale subtask is detected against).
     /// A `depends_on` edge is added from the parent to the child, and the parent is parked at
-    /// `blocked` — the same rule as Python's `suspend_parent` (F_128): the parent is not done, its
+    /// `blocked` — the same rule as Python's `suspend_parent` (`F_128`): the parent is not done, its
     /// work is delegated, so it must not be resumed until every subtask is terminal. The ordinary
     /// unblock pass moves it back to `pending` once the child completes or is cancelled.
     ///
@@ -497,10 +510,7 @@ impl TaskBoard {
         if record.revision > record.observed_revision {
             return Err(Error::validation(REASON_STALE_CONTENT));
         }
-        if !matches!(
-            record.status,
-            TaskStatus::InProgress | TaskStatus::Planning
-        ) {
+        if !matches!(record.status, TaskStatus::InProgress | TaskStatus::Planning) {
             return Err(Error::validation(format!(
                 "task '{task_id}' cannot be completed from status '{}'",
                 record.status.as_str()
@@ -598,11 +608,11 @@ impl TaskBoard {
                     verdict,
                 }));
                 unblocked = self.unblock_dependents(task_id).await?;
-                return Ok(TaskMutation {
+                Ok(TaskMutation {
                     task: record,
                     events,
                     unblocked,
-                });
+                })
             }
             Verdict::Fail => {
                 record.status = TaskStatus::InProgress;
@@ -631,11 +641,11 @@ impl TaskBoard {
                     member_name: author,
                     verdict,
                 }));
-                return Ok(TaskMutation {
+                Ok(TaskMutation {
                     task: record,
                     events,
                     unblocked,
-                });
+                })
             }
         }
     }
@@ -949,9 +959,7 @@ impl TaskBoard {
                 let age_ms = now_ms.saturating_sub(record.updated_at);
                 match record.status {
                     TaskStatus::Planning | TaskStatus::InProgress => age_ms >= claim_idle_ms,
-                    TaskStatus::Pending => {
-                        record.assignee.is_none() && age_ms >= pending_idle_ms
-                    }
+                    TaskStatus::Pending => record.assignee.is_none() && age_ms >= pending_idle_ms,
                     TaskStatus::Blocked
                     | TaskStatus::InReview
                     | TaskStatus::Completed
@@ -1000,7 +1008,10 @@ impl TaskBoard {
         let mut tasks = BTreeMap::new();
         let mut edges = BTreeMap::new();
         for record in records {
-            let dependencies = self.store.dependencies(&self.team_name, &record.task_id).await?;
+            let dependencies = self
+                .store
+                .dependencies(&self.team_name, &record.task_id)
+                .await?;
             edges.insert(
                 record.task_id.clone(),
                 dependencies.into_iter().collect::<BTreeSet<_>>(),
@@ -1038,7 +1049,8 @@ impl TaskBoard {
             let Some(record) = snapshot.tasks.get(&dependent_id).cloned() else {
                 continue;
             };
-            if record.status != TaskStatus::Blocked || !snapshot.blocked_by(&dependent_id).is_empty()
+            if record.status != TaskStatus::Blocked
+                || !snapshot.blocked_by(&dependent_id).is_empty()
             {
                 continue;
             }
@@ -1092,7 +1104,10 @@ impl TaskBoard {
 
 /// The stable refusal used whenever the caller is not the task's assignee.
 fn not_assignee_reason(assignee: Option<&str>) -> String {
-    format!("task is assigned to '{}'", assignee.unwrap_or("<unassigned>"))
+    format!(
+        "task is assigned to '{}'",
+        assignee.unwrap_or("<unassigned>")
+    )
 }
 
 /// Returns `values` in order, dropping blanks and duplicates.

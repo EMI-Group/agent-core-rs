@@ -69,7 +69,7 @@ pub use review::{tally, tally_with, ReviewTally};
 ///
 /// The default `max_subtask_depth = 0` means "no subtasks": a member may not split its task at all.
 /// The runtime raises it to enable the split, exactly as the Python tool boundary gates
-/// `create_subtask` on `max_subtask_depth > 0` (F_128).
+/// `create_subtask` on `max_subtask_depth > 0` (`F_128`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TaskBoardLimits {
@@ -234,8 +234,7 @@ mod tests {
 
     #[test]
     fn limits_default_a_partial_payload() {
-        let limits: TaskBoardLimits =
-            serde_json::from_str(r#"{"max_subtask_depth": 2}"#).unwrap();
+        let limits: TaskBoardLimits = serde_json::from_str(r#"{"max_subtask_depth": 2}"#).unwrap();
         assert_eq!(limits.default_max_review_rounds, 3);
         assert_eq!(limits.max_subtask_depth, 2);
         assert_eq!(
@@ -270,8 +269,8 @@ mod tests {
     fn mutation_defaults_to_an_empty_wake_list() {
         let mutation = TaskMutation::new(TaskRecord::new("team", "task-1", "t", "c"), Vec::new());
         assert_eq!(mutation.task_id(), "task-1");
-        assert!(mutation.events.is_empty());
-        assert!(mutation.unblocked.is_empty());
+        assert_eq!(mutation.events, Vec::new());
+        assert_eq!(mutation.unblocked, Vec::<String>::new());
     }
 
     #[test]

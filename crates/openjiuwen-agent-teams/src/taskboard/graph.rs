@@ -6,7 +6,7 @@
 //!
 //! Python parity source: `openjiuwen/agent_teams/tools/database/graph.py`
 //! (`mutate_dependency_graph`, which rejects a mutation whose post-state has a cycle) and
-//! `TeamTaskManager.task_depth` (F_128 subtask nesting).
+//! `TeamTaskManager.task_depth` (`F_128` subtask nesting).
 
 use std::collections::{BTreeMap, BTreeSet};
 

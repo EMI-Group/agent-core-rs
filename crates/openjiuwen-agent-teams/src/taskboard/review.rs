@@ -83,7 +83,9 @@ pub fn tally_with(votes: &[ReviewVote], reviewers: &[String]) -> ReviewTally {
     let reviewer_count = distinct_len(&allowed);
     ReviewTally {
         reviewer_count,
-        passed: reviewer_count > 0 && counted.voted() >= reviewer_count && counted.pass > counted.fail,
+        passed: reviewer_count > 0
+            && counted.voted() >= reviewer_count
+            && counted.pass > counted.fail,
         ..tally_from(counted)
     }
 }
@@ -219,7 +221,10 @@ mod tests {
 
     #[test]
     fn a_tie_does_not_pass() {
-        let votes = [vote(1, "alice", Verdict::Pass), vote(1, "bob", Verdict::Fail)];
+        let votes = [
+            vote(1, "alice", Verdict::Pass),
+            vote(1, "bob", Verdict::Fail),
+        ];
         let tied = tally_with(&votes, &reviewers(&["alice", "bob"]));
         assert!(tied.decided());
         assert!(!tied.passed);
