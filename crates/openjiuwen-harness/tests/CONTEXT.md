@@ -23,7 +23,7 @@ Test files (one concern each, 79 tests total):
 - Assert persisted JSON keys exactly where parity matters: the `deepagent` session payload (`iteration`, `pending_follow_ups`, `plan_mode`, `stop_condition_state`, `task_plan`) and `todo.json` (`activeForm`, item keys); todos never live inside the `deepagent` payload.
 - No `unwrap` in async tasks that could mask panics; prefer `expect("message")` in tests.
 - Every test file opens with `#![allow(clippy::unwrap_used, clippy::expect_used)]` because the workspace runs `clippy::all` + `pedantic` with `-D warnings`.
-- Import from `openjiuwen_harness::{agent,schema,…}`: the crate root has no flat re-exports.
+- Import from `openjiuwen_harness::{agent,schema,…}`; the crate root also flat-re-exports every primary item (`openjiuwen_harness::NativeHarness`, `openjiuwen_harness::DeepAgent`), and module paths are canonical.
 - Feature-gated areas (browser/cua/mobile) assert `Error::Unsupported` only.
 
 ## Routing Table
@@ -49,7 +49,7 @@ Test files (one concern each, 79 tests total):
 ## Test Harness Recipes
 
 Verified against HEAD `af1e0b0` by reading source; line numbers are current.
-`openjiuwen_harness` has **no crate-root flat re-exports** (`src/lib.rs:12-26` is `pub mod` only), so always import `openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`.
+`openjiuwen_harness` declares `pub mod` for every module and additionally flat-re-exports the primary items from `src/lib.rs` (e.g. `openjiuwen_harness::NativeHarness`, `openjiuwen_harness::DeepAgent`); module paths such as `openjiuwen_harness::protocol::NativeHarness` remain canonical and are what the suites import.
 Crate `dev-dependencies`: `openjiuwen-test-support`, `anyhow`, `tempfile`; normal deps usable from tests include `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-foundation`, `openjiuwen-sysop`, `openjiuwen-common`, `openjiuwen-harness-protocol`, `tokio`, `futures`, `async-trait`, `parking_lot`, `serde_json`.
 
 ### 0. Shared fixtures already in this directory (copy these)
@@ -411,6 +411,7 @@ Known config keys: `model`, `provider`, `api_key`, `api_base`, `temperature`, `w
 The only reachable end-to-end gating failures through the public API are a non-empty `HarnessContext::mcp_servers` in `start` (`"declare MCP servers in the agent manifest; the native harness does not mount context MCP servers"`) and endpoint/auth-fallback model config; the steer/abort/model-control gating branches are unreachable because `NativeHarness::new` hard-wires `native_card`.
 Cursor semantics: `events()`/`turn_events()` return a destructive single-consumer cursor; a second concurrent cursor is rejected on the first `next_event` with `HarnessError::State("the harness observation stream already has an active consumer")`, and no active cycle yields `State("native harness has no active event cycle")`.
 Checkpoint export type: `HarnessCheckpoint { provider, schema_version, agent_id, host_session_id, checkpoint_id, sequence, data: JsonObject, provider_session_id, revision }`; the native payload is `NativeCheckpointState` (`bridge.rs:47`), importable only through `HarnessContext::with_checkpoint` + `ResumePolicy`.
+Offline driving: only `NativeHarness::new(Arc<DeepAgent>, NativeHarnessOptions)` accepts an injected model, so build the agent with `DeepAgentBuilder::new(AgentCard::new("deep_agent")).config(DeepAgentConfig { model_name: Some("scripted-model".to_owned()), ..Default::default() }).model(Arc::new(ScriptedModel::text("answer")) as Arc<dyn Model>).workspace(Workspace::new(temp.path())).build()`; `NativeHarnessProvider::create` has no model key and always builds a model-less `DeepAgent`, so a provider-created harness cannot run a turn offline (`start` fails with `HarnessError::Protocol` carrying `"DeepAgent requires a model: supply one via the builder or configure model_name/model_provider."` when no model name is configured, and otherwise resolves a live model through `init_model`).
 
 ### 10. CLI (`src/cli/`)
 
