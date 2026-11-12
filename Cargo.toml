@@ -151,6 +151,8 @@ walkdir = "2"
 which = "8"
 notify = "8"
 
+# --- platform --------------------------------------------------------------
+nix = { version = "0.30", features = ["process", "fs", "signal", "term", "poll"] }
 # --- storage ---------------------------------------------------------------
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
