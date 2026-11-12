@@ -145,3 +145,31 @@ fn prelude_resolves_the_common_items() {
     let team_spec = TeamAgentSpec::default();
     assert!(team_spec.agents.is_empty());
 }
+
+#[test]
+fn prelude_resolves_the_agent_construction_items() {
+    use openjiuwen::prelude::*;
+
+    same_type::<ReActAgent, openjiuwen_agent::react::ReActAgent>();
+    same_type::<ReActAgentConfig, openjiuwen_agent::react::ReActAgentConfig>();
+    same_type::<AgentInput, openjiuwen_agent::input::AgentInput>();
+    same_type::<AgentOutput, openjiuwen_agent::output::AgentOutput>();
+    same_type::<AgentChunk, openjiuwen_agent::output::AgentChunk>();
+    same_type::<ResultType, openjiuwen_agent::output::ResultType>();
+    same_type::<LlmAgent, openjiuwen_agent::llm_agent::LlmAgent>();
+    same_type::<WorkflowAgent, openjiuwen_agent::workflow_agent::WorkflowAgent>();
+    same_type::<DeepAgentBuilder, openjiuwen_harness::agent::DeepAgentBuilder>();
+
+    // The prelude keeps forwarding the lifecycle/context items.
+    same_type::<ContextEngine, openjiuwen_context::engine::ContextEngine>();
+    same_type::<LongTermMemory, openjiuwen_memory::facade::LongTermMemory>();
+    same_type::<Runner, openjiuwen_runner::runner::Runner>();
+
+    // A prelude-only usage path: both items are constructible without a model.
+    let config = ReActAgentConfig::default();
+    assert_eq!(config.model_provider, "openai");
+    assert_eq!(config.max_iterations, 5);
+
+    let input = AgentInput::default();
+    assert!(input.conversation_id.is_none());
+}
