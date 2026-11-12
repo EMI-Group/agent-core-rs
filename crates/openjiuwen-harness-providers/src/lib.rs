@@ -30,11 +30,14 @@
 //! - [`input`] — harness input conversion, text projection and chunk-kind constants.
 //! - [`json`] — JSON projections (`to_json_safe`, `to_json_object`).
 //! - [`mcp_naming`] — the `<mcp-tools>` naming preamble for provider system prompts.
+//! - [`provider`] — the registered provider interface (`ProviderSpec`), its wrappers, the
+//!   registry-name constants and the introspection descriptor.
+//! - [`providers`] — the compile-time built-in provider table (`native`, plus the `vendor`-gated
+//!   stubs) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation.
 //!
-//! Later phases add the provider registry (`factory`), the provider table (`providers`) and the IO
-//! adapter (`io_adapter`); the strict JSON mapping helpers in the crate-internal `decode` module
-//! back their configuration decoders.
+//! Later phases add the provider registry (`factory`) and the IO adapter (`io_adapter`); the strict
+//! JSON mapping helpers in the crate-internal `decode` module back their configuration decoders.
 
 mod decode;
 
@@ -42,6 +45,8 @@ pub mod error;
 pub mod input;
 pub mod json;
 pub mod mcp_naming;
+pub mod provider;
+pub mod providers;
 pub mod skills;
 
 pub use error::providers_error_to_common;
@@ -51,6 +56,10 @@ pub use input::{
 };
 pub use json::{to_json_object, to_json_safe};
 pub use mcp_naming::{mcp_tool_naming_preamble, TOOL_PLACEHOLDER};
+pub use provider::{
+    is_builtin_provider, model_configuring_provider, plain_provider, provider_names,
+    ProviderDescriptor, ProviderSpec,
+};
 pub use skills::{
     install_skills, normalize_skills, skill_scan_dir, SkillConflict, SkillMode, SkillSource,
 };
