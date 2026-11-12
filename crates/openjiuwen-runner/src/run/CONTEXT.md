@@ -30,12 +30,26 @@ impl Default / Clone / Debug for RunOptions
 impl RunOptions { with_session, with_team_session, with_session_id, with_cancellation, with_timeout,
                   with_stream_modes, with_envs, with_checkpointer, with_metadata }
 
-// run/agent.rs
-//   Runner::run_agent / Runner::run_agent_streaming (implemented as `pub(crate)` fns called by the facade)
+// RunServices: the owned, cheap-to-clone execution context the facade hands down
+#[derive(Clone)]
+pub struct RunServices {
+    pub resources: Arc<ResourceMgr>,
+    pub callbacks: Arc<CallbackFramework>,
+    pub config: RunnerConfig,
+    pub checkpointer: Option<Arc<dyn Checkpointer>>,
+    pub guardrails: Option<Arc<GuardrailPipeline>>,
+}
+impl RunServices { pub fn new(resources, callbacks, config, checkpointer) -> Self; pub fn with_guardrails(self, pipeline) -> Self; }
+
+// run/agent.rs — public free functions; `Runner::run_agent*` are one-line delegates
+pub async fn invoke_agent(services: RunServices, agent: AgentRef, inputs: Value, options: RunOptions) -> Result<AgentOutput>;
+pub fn stream_agent(services: RunServices, agent: AgentRef, inputs: Value, options: RunOptions) -> BoxStream<'static, Result<AgentChunk>>;
 // run/workflow.rs
-//   Runner::run_workflow / Runner::run_workflow_streaming
+pub async fn invoke_workflow(services: RunServices, workflow: WorkflowRef, inputs: Value, options: RunOptions) -> Result<WorkflowOutput>;
+pub fn stream_workflow(services: RunServices, workflow: WorkflowRef, inputs: Value, options: RunOptions) -> BoxStream<'static, Result<WorkflowChunk>>;
 // run/team.rs
-//   Runner::run_agent_team / Runner::run_agent_team_streaming
+pub async fn invoke_team(services: RunServices, team: TeamRef, inputs: Value, options: RunOptions) -> Result<Value>;
+pub fn stream_team(services: RunServices, team: TeamRef, inputs: Value, options: RunOptions) -> BoxStream<'static, Result<Value>>;
 // run/span.rs  (pub(crate))
 //   RunSpan: opens a session-tracer Chain span when the session has a tracer, finishes with outputs or failure
 // run/teardown.rs (pub(crate))
