@@ -4,10 +4,11 @@
 //! [`openjiuwen_test_support::ScriptedModel`] and either the default workspace
 //! or a temporary one; no network, no provider and no real sys-operation work.
 //!
-//! Covered here (first batch): defaults and round-tripping, prompt content,
-//! single-round answers, tool execution, max-iteration mapping, permission
-//! denial, mode switching, input dispatch/phases, and the persisted-state entry
-//! points.
+//! Covered here: defaults and round-tripping, prompt content, single-round
+//! answers, tool execution, max-iteration mapping, permission denial, mode
+//! switching, input dispatch/phases, the persisted-state entry points, the outer
+//! task loop (follow-up rounds, steering, abort), stream frames, the single-run
+//! guard, rail-published prompt sections, and the factory assembly.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -16,21 +17,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openjiuwen_agent::{Agent, AgentCard, ResultType};
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use openjiuwen_agent::{Agent, AgentCard, AgentOutput, ResultType};
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::llm::Model;
+use openjiuwen_foundation::llm::{ChatResponse, Model, ModelRequestConfig, StreamChunk};
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
+use openjiuwen_foundation::{BaseMessage, Role};
 use openjiuwen_session::{AgentSession, Session};
 use openjiuwen_test_support::{
     MockCompletion, MockToolCall, ScriptedModel, ScriptedTurn, TempWorkspace,
 };
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
-use super::{DeepAgent, DeepAgentBuilder};
+use super::{create_deep_agent, DeepAgent, DeepAgentBuilder};
 use crate::permission::{PermissionLevel, PermissionsSection};
+use crate::prompts::{PromptSection, SectionName};
+use crate::rails::{publish_prompt_section, HarnessRail, HarnessRailContext};
 use crate::schema::{
     AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionPhase,
-    OnMaxIterations, SendInputRequest,
+    OnMaxIterations, SendInputRequest, SubAgentConfig,
 };
 use crate::tools::tool_card;
 use crate::workspace::Workspace;
@@ -75,6 +82,78 @@ impl Tool for EchoTool {
     }
 }
 
+/// A rail publishing one prompt section before every model call.
+struct SectionRail {
+    name: &'static str,
+    section: PromptSection,
+}
+
+#[async_trait]
+impl HarnessRail for SectionRail {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> i32 {
+        crate::rails::rail_priority::DEFAULT
+    }
+
+    async fn before_model_call(&self, ctx: &mut HarnessRailContext) -> Result<()> {
+        publish_prompt_section(ctx, &self.section);
+        Ok(())
+    }
+}
+
+/// A model whose streamed call blocks until the test opens the gate.
+///
+/// The gate proves the single-run guard: the first invocation is parked inside
+/// the model while the test issues the second one.
+struct GateModel {
+    inner: ScriptedModel,
+    /// One permit is added as soon as a streamed call is entered.
+    entered: Arc<Semaphore>,
+    /// The call proceeds after the test adds one permit here.
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl Model for GateModel {
+    fn provider(&self) -> &str {
+        self.inner.provider()
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: &[BaseMessage],
+        request: &ModelRequestConfig,
+    ) -> Result<ChatResponse> {
+        self.inner.invoke(messages, request).await
+    }
+
+    fn stream(
+        &self,
+        messages: Vec<BaseMessage>,
+        request: ModelRequestConfig,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let inner = self.inner.clone();
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        async_stream::stream! {
+            entered.add_permits(1);
+            let _permit = release.acquire().await;
+            let mut frames = inner.stream(messages, request);
+            while let Some(frame) = frames.next().await {
+                yield frame;
+            }
+        }
+        .boxed()
+    }
+}
+
 /// Builds a scripted-model agent over the default workspace.
 fn build_agent(model: impl Model + 'static) -> Arc<DeepAgent> {
     DeepAgentBuilder::new(AgentCard::new("test-agent").with_description("Test DeepAgent"))
@@ -82,6 +161,27 @@ fn build_agent(model: impl Model + 'static) -> Arc<DeepAgent> {
         .model(Arc::new(model))
         .build()
         .expect("agent builds")
+}
+
+/// Builds a scripted-model agent running the outer task loop.
+fn build_task_loop_agent(model: impl Model + 'static) -> Arc<DeepAgent> {
+    let config = DeepAgentConfig::default()
+        .with_language("en".to_string())
+        .with_enable_task_loop(true);
+    DeepAgentBuilder::new(AgentCard::new("loop-agent"))
+        .config(config)
+        .model(Arc::new(model))
+        .build()
+        .expect("agent builds")
+}
+
+/// Returns the system message of `call`, or an empty string when absent.
+fn system_text(call: &openjiuwen_test_support::ModelCall) -> String {
+    call.messages
+        .first()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.text().into_owned())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -296,4 +396,296 @@ async fn state_entry_points_round_trip_and_require_a_session() {
     agent.clear_state().await.unwrap();
     assert_eq!(agent.load_state().await.unwrap(), DeepAgentState::default());
     assert_eq!(session.id(), "agent-state-test");
+}
+
+#[tokio::test]
+async fn task_loop_runs_a_follow_up_round_and_persists_the_iteration() {
+    let model = ScriptedModel::new([
+        ScriptedTurn::text("first answer"),
+        ScriptedTurn::text("second answer"),
+    ]);
+    let agent = build_task_loop_agent(model.clone());
+    agent.follow_up("keep going", None);
+
+    let session = Arc::new(AgentSession::new("task-loop-session"));
+    let output = agent
+        .invoke(json!({"query": "start"}), Some(session))
+        .await
+        .expect("task loop invocation succeeds");
+
+    assert_eq!(output.output, "second answer");
+    assert_eq!(model.call_count(), 2);
+    let state = agent.load_state().await.unwrap();
+    assert_eq!(state.iteration, 2);
+}
+
+#[tokio::test]
+async fn follow_ups_reach_the_model_and_the_state_round_trips() {
+    let model = ScriptedModel::new([
+        ScriptedTurn::text("first answer"),
+        ScriptedTurn::text("second answer"),
+        ScriptedTurn::text("third answer"),
+    ]);
+    let agent = build_task_loop_agent(model.clone());
+    agent.follow_up("second", None);
+    agent.follow_up("third", None);
+
+    let session = Arc::new(AgentSession::new("follow-up-session"));
+    let output = agent
+        .invoke(json!({"query": "start"}), Some(session))
+        .await
+        .unwrap();
+    assert_eq!(output.output, "third answer");
+
+    let user_texts: Vec<String> = model
+        .calls()
+        .iter()
+        .filter_map(openjiuwen_test_support::ModelCall::last_user_text)
+        .collect();
+    assert!(
+        user_texts.iter().any(|text| text == "second"),
+        "the follow-up text must reach the model: {user_texts:?}"
+    );
+    assert!(user_texts.iter().any(|text| text == "third"));
+
+    // A queued follow-up and the plan-mode bookkeeping survive save/load.
+    agent.switch_mode(AgentMode::Plan).unwrap();
+    agent.follow_up("later", None);
+    agent.save_state().await.unwrap();
+    let loaded = agent.load_state().await.unwrap();
+    assert_eq!(loaded.pending_follow_ups, vec!["later".to_string()]);
+    assert_eq!(loaded.plan_mode.mode, "plan");
+    assert_eq!(loaded.plan_mode.pre_plan_mode.as_deref(), Some("normal"));
+    assert_eq!(loaded.iteration, 3);
+}
+
+#[tokio::test]
+async fn steering_is_injected_into_the_next_model_call() {
+    let model = ScriptedModel::text("steered answer");
+    let agent = build_agent(model.clone());
+    agent.steer("please focus");
+
+    let output = agent
+        .invoke(json!({"query": "hi"}), None)
+        .await
+        .expect("invocation succeeds");
+    assert_eq!(output.output, "steered answer");
+
+    let call = model.last_call().expect("the model was called");
+    assert!(
+        call.messages
+            .iter()
+            .any(|message| message.role == Role::User
+                && message.text().as_ref() == "User steering: please focus"),
+        "the steering message must reach the model window"
+    );
+    assert_eq!(agent.queues.steering_len(), 0);
+}
+
+#[tokio::test]
+async fn a_rail_published_section_reaches_the_system_prompt_once() {
+    let model = ScriptedModel::text("answered");
+    let agent =
+        DeepAgentBuilder::new(AgentCard::new("section-agent").with_description("Section identity"))
+            .config(DeepAgentConfig::default().with_language("en".to_string()))
+            .model(Arc::new(model.clone()))
+            .rail(Arc::new(SectionRail {
+                name: "custom_skill",
+                section: PromptSection::bilingual(
+                    "skill_demo",
+                    "技能演示",
+                    "Custom skill demo text",
+                    50,
+                ),
+            }))
+            .build()
+            .unwrap();
+
+    agent.invoke(json!({"query": "hi"}), None).await.unwrap();
+
+    let system = system_text(&model.last_call().unwrap());
+    assert_eq!(system.matches("Custom skill demo text").count(), 1);
+    assert!(!system.contains("技能演示"));
+}
+
+#[tokio::test]
+async fn a_published_identity_section_never_duplicates_the_static_one() {
+    let model = ScriptedModel::text("answered");
+    let agent =
+        DeepAgentBuilder::new(AgentCard::new("section-agent").with_description("Section identity"))
+            .config(DeepAgentConfig::default().with_language("en".to_string()))
+            .model(Arc::new(model.clone()))
+            .rail(Arc::new(SectionRail {
+                name: "custom_identity",
+                section: PromptSection::bilingual(
+                    SectionName::IDENTITY,
+                    "中文身份",
+                    "Published identity override",
+                    10,
+                ),
+            }))
+            .build()
+            .unwrap();
+
+    agent.invoke(json!({"query": "hi"}), None).await.unwrap();
+
+    let system = system_text(&model.last_call().unwrap());
+    assert_eq!(system.matches("Section identity").count(), 1);
+    assert!(!system.contains("Published identity override"));
+    assert!(!system.contains("中文身份"));
+}
+
+#[tokio::test]
+async fn stream_yields_frames_ending_with_the_answer() {
+    let agent = build_agent(ScriptedModel::text("streamed answer"));
+    let chunks: Vec<Result<openjiuwen_agent::AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
+
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().all(Result::is_ok), "no frame may fail");
+    let last = chunks.last().unwrap().as_ref().unwrap();
+    assert_eq!(last.kind, openjiuwen_agent::output::ANSWER);
+    let output = AgentOutput::from_value(last.payload.clone()).unwrap();
+    assert_eq!(output.output, "streamed answer");
+}
+
+#[tokio::test]
+async fn a_second_invocation_is_rejected_while_one_is_running() {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let model = GateModel {
+        inner: ScriptedModel::text("gated answer"),
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let agent = Arc::new(
+        DeepAgentBuilder::new(AgentCard::new("gate-agent"))
+            .config(DeepAgentConfig::default().with_language("en".to_string()))
+            .model(Arc::new(model))
+            .build()
+            .unwrap(),
+    );
+
+    let first = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.invoke(json!({"query": "hi"}), None).await })
+    };
+    // Park the first invocation inside the model call.
+    let permit = entered.acquire().await.unwrap();
+    drop(permit);
+
+    let error = agent
+        .invoke(json!({"query": "again"}), None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("invocation already running"),
+        "unexpected error: {error}"
+    );
+
+    let streamed: Vec<Result<openjiuwen_agent::AgentChunk>> = agent
+        .stream(json!({"query": "again"}), None)
+        .collect()
+        .await;
+    assert_eq!(streamed.len(), 1);
+    assert!(streamed[0]
+        .as_ref()
+        .unwrap_err()
+        .to_string()
+        .contains("invocation already running"));
+
+    release.add_permits(1);
+    let output = first.await.unwrap().unwrap();
+    assert_eq!(output.output, "gated answer");
+}
+
+/// Abort semantics: `abort` is synchronous and idempotent, a stopped agent
+/// reports [`InteractionPhase::Terminated`], and the next invocation refreshes
+/// the cancellation token and runs normally.
+///
+/// The in-round abort outcome (`RoundOutcome::abort()` after cancellation) is
+/// covered by the `round.rs` tests and is not duplicated here.
+#[tokio::test]
+async fn abort_is_idempotent_and_a_later_invocation_still_runs() {
+    let agent = build_agent(ScriptedModel::text("after abort"));
+    agent.abort();
+    agent.abort();
+    assert_eq!(agent.phase(), InteractionPhase::Terminated);
+
+    let output = agent
+        .invoke(json!({"query": "hi"}), None)
+        .await
+        .expect("a fresh invocation succeeds after an abort");
+    assert_eq!(output.output, "after abort");
+    assert_ne!(agent.phase(), InteractionPhase::Terminated);
+}
+
+#[tokio::test]
+async fn factory_wires_subagents_permissions_and_a_temp_workspace() {
+    let temp = TempWorkspace::new().unwrap();
+    let workspace = Workspace::for_language(temp.workspace(), "en");
+    let mut permissions = PermissionsSection::default();
+    permissions
+        .tools
+        .insert("echo".to_string(), PermissionLevel::Deny);
+    let echo = Arc::new(EchoTool::new());
+    let model = ScriptedModel::builder()
+        .completion(MockCompletion::tool_calls(vec![MockToolCall::new(
+            "echo",
+            json!({"text": "x"}),
+        )]))
+        .respond_text("factory answer")
+        .build();
+
+    let agent = create_deep_agent(
+        Arc::new(model),
+        None,
+        Some(DeepAgentConfig::default().with_add_general_purpose_agent(true)),
+        vec![echo.clone() as Arc<dyn Tool>],
+        Vec::new(),
+        Some(workspace.clone()),
+        Vec::new(),
+        vec![SubAgentConfig::new(AgentCard::new("helper"))],
+        true,
+        None,
+        Some("en".to_string()),
+        None,
+        true,
+        Some(permissions),
+        None,
+    )
+    .await
+    .expect("the factory builds the agent");
+
+    let mounted: Vec<String> = agent
+        .tool_cards
+        .read()
+        .iter()
+        .map(|card| card.name.clone())
+        .collect();
+    assert!(mounted.iter().any(|name| name == "task_tool"));
+    for tool in [
+        "subagent_spawn",
+        "subagent_wait",
+        "subagent_list",
+        "subagent_send_input",
+        "subagent_close",
+        "subagent_resume",
+    ] {
+        assert!(
+            mounted.iter().any(|name| name == tool),
+            "missing mounted tool {tool}: {mounted:?}"
+        );
+    }
+    assert_eq!(agent.config().workspace.root_path, workspace.root_path);
+    assert!(agent.config().enable_task_loop);
+    assert!(agent.rails().names().iter().any(|name| name == "subagent"));
+
+    let session = Arc::new(AgentSession::new("factory-session"));
+    let output = agent
+        .invoke(json!({"query": "answer"}), Some(session))
+        .await
+        .unwrap();
+    assert_eq!(output.output, "factory answer");
+    assert_eq!(echo.calls(), 0, "the denied tool must never run");
 }

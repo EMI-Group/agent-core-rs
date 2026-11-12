@@ -13,6 +13,9 @@
 //!   mode and state entry points
 //! - [`builder`] — [`DeepAgentBuilder`], prompt assembly, react-config
 //!   application and lazy model resolution
+//! - [`factory`] — [`resolve_deep_agent_parts`], [`apply_deep_agent_parts`] and
+//!   [`create_deep_agent`]: the Python factory surface (default rails, base
+//!   config merge, one-call assembly)
 //! - [`prompt_rail`] — [`PromptRail`] and [`PromptState`]: system-prompt
 //!   assembly plus steering injection before every model call
 //! - [`round`] — input normalization, [`RoundState`] and the task-loop
@@ -40,6 +43,7 @@
 //! retry.
 
 mod builder;
+mod factory;
 mod prompt_rail;
 mod round;
 mod state_store;
@@ -78,6 +82,9 @@ use crate::task_loop::{
 };
 
 pub use builder::DeepAgentBuilder;
+pub use factory::{
+    apply_deep_agent_parts, create_deep_agent, resolve_deep_agent_parts, DeepAgentParts,
+};
 pub use prompt_rail::{PromptRail, PromptState};
 pub use round::{normalize_inputs, RoundExecutorHandle, RoundState};
 pub use state_store::{clear_state, load_state, save_state, SESSION_STATE_KEY};
@@ -465,9 +472,10 @@ impl DeepAgent {
 
     /// Mounts additional tools and refreshes the tools prompt section.
     ///
-    /// Used by upper layers that add tools after construction; the mounted
-    /// cards are appended so the prompt always reflects the live tool set.
-    #[allow(dead_code, clippy::needless_pass_by_value)] // wired by the factory layer (next wave)
+    /// Used by [`apply_deep_agent_parts`] (and upper layers that add tools after
+    /// construction); the mounted cards are appended so the prompt always
+    /// reflects the live tool set.
+    #[allow(clippy::needless_pass_by_value)] // the parts carry an owned `Vec`
     pub(crate) fn apply_extra_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         for tool in &tools {
             self.inner.add_tool(tool.clone());
