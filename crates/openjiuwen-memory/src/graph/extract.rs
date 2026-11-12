@@ -3,7 +3,7 @@
 //! [`HeuristicExtractor`] is the deterministic, dependency-free default: it scans for
 //! quoted/backticked names, `@mentions`, path-like tokens, and non-sentence-initial
 //! capitalized runs, then derives simple verb-pattern relations. [`LlmExtractor`] asks
-//! a [`Model`](openjiuwen_foundation::llm::Model) for JSON and degrades to the heuristic
+//! a [`Model`] for JSON and degrades to the heuristic
 //! extractor when the model output stays unusable.
 //!
 //! The module is self-contained: it owns the extraction data types ([`Extraction`],

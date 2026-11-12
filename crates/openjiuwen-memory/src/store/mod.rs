@@ -4,8 +4,8 @@
 //! package on top of the `openjiuwen-foundation` storage traits:
 //!
 //! - [`keys`] — KV key and vector collection naming (Python `UMD/...` layout).
-//! - [`MemoryStorage`] — record/embedding/variable/scope-config persistence.
-//! - [`MessageStore`] — conversation history in the `messages` document collection.
+//! - `MemoryStorage` — record/embedding/variable/scope-config persistence.
+//! - `MessageStore` — conversation history in the `messages` document collection.
 //! - [`MemoryStores`] — the bundle of concrete backends every other module shares.
 //!
 //! A missing key or collection is never an error: reads yield `None`, deletes report

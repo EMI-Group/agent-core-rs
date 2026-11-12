@@ -45,7 +45,8 @@ impl super::MemoryEngine {
     ///
     /// # Errors
     ///
-    /// See [`MemoryEngine::add`]; the first failing item's error is returned.
+    /// See [`MemoryEngine::add`](super::MemoryEngine::add); the first failing item's
+    /// error is returned.
     pub async fn add_many(
         &self,
         scope: &MemoryScope,

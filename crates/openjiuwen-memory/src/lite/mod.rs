@@ -8,7 +8,7 @@
 //! # Record mapping
 //!
 //! A [`CodingFact`] is not a separate persistence concept: it is an ordinary
-//! [`MemoryType::Coding`] [`MemoryRecord`](crate::record::MemoryRecord) on the shared
+//! [`MemoryType::Coding`] [`MemoryRecord`] on the shared
 //! [`MemoryEngine`], so facts inherit scoping, dedupe/merge, recall, and every storage
 //! backend. The fact-specific fields live in the record metadata (see
 //! [`fact`](self)); [`CodingFact::from_record`] identifies coding records by their

@@ -124,7 +124,8 @@ pub struct CodingFact {
     pub content: String,
     /// Free-form tags stored alongside the fact.
     pub tags: Vec<String>,
-    /// Optional source path, used by [`super::index::citation`].
+    /// Optional source path, used to render the `path#L1-L<n>` citation
+    /// (see [`CodingMemory::citation`](crate::lite::CodingMemory::citation)).
     pub path: Option<String>,
     /// Last modification time of the fact.
     pub updated_at: DateTime<Utc>,

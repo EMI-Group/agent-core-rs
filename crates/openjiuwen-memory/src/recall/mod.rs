@@ -7,7 +7,7 @@
 //! - [`keyword`] — tokenizer, `BM25`, normalized `BM25`, coverage score, Jaccard.
 //! - [`scoring`] — cosine/normalized similarity, recency decay, the documented blend,
 //!   token-budget trimming.
-//! - [`dedupe`] — near-duplicate detection and record merging
+//! - `dedupe` — near-duplicate detection and record merging
 //!   (`// ports tests/unit_tests/core/memory/manage/test_mem_update_checker.py`).
 //! - [`pipeline`] — candidate ranking into [`crate::record::RecallHit`].
 //!
