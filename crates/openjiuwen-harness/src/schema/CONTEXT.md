@@ -87,6 +87,7 @@ Every public item is re-exported from `crate::schema`; the child modules themsel
 - `DeepLoopEventType { Followup, Steer, Abort }` (`followup`/`steer`/`abort`), `Default = Followup`.
 - `default_event_priority(DeepLoopEventType) -> i32` — abort `0` < steer `1` < followup `10` (unknown/custom defaults to `10`).
 - `DeepLoopEvent { priority: i32, seq: u64, created_at: f64 (monotonic seconds), event_id: String (uuid v4 default), event_type: DeepLoopEventType, content: String, task_id: Option<String>, metadata: BTreeMap<String, Value> }`; `Ord`/`Eq` compare only `(priority, seq)` (Python `dataclass(order=True)`).
+- `DeepLoopEvent` fields are private with no accessors: construct via `Default`/`create_loop_event` and read them back through serde (`serde_json::to_value`).
 - `create_loop_event(seq, event_type, content, task_id, metadata, priority: Option<i32>) -> DeepLoopEvent` — `priority = Some(0)` is honoured, `None` uses the type default.
 
 ## Constraints
