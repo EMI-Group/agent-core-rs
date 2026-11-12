@@ -35,7 +35,7 @@
 //!
 //! # Contracts
 //!
-//! Every public data type is `serde`-serializable (snake_case, tolerant of unknown
+//! Every public data type is `serde`-serializable (`snake_case`, tolerant of unknown
 //! fields), errors are [`openjiuwen_common::error::Error`], logging is `tracing`, and
 //! no `unsafe` is used. Async I/O is tokio-based; the registry and plan APIs never
 //! block on a lock across an `.await`.
