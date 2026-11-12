@@ -8,7 +8,7 @@
 //!
 //! The struct is a *cheap handle*: every field lives inside one `Arc<TeamAgentInner>`, so cloning
 //! it (the run loop does, on every `invoke`) copies one pointer. Building is the only fallible,
-//! `await`-heavy step; it lives in [`build`](crate::runtime::build), which owns the blueprint →
+//! `await`-heavy step; it lives in [`build`], which owns the blueprint →
 //! runtime path and is pinned by `src/runtime/CONTEXT.md` §"Build path".
 //!
 //! # Roles

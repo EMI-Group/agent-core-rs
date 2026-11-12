@@ -3,7 +3,7 @@
 //! Python parity source: `openjiuwen/agent_teams/runtime/pool.py` (`TeamRuntimePool`,
 //! `ActiveTeam`).
 //!
-//! One pool belongs to one [`TeamRuntimeManager`](crate::runtime::manager::TeamRuntimeManager) and
+//! One pool belongs to one [`TeamRuntimeManager`] and
 //! answers the single question the run entry points ask: *which team, if any, is live right now and
 //! in which session?* The Python pool is keyed by `team_name` only and stores an `ActiveTeam` record
 //! whose `current_session_id` is a field; this port keys the pool by session first and team second

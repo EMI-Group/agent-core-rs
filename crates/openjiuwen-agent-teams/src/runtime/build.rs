@@ -13,7 +13,7 @@
 //! 5. The leader row, its workspace and its harness, then the observer that feeds the chunk
 //!    fan-out and the activity registry.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
-//! 7. One bus subscription for the leader (drained only by [`leader`](crate::runtime::leader)) and
+//! 7. One bus subscription for the leader (drained only by [`leader`]) and
 //!    the interaction gate/inbox.
 //!
 //! The build always produces the *leader* handle: a teammate is not a second public constructor but
