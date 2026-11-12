@@ -15,6 +15,7 @@ mod config;
 mod envelope;
 mod error;
 mod handoff;
+mod hierarchical;
 mod member;
 mod message_bus;
 mod runtime;
@@ -36,6 +37,10 @@ pub use handoff::{
     HandoffTeamConfig, HandoffTool, TeamInterruptSignal, TerminationCondition,
     CONTEXT_HISTORY_STATE_KEY, COORDINATOR_STATE_KEY, HANDOFF_MESSAGE_KEY, HANDOFF_REASON_KEY,
     HANDOFF_TARGET_KEY, HISTORY_STATE_KEY,
+};
+pub use hierarchical::{
+    create_supervisor, hierarchical_msgbus_team, HierarchicalMsgbusConfig,
+    HierarchicalMsgbusStrategy, SupervisorAgent, SupervisorConfig,
 };
 pub use member::{AgentProvider, BindHook, TeamAgent, ToolHost};
 pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};
