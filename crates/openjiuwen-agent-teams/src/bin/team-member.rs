@@ -13,7 +13,7 @@
 //!
 //! Process contract (owned by `run_skill_cli`, documented in `src/skill/cli/mod.rs`):
 //!
-//! * `0` — success;
+//! * `0` — success, and `--help` (rendered to stdout, no descriptor needed);
 //! * `1` — the operation was refused, or no team this process hosts could be resolved;
 //! * `2` — a CLI-side error: a bad flag, a malformed descriptor, an unknown command, or anything
 //!   else that fails the connection stage or the clap parse;
