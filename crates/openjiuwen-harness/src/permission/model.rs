@@ -601,7 +601,7 @@ impl Default for ShellGuardSection {
 /// The `permissions:` section of the agent YAML.
 ///
 /// Python parity: the `PermissionsSection` `TypedDict`, modelled as typed data
-/// because it is embedded in [`crate::schema::DeepAgentConfig`]. Defaults are
+/// because it is embedded in `crate::schema::DeepAgentConfig`. Defaults are
 /// fail-closed: every tool falls back to [`PermissionLevel::Ask`] unless an
 /// explicit rule, override, baseline or `defaults` entry says otherwise.
 ///

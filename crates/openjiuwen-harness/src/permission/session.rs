@@ -288,7 +288,7 @@ fn unchanged(section: &PermissionsSection) -> MergeOutcome {
 /// - any other tool is widened to `tools.<tool> = allow`.
 ///
 /// The merge only happens when the current decision is
-/// [`PermissionLevel::Ask`](PermissionLevel::Ask): an allow needs no rule, and a
+/// [`PermissionLevel::Ask`]: an allow needs no rule, and a
 /// deny must never be remembered away. The result is therefore idempotent — a
 /// second merge on the merged section reports `rule_merged == false`.
 #[must_use]

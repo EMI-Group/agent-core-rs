@@ -39,7 +39,7 @@ const REGEX_META: &[char] = &['.', '+', '^', '$', '{', '}', '(', ')', '|', '[', 
 ///
 /// Backslashes are normalized to `/` in both arguments. `?` matches exactly one
 /// character and `*` matches zero or more characters of
-/// [`SHELL_WILDCARD_CLASS`]; a trailing `" *"` additionally makes the separating
+/// the shell wildcard class; a trailing `" *"` additionally makes the separating
 /// space optional, so `ls *` matches both `ls` and `ls -la`. `[` and `]` are
 /// literals, and `**` therefore degrades to `*`.
 ///
@@ -209,7 +209,7 @@ impl Eq for PolicyMatcher {}
 ///   `https://example.com.evil.com/x`, `https://example.com@evil.com/x` (userinfo
 ///   belongs to the authority) or `https://example.com:8443/x` (different port).
 /// - A pattern containing `://` and `*` or `?` is a full-string URL glob where the
-///   wildcards consume [`URL_WILDCARD_CLASS`], case-sensitively.
+///   wildcards consume the URL wildcard class, case-sensitively.
 /// - Any other pattern is a hostname wildcard: the lowercased hostname of the URL
 ///   (see [`extract_host`]) is matched against the lowercased pattern with
 ///   [`match_wildcard`], so `localhost`, `127.0.0.1` and `*.internal.example` work.

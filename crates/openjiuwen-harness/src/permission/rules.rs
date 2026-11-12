@@ -263,7 +263,7 @@ pub fn command_text(args: &Value) -> String {
 /// The text an `os_control` rule pattern is matched against.
 ///
 /// Ports `_os_control_pattern_matches`: the first non-blank
-/// [`OS_CONTROL_ARG_KEYS`] value, where a string is taken trimmed and an array is
+/// `OS_CONTROL_ARG_KEYS` value, where a string is taken trimmed and an array is
 /// joined with single spaces (nulls skipped). `None` when the call carries none of
 /// those arguments.
 #[must_use]
