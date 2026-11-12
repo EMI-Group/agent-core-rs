@@ -7,7 +7,7 @@
 //! - [`ScriptedCaseRunner`] serves canned answers keyed by case id, so tests and
 //!   deterministic pipelines never touch a model.
 //! - [`ModelCaseRunner`] sends one system message (the skill document) plus the
-//!   case prompt to a [`Model`](openjiuwen_foundation::llm::Model) and returns the
+//!   case prompt to a [`Model`] and returns the
 //!   answer text.
 //!
 //! Python ran cases through a shell harness; the Rust port replaces that with
