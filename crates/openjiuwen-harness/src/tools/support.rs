@@ -263,6 +263,7 @@ pub fn is_english(language: &str) -> bool {
 /// Path resolution is sandboxed: relative paths go through [`Workspace::resolve`], absolute
 /// paths are accepted only when they point inside the workspace, and a `deny` permission
 /// decision short-circuits before any path validation.
+#[derive(Clone)]
 pub struct ToolEnv {
     /// The workspace model-supplied paths are resolved against.
     workspace: Workspace,
