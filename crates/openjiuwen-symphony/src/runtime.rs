@@ -1,9 +1,13 @@
 //! The symphony composition root: configuration, lifecycle, graph build, plan, invoke,
 //! mutations, and evolution feedback.
 //!
-//! [`SymphonyRuntime`] wires the crate's parts into one engine: a [`CapabilityRegistry`]
-//! catalog, a [`GraphArtifactStore`] of immutable [`CapabilityGraph`] revisions, a
-//! [`Planner`], a [`CapabilityRunner`], and an optional [`SemanticIndex`]. Python's
+//! [`SymphonyRuntime`](crate::runtime::SymphonyRuntime) wires the crate's parts into one
+//! engine: a [`CapabilityRegistry`](crate::registry::CapabilityRegistry) catalog, a
+//! [`GraphArtifactStore`](crate::artifact::GraphArtifactStore) of immutable
+//! [`CapabilityGraph`](crate::graph::CapabilityGraph) revisions, a
+//! [`Planner`](crate::orchestration::planner::Planner), a
+//! [`CapabilityRunner`](crate::orchestration::executor::CapabilityRunner), and an optional
+//! [`SemanticIndex`](crate::search::semantic::SemanticIndex). Python's
 //! engine is host-driven and owns no composition root, so this type is the Rust port's.
 //!
 //! # Lifecycle
@@ -12,15 +16,20 @@
 //! Created --start--> Running --stop/close--> Stopped --start--> Running
 //! ```
 //!
-//! [`SymphonyRuntime::start`] publishes the first revision when the store holds none,
-//! [`SymphonyRuntime::stop`] stops the engine, and [`SymphonyRuntime::close`] stops it and
+//! [`SymphonyRuntime::start`](crate::runtime::SymphonyRuntime::start) publishes the first
+//! revision when the store holds none,
+//! [`SymphonyRuntime::stop`](crate::runtime::SymphonyRuntime::stop) stops the engine, and
+//! [`SymphonyRuntime::close`](crate::runtime::SymphonyRuntime::close) stops it and
 //! re-reads the current revision as a consistency check (the flush a caller awaits before
 //! dropping the runtime). `start` and `stop` are idempotent.
 //!
 //! # State discipline
 //!
-//! [`SymphonyRuntime::invoke`] and the three capability mutations require
-//! [`RuntimeState::Running`]; in [`RuntimeState::Created`] or [`RuntimeState::Stopped`]
+//! [`SymphonyRuntime::invoke`](crate::runtime::SymphonyRuntime::invoke) and the three
+//! capability mutations require
+//! [`RuntimeState::Running`](crate::runtime::RuntimeState::Running); in
+//! [`RuntimeState::Created`](crate::runtime::RuntimeState::Created) or
+//! [`RuntimeState::Stopped`](crate::runtime::RuntimeState::Stopped)
 //! they fail with an [`Error::Validation`] naming `runtime.state`. Everything else —
 //! `plan`, `graph`, `graph_status`, `read_graph`, `search`, `semantic_search`, `build`,
 //! `submit_evolution`, `capture_graph_snapshot`, and the read-only accessors — works in
@@ -40,7 +49,9 @@
 //! may span the registry snapshot read plus the embedding calls — that serialization is
 //! intentional, because a concurrent query must not clear the index another query is
 //! building — and it is released before the vector search and every unrelated `.await`.
-//! The mutex records the [`CapabilityRegistry::revision`] the index reflects, so an
+//! The mutex records the
+//! [`CapabilityRegistry::revision`](crate::registry::CapabilityRegistry::revision) the
+//! index reflects, so an
 //! unchanged catalog embeds only the query; a stale record just costs one extra reindex,
 //! never wrong results.
 

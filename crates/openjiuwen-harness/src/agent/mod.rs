@@ -9,26 +9,26 @@
 //! Module layout:
 //!
 //! - `mod.rs` (this file) — the [`DeepAgent`] facade, its [`Agent`] impl, the
-//!   internal [`Driver`] used by spawned stream tasks, and follow-up/steer,
+//!   internal `Driver` used by spawned stream tasks, and follow-up/steer,
 //!   mode and state entry points
-//! - [`builder`] — [`DeepAgentBuilder`], prompt assembly, react-config
+//! - `builder` — [`DeepAgentBuilder`], prompt assembly, react-config
 //!   application and lazy model resolution
-//! - [`factory`] — [`resolve_deep_agent_parts`], [`apply_deep_agent_parts`] and
+//! - `factory` — [`resolve_deep_agent_parts`], [`apply_deep_agent_parts`] and
 //!   [`create_deep_agent`]: the Python factory surface (default rails, base
 //!   config merge, one-call assembly)
-//! - [`prompt_rail`] — [`PromptRail`] and [`PromptState`]: system-prompt
+//! - `prompt_rail` — [`PromptRail`] and [`PromptState`]: system-prompt
 //!   assembly plus steering injection before every model call
-//! - [`round`] — input normalization, [`RoundState`] and the task-loop
+//! - `round` — input normalization, [`RoundState`] and the task-loop
 //!   [`RoundExecutorHandle`]
-//! - [`state_store`] — the session-persisted [`DeepAgentState`]
-//! - [`subagent_factory`] — the default [`SubAgentFactory`] and sub-agent
-//!   tool wiring
-//! - [`tests`] — offline unit and integration suite
+//! - `state_store` — the session-persisted [`DeepAgentState`]
+//! - `subagent_factory` — the default [`crate::subagents::SubAgentFactory`]
+//!   and sub-agent tool wiring
+//! - `tests` — offline unit and integration suite
 //!
 //! ## State sink (sync → async bridge)
 //!
 //! The task-loop controller invokes its `StateSink` synchronously after every
-//! round, while persisting to a session is async. [`Driver::run_task_loop`]
+//! round, while persisting to a session is async. `Driver::run_task_loop`
 //! therefore bridges the two with an unbounded channel: the sink forwards a
 //! state clone, a background task writes it to the session, and after the loop
 //! the controller's sink is replaced with a no-op so the channel closes and the
@@ -38,7 +38,7 @@
 //!
 //! `new`/`configure` build a usable agent without a model; the first
 //! invocation claims the wiring decision through an atomic compare-exchange,
-//! resolves the model through [`builder::ensure_agent_wired`], and marks the
+//! resolves the model through `builder::ensure_agent_wired`, and marks the
 //! agent wired. A failed resolution releases the claim so a later invocation can
 //! retry.
 
@@ -238,7 +238,7 @@ impl DeepAgent {
     /// Wires the agent and resolves its model when that has not happened yet.
     ///
     /// Idempotent: once the agent is wired and a model is available this is a
-    /// no-op. Concurrent first calls race on [`Self::initialized`], so only one
+    /// no-op. Concurrent first calls race on `Self::initialized`, so only one
     /// performs the work; a failure releases the claim for a later retry.
     ///
     /// # Errors

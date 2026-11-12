@@ -1,10 +1,15 @@
 //! Capability cards, fingerprints, data-type vocabulary, and naming helpers.
 //!
-//! This is the model layer of the capability-asset engine: the wire types a provider
-//! hands over ([`CapabilityDescriptor`], [`CapabilityIo`], [`CapabilityKey`]), their
-//! versioned semantic view ([`CapabilityFingerprint`], [`SemanticProfile`],
-//! [`FingerprintArtifact`]), and the two deterministic comparison helpers used by the
-//! graph and planner ([`DataTypeVocabulary`], [`normalize_name_key`]).
+//! This is the model layer of the capability-asset engine: the wire types a provider hands
+//! over ([`CapabilityDescriptor`](crate::model::CapabilityDescriptor),
+//! [`CapabilityIo`](crate::model::CapabilityIo),
+//! [`CapabilityKey`](crate::model::CapabilityKey)), their versioned semantic view
+//! ([`CapabilityFingerprint`](crate::model::CapabilityFingerprint),
+//! [`SemanticProfile`](crate::model::SemanticProfile),
+//! [`FingerprintArtifact`](crate::model::FingerprintArtifact)), and the two deterministic
+//! comparison helpers used by the graph and planner
+//! ([`DataTypeVocabulary`](crate::model::DataTypeVocabulary),
+//! [`normalize_name_key`](crate::model::normalize_name_key)).
 //!
 //! Every type here is `serde`-serializable with `snake_case` names, every field
 //! defaults, and unknown JSON fields are ignored. Derived values (schemas, content

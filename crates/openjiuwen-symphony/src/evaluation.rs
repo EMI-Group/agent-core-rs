@@ -3,23 +3,26 @@
 //! Ports the offline subset of Python `openjiuwen.symphony.evaluation`. Python's suite
 //! mixes deterministic static checks with LLM-judged and trace-driven metrics; the
 //! Rust port keeps the static metrics and defers the model-backed ones to
-//! [`LlmJudgedMetric`], which reports [`openjiuwen_common::error::Error::Unsupported`].
+//! [`LlmJudgedMetric`](crate::evaluation::LlmJudgedMetric), which reports
+//! [`openjiuwen_common::error::Error::Unsupported`].
 //!
 //! # Shapes
 //!
-//! [`EvaluationInput`] is what a metric inspects — one [`CapabilityDescriptor`] plus
-//! an optional judge target. A [`Metric`] produces one [`MetricScore`] in `[0.0, 1.0]`,
-//! and [`EvaluationSuite`] runs every metric in order, collecting the scores into an
-//! [`EvaluationReport`].
+//! [`EvaluationInput`](crate::evaluation::EvaluationInput) is what a metric inspects — one
+//! [`CapabilityDescriptor`](crate::model::CapabilityDescriptor) plus an optional judge target.
+//! A [`Metric`](crate::evaluation::Metric) produces one
+//! [`MetricScore`](crate::evaluation::MetricScore) in `[0.0, 1.0]`, and
+//! [`EvaluationSuite`](crate::evaluation::EvaluationSuite) runs every metric in order,
+//! collecting the scores into an [`EvaluationReport`](crate::evaluation::EvaluationReport).
 //!
 //! # Fail-soft contract
 //!
 //! A metric that fails does not abort the suite: the error is rendered into
-//! [`EvaluationReport::errors`] (prefixed with the metric name) and the remaining
-//! metrics still run. That mirrors Python's per-evaluator isolation, and it keeps a
-//! deferred or misconfigured metric from hiding the static results. `overall` is the
-//! mean of the *successful* scores, so `0.0` means "nothing could be scored", not
-//! "everything failed".
+//! [`EvaluationReport::errors`](crate::evaluation::EvaluationReport::errors) (prefixed with
+//! the metric name) and the remaining metrics still run. That mirrors Python's per-evaluator
+//! isolation, and it keeps a deferred or misconfigured metric from hiding the static results.
+//! `overall` is the mean of the *successful* scores, so `0.0` means "nothing could be scored",
+//! not "everything failed".
 //!
 //! # Determinism
 //!

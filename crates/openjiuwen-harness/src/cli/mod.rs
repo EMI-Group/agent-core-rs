@@ -9,14 +9,14 @@
 //! - `mod.rs` (this file) — the command grammar: [`Cli`], [`Command`],
 //!   [`RunArgs`]/[`ChatArgs`], [`OutputFormat`], [`Dispatch`] and
 //!   [`stdin_is_tty`]
-//! - [`config`] — `CliOptions` resolution (flags/env/settings/defaults)
-//! - [`io`] — `LineReader`/`Writer` traits and the `CliIo` handle
-//! - [`render`] — `RenderState`, the chunk-to-terminal renderer
-//! - [`run`] — one-shot execution and its output formats
-//! - [`repl`] — the interactive REPL and its slash commands
-//! - [`permissions`] — approval prompts and the permission host
-//! - [`session_store`] — append-only session records under the home directory
-//! - [`tests`] — offline unit and integration suite
+//! - `config` — `CliOptions` resolution (flags/env/settings/defaults)
+//! - `io` — `LineReader`/`Writer` traits and the `CliIo` handle
+//! - `render` — `RenderState`, the chunk-to-terminal renderer
+//! - `run` — one-shot execution and its output formats
+//! - `repl` — the interactive REPL and its slash commands
+//! - `permissions` — approval prompts and the permission host
+//! - `session_store` — append-only session records under the home directory
+//! - `tests` — offline unit and integration suite
 //!
 //! Dispatch is a pure function of the parsed command line plus one injected
 //! boolean, so it is testable without touching the process environment or the

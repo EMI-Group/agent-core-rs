@@ -9,9 +9,10 @@
 //! single endpoint. Two strategies ship in this port — the router/intelli-router strategies are
 //! deferred — selected by [`ModelPoolStrategy`](crate::schema::ModelPoolStrategy):
 //!
-//! * [`ModelPoolStrategy::RoundRobin`] rotates through every entry in pool order, ignoring the
-//!   requested model name. Always allocates.
-//! * [`ModelPoolStrategy::ByModelName`] picks the entry whose `model_name` the member asked for,
+//! * [`ModelPoolStrategy::RoundRobin`](crate::schema::ModelPoolStrategy::RoundRobin) rotates through
+//!   every entry in pool order, ignoring the requested model name. Always allocates.
+//! * [`ModelPoolStrategy::ByModelName`](crate::schema::ModelPoolStrategy::ByModelName) picks the
+//!   entry whose `model_name` the member asked for,
 //!   falling back to the first entry when the pool does not serve that name.
 //!
 //! Python builds no allocator when the pool is empty and lets every member resolve its per-agent
@@ -133,7 +134,7 @@ impl ModelAllocator {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`](openjiuwen_common::error::Error::Config) when the pool is empty and
+    /// Returns [`Error::Config`] when the pool is empty and
     /// no model name was requested — there is nothing to allocate and nothing to echo back.
     pub fn allocate(&self, model_name: Option<&str>) -> Result<TeamModelAllocation> {
         if self.entries.is_empty() {
@@ -170,7 +171,7 @@ impl ModelAllocator {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation) when `value` is
+    /// Returns [`Error::Validation`] when `value` is
     /// not a JSON object.
     pub fn from_state_dict(value: &Value) -> Result<Self> {
         let Some(object) = value.as_object() else {

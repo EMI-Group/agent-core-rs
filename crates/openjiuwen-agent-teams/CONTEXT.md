@@ -261,6 +261,8 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - Python `TeamAgent` is one class for both roles. Keep that: `TeamAgent` carries `TeamRole`; the leader owns dispatch, teammates poll the board.
 - Python `spec.build()` mutates the spec (fills `language`); the Rust `build_with` takes `&self` and does not mutate — documented deviation.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it, never define a second enum.
+- Module-level `//!` docs resolve intra-doc links in the *parent* module's scope, not the file's own `use` list, so a module doc needs a fully-qualified target (`[`X`](crate::schema::X)`) for anything the parent does not import; item-level `///` docs resolve in the item's module, where an imported name can be linked bare.
+- `cargo doc -p openjiuwen-agent-teams --no-deps` is warning-free; keep it that way (no `#[allow(rustdoc::…)]`, link private items as plain code spans rather than widening visibility).
 - The Python `_Bus` (in-process messager), `TeamDatabase` (sqlite) and `asyncio.Task` spawn handle map to `messager::InProcessMessager`, `storage::InMemoryTeamStore` and `member::InProcessSpawnHandle`.
 - `openjiuwen_multiagent` is used only for the `Team`/`AgentTeamSession` seam so `Runner::run_agent_team` can drive a `TeamAgent`; its message bus is not used (Python `agent_teams` has its own envelope).
 - Prefer `Error::validation` for user-supplied names/dispatch knobs, `Error::config` for missing build dependencies (model, factory), `Error::not_found` for unknown members/tasks.

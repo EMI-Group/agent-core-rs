@@ -22,7 +22,8 @@ use crate::workspace::schema::get_workspace_schema;
 
 /// The on-disk workspace: a root path plus the directory schema and its language.
 ///
-/// The schema is data only; materializing it is [`DirectoryBuilder`]'s job
+/// The schema is data only; materializing it is
+/// [`DirectoryBuilder`](crate::workspace::DirectoryBuilder)'s job
 /// ([`DirectoryBuilder`](crate::workspace::DirectoryBuilder)), and every model-supplied
 /// path is resolved through [`Workspace::resolve`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -100,8 +101,9 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns the first [`ErrorKind::Validation`] failure reported by
-    /// [`DirectoryNode::validate`](crate::workspace::DirectoryNode::validate).
+    /// Returns the first
+    /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation) failure
+    /// reported by [`DirectoryNode::validate`](crate::workspace::DirectoryNode::validate).
     pub fn validate(&self) -> Result<()> {
         for node in &self.directories {
             node.validate()?;
@@ -184,7 +186,8 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Validation`] when the node is invalid.
+    /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation) when
+    /// the node is invalid.
     pub fn set_directory(&mut self, node: DirectoryNode) -> Result<()> {
         node.validate()?;
         match self
@@ -203,8 +206,8 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Validation`] when any node is invalid; nothing is changed in
-    /// that case.
+    /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation) when
+    /// any node is invalid; nothing is changed in that case.
     pub fn set_directories(
         &mut self,
         nodes: impl IntoIterator<Item = DirectoryNode>,
