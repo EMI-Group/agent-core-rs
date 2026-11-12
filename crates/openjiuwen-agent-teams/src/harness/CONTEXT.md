@@ -152,7 +152,7 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 
 ## Notes for Agents
 
-- The `member` node lands in parallel with this one: `adapter.rs` imports `crate::member::{MemberObserver, MemberRuntime}`. If that module is still a placeholder in your checkout, the crate cannot compile until both commits are merged; do not add a second definition of those traits here.
+- `adapter.rs` imports `crate::member::{MemberObserver, MemberRuntime}` from the implemented `../member/` seam; import those traits, never add a second definition of them here.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it (crate root does) — never define a second enum.
 - The pump deliberately does not end on a terminal turn event: `events()` is the cycle-long view, and a member runs many rounds per cycle.
 - Observer callbacks are invoked outside the observer lock; a panicking observer ends the pump task (it is not caught), so observers must be cheap and non-panicking.

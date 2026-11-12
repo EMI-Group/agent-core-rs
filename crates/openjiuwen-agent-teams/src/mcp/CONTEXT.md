@@ -10,7 +10,8 @@ The scenario is chosen by the join descriptor's `scope`: `member` (an external C
 
 This node owns no team logic: it re-exposes `crate::skill::TeamClient` operations and the `crate::skill` tool catalogue.
 
-The descriptor and its `OPENJIUWEN_TEAM_JOIN` environment variable are owned by `crate::skill`; the process wiring (`openjiuwen-team-mcp` binary) is `openjiuwen-cli`'s job.
+The descriptor and its `OPENJIUWEN_TEAM_JOIN` environment variable are owned by `crate::skill`; the process wiring is this crate's `src/bin/openjiuwen-team-mcp.rs` (built with the `mcp` feature), which installs the stderr log subscriber and forwards to `mcp::stdio::run_mcp_server_from_env`.
+`openjiuwen-cli` is a sibling binary crate (read-only from this node) and does not host this server.
 
 ## API Surface
 

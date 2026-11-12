@@ -285,7 +285,7 @@ Unit tests beside each file plus `tests/runtime.rs` for the crossed seams; all o
 Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`,
 `cargo test -p openjiuwen-agent-teams --no-default-features` (549 crate lib tests green in both),
 `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for `src/runtime/**`
-(the only crate-wide diagnostics are the still-empty `mcp`/`skill` module docs, owned by other nodes).
+(crate-wide diagnostics belong to the crate root node; the `mcp`/`skill` modules are implemented).
 
 ## Notes for Agents / Deviations from Python
 

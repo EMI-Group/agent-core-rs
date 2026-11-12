@@ -138,7 +138,7 @@ The status-machine suite is `lifecycle_tests.rs`: start happy path (`starting` t
 Every file has a doctest; all pass.
 The accessor suite covers identity/role/execution getters, the cached `status()` and `stored_status()` on an unstarted member, `stored_status()` picking up a peer's write and then a local transition, and `stored_status()` on an unknown member reporting `ErrorKind::NotFound`.
 Definition of done for this node: `rustfmt --check` clean on every `src/member/*.rs`, `cargo test -p openjiuwen-agent-teams --lib` and `--no-default-features --lib` green, and no clippy diagnostic pointing at `src/member/`.
-Crate-wide `cargo clippy -- -D warnings` still reports `missing_docs` on the five still-empty sibling modules (`harness`, `mcp`, `runtime`, `skill`, `taskboard`), declared in `../lib.rs`; those belong to the crate root node.
+Crate-wide diagnostics belong to the crate root node; the `harness`, `mcp`, `runtime`, `skill` and `taskboard` sibling modules are implemented and re-exported from `../lib.rs`.
 
 ## Notes for Agents
 

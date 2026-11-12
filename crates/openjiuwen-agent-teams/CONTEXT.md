@@ -244,6 +244,11 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - `./src/constants.rs` → reserved names, defaults, mention parsing
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
 
+### Sibling consumers (read-only from this node)
+
+- `../openjiuwen/` → umbrella crate: `pub use openjiuwen_agent_teams as agent_teams` and forwards the `live-tests` feature (`crates/openjiuwen/src/lib.rs`, `crates/openjiuwen/Cargo.toml`); never edited here.
+- `../openjiuwen-cli/` → the `openjiuwen` binary front-end (sibling crate, no dependency on this crate); this crate is where the `team-member` and `openjiuwen-team-mcp` binaries are built.
+
 ## Test Strategy
 
 - Unit tests live beside their module (`#[cfg(test)]` in each file), ~676 of them, and cover the internals of `schema`, `storage`, `taskboard`, `messager`, `workspace`, `member`, `interaction`, `runtime`, `harness`, `skill` and `mcp`.
@@ -261,7 +266,7 @@ pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, p
 - Prefer `Error::validation` for user-supplied names/dispatch knobs, `Error::config` for missing build dependencies (model, factory), `Error::not_found` for unknown members/tasks.
 - Cross-node deviations from Python, each owned and explained by its child node: `SpecBuild` is `#[async_trait]` and `build_with` takes `&self` without mutating the spec (`./src/runtime/`); the worktree name suffix is a FNV-1a digest instead of `sha256(..)[:10]` and member state lives at `<base>/<team>/sessions/<sid>/members/<member>` (`./src/workspace/`); the multiagent `AgentTeamSession` is ignored by the adapter, `Team::add_agent` writes its row on the current runtime, and one run at a time per team (`./src/runtime/`); `HarnessMemberRuntime::send` drops transport-level `SendReceipt` (`./src/member/` Known gaps); `TaskStatus` transitions are narrower than Python's (no `in_progress→pending`, `planning→pending`) (`./src/taskboard/`).
 - Live attach is in-process only: `connect_live_client` reads the process-global runtime registry, so the CLI/MCP server can act on a team this process hosts; a team this process does not host is exit `1` (`Error::config`/CLI `1`), and cross-process attach via a shared store or distributed transport is deferred.
-- The `openjiuwen` umbrella re-exports this crate as `openjiuwen::agent_teams` (and forwards the `live-tests` feature).
+- The `openjiuwen` umbrella re-exports this crate as `openjiuwen::agent_teams` (and forwards the `live-tests` feature); the `openjiuwen` CLI is a sibling binary crate that does not depend on this crate, and the two binaries this crate ships (`team-member`, `openjiuwen-team-mcp`) are built from `./src/bin/`.
 - The `live-tests` feature is declared in `Cargo.toml` but no test or module in this crate reads it: real-provider runs are not gated here, so nothing in the crate needs the network.
 - Models reach a member only through `MemberHarnessFactory::create(&DeepAgentSpec, &MemberHarnessContext)`: the model name comes from `DeepAgentSpec::model` (else the resolver's default), and credentials/provider come from the factory's `ModelResolver` (`NativeMemberFactory::from_env` → `EnvModelResolver` reads `MODEL_PROVIDER`/`MODEL_NAME`/`API_KEY`/`API_BASE`).
 - `NativeMemberFactory` writes the effective model identity onto the `DeepAgentConfig` it builds as well as onto the builder model: `model_name`/`model_provider` take the spec's pinned `ModelRef` values, else the resolved model's own name/provider (blanks skipped).

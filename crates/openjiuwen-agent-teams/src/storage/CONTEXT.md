@@ -139,7 +139,7 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - `store_tests.rs`: team upsert (created preservation, replacement, store stamping), empty-key validation for every row kind, member CAS (first `unstarted -> starting` true, replay false, illegal `ready -> dormant` false, stale `from` false, unknown member false), member patch merge/clear/stamp, member listing order, task CAS + `updated_at` refresh + terminal status, `update_task` revision bump and change notes (content / title+content / identical content / note-only / explicit revision / `clear_assignee`), `list_tasks` filters (status, assignee, parent, limit) and ordering, dependency idempotence + sorting + team scoping + self-dependency rejection, per-round vote isolation with reviewer replacement, mailbox ordering, `mark_read` semantics, watermark coverage/regression, `message_count`, keyed message replacement, keyed member replacement, `open_store` selection and unsupported-backend messages, per-call store independence.
 
 Definition of done for this node: `rustfmt --check` clean on the four files, `cargo test -p openjiuwen-agent-teams --lib` and `--no-default-features --lib` green, no clippy diagnostic pointing at `src/storage/`.
-Crate-wide `cargo clippy -- -D warnings` still reports `missing_docs` on the ten still-empty sibling modules and two crate-root doctests (`lib.rs`, `constants.rs`) that reference root re-exports not yet declared; both belong to the crate root node.
+Crate-wide diagnostics (clippy `missing_docs`, crate-root doctests) belong to the crate root node; the sibling modules are implemented and re-exported from `../lib.rs`.
 
 ## Notes for Agents
 

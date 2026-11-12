@@ -83,11 +83,10 @@ pub fn recorded(&Recorder) -> Vec<EventMessage>;   pub fn event_types(&Recorder)
 - Reuse over re-implementation: drive the same seams the crate's own `src/runtime/tests/` crossed-seam suite drives, but from outside the crate.
 - Exact expectations (messages, statuses, JSON strings) are mined from the unit tests beside each module; the integration suite proves they survive across the module boundary.
 - Run `cargo test -p openjiuwen-agent-teams --tests` (182 integration + 662 unit) in both feature configurations; `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` is clean.
+- `cargo test -p openjiuwen-agent-teams --doc` is green: the crate-level doctests in `src/lib.rs`/`src/constants.rs` exercise the flat root re-exports (`DEFAULT_LEADER_MEMBER_NAME`, `is_reserved_name`, `parse_mention`).
 
 ## Known Issues
 
-- `cargo test -p openjiuwen-agent-teams` fails its **doctests** (`src/lib.rs` line 27 and `src/constants.rs` line 38) because the crate root does not re-export `DEFAULT_LEADER_MEMBER_NAME`, `is_reserved_name` or `parse_mention` flat, although the crate `CONTEXT.md` says it does; `src/` is out of scope for this node.
-- `cargo fmt -p openjiuwen-agent-teams -- --check` reports one pre-existing line in `src/constants.rs` (the multi-line `parse_mention` assertion); all files under `tests/` are rustfmt-clean.
 - The teammate `create_task` rejection (`ensure_leader_role`, `src/runtime/team_agent.rs`) is unreachable from outside the crate: `build_with` only produces a leader handle and `TeamAgent`'s constructor is crate-private, so `member_and_mail.rs` pins the leader path plus the ungated board seam instead.
 - `SkillCli`'s `descriptor`/`command` fields and its command enums are `pub(crate)` with no accessor, so `cli.rs` pins parsed shapes through `Debug` rendering and end-to-end behaviour.
 - `HarnessMemberRuntime::send` discards the `SendReceipt` and `support::ScriptedHarness` records only the text, so delivery/abort modes are observed through a file-local `ModeRecorder` decorator in `protocol_adapter.rs`.
