@@ -7,6 +7,7 @@ Python parity source: `openjiuwen/agent_teams/skill/cli.py` (293 lines), `extern
 Two scenarios are selected by the join descriptor's `scope`: `member` (a spawned CLI acting as a first-class member, driven through the real teammate tool set) and `operator` (default; an outside team-control surface over the task board, messaging and roster).
 One operation per invocation, plain-text output, and the exit code carries the outcome.
 The module is deliberately transport-agnostic: it talks to the `TeamStore`, `TaskBoard` and `Messager` seams, so the same code runs against the in-memory backend (tests) and a live team (the runtime bridge).
+The live bridge is `live::connect_live_client`: it resolves the joined team from the process-global runtime registry and builds the store-backed client over that team's own store, task board and messager.
 
 ## API Surface
 
@@ -37,6 +38,10 @@ pub fn operator_tools() -> Vec<TeamToolDef>;
 // store_client.rs
 pub struct StoreTeamClient;   // impl TeamClient over Arc<dyn TeamStore> + Arc<TaskBoard> + Arc<dyn Messager>
 impl StoreTeamClient { pub fn new(descriptor: TeamJoinDescriptor, store: Arc<dyn TeamStore>, taskboard: Arc<TaskBoard>, messager: Arc<dyn Messager>) -> Self }
+
+// live.rs
+pub fn connect_live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>;   // crate::runtime::try_global_registry() → manager.live(team) → TeamAgent::backend()
+pub(crate) fn resolve_live_client(manager: &TeamRuntimeManager, descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>;  // registry-free half
 
 // cli/
 pub struct SkillCli;
@@ -133,7 +138,8 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `./descriptor.rs` → `TeamJoinDescriptor`, `ClientScope`, env/file/JSON loading
 - `./client.rs` → `TeamClient` trait, outcome types, tool catalogue (`member_tools_for`, `operator_tools`)
 - `./store_client.rs` → `StoreTeamClient`: the store/task-board/messager implementation of the client
-- `./cli/mod.rs` → two-stage descriptor scan, `SkillCli::run`/`run_with`, exit codes, `run_skill_cli`, the live-team resolver seam
+- `./live.rs` → `connect_live_client` / `resolve_live_client`: attach to a team hosted in this process through `crate::runtime::try_global_registry()`
+- `./cli/mod.rs` → two-stage descriptor scan, `SkillCli::run`/`run_with`, exit codes, `run_skill_cli`, delegation to `live::connect_live_client`
 - `./cli/command.rs` → the two clap trees (member/operator), subcommand and value enums
 - `./cli/member.rs` → member-scope dispatch (real teammate tool set)
 - `./cli/operator.rs` → operator-scope dispatch (board, messaging, roster)
@@ -145,12 +151,13 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `descriptor.rs`: defaults, unknown fields, file/JSON/env precedence, missing env message, malformed JSON message.
 - `client.rs`: tool names and required schema properties for every dispatch/teammate-mode combination; operator tool order and schemas.
 - `store_client.rs`: persisted message/task rows, published event topics and sender, inbox rendering + read cursor, over-limit rejection, member-scope claim/complete, `invoke_tool` shapes.
+- `live.rs`: unknown team → `None` without touching the registry; registry install/clear through a local lock plus a restore guard; end-to-end attach to a team activated over the scripted fakes (roster, empty inbox, a created task claimable on the live team's own board).
 - `cli/`: parsing of every subcommand, `--descriptor-json` before and after the subcommand, unknown command → 2, refusal → 1 with the reason, happy-path output lines for every operator command, member `inbox`/`view_task`/`claim_task`/`send_message`, roster ordering.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for these files.
 
 ## Deferred
 
-- Cross-process attach: `run_skill_cli` resolves the team through the crate's process-global runtime registry (`crate::runtime::global_registry()`) once that surface lands; until then it reports `no live team '<name>' in this process` and exits `1`.
+- Cross-process attach: only a team hosted in *this* process resolves (through `crate::runtime::try_global_registry()`); reaching a team hosted in another process through a shared sqlite DB or a transport is deferred, and an unhosted team reports `no live team '<name>' in this process` and exits `1`.
 - `--watch` streaming: a single inbox read is performed; the event-driven re-render loop waits on the runtime's watch hook.
 - External CLI members (`claude`/`codex`), hybrid WebSocket publishing, file-backed SQLite descriptors and workspace metadata tools are not ported (see the crate "Deferred" list).
 
@@ -161,4 +168,5 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `StoreTeamClient` deliberately bypasses the task board for `update_task` (there is no board edit operation): it applies a `TaskPatch` through `TaskBoard::store()` after refusing non-`pending`/`blocked` rows.
 - Member-scope `claim_task` claims for the descriptor's `member_name`; the one-active-task check of the native tool is a runtime policy and is not duplicated here.
 - `store_client.rs` is legitimately long (~1200 lines, half of it its inline test suite): the `TeamClient` impl is one contract whose operations are each a store/board call plus the event it publishes, so splitting it would scatter that contract. The top-of-file note records the reason.
-- The live-team resolver (`cli::live_client`) is the single wiring point for the runtime registry; when `crate::runtime::global_registry()` lands, return `Some(Arc::new(StoreTeamClient::new(descriptor.clone(), backend.store(), backend.tasks(), backend.messager())))` from it.
+- The live-team resolver is `live::connect_live_client`, the single wiring point both the `team-member` CLI (`cli::live_client`) and the `openjiuwen-team-mcp` server go through; `live::resolve_live_client` is its registry-free half, which is what the unit tests drive against a local manager.
+- `cli::live_client` only delegates: the team is resolved through `crate::runtime::try_global_registry()` → `TeamRuntimeManager::live(team_name)` → `TeamAgent::backend()`, so a descriptor naming a team this process does not host reports exit `1`.

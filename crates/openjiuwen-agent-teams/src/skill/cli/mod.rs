@@ -274,17 +274,14 @@ pub(crate) fn refuse(err_out: &mut dyn Write, reason: Option<&str>) -> i32 {
 
 /// Resolves the live team behind `descriptor`, when this process hosts one.
 ///
-/// The cross-process bridge is not wired yet: `crate::runtime` is still an empty module at HEAD, so
-/// the process-global runtime registry (`crate::runtime::global_registry()`, team name → runtime
-/// manager exposing `backend()`, `store()`, `tasks()` and `messager()`) cannot be referenced here
-/// without breaking the build. Until that surface lands, an external CLI cannot attach to an
-/// in-process team and every invocation reports the missing team (exit `1`).
-fn live_client(_descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
-    // Intentional until `crate::runtime` exposes `global_registry()`:
-    // let backend = crate::runtime::global_registry().backend(&descriptor.team_name)?;
-    // Some(Arc::new(StoreTeamClient::new(descriptor.clone(), backend.store(),
-    //     backend.tasks(), backend.messager())))
-    None
+/// The team is resolved through `crate::runtime::try_global_registry()` and the manager's
+/// `live(team_name)`, then wrapped over that team's own store, task board and messager (see
+/// [`super::live::connect_live_client`], the single wiring point this CLI shares with the
+/// `openjiuwen-team-mcp` server). A team this process does not host — including every team hosted
+/// by *another* process, since cross-process attach is deferred — resolves to `None`, which the
+/// connection stage reports as `no live team '<name>' in this process` and exit code `1`.
+fn live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
+    super::live::connect_live_client(descriptor)
 }
 
 /// Parses and executes one `team-member` invocation against `std::io` and returns the exit code.
@@ -694,15 +691,6 @@ mod tests {
             String::from_utf8(err).unwrap(),
             "no live team 'alpha' in this process\n"
         );
-    }
-
-    #[test]
-    fn live_client_is_not_wired_to_the_runtime_registry_yet() {
-        let descriptor = TeamJoinDescriptor {
-            team_name: "alpha".to_string(),
-            ..TeamJoinDescriptor::default()
-        };
-        assert!(live_client(&descriptor).is_none());
     }
 
     #[test]
