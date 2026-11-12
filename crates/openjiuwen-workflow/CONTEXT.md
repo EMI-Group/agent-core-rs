@@ -279,7 +279,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
 - Checkpointing is opt-in through `session.checkpointer()`; when present the engine compiles with `CheckpointerStore` (namespace = workflow card id) and deletes the snapshot when a run completes.
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
-- `openjiuwen-retrieval` is a normal dependency; `openjiuwen-memory` is not (it is still a stub), hence the local memory trait seams.
+- `openjiuwen-retrieval` is a normal dependency; `openjiuwen-memory` is not one, although it is fully implemented — the memory components reach it through the local `MemoryRecall`/`MemoryRecord` trait seams, so callers inject adapters instead of this crate depending on the memory engine.
 
 ## Known Issues and Deferred Work
 
