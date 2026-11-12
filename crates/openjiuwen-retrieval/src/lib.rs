@@ -26,7 +26,9 @@ pub mod common;
 pub mod embedding;
 pub mod knowledge_base;
 pub mod loaders;
+pub mod model;
 pub mod reranker;
+pub mod rewrite;
 pub mod vector_store;
 
 pub use chunking::{
