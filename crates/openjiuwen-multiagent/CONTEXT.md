@@ -365,6 +365,8 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/handoff.rs` covers the full chain with scripted member agents: direct handoff, routed handoff, blocked hop completes, max-handoffs, timeout, interrupt forwarding, history resume, and streaming frames.
 - `tests/hierarchical.rs` covers supervisor-over-bus single hop + single stream frame, sub-agent tool cards and ordered parallel dispatch with the limiter, agents-as-tools wiring (`ToolHost` mount + pinned instance), and the error chunk.
 - `tests/streaming.rs` covers `team_stream` frame order, caller-owned vs standalone teardown, and producer-error-after-drain.
+- `tests/agent_tool.rs` covers the tool card shape, dispatch through the runtime (`tool_call_id` child session), the dropped-runtime and agent-failure tool errors, the `invocation_id` fallback, and the concurrency limiter.
+- `tests/api_surface.rs` pins the public contract at compile time: every crate-root re-export, inherent constructor and free-function signature, trait-object coercion (`Team`, `TeamStrategy`, `MessageHandler`, `ToolHost`, `Tool`), `Team` method reachability, the `Card` impl, serde round-trips and `schemars` property names, and the `TeamError` → `ErrorKind::External` mapping.
 - All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only.
 
 ## Deferred Python Behavior
@@ -388,3 +390,11 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `HandoffRequest::history` is appended before interrupt detection, so an interrupted hop is recorded then dropped on resume.
 - `ContainerAgent::invoke` returns `{}` on every path; results reach consumers only through the shared team stream.
 - `flush_team_session` = `end_stream()` then `commit()`; a commit failure is logged, never raised.
+- Additive public helpers beyond the list above: `team_stream` and `topic_matches` (also re-exported at the crate root, consumed by the strategy modules), `MessageBus::{effective_team_id, p2p_topic, pubsub_topic, agent_topics}`, `TeamRuntime::message_bus`, `SubscriptionManager::{patterns, agents_for_exact}`, `MessageEnvelope::with_metadata_map`, `AgentTool::agent_id`, `TeamError::{empty_response, execution}` plus `From<TeamError> for Error`, and `with_*` builders on `RuntimeConfig`/`MessageBusConfig`.
+- `TeamRuntime::new` builds the bus with `Arc::new_cyclic` (handler holds only `Weak<TeamRuntime>`, so there is no `Arc` cycle) and stamps `RuntimeConfig::team_id` onto the bus config, so topic names never fall back to `default` for a team with its own id.
+- `SessionLease::acquire` is `async` to mirror Python's acquire point even though the current body only takes short sync locks (clippy `unused_async` is allowed on it).
+- Every public data type derives `schemars::JsonSchema`; strategy configs with non-schema fields (for example `HandoffConfig::termination_condition`) need `#[schemars(skip)]` when they land.
+- `pin_agent` on an unregistered id inserts a registry entry whose card id and name are the agent id, so later lookups and error messages stay consistent.
+- `dispatch_pubsub` reports an unregistered subscriber with the same `not_found` wording as P2P (`"Recipient '<id>' not registered in runtime"`).
+- A member invoked over P2P receives a child `AgentSession` whose `parent_id()` is the bound team session id, so a container agent resolves the team session with `runtime.team_session(session.parent_id()?)` rather than from the envelope (the `Agent` seam has no envelope parameter).
+- Bus transport topics are created lazily by `send`/`publish`, so `TeamRuntime::subscribe` only updates the logical pattern registry; a strategy registers every endpoint agent before sending to it, because `send` validates registration up front.

@@ -24,11 +24,17 @@ pub trait Agent: Send + Sync {
     fn stream(&self, inputs: Value, session: Option<Arc<dyn Session>>) -> BoxStream<'static, Result<AgentChunk>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]   // no Default derive; no schemars transform
+#[serde(rename_all = "snake_case", default)]                            // unknown fields tolerated
 pub struct AgentCard { pub id: String, pub name: String, pub description: String,
                        pub input_params: Option<Value>, pub output_params: Option<Value>,
-                       pub interface_url: Option<String> }   // serde snake_case, id defaults to uuid hex
-impl AgentCard { pub fn new(name: impl Into<String>) -> Self; /* with_* builders */ }
-impl openjiuwen_common::card::Card for AgentCard { .. }
+                       pub interface_url: Option<String> }   // `description` is a String; optionals serialize as null (no skip_serializing_if)
+impl Default for AgentCard { .. }   // manual: fresh 32-lowercase-hex uuid id, empty strings, None optionals
+impl AgentCard { pub fn new(name: impl Into<String>) -> Self;
+                 // consuming #[must_use] builders: with_id/with_name/with_description/with_input_params/with_output_params/with_interface_url
+                 pub fn id(&self) -> &str; pub fn name(&self) -> &str; pub fn description(&self) -> &str; }
+impl openjiuwen_common::card::Card for AgentCard { .. }   // Card::description() -> None when the String is empty
+// No From/TryFrom conversions between AgentCard and CardBase or any other card type.
 
 pub enum ResultType { Answer, Error, Interrupt }   // wire "answer" | "error" | "interrupt"
 
@@ -55,7 +61,11 @@ pub struct AgentOutput {
     pub extra: BTreeMap<String, Value>,
 }
 impl AgentOutput { pub fn answer(text) -> Self; pub fn error(text) -> Self; pub fn interrupt(frames, ids) -> Self;
-                   pub fn is_interrupt(&self) -> bool; pub fn to_value(&self) -> Value; }
+                   pub fn is_interrupt(&self) -> bool; pub fn to_value(&self) -> Value; pub fn from_value(value: Value) -> Result<Self>;
+                   /* consuming builders: with_finish_reason, with_reasoning_present, with_iterations_used,
+                      with_termination_reason, with_data, with_extra, with_observations */ }
+impl OutputFrame { pub fn from_value(value: Value) -> Result<Self>; }   // Error::validation on non-object
+impl AgentChunk { pub fn from_value(value: Value) -> Result<Self>; }
 
 pub struct AgentChunk { pub kind: String, pub index: i64, pub payload: Value }
 // kind: "llm_output" | "llm_reasoning" | "llm_usage" | "answer" | "__interaction__" | "workflow_final" | "context.usage"
@@ -119,6 +129,7 @@ impl ReActAgent {
     pub fn unregister_rail(&self, name: &str);
     pub fn rails(&self) -> Arc<RailRegistry>;
     pub fn prompt_builder(&self) -> SystemPromptBuilder;
+    pub fn context_engine(&self) -> Arc<ContextEngine>;
 }
 impl Agent for ReActAgent { .. }
 ```
