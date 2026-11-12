@@ -25,7 +25,7 @@ Providers (module `providers`):
 - `providers::dsh` (`vendor`) — `DshHarnessConfig`, `PROVIDER_NAME`, `CARD_NAME` (`"deepseek-harness"`), `card()`, `provider()`, `model_config`.
 
 IO adapter (module `io_adapter`):
-- `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `ProviderInteractionHandler`.
+- `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler`.
 - `HarnessIOAdapter::{new, harness, state, session_id, pending_interrupt_ids, has_pending_interrupt, is_pending_interrupt_resume_valid, prepare_context, start, stop, outputs, delivery_mode, send, abort, pause, resume}` and `impl HarnessInteractionHandler` (`handle`, `cancel`).
 - Chunk kinds: `llm_output`, `llm_reasoning`, `tool_call`, `tool_result`, `__interaction__`, `turn_lifecycle`, `task_failed` — projected as `openjiuwen_agent::AgentChunk`.
 
@@ -86,6 +86,9 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - Unknown provider errors use `Error::NotFound`; deferred-but-known providers and missing features use `Error::Unsupported` (distinct from Python's single `ValueError`, documented).
 - The registry is global (like Python's module dict) to keep CLI/agent-teams call sites identical; tests use unique provider names instead of a reset hook.
 - `HarnessIOAdapter::outputs` is single-consumer and returns `HarnessError::State` on a second call — the Rust equivalent of Python's one async generator fed by the pump task.
+- The event pump is exactly one `tokio::spawn` task holding a `Weak<HarnessIOAdapter>` (no reference cycle with the stored join handle); it ends on `None`, on a cursor error (logged with `tracing::warn!`), or when `stop` aborts it, and always closes the cursor. Chunk indexes are allocated lazily so events that project to nothing consume no index.
+- `start` applies `prepare_context` itself (Python parity) and installs the adapter as `context.interactions` only when the host supplied none; `stop` aborts the pump, cancels every pending interaction, then stops the harness and is terminal for that adapter instance.
+- `send` resolves pending interactions from `interrupt_answers` first and then `user_inputs`, keyed by request id; an interactive-shaped payload matching no pending id is forwarded with `metadata["kind"] = "interactive_input"`. Python's extra "sole pending request answered from `raw_inputs`" rule is not ported: `raw_inputs` only marks the payload as interactive-shaped.
 - Approval answers are ported as data: `"yes"`/`"always"`/`"no"` words, `{"action": …}`, `{"approved": …, "feedback": …}`, `{"updated_arguments": …}` and `{"remember": true}`; every unrecognized shape becomes `Deny`.
 - `build_harness_context` **drops** `options.mcp_servers` for the `native` provider and never injects `HostCapability::McpServers` there (the native harness owns its tools, Python raises); every other provider gets the servers copied plus the capability when the list is non-empty, and a checkpoint sink always injects `HostCapability::CheckpointSink`.
 - Declared provider descriptors are static metadata: vendor names stay `implemented: false` even with the `vendor` feature, and feature flags never rewrite an entry (`resolve_provider` reports the missing feature instead).
