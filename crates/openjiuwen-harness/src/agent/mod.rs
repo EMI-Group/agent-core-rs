@@ -57,7 +57,7 @@ use std::time::Duration;
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput, ReActAgent};
+use openjiuwen_agent::{resolve_session, Agent, AgentCard, AgentChunk, AgentOutput, ReActAgent};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::tool::{Tool, ToolCard};
@@ -102,9 +102,6 @@ const TERMINATED_MESSAGE: &str = "interaction_terminated";
 
 /// Error message of `send_input` without usable user text.
 const SEND_INPUT_QUERY_MESSAGE: &str = "send_input requires a non-empty 'query'";
-
-/// Error message of task-loop mode without a session.
-const TASK_LOOP_SESSION_MESSAGE: &str = "session is required for task-loop mode.";
 
 /// Upper bound of the configured completion timeout, guarding `Duration` conversion.
 const MAX_COMPLETION_TIMEOUT_SECS: f64 = 1_000_000.0;
@@ -676,14 +673,37 @@ impl Driver {
     ) -> Result<AgentOutput> {
         self.ensure_wired().await?;
         let normalized = normalize_inputs(&inputs)?;
-        if let Some(session) = &session {
-            *self.last_session.lock() = Some(session.clone());
-        }
+        let conversation_id = normalized.get("conversation_id").and_then(Value::as_str);
+        let parent_session_id = normalized.get("parent_session_id").and_then(Value::as_str);
+        let run = resolve_session(
+            session,
+            &self.card.id,
+            Some(&self.card.name),
+            conversation_id,
+            parent_session_id,
+        )
+        .await?;
+        let session = run.session().clone();
+        let result = self.run_resolved(&normalized, &session, stream_tx).await;
+        run.finish().await;
+        result
+    }
+
+    /// Runs an invocation on the resolved session: reset, execute, persist.
+    ///
+    /// # Errors
+    ///
+    /// Propagates session-read and round-execution errors; a persistence
+    /// failure is logged, never propagated.
+    async fn run_resolved(
+        &self,
+        normalized: &Value,
+        session: &Arc<dyn Session>,
+        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+    ) -> Result<AgentOutput> {
+        *self.last_session.lock() = Some(session.clone());
         self.state.reset();
-        let loaded = match &session {
-            Some(session) => state_store::load_state(session.as_ref()).await?,
-            None => DeepAgentState::default(),
-        };
+        let loaded = state_store::load_state(session.as_ref()).await?;
         *self.last_state.lock() = loaded.clone();
 
         let config = self.config.read().clone();
@@ -691,20 +711,18 @@ impl Driver {
         let task_loop =
             config.enable_task_loop && config.max_iterations_hard_limit.is_none() && !interactive;
         let output = if task_loop {
-            self.run_task_loop(&normalized, session.clone(), loaded, stream_tx)
+            self.run_task_loop(normalized, session.clone(), loaded, stream_tx)
                 .await?
         } else {
-            self.round_handle(session.clone(), stream_tx)
-                .execute(&normalized)
+            self.round_handle(Some(session.clone()), stream_tx)
+                .execute(normalized)
                 .await?
         };
 
-        if let Some(session) = &session {
-            if let Err(error) = self.persist_state(session).await {
-                // Deviation from Python (which propagates): an answer must not
-                // be lost to a persistence hiccup.
-                tracing::warn!(error = %error, "failed to persist the DeepAgent state");
-            }
+        if let Err(error) = self.persist_state(session).await {
+            // Deviation from Python (which propagates): an answer must not be
+            // lost to a persistence hiccup.
+            tracing::warn!(error = %error, "failed to persist the DeepAgent state");
         }
         Ok(output)
     }
@@ -713,13 +731,10 @@ impl Driver {
     async fn run_task_loop(
         &self,
         normalized: &Value,
-        session: Option<Arc<dyn Session>>,
+        session: Arc<dyn Session>,
         loaded: DeepAgentState,
         stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
     ) -> Result<AgentOutput> {
-        let Some(session) = session else {
-            return Err(Error::validation(TASK_LOOP_SESSION_MESSAGE));
-        };
         let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel::<DeepAgentState>();
         let sink: StateSink = Arc::new(move |state: &DeepAgentState| {
             state_tx
@@ -739,7 +754,7 @@ impl Driver {
 
         let existing = self.controller.lock().take();
         let mut controller = match existing {
-            Some(mut controller) if controller.phase() != InteractionPhase::Terminated => {
+            Some(mut controller) if reusable(&controller) => {
                 controller.set_state(loaded);
                 controller.set_state_sink(sink);
                 controller
@@ -832,6 +847,17 @@ impl Driver {
         *self.last_state.lock() = state.clone();
         state_store::save_state(session.as_ref(), &state).await
     }
+}
+
+/// Whether a stored controller can serve another invocation.
+///
+/// Aborted, cancelled and terminated controllers carry latched state (the
+/// coordinator's abort flag, the cancel token, the terminated phase) that would
+/// poison the next round, so only a clean controller is reused.
+fn reusable(controller: &TaskLoopController) -> bool {
+    !controller.is_aborted()
+        && !controller.is_cancelled()
+        && controller.phase() != InteractionPhase::Terminated
 }
 
 /// Maps a configured completion timeout onto a valid [`Duration`].

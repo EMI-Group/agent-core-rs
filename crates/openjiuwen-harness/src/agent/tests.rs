@@ -689,3 +689,50 @@ async fn factory_wires_subagents_permissions_and_a_temp_workspace() {
     assert_eq!(output.output, "factory answer");
     assert_eq!(echo.calls(), 0, "the denied tool must never run");
 }
+
+/// Guards the stale abort latch: an idle abort leaves the stored controller
+/// aborted, so the next task-loop invocation must not reuse it.
+#[tokio::test]
+async fn abort_while_idle_does_not_poison_the_next_task_loop_invocation() {
+    let model = ScriptedModel::new([
+        ScriptedTurn::text("first answer"),
+        ScriptedTurn::text("second answer"),
+    ]);
+    let agent = build_task_loop_agent(model.clone());
+
+    let first_session = Arc::new(AgentSession::new("abort-reuse-session"));
+    let first = agent
+        .invoke(json!({"query": "start"}), Some(first_session))
+        .await
+        .expect("the first task-loop invocation succeeds");
+    assert_eq!(first.result_type, ResultType::Answer);
+    assert_eq!(first.output, "first answer");
+
+    agent.abort();
+
+    let second_session = Arc::new(AgentSession::new("abort-reuse-session-2"));
+    let second = agent
+        .invoke(json!({"query": "again"}), Some(second_session))
+        .await
+        .expect("the second task-loop invocation succeeds");
+    assert_eq!(second.result_type, ResultType::Answer);
+    assert_eq!(second.output, "second answer");
+    assert_ne!(agent.phase(), InteractionPhase::Terminated);
+}
+
+/// A `None` session is resolved by the agent, mirroring Python's
+/// `owns_session`: the run creates and finishes its own session.
+#[tokio::test]
+async fn a_task_loop_invocation_without_a_session_creates_one() {
+    let model = ScriptedModel::text("sessionless answer");
+    let agent = build_task_loop_agent(model.clone());
+
+    let output = agent
+        .invoke(json!("hi"), None)
+        .await
+        .expect("a sessionless task-loop invocation succeeds");
+    assert_eq!(output.result_type, ResultType::Answer);
+    assert_eq!(output.output, "sessionless answer");
+    assert_eq!(model.call_count(), 1);
+    assert_ne!(agent.phase(), InteractionPhase::Terminated);
+}
