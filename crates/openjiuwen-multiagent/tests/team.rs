@@ -166,6 +166,23 @@ async fn remove_agent_by_id_and_name() {
 }
 
 #[tokio::test]
+async fn remove_member_alias_drops_the_member() {
+    let team = BaseTeam::new(TeamCard::new("team"), TeamConfig::new());
+    team.add_agent(agent_card("alpha"), echoing_provider("alpha"))
+        .unwrap();
+    team.add_agent(agent_card("beta"), echoing_provider("beta"))
+        .unwrap();
+    assert_eq!(team.agent_count(), 2);
+    team.remove_member("alpha").unwrap();
+    assert_eq!(team.agent_count(), 1);
+    assert!(team.get_agent_card("alpha").is_none());
+    assert_eq!(team.list_agents(), vec!["beta".to_string()]);
+    // Unknown members are a no-op.
+    team.remove_member("alpha").unwrap();
+    assert_eq!(team.agent_count(), 1);
+}
+
+#[tokio::test]
 async fn send_and_publish_validate_membership() {
     let team = echo_team("team");
     team.add_agent(agent_card("a"), echoing_provider("a"))

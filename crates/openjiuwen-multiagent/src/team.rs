@@ -90,6 +90,17 @@ pub trait Team: Send + Sync {
     /// Propagates whatever [`TeamStrategy::on_member_removed`] reports.
     fn remove_agent(&self, agent: &str) -> Result<()>;
 
+    /// Alias of [`Team::remove_agent`].
+    ///
+    /// Accepts an agent id or a card id; an unknown member is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`TeamStrategy::on_member_removed`] reports.
+    fn remove_member(&self, agent: &str) -> Result<()> {
+        self.remove_agent(agent)
+    }
+
     /// Returns the registered card of `agent_id`, when it is a member.
     fn get_agent_card(&self, agent_id: &str) -> Option<AgentCard>;
 

@@ -183,6 +183,7 @@ pub trait Team: Send + Sync {
     fn add_agent(&self, card: AgentCard, provider: AgentProvider) -> Result<()>;          // duplicate: warning + Ok(())
     fn add_member(&self, card: AgentCard, provider: AgentProvider, options: MemberOptions) -> Result<()>;
     fn remove_agent(&self, agent: &str) -> Result<()>;          // id or card id; unknown is a no-op
+    fn remove_member(&self, agent: &str) -> Result<()>;         // alias of remove_agent (id or card id; unknown is a no-op)
     fn get_agent_card(&self, agent_id: &str) -> Option<AgentCard>;
     fn agent_count(&self) -> usize;
     fn list_agents(&self) -> Vec<String>;
@@ -363,7 +364,7 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/team_card.rs` pins the wire contract: JSON field names, `version: "1.0.0"`, `agent_cards`, `subscriptions`, `TeamConfig` defaults 10/100/30.0.
 - `tests/message_bus.rs` drives the bus directly with a recording handler: P2P ordering per sender, concurrent fan-out to sorted subscribers, missing-subscriber publish no-op, timeout error text, session cleanup, graceful shutdown.
 - `tests/runtime.rs` covers registration, provider binding, P2P session construction from a bound team session, empty-response error, and P2P timeout override.
-- `tests/team.rs` covers `add_agent`/`add_member`/`remove_agent`, duplicate no-op, `max_agents`, queries, send/publish validation, start/stop idempotence, a custom strategy, and the unsupported-strategy error.
+- `tests/team.rs` covers `add_agent`/`add_member`/`remove_agent`/`remove_member`, duplicate no-op, `max_agents`, queries, send/publish validation, start/stop idempotence, a custom strategy, and the unsupported-strategy error.
 - `tests/handoff.rs` covers the full chain with scripted member agents: direct handoff, routed handoff, blocked hop completes, max-handoffs, timeout, interrupt forwarding, history resume, and streaming frames.
 - `tests/hierarchical.rs` covers supervisor-over-bus single hop + single stream frame, sub-agent tool cards and ordered parallel dispatch with the limiter, agents-as-tools wiring (`ToolHost` mount + pinned instance), and the error chunk.
 - `tests/streaming.rs` covers `team_stream` frame order, caller-owned vs standalone teardown, and producer-error-after-drain.
