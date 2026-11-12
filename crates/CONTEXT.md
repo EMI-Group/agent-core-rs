@@ -147,6 +147,9 @@ Note: `openjiuwen-harness` and `openjiuwen-harness-providers` are non-optional u
 - Network/vendor tests are opt-in behind the `live-tests` feature and `OPENJIUWEN_LIVE`.
 - `cargo test --workspace` must pass offline; each crate additionally documents its own definition of done (`cargo fmt`, `cargo clippy -- -D warnings`).
 - Deferred areas are proven, not just documented: dedicated suites assert `Error::Unsupported` and its message (for example `openjiuwen-dev-tools/tests/deferred_surface.rs`, `openjiuwen-symphony/tests/deferred.rs`, agent-evolving RL stubs, `openjiuwen-sysop/tests/sandbox_stub.rs`).
+- `cargo doc --workspace --no-deps` (and `--all-features`) must stay warning-free; link private or feature-gated items as plain code spans instead of widening visibility, and never add crate-level `rustdoc::` allows.
+- Module-level (`//!`) docs resolve intra-doc links in the parent module's scope, so links there usually need an explicit `crate::…` path.
+- `crates/openjiuwen-cli`'s `[[bin]] name = "openjiuwen"` sets `doc = false`: its rustdoc output name would otherwise collide with the `openjiuwen` umbrella crate's `target/doc/openjiuwen/`.
 
 ## Routing Table
 
