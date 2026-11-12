@@ -4,10 +4,9 @@
 //! surface, so it doubles as a guard on the exported client shape. The peer is a
 //! `wiremock` server and each case is asserted from both ends: the folded
 //! `transform::AgentResult` the caller receives and the JSON-RPC envelope the
-//! peer actually received.
-//!
-//! Python counterparts: `tests/unit_tests/extensions/a2a/test_a2a_client.py`
-//! and `tests/unit_tests/extensions/a2a/test_a2a_transformer.py`.
+//! peer actually received. Python counterparts:
+//! `tests/unit_tests/extensions/a2a/test_a2a_client.py` and
+//! `tests/unit_tests/extensions/a2a/test_a2a_transformer.py`.
 #![cfg(feature = "a2a")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
