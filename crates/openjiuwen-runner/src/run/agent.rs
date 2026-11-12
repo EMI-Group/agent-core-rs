@@ -1,0 +1,578 @@
+//! Agent execution: [`invoke_agent`] and [`stream_agent`].
+//!
+//! Ports `Runner._prepare_agent`, `Runner._create_agent_session`,
+//! `Runner.run_agent`, and `Runner.run_agent_streaming`.
+//!
+//! The runner owns a session only when the caller did not provide one: an owned
+//! [`AgentSession`] is created with the resolved session id and committed by
+//! [`AgentSession::post_run`] after the run (on completion or on drop), while a
+//! caller-provided session is used as-is and never committed, closed, or ended.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use futures::stream::{BoxStream, StreamExt};
+use openjiuwen_agent::{AgentCard, AgentChunk, AgentOutput};
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_session::{AgentSession, AgentSessionOptions, Session};
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::{
+    effective_deadline, next_stream_step, record_stream_outcome, resolve_agent, resolve_session_id,
+    run_with_limits, trace_failure, trace_finish, trace_start, AgentRef, RunOptions, RunServices,
+    RunSpan, StreamStep, Teardown, LOG_TARGET,
+};
+use crate::callback::{CallbackContext, CallbackEvent};
+
+/// Runs one agent invocation to completion.
+///
+/// The reference is resolved first: an unregistered id is
+/// [`openjiuwen_common::error::Error::NotFound`] before any session is created
+/// or callback fires. Then `AgentInvokeInput` is fired, the session is resolved
+/// (caller-owned, or a fresh [`AgentSession`] announced with
+/// `AgentSessionCreated`), the invocation runs under the run deadline and
+/// cancellation token, `AgentInvokeOutput` is fired, and an owned session is
+/// committed by `post_run`.
+///
+/// A caller-provided session is never committed, closed, or ended by the
+/// runner; an owned session's teardown failure is logged and never replaces a
+/// successful output.
+///
+/// # Errors
+///
+/// `NotFound` for a missing id, the abort error of an `Abort` verdict on
+/// `AgentInvokeInput`/`AgentInvokeOutput`, `Cancelled` when the cancellation
+/// token fires, [`crate::error::run_timeout`] when the deadline expires, and
+/// whatever the agent itself reports.
+#[allow(clippy::needless_pass_by_value)]
+pub async fn invoke_agent(
+    services: RunServices,
+    agent: AgentRef,
+    inputs: Value,
+    options: RunOptions,
+) -> Result<AgentOutput> {
+    let run_id = Uuid::new_v4().to_string();
+    let started = Instant::now();
+
+    let agent = resolve_agent(&services, &agent)?;
+    let card = agent.card().clone();
+
+    let mut context = CallbackContext::new(CallbackEvent::AgentInvokeInput)
+        .with_component(card.id.clone())
+        .with_input(inputs.clone());
+    if let Some(session) = &options.session {
+        context = context.with_session(Arc::clone(session));
+    }
+    services
+        .callbacks
+        .trigger(CallbackEvent::AgentInvokeInput, &context)
+        .await?;
+
+    let (session, owned) = prepare_session(&services, &card, &options, &inputs).await?;
+    trace_start("agent", &run_id, &card.id, session.id());
+    let span = RunSpan::start(session.tracer(), "run_agent", inputs.clone());
+
+    let deadline = effective_deadline(&services, &options);
+    let result = run_with_limits(
+        "run_agent",
+        agent.invoke(inputs, Some(Arc::clone(&session))),
+        &options.cancellation,
+        deadline,
+    )
+    .await;
+
+    let teardown = agent_teardown(owned);
+    match result {
+        Ok(output) => {
+            let value = output.to_value();
+            span.finish(value.clone());
+            let context = CallbackContext::new(CallbackEvent::AgentInvokeOutput)
+                .with_component(card.id.clone())
+                .with_output(value)
+                .with_session(Arc::clone(&session));
+            let callback = services
+                .callbacks
+                .trigger(CallbackEvent::AgentInvokeOutput, &context)
+                .await;
+            teardown.finish().await;
+            trace_finish("agent", &run_id, &card.id, session.id(), started.elapsed());
+            callback?;
+            Ok(output)
+        }
+        Err(error) => {
+            span.fail(&error);
+            teardown.finish().await;
+            trace_failure(
+                "agent",
+                &run_id,
+                &card.id,
+                session.id(),
+                started.elapsed(),
+                &error,
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Runs one agent invocation as a stream of [`AgentChunk`] frames.
+///
+/// The stream is returned immediately, so a resolution or session-setup failure
+/// (a missing id, an aborting `AgentSessionCreated`/`AgentStreamInput` handler)
+/// is delivered as a one-element stream yielding that error. On success the
+/// stream fires `AgentStreamInput` first, fires `AgentStreamOutput` for every
+/// frame with a 0-based `index`, and enforces `options.cancellation` between
+/// frames plus the deadline as a **total** budget.
+///
+/// Termination yields exactly one terminal error ({cancelled}, {timeout}, or
+/// the inner stream's own failure) and then ends; an owned session is committed
+/// after the last frame and also when the consumer drops the stream early.
+#[allow(clippy::needless_pass_by_value)]
+pub fn stream_agent(
+    services: RunServices,
+    agent: AgentRef,
+    inputs: Value,
+    options: RunOptions,
+) -> BoxStream<'static, Result<AgentChunk>> {
+    let run_id = Uuid::new_v4().to_string();
+    async_stream::stream! {
+        let started = Instant::now();
+        let agent = match resolve_agent(&services, &agent) {
+            Ok(agent) => agent,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
+        let card = agent.card().clone();
+        let (session, owned) = match prepare_session(&services, &card, &options, &inputs).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
+
+        let teardown = agent_teardown(owned);
+        let context = CallbackContext::new(CallbackEvent::AgentStreamInput)
+            .with_component(card.id.clone())
+            .with_input(inputs.clone())
+            .with_session(Arc::clone(&session));
+        if let Err(error) = services
+            .callbacks
+            .trigger(CallbackEvent::AgentStreamInput, &context)
+            .await
+        {
+            teardown.finish().await;
+            yield Err(error);
+            return;
+        }
+
+        trace_start("agent", &run_id, &card.id, session.id());
+        let span = RunSpan::start(session.tracer(), "run_agent_stream", inputs.clone());
+        let deadline = effective_deadline(&services, &options);
+        let deadline_at = deadline.map(|limit| (tokio::time::Instant::now() + limit, limit));
+        let mut inner = agent.stream(inputs, Some(Arc::clone(&session)));
+        let mut index: i64 = 0;
+        let mut failure: Option<Error> = None;
+
+        loop {
+            if options.cancellation.is_cancelled() {
+                failure = Some(Error::cancelled());
+                break;
+            }
+            match next_stream_step(&mut inner, &options.cancellation, deadline_at).await {
+                StreamStep::Cancelled => {
+                    failure = Some(Error::cancelled());
+                    break;
+                }
+                StreamStep::TimedOut => {
+                    if let Some((_, limit)) = deadline_at {
+                        failure = Some(crate::error::run_timeout("run_agent", limit));
+                    }
+                    break;
+                }
+                StreamStep::Frame(Some(Ok(chunk))) => {
+                    let context = CallbackContext::new(CallbackEvent::AgentStreamOutput)
+                        .with_component(card.id.clone())
+                        .with_index(index)
+                        .with_output(chunk.to_value())
+                        .with_session(Arc::clone(&session));
+                    if let Err(error) = services
+                        .callbacks
+                        .trigger(CallbackEvent::AgentStreamOutput, &context)
+                        .await
+                    {
+                        failure = Some(error);
+                        break;
+                    }
+                    index += 1;
+                    yield Ok(chunk);
+                }
+                StreamStep::Frame(Some(Err(error))) => {
+                    failure = Some(error);
+                    break;
+                }
+                StreamStep::Frame(None) => break,
+            }
+        }
+
+        record_stream_outcome(
+            &span,
+            "agent",
+            &run_id,
+            &card.id,
+            session.id(),
+            started,
+            failure.as_ref(),
+        );
+        teardown.finish().await;
+        if let Some(error) = failure {
+            yield Err(error);
+        }
+    }
+    .boxed()
+}
+
+/// Resolves the run's session: the caller's, or a fresh owned [`AgentSession`].
+///
+/// Creating a session fires `AgentSessionCreated`; a handler that aborts turns
+/// the creation into an error.
+async fn prepare_session(
+    services: &RunServices,
+    card: &AgentCard,
+    options: &RunOptions,
+    inputs: &Value,
+) -> Result<(Arc<dyn Session>, Option<Arc<AgentSession>>)> {
+    if let Some(session) = &options.session {
+        return Ok((Arc::clone(session), None));
+    }
+    let owned = Arc::new(AgentSession::with_options(AgentSessionOptions {
+        session_id: Some(resolve_session_id(inputs, options, &services.config)),
+        agent_id: Some(card.id.clone()),
+        agent_name: Some(card.name.clone()).filter(|name| !name.is_empty()),
+        envs: options.envs.clone(),
+        metadata: options.metadata.clone(),
+        checkpointer: options
+            .checkpointer
+            .clone()
+            .or_else(|| services.checkpointer.clone()),
+        ..AgentSessionOptions::default()
+    }));
+    let session: Arc<dyn Session> = Arc::clone(&owned) as Arc<dyn Session>;
+    let created = services
+        .callbacks
+        .trigger(
+            CallbackEvent::AgentSessionCreated,
+            &CallbackContext::new(CallbackEvent::AgentSessionCreated)
+                .with_component(card.id.clone())
+                .with_session(Arc::clone(&session)),
+        )
+        .await;
+    if let Err(error) = created {
+        if let Err(teardown_error) = owned.post_run().await {
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = %teardown_error,
+                "agent session teardown after an aborted setup failed"
+            );
+        }
+        return Err(error);
+    }
+    Ok((session, Some(owned)))
+}
+
+/// Builds the teardown of an owned agent session (`post_run`, or nothing).
+fn agent_teardown(session: Option<Arc<AgentSession>>) -> Teardown {
+    match session {
+        None => Teardown::none(),
+        Some(session) => Teardown::new(async move {
+            if let Err(error) = session.post_run().await {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "agent session post_run failed"
+                );
+            }
+        }),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use openjiuwen_agent::{Agent, AgentCard};
+    use openjiuwen_session::MemoryCheckpointer;
+    use serde_json::json;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::callback::{CallbackFramework, CallbackVerdict};
+    use crate::config::RunnerConfig;
+    use crate::resources::ResourceMgr;
+
+    /// An agent whose invoke/stream behaviour the tests script.
+    struct FakeAgent {
+        card: AgentCard,
+        delay: Option<Duration>,
+        chunks: Vec<AgentChunk>,
+    }
+
+    impl FakeAgent {
+        fn new(name: &str) -> Self {
+            let mut card = AgentCard::new(name);
+            card.id = name.to_owned();
+            Self {
+                card,
+                delay: None,
+                chunks: vec![
+                    AgentChunk {
+                        kind: "llm_output".to_owned(),
+                        index: 0,
+                        payload: json!("one"),
+                    },
+                    AgentChunk {
+                        kind: "answer".to_owned(),
+                        index: 1,
+                        payload: json!("two"),
+                    },
+                ],
+            }
+        }
+
+        fn slowed(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for FakeAgent {
+        fn card(&self) -> &AgentCard {
+            &self.card
+        }
+
+        async fn invoke(
+            &self,
+            inputs: Value,
+            _session: Option<Arc<dyn Session>>,
+        ) -> Result<AgentOutput> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(AgentOutput {
+                output: format!("ok:{}", inputs["query"].as_str().unwrap_or_default()),
+                ..AgentOutput::default()
+            })
+        }
+
+        fn stream(
+            &self,
+            _inputs: Value,
+            _session: Option<Arc<dyn Session>>,
+        ) -> BoxStream<'static, Result<AgentChunk>> {
+            let chunks = self.chunks.clone();
+            Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+        }
+    }
+
+    /// A services bundle with a recording handler for every agent event.
+    fn services(events: &Arc<Mutex<Vec<CallbackEvent>>>) -> RunServices {
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default().with_default_session_id("runner-default"),
+            None,
+        );
+        for event in [
+            CallbackEvent::AgentInvokeInput,
+            CallbackEvent::AgentInvokeOutput,
+            CallbackEvent::AgentStreamInput,
+            CallbackEvent::AgentStreamOutput,
+            CallbackEvent::AgentSessionCreated,
+        ] {
+            let events = Arc::clone(events);
+            services
+                .callbacks
+                .register_sync(event, 0, move |ctx: &CallbackContext| {
+                    events.lock().unwrap().push(ctx.event.clone());
+                    Ok(CallbackVerdict::Continue)
+                });
+        }
+        services
+    }
+
+    fn fake(name: &str) -> AgentRef {
+        AgentRef::of(Arc::new(FakeAgent::new(name)))
+    }
+
+    // ports tests/unit_tests/core/runner/test_runner.py (run_agent callback order)
+    #[tokio::test]
+    async fn invoke_fires_input_then_output_and_returns_the_answer() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let output = invoke_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi", "conversation_id": "conv-9"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.output, "ok:hi");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                CallbackEvent::AgentInvokeInput,
+                CallbackEvent::AgentSessionCreated,
+                CallbackEvent::AgentInvokeOutput,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_uses_the_conversation_id_for_the_owned_session() {
+        let session_id = Arc::new(Mutex::new(None));
+        let services = RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default().with_default_session_id("runner-default"),
+            Some(Arc::new(MemoryCheckpointer::new())),
+        );
+        let observed = Arc::clone(&session_id);
+        services.callbacks.register_sync(
+            CallbackEvent::AgentSessionCreated,
+            0,
+            move |ctx: &CallbackContext| {
+                *observed.lock().unwrap() = ctx.session_id().map(ToOwned::to_owned);
+                Ok(CallbackVerdict::Continue)
+            },
+        );
+        invoke_agent(
+            services.clone(),
+            fake("fake"),
+            json!({"query": "hi", "conversation_id": "conv-9"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session_id.lock().unwrap().as_deref(), Some("conv-9"));
+        // Without a conversation id the runner's default applies.
+        invoke_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session_id.lock().unwrap().as_deref(),
+            Some("runner-default")
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_reports_an_unregistered_id_before_any_callback() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let error = invoke_agent(
+            services,
+            AgentRef::id("missing"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "not_found: agent 'missing' is not registered"
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_reports_cancellation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = invoke_agent(
+            services,
+            AgentRef::of(Arc::new(
+                FakeAgent::new("slow").slowed(Duration::from_secs(60)),
+            )),
+            json!({"query": "hi"}),
+            RunOptions::default().with_cancellation(token),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_cancelled());
+        assert_eq!(error.to_string(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_run_past_its_deadline_reports_a_timeout() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let error = invoke_agent(
+            services,
+            AgentRef::of(Arc::new(
+                FakeAgent::new("slow").slowed(Duration::from_secs(60)),
+            )),
+            json!({"query": "hi"}),
+            RunOptions::default().with_timeout(Duration::from_millis(5)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "timeout: run_agent timed out after 5ms");
+    }
+
+    #[tokio::test]
+    async fn streaming_fires_one_output_event_per_frame() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(Result::is_ok));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                CallbackEvent::AgentSessionCreated,
+                CallbackEvent::AgentStreamInput,
+                CallbackEvent::AgentStreamOutput,
+                CallbackEvent::AgentStreamOutput,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_reports_a_missing_id_as_its_only_item() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let services = services(&events);
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            AgentRef::id("missing"),
+            json!({}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].as_ref().unwrap_err().to_string(),
+            "not_found: agent 'missing' is not registered"
+        );
+    }
+}

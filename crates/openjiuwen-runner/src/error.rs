@@ -81,21 +81,30 @@ mod tests {
     fn not_found_names_the_resource() {
         let error = not_found("agent", "assistant");
         assert_eq!(error.kind(), ErrorKind::NotFound);
-        assert_eq!(error.to_string(), "not_found: agent 'assistant' is not registered");
+        assert_eq!(
+            error.to_string(),
+            "not_found: agent 'assistant' is not registered"
+        );
     }
 
     #[test]
     fn duplicate_is_a_validation_error() {
         let error = already_registered("workflow", "wf");
         assert_eq!(error.kind(), ErrorKind::Validation);
-        assert_eq!(error.to_string(), "validation: workflow 'wf' is already registered");
+        assert_eq!(
+            error.to_string(),
+            "validation: workflow 'wf' is already registered"
+        );
     }
 
     #[test]
     fn timeout_messages_report_milliseconds() {
         let error = run_timeout("run_agent", Duration::from_millis(1500));
         assert_eq!(error.kind(), ErrorKind::Timeout);
-        assert_eq!(error.to_string(), "timeout: run_agent timed out after 1500ms");
+        assert_eq!(
+            error.to_string(),
+            "timeout: run_agent timed out after 1500ms"
+        );
 
         let error = request_timeout("inbox", Duration::from_millis(50));
         assert_eq!(

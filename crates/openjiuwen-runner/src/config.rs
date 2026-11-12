@@ -261,7 +261,9 @@ impl RunnerConfig {
     /// (convenience for hosts that log their storage root).
     #[must_use]
     pub fn checkpointer_path(&self) -> Option<&PathBuf> {
-        self.checkpointer.as_ref().and_then(|config| config.path.as_ref())
+        self.checkpointer
+            .as_ref()
+            .and_then(|config| config.path.as_ref())
     }
 }
 
