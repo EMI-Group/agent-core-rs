@@ -160,3 +160,5 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `SkillCli::run` writes both stdout and failures to one writer; `run_skill_cli` gives the process stdout/stderr separately.
 - `StoreTeamClient` deliberately bypasses the task board for `update_task` (there is no board edit operation): it applies a `TaskPatch` through `TaskBoard::store()` after refusing non-`pending`/`blocked` rows.
 - Member-scope `claim_task` claims for the descriptor's `member_name`; the one-active-task check of the native tool is a runtime policy and is not duplicated here.
+- `store_client.rs` is legitimately long (~1200 lines, half of it its inline test suite): the `TeamClient` impl is one contract whose operations are each a store/board call plus the event it publishes, so splitting it would scatter that contract. The top-of-file note records the reason.
+- The live-team resolver (`cli::live_client`) is the single wiring point for the runtime registry; when `crate::runtime::global_registry()` lands, return `Some(Arc::new(StoreTeamClient::new(descriptor.clone(), backend.store(), backend.tasks(), backend.messager())))` from it.
