@@ -72,10 +72,9 @@ impl EventManager {
             if incoming_is_least_urgent {
                 return Some(event);
             }
-            return queue.pop().map(|dropped| {
-                insert_sorted(&mut queue, event);
-                dropped
-            });
+            let dropped = queue.pop();
+            insert_sorted(&mut queue, event);
+            return dropped;
         }
         insert_sorted(&mut queue, event);
         None
@@ -213,10 +212,10 @@ mod tests {
     #[test]
     fn pops_in_priority_then_sequence_order() {
         let manager = EventManager::new(0);
-        manager.publish_event(DeepLoopEventType::Followup, "f1", None, None, None);
-        manager.publish_event(DeepLoopEventType::Steer, "s1", None, None, None);
-        manager.publish_event(DeepLoopEventType::Abort, "a1", None, None, None);
-        manager.publish_event(DeepLoopEventType::Followup, "f2", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "f1", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Steer, "s1", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Abort, "a1", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "f2", None, None, None);
 
         assert_eq!(manager.len(), 4);
         assert_eq!(
@@ -236,9 +235,9 @@ mod tests {
     #[test]
     fn custom_priorities_override_type_defaults() {
         let manager = EventManager::new(0);
-        manager.publish_event(DeepLoopEventType::Followup, "low", None, None, Some(20));
-        manager.publish_event(DeepLoopEventType::Followup, "high", None, None, Some(-5));
-        manager.publish_event(DeepLoopEventType::Abort, "mid", None, None, Some(5));
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "low", None, None, Some(20));
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "high", None, None, Some(-5));
+        let _ = manager.publish_event(DeepLoopEventType::Abort, "mid", None, None, Some(5));
         let events = manager.drain();
         assert_eq!(priorities(&events), vec![-5, 5, 20]);
     }
@@ -257,8 +256,8 @@ mod tests {
     #[test]
     fn bounded_queue_evicts_least_urgent_event() {
         let manager = EventManager::new(2);
-        manager.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
-        manager.publish_event(DeepLoopEventType::Followup, "f", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "f", None, None, None);
         assert_eq!(manager.len(), 2);
 
         let rejected = manager.publish_event(DeepLoopEventType::Steer, "s", None, None, None);
@@ -273,7 +272,7 @@ mod tests {
     #[test]
     fn bounded_queue_rejects_least_urgent_incoming_event() {
         let manager = EventManager::new(1);
-        manager.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
         let rejected = manager.publish_event(DeepLoopEventType::Followup, "f", None, None, None);
         let rejected = rejected.expect("the incoming follow-up is least urgent");
         let value = serde_json::to_value(&rejected).expect("event");
@@ -285,10 +284,10 @@ mod tests {
     #[test]
     fn same_priority_keeps_oldest_event() {
         let manager = EventManager::new(1);
-        manager.publish_event(DeepLoopEventType::Steer, "first", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Steer, "first", None, None, None);
         let rejected = manager.publish_event(DeepLoopEventType::Steer, "second", None, None, None);
         let value =
-            serde_json::to_value(&rejected.expect("latest steer is rejected")).expect("event");
+            serde_json::to_value(rejected.expect("latest steer is rejected")).expect("event");
         assert_eq!(value["content"], json!("second"));
         assert_eq!(contents(&manager), vec!["first"]);
     }
@@ -296,15 +295,15 @@ mod tests {
     #[test]
     fn clear_and_drain_reset_the_queue_but_not_the_counter() {
         let manager = EventManager::new(0);
-        manager.publish_event(DeepLoopEventType::Followup, "a", None, None, None);
-        manager.publish_event(DeepLoopEventType::Followup, "b", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "a", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "b", None, None, None);
         manager.clear();
         assert!(manager.is_empty());
         assert_eq!(manager.next_seq(), 2);
 
-        manager.publish_event(DeepLoopEventType::Followup, "c", None, None, None);
+        let _ = manager.publish_event(DeepLoopEventType::Followup, "c", None, None, None);
         assert_eq!(manager.drain().len(), 1);
-        assert!(manager.drain().is_empty());
+        assert_eq!(manager.drain(), Vec::new());
     }
 
     #[test]
@@ -312,7 +311,7 @@ mod tests {
         let manager = EventManager::new(0);
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("origin".to_string(), json!("host"));
-        manager.publish_event(
+        let _ = manager.publish_event(
             DeepLoopEventType::Steer,
             "steer",
             Some("task-7".to_string()),
@@ -343,7 +342,7 @@ mod tests {
     fn clone_shares_queue_and_capacity() {
         let manager = EventManager::with_capacity(1);
         let clone = manager.clone();
-        clone.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
+        let _ = clone.publish_event(DeepLoopEventType::Abort, "a", None, None, None);
         assert_eq!(manager.len(), 1);
         assert_eq!(clone.capacity(), 1);
         let dropped = manager.publish_event(DeepLoopEventType::Steer, "s", None, None, None);

@@ -1,6 +1,6 @@
 //! Loop coordinator, queues, event manager, and the task-loop controller and handler.
 //!
-//! The outer task loop wraps single ReAct turns: it owns the round budget and
+//! The outer task loop wraps single `ReAct` turns: it owns the round budget and
 //! stop-condition chain ([`LoopCoordinator`]), the follow-up and steering queues
 //! ([`LoopQueues`]), the optional priority event queue ([`EventManager`]), the
 //! hook seam ([`TaskLoopEventHandler`]) and the driver that sequences them

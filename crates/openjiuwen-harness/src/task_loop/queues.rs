@@ -294,6 +294,6 @@ mod tests {
         );
         assert_eq!(queues.follow_up_len(), 2);
         queues.clear();
-        assert!(queues.follow_up_contents().is_empty());
+        assert_eq!(queues.follow_up_contents(), Vec::<String>::new());
     }
 }

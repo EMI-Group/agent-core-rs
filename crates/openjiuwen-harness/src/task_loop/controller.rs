@@ -399,7 +399,7 @@ impl TaskLoopController {
                 self.enqueue_next_work(next);
             }
             if outcome.is_error() {
-                report.stop_reason = outcome.error_code.clone();
+                report.stop_reason.clone_from(&outcome.error_code);
                 report.aborted = outcome.error_code.as_deref() == Some(ABORTED_CODE);
                 break;
             }
@@ -423,12 +423,11 @@ impl TaskLoopController {
             return self.last_outcome_snapshot().unwrap_or_else(no_active_round);
         }
         let notified = self.completion.notified();
-        let resolved = match timeout {
-            Some(duration) => tokio::time::timeout(duration, notified).await.is_ok(),
-            None => {
-                notified.await;
-                true
-            }
+        let resolved = if let Some(duration) = timeout {
+            tokio::time::timeout(duration, notified).await.is_ok()
+        } else {
+            notified.await;
+            true
         };
         if resolved {
             return self.last_outcome_snapshot().unwrap_or_else(no_active_round);
@@ -677,7 +676,7 @@ impl TaskLoopController {
             hook_error = self.dispatch_steering(round_id).await;
         }
         let mut outcome = if let Some(message) = hook_error {
-            self.handler_failure(message)
+            Self::handler_failure(message)
         } else if self.cancel.is_cancelled() || self.coordinator.is_aborted() {
             debug!(round_id, "task-loop round aborted before execution");
             RoundOutcome::abort()
@@ -687,7 +686,7 @@ impl TaskLoopController {
         if let Err(err) = self.run_terminal_hook(round_id, &active, &outcome).await {
             warn!(round_id, error = %err, "task-loop terminal hook failed");
             if !outcome.is_error() {
-                outcome = self.handler_failure(err.to_string());
+                outcome = Self::handler_failure(err.to_string());
             }
         }
         if let Err(err) = self.handler.after_round(round_id, &active, &outcome).await {
@@ -785,7 +784,7 @@ impl TaskLoopController {
     }
 
     /// Logs a hook failure and converts it into the `handler_error` outcome.
-    fn handler_failure(&self, message: String) -> RoundOutcome {
+    fn handler_failure(message: String) -> RoundOutcome {
         warn!(error = %message, "task-loop hook failed");
         RoundOutcome::failed(HANDLER_ERROR_CODE, message)
     }

@@ -72,7 +72,7 @@ impl fmt::Debug for LoopCoordinator {
             .field("elapsed_seconds", &self.elapsed_seconds)
             .field("last_result", &self.last_result)
             .field("stop_reason", &self.stop_reason)
-            .field("aborted", &self.is_aborted())
+            .field("abort", &self.is_aborted())
             .finish()
     }
 }
@@ -455,7 +455,8 @@ mod tests {
         coordinator.set_last_result(Some(short_answer()));
         coordinator.request_abort();
         let mut context = StopEvaluationContext::default();
-        assert!(coordinator.should_continue(&mut context).await);
+        // Abort wins at the top of `should_continue`, so the loop stops.
+        assert!(!coordinator.should_continue(&mut context).await);
 
         coordinator.reset();
         assert_eq!(coordinator.iteration(), 0);
@@ -516,11 +517,14 @@ mod tests {
         assert_eq!(restored.token_usage(), 42);
         assert_eq!(restored.state(), snapshot);
 
-        // The restored streak fires after two more short answers.
+        // `last_result` is not part of `StopConditionState`, so the caller
+        // re-supplies it before the refreshed context reaches the evaluators.
+        restored.set_last_result(Some(short_answer()));
+
+        // The restored streak (1) advances to 2 on the next short answer ...
         assert!(restored.should_continue(&mut context).await);
         restored.observe_round(2, 0, 0.0, Some(short_answer()));
-        assert!(restored.should_continue(&mut context).await);
-        restored.observe_round(3, 0, 0.0, Some(short_answer()));
+        // ... and to 3 on the following one, firing the guard.
         assert!(!restored.should_continue(&mut context).await);
         assert_eq!(restored.stop_reason(), Some("NoProgressAnswerEvaluator"));
     }

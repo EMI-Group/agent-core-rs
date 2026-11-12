@@ -184,7 +184,7 @@ impl TaskLoopEventHandler for Arc<RecordingHandler> {
 
     async fn handle_task_failed(
         &self,
-        round_id: RoundId,
+        _round_id: RoundId,
         _round: &ActiveInteractionRound,
         outcome: &RoundOutcome,
     ) -> Result<()> {
@@ -504,9 +504,15 @@ async fn state_sink_runs_after_every_round_with_remaining_follow_ups() {
     let snapshots = snapshots.lock().clone();
     assert_eq!(snapshots.len(), 3);
     assert_eq!(snapshots[0].iteration, 1);
-    assert_eq!(snapshots[0].pending_follow_ups, vec!["f2".to_string()]);
+    // Round 1 uses the submitted round; follow-ups are popped at the start of
+    // rounds 2 and 3, so both are still queued after round 1.
+    assert_eq!(
+        snapshots[0].pending_follow_ups,
+        vec!["f1".to_string(), "f2".to_string()]
+    );
     assert!(snapshots[0].stop_condition_state.is_some());
-    assert!(snapshots[1].pending_follow_ups.is_empty());
+    assert_eq!(snapshots[1].pending_follow_ups, vec!["f2".to_string()]);
+    assert_eq!(snapshots[2].pending_follow_ups, Vec::<String>::new());
     assert_eq!(snapshots[2].iteration, 3);
 }
 
@@ -693,7 +699,7 @@ async fn resume_continuation_stamps_continuation_rounds() {
     let report = ctrl.run_until_idle(&executor).await;
     assert_eq!(report.rounds, 2);
     let calls = executor.calls();
-    assert!(calls[0].context.get("resume_continuation").is_none());
+    assert!(!calls[0].context.contains_key("resume_continuation"));
     assert_eq!(
         calls[1].context.get("resume_continuation"),
         Some(&json!(true))
@@ -703,9 +709,11 @@ async fn resume_continuation_stamps_continuation_rounds() {
 #[tokio::test]
 async fn set_state_is_replaced_by_loop_bookkeeping() {
     let handler = Arc::new(RecordingHandler::new());
-    let mut seeded = DeepAgentState::default();
-    seeded.iteration = 7;
-    seeded.pending_follow_ups = vec!["queued".to_string()];
+    let seeded = DeepAgentState {
+        iteration: 7,
+        pending_follow_ups: vec!["queued".to_string()],
+        ..Default::default()
+    };
     let mut ctrl = controller(&handler, LoopQueues::default(), TaskLoopConfig::default())
         .with_state(seeded.clone());
     assert_eq!(ctrl.state(), seeded);
@@ -714,7 +722,7 @@ async fn set_state_is_replaced_by_loop_bookkeeping() {
     ctrl.submit_round(query_inputs("hello"), false, None);
     ctrl.run_until_idle(&executor).await;
     assert_eq!(ctrl.state().iteration, 1);
-    assert!(ctrl.state().pending_follow_ups.is_empty());
+    assert_eq!(ctrl.state().pending_follow_ups, Vec::<String>::new());
 }
 
 #[tokio::test]
