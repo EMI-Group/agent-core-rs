@@ -55,7 +55,11 @@ pub struct AgentOutput {
     pub extra: BTreeMap<String, Value>,
 }
 impl AgentOutput { pub fn answer(text) -> Self; pub fn error(text) -> Self; pub fn interrupt(frames, ids) -> Self;
-                   pub fn is_interrupt(&self) -> bool; pub fn to_value(&self) -> Value; }
+                   pub fn is_interrupt(&self) -> bool; pub fn to_value(&self) -> Value; pub fn from_value(value: Value) -> Result<Self>;
+                   /* consuming builders: with_finish_reason, with_reasoning_present, with_iterations_used,
+                      with_termination_reason, with_data, with_extra, with_observations */ }
+impl OutputFrame { pub fn from_value(value: Value) -> Result<Self>; }   // Error::validation on non-object
+impl AgentChunk { pub fn from_value(value: Value) -> Result<Self>; }
 
 pub struct AgentChunk { pub kind: String, pub index: i64, pub payload: Value }
 // kind: "llm_output" | "llm_reasoning" | "llm_usage" | "answer" | "__interaction__" | "workflow_final" | "context.usage"
@@ -119,6 +123,7 @@ impl ReActAgent {
     pub fn unregister_rail(&self, name: &str);
     pub fn rails(&self) -> Arc<RailRegistry>;
     pub fn prompt_builder(&self) -> SystemPromptBuilder;
+    pub fn context_engine(&self) -> Arc<ContextEngine>;
 }
 impl Agent for ReActAgent { .. }
 ```
