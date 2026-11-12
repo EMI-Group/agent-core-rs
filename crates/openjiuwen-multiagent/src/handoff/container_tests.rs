@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
-use openjiuwen_agent::{AgentCard, Observation, ReActAgent, ResultType};
+use openjiuwen_agent::{Observation, ReActAgent, ResultType};
 use openjiuwen_common::error::{Error, ErrorKind};
 use openjiuwen_session::{AgentTeamSession, AgentTeamSessionOptions, Session, StreamEvent};
 use parking_lot::Mutex;

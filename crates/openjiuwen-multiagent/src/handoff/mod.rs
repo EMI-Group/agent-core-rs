@@ -34,12 +34,6 @@
 //! worker cannot drain while it awaits the handler. Every follow-up hop is
 //! therefore published from a spawned task, and a failed publish is logged
 //! rather than raised (the chain then ends through its deadline).
-//!
-//! The wave-2 container/strategy are in place, but the crate-root re-export list
-//! (owned by another task) is not, so rustc still sees these items as
-//! unreachable and unused. Remove this allow once `lib.rs` re-exports the
-//! handoff items.
-#![allow(dead_code, unreachable_pub, unused_imports)]
 
 /// Signal key carrying the id of the agent to hand off to.
 pub const HANDOFF_TARGET_KEY: &str = "__handoff_to__";

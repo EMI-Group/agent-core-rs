@@ -28,6 +28,15 @@ pub use card::{EventDrivenTeamCard, TeamCard};
 pub use config::TeamConfig;
 pub use envelope::MessageEnvelope;
 pub use error::TeamError;
+pub use handoff::{
+    extract_handoff_signal, extract_handoff_signal_from_observations,
+    extract_handoff_signal_from_session, extract_interrupt_signal, flush_team_session,
+    handoff_team, ContainerAgent, HandoffConfig, HandoffHistoryEntry, HandoffOrchestrator,
+    HandoffRegistry, HandoffRequest, HandoffRoute, HandoffSignal, HandoffSnapshot, HandoffStrategy,
+    HandoffTeamConfig, HandoffTool, TeamInterruptSignal, TerminationCondition,
+    CONTEXT_HISTORY_STATE_KEY, COORDINATOR_STATE_KEY, HANDOFF_MESSAGE_KEY, HANDOFF_REASON_KEY,
+    HANDOFF_TARGET_KEY, HISTORY_STATE_KEY,
+};
 pub use member::{AgentProvider, BindHook, TeamAgent, ToolHost};
 pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};
 pub use runtime::{RuntimeConfig, TeamRuntime};
