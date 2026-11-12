@@ -49,7 +49,7 @@ Either way the assistant text is appended to the session history, so `status().r
 - Time is a parameter everywhere except `now_millis`, and randomness is used only for a missing DSL `agent_id`, so tests never depend on the wall clock or on generated ids.
 - No `unsafe`, no `unwrap`/`expect`/`panic!` in library code, no printing; diagnostics go through `tracing::debug`.
 - Async-first: `build_agent`/`build_agent_at` are `async fn` and compose inside an existing tokio runtime; no blocking calls and no environment reads.
-- Files stay under ~1000 lines with one responsibility each.
+- Files stay around ~1000 lines with one responsibility each; `builder.rs` sits just above that because its test module covers the full state/status matrix, and splitting it would separate the builder from its only consumers.
 
 ## Design Decisions
 
