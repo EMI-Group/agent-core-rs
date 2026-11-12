@@ -323,6 +323,8 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 - The `AgentChunk` frame-kind constants (`LLM_OUTPUT`, `LLM_REASONING`, `LLM_USAGE`, `ANSWER`, `INTERACTION`, `WORKFLOW_FINAL`, `CONTEXT_USAGE`) live in the `output` module but are not re-exported from the crate root; refer to them as `openjiuwen_agent::output::*`.
 - `abilities::AbilityManager::execute` batches runs of consecutive `parallel_safe` tools (capped by `MAX_PARALLEL_BATCH`), treats any other call as a barrier, and applies `ToolExecutionOptions::timeout` per call.
 - `parse_tool_arguments` strips a Markdown fence and repairs trailing commas and truncation before reporting an error.
+- `ReActAgent::tools()` returns owned `ToolCard` snapshots in model-visible order and the agent exposes no accessor to its `AbilityManager`, so callers needing `Arc<dyn Tool>` handles (or a name/description other than through `tool.card().name`/`.description`; the `Tool` trait has only `card()`) must keep their own references to the mounted tools.
+- `LlmAgent` and `WorkflowAgent` define no tool methods of their own: mount/read on an `LlmAgent` through `LlmAgent::react()`, and `WorkflowAgent` has no tool surface at all.
 - `WorkflowAgent` implements `invoke`/`stream`; `workflow_agent::select::select` asks the model to pick among several workflows from `description or name` and falls back to `default_response` and then the first workflow.
 - `LlmAgentConfig::agent_memory_config` is host-visible only: `ReActAgentConfig` has no memory-toggle field, so it does not change the composed `ReAct` configuration.
 - `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`.

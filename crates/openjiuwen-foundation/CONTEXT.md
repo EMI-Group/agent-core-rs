@@ -117,3 +117,4 @@ Storage (`store`):
 - There is no `format_messages` helper; the provider-side projection is `llm::openai::{convert_message, convert_messages}` (public), and `BaseMessage` has no `to_openai`.
 - Not ported (tracked in `docs/PARITY.md`): reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, DashScope media generation, `client.py` client-side tools, Anthropic `cache_control` breakpoints and mid-conversation `system` turns, Chroma/Milvus/Gauss/ES/pgvector/S3/Redis backends, OpenAPI and Playwright MCP transports.
 - `FunctionTool` handlers are async-only (`spawn_blocking` inside a handler for blocking work); Python's sync handlers and generator-based tool streams are not reproduced.
+- `Cargo.toml` declares `openjiuwen-macros.workspace = true`, but no code in the crate references `openjiuwen_macros` and nothing re-exports `#[tool]`, so the dependency is unused (callers add `openjiuwen-macros` themselves).
