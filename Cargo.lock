@@ -2218,15 +2218,20 @@ name = "openjiuwen-symphony"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
  "openjiuwen-common",
  "openjiuwen-core",
+ "openjiuwen-foundation",
+ "openjiuwen-graph",
+ "openjiuwen-retrieval",
+ "openjiuwen-session",
+ "schemars",
  "serde",
  "serde_json",
- "thiserror",
+ "sha2",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
- "uuid",
 ]
 
 [[package]]
