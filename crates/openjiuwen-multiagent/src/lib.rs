@@ -1,14 +1,20 @@
-//! `BaseTeam`, team runtime, message bus, and strategies.
+//! Teams of agents: team cards and configuration, an in-process message bus, a
+//! team runtime, and the strategy seam (`TeamStrategy`).
 //!
 //! Maps to the Python package `core.multi_agent` in the openJiuwen reference implementation.
 
-/// Returns the crate name.
-pub fn crate_name() -> &'static str {
-    "openjiuwen-multiagent"
-}
+#![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![allow(clippy::module_name_repetitions)]
 
+mod card;
+mod config;
 mod envelope;
+mod error;
 mod subscription;
 
+pub use card::{EventDrivenTeamCard, TeamCard};
+pub use config::TeamConfig;
 pub use envelope::MessageEnvelope;
-pub use subscription::{topic_matches, SubscriptionManager};
+pub use error::TeamError;
+pub use subscription::{SubscriptionManager, topic_matches};
