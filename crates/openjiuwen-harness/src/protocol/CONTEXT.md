@@ -80,6 +80,15 @@ Known keys, all optional: `model`, `provider`, `api_key`, `api_base`, `temperatu
 Unknown keys → `Validation("unknown native harness configuration fields: <sorted, ', '>")`; wrong types → `Validation("<key> must be a ...")`; blank string options → `Validation("native harness string options must be non-empty strings")`.
 `create` builds `DeepAgent` synchronously with `DeepAgentBuilder` (card `AgentCard::new("deep_agent")`, no model → lazily resolved by `ensure_initialized`) and returns an unstarted `NativeHarness`.
 
+## Offline driving
+
+- `NativeHarness::new` is the offline path: build the `DeepAgent` with `DeepAgentBuilder` + `ScriptedModel` + temp `Workspace`, then `start(HarnessContext::new(...))` (there is no `HarnessContext::default`).
+- A provider-created (`HarnessProvider::create`) harness carries no model handle: `start` resolves one lazily from `model`/`provider`/`api_base`/`api_key`, so turns need a real model even though `start` itself stays offline (a provider test starts against `https://example.invalid/v1`).
+- `create` hands back `Box<dyn HarnessProtocol>`: that handle exposes neither `agent()` nor `HarnessModelControl`.
+- `HarnessInput.content` is a JSON string used verbatim; a JSON object contributes its `query` string; anything else is stringified (`content_text`).
+- One observation cursor at a time: take `harness.events()` once and read `next_event()` until `None`; a second cursor reports `State`.
+- Answer text arrives as `HarnessEventPayload::Output` deltas (`channel == OutputChannel::Answer`, `content` a `String`, `operation == Delta`) and the turn ends with a `TurnLifecycle` payload whose `kind` is in `TERMINAL_TURN_EVENT_KINDS` and whose `result` is the `TurnResult`.
+
 ## Constraints
 
 - Harness methods take `&self`; all mutable state lives behind `parking_lot::Mutex`/atomics on the shared inner struct, never held across `.await` (a dedicated `tokio::sync::Mutex` serializes turn start).
