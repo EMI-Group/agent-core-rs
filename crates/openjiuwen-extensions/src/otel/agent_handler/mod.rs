@@ -235,7 +235,7 @@ impl OtelAgentHandler {
     ///
     /// Python counterpart: `on_llm_start` — a `chat {class_name}`
     /// [`SpanKind::Client`] span with the base fields, the `gen_ai.*` request
-    /// attributes (see [`llm_attrs::set_llm_request_attributes`]), and the
+    /// attributes (see `llm_attrs::set_llm_request_attributes`), and the
     /// `openjiuwen.agent.*` identity pair. A non-recording state skips the
     /// attribute block exactly like Python's early return.
     pub async fn on_llm_start(&self, span: &TraceSpan, inputs: &Value, instance_info: &Value) {

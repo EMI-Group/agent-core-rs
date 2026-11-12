@@ -6,7 +6,7 @@
 //!
 //! Feature summary:
 //!
-//! - `a2a` — the Agent-to-Agent protocol client and server ([`a2a`]).
+//! - `a2a` — the Agent-to-Agent protocol client and server (module `a2a`).
 //! - `otel` — live OpenTelemetry tracing; without it [`otel`] is a no-op seam.
 //! - `sqlite` / `redis` / `pulsar` — optional backends for the adapters.
 //!

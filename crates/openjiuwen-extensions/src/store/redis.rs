@@ -5,7 +5,7 @@
 //! the Python configuration surface but adds no Redis client dependency: the
 //! backend is deferred, so [`RedisStoreConfig`] is validated and every
 //! [`KvStore`] operation answers
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported).
+//! [`Error::Unsupported`].
 //!
 //! # Deviation from Python
 //!
@@ -62,7 +62,7 @@ pub struct RedisStoreConfig {
 /// A validated but deferred Redis key-value store.
 ///
 /// Construction validates the configuration; every [`KvStore`] operation then
-/// returns [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+/// returns [`Error::Unsupported`]
 /// naming the supported alternatives.
 #[derive(Debug, Clone)]
 pub struct RedisStore {

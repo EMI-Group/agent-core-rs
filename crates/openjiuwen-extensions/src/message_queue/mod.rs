@@ -7,7 +7,7 @@
 //!
 //! - [`QueueConfig`] / [`create_queue`] — a config-driven factory that maps the
 //!   Python `MessageQueueConfig.type` discriminators onto the kernel queue;
-//! - [`bridge::QueueBridge`] — a [`serde_json::Value`](serde_json::Value)
+//! - [`bridge::QueueBridge`] — a [`serde_json::Value`]
 //!   adapter with request/reply, publish/subscribe, and topic streams;
 //! - `pulsar` — the Apache Pulsar surface, preserved name-for-name but
 //!   deferred with [`openjiuwen_common::error::Error::Unsupported`].
@@ -134,7 +134,7 @@ pub enum KeyEncoding {
 /// Mirrors the kernel's [`MessageQueueConfig`] and adds the two Pulsar-only
 /// knobs Python kept on the extensions side. Defaults match the kernel:
 /// in-process, capacity
-/// [`DEFAULT_TOPIC_CAPACITY`](openjiuwen_core::runner::DEFAULT_TOPIC_CAPACITY),
+/// [`DEFAULT_TOPIC_CAPACITY`],
 /// a 30-second request deadline, and eight workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
