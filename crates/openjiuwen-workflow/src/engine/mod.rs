@@ -527,11 +527,6 @@ pub(crate) mod test_support {
 
         /// Yield `frames` from `stream`/`transform`.
         #[must_use]
-        pub(crate) fn with_frames(mut self, frames: Vec<Value>) -> Self {
-            self.frames = frames;
-            self
-        }
-
         /// Ask `question` from `invoke`.
         #[must_use]
         pub(crate) fn with_question(mut self, question: Value) -> Self {
@@ -653,14 +648,6 @@ mod tests {
 
     fn session(name: &str) -> Arc<dyn Session> {
         Arc::new(WorkflowSession::new(name))
-    }
-
-    fn checkpointed_session(name: &str) -> Arc<dyn Session> {
-        Arc::new(WorkflowSession::with_options(WorkflowSessionOptions {
-            session_id: Some(name.to_owned()),
-            checkpointer: Some(Arc::new(MemoryCheckpointer::new())),
-            ..WorkflowSessionOptions::default()
-        }))
     }
 
     fn echo() -> TestComponent {
