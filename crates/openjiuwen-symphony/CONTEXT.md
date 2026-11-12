@@ -145,13 +145,14 @@ KV keys are `<prefix><qualified_id>`; values are the descriptor's JSON. `get`/`l
 ### `registry` (`src/registry.rs`)
 
 ```rust
-pub struct CapabilityRegistry { /* std::sync::RwLock<BTreeMap<CapabilityKey, CapabilityDescriptor>>, Option<Arc<dyn AssetStore>> */ }
+pub struct CapabilityRegistry { /* std::sync::RwLock<BTreeMap<CapabilityKey, CapabilityDescriptor>>, Option<Arc<dyn AssetStore>>, std::sync::atomic::AtomicU64 */ }
 impl CapabilityRegistry {
     pub fn new() -> Self;
     pub fn with_store(store: Arc<dyn AssetStore>) -> Self;          // write-through; call `reload` to hydrate
-    pub async fn load(store: Arc<dyn AssetStore>) -> Result<Self>;   // hydrate from the store
+    pub async fn load(store: Arc<dyn AssetStore>) -> Result<Self>;   // hydrate from the store; revision starts at 0
     pub async fn reload(&self) -> Result<usize>;                     // replace the in-memory map from the store
     pub fn store(&self) -> Option<&Arc<dyn AssetStore>>;
+    pub fn revision(&self) -> u64;                                  // monotonic catalog revision, SeqCst, starts at 0
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub async fn register(&self, descriptor: CapabilityDescriptor) -> Result<()>;  // validate + upsert + persist
@@ -168,6 +169,8 @@ impl Default for CapabilityRegistry;
 
 The registry is authoritative in memory; writes are write-through to the optional store.
 The `std::sync::RwLock` is only held for map mutations and snapshot clones, never across an `.await`.
+`revision()` is an `AtomicU64` read/written outside that lock with `SeqCst`; it advances on `register` (+1), a non-empty `register_all` batch (+1 per batch), a `remove` that actually dropped a key, a `clear` of a non-empty catalog, and a store-backed `reload` — never on a no-op mutation or a failed one.
+Freshness rule: an observer (the runtime's semantic index) re-derives its view only when `revision()` differs from the value it recorded, so an unchanged catalog costs no re-embedding.
 
 ### `search` (`src/search/`)
 
@@ -472,7 +475,8 @@ impl SymphonyRuntime {
     pub async fn plan(&self, request: &PlanRequest) -> Result<OrchestrationPlan>;
     pub async fn invoke(&self, request: InvokeRequest) -> Result<InvokeResponse>;
     pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>>;
-    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>>;
+    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>>;   // lazily synchronized; `top_k == 0` = unlimited
+    pub async fn reindex_semantics(&self) -> Result<usize>;          // force a full re-embed; returns the indexed count
     pub async fn add_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn update_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn remove_capabilities(&self, keys: &[CapabilityKey], request_id: &str) -> Result<GraphMutationResult>;
@@ -512,6 +516,9 @@ A blank `request_id` is `Error::Validation` naming `request_id`; a replayed `req
 `submit_evolution` publishes only when at least one edge weight changed; otherwise it reports the current version.
 `invoke` with `execute` set on a `NoPlan` result returns `execution: None` rather than an error.
 `SymphonyRuntimeBuilder::with_asset_store` hydrates the registry from the store (`CapabilityRegistry::load`), so a preconfigured asset store survives restarts.
+`semantic_search` synchronizes lazily: the catalog is cleared and re-embedded only when `CapabilityRegistry::revision()` differs from the revision recorded by the last synchronization (or none is recorded yet), so an unchanged catalog embeds only the query; `start` does not seed the index.
+`reindex_semantics` force-re-embeds the whole catalog, records the current revision, and returns the indexed count; it is the escape hatch after an embedding-model change and serializes with `semantic_search` through the same `tokio::sync::Mutex` (held across the catalog snapshot, the clear, and the embedding calls, released before the vector search).
+Without a semantic index both entry points return `Error::Unsupported`.
 
 ### `deferred` (`src/deferred.rs`)
 
@@ -549,6 +556,7 @@ Each stub documents the Python class it mirrors and the reason it is deferred.
 - **`top_k == 0` means unlimited** in search requests, a Rust-only sentinel; Python clamps every retrieval `top_k` to `max(1, ...)` and has no unlimited mode. The sentinel is explicit in [`SearchRequest`] and `SemanticIndex::search`.
 - **Keyword search instead of LLM tree traversal for the default path.** Python's `retrieval.Retriever` is LLM-guided progressive tree disclosure (no vectors). BM25 is deterministic, offline, and covers the same selection job for a capability catalog; the LLM retriever keeps its API shape in [`deferred`].
 - **Semantic search uses embeddings**, via `openjiuwen_retrieval::{Embedding, InMemoryVectorStore}` (with `HashEmbedding` for deterministic tests). This is additive: Python symphony has no embedding path, and the search result type is shared with keyword search.
+- **The semantic index is catalog-revision-driven, not query-driven.** A `CapabilityRegistry::revision()` counter lets `semantic_search` embed the catalog only after a mutation (one re-embed per change instead of per query), which is what keeps a real embedding provider affordable; `reindex_semantics` covers the changes the counter cannot see (a new embedding model).
 - **Deterministic scoring replaces LLM semantic scoring.** `SemanticScorer` is the seam; `LexicalSemanticScorer` (query-term coverage) is the default, so planning is reproducible offline. An LLM-backed scorer is a drop-in implementation of the same trait and is deferred.
 - **Planning is a bounded graph search**, not an LLM beam search: same score formula and rank tuple as Python, with explicit `max_expansions`/`max_plans` bounds for termination.
 - **The graph engine facade maps onto `openjiuwen-graph` for execution.** Python's `graph_engine` is a JGF-document facade with no executor; here `CapabilityGraph`/`GraphArtifactStore` keep the document semantics and `PlanExecutor` compiles a plan into a real `openjiuwen_graph::CompiledGraph`.
@@ -592,13 +600,13 @@ These Python areas are not implemented; each keeps an API-shaped stub in [`defer
 
 - Unit tests live beside modules (`#[cfg(test)] mod tests`); cross-module behavior lives in `crates/openjiuwen-symphony/tests/`.
 - `tests/models.rs` — serde round-trips (`type` key, unknown-field tolerance, skipped `semantic_content`), `Card` impl, derived JSON schemas, content hash stability, datatype `can_feed` matrix, `normalize_name_key`/`fuzzy_name_distance`.
-- `tests/registry.rs` — CRUD, validation errors, deterministic ordering, JSON-file/KV persistence and `load`/`reload`, remove/clear.
+- `tests/registry.rs` — CRUD, validation errors, deterministic ordering, JSON-file/KV persistence and `load`/`reload`, remove/clear, and the revision counter (advances per mutation, never on a no-op or rejected write).
 - `tests/search.rs` — BM25 ranking and matching, metadata/tag/type/available filters, `top_k` semantics, filter-only ordering, `HashEmbedding` semantic index add/remove/search.
 - `tests/graph.rs` — graph from descriptors, edge validation/upsert, incident-edge removal, roots/leaves, JGF round-trip, malformed-document rejections.
 - `tests/artifact.rs` — memory + file artifact stores (versions, immutability, `current` pointer, missing status, `tmp`+`rename` atomicity, illegal versions, reopen hydration).
 - `tests/planner.rs` — candidate strategies/ordering, plan selection, disabled/candidate filters, `max_depth`, scoring/rank tie-breaks, `Ready`/`NeedsInput`/`NoPlan`, language normalization, plan serialization and `stages`.
 - `tests/executor.rs` — compile + execute with a fake runner, per-step state keys, input overlay, `max_steps` rejection, `fail_fast=false` failure reporting, `UnsupportedRunner`.
-- `tests/runtime.rs` — open/start/stop/close idempotency, invoke (plan-only and execute), build revisions, mutation idempotency by `request_id`, evolution EMA, semantic search, stopped-runtime errors, snapshot.
+- `tests/runtime.rs` — open/start/stop/close idempotency, invoke (plan-only and execute), build revisions, mutation idempotency by `request_id`, evolution EMA, semantic search (including lazy re-embedding proven by a counting `Embedding`, add/remove invalidation, and `reindex_semantics`), stopped-runtime errors, snapshot.
 - `tests/deferred.rs` — every stub returns `Error::Unsupported` and `error::is_unsupported` recognizes it.
 - Tests are offline and deterministic: `tempfile` for filesystem stores, `HashEmbedding` for semantic search, no network, no clock-dependent assertions.
 - `cargo fmt -p openjiuwen-symphony`, `cargo test -p openjiuwen-symphony`, and `cargo clippy -p openjiuwen-symphony --all-targets -- -D warnings` plus `--features sqlite` compile checks must pass.
