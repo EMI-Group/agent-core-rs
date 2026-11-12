@@ -172,6 +172,8 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 ## Frame-model adaptations (deviations forced by the Rust seams)
 
 - `OtelTraceSink::emit` is the whole agent/workflow handler pair collapsed onto one frame: `payload.kind == Agent` maps the agent callbacks, `Workflow`/`Component` map the workflow callbacks, and `payload.status` selects start / running / terminal. `item_type` is ignored.
+- The session tracer emits exactly one frame per span (its terminal `SpanHandle::complete`), so the sink opens spans lazily: an agent/workflow/component `running` or terminal frame whose invoke id has no open state first opens the span with the frame's `start_time` as the `OTel` start timestamp and the same name/kind/operation/parent/identity attributes as a `start` frame, then applies the running or terminal attributes. A `running`-only frame leaves the span open for its terminal frame; a lazily opened span ends at the frame's `end_time` (falling back to the local clock when the end is absent or precedes the start), while a span opened by a real `start` frame still ends at the local clock.
+- A frame with no mappable span (the sink holds no tracer) registers nothing, so an inactive sink stays a no-op.
 - The workflow handler has no per-event kwargs, so `parent_node_id`, `session_id`, and `source_ids` travel in the `metadata` object under those keys; `on_pre_invoke` has no `component_metadata`, so component/workflow attributes are written once on `on_call_start`.
 - Python's exception branch of `on_invoke` is split into `on_call_error(&Error)` and `on_call_interrupted(reason)` because a session frame carries no exception object; `on_invoke` records `inner_error` when its payload carries one.
 - Python's `on_invoke`/`on_pre_stream`/`on_post_stream` buffering becomes `meta_data` keys `on_invoke_data`, `stream_inputs`, `stream_outputs` on non-terminal frames (arrays append per element, scalars append once), flushed on the terminal frame.
@@ -193,6 +195,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 ## Test Strategy
 
 - `./sink/tests.rs` (feature-gated): frames driven through both the sink's `TraceSink::emit` and a real `Tracer::with_sink`; asserts span names/kinds, `gen_ai.*`/`openjiuwen.*` values, OK/ERROR/interrupted statuses, parent/child span ids, tool dedup, cross-dimension parenting, and buffer flushes.
+- `./sink/tests/lazy_open.rs`: `Tracer::with_sink` + `start_span`/`start_child`/`start_workflow_span` + `finish`/`fail`/`interrupted` with no synthetic start frame; asserts the lazy open exports exactly one span with the frame's timestamps, the `running`-only frame stays open, and every terminal status/ordering (child first, child after the parent's state was popped) still exports.
 - `./agent_handler/tests.rs`: the LLM/tool/prompt/chain/retriever/embedding/memory/evaluator/workflow callbacks over a `CaptureExporter`, tool dedup (`bug #2046`), error attributes, session fallback, `from_handle`.
 - `./workflow_handler/tests.rs`: root/component naming and kinds, retrieval query/documents, layer-root and sub-workflow parenting, cross-workflow isolation, buffer flushes, error/interrupt paths, stale-span cleanup on trace-id change.
 - Unit tests beside `redaction.rs` (all `test_redaction.py` cases: exact truncation marker, hash formula, field override truth table, system-prompt non-truncation), `span_names.rs` (every naming rule), `config.rs` (sample-rate validation, env toggle precedence), `handle.rs` (no-op vs active), `attrs.rs`, `llm_attrs.rs`.
@@ -210,6 +213,6 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 - `./attrs.rs` → shared span start/end/error/interrupt attribute writers and string helpers
 - `./llm_attrs.rs` → LLM payload normalization (`standard_messages`), GenAI request/response/usage attributes, retrieval extraction
 - `./span_manager.rs` → `OtelSpanState`, agent/workflow span managers, workflow buffers, tool dedup probe
-- `./sink/` → `OtelTraceSink` (`TraceSink` impl): `mod.rs` public type + emit dispatch/lifecycle, `frames.rs` agent/workflow frame mapping, `tests.rs`
+- `./sink/` → `OtelTraceSink` (`TraceSink` impl): `mod.rs` public type + emit dispatch/lifecycle, `frames.rs` agent-path callbacks plus the helpers shared with the workflow path, `frames/workflow.rs` workflow/component callbacks (classifier, buffers, lazy open), `tests.rs` + `tests/lazy_open.rs`
 - `./agent_handler/` → `OtelAgentHandler`: `mod.rs` lifecycle + LLM callbacks, `non_llm.rs` non-LLM callback families, `tests.rs`
 - `./workflow_handler/` → `OtelWorkflowHandler`: `mod.rs` lifecycle callbacks, `spans.rs` parent resolution + workflow attribute writers, `tests.rs`

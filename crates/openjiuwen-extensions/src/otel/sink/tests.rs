@@ -21,7 +21,6 @@ use serde_json::{json, Value};
 
 use openjiuwen_core::session::tracer::{
     InvokeType, SpanStatus, TraceFrame, TraceSink, TraceSpan, TraceSpanKind,
-    Tracer as SessionTracer,
 };
 
 use super::super::config::{ExporterType, OtelTracerConfig};
@@ -35,13 +34,15 @@ use super::super::semconv::{
     GEN_AI_RETRIEVAL_TOP_K, GEN_AI_SYSTEM_INSTRUCTIONS, GEN_AI_TOOL_CALL_ID, GEN_AI_TOOL_NAME,
     GEN_AI_TOOL_TYPE, GEN_AI_USAGE_INPUT_TOKENS, OJ_AGENT_ERROR_MESSAGE, OJ_AGENT_INPUTS,
     OJ_AGENT_INVOKE_TYPE, OJ_AGENT_NAME, OJ_AGENT_OUTPUTS, OJ_ELAPSED_TIME, OJ_END_TIME, OJ_ERROR,
-    OJ_PARENT_NODE_ID, OJ_SOURCE_IDS, OJ_STATUS, OJ_STREAM_INPUTS, OJ_STREAM_OUTPUTS, OJ_TRACE_ID,
+    OJ_PARENT_NODE_ID, OJ_SOURCE_IDS, OJ_STATUS, OJ_STREAM_INPUTS, OJ_STREAM_OUTPUTS,
     OJ_WORKFLOW_COMPONENT_ID, OJ_WORKFLOW_COMPONENT_NAME, OJ_WORKFLOW_COMPONENT_TYPE,
     OJ_WORKFLOW_ERROR_MESSAGE, OJ_WORKFLOW_EXECUTION_ID, OJ_WORKFLOW_ID, OJ_WORKFLOW_INPUTS,
     OJ_WORKFLOW_INVOKE_DATA, OJ_WORKFLOW_NAME, OJ_WORKFLOW_OUTPUTS, OJ_WORKFLOW_VERSION,
     SPAN_STATUS_ERROR, SPAN_STATUS_FINISH, SPAN_STATUS_INTERRUPTED, SPAN_STATUS_RUNNING,
 };
 use super::OtelTraceSink;
+
+mod lazy_open;
 
 /// Trace id every test frame carries.
 const TRACE: &str = "trace-1";
@@ -88,10 +89,10 @@ impl Fixture {
         Self::build(plain_config())
     }
 
-    /// Exported spans, after flushing the batch processor.
-    fn spans(&self) -> Vec<SpanData> {
+    /// The number of exported spans, after flushing the batch processor.
+    fn capture_len(&self) -> usize {
         self.handle.force_flush();
-        self.capture.spans()
+        self.capture.len()
     }
 
     /// The one exported span named `name`.
@@ -232,28 +233,6 @@ fn a_sink_is_send_sync_and_debug() {
         )
         .expect("a live handle builds a sink")
     );
-}
-
-#[test]
-fn a_real_tracer_emits_frames_the_sink_turns_into_spans() {
-    // test_handler.py: test_llm_start_creates_span / test_llm_end_ends_span,
-    // driven through the session Tracer instead of a direct handler call.
-    let fixture = Fixture::new();
-    let sink: Arc<dyn TraceSink> = fixture.sink.clone();
-    let tracer = SessionTracer::with_sink(SESSION, TRACE, sink);
-    let span = tracer.start_span("Model", InvokeType::Llm);
-    span.set_inputs(json!({"messages": [{"role": "user", "content": "hi"}]}));
-    // The frame model opens a span when the start frame arrives; the tracer
-    // emits the terminal frame itself.
-    fixture.sink.emit(TraceFrame::agent(span.snapshot()));
-    span.finish(json!({"outputs": {"content": "hello"}}));
-    let data = fixture.span("chat Model");
-    assert_eq!(data.status, Status::Ok);
-    assert_eq!(
-        attribute(&data, OJ_STATUS).as_deref(),
-        Some(SPAN_STATUS_FINISH)
-    );
-    assert_eq!(attribute(&data, OJ_TRACE_ID).as_deref(), Some(TRACE));
 }
 
 #[test]
@@ -834,28 +813,6 @@ fn a_workflow_interrupt_keeps_the_span_successful() {
     );
     assert!(attribute(&data, OJ_ERROR).is_none());
     assert_eq!(data.status, Status::Unset);
-}
-
-#[test]
-#[allow(clippy::assert_is_empty)] // the message documents which invariant failed
-fn a_terminal_frame_for_an_unknown_invoke_is_dropped() {
-    // Fail-open: an out-of-order frame must not panic nor create a span.
-    let fixture = Fixture::new();
-    for status in [
-        SpanStatus::Finish,
-        SpanStatus::Error,
-        SpanStatus::Interrupted,
-        SpanStatus::Running,
-    ] {
-        let mut agent = agent_start("missing", "Model", InvokeType::Llm);
-        agent.status = status;
-        fixture.emit(agent);
-
-        let mut workflow = base_span("missing-wf", "wf", TraceSpanKind::Workflow);
-        workflow.status = status;
-        fixture.emit(workflow);
-    }
-    assert!(fixture.spans().is_empty());
 }
 
 #[test]
