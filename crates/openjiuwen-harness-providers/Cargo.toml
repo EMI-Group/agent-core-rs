@@ -14,12 +14,21 @@ openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 thiserror = "2"
 async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true
+indexmap.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+openjiuwen-agent.workspace = true
+openjiuwen-foundation.workspace = true
+openjiuwen-test-support.workspace = true
+parking_lot.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["native"]
