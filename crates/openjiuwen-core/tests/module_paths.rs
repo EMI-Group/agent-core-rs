@@ -1,9 +1,10 @@
 //! Proves the kernel umbrella's Python-shaped module paths resolve, and that each
 //! alias points at the very same item as the concrete crate it re-exports.
 //!
-//! Every check is a compile-time identity check (`TypeId`) rather than a string
+//! Every type check is a compile-time identity check (`TypeId`) rather than a string
 //! comparison, so a rename or a diverging re-export inside a concrete crate fails
-//! this test instead of silently drifting.
+//! this test instead of silently drifting. Traits have no `TypeId`, so the trait
+//! seams are proved by generic bounds and trait-object coercions instead.
 
 use std::any::TypeId;
 
@@ -19,6 +20,9 @@ use openjiuwen_core::graph::CompiledGraph;
 use openjiuwen_core::memory::LongTermMemory;
 use openjiuwen_core::multi_agent::BaseTeam;
 use openjiuwen_core::retrieval::Document;
+use openjiuwen_core::runner::{
+    CallbackEvent, InMemoryMessageQueue, MessageQueue, ResourceMgr, RunOptions, Runner,
+};
 use openjiuwen_core::security::GuardrailPipeline;
 use openjiuwen_core::session::{Session, SessionConfig};
 use openjiuwen_core::single_agent::{AbilityManager, AgentCard, ReActAgent, ReActAgentConfig};
@@ -118,9 +122,25 @@ fn multi_agent_paths_resolve() {
     assert_same_type::<BaseTeam, openjiuwen_multiagent::BaseTeam>();
 }
 
+/// Asserts at compile time that `T` implements the runner's queue seam. A trait has
+/// no `TypeId`, so the bound (together with the `&dyn MessageQueue` coercion below)
+/// is what proves the umbrella exports the very trait the concrete crate defines.
+fn assert_queue<T: MessageQueue>() {}
+
 #[test]
 fn runner_paths_resolve() {
-    // The runner crate currently exports only its identity helper; the module path
-    // itself is what the umbrella guarantees.
-    assert_eq!(openjiuwen_core::runner::crate_name(), "openjiuwen-runner");
+    assert_same_type::<Runner, openjiuwen_runner::Runner>();
+    assert_same_type::<RunOptions, openjiuwen_runner::RunOptions>();
+    assert_same_type::<ResourceMgr, openjiuwen_runner::ResourceMgr>();
+    assert_same_type::<CallbackEvent, openjiuwen_runner::CallbackEvent>();
+    assert_same_type::<InMemoryMessageQueue, openjiuwen_runner::InMemoryMessageQueue>();
+
+    // `MessageQueue` is a trait, not a type: assert the concrete queue implements it
+    // and that it still coerces to the trait object.
+    assert_queue::<InMemoryMessageQueue>();
+    assert_queue::<openjiuwen_runner::InMemoryMessageQueue>();
+    // The constructors hand back an `Arc<Self>`, so coerce through it.
+    let queue = InMemoryMessageQueue::with_capacity(4);
+    let queue: &dyn MessageQueue = queue.as_ref();
+    assert!(!queue.is_started(), "a queue is created stopped");
 }

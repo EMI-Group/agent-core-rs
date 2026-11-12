@@ -61,6 +61,7 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// The crate version.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Returns the crate name.
+#[must_use]
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }

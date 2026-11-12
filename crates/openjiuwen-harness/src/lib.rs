@@ -107,6 +107,22 @@ pub use protocol::{
 };
 
 // --- cli -------------------------------------------------------------------
+/// Re-export of the `clap` crate that [`cli::Cli`] derives from.
+///
+/// The parser surface is invisible through the derive alone: a host or an
+/// integration test cannot call `Cli::parse_from`/`Cli::try_parse_from`
+/// (`clap::Parser`) or build the grammar with `Cli::command()`
+/// (`clap::CommandFactory`) without naming the `clap` crate itself, and a
+/// different `clap` version would not see those trait impls at all.
+/// Re-exporting the exact version this crate was built with lets downstream
+/// crates (`openjiuwen-e2e`, the `openjiuwen-cli` binary, tests) assert the CLI
+/// grammar, error kinds (`clap::error::ErrorKind`) and process exit codes
+/// (`clap::Error::exit_code`) without adding a dependency of their own.
+///
+/// This is a build-and-test seam, not part of the SDK domain API: production
+/// code should hand a parsed [`cli::Cli`] to [`cli::run_cli`] rather than
+/// parsing arguments itself.
+pub use clap;
 pub use cli::{run, run_cli, Cli, CliOptions, CliPermissionHost, Command, OutputFormat, Repl};
 
 // --- manifest --------------------------------------------------------------

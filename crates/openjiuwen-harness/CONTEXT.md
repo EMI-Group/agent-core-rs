@@ -25,6 +25,7 @@ Manifest (`openjiuwen_harness::manifest`): `ElementKind`, `HarnessElementDescrip
 Protocol (`openjiuwen_harness::protocol`): `NativeHarness` (impl `HarnessProtocol` + `HarnessModelControl`), `NativeHarnessProvider` (impl `HarnessProvider` + `ModelConfigProvider`).
 Observability (`openjiuwen_harness::observability`): span/event name helpers and the `TelemetrySink` seam.
 CLI (`openjiuwen_harness::cli`): `Cli`, `run`, `Repl`.
+Parser seam: the crate re-exports the exact `clap` version `Cli` derives from (`openjiuwen_harness::clap`), so hosts and `openjiuwen-e2e` can call `Cli::try_parse_from`/`Cli::command()` and assert grammar, `clap::error::ErrorKind` and `Error::exit_code()` without adding a clap dependency; it is a build/test seam, not SDK domain API (`tests/cli.rs` names clap only through it).
 Every public item is also re-exported flat from the crate root.
 
 ## Constraints

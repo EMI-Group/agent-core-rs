@@ -91,16 +91,20 @@ Every other event payload is forwarded only through the state/round/chunk projec
 | --- | --- |
 | `card` | builder card, else `AgentCard::new(member_name)` |
 | `system_prompt` | `DeepAgentConfig::system_prompt` |
-| `model` (`model_name`/`name`) | `ModelResolver::resolve` → `DeepAgentBuilder::model` |
+| `model` (`model_name`/`name`) | `ModelResolver::resolve` → `DeepAgentBuilder::model`; the effective name (spec, else the resolved model's) → `DeepAgentConfig::model_name` so the inner `ReAct` request carries it |
+| `model.provider` | `DeepAgentConfig::model_provider` (pinned spec provider, else the resolved model's `provider()`; never invented) |
 | `enable_task_loop`, `max_iterations` | same-named `DeepAgentConfig` fields |
 | `enable_security_rail`, `completion_timeout` | same-named `DeepAgentConfig` fields |
 | `cwd`, `project_root`, `skills`, `language`, `prompt_mode` | same-named `DeepAgentConfig` fields |
 | context `workspace_root` | `Workspace` (builder + config) |
 | context `mode` | `default_mode` (`plan_mode` ⇒ `AgentMode::Plan`) and `enable_plan_mode` |
 
-Ignored at factory level (logged once at `debug` when present): `tools`, `mcps`, `subagents`, `rails`, `approval_required_tools`, and a model `provider`/`params` (the resolver owns client configuration).
+Ignored at factory level (logged once at `debug` when present): `tools`, `mcps`, `subagents`, `rails`, `approval_required_tools`, and model `params`.
 Mounting live tools/MCP servers/rails belongs to the runtime wiring that owns those handles.
 Model resolution is always required: a missing provider/model is `Error::config`.
+
+The model identity must live on the config, not only on the model handle: `DeepAgentBuilder` copies `DeepAgentConfig::{model_name, model_provider}` onto the inner `ReActAgentConfig`, and the agent loop inherits a blank config name into every `ModelRequestConfig` whose request name is empty — an empty name makes provider requests and `list_models` fail (Python parity: `native_harness.py` reads `self._react_agent.config.model_name`).
+`api_base`/`api_key` are deliberately left unset by the factory: they belong to the resolver's `ModelClientConfig`, and `DeepAgentConfig` needs them only on the lazy-model path, which never runs because the factory always supplies a live model.
 
 ## Injection seam for tests and embedders
 
@@ -136,7 +140,7 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - `mapping.rs` pins every `HarnessState` for both status tables and every `TurnEventKind` for rounds/terminality, plus output/tool chunk shapes.
 - `checkpoint.rs` covers JSON round-trip, unknown-field tolerance, missing identity fields, and the session/card incompatibility messages.
 - `adapter.rs` drives `HarnessMemberRuntime` with a local `FakeHarness` (command recording, channel-backed cursor, fixed state): start publishes `Ready`, delivery/abort/pause/resume argument mapping, observer callback order, cursor drain/close, pump cancellation on `stop`, and error translation. Waits are bounded `yield_now`/1 ms polls.
-- `native.rs` covers factory identity, resolver error propagation, and the spec → `DeepAgentConfig` mapping (including plan mode and card/language overrides).
+- `native.rs` covers factory identity, resolver error propagation, the spec → `DeepAgentConfig` mapping (plan mode, card/language overrides), and model-identity propagation: a spec name/provider wins over the resolved one, a resolver-supplied default name reaches `NativeHarness::agent().config()`, and blank resolved names/providers neither erase a spec name nor invent a provider.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, `cargo test -p openjiuwen-agent-teams [--no-default-features]` green.
 
 ## Deferred
