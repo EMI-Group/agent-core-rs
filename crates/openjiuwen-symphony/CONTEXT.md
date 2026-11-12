@@ -397,13 +397,16 @@ Expansion follows graph edges with `weight >= min_edge_confidence`, never revisi
 `Fast` keeps one greedy best partial path per start plus its single-node plan; `Beam` keeps the best `top_k` partial paths per depth before ranking.
 `status` is `Ready` when the best plan's root steps have no missing inputs, `NeedsInput` when a plan exists but a root input is unfilled (listed in `message`), and `NoPlan` when no candidate plan exists.
 
-pub struct Execution mapping:** each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
+**Execution mapping:** each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
 
 A step's inputs start from `state["inputs"]` (an object) and are overlaid by predecessor step outputs whose normalized name matches one of the step's input names (a predecessor with exactly one output also fills a step's single unmatched input).
 Each node writes the top-level state key equal to its step id: `{"success": bool, "output": Value, "error": Option<String>, "duration_ms": u64}`.
 With `fail_fast` the first runner error aborts the run with `Error::Graph("step `<id>` failed: ...")`; otherwise every step runs and `PlanExecution::failed_steps()` reports the failures.
 `max_steps` is checked before compilation; exceeding it is `Error::Validation`.
 The default session is `WorkflowSession::new(<generated uuid>)` when the caller passes `None`.
+`execute` seeds no inputs (`execute_with_inputs` is the seeding entry point); an empty plan executes to an empty `PlanExecution` with `state = {}` rather than failing to compile.
+The engine prefixes node failures with `node `<id>` failed at superstep <n>: `; `execute` trims that wrapper so callers see exactly the documented `step `<id>` failed: <message>` text.
+A `Cancelled` or `Unsupported` runner error keeps its own [`ErrorKind`] instead of becoming `Error::Graph`, so a missing runner stays recognisable through [`error::is_unsupported`].
 
 ### `evaluation` (`src/evaluation.rs`)
 
@@ -421,6 +424,7 @@ impl EvaluationSuite {
     pub fn new(metrics: Vec<Arc<dyn Metric>>) -> Self;
     pub fn default_suite() -> Self;                 // CompletenessMetric + SchemaValidityMetric
     pub fn with_llm_judge(self) -> Self;            // adds LlmJudgedMetric (records a fail-soft error)
+    pub fn metrics(&self) -> &[Arc<dyn Metric>];
     pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;  // fail-soft: metric errors -> report.errors
 }
 ```
