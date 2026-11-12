@@ -11,15 +11,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use openjiuwen_agent::Agent;
+use openjiuwen_common::error::ErrorKind;
 use openjiuwen_dev_tools::agent_builder::{
-    map_state_to_status, AgentBuilder, AgentType, BuildOutput, BuildState, DslModelInfo,
-    LlmAgentDsl, LlmAgentSpec,
+    map_state_to_status, AgentBuilder, AgentType, BuildOutput, BuildState, DslEdge, DslModelInfo,
+    DslNode, LlmAgentDsl, LlmAgentSpec, WorkflowDsl, WorkflowSpec,
 };
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_test_support::ScriptedModel;
+use serde_json::json;
 
 /// The fixed timestamp every DSL assertion uses, so no test reads the clock.
 const STAMP: i64 = 1_700_000_000_000;
@@ -309,5 +312,107 @@ async fn clear_session_drops_history_and_status() {
         scripted.call_count(),
         2,
         "one round trip per session must be recorded on the shared model"
+    );
+}
+
+#[test]
+fn workflow_spec_converts_to_a_validated_dsl() {
+    let spec = WorkflowSpec {
+        name: "brief-flow".to_string(),
+        description: "extract then summarize".to_string(),
+        nodes: vec![
+            DslNode {
+                id: "extract".to_string(),
+                node_type: "llm".to_string(),
+                title: "Extract".to_string(),
+                description: "pull the claims out of the document".to_string(),
+                inputs: BTreeMap::from([("document".to_string(), json!({"type": "string"}))]),
+                outputs: BTreeMap::from([("claims".to_string(), json!({"type": "array"}))]),
+                data: json!({"prompt": "Extract the claims."}),
+            },
+            DslNode {
+                id: "summarize".to_string(),
+                node_type: "end".to_string(),
+                title: "Summarize".to_string(),
+                description: "render the brief".to_string(),
+                inputs: BTreeMap::new(),
+                outputs: BTreeMap::new(),
+                data: json!({"prompt": "Write the brief."}),
+            },
+        ],
+        edges: vec![DslEdge {
+            source: "extract".to_string(),
+            target: "summarize".to_string(),
+            condition: None,
+        }],
+    };
+
+    let dsl = spec.to_dsl();
+    dsl.validate()
+        .expect("a two-node, one-edge spec must convert into a structurally valid DSL");
+
+    let node_ids: Vec<&str> = dsl.nodes.iter().map(|node| node.id.as_str()).collect();
+    assert_eq!(
+        node_ids,
+        vec!["extract", "summarize"],
+        "the conversion must preserve the node ids in document order"
+    );
+    assert_eq!(
+        (dsl.edges[0].source.as_str(), dsl.edges[0].target.as_str()),
+        ("extract", "summarize"),
+        "the conversion must preserve the edge endpoints"
+    );
+    assert!(
+        dsl.node("extract").is_some(),
+        "node(\"extract\") must resolve the first node by id"
+    );
+    assert!(
+        dsl.node("summarize").is_some(),
+        "node(\"summarize\") must resolve the second node by id"
+    );
+    assert!(
+        dsl.node("missing").is_none(),
+        "node() must not invent a node the document does not contain"
+    );
+
+    let encoded = spec
+        .to_json_string()
+        .expect("a populated workflow spec must serialize");
+    let decoded =
+        WorkflowDsl::from_json_str(&encoded).expect("the serialized spec must parse as a DSL");
+    assert_eq!(
+        decoded, dsl,
+        "the workflow document must round trip through JSON unchanged"
+    );
+    assert_eq!(
+        decoded
+            .node("summarize")
+            .map(|node| node.node_type.as_str()),
+        Some("end"),
+        "the round-tripped document must keep the node type under its `type` wire name"
+    );
+
+    let broken = WorkflowSpec {
+        name: "broken-flow".to_string(),
+        description: "an edge that names a missing node".to_string(),
+        nodes: spec.nodes.clone(),
+        edges: vec![DslEdge {
+            source: "extract".to_string(),
+            target: "unknown-node".to_string(),
+            condition: None,
+        }],
+    };
+    let error = broken
+        .to_dsl()
+        .validate()
+        .expect_err("an edge naming a non-existent node must fail validation");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Validation,
+        "an unresolvable edge endpoint must be a validation error, not a runtime failure"
+    );
+    assert!(
+        error.to_string().contains("unknown-node"),
+        "the validation error must name the offending node id: {error}"
     );
 }

@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use openjiuwen_dev_tools::prompt_builder::{
     bank, BadCasePromptBuilder, FeedbackMode, FeedbackOptions, FeedbackPromptBuilder, Language,
     MetaBuildOptions, MetaTemplateBuilder, TemplateType, INSERT_STR,
@@ -24,7 +25,7 @@ use openjiuwen_dev_tools::tune::{Case, EvaluatedCase};
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::prompt::Role;
 use openjiuwen_foundation::tool::ToolInfo;
-use openjiuwen_test_support::ScriptedModel;
+use openjiuwen_test_support::{CallMode, ScriptedModel};
 use serde_json::{json, Value};
 
 /// The OpenAI-shape tool descriptor used by the plan-mode and round-trip tests.
@@ -350,4 +351,79 @@ async fn feedback_insert_mode_splices_the_marker() {
         optimize_user.contains("mention the weather"),
         "the optimize message must carry the normalized intent feedback: {optimize_user}"
     );
+}
+
+#[tokio::test]
+async fn bad_case_stream_build_matches_the_buffered_build() {
+    let analysis = "<intent>true</intent>\n<summary>the answer names the wrong city</summary>";
+    let prompt = "Answer the question with a city.";
+    let cases = vec![evaluated_case()];
+
+    // Two identically seeded models: one drives the buffered build, the other
+    // the streaming build, so the recorded call modes are unambiguous.
+    let (buffered_recorder, buffered_model) = scripted(&[analysis, "REPAIRED_PROMPT"]);
+    let (streamed_recorder, streamed_model) = scripted(&[analysis, "REPAIRED_PROMPT"]);
+
+    let buffered = BadCasePromptBuilder::new(buffered_model)
+        .build(prompt, &cases, Language::ZhCn)
+        .await
+        .expect("a non-empty prompt and one valid case make the buffered repair succeed");
+
+    let items: Vec<_> = BadCasePromptBuilder::new(streamed_model)
+        .stream_build(prompt.to_owned(), cases.clone(), Language::ZhCn)
+        .collect()
+        .await;
+    let streamed: String = items
+        .into_iter()
+        .map(|item| item.expect("every streamed item of a valid repair must be Ok"))
+        .collect();
+
+    assert_eq!(
+        streamed, buffered,
+        "the streamed chunks must concatenate to the buffered build's repaired prompt"
+    );
+    assert_eq!(
+        buffered_recorder.call_count(),
+        2,
+        "the buffered build must make exactly the analyze and optimize calls"
+    );
+    assert_eq!(
+        streamed_recorder.call_count(),
+        2,
+        "the streaming build must make exactly the analyze and optimize calls"
+    );
+
+    let buffered_calls = buffered_recorder.calls();
+    assert_eq!(
+        buffered_calls[1].mode,
+        CallMode::Invoke,
+        "the buffered build must reach the optimize stage through a non-streaming invoke"
+    );
+    let streamed_calls = streamed_recorder.calls();
+    assert_eq!(
+        streamed_calls[0].mode,
+        CallMode::Invoke,
+        "the streaming build must still run the analyze prerequisite as a non-streaming invoke"
+    );
+    assert_eq!(
+        streamed_calls[1].mode,
+        CallMode::Stream,
+        "the streaming build must deliver the optimize stage through a streaming call"
+    );
+    assert_eq!(
+        streamed_calls[1].messages.len(),
+        buffered_calls[1].messages.len(),
+        "the streaming and buffered optimize stages must send the same message count"
+    );
+    for (streamed_message, buffered_message) in streamed_calls[1]
+        .messages
+        .iter()
+        .zip(&buffered_calls[1].messages)
+    {
+        assert_eq!(
+            streamed_message.text(),
+            buffered_message.text(),
+            "the streaming and buffered optimize stages must send identical message text"
+        );
+    }
 }

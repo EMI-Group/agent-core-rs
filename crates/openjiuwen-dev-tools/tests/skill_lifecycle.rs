@@ -15,10 +15,12 @@ use openjiuwen_dev_tools::skill_creator::{
     SkillBundle, SkillCreator, SkillDefinition, SkillResource, SkillSpec,
 };
 use openjiuwen_dev_tools::skill_evaluator::{
-    CaseStatus, EvalCase, EvaluationReport, EvaluatorConfig, SafetyRule, ScriptedCaseRunner,
-    SkillEvaluator,
+    CaseStatus, EvalCase, EvaluationReport, EvaluatorConfig, ModelCaseRunner, SafetyRule,
+    ScriptedCaseRunner, SkillEvaluator,
 };
-use openjiuwen_test_support::TempWorkspace;
+use openjiuwen_foundation::llm::Model;
+use openjiuwen_foundation::prompt::Role;
+use openjiuwen_test_support::{ScriptedModel, TempWorkspace};
 use serde_json::json;
 
 /// The instruction template: every design-rubric dimension is satisfiable from it
@@ -385,4 +387,99 @@ async fn evaluated_skill_reports_pipeline_status_and_python_json_fields() {
         blocked.functional.timestamp, 1_700_000_000_000,
         "the blocked run must keep the caller-supplied timestamp"
     );
+}
+
+#[tokio::test]
+async fn model_runner_evaluates_the_authored_skill() {
+    let skill = author_skill();
+    let cases = evaluation_cases();
+
+    // The same pass/pass/fail answers the scripted runner serves, but queued on
+    // a model so the evaluator's own runner seam produces them.
+    let scripted = ScriptedModel::builder()
+        .respond_text("This brief lists the decisions in three bullets.")
+        .respond_text("The brief closes with a risk note: none recorded.")
+        .respond_text("A brief written for the leadership team.")
+        .build();
+    let model: Arc<dyn Model> = Arc::new(scripted.clone());
+
+    let report = SkillEvaluator::new(Arc::new(ModelCaseRunner::new(model)))
+        .evaluate_at(&skill, &cases, 1_700_000_000_000)
+        .await
+        .expect("a model-backed runner must evaluate the authored skill");
+
+    assert_eq!(
+        scripted.call_count(),
+        3,
+        "the model runner seam must make exactly one non-streaming call per evaluation case"
+    );
+
+    let statuses: Vec<CaseStatus> = report
+        .functional
+        .results
+        .iter()
+        .map(|result| result.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![CaseStatus::Passed, CaseStatus::Passed, CaseStatus::Failed],
+        "the model answers must be judged in case order: pass, pass, fail"
+    );
+    assert!(
+        (report.functional.summary.pass_rate - 2.0 / 3.0).abs() < 1e-9,
+        "the pass rate must reflect 2 of the 3 model answers, got {}",
+        report.functional.summary.pass_rate
+    );
+    assert_eq!(
+        (
+            report.functional.summary.passed,
+            report.functional.summary.failed
+        ),
+        (2, 1),
+        "the summary must count exactly the two passing and one failing model answer"
+    );
+
+    let calls = scripted.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "the recorded call list must hold one call per evaluation case"
+    );
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(
+            call.messages.len(),
+            2,
+            "case {index} must send exactly a system and a user message"
+        );
+        assert_eq!(
+            call.messages[0].role,
+            Role::System,
+            "case {index} must open with the skill-document system message"
+        );
+        let system = call.messages[0].text();
+        assert!(
+            system.contains(&skill.name),
+            "the system message of case {index} must name the authored skill: {system}"
+        );
+        assert!(
+            system.contains(&skill.description),
+            "the system message of case {index} must carry the authored description: {system}"
+        );
+        assert!(
+            system.contains(&skill.instructions),
+            "the system message of case {index} must carry the rendered instructions: {system}"
+        );
+        assert_eq!(
+            call.messages[1].role,
+            Role::User,
+            "case {index} must send the case prompt as the user message"
+        );
+    }
+    for (index, case) in cases.iter().enumerate() {
+        assert_eq!(
+            calls[index].messages[1].text().as_ref(),
+            case.prompt.as_str(),
+            "the user message of case {index} must be the case prompt verbatim"
+        );
+    }
 }
