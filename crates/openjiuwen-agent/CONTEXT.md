@@ -302,13 +302,12 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 
 ## Notes for Agents
 
-The public surface above is complete and compiling; several bodies are placeholders, each carrying a `// TODO:` marker.
-- `ReActAgent::invoke`/`stream`, `react::agent_loop::run`, and `react::resume::replay_interrupted` return `Error::unsupported`; the ReAct loop itself is unwritten.
+The public surface above is complete and compiling; the remaining placeholders (`WorkflowAgent` dispatch, workflow selection) carry a `// TODO:` marker.
 - The rails subsystem is implemented: `RailRegistry::fire` dispatches by event in stable descending priority and stops on the first `Err`; `GuardrailRail` enforces the enabled `ScanTargets` stages; `MemoryRail` recalls before the model call (at most once per invoke) and writes messages on `AfterInvoke` (failures logged only); `ModelBackupRail` fails over through `ctx.model_override` + retry; the interrupt rails pause, approve, reject, ask, and auto-confirm.
 - `abilities::AbilityManager::execute` is a sequential baseline: no `parallel_safe` batching and no per-call timeout; `parse_tool_arguments` does not repair truncated JSON yet.
 - `WorkflowAgent::invoke`/`stream` return `Error::unsupported`, and `workflow_agent::select::select_workflow` always returns index 0.
 - `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`; stage gating reuses that shared type instead of a local flag struct.
-- `react::model_step::ModelReply` is public because `RailContext::response` exposes it; `call_model` is a non-streaming baseline that a later loop implementation may replace.
+- `react::model_step::ModelReply` is public because `RailContext::response` exposes it; the loop calls the model through `call_model_streaming` (the normal session-scoped path, which emits `llm_reasoning`/`llm_output`/`llm_usage` frames) and uses `call_model` only for the tool-free `FinalAnswer` finalization call.
 - `LlmAgent::new` consumes `agent_memory_config` without mapping it (the `ReActAgentConfig` has no such field).
 
 ## Test Strategy
