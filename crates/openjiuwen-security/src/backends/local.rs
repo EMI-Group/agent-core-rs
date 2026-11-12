@@ -1,10 +1,11 @@
-//! Local-model backend seam.
+//! Local-model backend.
 //!
 //! Ports `LocalModelBackend` and `LocalModelBackendConfig` from
 //! `openjiuwen/core/security/guardrail/backends.py` (v0.1.20). Python lazily
 //! imports `torch`/`transformers` and runs the classifier in-process; this crate
-//! ships no inference runtime, so configuration and introspection are preserved
-//! (`model_info` reports a model that is never loaded) and `analyze` returns
+//! ships no inference runtime, so configuration, device validation, and
+//! introspection are preserved (`model_info` reports a model that is never
+//! loaded, `is_available` is always `false`) and `analyze` returns
 //! [`Error::unsupported`] after the empty-text short-circuit.
 #![allow(clippy::module_name_repetitions)]
 
@@ -24,6 +25,12 @@ use crate::{GuardrailContext, RiskAssessment};
 /// Python's default device (`device: str = "auto"`).
 const DEFAULT_DEVICE: &str = "auto";
 
+/// Devices a local classifier may be pinned to, matching Python's accepted set.
+///
+/// [`LocalModelBackendConfig::validate`] accepts these values (trimmed and
+/// case-insensitively) and rejects everything else.
+pub const SUPPORTED_DEVICES: [&str; 4] = ["auto", "cpu", "cuda", "mps"];
+
 /// Python's default risk type (`risk_type: str = "model_detection"`).
 const DEFAULT_RISK_TYPE: &str = "model_detection";
 
@@ -33,9 +40,10 @@ const NAME: &str = "local_model";
 /// Configuration for [`LocalModelBackend`].
 ///
 /// Field names and defaults mirror Python's `LocalModelBackendConfig`:
-/// `model_path`, `device` (`"auto"`, one of `auto`/`cpu`/`cuda` in Python), and
-/// `risk_type` (`"model_detection"`). Python's `parser` field is not part of the
-/// serialized config; inject a parser with [`LocalModelBackend::with_parser`].
+/// `model_path`, `device` (`"auto"`; accepted values are [`SUPPORTED_DEVICES`],
+/// checked by [`LocalModelBackendConfig::validate`]), and `risk_type`
+/// (`"model_detection"`). Python's `parser` field is not part of the serialized
+/// config; inject a parser with [`LocalModelBackend::with_parser`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct LocalModelBackendConfig {
@@ -58,6 +66,30 @@ impl Default for LocalModelBackendConfig {
     }
 }
 
+impl LocalModelBackendConfig {
+    /// Checks that [`device`](Self::device) is one of [`SUPPORTED_DEVICES`].
+    ///
+    /// The comparison ignores surrounding whitespace and ASCII case, so
+    /// `" CUDA "` is accepted. A blank `model_path` is allowed: only the device
+    /// is validated here, and the empty-text short-circuit makes an unset path
+    /// harmless.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] naming the rejected device and the accepted values.
+    pub fn validate(&self) -> Result<()> {
+        let device = self.device.trim().to_ascii_lowercase();
+        if SUPPORTED_DEVICES.contains(&device.as_str()) {
+            return Ok(());
+        }
+        Err(Error::validation(format!(
+            "unsupported local model device {:?}; expected one of {}",
+            self.device,
+            SUPPORTED_DEVICES.join(", ")
+        )))
+    }
+}
+
 /// Load state of the local model, mirroring Python's introspection fields.
 ///
 /// A [`LocalModelBackend`] in this crate never loads anything, so every field is
@@ -76,10 +108,11 @@ pub struct ModelInfo {
 
 /// Backend that would run a moderation model locally.
 ///
-/// The inference runtime is deferred: [`LocalModelBackend::analyze`] only
-/// short-circuits empty text and otherwise reports that the runtime is missing.
-/// Configuration and an optional [`ModelOutputParser`] are preserved so the
-/// adapter can be completed without an API change.
+/// No inference runtime is linked: [`LocalModelBackend::is_available`] is
+/// `false`, and [`LocalModelBackend::analyze`] only short-circuits empty text
+/// and otherwise reports that the runtime is missing. Configuration and an
+/// optional [`ModelOutputParser`] are preserved so the adapter can be completed
+/// without an API change.
 pub struct LocalModelBackend {
     config: LocalModelBackendConfig,
     parser: Option<Arc<dyn ModelOutputParser>>,
@@ -100,6 +133,44 @@ impl LocalModelBackend {
     pub fn with_parser(mut self, parser: Arc<dyn ModelOutputParser>) -> Self {
         self.parser = Some(parser);
         self
+    }
+
+    /// Overrides [`LocalModelBackendConfig::device`].
+    ///
+    /// The value is not validated here (Python defers the same check to load
+    /// time); call [`LocalModelBackendConfig::validate`] to reject unknown
+    /// devices.
+    #[must_use]
+    pub fn with_device(mut self, device: impl Into<String>) -> Self {
+        self.config.device = device.into();
+        self
+    }
+
+    /// The preserved configuration (path, device, risk type).
+    #[must_use]
+    pub fn config(&self) -> &LocalModelBackendConfig {
+        &self.config
+    }
+
+    /// The configured classifier path (possibly empty, as in Python).
+    #[must_use]
+    pub fn model_path(&self) -> &str {
+        &self.config.model_path
+    }
+
+    /// The configured device string (`"auto"` by default).
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.config.device
+    }
+
+    /// Whether a local inference runtime can answer here.
+    ///
+    /// Always `false`: the runtime is not implemented, so every non-empty scan
+    /// reports [`Error::unsupported`] rather than pretending to classify.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        false
     }
 
     /// The load state of the model: nothing is ever loaded here, so all `false`.
@@ -252,5 +323,67 @@ mod tests {
 
         let with_parser = backend.with_parser(Arc::new(BertBinaryParser::new()));
         assert!(format!("{with_parser:?}").contains("has_parser: true"));
+    }
+
+    #[test]
+    fn supported_devices_match_python() {
+        assert_eq!(SUPPORTED_DEVICES, ["auto", "cpu", "cuda", "mps"]);
+    }
+
+    #[test]
+    fn validate_accepts_supported_devices() {
+        for device in SUPPORTED_DEVICES {
+            let config = LocalModelBackendConfig {
+                device: device.to_owned(),
+                ..LocalModelBackendConfig::default()
+            };
+            config.validate().unwrap();
+        }
+
+        // Whitespace and case are normalized before the check.
+        for device in [" AUTO ", "cpu", " CUDA", "Mps"] {
+            let config = LocalModelBackendConfig {
+                device: device.to_owned(),
+                ..LocalModelBackendConfig::default()
+            };
+            config.validate().unwrap();
+        }
+
+        // A blank model path is allowed: only the device is validated.
+        LocalModelBackendConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_unknown_devices() {
+        for device in ["", "gpu", "tpu", "cuda:0"] {
+            let config = LocalModelBackendConfig {
+                device: device.to_owned(),
+                ..LocalModelBackendConfig::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Validation, "{device:?}");
+            let message = error.to_string();
+            assert!(message.contains("auto, cpu, cuda, mps"), "{message}");
+        }
+    }
+
+    #[test]
+    fn accessors_expose_the_configuration() {
+        let config = LocalModelBackendConfig {
+            model_path: "/models/bert".to_owned(),
+            device: "cpu".to_owned(),
+            risk_type: "prompt_injection".to_owned(),
+        };
+        let backend = LocalModelBackend::new(config.clone());
+        assert_eq!(backend.config(), &config);
+        assert_eq!(backend.model_path(), "/models/bert");
+        assert_eq!(backend.device(), "cpu");
+        assert!(!backend.is_available());
+
+        let moved = backend.with_device("cuda");
+        assert_eq!(moved.device(), "cuda");
+        assert_eq!(moved.config().risk_type, "prompt_injection");
+        assert_eq!(moved.model_path(), "/models/bert");
+        assert!(!moved.is_available());
     }
 }
