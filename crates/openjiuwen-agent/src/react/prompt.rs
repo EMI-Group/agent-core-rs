@@ -6,7 +6,7 @@
 //! `query`, `conversation_id`, `user_id`, and `run_kind` when present.
 use crate::input::AgentInput;
 use crate::react::config::ReActAgentConfig;
-use openjiuwen_foundation::{PromptTemplate, TemplateContent};
+use openjiuwen_foundation::{BaseMessage, PromptTemplate, TemplateContent};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -53,6 +53,15 @@ pub(crate) fn build_identity(config: &ReActAgentConfig, input: &AgentInput) -> S
         // practice; falling back to the unrendered text keeps it usable.
         TemplateContent::Messages(_) => raw,
     }
+}
+
+/// Wraps [`build_identity`] in the single system message the loop prepends.
+///
+/// The content may be empty when the template carries no system-role messages;
+/// the loop still passes one system message so the window shape is stable.
+#[allow(dead_code)] // used by the loop's prompt construction
+pub(crate) fn build_system(config: &ReActAgentConfig, input: &AgentInput) -> BaseMessage {
+    BaseMessage::system(build_identity(config, input))
 }
 
 #[cfg(test)]
@@ -104,5 +113,23 @@ mod tests {
             build_identity(&config, &AgentInput::default()),
             "system text"
         );
+    }
+
+    #[test]
+    fn build_system_wraps_the_identity_in_one_system_message() {
+        let config = ReActAgentConfig {
+            prompt_template: vec![BaseMessage::system("hello {{query}}")],
+            ..ReActAgentConfig::new()
+        };
+        let message = build_system(&config, &AgentInput::from_text("bob"));
+        assert!(message.role.is_system());
+        assert_eq!(message.text(), "hello bob");
+    }
+
+    #[test]
+    fn build_system_allows_empty_content() {
+        let message = build_system(&ReActAgentConfig::new(), &AgentInput::default());
+        assert!(message.role.is_system());
+        assert_eq!(message.text(), "");
     }
 }
