@@ -21,12 +21,14 @@ use openjiuwen_symphony::model::{CapabilityDescriptor, CapabilityIo, CapabilityK
 use openjiuwen_symphony::orchestration::PlanExecution;
 use openjiuwen_symphony::orchestration::{
     CandidateConfig, CapabilityRunner, ExecutorConfig, PlanConfig, PlanRequest, PlanStatus,
-    RunnerContext, StepOutcome,
+    Planner, RunnerContext, SemanticScorer, StepOutcome,
 };
+use openjiuwen_symphony::registry::CapabilityRegistry;
 use openjiuwen_symphony::runtime::{
     InvokeRequest, MutationOperation, RuntimeState, SymphonyConfig, SymphonyRuntime,
 };
 use openjiuwen_symphony::search::{SearchRequest, SemanticIndex};
+use openjiuwen_symphony::store::{AssetStore, KvAssetStore};
 use serde_json::{json, Value};
 
 /// One string-typed IO, which is all the catalog needs.
@@ -734,6 +736,200 @@ async fn file_backed_artifacts_persist_across_runtimes() {
         .expect("current exists");
     assert!(graph.has_node("tool:fetch"));
     assert_eq!(graph.graph_id, "default");
+}
+
+/// A [`SemanticScorer`] that scores one capability `1.0` and every other `0.0`.
+struct FixedScorer {
+    /// The qualified id the scorer prefers.
+    preferred: &'static str,
+}
+
+#[async_trait]
+impl SemanticScorer for FixedScorer {
+    async fn score(
+        &self,
+        _query: &str,
+        capabilities: &[CapabilityDescriptor],
+    ) -> Result<BTreeMap<String, f64>> {
+        Ok(capabilities
+            .iter()
+            .map(|capability| {
+                let qualified_id = capability.qualified_id();
+                let score = if qualified_id == self.preferred {
+                    1.0
+                } else {
+                    0.0
+                };
+                (qualified_id, score)
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn builder_with_registry_adopts_the_supplied_catalog() {
+    let registry = Arc::new(CapabilityRegistry::new());
+    for descriptor in catalog() {
+        registry.register(descriptor).await.expect("register");
+    }
+
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_registry(Arc::clone(&registry))
+        .open()
+        .await
+        .expect("open runtime");
+
+    assert!(
+        Arc::ptr_eq(runtime.registry(), &registry),
+        "the runtime must use the caller's registry, not a copy"
+    );
+    assert_eq!(runtime.registry().len(), 2);
+
+    let revision = runtime.build().await.expect("build");
+    assert_eq!(revision.node_count, 2);
+    assert_eq!(revision.edge_count, 1);
+    let graph = runtime
+        .read_graph(None)
+        .await
+        .expect("read current")
+        .expect("current exists");
+    assert!(graph.has_node("tool:fetch"));
+    assert!(graph.has_node("tool:transform"));
+}
+
+/// Opens a runtime over the `fetch`/`transform`/`sum` catalog with `planner` when given.
+async fn runtime_with_planner(planner: Option<Planner>) -> SymphonyRuntime {
+    let builder = SymphonyRuntime::builder(SymphonyConfig::default());
+    let builder = match planner {
+        Some(planner) => builder.with_planner(planner),
+        None => builder,
+    };
+    let runtime = builder.open().await.expect("open runtime");
+    for descriptor in catalog().into_iter().chain(std::iter::once(sum())) {
+        runtime
+            .registry()
+            .register(descriptor)
+            .await
+            .expect("register");
+    }
+    runtime
+}
+
+#[tokio::test]
+async fn builder_with_planner_honours_the_supplied_scorer() {
+    // The default lexical scorer matches `fetch`/`transform` on this query.
+    let default_runtime = runtime_with_planner(None).await;
+    let default_plan = default_runtime
+        .plan(&PlanRequest::new("fetches raw data"))
+        .await
+        .expect("plan");
+    assert_eq!(default_plan.steps[0].step_id, "tool:fetch");
+
+    // The injected planner swaps in a scorer that prefers `tool:sum` only.
+    let scorer: Arc<dyn SemanticScorer> = Arc::new(FixedScorer {
+        preferred: "tool:sum",
+    });
+    let runtime =
+        runtime_with_planner(Some(Planner::with_scorer(PlanConfig::default(), scorer))).await;
+    let plan = runtime
+        .plan(&PlanRequest::new("fetches raw data"))
+        .await
+        .expect("plan");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].step_id, "tool:sum");
+    assert_eq!(plan.status, PlanStatus::NeedsInput);
+}
+
+#[tokio::test]
+async fn builder_with_asset_store_hydrates_and_writes_through() {
+    let store: Arc<dyn AssetStore> = Arc::new(KvAssetStore::in_memory());
+    store.put(&fetch()).await.expect("seed store");
+
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_asset_store(Arc::clone(&store))
+        .open()
+        .await
+        .expect("open runtime");
+    assert_eq!(runtime.registry().len(), 1);
+    assert!(
+        runtime
+            .registry()
+            .contains(&CapabilityKey::new("tool", "fetch"))
+            .await
+    );
+
+    let plan = runtime
+        .plan(&PlanRequest::new("fetch data"))
+        .await
+        .expect("plan");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].step_id, "tool:fetch");
+
+    runtime.start().await.expect("start");
+    runtime
+        .add_capabilities(vec![sum()], "req-persist")
+        .await
+        .expect("add");
+    assert!(store
+        .get(&CapabilityKey::new("tool", "sum"))
+        .await
+        .expect("read through the store")
+        .is_some());
+    drop(runtime);
+
+    let reopened = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_asset_store(store)
+        .open()
+        .await
+        .expect("reopen runtime");
+    assert_eq!(reopened.registry().len(), 2);
+    assert!(
+        reopened
+            .registry()
+            .contains(&CapabilityKey::new("tool", "sum"))
+            .await
+    );
+    let plan = reopened
+        .plan(&PlanRequest::new("adds two numbers"))
+        .await
+        .expect("plan");
+    assert_eq!(plan.steps[0].step_id, "tool:sum");
+}
+
+#[tokio::test]
+async fn file_artifacts_and_asset_store_persist_together() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = SymphonyConfig {
+        graph_artifact_root: Some(directory.path().to_path_buf()),
+        ..SymphonyConfig::default()
+    };
+    let store: Arc<dyn AssetStore> = Arc::new(KvAssetStore::in_memory());
+
+    let first = SymphonyRuntime::builder(config.clone())
+        .with_asset_store(Arc::clone(&store))
+        .open()
+        .await
+        .expect("open first runtime");
+    first.start().await.expect("start");
+    let added = first
+        .add_capabilities(catalog(), "req-artifacts")
+        .await
+        .expect("add");
+    assert_eq!(added.revision, "v2");
+    first.close().await.expect("close");
+    drop(first);
+
+    let second = SymphonyRuntime::builder(config)
+        .with_asset_store(store)
+        .open()
+        .await
+        .expect("reopen runtime");
+    assert_eq!(second.registry().len(), 2);
+    let status = second.graph_status().await.expect("status");
+    assert!(status.is_ready());
+    assert_eq!(status.current_version.as_deref(), Some("v2"));
+    assert_eq!(status.node_count, 2);
+    assert_eq!(status.edge_count, 1);
 }
 
 /// Builds a plan execution with every listed step successful, in the given order.
