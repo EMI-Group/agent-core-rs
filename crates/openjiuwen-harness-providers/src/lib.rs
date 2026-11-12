@@ -27,6 +27,8 @@
 //! # Module map
 //!
 //! - [`error`] — translation from the harness SPI error type to the workspace error.
+//! - [`factory`] — the provider registry: registration, resolution, harness creation, the
+//!   model-configuration gates, provider descriptors and the harness-context builder.
 //! - [`input`] — harness input conversion, text projection and chunk-kind constants.
 //! - [`json`] — JSON projections (`to_json_safe`, `to_json_object`).
 //! - [`mcp_naming`] — the `<mcp-tools>` naming preamble for provider system prompts.
@@ -36,12 +38,14 @@
 //!   stubs) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation.
 //!
-//! Later phases add the provider registry (`factory`) and the IO adapter (`io_adapter`); the strict
-//! JSON mapping helpers in the crate-internal `decode` module back their configuration decoders.
+//! A later phase adds the IO adapter (`io_adapter`) that projects a harness onto the kernel IO
+//! surface; the strict JSON mapping helpers in the crate-internal `decode` module back its
+//! configuration decoders.
 
 mod decode;
 
 pub mod error;
+pub mod factory;
 pub mod input;
 pub mod json;
 pub mod mcp_naming;
@@ -50,6 +54,12 @@ pub mod providers;
 pub mod skills;
 
 pub use error::providers_error_to_common;
+pub use factory::{
+    available_providers, build_harness_context, create_harness, describe_provider,
+    provider_descriptors, provider_model_config, register_harness_provider, resolve_provider,
+    unregister_harness_provider, HarnessContextOptions, ProviderFactory,
+    HARNESS_PROVIDER_ENTRY_POINT_GROUP, PROVIDER_NAMES,
+};
 pub use input::{
     harness_input_text, to_harness_input, INTERACTION_KIND, INTERACTIVE_INPUT_KIND,
     TASK_FAILED_KIND, TURN_LIFECYCLE_KIND,
