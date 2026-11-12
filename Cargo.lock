@@ -2152,15 +2152,20 @@ dependencies = [
 name = "openjiuwen-rsi"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "futures",
  "openjiuwen-common",
  "openjiuwen-core",
  "openjiuwen-harness",
+ "openjiuwen-test-support",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
