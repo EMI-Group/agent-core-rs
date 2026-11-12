@@ -15,7 +15,7 @@ Everything here is pure data assembly: no IO, no async, no filesystem access.
 - `SectionName` — associated string constants: `IDENTITY`, `SAFETY`, `TOOLS`, `SKILLS`, `MEMORY`, `WORKSPACE`, `CONTEXT`, `TASK_LOOP`, `SUBAGENT_TOOLS`, `COMPLETION_SIGNAL`, `MODE_INSTRUCTIONS`, `TODO`, `ENVIRONMENT`.
 - `PromptCategory { SystemPrompt, Tools, Skills, Memory }` with `as_str`, `parse`, `display_name(language)`, `ORDER` (the fixed report order).
 - `PromptSection { name: String, content: BTreeMap<String, String>, priority: i32, category: Option<PromptCategory>, carrier: String }`:
-  `new(name, content, priority)`, `bilingual(name, cn, en, priority)`, `with_category`, `with_carrier`, `render(language) -> String`, `char_count(language) -> usize`, `is_empty(language) -> bool`.
+  `new(name, content, priority)` (carrier defaults to `"system"`), `bilingual(name, cn, en, priority)`, `with_category`, `with_carrier`, `render(language) -> String`, `char_count(language) -> usize`, `is_empty(language) -> bool` (true when the render is whitespace only).
   `render` fallback is exactly `content[language]` → `content["cn"]` → first value → `""`.
 - `HarnessPromptBuilder`:
   `new(language, mode)`, `default()` (= cn + `PromptMode::Full`), `language()`, `mode()`, `with_mode(mode)`,
@@ -46,7 +46,8 @@ Everything here is pure data assembly: no IO, no async, no filesystem access.
   `PromptReport { total_chars, estimated_tokens, section_count, sections, mode, language, categories }`.
 - `PromptReport::from_sections(mode, language, &[&PromptSection])`, `chars_per_token(language) -> f64`, `summary() -> String` (`[PromptReport] mode=… lang=… sections=… chars=… est_tokens≈…`).
 - Categories are emitted in the fixed order `system_prompt`, `tools`, `skills`, `memory`; sections with `category: None` count as `SystemPrompt`; empty groups are omitted.
-- Token heuristic: `chars / 2.5` for `"cn"`, `chars / 4.0` otherwise, truncated to `usize`.
+- Token heuristic: `chars / 2.5` for `"cn"`, `chars / 4.0` otherwise, truncated to `usize` (`chars * 2 / 5` and `chars / 4` in integer arithmetic).
+- Only `cn`/`zh*` use the Chinese divisor; an unrecognised language is estimated at 4 characters per token, though section *text* still falls back to Chinese.
 
 `sanitize.rs`:
 - `DEFAULT_MAX_USER_CONTENT_LEN: usize = 2000`.
@@ -88,6 +89,9 @@ Everything here is pure data assembly: no IO, no async, no filesystem access.
 - Plan mode instructions are a condensed five-phase workflow (understand, design, review, write plan, exit) rather than Python's full manual; only `AgentMode::Plan` emits text.
 - `PromptCategory` is an enum instead of Python's free-form string; categories only drive report grouping.
 - `environment` is bilingual here, although Python's CLI builder emits English only.
+- `build_report` measures only the sections the prompt actually renders (mode-filtered, non-empty, in render order); `PromptMode::None` yields an empty report.
+- Tool-description language selection maps `en*` to English and every other tag (including unknown ones) to Chinese; `HarnessPromptBuilder::new` normalises its language through `resolve_language`, so `en-US` becomes `en`.
+- `sanitize_*` drops only the escape sequences `\n`/`\r`; every other backslash survives so Windows-style paths keep working.
 
 ## Routing Table
 
