@@ -64,6 +64,7 @@ pub mod events;
 pub mod offload;
 pub mod processor;
 pub mod prompts;
+pub mod recall;
 pub mod stats;
 pub mod tokens;
 pub mod window;
@@ -88,6 +89,13 @@ pub use processor::{
     TruncationProcessor, CONTEXT_SUMMARY_PREFIX, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
 };
 pub use prompts::{render_summary_prompt, SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE};
+pub use recall::{
+    archive_from_messages, group_turns, parse_recall_marker, recall_compressed_context,
+    recall_marker, split_text, try_archive_from_messages, Bm25Index, InMemoryRecallArchiveStore,
+    KvRecallArchiveStore, RecallArchive, RecallArchiveStore, RecallChunk, RecallChunkMatch,
+    RecallOptions, RecallResult, RecallTurn, RecallTurnMatch, TurnRecord,
+    COMPRESSION_RECALL_MARKER_PREFIX,
+};
 pub use stats::{compute_stats, ContextStats, PreparedContext};
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
 pub use window::{
