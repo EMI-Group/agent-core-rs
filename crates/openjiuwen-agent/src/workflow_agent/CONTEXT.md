@@ -22,6 +22,7 @@ A child with a parent shares the parent's stream hub, config, checkpointer, and 
 Dispatch: an `InteractiveInput` query calls `Workflow::resume` (a missing checkpointer propagates `Error::workflow`), otherwise `Workflow::invoke` receives the start payload.
 The payload starts from `config.global_params`, then adds caller extras filtered to the workflow card's `input_params.properties` when that object exists, then overwrites `"query"` with the query text.
 Mapping: `Completed` → `AgentOutput::answer(JSON text of result)` with `data = result` and `workflow_output = output`; `InputRequired` → `AgentOutput::interrupt(frames, ids)` from the `__interaction__` wires in `result` (id from `payload["id"]`) with `workflow_output = output`; `Error` → `AgentOutput::error` with `termination_reason = "workflow_error"` and `workflow_output = output`.
+An interrupted output also fills `component_ids` from the interaction payload ids (frame order, non-string ids skipped, duplicates dropped), while `interrupt_ids` keeps the raw per-frame ids.
 
 ## Stream
 
@@ -29,7 +30,9 @@ Mapping: `Completed` → `AgentOutput::answer(JSON text of result)` with `data =
 The task resolves the session, runs `select`, and either sends one terminal default-response `answer` chunk or calls `workflow.stream_with(payload, child_session, WorkflowRunOptions { interactive, resume: interactive.is_some() })`.
 Every `Ok` workflow frame (component frames, `__interaction__`, `workflow_final`) is forwarded verbatim as `AgentChunk::new(item_type, index, payload)` with no synthesized duplicates.
 Collected `__interaction__` frames become agent `OutputFrame`s (index from the payload, default 0) and ids come from `payload["id"]`.
-Exactly one terminal `answer` chunk follows: `AgentOutput::interrupt` with `workflow_output = {result: <wire frames>, state: InputRequired}` when interactions arrived and no `workflow_final` did, otherwise `AgentOutput::answer(JSON text of the final payload)` with `data` and `workflow_output = {result, state: Completed}`.
+Exactly one terminal `answer` chunk follows: `AgentOutput::interrupt` (with `component_ids` filled from the interaction payload ids) with `workflow_output = {result: <wire frames>, state: InputRequired}` when interactions arrived and no `workflow_final` did, otherwise `AgentOutput::answer(JSON text of the final payload)` with `data` and `workflow_output = {result, state: Completed}`.
+The agent mirrors its own synthesized chunks into the supplied agent session (`session.write_stream(chunk.to_stream_item()).await`): the forwarded `workflow_final` chunk, the default-response `answer` chunk, and the terminal `answer` chunk; engine-originated frames reach that hub implicitly through the child session's shared writer and are never re-written.
+A mirroring failure is logged at debug level and never changes the caller-visible stream.
 Any non-cancellation setup/stream error becomes one terminal `answer` chunk carrying `AgentOutput::error`; `ErrorKind::Cancelled` surfaces as one `Err` item.
 The session is finished before the sender drops.
 
@@ -45,7 +48,8 @@ A model `Err`, a missing model, or a failed parse all fall back to `Default(text
 - Inputs are dispatched as `{"query": <text>}` merged over `global_params` and the caller's filtered `AgentInput.extra` keys.
 - `InteractiveInput` in the query selects the resume path; interruption results preserve `WorkflowExecutionState::InputRequired`.
 - Completed runs return `result_type = Answer`, `output` = JSON text of `workflow_output.result`, with the structured `WorkflowOutput` in `workflow_output`/`data`.
-- The workflow engine already writes its frames (including `__interaction__`) to the child session's shared hub, so the agent must never re-write them.
+- The workflow engine already writes its frames (including `__interaction__`) to the child session's shared hub, so the agent must never re-write them; only its synthesized `workflow_final` and `answer` chunks are mirrored explicitly.
+- An interrupted output reports the interaction payload ids in both `interrupt_ids` and `component_ids`.
 - The agent never mutates a `Workflow`; workflows are shared as `Arc<Workflow>` and may run concurrently.
 - No global registry lookups; model use is limited to intent detection.
 - Library code is panic-free: index lookups use `get`/`ok_or_else`, never direct indexing.
@@ -54,7 +58,7 @@ A model `Err`, a missing model, or a failed parse all fall back to `Default(text
 
 `../../tests/workflow_agent.rs` covers the public contract: single- and multi-workflow invoke/stream, default-response fallback, interrupt → `result_type = interrupt` with `__interaction__` frames, and resume after an `InteractiveInput` answer.
 Inline `select` unit tests cover the empty-slice error, the single-workflow fast path with zero model calls, `{"result": 2}`/bare `2`/quoted `"3"` parsing, the description-or-name prompt, garbage and out-of-range replies, missing default text, and model errors.
-Inline `mod.rs` tests cover card/registration behavior, `build_payload` merging and extra filtering, the no-workflow error, a `StartComponent`→`EndComponent` invoke, and stream forwarding plus its terminal/error frames.
+Inline `mod.rs` tests cover card/registration behavior, `build_payload` merging and extra filtering, the no-workflow error, a `StartComponent`→`EndComponent` invoke, interrupt mapping (`component_ids` from interaction ids, order/dedup of the helper), stream forwarding plus its terminal/error frames, and mirroring of the synthesized `workflow_final`/`answer` frames into a supplied session's hub (500 ms bounded drain).
 
 ## Routing Table
 
