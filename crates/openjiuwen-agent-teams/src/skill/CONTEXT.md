@@ -133,7 +133,8 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `./descriptor.rs` → `TeamJoinDescriptor`, `ClientScope`, env/file/JSON loading
 - `./client.rs` → `TeamClient` trait, outcome types, tool catalogue (`member_tools_for`, `operator_tools`)
 - `./store_client.rs` → `StoreTeamClient`: the store/task-board/messager implementation of the client
-- `./cli/mod.rs` → clap surface, two-stage parse, `SkillCli::run`, `run_skill_cli`, runtime bridge
+- `./cli/mod.rs` → two-stage descriptor scan, `SkillCli::run`/`run_with`, exit codes, `run_skill_cli`, the live-team resolver seam
+- `./cli/command.rs` → the two clap trees (member/operator), subcommand and value enums
 - `./cli/member.rs` → member-scope dispatch (real teammate tool set)
 - `./cli/operator.rs` → operator-scope dispatch (board, messaging, roster)
 - `./cli/output.rs` → line renderers shared by both scopes
