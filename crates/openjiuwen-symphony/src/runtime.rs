@@ -35,6 +35,14 @@
 //! [`tokio::sync::Mutex`], an async-aware lock that legitimately spans the `.await`s
 //! persisting a revision; holding it is what makes mutation replay and the edge diff
 //! meaningful.
+//!
+//! A second [`tokio::sync::Mutex`] (`semantic_sync`) serializes semantic (re)indexing. It
+//! may span the registry snapshot read plus the embedding calls — that serialization is
+//! intentional, because a concurrent query must not clear the index another query is
+//! building — and it is released before the vector search and every unrelated `.await`.
+//! The mutex records the [`CapabilityRegistry::revision`] the index reflects, so an
+//! unchanged catalog embeds only the query; a stale record just costs one extra reindex,
+//! never wrong results.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -229,6 +237,9 @@ impl SymphonyRuntimeBuilder {
             planner,
             runner,
             semantic: self.semantic_index,
+            // `None`: a `with_registry` catalog may already hold descriptors this index
+            // has never seen, so the first search must synchronize.
+            semantic_sync: AsyncMutex::new(None),
             ledger: AsyncMutex::new(MutationLedger::default()),
         };
         debug!(
@@ -282,6 +293,9 @@ pub struct SymphonyRuntime {
     runner: Arc<dyn CapabilityRunner>,
     /// The optional embedding-backed index used by [`SymphonyRuntime::semantic_search`].
     semantic: Option<Arc<SemanticIndex>>,
+    /// The catalog revision the semantic index currently reflects; `None` means the index
+    /// has not been synchronized yet. Serializes semantic (re)indexing.
+    semantic_sync: AsyncMutex<Option<u64>>,
     /// Serializes derive-and-publish and records mutation results per `request_id`.
     ledger: AsyncMutex<MutationLedger>,
 }
@@ -500,9 +514,14 @@ impl SymphonyRuntime {
         self.registry.search(request).await
     }
 
-    /// Searches the catalog semantically by clearing and re-indexing it, then embedding
-    /// `query`, so the hits reflect every mutation including removals. `top_k == 0` means
-    /// unlimited.
+    /// Searches the catalog semantically, embedding only `query` when the index is
+    /// already synchronized.
+    ///
+    /// The index is lazily synchronized: the catalog is cleared and embedded again only
+    /// when [`CapabilityRegistry::revision`] changed since the last synchronization, so an
+    /// unchanged catalog embeds just the query, while every mutation (including removals)
+    /// is reflected before the next search. `start` does not seed the index. `top_k == 0`
+    /// means unlimited.
     ///
     /// # Errors
     ///
@@ -514,10 +533,44 @@ impl SymphonyRuntime {
                 "semantic capability search without a semantic index",
             ));
         };
+        // The revision is read *before* the snapshot: a mutation in between records an
+        // older revision against a newer catalog (one harmless extra reindex) instead of
+        // recording a newer revision against a stale catalog.
+        let mut synced = self.semantic_sync.lock().await;
+        let revision = self.registry.revision();
+        if *synced != Some(revision) {
+            let capabilities = self.registry.list().await;
+            index.clear().await?;
+            index.index(&capabilities).await?;
+            *synced = Some(revision);
+        }
+        // The search is not part of the reindex critical section.
+        drop(synced);
+        index.search(query, top_k).await
+    }
+
+    /// Clears and re-embeds the whole catalog, recording the current revision, and returns
+    /// how many descriptors were indexed.
+    ///
+    /// This is the manual escape hatch for a changed embedding model, which the catalog
+    /// revision cannot observe by itself. It serializes with [`SymphonyRuntime::semantic_search`]
+    /// through the same mutex.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] without a [`SemanticIndex`], or the embedding
+    /// model's and vector store's errors.
+    pub async fn reindex_semantics(&self) -> Result<usize> {
+        let Some(index) = &self.semantic else {
+            return Err(unsupported("semantic reindex without a semantic index"));
+        };
+        let mut synced = self.semantic_sync.lock().await;
+        let revision = self.registry.revision();
         let capabilities = self.registry.list().await;
         index.clear().await?;
-        index.index(&capabilities).await?;
-        index.search(query, top_k).await
+        let indexed = index.index(&capabilities).await?;
+        *synced = Some(revision);
+        Ok(indexed)
     }
 
     /// Upserts `descriptors` into the catalog and publishes a new revision.

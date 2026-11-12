@@ -10,6 +10,7 @@
 #![allow(clippy::assert_is_empty)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -27,7 +28,7 @@ use openjiuwen_symphony::registry::CapabilityRegistry;
 use openjiuwen_symphony::runtime::{
     InvokeRequest, MutationOperation, RuntimeState, SymphonyConfig, SymphonyRuntime,
 };
-use openjiuwen_symphony::search::{SearchRequest, SemanticIndex};
+use openjiuwen_symphony::search::{SearchHit, SearchRequest, SemanticIndex};
 use openjiuwen_symphony::store::{AssetStore, KvAssetStore};
 use serde_json::{json, Value};
 
@@ -605,6 +606,61 @@ async fn evolution_without_a_revision_rejects_every_transition() {
     assert_eq!(result.revision, "");
 }
 
+/// A [`HashEmbedding`] that counts document-embedding invocations, so a test can observe
+/// whether the semantic index was re-embedded or only the query was.
+struct CountingEmbedding {
+    /// The deterministic embedder doing the actual work.
+    inner: HashEmbedding,
+    /// How many times `embed_documents` was called.
+    document_calls: AtomicUsize,
+}
+
+impl CountingEmbedding {
+    /// Creates a counting embedder over a [`HashEmbedding`] of `dimension` components.
+    fn new(dimension: usize) -> Self {
+        Self {
+            inner: HashEmbedding::new(dimension),
+            document_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many document-embedding batches were requested so far.
+    fn document_calls(&self) -> usize {
+        self.document_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Embedding for CountingEmbedding {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn dimension_hint(&self) -> Option<usize> {
+        self.inner.dimension_hint()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner.embed_query(text).await
+    }
+
+    async fn embed_documents(
+        &self,
+        texts: &[String],
+        batch_size: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.document_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.embed_documents(texts, batch_size).await
+    }
+}
+
+/// The qualified ids of `hits`, in hit order.
+fn hit_ids(hits: &[SearchHit]) -> Vec<String> {
+    hits.iter()
+        .map(|hit| hit.descriptor.qualified_id())
+        .collect()
+}
+
 #[tokio::test]
 async fn semantic_search_indexes_the_catalog_snapshot() {
     let embedder: Arc<dyn Embedding> = Arc::new(HashEmbedding::new(64));
@@ -640,6 +696,133 @@ async fn semantic_search_without_an_index_is_unsupported() {
     let runtime = runtime_with_catalog().await;
     let error = runtime
         .semantic_search("adds two numbers", 10)
+        .await
+        .expect_err("no semantic index is configured");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.message().contains("semantic index"));
+}
+
+#[tokio::test]
+async fn semantic_search_reembeds_only_when_the_catalog_changed() {
+    let embedder = Arc::new(CountingEmbedding::new(64));
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_semantic_index(Arc::new(SemanticIndex::new(embedder.clone())))
+        .open()
+        .await
+        .expect("open runtime");
+    runtime.registry().register(sum()).await.expect("register");
+
+    let first = runtime
+        .semantic_search("adds two numbers", 10)
+        .await
+        .expect("first semantic search");
+    let second = runtime
+        .semantic_search("adds two numbers", 10)
+        .await
+        .expect("second semantic search");
+
+    assert_eq!(hit_ids(&first), vec!["tool:sum"]);
+    assert_eq!(hit_ids(&second), vec!["tool:sum"]);
+    // The catalog did not change, so only the query was embedded once.
+    assert_eq!(embedder.document_calls(), 1);
+}
+
+#[tokio::test]
+async fn semantic_search_reflects_added_capabilities() {
+    let embedder = Arc::new(CountingEmbedding::new(64));
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_semantic_index(Arc::new(SemanticIndex::new(embedder.clone())))
+        .open()
+        .await
+        .expect("open runtime");
+    runtime.registry().register(sum()).await.expect("register");
+    runtime.start().await.expect("start");
+
+    let before = runtime
+        .semantic_search("fetches raw data", 0)
+        .await
+        .expect("semantic search before the add");
+    assert_eq!(hit_ids(&before), vec!["tool:sum"]);
+
+    runtime
+        .add_capabilities(vec![fetch()], "req-semantic-add")
+        .await
+        .expect("add capability");
+
+    let after = runtime
+        .semantic_search("fetches raw data", 0)
+        .await
+        .expect("semantic search after the add");
+    assert!(hit_ids(&after).contains(&"tool:fetch".to_string()));
+    assert_eq!(embedder.document_calls(), 2);
+}
+
+#[tokio::test]
+async fn semantic_search_reflects_removed_capabilities() {
+    let embedder = Arc::new(CountingEmbedding::new(64));
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_semantic_index(Arc::new(SemanticIndex::new(embedder.clone())))
+        .open()
+        .await
+        .expect("open runtime");
+    runtime.registry().register(sum()).await.expect("register");
+    runtime
+        .registry()
+        .register(fetch())
+        .await
+        .expect("register");
+    runtime.start().await.expect("start");
+    let before = runtime
+        .semantic_search("fetches raw data", 0)
+        .await
+        .expect("semantic search");
+    assert!(hit_ids(&before).contains(&"tool:sum".to_string()));
+
+    runtime
+        .remove_capabilities(&[CapabilityKey::new("tool", "sum")], "req-semantic-remove")
+        .await
+        .expect("remove capability");
+
+    let after = runtime
+        .semantic_search("adds two numbers", 0)
+        .await
+        .expect("semantic search after the removal");
+    assert_eq!(hit_ids(&after), vec!["tool:fetch"]);
+    // The removal invalidated the index, so the remaining catalog was re-embedded once.
+    assert_eq!(embedder.document_calls(), 2);
+}
+
+#[tokio::test]
+async fn reindex_semantics_reembeds_the_whole_catalog_repeatedly() {
+    let embedder = Arc::new(CountingEmbedding::new(64));
+    let runtime = SymphonyRuntime::builder(SymphonyConfig::default())
+        .with_semantic_index(Arc::new(SemanticIndex::new(embedder.clone())))
+        .open()
+        .await
+        .expect("open runtime");
+    for descriptor in catalog() {
+        runtime
+            .registry()
+            .register(descriptor)
+            .await
+            .expect("register");
+    }
+
+    assert_eq!(runtime.reindex_semantics().await.expect("reindex"), 2);
+    assert_eq!(runtime.reindex_semantics().await.expect("reindex again"), 2);
+    assert_eq!(embedder.document_calls(), 2);
+    let hits = runtime
+        .semantic_search("fetches raw data", 0)
+        .await
+        .expect("semantic search after reindex");
+    assert_eq!(hits.len(), 2);
+}
+
+#[tokio::test]
+async fn semantic_reindex_without_an_index_is_unsupported() {
+    let runtime = runtime_with_catalog().await;
+    let error = runtime
+        .reindex_semantics()
         .await
         .expect_err("no semantic index is configured");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
