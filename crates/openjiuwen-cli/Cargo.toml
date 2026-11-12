@@ -11,6 +11,7 @@ publish = false
 [[bin]]
 name = "openjiuwen"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 openjiuwen.workspace = true
