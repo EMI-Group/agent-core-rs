@@ -1,6 +1,6 @@
-//! LLM payload normalization and GenAI request/response attributes.
+//! LLM payload normalization and `GenAI` request/response attributes.
 //!
-//! Port of the GenAI attribute helpers of
+//! Port of the `GenAI` attribute helpers of
 //! `openjiuwen/extensions/tracer_otel/handler.py` (v0.1.20): the payload
 //! normalizer (`_standard_messages`, `_unwrap_llm_payload`, `_redacted_json`),
 //! the request-attribute block of `OtelAgentHandler.on_llm_start`, the
@@ -118,7 +118,7 @@ const LATENCY_USAGE_FIELDS: [(&str, &str); 2] = [
     ("reasoning_duration_ms", OJ_GEN_AI_REASONING_DURATION_MS),
 ];
 
-/// Normalizes an LLM input payload into GenAI `instructions` and `messages`.
+/// Normalizes an LLM input payload into `GenAI` `instructions` and `messages`.
 ///
 /// Python counterpart: `_standard_messages` in `tracer_otel/handler.py`. The
 /// value is unwrapped from its `messages`/`inputs` container (or used as an
@@ -268,9 +268,9 @@ pub(crate) fn redacted_json(
     redactor.redact_json(value, Some(field), system_prompt)
 }
 
-/// Converts a JSON scalar into the typed OTel value of the same shape.
+/// Converts a JSON scalar into the typed `OTel` value of the same shape.
 ///
-/// Objects, arrays, and `null` have no OTel scalar equivalent, so they yield
+/// Objects, arrays, and `null` have no `OTel` scalar equivalent, so they yield
 /// `None` and the caller skips that attribute. Numbers keep their JSON
 /// integer/float distinction; string values are passed through verbatim.
 fn scalar_value(value: &Value) -> Option<OtelValue> {
@@ -340,7 +340,7 @@ fn text_field<'a>(info: Option<&'a Map<String, Value>>, key: &str) -> Option<&'a
         .filter(|text| !text.is_empty())
 }
 
-/// Writes the GenAI request attributes of an LLM span.
+/// Writes the `GenAI` request attributes of an LLM span.
 ///
 /// Python counterpart: the attribute block of `OtelAgentHandler.on_llm_start`
 /// (without the `TraceSpan`-derived `openjiuwen.agent.*` pair, see the module
@@ -400,11 +400,11 @@ fn set_identity_attributes(span: &mut Span, info: Option<&Map<String, Value>>) {
     }
 }
 
-/// Writes the GenAI request parameters forwarded by the rail.
+/// Writes the `GenAI` request parameters forwarded by the rail.
 ///
 /// Python counterpart: the `request_params` loop of `on_llm_start`. Numbers
 /// keep their numeric type (`f64` for sampling knobs, `i64` for the token
-/// budget), `stop_sequences` becomes an OTel string array, and
+/// budget), `stop_sequences` becomes an `OTel` string array, and
 /// `reasoning_level` stays a string. A parameter of the wrong shape skips only
 /// itself.
 fn set_request_parameters(span: &mut Span, info: Option<&Map<String, Value>>) {
@@ -444,7 +444,7 @@ fn set_request_parameters(span: &mut Span, info: Option<&Map<String, Value>>) {
     }
 }
 
-/// Writes the GenAI system-instruction and input-message payloads.
+/// Writes the `GenAI` system-instruction and input-message payloads.
 ///
 /// Python counterpart: the `inputs is not None` block of `on_llm_start`.
 /// Instructions use the system-prompt redaction policy (hashed or verbatim,
@@ -476,7 +476,7 @@ fn set_prompt_attributes(span: &mut Span, inputs: &Value, config: &OtelTracerCon
     }
 }
 
-/// Writes the GenAI response / usage / cost / latency attributes of an LLM span.
+/// Writes the `GenAI` response / usage / cost / latency attributes of an LLM span.
 ///
 /// Python counterpart: `_set_llm_response_attrs`. The payload is unwrapped from
 /// its `messages`/`outputs`/`inputs` container and must be an object;

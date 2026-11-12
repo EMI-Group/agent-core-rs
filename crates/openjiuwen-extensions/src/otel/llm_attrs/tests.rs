@@ -1,6 +1,6 @@
-//! Unit tests of the LLM payload normalization and GenAI attribute helpers.
+//! Unit tests of the LLM payload normalization and `GenAI` attribute helpers.
 //!
-//! Port of the GenAI attribute assertions of
+//! Port of the `GenAI` attribute assertions of
 //! `tests/unit_tests/extensions/tracer_otel/test_handler.py`:
 //! `TestGenAiSemconvAttrs`, the `_standard_messages` cases, the retrieval
 //! projection cases, and the `usage_metadata` latency cases.
@@ -55,7 +55,7 @@ fn response_span(outputs: &Value) -> SpanData {
     export(|span| set_llm_response_attributes(span, outputs))
 }
 
-/// The typed OTel value of one attribute, when present.
+/// The typed `OTel` value of one attribute, when present.
 fn value_of<'a>(data: &'a SpanData, key: &str) -> Option<&'a SpanValue> {
     data.attributes
         .iter()

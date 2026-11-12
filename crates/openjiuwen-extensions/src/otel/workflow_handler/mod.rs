@@ -76,18 +76,12 @@
 //! [`SpanKind::Internal`]: opentelemetry::trace::SpanKind::Internal
 //! [`SpanKind::Client`]: opentelemetry::trace::SpanKind::Client
 
-// The otel `mod.rs` re-exports of this module land in a follow-up commit owned by
-// the parent agent, so nothing in the crate calls the handler yet and its `pub`
-// items are not reachable from outside the module tree. The `unused_async` opt-out
-// is deliberate as well: the callbacks mirror Python's coroutines and the
-// session-callback contract, while their bodies stay fully synchronous so no lock
-// is ever held across an `await`. All of these go away with the re-export.
-#![allow(
-    dead_code,
-    unreachable_pub,
-    clippy::unused_async,
-    clippy::unused_async_trait_impl
-)]
+// Both async opt-outs are deliberate: the callbacks mirror Python's coroutines and
+// the session-callback contract, so their signatures stay `async` even though the
+// bodies are fully synchronous (no lock is ever held across an `await`). Clippy
+// reports part of the family as `unused_async` and part as
+// `unused_async_trait_impl`, so both lints are allowed.
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 mod spans;
 #[cfg(test)]

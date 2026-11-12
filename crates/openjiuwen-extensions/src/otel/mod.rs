@@ -58,6 +58,119 @@
 //! # }
 //! ```
 //!
+//! # Handler callbacks
+//!
+//! The typed handlers are the seam for callers that already hold a
+//! [`TraceSpan`]; both are driven synchronously, so any executor works.
+//!
+//! ```
+//! # #[cfg(feature = "otel")]
+//! # {
+//! use futures::executor::block_on;
+//! use openjiuwen_core::session::tracer::{TraceSpan, TraceSpanKind};
+//! use openjiuwen_extensions::otel::{
+//!     init_otel_tracer, ExporterType, OtelAgentHandler, OtelTracerConfig,
+//! };
+//! use opentelemetry::trace::{SpanKind, Status};
+//! use serde_json::json;
+//!
+//! let config = OtelTracerConfig {
+//!     redaction_enabled: false, // keep the attribute values readable
+//!     ..OtelTracerConfig::default()
+//! }
+//! .with_exporter_type(ExporterType::Memory);
+//! let handle = init_otel_tracer(config).expect("the memory exporter initializes");
+//! let handler = OtelAgentHandler::from_handle(&handle).expect("the handle is active");
+//!
+//! // An LLM invocation: `chat {model}` with the GenAI conventions.
+//! let frame = TraceSpan::new("trace-1", "", "invoke-1", "", TraceSpanKind::Agent);
+//! let info = json!({"class_name": "TestModel"});
+//! block_on(handler.on_llm_start(&frame, &json!("hello"), &info));
+//! block_on(handler.on_llm_end(&frame, &json!({"content": "world"})));
+//!
+//! handle.force_flush();
+//! let exporter = handle.capture().expect("the memory exporter is attached");
+//! let span = exporter
+//!     .span_named("chat TestModel")
+//!     .expect("the LLM span is exported");
+//! let attribute = |key: &str| {
+//!     span.attributes
+//!         .iter()
+//!         .rev()
+//!         .find(|pair| pair.key.as_str() == key)
+//!         .map(|pair| pair.value.as_str().into_owned())
+//! };
+//! assert_eq!(span.name.as_ref(), "chat TestModel");
+//! assert_eq!(span.span_kind, SpanKind::Client);
+//! assert_eq!(attribute("gen_ai.operation.name").as_deref(), Some("chat"));
+//! assert_eq!(attribute("gen_ai.provider.name").as_deref(), Some("openjiuwen"));
+//! assert_eq!(span.status, Status::Ok);
+//! assert_eq!(attribute("openjiuwen.status").as_deref(), Some("finish"));
+//!
+//! // `bug #2046`: the tool rail opens the span, its decorator twin is deduped.
+//! let rail = TraceSpan::new("trace-1", "", "invoke-rail", "", TraceSpanKind::Agent);
+//! let rail_info = json!({"class_name": "get_weather", "type": "plugin"});
+//! block_on(handler.on_plugin_start(&rail, &json!(null), &rail_info));
+//! assert!(handler.has_open_tool_span("get_weather", "trace-1"));
+//!
+//! let decorator = TraceSpan::new("trace-1", "", "invoke-decorator", "", TraceSpanKind::Agent);
+//! let decorator_info = json!({"class_name": "get_weather", "type": "tool"});
+//! block_on(handler.on_plugin_start(&decorator, &json!(null), &decorator_info));
+//! block_on(handler.on_plugin_end(&rail, &json!("22C")));
+//!
+//! handle.force_flush();
+//! assert_eq!(
+//!     exporter.names(),
+//!     ["chat TestModel", "execute_tool get_weather"],
+//! );
+//! # }
+//! ```
+//!
+//! Workflow engines buffer their payloads and flush them on the terminal
+//! callback:
+//!
+//! ```
+//! # #[cfg(feature = "otel")]
+//! # {
+//! use futures::executor::block_on;
+//! use openjiuwen_extensions::otel::{
+//!     init_otel_tracer, ExporterType, OtelTracerConfig, OtelWorkflowHandler,
+//! };
+//! use serde_json::json;
+//!
+//! let config = OtelTracerConfig {
+//!     redaction_enabled: false, // keep the attribute values readable
+//!     ..OtelTracerConfig::default()
+//! }
+//! .with_exporter_type(ExporterType::Memory);
+//! let handle = init_otel_tracer(config).expect("the memory exporter initializes");
+//! let handler = OtelWorkflowHandler::from_handle(&handle).expect("the handle is active");
+//!
+//! let metadata = json!({"workflow_id": "wf1", "workflow_name": "MyWorkflow"});
+//! block_on(handler.on_call_start("wf_root", &metadata, None));
+//! block_on(handler.on_invoke("wf_root", &json!({"step": 1})));
+//! block_on(handler.on_call_done("wf_root", None));
+//!
+//! handle.force_flush();
+//! let exporter = handle.capture().expect("the memory exporter is attached");
+//! let span = exporter
+//!     .span_named("wf_root")
+//!     .expect("the workflow span is exported");
+//! let attribute = |key: &str| {
+//!     span.attributes
+//!         .iter()
+//!         .rev()
+//!         .find(|pair| pair.key.as_str() == key)
+//!         .map(|pair| pair.value.as_str().into_owned())
+//! };
+//! assert_eq!(
+//!     attribute("openjiuwen.workflow.invoke_data").as_deref(),
+//!     Some(r#"[{"step":1}]"#),
+//! );
+//! assert_eq!(attribute("openjiuwen.status").as_deref(), Some("finish"));
+//! # }
+//! ```
+//!
 //! [`TraceSink`]: openjiuwen_core::session::tracer::TraceSink
 //! [`TraceSpan`]: openjiuwen_core::session::tracer::TraceSpan
 

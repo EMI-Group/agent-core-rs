@@ -42,6 +42,23 @@
 //! the three snapshots as `openjiuwen.workflow.invoke_data`,
 //! `openjiuwen.stream_inputs`, and `openjiuwen.stream_outputs`.
 //!
+//! # Lazy open
+//!
+//! The session tracer emits exactly one frame per span — its terminal
+//! `SpanHandle::complete` — so the sink cannot rely on a `start` frame. An
+//! agent, workflow, or component `running`/terminal frame whose invoke id has no
+//! open state first *opens* the span: the frame's `start_time` becomes the
+//! `OTel` start timestamp, and the span gets the same name, kind, operation,
+//! parent, and identity attributes a `start` frame would have written, after
+//! which the running or terminal attributes are applied on top.
+//!
+//! A `running`-only frame leaves the span open for its terminal frame, and a
+//! span opened this way ends at the frame's `end_time` (falling back to the
+//! local clock when the end is absent or precedes the start), so an idiomatic
+//! `Tracer::with_sink(..)` + `start_span(..)` + `finish(..)` run still exports
+//! one span with a realistic duration. A span opened by a real `start` frame
+//! ends at the local clock instead, exactly like the typed handlers.
+//!
 //! # Provider lifetime
 //!
 //! [`TracerHandle`] is borrowed for the duration of [`OtelTraceSink::new`] and
@@ -54,10 +71,12 @@
 //! # Fail-open
 //!
 //! [`TraceSink::emit`] must never fail a traced run: it is synchronous, does no
-//! I/O, never flushes, and never panics. A malformed frame (a payload of the
-//! wrong shape, a terminal status for an unknown invoke id) is logged through
-//! `tracing` at `debug` and dropped. No lock is held across a snapshot call that
-//! could re-enter a span manager.
+//! I/O, never flushes, and never panics. A frame that cannot be mapped (a
+//! payload of the wrong shape, or any frame while the sink holds no tracer) is
+//! logged through `tracing` at `debug` and ignored; every other frame registers
+//! or closes exactly one span, including a terminal frame for an invoke id the
+//! sink has not seen yet, which lazily opens (see below). No lock is held across
+//! a snapshot call that could re-enter a span manager.
 //!
 //! # Deviations from Python
 //!

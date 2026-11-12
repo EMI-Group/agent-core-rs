@@ -373,7 +373,7 @@ impl super::OtelTraceSink {
         }
     }
 
-    /// Writes the GenAI completion messages of an LLM span.
+    /// Writes the `GenAI` completion messages of an LLM span.
     ///
     /// Python counterpart: the `outputs is not None` block of `on_llm_end` —
     /// unwrap the container, normalize with the `assistant` default role, and
@@ -459,7 +459,7 @@ fn model_name(payload: &TraceSpan) -> Option<String> {
 
 /// The span name of a retrieval component: `retrieval {name}`.
 ///
-/// Python formats `f"retrieval {name}"`; the space-joined GenAI style keeps the
+/// Python formats `f"retrieval {name}"`; the space-joined `GenAI` style keeps the
 /// bare operation name when the component name is blank, the same rule as
 /// [`span_names::tool_span_name`].
 fn retrieval_span_name(name: &str) -> String {

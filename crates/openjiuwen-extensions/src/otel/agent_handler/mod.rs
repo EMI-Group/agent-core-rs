@@ -8,7 +8,7 @@
 //! - an LLM invocation is a `chat {class_name}` span of [`SpanKind::Client`]
 //!   carrying the `gen_ai.*` request/response conventions;
 //! - a tool invocation is an `execute_tool {class_name}` span of
-//!   [`SpanKind::Internal`] carrying the GenAI tool identity;
+//!   [`SpanKind::Internal`] carrying the `GenAI` tool identity;
 //! - every other invocation is `{prefix}.{class_name}` (prompt, chain,
 //!   retriever, memory, evaluator, workflow) or `embeddings {model}`, all
 //!   [`SpanKind::Internal`] with the `openjiuwen.agent.*` attributes.
@@ -62,18 +62,12 @@
 //! [`SpanKind::Client`]: opentelemetry::trace::SpanKind::Client
 //! [`SpanKind::Internal`]: opentelemetry::trace::SpanKind::Internal
 
-// The otel `mod.rs` re-exports of this module land in a follow-up commit owned by
-// the parent agent, so nothing in the crate calls the handler yet and its `pub`
-// items are not reachable from outside the module tree. The `unused_async`
-// opt-out is deliberate as well: the callbacks mirror Python's coroutines and the
-// session-callback contract, while their bodies stay fully synchronous so no lock
-// is ever held across an `await`. All of these go away with the re-export.
-#![allow(
-    dead_code,
-    unreachable_pub,
-    clippy::unused_async,
-    clippy::unused_async_trait_impl
-)]
+// Both async opt-outs are deliberate: the callbacks mirror Python's coroutines and
+// the session-callback contract, so their signatures stay `async` even though the
+// bodies are fully synchronous (no lock is ever held across an `await`). Clippy
+// reports part of the family as `unused_async` and part as
+// `unused_async_trait_impl`, so both lints are allowed.
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 mod non_llm;
 #[cfg(test)]
@@ -332,7 +326,7 @@ impl OtelAgentHandler {
     /// Derives the parent [`Context`] of a frame from its `parent_invoke_id`.
     ///
     /// Python counterpart: `_resolve_parent_context`, which looks the parent
-    /// state up in the span manager and turns it into an OTel context. `None`
+    /// state up in the span manager and turns it into an `OTel` context. `None`
     /// (no parent id, or no open span for it) makes the new span a trace root.
     #[must_use]
     fn resolve_parent_context(&self, trace_span: &TraceSpan) -> Option<Context> {
@@ -566,7 +560,7 @@ impl OtelAgentHandler {
 /// Builds the span name of a non-LLM frame.
 ///
 /// Python counterpart: the `name` argument of `_start_non_llm_span` — the
-/// explicit `span_name` when given, else the GenAI `execute_tool {tool}` rule
+/// explicit `span_name` when given, else the `GenAI` `execute_tool {tool}` rule
 /// for a tool event, else `{prefix}.{class_name}`.
 fn non_llm_span_name(spec: &NonLlmSpan, instance_info: &Value) -> String {
     if let Some(name) = spec.span_name.as_deref() {

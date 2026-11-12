@@ -81,7 +81,7 @@ impl OtelAgentHandler {
     ///
     /// Python counterpart: `on_plugin_start`. A decorator event that duplicates
     /// an open rail span is dropped (`bug #2046`); otherwise the span carries the
-    /// GenAI tool identity (`gen_ai.operation.name = execute_tool`,
+    /// `GenAI` tool identity (`gen_ai.operation.name = execute_tool`,
     /// `gen_ai.tool.name`, the optional call id/type, and the executing agent)
     /// plus the redacted inputs. A rail event (`instance_info["type"] ==
     /// "plugin"`) flags the state so the nested decorator event is deduped.
@@ -256,7 +256,7 @@ impl OtelAgentHandler {
 impl OtelAgentHandler {
     /// Starts the span of an embedding invocation.
     ///
-    /// Python counterpart: `on_embedding_start` — the GenAI naming rule gives
+    /// Python counterpart: `on_embedding_start` — the `GenAI` naming rule gives
     /// `embeddings {gen_ai.request.model}` with the model taken from
     /// `model_name`, then `class_name`, then `"unknown"`; the inputs supply
     /// `gen_ai.embeddings.dimension.count` (`dimension`, then `dimensions`).
