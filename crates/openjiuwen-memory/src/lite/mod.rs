@@ -40,6 +40,22 @@ mod index;
 
 pub use fact::{CodingFact, CodingFactType};
 
+/// The lite memory's Markdown source of truth and its parse/render round trip.
+pub mod markdown;
+
+/// Cross-process advisory locking for the local Markdown/index pair.
+pub mod lock;
+
+/// Filesystem watching for externally edited Markdown memory files.
+pub mod watch;
+
+/// The local, file-backed coding-memory store (Markdown + derived index).
+pub mod local;
+
+/// SQLite FTS5 full-text index over coding facts (feature `sqlite`).
+#[cfg(feature = "sqlite")]
+pub mod fts;
+
 /// The tracing target of lite-memory diagnostics.
 const TARGET: &str = "openjiuwen_memory::lite";
 
