@@ -2,21 +2,22 @@
 //!
 //! Two seams, both offline and instant: **auto-harness orchestration**
 //! (`openjiuwen::rsi::auto_harness`), where a [`HarnessRunner`] is the only seam
-//! to `openjiuwen-harness`, and **the evolving trainer's collaborators**
-//! (`openjiuwen::agent_evolving`), whose `Optimizer` and `Evaluator` run over
-//! fixed data. Python counterparts: the evolving trainer mirrors
-//! `examples/agent_evolving/react_agent_evolving.py`; auto-harness has no Python
-//! example, so part one mirrors the Rust integration tests. Live mode stays scripted.
+//! to `openjiuwen-harness`, and **the evolving trainer's real loop**
+//! (`openjiuwen::agent_evolving`), where `Trainer::train` runs the baseline, the
+//! per-epoch forward pass and the candidate evaluations over a fake agent, a
+//! scripted optimizer and a keyword evaluator. Python counterparts: the evolving
+//! trainer mirrors `examples/agent_evolving/react_agent_evolving.py`; auto-harness
+//! has no Python example, so part one mirrors the Rust integration tests. Live mode
+//! stays scripted.
 //!
-//! Scope note: part two wires the trainer's two collaborator seams and drives them
-//! by hand. `Trainer::train` itself needs a `TrainableTarget`, whose
-//! `run_case` names `tokio_util::sync::CancellationToken` in this file, and this
-//! crate has no `tokio-util` dependency — adding `tokio-util.workspace = true`
-//! under `[dev-dependencies]` is what unlocks the full loop (see the last note
-//! part two prints).
+//! The fake agent has no model: it answers from a script keyed by the applied
+//! candidate, so the first candidate misses the keyword and the second hits it and
+//! early-stops the run after two epochs of a tiny two-train/one-validation case
+//! setup. `Trainer::new` installs a disabled checkpoint store, so the run writes
+//! nothing and every `EpochReport::checkpoint_saved` is false.
 
 #![allow(
-    // The two fakes name themselves with a literal, as their Python counterparts do.
+    // Every fake names itself with a literal, as its Python counterpart does.
     clippy::unnecessary_literal_bound
 )]
 
@@ -31,21 +32,31 @@ use async_trait::async_trait;
 use openjiuwen::agent_evolving::dataset::{Case as TrainingCase, EvaluatedCase};
 use openjiuwen::agent_evolving::evaluator::Evaluator as TrainerEvaluator;
 use openjiuwen::agent_evolving::optimizer::{Candidate, Optimizer};
-use openjiuwen::agent_evolving::trainer::{Trainer, TrainerConfig};
+use openjiuwen::agent_evolving::trainer::{
+    StopReason, TrainableTarget, Trainer, TrainerConfig, TrainerReport,
+};
 use openjiuwen::rsi::auto_harness::{
     AutoHarnessConfig, AutoHarnessOrchestrator, HarnessRunOutcome, HarnessRunRequest, HarnessRunner,
 };
 use openjiuwen::rsi::{Case, CaseResult, Error, EvaluationReport, Result as SdkResult};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 /// Upper bound on one session, so a misconfiguration cannot hang the demo.
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 const COST_BUDGET_USD: f64 = 1.0;
 const CASE_ID: &str = "case-1";
 const CANDIDATES: [(&str, f64); 2] = [("temperature-0.80", 0.8), ("temperature-0.30", 0.3)];
-/// The keyword a hit requires, and the two predictions the evaluator scores.
+/// The keyword a validation hit requires.
 const EXPECTED_KEYWORD: &str = "Paris";
-const PREDICTIONS: [&str; 2] = ["Paris is the capital of France.", "Lyon is in France."];
+/// What the fake agent answers before any candidate is applied, and after each.
+const BASELINE_ANSWER: &str = "Lyon is in France.";
+const SCRIPTED_ANSWERS: [(&str, &str); 2] = [
+    ("temperature-0.80", "Lyon is in France."),
+    ("temperature-0.30", "Paris is the capital of France."),
+];
+const TRAIN_CASE_IDS: [&str; 2] = ["train-1", "train-2"];
+const VAL_CASE_ID: &str = "val-1";
 
 /// A harness runner that answers from a script and records every request.
 /// A production session puts a real `DeepAgent` run behind [`HarnessRunner`].
@@ -238,9 +249,71 @@ impl TrainerEvaluator for KeywordEvaluator {
     }
 }
 
-/// Part 2: the optimizer and evaluator seams the evolving trainer drives.
+/// A fake agent with no model: it answers from a script keyed by the applied
+/// candidate, which is why no model is needed. A production target puts a
+/// `ReActAgent` behind the same [`TrainableTarget`] seam.
+struct FakeAgent {
+    applied: Mutex<Option<String>>,
+    baseline: &'static str,
+    script: &'static [(&'static str, &'static str)],
+}
+
+impl FakeAgent {
+    /// Starts unconfigured, so `run_case` answers with `baseline`.
+    fn new(baseline: &'static str, script: &'static [(&'static str, &'static str)]) -> Self {
+        Self {
+            applied: Mutex::new(None),
+            baseline,
+            script,
+        }
+    }
+
+    /// The answer scripted for the applied candidate, else the baseline one.
+    fn answer(&self) -> &'static str {
+        let applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(id) = applied.as_deref() else {
+            return self.baseline;
+        };
+        self.script
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map_or(self.baseline, |(_, answer)| *answer)
+    }
+}
+
+#[async_trait]
+impl TrainableTarget for FakeAgent {
+    fn id(&self) -> &str {
+        "fake-agent"
+    }
+
+    async fn run_case(&self, _case: &TrainingCase, cancel: &CancellationToken) -> SdkResult<Value> {
+        if cancel.is_cancelled() {
+            return Err(Error::cancelled());
+        }
+        Ok(json!({ "answer": self.answer() }))
+    }
+
+    async fn apply(&self, candidate: &Candidate) -> SdkResult<()> {
+        *self.applied.lock().unwrap_or_else(PoisonError::into_inner) = Some(candidate.id.clone());
+        Ok(())
+    }
+}
+
+/// Why the trainer stopped, in the lowercase spelling the notes use.
+fn stop_reason(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Completed => "completed",
+        StopReason::EarlyStop => "early stop",
+        StopReason::Cancelled => "cancelled",
+        StopReason::BudgetExhausted => "budget exhausted",
+        StopReason::NoCandidates => "no candidates",
+    }
+}
+
+/// Part 2: `Trainer::train` over the fake agent, optimizer, and evaluator.
 async fn evolving_section() -> Result<()> {
-    common::banner::step("part 2 — agent-evolving: propose, score, and observe a candidate");
+    common::banner::step("part 2 — agent-evolving: the Trainer::train loop over a fake agent");
 
     let candidates = CANDIDATES.iter().map(|(id, temperature)| {
         let parameters = BTreeMap::from([("temperature".to_owned(), json!(temperature))]);
@@ -248,50 +321,89 @@ async fn evolving_section() -> Result<()> {
     });
     let mut optimizer = ScriptedOptimizer::new(candidates);
     let evaluator = KeywordEvaluator;
+    let target = FakeAgent::new(BASELINE_ANSWER, &SCRIPTED_ANSWERS);
+    let trainer = Trainer::new(TrainerConfig::default());
+
     let inputs = BTreeMap::from([("question".to_owned(), json!("Capital of France?"))]);
     let label = BTreeMap::from([("answer".to_owned(), json!(EXPECTED_KEYWORD))]);
-    let validation_case = TrainingCase::new(inputs, label)?.with_case_id("val-1");
-    for answer in PREDICTIONS {
-        for candidate in optimizer.propose(1).await? {
-            let prediction = json!({ "answer": answer });
-            let evaluated = evaluator.evaluate(&validation_case, &prediction).await?;
-            common::banner::note(&format!(
-                "candidate `{}` scored {:.2} on `{}` ({})",
-                candidate.id, evaluated.score, evaluated.case.case_id, evaluated.reason
-            ));
-            optimizer.observe(&candidate, evaluated.score);
-        }
-    }
-    let best = optimizer.best().map_or_else(
-        || "none".to_owned(),
-        |best| format!("`{}` at {:.2}", best.id, best.score.unwrap_or_default()),
-    );
+    let train_cases = vec![
+        TrainingCase::new(inputs.clone(), label.clone())?.with_case_id(TRAIN_CASE_IDS[0]),
+        TrainingCase::new(inputs.clone(), label.clone())?.with_case_id(TRAIN_CASE_IDS[1]),
+    ];
+    let val_cases = vec![TrainingCase::new(inputs, label)?.with_case_id(VAL_CASE_ID)];
     common::banner::note(&format!(
-        "observed {} candidate(s); optimizer.best() = {best}",
-        optimizer.observed.len()
-    ));
-
-    // The trainer loop itself cannot run here: `Trainer::train` needs a
-    // `TrainableTarget`, whose `run_case(&self, case, cancel: &CancellationToken)`
-    // must name `tokio_util::sync::CancellationToken` in this file, and this crate
-    // has no `tokio-util` dependency (the SDK does not re-export the type).
-    let trainer = Trainer::new(TrainerConfig {
-        num_iterations: 1,
-        candidates_per_epoch: 1,
-        ..TrainerConfig::default()
-    });
-    common::banner::note(&format!(
-        "a Trainer is ready: {} epoch(s), {} candidate(s) per epoch, early stop at {:.1}",
+        "workload: {} train case(s), {} validation case(s), up to {} epoch(s) of {} \
+         candidate(s), early stop at {:.2}",
+        train_cases.len(),
+        val_cases.len(),
         trainer.config().num_iterations,
         trainer.config().candidates_per_epoch,
         trainer.config().early_stop_score
     ));
-    common::banner::note(
-        "`Trainer::train` would report `TrainerReport { best_score, steps, stopped_reason, \
-         evaluations }` over the two fakes above; add `tokio-util.workspace = true` under \
-         [dev-dependencies] in crates/openjiuwen-examples/Cargo.toml to name the token and run it",
-    );
+
+    let report = tokio::time::timeout(
+        RUN_TIMEOUT,
+        trainer.train(
+            &target,
+            &mut optimizer,
+            &evaluator,
+            &train_cases,
+            &val_cases,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .context("the evolving run timed out")??;
+
+    for step in &report.steps {
+        common::banner::note(&format!(
+            "epoch {}: score {:.2}, best {:.2}, {} candidate(s), {} evaluation(s), {}, {}",
+            step.epoch,
+            step.score,
+            step.best_score,
+            step.candidates,
+            step.evaluations,
+            if step.improved {
+                "improved"
+            } else {
+                "no improvement"
+            },
+            if step.checkpoint_saved {
+                "checkpoint saved"
+            } else {
+                "checkpoint not saved"
+            }
+        ));
+    }
+    print_summary(&report);
     Ok(())
+}
+
+/// Prints the run summary and the candidate the trainer adopted.
+fn print_summary(report: &TrainerReport) {
+    common::banner::note(&format!(
+        "stopped on {}, {} epoch(s), best {:.2} over {} evaluation(s)",
+        stop_reason(report.stopped_reason),
+        report.epochs_run,
+        report.best_score,
+        report.evaluations
+    ));
+    let winner = report.best_candidate.as_ref().map_or_else(
+        || "none".to_owned(),
+        |candidate| {
+            let temperature = candidate
+                .parameters
+                .get("temperature")
+                .map_or_else(|| "none".to_owned(), ToString::to_string);
+            format!("`{}` at temperature {temperature}", candidate.id)
+        },
+    );
+    common::banner::note(&format!("best candidate: {winner}"));
+    // `Trainer::new` disables the checkpoint store, so the run wrote nothing.
+    common::banner::note(
+        "the trainer's checkpoint store is disabled by default (`Trainer::new`), so this run \
+         wrote no file",
+    );
 }
 
 #[tokio::main]
