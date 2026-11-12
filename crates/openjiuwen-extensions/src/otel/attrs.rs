@@ -32,12 +32,6 @@
 //!   [`error_payload_for`], with [`DEFAULT_ERROR_CODE`] as the fallback for a
 //!   [`TraceSpan`], which carries no code.
 
-// The agent and workflow handlers that call these helpers are ported in
-// follow-up commits; until they land no crate code calls them, so the module
-// opts out of the dead-code lint instead of hiding every helper behind an
-// `#[allow]`. The unit tests below exercise each helper.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 use opentelemetry::trace::{Span as _, Status};
@@ -146,6 +140,8 @@ pub(crate) fn set_json_attribute(span: &mut Span, key: &'static str, value: &Val
 }
 
 /// Writes a JSON value as a string attribute, skipping the write for `None`.
+// Only the unit tests call this helper; the handlers inline their own `None` guard.
+#[allow(dead_code)]
 pub(crate) fn set_json_attribute_opt(span: &mut Span, key: &'static str, value: Option<&Value>) {
     if let Some(value) = value {
         set_json_attribute(span, key, value);
@@ -199,6 +195,8 @@ pub(crate) fn error_payload(error_code: &str, message: &str) -> String {
 ///
 /// The code is the [`openjiuwen_common::error::ErrorKind`] name (`workflow`,
 /// `tool`, …) and the message is [`openjiuwen_common::error::Error::message`].
+// Only the unit tests call this helper; the handlers pass the code themselves.
+#[allow(dead_code)]
 pub(crate) fn error_payload_for(error: &Error) -> String {
     let message = error.message();
     error_payload(error.kind().as_str(), &message)
