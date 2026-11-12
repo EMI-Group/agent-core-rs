@@ -26,7 +26,7 @@ All helpers are drop-scoped (temporary directory removed, environment restored) 
 - `OPENJIUWEN_HOME` is set to `<temp root>/home` and the directory is created eagerly.
 - `ISOLATED_ENV_VARS` uses the constants from `openjiuwen_common::config::env` where available (never re-typed string literals for those names).
 - `write_json`/`read_json` return `openjiuwen_common::error::Result` (`Error::sys_op` for I/O, `Error::validation` for serialization, both naming the path); plain file helpers return `io::Result`.
-- Sessions are deliberately not constructed here: `openjiuwen-session` has no `Session` implementation yet; document the gap in the crate `CONTEXT.md`, not with a stub module.
+- Session factories are deliberately not provided here; a test constructs `AgentSession::new(id)` or `WorkflowSession::new(id)` from `openjiuwen-session` and coerces to `Arc<dyn Session>` itself (as `openjiuwen-workflow/tests/common/mod.rs::session` does).
 
 ## Test Strategy
 
