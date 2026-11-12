@@ -71,4 +71,9 @@ Re-exported flat from `openjiuwen_harness::workspace`:
 - Links: symlink target/content, idempotent relink, sorted listing (`beta, alpha, gamma` → `alpha, beta, gamma`), unlink true/false, dangling symlinks listed from the `read_link` fallback without panicking, copy-fallback links discovered through `LINK_MARKER`, foreign files neither listed nor deleted.
 - Resolution: inside paths allowed (including missing leaves), `..`/absolute/drive/UNC/empty rejected, symlink escape rejected (Unix), `resolve_existing` missing → `Error::NotFound`.
 - Parity references: `tests/unit_tests/harness/test_deep_agent_workspace.py`, `test_workspace_links.py`.
-- Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness` (49 unit tests plus one doc test), `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` all clean for this module.
+- Definition of done: `cargo fmt -p openjiuwen-harness -- --check`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` all clean (49 unit tests + 1 doc test).
+
+## Known Issues
+
+- Crate-level `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` still fails on three pre-existing scaffold lints in `../lib.rs` (outside this node): `doc_markdown` on `DeepAgent` (lines 1 and 4) and `must_use_candidate` on `crate_name` (line 28). This module itself is clippy-clean; the fix belongs to the crate root.
+
