@@ -29,7 +29,10 @@ Re-exported flat from `openjiuwen_harness::workspace`:
 - `DirectoryBuilder` creates files only when absent (existence probed through the sysop backend, not the process filesystem) and writes an empty `.workspace` marker into every directory node; unsafe node paths abort before any I/O for that node.
 - Errors are `openjiuwen_common::error::{Error, Result}`; no panics, no `unwrap` outside tests. `tracing` only, no stdout.
 - Link methods are synchronous filesystem setup helpers (Python parity): symlink on Unix, directory symlink on Windows, recursive copy when symlinking is denied; listing is sorted by name and canonicalizes targets.
-- Files ≤1000 lines; `Workspace` is `Clone + Debug + PartialEq + Serialize + Deserialize + Default + JsonSchema`; `schemars` uses `#[schemars(with = "String")]` for `PathBuf` fields.
+- Files ≤1000 lines; `Workspace` is `Clone + Debug + Eq + PartialEq + Serialize + Deserialize + Default + JsonSchema`; `schemars` uses `#[schemars(with = "String")]` for `PathBuf` fields.
+- Items are reachable only as `openjiuwen_harness::workspace::*` (plus `Workspace` methods); the crate root declares `pub mod workspace` and no flat re-exports, so integration tests must use the qualified path.
+- The submodules (`node`, `workspace`, `resolve`, `links`, `directory_builder`, `schema`) and the free fns `find_node`/`path_to_string`/`file_exists` are private; only the names in `./mod.rs` are re-exported.
+- `DirectoryBuilder`'s `sys_operation` and `root_path` fields are public and `build` needs a filesystem backend (`SysOperation::local(LocalWorkConfig::unrestricted(root))?`); `Workspace::new`/`for_language` accept `impl Into<PathBuf>` and perform no I/O, so a `TempDir` must be passed as `temp.workspace()` / `temp.root().to_path_buf()`.
 
 ## Design decisions
 
