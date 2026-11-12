@@ -7,18 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-
 [dependencies]
+# The canonical implementation. Everything this crate exposes comes from here.
 openjiuwen-rsi.workspace = true
-openjiuwen-core.workspace = true
-openjiuwen-common.workspace = true
-thiserror = "2"
-async-trait.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-
 [features]
 default = []
-
 [lints]
 workspace = true

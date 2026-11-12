@@ -1762,13 +1762,7 @@ dependencies = [
 name = "openjiuwen-auto-harness"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "openjiuwen-common",
- "openjiuwen-core",
  "openjiuwen-rsi",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
