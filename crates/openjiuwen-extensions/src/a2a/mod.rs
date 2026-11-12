@@ -1,4 +1,4 @@
-//! The Agent2Agent (`A2A`) protocol client, server, and wire types.
+//! The Agent-to-Agent (`A2A`) protocol client, server, and wire types.
 //!
 //! Port of the Python package `openjiuwen.extensions.a2a` (v0.1.20). The Python
 //! implementation is a thin adapter over `a2a-sdk`; here the wire layer is owned
@@ -27,3 +27,6 @@ pub mod jsonrpc;
 pub mod server;
 pub mod transform;
 pub mod types;
+
+#[cfg(test)]
+mod e2e_tests;
