@@ -390,8 +390,8 @@ impl Workflow {
     ///
     /// # Errors
     ///
-    /// Returns the same compile error as [`Workflow::build`]; rendering itself cannot fail
-    /// (an uncompilable graph renders as an error document instead).
+    /// Returns the same compile error as [`Workflow::build`]; once a workflow compiles,
+    /// [`CompiledWorkflow::to_svg`] always returns a document.
     pub fn to_svg(&self) -> Result<String> {
         self.build().map(|compiled| compiled.to_svg())
     }
