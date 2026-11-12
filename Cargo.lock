@@ -2226,13 +2226,16 @@ name = "openjiuwen-security"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 
