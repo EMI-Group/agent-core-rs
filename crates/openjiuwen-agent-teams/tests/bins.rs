@@ -5,20 +5,22 @@
 //! the *process* contract of the two binaries in `src/bin/` — the part no in-process unit test can
 //! see: which stream each verdict lands on and which exit code a shell observes.
 //!
-//! 1. **`--help` is a CLI-side error.** The descriptor is resolved *before* the clap subcommand
-//!    parse, and every failure in that stage goes through `fail_cli`; clap's `DisplayHelp` is
-//!    mapped onto `Error::validation`, so rendered help lands on **stderr** with exit **2**. (A
-//!    library change that treats `--help` as success on stdout is out of this binary's scope — this
-//!    suite pins what the port actually does.)
-//! 2. **The descriptor stage runs first.** No arguments at all reports the missing
-//!    `OPENJIUWEN_TEAM_JOIN` descriptor, not a usage line; an unknown-to-this-port `--team` flag
-//!    also dies in the descriptor stage (exit `2`).
+//! 1. **`--help` is success on stdout.** Help is answered by the scope parser *before* the join
+//!    descriptor is loaded, so `--help` (before or after the subcommand) renders clap's help on
+//!    **stdout** and exits **0** even with no descriptor — Python argparse parity.
+//!    Every other CLI-side problem (bad flag, missing argument, malformed or absent descriptor)
+//!    still goes through `fail_cli`: diagnostic on **stderr**, exit **2**.
+//! 2. **The descriptor stage runs first for real commands.** No arguments at all reports the
+//!    missing `OPENJIUWEN_TEAM_JOIN` descriptor, not a usage line; an unknown-to-this-port `--team`
+//!    flag also dies in the descriptor stage (exit `2`).
 //! 3. **A team this process does not host exits `1`** with
 //!    `no live team '<team>' in this process` on stderr — the documented "unresolved" contract,
 //!    distinct from a CLI-side error (`2`).
-//! 4. **`openjiuwen-team-mcp` without a descriptor exits `1`** before any stdio serving and writes
-//!    nothing to stderr: the failure is reported through `tracing::error!` and no subscriber is
-//!    installed by that thin entry point.
+//! 4. **`openjiuwen-team-mcp` without a descriptor exits `1`** before any stdio serving with a
+//!    stderr diagnostic: the entry point installs a stderr log subscriber, so the
+//!    `tracing::error!` from the descriptor load is rendered while stdout stays a clean wire.
+//!    (`openjiuwen_common::logging` defaults to stdout, which would corrupt the protocol channel,
+//!    so the binary forces `LogWriter::Stderr`.)
 //!
 //! Everything is offline and deterministic: no network, no model, and the only waiting is a short
 //! bounded poll on the MCP child. Every child runs with `OPENJIUWEN_TEAM_JOIN` removed so an
@@ -59,24 +61,27 @@ fn describe(output: &Output) -> String {
     )
 }
 
-/// Pins that `--help` renders on stderr and exits `2`, not `0` on stdout.
+/// Pins that `--help` renders on stdout and exits `0` with no join descriptor at all.
 ///
-/// The library loads the descriptor *before* parsing the command tree, and maps clap's
-/// `DisplayHelp` onto `Error::validation`, so help travels the CLI-side error path. The descriptor
-/// must be supplied for the child to reach the parse stage at all.
+/// Help is answered by the scope parser before the descriptor is loaded (Python argparse parity), so
+/// the child never reports the missing `OPENJIUWEN_TEAM_JOIN` and stderr stays empty.
 #[test]
-fn help_is_reported_as_a_cli_side_error() {
-    let output = run_team_member(&["--descriptor-json", MEMBER_DESCRIPTOR, "--help"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(code_of(&output), 2, "{}", describe(&output));
+fn help_exits_zero_on_stdout() {
+    let output = run_team_member(&["--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(code_of(&output), 0, "{}", describe(&output));
     assert!(
-        output.stdout.is_empty(),
-        "help belongs on stderr in this port: {}",
+        output.stderr.is_empty(),
+        "help belongs on stdout: {}",
         describe(&output)
     );
-    // clap's rendered member-scope help: the usage line names the program, the tree lists `inbox`.
-    assert!(stderr.contains("team-member"), "{}", describe(&output));
-    assert!(stderr.contains("inbox"), "{}", describe(&output));
+    // clap's rendered help: the usage line names the program, the tree lists `inbox`.
+    assert!(
+        stdout.contains("Usage: team-member"),
+        "{}",
+        describe(&output)
+    );
+    assert!(stdout.contains("inbox"), "{}", describe(&output));
 }
 
 /// Pins that a bare invocation reports the missing descriptor, not a usage line.
@@ -124,14 +129,15 @@ fn unhosted_team_exits_one() {
     );
 }
 
-/// Pins that the MCP entry point fails fast without a join descriptor: exit `1`, nothing on stderr.
+/// Pins that the MCP entry point fails fast without a join descriptor: exit `1`, clean stdout, a
+/// stderr diagnostic.
 ///
-/// The descriptor load fails before any stdio serving, so no MCP frame is written either. The
-/// failure goes through `tracing::error!` and this thin entry point installs no subscriber, so
-/// stderr stays empty — that is the pinned behaviour, not an oversight.
+/// The descriptor load fails before any stdio serving, so no MCP frame is written. The failure goes
+/// through `tracing::error!` and the entry point installs a **stderr** subscriber, so the diagnostic
+/// is rendered on stderr while stdout stays a clean protocol channel.
 #[cfg(feature = "mcp")]
 #[test]
-fn mcp_without_descriptor_exits_one_silently() {
+fn mcp_without_descriptor_exits_one_with_a_diagnostic() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -175,8 +181,8 @@ fn mcp_without_descriptor_exits_one_silently() {
         describe(&output)
     );
     assert!(
-        output.stderr.is_empty(),
-        "no subscriber is installed, so the tracing error is not rendered: {}",
+        !String::from_utf8_lossy(&output.stderr).trim().is_empty(),
+        "the stderr subscriber should render the tracing diagnostic: {}",
         describe(&output)
     );
 }

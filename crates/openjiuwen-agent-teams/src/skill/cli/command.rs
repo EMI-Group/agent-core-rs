@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use openjiuwen_common::error::{Error, Result};
 
 use super::DescriptorArgs;
+use crate::skill::descriptor::ClientScope;
 
 /// Program name every parser and usage line carries.
 pub(crate) const PROG: &str = "team-member";
@@ -271,6 +272,30 @@ pub(crate) fn parse_operator(argv: Vec<String>) -> Result<(DescriptorArgs, Opera
 /// token).
 fn clap_error(err: &clap::Error) -> Error {
     Error::validation(err.to_string())
+}
+
+/// Renders the help text `argv` asks for, or `None` when it asks for none.
+///
+/// `--help`/`-h` is answered by clap itself, which reports it as a [`clap::error::ErrorKind`]
+/// display error rather than a parse success. Rendering it separately from
+/// [`parse_member`]/[`parse_operator`] lets the caller print help on stdout and exit `0` (Python
+/// argparse parity) before it needs a join descriptor, while every other failure keeps travelling
+/// the [`clap_error`] path.
+/// Only an explicit `--help`/`-h` counts: `DisplayHelpOnMissingArgumentOrSubcommand` (a bare
+/// invocation with no subcommand) is *not* help, because Python argparse reports a missing
+/// subcommand as a usage error on stderr with exit `2`.
+#[must_use]
+pub(crate) fn display_text(argv: Vec<String>, scope: ClientScope) -> Option<String> {
+    let err = match scope {
+        ClientScope::Member => MemberCli::try_parse_from(argv).err()?,
+        ClientScope::Operator => OperatorCli::try_parse_from(argv).err()?,
+    };
+    match err.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            Some(err.to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -8,10 +8,20 @@
 //!
 //! The exit code is the library's: `0` after a clean session, `1` when the descriptor, the client
 //! or the session fails. Every branch is owned by
-//! [`openjiuwen_agent_teams::mcp::stdio::run_mcp_server_from_env`]; this `main` only builds the
-//! async runtime around it and forwards the code.
+//! [`openjiuwen_agent_teams::mcp::stdio::run_mcp_server_from_env`]; this `main` only installs the
+//! log subscriber, builds the async runtime around it and forwards the code.
+//!
+//! The default subscriber writes the human-readable log stream to **stderr**, because stdout is the
+//! MCP wire: a descriptor, client or session failure therefore now produces a stderr diagnostic
+//! while stdout stays clean. [`openjiuwen_common::logging::init_with`] is idempotent, and a
+//! logging setup failure never prevents serving.
+use openjiuwen_common::logging::{LogWriter, LoggingConfig};
+
 #[tokio::main]
 async fn main() {
+    let _logging = openjiuwen_common::logging::init_with(
+        &LoggingConfig::from_env().with_writer(LogWriter::Stderr),
+    );
     let code = openjiuwen_agent_teams::mcp::stdio::run_mcp_server_from_env().await;
     std::process::exit(code);
 }

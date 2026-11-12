@@ -9,6 +9,8 @@
 //! (`command::parse_member` or `command::parse_operator`). A malformed flag or descriptor
 //! therefore fails before the subcommand is even considered, and an unknown subcommand fails with
 //! the scope parser's own message.
+//! `--help`/`-h` is the one exception: it is answered by the scope parser before a descriptor is
+//! required, so help always reaches stdout and exits `0` (Python argparse parity).
 //!
 //! | Part | Responsibility |
 //! | --- | --- |
@@ -18,8 +20,9 @@
 //! | `member` | member-scope dispatch (the real teammate tool set) |
 //! | `operator` | operator-scope dispatch (board, messaging, roster) |
 //!
-//! Exit codes: `0` success, `1` refused or unresolved team, `2` CLI-side error (unknown command or
-//! flag, missing argument, malformed descriptor), `130` a cancelled or timed-out operation.
+//! Exit codes: `0` success (including `--help` rendered on stdout, which needs no join descriptor),
+//! `1` refused or unresolved team, `2` CLI-side error (unknown command or flag, missing argument,
+//! malformed descriptor), `130` a cancelled or timed-out operation.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -295,6 +298,7 @@ fn live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
 /// output goes to stdout and diagnostics to stderr (through `writeln!`, never `println!`). Every
 /// CLI-side problem (bad flag, malformed descriptor, unknown command) exits `2`; a team this
 /// process does not host exits `1`.
+/// `--help` (and `-h`) is rendered on stdout and exits `0`, even without a join descriptor.
 #[must_use]
 pub fn run_skill_cli(argv: Vec<String>) -> i32 {
     let mut out = std::io::stdout();
@@ -318,6 +322,12 @@ pub(crate) fn run_skill_cli_with(
 }
 
 /// The single flow behind [`run_skill_cli`] and [`run_skill_cli_with`].
+///
+/// The connection flags are scanned first, then the descriptor is loaded *once* and kept as a
+/// `Result`: its scope decides which parser renders `--help` (stage 1, stdout, exit `0`) and which
+/// parser reads the command (stage 2). A descriptor that does not load still renders help through
+/// the default operator tree, so `--help` never depends on a join descriptor; a real command with
+/// no descriptor keeps failing on stderr with exit `2`.
 fn run_cli_with_resolver(
     argv: Vec<String>,
     resolve: &dyn Fn(&TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>,
@@ -328,7 +338,16 @@ fn run_cli_with_resolver(
         Ok(scanned) => scanned,
         Err(error) => return fail_cli(err, &error),
     };
-    let descriptor = match load_descriptor_from(&descriptor_args) {
+    let descriptor = load_descriptor_from(&descriptor_args);
+    let scope = descriptor
+        .as_ref()
+        .map_or(ClientScope::Operator, |loaded| loaded.scope);
+    if let Some(text) = command::display_text(argv.clone(), scope) {
+        // A write failure is ignored, exactly like `fail_cli`: help must not turn into an exit code.
+        let _ = out.write_all(text.as_bytes());
+        return 0;
+    }
+    let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => return fail_cli(err, &error),
     };
@@ -696,6 +715,92 @@ mod tests {
         assert!(String::from_utf8(err)
             .unwrap()
             .contains("malformed team join descriptor"));
+    }
+
+    #[test]
+    fn help_exits_zero_and_writes_stdout() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(
+            argv(&[
+                "--descriptor-json",
+                "{\"team_name\":\"alpha\",\"member_name\":\"dev-1\",\"scope\":\"member\"}",
+                "--help",
+            ]),
+            None,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(err.len(), 0, "help belongs on stdout, not stderr");
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("Usage: team-member"),
+            "unexpected help: {stdout}"
+        );
+        assert!(stdout.contains("inbox"), "unexpected help: {stdout}");
+    }
+
+    /// Help is answered before the join descriptor is loaded, like Python argparse: a descriptor
+    /// that would fail to load (here malformed JSON, and normally an absent
+    /// `OPENJIUWEN_TEAM_JOIN`) cannot turn `--help` into a CLI-side error.
+    /// This keeps the case independent of the ambient environment.
+    #[test]
+    fn help_does_not_require_a_descriptor() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(
+            argv(&["--descriptor-json", "{not json", "--help"]),
+            None,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(err.len(), 0, "a bad descriptor must not reach stderr");
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("Usage: team-member"),
+            "unexpected help: {stdout}"
+        );
+    }
+
+    #[test]
+    fn help_after_the_subcommand_also_exits_zero() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(
+            argv(&[
+                "--descriptor-json",
+                "{\"team_name\":\"alpha\",\"member_name\":\"dev-1\",\"scope\":\"member\"}",
+                "inbox",
+                "--help",
+            ]),
+            None,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(err.len(), 0, "help belongs on stdout, not stderr");
+        assert!(!out.is_empty(), "the subcommand help should be rendered");
+    }
+
+    #[test]
+    fn unknown_flag_still_exits_two() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(
+            argv(&[
+                "--descriptor-json",
+                "{\"team_name\":\"alpha\",\"member_name\":\"dev-1\",\"scope\":\"member\"}",
+                "--nope",
+            ]),
+            None,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 2);
+        assert_eq!(out.len(), 0);
+        assert!(!err.is_empty(), "the clap diagnostic should reach stderr");
     }
 
     #[test]

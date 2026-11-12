@@ -94,6 +94,7 @@ All async methods are `#[async_trait]`.
 Root: `team-member`, connection options `--descriptor-file <PATH>` and `--descriptor-json <JSON>` are `global = true` (accepted before or after the subcommand).
 Descriptor precedence: `--descriptor-json` > `--descriptor-file` > `TEAM_JOIN_ENV` (`OPENJIUWEN_TEAM_JOIN`).
 The scope-specific parser is chosen after the descriptor is loaded (two-stage parse).
+`--help` is the exception: when the descriptor does not resolve, help is rendered from the default operator tree and still exits `0`.
 
 ### `scope = "member"`
 
@@ -125,9 +126,11 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 ## Exit codes
 
 - `0` — the operation succeeded.
+- `0` — `--help`/`-h` was rendered on stdout (before or after the subcommand); this needs no join descriptor, so help wins over a missing descriptor.
 - `1` — the operation was refused or the team could not be resolved (message on stderr).
-- `2` — CLI-side error: unknown command/flag, missing required argument, malformed descriptor.
+- `2` — CLI-side error: unknown command/flag, missing required argument, malformed or absent descriptor.
 - `130` — a cancelled operation (`Error::Cancelled`-style timeout/cancel is mapped here; no signal handler is installed).
+- `--version` is not a flag in this port (the clap roots carry no `version` attribute), so it takes the unknown-argument path and exits `2`.
 
 ## Rendering contracts (wire-visible)
 
@@ -152,7 +155,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `./store_client.rs` → `StoreTeamClient`: the store/task-board/messager implementation of the client
 - `./live.rs` → `connect_live_client` / `resolve_live_client`: attach to a team hosted in this process through `crate::runtime::try_global_registry()`
 - `./cli/mod.rs` → two-stage descriptor scan, `SkillCli::run`/`run_with`, exit codes, `run_skill_cli`, delegation to `live::connect_live_client`
-- `./cli/command.rs` → the two clap trees (member/operator), subcommand and value enums
+- `./cli/command.rs` → the two clap trees (member/operator), subcommand and value enums, help rendering (`display_text`)
 - `./cli/member.rs` → member-scope dispatch (real teammate tool set)
 - `./cli/operator.rs` → operator-scope dispatch (board, messaging, roster)
 - `./cli/output.rs` → line renderers shared by both scopes
@@ -165,6 +168,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `store_client.rs`: persisted message/task rows, published event topics and sender, inbox rendering + read cursor, over-limit rejection, member-scope claim/complete, `invoke_tool` shapes.
 - `live.rs`: unknown team → `None` without touching the registry; registry install/clear through a local lock plus a restore guard; end-to-end attach to a team activated over the scripted fakes (roster, empty inbox, a created task claimable on the live team's own board).
 - `cli/`: parsing of every subcommand, `--descriptor-json` before and after the subcommand, unknown command → 2, refusal → 1 with the reason, happy-path output lines for every operator command, member `inbox`/`view_task`/`claim_task`/`send_message`, roster ordering; `parsed_shapes_are_publicly_inspectable` pins one operator and one member invocation through `SkillCli::command()`/`descriptor_args()`.
+- `cli/` help parity: `--help` exits `0` with help on stdout and empty stderr (with a descriptor, before/after the subcommand, and with a malformed descriptor — help is answered before the descriptor is required); an unknown flag still exits `2` with stdout empty; `tests/bins.rs` pins the same contract on the real `team-member` binary with no descriptor at all.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for these files.
 
 ## Deferred
@@ -176,6 +180,8 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 ## Notes for Agents
 
 - Python loads the descriptor with `argparse.parse_known_args`; here `parse_descriptor_args` scans the raw argv for the two connection flags so an unknown subcommand still reaches the scope parser (which owns exit code 2).
+- `--help`/`-h` is answered by the scope parser (`cli::command::display_text`) *before* the descriptor is required, so help reaches stdout with exit `0`; only an explicit help flag counts, a bare invocation still reports the missing descriptor and exits `2`.
+- `openjiuwen-team-mcp` installs a stderr log subscriber (`LoggingConfig::from_env().with_writer(LogWriter::Stderr)`) because stdout is the MCP wire, so a descriptor/client/session failure is diagnosable while stdout stays clean.
 - `SkillCli::run` writes both stdout and failures to one writer; `run_skill_cli` gives the process stdout/stderr separately.
 - `StoreTeamClient` deliberately bypasses the task board for `update_task` (there is no board edit operation): it applies a `TaskPatch` through `TaskBoard::store()` after refusing non-`pending`/`blocked` rows.
 - Member-scope `claim_task` claims for the descriptor's `member_name`; the one-active-task check of the native tool is a runtime policy and is not duplicated here.
