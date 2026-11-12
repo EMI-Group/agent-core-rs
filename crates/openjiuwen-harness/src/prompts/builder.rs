@@ -136,7 +136,7 @@ impl PromptCategory {
 /// `content` maps a language key (`"cn"`, `"en"`) to the rendered text; a section may
 /// carry either or both. `priority` orders sections in the built prompt (ascending),
 /// `category` only drives report grouping, and `carrier` names the message channel the
-/// section travels on (`"system"` unless a caller overrides it).
+/// section travels on (`"system_message"` unless a caller overrides it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSection {
     /// Section name; unique within a builder and used for upserts.
@@ -160,7 +160,7 @@ impl PromptSection {
             content,
             priority,
             category: None,
-            carrier: "system".to_string(),
+            carrier: "system_message".to_string(),
         }
     }
 
@@ -336,6 +336,9 @@ impl HarnessPromptBuilder {
     }
 
     /// Builds the size/token report of the prompt [`Self::build`] would produce.
+    ///
+    /// The report covers exactly the sections [`Self::build`] renders for the current
+    /// mode, including the lone identity section in [`PromptMode::None`].
     #[must_use]
     pub fn build_report(&self) -> PromptReport {
         PromptReport::from_sections(self.mode, &self.language, &self.visible_sections())
@@ -343,11 +346,18 @@ impl HarnessPromptBuilder {
 
     /// Returns the sections actually rendered, in render order.
     ///
-    /// [`PromptMode::None`] yields nothing (nothing is rendered); [`PromptMode::Minimal`]
-    /// keeps only [`MINIMAL_SECTIONS`]; empty sections are dropped in every mode.
+    /// [`PromptMode::None`] keeps only the identity section, and only when it is
+    /// registered and non-empty; [`PromptMode::Minimal`] keeps only [`MINIMAL_SECTIONS`];
+    /// [`PromptMode::Full`] keeps every section. Empty sections are dropped in every
+    /// mode, and the rest are sorted by ascending priority with ties broken by insertion
+    /// order.
     fn visible_sections(&self) -> Vec<&PromptSection> {
         if self.mode == PromptMode::None {
-            return Vec::new();
+            return self
+                .get_section(SectionName::IDENTITY)
+                .filter(|section| !section.is_empty(&self.language))
+                .into_iter()
+                .collect();
         }
         let mut sections: Vec<&PromptSection> = self
             .sections
@@ -647,15 +657,41 @@ mod tests {
     }
 
     #[test]
-    fn report_of_none_mode_is_empty() {
+    fn report_of_none_mode_covers_the_identity_section() {
+        let mut builder = HarnessPromptBuilder::new("en", PromptMode::None);
+        let identity = section(SectionName::IDENTITY, "身份", "hello", 10);
+        let rendered_len = identity.render("en").len();
+        builder.add_section(identity).unwrap();
+        builder
+            .add_section(section(SectionName::SAFETY, "安全", "safety", 20))
+            .unwrap();
+
+        let report = builder.build_report();
+        assert_eq!(report.mode, PromptMode::None);
+        assert_eq!(report.section_count, 1);
+        assert_eq!(report.sections[0].name, SectionName::IDENTITY);
+        assert_eq!(report.sections[0].char_count, rendered_len);
+        assert_eq!(report.total_chars, rendered_len);
+        assert_eq!(report.categories.len(), 1);
+        assert_eq!(report.categories[0].category, PromptCategory::SystemPrompt);
+    }
+
+    #[test]
+    fn report_of_none_mode_without_a_usable_identity_section_is_empty() {
         let mut builder = HarnessPromptBuilder::new("en", PromptMode::None);
         builder
-            .add_section(section(SectionName::IDENTITY, "身份", "hello", 10))
+            .add_section(section(SectionName::SAFETY, "安全", "safety", 20))
             .unwrap();
         let report = builder.build_report();
         assert_eq!(report.section_count, 0);
         assert_eq!(report.total_chars, 0);
         assert_eq!(report.categories.len(), 0);
+
+        let mut blank = HarnessPromptBuilder::new("en", PromptMode::None);
+        blank
+            .add_section(section(SectionName::IDENTITY, " ", "\n", 10))
+            .unwrap();
+        assert_eq!(blank.build_report().section_count, 0);
     }
 
     #[test]
@@ -686,7 +722,7 @@ mod tests {
             .with_carrier("user");
         assert_eq!(s.category, Some(PromptCategory::Memory));
         assert_eq!(s.carrier, "user");
-        assert_eq!(section("y", "y", "y", 1).carrier, "system");
+        assert_eq!(section("y", "y", "y", 1).carrier, "system_message");
         assert_eq!(section("y", "y", "y", 1).category, None);
     }
 }
