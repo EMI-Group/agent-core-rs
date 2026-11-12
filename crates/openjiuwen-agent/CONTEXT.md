@@ -304,7 +304,7 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 
 The public surface above is complete and compiling; several bodies are placeholders, each carrying a `// TODO:` marker.
 - `ReActAgent::invoke`/`stream`, `react::agent_loop::run`, and `react::resume::replay_interrupted` return `Error::unsupported`; the ReAct loop itself is unwritten.
-- `RailRegistry::fire` is a no-op and every built-in rail hook returns `Ok(())`.
+- The rails subsystem is implemented: `RailRegistry::fire` dispatches by event in stable descending priority and stops on the first `Err`; `GuardrailRail` enforces the enabled `ScanTargets` stages; `MemoryRail` recalls before the model call (at most once per invoke) and writes messages on `AfterInvoke` (failures logged only); `ModelBackupRail` fails over through `ctx.model_override` + retry; the interrupt rails pause, approve, reject, ask, and auto-confirm.
 - `abilities::AbilityManager::execute` is a sequential baseline: no `parallel_safe` batching and no per-call timeout; `parse_tool_arguments` does not repair truncated JSON yet.
 - `WorkflowAgent::invoke`/`stream` return `Error::unsupported`, and `workflow_agent::select::select_workflow` always returns index 0.
 - `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`; stage gating reuses that shared type instead of a local flag struct.
