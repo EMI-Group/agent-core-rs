@@ -46,7 +46,8 @@ pub enum MessageQueueKind {
     InMemory,
     /// Apache Pulsar (deferred; `openjiuwen-extensions` owns the client).
     Pulsar,
-    /// ZeroMQ (deferred).
+    /// `ZeroMQ` (deferred).
+    #[serde(rename = "zeromq")]
     ZeroMq,
 }
 
@@ -265,6 +266,7 @@ impl RunnerConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
