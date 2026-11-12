@@ -7,6 +7,7 @@
 
 pub mod branch;
 pub mod end;
+pub mod http_request;
 pub mod llm;
 pub mod loop_;
 pub mod memory;
@@ -16,6 +17,12 @@ pub mod tool;
 
 pub use branch::{BranchComponent, BranchRouterAdapter};
 pub use end::{EndComponent, EndConfig};
+pub use http_request::{
+    HttpAdvancedOptionsConfig, HttpAuthConfig, HttpAuthIn, HttpAuthType, HttpBackoffType,
+    HttpComponentConfig, HttpContentType, HttpHeadersConfig, HttpRateLimitConfig,
+    HttpRateLimitUnit, HttpRequestBodyConfig, HttpRequestComponent, HttpRequestParamConfig,
+    HttpResponseFormat, HttpResponseHandlingConfig, HttpResponseMode, HttpRetryConfig,
+};
 pub use llm::{LlmCompConfig, LlmComponent, LlmResponseFormat};
 pub use loop_::{LoopComponent, LoopConfig, LoopType};
 pub use memory::{MemoryRecall, MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent};

@@ -4,10 +4,10 @@
 //! the seam for callers that serialize component configuration (cards, workflow specs,
 //! the CLI) and need to construct components from a name plus a JSON config.
 //!
-//! [`ComponentRegistry::builtin`] registers the four dependency-free control-flow
-//! components: `start`, `end`, `branch`, and `loop`. The leaf components (`llm`, `tool`,
-//! `retrieval`, `memory`) own runtime collaborators (models, tools, knowledge bases,
-//! memory stores) and are therefore registered by the caller with
+//! [`ComponentRegistry::builtin`] registers the five dependency-free control-flow
+//! components: `start`, `end`, `branch`, `loop`, and `http_request`. The leaf components
+//! (`llm`, `tool`, `retrieval`, `memory`) own runtime collaborators (models, tools,
+//! knowledge bases, memory stores) and are therefore registered by the caller with
 //! [`ComponentRegistry::register_component`] or [`ComponentRegistry::register`].
 //!
 //! ```ignore
@@ -27,10 +27,13 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::component::Component;
 use crate::components::{
-    BranchComponent, EndComponent, EndConfig, LoopComponent, LoopConfig, StartComponent,
+    BranchComponent, EndComponent, EndConfig, HttpComponentConfig, HttpRequestComponent,
+    LoopComponent, LoopConfig, StartComponent,
 };
 use crate::condition::{Branch, BranchRouter, Condition};
-use crate::error::{branch_param_invalid, end_param_invalid, loop_param_invalid};
+use crate::error::{
+    branch_param_invalid, component_tool_input_param_error, end_param_invalid, loop_param_invalid,
+};
 
 /// Builds a component from its JSON configuration.
 pub type ComponentFactory = Arc<dyn Fn(Value) -> Result<Arc<dyn Component>> + Send + Sync>;
@@ -51,12 +54,13 @@ impl ComponentRegistry {
         Self::default()
     }
 
-    /// A registry holding the four control-flow built-ins: `start`, `end`, `branch`, and
-    /// `loop`.
+    /// A registry holding the five control-flow built-ins: `start`, `end`, `branch`,
+    /// `loop`, and `http_request`.
     ///
     /// Every built-in parses its JSON configuration; see [`Self::create`]. `start`
-    /// ignores its configuration, `end` and `loop` accept `null` or `{}` as the default
-    /// configuration, and `branch` requires a non-empty `branches` array.
+    /// ignores its configuration, `end`, `loop`, and `http_request` accept `null` or `{}`
+    /// as the default configuration, and `branch` requires a non-empty `branches` array.
+    /// `http_request` is config-only: it needs no runtime collaborator.
     #[must_use]
     pub fn builtin() -> Self {
         let mut registry = Self::new();
@@ -64,6 +68,10 @@ impl ComponentRegistry {
         registry.insert("end", factory(|config| Ok(boxed(build_end(config)?))));
         registry.insert("branch", factory(|config| Ok(boxed(build_branch(config)?))));
         registry.insert("loop", factory(|config| Ok(boxed(build_loop(config)?))));
+        registry.insert(
+            "http_request",
+            factory(|config| Ok(boxed(build_http_request(config)?))),
+        );
         registry
     }
 
@@ -173,6 +181,18 @@ fn build_end(config: Value) -> Result<EndComponent> {
     Ok(EndComponent::with_config(config))
 }
 
+/// Parses a [`HttpComponentConfig`]; `null` selects the default configuration.
+fn build_http_request(config: Value) -> Result<HttpRequestComponent> {
+    let config = if config.is_null() {
+        HttpComponentConfig::default()
+    } else {
+        serde_json::from_value::<HttpComponentConfig>(config).map_err(|error| {
+            component_tool_input_param_error(&format!("conf is invalid, {error}"))
+        })?
+    };
+    Ok(HttpRequestComponent::new(config))
+}
+
 /// The JSON configuration of a registry-built `branch` component.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -255,18 +275,19 @@ mod tests {
     #[test]
     fn builtin_registers_the_control_flow_components() {
         let registry = ComponentRegistry::builtin();
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 5);
         assert!(!registry.is_empty());
         assert_eq!(
             registry.names(),
             vec![
                 "branch".to_owned(),
                 "end".to_owned(),
+                "http_request".to_owned(),
                 "loop".to_owned(),
                 "start".to_owned()
             ]
         );
-        for name in ["start", "end", "branch", "loop"] {
+        for name in ["start", "end", "branch", "loop", "http_request"] {
             assert!(registry.contains(name), "missing builtin '{name}'");
         }
         assert!(!registry.contains("llm"));
