@@ -61,7 +61,7 @@ pub struct CaseSummary {
     pub partial: usize,
     /// Cases with no passing assertion.
     pub failed: usize,
-    /// `passed / total`, in `0.0..=1.0`.
+    /// `(passed + 0.5 * partial) / total`, in `0.0..=1.0`.
     pub pass_rate: f64,
 }
 
