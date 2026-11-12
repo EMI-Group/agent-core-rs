@@ -112,5 +112,8 @@ Storage (`store`):
 ## Known Issues and Gaps
 
 - MCP streamable HTTP opens no separate server-initiated `GET` stream; server requests arrive only on a POST's SSE stream.
+- There is no `ToolCollection`/tool-registry type: callers hold `Arc<dyn Tool>` values themselves (`FunctionTool::boxed` is the only built-in conversion).
+- `Model` has no abort/cancel or custom-invoke method; a stream is cancelled by dropping its `BoxStream`.
+- There is no `format_messages` helper; the provider-side projection is `llm::openai::{convert_message, convert_messages}` (public), and `BaseMessage` has no `to_openai`.
 - Not ported (tracked in `docs/PARITY.md`): reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, DashScope media generation, `client.py` client-side tools, Anthropic `cache_control` breakpoints and mid-conversation `system` turns, Chroma/Milvus/Gauss/ES/pgvector/S3/Redis backends, OpenAPI and Playwright MCP transports.
 - `FunctionTool` handlers are async-only (`spawn_blocking` inside a handler for blocking work); Python's sync handlers and generator-based tool streams are not reproduced.

@@ -36,7 +36,7 @@ All public data types are `serde` (`snake_case`, `#[serde(default)]`, unknown fi
 level:      RiskLevel { Safe, Low, Medium, High, Critical } (as_str/name/is_risky/at_least/from_value), GuardrailContentType { Text, Messages, ToolCall, Raw }
 context:    ScanStage { LlmInvokeInput, LlmInvokeOutput, ToolInvokeInput, ToolInvokeOutput, UserInput, Other(String) } with event()/from_event()/content_type()
             constants EVENT_LLM_INVOKE_INPUT "_framework:llm_invoke_input", EVENT_LLM_INVOKE_OUTPUT, EVENT_TOOL_INVOKE_INPUT, EVENT_TOOL_INVOKE_OUTPUT, EVENT_USER_INPUT "user_input"
-            GuardrailContext { content_type, content: Value, event: String, metadata: BTreeMap<String, Value> } + text()/messages()/tool_call()/raw() constructors,
+            GuardrailContext { content_type, content: Value, event: String, metadata: BTreeMap<String, Value> } + text(impl Into<String>, ScanStage)/messages(&[BaseMessage], ScanStage)/tool_call(impl Into<String>, &Value, ScanStage)/tool_output(same as tool_call)/raw(impl Into<String>, Value) constructors,
             get_text()/get_messages()/get_tool_name()/text_view()/with_metadata()/stage(); manual redacting Debug
 result:     GuardrailResult { is_safe, risk_level, risk_type, details, modified_data } with pass()/pass_with(details)/block(level, risk_type, details, modified_data)/message()
             RiskAssessment { has_risk, risk_level, risk_type, confidence, details } with into_result()
@@ -48,8 +48,8 @@ finding:    Finding { guardrail, risk_level, risk_type, message, blocking, detai
 guardrail:  #[async_trait] trait Guardrail { name(), priority() = 100, stages() = &[], handles(stage), check(&GuardrailContext) -> Result<GuardrailResult> }
             #[async_trait] trait GuardrailBackend { name(), analyze(&GuardrailContext) -> Result<RiskAssessment> }
             BackendGuardrail (backend adapter implementing Guardrail; no backend => Error::Security)
-pipeline:   GuardrailPipeline { add/add_arc/extend/guardrails/policy } running guardrails by descending priority, registration order as tiebreak
-            run(&GuardrailContext) -> GuardrailOutcome; scan_text/scan_user_input/scan_prompt/scan_model_output/scan_tool_input/scan_tool_output helpers
+pipeline:   GuardrailPipeline { add(&mut self, impl Guardrail + 'static)/add_arc(&mut self, Arc<dyn Guardrail>)/extend(IntoIterator<Item = Arc<dyn Guardrail>>)/guardrails()/policy(), builders new()/with_policy(SecurityPolicy)/Default } running guardrails by descending priority, registration order as tiebreak
+            run(&GuardrailContext) -> GuardrailOutcome (infallible); scan_text(ScanStage, impl Into<String>) / scan_user_input(impl Into<String>) / scan_prompt(&[BaseMessage]) / scan_model_output(impl Into<String>) / scan_tool_input(impl Into<String>, &Value) / scan_tool_output(impl Into<String>, &Value) -> GuardrailOutcome
 config:     SecurityConfig { enabled, policy, targets, prompt_injection, sensitive_data, content_rules, tool_arguments } with default()/protected()/pipeline() -> Result<GuardrailPipeline>
             SecurityPolicy { block_level = Critical, failure_policy = FailOpen, stop_on_block = true }, FailurePolicy { FailOpen, FailClosed },
             ScanTargets { prompts, user_input, model_outputs, tool_inputs, tool_outputs } (all true; stages() maps them to ScanStage)
@@ -59,9 +59,10 @@ parsers:    ModelOutputParser trait; BertBinaryParser, QwenGuardParser (see ./sr
 backends:   RuleBasedPromptInjectionBackend + RuleBasedBackendConfig (six Python default patterns),
             LlmPromptInjectionBackend + LlmPromptInjectionBackendConfig (Python stub semantics: delegates to the rule backend),
             ApiModelBackend + ApiModelBackendConfig (transport seam), LocalModelBackend + LocalModelBackendConfig (unsupported seam)
-guardrails: PromptInjectionGuardrail + PromptInjectionGuardrailConfig (Python parity, mode rules/api/local),
-            SensitiveDataGuardrail + config + SensitivePattern/SensitiveValidator (PII detect + redact) with SensitiveMatch/RedactionOutcome,
-            ContentRuleGuardrail + ContentRule + config, ToolArgumentGuardrail + config
+guardrails: PromptInjectionGuardrail + PromptInjectionGuardrailConfig (Python parity, mode rules/api/local) with new()/with_config()/with_config_and_parser(config, Arc<dyn ModelOutputParser>)/with_backend(Arc<dyn GuardrailBackend>)/with_stages/with_priority/backend_name/backend/config + const DEFAULT_STAGES = [LlmInvokeInput, ToolInvokeOutput],
+            SensitiveDataGuardrail + config + SensitivePattern/SensitiveValidator (PII detect + redact) with new()/with_config()/redact_text(&str) -> RedactionOutcome, SensitiveMatch/RedactionOutcome,
+            ContentRuleGuardrail + ContentRule + config with new(ContentRuleGuardrailConfig)/from_patterns(Vec<ContentRule>) (no Default impl), ToolArgumentGuardrail + config with new()/with_config() + const DEFAULT_STAGES = [ToolInvokeInput];
+            every built-in also has with_stages(impl IntoIterator<Item = ScanStage>), with_priority(i32), config()
 ```
 
 Crate root re-exports every item above flat (`openjiuwen_security::GuardrailPipeline`, `openjiuwen_security::RiskLevel`, ...); modules stay public for qualified paths.
