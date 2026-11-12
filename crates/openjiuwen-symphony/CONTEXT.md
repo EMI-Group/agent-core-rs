@@ -267,9 +267,17 @@ pub trait GraphArtifactStore: Send + Sync {
     async fn status(&self) -> Result<GraphArtifactStatus>;
     async fn versions(&self) -> Result<Vec<GraphRevision>>;
 }
-pub struct MemoryGraphArtifactStore;    // no persistent state; ::new()
+pub struct MemoryGraphArtifactStore;    // no persistent state; ::new(), Default
 pub struct FileGraphArtifactStore;      // ::new(root) loads existing versions
-impl FileGraphArtifactStore { pub async fn new(root: impl AsRef<Path>) -> Result<Self>; }
+impl FileGraphArtifactStore { pub async fn new(root: impl AsRef<Path>) -> Result<Self>; pub fn root(&self) -> &Path; }
+
+pub const STATUS_MISSING: &str = "missing";   // GraphArtifactStatus::status values
+pub const STATUS_READY: &str = "ready";
+impl GraphArtifactStatus {
+    pub fn missing() -> Self;   // Default: status "missing", empty snapshot
+    pub fn ready(revision: &GraphRevision) -> Self;
+    pub fn is_ready(&self) -> bool;
+}
 ```
 
 Revisions are immutable: publishing an existing version fails with `Error::Validation`.
@@ -303,6 +311,7 @@ impl OrchestrationPlan {
 }
 
 #[serde(rename_all = "snake_case")] pub enum MatchStrategy { ExactIo, SemanticOverlap, TextualCoercion }
+impl MatchStrategy { pub fn rank(self) -> u8; pub fn as_str(self) -> &'static str; }   // "exact_io" | "semantic_overlap" | "textual_coercion"
 pub struct RelationCandidate {
     pub source: String, pub target: String, pub relation: String /* CAN_FEED */,
     pub confidence: f64, pub strategy: MatchStrategy,
@@ -312,6 +321,7 @@ pub struct CandidateConfig { pub min_confidence: f64 /*0.7*/, pub min_token_over
 pub struct CandidateGenerator;
 impl CandidateGenerator {
     pub fn new(config: CandidateConfig) -> Self;
+    pub fn config(&self) -> &CandidateConfig;
     pub fn generate(&self, capabilities: &[CapabilityDescriptor]) -> Vec<RelationCandidate>;
     pub fn edges(&self, candidates: &[RelationCandidate]) -> Vec<CapabilityEdge>;
 }
@@ -362,6 +372,7 @@ impl PlanExecutor {
     pub fn with_config(config: ExecutorConfig, runner: Arc<dyn CapabilityRunner>) -> Self;
     pub fn compile(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor]) -> Result<CompiledGraph>;
     pub async fn execute(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
+    pub async fn execute_with_inputs(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], inputs: Value, session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;   // seeds state["inputs"]; `execute` delegates with Value::Null
 }
 impl Default for ExecutorConfig;
 ```
@@ -375,13 +386,19 @@ Candidates below `min_confidence` are dropped; each source keeps at most `max_ca
 **Plan scoring** (Python formula, deterministic substitute scorer):
 `score = 0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)`.
 `input_coverage` = distinct step inputs produced by an earlier step or listed in `provided_inputs`, divided by all distinct step inputs (`1.0` when there are none).
+`mean(semantic)` is the mean scorer value over the path's steps, falling back to Python's `SEED_BASELINE_SCORE` (`0.5`) when no step is scored; `mean(edge_confidence)` is the mean edge weight along the path, `1.0` when the path has no edges (Python `_state_edge_confidence`).
+A step input is *missing* when it is required (`required != Some(false)`; `None` means required) and neither an earlier step output (normalized name plus compatible type: equal, either side `any`/unknown, or a `DataTypeVocabulary` subtype) nor a `provided_inputs` name supplies it; `missing_inputs` and `filled_inputs` hold sorted, deduped normalized input names.
+`candidate_ids`/`disabled_ids` prune expansion targets as well as the start set; `available` gates the start set only, so a withdrawn capability can still be a downstream step.
+`plan_id` is a fresh `uuid_hex()`, so determinism holds for every field except `plan_id` and the `planned_graph.graph.id` that embeds it.
 Rank key: `(-score, missing_inputs, step_count, step_ids, edge_indices)` — the first element wins, later elements only break exact ties.
+The Rust planner has no graph edge indices (paths are linear), so the final slot is the path's edge weights; float comparisons use `total_cmp` and non-finite scores are sanitized to `0.0`.
 Start set: capabilities with a positive scorer value (all when the query has no tokens), minus `disabled_ids`, intersected with `candidate_ids` when given, `available` only.
 Expansion follows graph edges with `weight >= min_edge_confidence`, never revisiting a step, bounded by `max_depth`, `max_expansions` and `max_plans`.
 `Fast` keeps one greedy best partial path per start plus its single-node plan; `Beam` keeps the best `top_k` partial paths per depth before ranking.
 `status` is `Ready` when the best plan's root steps have no missing inputs, `NeedsInput` when a plan exists but a root input is unfilled (listed in `message`), and `NoPlan` when no candidate plan exists.
 
-**Execution mapping:** each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
+pub struct Execution mapping:** each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
+
 A step's inputs start from `state["inputs"]` (an object) and are overlaid by predecessor step outputs whose normalized name matches one of the step's input names (a predecessor with exactly one output also fills a step's single unmatched input).
 Each node writes the top-level state key equal to its step id: `{"success": bool, "output": Value, "error": Option<String>, "duration_ms": u64}`.
 With `fail_fast` the first runner error aborts the run with `Error::Graph("step `<id>` failed: ...")`; otherwise every step runs and `PlanExecution::failed_steps()` reports the failures.
