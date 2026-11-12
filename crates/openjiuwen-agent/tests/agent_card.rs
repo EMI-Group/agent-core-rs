@@ -25,7 +25,7 @@ const CARD_FIELDS: [&str; 6] = [
 ];
 
 /// Keys that a plain `AgentOutput::answer` must not emit, sorted.
-const ABSENT_FOR_ANSWER: [&str; 11] = [
+const ABSENT_FOR_ANSWER: [&str; 12] = [
     "component_ids",
     "data",
     "extra",
@@ -36,6 +36,7 @@ const ABSENT_FOR_ANSWER: [&str; 11] = [
     "observations",
     "state",
     "termination_reason",
+    "truncated_by_max_iterations",
     "workflow_execution_state",
 ];
 
@@ -231,12 +232,8 @@ fn none_and_empty_output_fields_are_absent_from_the_wire_object() {
 }
 
 /// Python only adds `truncated_by_max_iterations` to the result dict when the
-/// run was cut off (`react_agent.py::_finish_max_iterations`), never as `false`.
-///
-/// The test is ignored until `src/output.rs` skips the `false` value
-/// (`#[serde(skip_serializing_if = "std::ops::Not::not")]`); that source file
-/// lives outside this suite's scope.
-#[ignore = "wire bug: src/output.rs always serializes truncated_by_max_iterations=false"]
+/// run was cut off (`react_agent.py::_finish_max_iterations`), never as `false`,
+/// so the answer projection omits the key.
 #[test]
 fn truncated_by_max_iterations_is_absent_unless_truncated() {
     let untruncated = AgentOutput::answer("hi").to_value();

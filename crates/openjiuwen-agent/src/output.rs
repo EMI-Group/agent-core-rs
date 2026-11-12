@@ -95,6 +95,10 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_reason: Option<String>,
     /// Whether the run was cut off by the iteration limit.
+    ///
+    /// Python only adds this key to the result dict for a truncated run, so the
+    /// `false` value is omitted from the wire object.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated_by_max_iterations: bool,
     /// Number of loop iterations consumed, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
