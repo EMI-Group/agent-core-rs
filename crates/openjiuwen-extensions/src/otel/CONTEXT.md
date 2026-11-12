@@ -190,7 +190,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 - Tests must not read the real clock for assertions: elapsed/start-time assertions only check presence/format.
 - Never take two span-manager locks at once: `OtelWorkflowSpanManager::with_state` holds the manager lock, so buffer snapshots (`on_invoke_data`/`stream_inputs`/`stream_outputs`) are read *before* entering `with_state`.
 - Files ≤ ~1000 lines, one concern per file; no `unsafe`; no blocking calls; no `println!`.
-- `agent_handler` and `workflow_handler` are private modules whose items are still unexported at the `otel` root, so each carries a documented `#![allow(dead_code, unreachable_pub, clippy::unused_async)]`; drop them when `mod.rs` re-exports the handlers.
+- `agent_handler` and `workflow_handler` are private modules whose public types are re-exported at the `otel` root; each carries a documented `#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]` because the callbacks keep Python's async signatures with synchronous bodies (clippy reports part of the family under each lint).
 
 ## Test Strategy
 
@@ -200,6 +200,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 - `./workflow_handler/tests.rs`: root/component naming and kinds, retrieval query/documents, layer-root and sub-workflow parenting, cross-workflow isolation, buffer flushes, error/interrupt paths, stale-span cleanup on trace-id change.
 - Unit tests beside `redaction.rs` (all `test_redaction.py` cases: exact truncation marker, hash formula, field override truth table, system-prompt non-truncation), `span_names.rs` (every naming rule), `config.rs` (sample-rate validation, env toggle precedence), `handle.rs` (no-op vs active), `attrs.rs`, `llm_attrs.rs`.
 - Every test module always calls `force_flush()` before reading captured `SpanData`; Python counterparts are named in comments.
+- `./mod.rs` module docs carry three doctests that compile as external crates: the seam (`init_otel_tracer` active/inactive), the `TraceSink` integration (one exported `chat {model}` span from a terminal frame), and the typed handlers (LLM span attributes + `bug #2046` tool dedup, and the workflow buffer flush); the handler examples are wrapped in `# #[cfg(feature = "otel")] # { .. # }` so the default build stays green.
 - `./tests/otel.rs` (`#![cfg(feature = "otel")]`) and `./tests/otel_seam.rs` live in the crate's integration-test directory (outside this node).
 
 ## Routing Table
