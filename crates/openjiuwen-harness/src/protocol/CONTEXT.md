@@ -14,7 +14,7 @@ Ports the observable behavior of the Python native harness providers (`openjiuwe
 - Implements `HarnessModelControl`: `list_models`, `set_model`.
 - `NativeHarnessOptions { event_buffer_capacity: u64 /*1024*/, overflow: EventOverflowPolicy /*CoalesceOrBlock*/ }` with `new()` and `with_*` builders.
 - `NativeHarnessProvider` (`Default`, `new()`, `with_options(NativeHarnessOptions)`) implements `HarnessProvider` (`card`, `create(JsonObject)`) and `ModelConfigProvider` (`model_config(choice, fallback)`).
-- `NativeCheckpointState` — serde payload stored in `HarnessCheckpoint::data` (schema version, session scope, iteration, pending follow-ups, plan mode, turn counter, current model/effort).
+- `NativeCheckpointState` — serde payload stored in `HarnessCheckpoint::data` (schema version, session scope, iteration, pending follow-ups, plan mode, turn counter, current model/effort); `new(session_id, agent_id, host_session_id)`, `to_json() -> JsonObject`, `from_json(&JsonObject) -> HarnessResult<Self>` (rejects a foreign schema with `Validation("unsupported native checkpoint version")`).
 - Everything else (`inner`, `cursor`, `events`, `bridge`, `turn`) is crate-private.
 - Module file map: `mod.rs` (struct, lifecycle, `HarnessProtocol`/`HarnessModelControl` impls), `inner.rs` (shared protocol state and lock-scoped helpers), `turn.rs` (one turn task), `events.rs` (kernel frame/output → protocol payload mapping), `cursor.rs` (`EventChannel` + `ChannelEventCursor`), `bridge.rs` (sequence/envelope/turn ids, checkpoints), `provider.rs` (`NativeHarnessProvider`), `tests.rs` + `tests/` (offline suite).
 - `provider_session_id()` is `None` while `Terminated`; the id is the first successful `start`'s host session id and is stable for the harness lifetime (`OnceLock`), so restarting with a different host session id is `State("native harness cannot be restarted with a different host session")`.
@@ -85,6 +85,7 @@ Unknown keys → `Validation("unknown native harness configuration fields: <sort
 - Harness methods take `&self`; all mutable state lives behind `parking_lot::Mutex`/atomics on the shared inner struct, never held across `.await` (a dedicated `tokio::sync::Mutex` serializes turn start).
 - `send` spawns a tracked `tokio::task::JoinHandle` (joined by `stop`); event emission is `async` because the bounded channel applies the `EventBufferConfig::overflow` policy (`Block` awaits, coalescible/best-effort events are dropped when full — documented approximation of coalescing).
 - No duplicate event/result types: everything comes from `openjiuwen-harness-protocol`.
+- Out-of-crate visibility is exactly `NativeHarness`, `NativeHarnessOptions`, `native_card`, `HARNESS_NAME`/`PROVIDER_NAME`/`PROVIDER_VERSION`, `NativeCheckpointState` and `NativeHarnessProvider`; `inner`, `cursor`, `events`, `bridge` and `turn` are private modules (their helpers are `pub(crate)`), so integration tests in `crates/openjiuwen-harness/tests/` must assert via emitted events, `export_checkpoint`, and `NativeHarness::agent()` — never via the mapping helpers.
 - No network, no `unsafe`, `tracing` only, public items documented, files ≤1000 lines, no silent `unwrap`/`expect` outside tests.
 
 ## Routing Table
