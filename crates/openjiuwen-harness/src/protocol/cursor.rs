@@ -380,6 +380,16 @@ impl Drop for ChannelEventCursor {
     }
 }
 
+/// Builds a cursor that reports `message` as a [`HarnessError::State`] once, then ends.
+///
+/// The harness returns this cursor when no observation cycle is active (before
+/// [`start`](openjiuwen_harness_protocol::HarnessProtocol::start), or after
+/// [`stop`](openjiuwen_harness_protocol::HarnessProtocol::stop)), so callers
+/// observe the same error they would get from a channel that never opened.
+pub(crate) fn error_cursor(message: impl Into<String>) -> Box<dyn HarnessEventCursor> {
+    Box::new(ErrorCursor::new(HarnessError::state(message)))
+}
+
 /// Cursor that reports the same [`HarnessError::State`] once, then ends.
 #[derive(Debug)]
 struct ErrorCursor {
