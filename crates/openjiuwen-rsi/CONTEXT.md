@@ -132,8 +132,8 @@ orchestrator.rs AutoHarnessOrchestrator — builder(config) with with_runner/wit
               config(), session_id(), state() -> SessionState (snapshot), is_running(), is_cancelled(),
               start() -> Result<()>, resume() -> Result<Option<SessionState>>,
               run_iteration() -> Result<IterationRecord>, stop(), finish() -> Result<SessionSummary>,
-              stream() -> BoxStream<'static, Result<AutoHarnessEvent>>,
-              run() -> Result<SessionSummary> (start → iterations → finish).
+              stream(self: &Arc<Self>) -> BoxStream<'static, Result<AutoHarnessEvent>>,
+              run(self: &Arc<Self>) -> Result<SessionSummary> (start → iterations → finish).
               One iteration: seed if empty → select parents → mutate → evaluate each candidate through
               the Evaluator → mark statuses → compare best to incumbent (improvement, accepted) →
               append IterationRecord → checkpoint session state → evaluate stop conditions.
