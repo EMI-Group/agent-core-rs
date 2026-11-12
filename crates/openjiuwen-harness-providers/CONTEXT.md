@@ -45,6 +45,8 @@ Helpers (flat re-exports):
 - Errors keep Python message text and Python `repr` quoting (`unknown harness provider 'x'; expected one of …`, `unknown Claude Code configuration fields: …`).
 - Vendor providers are registered but not implemented: `create` returns `HarnessError::UnsupportedCapability` with the Python "SDK required" text, mapped to `Error::Unsupported` at the factory; cards stay behind the same `vendor` feature.
 - Features: `native` (default) enables the native provider; `vendor` enables the three vendor modules and their registration; `live-tests` is opt-in and never enabled by default; the crate builds with `--no-default-features` and with `--features vendor`.
+- All three features are empty toggles (`default = ["native"]`, `native = []`, `vendor = []`, `live-tests = []`) and every dependency is non-optional — `openjiuwen-harness` is compiled even with `--no-default-features`, where the feature only compiles out the `providers::native` module.
+- No source file references `feature = "live-tests"`; it is a reserved manifest flag with no gated code (the delivered end-to-end tests live in `tests/vendor.rs` under `vendor`).
 - Async-first: `HarnessIOAdapter` spawns exactly one event-pump task per `start`, owns it through the adapter lifetime, and stops it in `stop`; no detached task outlives the adapter.
 - Serde: config types are `snake_case`, tolerate unknown keys when deserializing from JSON, and reject unknown keys in `from_json` mapping (Python `from_mapping`); `api_key` is `SecretString` and redacted in `Debug`.
 - No `unsafe`, no stdout logging (`tracing` only), files ≤1000 lines, all public items documented.
