@@ -302,18 +302,46 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 
 ## Notes for Agents
 
-The public surface above is complete and compiling; the remaining placeholders (`WorkflowAgent` dispatch, workflow selection) carry a `// TODO:` marker.
-- The rails subsystem is implemented: `RailRegistry::fire` dispatches by event in stable descending priority and stops on the first `Err`; `GuardrailRail` enforces the enabled `ScanTargets` stages; `MemoryRail` recalls before the model call (at most once per invoke) and writes messages on `AfterInvoke` (failures logged only); `ModelBackupRail` fails over through `ctx.model_override` + retry; the interrupt rails pause, approve, reject, ask, and auto-confirm.
-- `abilities::AbilityManager::execute` is a sequential baseline: no `parallel_safe` batching and no per-call timeout; `parse_tool_arguments` does not repair truncated JSON yet.
-- `WorkflowAgent::invoke`/`stream` return `Error::unsupported`, and `workflow_agent::select::select_workflow` always returns index 0.
-- `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`; stage gating reuses that shared type instead of a local flag struct.
-- `react::model_step::ModelReply` is public because `RailContext::response` exposes it; the loop calls the model through `call_model_streaming` (the normal session-scoped path, which emits `llm_reasoning`/`llm_output`/`llm_usage` frames) and uses `call_model` only for the tool-free `FinalAnswer` finalization call.
-- `LlmAgent::new` consumes `agent_memory_config` without mapping it (the `ReActAgentConfig` has no such field).
+- The loop pauses a turn once: it fires `BeforeToolCall` for every tool call of the model turn in model order, drains each call's requests, and — when any request was recorded — executes no tool of that turn and returns all requests together in one `result_type: "interrupt"` output.
+- A resumed turn replays the interrupted calls without a model call; requests the caller left unanswered re-pause with only the remaining requests, whose `interrupt_id`s are replayed rather than re-minted.
+- Auto-confirm is seeded from the session's `__interrupt_auto_confirm__` into `ctx.extra["_interrupt_auto_confirm"]` on every invoke — fresh and resumed alike — matching Python's per-turn session read.
+- `InterruptRequest` serializes with Python wire names `interrupt_kind`/`interrupt_owner` (deserialization also accepts the Rust `kind`/`owner`), so an `__interaction__` frame payload is `{id, value}` with a Python-shaped `value`.
+- `AgentOutput::truncated_by_max_iterations` is omitted from the wire object unless it is `true`.
+- `abilities::AbilityManager::execute` batches runs of consecutive `parallel_safe` tools (capped by `MAX_PARALLEL_BATCH`), treats any other call as a barrier, and applies `ToolExecutionOptions::timeout` per call.
+- `parse_tool_arguments` strips a Markdown fence and repairs trailing commas and truncation before reporting an error.
+- `WorkflowAgent` implements `invoke`/`stream`; `workflow_agent::select::select` asks the model to pick among several workflows from `description or name` and falls back to `default_response` and then the first workflow.
+- `LlmAgentConfig::agent_memory_config` is host-visible only: `ReActAgentConfig` has no memory-toggle field, so it does not change the composed `ReAct` configuration.
+- `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`.
+- `react::model_step::ModelReply` is public because `RailContext::response` exposes it; the loop calls the model through `call_model_streaming` (the session-scoped path that emits `llm_reasoning`/`llm_output`/`llm_usage` frames) and uses `call_model` only for the tool-free `FinalAnswer` finalization call.
+
+## Deferred Python Behavior
+
+- Not ported: the legacy controller stack (`ControllerAgent`, `LLMController`, `WorkflowController`, intent-detection controllers, and `Runner.resource_mgr` lookups) — `LLMAgent` is a composition over `ReActAgent` and `WorkflowAgent` owns its workflows directly.
+- Not ported: steering queues and the `before_steering_drain` hook.
+- Not ported: KV-cache affinity for model requests.
+- Not ported: skill utilities (`SkillUtil`, `register_skill`).
+- Not ported: the agent callback framework (`register_callback`, the global `Runner.callback_framework`) — rails are this crate's only extension seam.
+- Not ported: sub-agent, workflow, and MCP abilities — `AbilityManager` holds plain `Tool` instances only.
+- Not ported: tool exposure policy, MCP tool allowlists, and client tools (`InterruptKind::ClientTool` exists as a wire kind only).
+- Not ported: per-tool `resilience` timeouts — only the run-level `ToolExecutionOptions::timeout` exists.
+- Not ported: `FinalRequestCheck`.
+- Not ported: image/multimodal tool results and deferred image payloads — tool output is text plus an optional JSON value.
+- Not ported: `ReActAgentEvolve` operators.
+- Not ported: `context.usage` and `llm_route` frames — `CONTEXT_USAGE` is a declared kind with no emitter.
+- Not ported: memory-variable prompt injection keys.
+- Not ported: prompt-file/YAML prompt packs — prompts are `BaseMessage` templates and `SystemPromptBuilder` sections.
 
 ## Test Strategy
 
-- Unit tests beside modules: card/`AgentInput`/`AgentOutput` serde round-trips; tool argument repair; registry ordering/revision; `match_answers`/`parse_approval`; prompt section ordering; `RailRegistry` priority ordering.
-- Integration tests in `tests/` with `ScriptedModel`: ReAct no-tool answer, single tool, parallel tools, tool error → tool message, max-iteration policies, empty response retry, streaming frame assembly, ability mounting, rails ordering/force-finish/model backup, guardrail blocking, memory rail injection, confirm/ask-user interrupt + resume, `LLMAgent`, `WorkflowAgent` over a simple workflow, card serde snapshots.
+- Unit tests beside every module (231) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection, model-backup ordering, interrupt rail flows, tool-argument repair, and parallel tool batching.
+- `tests/agent_card.rs` (15) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
+- `tests/react_agent.rs` (12) drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
+- `tests/streaming.rs` (4) assembles `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frames and checks the session mirror.
+- `tests/rails.rs` (7) proves rails steer a running agent: priority ordering per event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall + write-back, and `skip_tool`.
+- `tests/interrupt.rs` (7) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, and two pending calls pausing once and resuming individually.
+- `tests/llm_agent.rs` (7) covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
+- `tests/workflow_agent.rs` (5) covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
+- The crate suite (288 tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
 
 ## Routing Table
 

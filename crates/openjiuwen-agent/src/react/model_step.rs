@@ -4,13 +4,10 @@
 //! Python parity: the model call inside
 //! `openjiuwen/core/single_agent/agents/react_agent.py::_inner_invoke`.
 //!
-//! This round implements the non-streaming baseline: every call goes through
-//! `Model::invoke` and is projected to a
-//! [`ModelReply`]. Streaming (driving
-//! `Model::stream` through a `StreamAccumulator` and emitting
-//! `llm_reasoning`/`llm_output`/`llm_usage` chunks) arrives in a later round and
-//! may replace the signature of `call_model` freely; the reply type is the
-//! stable shape both paths must produce.
+//! The loop streams every `ReAct` iteration through `call_model_streaming` (so
+//! a session or streaming caller sees `llm_reasoning`/`llm_output`/`llm_usage`
+//! frames) and uses the non-streaming `call_model` only for the tool-free
+//! finalization call of the `FinalAnswer` max-iteration policy.
 use crate::output::{AgentChunk, LLM_OUTPUT, LLM_REASONING, LLM_USAGE};
 use futures::StreamExt;
 use openjiuwen_common::error::Result;
@@ -37,18 +34,16 @@ pub struct ModelReply {
 }
 /// Calls `model` once with `messages` and `request` and normalizes the reply.
 ///
+/// The loop uses this only for the tool-free finalization call of the
+/// `FinalAnswer` max-iteration policy; every `ReAct` iteration goes through
+/// [`call_model_streaming`].
+///
 /// An empty response (no choice at all) yields a default [`ModelReply`] rather
 /// than an error, so the loop can apply its own empty-response policy.
-///
-/// TODO: stream when a session/publisher is attached — drive `Model::stream`
-/// through a `StreamAccumulator`, emit `llm_reasoning`/`llm_output`/
-/// `llm_usage` chunks while consuming the stream, and build the same
-/// [`ModelReply`] from the accumulated turn.
 ///
 /// # Errors
 ///
 /// Returns the provider's error from `Model::invoke` unchanged.
-#[allow(dead_code)] // the loop that calls this lands in a later round
 pub(crate) async fn call_model(
     model: &Arc<dyn Model>,
     messages: &[BaseMessage],
@@ -81,7 +76,6 @@ pub(crate) struct DeltaSink<'a> {
 
 impl<'a> DeltaSink<'a> {
     /// Creates a sink that starts at index zero.
-    #[allow(dead_code)] // the loop that builds a sink lands in a later round
     pub(crate) fn new(
         publisher: Option<&'a UnboundedSender<AgentChunk>>,
         session: Option<&'a Arc<dyn Session>>,
@@ -133,7 +127,6 @@ impl<'a> DeltaSink<'a> {
 /// # Errors
 ///
 /// Returns the provider's error from the stream unchanged.
-#[allow(dead_code)] // the loop that calls this lands in a later round
 pub(crate) async fn call_model_streaming(
     model: &Arc<dyn Model>,
     messages: &[BaseMessage],

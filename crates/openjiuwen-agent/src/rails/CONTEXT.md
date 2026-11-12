@@ -11,6 +11,7 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 - `guardrail.rs` — `GuardrailRail` over `openjiuwen_security::GuardrailPipeline`: user input on `BeforeInvoke`, model output on `AfterModelCall`, tool input/output on `BeforeToolCall`/`AfterToolCall`, gated by `ScanTargets` flags; blocking returns `Error::Security` naming the stage, risk type, and level (from `GuardrailOutcome::enforce` + `violation`).
 - `guardrail.rs` keeps the `prompts` flag for `ScanTargets` parity but never scans the prepared window; user and tool content are scanned at their own stages.
 - `memory.rs` — `MemoryRail` over `openjiuwen_memory::LongTermMemory`: recall injected as a system message after the leading system messages before the model call (at most once per invoke, flagged in `ctx.extra`), message write on `AfterInvoke`; `with_top_k`/`top_k` control recall size (default 5); failures are logged only.
+- The recall lands in `ctx.messages`, and the loop sends that rail-mutated window (not the freshly prepared one) to the model.
 - `model_backup.rs` — `ModelBackupRail`: on `OnModelException`, advance a per-rail cursor to the next backup model via `ctx.model_override` and `ctx.request_retry(None)`; exhausted cursor leaves the context untouched.
 - `interrupt/mod.rs` — `ToolFilter`, `BaseInterruptRail`, `ConfirmInterruptRail`, `AskUserRail` (see `interrupt/CONTEXT.md`).
 
@@ -23,8 +24,8 @@ Ports the hook model of Python `core/single_agent/rail/base.py` (`AgentRail`, `A
 
 ## Test Strategy
 
-Unit tests beside each module: registry dispatch order, first-error stop, per-event hook targeting, guardrail stage blocking, memory recall injection/write-back, model-backup ordering and exhaustion, interrupt pause/approve/reject/ask-user/auto-confirm.
-`../../tests/rails.rs` is reserved for integration coverage once the ReAct loop fires the hooks.
+- Unit tests beside each module: registry dispatch order, first-error stop, per-event hook targeting, guardrail stage blocking, memory recall injection/write-back, model-backup ordering and exhaustion, interrupt pause/approve/reject/ask-user/auto-confirm.
+- `../../tests/rails.rs` proves the hooks are wired into the running loop: priority ordering for every event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall reaching the model plus write-back, and `skip_tool` replacing a result.
 
 ## Routing Table
 
