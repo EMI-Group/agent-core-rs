@@ -12,6 +12,7 @@ publish = false
 openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
+openjiuwen-session.workspace = true
 openjiuwen-harness-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,22 +24,41 @@ futures.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
+url.workspace = true
+sha2.workspace = true
 axum = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 
+[dev-dependencies]
+wiremock.workspace = true
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
 [features]
 default = []
-a2a = ["dep:axum"]
-otel = ["dep:opentelemetry", "dep:tracing-opentelemetry", "dep:opentelemetry_sdk"]
+a2a = ["dep:axum", "dep:async-stream", "dep:bytes"]
+otel = [
+    "dep:opentelemetry",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-subscriber",
+    "dep:chrono",
+]
 mcp = ["dep:rmcp", "dep:tokio-stream"]
-sqlite = ["dep:sqlx"]
+sqlite = ["dep:sqlx", "openjiuwen-foundation/sqlite", "openjiuwen-session/sqlite"]
 redis = []
 pulsar = []
+live-tests = []
 
 [lints]
 workspace = true
