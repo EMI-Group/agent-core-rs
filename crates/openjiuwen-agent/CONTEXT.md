@@ -72,7 +72,7 @@ pub struct AgentInput {
 }
 impl AgentInput { pub fn parse(inputs: &Value) -> Result<Self>; pub fn query_text(&self) -> Option<&str>; }
 ```
-`AgentOutput` serializes to the Python result dict: `output`, `result_type`, `finish_reason`, `reasoning_present`, `termination_reason`, `iterations_used`, `truncated_by_max_iterations`, `observations[{content,name,tool_call_id}]`, `finalization_error`, `state`, `interrupt_ids`, `component_ids`, `workflow_execution_state`, `data`, `extra`; `None`/empty fields are skipped.
+`AgentOutput` serializes to the Python result dict: `output`, `result_type`, `finish_reason`, `reasoning_present`, `termination_reason`, `iterations_used`, `truncated_by_max_iterations`, `observations[{content,name,tool_call_id}]`, `finalization_error`, `state`, `interrupt_ids`, `component_ids`, `workflow_execution_state`, `data`, `extra`; `None`/empty fields are skipped, and `reasoning_present`/`truncated_by_max_iterations` are omitted unless `true`.
 `AgentChunk::to_stream_item`/`from_stream_item` bridge to `openjiuwen_session::stream::StreamItem` (`mode = Output`).
 
 ### ReAct (`react/`)
@@ -333,15 +333,15 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 
 ## Test Strategy
 
-- Unit tests beside every module (231) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection, model-backup ordering, interrupt rail flows, tool-argument repair, and parallel tool batching.
-- `tests/agent_card.rs` (15) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
+- Unit tests beside every module (232) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection, model-backup ordering, interrupt rail flows, tool-argument repair, and parallel tool batching.
+- `tests/agent_card.rs` (16) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
 - `tests/react_agent.rs` (12) drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
 - `tests/streaming.rs` (4) assembles `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frames and checks the session mirror.
 - `tests/rails.rs` (7) proves rails steer a running agent: priority ordering per event, force-finish before the model and before a tool, `ModelBackupRail` failover, `GuardrailRail` blocking (`ErrorKind::Security`), `MemoryRail` recall + write-back, and `skip_tool`.
-- `tests/interrupt.rs` (7) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, and two pending calls pausing once and resuming individually.
+- `tests/interrupt.rs` (8) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, two pending calls pausing once and resuming individually, and the streaming pause path emitting and mirroring its `__interaction__` frame.
 - `tests/llm_agent.rs` (7) covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
 - `tests/workflow_agent.rs` (5) covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
-- The crate suite (288 tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
+- The crate suite (291 tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
 
 ## Routing Table
 

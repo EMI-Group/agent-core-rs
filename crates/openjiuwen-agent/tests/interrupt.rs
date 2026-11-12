@@ -11,16 +11,19 @@
 //! Everything is offline and deterministic: tools are in-process closures that
 //! record their inputs, sessions are `AgentSession`s, and assertions read the
 //! recorded model calls, the persisted session state, and the tool log.
+use futures::StreamExt;
+use openjiuwen_agent::output::ANSWER;
 use openjiuwen_agent::{
     Agent, AgentCard, AskUserRail, ConfirmInterruptRail, OutputFrame, ReActAgent, ReActAgentConfig,
     ResultType, AUTO_CONFIRM_STATE_KEY, DEFAULT_REJECT_FEEDBACK, INTERRUPTION_STATE_KEY,
 };
 use openjiuwen_foundation::{BaseMessage, FunctionTool, Model, Role, Tool, ToolContext};
-use openjiuwen_session::{AgentSession, Session};
+use openjiuwen_session::{AgentSession, Session, StreamEvent};
 use openjiuwen_test_support::{MockCompletion, MockToolCall, ScriptedModel};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 /// Session id every test uses; also the `conversation_id` a resume carries.
 const SESSION_ID: &str = "s1";
 /// Owner string `ConfirmInterruptRail` records on its requests.
@@ -450,5 +453,69 @@ async fn two_pending_calls_pause_once_and_resume_individually() {
         session.get_state(INTERRUPTION_STATE_KEY).await.unwrap(),
         None,
         "the finished turn clears the interruption"
+    );
+}
+
+/// The streaming path publishes the pause frames and mirrors them into the
+/// session before the terminal `answer` frame.
+#[tokio::test]
+async fn streaming_pause_emits_the_interaction_frame_and_mirrors_it() {
+    let model = ScriptedModel::builder()
+        .completion(MockCompletion::tool_call("write", json!({"path": "x"})))
+        .respond_text("done")
+        .build();
+    let agent = agent(&model);
+    let log = log();
+    agent.add_tool(recording_tool("write", &log));
+    agent.register_rail(Arc::new(ConfirmInterruptRail::for_tools(["write"])));
+    let session = new_session();
+    // Subscribe before the run so the mirrored frames are not missed.
+    let mut events = session.subscribe();
+    let chunks = agent
+        .stream(json!({"query": "do it"}), Some(Arc::clone(&session)))
+        .map(|chunk| chunk.unwrap())
+        .collect::<Vec<_>>()
+        .await;
+    let interactions = chunks
+        .iter()
+        .filter(|chunk| chunk.kind == "__interaction__")
+        .collect::<Vec<_>>();
+    assert_eq!(interactions.len(), 1, "{chunks:?}");
+    let frame = interactions[0];
+    assert_eq!(frame.payload["value"]["interrupt_kind"], json!("confirm"));
+    assert_eq!(frame.payload["value"]["tool_call_id"], json!("call_write"));
+    let terminal = chunks.last().expect("the stream has a terminal frame");
+    assert_eq!(terminal.kind, ANSWER, "{chunks:?}");
+    assert_eq!(terminal.payload["result_type"], json!("interrupt"));
+    assert!(
+        !terminal.payload["state"]
+            .as_array()
+            .expect("the paused output carries its frames")
+            .is_empty(),
+        "the terminal frame carries the pause state: {terminal:?}"
+    );
+    assert!(log.lock().is_empty(), "the paused tool never runs");
+    let mut mirrored = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, events.next()).await {
+            Ok(Some(Ok(StreamEvent::Item(item)))) => {
+                let terminal_item = item.item_type == ANSWER;
+                mirrored.push(item.item_type);
+                if terminal_item {
+                    break;
+                }
+            }
+            Ok(Some(Ok(StreamEvent::End)) | None) | Err(_) => break,
+            Ok(Some(Err(error))) => panic!("session stream failed: {error}"),
+        }
+    }
+    assert!(
+        mirrored.iter().any(|kind| kind == "__interaction__"),
+        "the interaction frame is mirrored into the session: {mirrored:?}"
     );
 }

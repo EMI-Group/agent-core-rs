@@ -90,6 +90,10 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     /// Whether the model emitted reasoning/thinking content.
+    ///
+    /// Python's plain answer dict is only `{"output", "result_type"}`, so the
+    /// `false` value is omitted from the wire object.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_present: bool,
     /// Why the loop stopped early (`max_iterations`, `token_budget`, `cancelled`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +385,17 @@ mod tests {
         assert!(value.get("interrupt_ids").is_none());
         assert!(value.get("workflow_execution_state").is_none());
         assert!(value.get("finish_reason").is_none());
+    }
+    #[test]
+    fn reasoning_present_is_absent_unless_true() {
+        assert!(AgentOutput::answer("hi")
+            .to_value()
+            .get("reasoning_present")
+            .is_none());
+        let present = AgentOutput::answer("hi").with_reasoning_present(true);
+        assert_eq!(present.to_value()["reasoning_present"], true);
+        let restored = AgentOutput::from_value(AgentOutput::answer("hi").to_value()).unwrap();
+        assert!(!restored.reasoning_present);
     }
     #[test]
     fn workflow_output_uses_execution_state_key() {

@@ -25,7 +25,7 @@ const CARD_FIELDS: [&str; 6] = [
 ];
 
 /// Keys that a plain `AgentOutput::answer` must not emit, sorted.
-const ABSENT_FOR_ANSWER: [&str; 12] = [
+const ABSENT_FOR_ANSWER: [&str; 13] = [
     "component_ids",
     "data",
     "extra",
@@ -34,6 +34,7 @@ const ABSENT_FOR_ANSWER: [&str; 12] = [
     "interrupt_ids",
     "iterations_used",
     "observations",
+    "reasoning_present",
     "state",
     "termination_reason",
     "truncated_by_max_iterations",
@@ -252,6 +253,14 @@ fn truncated_by_max_iterations_is_absent_unless_truncated() {
     );
 }
 
+#[test]
+fn reasoning_present_is_absent_unless_true() {
+    let plain = AgentOutput::answer("hi").to_value();
+    assert!(plain.get("reasoning_present").is_none(), "{plain}");
+    let reasoning = AgentOutput::answer("hi").with_reasoning_present(true);
+    assert_eq!(reasoning.to_value()["reasoning_present"], json!(true));
+    assert!(!AgentOutput::from_value(plain).unwrap().reasoning_present);
+}
 #[test]
 fn is_interrupt_is_true_only_for_interrupt_outputs() {
     assert!(!AgentOutput::answer("a").is_interrupt());
