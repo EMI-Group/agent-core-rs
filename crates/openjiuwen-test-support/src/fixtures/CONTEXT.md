@@ -26,6 +26,9 @@ The session fixtures build on the implemented `openjiuwen-session` factories, so
 - `set`/`remove` on an `EnvGuard` are only restored on drop for the names the guard was constructed with; names mutated without being listed keep their final value, so a test must list every variable it touches.
 - Strictly one env-mutating guard family per test is the documented pattern; parallel tests serialize automatically, never spin or poll for the lock.
 - Env guards are `!Send` (held lock) so they stay on the test thread; document that they must not be moved into spawned tasks.
+- `TempHomeGuard` is `!Send` as well because it owns an `EnvGuard`, so a test holding one cannot use `#[tokio::test(flavor = "multi_thread")]` and must not hand it to `tokio::spawn`; the default current-thread `#[tokio::test]` is fine.
+- `ENV_LOCK` serializes only guards inside one test binary: each `cargo test` target is a separate process, and the hand-rolled `EnvGuard` copies in other crates (e.g. `openjiuwen-common`, `openjiuwen-session` tests) use their own locks, so mutual exclusion is never guaranteed across binaries or foreign guards.
+- `EnvGuard::drop` restores the saved names in construction order (`saved.drain(..)`), although the `saved` field comment in `env.rs` says "reverse order"; only the set of restored names matters today.
 - `OPENJIUWEN_HOME` is set to `<temp root>/home` and the directory is created eagerly.
 - `ISOLATED_ENV_VARS` uses the constants from `openjiuwen_common::config::env` where available (never re-typed string literals for those names).
 - `write_json`/`read_json` return `openjiuwen_common::error::Result` (`Error::sys_op` for I/O, `Error::validation` for serialization, both naming the path); plain file helpers return `io::Result`.
