@@ -21,6 +21,6 @@ No public API; the suites exercise `openjiuwen_harness_providers` through its pu
 
 - `./registry.rs` → name resolution, registration semantics, model-config gates, context building, `create_harness`
 - `./native.rs` → native card, create validation, unstarted state, start/send/events/stop over `ScriptedModel`, model control, checkpoints
-- `./io_adapter.rs` → event→chunk projection, interactions, delivery modes, abort, failed-start cleanup
+- `./io_adapter.rs` → event→chunk projection, turn lifecycle/failure frames, interactions (host prompts, tool gateway, provider handlers), answer parsing, delivery modes, abort/pause/resume gating, lifecycle errors; four in-test doubles plus 20 tests make the file intentionally ~1550 lines
 - `./vendor.rs` → vendor cards/configs/model fragments/`Unsupported` create (feature `vendor`)
 - `./skills.rs` → skill normalization and conflict policies
