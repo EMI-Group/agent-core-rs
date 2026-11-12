@@ -6,10 +6,27 @@
 //! `PromptMode` (defined in [`mode`], re-exported by `crate::prompts`).
 //! See `CONTEXT.md` for the full public contract.
 
-pub mod config;
-pub mod interaction;
-pub mod loop_event;
-pub mod mode;
-pub mod state;
-pub mod stop_condition;
-pub mod task;
+mod config;
+mod interaction;
+mod loop_event;
+mod mode;
+mod state;
+mod stop_condition;
+mod task;
+
+pub use config::{
+    resolve_inner_react_max_iterations, DeepAgentConfig, OnMaxIterations, SubAgentConfig,
+    TaskLoopNoProgressGuardConfig,
+};
+pub use interaction::{
+    ActiveInteractionRound, InputDispatchMode, InteractionEvent, InteractionEventType,
+    InteractionPhase, RoundOutcome, RoundWorkItem, RoundWorkKind, SendInputRequest,
+};
+pub use loop_event::{create_loop_event, default_event_priority, DeepLoopEvent, DeepLoopEventType};
+pub use mode::{AgentMode, PromptMode};
+pub use state::{DeepAgentState, PlanModeState, SESSION_RUNTIME_ATTR, SESSION_STATE_KEY};
+pub use stop_condition::{
+    CompletionPromise, CustomPredicate, MaxRounds, NoProgressAnswer, StopConditionEvaluator,
+    StopConditionState, StopEvaluationContext, StopVerdict, Timeout, TokenBudget,
+};
+pub use task::{status_icon, ModelUsageRecord, TaskPlan, TodoItem, TodoStatus};
