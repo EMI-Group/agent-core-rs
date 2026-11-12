@@ -128,8 +128,17 @@ pub struct InterruptRequest {
     /// Request identifier, minted as `intr_<uuid hex>`.
     pub interrupt_id: String,
     /// What is being asked.
+    ///
+    /// Python's wire model (`core/single_agent/interrupt/response.py`) names
+    /// this `interrupt_kind`; `kind` is accepted as an alias so state persisted
+    /// before the rename still loads.
+    #[serde(rename = "interrupt_kind", alias = "kind")]
     pub kind: InterruptKind,
     /// Id of the agent or tool that raised the request.
+    ///
+    /// Python's wire model names this `interrupt_owner`; `owner` is accepted as
+    /// an alias for older persisted state.
+    #[serde(rename = "interrupt_owner", alias = "owner")]
     pub owner: String,
     /// Human-readable question.
     pub message: String,
@@ -555,7 +564,8 @@ mod tests {
         let frame = request.to_frame(1);
         assert_eq!(frame.kind, crate::output::INTERACTION);
         assert_eq!(frame.payload["id"], json!(request.interrupt_id.as_str()));
-        assert_eq!(frame.payload["value"]["kind"], json!("ask_user"));
+        assert_eq!(frame.payload["value"]["interrupt_kind"], json!("ask_user"));
+        assert_eq!(frame.payload["value"]["interrupt_owner"], json!("agent"));
         let interaction = request.to_interaction_request();
         assert_eq!(interaction.id, request.interrupt_id);
         assert_eq!(interaction.kind, InteractionKind::AskUser);
@@ -576,6 +586,27 @@ mod tests {
         assert_eq!(interaction.component_id.as_deref(), Some("call-1"));
         assert_eq!(interaction.metadata["source"], json!("tests"));
         assert_eq!(interaction.question["tool_name"], json!("shell"));
+    }
+    #[test]
+    fn request_serializes_python_wire_names_and_accepts_old_ones() {
+        let request = InterruptRequest::new(InterruptKind::Confirm, "agent", "ok?");
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["interrupt_kind"], json!("confirm"));
+        assert_eq!(value["interrupt_owner"], json!("agent"));
+        assert!(value.get("kind").is_none(), "python wire name only");
+        assert!(value.get("owner").is_none(), "python wire name only");
+
+        let legacy = json!({
+            "interrupt_id": request.interrupt_id,
+            "kind": "confirm",
+            "owner": "agent",
+            "message": "ok?",
+        });
+        let restored: InterruptRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.interrupt_id, request.interrupt_id);
+        assert_eq!(restored.kind, InterruptKind::Confirm);
+        assert_eq!(restored.owner, "agent");
+        assert_eq!(restored.message, "ok?");
     }
     #[test]
     fn parse_approval_variants() {

@@ -21,7 +21,8 @@
 //! - honour rail control flags: `force_finish` returns immediately, `retry`
 //!   repeats the model call once, `model_continue` keeps iterating, `skip_tool`
 //!   substitutes the tool result without executing it, and `interrupts` pause the
-//!   run;
+//!   run once every call of the turn has been asked, so one turn surfaces all of
+//!   its pending requests together and executes no tool;
 //! - persist contexts with `ContextEngine::save_contexts` and interruption state
 //!   under `__react_agent_interruption__`;
 //! - terminate with `termination_reason` `max_iterations` or `token_budget`.
@@ -289,12 +290,26 @@ fn request_for(runtime: &AgentRuntime, tools: &[Value]) -> ModelRequestConfig {
     request.with_tools(tools.to_vec())
 }
 
+/// Seeds `ctx` with the host's auto-confirm decision, when the session has one.
+///
+/// Python's `BaseInterruptRail.before_tool_call` reads the decision from the
+/// session on every turn, so both the fresh and the resumed branch seed it.
+async fn seed_auto_confirm(session: &Arc<dyn Session>, ctx: &mut RailContext) -> Result<()> {
+    if let Some(value) = session.get_state(AUTO_CONFIRM_STATE_KEY).await? {
+        if !value.is_null() {
+            ctx.extra.insert(AUTO_CONFIRM_EXTRA_KEY.to_owned(), value);
+        }
+    }
+    Ok(())
+}
+
 /// Seeds the conversation: replays a pending interruption or observes the query.
 ///
 /// A resumed turn clears the persisted state, seeds the rail scratch space with
 /// the auto-confirm decision and the matched answers, replays the interrupted
 /// tool calls, and starts at the iteration after the interruption. Requests the
-/// caller did not answer pause the run again.
+/// caller did not answer pause the run again. A fresh turn also seeds the
+/// auto-confirm decision, so a host can pre-approve tools before the first call.
 async fn resume_or_seed(
     runtime: &AgentRuntime,
     input: &AgentInput,
@@ -310,6 +325,7 @@ async fn resume_or_seed(
                 "interactive input requires a pending interruption to resume",
             ));
         };
+        seed_auto_confirm(session, ctx).await?;
         runtime
             .engine
             .observe(context, BaseMessage::user(text.to_owned()))
@@ -322,11 +338,7 @@ async fn resume_or_seed(
     };
 
     InterruptionState::clear(&**session).await?;
-    if let Some(value) = session.get_state(AUTO_CONFIRM_STATE_KEY).await? {
-        if !value.is_null() {
-            ctx.extra.insert(AUTO_CONFIRM_EXTRA_KEY.to_owned(), value);
-        }
-    }
+    seed_auto_confirm(session, ctx).await?;
     let interactive = input.interactive().cloned().unwrap_or_default();
     let pending = state
         .requests
@@ -447,6 +459,8 @@ async fn run_inner(
         if let Some(output) = ctx.take_force_finish() {
             return Ok(with_progress(output, used, &observations));
         }
+        // Capture the possibly rail-mutated window before the retry loop clears `ctx.messages`.
+        let messages = ctx.messages.clone();
         let mut model = ctx
             .model_override
             .take()
@@ -458,8 +472,7 @@ async fn run_inner(
         let reply = loop {
             attempt += 1;
             let mut sink = DeltaSink::new(publisher, Some(session));
-            match call_model_streaming(&model, &prepared.messages, request.clone(), &mut sink).await
-            {
+            match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
                 Ok(reply) => break reply,
                 Err(error) => {
                     reset_ctx(ctx, RailEvent::OnModelException);
@@ -536,6 +549,10 @@ async fn run_inner(
 
         let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
         let mut queued: Vec<(usize, ToolCall)> = Vec::new();
+        // Requests recorded by the turn's tool-call hooks. Every call is asked
+        // (in model order) before the turn pauses, so one model turn with two
+        // matching calls surfaces both requests at once.
+        let mut interrupted: Vec<InterruptRequest> = Vec::new();
         for (index, call) in calls.iter().enumerate() {
             reset_ctx(ctx, RailEvent::BeforeToolCall);
             ctx.iteration = iteration;
@@ -544,20 +561,11 @@ async fn run_inner(
             if let Some(output) = ctx.take_force_finish() {
                 return Ok(with_progress(output, used, &observations));
             }
-            if ctx.is_interrupted() {
-                let requests = std::mem::take(&mut ctx.interrupts);
-                let answers = BTreeMap::new();
-                return pause_output(
-                    session,
-                    publisher,
-                    iteration,
-                    &original_query,
-                    Some(reply.message.clone()),
-                    &requests,
-                    &answers,
-                    observations,
-                )
-                .await;
+            // `reset_ctx` clears `ctx.interrupts` per call, so drain now.
+            let recorded = std::mem::take(&mut ctx.interrupts);
+            if !recorded.is_empty() {
+                interrupted.extend(recorded);
+                continue;
             }
             if let Some(text) = ctx.take_skip_tool() {
                 let output = Value::String(text.clone());
@@ -565,6 +573,21 @@ async fn run_inner(
                 continue;
             }
             queued.push((index, call.clone()));
+        }
+        if !interrupted.is_empty() {
+            // No tool of this turn runs while a request is pending.
+            let answers = BTreeMap::new();
+            return pause_output(
+                session,
+                publisher,
+                iteration,
+                &original_query,
+                Some(reply.message.clone()),
+                &interrupted,
+                &answers,
+                observations,
+            )
+            .await;
         }
         if !queued.is_empty() {
             let calls_to_run = queued
