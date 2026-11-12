@@ -83,6 +83,7 @@ The default build needs no network and no external service: every feature above 
 - The provider registry is reached as `openjiuwen::harness_providers::{create_harness, resolve_provider, ...}`; `create_harness` is `openjiuwen_harness_providers::factory::create_harness` (proved by `tests/module_paths.rs:44-48`) and the prelude forwards it ungated (`src/prelude.rs:30`).
 - `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
 - Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
+- `openjiuwen::core::session` is the whole `openjiuwen-session` crate root (`openjiuwen-core/src/lib.rs:57` re-exports the crate as `session`), so `AgentSession`, `AgentSessionOptions`, `create_agent_session`, `Session`, `SessionType`, `SessionConfig`, `Checkpointer`, `MemoryCheckpointer`, `FileCheckpointer`, `Checkpoint`, `CheckpointMeta`, `CheckpointerConfig`, `create_checkpointer`, `StreamItem` and `StreamEvent` are all reachable directly at `openjiuwen::core::session::<Name>`; the nested `checkpoint::*` and inner `session::*` modules are alternative spellings of the same items.
 - The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
 
 ## Known Issues
