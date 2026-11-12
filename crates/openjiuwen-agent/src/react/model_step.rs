@@ -6,7 +6,7 @@
 //!
 //! This round implements the non-streaming baseline: every call goes through
 //! `Model::invoke` and is projected to a
-//! [`ModelReply`](crate::react::model_step::ModelReply). Streaming (driving
+//! [`ModelReply`]. Streaming (driving
 //! `Model::stream` through a `StreamAccumulator` and emitting
 //! `llm_reasoning`/`llm_output`/`llm_usage` chunks) arrives in a later round and
 //! may replace the signature of `call_model` freely; the reply type is the

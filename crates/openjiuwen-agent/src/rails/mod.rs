@@ -354,7 +354,7 @@ pub trait AgentRail: Send + Sync {
 ///
 /// Registration keeps the rails stable-sorted by descending priority, so rails
 /// of equal priority keep their insertion order.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RailRegistry {
     rails: Vec<Arc<dyn AgentRail>>,
 }
