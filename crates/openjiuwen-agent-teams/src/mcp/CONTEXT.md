@@ -82,9 +82,11 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - Operator results are `serde_json::to_string` of the shapes above (compact, no spaces).
 - A missing `reason` serializes as `""` and a missing `task_id` / `message_id` as `null`, matching the Python dataclass defaults.
 - Member results are the serialized value returned by `client.invoke_tool`.
+- `list_tasks` parses the `status` wire spelling (`pending`, `in_progress`, …); an unknown spelling is rejected, never silently ignored.
 - Unknown tool (either scope, and member-scope `read_inbox`): `Unknown tool: <name>`.
 - Any `Err` from the client: `Internal error: <error>`, logged with `tracing::error!`.
 - Missing required argument: `Tool <name> missing argument '<arg>'`.
+- Unparseable optional argument: `Tool <name> invalid argument '<arg>'`.
 - Malformed arguments (wrong JSON type) take the same text path; `call_tool` never panics.
 
 ## Constraints
