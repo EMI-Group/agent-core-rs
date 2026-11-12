@@ -276,6 +276,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - `src/condition.rs` is ~1100 lines on purpose: the lexer, parser, evaluator, `Condition`, `Branch`, `BranchRouter` and their inline tests form one cohesive grammar unit and lose coherence if split (split only when a second expression family appears).
 - `src/engine/definition.rs` (~1000 lines) likewise keeps the builder's recorded definition, ability selection, and `WorkflowSpec` projection together so the builder and validator share one source of truth.
 - The crate root re-exports every public item, so downstream code (and the engine) can reach them as `crate::{Component, ComponentContext, ...}`.
+- `Component::route` is consulted before the selected ability and wins outright: a component returning `Some(targets)` produces no value and writes no state (`NodeOutcome::Route`), so a component that must both emit output and pick successors has to route from an `openjiuwen_graph::Router` that reads the produced state (`BranchRouterAdapter` pattern) instead.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
 - Checkpointing is opt-in through `session.checkpointer()`; when present the engine compiles with `CheckpointerStore` (namespace = workflow card id) and deletes the snapshot when a run completes.
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
@@ -292,4 +293,5 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, and memory components return `memories`/record results instead of Python's fragment/summary split.
 - LLM `response_format` instruction injection and `enable_history` history insertion are carried in config but not applied.
 - Unknown-component ids and capability mismatches are reported as one compile error rather than Python's split between build-time and run-start checks.
-- `ExceptionConfig::default_outputs` recovery is not wired into the graph executor; only `handle_type="interrupt"` semantics (error propagation) are implemented.
+- `ExceptionConfig::default_outputs` recovery is not wired: `NodeConfig` (`src/engine/definition.rs`) has no `exception_config` field, `definition::node_spec` hard-codes `exception_config: None`, and only `handle_type="interrupt"` semantics (error propagation) exist.
+- The only place recovery could be applied is the `Err` branch of `ComponentNode::run` (`src/engine/node.rs`), before the failure is wrapped into `component_execution_error`.
