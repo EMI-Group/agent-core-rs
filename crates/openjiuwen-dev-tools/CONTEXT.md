@@ -46,7 +46,10 @@ Tool descriptors use `openjiuwen_foundation::tool::ToolInfo` (the wire `{"type":
 
 - Unit tests inside each module (`#[cfg(test)]`) cover deterministic transforms, validation errors, and serialization round-trips.
 - Model-driven paths use `ScriptedModel` with queued responses: prompt builders assert the rendered messages, skill creator asserts the parsed result, agent builder asserts DSL extraction, evaluator asserts scoring.
-- `crates/openjiuwen-dev-tools/tests/` holds crate-level round-trip suites: skill bundle write→read in a `TempWorkspace`, DSL JSON round-trip, prompt-builder template banks.
+- `crates/openjiuwen-dev-tools/tests/skill_lifecycle.rs` covers the `skill_creator`→`skill_evaluator` seam: author→bundle write/read→frontmatter re-parse in a `TempWorkspace`, then deterministic and `ModelCaseRunner` evaluation with the Python report JSON names and the safety gate.
+- `crates/openjiuwen-dev-tools/tests/prompt_assets.rs` covers the `tune`→`prompt_builder` seam: Python-field `Case`/`EvaluatedCase` JSON feeding the bad-case, meta (`Plan`), and feedback (`Insert`) builders, plus buffered-vs-streamed parity.
+- `crates/openjiuwen-dev-tools/tests/agent_assets.rs` covers the `agent_builder`→`openjiuwen_agent` seam: spec→DSL JSON→`LlmAgent`, workflow-spec validation, and session build/clarify/clear flows with the flattened `BuildResult` keys.
+- `crates/openjiuwen-dev-tools/tests/deferred_surface.rs` proves the deferred tuning entry points return `Error::Unsupported` naming their pipeline and that `WorkflowDsl::validate` rejects empty, duplicate, and dangling documents.
 - No network, no environment reads, no wall-clock dependence: ids and timestamps are parameters or fixed constants.
 
 ## Deferred
