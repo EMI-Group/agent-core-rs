@@ -72,6 +72,8 @@ let recovered: RecoveryOutcome = engine
 - A `TruncationConfig::max_tokens` below the current size acts regardless of the trigger threshold; the threshold only gates the case where no processor budget is set.
 - `TruncationConfig::keep_system = false` drops the oldest system messages first, which is the only way that field is not inert.
 - The context pool key is `(session_id, context_id)` with dots in `context_id` normalized to `_`, matching Python's pool identity; the context keeps its original id.
+- The processor extension surface is exactly: a config struct (`serde(default)`, snake_case), a `ProcessorConfig` variant (adjacently tagged `{"type": ...}`), an arm in `ContextPipeline::from_configs`, a re-export in `lib.rs`, and a `ContextEventKind` variant when it reports a new kind of change; `default_processors` lists only the two defaulted processors.
+- `ProcessorContext` carries no session handle, so a processor can persist only through `offload`/`scope` and `save_state`/`load_state`; the engine never calls the latter two today.
 - Context state persistence is a serde `ContextState { messages, revision }` written under session key `context.<context_id>`; the engine wraps a map of context id → state under `context`.
 
 ## Routing Table
