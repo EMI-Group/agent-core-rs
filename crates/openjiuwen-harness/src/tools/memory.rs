@@ -6,6 +6,11 @@
 //! `openjiuwen_memory`), so this module owns only the model-facing contract: the cards, the
 //! Python validation messages, the payload shapes and the per-kind [`Tool::render_for_llm`]
 //! strings.
+//!
+//! The file is longer than the ~1000-line concern threshold on purpose: eight tool kinds share
+//! one card/payload/validation shape and one backend seam, so splitting them into per-kind
+//! modules would duplicate that shared scaffolding, and the offline test suite (about half the
+//! file) has to live beside the kinds it covers.
 
 // The module stays private until `ToolRegistry::build` wires the tool set; keeping the
 // intended public surface (`pub`) documents the eventual export and avoids a churn diff.
