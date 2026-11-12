@@ -40,10 +40,10 @@ Facade (`facade`):
 - `LongTermMemory` — `in_memory`, `local_file`, `sqlite`, `with_stores`, `builder`, `engine`, `config`, `graph`, `coding`.
 - CRUD: `add`, `add_many`, `get`, `update`, `delete`, `clear`, `list`, `stats`.
 - Recall: `search`, `recall` (alias), `search_all` (memories + graph entities).
-- Messages: `add_messages`, `get_recent_messages`.
+- Messages: `add_messages`, `get_recent_messages`, `clear_messages` (deletes history rows matching a `MemoryFilter`; records and variables are untouched).
 - Variables: `set_variable`, `get_variables`, `delete_variables`.
 - Scope config: `set_scope_config`, `get_scope_config`, `delete_scope_config`.
-- Python-parity aliases: `search_user_mem`, `update_mem_by_id`, `delete_mem_by_id`, `delete_mem_by_user_id`, `delete_mem_by_scope`, `user_mem_total_num`, `get_user_mem_by_page`.
+- Python-parity aliases: `search_user_mem`, `search_user_history_summary`, `update_mem_by_id`, `delete_mem_by_id`, `delete_mem_by_user_id`, `delete_mem_by_scope`, `user_mem_total_num`, `get_user_mem_by_page`.
 
 Graph memory (`graph`):
 - `GraphMemory`, `Entity`, `Relation`, `EntityExtractor` trait, `HeuristicExtractor`, `LlmExtractor`, `Extraction`, `ExtractedEntity`, `ExtractedRelation`, `GraphRecallHit`, `GraphAddOptions`, `GraphSearchOptions`, `GraphMemoryStats`.
@@ -110,9 +110,9 @@ Prompt integration (`prompt`):
 ## Test Strategy
 
 - Unit tests live beside each module (`#[cfg(test)] mod tests`): record serde/JSON compatibility, config defaults/validation, key derivation, scoring formula, BM25 ordering, dedupe/merge, heuristic entity extraction, prompt rendering, citation rendering.
-- Integration tests under `tests/`: `crud.rs` (add/get/update/delete/clear/stats + JSON round-trip), `scoping.rs` (user/scope/session/agent isolation, variables, Python-parity aliases), `recall.rs` (semantic ordering, keyword fallback, hybrid blend, threshold/top-k/token budget, recency/importance effects), `dedupe.rs` (exact/similar merge policies), `graph.rs` (heuristic and `ScriptedModel` LLM extraction, neighbor expansion, scoping), `lite.rs` (coding facts, index, citation), `sqlite.rs` (feature `sqlite`: persistence across reopen).
+- Integration tests under `tests/` (see `tests/CONTEXT.md` for per-file scope): `crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs` (through the facade), `graph_memory.rs` (`GraphMemory` directly), `lite.rs`, `sqlite.rs` (feature `sqlite`: persistence across reopen; reports 0 tests without the feature), `store_backends.rs` (public `MemoryStores` and local-file reopen), `facade_smoke.rs` (constructors, CRUD, recall, variables, `add_messages` with `ScriptedModel`).
 - Deterministic offline fakes: `openjiuwen_retrieval::HashEmbedding`, `openjiuwen_test_support::ScriptedModel`, `tempfile::tempdir` for local-file and SQLite roots.
-- Gates (all must be green): `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --features sqlite`, `cargo clippy -p openjiuwen-memory --all-targets -- -D warnings`, and clippy with `--features sqlite`.
+- Gates (all must be green): `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --features sqlite`, `cargo clippy -p openjiuwen-memory --all-targets -- -D warnings` (with and without `--features sqlite`), and `cargo doc -p openjiuwen-memory --no-deps` with no warnings.
 
 ## Deferred (Python `core.memory` features not ported)
 
