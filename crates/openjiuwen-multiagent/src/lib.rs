@@ -14,6 +14,7 @@ mod card;
 mod config;
 mod envelope;
 mod error;
+mod handoff;
 mod member;
 mod message_bus;
 mod runtime;
