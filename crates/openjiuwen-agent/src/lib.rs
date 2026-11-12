@@ -11,7 +11,22 @@
 //! and `set_model`), sessions come from `openjiuwen-session`, conversation
 //! windows from `openjiuwen-context`, and workflows from `openjiuwen-workflow`.
 //!
-//! Modules:
+//! # Seams
+//!
+//! - [`Agent`] — the trait every runnable agent implements ([`ReActAgent`],
+//!   [`LlmAgent`], [`WorkflowAgent`]); it is what `openjiuwen-runner` drives.
+//! - [`AgentOutput`] / [`AgentChunk`] — the invoke result and the streaming
+//!   frame, both serialized with the Python wire names (`result_type`,
+//!   `workflow_execution_state`, `type`).
+//! - [`AgentInput`] — the caller's JSON payload, including interactive resume
+//!   input.
+//! - [`AbilityManager`] — the per-agent tool registry plus tool execution.
+//! - [`AgentRail`] / [`RailContext`] / [`RailRegistry`] — the hook seam around
+//!   invoke, model, tool, and iteration steps.
+//! - [`InterruptRequest`] / [`InterruptionState`] — a paused run is an output,
+//!   not an error; resuming is a normal invoke with interactive input.
+//!
+//! # Modules
 //!
 //! - [`agent`] — the [`Agent`] trait every runnable agent implements.
 //! - [`card`] — [`AgentCard`], the registry-safe identity of an agent.
@@ -22,10 +37,10 @@
 //! - [`interrupt`] — interrupt requests, answers, approval parsing, and the
 //!   persisted interruption state used to resume a paused turn.
 //! - [`abilities`] — tool mounting and execution.
-//! - [`rails`] — model/tool/loop hooks.
-//! - [`react`] — the `ReActAgent` loop.
-//! - [`llm_agent`] — `LLMAgent`, a configured `ReActAgent` composition.
-//! - [`workflow_agent`] — `WorkflowAgent` over one or more workflows.
+//! - [`rails`] — model/tool/loop hooks and the rails the kernel hosts itself.
+//! - [`react`] — the [`ReActAgent`] loop and its configuration.
+//! - [`llm_agent`] — [`LlmAgent`], a configured `ReActAgent` composition.
+//! - [`workflow_agent`] — [`WorkflowAgent`] over one or more workflows.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod abilities;
@@ -40,12 +55,30 @@ pub mod rails;
 pub mod react;
 pub mod run;
 pub mod workflow_agent;
+pub use abilities::{
+    parse_tool_arguments, AbilityManager, AddAbilityResult, ToolCallResult, ToolExecutionOptions,
+};
 pub use agent::Agent;
 pub use card::AgentCard;
 pub use input::{AgentInput, InputQuery};
+pub use interrupt::{
+    approval_value, match_answers, parse_approval, reject_feedback, InterruptAnswer, InterruptKind,
+    InterruptRequest, InterruptionState, MatchedAnswers, AUTO_CONFIRM_STATE_KEY,
+    DEFAULT_REJECT_FEEDBACK, INTERRUPTION_STATE_KEY,
+};
+pub use llm_agent::{
+    create_llm_agent_config, ConstrainConfig, LlmAgent, LlmAgentConfig, ModelConfig, ModelInfo,
+};
 pub use output::{AgentChunk, AgentOutput, Observation, OutputFrame, ResultType};
 pub use prompt::{PromptSection, SystemPromptBuilder};
+pub use rails::{
+    AgentRail, AskUserRail, BaseInterruptRail, ConfirmInterruptRail, GuardrailRail, MemoryRail,
+    ModelBackupRail, RailContext, RailEvent, RailRegistry, RetryRequest, StageFlags, ToolFilter,
+    DEFAULT_RAIL_PRIORITY,
+};
+pub use react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
 pub use run::{resolve_session, AgentRun};
+pub use workflow_agent::{DefaultResponse, WorkflowAgent, WorkflowAgentConfig};
 /// Returns the crate name as reported by `cargo`.
 #[must_use]
 pub const fn crate_name() -> &'static str {
