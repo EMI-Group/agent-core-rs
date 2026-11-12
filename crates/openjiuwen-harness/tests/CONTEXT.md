@@ -7,21 +7,23 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each):
-- `deep_agent_loop.rs` — no-tool answer, one tool round, permission denial, interrupt/resume, max-iteration error, follow-up, abort.
-- `workspace_safety.rs` — default schema seeding, traversal/absolute/drive rejection, `DirectoryBuilder` idempotency.
-- `permissions.rs` — allow/ask/deny precedence, session-scoped approvals, file guard path folds.
-- `state_persistence.rs` — `DeepAgentState` session round-trip, pending follow-ups, plan mode.
-- `subagents_skills.rs` — subagent spawn/wait via a fake factory, skill discovery/mount/budget.
-- `protocol.rs` — `NativeHarness` lifecycle, capability gating, cursors, checkpoint export.
-- `cli.rs` — clap parsing, `run` with a scripted model, permission prompt answers.
+Test files (one concern each, 79 tests total):
+- `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
+- `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
+- `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
+- `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, `todo.json` location and item keys.
+- `subagents_skills.rs` (15) — built-in presets, fake factory spawn/wait/close/capacity, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
+- `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
+- `cli.rs` (20) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
 
 ## Constraints
 
 - No network, no sleeps longer than a few milliseconds, no reliance on wall-clock ordering; use `ScriptedModel` and `tokio::test`.
 - Every test creates its own `tempfile::TempDir` workspace; never writes outside it.
-- Assert persisted JSON keys exactly where parity matters (`deepagent`, `todos`, `activeForm`).
+- Assert persisted JSON keys exactly where parity matters: the `deepagent` session payload (`iteration`, `pending_follow_ups`, `plan_mode`, `stop_condition_state`, `task_plan`) and `todo.json` (`activeForm`, item keys); todos never live inside the `deepagent` payload.
 - No `unwrap` in async tasks that could mask panics; prefer `expect("message")` in tests.
+- Every test file opens with `#![allow(clippy::unwrap_used, clippy::expect_used)]` because the workspace runs `clippy::all` + `pedantic` with `-D warnings`.
+- Import from `openjiuwen_harness::{agent,schema,…}`: the crate root has no flat re-exports.
 - Feature-gated areas (browser/cua/mobile) assert `Error::Unsupported` only.
 
 ## Routing Table
@@ -33,6 +35,16 @@ Test files (one concern each):
 - `./subagents_skills.rs` → subagents and skills
 - `./protocol.rs` → native harness protocol
 - `./cli.rs` → CLI parsing and run
+
+## Known Issues
+
+- `deepagent` payload null keys are lost on repeated saves (parity bug, source-owned).
+  `state_store::save_state` writes Python's explicit nulls (`task_plan: null`, `stop_condition_state: null`, null `plan_slug`/`prompt_context`/`pre_plan_mode`), but `Session::update_state` deep-merges with "a null value deletes the path" (`openjiuwen-session/src/state/paths.rs`), so only the first write into a fresh lane keeps all five keys.
+  After an invocation (controller state-sink write + final `persist_state`) the payload drops `task_plan` and `stop_condition_state`; decoding still round-trips because `from_session_dict` is lenient, but the stored JSON no longer matches Python's shape.
+  `state_persistence::repeated_saves_keep_python_null_keys` is `#[ignore]`d on this bug (observed keys: `iteration`, `pending_follow_ups`, `plan_mode` only).
+  Fix belongs in `state_store` (replace-style write, or deliberately omit nulls and update the contract) or in session merge semantics.
+- `DeepAgent::load_state`/`save_state` need a session bound by an invocation; there is no setter, so cross-instance assertions must use the public `openjiuwen_harness::agent::{load_state, save_state}` free functions.
+- Permission denial keeps `result_type == Answer`; the observable surface is `[PERMISSION_DENIED]` in `AgentOutput::observations` and in the next model call's tool message.
 
 ## Test Strategy
 
