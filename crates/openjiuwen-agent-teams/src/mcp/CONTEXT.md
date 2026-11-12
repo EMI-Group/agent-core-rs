@@ -53,7 +53,7 @@ pub async fn run_mcp_server_with<F>(resolver: F) -> i32 where F: FnOnce(&TeamJoi
 
 The default resolver `resolve_from_registry` calls `crate::skill::connect_live_client`, so the server attaches to a team hosted in *this* process through the process-global runtime registry.
 A team this process does not host is `Error::Config` with the text `no live team '<team_name>' hosted in this process`, logged with `tracing::error!`, and the entry point exits `1`.
-`run_mcp_server_from_env` and `run_mcp_server_with` both load `OPENJIUWEN_TEAM_JOIN` and delegate to `run_mcp_server_with_descriptor`, which carries the descriptor and therefore needs no process environment.
+`run_mcp_server_from_env` is `run_mcp_server_with(`[`resolve_from_registry`]`); both load `OPENJIUWEN_TEAM_JOIN` and then delegate to `run_mcp_server_with_descriptor`, the env-free seam that carries the descriptor and therefore needs no process environment.
 
 ## Tool tables per scope
 
@@ -124,7 +124,7 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - `call_tool` for all ten operator tools, asserting the exact compact JSON text; `get_task` missing → `null`.
 - Failure text: unknown tool, member-scope `read_inbox`, missing required argument, and a client `Err` → `Internal error: ...`.
 - `run_mcp_server_from_env` is not covered (process env + stdio): the transport is out of scope, and the process environment is never mutated in a test.
-- `resolve_from_registry` for an unhosted team returns `ErrorKind::Config` with the exact message, and `run_mcp_server_with_descriptor` returns exit code `1` for that error (both `#[cfg(feature = "mcp")]`, neither touches the global registry or the process environment).
+- `resolve_from_registry` for an unhosted team returns `ErrorKind::Config` with the exact message, and `run_mcp_server_with_descriptor` returns exit code `1` for that error (both `#[cfg(feature = "mcp")]`; neither installs nor clears the global registry, and neither mutates the process environment).
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green.
 
 ## Deferred
