@@ -145,6 +145,67 @@ pub struct MemberSnapshot { pub member_name: String, pub display_name: String,
 ```rust
 pub const LEADER_DEFAULT_DESC: &str = "Team leader";   // Python's i18n default, shipped as English
 
+pub struct LeaderSpec { pub member_name: String /* DEFAULT_LEADER_MEMBER_NAME */,
+                        pub display_name: String /* DEFAULT_LEADER_DISPLAY_NAME */, pub desc: String,
+                        pub goal: Option<TeamGoalSpec> }
+impl LeaderSpec { pub fn desc_or_default(&self) -> &str; }   // desc, else LEADER_DEFAULT_DESC
+
+pub enum GoalStrategy { AgentReport, Transcript, Hybrid }   // default Hybrid
+pub struct TeamGoalSpec { pub strategy: GoalStrategy, pub max_attempts: Option<u32> /* Some(10) */,
+                          pub token_budget: Option<u64> }
+
+pub struct MemberSpecBase { pub member_name: String, pub display_name: String, pub desc: String,
+                            pub prompt: String, pub model_name: Option<String> }
+impl MemberSpecBase { pub fn display_name_or_default(&self) -> &str;  // display_name, else member_name }
+
+pub struct TeamMemberSpec { #[serde(flatten)] pub base: MemberSpecBase,
+                            pub role_type: TeamRole /* Teammate */, pub goal: Option<bool> }
+impl From<TeamMemberSpec> for PredefinedMemberSpec;   // leader/teammate => Teammate
+
+pub enum PredefinedMemberSpec {            // #[serde(tag = "role_type")]
+    Teammate(MemberSpecBase), HumanAgent(MemberSpecBase), PassiveHuman(MemberSpecBase),
+    BridgeAgent(MemberSpecBaseBridge), ExternalCli(MemberSpecBaseExternal),
+}
+impl PredefinedMemberSpec {
+    pub fn base(&self) -> &MemberSpecBase;
+    pub fn member_name(&self) -> &str;
+    pub fn role_type(&self) -> TeamRole;
+    pub fn into_member_spec(self) -> TeamMemberSpec;
+}
+pub struct MemberSpecBaseBridge { #[serde(flatten)] pub base: MemberSpecBase,
+    pub mailbox_inject_mode: String /* "passthrough" */, pub protocol: String,
+    pub adapter_config: BTreeMap<String, Value> }
+pub struct MemberSpecBaseExternal { #[serde(flatten)] pub base: MemberSpecBase,
+    pub cli_agent: String, pub cli_path: Option<String>, pub command: Vec<String>,
+    pub env: BTreeMap<String, String> }
+
+pub struct TinyAgentSpec { pub system_prompt: String, pub model_name: String,
+    pub name: String /* "tiny" */, pub max_iterations: usize /* 6 */,
+    pub enable_security_rail: bool /* false */, pub default_schema: Option<Value> }
+
+pub struct ModelPoolEntry { pub model_name: String, pub api_key: SecretString,
+    pub api_base_url: String, pub api_provider: String, pub description: Option<String>,
+    pub model_id: String /* fresh uuid hex */, pub metadata: BTreeMap<String, Value> }
+impl ModelPoolEntry { pub fn new(model_name: impl Into<String>, api_provider: impl Into<String>,
+                                 api_base_url: impl Into<String>, api_key: impl Into<String>) -> Self; }
+```
+
+`LeaderSpec`, `MemberSpecBase`, `MemberSpecBaseBridge`, `MemberSpecBaseExternal` and `TeamGoalSpec` all need `Default` (the goal defaults: `Hybrid`, `Some(10)`, `None`).
+
+### `spec.rs` — team blueprint (Python `blueprint.py` enums, `TransportSpec`/`StorageSpec`/`TeamWorkspaceSpec`)
+
+```rust
+pub enum TeamLifecycle { Temporary, Persistent }            // default Temporary
+pub enum ConversationMode { Team, GroupChat }               // default Team
+pub enum DispatchMode { Autonomous, Scheduled }             // default Autonomous
+pub enum MemberMode { BuildMode, PlanMode }                 // default BuildMode
+pub enum SpawnMode { InProcess, Process }                   // "inprocess" | "process"; default InProcess
+pub enum BootstrapMode { Leader, Framework }                // default Leader
+pub enum ModelPoolStrategy { RoundRobin, ByModelName }      // default RoundRobin
+pub enum Language { Cn, Cf, En }                            // "cn"|"cf"|"en"; default Cn
+impl Language { pub const fn as_str(self) -> &'static str;
+                pub fn resolve(value: Option<&str>) -> &'static str; }   // None/unknown => DEFAULT_LANGUAGE
+
 pub struct TransportSpec { #[serde(rename = "type", alias = "kind")] pub kind: String /* "inprocess" */,
                            pub params: BTreeMap<String, Value> }
 impl TransportSpec { pub fn inprocess() -> Self; pub fn is_inprocess(&self) -> bool; }
