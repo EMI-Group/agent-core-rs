@@ -300,6 +300,17 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 - **Prompt window comes from `ContextEngine::prepare`** (system messages + tools + window), not from an agent-local buffer.
 - **`AgentOutput.output` is a string**; structured payloads travel in `data`/`workflow_output` (documented deviation from Python's nested dicts).
 
+## Notes for Agents
+
+The public surface above is complete and compiling; several bodies are placeholders, each carrying a `// TODO:` marker.
+- `ReActAgent::invoke`/`stream`, `react::agent_loop::run`, and `react::resume::replay_interrupted` return `Error::unsupported`; the ReAct loop itself is unwritten.
+- `RailRegistry::fire` is a no-op and every built-in rail hook returns `Ok(())`.
+- `abilities::AbilityManager::execute` is a sequential baseline: no `parallel_safe` batching and no per-call timeout; `parse_tool_arguments` does not repair truncated JSON yet.
+- `WorkflowAgent::invoke`/`stream` return `Error::unsupported`, and `workflow_agent::select::select_workflow` always returns index 0.
+- `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`; stage gating reuses that shared type instead of a local flag struct.
+- `react::model_step::ModelReply` is public because `RailContext::response` exposes it; `call_model` is a non-streaming baseline that a later loop implementation may replace.
+- `LlmAgent::new` consumes `agent_memory_config` without mapping it (the `ReActAgentConfig` has no such field).
+
 ## Test Strategy
 
 - Unit tests beside modules: card/`AgentInput`/`AgentOutput` serde round-trips; tool argument repair; registry ordering/revision; `match_answers`/`parse_approval`; prompt section ordering; `RailRegistry` priority ordering.
