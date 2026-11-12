@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 openjiuwen-core.workspace = true
+openjiuwen-harness-protocol.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
 openjiuwen-session.workspace = true
@@ -46,6 +47,11 @@ which.workspace = true
 indexmap.workspace = true
 tempfile.workspace = true
 notify = { workspace = true, optional = true }
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
+anyhow.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["native"]

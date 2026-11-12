@@ -1981,6 +1981,7 @@ dependencies = [
 name = "openjiuwen-harness"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "chrono",
@@ -1997,11 +1998,13 @@ dependencies = [
  "openjiuwen-core",
  "openjiuwen-foundation",
  "openjiuwen-graph",
+ "openjiuwen-harness-protocol",
  "openjiuwen-memory",
  "openjiuwen-retrieval",
  "openjiuwen-security",
  "openjiuwen-session",
  "openjiuwen-sysop",
+ "openjiuwen-test-support",
  "openjiuwen-workflow",
  "parking_lot",
  "regex",
