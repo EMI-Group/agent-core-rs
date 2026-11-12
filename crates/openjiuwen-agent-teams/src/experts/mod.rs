@@ -8,7 +8,8 @@
 //!   opens a manifest;
 //! * **package parsing** — [`load_agent_group`] reads and validates an `AgentGroup` package and
 //!   exposed its display cards;
-//! * **assembly** — [`compose_template_member`] turns a template into a [`DeepAgentSpec`], and
+//! * **assembly** — [`compose_template_member`] turns a template into a
+//!   [`DeepAgentSpec`](crate::schema::DeepAgentSpec), and
 //!   [`bind_group`] describes the spawnable members of a loaded group.
 //!
 //! The process-wide catalog ([`set_process_expert_catalog`] / [`get_process_expert_catalog`]) is
