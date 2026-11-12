@@ -15,8 +15,9 @@ Ports the observable behavior of the Python native harness providers (`openjiuwe
 - `NativeHarnessOptions { event_buffer_capacity: u64 /*1024*/, overflow: EventOverflowPolicy /*CoalesceOrBlock*/ }` with `new()` and `with_*` builders.
 - `NativeHarnessProvider` (`Default`, `new()`, `with_options(NativeHarnessOptions)`) implements `HarnessProvider` (`card`, `create(JsonObject)`) and `ModelConfigProvider` (`model_config(choice, fallback)`).
 - `NativeCheckpointState` — serde payload stored in `HarnessCheckpoint::data` (schema version, session scope, iteration, pending follow-ups, plan mode, turn counter, current model/effort).
-- Everything else (`cursor`, `events`, `bridge`, `turn`) is crate-private.
-- Module file map: `mod.rs` (struct, lifecycle, `HarnessProtocol`/`HarnessModelControl` impls), `turn.rs` (one turn task), `events.rs` (kernel frame/output → protocol payload mapping), `cursor.rs` (`EventChannel` + `ChannelEventCursor`), `bridge.rs` (sequence/envelope/turn ids, checkpoints), `provider.rs` (`NativeHarnessProvider`), `tests.rs` (offline suite).
+- Everything else (`inner`, `cursor`, `events`, `bridge`, `turn`) is crate-private.
+- Module file map: `mod.rs` (struct, lifecycle, `HarnessProtocol`/`HarnessModelControl` impls), `inner.rs` (shared protocol state and lock-scoped helpers), `turn.rs` (one turn task), `events.rs` (kernel frame/output → protocol payload mapping), `cursor.rs` (`EventChannel` + `ChannelEventCursor`), `bridge.rs` (sequence/envelope/turn ids, checkpoints), `provider.rs` (`NativeHarnessProvider`), `tests.rs` + `tests/` (offline suite).
+- `provider_session_id()` is `None` while `Terminated`; the id is the first successful `start`'s host session id and is stable for the harness lifetime (`OnceLock`), so restarting with a different host session id is `State("native harness cannot be restarted with a different host session")`.
 
 ## Capabilities
 
@@ -89,12 +90,13 @@ Unknown keys → `Validation("unknown native harness configuration fields: <sort
 ## Routing Table
 
 - `./mod.rs` → `NativeHarness`, `NativeHarnessOptions`, `native_card`, capability constants, `HarnessProtocol` + `HarnessModelControl` impls
+- `./inner.rs` → `NativeHarnessInner`, `ProtocolState`, `PendingInput`, `ActiveTurn`, emission/state/checkpoint helpers
 - `./turn.rs` → one turn task: spawn, frame consumption, pause/abort handling, chained queued turns, terminal events
 - `./events.rs` → kernel chunk/`AgentOutput` → protocol payload mapping and `TurnResult` construction
 - `./cursor.rs` → `EventChannel`, `ChannelEventCursor`, single-consumer lease, overflow policy, cycle/turn views
-- `./bridge.rs` → envelope builder (sequence/timestamp/ids), `NativeCheckpointState`, checkpoint emit/restore
+- `./bridge.rs` → envelope builder (sequence/timestamp/ids), `NativeCheckpointState`, checkpoint build/persist/restore
 - `./provider.rs` → `NativeHarnessProvider`, create-config parsing, `ModelConfigProvider`
-- `./tests.rs` → offline suite driving `DeepAgent` over `ScriptedModel` and temp workspaces
+- `./tests.rs`, `./tests/` → offline suite driving `DeepAgent` over `ScriptedModel` and temp workspaces (`lifecycle`, `turns`, `checkpoints`, `provider`, `model_control`)
 
 ## Test Strategy
 
