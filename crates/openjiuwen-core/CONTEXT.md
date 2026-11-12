@@ -47,7 +47,7 @@ it deliberately does not glob the whole agent crate.
 ## Test Strategy
 
 - `tests/module_paths.rs` proves every module path resolves and aliases the same type as the source crate via `TypeId`;
-  `single_agent`, `application`, and the runner identity helper are covered explicitly.
+  `single_agent`, `application`, and `runner` (its `Runner`, `RunOptions`, `ResourceMgr`, `CallbackEvent`, and `InMemoryMessageQueue` exports, plus a `MessageQueue` trait-object coercion) are covered explicitly.
 - The crate-level doc example compiles as a doctest (`cargo test -p openjiuwen-core`), guarding the public paths.
 - No unit tests here: the umbrella has no behavior; behavior is tested in the concrete crates.
 - `cargo clippy -p openjiuwen-core --all-targets --no-deps -- -D warnings` must stay clean.
