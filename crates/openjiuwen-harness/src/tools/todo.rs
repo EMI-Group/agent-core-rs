@@ -5,6 +5,11 @@
 //! message text and payload envelopes. Every create/modify action holds the per-session
 //! [`TodoStore::lock`] from load to save.
 //!
+//! Size note: the store plus the four tools are ~890 lines; the rest is the Python-message
+//! parity test table required by the module spec. The pieces cannot be split because the
+//! private `mod todo;` wiring in `mod.rs` is owned by the later registry wave, so this file
+//! stays one cohesive unit (the same shape as the test-heavy `search.rs`).
+//!
 //! Deviations from Python: the session id comes from [`ToolContext`] and falls back to `default`
 //! (Python raises `Session ID is required`); the file lives under the workspace `todo` node;
 //! expected failures (including IO errors and the validation errors Python raises) return a
