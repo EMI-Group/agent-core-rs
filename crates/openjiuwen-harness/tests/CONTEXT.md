@@ -23,7 +23,7 @@ Test files (one concern each, 79 tests total):
 - Assert persisted JSON keys exactly where parity matters: the `deepagent` session payload (`iteration`, `pending_follow_ups`, `plan_mode`, `stop_condition_state`, `task_plan`) and `todo.json` (`activeForm`, item keys); todos never live inside the `deepagent` payload.
 - No `unwrap` in async tasks that could mask panics; prefer `expect("message")` in tests.
 - Every test file opens with `#![allow(clippy::unwrap_used, clippy::expect_used)]` because the workspace runs `clippy::all` + `pedantic` with `-D warnings`.
-- Import from `openjiuwen_harness::{agent,schema,…}`: the crate root has no flat re-exports.
+- Import from `openjiuwen_harness::{agent,schema,…}`: module paths are canonical even though the crate root also re-exports the primary items flat.
 - Feature-gated areas (browser/cua/mobile) assert `Error::Unsupported` only.
 
 ## Routing Table
@@ -48,8 +48,8 @@ Test files (one concern each, 79 tests total):
 
 ## Test Harness Recipes
 
-Verified against HEAD `af1e0b0` by reading source; line numbers are current.
-`openjiuwen_harness` has **no crate-root flat re-exports** (`src/lib.rs:12-26` is `pub mod` only), so always import `openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`.
+Verified against HEAD `1f8a64d` by reading source; line numbers are current.
+`openjiuwen_harness` re-exports every primary item flat from the crate root (`src/lib.rs`, after the `pub mod` block), but these recipes import module paths (`openjiuwen_harness::{agent,schema,permission,workspace,subagents,skills,protocol,cli}::…`) because those are canonical.
 Crate `dev-dependencies`: `openjiuwen-test-support`, `anyhow`, `tempfile`; normal deps usable from tests include `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-foundation`, `openjiuwen-sysop`, `openjiuwen-common`, `openjiuwen-harness-protocol`, `tokio`, `futures`, `async-trait`, `parking_lot`, `serde_json`.
 
 ### 1. ScriptedModel (`crates/openjiuwen-test-support/src/scripted_model.rs`)
@@ -142,7 +142,7 @@ DeepAgentBuilder::new(card: AgentCard) -> Self                        // builder
 There is **no** builder setter for a session, prompt text, tempdir path, or a `PermissionEngine`; the permission engine is derived from `DeepAgentConfig::permissions`, and the filesystem root is set through `.workspace(...)` / `DeepAgentConfig::with_workspace`.
 `create_deep_agent(model, card: Option<AgentCard>, config: Option<DeepAgentConfig>, tools: Vec<Arc<dyn Tool>>, rails: Vec<Arc<dyn HarnessRail>>, workspace: Option<Workspace>, skills: Vec<String>, subagents: Vec<SubAgentConfig>, enable_task_loop: bool, max_iterations: Option<u32>, language: Option<String>, prompt_mode: Option<PromptMode>, restrict_to_work_dir: bool, permissions: Option<PermissionsSection>, permission_host: Option<Arc<dyn PermissionHost>>) -> Result<Arc<DeepAgent>>` (`factory.rs:249`).
 
-Minimal recipe (mirrors `src/agent/tests.rs:158-233` with public API only):
+Minimal recipe (mirrors the integration test `tests/deep_agent_loop.rs:112-131`; `src/agent/tests.rs:224-233` is the same shape with `session = None`):
 
 ```rust
 use std::sync::Arc;
@@ -401,6 +401,6 @@ Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — a
 ### 11. Commands and known state
 
 - `cargo fmt -p openjiuwen-harness`; `cargo test -p openjiuwen-harness`; `cargo test -p openjiuwen-harness --no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`.
-- `cargo build -p openjiuwen-harness --tests` was **not** run here: this investigator is read-only and must not execute builds; `tests/` currently contains only `CONTEXT.md`, so `--tests` would compile the crate's internal `#[cfg(test)]` modules plus future files (unverified).
+- The seven `*.rs` files above are the complete `tests/` tree; `cargo build -p openjiuwen-harness --tests` has not been observed here, so compile status of the integration suites is unverified against the current HEAD.
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.
