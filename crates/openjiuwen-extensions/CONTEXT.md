@@ -43,6 +43,7 @@ Deferred integrations (API-shaped, `Error::Unsupported`, documented in the modul
 - Logging: `tracing` only (targets `openjiuwen_extensions::*`); no stdout/stderr writes in library code; payload contents never logged above `debug`.
 - Safety: no `unsafe`; no global mutable state beyond the documented Python-compatible process globals (none today).
 - Size: files ≤ ~1000 lines; one file per concern; shared helpers (status mapping, SSE framing, redaction) live once at the module root.
+- Intentionally large: `src/otel/workflow_handler/tests.rs` and `src/otel/agent_handler/tests.rs` are exhaustive callback/attribute matrices that lose value if split further; split them only when a new callback family is added.
 - Feature tests must pass offline: `cargo test -p openjiuwen-extensions`, `--features a2a`, `--features otel`, plus `--features sqlite` where the environment allows.
 
 ## Test Strategy
