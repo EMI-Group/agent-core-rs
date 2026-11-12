@@ -515,7 +515,7 @@ impl HarnessProvider for CodexHarnessProvider {
     /// # Errors
     ///
     /// Returns `HarnessError::Validation` when `config` is not a valid [`CodexHarnessConfig`],
-    /// and `HarnessError::UnsupportedCapability` carrying [`vendor::CODEX_SDK_REQUIRED`]
+    /// and `HarnessError::UnsupportedCapability` carrying `vendor::CODEX_SDK_REQUIRED`
     /// otherwise.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
         vendor::unsupported_create(

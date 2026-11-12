@@ -2,8 +2,8 @@
 //!
 //! Providers differ in how they expose MCP tools; the harness tells the model how to address them
 //! through a single XML block. For every mapping entry (server name → tool-name pattern) the
-//! preamble contains one self-closing element, in server-name order (a
-//! [`BTreeMap`](std::collections::BTreeMap) iterates sorted), with no trailing newline:
+//! preamble contains one self-closing element, in server-name order (a [`BTreeMap`] iterates
+//! sorted), with no trailing newline:
 //!
 //! ```text
 //! <mcp-tools>

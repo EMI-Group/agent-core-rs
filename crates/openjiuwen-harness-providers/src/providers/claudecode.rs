@@ -497,7 +497,7 @@ impl HarnessProvider for ClaudeCodeHarnessProvider {
     ///
     /// Returns `HarnessError::Validation` when `config` is not a valid
     /// [`ClaudeCodeHarnessConfig`], and `HarnessError::UnsupportedCapability` carrying
-    /// [`vendor::CLAUDE_SDK_REQUIRED`] otherwise.
+    /// `vendor::CLAUDE_SDK_REQUIRED` otherwise.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
         vendor::unsupported_create(
             ClaudeCodeHarnessConfig::from_json(&config).map(|_| ()),

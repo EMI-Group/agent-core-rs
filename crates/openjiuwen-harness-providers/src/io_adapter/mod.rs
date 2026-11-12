@@ -15,9 +15,9 @@
 //!
 //! - this module — the adapter, its configuration, the two host-service traits, lifecycle,
 //!   delivery and the interaction-handler delegation;
-//! - [`projection`] — [`HarnessEvent`] to [`AgentChunk`] projection;
-//! - [`interactions`] — interaction routing, the pending-interaction map and its resolution;
-//! - [`answers`] — parsing host answers into approval and user-input responses.
+//! - `projection` — [`HarnessEvent`] to [`AgentChunk`] projection;
+//! - `interactions` — interaction routing, the pending-interaction map and its resolution;
+//! - `answers` — parsing host answers into approval and user-input responses.
 //!
 //! # Concurrency
 //!

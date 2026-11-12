@@ -437,7 +437,7 @@ impl HarnessProvider for DshHarnessProvider {
     /// # Errors
     ///
     /// Returns [`HarnessError::Validation`] when `config` is not a valid [`DshHarnessConfig`], and
-    /// [`HarnessError::UnsupportedCapability`] carrying [`vendor::DSH_SDK_REQUIRED`] otherwise.
+    /// [`HarnessError::UnsupportedCapability`] carrying `vendor::DSH_SDK_REQUIRED` otherwise.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
         vendor::unsupported_create(
             DshHarnessConfig::from_json(&config).map(|_| ()),
