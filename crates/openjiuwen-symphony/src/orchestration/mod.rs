@@ -25,4 +25,12 @@ pub mod plan;
 pub mod planner;
 
 pub use candidates::{CandidateConfig, CandidateGenerator, MatchStrategy, RelationCandidate};
+pub use executor::{
+    CapabilityRunner, ExecutorConfig, PlanExecution, PlanExecutor, RunnerContext, StepOutcome,
+    UnsupportedRunner,
+};
 pub use plan::{OrchestrationPlan, PlanEdge, PlanStatus, PlanStep};
+pub use planner::{
+    normalize_language, plan_title, LexicalSemanticScorer, PlanConfig, PlanMode, PlanRequest,
+    Planner, SemanticScorer,
+};

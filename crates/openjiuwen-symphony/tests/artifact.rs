@@ -211,7 +211,7 @@ async fn illegal_versions_are_rejected_without_publishing() {
             error.message()
         );
     }
-    assert!(store.versions().await.expect("versions").is_empty());
+    assert_eq!(store.versions().await.expect("versions"), Vec::new());
     assert_eq!(
         store.status().await.expect("status"),
         GraphArtifactStatus::missing()
@@ -343,7 +343,7 @@ async fn file_store_status_on_an_empty_root_is_missing() {
     assert!(status.snapshot.is_empty());
     assert_eq!((status.node_count, status.edge_count), (0, 0));
     assert!(store.read(None).await.expect("read").is_none());
-    assert!(store.versions().await.expect("versions").is_empty());
+    assert_eq!(store.versions().await.expect("versions"), Vec::new());
 }
 
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn file_store_rejects_duplicate_and_illegal_versions_without_writing() {
     assert_eq!(store.versions().await.expect("versions").len(), 1);
     assert!(!root.join("bad").exists());
     assert!(!root.join("..").join("evil").exists());
-    assert!(temp_files(root).is_empty());
+    assert_eq!(temp_files(root), Vec::<std::path::PathBuf>::new());
 }
 
 #[tokio::test]
@@ -418,7 +418,7 @@ async fn concurrent_publications_claim_distinct_versions() {
 
     let reopened = FileGraphArtifactStore::new(root).await.expect("reopen");
     assert_eq!(reopened.versions().await.expect("versions").len(), 2);
-    assert!(temp_files(root).is_empty());
+    assert_eq!(temp_files(root), Vec::<std::path::PathBuf>::new());
 }
 
 #[tokio::test]
