@@ -134,6 +134,7 @@ Unblocked tasks are reported through `TaskMutation::unblocked`, not as events; t
 - `./graph.rs` → `detect_cycle`, `depth_of` (pure)
 - `./review.rs` → `ReviewTally`, `tally`, `tally_with` (pure)
 - `./board_tests.rs` → the crate-internal board suite (`#[cfg(test)]`, in-memory store only)
+- Records and DTOs used here (`TaskRecord`, `TaskGraphSpec`, `TaskSummary`, `TaskDetail`, `TaskFilter`, `ReviewVote`, `Verdict`, `TaskPatch`) live in `../schema/task.rs`; statuses and `TASK_TRANSITIONS` in `../schema/status.rs`. There is no `priority` field and no `next_claimable`/`list`/`summaries` alias — `claimable()` and `view()` are the only read entry points.
 
 ## Test Strategy
 
