@@ -2,9 +2,11 @@
 //!
 //! Python's symphony engine keeps no catalog of its own: the host supplies a
 //! `CapabilityProvider` and the engine works on whatever snapshot it is handed. The
-//! Rust port needs a durable catalog with CRUD and search, so [`CapabilityRegistry`]
-//! is the authoritative in-memory map of [`CapabilityDescriptor`]s, optionally backed
-//! by an [`AssetStore`] that every write is forwarded to.
+//! Rust port needs a durable catalog with CRUD and search, so
+//! [`CapabilityRegistry`](crate::registry::CapabilityRegistry) is the authoritative
+//! in-memory map of [`CapabilityDescriptor`](crate::model::CapabilityDescriptor)s,
+//! optionally backed by an [`AssetStore`](crate::store::AssetStore) that every write is
+//! forwarded to.
 //!
 //! # Concurrency
 //!
@@ -14,9 +16,10 @@
 //! lock: writes persist first and only then become visible in memory, so a store
 //! failure leaves the in-memory catalog untouched.
 //!
-//! The catalog revision ([`CapabilityRegistry::revision`]) is a separate
-//! [`std::sync::atomic::AtomicU64`] that is read and written *outside* the lock with
-//! [`std::sync::atomic::Ordering::SeqCst`], so a reader can never observe a torn or
+//! The catalog revision
+//! ([`CapabilityRegistry::revision`](crate::registry::CapabilityRegistry::revision)) is a
+//! separate [`std::sync::atomic::AtomicU64`] that is read and written *outside* the lock
+//! with [`std::sync::atomic::Ordering::SeqCst`], so a reader can never observe a torn or
 //! stale-cheap value. A mutation bumps it only after the map write is visible (the
 //! write guard is dropped first), so a reader that observes a new revision and then
 //! reads the catalog is guaranteed to see the corresponding contents.
