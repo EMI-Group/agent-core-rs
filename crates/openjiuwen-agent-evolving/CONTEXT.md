@@ -28,7 +28,7 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 - `ExactMatchMetric { normalize }` — compares the answer projection (label key `answer`, single-key maps, else the full JSON object); normalized comparison trims, lowercases, and collapses whitespace; non-strings fall back to JSON equality.
 - `LlmAsJudgeMetric` — API-shaped stub; `compute` returns `Error::Unsupported` (needs a live model and is non-deterministic).
 - `MetricEvaluator { metrics, aggregate: Aggregate }` — per-metric values merged into `per_metric`; `Aggregate { Mean, First }` over the ordered metric values; numeric coercion never raises (bad values become `0.0`).
-- `DefaultEvaluator` — API-shaped stub for the Python model-judge evaluator; `evaluate` returns `Error::Unsupported`.
+- `DefaultEvaluator` — exported from `evaluator`; `new(metric)`/`metric()`/`name() == "default"`; `evaluate` returns `Error::Unsupported` naming the deferred live-model judge.
 - `EvaluationReport { run_id, num_cases, mean_score, min_score, max_score, per_metric, cases: Vec<EvaluatedCase> }` with `from_evaluated`/`from_cases`; empty report has zero counts and scores.
 - `evaluate_cases(run_id, runner, evaluator, cases, cancel, config) -> EvaluationReport` — runs cases with bounded parallelism, `EvaluationConfig { num_parallel, max_cases }`; the explicit `run_id` keeps reports deterministic (no uuid or clock).
 
@@ -83,6 +83,8 @@ Everything except the stubs is offline and deterministic: no model calls, no env
 ### `deferred` (`src/deferred.rs`)
 
 - `DeferredFeature { area, reason }`, `DEFERRED_FEATURES: &[DeferredFeature]`, `deferred_features()`, `unsupported(area) -> Error` — the machine-readable counterpart of the table below.
+
+The crate root re-exports the primary types from every module plus `CRATE_NAME`/`CRATE_VERSION`.
 
 ## Constraints
 
