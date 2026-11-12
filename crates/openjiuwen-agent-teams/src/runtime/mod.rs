@@ -27,6 +27,8 @@ pub mod allocator;
 pub mod adapter;
 /// The organisation facade a running team exposes: members, mail, events, tasks and snapshots.
 pub mod backend;
+/// The blueprint → runtime build path (`TeamAgentSpec::build` / `build_with`).
+pub mod build;
 /// Build dependencies and their defaults.
 pub mod deps;
 /// Run admission: create, attach, resume or reject.
@@ -43,3 +45,6 @@ pub mod pool;
 pub mod spawner;
 /// The team agent: one type for the leader and every teammate.
 pub mod team_agent;
+
+#[cfg(test)]
+mod tests;
