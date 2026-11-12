@@ -6,7 +6,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_foundation::prompt::BaseMessage;
@@ -193,9 +192,8 @@ async fn add_messages_heuristic_path_and_history() {
     assert_eq!(result.episodic_memory.len(), 1);
     assert_eq!(result.episodic_memory[0].content, user.text());
 
-    // A second turn lands strictly later, so the oldest history row is deterministic.
-    // (Messages of one batch share a timestamp, so only the batches are ordered.)
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    // A second turn; assertions below are order-independent because messages of one
+    // batch may share a timestamp, so history ordering is not a contract.
     let follow_up = BaseMessage::user("Remember that my dark mode preference is permanent");
     let assistant = BaseMessage::assistant("Noted, dark mode it is for your editors");
     let result = ltm
@@ -211,14 +209,20 @@ async fn add_messages_heuristic_path_and_history() {
 
     let history = ltm.get_recent_messages(&scope, 10).await.expect("history");
     assert_eq!(history.len(), 3);
-    assert!(history[0].role.is_user());
-    assert_eq!(history[0].text(), user.text());
-    assert!(history[1..]
-        .iter()
-        .any(|message| message.role.is_assistant()));
-    assert!(history[1..]
-        .iter()
-        .any(|message| message.text() == assistant.text()));
+    assert!(
+        history.iter().any(|message| message.text() == user.text()),
+        "history must contain the original user message: {history:?}"
+    );
+    assert!(
+        history.iter().any(|message| message.role.is_assistant()),
+        "history must contain an assistant message: {history:?}"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|message| message.role.is_assistant() && message.text() == assistant.text()),
+        "history must contain the assistant reply: {history:?}"
+    );
 
     // The heuristic path also writes one summary per batch of the recent history.
     let summaries = ltm

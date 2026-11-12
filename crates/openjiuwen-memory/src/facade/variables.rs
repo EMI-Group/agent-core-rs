@@ -64,8 +64,8 @@ impl LongTermMemory {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for an invalid scope and the storage error when a
-    /// read fails.
+    /// Returns [`Error::Validation`] for an invalid scope or variable name and the
+    /// storage error when a read fails.
     pub async fn get_variables(
         &self,
         scope: &MemoryScope,
@@ -77,6 +77,9 @@ impl LongTermMemory {
         let Some(names) = names else {
             return storage.list_variables(scope, session_id).await;
         };
+        for name in names {
+            validate_variable_name(name)?;
+        }
         let mut variables = BTreeMap::new();
         for name in names {
             if let Some(value) = storage.get_variable(scope, session_id, name).await? {
@@ -88,7 +91,9 @@ impl LongTermMemory {
 
     /// Deletes `names` from `scope`, returning how many variables existed.
     ///
-    /// An empty `names` slice deletes nothing and returns `0`.
+    /// Every name is validated before anything is deleted, so an invalid name cannot
+    /// leave a partial delete behind. An empty `names` slice deletes nothing and
+    /// returns `0`.
     ///
     /// # Errors
     ///
@@ -96,10 +101,12 @@ impl LongTermMemory {
     /// storage error when a delete fails.
     pub async fn delete_variables(&self, scope: &MemoryScope, names: &[String]) -> Result<usize> {
         scope.validate()?;
+        for name in names {
+            validate_variable_name(name)?;
+        }
         let session_id = scope.session_id.as_deref();
         let mut removed = 0;
         for name in names {
-            validate_variable_name(name)?;
             if self
                 .engine
                 .storage()
@@ -273,6 +280,35 @@ mod tests {
             .await
             .expect_err("invalid scope");
         assert!(matches!(error, Error::Validation(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn variable_reads_and_deletes_validate_names_before_io() {
+        let ltm = facade().await;
+        let scope = scope();
+        let error = ltm
+            .get_variables(&scope, Some(&["a/b".to_owned()]))
+            .await
+            .expect_err("invalid name");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+
+        ltm.set_variable(&scope, "ok", "value")
+            .await
+            .expect("set valid variable");
+        let error = ltm
+            .delete_variables(&scope, &["ok".to_owned(), "a/b".to_owned()])
+            .await
+            .expect_err("invalid name");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert_eq!(
+            ltm.get_variables(&scope, None)
+                .await
+                .expect("variables")
+                .get("ok")
+                .map(String::as_str),
+            Some("value"),
+            "an invalid name must not cause a partial delete"
+        );
     }
 
     #[tokio::test]
