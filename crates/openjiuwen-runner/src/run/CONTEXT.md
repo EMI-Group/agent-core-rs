@@ -60,7 +60,7 @@ pub fn stream_team(services: RunServices, team: TeamRef, inputs: Value, options:
 
 **Reference resolution.** `Id(_)` looks the resource up in `ResourceMgr` and a miss is `Error::NotFound("agent '<id>' is not registered")` (same wording for workflow/team) **before** any session is created. `Agent(..)`/`Workflow(..)`/`Team(..)` are used as-is. Python's `str | instance` union maps to these enums.
 
-**Session id resolution (Python precedence).** `inputs["conversation_id"]` (non-empty string) → `RunOptions::session_id` → `RunnerConfig::default_session_id` for agents/workflows; agents and teams treat an empty/non-string value as absent.
+**Session id resolution (Python precedence).** `inputs["conversation_id"]` (non-empty string) → `RunOptions::session_id` → `RunnerConfig::default_session_id` for agents/workflows; agents and teams treat an empty/non-string value as absent, and an empty `RunOptions::session_id` counts as absent too (`resolve_session_id`).
 
 **Agent run.**
 1. Resolve the agent; fire `AgentInvokeInput` (`component` = card id, `input` = inputs, `session` = the resolved session when owned). `Abort` from the callback aborts the run with that error; other findings continue.
@@ -69,16 +69,19 @@ pub fn stream_team(services: RunServices, team: TeamRef, inputs: Value, options:
 4. Fire `AgentInvokeOutput` with the output value; on error fire nothing extra (Python emits no agent-error event).
 5. Teardown for an owned session: `post_run()` (end stream + commit); a teardown failure is logged, never replaces a successful output; on an invocation error the teardown still runs and the invocation error wins.
 6. `Error::Cancelled` for cancellation (the in-flight future is dropped); `Error::Timeout("run_agent timed out after <ms>ms")` for the deadline. A runner-level deadline (`RunnerConfig::default_run_timeout`) applies when `options.timeout` is `None`.
+7. A session created before an aborting `AgentSessionCreated` handler is torn down (`post_run`) before the abort error propagates, so an owned session never leaks.
+8. An aborting `AgentInvokeOutput` handler wins over the successful output (the run reports the abort error) but only after the owned session's teardown has run.
 
 **Agent streaming.** Fire `AgentStreamInput` after resolving the session, then wrap `Agent::stream` in a guarded stream: per chunk fire `AgentStreamOutput` (with `index` = frame index), check cancellation between frames, enforce the deadline as a **total** budget. Termination: cancellation → one `Err(Error::Cancelled)` then end; deadline → one `Err(Error::Timeout(..))` then end; inner error → forwarded then end. Teardown runs after the last frame or on drop.
 
-**Workflow run.** Resolve; session = `RunOptions::session` (caller-owned) else a `WorkflowSession` built with the resolved id, `checkpointer`, and `envs`; fire `WorkflowInvokeInput`, invoke with `WorkflowRunOptions { cancellation, timeout, stream_modes, .. }` (the workflow engine owns its own deadline/cancellation), fire `WorkflowInvokeOutput` on success or `WorkflowError` on failure. No post-run commit for a workflow session (the engine commits user inputs); a created session is closed via `Session::close` after the run.
+**Workflow run.** Resolve; session = `RunOptions::session` (caller-owned) else a `WorkflowSession` built with the resolved id, `checkpointer`, and `envs`; fire `WorkflowInvokeInput`, invoke with `WorkflowRunOptions { cancellation, timeout, stream_modes, .. }` (the workflow engine owns its own deadline/cancellation, so `RunnerConfig::default_run_timeout` is deliberately not applied here), fire `WorkflowInvokeOutput` on success or `WorkflowError` on failure (an aborting `WorkflowError` handler is logged and the engine's error wins). No post-run commit for a workflow session (the engine commits user inputs); a created session is closed via `Session::close` after the run.
 
 **Workflow streaming.** `Workflow::stream_with(inputs, session, WorkflowRunOptions { stream_modes, .. })`, firing `WorkflowStreamInput` before and `WorkflowStreamOutput` per frame; teardown closes a created session.
 
 **Team run.** Resolve; call `Team::start()` (idempotent); take a `SessionLease` with `RunOptions::team_session` (borrowed) or a session built from the resolved id (owned): an owned lease creates, binds, and later unbinds + cleans topics + ends + commits; a borrowed lease is used as bound by the caller (Python's unconditional bind/unbind is deliberately relaxed to the multiagent contract — document in the deviating method's rustdoc). `Team::invoke(inputs, Some(session))`; the result `Value` is returned verbatim. Callback events: none (Python's `AgentTeamEvents` are p2p/pub-sub, which the multiagent bus owns).
 
 **Team streaming.** `Team::stream(inputs, Some(session))` frames forwarded verbatim; the lease is finished by `Teardown` (on completion or drop). Nothing is re-wrapped: the strategy already yields wire frames.
+**Team teardown outcome.** A lease-teardown failure is logged (`tracing::warn`, target `openjiuwen_runner::run`) and never replaces a successful team result.
 
 **Tracing.** Always emit `tracing` events (`openjiuwen_runner::run`) with `run_id`, `kind`, `component`, `session_id`, and duration on completion; additionally open a `Chain` span on the session tracer when the session exposes one (`RunSpan`). Span failures never affect the run.
 
