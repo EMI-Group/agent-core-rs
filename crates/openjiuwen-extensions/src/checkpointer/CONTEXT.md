@@ -29,6 +29,22 @@ pub mod redis {
     pub struct RedisCheckpointerConfig { pub connection: RedisConnectionConfig,
                                          pub ttl: Option<RedisTTLConfig> }
     pub struct RedisCheckpointer { .. }
+    impl RedisTTLConfig {
+        pub fn new(default_ttl_minutes: Option<f64>, refresh_on_read: bool) -> Self;
+    }
+    impl RedisConnectionConfig {
+        pub fn new(url: impl Into<String>) -> Self;
+        /// Missing URL or a scheme outside the four accepted ones -> `Error::Validation`.
+        pub fn validate(&self) -> Result<()>;
+        /// Explicit `cluster_mode` wins, else the `+cluster` scheme is inferred, else `false`.
+        pub fn is_cluster_mode(&self) -> bool;
+        /// Normalises `redis+cluster://`/`rediss+cluster://` to `redis://`/`rediss://`.
+        pub fn connection_url(&self) -> Option<String>;
+    }
+    impl RedisCheckpointerConfig {
+        pub fn new(connection: RedisConnectionConfig) -> Self;
+        pub fn with_ttl(self, ttl: Option<RedisTTLConfig>) -> Self;
+    }
     impl RedisCheckpointer {
         /// Validates the URL scheme (`redis://`, `rediss://`, `redis+cluster://`, `rediss+cluster://`).
         pub fn new(config: RedisCheckpointerConfig) -> Result<Self>;
@@ -43,7 +59,9 @@ pub mod redis {
 
 ## Ported Behavior
 
-- `RedisConnectionConfig` validation matches Python: a URL is required and must start with one of the four accepted schemes; `cluster_mode` is inferred from the `+cluster` scheme when unset; `connection_args` are carried untouched.
+- `RedisConnectionConfig` validation matches Python: a URL is required (Rust has no `redis_client`, so a URL is the only connection method) and must start with one of the four accepted schemes; `cluster_mode` is inferred from the `+cluster` scheme when unset; `connection_args` are carried untouched.
+- `connection_url()` mirrors Python `get_connection_url`: the `+cluster` marker is stripped because a real cluster client would take the plain `redis://`/`rediss://` URL.
+- `RedisTTLConfig::default_ttl_minutes` serializes as `default_ttl` to keep Python's field name; `refresh_on_read` defaults to `false` and unknown JSON fields are ignored.
 - `RedisTTLConfig::default_ttl_minutes` and `refresh_on_read` are serialized/preserved; the deferred backend names them in its `Unsupported` message so operators know what was requested.
 - `RedisCheckpointerConfig` round-trips through JSON with Python's field names (`connection`, `ttl`, `default_ttl`, `refresh_on_read`).
 - The Redis backend is **not** implemented: pickle-encoded blobs are a deliberate non-goal (`docs/PARITY.md` intentional deviations), and key layout (`{session_id}:agent:{agent_id}:agent_state_blobs`) is documented only.
