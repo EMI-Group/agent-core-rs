@@ -3,12 +3,15 @@
 //! The operator scope is a fixed catalogue ([`crate::skill::operator_tools`]) whose names this
 //! module dispatches over [`crate::skill::TeamClient`] operations; every result is the compact JSON
 //! text the Python server produces (`json.dumps`, no spaces). The member scope delegates every
-//! non-inbox name to [`crate::skill::TeamClient::invoke_tool`] and returns its text verbatim.
+//! non-inbox name to [`crate::skill::TeamClient::invoke_tool`] and serializes the JSON value it
+//! returns.
 //!
 //! Failure text is part of the wire contract: unknown tools answer `Unknown tool: <name>`, client
 //! errors answer `Internal error: <error>` (and are logged), a malformed required argument answers
-//! `Tool <name> missing argument '<arg>'`. Nothing here panics on user input.
+//! `Tool <name> missing argument '<arg>'` and an unparseable optional argument answers
+//! `Tool <name> invalid argument '<arg>'`. Nothing here panics on user input.
 use crate::mcp::READ_INBOX;
+use crate::schema::TaskStatus;
 use crate::skill::TeamClient;
 use openjiuwen_common::error::Error;
 use serde::Serialize;
@@ -27,7 +30,7 @@ pub async fn dispatch_operator(client: &dyn TeamClient, name: &str, args: &Value
         "send_message" => send_message(client, name, args).await,
         "create_task" => create_task(client, name, args).await,
         "update_task" => update_task(client, name, args).await,
-        "list_tasks" => list_tasks(client, args).await,
+        "list_tasks" => list_tasks(client, name, args).await,
         "claimable_tasks" => claimable_tasks(client).await,
         "get_task" => get_task(client, name, args).await,
         "claim_task" => task_action(client, name, args, TaskAction::Claim).await,
@@ -36,7 +39,7 @@ pub async fn dispatch_operator(client: &dyn TeamClient, name: &str, args: &Value
         _ => format!("Unknown tool: {name}"),
     }
 }
-/// Dispatches one member-scope tool call and returns the client's rendered text.
+/// Dispatches one member-scope tool call and returns the serialized result value.
 ///
 /// `read_inbox` is operator-only: a member is pushed its messages by the parent process, so the
 /// name answers `Unknown tool: read_inbox` here as well (belt and braces with `call_tool`).
@@ -45,7 +48,7 @@ pub async fn dispatch_member(client: &dyn TeamClient, name: &str, args: &Value) 
         return format!("Unknown tool: {name}");
     }
     match client.invoke_tool(name, args.clone()).await {
-        Ok(text) => text,
+        Ok(value) => render(&value),
         Err(error) => internal(name, &error),
     }
 }
@@ -81,7 +84,12 @@ async fn create_task(client: &dyn TeamClient, name: &str, args: &Value) -> Strin
     let task_id = optional_str(args, "task_id");
     let dependencies = optional_string_array(args, "dependencies");
     match client
-        .create_task(title, content, task_id, dependencies.as_deref())
+        .create_task(
+            title,
+            content,
+            task_id,
+            dependencies.as_deref().unwrap_or(&[]),
+        )
         .await
     {
         Ok(outcome) => render(&json!({
@@ -107,8 +115,12 @@ async fn update_task(client: &dyn TeamClient, name: &str, args: &Value) -> Strin
         Err(error) => internal(name, &error),
     }
 }
-async fn list_tasks(client: &dyn TeamClient, args: &Value) -> String {
-    match client.list_tasks(optional_str(args, "status")).await {
+async fn list_tasks(client: &dyn TeamClient, name: &str, args: &Value) -> String {
+    let status = match optional_status(name, args) {
+        Ok(status) => status,
+        Err(text) => return text,
+    };
+    match client.list_tasks(status).await {
         Ok(tasks) => render(
             &tasks
                 .iter()
@@ -199,6 +211,18 @@ fn required_str<'a>(
 /// Reads an optional string argument; absent or mistyped values are `None`.
 fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+/// Reads the optional `status` filter, parsing the Python wire spelling (`pending`, `in_progress`, …).
+///
+/// An absent filter is `None`; an unknown spelling returns the wire error text instead of silently
+/// listing the whole board.
+fn optional_status(name: &str, args: &Value) -> std::result::Result<Option<TaskStatus>, String> {
+    match args.get("status").and_then(Value::as_str) {
+        None => Ok(None),
+        Some(raw) => serde_json::from_value::<TaskStatus>(Value::String(raw.to_string()))
+            .map(Some)
+            .map_err(|_| format!("Tool {name} invalid argument 'status'")),
+    }
 }
 /// Reads an optional string array, dropping non-string elements; absent or mistyped values are
 /// `None`.

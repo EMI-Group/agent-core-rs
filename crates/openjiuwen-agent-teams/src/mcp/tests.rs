@@ -32,7 +32,7 @@ struct FakeClient {
     claimable: Vec<TaskSummary>,
     detail: Option<TaskDetail>,
     members: Vec<MemberSummary>,
-    invoke_text: String,
+    invoke_value: Value,
     /// When set, every operation fails with this message.
     fail: Option<&'static str>,
     log: Arc<Mutex<Vec<(String, Value)>>>,
@@ -69,7 +69,7 @@ impl Default for FakeClient {
             claimable: Vec::new(),
             detail: None,
             members: Vec::new(),
-            invoke_text: String::new(),
+            invoke_value: Value::Null,
             fail: None,
             log: Arc::new(Mutex::new(Vec::new())),
         }
@@ -106,7 +106,7 @@ impl FakeClient {
             claimable: vec![summary()],
             detail: Some(detail()),
             members: vec![faker_member()],
-            invoke_text: "tool text".to_string(),
+            invoke_value: json!({ "ok": true }),
             ..Self::default()
         }
     }
@@ -118,7 +118,7 @@ impl FakeClient {
                 tool_def("claim_task", &json!(["task_id"])),
                 tool_def("send_message", &json!(["to", "content"])),
             ],
-            invoke_text: "tool text".to_string(),
+            invoke_value: json!({ "ok": true }),
             ..Self::default()
         }
     }
@@ -173,7 +173,7 @@ impl TeamClient for FakeClient {
         title: &str,
         content: &str,
         task_id: Option<&str>,
-        dependencies: Option<&[String]>,
+        dependencies: &[String],
     ) -> Result<CreateOutcome> {
         self.record(
             "create_task",
@@ -205,7 +205,7 @@ impl TeamClient for FakeClient {
             reason: self.update.reason.clone(),
         })
     }
-    async fn list_tasks(&self, status: Option<&str>) -> Result<Vec<TaskSummary>> {
+    async fn list_tasks(&self, status: Option<TaskStatus>) -> Result<Vec<TaskSummary>> {
         self.record("list_tasks", json!({ "status": status }))?;
         Ok(self.tasks.clone())
     }
@@ -243,9 +243,9 @@ impl TeamClient for FakeClient {
             })
             .collect())
     }
-    async fn invoke_tool(&self, name: &str, arguments: Value) -> Result<String> {
+    async fn invoke_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         self.record(name, arguments)?;
-        Ok(self.invoke_text.clone())
+        Ok(self.invoke_value.clone())
     }
 }
 // ---------------------------------------------------------------------------
@@ -558,7 +558,7 @@ async fn member_scope_invokes_the_client_tool() {
     let text = server
         .call_tool("view_task", json!({ "action": "list" }))
         .await;
-    assert_eq!(text, "tool text");
+    assert_eq!(text, "{\"ok\":true}");
     assert_eq!(
         fake.calls(),
         vec![("view_task".to_string(), json!({ "action": "list" }))]
