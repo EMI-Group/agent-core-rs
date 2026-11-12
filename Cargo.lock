@@ -1892,11 +1892,18 @@ name = "openjiuwen-examples"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dotenvy",
  "futures",
  "openjiuwen",
+ "openjiuwen-macros",
+ "openjiuwen-test-support",
+ "schemars",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
