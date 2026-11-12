@@ -72,6 +72,7 @@ pub mod pulsar {
 - The in-memory queue is always the kernel implementation — this crate adds no transport.
 - No broker client dependency; the `pulsar` feature is API-only.
 - The bridge never holds a lock across `.await`; topics are created via `add_handler`/`subscribe`.
+- `topic_stream` keeps its synchronous signature: it spawns the `add_handler` registration on the current tokio runtime and the stream yields a registration failure as its first (and only) item, so it must be called inside a runtime.
 - Errors: `Error::Config`/`Error::Validation` (config), `Error::Unsupported` (deferred backend), otherwise the kernel's error unchanged.
 - Files ≤ ~1000 lines.
 
