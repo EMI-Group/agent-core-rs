@@ -43,7 +43,7 @@ Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared field
 `load_dotenv()` is the only `.env` entry point and is documented as binary-only; library constructors never read `.env`.
 
 ### `security` — `crate::security::{SecretString, constant_time_eq, redact}`
-`SecretString` redacts in `Debug`/`Display` (`<REDACTED>`), serializes its value (config round-trip, Python parity), never logs, exposes `expose_secret()`, `is_empty()`.
+`SecretString` redacts in `Debug`/`Display` (`<REDACTED>`), serializes its value (config round-trip, Python parity), never logs, exposes `SecretString::new(impl Into<String>)`, `From<String>`, `From<&str>`, `Default`, `expose_secret() -> &str`, `is_empty()`, `len()`; `PartialEq`/`Eq` compare in constant time.
 `redact`: `REDACTED = "<REDACTED>"`, `DEFAULT_SENSITIVE_FIELDS` (Python list: `messages`, `response_content`, `input_content`, `query`, `arguments`, `result`, `message_content`, `tool_calls`, `input_data`, `output_data`, `retrieved_memories`), `redact_json(&Value, Option<&[&str]>) -> Value` (recursive key match), `redact_str`, `redact_url_password(&str) -> String` (masks only the password, Python parity), `sanitize_headers(&BTreeMap<String,String>) -> BTreeMap<String,String>` (drops blank keys/values and protected `host`, `content-length`, `transfer-encoding`, `connection`, `authorization` case-insensitively), `constant_time_eq(&[u8], &[u8]) -> bool`.
 
 ### `http` — `crate::http`
