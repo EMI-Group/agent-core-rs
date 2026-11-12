@@ -236,6 +236,17 @@ fn unwrap_payload(value: &Value) -> &Value {
         .unwrap_or(value)
 }
 
+/// Returns an owned copy of the payload an LLM rail wrapped in a container.
+///
+/// Python counterpart: `_unwrap_llm_payload`. This is an additive wrapper over
+/// the borrowed [`unwrap_payload`] for callers that outlive the borrow (the
+/// agent handler's `on_llm_end` only holds the payload by reference while it
+/// normalizes the completion messages).
+#[must_use]
+pub(crate) fn unwrap_llm_payload(value: &Value) -> Value {
+    unwrap_payload(value).clone()
+}
+
 /// Serializes a payload with the configured redaction policy applied.
 ///
 /// Python counterpart: `_redacted_json`. The object walk lives in
