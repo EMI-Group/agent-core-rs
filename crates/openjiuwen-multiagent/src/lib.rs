@@ -6,3 +6,9 @@
 pub fn crate_name() -> &'static str {
     "openjiuwen-multiagent"
 }
+
+mod envelope;
+mod subscription;
+
+pub use envelope::MessageEnvelope;
+pub use subscription::{topic_matches, SubscriptionManager};
