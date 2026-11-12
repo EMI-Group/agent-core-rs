@@ -429,10 +429,9 @@ async fn memory_rail_recalls_and_writes_back() {
         ),
         "the assistant answer must be stored: {recent:?}"
     );
-    // (a) The recall block must be visible to the model as a system message.
-    // This depends on the loop passing post-rail `ctx.messages` to the model
-    // (the parallel `agent_loop.rs` fix); the assertion is intentionally kept
-    // strict because model visibility is the point of the rail.
+    // (a) The recall block must be visible to the model as a system message:
+    // the loop forwards the rail-mutated `ctx.messages` to the model, and model
+    // visibility is the point of the rail.
     let system_texts: Vec<String> = model
         .calls()
         .iter()

@@ -6,7 +6,7 @@
 //! - `BeforeModelCall` recalls against [`LongTermMemory`] for
 //!   [`MemoryRail::scope`] using the last user message as the query, renders the
 //!   hits with
-//!   [`hits_to_system_message`](openjiuwen_memory::hits_to_system_message) under
+//!   [`hits_to_system_message`] under
 //!   a fixed token budget, and inserts the resulting system message directly
 //!   after the leading system prompt, so the agent's own identity section always
 //!   comes first. Recall runs at most once per invocation, tracked by the
