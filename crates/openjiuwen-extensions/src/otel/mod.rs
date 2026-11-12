@@ -23,6 +23,8 @@ mod attrs;
 #[cfg(feature = "otel")]
 mod agent_handler;
 #[cfg(feature = "otel")]
+mod llm_attrs;
+#[cfg(feature = "otel")]
 pub mod provider;
 #[cfg(feature = "otel")]
 pub mod sink;
