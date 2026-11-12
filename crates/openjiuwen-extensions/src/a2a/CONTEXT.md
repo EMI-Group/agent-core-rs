@@ -202,4 +202,4 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `./server/` → axum router, dispatch, executor SPI, event sink, task store, server handle, adapter (`server/CONTEXT.md`)
 - `./harness_bridge.rs` → conversions to/from `openjiuwen_harness_protocol`
 - `./harness_bridge/tests.rs` → bridge mapping-table and round-trip tests
-- `./e2e_tests.rs` → end-to-end client/server suites (public API only; candidates for `../tests/`)
+- `./e2e_tests.rs` → end-to-end client/server suites (in-crate, public paths only; mirrored by `../tests/a2a_client.rs` and `../tests/a2a_server.rs`)
