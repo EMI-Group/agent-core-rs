@@ -39,8 +39,9 @@ pub use handoff::{
     HANDOFF_TARGET_KEY, HISTORY_STATE_KEY,
 };
 pub use hierarchical::{
-    create_supervisor, hierarchical_msgbus_team, HierarchicalMsgbusConfig,
-    HierarchicalMsgbusStrategy, SupervisorAgent, SupervisorConfig,
+    create_supervisor, hierarchical_msgbus_team, hierarchical_tools_team, HierarchicalMsgbusConfig,
+    HierarchicalMsgbusStrategy, HierarchicalToolsConfig, HierarchicalToolsStrategy,
+    SupervisorAgent, SupervisorConfig,
 };
 pub use member::{AgentProvider, BindHook, TeamAgent, ToolHost};
 pub use message_bus::{MessageBus, MessageBusConfig, MessageHandler};

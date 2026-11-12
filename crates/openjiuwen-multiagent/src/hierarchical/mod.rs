@@ -9,8 +9,10 @@
 //!   [`send`](crate::TeamRuntime::send) to the supervisor registered in the team
 //!   runtime, and the supervisor reaches its sub-agents through the same bus
 //!   (they are registered as members and exposed to its model as tools);
-//! - the agents-as-tools strategy (a later addition) wires the sub-agent tools
-//!   directly onto the root agent and invokes it in-process, bypassing the bus.
+//! - [`HierarchicalToolsStrategy`] wires the sub-agent tools directly onto the
+//!   root agent — one [`AgentTool`](crate::AgentTool) per member added with the
+//!   root as its `parent_agent_id` — pins that instance so later sends reach it,
+//!   and streams the root in-process, bypassing the bus.
 //!
 //! Every strategy is a [`TeamStrategy`](crate::TeamStrategy) object attached to
 //! the crate's single team type ([`BaseTeam`](crate::BaseTeam)): the team owns
@@ -18,10 +20,13 @@
 //! decides how one invocation becomes member calls. A team is built with
 //! [`hierarchical_msgbus_team`] plus the supervisor factory
 //! [`create_supervisor`], which returns the `(card, provider)` pair the team
-//! registers like any other member.
+//! registers like any other member, or with [`hierarchical_tools_team`], whose
+//! root agent is supplied as a card and registered by the caller.
 
 mod msgbus;
 mod supervisor;
+mod tools;
 
 pub use msgbus::{hierarchical_msgbus_team, HierarchicalMsgbusConfig, HierarchicalMsgbusStrategy};
 pub use supervisor::{create_supervisor, SupervisorAgent, SupervisorConfig};
+pub use tools::{hierarchical_tools_team, HierarchicalToolsConfig, HierarchicalToolsStrategy};
