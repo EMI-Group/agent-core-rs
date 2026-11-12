@@ -14,9 +14,12 @@
 //! - the subprocess spawn seam ([`AgentSpawner`], [`SpawnSpec`], [`SpawnMessage`]),
 //!   which is a documented contract without a process implementation.
 //!
+//! Every public type is re-exported flat at the crate root; the module paths
+//! (`openjiuwen_runner::callback::CallbackEvent`, `openjiuwen_runner::run::RunOptions`,
+//! ...) remain available for hosts that prefer them.
+//!
 //! ```no_run
-//! use openjiuwen_runner::run::RunOptions;
-//! use openjiuwen_runner::runner::Runner;
+//! use openjiuwen_runner::{RunOptions, Runner};
 //! use serde_json::json;
 //!
 //! # async fn example() -> openjiuwen_common::error::Result<()> {
@@ -25,7 +28,7 @@
 //! let output = runner
 //!     .run_agent("assistant", json!({"query": "hi"}), RunOptions::default())
 //!     .await?;
-//! println!("{}", output.output);
+//! assert!(!output.output.is_empty());
 //! runner.stop().await?;
 //! # Ok(())
 //! # }
@@ -43,5 +46,28 @@ pub mod run;
 pub mod runner;
 pub mod spawn;
 
-// The flat crate-root re-exports (`openjiuwen_runner::Runner`) are added by the
-// integration pass, once every module defines its public surface.
+// ------------------------------------------------------- flat re-exports --
+
+pub use callback::{
+    bind_guardrails, event_for_stage, scan_stage_for, AsyncHandler, CallbackContext, CallbackEvent,
+    CallbackFailure, CallbackFramework, CallbackHandler, CallbackId, CallbackInfo,
+    CallbackRegistration, CallbackReport, CallbackResult, CallbackVerdict, EventDomain,
+    GuardrailHandler, SyncHandler,
+};
+pub use config::{
+    DistributedConfig, MessageQueueConfig, MessageQueueKind, RunnerConfig, CONVERSATION_ID_KEY,
+    DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RUNNER_ID, DEFAULT_SESSION_ID, DEFAULT_TOPIC_CAPACITY,
+};
+pub use mq::{
+    create_message_queue, InMemoryMessageQueue, MessageHandler, MessageQueue, QueueMessage, SUCCESS,
+};
+pub use resources::{Provider, RegisterPolicy, Registration, Registry, ResourceCard, ResourceMgr};
+pub use run::{
+    invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
+    AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
+};
+pub use runner::Runner;
+pub use spawn::{
+    AgentSpawner, SpawnAgentKind, SpawnMessage, SpawnMessageKind, SpawnSpec, SpawnedAgent,
+    UnsupportedSpawner,
+};
