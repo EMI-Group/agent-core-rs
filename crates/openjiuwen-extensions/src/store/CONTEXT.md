@@ -51,13 +51,14 @@ pub struct ElasticsearchVectorStore { .. }
 impl ElasticsearchVectorStore {
     pub fn new(config: ElasticsearchVectorStoreConfig) -> Result<Self>;
     pub async fn connect(config: ElasticsearchVectorStoreConfig) -> Result<Arc<dyn VectorStore>>;
+    pub fn index_name(&self, collection: &str) -> String;  // "{index_prefix}__{collection}"
 }
 ```
 
 ## Ported Behavior
 
 - Backend selection is config-driven exactly like the Python `type` discriminators (`memory`, `file`, `sqlite`, `redis`, `elasticsearch`).
-- `RedisStore` keeps Python's method list and constants: `index_prefix`-style key prefixing is the caller's, `delete_by_prefix(prefix, batch_size)` and `batch_delete(keys, batch_size)` keep their batch-size parameter in the deferred surface, and `exclusive_set(key, value, expiry)` maps to the kernel's `KvValue`/`Duration` signature.
+- `RedisStore` keeps Python's method list and constants: `index_prefix`-style key prefixing is the caller's, `exclusive_set(key, value, expiry)` maps to the kernel's `KvValue`/`Duration` signature, and Python's 500-key chunking for `delete_by_prefix`/`batch_delete` is documented in `redis.rs` because the kernel `KvStore` trait takes the whole prefix or key set instead of a `batch_size` parameter.
 - `RedisStoreConfig` accepts `url` **or** `connection_args` in Python; the Rust surface validates the URL scheme (`redis://`, `rediss://`, `redis+cluster://`, `rediss+cluster://`) and records `cluster_mode` (inferred from `+cluster`).
 - Elasticsearch defaults: index = `"{index_prefix}__{collection}"`, vector field default `768` dimensions, cosine similarity — documented, not implemented.
 - Gauss/PostgreSQL document store is not surfaced: the kernel's document contract replaces the SQLAlchemy engine (`docs/PARITY.md` deviation), so there is no `GaussDbStore` analogue.
