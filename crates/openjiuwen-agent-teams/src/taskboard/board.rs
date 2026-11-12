@@ -19,7 +19,7 @@
 //!   point at a task that does not exist — which the cycle detector and the blocking rule treat as
 //!   an unresolved dependency, never as a half-created task. A cycle is rejected *before* any write,
 //!   so a rejected graph leaves no rows and no edges.
-//! * **Mutations of an existing task** write exactly one row ([`TaskBoard::persist`]), so a status
+//! * **Mutations of an existing task** write exactly one row (`TaskBoard::persist`), so a status
 //!   change, an assignee change, a note and the revision marker land together. Unblocking
 //!   dependents happens after that row write and is idempotent: a partial pass can be re-run without
 //!   changing the outcome.
