@@ -20,7 +20,7 @@ pub(crate) const PROG: &str = "team-member";
 
 /// The board view a member-scope `view_task` requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ViewAction {
+pub enum ViewAction {
     /// List the board (`list`, the default).
     #[default]
     List,
@@ -32,7 +32,8 @@ pub(crate) enum ViewAction {
 
 impl ViewAction {
     /// Returns the tool argument spelling of this action.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::List => "list",
             Self::Get => "get",
@@ -43,7 +44,7 @@ impl ViewAction {
 
 /// The status a member-scope `claim_task` drives a task to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ClaimStatus {
+pub enum ClaimStatus {
     /// Claim a pending task (`claimed`).
     Claimed,
     /// Complete a task the member holds (`completed`).
@@ -52,7 +53,8 @@ pub(crate) enum ClaimStatus {
 
 impl ClaimStatus {
     /// Returns the tool argument spelling of this status.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
             Self::Completed => "completed",
@@ -62,7 +64,7 @@ impl ClaimStatus {
 
 /// Member-scope command words (the teammate tool set plus `inbox`).
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub(crate) enum MemberCommand {
+pub enum MemberCommand {
     /// Show unread messages and the task board.
     #[command(about = "Show unread messages and the task board.")]
     Inbox {
@@ -103,7 +105,7 @@ pub(crate) enum MemberCommand {
 
 /// Operator-scope task subcommands.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub(crate) enum TaskCommand {
+pub enum TaskCommand {
     /// List tasks, optionally filtered by status.
     #[command(about = "List tasks.")]
     List {
@@ -124,7 +126,7 @@ pub(crate) enum TaskCommand {
 
 /// Operator-scope command words (the outside team-control surface).
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub(crate) enum OperatorCommand {
+pub enum OperatorCommand {
     /// Show unread messages and the task board.
     #[command(about = "Show unread messages and the task board.")]
     Inbox {

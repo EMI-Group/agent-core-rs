@@ -18,7 +18,10 @@ pub mod descriptor;
 pub mod live;
 pub mod store_client;
 
-pub use cli::{run_skill_cli, DescriptorArgs, SkillCli};
+pub use cli::{
+    run_skill_cli, ClaimStatus, CliCommand, DescriptorArgs, MemberCommand, OperatorCommand,
+    SkillCli, TaskCommand, ViewAction,
+};
 pub use client::{
     member_tools_for, operator_tools, CreateOutcome, MemberSummary, OpOutcome, SendOutcome,
     TeamClient, TeamToolDef,

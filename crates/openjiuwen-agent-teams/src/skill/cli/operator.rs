@@ -20,7 +20,7 @@ use super::output::{
     format_status_filter, member_line, sent_line, task_detail_block, task_list_line, updated_line,
 };
 use super::{
-    emit_line, emit_lines, fail, refuse, OperatorCommand, ScopeCommand, SkillCli, TaskCommand,
+    emit_line, emit_lines, fail, refuse, CliCommand, OperatorCommand, SkillCli, TaskCommand,
 };
 
 /// Dispatches one operator-scope command, returning the process exit code.
@@ -30,7 +30,7 @@ pub(crate) async fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let ScopeCommand::Operator(command) = cli.command() else {
+    let CliCommand::Operator(command) = cli.command() else {
         let _ = writeln!(err, "internal: the operator command tree was not selected");
         return 2;
     };
