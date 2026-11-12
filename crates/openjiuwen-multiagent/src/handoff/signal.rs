@@ -30,7 +30,9 @@ use serde_json::Value;
 use super::{HANDOFF_MESSAGE_KEY, HANDOFF_REASON_KEY, HANDOFF_TARGET_KEY};
 
 /// Context-engine key holding the default context (Python `default_context_id`).
-const DEFAULT_CONTEXT_ID: &str = "default_context_id";
+///
+/// Shared with [`super::container`], which mirrors the same messages.
+pub(crate) const DEFAULT_CONTEXT_ID: &str = "default_context_id";
 
 /// Keys probed, in order, when the directive is wrapped one level deep.
 const NESTED_PROBE_KEYS: [&str; 3] = ["output", "result", "content"];
