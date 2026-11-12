@@ -113,16 +113,17 @@ async fn main() -> anyhow::Result<()> {
         "chunked the overview document"
     );
     banner::note(&format!(
-        "{} chunks of at most {} characters with {} shared (chunk ids are fresh uuid4s per run)",
+        "{} chunks of at most {} characters with {} shared; every chunk carries a generated uuid4 id, \
+fresh per run, so the listing shows each window's size and text instead",
         chunks.len(),
         chunker.chunk_size(),
         chunker.chunk_overlap()
     ));
     for (index, chunk) in chunks.iter().enumerate() {
         banner::step(&format!(
-            "chunk[{index}] doc={} id={} {:?}",
+            "chunk[{index}] doc={} chars={} {:?}",
             chunk.doc_id,
-            short_id(&chunk.id),
+            chunk.text.chars().count(),
             snippet(&chunk.text, PREVIEW_CHARS)
         ));
     }
@@ -216,11 +217,14 @@ async fn main() -> anyhow::Result<()> {
         store.len().await?,
         kb.id()
     ));
+    banner::note(
+        "hit ids stay out of the narrative: the raw record's id is the stable `raw-note`, while a \
+knowledge-base hit carries a generated chunk id — both appear in the stderr trace log",
+    );
     for (rank, hit) in hits.iter().enumerate() {
         tracing::info!(rank, id = %hit.id, score = hit.score, "store hit");
         banner::step(&format!(
-            "store hit[{rank}] {} score={:.4} {:?}",
-            hit.id,
+            "store hit[{rank}] score={:.4} {:?}",
             hit.score,
             snippet(&hit.text, PREVIEW_CHARS)
         ));
@@ -248,14 +252,6 @@ fn print_result(rank: usize, result: &RetrievalResult) {
         result.score,
         snippet(&result.text, PREVIEW_CHARS)
     ));
-}
-
-/// Shortens an identifier to its first eight characters.
-///
-/// Chunk ids are generated `uuid4`s, which are long enough to wrap the terminal;
-/// the prefix is enough to tell two chunks apart in the narrative.
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
 }
 
 /// Collapses whitespace and truncates `text` to `limit` characters.
