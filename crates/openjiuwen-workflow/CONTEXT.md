@@ -271,7 +271,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - Every module is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context`, `output`, `interrupt`, `registry`, `components/`, `engine/`, and `workflow`.
 - `src/workflow.rs` exposes `Workflow` (builder + `build`/`invoke`/`invoke_with`/`resume`/`stream`/`stream_with`/`to_mermaid`) and `ComponentOptions`; both are re-exported from the crate root.
 - `stream`/`stream_with` deliver a build error as the stream's single `Err` item instead of returning it.
-- Integration tests (`./tests/`) are not written yet.
+- Integration tests exist for `common/mod.rs` (shared fakes), `linear.rs`, `references.rs`, and `card_spec.rs`; the remaining suites listed under Test Strategy are not written yet.
 - The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
 - The crate root re-exports every public item, so downstream code (and the engine) can reach them as `crate::{Component, ComponentContext, ...}`.
 - `WorkflowSession` is the expected concrete session; anything implementing `Session` must work (the engine only uses the trait).
