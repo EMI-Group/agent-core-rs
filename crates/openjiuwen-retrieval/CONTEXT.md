@@ -153,7 +153,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 - Errors: `openjiuwen_common::error::{Error, Result}`; no panics on user input; invalid sizes/overlaps/inputs → `Error::Validation`; missing files → `Error::NotFound`; unsupported formats/providers → `Error::Unsupported`; store/embedding/network failures → `Error::Retrieval`/`Error::Transport`/`Error::Timeout`.
 - Logging: `tracing` (`openjiuwen_common::logging` re-exports); libraries never use `println!`/`eprintln!`.
 - Files ≤1000 lines; one responsibility per file; shared helpers live in the lowest module that needs them.
-- No new workspace dependencies: use the crates already in the workspace manifest (`regex`, `uuid`, `sha2`, `parking_lot`, `url`, `tempfile`, `wiremock`).
+- No new workspace dependencies: use the crates already in the workspace manifest (`regex`, `uuid`, `sha2`, `parking_lot`, `indexmap`, `futures`, `url`, `tempfile`, `wiremock`).
 - Tests are offline and deterministic; `openjiuwen-test-support` is not required.
 - Crate-level clippy allowances are limited to `module_name_repetitions`, `must_use_candidate`, `missing_errors_doc`, `missing_panics_doc`, and numeric-cast lints; everything else must be clean under `-D warnings`.
 

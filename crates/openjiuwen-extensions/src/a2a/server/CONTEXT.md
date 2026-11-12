@@ -11,6 +11,8 @@ The module-level documentation (routes, method table, event order, store semanti
 Everything is re-exported at `crate::a2a::server::`; the child modules are private.
 
 - `A2aServerConfig`, `DEFAULT_RPC_PATH`, `DEFAULT_CARD_PATH`, `DEFAULT_PROTOCOL_VERSION`, `DEFAULT_HOST`, `DEFAULT_PORT`
+- `A2aServerConfig` implements `Default` and offers `new(card)`, `with_interface_url`, `with_bind(host, port)`, `with_rpc_path` — there is no `with_card_path`; set the field directly.
+- Only `serve_in_background` (async, binds before returning) exposes the bound address, so a `port = 0` caller must use it or `A2aServerAdapter::local_addr`; `serve()` consumes `self` and reports the address only through `tracing::info!`.
 - `A2aExecutionContext`, `A2aExecutor`
 - `EventSink` (`EventSink::new` is `pub(crate)`)
 - `TaskStore`, `InMemoryTaskStore`

@@ -79,6 +79,17 @@ The provider's `model_config` returns the create-config fragment (`model`, `temp
 Known keys, all optional: `model`, `provider`, `api_key`, `api_base`, `temperature` (`0.0..=2.0` → `ModelRequestConfig::temperature`), `workspace` (root + cwd), `enable_task_loop`, `max_iterations` (positive), `system_prompt`, `permissions` (`PermissionsSection`), `language`.
 Unknown keys → `Validation("unknown native harness configuration fields: <sorted, ', '>")`; wrong types → `Validation("<key> must be a ...")`; blank string options → `Validation("native harness string options must be non-empty strings")`.
 `create` builds `DeepAgent` synchronously with `DeepAgentBuilder` (card `AgentCard::new("deep_agent")`, no model → lazily resolved by `ensure_initialized`) and returns an unstarted `NativeHarness`.
+`create` cannot take a pre-built `Model`/`DeepAgent`: a caller that already holds one skips the provider and calls `NativeHarness::new(Arc<DeepAgent>, NativeHarnessOptions)` directly, building the agent with `DeepAgentBuilder::model(Arc<dyn Model>)`.
+`temperature` is written to `ModelRequestConfig::temperature` only when `model` is also set; without a model name it is dropped with a `warn!` (a `ModelRequestConfig` always needs a model name).
+
+## Offline driving
+
+- `NativeHarness::new` is the offline path: build the `DeepAgent` with `DeepAgentBuilder` + `ScriptedModel` + temp `Workspace`, then `start(HarnessContext::new(...))` (there is no `HarnessContext::default`).
+- A provider-created (`HarnessProvider::create`) harness carries no model handle: `start` resolves one lazily from `model`/`provider`/`api_base`/`api_key`, so turns need a real model even though `start` itself stays offline (a provider test starts against `https://example.invalid/v1`).
+- `create` hands back `Box<dyn HarnessProtocol>`: that handle exposes neither `agent()` nor `HarnessModelControl`.
+- `HarnessInput.content` is a JSON string used verbatim; a JSON object contributes its `query` string; anything else is stringified (`content_text`).
+- One observation cursor at a time: take `harness.events()` once and read `next_event()` until `None`; a second cursor reports `State`.
+- Answer text arrives as `HarnessEventPayload::Output` deltas (`channel == OutputChannel::Answer`, `content` a `String`, `operation == Delta`) and the turn ends with a `TurnLifecycle` payload whose `kind` is in `TERMINAL_TURN_EVENT_KINDS` and whose `result` is the `TurnResult`.
 
 ## Constraints
 

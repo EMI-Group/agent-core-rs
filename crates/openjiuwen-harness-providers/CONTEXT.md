@@ -16,7 +16,7 @@ Registry and factory (module `factory`, flat re-exports):
 - `create_harness(provider, config) -> Result<Box<dyn HarnessProtocol>>` (never starts the harness).
 - `provider_model_config(provider, choice, fallback) -> Result<JsonObject>` with the Python capability gates and message text.
 - `ProviderDescriptor { name, card_name, implementation_version, builtin, implemented, configures_models, requires }`, `provider_descriptors()`, `describe_provider(name)`.
-- `HarnessContextOptions` + `build_harness_context(provider, options) -> Result<HarnessContext>` — manifest-free variant of Python `build_harness_context` (defaults, capability injection, native MCP refusal).
+- `HarnessContextOptions` (`new(host_session_id, system_prompt)` + public fields, `src/factory.rs:377`, `:414`) + `build_harness_context(provider, options) -> Result<HarnessContext>` — manifest-free variant of Python `build_harness_context` (defaults, capability injection, native MCP refusal).
 
 Providers (module `providers`):
 - `providers::native` — `provider() -> NativeHarnessProvider`, `card()`, `PROVIDER_NAME` (`"native"`); re-exports `NativeHarness`, `NativeHarnessProvider`, `NativeHarnessOptions` from `openjiuwen_harness`.
@@ -45,6 +45,8 @@ Helpers (flat re-exports):
 - Errors keep Python message text and Python `repr` quoting (`unknown harness provider 'x'; expected one of …`, `unknown Claude Code configuration fields: …`).
 - Vendor providers are registered but not implemented: `create` returns `HarnessError::UnsupportedCapability` with the Python "SDK required" text, mapped to `Error::Unsupported` at the factory; cards stay behind the same `vendor` feature.
 - Features: `native` (default) enables the native provider; `vendor` enables the three vendor modules and their registration; `live-tests` is opt-in and never enabled by default; the crate builds with `--no-default-features` and with `--features vendor`.
+- All three features are empty toggles (`default = ["native"]`, `native = []`, `vendor = []`, `live-tests = []`) and every dependency is non-optional — `openjiuwen-harness` is compiled even with `--no-default-features`, where the feature only compiles out the `providers::native` module.
+- No source file references `feature = "live-tests"`; it is a reserved manifest flag with no gated code (the delivered end-to-end tests live in `tests/vendor.rs` under `vendor`).
 - Async-first: `HarnessIOAdapter` spawns exactly one event-pump task per `start`, owns it through the adapter lifetime, and stops it in `stop`; no detached task outlives the adapter.
 - Serde: config types are `snake_case`, tolerate unknown keys when deserializing from JSON, and reject unknown keys in `from_json` mapping (Python `from_mapping`); `api_key` is `SecretString` and redacted in `Debug`.
 - No `unsafe`, no stdout logging (`tracing` only), files ≤1000 lines, all public items documented.
@@ -129,5 +131,8 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - The Python reference is read-only; consult it through `subagent_investigator` only.
 - Do not add vendor SDK crates or spawn external CLIs: the vendor surface is data + explicit `Unsupported` errors.
 - `HarnessCard` is not serde-optional: build cards with `HarnessCard::new(name, version)` and fill `capabilities`, `optional_host_capabilities`, `fork_modes`.
+- A harness created through `create_harness` cannot be handed an injected `Model`: the native provider builds its client lazily inside `start` (`openjiuwen-harness/src/agent/builder.rs:446`), so offline scripted-model tests construct `NativeHarness::new(agent, options)` over a `DeepAgentBuilder::model(Arc<dyn Model>)` and use the registry only for identity/create/descriptor assertions.
+- Registry reachability: the umbrella exposes it ungated as `openjiuwen::harness_providers` (`crates/openjiuwen/src/lib.rs:67`); `openjiuwen-core` has no harness-provider symbols.
+- `native` is default-on in this crate (`Cargo.toml:32`) and the umbrella's non-optional dependency inherits those default features, so `--no-default-features` on `openjiuwen` still builds the native provider; no workspace crate enables `vendor`.
 - `HarnessError` is `#[non_exhaustive]`; match with a wildcard arm and translate through `error::providers_error_to_common`.
 - `openjiuwen-session::interaction::InteractiveInput` is the shared HITL answer batch — never define a second copy.

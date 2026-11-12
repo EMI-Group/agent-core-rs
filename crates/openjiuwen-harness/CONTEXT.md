@@ -94,6 +94,13 @@ Every public item is also re-exported flat from the crate root.
 - `./src/lib.rs` → crate docs, module declarations, flat re-exports, feature flags
 - `./tests/` → offline integration suites (loop, workspace safety, permissions, state, subagents, protocol, CLI) (`tests/CONTEXT.md`)
 
+## Offline recipe (DeepAgent + native harness)
+
+- Minimal agent: `DeepAgentBuilder::new(AgentCard::new(id)).config(DeepAgentConfig::default().with_language("en").with_workspace(Workspace::for_language(tmp.path(), "en"))).model(Arc::new(ScriptedModel::text("hi"))).build()` → `Result<Arc<DeepAgent>>`, then `agent.invoke(json!({"query": "hi"}), None).await` (`Agent` trait) for one turn; canonical example `./tests/deep_agent_loop.rs:112-131`.
+- One-call factory: `create_deep_agent(model, card, config, tools, rails, workspace, skills, subagents, enable_task_loop, max_iterations, language, prompt_mode, restrict_to_work_dir, permissions, permission_host)` at `./src/agent/factory.rs:249`; it always sets `enable_task_loop`/`restrict_to_work_dir` from its arguments.
+- Native harness: `NativeHarness::new(Arc<DeepAgent>, NativeHarnessOptions::new())` then `start(HarnessContext::new(name, agent_id, host_session_id, prompt))`, `events()` (single consumer), `send(HarnessInput::text(..), DeliveryMode::Auto)`, `stop()`; driving example `./src/protocol/tests/turns.rs:5-51`.
+- Builder path registers only `PromptRail` (+ memory/subagent/caller rails); the security and skills rails come from `create_deep_agent`/`resolve_deep_agent_parts`. No default path opens a network connection; the local sysop backend and the builtin tools touch the filesystem only when a tool is invoked.
+
 ## Test Strategy
 
 - Integration tests drive `DeepAgent` with `openjiuwen_test_support::ScriptedModel` and temp workspaces: no-tool answer, tool round, permission denial, interrupt/resume, max-iteration, follow-up queue, state round-trip.

@@ -85,6 +85,9 @@ pub fn serialize_param_payload(value: &Value) -> String;    // json.dumps sort_k
 
 // client.rs
 pub struct A2aClientConfig { pub rpc_url: String, pub timeout: Option<Duration>, pub headers: BTreeMap<String, String> }
+// A2aClientConfig: Default (empty rpc_url, timeout None = 60 s, no headers) + builders
+//   new(rpc_url: impl Into<String>) -> Self, with_timeout(Duration) -> Self, with_header(name, value) -> Self
+// rpc_url is the FULL JSON-RPC endpoint, POSTed verbatim (no base-URL joining by the client)
 pub struct A2aClient { /* reqwest::Client + request-id counter */ }
 impl A2aClient {
     pub fn new(config: A2aClientConfig) -> Result<Self>;       // empty rpc_url -> Error::Config
@@ -97,6 +100,7 @@ impl A2aClient {
 pub struct RemoteClientConfig { pub id, version, name, description, protocol: String,
                                 pub card: Option<AgentCard>, pub url: String,
                                 pub timeout: Option<Duration>, pub kwargs: Map<String, Value> }
+// RemoteClientConfig: Default sets protocol "A2A"; new(id, url) sets both and defaults the rest
 pub struct A2aRemoteClient { .. }
 impl A2aRemoteClient {
     pub fn new(config: RemoteClientConfig) -> Result<Self>;     // protocol "A2A" + card required -> Validation
@@ -175,6 +179,7 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - No `unsafe`; no blocking I/O; `reqwest` with rustls; SSE parsing is incremental over `bytes_stream` (no whole-body buffering).
 - Timeouts: per-request via `A2aClientConfig.timeout` (default 60 s); `A2aRemoteClient::invoke/stream` wrap the call in the caller timeout and stop the client on timeout/error exactly like Python (`stop()` before re-raising; `Cancelled` propagates without calling `stop`). Stream deadlines are applied per chunk against a single total budget.
 - gRPC and REST (`HTTP+JSON`) transports are **not** implemented; a gRPC `protocol_binding` yields `Error::Unsupported("gRPC transport is not supported")`; a REST/`HTTP+JSON` binding is tolerated but the REST route is not mounted.
+- Endpoint derivation is private (`resolve_rpc_url`, `derive_interface_url`): no public base-URL→JSON-RPC-URL helper is exported, so a plain `A2aClient` caller must pass the full endpoint in `rpc_url`; only `A2aRemoteClient::new` derives it (card JSON-RPC interface, else `trim_end_matches('/')` + `/a2a/jsonrpc/`).
 - The JSON-RPC route is mounted at the literal `rpc_path` (default trailing slash), matching Python's normalization; the well-known card route serves the configured card.
 - Errors map to `Error::Transport` (HTTP/SSE), `Error::Timeout`, `Error::Validation` (card/inputs/JSON-RPC params), `Error::NotFound` (JSON-RPC `TASK_NOT_FOUND`), `Error::Unsupported` (`METHOD_NOT_FOUND`/gRPC), `Error::Config` (client construction).
 - Serde: wire structs are camelCase with unknown fields tolerated and unset `Option`s omitted; enums serialize proto strings (`ROLE_USER`, `TASK_STATE_WORKING`) and decode tolerantly (bare suffix, snake_case, camelCase, `cancelled`, unknown → `Unspecified`). Empty maps serialize as `{}`.
@@ -187,6 +192,7 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `./e2e_tests.rs` holds the in-crate integration suites as two in-module submodules (`client_suite` with `wiremock`, `server_suite` with `Router::oneshot` via `tower::ServiceExt` + `http_body_util::BodyExt` and one real ephemeral socket).
 - `../tests/a2a_client.rs` and `../tests/a2a_server.rs` are the crate-boundary mirrors of those suites; they use only `openjiuwen_extensions::a2a::` public paths and are gated with `#![cfg(feature = "a2a")]`.
 - Coverage: send folds to `AgentResult`; SSE stream of three frames yields three results in order; `CancelTask` fields and `CANCELED`; JSON-RPC error → typed `Error`; non-2xx → `Transport`; remote-client protocol/card validation and card-interface invocation; card route; `message/send` + v0.3 alias; `tasks/get` unknown → `-32001`; `tasks/cancel` → `CANCELED` then `-32002`; `message/stream` frame order; executor error → `FAILED` + `-32603`; real-socket card/send round trip.
+- Test gap: no suite pairs the two halves — `A2aClient` is only driven against `wiremock`, and the single real-socket test (`e2e_tests.rs`, `server_suite::server_answers_over_a_real_socket`) posts with raw `reqwest`; the only loopback wiring recipe is `A2aServerConfig::with_bind("127.0.0.1", 0)` + `serve_in_background` + `A2aClientConfig::new(format!("http://{}{}", handle.local_addr(), rpc_path))`.
 - Python counterparts named in comments: `tests/unit_tests/extensions/a2a/test_a2a_transformer.py`, `test_a2a_agentcard_adapter.py`, `test_a2a_client.py`, `test_a2a_server.py`.
 - Definition of done: `cargo fmt -p openjiuwen-extensions`, `cargo test -p openjiuwen-extensions --features a2a --lib`, and `cargo clippy -p openjiuwen-extensions --all-targets --features a2a -- -D warnings` all clean for this subtree.
 
