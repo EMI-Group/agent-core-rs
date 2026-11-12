@@ -184,12 +184,13 @@ async fn main() -> Result<()> {
         .context("the a2a server rejected the call")?;
 
     banner::note(&format!("status: {}", result.status.as_str()));
-    if let Some(task_id) = result.task_id.as_deref() {
-        banner::note(&format!("task: {task_id}"));
-    }
-    if let Some(session_id) = result.session_id.as_deref() {
-        banner::note(&format!("context: {session_id}"));
-    }
+    // The task and context ids are minted per run, so they go to the log rather than
+    // to stdout: the narrative stays byte-identical between two runs.
+    tracing::info!(
+        task_id = result.task_id.as_deref().unwrap_or_default(),
+        context_id = result.session_id.as_deref().unwrap_or_default(),
+        "the server answered with a task and a context"
+    );
 
     let echoed = result_text(&result);
     if echoed.is_empty() {

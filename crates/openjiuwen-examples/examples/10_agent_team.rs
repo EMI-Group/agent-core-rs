@@ -54,9 +54,7 @@ use openjiuwen::agent_teams::workspace::{
     LocalWorkspaceProvider, MemberWorkspaceLayout, WorkspaceProvider,
 };
 use openjiuwen::core::common::error::Result as SdkResult;
-use openjiuwen::core::foundation::llm::{
-    ChatResponse, Model, ModelRequestConfig, StreamChunk,
-};
+use openjiuwen::core::foundation::llm::{ChatResponse, Model, ModelRequestConfig, StreamChunk};
 use openjiuwen::core::foundation::BaseMessage;
 use openjiuwen::core::single_agent::{AgentCard, ResultType};
 use serde_json::json;
@@ -139,8 +137,7 @@ impl Model for NamedModel {
         messages: Vec<BaseMessage>,
         request: ModelRequestConfig,
     ) -> BoxStream<'static, SdkResult<StreamChunk>> {
-        self.inner
-            .stream(messages, named(&request, &self.name))
+        self.inner.stream(messages, named(&request, &self.name))
     }
 }
 
@@ -230,8 +227,7 @@ async fn main() -> Result<()> {
 
     common::banner::step(&format!("blueprint: {TEAM_NAME}"));
     let spec = blueprint();
-    spec.validate()
-        .context("the team blueprint is not valid")?;
+    spec.validate().context("the team blueprint is not valid")?;
     common::banner::note(&format!(
         "validated: {} agent blueprint(s), {} predefined member(s)",
         spec.agents.len(),
@@ -245,10 +241,9 @@ async fn main() -> Result<()> {
         .with_model_name(MODEL_NAME)
         .with_api_base(server.base_url())
         .with_api_key(PLACEHOLDER_API_KEY);
-    let workspace: Arc<dyn WorkspaceProvider> =
-        Arc::new(LocalWorkspaceProvider::new(MemberWorkspaceLayout::new(
-            workspace_root.path(),
-        )));
+    let workspace: Arc<dyn WorkspaceProvider> = Arc::new(LocalWorkspaceProvider::new(
+        MemberWorkspaceLayout::new(workspace_root.path()),
+    ));
     let factory: Arc<dyn MemberHarnessFactory> = Arc::new(NativeMemberFactory::new(Arc::new(
         LoopbackResolver::new(resolver),
     )));
@@ -269,10 +264,9 @@ async fn main() -> Result<()> {
     .context("the team did not activate")?;
 
     common::banner::note(&format!(
-        "team: {} (leader {}, session {})",
+        "team: {} (leader {}, session {SESSION_ID})",
         team.team_name(),
-        team.leader_member_name(),
-        team.session_id()
+        team.leader_member_name()
     ));
     common::banner::note(&format!("roster: {}", team.roster().join(", ")));
 
@@ -307,11 +301,10 @@ async fn main() -> Result<()> {
     ));
 
     common::banner::step("stopping the team");
-    let stopped =
-        tokio::time::timeout(TEARDOWN_TIMEOUT, manager.stop_team(TEAM_NAME, SESSION_ID))
-            .await
-            .context("stopping the team timed out")?
-            .context("the team did not stop cleanly")?;
+    let stopped = tokio::time::timeout(TEARDOWN_TIMEOUT, manager.stop_team(TEAM_NAME, SESSION_ID))
+        .await
+        .context("stopping the team timed out")?
+        .context("the team did not stop cleanly")?;
     if stopped {
         common::banner::note("team stopped and removed from the live pool");
     } else {

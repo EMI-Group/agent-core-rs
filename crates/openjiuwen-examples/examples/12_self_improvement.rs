@@ -7,6 +7,13 @@
 //! fixed data. Python counterparts: the evolving trainer mirrors
 //! `examples/agent_evolving/react_agent_evolving.py`; auto-harness has no Python
 //! example, so part one mirrors the Rust integration tests. Live mode stays scripted.
+//!
+//! Scope note: part two wires the trainer's two collaborator seams and drives them
+//! by hand. `Trainer::train` itself needs a `TrainableTarget`, whose
+//! `run_case` names `tokio_util::sync::CancellationToken` in this file, and this
+//! crate has no `tokio-util` dependency — adding `tokio-util.workspace = true`
+//! under `[dev-dependencies]` is what unlocks the full loop (see the last note
+//! part two prints).
 
 #![allow(
     // The two fakes name themselves with a literal, as their Python counterparts do.
