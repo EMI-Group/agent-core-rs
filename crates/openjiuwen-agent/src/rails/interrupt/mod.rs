@@ -4,8 +4,7 @@
 //! Ports the kernel-side behaviour of Python `harness/rails/interrupt/`
 //! (`BaseInterruptRail`, `ConfirmInterruptRail`) plus the `ask_user` kind, on
 //! this crate's [`AgentRail`] seam. The loop owns state persistence and the
-//! interrupt output; a rail only records an
-//! [`InterruptRequest`](crate::interrupt::InterruptRequest) on the context.
+//! interrupt output; a rail only records an [`InterruptRequest`] on the context.
 use super::{AgentRail, RailContext};
 use crate::abilities::parse_tool_arguments;
 use crate::interrupt::{self, InterruptKind, InterruptRequest};
