@@ -37,6 +37,9 @@ It is convenience only: no new types, no behavior, and no stability promise beyo
 | --- | --- |
 | `Error`, `Result` | `core::common::error` |
 | `Agent`, `AgentCard` | `core::single_agent` |
+| `ReActAgent`, `ReActAgentConfig` | `core::single_agent` (`openjiuwen_agent::react`) |
+| `AgentInput`, `AgentOutput`, `AgentChunk`, `ResultType` | `core::single_agent` (`openjiuwen_agent::{input, output}`) |
+| `LlmAgent`, `WorkflowAgent` | `core::single_agent` (`openjiuwen_agent::{llm_agent, workflow_agent}`) |
 | `Session`, `AgentSession` | `core::session` |
 | `Model`, `BaseMessage` | `core::foundation` |
 | `Tool`, `FunctionTool` | `core::foundation` |
@@ -45,7 +48,7 @@ It is convenience only: no new types, no behavior, and no stability promise beyo
 | `ContextEngine` | `core::context_engine` |
 | `LongTermMemory` | `core::memory` |
 | `Runner` | `core::runner` |
-| `DeepAgent`, `DeepAgentConfig`, `create_deep_agent` | `harness` |
+| `DeepAgent`, `DeepAgentConfig`, `DeepAgentBuilder`, `create_deep_agent` | `harness` |
 | `HarnessCard`, `HarnessProtocol` | `harness_protocol` |
 | `create_harness`, `HarnessIOAdapter` | `harness_providers` |
 | `TeamAgent`, `TeamAgentSpec` | `agent_teams` |
@@ -53,6 +56,7 @@ It is convenience only: no new types, no behavior, and no stability promise beyo
 | `OtelTracerConfig` (feature `otel`) | `extensions::otel` |
 
 `AgentSession` is the in-memory session implementation (`openjiuwen-session`); there is no separate `InMemorySession` type in the Rust API.
+The prelude is capped at ~35 items so `use openjiuwen::prelude::*;` stays unpolluted: agent-construction types and entry points only, no module globs, and the only config structs it forwards are `ReActAgentConfig`, `DeepAgentConfig` and `TeamAgentSpec`.
 
 ### Feature matrix
 
@@ -83,6 +87,8 @@ The default build needs no network and no external service: every feature above 
 - The provider registry is reached as `openjiuwen::harness_providers::{create_harness, resolve_provider, ...}`; `create_harness` is `openjiuwen_harness_providers::factory::create_harness` (proved by `tests/module_paths.rs:44-48`) and the prelude forwards it ungated (`src/prelude.rs:30`).
 - `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
 - Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
+- `ReActAgent`/`ReActAgentConfig` are forwarded from `core::single_agent` (`openjiuwen_agent::react`) because examples and construction code need them without spelling the kernel path; `tests/module_paths.rs::prelude_resolves_the_agent_construction_items` proves identity for the agent-construction items and the `ContextEngine`/`LongTermMemory`/`Runner` lifecycle items.
+- `LlmAgent` is forwarded with the crate-root spelling (`openjiuwen_agent::LlmAgent`); `core::application` exposes the same type as `LLMAgent`, so the prelude deliberately carries only one of the two spellings.
 - `openjiuwen::core::session` is the whole `openjiuwen-session` crate root (`openjiuwen-core/src/lib.rs:57` re-exports the crate as `session`), so `AgentSession`, `AgentSessionOptions`, `create_agent_session`, `Session`, `SessionType`, `SessionConfig`, `Checkpointer`, `MemoryCheckpointer`, `FileCheckpointer`, `Checkpoint`, `CheckpointMeta`, `CheckpointerConfig`, `create_checkpointer`, `StreamItem` and `StreamEvent` are all reachable directly at `openjiuwen::core::session::<Name>`; the nested `checkpoint::*` and inner `session::*` modules are alternative spellings of the same items.
 - The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
 - `core` is `pub use openjiuwen_core as core` (`src/lib.rs:62`) and that crate aliases the whole foundation crate (`pub use openjiuwen_foundation as foundation`, `../openjiuwen-core/src/lib.rs:52`), so `openjiuwen::core::foundation::…` is the full `openjiuwen_foundation` module tree, not a hand-written shim.
@@ -98,11 +104,12 @@ The default build needs no network and no external service: every feature above 
 - `./src/lib.rs` → crate docs (Python→Rust table, feature matrix, getting-started doctest), module aliases, `crate_name()`
 - `./src/prelude.rs` → curated convenience re-exports and the "prelude is convenience only" note
 - `./Cargo.toml` → dependency list and the feature mapping table
-- `./tests/module_paths.rs` → identity checks for one representative item per module alias, plus feature-gated `a2a` / `otel` checks
+- `./tests/module_paths.rs` → identity checks for one representative item per module alias, prelude compile/identity checks for the agent-construction and lifecycle items, plus feature-gated `a2a` / `otel` checks
 
 ## Test Strategy
 
 - `tests/module_paths.rs` asserts `TypeId` identity (and `std::ptr::eq` for functions) between each alias and the concrete crate, so a mis-pointed alias fails loudly; `a2a` and `otel` items are behind `#[cfg(feature = ...)]`.
+- `prelude_resolves_the_common_items` and `prelude_resolves_the_agent_construction_items` import `openjiuwen::prelude::*` and assert both usability and `TypeId` identity against the concrete crates, so a dropped or mis-pointed prelude export fails loudly.
 - The crate-level getting-started example is the doctest that guards the primary public paths (`cargo test -p openjiuwen`).
 - No unit tests: the facade has no behavior; behavior is tested in the concrete crates.
 - Definition of done: `cargo fmt -p openjiuwen`, `cargo test -p openjiuwen`, `cargo test -p openjiuwen --features otel,a2a`, and `cargo clippy -p openjiuwen --all-targets -- -D warnings` all clean (add `--no-deps` while the sibling `crate_name` lint in `## Known Issues` is open).
