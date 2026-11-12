@@ -1,11 +1,12 @@
 //! Error constructors and helpers over [`openjiuwen_common::error`].
 //!
-//! Every failure in this crate is an [`openjiuwen_common::error::Error`], so callers
-//! see the same discriminants ([`ErrorKind`]) as the rest of the workspace. The three
-//! helpers here cover the crate's recurring shapes: a message naming the offending
-//! field ([`validation`]), the standard message used by every deferred Python area
-//! ([`unsupported`]), and the discriminant test used by callers that degrade
-//! gracefully ([`is_unsupported`]).
+//! Every failure in this crate is an [`openjiuwen_common::error::Error`], so callers see the
+//! same discriminants ([`ErrorKind`](crate::error::ErrorKind)) as the rest of the workspace.
+//! The three helpers here cover the crate's recurring shapes: a message naming the offending
+//! field ([`validation`](crate::error::validation)), the standard message used by every
+//! deferred Python area ([`unsupported`](crate::error::unsupported)), and the discriminant
+//! test used by callers that degrade gracefully
+//! ([`is_unsupported`](crate::error::is_unsupported)).
 
 use std::fmt;
 

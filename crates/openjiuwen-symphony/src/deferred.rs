@@ -9,11 +9,13 @@
 //! Every entry point returns [`openjiuwen_common::error::Error::Unsupported`] built by
 //! [`crate::error::unsupported`], whose message names the feature and points at the
 //! crate `CONTEXT.md` `## Deferred Scope` table. The documented constructors
-//! ([`LlmTreeRetriever::new`], [`FlowEngine::new`], [`ExperienceBank::new`],
-//! [`SkillFolderScanner::new`]) always fail, so a caller cannot build one of these types
-//! by accident and mistake it for a working implementation. The operations are
-//! associated functions: `FlowEngine::distill()` reports the same explicit error without
-//! needing a value.
+//! ([`LlmTreeRetriever::new`](crate::deferred::LlmTreeRetriever::new),
+//! [`FlowEngine::new`](crate::deferred::FlowEngine::new),
+//! [`ExperienceBank::new`](crate::deferred::ExperienceBank::new),
+//! ([`SkillFolderScanner::new`](crate::deferred::SkillFolderScanner::new)) always fail, so
+//! a caller cannot build one of these types by accident and mistake it for a working
+//! implementation. The operations are associated functions: `FlowEngine::distill()` reports
+//! the same explicit error without needing a value.
 //!
 //! The data types in this module are ordinary `serde` types (`snake_case`,
 //! default-tolerant) so a caller can build a request or decode a recorded result
