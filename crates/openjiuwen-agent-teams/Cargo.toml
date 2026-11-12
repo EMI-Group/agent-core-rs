@@ -14,26 +14,41 @@ openjiuwen-harness-protocol.workspace = true
 openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
+openjiuwen-multiagent.workspace = true
+openjiuwen-session.workspace = true
+openjiuwen-agent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
 async-trait.workspace = true
+async-stream.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-regex.workspace = true
-glob.workspace = true
 tempfile.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, optional = true }
 clap.workspace = true
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
 
 [features]
 default = ["mcp"]
-mcp = []
+mcp = ["dep:rmcp"]
 distributed = []
 live-tests = []
+
+[[bin]]
+name = "team-member"
+path = "src/bin/team-member.rs"
+
+[[bin]]
+name = "openjiuwen-team-mcp"
+path = "src/bin/openjiuwen-team-mcp.rs"
+required-features = ["mcp"]
 
 [lints]
 workspace = true

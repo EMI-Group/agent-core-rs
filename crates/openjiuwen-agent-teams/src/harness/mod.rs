@@ -1,0 +1,32 @@
+//! Adapter between a team member and the provider-neutral harness protocol.
+//!
+//! Python parity source: `openjiuwen/agent_teams/harness/` (`protocol_adapter.py`,
+//! `native_harness.py`, `checkpoint.py`). The team runtime never talks to a harness implementation
+//! directly: it builds one through [`MemberHarnessFactory`], wraps it in
+//! [`HarnessMemberRuntime`], and observes it through
+//! [`MemberObserver`](crate::member::MemberObserver).
+//!
+//! Module map:
+//!
+//! | File | Contents |
+//! | --- | --- |
+//! | [`adapter`] | [`MemberHarnessContext`], [`MemberHarnessFactory`], [`HarnessMemberRuntime`] |
+//! | [`mapping`] | state/round/chunk projections onto the team vocabulary |
+//! | [`checkpoint`] | [`NativeCheckpoint`], the portable member snapshot |
+//! | [`native`] | [`NativeMemberFactory`], [`ModelResolver`], [`EnvModelResolver`] |
+//!
+//! The harness handle itself is `Arc<dyn openjiuwen_harness_protocol::HarnessProtocol>`; the
+//! in-process implementation is `openjiuwen_harness::NativeHarness`, which already conforms to
+//! that protocol. Distributed/external harness modes are not part of this module.
+pub mod adapter;
+pub mod checkpoint;
+pub mod mapping;
+pub mod native;
+pub use adapter::{HarnessMemberRuntime, MemberHarnessContext, MemberHarnessFactory};
+pub use checkpoint::NativeCheckpoint;
+pub use mapping::{
+    chunk_from_event, is_terminal_event, round_from_event, state_from_event,
+    state_to_execution_status, state_to_member_status, CHUNK_LLM_OUTPUT, CHUNK_LLM_REASONING,
+    CHUNK_TOOL_CALL, CHUNK_TOOL_RESULT,
+};
+pub use native::{EnvModelResolver, ModelResolver, NativeMemberFactory, NATIVE_FACTORY_NAME};
