@@ -131,6 +131,13 @@ pub fn bind_guardrails(framework: &CallbackFramework, pipeline: Arc<GuardrailPip
 - `trigger` with no subscribers returns `Ok(CallbackReport { fired: 0, .. })` without touching the context.
 - A guardrail handler builds its `GuardrailContext` from `ctx.guardrail` when present; otherwise it derives one from `ctx.input` (tool/LLM input) or `ctx.output` (tool/LLM output) as raw text and sets the stage. A blocked outcome is `Ok(Abort(error))` where `error` is `outcome.enforce()`'s `Error::Security`; allowed outcomes are `Ok(Continue)` (non-blocking findings are logged and dropped, matching Python's swallowed `GuardrailError`).
 
+## Design Decisions
+
+- `ScanStage::UserInput` has no preset callback event (`"user_input"` is unscoped), so `event_for_stage` represents it as `CallbackEvent::Custom("user_input")` and `scan_stage_for` maps that back.
+- `bind_guardrails` therefore subscribes only to the four event-backed stages (`GUARDRAIL_STAGES`); user-input scanning is an explicit `Runner::scan`.
+- `CallbackId` is the sole removal handle; duplicate registration stays legal so Python-style double-subscription dispatches twice.
+- `CallbackContext`'s manual `Debug` prints payload shapes and metadata keys, never values.
+
 ## Constraints
 
 - `CallbackEvent::as_str()` values are a wire contract with `openjiuwen-security` (`ScanStage::event()`) and with harness code that subscribes by string; every Python preset name must be representable, and `from_name` must round-trip all of `ALL`.
