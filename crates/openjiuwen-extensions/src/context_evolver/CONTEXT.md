@@ -39,7 +39,7 @@ impl MemoryVectorStore {
     pub async fn len(&self) -> usize;
     pub async fn clear(&self);
 }
-pub struct ScoredNode { pub node: VectorNode, pub score: f32 }   // cosine normalized to [0,1], higher first
+pub struct ScoredNode { pub node: VectorNode, pub score: f32 }   // raw cosine in [-1, 1], higher first; non-finite scores clamp to 0.0
 
 pub struct RetrieveRequest { pub user_id: String, pub query: String }
 pub struct RetrieveResponse { pub status: String, pub memory_string: String, pub retrieved_memory: Value }
