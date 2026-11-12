@@ -174,6 +174,9 @@ the sink open and stall the frame loop.
   live consumers, and end-node frames are replayed in template order — observable text and order match for
   finite streams, live interleaving does not.
 - `wait_for_all=False` first-arrival fan-in has no equivalent (CNF barriers only), so alternative branch targets merging into one node wait for every predecessor; wire each alternative path separately.
+  The graph layer's only any-of primitive is a *group-less* trigger channel, and a workflow node gets one only when every edge targeting it is dynamic: `GraphBuilder::conditional_edges` (target `"*"`) contributes no channel group, while `conditional_edges_to`, `edge` and `barrier_edge` all do.
+  A first-arrival fan-in is therefore expressible in `build_graph` by emitting `conditional_edges(source, router→[join])` per source instead of `barrier_edge`, with re-activation on a late source (Python's `TriggerChannel` behaves the same); the explicit `.entry(start_id)` keeps the join from being seeded as an implicit entry.
+- `ExceptionConfig` is spec-only: `NodeConfig` has no `exception_config` field, `node_spec` writes `None`, and `ComponentNode::run`'s `Err` branch is the only place a `default_outputs` recovery could substitute a value before `component_execution_error`.
 - Interaction indices and pending frames are tracked by `InteractionState`, not a session broker.
 - `response_format` injection and `enable_history` are carried in LLM config but not applied.
 
