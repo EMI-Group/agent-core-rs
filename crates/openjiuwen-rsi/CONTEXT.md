@@ -64,9 +64,9 @@ config.rs   AutoHarnessConfig — serde data only (no live models/clients):
               session_budget_secs (900000.0), cost_limit_usd (10.0), task_timeout_secs (300000.0),
               model_timeout_secs (300000.0), max_tasks_per_session (10),
               max_iterations (10), target_score: Option<f64>, min_improvement (0.05), patience (2),
-              agent_iterations: BTreeMap<String, u32> (Python defaults incl. implement 30, assess 30,
-                plan 15, select_pipeline 10, eval 10, pr_draft 5, learnings 5, explore 20, browser 20,
-                merge_ext 8), immutable_files, high_impact_prefixes (["openjiuwen/core/"]),
+              agent_iterations: BTreeMap<String, u32> (Python defaults: implement 30, assess 30,
+                plan 15, select_pipeline 10, eval 10, pr_draft 5, learnings 5, explore_subagent 20,
+                browser_subagent 20, merge_ext 8), immutable_files, high_impact_prefixes (["openjiuwen/core/"]),
               git_base_branch ("develop"), fix_phase1_max_retries (10), fix_phase2_max_retries (9),
               config_bootstrapped (false), suggested_local_repo, extra: Value
             Default (Python defaults), from_json_value, from_yaml_str, load(path) (async tokio::fs),
@@ -120,15 +120,22 @@ runner.rs   HarnessRunRequest { session_id, iteration, candidate: Candidate, cas
 checkpoint.rs SessionState { session_id, iteration, running: bool, best_candidate, best_score,
                               candidates: Vec<Candidate>, history: Vec<IterationRecord>,
                               spent_usd, stop_reason }   (full serde round-trip = resume)
-            #[async_trait] trait CheckpointStore { save(&SessionState), load(&str) -> Option<SessionState>,
-                                                   delete(&str) }
+            #[async_trait] trait CheckpointStore { save(&SessionState) -> Result<()>,
+              load(&str) -> Result<Option<SessionState>>, delete(&str) -> Result<()> }
+              — backend/deserialization failures are `Error::session`, never "no checkpoint"
             InMemoryCheckpointStore (RwLock<BTreeMap>), KvCheckpointStore { store: Arc<dyn KvStore>,
               key_prefix: String /* "rsi:auto_harness:" */ } over
               `openjiuwen_core::foundation::store::kv::KvStore` (state stored as JSON under
               `<prefix><session_id>`), SessionCheckpointStore { session: Arc<dyn Session>,
               component_id /* "rsi_auto_harness" */ } over `update_component_state`.
-orchestrator.rs AutoHarnessOrchestrator — builder(config) with with_runner/with_mutator/with_selector/
-              with_evaluator/with_checkpoint_store/with_cases/with_seed_body/with_session_id/build;
+orchestrator.rs AutoHarnessOrchestrator — `builder(config)` (a required runner **or** evaluator) with
+              with_runner/with_mutator/with_selector/with_evaluator/with_checkpoint_store/with_cases/
+              with_seed_body/with_session_id/with_mutation_count/build;
+              builder defaults: `DeterministicMutator` (one variant per parent), `ElitistSelection`
+              (elite of one), `InMemoryCheckpointStore`, empty cases, `DEFAULT_SEED_BODY`,
+              fresh `uuid_v4` session id, one proposal per iteration; a runner-only build is wrapped
+              in `SessionIterationEvaluator`, which stamps the session id and current iteration onto
+              each `HarnessEvaluator` run (the `Evaluator` trait carries neither).
               config(), session_id(), state() -> SessionState (snapshot), is_running(), is_cancelled(),
               start() -> Result<()>, resume() -> Result<Option<SessionState>>,
               run_iteration() -> Result<IterationRecord>, stop(), finish() -> Result<SessionSummary>,
@@ -137,9 +144,14 @@ orchestrator.rs AutoHarnessOrchestrator — builder(config) with with_runner/wit
               One iteration: seed if empty → select parents → mutate → evaluate each candidate through
               the Evaluator → mark statuses → compare best to incumbent (improvement, accepted) →
               append IterationRecord → checkpoint session state → evaluate stop conditions.
+              `improvement` is `best - previous_best` clamped at 0 (0.0 for the first best, which is
+              accepted); the winner becomes `CandidateStatus::Selected`.
               `run_iteration` on a finished/stopped session returns Error::Cancelled; evaluation errors
               mark the candidate Invalid and are recorded, they never abort the session; a checkpoint
-              write failure is returned as Error::Session.
+              write failure is returned as Error::Session. `finish()` is idempotent, emits no event, and
+              defaults a missing stop reason to MaxIterations (cap reached) → last record → Failed.
+              `run` and `stream` are alternative single-call entries with a terminal-event latch, so a
+              session reports at most one terminal event.
 ```
 
 ### `artifact_rsi::program_opt` (`src/artifact_rsi/program_opt/`)
@@ -231,7 +243,7 @@ API-shaped stubs, all documented and all returning
   - `./src/evolution/selection.rs` → `SelectionStrategy`, `ElitistSelection`, `rank_score`, `ranked`
 - `./src/harness_rsi/` → harness-side RSI
   - `./src/harness_rsi/auto_harness/` → bounded self-optimisation session loop
-    - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `orchestrator.rs`
+    - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `builder.rs` (collaborator defaults/validation), `orchestrator.rs` (+ `orchestrator_tests.rs`, a `#[cfg(test)]` child module)
 - `./src/artifact_rsi/` → artifact-side RSI
   - `./src/artifact_rsi/program_opt/` → `ProgramOptConfig` and the PUCT tree (`config.rs`, `tree.rs`)
 - `./src/deferred/` → documented `Error::Unsupported` stubs for ML/vendor surfaces (`agentdescent.rs`, `runtime.rs`, `evaluators.rs`, `paper_opt.rs`, `member_optimizer.rs`)
