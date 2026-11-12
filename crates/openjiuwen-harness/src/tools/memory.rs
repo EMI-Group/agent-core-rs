@@ -12,10 +12,6 @@
 //! modules would duplicate that shared scaffolding, and the offline test suite (about half the
 //! file) has to live beside the kinds it covers.
 
-// The module stays private until `ToolRegistry::build` wires the tool set; keeping the
-// intended public surface (`pub`) documents the eventual export and avoids a churn diff.
-#![allow(unreachable_pub)]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

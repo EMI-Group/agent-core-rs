@@ -17,11 +17,6 @@
 //!   `PowerShellTool` variant are deferred.
 //! - The streaming `stream()` override is not implemented yet, so callers get the
 //!   trait-default single-result stream.
-
-// The tool modules are private and their surface is re-exported from `mod.rs`; these items
-// are `pub` for that re-export, which lands with the registry wiring wave.
-#![allow(unreachable_pub)]
-
 use std::path::Path;
 use std::sync::Arc;
 

@@ -10,10 +10,6 @@
 //! tolerance, XML desanitization, trailing-whitespace stripping and the scripted "similar
 //! paths" hint are not ported, and `original_file` is always `null` in the write payload.
 
-// The module stays private until `ToolRegistry::build` wires the tool set; keeping the
-// intended public surface (`pub`) documents the eventual export and avoids a churn diff.
-#![allow(unreachable_pub)]
-
 use std::path::Path;
 use std::sync::Arc;
 

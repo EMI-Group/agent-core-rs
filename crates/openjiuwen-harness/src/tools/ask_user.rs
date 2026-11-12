@@ -5,10 +5,6 @@
 //! validation) and delegates the actual interaction to an injected [`UserAsker`], so the rail
 //! can be wired in `crate::rails` without the tool depending on it.
 
-// The module stays private until `ToolRegistry::build` wires the tool set; keeping the
-// intended public surface (`pub`) documents the eventual export and avoids a churn diff.
-#![allow(unreachable_pub)]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

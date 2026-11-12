@@ -35,6 +35,22 @@ pub use support::{
     truncation_marker, ToolEnv, ToolPayload, Truncated,
 };
 
+pub use ask_user::{AskOption, AskQuestion, AskUserArgs, AskUserTool, UserAsker};
+pub use memory::{
+    MemoryEditData, MemoryReadData, MemoryScope, MemorySearchRequest, MemoryTool,
+    MemoryToolBackend, MemoryToolKind, MemoryWriteData,
+};
+pub use read::{ReadFileArgs, ReadFileTool};
+pub use search::{
+    GlobArgs, GlobTool, GrepArgs, GrepOutputMode, GrepTool, ListDirArgs, ListDirTool,
+};
+pub use shell::{BashArgs, BashTool};
+pub use todo::{
+    session_key, TodoAction, TodoCreateArgs, TodoCreateTool, TodoData, TodoGetArgs, TodoGetTool,
+    TodoListTool, TodoModifyArgs, TodoModifyTool, TodoStore,
+};
+pub use write::{EditFileArgs, EditFileTool, WriteFileArgs, WriteFileTool};
+
 /// A built-in model-facing tool of the `DeepAgent`.
 ///
 /// The variant order is the registry order and matches the order of [`tool_names`]; the
@@ -177,6 +193,26 @@ pub fn tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Maps a memory [`BuiltinTool`] variant to its [`MemoryToolKind`].
+///
+/// # Panics
+///
+/// Panics only when called with a non-memory variant, which the callers never do; the helper
+/// exists to keep the eight `build`/`card` arms explicit without duplicating the mapping.
+fn memory_kind(tool: BuiltinTool) -> MemoryToolKind {
+    match tool {
+        BuiltinTool::MemorySearch => MemoryToolKind::Search,
+        BuiltinTool::MemoryGet => MemoryToolKind::Get,
+        BuiltinTool::WriteMemory => MemoryToolKind::Write,
+        BuiltinTool::ReadMemory => MemoryToolKind::Read,
+        BuiltinTool::EditMemory => MemoryToolKind::Edit,
+        BuiltinTool::CodingMemoryRead => MemoryToolKind::CodingRead,
+        BuiltinTool::CodingMemoryWrite => MemoryToolKind::CodingWrite,
+        BuiltinTool::CodingMemoryEdit => MemoryToolKind::CodingEdit,
+        other => unreachable!("{} is not a memory tool", other.name()),
+    }
+}
+
 /// The built-in tool set of one agent, with its workspace, backends and shared read state.
 ///
 /// The registry owns the [`ToolEnv`] path/permission gate, the sys-operation backends, the
@@ -195,6 +231,10 @@ pub struct ToolRegistry {
     read_state: Arc<ReadStateRegistry>,
     /// Override for the todo file directory; `None` uses the workspace `todo` node.
     todo_dir: Option<PathBuf>,
+    /// The user-interaction handler the `ask_user` tool delegates to, when one is wired.
+    user_asker: Option<Arc<dyn UserAsker>>,
+    /// The memory backend the eight memory tools delegate to, when one is wired.
+    memory_backend: Option<Arc<dyn MemoryToolBackend>>,
     /// The tools this registry builds, in registry order.
     tools: Vec<BuiltinTool>,
 }
@@ -230,6 +270,8 @@ impl ToolRegistry {
             shell,
             read_state: ReadStateRegistry::new(),
             todo_dir: None,
+            user_asker: None,
+            memory_backend: None,
             tools: BuiltinTool::ALL.to_vec(),
         }
     }
@@ -264,6 +306,21 @@ impl ToolRegistry {
         self
     }
 
+    /// Wires the user-interaction handler behind the `ask_user` tool, replacing any previous
+    /// handler.
+    #[must_use]
+    pub fn with_user_asker(mut self, asker: Arc<dyn UserAsker>) -> Self {
+        self.user_asker = Some(asker);
+        self
+    }
+
+    /// Wires the memory backend behind the eight memory tools, replacing any previous backend.
+    #[must_use]
+    pub fn with_memory(mut self, backend: Arc<dyn MemoryToolBackend>) -> Self {
+        self.memory_backend = Some(backend);
+        self
+    }
+
     /// Sets the description language used for the rendered tool cards.
     #[must_use]
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
@@ -286,31 +343,121 @@ impl ToolRegistry {
     }
 
     /// Builds the tool implementations of this registry.
+    ///
+    /// Every selected [`BuiltinTool`] yields exactly one [`Tool`], in registry order. The todo
+    /// tools share one [`TodoStore`] and the filesystem tools share one [`ReadStateRegistry`],
+    /// so a registry behaves like a single agent's tool set.
     #[must_use]
     pub fn build(&self) -> Vec<Arc<dyn Tool>> {
-        tracing::debug!(
-            tools = self.tools.len(),
-            "tool registry build is not implemented yet"
-        );
-        Vec::new()
+        let language = self.env.language();
+        let mut todo_store: Option<Arc<TodoStore>> = None;
+        self.tools
+            .iter()
+            .map(|tool| {
+                let tool: Arc<dyn Tool> = match tool {
+                    BuiltinTool::Bash => {
+                        Arc::new(BashTool::new(self.env.clone(), self.shell.clone()))
+                    }
+                    BuiltinTool::ReadFile => Arc::new(ReadFileTool::new(
+                        self.env.clone(),
+                        self.fs.clone(),
+                        self.read_state.clone(),
+                    )),
+                    BuiltinTool::WriteFile => Arc::new(WriteFileTool::new(
+                        self.env.clone(),
+                        self.fs.clone(),
+                        self.read_state.clone(),
+                    )),
+                    BuiltinTool::EditFile => Arc::new(EditFileTool::new(
+                        self.env.clone(),
+                        self.fs.clone(),
+                        self.read_state.clone(),
+                    )),
+                    BuiltinTool::Glob => Arc::new(GlobTool::new(self.env.clone(), self.fs.clone())),
+                    BuiltinTool::ListFiles => {
+                        Arc::new(ListDirTool::new(self.env.clone(), self.fs.clone()))
+                    }
+                    BuiltinTool::Grep => Arc::new(GrepTool::new(self.env.clone())),
+                    BuiltinTool::TodoCreate => Arc::new(TodoCreateTool::new(
+                        self.todo_store(&mut todo_store),
+                        language,
+                    )),
+                    BuiltinTool::TodoList => Arc::new(TodoListTool::new(
+                        self.todo_store(&mut todo_store),
+                        language,
+                    )),
+                    BuiltinTool::TodoGet => {
+                        Arc::new(TodoGetTool::new(self.todo_store(&mut todo_store), language))
+                    }
+                    BuiltinTool::TodoModify => Arc::new(TodoModifyTool::new(
+                        self.todo_store(&mut todo_store),
+                        language,
+                    )),
+                    BuiltinTool::AskUser => {
+                        Arc::new(AskUserTool::new(self.user_asker.clone(), language))
+                    }
+                    BuiltinTool::MemorySearch
+                    | BuiltinTool::MemoryGet
+                    | BuiltinTool::WriteMemory
+                    | BuiltinTool::ReadMemory
+                    | BuiltinTool::EditMemory
+                    | BuiltinTool::CodingMemoryRead
+                    | BuiltinTool::CodingMemoryWrite
+                    | BuiltinTool::CodingMemoryEdit => Arc::new(MemoryTool::new(
+                        memory_kind(*tool),
+                        self.memory_backend.clone(),
+                        language,
+                    )),
+                };
+                tool
+            })
+            .collect()
+    }
+
+    /// Returns the todo store of this registry, creating and caching it on first use.
+    fn todo_store(&self, cache: &mut Option<Arc<TodoStore>>) -> Arc<TodoStore> {
+        cache
+            .get_or_insert_with(|| match &self.todo_dir {
+                Some(dir) => TodoStore::new(dir.clone()),
+                None => TodoStore::for_workspace(self.env.workspace()),
+            })
+            .clone()
     }
 
     /// Builds the model-facing cards of every selected tool, in registry order.
     #[must_use]
     pub fn cards(&self, language: &str) -> Vec<ToolCard> {
-        tracing::debug!(language, "tool card generation is not implemented yet");
-        Vec::new()
+        self.tools
+            .iter()
+            .map(|tool| self.card(*tool, language))
+            .collect()
     }
 
     /// Builds the model-facing card of one tool.
     #[must_use]
     pub fn card(&self, tool: BuiltinTool, language: &str) -> ToolCard {
-        tool_card(
-            tool.name(),
-            descriptions::description(tool.name(), language),
-            serde_json::json!({"type": "object", "properties": {}}),
-            tool.parallel_safe(),
-        )
+        match tool {
+            BuiltinTool::Bash => BashTool::card_for(language),
+            BuiltinTool::ReadFile => ReadFileTool::card_for(language),
+            BuiltinTool::WriteFile => WriteFileTool::card_for(language),
+            BuiltinTool::EditFile => EditFileTool::card_for(language),
+            BuiltinTool::Glob => GlobTool::card_for(language),
+            BuiltinTool::ListFiles => ListDirTool::card_for(language),
+            BuiltinTool::Grep => GrepTool::card_for(language),
+            BuiltinTool::TodoCreate => TodoCreateTool::card_for(language),
+            BuiltinTool::TodoList => TodoListTool::card_for(language),
+            BuiltinTool::TodoGet => TodoGetTool::card_for(language),
+            BuiltinTool::TodoModify => TodoModifyTool::card_for(language),
+            BuiltinTool::AskUser => AskUserTool::card_for(language),
+            BuiltinTool::MemorySearch
+            | BuiltinTool::MemoryGet
+            | BuiltinTool::WriteMemory
+            | BuiltinTool::ReadMemory
+            | BuiltinTool::EditMemory
+            | BuiltinTool::CodingMemoryRead
+            | BuiltinTool::CodingMemoryWrite
+            | BuiltinTool::CodingMemoryEdit => MemoryTool::card_for(memory_kind(tool), language),
+        }
     }
 
     /// The path resolution and permission environment shared by the tools.
@@ -341,6 +488,18 @@ impl ToolRegistry {
     #[must_use]
     pub fn shell_operation(&self) -> Option<&Arc<dyn ShellOperation>> {
         self.shell.as_ref()
+    }
+
+    /// The user-interaction handler wired into the `ask_user` tool, when one is configured.
+    #[must_use]
+    pub fn user_asker(&self) -> Option<&Arc<dyn UserAsker>> {
+        self.user_asker.as_ref()
+    }
+
+    /// The memory backend wired into the memory tools, when one is configured.
+    #[must_use]
+    pub fn memory_backend(&self) -> Option<&Arc<dyn MemoryToolBackend>> {
+        self.memory_backend.as_ref()
     }
 
     /// The todo directory override, when one was set.

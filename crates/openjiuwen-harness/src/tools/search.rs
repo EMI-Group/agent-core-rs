@@ -17,9 +17,6 @@
 //!   resolved base; the Python symlink normalization of `os.path.relpath` is replaced by a
 //!   canonicalized-base retry.
 
-// The tool modules are private and their surface is re-exported from `mod.rs`; these items
-// are `pub` for that re-export, which lands with the registry wiring wave.
-#![allow(unreachable_pub)]
 // Python parity: the grep helpers report expected failures as `ToolPayload`, and the public
 // signature is part of the tool contract. Boxing the error would change every caller, so the
 // size/performance heuristic does not apply here.

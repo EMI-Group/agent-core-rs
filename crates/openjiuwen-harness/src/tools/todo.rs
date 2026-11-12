@@ -7,18 +7,15 @@
 //!
 //! Size note: the store plus the four tools are ~890 lines; the rest is the Python-message
 //! parity test table required by the module spec. The pieces cannot be split because the
-//! private `mod todo;` wiring in `mod.rs` is owned by the later registry wave, so this file
-//! stays one cohesive unit (the same shape as the test-heavy `search.rs`).
+//! tools share [`TodoStore`] and the payload helpers, so this file stays one cohesive unit
+//! (the same shape as the test-heavy `search.rs`); [`crate::tools::ToolRegistry`] re-exports
+//! these items.
 //!
 //! Deviations from Python: the session id comes from [`ToolContext`] and falls back to `default`
 //! (Python raises `Session ID is required`); the file lives under the workspace `todo` node;
 //! expected failures (including IO errors and the validation errors Python raises) return a
 //! `success=false` payload instead of an `Err`; and a save writes a temporary file that is
 //! renamed over `todo.json`, so no reader sees a partial list.
-
-// The module stays private until `ToolRegistry::build` wires the tool set; keeping the
-// intended public surface (`pub`) documents the eventual export and avoids a churn diff.
-#![allow(unreachable_pub)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
