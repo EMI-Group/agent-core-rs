@@ -49,7 +49,7 @@ The configured `timeout` (seconds) becomes one `Duration` at construction; every
 `invoke` checks readiness, acquires a `SessionLease`, sends the input verbatim to the supervisor with sender `ctx.card.id`, finishes the lease, and returns the supervisor's value.
 `stream` sends the same request inside `crate::session::team_stream` and writes exactly one frame, `{"type":"message","index":0,"payload":{"output": <result>}}`, when the supervisor result is not JSON null.
 A null reply never reaches that guard as a success: `TeamRuntime::send` rejects it as `TeamError::EmptyResponse`, so the guard is defensive and a null reply surfaces as a stream error.
-`stream` does not call `check_ready`: the run task's `send` validates the recipient, so an unregistered supervisor surfaces as a stream error after the session was set up.
+`stream` checks readiness before the first frame, so an unregistered or blank supervisor yields exactly one `Err` item and then the stream ends (mirroring Python raising on the first `__anext__`); on the successful path it writes exactly one `{"type":"message","index":0,"payload":{"output": <result>}}` frame.
 
 ### Supervisor factory (`supervisor.rs`)
 
@@ -138,12 +138,11 @@ An agent stream failure is swallowed into one `{"type":"message","index":0,"payl
 - **A later membership event rewires**: `setup` re-runs whenever pending children exist, and `resolve_handle` prefers the cached instance, so new children mount on the already-wired parent instead of a fresh one.
 - **The agents-as-tools stream bypasses the bus entirely** (in-process `Agent::stream`), forwards raw `AgentChunk` frames, and swallows an agent stream error into one error frame (Python parity); a readiness or root-resolution failure is an error item, never a panic.
 - **Wiring misses are logged, never raised**: a missing parent, a parent without a `ToolHost`, and a rejected mount behave like Python's failed attribute probe.
-- **The message-bus strategy does not call `check_ready` in `stream`**, because its run task's `send` already validates the recipient and a team stream reports failures as data after setup.
 
 ## Routing Table
 
 - `./mod.rs` → module docs (the two topologies, the `TeamStrategy` seam), the three submodule declarations, and the re-exports.
-- `./msgbus.rs` → `HierarchicalMsgbusConfig` (+ `new`/serde defaults), the timeout-to-deadline conversion, `HierarchicalMsgbusStrategy` (readiness, deadline adoption, `invoke`, one-frame `stream`), `hierarchical_msgbus_team`, and its 11 unit tests.
+- `./msgbus.rs` → `HierarchicalMsgbusConfig` (+ `new`/serde defaults), the timeout-to-deadline conversion, `HierarchicalMsgbusStrategy` (readiness before the first frame, deadline adoption, `invoke`, one-frame `stream`), `hierarchical_msgbus_team`, and its 11 unit tests.
 - `./supervisor.rs` → `SupervisorConfig` (+ `new`, `Debug`), `SupervisorAgent::create`, `create_supervisor`, sub-agent validation, the provider/bind hook, and its 8 unit tests.
 - `./tools.rs` → `HierarchicalToolsConfig` (+ `new`), `shape_input`, `HierarchicalToolsStrategy` (queueing, lazy wiring/pinning, readiness, `invoke`, bus-free `stream`), `hierarchical_tools_team`, and its 20 unit tests.
 
@@ -153,8 +152,8 @@ An agent stream failure is swallowed into one `{"type":"message","index":0,"payl
 - `supervisor.rs` in-module (8): `SupervisorConfig::new` defaults (1), the validation messages for empty/blank/duplicate cards (3), the returned card's serde round-trip (1), a fresh tool-hosting instance per provider call (1), a bind that registers nothing and is idempotent (1), and the `max_parallel_sub_agents = 0` clamp (1).
 - `tools.rs` in-module (20): config defaults/`new`/serde (3), `kind()` (1), queueing and removal bookkeeping (2), readiness (3), `shape_input` for objects/scalars/null (2), setup wiring, pinning, reuse, and the two skip paths (4), `invoke` to the root (1), frame forwarding, error-frame swallow, and readiness-as-error-item (3), and the team builder (1).
 - `cargo test -p openjiuwen-multiagent --offline --lib hierarchical` runs these 39 unit tests; they need no runtime feature beyond tokio's test runtime.
-- `../../tests/hierarchical.rs` holds 21 integration tests in one shared config test plus three groups: msgbus (7), agents as tools (8), supervisor factory (5).
-- The msgbus group pins both readiness errors verbatim, the verbatim input and child `parent_id()` of the single P2P hop, deadline adoption and the no-deadline pass-through, the exactly-one `{"type":"message","index":0,"payload":{"output":..}}` stream frame, and the per-invoke `ErrorKind::Timeout`.
+- `../../tests/hierarchical.rs` holds 23 integration tests in one shared config test plus three groups: msgbus (9), agents as tools (8), supervisor factory (5).
+- The msgbus group pins both readiness errors verbatim (as `invoke` errors and as the stream's only error item), the verbatim input and child `parent_id()` of the single P2P hop, deadline adoption and the no-deadline pass-through, the exactly-one `{"type":"message","index":0,"payload":{"output":..}}` stream frame, and the per-invoke `ErrorKind::Timeout`.
 - The agents-as-tools group pins `RecordingToolHost` mounts in member order, one provider resolution across two invocations (pinning), mounted-tool dispatch through the runtime, the shaped root input for objects and scalars, both root readiness errors, and the single error frame after an agent failure.
 - The supervisor group pins the empty-agent validation, the returned card round-trip, one end-to-end tool-call run over the bus, the model-visible tool cards (`function.name`/`description`/`parameters` plus the empty-object fallback), and that parallel budgets `0` and `1` both dispatch.
 

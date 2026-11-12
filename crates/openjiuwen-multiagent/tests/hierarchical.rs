@@ -231,6 +231,51 @@ async fn msgbus_invoke_honours_the_per_invoke_deadline() {
     assert!(error.message().contains("timed out after"), "{error}");
 }
 
+#[tokio::test]
+async fn stream_reports_an_unregistered_supervisor_as_the_only_error() {
+    let config = HierarchicalMsgbusConfig::new(agent_card("boss"));
+    let team = hierarchical_msgbus_team(TeamCard::new("hier-msg-stream-noboss"), config);
+    team.add_agent(agent_card("worker"), provider(FakeAgent::echoing("worker")))
+        .unwrap();
+
+    let mut frames = team.stream(
+        json!({"conversation_id": "hier-msg-stream-noboss-1", "query": "hi"}),
+        None,
+    );
+    let error = frames.next().await.expect("one error item").unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert_eq!(
+        error.message(),
+        "Supervisor 'boss' is not registered in runtime. Call \
+         add_agent(supervisor_card, supervisor_provider) before invoke()/stream()."
+    );
+    assert!(
+        frames.next().await.is_none(),
+        "the readiness failure is the stream's only item"
+    );
+}
+
+#[tokio::test]
+async fn stream_reports_an_empty_supervisor_id_as_the_only_error() {
+    let config = HierarchicalMsgbusConfig::new(blank_card());
+    let team = hierarchical_msgbus_team(TeamCard::new("hier-msg-stream-nosup"), config);
+
+    let mut frames = team.stream(
+        json!({"conversation_id": "hier-msg-stream-nosup-1", "query": "hi"}),
+        None,
+    );
+    let error = frames.next().await.expect("one error item").unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert_eq!(
+        error.message(),
+        "No supervisor configured in HierarchicalTeamConfig."
+    );
+    assert!(
+        frames.next().await.is_none(),
+        "the readiness failure is the stream's only item"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // tools: agents as tools
 // ---------------------------------------------------------------------------

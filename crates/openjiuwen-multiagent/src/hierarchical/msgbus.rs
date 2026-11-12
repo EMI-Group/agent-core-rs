@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::{AgentTeamSession, Session, StreamItem};
@@ -203,16 +203,22 @@ impl TeamStrategy for HierarchicalMsgbusStrategy {
 
     /// Sends the input to the supervisor and streams its single result frame.
     ///
-    /// The run task writes exactly one `message` frame carrying
-    /// `{"output": <result>}` when the supervisor answered with a non-null
-    /// value; a send failure is surfaced after the frames like any other
-    /// strategy error.
+    /// Readiness is checked before the first frame: an empty supervisor id or an
+    /// unregistered supervisor is surfaced as the stream's single error item and
+    /// then the stream ends (Python parity: `HierarchicalTeam.stream` raises on
+    /// the first `__anext__`). On the successful path the run task writes
+    /// exactly one `message` frame carrying `{"output": <result>}` when the
+    /// supervisor answered with a non-null value; a send failure is surfaced
+    /// after the frames like any other strategy error.
     fn stream(
         &self,
         ctx: &StrategyContext,
         input: Value,
         session: Option<Arc<AgentTeamSession>>,
     ) -> BoxStream<'static, Result<Value>> {
+        if let Err(error) = self.check_ready(ctx) {
+            return futures::stream::once(async move { Err(error) }).boxed();
+        }
         let run_runtime = Arc::clone(&ctx.runtime);
         let supervisor_id = self.supervisor_id.clone();
         let sender = ctx.card.id.clone();
