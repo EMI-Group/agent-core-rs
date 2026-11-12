@@ -24,6 +24,7 @@ pub mod rule_based;
 pub mod vendors;
 
 pub use api::{ApiModelBackend, ApiModelBackendConfig, ModerationRequest, ModerationTransport};
+pub use http::{HttpAuth, HttpModerationConfig, HttpModerationTransport};
 pub use llm::{LlmPromptInjectionBackend, LlmPromptInjectionBackendConfig};
 pub use local::{LocalModelBackend, LocalModelBackendConfig, ModelInfo};
 pub use rule_based::{RuleBasedBackendConfig, RuleBasedPromptInjectionBackend};
