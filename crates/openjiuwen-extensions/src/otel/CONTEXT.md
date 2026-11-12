@@ -184,7 +184,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 
 ## Constraints
 
-- `otel` feature deps: `opentelemetry`, `opentelemetry_sdk`, `tracing-opentelemetry`, `tracing-subscriber`, `chrono`, `serde_json`, `tokio` (unused by this module), `openjiuwen-core`.
+- `otel` feature deps: `opentelemetry`, `opentelemetry_sdk`, `tracing-opentelemetry`, `tracing-subscriber`, `chrono`; `serde_json`, `openjiuwen-core`, and `tracing` are unconditional crate dependencies.
 - The provider is per-handle, never the process-global `opentelemetry::global` provider (Python keeps a private provider too); `TracerHandle::shutdown` calls `SdkTracerProvider::shutdown` and is idempotent.
 - OTLP export is deferred: `ExporterType::Otlp` → `Error::Unsupported("OTLP span export is deferred; use ExporterType::Memory/Console or inject a SpanExporter")`. `Console` uses an in-crate line-per-span exporter writing through `tracing` at `debug` (no stdout writes).
 - Tests must not read the real clock for assertions: elapsed/start-time assertions only check presence/format.
@@ -201,7 +201,7 @@ pub fn tracing_layer<S>(tracer: SdkTracer) -> tracing_opentelemetry::OpenTelemet
 - Unit tests beside `redaction.rs` (all `test_redaction.py` cases: exact truncation marker, hash formula, field override truth table, system-prompt non-truncation), `span_names.rs` (every naming rule), `config.rs` (sample-rate validation, env toggle precedence), `handle.rs` (no-op vs active), `attrs.rs`, `llm_attrs.rs`.
 - Every test module always calls `force_flush()` before reading captured `SpanData`; Python counterparts are named in comments.
 - `./mod.rs` module docs carry three doctests that compile as external crates: the seam (`init_otel_tracer` active/inactive), the `TraceSink` integration (one exported `chat {model}` span from a terminal frame), and the typed handlers (LLM span attributes + `bug #2046` tool dedup, and the workflow buffer flush); the handler examples are wrapped in `# #[cfg(feature = "otel")] # { .. # }` so the default build stays green.
-- `./tests/otel.rs` (`#![cfg(feature = "otel")]`) and `./tests/otel_seam.rs` live in the crate's integration-test directory (outside this node).
+- The crate-level integration suites `crates/openjiuwen-extensions/tests/otel.rs` (`#![cfg(feature = "otel")]`) and `tests/otel_seam.rs` do not exist yet: `tests/` sits outside this node, so the three `mod.rs` doctests carry the same public-surface assertions from outside the crate until a crate-level agent adds them.
 
 ## Routing Table
 
