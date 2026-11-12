@@ -288,6 +288,8 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 ## Notes for Agents
 
 - `graph`/`workflow` should take `Arc<WorkflowState>` from `WorkflowSession::state()` for the io/workflow lanes and staging; the `Session` trait intentionally exposes only global + component state.
+- `AgentSession` is a state/stream/trace container only: it stores no conversation history or message list, and this crate has no `AgentStreamMode`, `StreamData`, or agent-chunk type — agent crates push chunks as `StreamItem::output`/`output_at`/`custom` frames.
+- `AgentSessionOptions` has no `config` field: a fresh session gets `SessionConfig::new()` (env-seeded, then `options.envs` applied) or inherits the parent's config; afterwards it is mutable only through `Session::config()` (`Arc<parking_lot::RwLock<SessionConfig>>`).
 - Sessions write the committed global lane through `StateStore::write_global`; `update_global` keeps Python's staging behavior for graph/workflow commit cycles — do not swap the two.
 - Use `StreamWriterManager::write_now` (and `StreamHub::send_now`) from synchronous code such as trace sinks and callbacks; use `write`/`send` in async code. Both are non-blocking.
 - `request_interaction` only completes when another task calls `resolve_interaction` (normally the host transport reading `__interaction__` frames); seeded `InteractiveInput::interrupt_answers` short-circuit it on resume.
