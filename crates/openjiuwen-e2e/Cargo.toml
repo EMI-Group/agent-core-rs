@@ -8,18 +8,37 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# The crate is a scenario harness: its `src/lib.rs` is a marker module and every
+# line of behaviour lives in an integration-test binary under `tests/`.
+# Dependencies therefore sit here (not under `[dev-dependencies]`) so that the
+# `a2a`/`otel` features can enable features of the same crates unambiguously.
 [dependencies]
 openjiuwen.workspace = true
+openjiuwen-harness.workspace = true
+openjiuwen-harness-protocol.workspace = true
+openjiuwen-harness-providers.workspace = true
+openjiuwen-agent-teams.workspace = true
+openjiuwen-extensions.workspace = true
+openjiuwen-symphony.workspace = true
+openjiuwen-rsi.workspace = true
+openjiuwen-agent-evolving.workspace = true
 openjiuwen-test-support.workspace = true
-tokio.workspace = true
-serde_json.workspace = true
 anyhow.workspace = true
-tempfile.workspace = true
-futures.workspace = true
 async-trait.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [features]
 default = []
+# Enables the A2A client/server scenario (`tests/a2a_roundtrip.rs`).
+a2a = ["openjiuwen/a2a", "openjiuwen-extensions/a2a"]
+# Declared for parity with the umbrella; the OTel seam is covered by the
+# `openjiuwen-extensions` unit tests and has no cross-crate scenario here.
+otel = ["openjiuwen/otel", "openjiuwen-extensions/otel"]
 
 [lints]
 workspace = true
