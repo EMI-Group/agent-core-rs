@@ -639,3 +639,25 @@ async fn agent_runner_feeds_case_inputs_and_scores_cancellation() {
     assert!(error.is_cancelled(), "unexpected error: {error}");
     assert_eq!(agent.invocations(), 1);
 }
+
+#[tokio::test]
+async fn default_evaluator_is_reachable_from_the_crate_root() {
+    // The crate root re-exports the primary evaluator types.
+    let evaluator = openjiuwen_agent_evolving::DefaultEvaluator::new("accuracy");
+    assert_eq!(evaluator.name(), "default");
+    assert_eq!(evaluator.metric(), "accuracy");
+    assert_eq!(
+        openjiuwen_agent_evolving::CRATE_NAME,
+        "openjiuwen-agent-evolving"
+    );
+
+    let error = evaluator
+        .evaluate(&answer_case("case-1", "4"), &Value::Null)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Unsupported(message)
+            if message.contains("DefaultEvaluator") && message.contains("docs/PARITY.md")),
+        "unexpected error: {error}"
+    );
+}

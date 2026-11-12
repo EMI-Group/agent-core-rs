@@ -75,7 +75,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub use metrics::{
-    Aggregate, ExactMatchMetric, LlmAsJudgeMetric, Metric, MetricEvaluator, MetricValue,
+    Aggregate, DefaultEvaluator, ExactMatchMetric, LlmAsJudgeMetric, Metric, MetricEvaluator,
+    MetricValue,
 };
 pub use runner::{AgentCaseRunner, MapCaseRunner};
 

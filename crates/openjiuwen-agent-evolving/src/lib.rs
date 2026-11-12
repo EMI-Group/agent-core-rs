@@ -56,3 +56,40 @@ pub mod rl;
 pub mod service;
 /// Bounded train/evaluate loop, progress, callbacks, and reports.
 pub mod trainer;
+
+/// The crate name as reported by Cargo.
+pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+/// The crate version as reported by Cargo.
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Case datasets: `Case`, `EvaluatedCase`, `CaseLoader`, JSON/JSONL loading.
+pub use dataset::{
+    load_cases_from_path, parse_cases_json, parse_cases_jsonl, parse_cases_str, shuffle_cases,
+    split_cases, Case, CaseFormat, CaseLoader, EvaluatedCase,
+};
+/// Evaluator/metric/runner seams, reports, and offline scoring.
+pub use evaluator::{
+    evaluate_cases, AgentCaseRunner, Aggregate, CaseRunner, DefaultEvaluator, EvaluationConfig,
+    EvaluationReport, Evaluator, ExactMatchMetric, LlmAsJudgeMetric, MapCaseRunner, Metric,
+    MetricEvaluator, MetricValue,
+};
+/// Candidates, the optimizer baseline, and checkpoints/stores/manager.
+pub use optimizer::{
+    select_best, BestSoFar, Candidate, CheckpointManager, CheckpointSnapshot, CheckpointStore,
+    DefaultCheckpointManager, EvolveCheckpoint, FileCheckpointStore, GridSearchOptimizer,
+    LlmInvokePolicy, MemoryCheckpointStore, Optimizer, ParameterSpace, RestoredState,
+};
+/// Pure evolution events, observer trait, and harness rail adapter.
+pub use rails::{
+    registerable_rail, EvolutionEvent, EvolutionObserver, EvolutionRailSpec, HarnessEvolutionRail,
+    EVOLUTION_PRIORITY,
+};
+/// Axum RL service skeleton (health/evaluate, 501 RL endpoints).
+pub use service::{
+    build_router, serve, ApiError, EvaluateRequest, EvaluateResponse, RlServiceConfig,
+};
+/// Bounded train/evaluate loop, progress, callbacks, and reports.
+pub use trainer::{
+    Callbacks, EpochReport, NoopCallbacks, Progress, StopReason, TrainableTarget, Trainer,
+    TrainerConfig, TrainerReport,
+};

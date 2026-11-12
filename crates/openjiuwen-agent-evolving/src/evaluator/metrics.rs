@@ -191,6 +191,47 @@ impl Metric for LlmAsJudgeMetric {
     }
 }
 
+/// The deferred default (model-judge) evaluator.
+///
+/// Python: `openjiuwen.agent_evolving.evaluator.evaluator.DefaultEvaluator`.
+/// Python scores cases by calling a live model with a judge prompt, which needs
+/// provider credentials and is non-deterministic; this crate keeps the type and
+/// returns [`Error::Unsupported`] instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultEvaluator {
+    metric: String,
+}
+
+impl DefaultEvaluator {
+    /// Creates the stub evaluator for the named metric.
+    #[must_use]
+    pub fn new(metric: impl Into<String>) -> Self {
+        Self {
+            metric: metric.into(),
+        }
+    }
+
+    /// The metric name the Python evaluator would have scored with.
+    #[must_use]
+    pub fn metric(&self) -> &str {
+        &self.metric
+    }
+}
+
+#[async_trait]
+impl Evaluator for DefaultEvaluator {
+    fn name(&self) -> &'static str {
+        "default"
+    }
+
+    async fn evaluate(&self, case: &Case, prediction: &Value) -> Result<EvaluatedCase> {
+        let _ = (case, prediction);
+        Err(Error::unsupported(
+            "DefaultEvaluator is deferred: it requires a live model judge and is non-deterministic; see docs/PARITY.md",
+        ))
+    }
+}
+
 /// How [`MetricEvaluator`] turns the ordered metric values into one score.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -456,6 +497,27 @@ mod tests {
         );
         assert_eq!(LlmAsJudgeMetric::new().name(), "llm_as_judge");
         assert!(LlmAsJudgeMetric::new().higher_is_better());
+    }
+
+    #[tokio::test]
+    async fn default_evaluator_is_an_unsupported_stub() {
+        let evaluator = DefaultEvaluator::new("accuracy");
+        assert_eq!(evaluator.name(), "default");
+        assert_eq!(evaluator.metric(), "accuracy");
+        assert_eq!(DefaultEvaluator::default().metric(), "");
+
+        let error = evaluator
+            .evaluate(
+                &case(map("answer", Value::String("x".to_owned()))),
+                &Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Unsupported(message)
+                if message.contains("DefaultEvaluator") && message.contains("docs/PARITY.md")),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
