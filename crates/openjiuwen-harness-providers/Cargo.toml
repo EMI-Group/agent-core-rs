@@ -12,14 +12,20 @@ publish = false
 openjiuwen-harness-protocol.workspace = true
 openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
+openjiuwen-agent.workspace = true
+openjiuwen-session.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
 async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
-uuid.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+openjiuwen-test-support.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
 
 [features]
 default = ["native"]
