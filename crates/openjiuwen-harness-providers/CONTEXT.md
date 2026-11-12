@@ -65,7 +65,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 
 - `./src/lib.rs` → crate docs, module declarations, feature flags, flat re-exports
 - `./src/provider.rs` → `ProviderSpec`, wrappers, `ProviderDescriptor`, provider-name constants
-- `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `build_harness_context`
+- `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter.rs` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `ProviderInteractionHandler`, event→chunk projection, interaction routing
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
@@ -87,6 +87,9 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - The registry is global (like Python's module dict) to keep CLI/agent-teams call sites identical; tests use unique provider names instead of a reset hook.
 - `HarnessIOAdapter::outputs` is single-consumer and returns `HarnessError::State` on a second call — the Rust equivalent of Python's one async generator fed by the pump task.
 - Approval answers are ported as data: `"yes"`/`"always"`/`"no"` words, `{"action": …}`, `{"approved": …, "feedback": …}`, `{"updated_arguments": …}` and `{"remember": true}`; every unrecognized shape becomes `Deny`.
+- `build_harness_context` **drops** `options.mcp_servers` for the `native` provider and never injects `HostCapability::McpServers` there (the native harness owns its tools, Python raises); every other provider gets the servers copied plus the capability when the list is non-empty, and a checkpoint sink always injects `HostCapability::CheckpointSink`.
+- Declared provider descriptors are static metadata: vendor names stay `implemented: false` even with the `vendor` feature, and feature flags never rewrite an entry (`resolve_provider` reports the missing feature instead).
+- Registry names are unique per test because the registry is process-global; `src/factory/tests.rs` uses `uuid`-derived names and never resets the map.
 - `to_json_safe` is an identity in Rust (values are already JSON-safe); `to_json_object` wraps non-objects as `{"value": …}`. Documented deviation.
 - `install_skills` keeps Python's safety rules (reject escaping paths, reject non-regular files, atomic stage-then-rename) but materializes internal symlinks by copying through them instead of recreating them.
 
