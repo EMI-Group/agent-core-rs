@@ -233,8 +233,14 @@ mod tests {
         assert!(!queues.has_steering());
         assert!(!queues.is_empty());
 
-        assert_eq!(queues.pop_follow_up().map(|i| i.content().to_string()), Some("first".to_string()));
-        assert_eq!(queues.pop_follow_up().map(|i| i.content().to_string()), Some("second".to_string()));
+        assert_eq!(
+            queues.pop_follow_up().map(|i| i.content().to_string()),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            queues.pop_follow_up().map(|i| i.content().to_string()),
+            Some("second".to_string())
+        );
         assert!(queues.pop_follow_up().is_none());
         assert!(queues.is_empty());
     }
@@ -282,7 +288,10 @@ mod tests {
         let queues = LoopQueues::default();
         queues.push_follow_up("a");
         queues.push_follow_up("b");
-        assert_eq!(queues.follow_up_contents(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            queues.follow_up_contents(),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(queues.follow_up_len(), 2);
         queues.clear();
         assert!(queues.follow_up_contents().is_empty());

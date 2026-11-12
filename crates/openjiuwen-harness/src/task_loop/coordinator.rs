@@ -147,10 +147,7 @@ impl LoopCoordinator {
     /// `extra` supplied by the caller survives while loop bookkeeping stays
     /// authoritative. Evaluators are stateful: call either this or
     /// [`Self::should_continue`], never both, for one loop pass.
-    pub async fn evaluate(
-        &mut self,
-        context: &mut StopEvaluationContext,
-    ) -> Option<StopVerdict> {
+    pub async fn evaluate(&mut self, context: &mut StopEvaluationContext) -> Option<StopVerdict> {
         self.refresh(context);
         let mut verdict = None;
         for evaluator in &mut self.evaluators {
@@ -291,10 +288,7 @@ impl LoopCoordinator {
             .get("iteration")
             .and_then(Value::as_u64)
             .map_or(0, |value| usize::try_from(value).unwrap_or(usize::MAX));
-        self.token_usage = data
-            .get("token_usage")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        self.token_usage = data.get("token_usage").and_then(Value::as_u64).unwrap_or(0);
         self.stop_reason = data
             .get("stop_reason")
             .and_then(Value::as_str)
@@ -338,8 +332,8 @@ mod tests {
 
     use super::{default_evaluators, LoopCoordinator, DEFAULT_MAX_OUTER_ROUNDS};
     use crate::schema::{
-        CustomPredicate, NoProgressAnswer, StopConditionEvaluator, StopConditionState,
-        StopEvaluationContext, TaskLoopNoProgressGuardConfig,
+        CustomPredicate, NoProgressAnswer, StopConditionState, StopEvaluationContext,
+        TaskLoopNoProgressGuardConfig,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -355,7 +349,8 @@ mod tests {
     #[test]
     fn default_evaluators_follow_guard_flag() {
         let enabled = TaskLoopNoProgressGuardConfig::default();
-        let names: Vec<&str> = default_evaluators(&enabled)
+        let evaluators = default_evaluators(&enabled);
+        let names: Vec<&str> = evaluators
             .iter()
             .map(|evaluator| evaluator.name())
             .collect();
