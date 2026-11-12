@@ -29,7 +29,7 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// Number of leading lines read when probing a `SKILL.md` front matter.
 ///
 /// Python reads the first 64 lines (`read_file(..., head=64)`); a fence beyond that
-/// boundary is recovered by [`read_front_matter_text`] through a whole-file re-read.
+/// boundary is recovered by `read_front_matter_text` through a whole-file re-read.
 pub const FRONT_MATTER_PROBE_LINES: usize = 64;
 
 /// Front-matter metadata of a `SKILL.md` file.

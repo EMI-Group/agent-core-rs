@@ -83,7 +83,7 @@ pub struct BashArgs {
     /// Interpreter selection: `auto`, `cmd`, `powershell`, `bash` or `sh`.
     ///
     /// The schema is declared as a string and gets its enum members from
-    /// [`install_shell_type_enum`]: a `$ref` into `$defs` would be stripped by
+    /// `install_shell_type_enum`: a `$ref` into `$defs` would be stripped by
     /// [`schema_for`] and leave a dangling reference in the card.
     #[serde(default, deserialize_with = "deserialize_shell_type")]
     #[schemars(with = "String")]
@@ -93,7 +93,7 @@ pub struct BashArgs {
 impl BashArgs {
     /// The timeout to apply, in seconds.
     ///
-    /// `None` and `0` select [`DEFAULT_TIMEOUT_SECS`]; anything else is clamped into
+    /// `None` and `0` select `DEFAULT_TIMEOUT_SECS`; anything else is clamped into
     /// `1..=3600`.
     #[must_use]
     pub fn resolve_timeout(&self) -> u64 {
@@ -105,8 +105,8 @@ impl BashArgs {
 
     /// The output budget to apply, in characters.
     ///
-    /// `None` selects [`DEFAULT_MAX_OUTPUT_CHARS`]; `0` means unlimited; any other value is
-    /// raised to at least [`MIN_MAX_OUTPUT_CHARS`] so a tiny budget cannot hide all output.
+    /// `None` selects `DEFAULT_MAX_OUTPUT_CHARS`; `0` means unlimited; any other value is
+    /// raised to at least `MIN_MAX_OUTPUT_CHARS` so a tiny budget cannot hide all output.
     #[must_use]
     pub fn resolve_max_output_chars(&self) -> u64 {
         match self.max_output_chars {
@@ -187,7 +187,7 @@ impl BashTool {
 
     /// Renders the Python `BashTool` result block.
     ///
-    /// An empty stream renders as [`EMPTY_STREAM`], so the model always sees which of the
+    /// An empty stream renders as `EMPTY_STREAM`, so the model always sees which of the
     /// two streams produced output.
     #[must_use]
     pub fn render_content(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> String {

@@ -44,7 +44,7 @@ pub struct TaskTool {
 impl TaskTool {
     /// Builds the tool over `runtime` in the default language.
     ///
-    /// The delegation ceiling is read from [`TIMEOUT_ENV`] on construction.
+    /// The delegation ceiling is read from `TIMEOUT_ENV` on construction.
     #[must_use]
     pub fn new(runtime: Arc<SubAgentRuntime>) -> Self {
         let raw = std::env::var(TIMEOUT_ENV).ok();
