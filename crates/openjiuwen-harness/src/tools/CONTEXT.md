@@ -14,7 +14,8 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `tool_names() -> &'static [&'static str]` — the model-facing names in registry order.
 - `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `user_asker()`, `memory_backend()`, `todo_dir()`, `tools()`.
 - `build()` yields one `Arc<dyn Tool>` per selected variant in `self.tools` order; the four todo tools share one `Arc<TodoStore>` created lazily once per call (`todo_dir` when set, else `TodoStore::for_workspace`), and the filesystem tools share the registry's `ReadStateRegistry`.
-- `cards(language)` maps `self.tools` through `card(tool, language)`, which returns the owning module's real `card_for` (full `schemars` schema), never a placeholder.
+- `cards(language)` maps `self.tools` through `card(tool, language)`, which returns the owning module's real `card_for`, never a placeholder.
+- Card schemas are Python-shaped: `schemars` output with `$schema`/`title`/`$defs` stripped, every `$ref` inlined (`todo` and `ask_user` post-process theirs), and `required` narrowed to Python's list; no card contains a dangling reference.
 - The public API of every tool module is re-exported here (`AskUserTool`/`UserAsker`, `MemoryTool`/`MemoryToolBackend`/`MemoryToolKind`, `BashTool`, the read/write/edit/glob/list/grep tools and their arg structs, the todo store/tools); `support` and `read_state` helpers are re-exported as well, so upper layers import from `crate::tools` only.
 - The registry never builds `task`/subagent tools (they live in `crate::subagents`).
 
@@ -147,3 +148,4 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `tests.rs` also asserts the exact model-facing names, per-tool `required` lists, `parallel_safe` flags and `input_params` shape.
 - All tests are offline and deterministic: `tempfile` workspaces, fake `UserAsker`/`MemoryToolBackend` implementations, no network, no reliance on `rg`/`git` binaries.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
+- Current counts: 613 unit tests plus 6 doc tests, all four gates clean; every file in this subtree is under the 1000-line baseline.
