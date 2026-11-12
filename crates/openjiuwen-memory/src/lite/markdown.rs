@@ -756,7 +756,7 @@ fn trim_blank_edges<S: AsRef<str>>(lines: &[S]) -> String {
         .unwrap_or(first);
     lines[first..=last]
         .iter()
-        .map(|line| line.as_ref())
+        .map(AsRef::as_ref)
         .collect::<Vec<&str>>()
         .join("\n")
 }
@@ -822,7 +822,7 @@ mod tests {
         assert_eq!(document.front_matter().get("schema"), Some(SCHEMA_MARKER));
         assert_eq!(document.front_matter().get("version"), Some(FORMAT_VERSION));
         assert!(document.is_empty());
-        assert!(document.facts().is_empty());
+        assert_eq!(document.facts(), Vec::<CodingFact>::new());
         assert_eq!(
             document.render(),
             "---\nschema: openjiuwen-memory-lite\nversion: 1\n---\n\n# Memory\n"
@@ -869,7 +869,7 @@ mod tests {
         for text in ["", "\n", "   \n\n\t\n"] {
             let document = MarkdownMemory::parse(text).unwrap();
             assert!(document.is_empty());
-            assert!(document.facts().is_empty());
+            assert_eq!(document.facts(), Vec::<CodingFact>::new());
             // Rendering an empty document still emits the canonical header.
             assert!(document.render().ends_with("# Memory\n"));
         }
