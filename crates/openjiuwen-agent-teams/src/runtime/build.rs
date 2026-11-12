@@ -1,24 +1,25 @@
-//! The blueprint → runtime build path: [`TeamAgentSpec::build`] and [`TeamAgentSpec::build_with`].
+//! The blueprint → runtime build path: [`SpecBuild::build`] and [`SpecBuild::build_with`].
 //!
 //! Python parity source: `openjiuwen/agent_teams/agent/agent_configurator.py`, the wiring
 //! `TeamAgent.__init__` performs. The build order is pinned by `src/runtime/CONTEXT.md`
 //! §"Build path":
 //!
-//! 1. [`TeamAgentSpec::validate`] — reserved names and the dispatch/bootstrap pairing.
-//! 2. The runtime mirror ([`TeamSpec`]) and the resolved language.
+//! 1. [`TeamAgentSpec::validate`](crate::schema::TeamAgentSpec::validate) — reserved names and the
+//!    dispatch/bootstrap pairing.
+//! 2. The runtime mirror ([`TeamSpec`](crate::schema::TeamSpec)) and the resolved language.
 //! 3. One store (injected, never a second one), one in-process transport, one activity registry.
 //! 4. [`TeamBackend`] over the store, board, transport, spawner and workspace provider; the team
 //!    row is written before any member row.
 //! 5. The leader row, its workspace and its harness, then the observer that feeds the chunk
 //!    fan-out and the activity registry.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
-//! 7. One bus subscription for the leader (drained only by [`super::leader`]) and the interaction
-//!    gate/inbox.
+//! 7. One bus subscription for the leader (drained only by [`leader`](crate::runtime::leader)) and
+//!    the interaction gate/inbox.
 //!
 //! The build always produces the *leader* handle: a teammate is not a second public constructor but
-//! a [`TeamMember`] whose runtime is materialized by `TeamAgent::spawn_member` through the same
-//! harness-factory seam. The role field exists because the shared run loop and the adapter must
-//! know which half of the contract they are executing.
+//! a [`TeamMember`](crate::member::TeamMember) whose runtime is materialized by
+//! `TeamAgent::spawn_member` through the same harness-factory seam. The role field exists because
+//! the shared run loop and the adapter must know which half of the contract they are executing.
 //!
 //! # Async build
 //!

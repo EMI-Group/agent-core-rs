@@ -1,9 +1,11 @@
-//! The harness-backed [`MemberSpawner`]: one member's cold spec in, a live member runtime out.
+//! The harness-backed [`MemberSpawner`](crate::member::MemberSpawner): one member's cold spec in,
+//! a live member runtime out.
 //!
 //! Python parity source: `openjiuwen/agent_teams/spawn/inprocess_spawn.py`, which builds a
 //! teammate `TeamAgent` from the blueprint before wrapping it in an `asyncio.Task`. The Rust port
 //! splits that in two: this spawner materializes the member's *brain* through the injected
-//! [`MemberHarnessFactory`] and returns it as a [`MemberRuntime`]; owning the driving task is the
+//! [`MemberHarnessFactory`](crate::harness::MemberHarnessFactory) and returns it as a
+//! [`MemberRuntime`](crate::member::MemberRuntime); owning the driving task is the
 //! caller's job (`InProcessSpawnHandle` / `TeamBackend`).
 //!
 //! The spawner is deliberately stateless beyond its three injected values — the blueprint, the
