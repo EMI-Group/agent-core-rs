@@ -50,6 +50,35 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// The crate version.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// --- third-party re-exports -------------------------------------------------
+
+/// Re-export of the [`async_trait`] crate so downstream hand-written [`Tool`] or
+/// [`Model`] implementations can reach the attribute macro without adding
+/// `async-trait` as a direct dependency.
+///
+/// This is a crate re-export, so the macro is addressed through the nested path
+/// (`#[openjiuwen_foundation::async_trait::async_trait]`); this crate does not
+/// flatten it into `#[openjiuwen_foundation::async_trait]`.
+///
+/// ```
+/// #[openjiuwen_foundation::async_trait::async_trait]
+/// trait Double {
+///     async fn double(&self, value: i32) -> i32;
+/// }
+///
+/// struct Doubler;
+///
+/// #[openjiuwen_foundation::async_trait::async_trait]
+/// impl Double for Doubler {
+///     async fn double(&self, value: i32) -> i32 {
+///         value * 2
+///     }
+/// }
+///
+/// # fn main() {}
+/// ```
+pub use async_trait;
+
 // --- messages and prompts ---------------------------------------------------
 
 pub use prompt::{

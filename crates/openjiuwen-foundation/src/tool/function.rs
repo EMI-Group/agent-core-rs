@@ -22,23 +22,32 @@
 //!
 //! # The `#[tool]` macro contract
 //!
-//! The `openjiuwen-macros` `#[tool]` attribute expands to exactly this builder
-//! chain, where `Args` derives `serde::Serialize + serde::Deserialize +
-//! schemars::JsonSchema`:
+//! The `openjiuwen-macros` `#[tool]` attribute does **not** emit the fallible
+//! builder chain. It generates a wrapper struct holding a [`FunctionTool`] whose
+//! `new()` builds the card and the boxed handler directly, then wraps them with
+//! [`FunctionTool::new`] (infallible, so no `Result` is involved). The generated
+//! code is equivalent to:
 //!
 //! ```ignore
-//! // inside a function returning `Result<FunctionTool>`, because `build` is fallible
-//! FunctionTool::builder()
-//!     .name(<fn name>)
-//!     .description(<doc comment>)
-//!     .input_schema(schema_for::<Args>())
-//!     .typed_handler::<Args, _, _, _>(<fn>)
-//!     .build()
+//! // `Args` derives `serde::Deserialize + schemars::JsonSchema`
+//! let card = ToolCard::new(Self::NAME, Self::DESCRIPTION, schema_for::<Args>())
+//!     /* .with_* policy chain for the attributes that were supplied */;
+//! let handler: ToolHandler = Arc::new(|inputs: Value, ctx: ToolContext| {
+//!     Box::pin(async move { /* deserialize `Args`, call the fn, serialize the output */ })
+//! });
+//! Self { inner: FunctionTool::new(card, handler) }
 //! ```
 //!
-//! [`FunctionToolBuilder::build`] returns [`Result`], so the macro emits the chain
-//! as the tail expression of a function whose return type is
-//! `Result<FunctionTool>` (or `?`-propagates it).
+//! The wrapper's `Tool` impl is annotated with `#[::async_trait::async_trait]`,
+//! so a consumer crate whose tools are macro-generated needs `async-trait` in
+//! its own dependencies (the absolute `::async_trait::` path does not resolve
+//! through this crate). Hand-written `Tool` (or `Model`) impls can instead use
+//! the crate-root re-export, `#[openjiuwen_foundation::async_trait::async_trait]`,
+//! and skip the extra dependency.
+//!
+//! [`FunctionTool::builder`] remains the way to build a tool by hand; its
+//! [`FunctionToolBuilder::build`] returns [`Result`], which is why the macro
+//! avoids it.
 //!
 //! ```
 //! use openjiuwen_foundation::tool::function::FunctionTool;

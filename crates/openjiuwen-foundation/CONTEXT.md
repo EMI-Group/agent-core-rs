@@ -26,6 +26,7 @@ Tools (`tool`):
 - `Tool` trait: `card()`, `invoke(Value, &ToolContext)`, `stream(Value, ToolContext)` (default = single invoke), `render_for_llm(&Value)`.
 - `ToolContext { session_id, invocation_id, cancellation, metadata, timeout }`, `ToolOutput`, `render_payload_text`, `render_tool_output`.
 - `FunctionTool` + `FunctionToolBuilder` (`handler`, `typed_handler`, `input_schema`, `input_schema_for::<T>`), `schema_for::<T>`, `validate_inputs`, `apply_defaults`.
+- Crate-root re-export `pub use async_trait;` so downstream hand-written `Tool`/`Model` impls can write `#[openjiuwen_foundation::async_trait::async_trait]` without a direct `async-trait` dependency; macro-generated tools still reference `::async_trait::` and therefore need `async-trait` in the consumer crate.
 - `RestfulApiTool` + `RestfulApiConfig` + `ApiParamMapper`/`ParamLocation`.
 - `mcp` (feature `mcp`): `McpServerConfig`, `McpClientType`, `McpClient` trait, `connect_mcp_server`, `load_mcp_tools`, `McpTool`, `McpToolResult`.
 
