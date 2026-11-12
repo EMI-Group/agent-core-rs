@@ -13,7 +13,7 @@ mod presets;
 mod runtime;
 mod subagent_tools;
 mod task_tool;
-
+#[cfg(test)] mod test_support;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
