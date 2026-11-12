@@ -2253,6 +2253,7 @@ dependencies = [
  "futures",
  "openjiuwen-common",
  "openjiuwen-foundation",
+ "openjiuwen-session",
  "serde",
  "serde_json",
  "tempfile",
