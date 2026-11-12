@@ -67,7 +67,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `./src/provider.rs` → `ProviderSpec`, wrappers, `ProviderDescriptor`, provider-name constants
 - `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
-- `./src/io_adapter.rs` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `ProviderInteractionHandler`, event→chunk projection, interaction routing
+- `./src/io_adapter/` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler` (`mod.rs`), event→chunk projection (`projection.rs`), interaction routing and the pending map (`interactions.rs`), host-answer parsing (`answers.rs`)
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
 - `./src/decode.rs` → strict JSON mapping helpers shared by factory + vendor configs (unknown-key rejection, typed option decoding)
 - `./src/error.rs` → `HarnessError` → `openjiuwen_common::error::Error` translation

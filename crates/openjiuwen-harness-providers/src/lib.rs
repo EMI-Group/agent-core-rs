@@ -30,6 +30,8 @@
 //! - [`factory`] — the provider registry: registration, resolution, harness creation, the
 //!   model-configuration gates, provider descriptors and the harness-context builder.
 //! - [`input`] — harness input conversion, text projection and chunk-kind constants.
+//! - [`io_adapter`] — the harness IO adapter: lifecycle, the single-consumer event pump, event
+//!   to chunk projection, interaction routing and host answer parsing.
 //! - [`json`] — JSON projections (`to_json_safe`, `to_json_object`).
 //! - [`mcp_naming`] — the `<mcp-tools>` naming preamble for provider system prompts.
 //! - [`provider`] — the registered provider interface (`ProviderSpec`), its wrappers, the
@@ -38,15 +40,16 @@
 //!   stubs) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation.
 //!
-//! A later phase adds the IO adapter (`io_adapter`) that projects a harness onto the kernel IO
-//! surface; the strict JSON mapping helpers in the crate-internal `decode` module back its
-//! configuration decoders.
+//! The crate-internal `decode` module holds the strict JSON mapping helpers (unknown-key
+//! rejection, typed option decoding) shared by the factory and the provider configuration
+//! decoders.
 
 mod decode;
 
 pub mod error;
 pub mod factory;
 pub mod input;
+pub mod io_adapter;
 pub mod json;
 pub mod mcp_naming;
 pub mod provider;
@@ -63,6 +66,9 @@ pub use factory::{
 pub use input::{
     harness_input_text, to_harness_input, INTERACTION_KIND, INTERACTIVE_INPUT_KIND,
     TASK_FAILED_KIND, TURN_LIFECYCLE_KIND,
+};
+pub use io_adapter::{
+    EventObserver, HarnessIOAdapter, HarnessIOAdapterConfig, ProviderInteractionHandler,
 };
 pub use json::{to_json_object, to_json_safe};
 pub use mcp_naming::{mcp_tool_naming_preamble, TOOL_PLACEHOLDER};
