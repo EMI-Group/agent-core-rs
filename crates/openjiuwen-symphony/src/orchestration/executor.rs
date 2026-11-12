@@ -61,10 +61,12 @@
 //! # Seeding caller inputs
 //!
 //! [`PlanExecutor::execute`] has no caller-input parameter, so it runs the graph with an
-//! empty state: the overlay then starts from each predecessor's output only. A caller
-//! that must supply request inputs seeds the graph itself by invoking the compiled
-//! graph directly with `{"inputs": {...}}` (see [`PlanExecutor::compile`]); the executor
-//! documents that shape because [`PlanExecutor::execute`] never invents it.
+//! empty state: the overlay then starts from each predecessor's output only.
+//! [`PlanExecutor::execute_with_inputs`] is the same run with a caller-supplied seed: a
+//! non-`null` value is wrapped as the top-level `{"inputs": {...}}` object the overlay
+//! reads, while [`Value::Null`] keeps the empty state. A caller that needs full control
+//! can also invoke the compiled graph directly with that shape (see
+//! [`PlanExecutor::compile`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -347,8 +349,9 @@ impl PlanExecutor {
     /// Executes `plan`, returning one outcome per step.
     ///
     /// `session` defaults to a fresh [`WorkflowSession`] with a generated id. The graph
-    /// is seeded with an empty state; caller-supplied inputs reach the graph only when a
-    /// caller invokes the compiled graph directly with `{"inputs": {...}}`.
+    /// is seeded with an empty state, exactly like
+    /// [`Self::execute_with_inputs`] with [`Value::Null`] inputs; a caller that must
+    /// supply request inputs uses that method instead.
     ///
     /// A plan with no steps has nothing to run and returns an empty [`PlanExecution`].
     ///
@@ -364,6 +367,29 @@ impl PlanExecutor {
         capabilities: &[CapabilityDescriptor],
         session: Option<Arc<dyn Session>>,
     ) -> Result<PlanExecution> {
+        self.execute_with_inputs(plan, capabilities, Value::Null, session)
+            .await
+    }
+
+    /// Executes `plan` with caller-supplied `inputs` seeded into the graph state.
+    ///
+    /// A non-`null` `inputs` value is wrapped as the top-level `{"inputs": <inputs>}`
+    /// object the node overlay reads, so a root step's declared inputs are filled by the
+    /// caller and the overlay precedence of the module docs applies unchanged.
+    /// [`Value::Null`] seeds an empty state, which is exactly what [`Self::execute`]
+    /// does. Everything else — step records, failure handling, the default session —
+    /// matches [`Self::execute`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute`].
+    pub async fn execute_with_inputs(
+        &self,
+        plan: &OrchestrationPlan,
+        capabilities: &[CapabilityDescriptor],
+        inputs: Value,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<PlanExecution> {
         self.validate_plan(plan, capabilities)?;
         if plan.steps.is_empty() {
             return Ok(PlanExecution {
@@ -377,11 +403,7 @@ impl PlanExecutor {
         let graph = self.compile(plan, capabilities)?;
         let session = session.unwrap_or_else(default_session);
         let run = graph
-            .run(
-                Value::Object(Map::new()),
-                session,
-                ExecutionOptions::default(),
-            )
+            .run(seed_state(inputs), session, ExecutionOptions::default())
             .await
             .map_err(|error| trim_engine_context(plan, error))?;
 
@@ -490,6 +512,18 @@ impl std::fmt::Debug for PlanExecutor {
 /// Builds the default execution session.
 fn default_session() -> Arc<dyn Session> {
     Arc::new(WorkflowSession::new(uuid_hex())) as Arc<dyn Session>
+}
+
+/// Wraps caller-supplied inputs into the top-level state the node overlay reads.
+///
+/// A [`Value::Null`] seed produces the empty state `execute` always used; any other value
+/// becomes `{"inputs": <value>}`, which the overlay treats as the starting payload (a
+/// non-object seed is ignored there, so wrapping a scalar is harmless but pointless).
+fn seed_state(inputs: Value) -> Value {
+    match inputs {
+        Value::Null => Value::Object(Map::new()),
+        inputs => Value::Object(Map::from_iter([(SEED_INPUTS_KEY.to_string(), inputs)])),
+    }
 }
 
 /// Strips the graph engine's wrapper off a step failure.

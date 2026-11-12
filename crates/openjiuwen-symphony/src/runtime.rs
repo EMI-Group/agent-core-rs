@@ -1,1 +1,1046 @@
+//! The symphony composition root: configuration, lifecycle, graph build, plan, invoke,
+//! mutations, and evolution feedback.
+//!
+//! [`SymphonyRuntime`] wires the crate's parts into one engine: a [`CapabilityRegistry`]
+//! catalog, a [`GraphArtifactStore`] of immutable [`CapabilityGraph`] revisions, a
+//! [`Planner`], a [`CapabilityRunner`], and an optional [`SemanticIndex`]. Python's
+//! engine is host-driven and owns no composition root, so this type is the Rust port's.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! Created --start--> Running --stop/close--> Stopped --start--> Running
+//! ```
+//!
+//! [`SymphonyRuntime::start`] publishes the first revision when the store holds none,
+//! [`SymphonyRuntime::stop`] stops the engine, and [`SymphonyRuntime::close`] stops it and
+//! re-reads the current revision as a consistency check (the flush a caller awaits before
+//! dropping the runtime). `start` and `stop` are idempotent.
+//!
+//! # State discipline
+//!
+//! [`SymphonyRuntime::invoke`] and the three capability mutations require
+//! [`RuntimeState::Running`]; in [`RuntimeState::Created`] or [`RuntimeState::Stopped`]
+//! they fail with an [`Error::Validation`] naming `runtime.state`. Everything else —
+//! `plan`, `graph`, `graph_status`, `read_graph`, `search`, `semantic_search`, `build`,
+//! `submit_evolution`, `capture_graph_snapshot`, and the read-only accessors — works in
+//! every state, so a stopped engine can still be inspected, planned against, and rebuilt.
+//!
+//! # Concurrency
+//!
+//! The lifecycle state and the cached graph pointer live behind a [`std::sync::RwLock`]
+//! held only for a single copy or clone — never across an `.await` — with poisoned locks
+//! recovered through [`std::sync::PoisonError::into_inner`]. The derive-and-publish
+//! critical section (`build`, the mutations, `submit_evolution`) is serialized by a
+//! [`tokio::sync::Mutex`], an async-aware lock that legitimately spans the `.await`s
+//! persisting a revision; holding it is what makes mutation replay and the edge diff
+//! meaningful.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
+
+use openjiuwen_session::Session;
+
+use crate::artifact::{
+    FileGraphArtifactStore, GraphArtifactStatus, GraphArtifactStore, GraphRevision,
+    MemoryGraphArtifactStore,
+};
+use crate::error::{unsupported, validation, Error, Result};
+use crate::graph::CapabilityGraph;
+use crate::model::{CapabilityDescriptor, CapabilityKey};
+use crate::orchestration::executor::StepOutcome;
+use crate::orchestration::{
+    CandidateConfig, CandidateGenerator, CapabilityRunner, ExecutorConfig, OrchestrationPlan,
+    PlanConfig, PlanExecution, PlanExecutor, PlanRequest, PlanStatus, Planner, UnsupportedRunner,
+};
+use crate::registry::CapabilityRegistry;
+use crate::search::{SearchHit, SearchRequest, SemanticIndex};
+use crate::store::AssetStore;
+
+/// The graph scope a runtime publishes into when its configuration does not name one.
+const DEFAULT_GRAPH_SCOPE_ID: &str = "default";
+
+/// The lifecycle state of a [`SymphonyRuntime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeState {
+    /// Built by [`SymphonyRuntime::open`], started by nothing yet.
+    #[default]
+    Created,
+    /// Serving `invoke` and capability mutations.
+    Running,
+    /// Stopped by [`SymphonyRuntime::stop`] or [`SymphonyRuntime::close`].
+    Stopped,
+}
+
+/// Everything a [`SymphonyRuntime`] is opened with; every field has a usable default, so
+/// `SymphonyConfig::default()` opens an in-memory engine on the `"default"` graph scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct SymphonyConfig {
+    /// Root directory for file-backed graph revisions; `None` keeps them in memory.
+    pub graph_artifact_root: Option<PathBuf>,
+    /// The `graph_id` every published revision carries.
+    pub graph_scope_id: String,
+    /// The bounded planner's tuning.
+    pub plan: PlanConfig,
+    /// The plan executor's limits and failure handling.
+    pub executor: ExecutorConfig,
+    /// The deterministic `can_feed` candidate rules.
+    pub candidates: CandidateConfig,
+}
+
+impl Default for SymphonyConfig {
+    /// Returns in-memory artifacts, the `"default"` graph scope, and the default planner,
+    /// executor, and candidate configurations.
+    fn default() -> Self {
+        Self {
+            graph_artifact_root: None,
+            graph_scope_id: DEFAULT_GRAPH_SCOPE_ID.to_string(),
+            plan: PlanConfig::default(),
+            executor: ExecutorConfig::default(),
+            candidates: CandidateConfig::default(),
+        }
+    }
+}
+
+/// Assembles a [`SymphonyRuntime`] from explicit parts; every setter is optional and an
+/// unset part falls back to its documented default (an empty registry, in-memory
+/// artifacts, a lexical planner, [`UnsupportedRunner`], no semantic index).
+pub struct SymphonyRuntimeBuilder {
+    /// The engine configuration.
+    config: SymphonyConfig,
+    /// The supplied catalog, if any.
+    registry: Option<Arc<CapabilityRegistry>>,
+    /// The supplied asset store, used to hydrate a catalog when none is given.
+    asset_store: Option<Arc<dyn AssetStore>>,
+    /// The supplied revision store, if any.
+    artifacts: Option<Arc<dyn GraphArtifactStore>>,
+    /// The supplied planner, if any.
+    planner: Option<Planner>,
+    /// The supplied capability runner, if any.
+    runner: Option<Arc<dyn CapabilityRunner>>,
+    /// The supplied semantic index, if any.
+    semantic_index: Option<Arc<SemanticIndex>>,
+}
+
+impl SymphonyRuntimeBuilder {
+    /// Starts a builder from `config` with every optional part unset.
+    #[must_use]
+    pub fn new(config: SymphonyConfig) -> Self {
+        Self {
+            config,
+            registry: None,
+            asset_store: None,
+            artifacts: None,
+            planner: None,
+            runner: None,
+            semantic_index: None,
+        }
+    }
+
+    /// Uses `registry` as the authoritative catalog, ignoring any asset store.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<CapabilityRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Hydrates the catalog from `store` when no registry is supplied.
+    ///
+    /// The runtime becomes the store's single writer, so every later registration is
+    /// persisted through it. Ignored when [`Self::with_registry`] is also called.
+    #[must_use]
+    pub fn with_asset_store(mut self, store: Arc<dyn AssetStore>) -> Self {
+        self.asset_store = Some(store);
+        self
+    }
+
+    /// Publishes revisions into `artifacts` instead of the configured backend.
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: Arc<dyn GraphArtifactStore>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
+
+    /// Invokes capabilities through `runner` instead of [`UnsupportedRunner`].
+    #[must_use]
+    pub fn with_runner(mut self, runner: Arc<dyn CapabilityRunner>) -> Self {
+        self.runner = Some(runner);
+        self
+    }
+
+    /// Plans with `planner` instead of `Planner::new(config.plan)`.
+    #[must_use]
+    pub fn with_planner(mut self, planner: Planner) -> Self {
+        self.planner = Some(planner);
+        self
+    }
+
+    /// Enables [`SymphonyRuntime::semantic_search`] with `index`.
+    #[must_use]
+    pub fn with_semantic_index(mut self, index: Arc<SemanticIndex>) -> Self {
+        self.semantic_index = Some(index);
+        self
+    }
+
+    /// Assembles the runtime in [`RuntimeState::Created`], seeding the graph pointer from
+    /// the store's current revision so a reopened file-backed root is reported as-is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the asset store's hydration error, the artifact backend's open/status
+    /// error, or [`Error::Config`] when [`SymphonyConfig::graph_artifact_root`] is unusable.
+    pub async fn open(self) -> Result<SymphonyRuntime> {
+        let artifacts: Arc<dyn GraphArtifactStore> = match self.artifacts {
+            Some(artifacts) => artifacts,
+            None => match self.config.graph_artifact_root.clone() {
+                Some(root) => Arc::new(FileGraphArtifactStore::new(root).await?),
+                None => Arc::new(MemoryGraphArtifactStore::new()),
+            },
+        };
+        let registry = match self.registry {
+            Some(registry) => registry,
+            None => match self.asset_store {
+                Some(store) => Arc::new(CapabilityRegistry::load(store).await?),
+                None => Arc::new(CapabilityRegistry::new()),
+            },
+        };
+        let planner = self
+            .planner
+            .unwrap_or_else(|| Planner::new(self.config.plan.clone()));
+        let runner = self
+            .runner
+            .unwrap_or_else(|| Arc::new(UnsupportedRunner::new()) as Arc<dyn CapabilityRunner>);
+        let status = artifacts.status().await?;
+        let runtime = SymphonyRuntime {
+            config: self.config,
+            state: RwLock::new(RuntimeState::Created),
+            pointer: RwLock::new(GraphPointer::from_status(&status)),
+            registry,
+            artifacts,
+            planner,
+            runner,
+            semantic: self.semantic_index,
+            ledger: AsyncMutex::new(MutationLedger::default()),
+        };
+        debug!(
+            graph_scope_id = %runtime.config.graph_scope_id,
+            revision = ?status.current_version,
+            capabilities = runtime.registry.len(),
+            "opened the symphony runtime"
+        );
+        Ok(runtime)
+    }
+}
+
+impl fmt::Debug for SymphonyRuntimeBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SymphonyRuntimeBuilder")
+            .field("config", &self.config)
+            .field(
+                "supplied",
+                &(
+                    self.registry.is_some(),
+                    self.asset_store.is_some(),
+                    self.artifacts.is_some(),
+                    self.planner.is_some(),
+                    self.runner.is_some(),
+                    self.semantic_index.is_some(),
+                ),
+            )
+            .finish()
+    }
+}
+
+/// The engine: catalog, graph revisions, planner, runner, and lifecycle in one place.
+///
+/// See the module docs for the lifecycle, the state discipline, and the locking rules.
+/// A runtime is shared as `Arc<SymphonyRuntime>`; every method takes `&self`.
+pub struct SymphonyRuntime {
+    /// The configuration captured at `open` time.
+    config: SymphonyConfig,
+    /// The lifecycle state; guarded by a `std::sync` lock never held across an `.await`.
+    state: RwLock<RuntimeState>,
+    /// The cached pointer to the current revision (`capture_graph_snapshot` is synchronous).
+    pointer: RwLock<GraphPointer>,
+    /// The authoritative capability catalog.
+    registry: Arc<CapabilityRegistry>,
+    /// The published graph revisions.
+    artifacts: Arc<dyn GraphArtifactStore>,
+    /// The bounded planner, configured from [`SymphonyConfig::plan`].
+    planner: Planner,
+    /// The capability invoker used by [`SymphonyRuntime::invoke`].
+    runner: Arc<dyn CapabilityRunner>,
+    /// The optional embedding-backed index used by [`SymphonyRuntime::semantic_search`].
+    semantic: Option<Arc<SemanticIndex>>,
+    /// Serializes derive-and-publish and records mutation results per `request_id`.
+    ledger: AsyncMutex<MutationLedger>,
+}
+
+impl SymphonyRuntime {
+    /// Opens a runtime with every default part and no preliminary wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`SymphonyRuntimeBuilder::open`].
+    pub async fn open(config: SymphonyConfig) -> Result<Self> {
+        Self::builder(config).open().await
+    }
+
+    /// Starts a builder for a runtime configured by `config`.
+    #[must_use]
+    pub fn builder(config: SymphonyConfig) -> SymphonyRuntimeBuilder {
+        SymphonyRuntimeBuilder::new(config)
+    }
+
+    /// The configuration this runtime was opened with.
+    #[must_use]
+    pub fn config(&self) -> &SymphonyConfig {
+        &self.config
+    }
+
+    /// The current lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> RuntimeState {
+        *self.read_state()
+    }
+
+    /// The authoritative capability catalog.
+    ///
+    /// Handy for direct catalog management: writing through this handle does not publish
+    /// a graph revision, so call [`Self::build`] afterwards to reflect the change.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<CapabilityRegistry> {
+        &self.registry
+    }
+
+    /// Starts the engine: [`RuntimeState::Created`] (or [`RuntimeState::Stopped`]) becomes
+    /// [`RuntimeState::Running`], publishing a first revision through [`Self::build`] when
+    /// the store holds none. The state changes only after a successful build, and calling
+    /// `start` while running is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifact backend's status error or the [`Self::build`] errors.
+    pub async fn start(&self) -> Result<()> {
+        if self.state() == RuntimeState::Running {
+            return Ok(());
+        }
+        if !self.artifacts.status().await?.is_ready() {
+            self.build().await?;
+        }
+        *self.write_state() = RuntimeState::Running;
+        info!("symphony runtime started");
+        Ok(())
+    }
+
+    /// Stops the engine; idempotent.
+    ///
+    /// # Errors
+    ///
+    /// This implementation never fails; the [`Result`] keeps the lifecycle API uniform
+    /// with [`Self::start`] and [`Self::close`].
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn stop(&self) -> Result<()> {
+        if self.state() != RuntimeState::Stopped {
+            *self.write_state() = RuntimeState::Stopped;
+            info!("symphony runtime stopped");
+        }
+        Ok(())
+    }
+
+    /// Stops the engine and flushes the artifact store by re-reading the current revision,
+    /// so a backend that cannot reproduce what it published surfaces here. Idempotent like
+    /// [`Self::stop`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifact backend's status and read errors.
+    pub async fn close(&self) -> Result<()> {
+        self.stop().await?;
+        let status = self.graph_status().await?;
+        let flushed = self.artifacts.read(None).await?;
+        debug!(
+            revision = ?status.current_version,
+            nodes = flushed.as_ref().map_or(0, CapabilityGraph::node_count),
+            edges = flushed.as_ref().map_or(0, CapabilityGraph::edge_count),
+            "closed the symphony runtime and flushed its graph artifacts"
+        );
+        Ok(())
+    }
+
+    /// Re-derives the capability graph from the catalog plus the [`CandidateGenerator`]'s
+    /// `can_feed` edges and publishes a new immutable revision (`v1`, `v2`, ...).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a rejected derived edge, or the artifact
+    /// backend's publish error.
+    pub async fn build(&self) -> Result<GraphRevision> {
+        let _ledger = self.ledger.lock().await;
+        self.rebuild().await
+    }
+
+    /// The current graph revision, or a node-only graph derived from the catalog.
+    ///
+    /// A backend read failure is logged and answered with the derived graph: this accessor
+    /// reports a best-effort view instead of failing a caller that only wants to inspect.
+    pub async fn graph(&self) -> CapabilityGraph {
+        match self.artifacts.read(None).await {
+            Ok(Some(graph)) => graph,
+            Ok(None) => self.derived_graph().await,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read the current capability graph; deriving one from the catalog"
+                );
+                self.derived_graph().await
+            }
+        }
+    }
+
+    /// Describes the current revision, or reports `"missing"` when none is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifact backend's error.
+    pub async fn graph_status(&self) -> Result<GraphArtifactStatus> {
+        let status = self.artifacts.status().await?;
+        *self.write_pointer() = GraphPointer::from_status(&status);
+        Ok(status)
+    }
+
+    /// Reads a published revision; `None` means the current one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an illegal version, or the backend's error.
+    pub async fn read_graph(&self, version: Option<&str>) -> Result<Option<CapabilityGraph>> {
+        self.artifacts.read(version).await
+    }
+
+    /// Plans a request over the current graph and catalog, building a revision first when
+    /// the store holds none. Planning never mutates the catalog or the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank query, the [`Self::build`] errors, or the
+    /// configured planner's scorer error.
+    pub async fn plan(&self, request: &PlanRequest) -> Result<OrchestrationPlan> {
+        if !self.artifacts.status().await?.is_ready() {
+            self.build().await?;
+        }
+        let graph = self.graph().await;
+        let capabilities = self.registry.list().await;
+        self.planner.plan(request, &graph, &capabilities).await
+    }
+
+    /// Plans the request, and optionally executes the plan.
+    ///
+    /// Requires [`RuntimeState::Running`]. `query`, `candidate_ids`, and `disabled_ids` map
+    /// onto a [`PlanRequest`] whose other fields keep their defaults (`"cn"` language, no
+    /// `provided_inputs`, no overrides). With [`InvokeRequest::execute`] set and a plan
+    /// that is not [`PlanStatus::NoPlan`], the plan runs through the configured
+    /// [`CapabilityRunner`] with the request's `inputs` and `session`; a
+    /// [`PlanStatus::NoPlan`] result has nothing to execute, so `execution` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] naming `runtime.state` unless running, the
+    /// [`Self::plan`] errors, and the [`PlanExecutor::execute_with_inputs`] errors —
+    /// notably [`Error::Unsupported`] without a runner.
+    pub async fn invoke(&self, request: InvokeRequest) -> Result<InvokeResponse> {
+        self.require_running()?;
+        let plan_request = PlanRequest {
+            query: request.query.clone(),
+            candidate_ids: request.candidate_ids.clone(),
+            disabled_ids: request.disabled_ids.clone(),
+            ..PlanRequest::default()
+        };
+        let plan = self.plan(&plan_request).await?;
+        let execution = if request.execute && plan.status != PlanStatus::NoPlan {
+            let capabilities = self.registry.list().await;
+            let executor =
+                PlanExecutor::with_config(self.config.executor.clone(), Arc::clone(&self.runner));
+            let execution = executor
+                .execute_with_inputs(
+                    &plan,
+                    &capabilities,
+                    request.inputs.clone(),
+                    request.session.clone(),
+                )
+                .await?;
+            Some(execution)
+        } else {
+            None
+        };
+        let graph_status = self.graph_status().await?;
+        Ok(InvokeResponse {
+            plan,
+            execution,
+            graph_status,
+        })
+    }
+
+    /// Searches the catalog with keyword and metadata filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an invalid `metadata_filter` predicate.
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
+        self.registry.search(request).await
+    }
+
+    /// Searches the catalog semantically by clearing and re-indexing it, then embedding
+    /// `query`, so the hits reflect every mutation including removals. `top_k == 0` means
+    /// unlimited.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] without a [`SemanticIndex`], or the embedding
+    /// model's and vector store's errors.
+    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
+        let Some(index) = &self.semantic else {
+            return Err(unsupported(
+                "semantic capability search without a semantic index",
+            ));
+        };
+        let capabilities = self.registry.list().await;
+        index.clear().await?;
+        index.index(&capabilities).await?;
+        index.search(query, top_k).await
+    }
+
+    /// Upserts `descriptors` into the catalog and publishes a new revision.
+    ///
+    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` (a replay
+    /// returns the recorded result with `replayed = true` and no side effect). Every
+    /// descriptor is validated first, so a bad batch changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`, or a descriptor,
+    /// plus the store's and artifact backend's errors.
+    pub async fn add_capabilities(
+        &self,
+        descriptors: Vec<CapabilityDescriptor>,
+        request_id: &str,
+    ) -> Result<GraphMutationResult> {
+        self.mutate(MutationSubject::Add(descriptors), request_id)
+            .await
+    }
+
+    /// Upserts only already-registered `descriptors` and publishes a new revision.
+    ///
+    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` like
+    /// [`Self::add_capabilities`]; an unknown key rejects the whole batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] naming `runtime.state`/`request_id` or a descriptor,
+    /// [`Error::NotFound`] naming the first unregistered id, and backend errors.
+    pub async fn update_capabilities(
+        &self,
+        descriptors: Vec<CapabilityDescriptor>,
+        request_id: &str,
+    ) -> Result<GraphMutationResult> {
+        self.mutate(MutationSubject::Update(descriptors), request_id)
+            .await
+    }
+
+    /// Removes the listed keys and publishes a new revision.
+    ///
+    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` like
+    /// [`Self::add_capabilities`]; an unregistered key is skipped, not reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] naming `runtime.state` or `request_id`, and backend
+    /// errors.
+    pub async fn remove_capabilities(
+        &self,
+        keys: &[CapabilityKey],
+        request_id: &str,
+    ) -> Result<GraphMutationResult> {
+        self.mutate(MutationSubject::Remove(keys.to_vec()), request_id)
+            .await
+    }
+
+    /// Applies observed step transitions to the graph as an exponentially weighted moving
+    /// average: each consecutive pair of successful steps (sorted by id) whose pair has a
+    /// graph edge sets that weight to `(w + 1.0) / 2` and is accepted, the rest are
+    /// rejected. A revision is published only when at least one edge was updated —
+    /// otherwise `revision` is the current version (empty when none exists). Evolution
+    /// works in every state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifact backend's read or publish errors.
+    pub async fn submit_evolution(&self, execution: &PlanExecution) -> Result<EvolutionResult> {
+        let _ledger = self.ledger.lock().await;
+        let transitions = transitions(execution);
+        let Some(mut graph) = self.artifacts.read(None).await? else {
+            debug!(
+                transitions = transitions.len(),
+                "no graph revision exists; every observed transition is rejected"
+            );
+            return Ok(EvolutionResult {
+                accepted_edges: 0,
+                rejected_edges: transitions.len(),
+                revision: String::new(),
+            });
+        };
+        let mut accepted_edges = 0;
+        let mut rejected_edges = 0;
+        for (source, target) in &transitions {
+            // Weights stay inside `[0, 1]` because `[0, 1]` maps onto `[0.5, 1]`, so the
+            // updated edge is always valid and the in-place update cannot corrupt the
+            // document ordering.
+            let edge = graph
+                .edges
+                .iter_mut()
+                .find(|edge| edge.source == *source && edge.target == *target);
+            match edge {
+                Some(edge) => {
+                    edge.weight = f64::midpoint(edge.weight, 1.0);
+                    accepted_edges += 1;
+                }
+                None => rejected_edges += 1,
+            }
+        }
+        let revision = if accepted_edges > 0 {
+            let revision = self.artifacts.publish(&graph, None).await?;
+            self.observe(&revision);
+            revision.version
+        } else {
+            self.artifacts
+                .status()
+                .await?
+                .current_version
+                .unwrap_or_default()
+        };
+        debug!(
+            accepted = accepted_edges,
+            rejected = rejected_edges,
+            revision = %revision,
+            "applied evolution feedback to the capability graph"
+        );
+        Ok(EvolutionResult {
+            accepted_edges,
+            rejected_edges,
+            revision,
+        })
+    }
+
+    /// A synchronous snapshot of the current revision pointer:
+    /// `{"current_version", "graph_id", "graph_scope_id"}`, with the first two `null` when
+    /// no revision is known yet. The pointer is cached on open, publish, and status, so
+    /// this accessor never awaits.
+    #[must_use]
+    pub fn capture_graph_snapshot(&self) -> BTreeMap<String, Value> {
+        let pointer = self.read_pointer();
+        BTreeMap::from([
+            (
+                "current_version".to_string(),
+                pointer
+                    .current_version
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            ),
+            (
+                "graph_id".to_string(),
+                pointer.graph_id.clone().map_or(Value::Null, Value::String),
+            ),
+            (
+                "graph_scope_id".to_string(),
+                Value::String(self.config.graph_scope_id.clone()),
+            ),
+        ])
+    }
+
+    /// Re-derives and publishes a revision; the caller holds the ledger lock.
+    async fn rebuild(&self) -> Result<GraphRevision> {
+        let capabilities = self.registry.list().await;
+        let mut graph =
+            CapabilityGraph::from_descriptors(self.config.graph_scope_id.clone(), &capabilities);
+        let generator = CandidateGenerator::new(self.config.candidates.clone());
+        let candidates = generator.generate(&capabilities);
+        for edge in generator.edges(&candidates) {
+            graph.add_edge(edge)?;
+        }
+        let revision = self.artifacts.publish(&graph, None).await?;
+        self.observe(&revision);
+        debug!(
+            version = %revision.version,
+            nodes = revision.node_count,
+            edges = revision.edge_count,
+            "published a capability graph revision"
+        );
+        Ok(revision)
+    }
+
+    /// Builds the node-only graph the catalog implies (no derived edges).
+    async fn derived_graph(&self) -> CapabilityGraph {
+        CapabilityGraph::from_descriptors(
+            self.config.graph_scope_id.clone(),
+            &self.registry.list().await,
+        )
+    }
+
+    /// Runs one mutation under the ledger lock: replay check, apply, rebuild, diff.
+    async fn mutate(
+        &self,
+        subject: MutationSubject,
+        request_id: &str,
+    ) -> Result<GraphMutationResult> {
+        self.require_running()?;
+        if request_id.trim().is_empty() {
+            return Err(validation("request_id", "must not be blank"));
+        }
+        let mut ledger = self.ledger.lock().await;
+        if let Some(recorded) = ledger.recorded.get(request_id) {
+            let mut replayed = recorded.clone();
+            replayed.replayed = true;
+            debug!(request_id, "replayed a recorded capability mutation");
+            return Ok(replayed);
+        }
+        let operation = subject.operation();
+        let previous = self.edge_set().await?;
+        let changed = self.apply(subject).await?;
+        let revision = self.rebuild().await?;
+        let current = self.edge_set().await?;
+        let result = GraphMutationResult {
+            operation,
+            request_id: request_id.to_string(),
+            changed,
+            added_edges: current.difference(&previous).count(),
+            removed_edges: previous.difference(&current).count(),
+            revision: revision.version,
+            replayed: false,
+        };
+        ledger
+            .recorded
+            .insert(request_id.to_string(), result.clone());
+        info!(
+            operation = ?result.operation,
+            changed = result.changed.len(),
+            added_edges = result.added_edges,
+            removed_edges = result.removed_edges,
+            revision = %result.revision,
+            "applied a capability mutation"
+        );
+        Ok(result)
+    }
+
+    /// Applies `subject` to the catalog and reports the sorted changed qualified ids.
+    async fn apply(&self, subject: MutationSubject) -> Result<Vec<String>> {
+        match subject {
+            MutationSubject::Add(descriptors) => {
+                for descriptor in &descriptors {
+                    descriptor.validate()?;
+                }
+                let changed = qualified_ids(&descriptors);
+                self.registry.register_all(descriptors).await?;
+                Ok(changed)
+            }
+            MutationSubject::Update(descriptors) => {
+                for descriptor in &descriptors {
+                    descriptor.validate()?;
+                    if !self.registry.contains(&descriptor.key()).await {
+                        return Err(Error::not_found(format!(
+                            "capability `{}` is not registered",
+                            descriptor.qualified_id()
+                        )));
+                    }
+                }
+                let changed = qualified_ids(&descriptors);
+                self.registry.register_all(descriptors).await?;
+                Ok(changed)
+            }
+            MutationSubject::Remove(keys) => {
+                let mut removed = BTreeSet::new();
+                for key in keys {
+                    if self.registry.remove(&key).await? {
+                        removed.insert(key.qualified());
+                    }
+                }
+                Ok(removed.into_iter().collect())
+            }
+        }
+    }
+
+    /// The `(source, target)` pairs of the current revision, or an empty set.
+    async fn edge_set(&self) -> Result<BTreeSet<(String, String)>> {
+        let Some(graph) = self.artifacts.read(None).await? else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(graph
+            .edges
+            .iter()
+            .map(|edge| (edge.source.clone(), edge.target.clone()))
+            .collect())
+    }
+
+    /// Fails unless the runtime is [`RuntimeState::Running`].
+    fn require_running(&self) -> Result<()> {
+        let state = self.state();
+        if state == RuntimeState::Running {
+            return Ok(());
+        }
+        Err(validation(
+            "runtime.state",
+            format!(
+                "must be `running` for this operation, got `{}`",
+                state_name(state)
+            ),
+        ))
+    }
+
+    /// Records a published revision in the cached pointer.
+    fn observe(&self, revision: &GraphRevision) {
+        *self.write_pointer() = GraphPointer {
+            current_version: Some(revision.version.clone()),
+            graph_id: Some(revision.graph_id.clone()),
+        };
+    }
+
+    /// Locks the lifecycle state for reading, recovering from a poisoned lock.
+    fn read_state(&self) -> RwLockReadGuard<'_, RuntimeState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the lifecycle state for writing, recovering from a poisoned lock.
+    fn write_state(&self) -> RwLockWriteGuard<'_, RuntimeState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the cached graph pointer for reading, recovering from a poisoned lock.
+    fn read_pointer(&self) -> RwLockReadGuard<'_, GraphPointer> {
+        self.pointer.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the cached graph pointer for writing, recovering from a poisoned lock.
+    fn write_pointer(&self) -> RwLockWriteGuard<'_, GraphPointer> {
+        self.pointer.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for SymphonyRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SymphonyRuntime")
+            .field("config", &self.config)
+            .field("state", &self.state())
+            .field("pointer", &*self.read_pointer())
+            .field("capabilities", &self.registry.len())
+            .field("artifacts", &"dyn GraphArtifactStore")
+            .field("planner", &"Planner")
+            .field("runner", &"dyn CapabilityRunner")
+            .field("semantic_index", &self.semantic.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The cached pointer to the current graph revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GraphPointer {
+    /// The version of the current revision, when one is known.
+    current_version: Option<String>,
+    /// The `graph_id` of the current revision, when one is known.
+    graph_id: Option<String>,
+}
+
+impl GraphPointer {
+    /// Builds the pointer an artifact status reports.
+    fn from_status(status: &GraphArtifactStatus) -> Self {
+        Self {
+            current_version: status.current_version.clone(),
+            graph_id: status.graph_id.clone(),
+        }
+    }
+}
+
+/// The recorded results of past mutations, keyed by caller `request_id`.
+#[derive(Debug, Default)]
+struct MutationLedger {
+    /// Mutations in `request_id` order; replays read from here instead of re-applying.
+    recorded: BTreeMap<String, GraphMutationResult>,
+}
+
+/// What one mutation changes in the catalog.
+#[derive(Debug)]
+enum MutationSubject {
+    /// Descriptors to upsert unconditionally.
+    Add(Vec<CapabilityDescriptor>),
+    /// Descriptors to upsert only when already registered.
+    Update(Vec<CapabilityDescriptor>),
+    /// Keys to delete; absent keys are skipped.
+    Remove(Vec<CapabilityKey>),
+}
+
+impl MutationSubject {
+    /// The [`MutationOperation`] this subject performs.
+    fn operation(&self) -> MutationOperation {
+        match self {
+            Self::Add(_) => MutationOperation::Add,
+            Self::Update(_) => MutationOperation::Update,
+            Self::Remove(_) => MutationOperation::Delete,
+        }
+    }
+}
+
+/// The sorted, de-duplicated qualified ids of `descriptors`.
+fn qualified_ids(descriptors: &[CapabilityDescriptor]) -> Vec<String> {
+    descriptors
+        .iter()
+        .map(CapabilityDescriptor::qualified_id)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// The consecutive successful step pairs of `execution`, sorted by step id.
+fn transitions(execution: &PlanExecution) -> Vec<(String, String)> {
+    let steps: Vec<&StepOutcome> = execution.steps.values().collect();
+    steps
+        .windows(2)
+        .filter(|pair| pair[0].success && pair[1].success)
+        .map(|pair| (pair[0].step_id.clone(), pair[1].step_id.clone()))
+        .collect()
+}
+
+/// The lowercase name of `state`, used in error messages and logs.
+fn state_name(state: RuntimeState) -> &'static str {
+    match state {
+        RuntimeState::Created => "created",
+        RuntimeState::Running => "running",
+        RuntimeState::Stopped => "stopped",
+    }
+}
+
+/// One call to [`SymphonyRuntime::invoke`]: a request, and whether to execute the plan.
+///
+/// `inputs` and `session` are the execution seeds; a plan-only call ignores them.
+pub struct InvokeRequest {
+    /// The natural-language request the plan must answer.
+    pub query: String,
+    /// When set, only these qualified ids may appear in the plan.
+    pub candidate_ids: Option<Vec<String>>,
+    /// Qualified ids excluded from the plan entirely.
+    pub disabled_ids: Vec<String>,
+    /// Whether to execute the plan after planning it.
+    pub execute: bool,
+    /// The caller-supplied inputs seeded into the plan's root steps.
+    pub inputs: Value,
+    /// The session the plan executes in; `None` uses a fresh workflow session.
+    pub session: Option<Arc<dyn Session>>,
+}
+
+impl InvokeRequest {
+    /// Builds a plan-only `"cn"` request for `query` with no filters and no inputs.
+    #[must_use]
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            candidate_ids: None,
+            disabled_ids: Vec::new(),
+            execute: false,
+            inputs: Value::Null,
+            session: None,
+        }
+    }
+
+    /// Requests execution of the resulting plan.
+    #[must_use]
+    pub fn execute(mut self) -> Self {
+        self.execute = true;
+        self
+    }
+
+    /// Seeds the plan's root steps with `inputs`.
+    #[must_use]
+    pub fn with_inputs(mut self, inputs: Value) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// Runs the plan in `session`.
+    #[must_use]
+    pub fn with_session(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+}
+
+/// What [`SymphonyRuntime::invoke`] produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InvokeResponse {
+    /// The plan for the request.
+    pub plan: OrchestrationPlan,
+    /// The execution, when the request asked for one and the plan has steps.
+    pub execution: Option<PlanExecution>,
+    /// The graph revision status observed after handling the request.
+    pub graph_status: GraphArtifactStatus,
+}
+
+/// The kind of change a capability mutation applied.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationOperation {
+    /// Descriptors were inserted or replaced.
+    #[default]
+    Add,
+    /// Already-registered descriptors were replaced.
+    Update,
+    /// Keys were deleted.
+    Delete,
+}
+
+/// What one capability mutation changed.
+///
+/// `changed` holds the sorted qualified ids the mutation touched (inserted/replaced for
+/// add and update, actually removed for delete), and `added_edges`/`removed_edges` count
+/// the `(source, target)` graph pairs that appeared or disappeared. A replay of a
+/// recorded `request_id` returns the same result with [`Self::replayed`] set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct GraphMutationResult {
+    /// Which mutation ran.
+    pub operation: MutationOperation,
+    /// The caller's idempotency key.
+    pub request_id: String,
+    /// The sorted qualified ids that changed.
+    pub changed: Vec<String>,
+    /// The number of `(source, target)` edge pairs the mutation added.
+    pub added_edges: usize,
+    /// The number of `(source, target)` edge pairs the mutation removed.
+    pub removed_edges: usize,
+    /// The version of the revision published by this mutation.
+    pub revision: String,
+    /// Whether this result is a replay of an earlier mutation with the same id.
+    pub replayed: bool,
+}
+
+/// What [`SymphonyRuntime::submit_evolution`] applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct EvolutionResult {
+    /// The number of observed transitions whose graph edge weight was updated.
+    pub accepted_edges: usize,
+    /// The number of observed transitions with no matching graph edge.
+    pub rejected_edges: usize,
+    /// The version of the published revision, or the unchanged current version.
+    pub revision: String,
+}
