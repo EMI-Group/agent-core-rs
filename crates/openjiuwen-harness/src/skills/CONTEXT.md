@@ -13,7 +13,7 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 
 ### Library (`mod.rs`)
 
-- `Skill { name: String, description: String, directory: PathBuf }` — `Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema`.
+- `Skill { name: String, description: String, directory: PathBuf }` — `Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema`; `new(name, description, directory)` and `path()` (the `SKILL.md` path).
   `name` is the bare directory name (a `name:` front-matter field never renames a skill); first-wins across roots.
 - `SkillBudget { max_skills: Option<usize>, max_total_chars: Option<usize> }` — `Default`, `unlimited()`, `is_unlimited()`, builder setters.
   `max_total_chars` sums `description.chars().count()` (Python `len(description)` ≈ chars) of whole skills, never mid-description.
@@ -27,6 +27,7 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 
 - `SKILLS_STATE_FILENAME = "skills_state.json"`.
 - `collect_disabled_skills(roots: &[PathBuf]) -> BTreeSet<String>` — async, fail-open: only the exact JSON value `{"skill_configs": {"<name>": {"enabled": false}}}` disables; missing file, unreadable/invalid JSON, non-object root or `skill_configs`, and non-object entries contribute nothing (one `tracing::warn` per unreadable file). Names are sorted/deduped across roots.
+- `read_disabled_skills(root) -> BTreeSet<String>` — async single-root read; a missing or non-file state path is silent, read/parse failures warn and yield an empty set.
 - `save_disabled_skills(root, &BTreeSet<String>)` — async, writes `{"skill_configs": {"<name>": {"enabled": false}}}` (pretty, trailing newline), creating the root if needed.
 - `parse_disabled_skills(&str) -> BTreeSet<String>` — pure, unit-tested JSON parser.
 
