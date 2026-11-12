@@ -7,7 +7,7 @@ Mirrors the Python reference tree `examples/` (read-only foreign repo), reduced 
 Every example is a `cargo example` binary; the crate's library in `./src/` only holds the shared setup helpers the binaries use, so the helpers are unit-testable.
 There is no `tests/` directory: the only tests are the library unit tests under `./src/`, and the examples are validated by compilation plus smoke runs.
 All examples are offline-capable: the six kernel examples and the harness examples run against `ScriptedModel` or the loopback `MockLlmServer`, and switch to a real provider only when `OPENJIUWEN_LIVE` and credentials are present.
-Every example prints its narrative to stdout and diagnostics to stderr, and its stdout is deterministic (byte-identical across runs) so it can be diffed.
+Every example prints its narrative to stdout and diagnostics to stderr; the narrative output is deterministic, but identifiers such as generated UUIDs, temp paths, interrupt ids, and ephemeral ports vary between runs.
 
 ## Example Matrix
 
@@ -69,7 +69,7 @@ Deliberately not ported: the research drops `examples/MANGO/` and `examples/PerS
 
 - `cargo test -p openjiuwen-examples` runs the library unit tests: run-mode detection over injected env lookups (offline default, live with flag+model+key, live flag without credentials degrading to offline, falsy flag values) and banner formatting.
 - The examples themselves are validated by compilation gates, not by tests: `cargo build -p openjiuwen-examples --examples` and `--examples --features a2a,mcp` must compile every example, and `cargo clippy -p openjiuwen-examples --all-targets --no-deps -- -D warnings` must be clean.
-- Each example is deterministic and idempotent: scripted models, in-memory stores, temp directories, no wall-clock assertions; running one twice in a row must produce the same narrative.
+- Each example is deterministic and idempotent: scripted models, in-memory stores, temp directories, no wall-clock assertions; the narrative output is deterministic, but identifiers such as generated UUIDs, temp paths, interrupt ids, and ephemeral ports vary between runs.
 - Manual smoke run per example (`cargo run -p openjiuwen-examples --example 01_hello_agent`) is the acceptance check that the narrative and the "set X to run" messages are right.
 
 ## Notes for Agents
@@ -81,7 +81,7 @@ Deliberately not ported: the research drops `examples/MANGO/` and `examples/PerS
 - Deep-agent file tool (`08`): `write_file` with `{"file_path": "<workspace-relative>", "content": "..."}`; `Observation` has no success flag, so a round is proven by reading the file back.
 - Native harness turn (`09`): with `enable_task_loop=false` one turn makes exactly one model request and emits six events — `state_changed` ×2, `turn_lifecycle/started`, `output/answer`, `usage_updated`, `turn_lifecycle/finished`; `events()` is single-consumer, so drain with a timeout **and** an event cap.
 - `10` injects `NativeMemberFactory::new(Arc::new(EnvModelResolver))` through `TeamBuildDeps::with_harness_factory`; the factory copies the resolved model's name and provider onto the member's `DeepAgentConfig`, so the resolver only supplies the client (`api_base`/`api_key`) and no wrapper model is needed.
-- `11` uses `A2aServer::serve_in_background(CancellationToken::new())` + `ServerHandle::{local_addr, shutdown, join}`, and logs the ephemeral port to stderr so stdout stays deterministic; `11`/`12` name `tokio_util::sync::CancellationToken` directly, which is why `tokio-util` is a dev-dependency.
+- `11` uses `A2aServer::serve_in_background(CancellationToken::new())` + `ServerHandle::{local_addr, shutdown, join}`, and logs the ephemeral port to stderr and prints only the host on stdout, so unlike `09`/`10` (which print the mock server's base URL) the varying port never reaches stdout; `11`/`12` name `tokio_util::sync::CancellationToken` directly, which is why `tokio-util` is a dev-dependency.
 - `05` (410 lines) and `12` (420 lines) deliberately exceed the ~300-line aim: each teaches two seams (context + memory; auto-harness + trainer), and splitting them would create artificial examples.
 - API gaps this set works around (do not "fix" them inside an example): `create_harness` has no fake-model injection, so `09` points `api_base` at a loopback server; there is no in-process MCP server and `FakeMcpClient` is `#[cfg(test)]`-only, so `07` implements a small `McpClient` and gates the real stdio path on `OPENJIUWEN_MCP_SERVER_CMD`; there is no `Interrupt` type — an interrupt is `AgentOutput::result_type == Interrupt` and resume is re-invoking the same agent with the same session and an interactive payload; `openjiuwen::prelude` carries the agent/model/session/harness surface (`01` and `08` import from it), so examples fall back to `openjiuwen::core::single_agent` only for items the prelude omits (`ConfirmInterruptRail`).
 - `openjiuwen-foundation` compiles MCP unconditionally, so the crate's `mcp` feature is a documented marker; `a2a` is a real passthrough and gates example 11.

@@ -65,8 +65,10 @@ crates (workflow, context/memory, retrieval); `07` → `10` climb to the harness
 protocol and self-improvement surfaces.
 
 Each example prints its narrative to stdout and its diagnostics to stderr
-(`OPENJIUWEN_LOG_LEVEL=debug` for detail). No example prints a credential, and each
-one's stdout is deterministic so runs can be diffed.
+(`OPENJIUWEN_LOG_LEVEL=debug` for detail). No example prints a credential. The
+narrative output is deterministic, but identifiers such as generated UUIDs, temp
+paths, interrupt ids, and ephemeral ports vary between runs, so a diff shows those
+lines.
 
 ## Notes and known workarounds
 
@@ -76,5 +78,5 @@ one's stdout is deterministic so runs can be diffed.
 - **10** injects `NativeMemberFactory` with an `EnvModelResolver` pointed at the loopback
   server; the factory copies the resolved model's name and provider onto the member's
   `DeepAgentConfig`, so no wrapper model is needed.
-- **11** logs the ephemeral loopback port to stderr, so its stdout stays stable
-  across runs.
+- **11** logs the ephemeral loopback port to stderr and prints only the host on stdout,
+  so the varying port number never appears in the narrative.
