@@ -23,3 +23,6 @@ pub mod candidates;
 pub mod executor;
 pub mod plan;
 pub mod planner;
+
+pub use candidates::{CandidateConfig, CandidateGenerator, MatchStrategy, RelationCandidate};
+pub use plan::{OrchestrationPlan, PlanEdge, PlanStatus, PlanStep};
