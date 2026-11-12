@@ -38,8 +38,11 @@
     clippy::manual_let_else,
     clippy::needless_pass_by_value
 )]
+pub mod analyzer;
 pub mod config;
+pub mod dreaming;
 pub mod engine;
+pub mod external;
 pub mod facade;
 pub mod graph;
 pub mod lite;
@@ -47,6 +50,7 @@ pub mod prompt;
 pub mod recall;
 pub mod record;
 pub mod store;
+pub mod team;
 pub use config::*;
 pub use engine::*;
 pub use facade::*;
