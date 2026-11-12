@@ -25,13 +25,13 @@
 //! | `d2_expert_knowledge_craft` | 25 | at least 6 distinct section headings plus numbered steps |
 //! | `d3_spec_compliance` | 15 | name, description, and markdown round trip all hold |
 //! | `d4_progressive_disclosure` | 10 | a resource exists and the body references it |
-//! | `d5_pattern_freedom_fit` | 10 | the body has both a `#` and a `##` heading |
+//! | `d5_pattern_freedom_fit` | 15 | the body has both a `#` and a `##` heading |
 //! | `d6_practical_usability` | 15 | the body has a list item or a fenced code block |
 //! | `d7_output_specification` | 10 | the body describes the output/result format |
 //!
-//! The dimension maxima sum to 95; [`DesignReport::design_score`] normalizes the
-//! awarded points onto the reported 100-point scale, so an all-full rubric reads
-//! as `100.0` and a half-full one as `50.0`.
+//! The dimension maxima sum to 100; [`DesignReport::design_score`] is the sum of
+//! the awarded points, so an all-full rubric reads as `100.0` and a half-full one
+//! as `50.0`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -101,14 +101,13 @@ pub fn score_design(skill: &SkillDefinition) -> DesignReport {
         ("d2_expert_knowledge_craft", 25.0, d2_level(body)),
         ("d3_spec_compliance", 15.0, d3_level(skill)),
         ("d4_progressive_disclosure", 10.0, d4_level(skill)),
-        ("d5_pattern_freedom_fit", 10.0, d5_level(body)),
+        ("d5_pattern_freedom_fit", 15.0, d5_level(body)),
         ("d6_practical_usability", 15.0, d6_level(body)),
         ("d7_output_specification", 10.0, d7_level(body)),
     ];
 
     let mut dimensions = BTreeMap::new();
     let mut awarded = 0.0;
-    let mut available = 0.0;
     for (name, max, level) in levels {
         let score = match level {
             0 => 0.0,
@@ -116,12 +115,11 @@ pub fn score_design(skill: &SkillDefinition) -> DesignReport {
             _ => max,
         };
         awarded += score;
-        available += max;
         dimensions.insert(name.to_string(), ScoreDimension { score, max });
     }
 
-    let design_score = round2(awarded / available * 100.0);
-    let design_score_pct = round2(design_score / 100.0 * 100.0);
+    let design_score = round2(awarded);
+    let design_score_pct = round2(design_score);
     DesignReport {
         skill_name: skill.name.clone(),
         design_score,
@@ -209,12 +207,12 @@ pub fn aggregate(
     let evaluators = EvaluatorScores {
         e1_llm_judge: Some(EvaluatorScore {
             score_pct: round2(design.design_score_pct),
-            weight: round2(design_weight),
+            weight: design_weight,
             contribution: round2(design_weight * design.design_score_pct),
         }),
         e2_functional: EvaluatorScore {
             score_pct: round2(functional.summary.pass_rate * 100.0),
-            weight: round2(functional_weight),
+            weight: functional_weight,
             contribution: round2(functional_weight * functional.summary.pass_rate * 100.0),
         },
     };
@@ -514,6 +512,18 @@ mod tests {
         assert!((report.knowledge_delta - 1.0).abs() < 1e-9);
         assert!(report.ready_for_functional_testing);
         assert_eq!(report.skill_name, "demo");
+    }
+
+    #[test]
+    fn rubric_maxima_sum_to_one_hundred() {
+        let report = score_design(&rich_skill());
+        let total: f64 = report
+            .dimensions
+            .values()
+            .map(|dimension| dimension.max)
+            .sum();
+        assert!((total - 100.0).abs() < 1e-9, "maxima sum to {total}");
+        assert!((report.dimensions["d5_pattern_freedom_fit"].max - 15.0).abs() < 1e-9);
     }
 
     #[test]

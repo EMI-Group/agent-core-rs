@@ -10,11 +10,12 @@
 //!    rubric to a [`SkillDefinition`]: knowledge volume, section/numbered-step
 //!    craft, `SKILL.md` spec compliance and round-trip fidelity, resource
 //!    references, heading structure, practical lists/code, and output
-//!    specification. The dimension maxima sum to 95 points and are normalized
-//!    onto a 100-point design score.
-//! 2. **Functional evaluation** runs each [`EvalCase`] and checks its parsed
-//!    [`Assertion`]s against the answer, producing a [`FunctionalReport`] whose
-//!    summary carries the pass rate. Case execution lives in the runner layer.
+//!    specification. The dimension maxima sum to 100 points and the design score
+//!    is their sum.
+//! 2. **Functional evaluation** runs each [`EvalCase`] through a [`CaseRunner`]
+//!    (scripted or model-backed) and checks its parsed [`Assertion`]s against the
+//!    answer, producing a [`FunctionalReport`] whose summary carries the pass
+//!    rate ([`SkillEvaluator`] drives the whole pipeline).
 //! 3. **Safety gate** ([`scan_safety`]) scans the rendered document with
 //!    caller-supplied [`SafetyRule`] regexes. Each match costs 25 points and
 //!    any `critical` finding blocks unconditionally.
@@ -35,13 +36,17 @@
 //! [`SkillDefinition`]: crate::skill_creator::SkillDefinition
 pub mod assertion;
 pub mod case;
+pub mod evaluator;
 pub mod report;
+pub mod runner;
 pub mod scoring;
 
 pub use assertion::{Assertion, AssertionOutcome};
 pub use case::{CaseStatus, EvalCase};
+pub use evaluator::{EvaluatorConfig, SkillEvaluator};
 pub use report::{
     grade_for, CaseResult, CaseSummary, DesignReport, EvaluationReport, EvaluatorScore,
     EvaluatorScores, FinalScore, FunctionalReport, SafetyFinding, SafetyReport, ScoreDimension,
 };
+pub use runner::{CaseRunner, ModelCaseRunner, ScriptedCaseRunner};
 pub use scoring::{aggregate, scan_safety, score_design, SafetyRule};
