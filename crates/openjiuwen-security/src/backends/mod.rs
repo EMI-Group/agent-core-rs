@@ -17,9 +17,11 @@
 use crate::{RiskAssessment, RiskLevel};
 
 pub mod api;
+pub mod http;
 pub mod llm;
 pub mod local;
 pub mod rule_based;
+pub mod vendors;
 
 pub use api::{ApiModelBackend, ApiModelBackendConfig, ModerationRequest, ModerationTransport};
 pub use llm::{LlmPromptInjectionBackend, LlmPromptInjectionBackendConfig};

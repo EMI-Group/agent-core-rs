@@ -18,6 +18,9 @@ tokio.workspace = true
 tracing.workspace = true
 regex.workspace = true
 
+[dev-dependencies]
+wiremock.workspace = true
+
 [features]
 default = []
 
