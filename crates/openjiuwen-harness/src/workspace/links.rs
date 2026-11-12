@@ -53,8 +53,10 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
-    /// for an unsafe `team_id`, [`ErrorKind::NotFound`] when `target` is missing, and
-    /// [`ErrorKind::SysOp`] for a filesystem failure.
+    /// for an unsafe `team_id`,
+    /// [`ErrorKind::NotFound`](openjiuwen_common::error::ErrorKind::NotFound) when `target`
+    /// is missing, and [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) for
+    /// a filesystem failure.
     pub fn link_team(&self, team_id: &str, target: impl AsRef<Path>) -> Result<PathBuf> {
         link(&self.root_path, TEAM_LINKS_DIR, team_id, target.as_ref())
     }
@@ -63,7 +65,8 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Validation`] for an unsafe `team_id` and [`ErrorKind::SysOp`]
+    /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation) for
+    /// an unsafe `team_id` and [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp)
     /// when removal fails.
     pub fn unlink_team(&self, team_id: &str) -> Result<bool> {
         unlink(&self.root_path, TEAM_LINKS_DIR, team_id)

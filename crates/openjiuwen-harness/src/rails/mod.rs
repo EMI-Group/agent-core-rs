@@ -79,7 +79,7 @@ pub mod rail_priority {
     pub const EVOLUTION: i32 = 60;
     /// LSP rail.
     pub const LSP: i32 = 60;
-    /// Priority of a rail that overrides nothing ([`DEFAULT_RAIL_PRIORITY`]).
+    /// Priority of a rail that overrides nothing (`DEFAULT_RAIL_PRIORITY`).
     pub const DEFAULT: i32 = 50;
     /// Completion-signal rail.
     pub const COMPLETION: i32 = 10;
