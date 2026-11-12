@@ -94,6 +94,7 @@ impl NativeCheckpointState {
     /// A [`NativeCheckpointState`] is always JSON-serializable, so encoding
     /// cannot fail; the fallback empty object only satisfies the infallible
     /// signature.
+    #[must_use]
     pub fn to_json(&self) -> JsonObject {
         json_object_from_value(serde_json::to_value(self).unwrap_or(JsonValue::Null))
             .unwrap_or_default()
@@ -152,16 +153,6 @@ impl EnvelopeBuilder {
     /// Sets (or clears) the provider session id applied to new envelopes.
     pub(crate) fn set_provider_session_id(&mut self, value: Option<String>) {
         self.provider_session_id = value;
-    }
-
-    /// Returns the sequence of the last emitted event.
-    pub(crate) fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// Overrides the sequence counter, e.g. after resuming a checkpoint.
-    pub(crate) fn set_sequence(&mut self, sequence: u64) {
-        self.sequence = sequence;
     }
 
     /// Builds the next envelope for `payload`.
@@ -405,13 +396,11 @@ mod tests {
     #[test]
     fn envelopes_are_monotonic_and_carry_the_provider_session() {
         let mut builder = EnvelopeBuilder::new("host-1", "agent-1");
-        assert_eq!(builder.sequence(), 0);
         builder.set_provider_session_id(Some("provider-1".to_owned()));
         let first = builder.next(payload());
         let second = builder.next(payload());
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
-        assert_eq!(builder.sequence(), 2);
         assert_eq!(first.host_session_id, "host-1");
         assert_eq!(first.agent_id, "agent-1");
         assert_eq!(first.provider_session_id.as_deref(), Some("provider-1"));
@@ -421,11 +410,9 @@ mod tests {
         assert_eq!(first.causation_ids, Vec::<String>::new());
 
         builder.set_provider_session_id(None);
-        builder.set_sequence(10);
         let third = builder.next(payload());
-        assert_eq!(third.sequence, 11);
+        assert_eq!(third.sequence, 3);
         assert_eq!(third.provider_session_id, None);
-        assert_eq!(builder.sequence(), 11);
     }
 
     #[test]
