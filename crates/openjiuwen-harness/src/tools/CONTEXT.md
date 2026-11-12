@@ -134,10 +134,10 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `./shell.rs` → `BashTool` and the `bash` card
 - `./read.rs` → `ReadFileTool`
 - `./write.rs` → `WriteFileTool`, `EditFileTool`
-- `./search.rs` → `GlobTool`, `ListDirTool`, `GrepTool`
-- `./todo.rs` → `TodoStore` and the four todo tools
+- `./search/` → `glob`, `list_files` and `grep` tools, one per file, plus the in-process grep scanner (`search/CONTEXT.md`)
+- `./todo/` → todo store, card-schema inlining, shared validation and the four todo tools, one per file (`todo/CONTEXT.md`)
 - `./ask_user.rs` → `UserAsker` seam and `AskUserTool`
-- `./memory.rs` → `MemoryToolBackend` seam and the eight memory tools
+- `./memory/` → memory backend seam, tool kinds and the eight memory tools (`memory/CONTEXT.md`)
 - `./tests.rs` → cross-module parity suite: name order, card schemas/languages, `required` lists, `parallel_safe`, end-to-end registry calls over a temp workspace, `render_for_llm` strings
 
 ## Test Strategy
