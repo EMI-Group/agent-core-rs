@@ -67,7 +67,7 @@ State semantics (contract for every implementor):
 - `update_state(patch)` deep-merges an object patch into the global lane under one write lock: object-vs-object recurses, a `null` value deletes the path (deletes applied after writes), any other value replaces wholesale (arrays are never element-merged).
 - `get_component_state(id)` / `update_component_state(id, patch)` address the component lane by component id; ids are treated as nested paths, so component `a.b` is stored at `{"a": {"b": ...}}` exactly like Python's `executable_id` nesting. An empty component id is `Error::Validation`.
 - `write_stream` publishes a [`StreamItem`] to the session's hub; a `Null` payload is `Error::Validation` (Python error 111132). `end_stream` publishes the completion marker (`StreamEvent::End`), is idempotent, and never fails on an already-closed stream.
-- `request_interaction` publishes a `__interaction__` output frame and awaits a [`InteractionResponse`]; a seeded answer (`InteractiveInput::interrupt_answers`) returns immediately. Timeout resolves to `Error::Timeout`, cancellation to `Error::Cancelled`.
+- `request_interaction` publishes a `__interaction__` output frame and awaits a [`InteractionResponse`]; a broker seeded via `InteractionBroker::seed`/`seed_interrupt` returns the queued answer immediately without re-emitting the frame, but the `Session` trait exposes no seeding accessor (a session's broker stays private; `openjiuwen-workflow` seeds its own `InteractionState` instead). Timeout resolves to `Error::Timeout`, cancellation to `Error::Cancelled`.
 - `trace()` returns the session's sink; `tracer()` returns the span factory when the session owns one.
 - `snapshot`/`restore` are the checkpointing seam: default implementations cover global state + trace position; concrete sessions add component state.
 - `save_checkpoint` returns the checkpoint id (generated when `None`); `resume` loads and restores, returning `Ok(false)` when the checkpoint does not exist.
@@ -100,7 +100,8 @@ pub struct StreamHub;                                // bounded broadcast transp
 pub struct StreamWriterManager;                      // mode routing over one hub
 ```
 
-- `StreamItem::output(item_type, index, payload)`, `::trace(item_type, payload)`, `::custom(payload)`, `is_end()`, `to_wire() -> Value` (`{"type","index","payload"}`, mode dropped for wire parity).
+- `StreamItem::output(item_type, index, payload)`, `::output_at(item_type, index: i64, payload)`, `::trace(item_type, payload)`, `::custom(payload)` (frame type `"custom"`), `with_mode(mode)`, `is_end()`, `to_wire() -> Value` (`{"type","index","payload"}`, mode dropped for wire parity, `index` omitted when `None`).
+- `StreamMode::as_str() -> &'static str` returns `"output"`/`"trace"`/`"custom"`; `StreamMode` is `Copy` and `Default = Output`.
 - `StreamHub::new()` (capacity `DEFAULT_STREAM_CAPACITY = 1024`), `with_capacity`, `send_now`, `send`, `subscribe() -> BoxStream<'static, Result<StreamEvent>>`, `close`, `is_closed`, `capacity`.
 - `send_now` is the canonical publish path: a synchronous `tokio::sync::broadcast` send with no I/O and no await, usable from synchronous trace sinks and from any thread; `send` is an `async` wrapper that never awaits internally (kept for API symmetry with Python).
 - `StreamWriterManager::new(hub)` (all modes), `with_modes(hub, modes)`, `write_now`, `write`, `subscribe`, `close`, `is_closed`, `modes`, `enables`, `hub`.
@@ -164,7 +165,7 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 ```
 
 - `build_key(parts: &[&str]) -> String` (`:`-joined) and `build_key_with_namespace(session_id, namespace, entity_id, suffixes)` preserve Python's key layout.
-- Backends: `MemoryCheckpointer` (`new()`, `shared()` process-wide singleton, `len()`, `is_empty()`, `clear()`), `FileCheckpointer` (`new(root)`, `<root>/<session_id>/<checkpoint_id>.json`, atomic write through a `.<uuid>.tmp` file plus rename, corrupt JSON is `Error::Session`), `SqliteCheckpointer` (feature `sqlite`, `open(path).await` / `in_memory().await`, one `session_checkpoints` table, a single upsert statement per save, corrupt payload is `Error::Session`).
+- Backends: `MemoryCheckpointer` (`new()`, `shared()` process-wide singleton, `len(session_id)`, `is_empty()`, `clear()`; clones share storage), `FileCheckpointer` (`new(root)`, `<root>/<session_id>/<checkpoint_id>.json`, atomic write through a `.<uuid>.tmp` file plus rename, corrupt JSON is `Error::Session`), `SqliteCheckpointer` (feature `sqlite`, `open(path).await` / `in_memory().await`, one `session_checkpoints` table, a single upsert statement per save, corrupt payload is `Error::Session`).
 - `CheckpointerConfig { kind, path, extra }`, `CheckpointerKind { InMemory, File, Sqlite }`, `create_checkpointer(&config).await -> Result<Arc<dyn Checkpointer>>`; `file` and `sqlite` require a `path` (`Error::Validation` otherwise), and `sqlite` additionally requires the `sqlite` feature (`Error::Unsupported` without it).
 - `Checkpoint` derives serde with snake_case field names; checkpoint ids are generated (`uuid_hex()`) when empty; `latest` sorts `(created_at, checkpoint_id)` descending itself, so it does not depend on backend list order; session and checkpoint ids are validated (no path separators, no `..`).
 - `list` order is backend-defined: `MemoryCheckpointer` and `FileCheckpointer` return `(created_at, checkpoint_id)` ascending, `SqliteCheckpointer` newest first; callers that need a specific order must sort the result.
@@ -291,6 +292,7 @@ pub struct SpanHandle; // id / trace_id / set_inputs / set_outputs / set_metadat
 - Use `StreamWriterManager::write_now` (and `StreamHub::send_now`) from synchronous code such as trace sinks and callbacks; use `write`/`send` in async code. Both are non-blocking.
 - `request_interaction` only completes when another task calls `resolve_interaction` (normally the host transport reading `__interaction__` frames); seeded `InteractiveInput::interrupt_answers` short-circuit it on resume.
 - Facades above own the `Arc<dyn Checkpointer>` and inject it through the options structs; there is no process-global default checkpointer.
+- `Session::trace()` on a concrete session returns its `StreamTraceSink` (the checkpointed trace position); to record spans in a test install a `MemoryTraceSink` with `session.tracer().expect("tracer").set_sink(sink.clone())` — `set_sink` affects only spans started afterwards and does not change `trace()` or its position, and `WorkflowSessionOptions` has no sink field.
 - Interaction vocabulary maps to `openjiuwen-harness-protocol` by table only (see the mapping above); this crate must not depend on the protocol crate (layer rule, `docs/ARCHITECTURE.md` §1).
 - `src/tracer.rs` is ~1100 lines because it holds the span model, frame type, three sinks, the tracer, and their inline tests; split it when another sink or span family lands.
 

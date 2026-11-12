@@ -133,6 +133,8 @@ pub struct KnowledgeBaseStatistics { pub kb_id: String, pub index_type: String, 
                                      pub document_count: usize, pub has_reranker: bool, pub has_loader: bool }
 pub async fn retrieve_multi_kb(kbs: &[Arc<SimpleKnowledgeBase>], query: &str, top_k: Option<usize>)
     -> Vec<RetrievalResult>; // dedupe by text, keep max score, descending
+pub async fn retrieve_multi_kb_with_source(kbs: &[Arc<SimpleKnowledgeBase>], query: &str, top_k: Option<usize>)
+    -> Vec<MultiKBRetrievalResult>; // adds sorted, deduped kb_ids plus raw_score/raw_score_scaled metadata
 ```
 `add_documents` fills empty ids, chunks, embeds all chunk texts in batches, upserts `VectorRecord`s (chunk id, doc_id, chunk metadata), returns document ids in input order.
 `retrieve_with_config` embeds the query, searches with `top_k`/`score_threshold`/`filters`, optionally reranks, returns `RetrievalResult`s (`chunk_id` from the hit id, `doc_id` from result metadata) truncated to `top_k`.
@@ -189,6 +191,7 @@ No streaming search: Python exposes none (only `Parser.lazy_parse`, which is non
 
 - All seven modules are implemented: `common`, `chunking`, `loaders`, `embedding`, `vector_store`, `reranker`, `knowledge_base`, re-exported from the crate root.
 - `tests/` holds `document_json.rs`, `chunking.rs`, `loaders.rs`, `embedding.rs`, `vector_store.rs`, and `knowledge_base.rs`; unit tests live beside their modules.
+- Minimal offline knowledge base: `SimpleKnowledgeBase::from_config(KnowledgeBaseConfig::new("kb"), Arc::new(InMemoryVectorStore::new()), Arc::new(HashEmbedding::new(64)))?` then `.add_documents(...)`/`.add_texts(...)` and `.retrieve_with_config(query, &RetrievalConfig::default())`; `InMemoryVectorStore::new()` is sync (only `open`/`open_with_collection` are async).
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
 - `cargo clippy -p openjiuwen-retrieval --all-targets -- -D warnings` is clean now that the scaffolded foundation dependency is gone; no `--no-deps` workaround is needed.
 
