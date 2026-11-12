@@ -21,6 +21,10 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
+pub use runtime::{
+    ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
+    SubAgentSpawnRequest, SubagentMetadata, SubagentStatus,
+};
 
 /// One registered sub-agent definition: its configuration plus the preset it came from.
 ///
