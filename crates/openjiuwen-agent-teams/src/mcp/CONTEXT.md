@@ -40,12 +40,20 @@ impl TeamServerHandler { pub fn new(server: TeamMcpServer) -> Self; }
 
 // stdio.rs — #[cfg(feature = "mcp")]
 pub async fn serve_stdio(server: TeamMcpServer) -> Result<()>;
-pub async fn run_mcp_server_from_env() -> i32;
+pub async fn run_mcp_server_from_env() -> i32;                                     // OPENJIUWEN_TEAM_JOIN → run_mcp_server_with_descriptor
+pub(crate) fn resolve_from_registry(descriptor: &TeamJoinDescriptor) -> Result<Arc<dyn TeamClient>>;  // in-process team, else Error::Config
+pub(crate) async fn run_mcp_server_with_descriptor<F>(descriptor: TeamJoinDescriptor, resolver: F) -> i32;  // env-free seam
 pub async fn run_mcp_server_with<F>(resolver: F) -> i32 where F: FnOnce(&TeamJoinDescriptor) -> Result<Arc<dyn TeamClient>>;
 ```
 
 `TeamClient`, `TeamToolDef`, `ClientScope`, `SendOutcome`, `CreateOutcome`, `OpOutcome`, `MemberSummary`, `operator_tools()` and `TeamJoinDescriptor` come from `crate::skill`.
 `TeamToolDef { name, description, input_schema }` is the only tool representation crossing this node; rmcp `Tool` values are built from it inside `server.rs`.
+
+## Live-team attach
+
+The default resolver `resolve_from_registry` calls `crate::skill::connect_live_client`, so the server attaches to a team hosted in *this* process through the process-global runtime registry.
+A team this process does not host is `Error::Config` with the text `no live team '<team_name>' hosted in this process`, logged with `tracing::error!`, and the entry point exits `1`.
+`run_mcp_server_from_env` and `run_mcp_server_with` both load `OPENJIUWEN_TEAM_JOIN` and delegate to `run_mcp_server_with_descriptor`, which carries the descriptor and therefore needs no process environment.
 
 ## Tool tables per scope
 
@@ -105,7 +113,7 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - `./mod.rs` → constants, `TeamMcpServer`, scope routing, `build_mcp_server`, flat re-exports
 - `./dispatch.rs` → operator/member dispatch over `TeamClient`, argument extraction, error text
 - `./server.rs` → `TeamServerHandler`: `rmcp::ServerHandler` (`get_info`, `list_tools`, `call_tool`)
-- `./stdio.rs` → `serve_stdio` and the environment-driven entry point
+- `./stdio.rs` → `serve_stdio`, the environment entry point, the registry resolver and the env-free descriptor seam
 - `./tests.rs` → offline `FakeClient` suite (runs with and without the `mcp` feature)
 
 ## Test Strategy
@@ -115,14 +123,15 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - `instructions` per scope: `None` for member, `Some(OPERATOR_INSTRUCTIONS)` for operator.
 - `call_tool` for all ten operator tools, asserting the exact compact JSON text; `get_task` missing → `null`.
 - Failure text: unknown tool, member-scope `read_inbox`, missing required argument, and a client `Err` → `Internal error: ...`.
-- `run_mcp_server_from_env` is not covered (process env + stdio): its descriptor failure path is exercised through the resolver seam only if cheap; the transport itself is out of scope.
+- `run_mcp_server_from_env` is not covered (process env + stdio): the transport is out of scope, and the process environment is never mutated in a test.
+- `resolve_from_registry` for an unhosted team returns `ErrorKind::Config` with the exact message, and `run_mcp_server_with_descriptor` returns exit code `1` for that error (both `#[cfg(feature = "mcp")]`, neither touches the global registry or the process environment).
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green.
 
 ## Deferred
 
 - HTTP/SSE transport: remote exposure is deployment's concern; stdio is the only transport, as in Python.
 - Elicitation, prompts, resources and sampling: only the `tools` capability is advertised.
-- Live client resolution: `run_mcp_server_from_env` validates the descriptor but resolves the `TeamClient` through an injected resolver; the default resolver reports `Error::Unsupported` until `crate::runtime`'s process-global team registry lands.
+- Live client resolution: the MCP process serves teams hosted in *this* process only, through `crate::skill::connect_live_client`; cross-process attach (a shared sqlite store or a distributed transport) is deferred and an unhosted team is reported as `Error::Config`.
 - Structured content / annotations: results are a single text block (Python parity).
 - Resumability, progress notifications and graceful shutdown hooks.
 
@@ -133,3 +142,4 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 - Python's `_ClientHolder` lazily connects and re-binds session context per call; in Rust the `TeamClient` is already constructed and bound, so `TeamMcpServer` only holds the `Arc`.
 - `READ_INBOX` is the one operator-only pull tool; keep the name stable (CLI prompts reference it).
 - Keep the operator result shapes byte-identical to the table above: consumers (external CLIs) parse them as JSON.
+- `run_mcp_server_from_env` loads `OPENJIUWEN_TEAM_JOIN` and delegates to `run_mcp_server_with_descriptor`, which is the env-free seam tests drive.
