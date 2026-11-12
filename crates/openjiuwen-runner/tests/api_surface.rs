@@ -244,7 +244,7 @@ fn constructors_and_builders_are_reachable() {
     let options = RunOptions::default()
         .with_session_id("s1")
         .with_timeout(Duration::from_secs(1))
-        .with_envs(std::collections::BTreeMap::new());
+        .with_envs("K", Value::from("v"));
     let _ = options.metadata;
     let _: AgentRef = "a1".into();
     let _: WorkflowRef = "w1".into();
