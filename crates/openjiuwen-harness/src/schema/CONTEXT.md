@@ -96,7 +96,7 @@ Every public item is re-exported from `crate::schema`; the child modules themsel
 - `DeepAgentConfig`, `SubAgentConfig` and the persisted state types derive `JsonSchema`; schemars overrides cover `SecretString`, `ModelRequestConfig`, `ModelClientConfig`, `MaxIterationsPolicy` and `PathBuf` fields.
 - Validation returns `openjiuwen_common::error::{Error, Result}` with Python message text; no panics outside tests.
 - This module must not import any other harness module except `crate::workspace::Workspace`, `crate::permission::PermissionsSection`, and `crate::prompts::PromptMode` (re-export of `mode::PromptMode`, leaf reference only).
-- Files ≤1000 lines; split `config.rs` into `config/{mod,agent,subagent,tests}.rs` if it grows past the limit (the facade re-exports keep the API unchanged).
+- Files ≤1000 lines; `config` is split into `config/{mod,agent,subagent,tests}.rs` (the facade re-exports keep the API unchanged).
 - Unit tests live in each file (`#[cfg(test)] mod tests`) or a sibling `*_tests.rs`; no integration-test changes (that directory is owned elsewhere).
 
 ## Design decisions
@@ -112,11 +112,14 @@ Every public item is re-exported from `crate::schema`; the child modules themsel
 - Interaction streaming guards (`OutputLease`, `OutputLeaseManager`, `InteractionOutputStream`) are runtime concurrency, not schema data; they belong to the agent streaming layer and are not ported here.
 - `NoProgressAnswer` defaults `min_answer_chars` to 20 (the production guard-config value); Python's standalone evaluator default of 80 only applies when constructed directly and is not used by `DeepAgent`.
 - The second, flat session layout written by `ContextProcessorRail` (`task_state`, `iteration`, `pending_follow_ups`, `plan_mode`) is a consumer concern; this module only owns the `"deepagent"` payload.
+- `StopEvaluationContext` also exposes read accessors (`iteration`, `token_usage`, `elapsed_seconds`, `last_result`, `extra`) because `CustomPredicate` closures receive `&StopEvaluationContext` and cannot move fields out.
+- `TaskPlan::to_markdown` joins its lines with `\n` (Python `"\n".join`): a plan with tasks ends on the last task line with no trailing newline, while a task-less plan still ends with one because of its blank second line.
+- `resolve_inner_react_max_iterations` is a `const fn`, so callers may use it in const context.
 
 ## Routing Table
 
 - `./mode.rs` → `AgentMode`, `PromptMode`
-- `./config.rs` → `DeepAgentConfig`, `SubAgentConfig`, `OnMaxIterations`, `TaskLoopNoProgressGuardConfig`, iteration helper
+- `./config/` → `DeepAgentConfig`, `SubAgentConfig`, `OnMaxIterations`, `TaskLoopNoProgressGuardConfig`, iteration helper (`mod.rs` facade, `agent.rs`, `subagent.rs`, `tests.rs`; public paths stay `crate::schema::<item>`)
 - `./state.rs` → `DeepAgentState`, `PlanModeState`, session JSON round-trip, session keys
 - `./task.rs` → `TaskPlan`, `TodoItem`, `TodoStatus`, `ModelUsageRecord`, status icons
 - `./stop_condition.rs` → evaluation context/verdict, evaluator trait, built-in evaluators, persisted state
