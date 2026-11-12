@@ -1,10 +1,12 @@
-//! Capability-asset persistence: the [`AssetStore`] seam and its KV backend.
+//! Capability-asset persistence: the [`AssetStore`](crate::store::AssetStore) seam and
+//! its KV backend.
 //!
 //! Python's symphony engine receives capability inventories from the host and keeps no
 //! durable catalog of its own. The Rust port needs CRUD and search across restarts, so
-//! an [`AssetStore`] persists descriptors, and [`KvAssetStore`] implements it on top of
-//! `openjiuwen-foundation`'s [`KvStore`] (in-memory, one JSON file per entry, or
-//! `SQLite`).
+//! an [`AssetStore`](crate::store::AssetStore) persists descriptors, and
+//! [`KvAssetStore`](crate::store::KvAssetStore) implements it on top of
+//! `openjiuwen-foundation`'s [`KvStore`](openjiuwen_foundation::store::KvStore)
+//! (in-memory, one JSON file per entry, or `SQLite`).
 //!
 //! Storage layout: the key is `<prefix><qualified capability id>` and the value is the
 //! descriptor's JSON, so a backend can be inspected (and repaired) with plain JSON

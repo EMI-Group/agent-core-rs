@@ -6,11 +6,12 @@
 //! revision, so a reader observes either the previous document or the new one — never a
 //! half-written file nor a revision that changed underneath it.
 //!
-//! Two backends implement [`GraphArtifactStore`]:
+//! Two backends implement [`GraphArtifactStore`](crate::artifact::GraphArtifactStore):
 //!
-//! - [`MemoryGraphArtifactStore`] keeps revisions in process memory. It is the default
-//!   for ephemeral runs and tests.
-//! - [`FileGraphArtifactStore`] keeps one JSON document per revision below
+//! - [`MemoryGraphArtifactStore`](crate::artifact::MemoryGraphArtifactStore) keeps
+//!   revisions in process memory. It is the default for ephemeral runs and tests.
+//! - [`FileGraphArtifactStore`](crate::artifact::FileGraphArtifactStore) keeps one JSON
+//!   document per revision below
 //!   `root/versions/<version>/graph.json`, plus the `root/current.json` pointer document.
 //!   Both are written with the same-directory `*.tmp` write followed by `rename`, so an
 //!   interrupted publish leaves the previous revision (and the previous pointer) intact.
@@ -25,10 +26,12 @@
 //!   current.json         # the same envelope, for the current revision
 //! ```
 //!
-//! Each document is a revision envelope: the [`GraphRevision`] metadata sits next to the
-//! JGF document produced by [`CapabilityGraph::to_value`]. Keeping the metadata in the
-//! document (instead of deriving it from file timestamps) is what makes a reopened store
-//! report identical revisions and deterministic ordering.
+//! Each document is a revision envelope: the
+//! [`GraphRevision`](crate::artifact::GraphRevision) metadata sits next to the JGF
+//! document produced by
+//! [`CapabilityGraph::to_value`](crate::graph::CapabilityGraph::to_value). Keeping the
+//! metadata in the document (instead of deriving it from file timestamps) is what makes
+//! a reopened store report identical revisions and deterministic ordering.
 //!
 //! # Concurrency
 //!
