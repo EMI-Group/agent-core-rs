@@ -8,8 +8,13 @@
 //! No ranking, extraction, or engine policy lives here; the module only derives keys,
 //! serializes values, and propagates store errors (a missing key/collection is never an
 //! error, it is `None`/`false`/`0`/empty).
+//!
+//! Writes always use the current key layout (`keys`). Reads fall back to the legacy
+//! layout (`keys::legacy_alternatives`) only when the current key is absent, and
+//! deletes remove both variants; a legacy hit is logged at debug level and never
+//! migrated implicitly. See the `keys` module docs for the family mapping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::store::{
@@ -58,27 +63,32 @@ impl MemoryStorage {
     ///
     /// A stored value that is not UTF-8 text or not a valid record JSON is reported as
     /// `Error::Validation`: unlike a listing, a point read must not hide corruption.
+    /// The current key wins; a record stored under the legacy layout is read only when
+    /// the current key is absent.
     pub(crate) async fn get_record(
         &self,
         scope: &MemoryScope,
         id: &str,
     ) -> Result<Option<MemoryRecord>> {
         let key = keys::record_key(scope, id);
-        let Some(value) = self.stores.kv.get(&key).await? else {
+        let Some((found, text)) = self.get_text_with_legacy(key).await? else {
             return Ok(None);
         };
-        let Some(text) = value.as_str() else {
-            return Err(Error::validation(format!(
-                "stored memory record `{key}` is not UTF-8 text"
-            )));
-        };
-        json::record_from_text(text).map(Some)
+        json::record_from_text(&text)
+            .map_err(|error| {
+                Error::validation(format!(
+                    "stored memory record `{found}` is not a valid record: {error}"
+                ))
+            })
+            .map(Some)
     }
 
     /// Lists every record matching `filter`, newest first and by id ascending on ties.
     ///
     /// The scan uses the narrowest key prefix the filter allows. Malformed entries are
-    /// logged and skipped: one corrupt record must not fail a whole listing.
+    /// logged and skipped: one corrupt record must not fail a whole listing. Records
+    /// found only under the legacy layout are appended after the current-layout scan,
+    /// and a record present in both layouts is reported once from the current one.
     pub(crate) async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
         let prefix = match (&filter.user_id, &filter.scope_id) {
             (Some(user_id), Some(scope_id)) => {
@@ -88,7 +98,34 @@ impl MemoryStorage {
             (None, Some(scope_id)) => keys::record_prefix_for_scope(scope_id),
             (None, None) => keys::record_prefix_for_scope(""),
         };
-        let entries = self.stores.kv.get_by_prefix(&prefix).await?;
+        let mut records = self.scan_records(&prefix, filter).await?;
+        let mut seen: BTreeSet<String> = records
+            .iter()
+            .map(|record| keys::record_key(&record.scope, &record.id))
+            .collect();
+        for legacy in keys::legacy_alternatives(&prefix) {
+            for record in self.scan_records(&legacy, filter).await? {
+                let current = keys::record_key(&record.scope, &record.id);
+                if seen.insert(current.clone()) {
+                    log_legacy_read(&current, &legacy);
+                    records.push(record);
+                }
+            }
+        }
+        records.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(records)
+    }
+
+    /// Scans `prefix`, returning the records that match `filter` (unsorted).
+    ///
+    /// Malformed or non-text entries are logged and skipped, never fatal.
+    async fn scan_records(&self, prefix: &str, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
+        let entries = self.stores.kv.get_by_prefix(prefix).await?;
         let mut records = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             let Some(text) = value.as_str() else {
@@ -113,20 +150,16 @@ impl MemoryStorage {
                 ),
             }
         }
-        records.sort_by(|left, right| {
-            right
-                .timestamp
-                .cmp(&left.timestamp)
-                .then_with(|| left.id.cmp(&right.id))
-        });
         Ok(records)
     }
 
     /// Deletes `record` and its embedding, returning whether the record row existed.
+    ///
+    /// Both the current and the legacy key are removed; a legacy row therefore reports
+    /// `true` on its first delete and `false` afterwards.
     pub(crate) async fn delete_record(&self, record: &MemoryRecord) -> Result<bool> {
         let key = keys::record_key(&record.scope, &record.id);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
+        let existed = self.delete_with_legacy(&key).await?;
         self.delete_embedding(record).await?;
         Ok(existed)
     }
@@ -227,6 +260,8 @@ impl MemoryStorage {
     }
 
     /// Reads a text variable, or `None` when it is absent or not stored as text.
+    ///
+    /// The current key wins; the legacy key layout is consulted only when it is absent.
     pub(crate) async fn get_variable(
         &self,
         scope: &MemoryScope,
@@ -234,39 +269,60 @@ impl MemoryStorage {
         name: &str,
     ) -> Result<Option<String>> {
         let key = variable_key(scope, session_id, name);
-        let Some(value) = self.stores.kv.get(&key).await? else {
-            return Ok(None);
-        };
-        Ok(value.as_str().map(str::to_owned))
+        match self.get_text_with_legacy(key).await {
+            Ok(found) => Ok(found.map(|(_, text)| text)),
+            // A non-text value is "not a text variable", the documented contract here.
+            Err(Error::Validation(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists every variable of the scope namespace, keyed by variable name.
+    ///
+    /// The current namespace is scanned first; names found only under the legacy layout
+    /// are added afterwards, so a current-layout variable always wins on a name clash.
     pub(crate) async fn list_variables(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
     ) -> Result<BTreeMap<String, String>> {
         let prefix = variable_prefix(scope, session_id);
-        let entries = self.stores.kv.get_by_prefix(&prefix).await?;
+        let mut candidates = vec![(prefix.clone(), false)];
+        candidates.extend(
+            keys::legacy_alternatives(&prefix)
+                .into_iter()
+                .map(|legacy| (legacy, true)),
+        );
         let mut variables = BTreeMap::new();
-        for (key, value) in entries {
-            let Some(name) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Some(text) = value.as_str() else {
-                tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    key = %key,
-                    "skipping a memory variable that is not UTF-8 text"
-                );
-                continue;
-            };
-            variables.insert(name.to_owned(), text.to_owned());
+        for (candidate, from_legacy) in candidates {
+            let entries = self.stores.kv.get_by_prefix(&candidate).await?;
+            for (key, value) in entries {
+                let Some(name) = key.strip_prefix(&candidate) else {
+                    continue;
+                };
+                let Some(text) = value.as_str() else {
+                    tracing::warn!(
+                        target: "openjiuwen_memory::store",
+                        key = %key,
+                        "skipping a memory variable that is not UTF-8 text"
+                    );
+                    continue;
+                };
+                if from_legacy {
+                    let current = keys::current_equivalent(&key).unwrap_or_else(|| prefix.clone());
+                    log_legacy_read(&current, &key);
+                    variables
+                        .entry(name.to_owned())
+                        .or_insert_with(|| text.to_owned());
+                } else {
+                    variables.insert(name.to_owned(), text.to_owned());
+                }
+            }
         }
         Ok(variables)
     }
 
-    /// Deletes a variable, returning whether the key existed.
+    /// Deletes a variable, returning whether any of its keys existed.
     pub(crate) async fn delete_variable(
         &self,
         scope: &MemoryScope,
@@ -274,12 +330,12 @@ impl MemoryStorage {
         name: &str,
     ) -> Result<bool> {
         let key = variable_key(scope, session_id, name);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
-        Ok(existed)
+        self.delete_with_legacy(&key).await
     }
 
     /// Stores the configuration of `scope_id`, returning whether it replaced one.
+    ///
+    /// Writes only the current key: the legacy layout is read-only compatibility.
     pub(crate) async fn set_scope_config(
         &self,
         scope_id: &str,
@@ -297,6 +353,7 @@ impl MemoryStorage {
 
     /// Reads the configuration of `scope_id`, or `None` when it is absent.
     ///
+    /// The current key wins; the legacy layout is consulted only when it is absent.
     /// Stored JSON that is not a valid [`MemoryScopeConfig`] is `Error::Validation`,
     /// never a silent default.
     pub(crate) async fn get_scope_config(
@@ -304,29 +361,75 @@ impl MemoryStorage {
         scope_id: &str,
     ) -> Result<Option<MemoryScopeConfig>> {
         let key = keys::scope_config_key(scope_id);
-        let Some(value) = self.stores.kv.get(&key).await? else {
+        let Some((found, text)) = self.get_text_with_legacy(key).await? else {
             return Ok(None);
         };
-        let Some(text) = value.as_str() else {
-            return Err(Error::validation(format!(
-                "stored memory scope config `{scope_id}` is not UTF-8 text"
-            )));
-        };
-        let config = serde_json::from_str(text).map_err(|error| {
+        let config = serde_json::from_str(&text).map_err(|error| {
             Error::validation(format!(
-                "malformed memory scope config JSON for `{scope_id}`: {error}"
+                "malformed memory scope config JSON for `{found}`: {error}"
             ))
         })?;
         Ok(Some(config))
     }
 
     /// Deletes the configuration of `scope_id`, returning whether it existed.
+    ///
+    /// Both the current and the legacy key are removed.
     pub(crate) async fn delete_scope_config(&self, scope_id: &str) -> Result<bool> {
         let key = keys::scope_config_key(scope_id);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
+        self.delete_with_legacy(&key).await
+    }
+
+    /// Reads the UTF-8 text stored under `key`, falling back to the legacy key layout.
+    ///
+    /// Returns the key that was actually found plus its text. The current key always
+    /// wins: a legacy candidate is tried only when `key` is absent. A candidate holding
+    /// a non-text value is `Error::Validation` naming that key, because a point read
+    /// must not hide corruption behind a "missing" answer. `None` means no candidate
+    /// key exists at all.
+    async fn get_text_with_legacy(&self, key: String) -> Result<Option<(String, String)>> {
+        let mut candidates = vec![key.clone()];
+        candidates.extend(keys::legacy_alternatives(&key));
+        for (position, candidate) in candidates.into_iter().enumerate() {
+            let Some(value) = self.stores.kv.get(&candidate).await? else {
+                continue;
+            };
+            let Some(text) = value.as_str() else {
+                return Err(Error::validation(format!(
+                    "stored memory value `{candidate}` is not UTF-8 text"
+                )));
+            };
+            if position > 0 {
+                log_legacy_read(&key, &candidate);
+            }
+            return Ok(Some((candidate, text.to_owned())));
+        }
+        Ok(None)
+    }
+
+    /// Deletes `key` and every legacy alternative, reporting whether any of them existed.
+    async fn delete_with_legacy(&self, key: &str) -> Result<bool> {
+        let mut candidates = vec![key.to_owned()];
+        candidates.extend(keys::legacy_alternatives(key));
+        let mut existed = false;
+        for candidate in candidates {
+            if self.stores.kv.exists(&candidate).await? {
+                existed = true;
+            }
+            self.stores.kv.delete(&candidate).await?;
+        }
         Ok(existed)
     }
+}
+
+/// Logs a read that was served from the legacy key layout.
+fn log_legacy_read(current_key: &str, legacy_key: &str) {
+    tracing::debug!(
+        target: "openjiuwen_memory::store",
+        current_key = %current_key,
+        legacy_key = %legacy_key,
+        "read from a legacy memory key"
+    );
 }
 
 /// Creates the vector collection when it does not exist.
@@ -772,6 +875,267 @@ mod tests {
             .await
             .expect("delete again"));
         assert_eq!(storage.get_scope_config("ws").await.expect("absent"), None);
+    }
+
+    async fn put_legacy(storage: &MemoryStorage, key: &str, value: &str) {
+        storage
+            .stores
+            .kv
+            .set(key, KvValue::text(value))
+            .await
+            .expect("write legacy value");
+    }
+
+    async fn kv_text(storage: &MemoryStorage, key: &str) -> Option<String> {
+        storage
+            .stores
+            .kv
+            .get(key)
+            .await
+            .expect("read key")
+            .and_then(|value| value.as_str().map(str::to_owned))
+    }
+
+    async fn assert_key_gone(storage: &MemoryStorage, key: &str) {
+        assert!(
+            kv_text(storage, key).await.is_none(),
+            "`{key}` still exists"
+        );
+    }
+
+    fn variables(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_record_keys_are_read_without_outranking_the_current_key() {
+        let storage = storage();
+        let scope = scope();
+        let legacy_key = keys::legacy_record_key(&scope, "legacy");
+        let legacy = record("legacy", "from the legacy layout", 0);
+        let legacy_text = json::record_to_text(&legacy).expect("serialize record");
+        put_legacy(&storage, &legacy_key, &legacy_text).await;
+        let found = storage
+            .get_record(&scope, "legacy")
+            .await
+            .expect("get legacy")
+            .expect("legacy record readable");
+        assert_eq!(found.content, "from the legacy layout");
+        let listed = storage
+            .list_records(&MemoryFilter::for_scope(&scope))
+            .await
+            .expect("list legacy");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "legacy");
+        // A current-layout write of the same id wins for point reads and listings.
+        let current = record("legacy", "from the current layout", 1);
+        storage.put_record(&current).await.expect("put current");
+        let found = storage
+            .get_record(&scope, "legacy")
+            .await
+            .expect("get current")
+            .expect("current record");
+        assert_eq!(found.content, "from the current layout");
+        let listed = storage
+            .list_records(&MemoryFilter::for_scope(&scope))
+            .await
+            .expect("list both");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "from the current layout");
+        // Reads never migrate implicitly: the legacy row is still stored.
+        assert!(kv_text(&storage, &legacy_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_user_variables_are_read_and_current_writes_win() {
+        let storage = storage();
+        let scope = scope();
+        let theme = keys::legacy_variable_key(&scope, "theme");
+        put_legacy(&storage, &theme, "dark").await;
+        put_legacy(&storage, &keys::legacy_variable_key(&scope, "lang"), "en").await;
+        let value = storage
+            .get_variable(&scope, None, "theme")
+            .await
+            .expect("get legacy");
+        assert_eq!(value.as_deref(), Some("dark"));
+        let listed = storage
+            .list_variables(&scope, None)
+            .await
+            .expect("list legacy");
+        assert_eq!(listed, variables(&[("theme", "dark"), ("lang", "en")]));
+        storage
+            .set_variable(&scope, None, "theme", "light")
+            .await
+            .expect("set theme");
+        assert_eq!(
+            kv_text(&storage, &theme).await.as_deref(),
+            Some("dark"),
+            "the write must land on the current key only"
+        );
+        let value = storage
+            .get_variable(&scope, None, "theme")
+            .await
+            .expect("get current");
+        assert_eq!(value.as_deref(), Some("light"));
+        // The current-layout value wins over the legacy one, a legacy-only variable stays.
+        let listed = storage
+            .list_variables(&scope, None)
+            .await
+            .expect("list mixed");
+        assert_eq!(listed, variables(&[("theme", "light"), ("lang", "en")]));
+    }
+
+    #[tokio::test]
+    async fn legacy_session_variables_stay_in_their_session_namespace() {
+        let storage = storage();
+        let scope = scope();
+        put_legacy(
+            &storage,
+            &keys::legacy_session_variable_key(&scope, "s1", "theme"),
+            "light",
+        )
+        .await;
+        let value = storage
+            .get_variable(&scope, Some("s1"), "theme")
+            .await
+            .expect("get legacy session");
+        assert_eq!(value.as_deref(), Some("light"));
+        let listed = storage
+            .list_variables(&scope, Some("s1"))
+            .await
+            .expect("list legacy session");
+        assert_eq!(listed, variables(&[("theme", "light")]));
+        // A session variable never leaks into the user-scoped namespace.
+        let value = storage
+            .get_variable(&scope, None, "theme")
+            .await
+            .expect("get user");
+        assert_eq!(value, None);
+        assert!(storage
+            .list_variables(&scope, None)
+            .await
+            .expect("list user")
+            .is_empty());
+        assert!(storage
+            .list_variables(&scope, Some("s2"))
+            .await
+            .expect("list other session")
+            .is_empty());
+        storage
+            .set_variable(&scope, Some("s1"), "theme", "blue")
+            .await
+            .expect("set session");
+        let value = storage
+            .get_variable(&scope, Some("s1"), "theme")
+            .await
+            .expect("get current session");
+        assert_eq!(value.as_deref(), Some("blue"));
+    }
+
+    #[tokio::test]
+    async fn legacy_scope_config_is_read_and_current_writes_win() {
+        let storage = storage();
+        let legacy = MemoryScopeConfig {
+            user_profile_definition: Some("legacy facts".to_owned()),
+            semantic_memory_definition: None,
+            episodic_memory_definition: None,
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize config");
+        put_legacy(&storage, &keys::legacy_scope_config_key("ws"), &legacy_json).await;
+        let found = storage.get_scope_config("ws").await.expect("get legacy");
+        assert_eq!(found, Some(legacy.clone()));
+        let current = MemoryScopeConfig {
+            user_profile_definition: Some("current facts".to_owned()),
+            ..legacy
+        };
+        assert!(
+            !storage
+                .set_scope_config("ws", &current)
+                .await
+                .expect("set current"),
+            "only the legacy key existed, so nothing was replaced"
+        );
+        let found = storage.get_scope_config("ws").await.expect("get current");
+        assert_eq!(found, Some(current));
+    }
+
+    #[tokio::test]
+    async fn deletes_remove_current_and_legacy_keys_and_report_existence() {
+        let storage = storage();
+        let scope = scope();
+        let shared = record("shared", "record", 0);
+        let shared_json = json::record_to_text(&shared).expect("serialize record");
+        storage.put_record(&shared).await.expect("put record");
+        put_legacy(
+            &storage,
+            &keys::legacy_record_key(&scope, "shared"),
+            &shared_json,
+        )
+        .await;
+        assert!(storage.delete_record(&shared).await.expect("delete record"));
+        assert_key_gone(&storage, &keys::record_key(&scope, "shared")).await;
+        assert_key_gone(&storage, &keys::legacy_record_key(&scope, "shared")).await;
+        assert!(!storage.delete_record(&shared).await.expect("delete again"));
+        // A legacy-only row is reported `true` on its first delete and `false` afterwards.
+        let orphan = record("orphan", "legacy only", 1);
+        let orphan_json = json::record_to_text(&orphan).expect("serialize orphan");
+        put_legacy(
+            &storage,
+            &keys::legacy_record_key(&scope, "orphan"),
+            &orphan_json,
+        )
+        .await;
+        assert!(storage.delete_record(&orphan).await.expect("delete orphan"));
+        assert!(!storage
+            .delete_record(&orphan)
+            .await
+            .expect("delete orphan again"));
+
+        storage
+            .set_variable(&scope, None, "theme", "dark")
+            .await
+            .expect("set variable");
+        put_legacy(
+            &storage,
+            &keys::legacy_variable_key(&scope, "theme"),
+            "grey",
+        )
+        .await;
+        assert!(storage
+            .delete_variable(&scope, None, "theme")
+            .await
+            .expect("delete variable"));
+        assert_key_gone(&storage, &keys::variable_key(&scope, "theme")).await;
+        assert_key_gone(&storage, &keys::legacy_variable_key(&scope, "theme")).await;
+        assert!(!storage
+            .delete_variable(&scope, None, "theme")
+            .await
+            .expect("delete variable again"));
+
+        let config = MemoryScopeConfig {
+            user_profile_definition: None,
+            semantic_memory_definition: Some("facts".to_owned()),
+            episodic_memory_definition: None,
+        };
+        let config_json = serde_json::to_string(&config).expect("serialize config");
+        storage
+            .set_scope_config("ws", &config)
+            .await
+            .expect("set config");
+        put_legacy(&storage, &keys::legacy_scope_config_key("ws"), &config_json).await;
+        assert!(storage
+            .delete_scope_config("ws")
+            .await
+            .expect("delete config"));
+        assert_key_gone(&storage, &keys::scope_config_key("ws")).await;
+        assert_key_gone(&storage, &keys::legacy_scope_config_key("ws")).await;
+        assert!(!storage
+            .delete_scope_config("ws")
+            .await
+            .expect("delete config again"));
     }
 
     #[cfg(feature = "sqlite")]
