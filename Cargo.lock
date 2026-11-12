@@ -1900,27 +1900,38 @@ dependencies = [
 name = "openjiuwen-extensions"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "axum",
+ "bytes",
+ "chrono",
  "futures",
+ "http-body-util",
  "openjiuwen-common",
  "openjiuwen-core",
  "openjiuwen-foundation",
  "openjiuwen-harness-protocol",
+ "openjiuwen-session",
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
