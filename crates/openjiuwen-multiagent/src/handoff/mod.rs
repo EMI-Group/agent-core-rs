@@ -356,7 +356,9 @@ impl TeamStrategy for HandoffStrategy {
     ///
     /// # Errors
     ///
-    /// See [`HandoffStrategy::wire_endpoints`].
+    /// Returns the endpoint-wiring error: a validation error for a team without
+    /// members, and the runtime's subscription error when an endpoint cannot be
+    /// subscribed.
     async fn setup(&self, ctx: &StrategyContext) -> Result<()> {
         if self.ready.load(Ordering::SeqCst) {
             return Ok(());
