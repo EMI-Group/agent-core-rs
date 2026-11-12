@@ -18,6 +18,9 @@
 //!   sequences.
 //! - `TempWorkspace`, `EnvGuard`, and `TempHomeGuard` — filesystem and
 //!   environment isolation.
+//! - `workflow_session`, `agent_session`, and `memory_checkpointer` — ready-made
+//!   `Arc<dyn Session>` workflow/agent fixtures, optionally backed by an
+//!   in-memory checkpointer.
 //! - `assert_json_eq` and friends — JSON equality, subset, and round-trip
 //!   assertions with readable diffs.
 //! - `eventually` and friends — bounded async polling helpers.

@@ -2,8 +2,8 @@
 
 ## Intent
 
-The three integration binaries that prove the fakes behave like the Python ones end to end.
-`mock_server.rs` drives the real `OpenAiCompatibleClient` over a bound loopback socket; `scripted_model.rs` exercises the fake through `Arc<dyn Model>` and `ModelExt`; `fixtures.rs` proves the temp-directory and environment guards are drop-scoped.
+The four integration binaries that prove the fakes behave like the Python ones end to end.
+`mock_server.rs` drives the real `OpenAiCompatibleClient` over a bound loopback socket; `scripted_model.rs` exercises the fake through `Arc<dyn Model>` and `ModelExt`; `fixtures.rs` proves the temp-directory and environment guards are drop-scoped; `session_fixtures.rs` proves the session helpers return real `Arc<dyn Session>` workflow/agent sessions with working state and checkpoints.
 Unit tests stay beside the modules in `../src/`; only behavior that needs a real client, a real socket, or process-global environment mutation lives here.
 
 ## Constraints
@@ -21,3 +21,4 @@ Unit tests stay beside the modules in `../src/`; only behavior that needs a real
 - `./mock_server.rs` → end-to-end client behavior: non-streaming/streaming text, tool calls, reasoning, error status mapping, fallback and deterministic ids, request recording, route alias, wrong-method 404, waiter wake-up, graceful shutdown, builder options
 - `./scripted_model.rs` → `ScriptedModel` through the public trait: `Arc<dyn Model>` dispatch, `ModelExt::complete`, mixed turn order, failure propagation, call recording, fallback, `wait_for_calls`, builder overrides, `ScriptedError` kinds
 - `./fixtures.rs` → `TempWorkspace` drop cleanup and I/O, `TempHomeGuard` + `OpenJiuwenHome::resolve`, `EnvGuard` restore/clear semantics, `ISOLATED_ENV_VARS` contents, cross-thread guard visibility
+- `./session_fixtures.rs` → `workflow_session`/`agent_session` id and kind through `Arc<dyn Session>`, global/component state, `*_with` option pass-through, in-memory checkpointer save/resume and store isolation

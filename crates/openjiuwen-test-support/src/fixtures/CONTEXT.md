@@ -11,7 +11,9 @@ All helpers are drop-scoped (temporary directory removed, environment restored) 
 - `EnvGuard` — `new`, `hold`, `set`, `remove`, `get`; `ISOLATED_ENV_VARS`.
 - `EnvGuard` deliberately has no `Debug` because it holds saved environment values that may be secrets; `TempHomeGuard` does implement it.
 - `TempHomeGuard` — `new`, `isolated`, `root`, `home`, `set_var`; it keeps its own resolved `home` path so `home()` can return a borrow instead of recomputing the join.
-- `mod.rs` re-exports the three types and the constant, and nothing else.
+- Session fixtures (`session.rs`) — `workflow_session`, `workflow_session_with`, `agent_session`, `agent_session_with`, `memory_checkpointer`, `workflow_session_with_checkpointer`, `agent_session_with_checkpointer`; the plain helpers build a default `WorkflowSessionOptions`/`AgentSessionOptions` around the given id and return `Arc<dyn openjiuwen_session::Session>`.
+- `memory_checkpointer` returns a fresh `Arc<dyn Checkpointer>` wrapping `MemoryCheckpointer::new`, so each call is an isolated store.
+- `mod.rs` re-exports the three guard types, the session helpers, and the constant, and nothing else.
 
 ## Constraints
 
@@ -26,10 +28,13 @@ All helpers are drop-scoped (temporary directory removed, environment restored) 
 - `OPENJIUWEN_HOME` is set to `<temp root>/home` and the directory is created eagerly.
 - `ISOLATED_ENV_VARS` uses the constants from `openjiuwen_common::config::env` where available (never re-typed string literals for those names).
 - `write_json`/`read_json` return `openjiuwen_common::error::Result` (`Error::sys_op` for I/O, `Error::validation` for serialization, both naming the path); plain file helpers return `io::Result`.
-- Sessions are deliberately not constructed here: `openjiuwen-session` has no `Session` implementation yet; document the gap in the crate `CONTEXT.md`, not with a stub module.
+- A session takes its checkpointer at construction only: `WorkflowSessionOptions::checkpointer` / `AgentSessionOptions::checkpointer` are the attach point and `Session::checkpointer` is a read-only getter, so there is no post-construction `attach`.
+- To resume, callers build both sessions through `*_with` with the same session id and the same `Arc<dyn Checkpointer>`; the convenience `*_with_checkpointer` helpers create a fresh isolated `MemoryCheckpointer` per call.
+- Session fixtures never touch the process environment and never use the process-wide `MemoryCheckpointer::shared` store, so parallel tests stay isolated.
 
 ## Test Strategy
 
 Unit tests in `workspace.rs` (layout creation, nested relative paths, missing-file errors, JSON round-trip) and in `env.rs` (set/restore on drop, clear on construction, nested guards on one thread, and cross-thread serialization).
 The cross-thread `env.rs` test proves mutual exclusion with a channel handshake rather than a bare sleep: the child signals that it is about to construct its guard, the parent asserts no acquisition arrives while its own guard is alive, and only after the parent drops the guard does the child report acquiring it.
 `../../tests/fixtures.rs` verifies drop cleanup and `OPENJIUWEN_HOME` resolution through `OpenJiuwenHome::resolve`.
+`../../tests/session_fixtures.rs` verifies the session helpers return the requested id/kind through `Arc<dyn Session>`, that state is readable and writable, that `*_with` passes options through, and that the in-memory checkpointer saves and resumes checkpoints (including the per-call store isolation).

@@ -2,7 +2,7 @@
 
 ## Intent
 
-Dev-only shared test infrastructure for the Rust rewrite: a real loopback OpenAI-compatible HTTP server, an in-process scripted `Model`, temp-directory and environment fixtures, JSON assertions, and async eventual-consistency helpers.
+Dev-only shared test infrastructure for the Rust rewrite: a real loopback OpenAI-compatible HTTP server, an in-process scripted `Model`, temp-directory and environment fixtures, ready-made workflow/agent sessions, JSON assertions, and async eventual-consistency helpers.
 It replaces two Python patterns from `tests/unit_tests/fixtures/mock_llm.py`: the scripted `MockLLMModel` (ordered response queue, no prompt matching) and `httpx.MockTransport` request fakes.
 The Rust version upgrades the HTTP fake to a real loopback server so the actual `OpenAiCompatibleClient` transport, SSE decoder, and error mapping are exercised instead of stubbed.
 Never depended on by a library crate; only `[dev-dependencies]` and `openjiuwen-e2e` may use it.
@@ -242,7 +242,18 @@ impl TempHomeGuard {
     pub fn home(&self) -> &Path;
     pub fn set_var(&self, name: &str, value: impl AsRef<OsStr>);
 }
+
+pub fn workflow_session(id: &str) -> Arc<dyn Session>;                  // WorkflowSessionOptions { session_id, ..default }
+pub fn workflow_session_with(options: WorkflowSessionOptions) -> Arc<dyn Session>;
+pub fn agent_session(id: &str) -> Arc<dyn Session>;                     // AgentSessionOptions { session_id, ..default }
+pub fn agent_session_with(options: AgentSessionOptions) -> Arc<dyn Session>;
+pub fn memory_checkpointer() -> Arc<dyn Checkpointer>;                  // fresh MemoryCheckpointer::new, never the shared singleton
+pub fn workflow_session_with_checkpointer(id: &str) -> Arc<dyn Session>;
+pub fn agent_session_with_checkpointer(id: &str) -> Arc<dyn Session>;
 ```
+
+Session helpers wrap `openjiuwen_session::create_workflow_session` / `create_agent_session`; `id` becomes the session id (and, for an agent, the default agent id), and the default workflow id is `openjiuwen_session::DEFAULT_WORKFLOW_ID`.
+A checkpointer is attached only at construction (`WorkflowSessionOptions::checkpointer` / `AgentSessionOptions::checkpointer`); `Session::checkpointer` is read-only, so resuming requires two `*_with` sessions sharing one `Arc<dyn Checkpointer>` and one session id.
 
 ### JSON assertions — `src/assert_json.rs`
 
@@ -323,21 +334,22 @@ let model = ScriptedModel::builder()
 - The builder's `script` replaces the queued script while `item` appends, so `.script([a, b]).item(c)` serves `a`, `b`, `c`; the fallback is served only when the queue is empty.
 - `src/internal.rs` holds the three helpers both fakes need (`lock`, `FUNCTION_KIND`, `DEFAULT_FALLBACK_TEXT`), so the Python-parity fallback string exists once; the module is private and carries no public API.
 - `wiremock` is re-exported rather than wrapped: wrapping it would duplicate a mature mock server and couple us to its version.
-- Session factory helpers are deliberately omitted: `openjiuwen-session` is still a stub with no `Session` implementation, so there is nothing to construct.
-  When it lands, add `src/fixtures/session.rs` with `workflow_session()` / `agent_session()` helpers mirroring Python `create_agent_session`, and re-export them from `fixtures` and `lib.rs`.
+- Session fixtures wrap the now-implemented `openjiuwen-session` factories (`create_workflow_session`/`create_agent_session`) instead of constructing the concrete session types, so tests receive the same `Arc<dyn Session>` seam production code uses.
+  The plain helpers take only an id; `*_with` variants pass a full options struct through for workflow ids, metadata, parents, or checkpointers, and `*_with_checkpointer` wires a fresh `MemoryCheckpointer`.
+- A checkpointer is attached at construction only (`WorkflowSessionOptions`/`AgentSessionOptions`), because `Session::checkpointer` is a read-only getter; resuming is therefore expressed as two `*_with` sessions sharing one `Arc<dyn Checkpointer>` and one session id.
 - `EnvGuard` is reentrant on one thread (nesting allowed) but serializes across threads/parallel tests through one process-global lock; guards are `!Send` so they stay on the test's runtime thread.
 - Modules are public for navigable rustdoc and for path-stable `use` statements; the crate root also glob-re-exports them so tests can import flat.
 
 ## Routing Table
 
 - `./src/mock_llm/` → loopback OpenAI-compatible server: routing, request recording, script queue, wire (JSON/SSE) projection (`src/mock_llm/CONTEXT.md`)
-- `./src/fixtures/` → temp workspace, `EnvGuard`, `TempHomeGuard` (`src/fixtures/CONTEXT.md`)
+- `./src/fixtures/` → temp workspace, `EnvGuard`, `TempHomeGuard`, workflow/agent session and in-memory checkpointer fixtures (`src/fixtures/CONTEXT.md`)
 - `./src/internal.rs` → crate-private shared helpers (`lock`, `FUNCTION_KIND`, `DEFAULT_FALLBACK_TEXT`); no public API
 - `./src/responses.rs` → `MockCompletion`/`MockToolCall` and `ChatResponse` ↔ `StreamChunk` conversions shared by both fakes
 - `./src/scripted_model.rs` → `ScriptedModel`, script turns, call recording, `Model` implementation
 - `./src/assert_json.rs` → JSON equality/subset/round-trip assertions and diff paths
 - `./src/eventually.rs` → async eventual-consistency polling helpers
-- `./tests/` → the three crate-level integration binaries: client end-to-end, scripted-model trait behavior, fixture isolation (`tests/CONTEXT.md`)
+- `./tests/` → the four crate-level integration binaries: client end-to-end, scripted-model trait behavior, fixture isolation, session fixtures (`tests/CONTEXT.md`)
 - `./Cargo.toml` → dev-only manifest (`publish = false`), no external services, no extra features
 
 ## Test Strategy
@@ -346,5 +358,6 @@ let model = ScriptedModel::builder()
 - `tests/mock_server.rs`: end-to-end through `OpenAiCompatibleClient` (non-streaming, streaming, tool calls, reasoning, error status, queue exhaustion, request recording, the `/chat/completions` alias, wrong-method 404, fallback ids, a waiter parked before the request arrives, `shutdown`).
 - `tests/scripted_model.rs`: trait-level behavior through `Arc<dyn Model>` and `ModelExt::complete`.
 - `tests/fixtures.rs`: `TempWorkspace` drop cleanup, `TempHomeGuard` + `OpenJiuwenHome::resolve`, `EnvGuard` restore and cross-thread serialization.
+- `tests/session_fixtures.rs`: `workflow_session`/`agent_session` id and kind through `Arc<dyn Session>`, global and component state read/write, `*_with` option pass-through, and in-memory checkpointer save/resume (workflow and agent) plus per-call store isolation.
 - All tests are offline, deterministic, and bind only loopback; timeouts use short fixed durations (≤2 s) so a regression fails fast instead of hanging.
 - Ported tests cite the Python source they mirror in a comment (for example `tests/unit_tests/fixtures/mock_llm.py`).
