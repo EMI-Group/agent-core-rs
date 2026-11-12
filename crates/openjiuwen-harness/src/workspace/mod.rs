@@ -23,12 +23,12 @@
 //!
 //! Module layout:
 //!
-//! - [`node`] — [`WorkspaceNode`] and [`DirectoryNode`]
-//! - [`schema`] — the cn/en default schema and packaged seed content
-//! - [`workspace`] — the [`Workspace`] type: construction, normalization, lookup, mutation
-//! - [`resolve`] — sandboxed path resolution (impl block on [`Workspace`])
-//! - [`links`] — `.team`/`.worktree` link management
-//! - [`directory_builder`] — [`DirectoryBuilder`] and [`is_safe_relative_path`]
+//! - `node` — [`WorkspaceNode`] and [`DirectoryNode`]
+//! - `schema` — the cn/en default schema and packaged seed content
+//! - `workspace` — the [`Workspace`] type: construction, normalization, lookup, mutation
+//! - `resolve` — sandboxed path resolution (impl block on [`Workspace`])
+//! - `links` — `.team`/`.worktree` link management
+//! - `directory_builder` — [`DirectoryBuilder`] and [`is_safe_relative_path`]
 
 mod directory_builder;
 mod links;

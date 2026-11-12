@@ -23,9 +23,10 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// - [`ErrorKind::Validation`] when the path is unsafe (empty, absolute, drive-letter,
-    ///   UNC, or `..`-escaping).
-    /// - [`ErrorKind::Security`] when the resolved path escapes the workspace root.
+    /// - [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation) when the
+    ///   path is unsafe (empty, absolute, drive-letter, UNC, or `..`-escaping).
+    /// - [`ErrorKind::Security`](openjiuwen_common::error::ErrorKind::Security) when the
+    ///   resolved path escapes the workspace root.
     pub async fn resolve(&self, path: &str) -> Result<PathBuf> {
         if !is_safe_relative_path(path) {
             return Err(Error::validation(format!("unsafe workspace path: {path}")));
@@ -45,7 +46,8 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Propagates [`Self::resolve`] failures and returns [`ErrorKind::NotFound`] when the
+    /// Propagates [`Self::resolve`] failures and returns
+    /// [`ErrorKind::NotFound`](openjiuwen_common::error::ErrorKind::NotFound) when the
     /// resolved path cannot be stat'ed.
     pub async fn resolve_existing(&self, path: &str) -> Result<PathBuf> {
         let resolved = self.resolve(path).await?;
