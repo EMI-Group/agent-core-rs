@@ -113,8 +113,10 @@ pub use harness::{
 // --- CLI and MCP -----------------------------------------------------------
 pub use mcp::{build_mcp_server, TeamMcpServer, OPERATOR_INSTRUCTIONS, SERVER_NAME};
 pub use skill::{
-    member_tools_for, operator_tools, run_skill_cli, ClientScope, CreateOutcome, MemberSummary,
-    OpOutcome, SendOutcome, SkillCli, StoreTeamClient, TeamClient, TeamJoinDescriptor, TeamToolDef,
+    connect_live_client, member_tools_for, operator_tools, run_skill_cli, ClaimStatus, CliCommand,
+    ClientScope, CreateOutcome, DescriptorArgs, MemberCommand, MemberSummary, OpOutcome,
+    OperatorCommand, SendOutcome, SkillCli, StoreTeamClient, TaskCommand, TeamClient,
+    TeamJoinDescriptor, TeamToolDef, ViewAction,
 };
 // The protocol crate owns this type; agent-teams re-exports it so hosts can branch on member
 // state without depending on the protocol crate directly.
