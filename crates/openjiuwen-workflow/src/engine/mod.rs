@@ -295,6 +295,39 @@ impl CompiledWorkflow {
         }
     }
 
+    /// Renders the workflow as an inline SVG document.
+    ///
+    /// Like [`CompiledWorkflow::to_mermaid`] this never fails: a definition that cannot be
+    /// compiled yields an SVG document naming the problem instead of panicking. The end
+    /// component is passed explicitly so the renderer shapes it as an exit node, and the
+    /// card name becomes the document title when it is not empty.
+    #[must_use]
+    pub fn to_svg(&self) -> String {
+        match self.build_graph(None, None, None) {
+            Ok(_) => crate::render::render_svg(
+                self.spec(),
+                self.card(),
+                &crate::render::SvgOptions {
+                    title: Some(self.inner.card.name.clone())
+                        .filter(|name| !name.trim().is_empty()),
+                    end_nodes: vec![self.inner.end_id.clone()],
+                    ..crate::render::SvgOptions::default()
+                },
+            ),
+            Err(failure) => {
+                tracing::warn!(
+                    workflow = self.inner.card.id.as_str(),
+                    error = %failure,
+                    "failed to compile the workflow graph for SVG rendering"
+                );
+                crate::render::error_svg(&format!(
+                    "workflow '{}' could not be compiled: {failure}",
+                    self.inner.card.id
+                ))
+            }
+        }
+    }
+
     /// The ability recorded for `id`, defaulting to `Invoke`.
     fn ability_or_default(&self, id: &str) -> ComponentAbility {
         self.inner.abilities.get(id).copied().unwrap_or_default()
