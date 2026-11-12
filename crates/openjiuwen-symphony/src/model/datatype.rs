@@ -48,7 +48,7 @@ pub struct DataTypeVocabulary {
 }
 
 impl DataTypeVocabulary {
-    /// Builds the standard vocabulary (the canonical names plus [`ALIASES`]).
+    /// Builds the standard vocabulary (the canonical names plus `ALIASES`).
     #[must_use]
     pub fn standard() -> Self {
         Self {
