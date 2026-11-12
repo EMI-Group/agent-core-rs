@@ -73,3 +73,9 @@ Mirrors the Python `openjiuwen.harness_protocol` package (v0.1.20): the vocabula
 - `openjiuwen-agent-teams` re-exports `HarnessState` from here — never define a second copy.
 - Changing a field name, enum value, or validation message is a protocol break: update `DESIGN.md`, this file, and every dependent crate.
 - Additive changes within the `"1.0"` major version must keep the `EVENT_WIRE_SCHEMA_VERSION` `"1"` decode path backward compatible; bump the wire schema version for incompatible payload changes.
+- `HarnessInput` is a struct, not an enum (`{ content: JsonValue, metadata: JsonObject }`); `HarnessInput::text(..)` is the only helper constructor, and any other shape (interrupt answers, raw payloads) is expressed through `content`.
+- `HarnessContext` has no `Default` and is not serde: build it with `HarnessContext::new(agent_name, agent_id, host_session_id, system_prompt)` then the `with_*` builders; it is `Clone` and its `Debug` redacts `env`/`metadata`.
+- `HarnessEventCursor` exposes only `async fn next_event(&mut self)` and `async fn close(&mut self)`; there is no `next`/`next_batch`/`try_next`. Drain deterministically with `futures::executor::block_on` in a loop, or `event_cursor_stream(cursor)` plus `futures::StreamExt`; no sleeps or runtime are needed.
+- `HarnessProvider::create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>>` is the factory seam; a name-keyed provider registry such as `create_harness("native", …)` lives outside this crate in `openjiuwen-harness-providers`.
+- `HarnessProtocol::events()` is cycle-long (ends only when the start/stop cycle closes); a finite per-turn view is `turn_events(Some(turn_id))`, which ends on `Finished`/`Aborted`/`Failed`.
+- Interaction requests are awaited host callbacks (`HarnessInteractionHandler`), never `HarnessEvent` payloads; tool activity is observed as `ItemLifecycleEvent { item_type: "tool_call", .. }`, not as a dedicated tool event.
