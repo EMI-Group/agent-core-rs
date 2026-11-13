@@ -26,7 +26,9 @@
 //! peer that is still answering an earlier request. A read is never abandoned mid-line (a cancelled
 //! buffered read would lose bytes), so the queue is flushed whenever the reader is not blocked on
 //! the stream; an answer to a server request is therefore written as soon as the application
-//! supplies it.
+//! supplies it. A transport that offers a [`writer`](RpcTransport::writer) bypasses the queue: its
+//! writes go straight to the peer, which is what a command like `turn/interrupt` needs while the
+//! turn loop is parked on a silent stream.
 //!
 //! When stdout reaches end of file the client fails every pending request with
 //! `the {label} CLI exited before answering '{method}'` (plus the stderr tail when the peer wrote
@@ -50,7 +52,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use super::child::ChildProcess;
+use super::child::{ChildProcess, LineWriter};
 use super::jsonl::encode_line;
 use super::lock;
 
@@ -88,12 +90,25 @@ pub trait RpcTransport: Send {
     /// Returns the diagnostic tail captured from the peer's stderr.
     #[must_use]
     fn stderr_tail(&self) -> String;
+    /// Returns a writer that can send a line while a read is still pending on this transport.
+    ///
+    /// The default is [`None`]: such a transport queues every write for the reader task to flush
+    /// between reads, which is enough for a strictly request/response protocol. A transport whose
+    /// peer can stay silent while the application owes it a command (the codex app-server during an
+    /// idle turn) overrides this with a writer independent of the read path.
+    fn writer(&self) -> Option<std::sync::Arc<dyn LineWriter>> {
+        None
+    }
 }
 
 #[async_trait]
 impl RpcTransport for ChildProcess {
     async fn write_line(&mut self, line: &str) -> HarnessResult<()> {
         ChildProcess::write_line(self, line).await
+    }
+
+    fn writer(&self) -> Option<std::sync::Arc<dyn LineWriter>> {
+        Some(std::sync::Arc::new(ChildProcess::writer(self)))
     }
 
     async fn read_json(&mut self) -> HarnessResult<Option<JsonValue>> {
@@ -175,8 +190,12 @@ pub struct JsonRpcClient {
     transport: Arc<AsyncMutex<Option<Box<dyn RpcTransport>>>>,
     /// Requests waiting for their response, keyed by client id.
     pending: Mutex<BTreeMap<u64, PendingRequest>>,
-    /// Messages queued for the reader task, oldest first.
+    /// Messages queued for the reader task, oldest first; unused once [`writer`] is present.
+    ///
+    /// [`writer`]: RpcTransport::writer
     outbound: Arc<Mutex<VecDeque<Outbound>>>,
+    /// Immediate write path, when the transport offers one.
+    writer: Option<std::sync::Arc<dyn LineWriter>>,
     /// Sender of the inbound notification/server-request queue; [`None`] once closed.
     incoming_sender: Mutex<Option<mpsc::UnboundedSender<JsonObject>>>,
     /// Receiver handed to [`next_incoming`](Self::next_incoming) one call at a time.
@@ -211,6 +230,7 @@ impl JsonRpcClient {
     #[must_use]
     pub fn spawn(transport: Box<dyn RpcTransport>, label: &'static str) -> Arc<Self> {
         let (incoming_sender, incoming) = mpsc::unbounded_channel();
+        let writer = transport.writer();
         let transport = Arc::new(AsyncMutex::new(Some(transport)));
         let outbound = Arc::new(Mutex::new(VecDeque::new()));
         let demand = Arc::new(Notify::new());
@@ -218,6 +238,7 @@ impl JsonRpcClient {
             transport: Arc::clone(&transport),
             pending: Mutex::new(BTreeMap::new()),
             outbound: Arc::clone(&outbound),
+            writer,
             incoming_sender: Mutex::new(Some(incoming_sender)),
             incoming: AsyncMutex::new(Some(incoming)),
             incoming_waiters: AtomicUsize::new(0),
@@ -250,7 +271,7 @@ impl JsonRpcClient {
     /// `error` object, with `the {label} CLI exited before answering '{method}'` when the stream
     /// ended, and with `the {label} CLI closed its JSON-RPC stream` when the client was closed.
     pub async fn request(&self, method: &str, params: JsonValue) -> HarnessResult<JsonValue> {
-        let (id, receiver) = self.start_request(method, &params)?;
+        let (id, receiver) = self.start_request(method, &params).await?;
         self.await_response(id, receiver).await
     }
 
@@ -267,7 +288,7 @@ impl JsonRpcClient {
         params: JsonValue,
         timeout: Duration,
     ) -> HarnessResult<JsonValue> {
-        let (id, receiver) = self.start_request(method, &params)?;
+        let (id, receiver) = self.start_request(method, &params).await?;
         match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
@@ -292,11 +313,9 @@ impl JsonRpcClient {
     /// # Errors
     ///
     /// Returns [`HarnessError::Protocol`] when the client is already closed.
-    // The write happens in the reader task, so this call has nothing to await; `async` keeps the
-    // public surface uniform with the other commands.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn notify(&self, method: &str, params: JsonValue) -> HarnessResult<()> {
         self.enqueue(&json!({"method": method, "params": params}), None)
+            .await
     }
 
     /// Returns the next inbound message that is *not* a response.
@@ -329,6 +348,7 @@ impl JsonRpcClient {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn respond(&self, id: JsonValue, result: JsonValue) -> HarnessResult<()> {
         self.enqueue(&json!({"id": id, "result": result}), None)
+            .await
     }
 
     /// Answers a server-to-client request with an error object.
@@ -348,6 +368,7 @@ impl JsonRpcClient {
             &json!({"id": id, "error": {"code": code, "message": message}}),
             None,
         )
+        .await
     }
 
     /// Stops the reader task, fails every pending request and drops the transport.
@@ -395,8 +416,8 @@ impl JsonRpcClient {
         }
     }
 
-    /// Mints the next request id, queues the request and returns its waiter.
-    fn start_request(
+    /// Mints the next request id, sends the request and returns its waiter.
+    async fn start_request(
         &self,
         method: &str,
         params: &JsonValue,
@@ -414,7 +435,7 @@ impl JsonRpcClient {
             },
         );
         let message = json!({"id": id, "method": method, "params": params});
-        self.enqueue(&message, Some(id))?;
+        self.enqueue(&message, Some(id)).await?;
         Ok((id, receiver))
     }
 
@@ -432,15 +453,25 @@ impl JsonRpcClient {
         result
     }
 
-    /// Queues one encoded message and wakes the reader task.
-    fn enqueue(&self, message: &JsonValue, id: Option<u64>) -> HarnessResult<()> {
+    /// Sends one encoded message, either immediately or through the reader's queue.
+    async fn enqueue(&self, message: &JsonValue, id: Option<u64>) -> HarnessResult<()> {
         if self.is_closed() {
             return Err(self.closed_error());
         }
-        lock(&self.outbound).push_back(Outbound {
-            line: encode_line(message),
-            id,
-        });
+        let line = encode_line(message);
+        if let Some(writer) = self.writer.as_ref() {
+            if let Err(error) = writer.write_line(&line).await {
+                if let Some(id) = id {
+                    self.fail_request(id, error.message());
+                }
+                return Err(error);
+            }
+            // The reader may be parked because nothing was pending when it last looked; wake it so
+            // it starts reading the answer this message is about to produce.
+            self.demand.notify_one();
+            return Ok(());
+        }
+        lock(&self.outbound).push_back(Outbound { line, id });
         self.demand.notify_one();
         Ok(())
     }
