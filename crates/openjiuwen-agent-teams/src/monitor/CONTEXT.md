@@ -99,6 +99,7 @@ Time of day is computed in `i128` and reduced with `rem_euclid`, so any `u64` ti
 - Logging: `tracing` only — no `println!`/`eprintln!` in library code.
 - Async: no lock held across `.await` (the `items` guard is dropped before every await), no blocking call in an async task, `tokio::spawn` only inside `StatusStream::spawn`.
 - No `unsafe`; workspace lints `all` + `pedantic` + `unwrap_used`/`expect_used` with `-D warnings`; files ≤ 1000 lines.
+- `stream.rs` reaches ~1000 lines only because of its inline suite: the production half (queue, emitter, receiver, writer task, handle) is ~570 lines and the tests ~420, so it stays one file by responsibility (the whole bounded-queue contract is only meaningful together).
 
 ## Design Decisions
 
