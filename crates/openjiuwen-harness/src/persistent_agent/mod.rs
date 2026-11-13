@@ -8,25 +8,9 @@
 //! queueing or delivery.
 //!
 //! Every entry point takes its clock and root directory from the caller, so the module is
-//! deterministic and offline in tests. See [`CONTEXT.md`](https://example.invalid) in this
-//! directory for the API contract and routing table; the module-level [`Clock`] is the crate's
-//! existing injectable clock ([`crate::subagents::Clock`]) re-exported here.
-//!
-//! ```
-//! use openjiuwen_harness::persistent_agent::{
-//!     EntryPayload, ExecutionIdentity, ExecutionLog, LogCapacity,
-//! };
-//!
-//! # async fn example() -> openjiuwen_common::error::Result<()> {
-//! let dir = tempfile::TempDir::new().unwrap();
-//! let identity = ExecutionIdentity::new("ns", "agent", "session", "request", "execution", "source")?;
-//! let log = ExecutionLog::open(dir.path(), identity, LogCapacity::default()).await?;
-//! log.append(EntryPayload::execution_started("say hi")).await?;
-//! let snapshot = log.read().await?;
-//! assert_eq!(snapshot.entries.len(), 1);
-//! # Ok(())
-//! # }
-//! ```
+//! deterministic and offline in tests. The `CONTEXT.md` file in this directory carries the API
+//! contract and routing table; the module-level [`Clock`] is the crate's existing injectable
+//! clock ([`crate::subagents::Clock`]) re-exported here.
 pub mod continuation;
 pub mod control;
 pub mod emitter;
