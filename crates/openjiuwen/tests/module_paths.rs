@@ -86,6 +86,7 @@ fn every_public_module_tree_is_reachable() {
     same_paths! {
         openjiuwen::core::retrieval::sparse::Bm25Index => openjiuwen_retrieval::sparse::Bm25Index,
         openjiuwen::core::retrieval::rewrite::RewriteRequest => openjiuwen_retrieval::rewrite::RewriteRequest,
+        openjiuwen::core::retrieval::parsing::PdfParser => openjiuwen_retrieval::parsing::PdfParser,
     }
 
     // Harness: LSP, spec registry, worktrees, subagents, built-in tool catalog.
@@ -107,6 +108,7 @@ fn every_public_module_tree_is_reachable() {
     ));
 
     same_paths! {
+        openjiuwen::agent_teams::attach::AttachClient => openjiuwen_agent_teams::attach::client::AttachClient,
         openjiuwen::agent_teams::kv_cache::MemberCacheKey => openjiuwen_agent_teams::kv_cache::MemberCacheKey,
         openjiuwen::agent_teams::models::ModelPool => openjiuwen_agent_teams::models::ModelPool,
         openjiuwen::agent_teams::monitor::TeamMonitor => openjiuwen_agent_teams::monitor::TeamMonitor,
@@ -198,6 +200,12 @@ fn symphony_alias_points_at_openjiuwen_symphony() {
 #[test]
 fn rsi_alias_points_at_openjiuwen_rsi() {
     same_type::<openjiuwen::rsi::Candidate, openjiuwen_rsi::evolution::Candidate>();
+    // The auto-harness orchestrator lives under the `harness_rsi` module in the concrete
+    // crate; the umbrella forwards it under the shorter `rsi::auto_harness` path.
+    same_paths! {
+        openjiuwen::rsi::auto_harness::AutoHarnessConfig => openjiuwen_rsi::harness_rsi::auto_harness::AutoHarnessConfig,
+        openjiuwen::rsi::auto_harness::AutoHarnessOrchestrator => openjiuwen_rsi::harness_rsi::auto_harness::AutoHarnessOrchestrator,
+    }
 }
 
 #[test]
@@ -322,4 +330,201 @@ fn otel_feature_reaches_the_kernel_trace_sink_hook() {
         std::sync::Arc<dyn openjiuwen_session::TraceSink>,
     ) -> Result<()> = openjiuwen_session::install_trace_sink;
     assert!(std::ptr::eq(umbrella as *const (), concrete as *const ()));
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn otel_feature_reaches_the_agent_teams_span_sink() {
+    // The umbrella's `otel` feature also forwards to `openjiuwen-agent-teams/otel`, which
+    // compiles the team observability sink in.
+    same_paths! {
+        openjiuwen::agent_teams::observability::OtelSpanSink => openjiuwen_agent_teams::observability::OtelSpanSink,
+        openjiuwen::agent_teams::observability::OtelHooks => openjiuwen_agent_teams::observability::OtelHooks,
+        openjiuwen::agent_teams::observability::SpanRecord => openjiuwen_agent_teams::observability::SpanRecord,
+    }
+}
+
+#[test]
+fn crate_version_is_exported() {
+    // Python's `openjiuwen/__init__.py` exports `__version__`; the facade mirrors it as `VERSION`.
+    assert_eq!(openjiuwen::VERSION, env!("CARGO_PKG_VERSION"));
+    assert_ne!(openjiuwen::VERSION, "");
+}
+
+#[cfg(feature = "native-v2")]
+#[test]
+fn native_v2_feature_reaches_the_agent_teams_hosted_provider() {
+    same_paths! {
+        openjiuwen::harness_providers::providers::native_v2::NativeV2Config => openjiuwen_harness_providers::providers::native_v2::NativeV2Config,
+        openjiuwen::harness_providers::providers::native_v2::NativeV2HarnessProvider => openjiuwen_harness_providers::providers::native_v2::NativeV2HarnessProvider,
+    }
+
+    // With the forwarded feature the built-in table resolves the name instead of
+    // answering `Unsupported`.
+    let resolved = openjiuwen::harness_providers::providers::builtin_provider(
+        openjiuwen_harness_providers::provider::provider_names::NATIVE_V2,
+    );
+    assert!(
+        matches!(resolved, Some(Ok(_))),
+        "`native-v2` must make the native_v2 provider resolvable through the umbrella"
+    );
+}
+
+#[cfg(feature = "vendor")]
+#[test]
+fn vendor_feature_reaches_the_vendor_providers() {
+    same_paths! {
+        openjiuwen::harness_providers::providers::claudecode::ClaudeCodeHarnessConfig => openjiuwen_harness_providers::providers::claudecode::ClaudeCodeHarnessConfig,
+        openjiuwen::harness_providers::providers::claudecode::ClaudeCodeHarnessProvider => openjiuwen_harness_providers::providers::claudecode::ClaudeCodeHarnessProvider,
+        openjiuwen::harness_providers::providers::codex::CodexHarnessConfig => openjiuwen_harness_providers::providers::codex::CodexHarnessConfig,
+        openjiuwen::harness_providers::providers::codex::CodexHarnessProvider => openjiuwen_harness_providers::providers::codex::CodexHarnessProvider,
+        openjiuwen::harness_providers::providers::dsh::DshHarnessConfig => openjiuwen_harness_providers::providers::dsh::DshHarnessConfig,
+        openjiuwen::harness_providers::providers::dsh::DshHarnessProvider => openjiuwen_harness_providers::providers::dsh::DshHarnessProvider,
+    }
+
+    // Registration only: driving a vendor provider needs the vendor CLI, so nothing here
+    // constructs or runs one.
+    for name in [
+        openjiuwen_harness_providers::provider::provider_names::CLAUDE_CODE,
+        openjiuwen_harness_providers::provider::provider_names::CODEX,
+        openjiuwen_harness_providers::provider::provider_names::DSH,
+    ] {
+        let resolved = openjiuwen::harness_providers::providers::builtin_provider(name);
+        assert!(
+            matches!(resolved, Some(Ok(_))),
+            "`vendor` must register `{name}` through the umbrella"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_feature_reaches_every_backend() {
+    same_paths! {
+        openjiuwen::core::session::checkpoint::SqliteCheckpointer => openjiuwen_session::checkpoint::SqliteCheckpointer,
+        openjiuwen::core::foundation::store::SqliteKvStore => openjiuwen_foundation::store::SqliteKvStore,
+        openjiuwen::extensions::store::SqliteKvStore => openjiuwen_core::foundation::store::SqliteKvStore,
+        openjiuwen::agent_teams::storage::SqliteTeamStore => openjiuwen_agent_teams::storage::SqliteTeamStore,
+    }
+
+    // The feature-gated constructors are referenced by building their futures: an async fn
+    // body does not run until it is polled, so no database is opened.
+    let _memory_stores_from_umbrella =
+        openjiuwen::core::memory::store::MemoryStores::sqlite("/nonexistent/memory");
+    let _memory_stores_from_concrete =
+        openjiuwen_memory::store::MemoryStores::sqlite("/nonexistent/memory");
+    let _asset_store_from_umbrella =
+        openjiuwen::symphony::store::KvAssetStore::sqlite("sqlite::memory:");
+    let _asset_store_from_concrete =
+        openjiuwen_symphony::store::KvAssetStore::sqlite("sqlite::memory:");
+}
+
+#[cfg(feature = "redis")]
+#[test]
+fn redis_feature_reaches_the_store_surface() {
+    // Construction returns `Error::Unsupported`; nothing here connects.
+    same_paths! {
+        openjiuwen::extensions::store::redis::RedisStore => openjiuwen_extensions::store::redis::RedisStore,
+        openjiuwen::extensions::store::redis::RedisStoreConfig => openjiuwen_extensions::store::redis::RedisStoreConfig,
+    }
+}
+
+#[cfg(feature = "pulsar")]
+#[test]
+fn pulsar_feature_reaches_the_message_queue_surface() {
+    // Construction returns `Error::Unsupported`; nothing here connects.
+    same_paths! {
+        openjiuwen::extensions::message_queue::PulsarConfig => openjiuwen_extensions::message_queue::PulsarConfig,
+        openjiuwen::extensions::message_queue::PulsarMessageQueue => openjiuwen_extensions::message_queue::PulsarMessageQueue,
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_feature_is_wired_and_the_team_mcp_surface_resolves() {
+    // The umbrella's `mcp` feature wires `openjiuwen-extensions/mcp`, which currently gates
+    // no source; the runtime MCP server ships from `openjiuwen-agent-teams`, whose `mcp`
+    // feature is on by default. This test keeps the umbrella feature exercised and proves
+    // that surface resolves.
+    same_paths! {
+        openjiuwen::agent_teams::mcp::TeamMcpServer => openjiuwen_agent_teams::mcp::TeamMcpServer,
+    }
+    assert_eq!(
+        openjiuwen::agent_teams::mcp::SERVER_NAME,
+        openjiuwen_agent_teams::mcp::SERVER_NAME
+    );
+    assert_eq!(
+        openjiuwen::agent_teams::mcp::OPERATOR_INSTRUCTIONS,
+        openjiuwen_agent_teams::mcp::OPERATOR_INSTRUCTIONS
+    );
+}
+
+#[cfg(feature = "distributed")]
+#[test]
+fn distributed_feature_reaches_the_messager_seam() {
+    // The ZeroMQ messager is a construction-time-rejecting seam; only its type is asserted.
+    same_paths! {
+        openjiuwen::agent_teams::messager::PyZmqMessager => openjiuwen_agent_teams::messager::PyZmqMessager,
+    }
+}
+
+#[cfg(feature = "sandbox")]
+#[test]
+fn sandbox_feature_reaches_the_provider_registry() {
+    same_paths! {
+        openjiuwen::core::sys_operation::sandbox::provider::SandboxProviderRegistry => openjiuwen_sysop::sandbox::provider::SandboxProviderRegistry,
+    }
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_feature_reaches_the_reporting_preset() {
+    // The preset exists (the umbrella forwarded `openjiuwen-harness/browser`) but the agent
+    // behind it stays deferred, exactly as the harness crate reports it.
+    let result = openjiuwen::harness::subagents::build_preset(
+        openjiuwen::harness::subagents::SubAgentPreset::Browser,
+        "en",
+    );
+    let message = match result {
+        Ok(_) => panic!("the browser preset agent is deferred"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("browser_agent") && message.contains("'browser' cargo feature"),
+        "unexpected message: {message}"
+    );
+}
+
+#[cfg(feature = "cua")]
+#[test]
+fn cua_feature_reaches_the_reporting_preset() {
+    let result = openjiuwen::harness::subagents::build_preset(
+        openjiuwen::harness::subagents::SubAgentPreset::Cua,
+        "en",
+    );
+    let message = match result {
+        Ok(_) => panic!("the cua preset agent is deferred"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("cua_agent") && message.contains("'cua' cargo feature"),
+        "unexpected message: {message}"
+    );
+}
+
+#[cfg(feature = "mobile")]
+#[test]
+fn mobile_feature_reaches_the_reporting_preset() {
+    let result = openjiuwen::harness::subagents::build_preset(
+        openjiuwen::harness::subagents::SubAgentPreset::Mobile,
+        "en",
+    );
+    let message = match result {
+        Ok(_) => panic!("the mobile preset agent is deferred"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("mobile_gui_agent") && message.contains("'mobile' cargo feature"),
+        "unexpected message: {message}"
+    );
 }
