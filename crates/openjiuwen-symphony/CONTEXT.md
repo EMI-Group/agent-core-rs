@@ -857,12 +857,12 @@ A blank bucket is `Error::Validation` on every operation; a malformed `current.j
 
 Two API-shaped stubs remain, and each entry point returns [`Error::Unsupported`] via [`error::unsupported`] with a reason that points at this section:
 
-```rust
-pub struct ExperienceIndex;   // Python `experience`: faiss + sentence-transformers vector index
-pub struct LogitSelector;     // Python `retrieval`: transformers/vLLM logit-based branch selection
-```
+- the faiss + sentence-transformers experience index (Python `experience`), because the offline bank uses deterministic lexical/cosine ranking instead;
+- the `transformers`/vLLM logit-selection backend (Python `retrieval`), because the portable tree walk uses a `CompletionModel` plus a lexical fallback instead.
 
-Every other Python area these stubs used to cover now has a real implementation: LLM tree retrieval lives in [`llm::TreeRetriever`], flow distillation and packaging in [`flow`], the experience bank in [`experience`], and SKILL.md scanning in [`discovery`].
+Each stub documents the Python class it mirrors and the reason it is deferred, and its data types stay ordinary `serde` types so a caller can build a request without depending on the deferred machinery.
+
+The corresponding Python areas are implemented rather than stubbed: LLM tree retrieval lives in [`llm::TreeRetriever`], flow distillation and packaging in [`flow`], the experience bank in [`experience`], and SKILL.md scanning in [`discovery`].
 
 ## Notes for Agents
 
@@ -915,7 +915,7 @@ Every other Python area these stubs used to cover now has a real implementation:
 - **A generated version bumps past pinned ids**: `None` publishes `v{n+1}` with `n` = revision count, skipping forward when a caller already pinned that id, so an explicit `v2` never makes a later generated publish fail.
 - **An illegal version is a validation error on read as well as write** (`read(Some("../evil"))`), because it would otherwise escape the store root; a legal-but-unknown version returns `Ok(None)`.
 - **The planner follows the Python scoring constants exactly** (`SEED_BASELINE_SCORE = 0.5` for an unscored path, `1.0` edge confidence for an edgeless path) while using this contract's distinct-input coverage definition, which counts every declared input rather than Python's required-flag count.
-- **`src/runtime.rs` is ~1050 lines by design**: it is the single composition root, and splitting it would contradict this routing table; every other module stays well under the ~1000-line guideline.
+- **`src/runtime.rs` is ~1100 lines by design**: it is the single composition root, and splitting it would contradict this routing table; every other module stays at or under the ~1000-line guideline (the largest are `flow/pack.rs`, `flow/engine.rs`, and `object_artifact.rs`).
 - **Static evaluation remains the offline default.** The evaluation suite ships deterministic completeness/schema metrics, and `llm::LlmJudgeMetric` implements Python's LLM-judged metric with a static description/input/output rubric as its fallback.
 
 ## Deferred Scope
