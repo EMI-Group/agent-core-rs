@@ -1,27 +1,36 @@
-//! Document loaders for text-like sources.
+//! Document loaders for text-like and office sources.
 //!
 //! Port of the offline subset of the Python
 //! `openjiuwen/core/retrieval/indexing/processor/parser/` package: plain text,
-//! Markdown, `JSON`, `CSV`/`TSV`, local `HTML`, `HTTP(S)` URLs, and the
-//! auto-dispatch behavior of `AutoFileParser` / `AutoLinkParser` / `AutoParser`.
+//! Markdown, `JSON`, `CSV`/`TSV`, local `HTML`, `HTTP(S)` URLs, `PDF`, `DOCX`,
+//! `XLSX`, images, and the auto-dispatch behavior of `AutoFileParser` /
+//! `AutoLinkParser` / `AutoParser`.
 //!
-//! `PDF`, `DOCX`, `XLSX`, images, `WeChat` articles, and article-extraction
-//! services are out of scope: [`AutoLoader`] rejects them with
+//! The binary formats are read in-crate by [`crate::parsing`] (no external
+//! office or PDF crate) and images by [`crate::multimodal::ImageLoader`]; both
+//! are registered in [`LoaderRegistry::with_defaults`], so [`AutoLoader`] picks
+//! them up by extension. Formats with no registered loader still fail with
 //! [`openjiuwen_common::error::Error::Unsupported`].
 
 pub mod auto;
 pub mod csv;
+pub mod docx;
 pub mod html;
 pub mod json;
+pub mod pdf;
 pub mod text;
 pub mod url;
+pub mod xlsx;
 
 pub use auto::{AutoLoader, LoaderRegistry};
 pub use csv::CsvLoader;
+pub use docx::DocxLoader;
 pub use html::{extract_title, html_to_text, HtmlLoader};
 pub use json::JsonLoader;
+pub use pdf::PdfLoader;
 pub use text::{MarkdownLoader, TextLoader};
 pub use url::UrlLoader;
+pub use xlsx::XlsxLoader;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -124,6 +133,92 @@ async fn read_source(source: &str) -> Result<String> {
 #[allow(clippy::expect_used)]
 fn compile_pattern(pattern: &str) -> Regex {
     Regex::new(pattern).expect("loader patterns are valid regular expressions")
+}
+
+/// Binary fixtures shared by the loader unit tests.
+///
+/// `DOCX`/`XLSX` fixtures are `ZIP` archives of stored entries and the `PDF`
+/// fixture is a file with uncompressed content streams, so nothing here needs a
+/// compression library, network access, or the wall clock.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
+pub(crate) mod fixtures {
+    use crate::parsing::crc32;
+
+    /// Builds a `ZIP` archive with stored (uncompressed) entries.
+    pub(crate) fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut directory = Vec::new();
+        let count = entries.len() as u16;
+        for (name, contents) in entries {
+            let name = name.as_bytes();
+            let payload = contents.as_bytes();
+            let offset = data.len() as u32;
+            let crc = crc32(payload);
+            let size = payload.len() as u32;
+            data.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+            data.extend_from_slice(&20u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&crc.to_le_bytes());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(name);
+            data.extend_from_slice(payload);
+
+            directory.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+            directory.extend_from_slice(&20u16.to_le_bytes());
+            directory.extend_from_slice(&20u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&crc.to_le_bytes());
+            directory.extend_from_slice(&size.to_le_bytes());
+            directory.extend_from_slice(&size.to_le_bytes());
+            directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes());
+            directory.extend_from_slice(&0u32.to_le_bytes());
+            directory.extend_from_slice(&offset.to_le_bytes());
+            directory.extend_from_slice(name);
+        }
+        let directory_offset = data.len() as u32;
+        let directory_size = directory.len() as u32;
+        data.extend_from_slice(&directory);
+        data.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&directory_size.to_le_bytes());
+        data.extend_from_slice(&directory_offset.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data
+    }
+
+    /// Wraps `body` in a minimal `PDF` document.
+    pub(crate) fn pdf_document(body: &str) -> Vec<u8> {
+        format!("%PDF-1.7\n{body}\n%%EOF\n").into_bytes()
+    }
+
+    /// Builds one uncompressed PDF content-stream object.
+    pub(crate) fn plain_stream(content: &str) -> String {
+        format!(
+            "1 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj",
+            content.len()
+        )
+    }
 }
 
 #[cfg(test)]
