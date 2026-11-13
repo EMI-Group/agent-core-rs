@@ -121,17 +121,20 @@ pub use interaction::{
 };
 // --- runtime ---------------------------------------------------------------
 pub use runtime::{
-    clear_global_registry, decide_run_action, global_registry, parse_initial_input,
-    set_global_registry, try_global_registry, AttachConfig, AttachHost, BackendAttachHandler,
-    ForkDirective, InitialInput, LiveTeamState, ModelAllocator, ModelSelection, OrgBinding,
-    OrganizationBlock, RunAction, RunActionKind, SpecBuild, TeamAgent, TeamBackend, TeamBuildDeps,
+    checkpoint_config, clear_global_registry, decide_run_action, global_registry,
+    parse_initial_input, set_global_registry, try_global_registry, AttachConfig, AttachHost,
+    BackendAttachHandler, CheckpointConfig, CheckpointStoreConfig, ForkDirective, InitialInput,
+    LiveTeamState, MemberHealth, ModelAllocator, ModelSelection, OrgBinding, OrganizationBlock,
+    RunAction, RunActionKind, SpecBuild, TeamAgent, TeamBackend, TeamBuildDeps, TeamHealth,
     TeamMemberSpawner, TeamModelAllocation, TeamModelRouter, TeamRuntimeManager, TeamRuntimePool,
     TeamSignals,
 };
 // --- harness protocol ------------------------------------------------------
 pub use harness::{
     chunk_from_event, is_terminal_event, round_from_event, state_from_event,
-    state_to_execution_status, state_to_member_status, EnvModelResolver, HarnessMemberRuntime,
+    state_to_execution_status, state_to_member_status, CheckpointResume, EnvModelResolver,
+    FileMemberCheckpointStore, HarnessMemberRuntime, InMemoryMemberCheckpointStore,
+    MemberCheckpointPolicy, MemberCheckpointRecord, MemberCheckpointSink, MemberCheckpointStore,
     MemberHarnessContext, MemberHarnessFactory, ModelResolver, NativeCheckpoint,
     NativeMemberFactory,
 };
