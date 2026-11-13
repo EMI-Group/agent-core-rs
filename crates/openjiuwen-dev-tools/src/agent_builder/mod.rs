@@ -1,11 +1,11 @@
 //! Agent specifications, build stages, and the bridge into `openjiuwen-agent`.
 //!
-//! Ports `openjiuwen/dev_tools/agent_builder/` across thirteen modules: the
+//! Ports `openjiuwen/dev_tools/agent_builder/` across fifteen modules: the
 //! programmatic specs, the serialized LLM-agent and workflow documents, the
 //! bounded dialogue history, the staged builder pipeline (requirement clarifier,
 //! workflow designer, DL generator, DL reflector, cycle checker, Mermaid
-//! rendering), the session-based builder, its result vocabulary, and the kernel
-//! bridge.
+//! rendering), the session-based builder, its result vocabulary, the stage
+//! progress weights, the deterministic helpers, and the kernel bridge.
 //!
 //! Module layout:
 //!
@@ -29,8 +29,12 @@
 //!   ([`render_design`], [`render_mermaid`]).
 //! - `outcome` — the result and state vocabulary ([`BuildResult`],
 //!   [`BuildStatus`], [`BuildOutput`], [`BuildState`], [`map_state_to_status`]).
+//! - `progress` — Python's stage vocabulary and progress weights
+//!   ([`ProgressStage`], [`progress_for`]).
 //! - `spec` — programmatic agent and workflow specifications
 //!   ([`LlmAgentSpec`], [`WorkflowSpec`]) that convert into the DSL.
+//! - `utils` — the deterministic helpers ([`extract_json_from_text`],
+//!   [`format_dialog_history`], [`merge_dict_lists`], [`validate_session_id`]).
 //! - `workflow_dsl` — the serialized workflow document ([`WorkflowDsl`]) and its
 //!   structural validation.
 //!
@@ -60,7 +64,9 @@ pub mod dsl;
 pub mod history;
 pub mod mermaid;
 pub mod outcome;
+pub mod progress;
 pub mod spec;
+pub mod utils;
 pub mod workflow_dsl;
 
 pub use builder::{now_millis, AgentBuilder, AgentType};
@@ -75,5 +81,10 @@ pub use dsl::{
 pub use history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
 pub use mermaid::{render_design, render_mermaid};
 pub use outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
+pub use progress::{progress_for, ProgressStage, LLM_AGENT_STAGE_WEIGHTS, WORKFLOW_STAGE_WEIGHTS};
 pub use spec::{LlmAgentSpec, WorkflowSpec};
+pub use utils::{
+    extract_json_from_text, format_dialog_history, format_dialog_history_with, is_valid_session_id,
+    merge_dict_lists, validate_session_id,
+};
 pub use workflow_dsl::{DslEdge, DslNode, WorkflowDsl};
