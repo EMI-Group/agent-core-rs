@@ -169,6 +169,15 @@ async fn unsupported_task_memory_service_reports_every_flow() {
 async fn pulsar_queue_is_deferred() {
     use openjiuwen_extensions::message_queue::pulsar::{self, PulsarConfig};
 
+    // The deferred factory hands back a trait object that is not `Debug`, so the
+    // error is unwrapped by hand rather than with `unwrap_err`.
+    fn expect_error<T>(result: Result<T>) -> Error {
+        match result {
+            Ok(_) => panic!("expected a deferred backend to fail"),
+            Err(error) => error,
+        }
+    }
+
     let config = PulsarConfig::new("pulsar://localhost:6650");
     let error = expect_error(pulsar::connect(config.clone()).await);
     assert_eq!(error.kind(), ErrorKind::Unsupported);
