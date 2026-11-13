@@ -66,6 +66,9 @@ pub mod redis {
 - `RedisCheckpointerConfig` round-trips through JSON with Python's field names (`connection`, `ttl`, `default_ttl`, `refresh_on_read`).
 - The Redis backend is **not** implemented: pickle-encoded blobs are a deliberate non-goal (`docs/PARITY.md` intentional deviations), and key layout (`{session_id}:agent:{agent_id}:agent_state_blobs`) is documented only.
 - Every `Checkpointer` method on `RedisCheckpointer` returns `Error::Unsupported("redis checkpointer backend is deferred; use the in-memory, file, or sqlite backend")`; `session_exists` also returns that error rather than `false`, so callers cannot mistake deferral for an empty session.
+- `RedisCheckpointer` derives `Debug` + `Clone`, holds a private `config` field, and implements `Checkpointer` through `#[async_trait::async_trait]`; `latest` is the trait's default method, so it reaches the deferral via `list`.
+- `RedisTTLConfig` and `RedisConnectionConfig` carry container-level `#[serde(default)]` (partial JSON parses); `RedisCheckpointerConfig` defaults only `ttl`, so `connection` is required in JSON.
+- Python's `async` signatures are kept over synchronous bodies, so `redis.rs` opens with `#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]`.
 
 ## Constraints
 
