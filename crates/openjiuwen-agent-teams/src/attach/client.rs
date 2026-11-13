@@ -517,7 +517,9 @@ impl AttachClient {
 
     /// Asks the hosting process to stop the team.
     ///
-    /// The payload is the adapter's own `{"stopped": true}` object, returned as raw JSON.
+    /// The payload is the adapter's own `{"stopping": true}` object, returned as raw JSON: the
+    /// handler cancels the team and acknowledges the request, so the object says the stop is under
+    /// way rather than that it has finished.
     ///
     /// # Errors
     ///

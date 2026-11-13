@@ -18,14 +18,18 @@
 //!    usage mismatch).
 //! 4. **Member runs**: the member mailbox, `view_task` rendering (including `null` for an unknown
 //!    task id), `claim_task` for the descriptor's member, and `send_message` direct/broadcast.
+//! 5. **The scope-independent `serve` stage.** `serve` belongs to neither scope tree (no help line,
+//!    no parse), and it is dispatched before the join descriptor is loaded, so `serve --help`
+//!    succeeds without one and a bad `serve` flag is a CLI-side error.
 //!
 //! Everything is offline and deterministic: rows are seeded with explicit timestamps, and the only
 //! values not asserted byte-for-byte are the generated message/task ids (asserted by shape and by
 //! reading the id back out of the store).
 //!
-//! The live-team resolver (`run_skill_cli` against the process-global runtime registry) is
+//! The live-team resolver of `run_skill_cli` (against the process-global runtime registry) is
 //! deliberately *not* exercised here: it is another node's wiring and would make the suite depend
-//! on process-global state.
+//! on process-global state. `run_skill_cli` itself is only reached through its scope-independent
+//! `serve` stage, which never resolves a team.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(clippy::missing_panics_doc)]
@@ -34,9 +38,9 @@ use std::sync::Arc;
 
 use openjiuwen_agent_teams::messager::InProcessMessager;
 use openjiuwen_agent_teams::schema::{MemberStatus, TaskRecord, TaskStatus, TeamRole};
-use openjiuwen_agent_teams::skill::cli::parse_descriptor_args;
+use openjiuwen_agent_teams::skill::cli::{parse_descriptor_args, CliCommand};
 use openjiuwen_agent_teams::skill::{
-    ClientScope, SkillCli, StoreTeamClient, TeamClient, TeamJoinDescriptor,
+    run_skill_cli, ClientScope, SkillCli, StoreTeamClient, TeamClient, TeamJoinDescriptor,
 };
 use openjiuwen_agent_teams::storage::{InMemoryTeamStore, MemberRecord, MessageRecord, TeamStore};
 use openjiuwen_agent_teams::taskboard::TaskBoard;
@@ -541,6 +545,86 @@ fn member_tree_rejects_operator_words_and_unknown_commands() {
     assert!(parse_err(&["read_inbox"], ClientScope::Member).contains("read_inbox"));
     assert!(parse_err(&["explode"], ClientScope::Member).contains("explode"));
     assert!(parse_err(&[], ClientScope::Member).starts_with("validation: "));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scope-independent `serve` stage
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn serve_is_not_a_member_or_operator_command() {
+    // `serve` is the child end of the member protocol, not a word in either control tree.
+    for scope in [ClientScope::Member, ClientScope::Operator] {
+        let message = parse_err(&["serve"], scope);
+        assert!(
+            message.starts_with("validation: "),
+            "{scope:?} should refuse `serve`: {message}"
+        );
+        assert!(
+            message.contains("serve"),
+            "{scope:?} should name the refused word: {message}"
+        );
+
+        // Neither tree's help advertises it: help renders that tree's own command table.
+        let help = parse_err(&["--help"], scope);
+        assert!(
+            help.contains("Usage: team-member"),
+            "{scope:?} should render its own usage: {help}"
+        );
+        assert!(
+            !help.contains("serve"),
+            "{scope:?} must not list `serve`: {help}"
+        );
+
+        // A command parsed out of a tree is that tree's variant — `SkillCli::try_parse_from` never
+        // yields `CliCommand::Serve`, which only the scope-independent stage produces.
+        let command = parse(&["inbox"], scope).command().clone();
+        assert!(
+            matches!(command, CliCommand::Member(_) | CliCommand::Operator(_)),
+            "{scope:?} should not yield a serve command: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn serve_help_is_answered_before_the_descriptor_stage() {
+    // `serve` is dispatched before the join descriptor is loaded, so a descriptor that cannot
+    // possibly load does not turn its help into a failure — and no `OPENJIUWEN_TEAM_JOIN` is needed.
+    let code = run_skill_cli(argv(&[
+        "--descriptor-file",
+        "/nonexistent/team-join.json",
+        "serve",
+        "--help",
+    ]));
+    assert_eq!(code, 0, "help must not depend on a join descriptor");
+
+    // The same connection flags without `serve` do fail in the descriptor stage (exit `2`), so the
+    // `0` above proves the serve stage ran first rather than the descriptor scan succeeding.
+    assert_eq!(
+        run_skill_cli(argv(&[
+            "--descriptor-file",
+            "/nonexistent/team-join.json",
+            "inbox",
+        ])),
+        2,
+        "an unreadable descriptor is still a CLI-side error"
+    );
+}
+
+#[test]
+fn a_bad_serve_flag_is_a_cli_side_error() {
+    // A flag clap never declared on `serve` is a usage mismatch: exit `2`, never the serve loop.
+    assert_eq!(run_skill_cli(argv(&["serve", "--nope"])), 2);
+    // The serve stage runs before the descriptor stage even when both would fail.
+    assert_eq!(
+        run_skill_cli(argv(&[
+            "--descriptor-file",
+            "/nonexistent/team-join.json",
+            "serve",
+            "--nope",
+        ])),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
