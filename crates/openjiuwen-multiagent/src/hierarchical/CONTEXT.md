@@ -8,6 +8,7 @@ Both topologies are `TeamStrategy` objects attached to the crate's single `BaseT
 A message-bus team registers its supervisor as an ordinary member and dispatches every invocation as one P2P request over the bus.
 An agents-as-tools team mounts every sub-agent on its root as an `AgentTool` and streams the root in-process, bypassing the bus.
 Everything is in-process and tokio-native; members are resolved from the team runtime only.
+The module also re-exports `P2PAbilityManager` (with `AbilityCall`, `AbilityResult`, `AbilityRoute`, `AbilityExecutor`) under its Python path, so `hierarchical::P2PAbilityManager` resolves; the implementation lives in `../ability.rs` (`../CONTEXT.md`).
 
 ## API Surface
 
@@ -129,7 +130,7 @@ An agent stream failure is swallowed into one `{"type":"message","index":0,"payl
 
 ## Design Decisions
 
-- **Sub-agents are ordinary `AgentTool`s mounted by a bind hook**: `SupervisorAgent::create` replaces Python's `P2PAbilityManager` subclassing/injection attribute; the tools dispatch through `TeamRuntime::invoke_agent`, so there is no bus hop and no topic re-entrancy, and one shared `Semaphore` (clamped to `max(1, max_parallel_sub_agents)`) bounds concurrent dispatches.
+- **Sub-agents are ordinary `AgentTool`s mounted by a bind hook**: `SupervisorAgent::create` does not need Python's `P2PAbilityManager` subclassing/injection attribute; the tools dispatch through `TeamRuntime::invoke_agent`, so there is no bus hop and no topic re-entrancy, and one shared `Semaphore` (clamped to `max(1, max_parallel_sub_agents)`) bounds concurrent dispatches. `P2PAbilityManager` itself is still available (`../ability.rs`) for callers that drive model tool calls through the runtime explicitly.
 - **The bind hook is the only point where the runtime exists**: it mounts at most once per bound provider call (a per-provider-call `AtomicBool`), and the sub-agent card set is the snapshot taken at `create` time (Python parity: later members are invisible to the supervisor).
 - **`SupervisorAgent::create` takes an `Arc<dyn Model>`** instead of client/request configs: model construction stays with the caller (`init_model`), the crate stays provider-agnostic, and tests pass a `ScriptedModel`.
 - **The provider builds a fresh `ReActAgent` per resolution**, so each member instance owns its own mounted tools, semaphore, and mount latch, and two concurrent team invocations never share a parallel-dispatch budget.
@@ -145,6 +146,7 @@ An agent stream failure is swallowed into one `{"type":"message","index":0,"payl
 - `./msgbus.rs` → `HierarchicalMsgbusConfig` (+ `new`/serde defaults), the timeout-to-deadline conversion, `HierarchicalMsgbusStrategy` (readiness before the first frame, deadline adoption, `invoke`, one-frame `stream`), `hierarchical_msgbus_team`, and its 11 unit tests.
 - `./supervisor.rs` → `SupervisorConfig` (+ `new`, `Debug`), `SupervisorAgent::create`, `create_supervisor`, sub-agent validation, the provider/bind hook, and its 8 unit tests.
 - `./tools.rs` → `HierarchicalToolsConfig` (+ `new`), `shape_input`, `HierarchicalToolsStrategy` (queueing, lazy wiring/pinning, readiness, `invoke`, bus-free `stream`), `hierarchical_tools_team`, and its 20 unit tests.
+- `../ability.rs` → `P2PAbilityManager` and its ability types, re-exported here as the Python-shaped path (see `../CONTEXT.md`).
 
 ## Test Strategy
 
