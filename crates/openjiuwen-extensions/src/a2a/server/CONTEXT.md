@@ -18,6 +18,15 @@ Everything is re-exported at `crate::a2a::server::`; the child modules are priva
 - `TaskStore`, `InMemoryTaskStore`
 - `A2aServer`, `ServerHandle`, `A2aServerAdapter`
 
+## Extending the Routes (e.g. a REST binding)
+
+- `A2aServer::router(&self) -> Router` is public and returns the fully state-injected router: `Router::new().route(&config.card_path, get(card_handler)).route(&config.rpc_path, post(rpc_handler)).with_state(Arc::clone(&self.inner))`.
+- State is the private `struct Inner { config: A2aServerConfig, executor: Arc<dyn A2aExecutor>, store: Arc<dyn TaskStore> }`; because `Inner` and the handlers are private, extra routes are added by `.merge(..)`-ing an independently-built router onto `server.router()`, or by adding handlers inside `service.rs` — never by constructing `Inner` elsewhere.
+- `A2aServer::config()`, `store()`, and `Clone` give an outside compositor the card, the task store, and a cheap handle; `A2aServerAdapter` only wraps `serve`/`serve_in_background` lifecycle.
+- A card advertising `protocol_binding = "HTTP+JSON"` is tolerated: `reject_unsupported_transports` only rejects `gRPC`, and no REST route is mounted today.
+- The SSE framing helpers (`sse_frame`, `sse_response`, `sse_responses`, `sse_receiver_response`, `json_result`, `json_error`, `task_id_param`) are private to `service.rs`, so a new REST/SSE route must live in that module to reuse them or rebuild `Body::from_stream` plus the `text/event-stream`/`no-cache` headers itself.
+- `EventSink::new` is `pub(crate)`; a new route inside `service.rs` can therefore build a sink exactly like `plan_send` does, keeping the store coherent through the same path.
+
 ## Constraints
 
 - Public paths must stay at `crate::a2a::server::`; child modules are declared `mod x;` and re-exported with `pub use`.
