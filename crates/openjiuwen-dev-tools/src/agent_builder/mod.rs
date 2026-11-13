@@ -60,6 +60,7 @@ pub mod cycle_checker;
 pub mod designer;
 pub mod dl_generator;
 pub mod dl_reflector;
+pub mod dl_transformer;
 pub mod dsl;
 pub mod history;
 pub mod mermaid;
@@ -75,6 +76,7 @@ pub use cycle_checker::{find_cycle, has_cycle};
 pub use designer::{DesignEdge, DesignNode, DesignNodeKind, WorkflowDesign, WorkflowDesigner};
 pub use dl_generator::DlGenerator;
 pub use dl_reflector::{DlReflector, Reflection, ReflectionIssue, ReflectionIssueKind};
+pub use dl_transformer::{DlCondition, DlDocument, DlNode, DlNodeType, DlParameters, DlVariable};
 pub use dsl::{
     DslConfigs, DslDependencies, DslModel, DslModelInfo, LlmAgentDsl, PluginRef, WorkflowRef,
 };
