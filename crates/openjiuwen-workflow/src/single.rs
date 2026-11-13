@@ -45,14 +45,19 @@
 //! - `inputs_schema`, resolved with the same `${node.field}` template semantics the
 //!   engine uses ([`crate::reference::resolve_schema`]); without a schema the component
 //!   receives the inputs unchanged.
-//! - `outputs_schema`, resolved exactly like the engine's node adapter: against the
-//!   resolved inputs plus `{"<component_id>": raw, "output": raw}`, so
-//!   `${output.field}` and `${<component_id>.field}` both work.
+//! - `outputs_schema`, resolved by the engine's own output-projection helper against the
+//!   resolved inputs plus `{"<component_id>": raw, "output": raw}`, so `${output.field}`
+//!   and `${<component_id>.field}` both work.
 //! - Human-in-the-loop: an unseeded [`ComponentContext::interact`](crate::ComponentContext::interact)
 //!   returns [`crate::WorkflowExecutionState::InputRequired`]
 //!   with the same `{"type", "index", "payload"}` interaction wires an interrupted run
-//!   reports; seeding [`SingleComponentOptions::interactive`] answers the question
-//!   instead, exactly as Python's `InteractiveInput` fast path does.
+//!   reports (built by the engine's wire builder); seeding
+//!   [`SingleComponentOptions::interactive`] answers the question instead, exactly as
+//!   Python's `InteractiveInput` fast path does.
+//!
+//! Both mappings reuse the engine helpers instead of reimplementing them, so a
+//! single-component call and a workflow run agree on output projection and on the shape
+//! of an interrupted result.
 //!
 //! # Deviations from Python
 //!
@@ -75,14 +80,14 @@
 use std::sync::Arc;
 
 use openjiuwen_common::error::Result;
-use openjiuwen_session::interaction::INTERACTION_FRAME_TYPE;
 use openjiuwen_session::{InteractiveInput, Session};
-use serde_json::{json, Map, Value};
+use serde_json::Value;
 
 use crate::component::Component;
 use crate::context::ComponentContext;
+use crate::engine::node::{interaction_wires, project_output};
 use crate::interrupt::{find_interrupt, InteractionState};
-use crate::output::{FrameWriter, OutputFrame, WorkflowExecutionState, WorkflowOutput};
+use crate::output::{FrameWriter, WorkflowExecutionState, WorkflowOutput};
 use crate::reference;
 
 /// Per-call data mapping and seeded answers for [`execute_single_component_with`].
@@ -214,50 +219,4 @@ pub async fn execute_single_component_with(
             Err(failure)
         }
     }
-}
-
-/// Projects a component's raw output through an `outputs_schema`.
-///
-/// This is the engine node adapter's rule
-/// ([`crate::engine::node`](crate::engine::node)'s `project_output`, private): the schema
-/// resolves against the workflow state plus `{"<id>": raw, "output": raw}`, so a template
-/// can reference its own component id or the bare `output` key. Here the "workflow state"
-/// is the call's resolved inputs. Keep the two implementations in step.
-fn project_output(schema: Option<&Value>, inputs: &Value, id: &str, raw: &Value) -> Value {
-    let Some(schema) = schema else {
-        return raw.clone();
-    };
-    let mut scope = if inputs.is_object() {
-        inputs.clone()
-    } else {
-        Value::Object(Map::new())
-    };
-    if let Value::Object(map) = &mut scope {
-        map.insert(id.to_owned(), raw.clone());
-        map.insert("output".to_owned(), raw.clone());
-    }
-    reference::resolve_schema(schema, &scope)
-}
-
-/// The interaction wires an interrupted call reports: `{"type", "index", "payload"}` frames.
-///
-/// Same shape as an interrupted workflow run reports (the engine's `interaction_wires`).
-fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
-    interactions
-        .drain_pending()
-        .into_iter()
-        .map(|interaction| {
-            let payload = json!({
-                "id": interaction.id,
-                "index": interaction.index,
-                "question": interaction.value,
-            });
-            OutputFrame {
-                item_type: INTERACTION_FRAME_TYPE.to_owned(),
-                index: interaction.index,
-                payload,
-            }
-            .to_wire()
-        })
-        .collect()
 }

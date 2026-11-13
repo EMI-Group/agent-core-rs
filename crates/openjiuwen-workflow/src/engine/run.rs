@@ -285,8 +285,10 @@ async fn run_blocking(
 /// The interaction wires an interrupted run reports: `{"type", "index", "payload"}` frames.
 ///
 /// Draining here (instead of in the node adapter) keeps the interrupt in the graph's
-/// failure path, which is what stores the pre-superstep boundary `resume` needs.
-fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
+/// failure path, which is what stores the pre-superstep boundary `resume` needs. The
+/// payload is `{"id", "index", "question"}` per pending interaction; `crate::single` calls
+/// this same builder so a single-component call reports identical wires.
+pub(crate) fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
     interactions
         .drain_pending()
         .into_iter()
