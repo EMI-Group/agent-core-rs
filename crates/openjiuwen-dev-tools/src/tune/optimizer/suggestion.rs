@@ -294,15 +294,47 @@ impl Mutator {
     /// Returns `None` when no model is attached, the call fails, the answer has
     /// no `<PROMPT_OPTIMIZED>` block, or the rewrite equals `base`. A failure is
     /// logged and never propagated: the deterministic bank remains the baseline.
+    ///
+    /// This is [`Self::model_rewrite_with`] with no sampling temperature and no
+    /// extra policy context, so the instruction, example, and joint optimizers
+    /// keep byte-identical requests.
     pub(crate) async fn model_rewrite(
         &self,
         base: &str,
         bad_cases: &[EvaluatedCase],
         cases: &[Case],
     ) -> Option<String> {
+        self.model_rewrite_with(base, bad_cases, cases, None, None)
+            .await
+    }
+
+    /// Asks the model to rewrite `base`, optionally sampling with `temperature`
+    /// and appending `context` to the request.
+    ///
+    /// `temperature` is the prompt-search policy temperature
+    /// ([`PromptSearchConfig::policy_temperature`]) and is the only way that
+    /// tunable reaches the model; `context` is the multi-round policy update —
+    /// the compressed lessons plus the warm-start prompts, already rendered as
+    /// text — and appears as a `<policy_context>` block between the bad cases
+    /// and the instruction. Both default to "absent" in [`Self::model_rewrite`],
+    /// so a request without them is byte-identical to before.
+    ///
+    /// [`PromptSearchConfig::policy_temperature`]:
+    ///     crate::tune::PromptSearchConfig::policy_temperature
+    pub(crate) async fn model_rewrite_with(
+        &self,
+        base: &str,
+        bad_cases: &[EvaluatedCase],
+        cases: &[Case],
+        temperature: Option<f32>,
+        context: Option<&str>,
+    ) -> Option<String> {
         let model = self.model.as_ref()?;
-        let messages = rewrite_messages(base, bad_cases, cases);
-        let request = ModelRequestConfig::new(model.model_name());
+        let messages = rewrite_messages_with(base, bad_cases, cases, context);
+        let mut request = ModelRequestConfig::new(model.model_name());
+        if let Some(temperature) = temperature {
+            request = request.with_temperature(temperature);
+        }
         let completion = match model.invoke(&messages, &request).await {
             Ok(completion) => completion,
             Err(error) => {
@@ -374,9 +406,26 @@ pub(crate) fn tools_block(cases: &[Case]) -> Option<String> {
     ))
 }
 
-/// Renders the rewrite conversation: the prompt under revision, the declared
-/// tools when there are any, and the cases that scored worst.
+/// Renders the rewrite conversation with no policy context.
+///
+/// Test-only: the production paths go through [`rewrite_messages_with`].
+#[cfg(test)]
 fn rewrite_messages(base: &str, bad_cases: &[EvaluatedCase], cases: &[Case]) -> Vec<BaseMessage> {
+    rewrite_messages_with(base, bad_cases, cases, None)
+}
+
+/// Renders the rewrite conversation, optionally appending the round's policy
+/// context.
+///
+/// The `<policy_context>` block sits between the bad cases and the instruction
+/// and is omitted entirely for an absent or blank `context`, so every existing
+/// caller's request stays byte-identical.
+fn rewrite_messages_with(
+    base: &str,
+    bad_cases: &[EvaluatedCase],
+    cases: &[Case],
+    context: Option<&str>,
+) -> Vec<BaseMessage> {
     let mut evidence = String::new();
     for bad in bad_cases {
         let inputs = bad
@@ -409,11 +458,15 @@ fn rewrite_messages(base: &str, bad_cases: &[EvaluatedCase], cases: &[Case]) -> 
         user.push_str(&block);
         user.push_str("\n\n");
     }
-    let _ = write!(
-        user,
-        "<bad_cases>\n{evidence}</bad_cases>\n\n\
-         Rewrite the prompt so those cases are handled correctly."
-    );
+    let _ = write!(user, "<bad_cases>\n{evidence}</bad_cases>");
+    if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+        let _ = write!(
+            user,
+            "\n\n<policy_context>\n{}\n</policy_context>",
+            context.trim()
+        );
+    }
+    user.push_str("\n\nRewrite the prompt so those cases are handled correctly.");
     vec![
         BaseMessage::system(REWRITE_SYSTEM_PROMPT.to_owned()),
         BaseMessage::user(user),
