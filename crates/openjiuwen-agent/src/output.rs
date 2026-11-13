@@ -4,7 +4,7 @@
 //! to the Python result dict; [`AgentChunk`] is one frame of a streaming
 //! invocation and bridges to [`openjiuwen_session::StreamItem`].
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::Usage;
+use openjiuwen_foundation::{ContentPart, Usage};
 use openjiuwen_session::StreamItem;
 use openjiuwen_workflow::WorkflowOutput;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,10 @@ pub enum ResultType {
     Interrupt,
 }
 /// One tool observation recorded during a run.
+///
+/// A tool that answers with multimodal content keeps the text rendering in
+/// [`Observation::content`] and its typed payloads in [`Observation::parts`], so
+/// an output without parts serializes exactly like the Python result entry.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct Observation {
@@ -36,6 +40,22 @@ pub struct Observation {
     /// Id of the tool call the observation answers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Multimodal content parts of the tool result, in wire order.
+    ///
+    /// Python carries content parts inside the tool message's `content`; here
+    /// the text rendering stays in [`Observation::content`] and the typed parts
+    /// travel beside it, serialized as `parts` and omitted when empty
+    /// (documented deviation from Python's nested `content` shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ContentPart>,
+}
+impl Observation {
+    /// Attaches the multimodal content parts of the tool result.
+    #[must_use]
+    pub fn with_parts(mut self, parts: Vec<ContentPart>) -> Self {
+        self.parts = parts;
+        self
+    }
 }
 /// A persisted output frame; interrupt frames use [`INTERACTION`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -253,6 +273,8 @@ pub const INTERACTION: &str = "__interaction__";
 pub const WORKFLOW_FINAL: &str = "workflow_final";
 /// Frame kind for context/token usage statistics.
 pub const CONTEXT_USAGE: &str = "context.usage";
+/// Frame kind for a model-route switch (a rail swapped the model for this call).
+pub const LLM_ROUTE: &str = "llm_route";
 impl AgentChunk {
     /// Builds a frame of `kind`.
     #[must_use]
@@ -361,9 +383,74 @@ mod tests {
                 content: "42".to_owned(),
                 name: Some("calc".to_owned()),
                 tool_call_id: Some("call-1".to_owned()),
+                ..Observation::default()
             }]);
         let value = output.to_value();
         let restored = AgentOutput::from_value(value).unwrap();
+        assert_eq!(restored, output);
+    }
+    #[test]
+    fn observation_parts_are_omitted_when_empty() {
+        let observation = Observation {
+            content: "42".to_owned(),
+            name: Some("calc".to_owned()),
+            tool_call_id: Some("call-1".to_owned()),
+            ..Observation::default()
+        };
+        let value = serde_json::to_value(&observation).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "content": "42",
+                "name": "calc",
+                "tool_call_id": "call-1",
+            })
+        );
+        let output = AgentOutput::answer("done").with_observations(vec![observation]);
+        assert!(output.to_value()["observations"][0].get("parts").is_none());
+    }
+    #[test]
+    fn observation_parts_serialize_as_tagged_parts() {
+        let observation = Observation {
+            content: "ok".to_owned(),
+            name: Some("screenshot".to_owned()),
+            tool_call_id: Some("call-1".to_owned()),
+            ..Observation::default()
+        }
+        .with_parts(vec![
+            ContentPart::Text {
+                text: "ok".to_owned(),
+            },
+            ContentPart::ImageUrl {
+                image_url: openjiuwen_foundation::ImageUrl {
+                    url: "data:image/png;base64,AAA".to_owned(),
+                    detail: None,
+                },
+            },
+        ]);
+        let value = serde_json::to_value(&observation).unwrap();
+        assert_eq!(value["content"], "ok");
+        let parts = value["parts"].as_array().expect("parts is an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA");
+    }
+    #[test]
+    fn observation_parts_survive_the_output_round_trip() {
+        let parts = vec![ContentPart::ImageUrl {
+            image_url: openjiuwen_foundation::ImageUrl {
+                url: "https://example.test/shot.png".to_owned(),
+                detail: Some("high".to_owned()),
+            },
+        }];
+        let output = AgentOutput::answer("done").with_observations(vec![Observation {
+            content: "ok".to_owned(),
+            ..Observation::default()
+        }
+        .with_parts(parts.clone())]);
+        let restored = AgentOutput::from_value(output.to_value()).unwrap();
+        assert_eq!(restored.observations[0].parts, parts);
         assert_eq!(restored, output);
     }
     #[test]
@@ -443,6 +530,7 @@ mod tests {
         assert_eq!(LLM_OUTPUT, "llm_output");
         assert_eq!(LLM_USAGE, "llm_usage");
         assert_eq!(CONTEXT_USAGE, "context.usage");
+        assert_eq!(LLM_ROUTE, "llm_route");
     }
     #[test]
     fn usage_chunk_serializes_usage() {

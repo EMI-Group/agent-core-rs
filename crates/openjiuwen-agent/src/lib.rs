@@ -45,15 +45,24 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod abilities;
 pub mod agent;
+pub mod callbacks;
 pub mod card;
+pub mod controller;
+pub mod evolve;
 pub mod input;
 pub mod interrupt;
+pub mod kv_cache;
 pub mod llm_agent;
+pub mod operator;
 pub mod output;
+pub mod policy;
 pub mod prompt;
+pub mod prompt_pack;
 pub mod rails;
 pub mod react;
 pub mod run;
+pub mod skills;
+pub mod steering;
 pub mod workflow_agent;
 pub use abilities::{
     parse_tool_arguments, AbilityManager, AddAbilityResult, ToolCallResult, ToolExecutionOptions,

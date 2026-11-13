@@ -4,7 +4,8 @@
 //! model, mounted tools, rails, prompt builder, and context engine — behind
 //! interior mutability, so a single value can be shared as `Arc<dyn Agent>`.
 //! The iteration loop lives in `agent_loop`, one model call in [`model_step`],
-//! interrupt replay in `resume`, and identity prompt rendering in `prompt`.
+//! pause persistence and rendering in `pause`, interrupt replay and turn
+//! seeding in `resume`, and identity prompt rendering in `prompt`.
 //!
 //! The implemented loop semantics match Python's
 //! `openjiuwen/core/single_agent/agents/react_agent.py::_inner_invoke`:
@@ -29,23 +30,47 @@
 //!    `skip_tool`; an interrupt pauses the loop into an output carrying state
 //!    frames and interrupt ids that a later invocation resumes.
 //!
+//! The loop also drives the agent's side seams, all of which are no-ops in
+//! their defaults: `hooks` drains steering messages at the top of every
+//! iteration, fires the six lifecycle callbacks (logging their errors instead
+//! of failing the run), and runs the optional final-request check; a client
+//! tool call pauses the turn as a `client_tool` interrupt instead of executing
+//! locally; and `frames` publishes a `context.usage` frame after each
+//! preparation plus an `llm_route` frame when a rail swapped the model.
+//! `exposure` owns the model-facing projection computed once per run: tools
+//! the exposure policy or MCP allowlist denies never reach the model, while
+//! execution still sees the full tool map.
+//!
 //! [`Agent::stream`] runs the same loop in a spawned task and yields
-//! [`AgentChunk`] frames: model deltas, one usage frame per call, the
-//! `__interaction__` frames of a pause, and one final `answer` frame.
+//! [`AgentChunk`] frames: model deltas, one usage frame per call, context and
+//! route frames, the `__interaction__` frames of a pause, and one final `answer`
+//! frame.
 pub(crate) mod agent_loop;
 pub mod config;
+pub(crate) mod exposure;
+pub(crate) mod frames;
+pub(crate) mod hooks;
 pub mod model_step;
-pub(crate) mod prompt;
+pub(crate) mod pause;
+pub mod prompt;
 pub(crate) mod resume;
+#[cfg(test)]
+mod wiring;
 
 pub use config::{MaxIterationsPolicy, ReActAgentConfig};
 
 use crate::abilities::{AbilityManager, AddAbilityResult};
 use crate::agent::Agent;
+use crate::callbacks::{AgentCallback, AgentCallbackEvent, CallbackFramework};
 use crate::card::AgentCard;
 use crate::output::{AgentChunk, AgentOutput};
+use crate::policy::{
+    ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
+    ToolResiliencePolicy,
+};
 use crate::prompt::{PromptSection, SystemPromptBuilder, IDENTITY_PRIORITY};
 use crate::rails::{AgentRail, RailRegistry};
+use crate::steering::SteeringQueue;
 use agent_loop::AgentRuntime;
 use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
@@ -97,11 +122,24 @@ pub struct ReActAgent {
     rails: parking_lot::RwLock<Arc<RailRegistry>>,
     prompt_builder: parking_lot::RwLock<SystemPromptBuilder>,
     engine: parking_lot::RwLock<Arc<ContextEngine>>,
+    callbacks: parking_lot::RwLock<Arc<CallbackFramework>>,
+    steering: SteeringQueue,
+    exposure: parking_lot::RwLock<ToolExposurePolicy>,
+    mcp_allowlist: parking_lot::RwLock<McpToolAllowlist>,
+    client_tools: parking_lot::RwLock<Arc<ClientToolRegistry>>,
+    resilience: parking_lot::RwLock<ToolResiliencePolicy>,
+    final_check: parking_lot::RwLock<Option<Arc<dyn FinalRequestCheck>>>,
 }
 
 impl ReActAgent {
     /// Creates an agent around `card` with the default configuration, no model,
     /// nobody's tools, no rails, and a default context engine.
+    ///
+    /// The policy, callback, and steering seams start in their
+    /// behavior-preserving defaults: an empty callback registry, an empty
+    /// steering queue, allow-all tool exposure with no MCP restriction, no
+    /// client tools, an empty resilience policy (single attempt, no per-tool
+    /// timeout), and no final-request check.
     #[must_use]
     pub fn new(card: AgentCard) -> Self {
         let abilities = AbilityManager::new(&card.id);
@@ -116,6 +154,13 @@ impl ReActAgent {
             engine: parking_lot::RwLock::new(Arc::new(
                 ContextEngine::new(ContextConfig::default()),
             )),
+            callbacks: parking_lot::RwLock::new(Arc::new(CallbackFramework::new())),
+            steering: SteeringQueue::new(),
+            exposure: parking_lot::RwLock::new(ToolExposurePolicy::allow_all()),
+            mcp_allowlist: parking_lot::RwLock::new(McpToolAllowlist::new()),
+            client_tools: parking_lot::RwLock::new(Arc::new(ClientToolRegistry::new())),
+            resilience: parking_lot::RwLock::new(ToolResiliencePolicy::new()),
+            final_check: parking_lot::RwLock::new(None),
         }
     }
 
@@ -237,6 +282,109 @@ impl ReActAgent {
     #[must_use]
     pub fn context_engine(&self) -> Arc<ContextEngine> {
         Arc::clone(&*self.engine.read())
+    }
+
+    /// Replaces the whole callback registry.
+    ///
+    /// A running loop keeps the framework snapshot it started with, so a
+    /// replacement affects later invocations.
+    pub fn set_callback_framework(&self, framework: Arc<CallbackFramework>) {
+        *self.callbacks.write() = framework;
+    }
+
+    /// Returns the current callback registry snapshot; empty by default.
+    #[must_use]
+    pub fn callbacks(&self) -> Arc<CallbackFramework> {
+        Arc::clone(&*self.callbacks.read())
+    }
+
+    /// Registers `callback` for `event`, adding to the existing registry.
+    ///
+    /// The registry is copy-on-write like [`ReActAgent::register_rail`], so a
+    /// running loop keeps the framework snapshot it started with and the
+    /// callback fires on later invocations. [`CallbackFramework`] is not `Clone`
+    /// (its handlers are trait objects), so the replacement snapshot is rebuilt
+    /// by re-registering the existing handlers in their current order.
+    pub fn register_callback(&self, event: AgentCallbackEvent, callback: Arc<dyn AgentCallback>) {
+        let mut guard = self.callbacks.write();
+        let mut framework = CallbackFramework::new();
+        for existing in AgentCallbackEvent::ALL {
+            for registered in guard.handlers(existing) {
+                framework.register(existing, registered);
+            }
+        }
+        framework.register(event, callback);
+        *guard = Arc::new(framework);
+    }
+
+    /// Returns the steering queue; the clone shares this agent's backlog.
+    #[must_use]
+    pub fn steering(&self) -> SteeringQueue {
+        self.steering.clone()
+    }
+
+    /// Pushes one steering message and returns the resulting queue length.
+    ///
+    /// A blank text is dropped and leaves the length unchanged. This delegates
+    /// to [`SteeringQueue::push_text`] on [`ReActAgent::steering`].
+    pub fn steer(&self, text: impl Into<String>) -> usize {
+        self.steering.push_text(text)
+    }
+
+    /// Replaces the tool exposure policy; allow-all by default.
+    pub fn set_tool_exposure_policy(&self, policy: ToolExposurePolicy) {
+        *self.exposure.write() = policy;
+    }
+
+    /// Returns a copy of the current tool exposure policy.
+    #[must_use]
+    pub fn tool_exposure_policy(&self) -> ToolExposurePolicy {
+        self.exposure.read().clone()
+    }
+
+    /// Replaces the MCP tool allowlist; an empty allowlist restricts nothing.
+    pub fn set_mcp_tool_allowlist(&self, allowlist: McpToolAllowlist) {
+        *self.mcp_allowlist.write() = allowlist;
+    }
+
+    /// Returns a copy of the current MCP tool allowlist.
+    #[must_use]
+    pub fn mcp_tool_allowlist(&self) -> McpToolAllowlist {
+        self.mcp_allowlist.read().clone()
+    }
+
+    /// Replaces the registry of client-executed tool handlers.
+    pub fn set_client_tools(&self, tools: Arc<ClientToolRegistry>) {
+        *self.client_tools.write() = tools;
+    }
+
+    /// Returns the current client tool registry; empty by default.
+    #[must_use]
+    pub fn client_tools(&self) -> Arc<ClientToolRegistry> {
+        Arc::clone(&*self.client_tools.read())
+    }
+
+    /// Replaces the per-tool resilience policy; empty by default, which keeps
+    /// the single-attempt, no-per-tool-timeout behavior.
+    pub fn set_tool_resilience(&self, policy: ToolResiliencePolicy) {
+        *self.resilience.write() = policy;
+    }
+
+    /// Returns a copy of the current resilience policy.
+    #[must_use]
+    pub fn tool_resilience(&self) -> ToolResiliencePolicy {
+        self.resilience.read().clone()
+    }
+
+    /// Installs the check run before the final model request of a round.
+    pub fn set_final_request_check(&self, check: Arc<dyn FinalRequestCheck>) {
+        *self.final_check.write() = Some(check);
+    }
+
+    /// Returns the installed final-request check; `None` (no check) by default.
+    #[must_use]
+    pub fn final_request_check(&self) -> Option<Arc<dyn FinalRequestCheck>> {
+        self.final_check.read().clone()
     }
 }
 
@@ -538,5 +686,120 @@ mod tests {
         assert!(frames
             .iter()
             .any(|frame| frame.kind == crate::output::LLM_OUTPUT));
+    }
+
+    #[test]
+    fn policy_callback_and_steering_seams_start_in_their_defaults() {
+        let agent = agent();
+        assert!(!agent.callbacks().has_hooks(AgentCallbackEvent::InvokeStart));
+        assert!(agent.steering().is_empty());
+        assert_eq!(
+            agent.tool_exposure_policy(),
+            ToolExposurePolicy::allow_all()
+        );
+        assert!(agent.mcp_tool_allowlist().is_empty());
+        assert_eq!(agent.client_tools().names(), Vec::<String>::new());
+        assert!(agent.tool_resilience().is_empty());
+        assert!(agent.final_request_check().is_none());
+    }
+
+    #[test]
+    fn register_callback_populates_the_registry() {
+        struct Named;
+
+        #[async_trait::async_trait]
+        impl AgentCallback for Named {
+            fn name(&self) -> &'static str {
+                "named"
+            }
+        }
+
+        let agent = agent();
+        let before = agent.callbacks();
+        assert!(!before.has_hooks(AgentCallbackEvent::StepStart));
+
+        agent.register_callback(AgentCallbackEvent::StepStart, Arc::new(Named));
+        assert!(agent.callbacks().has_hooks(AgentCallbackEvent::StepStart));
+        // Copy-on-write: a snapshot taken before registration is unaffected and
+        // only the event that was subscribed to gains a handler.
+        assert!(!before.has_hooks(AgentCallbackEvent::StepStart));
+        assert!(!agent.callbacks().has_hooks(AgentCallbackEvent::InvokeStart));
+
+        agent.set_callback_framework(Arc::new(CallbackFramework::new()));
+        assert!(!agent.callbacks().has_hooks(AgentCallbackEvent::StepStart));
+    }
+
+    #[test]
+    fn policy_setters_round_trip() {
+        struct EchoAnswer;
+
+        #[async_trait::async_trait]
+        impl crate::policy::ClientToolHandler for EchoAnswer {
+            async fn invoke(
+                &self,
+                _call: &openjiuwen_foundation::ToolCall,
+                answer: &Value,
+            ) -> Result<Value> {
+                Ok(answer.clone())
+            }
+        }
+
+        struct AllowEveryRequest;
+
+        #[async_trait::async_trait]
+        impl FinalRequestCheck for AllowEveryRequest {
+            async fn check(
+                &self,
+                _ctx: &crate::policy::FinalRequestContext<'_>,
+            ) -> Result<crate::policy::FinalRequestDecision> {
+                Ok(crate::policy::FinalRequestDecision::Allow)
+            }
+        }
+
+        let agent = agent();
+
+        // Exposure policy.
+        let policy = ToolExposurePolicy::allowlist(["echo"]);
+        agent.set_tool_exposure_policy(policy.clone());
+        assert_eq!(agent.tool_exposure_policy(), policy);
+        let cards = vec![
+            ToolCard::new("echo", "echoes", Value::Null),
+            ToolCard::new("other", "other", Value::Null),
+        ];
+        let visible = agent.tool_exposure_policy().filter_cards(&cards);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "echo");
+
+        // MCP allowlist.
+        let mut allowlist = McpToolAllowlist::new();
+        allowlist.allow("files", "read_file");
+        agent.set_mcp_tool_allowlist(allowlist.clone());
+        assert_eq!(agent.mcp_tool_allowlist(), allowlist);
+        assert!(agent.mcp_tool_allowlist().allows("files", "read_file"));
+        assert!(!agent.mcp_tool_allowlist().allows("files", "write_file"));
+
+        // Steering: the clone shares the agent's backlog.
+        let shared = agent.steering();
+        assert_eq!(agent.steer("stop after this step"), 1);
+        assert_eq!(agent.steering().len(), 1);
+        assert_eq!(shared.len(), 1);
+
+        // Client tools.
+        let registry = Arc::new(ClientToolRegistry::new());
+        registry.register("pick", Arc::new(EchoAnswer));
+        agent.set_client_tools(Arc::clone(&registry));
+        assert!(agent.client_tools().is_client_tool("pick"));
+        assert_eq!(agent.client_tools().names(), vec!["pick".to_owned()]);
+
+        // Resilience.
+        let mut resilience = ToolResiliencePolicy::new();
+        resilience.set_default(crate::policy::ToolResilience::new().with_attempts(3));
+        agent.set_tool_resilience(resilience.clone());
+        assert_eq!(agent.tool_resilience(), resilience);
+        assert_eq!(agent.tool_resilience().for_tool("echo").attempts(), 3);
+
+        // Final request check.
+        agent.set_final_request_check(Arc::new(AllowEveryRequest));
+        assert!(agent.final_request_check().is_some());
     }
 }

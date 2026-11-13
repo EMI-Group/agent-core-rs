@@ -9,18 +9,33 @@
 //! Execution is rail-free: [`AbilityManager::execute`] runs the calls and turns
 //! every failure into a [`ToolCallResult`], while the loop fires the
 //! `BeforeToolCall`/`AfterToolCall` rails around it.
+//!
+//! A successful result keeps its text rendering in [`ToolCallResult::text`] and
+//! any multimodal payloads in [`ToolCallResult::parts`]; the
+//! `tool` message carries both, so a provider that accepts content parts
+//! receives the image/audio/file blocks and a text-only provider keeps the plain
+//! string form.
 pub mod arguments;
 pub(crate) mod execute;
+pub mod mcp;
+pub mod parts;
+pub mod sub_agent;
+pub mod workflow;
 
 pub use arguments::parse_tool_arguments;
 use indexmap::IndexMap;
-use openjiuwen_foundation::{openai_tools, BaseMessage, Tool, ToolCall, ToolCard};
+pub use mcp::{load_mcp_abilities, McpAbilityOptions, McpToolAbility};
+use openjiuwen_foundation::{
+    openai_tools, BaseMessage, ContentPart, MessageContent, Tool, ToolCall, ToolCard,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+pub use sub_agent::SubAgentAbility;
 use tokio_util::sync::CancellationToken;
+pub use workflow::WorkflowAbility;
 
 /// Outcome of [`AbilityManager::add_tool`].
 ///
@@ -117,6 +132,8 @@ pub struct ToolCallResult {
     pub success: bool,
     /// Error message when the call failed.
     pub error: Option<String>,
+    /// Multimodal content parts of the tool output; empty on failures.
+    pub parts: Vec<ContentPart>,
 }
 
 impl ToolCallResult {
@@ -129,6 +146,7 @@ impl ToolCallResult {
             text: text.into(),
             success: true,
             error: None,
+            parts: Vec::new(),
         }
     }
 
@@ -143,13 +161,37 @@ impl ToolCallResult {
             text: error.clone(),
             success: false,
             error: Some(error),
+            parts: Vec::new(),
         }
     }
 
+    /// Attaches the multimodal content parts of the tool output.
+    #[must_use]
+    pub fn with_parts(mut self, parts: Vec<ContentPart>) -> Self {
+        self.parts = parts;
+        self
+    }
+
     /// Renders the result as the `tool` message appended to the conversation.
+    ///
+    /// With content parts the message carries a part list — the text first, then
+    /// the parts — so a capable provider receives the multimodal tool output;
+    /// without them it keeps the plain-string wire form.
     #[must_use]
     pub fn message(&self) -> BaseMessage {
-        BaseMessage::tool(self.call.id.clone().unwrap_or_default(), self.text.clone())
+        let content = if self.parts.is_empty() {
+            MessageContent::Text(self.text.clone())
+        } else {
+            let mut parts = Vec::with_capacity(self.parts.len() + 1);
+            if !self.text.is_empty() {
+                parts.push(ContentPart::Text {
+                    text: self.text.clone(),
+                });
+            }
+            parts.extend(self.parts.iter().cloned());
+            MessageContent::Parts(parts)
+        };
+        BaseMessage::tool(self.call.id.clone().unwrap_or_default(), content)
             .with_name(self.call.name.clone())
     }
 }
@@ -327,7 +369,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use openjiuwen_common::error::Result;
-    use openjiuwen_foundation::ToolContext;
+    use openjiuwen_foundation::{Role, ToolContext};
     use serde_json::json;
 
     struct FakeTool {
@@ -493,5 +535,62 @@ mod tests {
         assert!(results.iter().all(|result| !result.success));
         assert!(results.iter().all(|result| result.error.as_deref()
             == Some("Tool 'echo' execution was cancelled by user.")));
+    }
+
+    fn image_part(url: &str) -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: openjiuwen_foundation::ImageUrl {
+                url: url.to_owned(),
+                detail: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_result_with_parts_renders_a_multimodal_tool_message() {
+        let call = ToolCall::new("screenshot").with_id("call-1");
+        let result = ToolCallResult::success(call, json!({"ok": true}), "ok")
+            .with_parts(vec![image_part("data:image/png;base64,AAA")]);
+        let message = result.message();
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.name.as_deref(), Some("screenshot"));
+        assert_eq!(message.tool_call_id.as_deref(), Some("call-1"));
+        let parts = match &message.content {
+            MessageContent::Parts(parts) => parts.clone(),
+            MessageContent::Text(text) => panic!("expected parts, found text `{text}`"),
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            ContentPart::Text {
+                text: "ok".to_owned()
+            }
+        );
+        assert_eq!(parts[1], image_part("data:image/png;base64,AAA"));
+    }
+
+    #[test]
+    fn a_result_without_parts_keeps_the_plain_text_message() {
+        let call = ToolCall::new("echo").with_id("call-1");
+        let result = ToolCallResult::success(call, json!({"x": 1}), "{\"x\":1}");
+        assert_eq!(result.parts, Vec::new());
+        let message = result.message();
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.name.as_deref(), Some("echo"));
+        assert_eq!(message.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            message.content,
+            MessageContent::Text("{\"x\":1}".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_failed_result_has_no_parts_and_a_text_message() {
+        let result = ToolCallResult::failure(ToolCall::new("echo").with_id("call-1"), "boom");
+        assert_eq!(result.parts, Vec::new());
+        let message = result.message();
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.content, MessageContent::Text("boom".to_owned()));
+        assert_eq!(message.name.as_deref(), Some("echo"));
     }
 }
