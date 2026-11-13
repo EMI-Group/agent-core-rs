@@ -102,3 +102,5 @@ pub use tracer::{
     InvokeType, MemoryTraceSink, NoopTraceSink, SpanHandle, SpanStatus, StreamTraceSink,
     TraceFrame, TraceFrameType, TracePosition, TraceSink, TraceSpan, TraceSpanKind, Tracer,
 };
+
+pub use checkpoint::{RedisCheckpointer, RedisOptions};
