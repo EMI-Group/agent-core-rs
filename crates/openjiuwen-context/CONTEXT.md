@@ -37,19 +37,21 @@ let recovered: RecoveryOutcome = engine
 - `CompressionRecallConfig` — `enabled`, `chunk_size_tokens`, `chunk_overlap_tokens`.
 - `DEFAULT_CONTEXT_TOKENS` — 200 000, used when `max_context_tokens` is `None`.
 - `ModelContext` trait — `context_id`, `session_id`, `messages`, `set_messages`, `add_message`, `pop_messages`, `clear_messages`, `token_counter`, `statistics`, `revision`.
-- `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `recall_store()`, `session_memory_store()`, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state`, `prepare`; the constructor is engine-only.
+- `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `recall_store()`, `session_memory_store()`, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state` (history + processor checkpoints), `prepare`; the constructor is engine-only.
+- `ProcessorState` — the cheap `Send + Sync` JSON bag a processor keeps its cross-run counters in: `snapshot`, `restore`, `bump`, `counter`, `set_u64`, `record_tokens`, and a `Clone` that copies the snapshot.
 - `PreparedContext` — `messages` (system first, then selected context), `tools`, `stats: ContextStats`, `token_count`, `overflow`, `window_size`, `events`.
 - `ContextStats` — total/per-role message counts and token counts, `total_dialogues`, `compressions`, `tokens_before_compression`, `tokens_after_compression`.
 - `ContextEvent` / `ContextEventKind` (`truncated`, `summarized`, `offloaded`, `tool_result_trimmed`), `CompressionStatus`, `CompressReport`, `RecoveryOutcome`, `ObserveOutcome`.
-- `ContextState` — serde `{ messages, revision }` snapshot used by session persistence.
-- Processors (`processor` module): `ContextProcessor` trait (`name`, `process`, `save_state`, `load_state`), `ProcessorContext` (with `recall: Option<&dyn RecallArchiveStore>` and `session_memory: Option<&dyn SessionMemoryStore>`), `ContextPipeline::{new, from_configs, from_configs_with, processors, run}`, `ProcessorConfig::{Truncation, ToolResult, Summarization}` with `TruncationConfig`, `ToolResultConfig`, `SummarizationConfig`; constants `TRUNCATED_MARKER`, `PERSISTED_OUTPUT_TAG`, `CONTEXT_SUMMARY_PREFIX`.
+- `ContextState` — serde `{ messages, revision, processors }` snapshot used by session persistence; `processors` is a `BTreeMap<String, serde_json::Value>` keyed by processor name and defaults to empty, so a state written before processors kept counters still loads.
+- Processors (`processor` module): `ContextProcessor` trait (`name`, `process`, `save_state`, `load_state`), `ProcessorContext` (with `recall: Option<&dyn RecallArchiveStore>` and `session_memory: Option<&dyn SessionMemoryStore>`), `ContextPipeline::{new, from_configs, from_configs_with, processors, save_state, load_state, run}`, `ProcessorConfig::{Truncation, ToolResult, Summarization}` with `TruncationConfig`, `ToolResultConfig`, `SummarizationConfig`; constants `TRUNCATED_MARKER`, `PERSISTED_OUTPUT_TAG`, `CONTEXT_SUMMARY_PREFIX`.
 - Offload (`offload` module): `OffloadStore` trait (`kind`, `put`, `get`, `remove`), `InMemoryOffloadStore`, `KvOffloadStore` (foundation `KvStore`, `new`/`with_prefix`), `SessionOffloadStore` (`openjiuwen_session::Session`), `OffloadScope`, `OffloadRecord`, `OffloadKind`, `OffloadMarker::{to_marker_string, parse}`, `OFFLOAD_MARKER_PREFIX`, `sanitize_key`, `rehydrate`.
 - `window` module: `dialogue_round_ranges`, `find_last_n_rounds_start`, `WindowOptions`, `assemble_window`, `strip_leading_tool_messages`, `drop_orphan_tool_results`, `validate_tool_pairs`, `truncate_keeping_rounds`.
 - `tokens` module: `count_message`, `count_messages`, `TokenBudget`, `check_budget`.
 - `stats` module: `compute_stats`.
 - `prompts` module: `SUMMARY_SYSTEM_PROMPT`, `SUMMARY_USER_TEMPLATE`, `render_summary_prompt`.
 - Compressor recall (`processor::compressor` module): `archive_replaced_messages`, `rollback_recall_archive`, `RecallArchiveMarker` (`memory_id`, `marker()`, `append()`), `split_recall_markers`, `append_recall_markers`.
-- Offloaders (`offloader` module): `MessageOffloader` + `MessageOffloaderConfig`, `MessageOffloadRole` (`User`/`Assistant`/`Tool`), `ToolResultBudgetProcessor` + `ToolResultBudgetProcessorConfig`, `ToolResultWindowProcessor` + `ToolResultWindowProcessorConfig`, `wildcard_match`, `OMIT_STRING`, `WINDOWED_OUTPUT_TAG`, `WINDOW_MANAGED_METADATA_KEY`.
+- Offloaders (`offloader` module): `MessageOffloader` + `MessageOffloaderConfig`, `MessageOffloadRole` (`User`/`Assistant`/`Tool`), `ToolResultBudgetProcessor` + `ToolResultBudgetProcessorConfig`, the re-exported `ToolResultWindowProcessor` + `ToolResultWindowProcessorConfig`, `wildcard_match`, `OMIT_STRING`, `WINDOWED_OUTPUT_TAG`, `WINDOW_MANAGED_METADATA_KEY`.
+- Each stateful processor also exposes a `pub state: ProcessorState` field and counts its own work there: `dialogue` (`compressions`, `rounds_dropped`), `current_round` (`compressions`, `merges`), `round_level` (`compressions`, `blocks`, `merges`, `truncations`), `full_compact` (`compactions`, `session_memory_compactions`), `micro_compact` (`cleared`, `groups`), the three offloaders (`offloaded`, `trimmed`), `message_summary_offloader` (`offloaded`, `summaries`), plus `last_tokens_before`/`last_tokens_after` wherever the processor reports tokens.
 - Summary offloader (`summary_offloader` module): `MessageSummaryOffloader` (`new(config, model, store)`) + `MessageSummaryOffloaderConfig`, `summarize_text_offline`, `OFFLOADED_INFO_TAG`, `SUMMARY_COMPRESSION_SYSTEM_PROMPT`.
 - `ProcessorConfig` also carries `MessageOffloader`, `ToolResultBudget`, `ToolResultWindow`, `MessageSummaryOffloader` (wire tags `message_offloader`, `tool_result_budget`, `tool_result_window`, `message_summary_offloader`).
 
@@ -80,8 +82,8 @@ let recovered: RecoveryOutcome = engine
 - `TruncationConfig::keep_system = false` drops the oldest system messages first, which is the only way that field is not inert.
 - The context pool key is `(session_id, context_id)` with dots in `context_id` normalized to `_`, matching Python's pool identity; the context keeps its original id.
 - The processor extension surface is exactly: a config struct (`serde(default)`, snake_case), a `ProcessorConfig` variant (adjacently tagged `{"type": ...}`), an arm in `ContextPipeline::from_configs`, a re-export in `lib.rs`, and a `ContextEventKind` variant when it reports a new kind of change; `default_processors` lists only the two defaulted processors.
-- `ProcessorContext` carries no session handle, so a processor can persist only through `offload`/`scope` and `save_state`/`load_state`; the engine never calls the latter two today.
-- Context state persistence is a serde `ContextState { messages, revision }` written under session key `context.<context_id>`; the engine wraps a map of context id → state under `context`.
+- `ProcessorContext` carries no session handle, so a processor persists only through `offload`/`scope` and its own `ProcessorState`, which the pipeline saves and loads around the session checkpoint.
+- Context state persistence is a serde `ContextState { messages, revision, processors }` written under session key `context.<context_id>`; the engine wraps a map of context id → state under `context`.
 - Every offloader reports `ContextEventKind::Offloaded` with the pre-change indices, the last handle it wrote, and whole-history before/after token counts, and returns `None` when it changed nothing; `cx.manual` bypasses the thresholds, never the candidate rules.
 - `MessageOffloader` forbids indices at or after `min(len - messages_to_keep, newest assistant without tool calls)` when `keep_last_round` is set, and resolves a tool result's name through the owning assistant's `tool_calls` (`name` or `name:glob` protection, `*`/`?` over string arguments).
 - `ToolResultBudgetProcessor` re-measures the round after every offload and takes the largest eligible result (oldest on a tie) until the round fits or no candidate remains; `tool_name_allowlist = None` protects nothing.
@@ -90,6 +92,8 @@ let recovered: RecoveryOutcome = engine
 - Store resolution per context is `ContextOptions` override → engine-level store (`with_stores`) → configuration default: an in-memory recall archive when `compression_recall.enabled`, and an in-memory session-memory store when the pipeline holds `FullCompact` or `MessageSummaryOffloader`.
 - Compressors archive the history they replace through `archive_replaced_messages` (only when `compression_recall.enabled` and `ProcessorContext::recall` is set) and append `[[COMPRESSION_RECALL: id=...]]` as the block's last line; a replacement rejected by a benefit gate calls `rollback_recall_archive`.
 - Merge stages (`CurrentRoundCompressor`, `RoundLevelCompressor` phase 2) strip the individual blocks' recall markers from the joined bodies and re-append them deduplicated, so a merged block keeps every handle exactly once; markers are never treated as summary content.
+- Processor checkpoints ride the existing session seam: `ConversationContext::save_state` fills `ContextState::processors` from `ContextPipeline::save_state`, and `load_state` calls `ContextPipeline::load_state` after replacing the messages. Keys are positional in pipeline order (`name`, `name#2`, `name#3`), `Null` states are omitted, and an unknown key is ignored with a debug log.
+- Counters are observability only: a processor bumps them solely when its pass really changed the working history, so a no-op run leaves the checkpoint untouched and no transform ever reads a counter.
 - `prepare` injects the English reload hint (`inject_reload_hint`, after the leading system messages) only when `enable_reload` is set and the assembled window carries an offload marker; `PreparedContext`'s fields are unchanged and the hint is visible in `messages`.
 
 ## Routing Table
@@ -111,6 +115,7 @@ let recovered: RecoveryOutcome = engine
 - `./src/processor/tool_result.rs` → `ToolResultProcessor` + config (per-result truncation and offload)
 - `./src/processor/offloader.rs` → `MessageOffloader`, `ToolResultBudgetProcessor`, `ToolResultWindowProcessor`, shared offloader helpers (protection patterns, placeholder, marker/event builders)
 - `./src/processor/summary_offloader.rs` → `MessageSummaryOffloader` + config, offline head/tail summary
+- `./src/processor/tool_result_window.rs` → `ToolResultWindowProcessor` + config (global per-tool window, in-place compaction), re-exported from `offloader`
 - `./src/processor/compressor/mod.rs` → shared compressor helpers (memory-block envelope, completed-round grouping, merge ranges, offline/LLM summarisation, recall archiving and marker merge)
 - `./src/processor/compressor/dialogue.rs` → `DialogueCompressor` (whole-dialogue compaction)
 - `./src/processor/compressor/current_round.rs` → `CurrentRoundCompressor` (in-flight round compaction)
@@ -125,10 +130,11 @@ let recovered: RecoveryOutcome = engine
 - `./tests/compressors_compact.rs` → full-compact boundary/kept-tail/session-memory paths and micro-compact clearing, `ProcessorConfig` tags
 - `./tests/integration.rs` → engine/context plumbing: store resolution and precedence, `from_configs_with` wiring, prepare reload injection, `ProcessorContext` store fields
 - `./tests/recall_integration.rs` → compressor recall: archives per compressor, marker placement, merge preservation, hard-truncation prefix, full-compaction paths, rollback, disabled/absent store
+- `./tests/processor_state.rs` → `ProcessorState` semantics, pipeline key scheme, one counter test per stateful processor, session save/load round trip, backward-compatible and corrupt state
 
 ## Test Strategy
 
-- Unit tests live beside each module (123 tests); integration suites live in `crates/openjiuwen-context/tests/` (218 tests, `integration.rs` included); doc tests cover the crate-level example paths (9).
+- Unit tests live beside each module (123 tests); integration suites live in `crates/openjiuwen-context/tests/` (`integration.rs` and `processor_state.rs` included); doc tests cover the crate-level example paths (10).
 - Deterministic offline tests use `ApproxTokenCounter::with_chars_per_token(1)` (via `TokenCounterKind::Characters`) and `openjiuwen_test_support::ScriptedModel` as the `Model`; sessions are real `openjiuwen_session::AgentSession` instances.
 - Covered behaviors: window assembly with round/message budgets, leading-tool stripping, per-role stats, overflow detection, every processor, summary replacement with system/recent preservation, tool-pair preservation, offload/rehydrate round-trip, session isolation, `noop`/`compressed`/`busy`, overflow recovery refusal after streamed chunks, config serde round-trip, cancellation, `save_contexts`/`load_contexts` round-trip, corrupt-state tolerance, and for the offloaders: trim/placeholder wire formats, keep boundaries, protection patterns, the per-round budget order, the global tool window, managed-flag idempotence, and the offline summary fallback.
 - `cargo test -p openjiuwen-context --offline` must pass; `cargo clippy -p openjiuwen-context --all-targets --offline -- -D warnings` and `cargo fmt -p openjiuwen-context -- --check` must be clean.
@@ -141,4 +147,4 @@ let recovered: RecoveryOutcome = engine
 - Python's adaptive strategy selection inside the compressor family (model-chosen passes, task extraction, JSON-schema memory blocks): the Rust compressors run a fixed deterministic ladder with an optional single summary call.
 - Python's adaptive summarisation pipeline inside `MessageSummaryOffloader` (task extraction, JSON-schema output, `offload_data_explanation`, `enable_precise_step`, strategy selection): the Rust processor makes one summary call with a fixed system prompt and falls back to a deterministic head/tail summary.
 - `processor/forked/` registry monkey-patching, session-memory agent, `[SESSION_MEMORY_BOUNDARY]` reinjection, skill/tool reinjection, and compression observability hooks beyond `ContextEvent`/`tracing`.
-- `enable_reload` filesystem rehydration prompt injection and per-processor `save_state`/`load_state` checkpointing (the trait hooks exist but the engine does not persist processor state).
+- `enable_reload` filesystem rehydration prompt injection and per-processor checkpoint state beyond the cross-run counters (`ContextPipeline` persists and restores the counters; richer per-processor snapshots are not written).
