@@ -1,94 +1,63 @@
 //! Mermaid rendering for the workflow DSL and the typed workflow design.
 //!
 //! Ports
-//! `openjiuwen.dev_tools.agent_builder.builders.workflow.dl_transformer.simpleir_to_mermaid`,
-//! adapted to the typed graphs of this crate instead of the Python `SimpleIR`
-//! dictionaries. Python walks a node list, derives edges from `next` and
-//! `conditions`, and emits one rectangle per node; this module renders the
-//! [`WorkflowDsl`] and the [`WorkflowDesign`] as a
-//! Mermaid `flowchart` with a shape per node kind, escaped labels, and
-//! sanitized ids.
+//! `openjiuwen.dev_tools.agent_builder.builders.workflow.dl_transformer.simpleir_to_mermaid`
+//! to the typed graphs of this crate, and keeps Python's exact output grammar.
+//! Python walks a node list, derives edges from `next` and `conditions`, and
+//! emits one `Node<id>: <description>` rectangle per node; this module renders
+//! the [`WorkflowDsl`] and the [`WorkflowDesign`] with the same grammar:
 //!
-//! Rendering is deterministic and follows document order: the header line, then
-//! one two-space-indented line per node, then one line per edge. Node shapes:
+//! ```text
+//! graph TD
+//!   start[Nodestart: Begin]
+//!   decide[Nodedecide: Decide]
+//!   yes[Nodeyes: Yes path]
+//!   start --> decide
+//!   decide -- score > 0.5 --> yes
+//! ```
 //!
-//! | kind | shape | syntax |
-//! | --- | --- | --- |
-//! | start, end | stadium | `([label])` |
-//! | llm | rectangle | `[label]` |
-//! | branch | rhombus | `{label}` |
-//! | tool | hexagon | `{{label}}` |
-//! | anything else | rectangle | `[label]` |
+//! Rendering is deterministic and follows document order: the literal
+//! `graph TD` header, then one two-space-indented line per node in node-array
+//! order, then one line per edge in edge-array order. There is no trailing
+//! newline.
 //!
-//! Edges render as `source --> target` and gain a `-->|condition|` label when
-//! the edge carries a non-blank condition.
+//! Node lines are always `  {id}[Node{id}: {label}]` (square brackets, no space
+//! after `Node`). The label is the node description, falling back to the node id
+//! when the description is blank; the title is not used. Labels escape only
+//! backticks and double quotes, both to a single quote, mirroring Python's two
+//! chained `str.replace` calls; whitespace and shape delimiters are left
+//! untouched exactly as Python leaves them.
 //!
-//! Deviations from Python:
+//! Edge lines are `  {src} --> {dst}`. A labelled edge is
+//! `  {src} -- {label} --> {dst}` only when the source node has more than one
+//! outgoing edge *and* the edge condition is non-blank; the label is the escaped
+//! condition. A single-successor source never gets an edge label, even when its
+//! edge carries a condition.
 //!
-//! - The header is `flowchart TD` (the current Mermaid keyword); Python emits
-//!   the legacy `graph TD`. Both parse to the same top-down diagram.
-//! - Shapes follow the node kind instead of Python's uniform rectangles with a
-//!   `Node<id>:` label prefix.
-//! - Labels are escaped and ids sanitized, so quotes, brackets, pipes,
-//!   newlines, and non-ASCII ids still produce a parseable diagram.
-//! - Edge labels come from the typed condition and use the `-->|label|` form;
-//!   Python labels only the outgoing edges of a multi-successor node and uses
-//!   `-- label -->`. Edge labels keep `<` and `>` so comparisons such as
-//!   `score > 0.5` read naturally, while node labels drop them together with the
-//!   shape delimiters.
+//! Ids are sanitized (ASCII alphanumerics and `_` kept, every other character
+//! mapped to `_`, empty ids named `node_<index>`, digit-leading ids prefixed with
+//! `n_`, collisions resolved with `_2`, `_3`, ... in document order) so that a
+//! document with non-ASCII or duplicate ids still renders a parseable diagram.
+//! An edge whose endpoint names no node keeps its sanitized form.
+//!
+//! [`render_design`] feeds the same renderer, so it produces byte-identical
+//! output to [`render_mermaid`] over the equivalent
+//! [`WorkflowDesign::to_workflow_dsl`] document.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::designer::{DesignNodeKind, WorkflowDesign};
+use super::designer::WorkflowDesign;
 use super::workflow_dsl::WorkflowDsl;
 
 /// The Mermaid header line of every rendered diagram.
-const HEADER: &str = "flowchart TD";
-
-/// The node shapes a rendered diagram can use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeShape {
-    /// A rounded/stadium node (`([label])`), used for start and end.
-    Stadium,
-    /// A rectangular node (`[label]`), used for llm and unknown kinds.
-    Rectangle,
-    /// A rhombus node (`{label}`), used for branches.
-    Rhombus,
-    /// A hexagonal node (`{{label}}`), used for tools.
-    Hexagon,
-}
-
-impl NodeShape {
-    /// The opening delimiter of the shape.
-    const fn open(self) -> &'static str {
-        match self {
-            Self::Stadium => "([",
-            Self::Rectangle => "[",
-            Self::Rhombus => "{",
-            Self::Hexagon => "{{",
-        }
-    }
-
-    /// The closing delimiter of the shape.
-    const fn close(self) -> &'static str {
-        match self {
-            Self::Stadium => "])",
-            Self::Rectangle => "]",
-            Self::Rhombus => "}",
-            Self::Hexagon => "}}",
-        }
-    }
-}
+const HEADER: &str = "graph TD";
 
 /// A node of the intermediate graph both public entry points render.
 struct RenderNode<'a> {
-    /// The original node id, used for the id map and as the label fallback.
+    /// The original node id, used for the id map, the label prefix, and the
+    /// label fallback when the description is blank.
     id: &'a str,
-    /// The Mermaid shape the node renders with.
-    shape: NodeShape,
-    /// The node title, preferred as the label.
-    title: &'a str,
-    /// The node description, the label fallback after the title.
+    /// The node description, used as the label.
     description: &'a str,
 }
 
@@ -102,14 +71,13 @@ struct RenderEdge<'a> {
     condition: Option<&'a str>,
 }
 
-/// Renders a workflow DSL document as a Mermaid `flowchart TD` diagram.
+/// Renders a workflow DSL document as a Mermaid `graph TD` diagram.
 ///
-/// Nodes appear in document order, each with a shape derived from its `type`
-/// (case-insensitively: `start`/`end`, `llm`, `branch`, `tool`, anything else
-/// as a rectangle). Edges follow in document order, labelled with their
-/// condition when it is non-blank. Ids are sanitized and deduplicated, labels
-/// are escaped, so the result is always parseable; rendering the same document
-/// twice yields byte-identical output.
+/// Nodes appear in document order as `  {id}[Node{id}: {description}]`, edges
+/// follow as `  {src} --> {dst}`, and an edge is labelled `-- {condition} -->`
+/// only when its source has more than one outgoing edge. Ids are sanitized and
+/// deduplicated, so rendering the same document twice yields byte-identical
+/// output.
 #[must_use]
 pub fn render_mermaid(dsl: &WorkflowDsl) -> String {
     let nodes: Vec<RenderNode<'_>> = dsl
@@ -117,8 +85,6 @@ pub fn render_mermaid(dsl: &WorkflowDsl) -> String {
         .iter()
         .map(|node| RenderNode {
             id: node.id.as_str(),
-            shape: dsl_shape(&node.node_type),
-            title: node.title.as_str(),
             description: node.description.as_str(),
         })
         .collect();
@@ -135,12 +101,9 @@ pub fn render_mermaid(dsl: &WorkflowDsl) -> String {
     render(&nodes, &edges)
 }
 
-/// Renders a workflow design as a Mermaid `flowchart TD` diagram.
+/// Renders a workflow design as a Mermaid `graph TD` diagram.
 ///
-/// Applies the same shape, escaping, and sanitizing rules as [`render_mermaid`]:
-/// [`DesignNodeKind::Start`] and [`DesignNodeKind::End`] render as stadiums,
-/// [`DesignNodeKind::Llm`] as rectangles, [`DesignNodeKind::Branch`] as
-/// rhombuses, and [`DesignNodeKind::Tool`] as hexagons. A design renders
+/// Uses the same renderer as [`render_mermaid`], so a design renders
 /// byte-identically to the [`WorkflowDsl`] produced by
 /// [`WorkflowDesign::to_workflow_dsl`].
 #[must_use]
@@ -150,8 +113,6 @@ pub fn render_design(design: &WorkflowDesign) -> String {
         .iter()
         .map(|node| RenderNode {
             id: node.id.as_str(),
-            shape: design_shape(node.kind),
-            title: node.title.as_str(),
             description: node.description.as_str(),
         })
         .collect();
@@ -180,49 +141,27 @@ fn render(nodes: &[RenderNode<'_>], edges: &[RenderEdge<'_>]) -> String {
         rendered_ids.push(id);
     }
 
+    let mut outgoing: BTreeMap<&str, usize> = BTreeMap::new();
+    for edge in edges {
+        *outgoing.entry(edge.source).or_insert(0) += 1;
+    }
+
     let mut lines: Vec<String> = Vec::with_capacity(nodes.len() + edges.len() + 1);
     lines.push(HEADER.to_string());
 
     for (node, id) in nodes.iter().zip(&rendered_ids) {
-        let label = node_label(node, id);
-        lines.push(format!(
-            "  {id}{}{label}{}",
-            node.shape.open(),
-            node.shape.close()
-        ));
+        let label = escape_label(node_label_source(node, id));
+        lines.push(format!("  {id}[Node{id}: {label}]"));
     }
 
     for edge in edges {
         let source = resolve_endpoint(&by_original, edge.source);
         let target = resolve_endpoint(&by_original, edge.target);
-        lines.push(edge_line(&source, &target, edge.condition));
+        let branching = outgoing.get(edge.source).copied().unwrap_or(0) > 1;
+        lines.push(edge_line(&source, &target, edge.condition, branching));
     }
 
     lines.join("\n")
-}
-
-/// Maps a DSL node `type` to its shape.
-///
-/// Matching is case-insensitive; only `start`, `end`, `llm`, `branch`, and
-/// `tool` are recognized, and every other value (including an empty one)
-/// renders as a rectangle.
-fn dsl_shape(node_type: &str) -> NodeShape {
-    match node_type.trim().to_ascii_lowercase().as_str() {
-        "start" | "end" => NodeShape::Stadium,
-        "branch" => NodeShape::Rhombus,
-        "tool" => NodeShape::Hexagon,
-        _ => NodeShape::Rectangle,
-    }
-}
-
-/// Maps a typed design node kind to its shape.
-const fn design_shape(kind: DesignNodeKind) -> NodeShape {
-    match kind {
-        DesignNodeKind::Start | DesignNodeKind::End => NodeShape::Stadium,
-        DesignNodeKind::Llm => NodeShape::Rectangle,
-        DesignNodeKind::Branch => NodeShape::Rhombus,
-        DesignNodeKind::Tool => NodeShape::Hexagon,
-    }
 }
 
 /// Sanitizes a node id into a Mermaid-safe identifier.
@@ -281,94 +220,59 @@ fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
 
-/// Picks and escapes the label of a node.
+/// The raw text a node label renders, before escaping.
 ///
-/// The title wins, then the description, then the original id (or the rendered
-/// `node_<index>` for an empty id). The escaped text falls back to the escaped
-/// original id, and finally to the rendered id, so a label is never empty.
-fn node_label(node: &RenderNode<'_>, rendered_id: &str) -> String {
-    let fallback: &str = if node.id.is_empty() {
-        rendered_id
-    } else {
-        node.id
-    };
-    let label = if is_blank(node.title) {
-        if is_blank(node.description) {
-            fallback
+/// The description wins; a blank description falls back to the original node id,
+/// or to the rendered id when the original id is empty, so a label is never empty.
+fn node_label_source<'a>(node: &RenderNode<'a>, rendered_id: &'a str) -> &'a str {
+    if is_blank(node.description) {
+        if node.id.is_empty() {
+            rendered_id
         } else {
-            node.description
+            node.id
         }
     } else {
-        node.title
-    };
-
-    let escaped = escape_label(label);
-    if escaped.is_empty() {
-        let escaped_id = escape_label(fallback);
-        if escaped_id.is_empty() {
-            rendered_id.to_string()
-        } else {
-            escaped_id
-        }
-    } else {
-        escaped
+        node.description
     }
 }
 
-/// Escapes free text into a label Mermaid can parse inside any node shape.
+/// Escapes free text into a label, exactly like Python's `to_mermaid`.
 ///
-/// `"` and `` ` `` become `'`; `[`, `]`, `{`, `}`, `(`, `)`, `|`, `<`, `>`, and
-/// newlines/tabs become spaces. Runs of whitespace collapse to one space and the
-/// result is trimmed, so the label never spans lines or closes its shape early.
+/// Backticks and double quotes become `'`; every other character is kept
+/// verbatim, so whitespace, brackets, pipes, and angle brackets survive.
 fn escape_label(raw: &str) -> String {
-    escape(raw, true)
+    raw.chars()
+        .map(|character| {
+            if character == '`' || character == '"' {
+                '\''
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
-/// Escapes a condition into an edge label.
+/// Formats one edge line.
 ///
-/// Applies the same rules as [`escape_label`] except that `<` and `>` survive:
-/// an edge label is delimited by pipes alone, and comparisons such as
-/// `score > 0.5` are the usual condition text.
-fn escape_edge_label(raw: &str) -> String {
-    escape(raw, false)
-}
+/// The edge is labelled `-- {condition} -->` only when `branching` (the source
+/// node has more than one outgoing edge) and the escaped condition is non-blank;
+/// otherwise it renders as `-->`.
+fn edge_line(source: &str, target: &str, condition: Option<&str>, branching: bool) -> String {
+    let label = condition.map(escape_label).unwrap_or_default();
 
-/// Replaces the characters that would break a label and collapses whitespace.
-///
-/// `replace_angles` also maps `<` and `>` to spaces; it is set for node labels,
-/// whose shape delimiters the engine parses together with the label.
-fn escape(raw: &str, replace_angles: bool) -> String {
-    let mut replaced = String::with_capacity(raw.len());
-    for character in raw.chars() {
-        match character {
-            '"' | '`' => replaced.push('\''),
-            '[' | ']' | '{' | '}' | '(' | ')' | '|' | '\n' | '\r' | '\t' => replaced.push(' '),
-            '<' | '>' if replace_angles => replaced.push(' '),
-            other => replaced.push(other),
-        }
-    }
-
-    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Formats one edge line, labelled when the escaped condition is non-blank.
-fn edge_line(source: &str, target: &str, condition: Option<&str>) -> String {
-    let label = match condition {
-        Some(condition) => escape_edge_label(condition),
-        None => String::new(),
-    };
-
-    if label.is_empty() {
-        format!("  {source} --> {target}")
+    if branching && !is_blank(&label) {
+        format!("  {source} -- {label} --> {target}")
     } else {
-        format!("  {source} -->|{label}| {target}")
+        format!("  {source} --> {target}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_builder::designer::{DesignEdge, DesignNode, WorkflowDesigner};
+    use crate::agent_builder::designer::{
+        DesignEdge, DesignNode, DesignNodeKind, WorkflowDesigner,
+    };
     use crate::agent_builder::workflow_dsl::{DslEdge, DslNode};
 
     /// A DSL node with only the fields rendering reads.
@@ -402,304 +306,301 @@ mod tests {
     }
 
     /// A design node with only the fields rendering reads.
-    fn design_node(id: &str, kind: DesignNodeKind, title: &str) -> DesignNode {
+    fn design_node(id: &str, kind: DesignNodeKind, description: &str) -> DesignNode {
         DesignNode {
             id: id.to_string(),
             kind,
-            title: title.to_string(),
+            title: format!("title of {id}"),
+            description: description.to_string(),
             ..DesignNode::default()
         }
     }
 
-    #[test]
-    fn node_shapes_follow_the_node_kind() {
-        let dsl = graph(
-            vec![
-                dsl_node("start", "start", "Begin", ""),
-                dsl_node("generate", "llm", "Generate", ""),
-                dsl_node("decide", "branch", "Decide", ""),
-                dsl_node("lookup", "tool", "Lookup", ""),
-                dsl_node("end", "end", "Finish", ""),
-                dsl_node("legacy", "questioner", "Legacy", ""),
-            ],
-            Vec::new(),
-        );
-
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-
-        assert_eq!(
-            lines,
-            [
-                "flowchart TD",
-                "  start([Begin])",
-                "  generate[Generate]",
-                "  decide{Decide}",
-                "  lookup{{Lookup}}",
-                "  end([Finish])",
-                "  legacy[Legacy]",
-            ]
-        );
+    /// A design edge with only the fields rendering reads.
+    fn design_edge(source: &str, target: &str, condition: Option<&str>) -> DesignEdge {
+        DesignEdge {
+            source: source.to_string(),
+            target: target.to_string(),
+            condition: condition.map(str::to_string),
+        }
     }
 
     #[test]
-    fn node_type_matching_is_case_insensitive() {
+    fn full_diagram_is_byte_exact() {
         let dsl = graph(
             vec![
-                dsl_node("a", "START", "Upper start", ""),
-                dsl_node("b", "Llm", "Mixed llm", ""),
-                dsl_node("c", " Branch ", "Padded branch", ""),
-                dsl_node("d", "Tool", "Mixed tool", ""),
-                dsl_node("e", "End", "Mixed end", ""),
-                dsl_node("f", "", "No type", ""),
-            ],
-            Vec::new(),
-        );
-
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-
-        assert_eq!(lines[1], "  a([Upper start])");
-        assert_eq!(lines[2], "  b[Mixed llm]");
-        assert_eq!(lines[3], "  c{Padded branch}");
-        assert_eq!(lines[4], "  d{{Mixed tool}}");
-        assert_eq!(lines[5], "  e([Mixed end])");
-        assert_eq!(lines[6], "  f[No type]");
-    }
-
-    #[test]
-    fn edges_render_conditions_as_labels() {
-        let dsl = graph(
-            vec![
-                dsl_node("start", "start", "Begin", ""),
-                dsl_node("decide", "branch", "Decide", ""),
-                dsl_node("approve", "llm", "Approve", ""),
-                dsl_node("reject", "llm", "Reject", ""),
+                dsl_node("start", "start", "Begin", "Begin"),
+                dsl_node("decide", "branch", "Decide", "Decide"),
+                dsl_node("yes", "llm", "Yes path", "Yes path"),
+                dsl_node("no", "llm", "No path", "No path"),
+                dsl_node("end", "end", "Finish", "Finish"),
             ],
             vec![
                 dsl_edge("start", "decide", None),
-                dsl_edge("decide", "approve", Some("score > 0.5")),
-                dsl_edge("decide", "reject", Some("   ")),
+                dsl_edge("decide", "yes", Some("score > 0.5")),
+                dsl_edge("decide", "no", Some("otherwise")),
+                dsl_edge("yes", "end", None),
+                dsl_edge("no", "end", None),
             ],
         );
 
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-
-        assert_eq!(lines[5], "  start --> decide");
-        assert_eq!(lines[6], "  decide -->|score > 0.5| approve");
-        assert_eq!(lines[7], "  decide --> reject");
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  start[Nodestart: Begin]
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  end[Nodeend: Finish]
+  start --> decide
+  decide -- score > 0.5 --> yes
+  decide -- otherwise --> no
+  yes --> end
+  no --> end"
+        );
     }
 
     #[test]
-    fn edge_conditions_are_escaped() {
+    fn single_outgoing_condition_is_not_labelled() {
         let dsl = graph(
             vec![
-                dsl_node("a", "branch", "A", ""),
-                dsl_node("b", "llm", "B", ""),
+                dsl_node("a", "start", "A", "A"),
+                dsl_node("b", "llm", "B", "B"),
+                dsl_node("c", "end", "C", "C"),
             ],
-            vec![dsl_edge("a", "b", Some("\"quoted\" | piped\nnext"))],
+            vec![
+                dsl_edge("a", "b", Some("only path")),
+                dsl_edge("b", "c", None),
+            ],
         );
 
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-
-        assert_eq!(lines[3], "  a -->|'quoted' piped next| b");
-        assert!(!lines[3].contains('"'));
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: A]
+  b[Nodeb: B]
+  c[Nodec: C]
+  a --> b
+  b --> c"
+        );
     }
 
     #[test]
-    fn labels_are_escaped_and_fall_back() {
+    fn branching_source_leaves_conditionless_edges_unlabelled() {
         let dsl = graph(
             vec![
-                dsl_node("first", "llm", "\"quoted\" [brackets] | pipe", ""),
-                dsl_node("second", "llm", "", "line one\nline two\tthree"),
-                dsl_node("third", "llm", "", ""),
+                dsl_node("decide", "branch", "Decide", "Decide"),
+                dsl_node("yes", "llm", "Yes path", "Yes path"),
+                dsl_node("no", "llm", "No path", "No path"),
+            ],
+            vec![
+                dsl_edge("decide", "yes", Some("yes")),
+                dsl_edge("decide", "no", None),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  decide -- yes --> yes
+  decide --> no"
+        );
+    }
+
+    #[test]
+    fn blank_condition_on_a_branching_source_is_unlabelled() {
+        let dsl = graph(
+            vec![
+                dsl_node("a", "branch", "A", "A"),
+                dsl_node("b", "end", "B", "B"),
+                dsl_node("c", "end", "C", "C"),
+            ],
+            vec![
+                dsl_edge("a", "b", Some("   ")),
+                dsl_edge("a", "c", Some("")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: A]
+  b[Nodeb: B]
+  c[Nodec: C]
+  a --> b
+  a --> c"
+        );
+    }
+
+    #[test]
+    fn node_label_prefers_description_over_title() {
+        let dsl = graph(
+            vec![
+                dsl_node("a", "start", "Title A", "Description A"),
+                dsl_node("b", "llm", "Title B", ""),
+                dsl_node("c", "end", "", "   "),
             ],
             Vec::new(),
         );
 
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-
-        assert_eq!(lines.len(), 4, "every node renders on exactly one line");
-        assert_eq!(lines[1], "  first['quoted' brackets pipe]");
-        assert_eq!(lines[2], "  second[line one line two three]");
-        assert_eq!(lines[3], "  third[third]");
-        assert!(!rendered.contains('"'));
-        assert!(!rendered.contains('`'));
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: Description A]
+  b[Nodeb: b]
+  c[Nodec: c]"
+        );
     }
 
     #[test]
-    fn labels_never_contain_shape_delimiters() {
-        for title in [
-            "a [b] {c} (d) | e <f>",
-            "<<[[]]>>",
-            "\"|(){}[]\"",
-            "multi\nline\ndescription",
-        ] {
-            let dsl = graph(vec![dsl_node("node", "node", title, "")], Vec::new());
-            let rendered = render_mermaid(&dsl);
-            let lines: Vec<&str> = rendered.lines().collect();
-            assert_eq!(lines.len(), 2, "one node line expected for {title:?}");
-
-            let label_start = lines[1]
-                .find('[')
-                .expect("a rectangle opens with a bracket")
-                + 1;
-            let label = &lines[1][label_start..lines[1].len() - 1];
-            assert!(
-                label.chars().all(|character| !matches!(
-                    character,
-                    '[' | ']' | '{' | '}' | '(' | ')' | '|' | '<' | '>' | '\n' | '\r' | '"' | '`'
-                )),
-                "label leaked a delimiter: {label:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn all_delimiter_only_titles_fall_back_to_the_id() {
-        let dsl = graph(vec![dsl_node("plain", "llm", "[]{}()|", "")], Vec::new());
-        let rendered = render_mermaid(&dsl);
-        assert_eq!(rendered, "flowchart TD\n  plain[plain]");
-    }
-
-    #[test]
-    fn rendering_is_deterministic_and_follows_document_order() {
+    fn labels_escape_only_quotes_and_backticks() {
         let dsl = graph(
             vec![
-                dsl_node("alpha", "start", "Alpha", ""),
-                dsl_node("beta", "llm", "Beta", ""),
-                dsl_node("gamma", "end", "Gamma", ""),
+                dsl_node("quote", "llm", "", "say \"hi\" and `bye`"),
+                dsl_node(
+                    "keep",
+                    "llm",
+                    "",
+                    "keep [brackets] {braces} | pipes <angles>",
+                ),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  quote[Nodequote: say 'hi' and 'bye']
+  keep[Nodekeep: keep [brackets] {braces} | pipes <angles>]"
+        );
+    }
+
+    #[test]
+    fn edge_labels_escape_quotes_and_backticks() {
+        let dsl = graph(
+            vec![
+                dsl_node("a", "branch", "A", "A"),
+                dsl_node("b", "end", "B", "B"),
+                dsl_node("c", "end", "C", "C"),
             ],
             vec![
-                dsl_edge("alpha", "beta", None),
-                dsl_edge("beta", "gamma", Some("done")),
-                dsl_edge("alpha", "gamma", None),
+                dsl_edge("a", "b", Some("`tick` and \"quote\"")),
+                dsl_edge("a", "c", Some("score > 0.5")),
             ],
         );
 
-        let expected = [
-            "flowchart TD",
-            "  alpha([Alpha])",
-            "  beta[Beta]",
-            "  gamma([Gamma])",
-            "  alpha --> beta",
-            "  beta -->|done| gamma",
-            "  alpha --> gamma",
-        ]
-        .join("\n");
-
-        assert_eq!(render_mermaid(&dsl), expected);
-        assert_eq!(render_mermaid(&dsl), render_mermaid(&dsl));
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: A]
+  b[Nodeb: B]
+  c[Nodec: C]
+  a -- 'tick' and 'quote' --> b
+  a -- score > 0.5 --> c"
+        );
     }
 
     #[test]
-    fn every_node_and_edge_is_rendered_exactly_once() {
+    fn header_is_graph_td_without_a_trailing_newline() {
         let dsl = graph(
             vec![
-                dsl_node("start", "start", "Begin", ""),
-                dsl_node("generate", "llm", "Generate", ""),
-                dsl_node("decide", "branch", "Decide", ""),
-                dsl_node("end", "end", "Finish", ""),
+                dsl_node("a", "start", "A", "A"),
+                dsl_node("b", "end", "B", "B"),
             ],
-            vec![
-                dsl_edge("start", "generate", None),
-                dsl_edge("generate", "decide", None),
-                dsl_edge("decide", "end", Some("ok")),
-            ],
+            vec![dsl_edge("a", "b", None)],
         );
 
         let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(rendered.starts_with("graph TD\n"), "{rendered}");
+        assert!(!rendered.contains("flowchart"), "{rendered}");
+        assert!(!rendered.ends_with('\n'), "{rendered}");
+        assert_eq!(rendered.lines().count(), 1 + 2 + 1);
+    }
 
-        for definition in [
-            "  start([Begin])",
-            "  generate[Generate]",
-            "  decide{Decide}",
-            "  end([Finish])",
-        ] {
-            assert_eq!(
-                lines.iter().filter(|line| **line == definition).count(),
-                1,
-                "node definition `{definition}` should appear once"
-            );
-        }
-        for connection in ["  start --> generate", "  generate --> decide"] {
-            assert_eq!(
-                lines.iter().filter(|line| **line == connection).count(),
-                1,
-                "edge `{connection}` should appear once"
-            );
-        }
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|line| **line == "  decide -->|ok| end")
-                .count(),
-            1
+    #[test]
+    fn one_line_per_node_then_one_line_per_edge_in_document_order() {
+        let dsl = graph(
+            vec![
+                dsl_node("third", "llm", "", "Third"),
+                dsl_node("first", "start", "", "First"),
+                dsl_node("second", "end", "", "Second"),
+            ],
+            vec![
+                dsl_edge("third", "first", None),
+                dsl_edge("first", "second", None),
+            ],
         );
+
+        let rendered = render_mermaid(&dsl);
         assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line.starts_with("  ") && !line.contains(" -->"))
-                .count(),
-            dsl.nodes.len()
+            rendered.lines().collect::<Vec<_>>(),
+            [
+                "graph TD",
+                "  third[Nodethird: Third]",
+                "  first[Nodefirst: First]",
+                "  second[Nodesecond: Second]",
+                "  third --> first",
+                "  first --> second",
+            ]
         );
+        assert_eq!(rendered, render_mermaid(&dsl));
+    }
+
+    #[test]
+    fn empty_document_renders_the_header_only() {
+        assert_eq!(render_mermaid(&graph(Vec::new(), Vec::new())), "graph TD");
+    }
+
+    #[test]
+    fn nodes_without_edges_still_render() {
+        let dsl = graph(vec![dsl_node("lonely", "llm", "", "Lonely")], Vec::new());
         assert_eq!(
-            lines.iter().filter(|line| line.contains(" -->")).count(),
-            dsl.edges.len()
+            render_mermaid(&dsl),
+            "graph TD\n  lonely[Nodelonely: Lonely]"
         );
     }
 
     #[test]
-    fn node_ids_are_sanitized_and_deduplicated() {
+    fn ids_are_sanitized_and_deduplicated() {
         let dsl = graph(
             vec![
-                dsl_node("my node-1", "llm", "Mine", ""),
-                dsl_node("1", "llm", "Digit", ""),
-                dsl_node("开始", "llm", "Cjk", ""),
-                dsl_node("a b", "llm", "First", ""),
-                dsl_node("a-b", "llm", "Second", ""),
-                dsl_node("", "llm", "Empty", ""),
+                dsl_node("my node 1", "llm", "", "Mine"),
+                dsl_node("1", "llm", "", "Digit"),
+                dsl_node("中文", "llm", "", "Cjk"),
+                dsl_node("a b", "llm", "", "First"),
+                dsl_node("a-b", "llm", "", "Second"),
+                dsl_node("", "llm", "", "Empty"),
             ],
             vec![
-                dsl_edge("my node-1", "1", None),
+                dsl_edge("my node 1", "1", None),
                 dsl_edge("a b", "a-b", None),
-                dsl_edge("ghost node", "end", None),
+                dsl_edge("ghost node", "中文", None),
             ],
         );
 
-        let rendered = render_mermaid(&dsl);
-        let node_lines: Vec<&str> = rendered
-            .lines()
-            .filter(|line| !line.contains(" -->"))
-            .collect();
         assert_eq!(
-            node_lines,
-            [
-                "flowchart TD",
-                "  my_node_1[Mine]",
-                "  n_1[Digit]",
-                "  __[Cjk]",
-                "  a_b[First]",
-                "  a_b_2[Second]",
-                "  node_6[Empty]",
-            ]
-        );
-
-        let edge_lines: Vec<&str> = rendered
-            .lines()
-            .filter(|line| line.contains(" -->"))
-            .collect();
-        assert_eq!(
-            edge_lines,
-            [
-                "  my_node_1 --> n_1",
-                "  a_b --> a_b_2",
-                "  ghost_node --> end",
-            ]
+            render_mermaid(&dsl),
+            "\
+graph TD
+  my_node_1[Nodemy_node_1: Mine]
+  n_1[Noden_1: Digit]
+  __[Node__: Cjk]
+  a_b[Nodea_b: First]
+  a_b_2[Nodea_b_2: Second]
+  node_6[Nodenode_6: Empty]
+  my_node_1 --> n_1
+  a_b --> a_b_2
+  ghost_node --> __"
         );
     }
 
@@ -707,77 +608,124 @@ mod tests {
     fn sanitized_ids_never_collide() {
         let dsl = graph(
             vec![
-                dsl_node("a", "llm", "One", ""),
-                dsl_node("a", "llm", "Two", ""),
-                dsl_node("a_2", "llm", "Three", ""),
+                dsl_node("a", "llm", "", "One"),
+                dsl_node("a", "llm", "", "Two"),
+                dsl_node("a_2", "llm", "", "Three"),
             ],
             Vec::new(),
         );
 
-        let rendered = render_mermaid(&dsl);
-        let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines[1], "  a[One]");
-        assert_eq!(lines[2], "  a_2[Two]");
-        assert_eq!(lines[3], "  a_2_2[Three]");
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: One]
+  a_2[Nodea_2: Two]
+  a_2_2[Nodea_2_2: Three]"
+        );
     }
 
     #[test]
-    fn render_design_shapes_follow_the_design_kind() {
-        let design = WorkflowDesign {
-            name: "demo".to_string(),
-            description: "a demo design".to_string(),
-            nodes: vec![
-                design_node("start", DesignNodeKind::Start, "Begin"),
-                design_node("think", DesignNodeKind::Llm, "Think"),
-                design_node("choose", DesignNodeKind::Branch, "Choose"),
-                design_node("call", DesignNodeKind::Tool, "Call"),
-                design_node("end", DesignNodeKind::End, "Finish"),
+    fn dangling_endpoints_still_render_sanitized() {
+        let dsl = graph(
+            vec![dsl_node("start", "start", "", "Start")],
+            vec![
+                dsl_edge("start", "missing node", None),
+                dsl_edge("gone", "start", Some("ignored")),
             ],
-            edges: vec![
-                DesignEdge {
-                    source: "start".to_string(),
-                    target: "think".to_string(),
-                    condition: None,
-                },
-                DesignEdge {
-                    source: "choose".to_string(),
-                    target: "call".to_string(),
-                    condition: Some("ok".to_string()),
-                },
-            ],
-        };
-
-        let rendered = render_design(&design);
-        let lines: Vec<&str> = rendered.lines().collect();
+        );
 
         assert_eq!(
-            lines,
-            [
-                "flowchart TD",
-                "  start([Begin])",
-                "  think[Think]",
-                "  choose{Choose}",
-                "  call{{Call}}",
-                "  end([Finish])",
-                "  start --> think",
-                "  choose -->|ok| call",
-            ]
+            render_mermaid(&dsl),
+            "\
+graph TD
+  start[Nodestart: Start]
+  start --> missing_node
+  gone --> start"
+        );
+    }
+
+    #[test]
+    fn edge_labels_count_raw_source_ids() {
+        let dsl = graph(
+            vec![
+                dsl_node("a", "branch", "", "A"),
+                dsl_node("b", "end", "", "B"),
+                dsl_node("c", "end", "", "C"),
+            ],
+            vec![
+                dsl_edge("a", "b", Some("left")),
+                dsl_edge("a", "c", Some("right")),
+            ],
+        );
+
+        assert_eq!(
+            render_mermaid(&dsl),
+            "\
+graph TD
+  a[Nodea: A]
+  b[Nodeb: B]
+  c[Nodec: C]
+  a -- left --> b
+  a -- right --> c"
         );
     }
 
     #[test]
     fn render_design_matches_the_equivalent_dsl() {
+        let design = WorkflowDesign {
+            name: "demo".to_string(),
+            description: "a demo design".to_string(),
+            nodes: vec![
+                design_node("start", DesignNodeKind::Start, "Begin"),
+                design_node("decide", DesignNodeKind::Branch, "Decide"),
+                design_node("yes", DesignNodeKind::Llm, "Yes path"),
+                design_node("no", DesignNodeKind::Tool, "No path"),
+                design_node("end", DesignNodeKind::End, "Finish"),
+            ],
+            edges: vec![
+                design_edge("start", "decide", None),
+                design_edge("decide", "yes", Some("ok")),
+                design_edge("decide", "no", Some("fail")),
+                design_edge("yes", "end", None),
+            ],
+        };
+
+        let rendered = render_design(&design);
+        assert_eq!(
+            rendered,
+            "\
+graph TD
+  start[Nodestart: Begin]
+  decide[Nodedecide: Decide]
+  yes[Nodeyes: Yes path]
+  no[Nodeno: No path]
+  end[Nodeend: Finish]
+  start --> decide
+  decide -- ok --> yes
+  decide -- fail --> no
+  yes --> end"
+        );
+
+        let dsl = design.to_workflow_dsl().expect("the design converts");
+        assert_eq!(rendered, render_mermaid(&dsl));
+    }
+
+    #[test]
+    fn render_design_renders_the_offline_designer_output() {
         let design = WorkflowDesigner::new()
             .design_offline("Collect the order. Then confirm it.")
             .expect("the offline designer accepts a non-blank query");
 
         let rendered = render_design(&design);
-        assert!(rendered.starts_with("flowchart TD\n"), "{rendered}");
-        assert!(rendered.contains("start"), "{rendered}");
-        assert!(rendered.contains("llm_1"), "{rendered}");
-        assert!(rendered.contains("end"), "{rendered}");
+        assert!(rendered.starts_with("graph TD\n"), "{rendered}");
+        assert!(!rendered.contains("flowchart"), "{rendered}");
+        assert!(rendered.contains("start[Nodestart: "), "{rendered}");
+        assert!(rendered.contains("llm_1[Nodellm_1: "), "{rendered}");
+        assert!(rendered.contains("end[Nodeend: "), "{rendered}");
 
         let dsl = design.to_workflow_dsl().expect("the design converts");
         assert_eq!(rendered, render_mermaid(&dsl));
+        assert_eq!(rendered, render_design(&design));
     }
 }
