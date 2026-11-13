@@ -266,6 +266,13 @@ impl LlmCompConfig {
     }
 }
 
+/// Mirrors the Python class name `LLMCompConfig` (`llm_comp.py`).
+///
+/// A plain alias, not a distinct type: [`LlmCompConfig`] is the canonical Rust name and
+/// both spellings name the same struct.
+#[allow(clippy::upper_case_acronyms)]
+pub type LLMCompConfig = LlmCompConfig;
+
 /// The built-in `llm` component.
 ///
 /// `invoke` returns one field named by [`LlmComponent::output_key`] whose value is
@@ -447,6 +454,13 @@ impl Component for LlmComponent {
         })
     }
 }
+
+/// Mirrors the Python class name `LLMComponent` (`llm_comp.py`).
+///
+/// A plain alias, not a distinct type: [`LlmComponent`] is the canonical Rust name and
+/// both spellings name the same struct.
+#[allow(clippy::upper_case_acronyms)]
+pub type LLMComponent = LlmComponent;
 
 #[cfg(test)]
 #[allow(
