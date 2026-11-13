@@ -33,6 +33,7 @@ pub mod docx;
 pub mod inflate;
 pub mod odt;
 pub mod pdf;
+pub mod pptx;
 pub mod xlsx;
 pub mod xml;
 pub mod zip;
@@ -41,6 +42,7 @@ pub use docx::{DocxBlock, DocxDocument, DocxParser, CORE_PROPERTIES_PART, DOCUME
 pub use inflate::{adler32, crc32, inflate, zlib_decompress, DEFAULT_MAX_OUTPUT_BYTES};
 pub use odt::{OdtDocument, OdtParser};
 pub use pdf::{PdfDocument, PdfParser, KERNING_SPACE_THRESHOLD};
+pub use pptx::{PptxDocument, PptxParser, PptxSlide};
 pub use xlsx::{
     SheetRef, XlsxParser, XlsxSheet, XlsxWorkbook, SHARED_STRINGS_PART, WORKBOOK_PART,
     WORKBOOK_RELS_PART,
