@@ -47,7 +47,11 @@ async fn build_produces_the_leader_handle_and_the_roster() {
     assert_eq!(card.name, "alpha");
     assert_eq!(card.agent_cards.len(), 3);
     assert_eq!(card.agent_cards[0].name, "alpha_boss");
-    assert_eq!(agent.runtime().session_id(), agent.session_id());
+    assert_eq!(
+        agent.runtime().session_id(),
+        format!("{}:{}", agent.session_id(), agent.member_name()),
+        "the leader's runtime runs under its derived member session id"
+    );
 }
 
 #[tokio::test]

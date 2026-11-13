@@ -11,10 +11,13 @@
 //! 3. One store — an injected store wins over `spec.storage`, while a non-memory `spec.storage`
 //!    opens its own backend through `crate::storage::open_store` (with a warning when an injected
 //!    store overrode it) — plus one in-process transport, one activity registry, one signals bundle
-//!    (observability hooks + monitor), one model router, one KV-cache registry.
+//!    (observability hooks + monitor), one model router, one KV-cache registry, and the team-shared
+//!    member checkpoint store resolved from `metadata["checkpoint"]` (injected into the dependencies
+//!    so every member, leader included, persists into it).
 //! 4. [`TeamBackend`] over the store, board, transport, spawner and workspace provider; the team
 //!    row is written before any member row; the organisation layer is bound when configured.
-//! 5. The leader row, its workspace and its harness (with the pool-selected model), then the
+//! 5. The leader row, its workspace and its harness (with the pool-selected model and its own
+//!    checkpoint identity — derived member session id + card id, policy, store and cwd), then the
 //!    observer that feeds status, rounds, chunks, observability and the monitor.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
 //! 7. One bus subscription for the leader (drained only by [`leader`]) and the interaction
@@ -45,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::backend::TeamBackend;
+use super::checkpoints::{member_card_id, team_checkpoint_store, wire_runtime};
 use super::deps::TeamBuildDeps;
 use super::observability_bind::TeamSignals;
 use super::observer::MemberStreamObserver;
@@ -52,8 +56,8 @@ use super::org_bind::{org_task_sink, OrgBinding};
 use super::routing::TeamModelRouter;
 use super::spawner::TeamMemberSpawner;
 use super::spec_meta::{
-    attach_config, fork_directive, isolation_mode, kv_cache_config, organization_block,
-    spawn_options,
+    attach_config, checkpoint_config, fork_directive, isolation_mode, kv_cache_config,
+    organization_block, spawn_options,
 };
 use super::team_agent::{SpecBuild, TeamAgent, TeamAgentInner};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
@@ -116,9 +120,15 @@ impl SpecBuild for TeamAgentSpec {
             .clone()
             .unwrap_or_else(|| Arc::new(TeamKvCacheAffinity::new(kv_cache_config(self))));
         let signals = TeamSignals::new(team_name.clone(), deps.observability_hooks.clone());
-        let deps = deps
+        let checkpoint = checkpoint_config(self);
+        let mut deps = deps
             .with_routing(Arc::clone(&routing))
             .with_kv_cache(Arc::clone(&kv_cache));
+        // Resolve the team-shared checkpoint store once, before the spawner is built: the cloned
+        // `deps` it receives carries the same store, so the leader and every teammate share it.
+        if let Some(store) = team_checkpoint_store(&checkpoint, deps.checkpoints.as_ref()) {
+            deps = deps.with_checkpoint_store(store);
+        }
         let options = spawn_options(self);
         let fork = fork_directive(self);
         let isolation = isolation_mode(self);
@@ -180,22 +190,28 @@ impl SpecBuild for TeamAgentSpec {
                 isolation,
             })
             .await?;
+        let card_id = member_card_id(&leader_effective, &leader_name);
+        let member_session = MemberHarnessContext::member_session_id(&session_id, &leader_name);
+        let context = MemberHarnessContext::new(
+            team_name.clone(),
+            leader_name.clone(),
+            member_session.clone(),
+            workspace.root.clone(),
+            language.clone(),
+            self.teammate_mode,
+        )
+        .with_card_id(card_id.clone());
         let harness = deps
             .harness_factory
-            .create(
-                &leader_effective,
-                &MemberHarnessContext::new(
-                    team_name.clone(),
-                    leader_name.clone(),
-                    session_id.clone(),
-                    workspace.root.clone(),
-                    language.clone(),
-                    self.teammate_mode,
-                ),
-            )
+            .create(&leader_effective, &context)
             .await?;
-        let runtime: Arc<dyn MemberRuntime> =
-            Arc::new(HarnessMemberRuntime::new(harness, session_id.clone()));
+        let runtime: Arc<dyn MemberRuntime> = Arc::new(wire_runtime(
+            HarnessMemberRuntime::new(harness, member_session),
+            &card_id,
+            &checkpoint,
+            deps.checkpoints.as_ref(),
+            &workspace.root,
+        ));
         leader_member.attach_runtime(Arc::clone(&runtime));
         let model = leader_selection.model_name().to_owned();
         let _identity = kv_cache.register_member(
@@ -492,7 +508,11 @@ mod tests {
         assert_eq!(card.name, "alpha");
         assert_eq!(card.agent_cards.len(), 3);
         assert_eq!(card.agent_cards[0].name, "alpha_boss");
-        assert_eq!(agent.runtime().session_id(), agent.session_id());
+        assert_eq!(
+            agent.runtime().session_id(),
+            format!("{}:{}", agent.session_id(), agent.member_name()),
+            "the leader's runtime runs under its derived member session id"
+        );
     }
 
     #[tokio::test]
