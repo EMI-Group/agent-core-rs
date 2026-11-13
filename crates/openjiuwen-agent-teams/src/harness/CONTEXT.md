@@ -158,3 +158,5 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - Observer callbacks are invoked outside the observer lock; a panicking observer ends the pump task (it is not caught), so observers must be cheap and non-panicking.
 - Python `on_state`/`on_round` fire from one supervisor writer; here they fire from the single pump task, preserving event order.
 - `HarnessMemberRuntime::state()` returns the protocol state verbatim; the team-visible `MemberStatus`/`ExecutionStatus` translations are the pure functions in `mapping.rs`.
+- The crate implements `HarnessProtocol` only in `#[cfg(test)]` fakes: it is a protocol *consumer*, and `TeamAgent::runtime()` yields `Arc<dyn MemberRuntime>` with no downcast to `HarnessMemberRuntime`, so the leader's protocol handle cannot be reached for wrapping.
+- There is no `NativeV2HarnessProvider` anywhere in the crate; a team-backed protocol harness would wrap `TeamAgent` (`invoke`/`stream`/`subscribe_chunks`/`monitor_stream`/`stop`), which exposes no `HarnessEvent` stream, no per-turn abort and no checkpoint export.
