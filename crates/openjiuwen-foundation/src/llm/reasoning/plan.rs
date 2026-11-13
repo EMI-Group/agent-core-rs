@@ -14,7 +14,8 @@
 //!
 //! Every encoder is a private function named after the Python one it mirrors, so
 //! a vendor change is a table edit plus (at most) one encoder.
-use super::profiles::{find_reasoning_profile, provider_key_for};
+use super::profiles::{find_reasoning_profile, provider_key_for_endpoint};
+use super::vllm::vllm_enable_thinking_plan;
 use super::{
     CapabilitySpec, ReasoningConfig, ReasoningMode, ReasoningPlan, ReasoningProfile,
     ReasoningProtocol,
@@ -71,14 +72,61 @@ pub fn resolve_reasoning_plan_for(
     model: &str,
     intent: &ReasoningConfig,
 ) -> ReasoningPlan {
+    resolve_reasoning_plan_with_endpoint(protocol, provider, None, api_base, model, intent)
+}
+
+/// The OpenAI-compatible chat-completions convenience for
+/// [`resolve_reasoning_plan_with_endpoint`].
+#[must_use]
+pub fn resolve_chat_completion_plan_with_endpoint(
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
+    model: &str,
+    intent: &ReasoningConfig,
+) -> ReasoningPlan {
+    resolve_reasoning_plan_with_endpoint(
+        ReasoningProtocol::ChatCompletions,
+        provider,
+        endpoint_profile,
+        api_base,
+        model,
+        intent,
+    )
+}
+
+/// Resolves a reasoning intent for an explicit wire protocol and endpoint
+/// profile.
+///
+/// An `endpoint_profile` names the wire dialect a self-hosted gateway speaks,
+/// which can differ from the vendor the provider name suggests: the profile is
+/// resolved by [`provider_key_for_endpoint`] (a non-generic profile wins over the
+/// provider name and the host hint). A resolved `"vllm"` endpoint bypasses the
+/// profile table on **both** the OpenAI-compatible and the Anthropic Messages
+/// protocols and uses the `enable_thinking`/`thinking_budget` encoder, because
+/// such a gateway ignores the official `thinking.type` and `reasoning_effort`
+/// spellings. Every other endpoint resolves exactly like
+/// [`resolve_reasoning_plan_for`].
+#[must_use]
+pub fn resolve_reasoning_plan_with_endpoint(
+    protocol: ReasoningProtocol,
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
+    model: &str,
+    intent: &ReasoningConfig,
+) -> ReasoningPlan {
     if intent.is_no_intent() {
         return ReasoningPlan::new();
     }
-    let provider_key = provider_key_for(provider, api_base);
+    let provider_key = provider_key_for_endpoint(provider, endpoint_profile, api_base);
     match protocol {
         ReasoningProtocol::Responses => responses_plan(intent),
         ReasoningProtocol::AnthropicMessages => anthropic_plan(&provider_key, model, intent),
         ReasoningProtocol::ChatCompletions => {
+            if provider_key == VLLM_PROFILE {
+                return vllm_enable_thinking_plan(intent);
+            }
             let provider_key = if is_deepseek(provider, api_base, &provider_key) {
                 "deepseek".to_owned()
             } else {
@@ -92,6 +140,9 @@ pub fn resolve_reasoning_plan_for(
         }
     }
 }
+
+/// The endpoint profile of a self-hosted `vLLM` gateway.
+const VLLM_PROFILE: &str = "vllm";
 /// Whether this endpoint is `DeepSeek`, whichever name or host it was configured
 /// under (Python's `_is_deepseek`).
 fn is_deepseek(provider: &str, api_base: Option<&str>, provider_key: &str) -> bool {
@@ -99,9 +150,12 @@ fn is_deepseek(provider: &str, api_base: Option<&str>, provider_key: &str) -> bo
         || provider.trim().to_lowercase().replace('_', "-") == "deepseek"
         || api_base.is_some_and(|base| base.to_lowercase().contains("deepseek.com"))
 }
-/// Anthropic Messages resolution: a matching profile wins, otherwise the
-/// protocol default.
+/// Anthropic Messages resolution: a self-hosted `vLLM` endpoint bypasses the
+/// table, otherwise a matching profile wins, otherwise the protocol default.
 fn anthropic_plan(provider_key: &str, model: &str, intent: &ReasoningConfig) -> ReasoningPlan {
+    if provider_key == VLLM_PROFILE {
+        return vllm_enable_thinking_plan(intent);
+    }
     match find_reasoning_profile(provider_key, model) {
         Some(profile) => profile_plan(profile, ReasoningProtocol::AnthropicMessages, model, intent),
         None => standard_anthropic_plan(intent),

@@ -296,3 +296,79 @@ fn an_explicit_provider_wins_over_the_api_base_host_hint() {
     );
     assert!(body.get("output_config").is_none());
 }
+#[test]
+fn a_vllm_endpoint_profile_encodes_enable_thinking_for_the_messages_api() {
+    let request = ModelRequestConfig::new("glm-5")
+        .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "medium"}}));
+    let body = build_messages_body_with_endpoint(
+        &[BaseMessage::user("hello")],
+        &request,
+        false,
+        "openai",
+        Some("vllm"),
+        Some("http://localhost:8000/v1"),
+    )
+    .expect("the body builds");
+    assert_eq!(body.get("enable_thinking"), Some(&json!(true)));
+    assert_eq!(
+        body.get("chat_template_kwargs"),
+        Some(&json!({"enable_thinking": true}))
+    );
+    assert_eq!(body.get("thinking_budget"), Some(&json!(4096)));
+    assert!(
+        body.get("thinking").is_none(),
+        "a self-hosted gateway ignores the official thinking object: {body}"
+    );
+    assert!(body.get("output_config").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn a_vllm_endpoint_profile_disables_thinking_in_both_keys() {
+    let request =
+        ModelRequestConfig::new("glm-5").with_extra(json!({"reasoning": {"mode": "disabled"}}));
+    let body = build_messages_body_with_endpoint(
+        &[BaseMessage::user("hello")],
+        &request,
+        false,
+        "anthropic",
+        Some("vllm"),
+        None,
+    )
+    .expect("the body builds");
+    assert_eq!(body.get("enable_thinking"), Some(&json!(false)));
+    assert_eq!(
+        body.get("chat_template_kwargs"),
+        Some(&json!({"enable_thinking": false}))
+    );
+    assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn a_non_vllm_endpoint_profile_keeps_the_profile_table_encoder() {
+    let request = ModelRequestConfig::new(SONNET_45)
+        .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "low"}}));
+    let with_profile = build_messages_body_with_endpoint(
+        &[BaseMessage::user("hello")],
+        &request,
+        false,
+        "anthropic",
+        Some("anthropic"),
+        Some("https://api.anthropic.com"),
+    )
+    .expect("the body builds");
+    let with_provider = build_messages_body_with_provider(
+        &[BaseMessage::user("hello")],
+        &request,
+        false,
+        "anthropic",
+        None,
+    )
+    .expect("the body builds");
+    assert_eq!(with_profile, with_provider);
+    assert_eq!(
+        with_profile.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 2048}))
+    );
+    assert!(with_profile.get("enable_thinking").is_none());
+}

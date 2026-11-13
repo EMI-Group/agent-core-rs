@@ -406,12 +406,14 @@ mod tests {
     #[test]
     fn empty_deltas_and_unknown_events_are_ignored() {
         let mut state = ResponsesStreamState::new();
-        assert!(state
-            .handle_data(&data(
-                json!({"type": "response.output_text.delta", "delta": ""})
-            ))
-            .expect("empty delta")
-            .is_empty());
+        assert_eq!(
+            state
+                .handle_data(&data(
+                    json!({"type": "response.output_text.delta", "delta": ""})
+                ))
+                .expect("empty delta"),
+            Vec::<StreamChunk>::new()
+        );
         for event_type in [
             "response.created",
             "response.in_progress",
@@ -419,11 +421,11 @@ mod tests {
             "response.output_text.done",
             "ping",
         ] {
-            assert!(
+            assert_eq!(
                 state
                     .handle_data(&data(json!({"type": event_type})))
-                    .expect("ignored event")
-                    .is_empty(),
+                    .expect("ignored event"),
+                Vec::<StreamChunk>::new(),
                 "{event_type} must be ignored"
             );
         }

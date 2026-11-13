@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_common::http::{HttpClient, HttpClientConfig, HttpRequest, HttpResponse};
 use serde_json::Value;
 
@@ -197,7 +197,14 @@ impl DashScopeMediaClient {
                 .bearer(self.config.api_key.clone())
                 .timeout(remaining);
             let response = match tokio::time::timeout(remaining, self.http.execute(poll)).await {
-                Ok(response) => response?,
+                Ok(Ok(response)) => response,
+                // The request carried `remaining` as its own budget, so a client
+                // timeout that fires first means the same thing: the task did not
+                // finish within the configured budget.
+                Ok(Err(error)) if error.kind() == ErrorKind::Timeout => {
+                    return Err(task_timed_out(task_id, self.config.task_timeout));
+                }
+                Ok(Err(error)) => return Err(error),
                 Err(_) => return Err(task_timed_out(task_id, self.config.task_timeout)),
             };
             let payload = decode("video generation", &response)?;

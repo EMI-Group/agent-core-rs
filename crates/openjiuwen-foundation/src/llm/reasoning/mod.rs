@@ -51,12 +51,16 @@ mod plan;
 mod profiles;
 #[cfg(test)]
 mod tests;
+mod vllm;
 pub use apply::{apply_reasoning_plan, apply_reasoning_plan_with};
-pub use plan::{resolve_reasoning_plan, resolve_reasoning_plan_for};
+pub use plan::{
+    resolve_chat_completion_plan_with_endpoint, resolve_reasoning_plan, resolve_reasoning_plan_for,
+    resolve_reasoning_plan_with_endpoint,
+};
 pub use profiles::{
-    find_reasoning_profile, matches_pattern, provider_key_for, reasoning_capability,
-    reasoning_capability_for, standard_reasoning_capability, MODEL_REASONING_FALLBACKS,
-    REASONING_PROFILES,
+    find_reasoning_profile, matches_pattern, provider_key_for, provider_key_for_endpoint,
+    reasoning_capability, reasoning_capability_for, reasoning_capability_for_endpoint,
+    standard_reasoning_capability, MODEL_REASONING_FALLBACKS, REASONING_PROFILES,
 };
 /// Provider-neutral reasoning mode.
 ///

@@ -10,6 +10,7 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 - `AnthropicClient` — `new(ModelClientConfig, ModelRequestConfig)`, `with_http_client`, `client_config`, `request_config`, `base_url`, `impl Model` (`invoke`, `stream`, `provider`, `model_name`).
 - `build_messages_body(&[BaseMessage], &ModelRequestConfig, stream) -> Result<Value>` — pure request projection for the `anthropic` provider.
 - `build_messages_body_with_provider(&[BaseMessage], &ModelRequestConfig, stream, provider, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's provider name and endpoint, which select the reasoning profile.
+- `build_messages_body_with_endpoint(&[BaseMessage], &ModelRequestConfig, stream, provider, endpoint_profile: Option<&str>, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's `endpoint_profile` as well; the client calls this one, and `_with_provider` delegates with no profile.
 - `normalize_api_base(&str) -> String` — strips a pasted `/v1/messages` or `/v1` suffix.
 - `parse_messages_response`, `parse_anthropic_usage`, `AnthropicStreamState` — response and stream conversion.
 
@@ -23,15 +24,16 @@ Assistant `tool_calls` become `tool_use` blocks with a parsed JSON `input` (`{"_
 
 ## Reasoning Plan (`request.rs`)
 
-A provider-neutral intent in `request.extra["reasoning"]` (`{mode, effort, budget_tokens}`, also `true`/`false` or a mode/effort string) is parsed with `ReasoningConfig::from_value` and resolved with `resolve_reasoning_plan_for(ReasoningProtocol::AnthropicMessages, provider, api_base, model, &intent)`.
-`provider`/`api_base` are the client's resolved values (`AnthropicClient::invoke`/`stream` pass `client_config.provider` and `client_config.api_base`), so a generic provider name defers to an API-base host hint (a DashScope-hosted Claude resolves the DashScope Anthropic wire).
+A provider-neutral intent in `request.extra["reasoning"]` (`{mode, effort, budget_tokens}`, also `true`/`false` or a mode/effort string) is parsed with `ReasoningConfig::from_value` and resolved with `resolve_reasoning_plan_with_endpoint(ReasoningProtocol::AnthropicMessages, provider, endpoint_profile, api_base, model, &intent)`.
+An `endpoint_profile` of `vllm` bypasses the profile table and writes `enable_thinking` plus `chat_template_kwargs.enable_thinking` (with an optional `thinking_budget`) instead of the `thinking` object.
+`provider`, `endpoint_profile`, and `api_base` are the client's resolved values (`AnthropicClient::invoke`/`stream` pass `client_config.provider`, `client_config.endpoint_profile`, and the normalized base URL), so a generic provider name defers to an API-base host hint (a DashScope-hosted Claude resolves the DashScope Anthropic wire) and a non-generic profile wins.
 `plan.sdk_params` are merged first, then `plan.extra_body`, both at the body top level because the Messages API takes `thinking`, `output_config`, `reasoning_effort` there; `apply_reasoning_plan` keeps a caller key that is already present.
 `request.extra` is merged afterwards, so a caller's own keys still win, and `reasoning` is never forwarded.
 Examples: `{"mode":"enabled","effort":"medium"}` on `claude-sonnet-4-5*` → `thinking: {"type":"enabled","budget_tokens":8192}` (the `anthropic_manual` effort map); `{"mode":"disabled"}` → `thinking: {"type":"disabled"}`; an unlisted model with `{"mode":"enabled","budget_tokens":2048}` → `thinking: {"type":"enabled","budget_tokens":2048}`; `{"mode":"enabled","effort":"high"}` on an unlisted model → `thinking: {"type":"adaptive"}` plus `output_config: {"effort":"high"}`.
 
 Legacy precedence: when `extra` already carries any of `reasoning_effort`, `thinking`, `enable_thinking`, `thinking_budget`, `thinking_strategy`, `chat_template_kwargs` — at the top level or inside a nested `extra_body` object — no plan is resolved or applied, so the caller's explicit vendor control is the only encoding sent (a `tracing::debug!` records the skip).
 A present `reasoning` key that is not an intent (`null` means "no intent"; a number, an array, or an object with foreign keys like `{"thinking": …}`) is `Error::Validation`, never a panic and never a silently dropped key.
-Without a `reasoning` key the produced body is unchanged, and `build_messages_body` is exactly `build_messages_body_with_provider(…, "anthropic", None)`.
+Without a `reasoning` key the produced body is unchanged, and `build_messages_body` is exactly `build_messages_body_with_provider(…, "anthropic", None)`, which is `build_messages_body_with_endpoint(…, "anthropic", None, None)`.
 
 ## Cache Breakpoints (`cache.rs`)
 

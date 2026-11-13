@@ -524,6 +524,9 @@ pub const MODEL_REASONING_FALLBACKS: &[ReasoningProfile] = &[
 /// Provider keys treated as "no vendor information": an API-base host hint may
 /// override them.
 const GENERIC_PROVIDER_KEYS: [&str; 3] = ["", "openai", "openaicompatible"];
+/// Endpoint profiles treated as "no vendor information" (Python's
+/// `_GENERIC_ENDPOINT_PROFILES`, after `_` → `-` normalization).
+const GENERIC_ENDPOINT_PROFILES: [&str; 3] = ["", "openai", "openai-compatible"];
 /// API-base hosts that identify the upstream vendor, longest/most specific first.
 const API_BASE_PROVIDER_HINTS: &[(&str, &str)] = &[
     ("openrouter.ai", "openrouter"),
@@ -582,13 +585,82 @@ const API_BASE_PROVIDER_HINTS: &[(&str, &str)] = &[
 /// ```
 #[must_use]
 pub fn provider_key_for(provider: &str, api_base: Option<&str>) -> String {
+    provider_key_for_endpoint(provider, None, api_base)
+}
+/// Resolves the provider key from the provider name, its `endpoint_profile`, and
+/// an optional API-base host hint.
+///
+/// The endpoint profile is trimmed, lowercased, and has `_` folded onto `-`. A
+/// non-generic profile (`"vllm"`, `"dashscope"`, …) names the wire dialect the
+/// gateway speaks and therefore wins over both the provider name and the host.
+/// A generic profile (`""`, `"openai"`, `"openai-compatible"`) falls back to the
+/// host hint, then to the profile as written, then to the normalized provider —
+/// the Python `inferred or profile or provider_key` order. An empty or absent
+/// profile reduces to [`provider_key_for`] exactly, so existing call sites keep
+/// their resolution; a written generic profile additionally lets the host hint
+/// override a non-generic provider name, because the caller has just declared the
+/// endpoint's dialect generic.
+///
+/// ```
+/// use openjiuwen_foundation::llm::reasoning::provider_key_for_endpoint;
+///
+/// // A non-generic profile names the dialect:
+/// assert_eq!(
+///     provider_key_for_endpoint("openai", Some("vllm"), Some("http://localhost:8000/v1")),
+///     "vllm"
+/// );
+/// // A generic profile defers to the host hint:
+/// assert_eq!(
+///     provider_key_for_endpoint("openai", Some("openai-compatible"), Some("https://openrouter.ai/api/v1")),
+///     "openrouter"
+/// );
+/// // `_` is the same generic profile, which defers to the host hint:
+/// assert_eq!(
+///     provider_key_for_endpoint("dashscope", Some("openai_compatible"), Some("openrouter.ai")),
+///     "openrouter"
+/// );
+/// // A generic profile without a host hint is returned as written, exactly like
+/// // the Python resolver, so blank the profile to keep the provider's dialect:
+/// assert_eq!(
+///     provider_key_for_endpoint("dashscope", Some("openai"), None),
+///     "openai"
+/// );
+/// assert_eq!(provider_key_for_endpoint("dashscope", None, None), "dashscope");
+/// ```
+#[must_use]
+pub fn provider_key_for_endpoint(
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
+) -> String {
+    let profile = normalized_endpoint_profile(endpoint_profile);
+    if !GENERIC_ENDPOINT_PROFILES.contains(&profile.as_str()) {
+        return profile;
+    }
     let canonical = reasoning_provider_key(provider);
-    if GENERIC_PROVIDER_KEYS.contains(&canonical.as_str()) {
+    // An explicit generic profile says "this is a generic OpenAI-compatible
+    // gateway", so the host is the only vendor evidence there is; with no profile
+    // at all the provider name stays authoritative for a non-generic name, which
+    // is `provider_key_for`'s documented rule.
+    let hint_applies = !profile.is_empty() || GENERIC_PROVIDER_KEYS.contains(&canonical.as_str());
+    if hint_applies {
         if let Some(hint) = api_base.and_then(provider_from_api_base) {
             return hint.to_owned();
         }
     }
-    canonical
+    if profile.is_empty() {
+        canonical
+    } else {
+        profile
+    }
+}
+/// Normalizes an endpoint profile to its comparison form.
+fn normalized_endpoint_profile(endpoint_profile: Option<&str>) -> String {
+    endpoint_profile
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        .replace('_', "-")
 }
 /// Maps a provider name onto the reasoning table's provider vocabulary.
 fn reasoning_provider_key(provider: &str) -> String {
@@ -729,7 +801,35 @@ pub fn reasoning_capability_for(
     provider: &str,
     model: &str,
 ) -> ReasoningCapability {
-    match find_reasoning_profile(provider, model) {
+    capability_for_key(protocol, &reasoning_provider_key(provider), model)
+}
+/// The capability offered by `provider`/`model` over OpenAI-compatible chat
+/// completions, resolving an `endpoint_profile` first.
+///
+/// An `endpoint_profile` only changes which profile the *resolver* consults; the
+/// capability is advisory (it drives a UI's option list) and keeps using the
+/// model-name fallback table, so a gateway profile such as `"vllm"` reports the
+/// capability of the model family it serves rather than nothing.
+#[must_use]
+pub fn reasoning_capability_for_endpoint(
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
+    model: &str,
+) -> ReasoningCapability {
+    capability_for_key(
+        ReasoningProtocol::ChatCompletions,
+        &provider_key_for_endpoint(provider, endpoint_profile, api_base),
+        model,
+    )
+}
+/// Looks a capability up by an already-resolved provider key.
+fn capability_for_key(
+    protocol: ReasoningProtocol,
+    provider_key: &str,
+    model: &str,
+) -> ReasoningCapability {
+    match find_reasoning_profile(provider_key, model) {
         Some(profile) => profile.capability_for(protocol),
         None => standard_reasoning_capability(protocol),
     }
@@ -953,6 +1053,68 @@ mod tests {
         assert_eq!(
             profile.capability_spec_for(ReasoningProtocol::AnthropicMessages),
             profile.capability
+        );
+    }
+    #[test]
+    fn endpoint_profile_wins_only_when_it_is_not_generic() {
+        assert_eq!(
+            provider_key_for_endpoint("openai", Some("vllm"), None),
+            "vllm"
+        );
+        assert_eq!(
+            provider_key_for_endpoint("openai", Some(" VLLM "), Some("https://api.openai.com")),
+            "vllm"
+        );
+        assert_eq!(
+            provider_key_for_endpoint("anthropic", Some("dashscope"), None),
+            "dashscope"
+        );
+        for generic in ["openai", "openai-compatible", "openai_compatible"] {
+            // A generic profile without a hint is returned as written.
+            assert_eq!(
+                provider_key_for_endpoint("deepseek", Some(generic), None),
+                generic.replace('_', "-"),
+                "{generic} must be returned as written"
+            );
+            assert_eq!(
+                provider_key_for_endpoint(
+                    "openai",
+                    Some(generic),
+                    Some("https://openrouter.ai/api/v1")
+                ),
+                "openrouter",
+                "{generic} must defer to the host hint"
+            );
+        }
+        assert_eq!(
+            provider_key_for_endpoint("openai", Some(""), None),
+            "openai"
+        );
+        assert_eq!(provider_key_for_endpoint("qwen", None, None), "dashscope");
+        // No profile at all is exactly `provider_key_for`.
+        for (provider, api_base) in [
+            ("openai", None),
+            ("openai", Some("https://api.deepseek.com/v1")),
+            ("kimi", None),
+            ("", Some("https://example.com")),
+        ] {
+            assert_eq!(
+                provider_key_for_endpoint(provider, None, api_base),
+                provider_key_for(provider, api_base)
+            );
+        }
+    }
+    #[test]
+    fn endpoint_capability_reports_the_model_family_for_a_gateway_profile() {
+        // The gateway profile only forces the wire; the advisory capability still
+        // comes from the model-name fallback table.
+        assert_eq!(
+            reasoning_capability_for_endpoint("openai", Some("vllm"), None, "glm-5.2"),
+            reasoning_capability("zhipu", "glm-5.2")
+        );
+        assert_eq!(
+            reasoning_capability_for_endpoint("openai", None, None, "gpt-4o"),
+            standard_reasoning_capability(ReasoningProtocol::ChatCompletions)
         );
     }
     #[test]

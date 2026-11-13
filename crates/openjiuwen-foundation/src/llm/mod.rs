@@ -58,8 +58,8 @@ pub use provider::{
 };
 pub use reasoning::{
     apply_reasoning_plan, apply_reasoning_plan_with, find_reasoning_profile,
-    resolve_reasoning_plan, ReasoningCapability, ReasoningConfig, ReasoningMode, ReasoningPlan,
-    ReasoningProfile, ReasoningProtocol,
+    resolve_reasoning_plan, resolve_reasoning_plan_with_endpoint, ReasoningCapability,
+    ReasoningConfig, ReasoningMode, ReasoningPlan, ReasoningProfile, ReasoningProtocol,
 };
 pub use registry::{
     register_builtin_providers, register_model_provider, ModelProvider, ModelProviderRegistry,

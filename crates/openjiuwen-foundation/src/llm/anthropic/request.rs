@@ -30,7 +30,7 @@ use serde_json::{Map, Value};
 
 use crate::llm::config::ModelRequestConfig;
 use crate::llm::reasoning::{
-    apply_reasoning_plan, resolve_reasoning_plan_for, ReasoningConfig, ReasoningProtocol,
+    apply_reasoning_plan, resolve_reasoning_plan_with_endpoint, ReasoningConfig, ReasoningProtocol,
 };
 use crate::prompt::BaseMessage;
 
@@ -133,6 +133,32 @@ pub fn build_messages_body_with_provider(
     provider: &str,
     api_base: Option<&str>,
 ) -> Result<Value> {
+    build_messages_body_with_endpoint(messages, request, stream, provider, None, api_base)
+}
+
+/// Builds the Anthropic Messages request body, resolving an endpoint profile
+/// first.
+///
+/// `endpoint_profile` names the wire dialect the configured endpoint speaks and
+/// `api_base` is the resolved base URL; together with `provider` they select the
+/// reasoning encoder for a provider-neutral intent in `request.extra["reasoning"]`
+/// (see [`resolve_reasoning_plan_with_endpoint`]). A non-generic profile such as
+/// `"vllm"` bypasses the profile table and writes the `enable_thinking` /
+/// `thinking_budget` keys a self-hosted gateway honors, instead of the official
+/// `thinking` object. Without an `endpoint_profile` the body is exactly the one
+/// [`build_messages_body_with_provider`] produces.
+///
+/// # Errors
+///
+/// See [`build_messages_body_with_provider`].
+pub fn build_messages_body_with_endpoint(
+    messages: &[BaseMessage],
+    request: &ModelRequestConfig,
+    stream: bool,
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
+) -> Result<Value> {
     if request.model_name.trim().is_empty() {
         return Err(Error::validation(
             "model_name must not be empty for an Anthropic Messages request",
@@ -196,9 +222,10 @@ pub fn build_messages_body_with_provider(
                  the provider-neutral reasoning intent is ignored"
             );
         } else {
-            let plan = resolve_reasoning_plan_for(
+            let plan = resolve_reasoning_plan_with_endpoint(
                 ReasoningProtocol::AnthropicMessages,
                 provider,
+                endpoint_profile,
                 api_base,
                 &request.model_name,
                 &intent,

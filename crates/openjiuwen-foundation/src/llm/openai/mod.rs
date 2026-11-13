@@ -52,8 +52,9 @@ use super::sse::SseDecoder;
 use super::transport::{self, carries_payload, next_chunk, poll_budget, read_error_body};
 
 pub use request::{
-    build_chat_completion_body, convert_message, convert_messages, convert_tool_choice,
-    convert_tools, normalize_api_base, replays_reasoning_content,
+    build_chat_completion_body, build_chat_completion_body_with_endpoint, convert_message,
+    convert_messages, convert_tool_choice, convert_tools, normalize_api_base,
+    replays_reasoning_content,
 };
 pub use response::{parse_chat_completion, parse_finish_reason, parse_usage};
 pub use stream::{parse_stream_chunk, OpenAiStreamState};
@@ -200,7 +201,14 @@ impl Model for OpenAiCompatibleClient {
         messages: &[BaseMessage],
         request: &ModelRequestConfig,
     ) -> Result<ChatResponse> {
-        let body = build_chat_completion_body(&self.provider, messages, request, false)?;
+        let body = build_chat_completion_body_with_endpoint(
+            &self.provider,
+            self.client.endpoint_profile.as_deref(),
+            Some(&self.base_url),
+            messages,
+            request,
+            false,
+        )?;
         let url = transport::join_url(&self.base_url, self.profile.chat_path);
         let http_request = self.build_request(url.clone()).json(&body)?;
 
@@ -237,9 +245,17 @@ impl Model for OpenAiCompatibleClient {
         let timeout = self.client.timeout;
         let first_chunk_timeout = self.client.stream_first_chunk_timeout;
         let idle_timeout = self.client.stream_idle_timeout;
+        let endpoint_profile = self.client.endpoint_profile.clone();
 
         Box::pin(try_stream! {
-            let body = build_chat_completion_body(&provider, &messages, &request, true)?;
+            let body = build_chat_completion_body_with_endpoint(
+                &provider,
+                endpoint_profile.as_deref(),
+                Some(&base_url),
+                &messages,
+                &request,
+                true,
+            )?;
             let url = transport::join_url(&base_url, chat_path);
             let mut http_request = HttpRequest::post(url.clone()).with_headers(headers);
             if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
