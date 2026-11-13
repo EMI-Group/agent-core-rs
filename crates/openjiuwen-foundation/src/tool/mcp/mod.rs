@@ -16,8 +16,7 @@
 //! tool per operation of an OpenAPI document, called over plain HTTP instead of
 //! JSON-RPC. Its Playwright sibling stays deferred — a browser runtime is not
 //! shipped here, so [`McpClientType::Playwright`] is rejected with
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) and the
-//! streamable-HTTP/SSE transports remain the only Playwright-compatible ones.
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported).
 //!
 //! The HTTP transports are implemented directly on `reqwest` and implement
 //! [`rmcp::transport::Transport`] themselves: the workspace enables `rmcp`
