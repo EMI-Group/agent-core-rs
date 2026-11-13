@@ -7,8 +7,11 @@
 //! [`MemberSpawner`] builds the member's runtime and a [`InProcessSpawnHandle`] owns the tokio task
 //! that drives it.
 //!
-//! Only the in-process mode is implemented; OS-process members, external-CLI members and the SSH
-//! transport are deferred (see `src/member/CONTEXT.md`), so a spawner for them fails with
+//! Only the in-process mode is wired up in this crate so far; the launch configuration for
+//! OS-process members, external-CLI members and the SSH transport lives in
+//! [`spawn_config`](crate::member::spawn_config) and travels on
+//! [`MemberSpawnRequest::options`], but the child-process spawners built on it are still being
+//! ported. A spawner asked for a mode it cannot serve fails with
 //! [`openjiuwen_common::error::Error::Unsupported`] rather than pretending to work.
 //!
 //! Ownership rule: a [`InProcessSpawnHandle`] is the only owner of its task. Dropping a
@@ -30,13 +33,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::runtime::MemberRuntime;
+use super::spawn_config::MemberSpawnOptions;
 
 /// Everything a spawner needs to bring one member up.
 ///
 /// Python passes a `TeamRuntimeContext` plus the owning `TeamAgent`; Rust keeps the request to the
-/// facts a spawner cannot derive: which team and member, the session id to propagate, and where
-/// the member's workspace is rooted.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// facts a spawner cannot derive: which team and member, the session id to propagate, where
+/// the member's workspace is rooted, and how the member should be launched
+/// ([`MemberSpawnOptions`], in-process by default).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct MemberSpawnRequest {
     /// Team the member belongs to.
@@ -47,10 +52,15 @@ pub struct MemberSpawnRequest {
     pub session_id: String,
     /// Root of the member's workspace.
     pub workspace_root: PathBuf,
+    /// Spawn mode plus the per-kind launch configuration.
+    ///
+    /// Defaults to in-process, so a payload without `options` spawns the member the way this
+    /// crate has always done it.
+    pub options: MemberSpawnOptions,
 }
 
 impl MemberSpawnRequest {
-    /// Builds a request.
+    /// Builds an in-process request.
     #[must_use]
     pub fn new(
         team_name: impl Into<String>,
@@ -63,7 +73,15 @@ impl MemberSpawnRequest {
             member_name: member_name.into(),
             session_id: session_id.into(),
             workspace_root: workspace_root.into(),
+            options: MemberSpawnOptions::default(),
         }
+    }
+
+    /// Replaces the spawn options, selecting another mode or a launch configuration.
+    #[must_use]
+    pub fn with_options(mut self, options: MemberSpawnOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -273,6 +291,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::member::spawn_config::{MemberSpawnKind, MemberSpawnOptions, SshTransportSpec};
 
     fn finished_handle(member_name: &str) -> InProcessSpawnHandle {
         InProcessSpawnHandle::new(member_name, tokio::spawn(async { Ok(()) }))
@@ -426,10 +445,55 @@ mod tests {
         let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws");
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(encoded.contains("\"workspace_root\""));
+        assert!(encoded.contains("\"options\""));
         let decoded: MemberSpawnRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
         let default: MemberSpawnRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(default, MemberSpawnRequest::default());
+    }
+
+    #[test]
+    fn a_request_without_options_decodes_to_in_process() {
+        let decoded: MemberSpawnRequest = serde_json::from_str(
+            r#"{"team_name":"a","member_name":"dev-1","session_id":"s","workspace_root":"/tmp/ws"}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.options, MemberSpawnOptions::default());
+        assert_eq!(decoded.options.kind, MemberSpawnKind::InProcess);
+        assert!(decoded.options.is_in_process());
+    }
+
+    #[test]
+    fn spawn_options_travel_with_the_request() {
+        let request = MemberSpawnRequest::new("a", "dev-1", "s", "/tmp/ws");
+        assert_eq!(request.options.kind, MemberSpawnKind::InProcess);
+
+        let ssh = SshTransportSpec {
+            host: "build-box".to_string(),
+            remote_command: "team-member serve".to_string(),
+            ..SshTransportSpec::default()
+        };
+        let request =
+            request.with_options(MemberSpawnOptions::from_kind(MemberSpawnKind::Ssh).with_ssh(ssh));
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"kind\":\"ssh\""));
+        let decoded: MemberSpawnRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.options.kind, MemberSpawnKind::Ssh);
+        assert_eq!(
+            decoded.options.ssh.as_ref().unwrap().host,
+            "build-box".to_string()
+        );
+    }
+
+    #[test]
+    fn unknown_request_fields_are_tolerated() {
+        let decoded: MemberSpawnRequest = serde_json::from_str(
+            r#"{"team_name":"a","options":{"kind":"process","unknown_knob":1},"extra":true}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.options.kind, MemberSpawnKind::Process);
+        assert_eq!(decoded.member_name, String::new());
     }
 
     /// A spawner is object-safe and can be stored behind an `Arc`.
