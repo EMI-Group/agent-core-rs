@@ -81,7 +81,7 @@ A PDF with no extractable text (scanned/image-only) → `Error::Unsupported("PDF
 }
 ```
 `HashEmbedding::new(dimension)` (`DEFAULT_HASH_DIMENSION = 64`; `0` falls back to it) — deterministic SHA-256 token hashing with mean pooling and L2 normalisation, zero vector for blank text; `with_model_name`, `dimension_size`, `Default`; used by tests.
-`OpenAiEmbedding::new(EmbeddingConfig) -> Result<Self>` — OpenAI-compatible `POST {base_url}/embeddings` with `{model, input[, dimensions]}`, bearer auth, batches of `max_batch_size`, tolerant response shapes (`data[].embedding`, `embedding`, `embeddings`); empty input → `Error::Validation`, non-2xx → `Error::Retrieval`; accessors `config()`, `endpoint()`.
+`OpenAiEmbedding::new(EmbeddingConfig) -> Result<Self>` — OpenAI-compatible `POST {base_url}/embeddings` with `{model, input[, dimensions]}`, bearer auth, batches of `max_batch_size`, tolerant response shapes (`data[].embedding`, `embedding`, `embeddings`); empty input → `Error::Validation`, non-2xx → `Error::Retrieval`; accessors `config()`, `endpoint()` (appends `/embeddings` unless the base URL already ends in it); `timeout`/`max_retries`/`verify_ssl`/`headers` are forwarded to `openjiuwen_common::http::HttpClientConfig`.
 
 ### Vector store (`vector_store`)
 ```rust
@@ -106,6 +106,9 @@ pub struct VectorQuery { pub vector: Vec<f32>, pub top_k: usize /*5*/,
 `InMemoryVectorStore::new()`, `::with_collection(name)`, `::open(path)` / `::open_with_collection(path, name)` (load JSON if present, auto-persist after mutations), `persist()`; cosine similarity mapped to `(cos + 1) / 2`, descending score with insertion-order tie-break; dimension-mismatched records are skipped; filters resolve `doc_id`/`chunk_id` pseudo-fields; `search` injects them into result metadata.
 Persistence JSON: `{"version":1,"name":"…","records":[…]}` written atomically (temp file + rename).
 `VectorStoreRegistry::with_builtin()` registers `"memory"`/`"in_memory"`; `create(&VectorStoreConfig)` returns `Error::Unsupported` for Milvus/Chroma/PGVector/Elasticsearch.
+The registry's factory type is `VectorStoreFactory = Arc<dyn Fn(&VectorStoreConfig) -> Result<Arc<dyn VectorStore>> + Send + Sync>`.
+Free functions re-exported at the crate root: `cosine_similarity(a, b) -> f32` (`0.0` on empty/mismatched slices) and `normalize_cosine(cos) -> f32` (`(cos + 1) / 2`); filter pseudo-field constants `DOC_ID_FIELD = "doc_id"` and `CHUNK_ID_FIELD = "chunk_id"`.
+No distance-metric enum exists: only cosine scoring is implemented, and `VectorStoreConfig::distance_metric` is a plain `String` defaulting to `"cosine"`.
 
 ### Rerankers (`reranker`)
 ```rust
