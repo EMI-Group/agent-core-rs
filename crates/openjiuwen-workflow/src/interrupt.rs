@@ -5,7 +5,7 @@
 //! run seeds [`openjiuwen_session::InteractiveInput`] answers into
 //! [`InteractionState`] so the same question resolves without halting again.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use openjiuwen_common::error::Error;
@@ -116,22 +116,57 @@ impl InteractionState {
 
     /// Queue every answer in `input`.
     ///
-    /// Interrupt-addressed answers are queued first; node-addressed answers are
-    /// queued afterwards only for ids that received no interrupt answer.
+    /// Interrupt-addressed answers are queued first; node-addressed answers are queued
+    /// afterwards only for ids that received an interrupt answer *in this call*, so the
+    /// interrupt-addressed answer wins. An id whose queue already holds answers from an
+    /// earlier [`InteractionState::append`]/[`InteractionState::seed`] call still takes
+    /// the node-addressed answer, in FIFO order.
     pub fn seed(&self, input: &InteractiveInput) {
         let mut answers = self.answers.lock();
+        let mut interrupt_addressed: BTreeSet<&str> = BTreeSet::new();
         for (id, value) in &input.interrupt_answers {
             answers
                 .entry(id.clone())
                 .or_default()
                 .push_back(value.clone());
+            interrupt_addressed.insert(id.as_str());
         }
         for (id, value) in &input.user_inputs {
-            let queue = answers.entry(id.clone()).or_default();
-            if queue.is_empty() {
+            if interrupt_addressed.contains(id.as_str()) {
+                continue;
+            }
+            answers
+                .entry(id.clone())
+                .or_default()
+                .push_back(value.clone());
+        }
+    }
+
+    /// Appends every answer of every id, in order.
+    ///
+    /// Used to replay answers that were already delivered in earlier resumes before the
+    /// newly supplied ones (a nested run forwards what its child consumed).
+    pub fn append(&self, answers: &BTreeMap<String, Vec<Value>>) {
+        let mut queues = self.answers.lock();
+        for (id, values) in answers {
+            let queue = queues.entry(id.clone()).or_default();
+            for value in values {
                 queue.push_back(value.clone());
             }
         }
+    }
+
+    /// A copy of the remaining per-id answer queues, in first-delivery order.
+    ///
+    /// Reading does not consume anything; [`InteractionState::take_answer`] keeps its
+    /// position in the queue.
+    #[must_use]
+    pub fn queued_answers(&self) -> BTreeMap<String, Vec<Value>> {
+        self.answers
+            .lock()
+            .iter()
+            .map(|(id, queue)| (id.clone(), queue.iter().cloned().collect()))
+            .collect()
     }
 
     /// Pop the next seeded answer for `id`.
@@ -277,6 +312,79 @@ mod tests {
         assert_eq!(state.take_answer("q"), Some(json!(2)));
         assert_eq!(state.take_answer("q"), None);
         assert_eq!(state.take_answer("missing"), None);
+    }
+
+    #[test]
+    fn a_later_node_addressed_seed_is_appended_after_the_queued_interrupt_answer() {
+        let state = InteractionState::new();
+        let mut interrupt = InteractiveInput::new();
+        interrupt
+            .interrupt_answers
+            .insert("q".to_owned(), json!("i"));
+        state.seed(&interrupt);
+        // The rule is per call: this call carries only the node-addressed answer, so it is
+        // queued after the interrupt answer the earlier call left behind.
+        let mut node = InteractiveInput::new();
+        node.user_inputs.insert("q".to_owned(), json!("n"));
+        state.seed(&node);
+
+        assert_eq!(
+            state.queued_answers(),
+            BTreeMap::from([("q".to_owned(), vec![json!("i"), json!("n")])])
+        );
+        assert_eq!(state.take_answer("q"), Some(json!("i")));
+        assert_eq!(state.take_answer("q"), Some(json!("n")));
+        assert_eq!(state.take_answer("q"), None);
+    }
+
+    #[test]
+    fn append_replays_answers_in_order_and_queued_answers_does_not_consume() {
+        let state = InteractionState::new();
+        let mut interactive = InteractiveInput::new();
+        interactive
+            .interrupt_answers
+            .insert("q".to_owned(), json!(3));
+        state.append(&BTreeMap::from([
+            ("q".to_owned(), vec![json!(1), json!(2)]),
+            ("other".to_owned(), vec![json!("a")]),
+        ]));
+        state.seed(&interactive);
+
+        assert_eq!(
+            state.queued_answers(),
+            BTreeMap::from([
+                ("other".to_owned(), vec![json!("a")]),
+                ("q".to_owned(), vec![json!(1), json!(2), json!(3)]),
+            ])
+        );
+        assert_eq!(
+            state.queued_answers(),
+            BTreeMap::from([
+                ("other".to_owned(), vec![json!("a")]),
+                ("q".to_owned(), vec![json!(1), json!(2), json!(3)]),
+            ]),
+            "reading the queues does not consume them"
+        );
+
+        assert_eq!(state.take_answer("q"), Some(json!(1)));
+        assert_eq!(
+            state.queued_answers().get("q").cloned(),
+            Some(vec![json!(2), json!(3)])
+        );
+        assert_eq!(state.take_answer("q"), Some(json!(2)));
+        assert_eq!(state.take_answer("q"), Some(json!(3)));
+        assert_eq!(
+            state.queued_answers(),
+            BTreeMap::from([("other".to_owned(), vec![json!("a")])]),
+            "only the untouched id keeps a queue"
+        );
+    }
+
+    #[test]
+    fn appending_an_empty_map_changes_nothing() {
+        let state = InteractionState::new();
+        state.append(&BTreeMap::new());
+        assert!(state.queued_answers().is_empty());
     }
 
     #[test]

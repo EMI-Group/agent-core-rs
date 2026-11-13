@@ -10,6 +10,10 @@
 //! `stream`, `to_mermaid`). Everything else (id syntax, edge endpoints, capability
 //! mismatches) is [`validate`](crate::engine::validate::validate)'s job.
 //!
+//! Drawing follows the same split: [`Workflow::draw`] renders Mermaid text and SVG locally,
+//! and reports [`DrawFormat::Png`] as a typed `Error::Unsupported` because Python produces
+//! PNG through the external mermaid.ink service.
+//!
 //! ```
 //! use openjiuwen_workflow::{
 //!     ComponentOptions, EndComponent, StartComponent, Workflow, WorkflowCard,
@@ -27,7 +31,7 @@
 use std::sync::Arc;
 
 use futures::stream::{self, BoxStream, StreamExt};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_graph::Router;
 use openjiuwen_session::{InteractiveInput, Session};
 use serde_json::Value;
@@ -409,17 +413,27 @@ impl Workflow {
     /// Renders the workflow in `format`.
     ///
     /// This is the Rust stand-in for Python's `Workflow.draw(..., output_format=...)`:
-    /// [`DrawFormat`] replaces the format string. PNG is intentionally not provided —
-    /// Python renders both PNG and SVG through the mermaid.ink network service, whereas
-    /// [`DrawFormat::Svg`] is rendered locally and deterministically.
+    /// [`DrawFormat`] replaces the format string. [`DrawFormat::Mermaid`] and
+    /// [`DrawFormat::Svg`] render locally and deterministically; [`DrawFormat::Png`] is
+    /// rejected with `Error::Unsupported` because Python rasterizes PNG through the
+    /// external mermaid.ink service.
     ///
     /// # Errors
     ///
-    /// Returns the same compile error as [`Workflow::build`]; rendering itself cannot fail.
+    /// Returns `Error::Unsupported` for [`DrawFormat::Png`], otherwise the same compile
+    /// error as [`Workflow::build`]; once a workflow compiles, rendering itself cannot
+    /// fail.
     pub fn draw(&self, format: DrawFormat) -> Result<String> {
         match format {
             DrawFormat::Mermaid => self.to_mermaid(),
             DrawFormat::Svg => self.to_svg(),
+            DrawFormat::Png => Err(Error::unsupported(
+                "PNG drawing is unsupported: Python's output_format=\"png\" posts the chart \
+                 to the external https://mermaid.ink service (mermaid-py over blocking \
+                 `requests`), which an offline build cannot reach and no local rasterizer \
+                 reproduces; use DrawFormat::Svg for SVG rendered locally by this crate, or \
+                 DrawFormat::Mermaid for Mermaid text",
+            )),
         }
     }
 

@@ -6,9 +6,10 @@
 //! instead of asking the mermaid.ink web service to rasterize a Mermaid chart, so the same
 //! spec always produces byte-identical SVG.
 //!
-//! PNG is not provided: Python's `output_format="png"` path needs the mermaid.ink network
-//! service, so [`crate::Workflow::draw`](crate::workflow::Workflow::draw) offers only
-//! Mermaid text and SVG.
+//! PNG selection is typed rather than silent: Python's `output_format="png"` path sends the
+//! chart to the mermaid.ink network service, so [`crate::Workflow::draw`](crate::workflow::Workflow::draw)
+//! rejects [`DrawFormat::Png`] with `Error::Unsupported` while Mermaid text and SVG render
+//! here.
 //!
 //! ```
 //! use openjiuwen_workflow::card::{WorkflowCard, WorkflowSpec};
@@ -40,8 +41,9 @@ const MIN_H: u32 = 120;
 
 /// The document format [`crate::workflow::Workflow::draw`] produces.
 ///
-/// Replaces Python's `output_format` string argument; PNG (`"png"`) is intentionally
-/// absent because Python renders it through the mermaid.ink network service.
+/// Replaces Python's `output_format` string argument. Mermaid text and SVG are rendered by
+/// this crate; [`DrawFormat::Png`] exists so Python's third format is a typed rejection
+/// instead of a silent fallback, and `draw` returns `Error::Unsupported` for it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DrawFormat {
@@ -50,15 +52,18 @@ pub enum DrawFormat {
     Mermaid,
     /// A standalone SVG document rendered by this crate.
     Svg,
+    /// A raster PNG image; rejected by `draw` because it is not rendered offline.
+    Png,
 }
 
 impl DrawFormat {
-    /// The wire name of the format (`"mermaid"` or `"svg"`).
+    /// The wire name of the format (`"mermaid"`, `"svg"`, or `"png"`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mermaid => "mermaid",
             Self::Svg => "svg",
+            Self::Png => "png",
         }
     }
 }

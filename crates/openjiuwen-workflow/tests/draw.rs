@@ -1,14 +1,15 @@
-//! Ports the `Workflow.draw` surface: Mermaid text and offline SVG rendering.
+//! Ports the `Workflow.draw` surface: Mermaid text, offline SVG rendering, and the typed
+//! rejection of PNG.
 //!
 //! Python's `Workflow.draw(title="", output_format="mermaid")` delegates to
 //! `Drawable.to_mermaid` / `to_mermaid_svg`, with mermaid.ink rasterizing the chart. These
 //! tests cover the Rust stand-ins — [`Workflow::draw`] with a [`DrawFormat`] — and assert
-//! the SVG is rendered locally and deterministically. Everything here is offline: no
-//! network, no clocks, no hash-ordered iteration.
+//! the SVG is rendered locally and deterministically while PNG reports `Unsupported`.
+//! Everything here is offline: no network, no clocks, no hash-ordered iteration.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use async_trait::async_trait;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_workflow::card::{NodeSpec, WorkflowCard, WorkflowSpec};
 use openjiuwen_workflow::{
     render, Component, ComponentAbility, ComponentCard, ComponentContext, ComponentOptions,
@@ -184,6 +185,56 @@ fn draw_mermaid_matches_to_mermaid() {
         drawn.contains("flowchart"),
         "expected a flowchart:\n{drawn}"
     );
+}
+
+#[test]
+fn png_format_wire_name_is_png() {
+    assert_eq!(DrawFormat::Png.as_str(), "png");
+    assert_eq!(DrawFormat::Mermaid.as_str(), "mermaid");
+    assert_eq!(DrawFormat::Svg.as_str(), "svg");
+    assert_eq!(DrawFormat::default(), DrawFormat::Mermaid);
+}
+
+#[test]
+fn draw_png_is_unsupported() {
+    let workflow = demo();
+    let error = workflow
+        .draw(DrawFormat::Png)
+        .expect_err("PNG drawing must not return a document");
+
+    let Error::Unsupported(message) = &error else {
+        panic!("expected Error::Unsupported, got {error:?}");
+    };
+    assert!(
+        message.contains("mermaid.ink"),
+        "the reason names the external service:\n{message}"
+    );
+    assert!(
+        message.contains("DrawFormat::Svg"),
+        "the message points at the supported alternative:\n{message}"
+    );
+
+    // The rejection never silently degrades to another format's output.
+    let wire = error.to_string();
+    assert!(!wire.contains("<?xml"), "no SVG leaked:\n{wire}");
+    assert!(
+        !wire.contains("flowchart"),
+        "no Mermaid text leaked:\n{wire}"
+    );
+}
+
+#[test]
+fn png_rejection_does_not_affect_mermaid_or_svg() {
+    let workflow = demo();
+
+    let _ = workflow.draw(DrawFormat::Png);
+    let mermaid = workflow.draw(DrawFormat::Mermaid).unwrap();
+    let svg = workflow.draw(DrawFormat::Svg).unwrap();
+
+    assert!(mermaid.contains("flowchart"), "{mermaid}");
+    assert!(svg.starts_with("<?xml"), "{svg}");
+    assert_eq!(mermaid, workflow.to_mermaid().unwrap());
+    assert_eq!(svg, workflow.to_svg().unwrap());
 }
 
 #[test]

@@ -19,6 +19,7 @@ pub mod output;
 pub mod reference;
 pub mod registry;
 pub mod render;
+pub mod single;
 pub mod workflow;
 
 /// Returns the crate name.
@@ -29,8 +30,8 @@ pub fn crate_name() -> &'static str {
 
 pub use ability::ComponentAbility;
 pub use card::{
-    validate_component_id, CompIoConfig, ExceptionConfig, NodeSpec, WorkflowCard, WorkflowConfig,
-    WorkflowSpec,
+    generate_workflow_key, validate_component_id, CompIoConfig, ExceptionConfig, NodeSpec,
+    WorkflowCard, WorkflowConfig, WorkflowSpec,
 };
 pub use component::{unsupported_ability, Component, ComponentCard};
 pub use components::{
@@ -79,11 +80,13 @@ pub use interrupt::{
 };
 pub use output::{
     custom_chunk, output_chunk, trace_chunk, FrameWriter, OutputFrame, WorkflowChunk,
-    WorkflowExecutionState, WorkflowOutput, END_NODE_STREAM, OUTPUT_FRAME_TYPE, WORKFLOW_FINAL,
+    WorkflowChunkType, WorkflowExecutionState, WorkflowOutput, END_NODE_STREAM, OUTPUT_FRAME_TYPE,
+    WORKFLOW_FINAL,
 };
 pub use reference::{
     extract_origin_key, is_ref_path, project, resolve_path, resolve_schema, split_path, PathSegment,
 };
 pub use registry::{ComponentFactory, ComponentRegistry};
 pub use render::{render_svg, to_svg, DrawFormat, LayoutDirection, SvgOptions};
+pub use single::{execute_single_component, execute_single_component_with, SingleComponentOptions};
 pub use workflow::{ComponentOptions, Workflow};
