@@ -31,7 +31,9 @@ Pipeline stages (new modules):
 - `dl_reflector.rs` — `DlReflector::{new, with_model}`, `reflect(&WorkflowDsl)`, `async reflect_with_model(&WorkflowDsl, instructions)`; `Reflection { passed, issues, repaired }`, `ReflectionIssue { kind, message, node_id }`, `ReflectionIssueKind::{DanglingEdge, DuplicateNodeId, MissingStart, MissingEnd, Cycle, InvalidNode, UnreachableNode}`.
 - `cycle_checker.rs` — `find_cycle(&WorkflowDsl) -> Option<Vec<String>>`, `has_cycle(&WorkflowDsl) -> bool`.
 - `mermaid.rs` — `render_mermaid(&WorkflowDsl) -> String`, `render_design(&WorkflowDesign) -> String`.
-- `mod.rs` re-exports every type above plus `find_cycle`, `has_cycle`, `render_mermaid`, `render_design`.
+- `utils.rs` — the deterministic `agent_builder/utils/utils.py` helpers: `extract_json_from_text`, `format_dialog_history`/`format_dialog_history_with`, `merge_dict_lists(existing, new_items, unique_key)`, `validate_session_id`/`is_valid_session_id`.
+- `progress.rs` — the `agent_builder/utils/progress.py` weights: `ProgressStage` (15 stages, `as_str`/`Display`, serde snake_case), `LLM_AGENT_STAGE_WEIGHTS` (6), `WORKFLOW_STAGE_WEIGHTS` (9), `progress_for(agent_type, stage) -> u8`, and `BuildStatus::progress(stage)` as a derived view.
+- `mod.rs` re-exports every type above plus `find_cycle`, `has_cycle`, `render_mermaid`, `render_design`, the `utils` helpers, and the `progress` items.
 
 ## Pipeline (`build_with_pipeline`)
 
@@ -137,14 +139,14 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 - Python's DL→DSL transformer (`builders/workflow/dl_transformer/`) is not ported: there is no SimpleIR node list, no numeric `NodeType.dsl_type` ids (Start→1 … Plugin→19), no x/y `+20` position assignment, no `${node.a_of_b}` `_of_` splitting, no None-dropping recursive dict serialiser, and no per-converter defaults (plugin `toolID`/`pluginVersion: "draft"` and default outputs, questioner empty-input `node_start.query`, `BRANCH_OPERATOR_MAP`/`BRANCH_LOGIC_MAP`).
 - `WorkflowDesign::to_workflow_dsl` is the only design→DSL converter and it keeps string node types (`start`/`llm`/`branch`/`tool`/`end`); Python DL node types outside that set (`Questioner`, `IntentDetection`, `Output`, `Code`, `Plugin`) exist only as `DesignNodeKind` parse aliases (`Questioner`→`Llm`, `Output`→`End`, `Plugin`/`Code`→`Tool`, `IntentDetection`→`Branch`).
 - Reflection is graph-structural only: Python's per-node-type field checks (`_check_start_node` query/用户输入 output, `_check_llm_node` `configs.system_prompt`+`configs.user_prompt`, `_check_questioner_node` `configs.prompt`, `_check_plugin_node` `configs.tool_id`, `_check_code_node` `configs.code`, `_check_output_node`/End `configs.template`, intent/branch condition `operator`/`variable`/`default` rules, `_check_inputs_list`/`_check_outputs_list` placeholder resolution, `_check_next_missing`) are not ported; the port validates node presence, unique ids, resolvable edges, exactly one start, at least one end, reachability, and acyclicity.
-- Python's `utils/utils.py` helpers `extract_json_from_text` (first fence, string), `format_dialog_history`, `merge_dict_lists(unique_key="resource_id")`, and `validate_session_id` are absent; the port parses model output with `crate::util::extract_json_fence` (`Option<Value>`) and sends history as individual `BaseMessage`s.
-- Python's `utils/progress.py` `ProgressReporter`/`ProgressManager` (stage percentage tables) and its singleton are absent; build progress is observable only through `AgentBuilder::status` (`BuildStatus.state`/`resource_count`).
+- Python's `utils/utils.py` `safe_json_loads`, `deep_merge_dict`, and `load_json_file` are not ported (`serde_json` covers safe parsing at the call site, and file loading belongs to the caller); the deterministic text/dict helpers are ported in `utils.rs`.
+- Python's `utils/progress.py` `ProgressReporter`/`BuildProgress`/`ProgressStep`/`ProgressManager` and the process-global `progress_manager` singleton are not ported — no mutable per-session progress state, callbacks, or wall-clock timestamps; the port keeps the stage vocabulary and the two `_calculate_progress` weight tables, and build progress is observed through `BuildStatus::progress`/`progress_for` plus `AgentBuilder::status`.
 - Multi-turn refinement after `Completed` is a plain second call: no state-machine re-entry, no error-correction pass over a previously produced artifact.
 - Any streaming variant of the pipeline or the stages is not implemented.
 
 ## Test Strategy
 
-- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, `outcome`, `clarifier`, `cycle_checker`, `dl_generator`, and `mermaid` each own an inline `#[cfg(test)] mod tests`, while `designer`, `dl_reflector`, and `builder` declare `#[cfg(test)] mod tests;` resolving to the sibling `designer/tests.rs`, `dl_reflector/tests.rs`, and `builder/tests.rs`; `builder` additionally declares `#[cfg(test)] mod pipeline_tests;` resolving to `builder/pipeline_tests.rs`.
+- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, `outcome`, `clarifier`, `cycle_checker`, `dl_generator`, `mermaid`, `progress`, and `utils` each own an inline `#[cfg(test)] mod tests`, while `designer`, `dl_reflector`, and `builder` declare `#[cfg(test)] mod tests;` resolving to the sibling `designer/tests.rs`, `dl_reflector/tests.rs`, and `builder/tests.rs`; `builder` additionally declares `#[cfg(test)] mod pipeline_tests;` resolving to `builder/pipeline_tests.rs`.
 - A test module in a sibling file opens with `use super::*;`, so it reaches the parent module's private items exactly as the inline module did.
 - `cycle_checker`: acyclic chain, diamond, self-loop, three-node cycle, cycle behind an isolated root, dangling-edge tolerance, empty document, determinism.
 - `clarifier`: blank validation with zero calls, ready/missing-signal questions, history-carried signals, model JSON path with message-order assertions, garbage/error fallbacks, serde round-trip.
@@ -152,6 +154,8 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 - `dl_generator`: deterministic parity with `to_workflow_dsl`, `from_spec` valid/invalid, model success assertions, invalid/garbage/error fallbacks, no-model passthrough.
 - `dl_reflector`: every issue kind repaired and the repaired document validating, `passed` semantics, valid-document passthrough, determinism, serde round-trips, model revision accepted only with the same id set, all rejection paths.
 - `mermaid`: shapes per kind, escaping of labels and conditions, id sanitizing/deduplication, determinism/document order, exactly-once node and edge lines, design/DSL equivalence.
+- `utils`: json-tagged and untagged fences, first-of-several, multiline bodies, non-`json` info strings, no-fence and empty passthrough; history formatting with the default/custom/empty separator and blank roles; first-wins merging, falsy/missing keys, custom keys, duplicate handling; session ids accepted/rejected with the id named in the error.
+- `progress`: both weight tables entry by entry, unlisted stages → 0, serde/`as_str`/`Display` round-trip of all 15 stages, table coverage, and `BuildStatus::progress` delegation with the serialized snapshot unchanged.
 - Pipeline tests: scripted model with queued turns for clarification-only, full workflow (3 calls), unparseable LLM answer (2 calls, deterministic repair, fixed timestamps), model failure absorbed, fully offline workflow via `ScriptedModel::new([])`, blank-query validation, fallback determinism, and a legacy `build_agent_at` regression.
 - Every test is offline and deterministic: `openjiuwen_test_support::ScriptedModel`, no network, no environment reads, no wall-clock or generated-id assertions beyond non-emptiness.
 
@@ -170,6 +174,8 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 - `./dl_reflector.rs` → `DlReflector`, rule-based repair with issue reporting, optional model revision
 - `./cycle_checker.rs` → deterministic `find_cycle`/`has_cycle` over the workflow graph
 - `./mermaid.rs` → `render_mermaid`/`render_design` Mermaid `flowchart TD` output
+- `./progress.rs` → `ProgressStage`, the LLM-agent/workflow weight tables, and `progress_for`
+- `./utils.rs` → fence extraction, dialogue-history formatting, first-wins dict-list merging, and session-id validation
 - `./designer/tests.rs` → `designer`'s `mod tests`: offline synthesis, model path and aliases, validation, design→DSL conversion
 - `./builder/tests.rs` → `builder`'s `mod tests`: legacy single-round-trip builds, result vocabulary, deterministic LLM-agent repair
 - `./builder/pipeline_tests.rs` → `builder`'s `mod pipeline_tests`: `build_with_pipeline` stages, model-call counts, fallbacks
