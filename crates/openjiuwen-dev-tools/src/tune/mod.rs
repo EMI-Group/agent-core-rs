@@ -80,7 +80,10 @@ pub use optimizer::{
     candidate_space, format_prompt, generate_candidates, optimize_prompt, placeholders,
     render_examples, EvaluationSummary, ExampleOptimizer, InstructionOptimizer, JointOptimizer,
     OptimizationResult, OptimizerConfig, ParameterSearchOutcome, ParameterSearcher,
-    PromptSearchOptimizer, Trainer, DEFAULT_CANDIDATES_SAMPLE_NUM,
+    PromptSearchConfig, PromptSearchOptimizer, Trainer, DEFAULT_CANDIDATES_SAMPLE_NUM,
+    DEFAULT_CONVERGENCE_THRESHOLD, DEFAULT_CONVERGENCE_WINDOW, DEFAULT_DRIFT_PENALTY,
+    DEFAULT_MAX_NUM_SAMPLE_ERROR_CASES, DEFAULT_MAX_SAMPLED_EXAMPLE_NUM, DEFAULT_MIN_CORRECTNESS,
+    DEFAULT_POLICY_TEMPERATURE, DEFAULT_SEARCH_CANDIDATE_PROMPTS, DEFAULT_SEARCH_MAX_ITERATIONS,
 };
 pub use optimizer::{
     DEFAULT_EARLY_STOP_SCORE, DEFAULT_EXAMPLE_NUM, DEFAULT_ITERATION_NUM, DEFAULT_PARALLEL_NUM,
