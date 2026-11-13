@@ -11,11 +11,11 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 | `agent.rs` | the `Agent` trait |
 | `card.rs` | `AgentCard` |
 | `input.rs` | `AgentInput` parsing |
-| `output.rs` | `AgentOutput`, `AgentChunk`, `Observation`, `OutputFrame`, frame-kind constants |
+| `output.rs` | `AgentOutput`, `AgentChunk`, `Observation` (text `content` plus multimodal `parts`), `OutputFrame`, frame-kind constants |
 | `prompt.rs` | `SystemPromptBuilder` and `PromptSection` |
 | `run.rs` | session acquisition/commit |
 | `interrupt.rs` | interrupt data model and resume matching |
-| `abilities/` | tool registry, argument repair, tool execution |
+| `abilities/` | tool registry, argument repair, tool execution, multimodal part extraction |
 | `rails/` | rail trait/context/registry and built-in rails |
 | `react/` | `ReActAgent`, config, iteration loop, model step, resume replay, loop hooks (callbacks/steering/final check), frame emission, tool-exposure projection, wiring behaviour tests |
 | `llm_agent.rs` | `LlmAgent` over `ReActAgent` |
@@ -41,6 +41,7 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 - The seams are consumed, not duplicated: `react/hooks.rs` fires callbacks and drains steering, `react/exposure.rs` projects the model-visible tools, `react/frames.rs` builds the `context.usage`/`llm_route` payloads, `react/pause.rs` persists an intercepted turn, and `react/resume.rs` replays it (including client tools).
 - Every seam defaults to the pre-wiring behavior (empty callback framework, empty steering queue, allow-all exposure, no MCP restriction, empty client registry, single-attempt resilience, no final check); a caller that configures nothing must keep observing today's loop, which the integration suites `react_agent`, `rails`, `interrupt`, `streaming`, `workflow_agent`, and `agent_card` enforce.
 - `crate::callbacks`, `crate::steering`, and `crate::policy` own their types and are read-only from `react/`; new loop behavior goes through `react/hooks.rs`, `react/exposure.rs`, `react/frames.rs`, `react/pause.rs`, or `react/resume.rs`.
+- Multimodal tool results reuse `openjiuwen_foundation::{MessageContent, ContentPart}`: `abilities::parts::extract_parts` scans a tool's raw output, the parts ride on `ToolCallResult::parts` and `Observation::parts`, and `ToolCallResult::message()` emits `MessageContent::Parts` (text first) only when parts exist; `Observation::parts` is omitted from the wire form when empty, so text-only results stay Python-shaped.
 
 ## Routing Table
 
