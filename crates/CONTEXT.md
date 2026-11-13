@@ -96,6 +96,9 @@ Deferred areas per crate (the 16 Subset crates, plus the documented gaps inside 
 - Crates are `publish = false` until the API stabilizes.
 - Test-only crates are never dependencies of library crates; `openjiuwen-examples` uses `openjiuwen` (umbrella) plus dev-dependency crates only.
 - Two binaries live outside `openjiuwen-cli`: `team-member` and `openjiuwen-team-mcp` (`required-features = ["mcp"]`) in `openjiuwen-agent-teams`.
+- Request signing is hand-rolled over `sha2` in exactly two places — `openjiuwen-foundation::store::external::s3::sigv4` (AWS SigV4) and `openjiuwen-security::backends::vendors::aliyun::signing` (ACS3-HMAC-SHA256); no workspace crate depends on the RustCrypto `hmac` crate (`hmac 0.12.1` is only a transitive lock entry via `sqlx-postgres`), and Azure SharedKey / GCS signed URLs have no implementation anywhere (symphony's GCS/Azure artifact transports are typed `Error::Unsupported`).
+- The only real XML parser is the in-crate tolerant one at `openjiuwen-retrieval::parsing::xml` (re-exported as `parsing::parse_xml` and `openjiuwen_retrieval::parse_xml`); no XML crate (`quick-xml`, `roxmltree`, `xml-rs`, …) is a dependency or a `Cargo.lock` entry, and `openjiuwen-rsi`'s JUnit reader plus `openjiuwen-dev-tools`' tag helpers are hand-rolled scanners.
+- `openjiuwen-foundation` and `openjiuwen-retrieval` are both layer 1, so foundation cannot reuse that XML parser; upper layers reach it through the `openjiuwen_core::retrieval` umbrella alias.
 
 ## Feature Flags
 
