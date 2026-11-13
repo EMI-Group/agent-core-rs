@@ -22,7 +22,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::harness::{MemberHarnessFactory, NativeMemberFactory};
+use crate::harness::{MemberCheckpointStore, MemberHarnessFactory, NativeMemberFactory};
 use crate::kv_cache::TeamKvCacheAffinity;
 use crate::observability::ObservabilityHooks;
 use crate::schema::Language;
@@ -66,6 +66,15 @@ pub struct TeamBuildDeps {
     pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,
     /// Shared model router; `None` lets the spawner build one from the blueprint.
     pub routing: Option<Arc<super::routing::TeamModelRouter>>,
+    /// Team-shared member checkpoint store: the one the build path resolved or the host injected.
+    ///
+    /// `None` makes the build path resolve the store from
+    /// [`metadata["checkpoint"]`](crate::schema::TeamAgentSpec::metadata) (see
+    /// [`checkpoint_config`](super::spec_meta::checkpoint_config) and the `src/runtime/checkpoints`
+    /// module). The resolved store is
+    /// written back here before the spawner is built, so the leader and every teammate share one
+    /// destination instead of each opening its own.
+    pub checkpoints: Option<Arc<dyn MemberCheckpointStore>>,
 }
 
 impl TeamBuildDeps {
@@ -158,6 +167,24 @@ impl TeamBuildDeps {
         }
     }
 
+    /// Injects the team-shared checkpoint store used by the leader and every spawned member.
+    #[must_use]
+    pub fn with_checkpoint_store(self, store: Arc<dyn MemberCheckpointStore>) -> Self {
+        Self {
+            checkpoints: Some(store),
+            ..self
+        }
+    }
+
+    /// Returns `true` when a host injected the checkpoint store.
+    ///
+    /// The build path treats an injected store as the team's destination and only falls back to
+    /// [`metadata["checkpoint"]`](crate::schema::TeamAgentSpec::metadata) when none was supplied.
+    #[must_use]
+    pub fn has_injected_checkpoints(&self) -> bool {
+        self.checkpoints.is_some()
+    }
+
     /// Resolves the declared language to its wire value, falling back to `cn`.
     ///
     /// Python parity: `resolve_language`, which treats an absent or unknown value as the default
@@ -181,6 +208,7 @@ impl Default for TeamBuildDeps {
             observability_hooks: Vec::new(),
             kv_cache: None,
             routing: None,
+            checkpoints: None,
         }
     }
 }
@@ -199,6 +227,10 @@ impl fmt::Debug for TeamBuildDeps {
             .field("observability_hooks", &self.observability_hooks.len())
             .field("kv_cache", &self.kv_cache.is_some())
             .field("routing", &self.routing.is_some())
+            .field(
+                "checkpoints",
+                &self.checkpoints.as_ref().map(|store| store.name()),
+            )
             .finish()
     }
 }
@@ -210,7 +242,9 @@ mod tests {
     use openjiuwen_harness_protocol::HarnessProtocol;
 
     use super::*;
-    use crate::harness::{MemberHarnessContext, NATIVE_FACTORY_NAME};
+    use crate::harness::{
+        InMemoryMemberCheckpointStore, MemberHarnessContext, NATIVE_FACTORY_NAME,
+    };
     use crate::schema::DeepAgentSpec;
     use crate::storage::MEMORY_STORAGE_KIND;
 
@@ -245,6 +279,11 @@ mod tests {
         );
         assert_eq!(deps.language, None);
         assert_eq!(deps.resolved_language(), "cn");
+        assert!(
+            deps.checkpoints.is_none(),
+            "the default has no checkpoint store"
+        );
+        assert!(!deps.has_injected_checkpoints());
     }
 
     #[test]
@@ -313,6 +352,29 @@ mod tests {
     }
 
     #[test]
+    fn with_checkpoint_store_overrides_only_the_checkpoints() {
+        let base = TeamBuildDeps::default();
+        let store = InMemoryMemberCheckpointStore::shared();
+        let deps = base.clone().with_checkpoint_store(Arc::clone(&store));
+
+        let injected = deps
+            .checkpoints
+            .as_ref()
+            .expect("the checkpoint store was injected");
+        assert!(Arc::ptr_eq(injected, &store));
+        assert_eq!(injected.name(), "memory");
+        assert!(deps.has_injected_checkpoints());
+        assert!(!base.has_injected_checkpoints());
+        assert!(Arc::ptr_eq(&deps.harness_factory, &base.harness_factory));
+        assert!(Arc::ptr_eq(&deps.store, &base.store));
+        assert!(Arc::ptr_eq(&deps.workspace, &base.workspace));
+        assert_eq!(deps.language, base.language);
+        assert_eq!(deps.store_injected, base.store_injected);
+        assert!(deps.routing.is_none());
+        assert!(format!("{deps:?}").contains("checkpoints: Some(\"memory\")"));
+    }
+
+    #[test]
     fn resolved_language_accepts_wire_values_and_falls_back() {
         let cases = [
             (None, "cn"),
@@ -341,5 +403,6 @@ mod tests {
         assert!(debug.contains("injected"), "{debug}");
         assert!(debug.contains("store_injected: false"), "{debug}");
         assert!(debug.contains("language: None"), "{debug}");
+        assert!(debug.contains("checkpoints: None"), "{debug}");
     }
 }
