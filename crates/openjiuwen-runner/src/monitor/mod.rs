@@ -137,7 +137,9 @@ impl RunMonitor {
     /// [`Error::NotFound`](openjiuwen_common::error::Error::NotFound) when the id is
     /// unknown (or was evicted), and
     /// [`Error::Validation`](openjiuwen_common::error::Error::Validation) when the
-    /// run already reached a terminal phase.
+    /// run already reached a terminal phase, or when `phase` is itself terminal
+    /// (a terminal phase must go through [`finish`](Self::finish) so
+    /// `finished_at` is stamped and the run is retained).
     pub fn update(&self, run_id: &str, phase: RunPhase, detail: Value) -> Result<RunStatus> {
         self.inner.update(run_id, phase, detail)
     }
@@ -429,6 +431,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_terminal_phase_must_go_through_finish() {
+        let monitor = RunMonitor::new();
+        let created = monitor.begin(start(RunKind::Workflow, "wf"));
+        monitor
+            .update(&created.run_id, RunPhase::Running, Value::Null)
+            .expect("running");
+        for phase in [RunPhase::Completed, RunPhase::Failed, RunPhase::Cancelled] {
+            let error = monitor
+                .update(&created.run_id, phase, Value::Null)
+                .expect_err("terminal update");
+            assert_eq!(error.kind(), ErrorKind::Validation);
+            assert!(
+                error.to_string().contains("must be finished with `finish`"),
+                "unexpected message: {error}"
+            );
+        }
+        let status = monitor.snapshot(&created.run_id).expect("still live");
+        assert_eq!(status.phase, RunPhase::Running);
+        assert!(status.finished_at.is_none());
+        assert_eq!(
+            monitor.list_active().len(),
+            1,
+            "a rejected terminal update keeps the run live"
+        );
+        assert_eq!(monitor.history(&created.run_id).expect("history").len(), 2);
+    }
     #[test]
     fn subscribers_receive_events_in_order() {
         let monitor = RunMonitor::new();

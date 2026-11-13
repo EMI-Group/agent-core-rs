@@ -44,6 +44,16 @@ fn not_tracked(run_id: &str) -> Error {
 fn already_finished(run_id: &str) -> Error {
     Error::Validation(format!("run '{run_id}' has already finished"))
 }
+/// A terminal phase requested through `update`: only `finish` may end a run.
+///
+/// A terminal phase reached through `update` would record no `finished_at` and
+/// enter no retention slot, leaving a run that looks finished but is neither
+/// retained nor listable, so it is rejected instead.
+fn terminal_needs_finish(run_id: &str) -> Error {
+    Error::Validation(format!(
+        "run '{run_id}' must be finished with `finish`, not `update` to a terminal phase"
+    ))
+}
 
 /// The mutable run table, guarded as one unit so a status and its history never
 /// diverge.
@@ -109,6 +119,9 @@ impl Inner {
                 .ok_or_else(|| not_tracked(run_id))?;
             if status.phase.is_terminal() {
                 return Err(already_finished(run_id));
+            }
+            if phase.is_terminal() {
+                return Err(terminal_needs_finish(run_id));
             }
             status.phase = phase;
             status.detail = detail;

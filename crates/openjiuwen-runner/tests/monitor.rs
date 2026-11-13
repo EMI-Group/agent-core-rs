@@ -312,27 +312,25 @@ fn unknown_ids_and_terminal_transitions_report_typed_errors() {
         "a rejected transition changes nothing"
     );
 
-    // `update` validates the run's *current* phase, not the requested one: a live
-    // run accepts a terminal phase through `update`, which records the phase but
-    // never stamps `finished_at` (only `finish` does) and leaves the active list.
+    // A terminal phase must go through `finish`: `update` only advances live
+    // runs, so a terminal update is rejected without changing the run.
     let live = monitor.begin(RunStart::new(RunKind::Workflow, "wf"));
-    let terminal = monitor
-        .update(&live.run_id, RunPhase::Failed, json!({"step": "llm"}))
-        .expect("a live run accepts any phase");
-    assert_eq!(terminal.phase, RunPhase::Failed);
-    assert!(
-        terminal.finished_at.is_none(),
-        "`update` never stamps the terminal timestamp"
-    );
+    for phase in [RunPhase::Completed, RunPhase::Failed, RunPhase::Cancelled] {
+        let error = monitor
+            .update(&live.run_id, phase, json!({"step": "llm"}))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("must be finished with `finish`"));
+    }
+    let status = monitor.snapshot(&live.run_id).expect("still live");
+    assert_eq!(status.phase, RunPhase::Queued);
+    assert!(status.finished_at.is_none());
     assert_eq!(
-        monitor.list_active(),
-        Vec::new(),
-        "a terminal phase leaves the active list"
+        monitor.list_active().len(),
+        1,
+        "a rejected terminal update keeps the run live"
     );
-    let after = monitor
-        .update(&live.run_id, RunPhase::Running, Value::Null)
-        .unwrap_err();
-    assert_eq!(after.kind(), ErrorKind::Validation);
+    assert_eq!(monitor.history(&live.run_id).expect("history").len(), 1);
 }
 
 // ---------------------------------------------------------------------------

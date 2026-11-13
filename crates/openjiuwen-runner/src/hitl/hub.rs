@@ -524,7 +524,7 @@ impl InteractionHub {
             entry.pending.clear();
             entry.session.clone().map(|session| (session, ids))
         };
-        self.mirror(run_id, RunPhase::Cancelled);
+        self.mirror_cancelled(run_id);
 
         if let Some((session, ids)) = deliveries {
             if !ids.is_empty() {
@@ -629,6 +629,32 @@ impl InteractionHub {
                 %error,
                 "run status mirror failed"
             );
+        }
+    }
+    /// Finalises a cancelled run on the monitor with `finish`.
+    ///
+    /// A terminal phase never goes through `update`, so the mirrored run gets its
+    /// `finished_at` stamped and enters the retention queue. A monitor that does
+    /// not track the run, or that already finished it, is logged and ignored.
+    fn mirror_cancelled(&self, run_id: &str) {
+        let Some(monitor) = self.monitor.as_ref() else {
+            return;
+        };
+        match monitor.snapshot(run_id) {
+            Ok(status) if !status.is_terminal() => {
+                if let Err(error) = monitor.finish(run_id, RunOutcome::cancelled()) {
+                    warn!(
+                        target: TARGET,
+                        run_id,
+                        %error,
+                        "run status finish failed"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                debug!(target: TARGET, run_id, %error, "monitor did not track the run");
+            }
         }
     }
 }
