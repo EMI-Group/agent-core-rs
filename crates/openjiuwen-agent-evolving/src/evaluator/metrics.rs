@@ -4,19 +4,26 @@
 //!
 //! - [`Metric`] and [`MetricValue`] — the scoring seam and its result shape.
 //! - [`ExactMatchMetric`] — offline string/JSON equality, optionally normalized.
-//! - [`LlmAsJudgeMetric`] — API-shaped stub for the deferred model judge.
+//! - [`LlmAsJudgeMetric`] — scores verdict-shaped predictions produced by a
+//!   judge model (the live model path is
+//!   [`LlmJudgeEvaluator`](super::judge::LlmJudgeEvaluator)).
+//! - [`DefaultEvaluator`] — the Python entry point: it scores with a model
+//!   judge when one is configured and with a deterministic metric otherwise.
 //! - [`MetricEvaluator`] — runs every metric and aggregates the ordered values
 //!   with [`Aggregate::Mean`] or [`Aggregate::First`], exposing the per-metric
 //!   breakdown.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
+use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::judge::{fallback_evaluated, judge_evaluated, JudgeRubric, JudgeVerdict, LlmJudge};
 use super::Evaluator;
 use crate::dataset::{Case, EvaluatedCase};
 
@@ -50,7 +57,7 @@ pub trait Metric: Send + Sync {
     /// # Errors
     ///
     /// Implementations may return an error when scoring cannot proceed (for
-    /// example the deferred model-judge metric).
+    /// example a verdict with a non-finite score).
     fn compute(&self, prediction: &Value, label: &BTreeMap<String, Value>) -> Result<MetricValue>;
 }
 
@@ -158,20 +165,46 @@ impl Metric for ExactMatchMetric {
     }
 }
 
-/// The deferred LLM-as-judge metric.
+/// The deterministic LLM-as-judge metric.
 ///
 /// Python: `openjiuwen.agent_evolving.evaluator.metrics.llm_as_judge.LlmAsJudgeMetric`.
-/// The Python implementation calls a live model with a judge prompt, which is
-/// non-deterministic and needs provider credentials; this crate keeps the type
-/// and returns [`Error::Unsupported`] instead.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LlmAsJudgeMetric;
+/// Python calls a live model from `compute`; that path is async and needs
+/// provider credentials, so it lives in
+/// [`LlmJudgeEvaluator`](super::judge::LlmJudgeEvaluator) instead. This metric is
+/// the offline counterpart: it scores a prediction that already *is* a verdict
+/// (a JSON object, or a string containing one) by parsing it with
+/// [`JudgeVerdict::parse`], which keeps recorded model responses replayable
+/// without a network.
+///
+/// Predictions that are not verdict-shaped fall back to [`ExactMatchMetric`], so
+/// a dataset of plain answers still scores instead of failing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct LlmAsJudgeMetric {
+    /// The rubric scores are read against.
+    rubric: JudgeRubric,
+}
 
 impl LlmAsJudgeMetric {
-    /// Creates the stub metric.
+    /// Creates the metric with the default rubric.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            rubric: JudgeRubric::default_rubric(),
+        }
+    }
+
+    /// Replaces the rubric.
+    #[must_use]
+    pub fn with_rubric(mut self, rubric: JudgeRubric) -> Self {
+        self.rubric = rubric;
+        self
+    }
+
+    /// The rubric scores are read against.
+    #[must_use]
+    pub fn rubric(&self) -> &JudgeRubric {
+        &self.rubric
     }
 }
 
@@ -180,41 +213,157 @@ impl Metric for LlmAsJudgeMetric {
         "llm_as_judge"
     }
 
-    fn compute(
-        &self,
-        _prediction: &Value,
-        _label: &BTreeMap<String, Value>,
-    ) -> Result<MetricValue> {
-        Err(Error::unsupported(
-            "LlmAsJudgeMetric is deferred: it requires a live model and is non-deterministic; see docs/PARITY.md",
-        ))
+    fn compute(&self, prediction: &Value, label: &BTreeMap<String, Value>) -> Result<MetricValue> {
+        let verdict_text = match prediction {
+            Value::String(text) => Some(text.clone()),
+            Value::Null => None,
+            other => Some(other.to_string()),
+        };
+        if let Some(text) = verdict_text {
+            if let Ok(verdict) = JudgeVerdict::parse(&text, &self.rubric) {
+                return Ok(MetricValue::Scalar(verdict.score));
+            }
+        }
+        ExactMatchMetric::new().compute(prediction, label)
     }
 }
 
-/// The deferred default (model-judge) evaluator.
+/// The Python default evaluator: a model judge with a deterministic fallback.
 ///
 /// Python: `openjiuwen.agent_evolving.evaluator.evaluator.DefaultEvaluator`.
-/// Python scores cases by calling a live model with a judge prompt, which needs
-/// provider credentials and is non-deterministic; this crate keeps the type and
-/// returns [`Error::Unsupported`] instead.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Python constructs a model client in `__init__` and judges every case; this
+/// port keeps the same shape while allowing a model-less instance, which scores
+/// with the fallback metric and says so in the reason.
+///
+/// The judge is chosen in this order:
+///
+/// 1. an explicit [`LlmJudge`] installed with
+///    [`with_judge`](Self::with_judge);
+/// 2. a model installed with [`with_model`](Self::with_model), wrapped in a
+///    [`LlmJudge`] per evaluation (configuration errors propagate);
+/// 3. no judge — the fallback metric scores the case.
+///
+/// A judge failure is never swallowed: the reason names the error and the
+/// fallback metric that produced the score.
+#[derive(Clone)]
 pub struct DefaultEvaluator {
     metric: String,
+    fallback: Arc<dyn Metric>,
+    judge: Option<Arc<LlmJudge>>,
+    model: Option<Arc<dyn Model>>,
+    rubric: JudgeRubric,
+    request: ModelRequestConfig,
+}
+
+impl fmt::Debug for DefaultEvaluator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DefaultEvaluator")
+            .field("metric", &self.metric)
+            .field("fallback", &self.fallback.name())
+            .field("judge", &self.judge)
+            .field("model", &self.model.as_deref().map(Model::model_name))
+            .field("rubric", &self.rubric)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+impl Default for DefaultEvaluator {
+    /// Equivalent to `DefaultEvaluator::new("")`, which scores by exact match.
+    fn default() -> Self {
+        Self::new("")
+    }
 }
 
 impl DefaultEvaluator {
-    /// Creates the stub evaluator for the named metric.
+    /// Creates an evaluator for the named metric.
+    ///
+    /// The name selects the deterministic fallback: `"llm_as_judge"` uses
+    /// [`LlmAsJudgeMetric`], `"exact_match"` and the empty name use
+    /// [`ExactMatchMetric`], and an unknown name keeps [`ExactMatchMetric`] so a
+    /// typo degrades to the offline baseline instead of failing.
     #[must_use]
     pub fn new(metric: impl Into<String>) -> Self {
+        let metric = metric.into();
+        let fallback: Arc<dyn Metric> = match metric.as_str() {
+            "llm_as_judge" => Arc::new(LlmAsJudgeMetric::new()),
+            _ => Arc::new(ExactMatchMetric::new()),
+        };
         Self {
-            metric: metric.into(),
+            metric,
+            fallback,
+            judge: None,
+            model: None,
+            rubric: JudgeRubric::default_rubric(),
+            request: ModelRequestConfig::default(),
         }
     }
 
-    /// The metric name the Python evaluator would have scored with.
+    /// Creates an exact-match evaluator, the offline default.
+    #[must_use]
+    pub fn exact_match() -> Self {
+        Self::new("exact_match")
+    }
+
+    /// The metric name the evaluator was created with.
     #[must_use]
     pub fn metric(&self) -> &str {
         &self.metric
+    }
+
+    /// Installs the judge and adopts a copy of its rubric.
+    #[must_use]
+    pub fn with_judge(mut self, judge: Arc<LlmJudge>) -> Self {
+        self.rubric = judge.rubric().clone();
+        self.judge = Some(judge);
+        self
+    }
+
+    /// Installs the model a judge is built from on every evaluation.
+    #[must_use]
+    pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Replaces the rubric the judge scores against.
+    #[must_use]
+    pub fn with_rubric(mut self, rubric: JudgeRubric) -> Self {
+        self.rubric = rubric;
+        self
+    }
+
+    /// Replaces the deterministic metric used when no judge can score.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: Arc<dyn Metric>) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// Replaces the request configuration sent with every judge call.
+    #[must_use]
+    pub fn with_request(mut self, request: ModelRequestConfig) -> Self {
+        self.request = request;
+        self
+    }
+
+    /// The rubric the judge scores against.
+    #[must_use]
+    pub fn rubric(&self) -> &JudgeRubric {
+        &self.rubric
+    }
+
+    /// The deterministic metric used when no judge can score.
+    #[must_use]
+    pub fn fallback(&self) -> &dyn Metric {
+        self.fallback.as_ref()
+    }
+
+    /// The installed judge, if any.
+    #[must_use]
+    pub fn judge(&self) -> Option<&LlmJudge> {
+        self.judge.as_deref()
     }
 }
 
@@ -225,10 +374,41 @@ impl Evaluator for DefaultEvaluator {
     }
 
     async fn evaluate(&self, case: &Case, prediction: &Value) -> Result<EvaluatedCase> {
-        let _ = (case, prediction);
-        Err(Error::unsupported(
-            "DefaultEvaluator is deferred: it requires a live model judge and is non-deterministic; see docs/PARITY.md",
-        ))
+        if let Some(judge) = &self.judge {
+            return match judge.judge(case, prediction).await {
+                Ok(verdict) => judge_evaluated(case, &verdict),
+                Err(error) => fallback_evaluated(
+                    case,
+                    prediction,
+                    self.fallback.as_ref(),
+                    Some(&error),
+                    "the judge call failed",
+                ),
+            };
+        }
+
+        if let Some(model) = &self.model {
+            let judge =
+                LlmJudge::new(Arc::clone(model), self.rubric.clone(), self.request.clone())?;
+            return match judge.judge(case, prediction).await {
+                Ok(verdict) => judge_evaluated(case, &verdict),
+                Err(error) => fallback_evaluated(
+                    case,
+                    prediction,
+                    self.fallback.as_ref(),
+                    Some(&error),
+                    "the judge call failed",
+                ),
+            };
+        }
+
+        fallback_evaluated(
+            case,
+            prediction,
+            self.fallback.as_ref(),
+            None,
+            "no judge model is configured",
+        )
     }
 }
 
@@ -284,7 +464,7 @@ impl MetricEvaluator {
 }
 
 /// Coerces a non-finite score to `0.0` so aggregation never propagates `NaN`.
-fn finite_or_zero(value: f64) -> f64 {
+pub(super) fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() {
         value
     } else {
@@ -345,6 +525,11 @@ impl Evaluator for MetricEvaluator {
 
 #[cfg(test)]
 mod tests {
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use openjiuwen_core::foundation::llm::{ChatResponse, StreamChunk};
+    use openjiuwen_core::foundation::prompt::BaseMessage;
+
     use super::*;
 
     fn map(key: &str, value: Value) -> BTreeMap<String, Value> {
@@ -390,6 +575,38 @@ mod tests {
 
     fn scalar(value: f64) -> Arc<dyn Metric> {
         named_scalar("scalar", value)
+    }
+
+    /// A model whose calls always fail, standing in for an unreachable provider.
+    struct FixedModel;
+
+    #[async_trait]
+    impl Model for FixedModel {
+        fn provider(&self) -> &'static str {
+            "fixed"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "fixed-judge"
+        }
+
+        async fn invoke(
+            &self,
+            _messages: &[BaseMessage],
+            _request: &ModelRequestConfig,
+        ) -> Result<ChatResponse> {
+            Err(openjiuwen_common::error::Error::llm(
+                "no provider in unit tests",
+            ))
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<BaseMessage>,
+            _request: ModelRequestConfig,
+        ) -> BoxStream<'static, Result<StreamChunk>> {
+            futures::stream::empty().boxed()
+        }
     }
 
     #[test]
@@ -487,36 +704,122 @@ mod tests {
     }
 
     #[test]
-    fn stub_metric_returns_unsupported() {
-        let error = LlmAsJudgeMetric::new()
-            .compute(&Value::Null, &map("answer", Value::String("x".to_owned())))
-            .unwrap_err();
-        assert!(
-            matches!(&error, Error::Unsupported(message) if message.contains("LlmAsJudgeMetric")),
-            "unexpected error: {error}"
+    fn llm_as_judge_metric_scores_verdict_shaped_predictions() {
+        let metric = LlmAsJudgeMetric::new();
+        assert_eq!(metric.name(), "llm_as_judge");
+        assert!(metric.higher_is_better());
+        assert_eq!(metric.rubric().max_score(), 10.0);
+
+        let label = map("answer", Value::String("4".to_owned()));
+        // `8` on the rubric's 0..10 scale normalises to 0.8.
+        assert_eq!(
+            metric
+                .compute(&serde_json::json!({"score": 8, "reasoning": "ok"}), &label)
+                .unwrap(),
+            MetricValue::Scalar(0.8)
         );
-        assert_eq!(LlmAsJudgeMetric::new().name(), "llm_as_judge");
-        assert!(LlmAsJudgeMetric::new().higher_is_better());
+        // A verdict carried as a JSON string scores the same way.
+        assert_eq!(
+            metric
+                .compute(&Value::String("{\"score\": 10}".to_owned()), &label)
+                .unwrap(),
+            MetricValue::Scalar(1.0)
+        );
+        // A prediction that is not verdict-shaped falls back to exact match.
+        assert_eq!(
+            metric
+                .compute(&Value::String("4".to_owned()), &label)
+                .unwrap(),
+            MetricValue::Scalar(1.0)
+        );
+        assert_eq!(
+            metric
+                .compute(&Value::String("5".to_owned()), &label)
+                .unwrap(),
+            MetricValue::Scalar(0.0)
+        );
+        assert_eq!(
+            metric.compute(&Value::Null, &label).unwrap(),
+            MetricValue::Scalar(0.0)
+        );
     }
 
     #[tokio::test]
-    async fn default_evaluator_is_an_unsupported_stub() {
+    async fn default_evaluator_scores_without_a_model() {
         let evaluator = DefaultEvaluator::new("accuracy");
         assert_eq!(evaluator.name(), "default");
         assert_eq!(evaluator.metric(), "accuracy");
         assert_eq!(DefaultEvaluator::default().metric(), "");
+        assert!(evaluator.judge().is_none());
+        assert_eq!(evaluator.fallback().name(), "exact_match");
 
+        let matching = case(map("answer", Value::String("x".to_owned())));
+        let evaluated = evaluator
+            .evaluate(&matching, &Value::String("x".to_owned()))
+            .await
+            .unwrap();
+        assert!(close(evaluated.score, 1.0), "score: {}", evaluated.score);
+        assert!(
+            evaluated.reason.contains("no judge model is configured")
+                && evaluated.reason.contains("exact_match"),
+            "reason: {}",
+            evaluated.reason
+        );
+        let per_metric = evaluated.per_metric.expect("per-metric breakdown");
+        assert!(close(per_metric["exact_match"], 1.0));
+
+        let evaluated = evaluator
+            .evaluate(&matching, &Value::String("y".to_owned()))
+            .await
+            .unwrap();
+        assert!(close(evaluated.score, 0.0), "score: {}", evaluated.score);
+
+        // `"llm_as_judge"` selects the verdict-parsing fallback metric.
+        let judge_metric = DefaultEvaluator::new("llm_as_judge");
+        assert_eq!(judge_metric.fallback().name(), "llm_as_judge");
+        let evaluated = judge_metric
+            .evaluate(&matching, &serde_json::json!({"score": 5}))
+            .await
+            .unwrap();
+        assert!(close(evaluated.score, 0.5), "score: {}", evaluated.score);
+        assert_eq!(DefaultEvaluator::exact_match().metric(), "exact_match");
+    }
+
+    #[tokio::test]
+    async fn default_evaluator_propagates_an_invalid_rubric() {
+        let evaluator = DefaultEvaluator::new("exact_match")
+            .with_rubric(JudgeRubric::new(Vec::new(), 10.0, 0.6))
+            .with_model(Arc::new(FixedModel));
         let error = evaluator
             .evaluate(
                 &case(map("answer", Value::String("x".to_owned()))),
-                &Value::Null,
+                &Value::String("x".to_owned()),
             )
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Unsupported(message)
-                if message.contains("DefaultEvaluator") && message.contains("docs/PARITY.md")),
+            matches!(&error, openjiuwen_common::error::Error::Validation(message)
+                if message.contains("criterion")),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_evaluator_falls_back_when_the_judge_fails() {
+        let evaluator = DefaultEvaluator::new("exact_match").with_model(Arc::new(FixedModel));
+        let evaluated = evaluator
+            .evaluate(
+                &case(map("answer", Value::String("x".to_owned()))),
+                &Value::String("x".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert!(close(evaluated.score, 1.0), "score: {}", evaluated.score);
+        assert!(
+            evaluated.reason.contains("the judge call failed")
+                && evaluated.reason.contains("exact_match"),
+            "reason: {}",
+            evaluated.reason
         );
     }
 
