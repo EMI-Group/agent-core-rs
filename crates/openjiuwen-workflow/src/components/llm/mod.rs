@@ -18,14 +18,38 @@
 //! input under `"inputs"`. Only the `{{name}}` delimiters of
 //! [`PromptTemplate`] are placeholders; single-brace `{name}` stays literal.
 //!
+//! # Response formatting
+//!
+//! `response_format` is applied in two steps, both ported from Python:
+//!
+//! - `format_prompt` (Python `LLMPromptFormatter.format_prompt`) rewrites the
+//!   **last** user message with a format instruction — `DEFAULT_MARKDOWN_INSTRUCTION`
+//!   / `DEFAULT_JSON_INSTRUCTION`, or the `markdown_instruction` /
+//!   `json_instruction` override. JSON embeds the compact schema produced by
+//!   `generate_json_schema` (Python `SchemaGenerator.generate_json_schema`).
+//! - `shape_output` (Python `OutputFormatter.format_response` /
+//!   `_format_text_response` / `_format_json_response`) turns the answer into the
+//!   configured output object. JSON replies are parsed by
+//!   `JsonParser.parse_json_content` after `_clean_markdown_blocks`, so a fenced
+//!   ` ```json … ``` ` answer is accepted.
+//!
+//! A JSON-format `stream` is one non-streaming `Model::invoke` call whose whole
+//! answer is shaped and yielded as a single frame (Python
+//! `_invoke_for_json_format`). Text and markdown streams keep one frame per
+//! non-empty content delta.
+//!
+//! No provider `response_format` parameter is ever sent: Python shapes the answer
+//! text instead of asking the provider, and this component does the same.
+//! Configuration failures use `[101002]` (text/markdown must name exactly one
+//! output field) and JSON parsing/validation failures use `[101004]`. The schema
+//! embedded in a prompt is serialized compactly, whereas Python's `json.dumps`
+//! inserts spaces after `:` and `,`; the value only ever appears inside a prompt.
+//!
 //! # Deferred behavior
 //!
 //! - `enable_history` is carried for builder/spec parity but history insertion is
 //!   deferred: there is no history source on [`ComponentContext`] yet, and
 //!   inventing one would change the observable conversation.
-//! - `response_format` is carried but does not reshape the answer; Python applies
-//!   the format through a post-processing step that needs a JSON-schema
-//!   generator.
 //! - Stream frames are content deltas: each frame carries the
 //!   [`StreamChunk::Delta`](openjiuwen_foundation::StreamChunk::Delta) text, not the
 //!   accumulated answer.
@@ -49,11 +73,13 @@ use crate::component::{Component, ComponentCard};
 use crate::context::ComponentContext;
 use crate::error::llm_invoke_call_failed;
 
+mod format;
+
 /// The requested shape of the model answer.
 ///
 /// Serializes as a `snake_case` string (`"text"`, `"markdown"`, `"json"`), the form
-/// Python stores in `response_format["type"]`. The value is carried for
-/// configuration parity; see the module docs for the deferred post-processing.
+/// Python stores in `response_format["type"]`. The value drives both the prompt
+/// instruction and the shaped output object; see the module docs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmResponseFormat {
@@ -105,6 +131,10 @@ pub struct LlmCompConfig {
     pub template_content: Vec<BaseMessage>,
     /// Requested answer shape.
     pub response_format: LlmResponseFormat,
+    /// Overrides the default markdown instruction (`response_format["markdownInstruction"]` in Python).
+    pub markdown_instruction: Option<String>,
+    /// Overrides the default JSON instruction (`response_format["jsonInstruction"]` in Python).
+    pub json_instruction: Option<String>,
     /// Python `output_config`; its first key names the output field.
     pub output_config: Option<Value>,
     /// Whether history is inserted before the call; deferred (see module docs).
@@ -121,6 +151,8 @@ impl fmt::Debug for LlmCompConfig {
             .field("user_prompt_template", &self.user_prompt_template)
             .field("template_content", &self.template_content)
             .field("response_format", &self.response_format)
+            .field("markdown_instruction", &self.markdown_instruction)
+            .field("json_instruction", &self.json_instruction)
             .field("output_config", &self.output_config)
             .field("enable_history", &self.enable_history)
             .finish()
@@ -174,6 +206,24 @@ impl LlmCompConfig {
     #[must_use]
     pub fn with_response_format(mut self, response_format: LlmResponseFormat) -> Self {
         self.response_format = response_format;
+        self
+    }
+
+    /// Overrides the default markdown instruction.
+    ///
+    /// `${query}` in the instruction is replaced by the rendered user text.
+    #[must_use]
+    pub fn with_markdown_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.markdown_instruction = Some(instruction.into());
+        self
+    }
+
+    /// Overrides the default JSON instruction.
+    ///
+    /// `${query}` and `${json_schema}` are replaced before the call.
+    #[must_use]
+    pub fn with_json_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.json_instruction = Some(instruction.into());
         self
     }
 
@@ -238,14 +288,12 @@ impl LlmComponent {
 
     /// The key the answer is written under.
     ///
-    /// This is the first key of `output_config` when it is a JSON object with at
-    /// least one key, otherwise `"result"` (Python's `outputs_config` default).
+    /// This is the first key of the normalized `output_config`, otherwise `"result"`
+    /// (Python's `outputs_config` default; see `format::output_config_object`).
     #[must_use]
     pub fn output_key(&self) -> String {
-        self.config
-            .output_config
-            .as_ref()
-            .and_then(Value::as_object)
+        format::output_config_object(self.config.output_config.as_ref())
+            .as_object()
             .and_then(|object| object.keys().next().cloned())
             .unwrap_or_else(|| "result".to_owned())
     }
@@ -281,7 +329,7 @@ impl LlmComponent {
     }
 
     /// The wire frame carrying one answer fragment.
-    fn frame(output_key: &str, text: &str) -> Value {
+    pub(super) fn frame(output_key: &str, text: &str) -> Value {
         let mut output = serde_json::Map::new();
         output.insert(output_key.to_owned(), Value::String(text.to_owned()));
         Value::Object(output)
@@ -336,7 +384,13 @@ impl Component for LlmComponent {
     }
 
     async fn invoke(&self, inputs: Value, _ctx: &ComponentContext) -> Result<Value> {
-        let messages = self.build_messages(&inputs);
+        let messages = format::format_prompt(
+            self.build_messages(&inputs),
+            self.config.response_format,
+            self.config.markdown_instruction.as_deref(),
+            self.config.json_instruction.as_deref(),
+            self.config.output_config.as_ref(),
+        );
         let response: ChatResponse = self
             .model
             .invoke(&messages, &self.config.request)
@@ -346,7 +400,11 @@ impl Component for LlmComponent {
             .message()
             .map(|message| message.text().into_owned())
             .unwrap_or_default();
-        Ok(Self::frame(&self.output_key(), &text))
+        format::shape_output(
+            &text,
+            self.config.response_format,
+            self.config.output_config.as_ref(),
+        )
     }
 
     fn stream(
@@ -354,9 +412,46 @@ impl Component for LlmComponent {
         inputs: Value,
         _ctx: Arc<ComponentContext>,
     ) -> BoxStream<'static, Result<Value>> {
-        let messages = self.build_messages(&inputs);
+        let messages = format::format_prompt(
+            self.build_messages(&inputs),
+            self.config.response_format,
+            self.config.markdown_instruction.as_deref(),
+            self.config.json_instruction.as_deref(),
+            self.config.output_config.as_ref(),
+        );
         let request = self.config.request.clone();
-        let output_key = self.output_key();
+        let response_format = self.config.response_format;
+        let output_config = self.config.output_config.clone();
+
+        // Python's `_invoke_for_json_format`: a JSON answer cannot be shaped per
+        // delta, so the stream is one non-streaming call yielding one frame.
+        if response_format == LlmResponseFormat::Json {
+            let model = Arc::clone(&self.model);
+            return Box::pin(async_stream::stream! {
+                match model.invoke(&messages, &request).await {
+                    Err(error) => yield Err(llm_invoke_call_failed(&format!("{error}"))),
+                    Ok(response) => {
+                        let text = response
+                            .message()
+                            .map(|message| message.text().into_owned())
+                            .unwrap_or_default();
+                        match format::shape_output(&text, response_format, output_config.as_ref()) {
+                            Ok(value) => yield Ok(value),
+                            Err(error) => yield Err(error),
+                        }
+                    }
+                }
+            });
+        }
+
+        // The one-field rule is a configuration error, so it fails before any frame
+        // is produced rather than on the first delta.
+        if let Err(error) = format::single_output_key(output_config.as_ref()) {
+            return Box::pin(futures::stream::iter(std::iter::once(Err::<Value, Error>(
+                error,
+            ))));
+        }
+
         let mut source = self.model.stream(messages, request);
         Box::pin(async_stream::stream! {
             while let Some(item) = source.next().await {
@@ -370,7 +465,17 @@ impl Component for LlmComponent {
                     Ok(chunk) => {
                         if let Some(text) = chunk.content() {
                             if !text.is_empty() {
-                                yield Ok(LlmComponent::frame(&output_key, text));
+                                match format::shape_output(
+                                    text,
+                                    response_format,
+                                    output_config.as_ref(),
+                                ) {
+                                    Ok(value) => yield Ok(value),
+                                    Err(error) => {
+                                        yield Err(error);
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -536,7 +641,7 @@ mod tests {
         let model = ScriptedModel::text("answer");
         let llm = component(LlmCompConfig {
             model: Some(Arc::new(model)),
-            output_config: Some(json!({"answer": {"type": "string"}, "other": {}})),
+            output_config: Some(json!({"answer": {"type": "string"}})),
             ..LlmCompConfig::default()
         });
 
@@ -674,6 +779,8 @@ mod tests {
             .with_user_prompt("u")
             .with_template_content(vec![BaseMessage::user("t")])
             .with_response_format(LlmResponseFormat::Json)
+            .with_markdown_instruction("md ${query}")
+            .with_json_instruction("json ${json_schema} ${query}")
             .with_output_config(json!({"out": {}}))
             .with_enable_history(true);
 
@@ -683,6 +790,11 @@ mod tests {
         assert_eq!(config.user_prompt_template.as_deref(), Some("u"));
         assert_eq!(config.template_content.len(), 1);
         assert_eq!(config.response_format, LlmResponseFormat::Json);
+        assert_eq!(config.markdown_instruction.as_deref(), Some("md ${query}"));
+        assert_eq!(
+            config.json_instruction.as_deref(),
+            Some("json ${json_schema} ${query}")
+        );
         assert_eq!(config.output_config, Some(json!({"out": {}})));
         assert!(config.enable_history);
 

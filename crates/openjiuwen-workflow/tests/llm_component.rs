@@ -24,14 +24,16 @@ mod common;
 use std::sync::Arc;
 
 use futures::StreamExt;
+use openjiuwen_common::error::Error;
 use openjiuwen_foundation::{Model, Role, StreamChunk};
 use openjiuwen_session::Session;
 use openjiuwen_test_support::{CallMode, ModelCall, ScriptedModel};
 use serde_json::{json, Value};
 
 use openjiuwen_workflow::{
-    ComponentOptions, EndComponent, LlmCompConfig, LlmComponent, StartComponent, Workflow,
-    WorkflowChunk, WorkflowExecutionState, END_NODE_STREAM, WORKFLOW_FINAL,
+    ComponentOptions, EndComponent, LlmCompConfig, LlmComponent, LlmResponseFormat, StartComponent,
+    Workflow, WorkflowChunk, WorkflowExecutionState, WorkflowOutput, END_NODE_STREAM,
+    WORKFLOW_FINAL,
 };
 
 use common::{assistant_text, card, end_with_template, llm_component, session};
@@ -139,7 +141,7 @@ async fn output_config_names_the_answer_field() {
     let llm = LlmComponent::new(LlmCompConfig {
         model: Some(model),
         user_prompt_template: Some("{{query}}".to_owned()),
-        output_config: Some(json!({"answer": {"type": "string"}, "other": {}})),
+        output_config: Some(json!({"answer": {"type": "string"}})),
         ..LlmCompConfig::default()
     })
     .unwrap();
@@ -389,5 +391,191 @@ async fn two_llm_nodes_each_get_their_own_turn_and_compose() {
     assert_eq!(
         output.result,
         json!({"output": {"result": "second answer"}})
+    );
+}
+
+/// Runs `start -> llm -> end`, with the end node reading `${llm.<answer_key>}`.
+async fn invoke_llm(
+    id: &str,
+    llm: LlmComponent,
+    answer_key: &str,
+    query: &str,
+) -> Result<WorkflowOutput, Error> {
+    let mut workflow = Workflow::new(card(id));
+    workflow
+        .set_start_comp(
+            "start",
+            StartComponent::new(),
+            ComponentOptions::new().with_inputs_schema(json!({"query": "${inputs.query}"})),
+        )
+        .add_workflow_comp(
+            "llm",
+            llm,
+            ComponentOptions::new().with_inputs_schema(json!({"query": "${start.query}"})),
+        )
+        .set_end_comp(
+            "end",
+            EndComponent::new(),
+            ComponentOptions::new()
+                .with_inputs_schema(json!({"answer": format!("${{llm.{answer_key}}}")})),
+        )
+        .add_connection("start", "llm")
+        .add_connection("llm", "end");
+
+    workflow
+        .invoke(json!({ "query": query }), session(id))
+        .await
+}
+
+// port of openjiuwen/core/workflow/components/llm/llm_comp.py::LLMPromptFormatter.format_prompt
+#[tokio::test]
+async fn markdown_format_rewrites_the_prompt_and_keeps_the_answer_key() {
+    let (turns, model) = scripted(ScriptedModel::builder().respond_text("**bold**").build());
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(Arc::clone(&model)),
+        user_prompt_template: Some("{{query}}".to_owned()),
+        response_format: LlmResponseFormat::Markdown,
+        output_config: Some(json!({"answer": {}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    let output = invoke_llm("llm-markdown", llm, "answer", "hi")
+        .await
+        .unwrap();
+    assert_eq!(output.result, json!({"output": {"answer": "**bold**"}}));
+
+    let call = turns.last_call().unwrap();
+    let prompt = call.last_user_text().unwrap();
+    assert!(prompt.contains("Please return the answer in markdown format."));
+    assert!(prompt.ends_with("The question is: hi."));
+    assert_eq!(
+        call.messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1,
+        "only the last user message is rewritten"
+    );
+}
+
+#[tokio::test]
+async fn a_custom_markdown_instruction_replaces_the_default() {
+    let (turns, model) = scripted(ScriptedModel::builder().respond_text("ok").build());
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(Arc::clone(&model)),
+        user_prompt_template: Some("{{query}}".to_owned()),
+        response_format: LlmResponseFormat::Markdown,
+        markdown_instruction: Some("Answer in markdown. Question: ${query}".to_owned()),
+        output_config: Some(json!({"answer": {}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    invoke_llm("llm-markdown-override", llm, "answer", "hi")
+        .await
+        .unwrap();
+
+    let prompt = turns.last_call().unwrap().last_user_text().unwrap();
+    assert!(
+        prompt.starts_with("Answer in markdown. Question: hi"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("Please return the answer in markdown format."),
+        "{prompt}"
+    );
+}
+
+// port of openjiuwen/core/workflow/components/llm/llm_comp.py::SchemaGenerator / OutputFormatter
+#[tokio::test]
+async fn json_format_embeds_the_schema_and_shapes_a_fenced_reply() {
+    let (turns, model) = scripted(
+        ScriptedModel::builder()
+            .respond_text("```json\n{\"answer\": \"42\", \"extra\": 1}\n```")
+            .build(),
+    );
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(Arc::clone(&model)),
+        user_prompt_template: Some("{{query}}".to_owned()),
+        response_format: LlmResponseFormat::Json,
+        output_config: Some(json!({"answer": {"type": "string"}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    let output = invoke_llm("llm-json", llm, "answer", "hi").await.unwrap();
+    // The fenced block is stripped, the unconfigured `extra` key is dropped, and the
+    // value lands under the configured output key.
+    assert_eq!(output.result, json!({"output": {"answer": "42"}}));
+
+    let prompt = turns.last_call().unwrap().last_user_text().unwrap();
+    assert!(prompt.contains("Here is the JSON schema:"), "{prompt}");
+    assert!(prompt.contains("\"answer\""), "{prompt}");
+    assert!(prompt.ends_with("The question is: hi."), "{prompt}");
+}
+
+#[tokio::test]
+async fn json_missing_required_field_is_an_execution_error() {
+    let (_turns, model) = scripted(
+        ScriptedModel::builder()
+            .respond_text("{\"a\": \"x\"}")
+            .build(),
+    );
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(model),
+        user_prompt_template: Some("{{query}}".to_owned()),
+        response_format: LlmResponseFormat::Json,
+        output_config: Some(json!({"a": {}, "b": {}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    let error = invoke_llm("llm-json-missing", llm, "a", "hi")
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("[101004]"), "{error}");
+    assert!(
+        error.message().contains("missing required fields: b"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn text_format_with_two_output_keys_is_a_config_error() {
+    let (_turns, model) = scripted(ScriptedModel::builder().respond_text("x").build());
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(model),
+        user_prompt_template: Some("{{query}}".to_owned()),
+        output_config: Some(json!({"a": {}, "b": {}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    let error = invoke_llm("llm-text-two-keys", llm, "a", "hi")
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("[101002]"), "{error}");
+}
+
+#[tokio::test]
+async fn text_format_leaves_the_rendered_prompt_untouched() {
+    let (turns, model) = scripted(ScriptedModel::builder().respond_text("plain").build());
+    let llm = LlmComponent::new(LlmCompConfig {
+        model: Some(Arc::clone(&model)),
+        user_prompt_template: Some("hello {{query}}".to_owned()),
+        output_config: Some(json!({"answer": {}})),
+        ..LlmCompConfig::default()
+    })
+    .unwrap();
+
+    let output = invoke_llm("llm-text-untouched", llm, "answer", "hi")
+        .await
+        .unwrap();
+    assert_eq!(output.result, json!({"output": {"answer": "plain"}}));
+    assert_eq!(
+        turns.last_call().unwrap().last_user_text(),
+        Some("hello hi".to_owned()),
+        "a text response leaves the rendered conversation byte-identical"
     );
 }
