@@ -17,7 +17,7 @@ The module never touches storage — callers apply a `ConsolidationPlan` through
 `prompt`: `EXTRACTION_SYSTEM_PROMPT`, `EXTRACTION_JSON_SCHEMA`, `CONFLICT_SYSTEM_PROMPT`, `CONFLICT_JSON_SCHEMA` (`pub const`), `MEMORY_KINDS`, `render_conversation`, `render_conflict_input`.
 `conflict`: `ConflictKind { Redundant, Conflicting, Unrelated (default) }`, `ConflictVerdict { kind, target_id, reason, merged_content, degraded }`, `#[async_trait] trait ConflictClassifier`, `RuleClassifier { config }`.
 `llm_classifier`: `LlmClassifier { model, config, fallback }` (`new`, `with_fallback`, `config`), name `"llm"`.
-`orchestrator`: `MemoryAnalyzer` (`rule`, `from_config`, `with_extractor`, `config`, `extractor_name`, `analyze`, `classifier`, `consolidate`), `ConsolidationPlan { actions }` (+ `adds()`), `ConsolidationAction { Add { fact_index }, Merge { fact_index, target_id, merged_content }, Replace { fact_index, target_id }, Skip { fact_index, target_id } }` serialized with an `action` tag.
+`orchestrator`: `MemoryAnalyzer` (`rule`, `from_config`, `from_engine`, `with_extractor`, `config`, `extractor_name`, `analyze`, `classifier`, `consolidate`), `ConsolidationPlan { actions }` (+ `adds()`), `ConsolidationAction { Add { fact_index }, Merge { fact_index, target_id, merged_content }, Replace { fact_index, target_id }, Skip { fact_index, target_id } }` serialized with an `action` tag.
 `mod.rs` re-exports every public item above; nothing else in the module is public.
 
 ## Rule Inventory

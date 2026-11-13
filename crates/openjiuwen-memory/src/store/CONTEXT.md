@@ -59,6 +59,7 @@ impl MemoryStores {
     pub fn in_memory() -> Self;                                      // includes InMemoryGraphStore
     pub async fn local_file(root: impl AsRef<Path>) -> Result<Self>;// kv/, vector/, documents/, graph/ subdirs
     #[cfg(feature = "sqlite")] pub async fn sqlite(path: impl AsRef<Path>) -> Result<Self>; // SqliteKvStore + SqliteDocumentStore + LocalFileVectorStore under "<path>.vectors/" + LocalFileGraphStore under "<path>.graph/"
+    #[cfg(feature = "sqlite")] pub async fn sqlite_migrated(path: impl AsRef<Path>) -> Result<Self>; // migrate_sqlite(path) first, then sqlite(path)
     pub fn from_parts(kv: Arc<dyn KvStore>, vector: Arc<dyn VectorStore>, document: Arc<dyn DocumentStore>) -> Self; // graph = None
     pub fn with_graph(self, graph: Arc<dyn GraphStore>) -> Self;
 }
