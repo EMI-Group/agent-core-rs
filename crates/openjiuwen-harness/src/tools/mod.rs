@@ -343,6 +343,19 @@ fn memory_kind(tool: BuiltinTool) -> MemoryToolKind {
     }
 }
 
+/// The sibling-shared caches of one [`ToolRegistry::build`] pass, each populated on first use.
+#[derive(Default)]
+struct BuildCaches {
+    /// The todo store shared by the four todo tools.
+    todo_store: Option<Arc<TodoStore>>,
+    /// The cron scheduler behind the `cron` tool.
+    cron_scheduler: Option<Arc<cron::CronScheduler>>,
+    /// The goal store shared by the two goal tools.
+    goal_store: Option<Arc<goal::GoalStore>>,
+    /// The discovery index behind `tool_search`.
+    tool_index: Option<Arc<discovery::ToolIndex>>,
+}
+
 /// The built-in tool set of one agent, with its workspace, backends and shared read state.
 ///
 /// The registry owns the [`ToolEnv`] path/permission gate, the sys-operation backends, the
@@ -550,113 +563,121 @@ impl ToolRegistry {
     #[must_use]
     pub fn build(&self) -> Vec<Arc<dyn Tool>> {
         let language = self.env.language();
-        let mut todo_store: Option<Arc<TodoStore>> = None;
-        let mut cron_scheduler: Option<Arc<cron::CronScheduler>> = None;
-        let mut goal_store: Option<Arc<goal::GoalStore>> = None;
-        let mut tool_index: Option<Arc<discovery::ToolIndex>> = None;
+        let mut caches = BuildCaches::default();
         self.tools
             .iter()
-            .map(|tool| {
-                let tool: Arc<dyn Tool> = match tool {
-                    BuiltinTool::Bash => {
-                        Arc::new(BashTool::new(self.env.clone(), self.shell.clone()))
-                    }
-                    BuiltinTool::ReadFile => Arc::new(ReadFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::WriteFile => Arc::new(WriteFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::EditFile => Arc::new(EditFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::Glob => Arc::new(GlobTool::new(self.env.clone(), self.fs.clone())),
-                    BuiltinTool::ListFiles => {
-                        Arc::new(ListDirTool::new(self.env.clone(), self.fs.clone()))
-                    }
-                    BuiltinTool::Grep => Arc::new(GrepTool::new(self.env.clone())),
-                    BuiltinTool::TodoCreate => Arc::new(TodoCreateTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::TodoList => Arc::new(TodoListTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::TodoGet => {
-                        Arc::new(TodoGetTool::new(self.todo_store(&mut todo_store), language))
-                    }
-                    BuiltinTool::TodoModify => Arc::new(TodoModifyTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::AskUser => {
-                        Arc::new(AskUserTool::new(self.user_asker.clone(), language))
-                    }
-                    BuiltinTool::MemorySearch
-                    | BuiltinTool::MemoryGet
-                    | BuiltinTool::WriteMemory
-                    | BuiltinTool::ReadMemory
-                    | BuiltinTool::EditMemory
-                    | BuiltinTool::CodingMemoryRead
-                    | BuiltinTool::CodingMemoryWrite
-                    | BuiltinTool::CodingMemoryEdit => Arc::new(MemoryTool::new(
-                        memory_kind(*tool),
-                        self.memory_backend.clone(),
-                        language,
-                    )),
-                    BuiltinTool::FetchWebpage => Arc::new(web::FetchWebpageTool::new(
-                        self.env.clone(),
-                        Some(self.fetcher()),
-                        language,
-                    )),
-                    BuiltinTool::WebSearch => {
-                        Arc::new(web::WebSearchTool::new(self.search.clone(), language))
-                    }
-                    BuiltinTool::ImageMetadata => {
-                        Arc::new(media::ImageMetadataTool::new(self.env.clone(), language))
-                    }
-                    BuiltinTool::AudioMetadata => {
-                        Arc::new(media::AudioMetadataTool::new(self.env.clone(), language))
-                    }
-                    BuiltinTool::Cron => Arc::new(cron::CronTool::new(
-                        self.cron_scheduler(&mut cron_scheduler),
-                        language,
-                    )),
-                    BuiltinTool::ListMcpResources => {
-                        Arc::new(mcp_resources::ListMcpResourcesTool::new(
-                            self.mcp_provider.clone(),
-                            language,
-                        ))
-                    }
-                    BuiltinTool::ReadMcpResource => {
-                        Arc::new(mcp_resources::ReadMcpResourceTool::new(
-                            self.mcp_provider.clone(),
-                            language,
-                        ))
-                    }
-                    BuiltinTool::ToolSearch => Arc::new(discovery::ToolSearchTool::new(
-                        self.tool_index(&mut tool_index, language),
-                        language,
-                    )),
-                    BuiltinTool::GetCurrentGoal => Arc::new(goal::GetCurrentGoalTool::new(
-                        self.goal_store(&mut goal_store),
-                        language,
-                    )),
-                    BuiltinTool::SubmitGoalReport => Arc::new(goal::SubmitGoalReportTool::new(
-                        self.goal_store(&mut goal_store),
-                        language,
-                    )),
-                };
-                tool
+            .map(|tool| match *tool {
+                BuiltinTool::Bash => Arc::new(BashTool::new(self.env.clone(), self.shell.clone())),
+                BuiltinTool::ReadFile | BuiltinTool::WriteFile | BuiltinTool::EditFile => {
+                    self.build_filesystem_tool(*tool)
+                }
+                BuiltinTool::Glob | BuiltinTool::ListFiles | BuiltinTool::Grep => {
+                    self.build_search_tool(*tool)
+                }
+                BuiltinTool::TodoCreate
+                | BuiltinTool::TodoList
+                | BuiltinTool::TodoGet
+                | BuiltinTool::TodoModify => self.build_todo_tool(*tool, language, &mut caches),
+                BuiltinTool::AskUser => {
+                    Arc::new(AskUserTool::new(self.user_asker.clone(), language))
+                }
+                BuiltinTool::MemorySearch
+                | BuiltinTool::MemoryGet
+                | BuiltinTool::WriteMemory
+                | BuiltinTool::ReadMemory
+                | BuiltinTool::EditMemory
+                | BuiltinTool::CodingMemoryRead
+                | BuiltinTool::CodingMemoryWrite
+                | BuiltinTool::CodingMemoryEdit => self.build_memory_tool(*tool, language),
+                BuiltinTool::FetchWebpage => Arc::new(web::FetchWebpageTool::new(
+                    self.env.clone(),
+                    Some(self.fetcher()),
+                    language,
+                )),
+                BuiltinTool::WebSearch => {
+                    Arc::new(web::WebSearchTool::new(self.search.clone(), language))
+                }
+                BuiltinTool::ImageMetadata => {
+                    Arc::new(media::ImageMetadataTool::new(self.env.clone(), language))
+                }
+                BuiltinTool::AudioMetadata => {
+                    Arc::new(media::AudioMetadataTool::new(self.env.clone(), language))
+                }
+                BuiltinTool::Cron => Arc::new(cron::CronTool::new(
+                    self.cron_scheduler(&mut caches.cron_scheduler),
+                    language,
+                )),
+                BuiltinTool::ListMcpResources => Arc::new(
+                    mcp_resources::ListMcpResourcesTool::new(self.mcp_provider.clone(), language),
+                ),
+                BuiltinTool::ReadMcpResource => Arc::new(mcp_resources::ReadMcpResourceTool::new(
+                    self.mcp_provider.clone(),
+                    language,
+                )),
+                BuiltinTool::ToolSearch => Arc::new(discovery::ToolSearchTool::new(
+                    self.tool_index(&mut caches.tool_index, language),
+                    language,
+                )),
+                BuiltinTool::GetCurrentGoal => Arc::new(goal::GetCurrentGoalTool::new(
+                    self.goal_store(&mut caches.goal_store),
+                    language,
+                )),
+                BuiltinTool::SubmitGoalReport => Arc::new(goal::SubmitGoalReportTool::new(
+                    self.goal_store(&mut caches.goal_store),
+                    language,
+                )),
             })
             .collect()
+    }
+
+    /// Builds one of the three filesystem tools over the registry's shared read-before-write state.
+    ///
+    /// Any variant other than `write_file`/`edit_file` falls back to `read_file`.
+    fn build_filesystem_tool(&self, tool: BuiltinTool) -> Arc<dyn Tool> {
+        let env = self.env.clone();
+        let fs = self.fs.clone();
+        let read_state = self.read_state.clone();
+        match tool {
+            BuiltinTool::WriteFile => Arc::new(WriteFileTool::new(env, fs, read_state)),
+            BuiltinTool::EditFile => Arc::new(EditFileTool::new(env, fs, read_state)),
+            _ => Arc::new(ReadFileTool::new(env, fs, read_state)),
+        }
+    }
+
+    /// Builds one of the three discovery tools (`list_files`, `grep`, else `glob`).
+    fn build_search_tool(&self, tool: BuiltinTool) -> Arc<dyn Tool> {
+        match tool {
+            BuiltinTool::ListFiles => Arc::new(ListDirTool::new(self.env.clone(), self.fs.clone())),
+            BuiltinTool::Grep => Arc::new(GrepTool::new(self.env.clone())),
+            _ => Arc::new(GlobTool::new(self.env.clone(), self.fs.clone())),
+        }
+    }
+
+    /// Builds one of the four todo tools over the store shared by this build pass.
+    ///
+    /// Any variant other than `todo_list`/`todo_get`/`todo_modify` falls back to `todo_create`.
+    fn build_todo_tool(
+        &self,
+        tool: BuiltinTool,
+        language: &str,
+        caches: &mut BuildCaches,
+    ) -> Arc<dyn Tool> {
+        let store = self.todo_store(&mut caches.todo_store);
+        match tool {
+            BuiltinTool::TodoList => Arc::new(TodoListTool::new(store, language)),
+            BuiltinTool::TodoGet => Arc::new(TodoGetTool::new(store, language)),
+            BuiltinTool::TodoModify => Arc::new(TodoModifyTool::new(store, language)),
+            _ => Arc::new(TodoCreateTool::new(store, language)),
+        }
+    }
+
+    /// Builds one of the eight memory tools, whose kind [`memory_kind`] maps from the variant.
+    fn build_memory_tool(&self, tool: BuiltinTool, language: &str) -> Arc<dyn Tool> {
+        Arc::new(MemoryTool::new(
+            memory_kind(tool),
+            self.memory_backend.clone(),
+            language,
+        ))
     }
 
     /// The HTTP seam of `fetch_webpage`: the wired fetcher, else a [`web::ReqwestFetcher`].

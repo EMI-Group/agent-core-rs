@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use super::{
-    cron, descriptions, discovery, goal, mcp_resources, tool_names, web, BuiltinTool, ToolRegistry,
+    descriptions, discovery, goal, mcp_resources, tool_names, web, BuiltinTool, ToolRegistry,
 };
 use crate::workspace::Workspace;
 
@@ -1034,5 +1034,5 @@ fn deferred_tools_are_hidden_until_discovered() {
             .collect::<Vec<&str>>(),
         vec!["fetch_webpage", "cron"]
     );
-    assert!(registry.reveal(&["nope"]).is_empty());
+    assert_eq!(registry.reveal(&["nope"]).len(), 0);
 }
