@@ -3,13 +3,18 @@
 //! Ports the selection half of the Python `openjiuwen/extensions/store/`
 //! package: the memory, local-file, and SQLite backends live in the kernel
 //! ([`openjiuwen_core::foundation::store`]) and this module only dispatches to
-//! them from a [`StoreBackend`] value. Vendor backends keep their deferred
-//! surfaces in child modules: `redis` (feature `redis`) for key-value and
-//! [`elasticsearch`] for vectors. A deferred backend validates its
-//! configuration and then answers
-//! [`Error::Unsupported`]; the
-//! Python `GaussDbStore` has no Rust analogue because the kernel's document
-//! contract replaces the `SQLAlchemy` engine (see `docs/PARITY.md`).
+//! them from a [`StoreBackend`] value. Vendor backends keep their surfaces in
+//! child modules: `redis` (feature `redis`) is a live single-node key-value
+//! store over this crate's RESP client, and [`elasticsearch`] is the vector
+//! backend. A backend without a surface for the requested factory answers
+//! [`Error::Unsupported`]; the Python `GaussDbStore` has no Rust analogue
+//! because the kernel's document contract replaces the `SQLAlchemy` engine (see
+//! `docs/PARITY.md`).
+//!
+//! The `redis` backend stores every value as a one-byte kind tag followed by the
+//! payload so a [`KvValue`] keeps its `Text`/`Bytes` variant across a round trip;
+//! that is an intentional deviation from Python's `RedisStore`, which writes the
+//! bare payload. TLS (`rediss://`) and cluster slot routing stay deferred.
 //!
 //! Every factory takes a [`StoreBackend`] so callers can select a backend from
 //! configuration (see [`StoreBackend::from_json`]) and hand it to
@@ -45,7 +50,8 @@ pub enum StoreKind {
     File,
     /// A SQLite database behind the `sqlite` feature.
     Sqlite,
-    /// Redis key-value storage (deferred, feature `redis`).
+    /// Redis key-value storage (live over the in-crate client, feature
+    /// `redis`).
     Redis,
     /// Elasticsearch vector storage (deferred).
     Elasticsearch,
@@ -72,7 +78,7 @@ pub enum StoreBackend {
         /// `SQLx` connection string.
         url: String,
     },
-    /// Redis key-value storage; deferred, so only the configuration is kept.
+    /// Redis key-value storage; the `url` configures the in-crate RESP client.
     Redis {
         /// Optional `redis://`, `rediss://`, `redis+cluster://`, or
         /// `rediss+cluster://` URL.
@@ -188,20 +194,18 @@ fn optional_string(object: &Map<String, Value>, kind: &str, field: &str) -> Resu
 ///
 /// # Errors
 ///
-/// Returns the kernel's construction error for `file` and `sqlite` backends
-/// (an unavailable `sqlite` feature is reported as
+/// Returns the kernel's construction error for the `file` backend, the client's
+/// connection error for a `redis` backend (a missing `url` is a validation
+/// error, and an unavailable `sqlite`/`redis` feature is reported as
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
 /// and [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for the deferred `redis` backend and for `elasticsearch`, which is not a
-/// key-value store.
+/// for `elasticsearch`, which is not a key-value store.
 pub async fn build_kv_store(backend: &StoreBackend) -> Result<Arc<dyn KvStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryKvStore::new())),
         StoreBackend::File { root } => Ok(Arc::new(LocalFileKvStore::new(root).await?)),
         StoreBackend::Sqlite { url } => sqlite_kv_store(url).await,
-        StoreBackend::Redis { .. } => Err(Error::unsupported(
-            "redis key-value store backend is deferred; use the in-memory, file, or sqlite backend",
-        )),
+        StoreBackend::Redis { url } => redis_kv_store(url.as_deref()).await,
         StoreBackend::Elasticsearch { .. } => Err(Error::unsupported(
             "elasticsearch is not a key-value store backend; use the in-memory, file, or sqlite backend",
         )),
@@ -231,12 +235,15 @@ pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn Docu
 }
 /// Builds a vector store from `backend`.
 ///
+/// `StoreBackend` carries no vector dimension, so the `elasticsearch` backend
+/// uses its own default (`768`).
+///
 /// # Errors
 ///
 /// Returns the kernel's construction error for the `file` backend and
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for `sqlite` (the kernel has no SQLite vector backend), `redis` (deferred),
-/// and `elasticsearch` (deferred).
+/// for `sqlite` (the kernel has no SQLite vector backend) and `redis` (not a
+/// vector store), plus the `elasticsearch` backend's own construction error.
 pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn VectorStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryVectorStore::new())),
@@ -247,9 +254,14 @@ pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn Vector
         StoreBackend::Redis { .. } => Err(Error::unsupported(
             "redis has no vector store backend; use the in-memory or file vector store",
         )),
-        StoreBackend::Elasticsearch { .. } => Err(Error::unsupported(
-            "elasticsearch vector store backend is deferred; use the in-memory or file backend",
-        )),
+        StoreBackend::Elasticsearch { url, index_prefix } => {
+            let config = elasticsearch::ElasticsearchVectorStoreConfig {
+                url: url.clone(),
+                index_prefix: index_prefix.clone(),
+                ..elasticsearch::ElasticsearchVectorStoreConfig::default()
+            };
+            elasticsearch::ElasticsearchVectorStore::connect(config).await
+        }
     }
 }
 /// Builds the SQLite key-value store, or reports the missing feature.
@@ -278,6 +290,26 @@ async fn sqlite_document_store(url: &str) -> Result<Arc<dyn DocumentStore>> {
 async fn sqlite_document_store(_url: &str) -> Result<Arc<dyn DocumentStore>> {
     Err(Error::unsupported(
         "sqlite document store backend is unavailable; enable the `sqlite` feature or use the in-memory or file backend",
+    ))
+}
+/// Builds the Redis key-value store, or reports a missing `url`.
+#[cfg(feature = "redis")]
+async fn redis_kv_store(url: Option<&str>) -> Result<Arc<dyn KvStore>> {
+    let url =
+        url.ok_or_else(|| Error::validation("redis key-value store backend requires a `url`"))?;
+    redis::RedisStore::connect(redis::RedisStoreConfig {
+        url: Some(url.to_string()),
+        ..redis::RedisStoreConfig::default()
+    })
+    .await
+}
+/// Reports that the `redis` feature is off; keeps the factory match arms
+/// uniform.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)] // mirrors the async Redis helper
+async fn redis_kv_store(_url: Option<&str>) -> Result<Arc<dyn KvStore>> {
+    Err(Error::unsupported(
+        "redis key-value store backend is unavailable; enable the `redis` feature or use the in-memory, file, or sqlite backend",
     ))
 }
 #[cfg(test)]
@@ -489,15 +521,12 @@ mod tests {
         assert!(store.collection_exists("vectors").await.unwrap());
     }
     #[tokio::test]
-    async fn redis_and_elasticsearch_backends_are_unsupported() {
-        let redis = StoreBackend::Redis {
-            url: Some("redis://localhost:6379".to_string()),
-        };
+    async fn elasticsearch_backend_is_unsupported() {
         let elasticsearch = StoreBackend::Elasticsearch {
             url: "http://localhost:9200".to_string(),
             index_prefix: "agent_vector".to_string(),
         };
-        for backend in [&redis, &elasticsearch] {
+        for backend in [&elasticsearch] {
             let error = build_kv_store(backend)
                 .await
                 .err()
@@ -543,6 +572,100 @@ mod tests {
             StoreKind::Elasticsearch => "elasticsearch",
             _ => "store",
         }
+    }
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_kv_store_round_trips_against_the_fake_server() {
+        let fake = crate::redis::testsupport::FakeRedis::start().await;
+        let backend = StoreBackend::Redis {
+            url: Some(fake.url()),
+        };
+        let store = build_kv_store(&backend).await.unwrap();
+        store.set("alpha", KvValue::text("one")).await.unwrap();
+        assert_eq!(
+            store.get("alpha").await.unwrap(),
+            Some(KvValue::text("one"))
+        );
+        assert!(store.exists("alpha").await.unwrap());
+        store.set("pre/a", KvValue::text("a")).await.unwrap();
+        store
+            .set("pre/b", KvValue::bytes(vec![0, 1, 2, 255]))
+            .await
+            .unwrap();
+        let prefixed = store.get_by_prefix("pre/").await.unwrap();
+        assert_eq!(prefixed.len(), 2);
+        assert_eq!(prefixed.get("pre/a"), Some(&KvValue::text("a")));
+        assert_eq!(
+            prefixed.get("pre/b"),
+            Some(&KvValue::bytes(vec![0, 1, 2, 255]))
+        );
+        let keys = vec!["alpha".to_string(), "missing".to_string()];
+        assert_eq!(
+            store.mget(&keys).await.unwrap(),
+            vec![Some(KvValue::text("one")), None]
+        );
+        let mut pipeline = store.pipeline();
+        pipeline.set("pipe", KvValue::text("value"));
+        pipeline.get("pipe");
+        pipeline.exists("pipe");
+        assert_eq!(
+            pipeline.execute().await.unwrap(),
+            vec![
+                None,
+                Some(KvValue::text("value")),
+                Some(KvValue::text("true")),
+            ]
+        );
+        assert_eq!(store.delete_by_prefix("pre/").await.unwrap(), 2);
+        store.delete("alpha").await.unwrap();
+        assert!(!store.exists("alpha").await.unwrap());
+        fake.shutdown().await;
+    }
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_kv_store_requires_a_url() {
+        let error = build_kv_store(&StoreBackend::Redis { url: None })
+            .await
+            .err()
+            .expect("a redis backend without a url must fail");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        let message = error.message().to_string();
+        assert!(message.contains("url"), "{message}");
+    }
+    #[tokio::test]
+    async fn redis_backend_has_no_document_or_vector_store() {
+        let backend = StoreBackend::Redis {
+            url: Some("redis://localhost:6379".to_string()),
+        };
+        let error = build_document_store(&backend)
+            .await
+            .err()
+            .expect("redis is not a document store");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("redis"), "{message}");
+        let error = build_vector_store(&backend)
+            .await
+            .err()
+            .expect("redis is not a vector store");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("redis"), "{message}");
+    }
+    #[cfg(not(feature = "redis"))]
+    #[tokio::test]
+    async fn redis_kv_store_requires_the_feature() {
+        let backend = StoreBackend::Redis {
+            url: Some("redis://localhost:6379".to_string()),
+        };
+        let error = build_kv_store(&backend)
+            .await
+            .err()
+            .expect("redis backend without the feature must fail");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("redis"), "{message}");
+        assert!(message.contains("`redis` feature"), "{message}");
     }
     #[cfg(feature = "sqlite")]
     #[tokio::test]
