@@ -1,5 +1,9 @@
 //! The adapter from a member's harness protocol to the team's member-runtime seam.
 //!
+//! Length note: this file is deliberately long because it pairs the adapter with its unit tests
+//! (roughly half the lines are `#[cfg(test)]`); the runtime-side pieces it depends on live in
+//! `checkpoint`, `checkpoint_store` and `mapping`.
+//!
 //! Python parity source: `openjiuwen/agent_teams/harness/protocol_adapter.py` and
 //! `openjiuwen/agent_teams/harness/native_harness.py` (`send`/`abort`/`pause`/`resume` surface and
 //! the `on_state`/`on_round` subscription). Python adapts `NativeHarness` *down* to the
