@@ -3,8 +3,7 @@
 //! Maps to the Python package `openjiuwen.core.session` in the openJiuwen
 //! reference implementation. The crate is the kernel's stable seam for
 //! per-run execution context: state lanes, stream frames, and interaction
-//! requests/responses, checkpoint persistence, and trace spans and frames. The
-//! concrete session types land in later phases.
+//! requests/responses, checkpoint persistence, and trace spans and frames.
 //!
 //! Modules:
 //!
@@ -21,19 +20,25 @@
 //!   state scopes, streaming, human-in-the-loop, tracing, and snapshot/restore.
 //! - [`sessions`] — concrete sessions ([`sessions::WorkflowSession`],
 //!   [`sessions::NodeSession`], [`sessions::AgentSession`],
-//!   [`sessions::AgentTeamSession`]) and their construction factories
+//!   [`sessions::AgentTeamSession`], [`sessions::SubWorkflowSession`],
+//!   [`sessions::RouterSession`]) and their construction factories
 //!   ([`sessions::create_workflow_session`],
 //!   [`sessions::create_agent_session`],
-//!   [`sessions::create_agent_team_session`]), plus the two wrapper sessions
-//!   ([`sessions::SubWorkflowSession`], [`sessions::RouterSession`]).
+//!   [`sessions::create_agent_team_session`]).
 //! - [`trace_hook`] — [`trace_hook::SwappableTraceSink`], the swappable sink a
 //!   session owns so [`session::Session::install_trace_sink`] can reroute
 //!   tracing after construction.
 //! - [`otel`] — the feature-gated [`otel::install_trace_sink`] helper (a
 //!   documented no-op unless the `otel` feature is on).
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
-//!   [`checkpoint::Checkpoint`] model, and the memory, file, and feature-gated
-//!   SQLite backends.
+//!   [`checkpoint::Checkpoint`] model, and the memory, file, SQLite
+//!   (feature-gated), and Redis (RESP2) backends.
+//! - [`session_controller`] — scope-isolated, disk-backed session records
+//!   ([`session_controller::DiskSessionStore`],
+//!   [`session_controller::SessionController`]) in the Python
+//!   `sessions.json`/`state.data` layout.
+//! - [`vcs`] — local session version history
+//!   ([`vcs::SessionHistory`]) and snapshot JSON diffing.
 //! - [`tracer`] — trace spans ([`tracer::TraceSpan`]), frames
 //!   ([`tracer::TraceFrame`]), sinks ([`tracer::TraceSink`],
 //!   [`tracer::MemoryTraceSink`], [`tracer::StreamTraceSink`]), the
@@ -47,13 +52,18 @@
 //! [`StateLane`], and the `*_KEY` constants), the interaction vocabulary
 //! ([`InteractionBroker`], [`InteractionRequest`], [`InteractionResponse`],
 //! [`InteractionKind`], [`InteractionDecision`], [`InteractionOption`],
-//! [`InteractionOutput`], [`InteractiveInput`]), and the stream frames
+//! [`InteractionOutput`], [`InteractiveInput`]), the stream frames
 //! ([`StreamItem`], [`StreamEvent`], [`StreamMode`], [`StreamHub`],
-//! [`StreamWriterManager`]), and checkpointing ([`Checkpointer`], [`Checkpoint`],
+//! [`StreamWriterManager`]), checkpointing ([`Checkpointer`], [`Checkpoint`],
 //! [`CheckpointMeta`], [`CheckpointNamespace`], [`CheckpointerConfig`],
 //! [`CheckpointerKind`], [`MemoryCheckpointer`], [`FileCheckpointer`],
-//! [`build_key`], [`build_key_with_namespace`], and the namespace constants),
-//! and tracing ([`Tracer`], [`TraceSpan`], [`TraceFrame`], [`TraceSink`],
+//! [`RedisCheckpointer`], [`RedisOptions`], [`build_key`],
+//! [`build_key_with_namespace`], and the namespace constants),
+//! disk-backed sessions and history ([`DiskSessionStore`],
+//! [`SessionController`], [`SessionScope`], [`SessionHistory`], [`Version`]),
+//! wrapper sessions ([`SubWorkflowSession`], [`RouterSession`]), the
+//! trace-sink hook ([`SwappableTraceSink`], [`install_trace_sink`]), and
+//! tracing ([`Tracer`], [`TraceSpan`], [`TraceFrame`], [`TraceSink`],
 //! [`MemoryTraceSink`], [`StreamTraceSink`], [`NoopTraceSink`],
 //! [`TraceSpanKind`], [`TraceFrameType`], [`TracePosition`], [`SpanHandle`],
 //! [`InvokeType`], [`SpanStatus`]).
