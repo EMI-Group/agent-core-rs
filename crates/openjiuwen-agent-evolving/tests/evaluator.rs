@@ -8,8 +8,9 @@
 //! `evaluate_cases` driver, model-less `DefaultEvaluator` scoring, and
 //! `AgentCaseRunner` over a fake `Agent`.
 //!
-//! The model-backed judge (`LlmJudge`/`LlmJudgeEvaluator`) is covered by the
-//! unit tests in `src/evaluator/judge.rs`; nothing here needs a model.
+//! The model-backed judge (`LlmJudge`/`LlmJudgeEvaluator`, plus the rubric,
+//! verdict, and prompt pieces) is covered by `tests/judge.rs` together with the
+//! unit tests in `src/evaluator/judge/`; nothing here needs a model.
 //!
 //! Everything here is offline and deterministic: no network, no environment
 //! reads, no clock, and no dependence on execution order.
