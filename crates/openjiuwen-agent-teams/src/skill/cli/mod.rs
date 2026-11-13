@@ -15,14 +15,20 @@
 //! | Part | Responsibility |
 //! | --- | --- |
 //! | [`SkillCli`] | connection flags + the parsed scope command, and [`SkillCli::run`] |
-//! | `command` | the clap trees, one root per scope |
+//! | `command` | the clap trees, one root per scope plus the scope-independent `serve` root |
 //! | `output` | the plain-text line renderers |
 //! | `member` | member-scope dispatch (the real teammate tool set) |
 //! | `operator` | operator-scope dispatch (board, messaging, roster) |
 //!
-//! Exit codes: `0` success (including `--help` rendered on stdout, which needs no join descriptor),
-//! `1` refused or unresolved team, `2` CLI-side error (unknown command or flag, missing argument,
-//! malformed descriptor), `130` a cancelled or timed-out operation.
+//! `serve` is the exception that proves the two-stage rule: it is the child end of the member
+//! protocol (see [`super::serve`]), it takes its identity from the environment rather than from a
+//! join descriptor, and it belongs to neither scope tree. It is therefore detected in the raw argv
+//! *before* the descriptor is loaded and dispatched straight to the serve loop.
+//!
+//! Exit codes: `0` success (including `--help` rendered on stdout, which needs no join descriptor,
+//! and `serve` ending on `stop` or end of input), `1` refused or unresolved team (and a `serve`
+//! whose member harness cannot be built or started), `2` CLI-side error (unknown command or flag,
+//! missing argument, malformed descriptor), `130` a cancelled or timed-out operation.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -38,7 +44,9 @@ pub(crate) mod operator;
 pub(crate) mod output;
 
 pub(crate) use command::{parse_member, parse_operator};
-pub use command::{ClaimStatus, MemberCommand, OperatorCommand, TaskCommand, ViewAction};
+pub use command::{
+    ClaimStatus, MemberCommand, OperatorCommand, ServeCommand, TaskCommand, ViewAction,
+};
 
 /// Diagnostic written when an operation is refused without a reason.
 const DEFAULT_REFUSAL: &str = "operation refused";
@@ -75,6 +83,12 @@ pub enum CliCommand {
     Member(MemberCommand),
     /// Operator-scope command (the outside team-control surface).
     Operator(OperatorCommand),
+    /// Scope-independent command: serve the member protocol over stdio.
+    ///
+    /// [`SkillCli::try_parse_from`] never produces this variant — `serve` is parsed by the
+    /// scope-independent stage in `run_cli_with_resolver` before a descriptor exists — but the
+    /// variant keeps the command vocabulary in one type.
+    Serve(ServeCommand),
 }
 
 impl SkillCli {
@@ -171,6 +185,11 @@ impl SkillCli {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> i32 {
+        match &self.command {
+            // `serve` needs no client; it owns the process's stdio instead of the given writers.
+            CliCommand::Serve(_) => return super::serve::serve_stdio().await,
+            CliCommand::Member(_) | CliCommand::Operator(_) => {}
+        }
         match client.scope() {
             ClientScope::Member => member::dispatch(self, client, out, err).await,
             ClientScope::Operator => operator::dispatch(self, client, out, err).await,
@@ -321,6 +340,42 @@ pub(crate) fn run_skill_cli_with(
     run_cli_with_resolver(argv, &resolver, out, err)
 }
 
+/// Runs the scope-independent `serve` stage when `argv` names it, else returns `None`.
+///
+/// `serve` is the child end of the member protocol: it needs no join descriptor (its identity is
+/// in the environment) and belongs to neither scope tree, so it is detected in the raw argv before
+/// [`SkillCli::parse_descriptor_args`] runs. `--help` is rendered on stdout and exits `0`; a bad
+/// flag exits `2`; the loop's own exit code (`0` on `stop`/EOF, `1` on a runtime failure) is
+/// returned unchanged.
+fn run_serve_stage(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Option<i32> {
+    if !command::names_serve(argv) {
+        return None;
+    }
+    if let Some(text) = command::serve_display_text(argv.to_vec()) {
+        // A write failure is ignored, exactly like the other help path: help must not fail.
+        let _ = out.write_all(text.as_bytes());
+        return Some(0);
+    }
+    let command = match command::parse_serve(argv.to_vec()) {
+        Ok(command) => command,
+        Err(error) => return Some(fail_cli(err, &error)),
+    };
+    match command {
+        ServeCommand::Serve => {}
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "failed to start the async runtime: {error}");
+            return Some(1);
+        }
+    };
+    Some(runtime.block_on(super::serve::serve_stdio()))
+}
+
 /// The single flow behind [`run_skill_cli`] and [`run_skill_cli_with`].
 ///
 /// The connection flags are scanned first, then the descriptor is loaded *once* and kept as a
@@ -334,6 +389,9 @@ fn run_cli_with_resolver(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    if let Some(code) = run_serve_stage(&argv, out, err) {
+        return code;
+    }
     let descriptor_args = match SkillCli::parse_descriptor_args(&argv) {
         Ok(scanned) => scanned,
         Err(error) => return fail_cli(err, &error),
@@ -903,5 +961,27 @@ mod tests {
         let code = runtime.block_on(cli.run(Arc::clone(&fixture.client), &mut out));
         assert_eq!(code, 1);
         assert_eq!(String::from_utf8(out).unwrap(), "Task 'nope' not found\n");
+    }
+    #[test]
+    fn serve_help_is_answered_without_a_descriptor() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(argv(&["serve", "--help"]), None, &mut out, &mut err);
+        assert_eq!(code, 0);
+        assert_eq!(err.len(), 0, "help belongs on stdout, not stderr");
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("Usage: team-member"),
+            "unexpected help: {stdout}"
+        );
+    }
+    #[test]
+    fn a_bad_serve_flag_exits_two() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_skill_cli_with(argv(&["serve", "--nope"]), None, &mut out, &mut err);
+        assert_eq!(code, 2);
+        assert_eq!(out.len(), 0);
+        assert!(!err.is_empty(), "the clap diagnostic should reach stderr");
     }
 }

@@ -196,6 +196,9 @@ pub enum OperatorCommand {
     Members,
 }
 
+/// The scope-independent command word that starts the member server.
+pub(crate) const SERVE_COMMAND: &str = "serve";
+
 /// The member-scope parser: connection flags plus the member command words.
 #[derive(Debug, Parser)]
 #[command(
@@ -234,6 +237,40 @@ struct OperatorCli {
     command: OperatorCommand,
 }
 
+/// The scope-independent command words: the child end of the member protocol.
+///
+/// `serve` is deliberately not part of the member/operator trees: a served member needs no join
+/// descriptor (its identity comes from the environment), and `run_cli_with_resolver` dispatches it
+/// before the descriptor is loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ServeCommand {
+    /// Serve one member over stdin/stdout until `stop` or end of input.
+    #[command(about = "Serve one member over stdin/stdout until stopped.")]
+    Serve,
+}
+
+/// The scope-independent parser: just the `serve` command word.
+///
+/// The connection flags are accepted (and ignored) so a launcher that exports the descriptor flags
+/// uniformly can still start the member server; `serve` never needs one.
+#[derive(Debug, Parser)]
+#[command(
+    name = PROG,
+    about = "Serve one team member over the JSON-lines member protocol.",
+    disable_help_subcommand = true
+)]
+struct ServeCli {
+    /// Path to a JSON team join descriptor (accepted for parity; unused by `serve`).
+    #[arg(long = "descriptor-file", global = true, value_name = "PATH")]
+    descriptor_file: Option<String>,
+    /// Inline JSON team join descriptor (accepted for parity; unused by `serve`).
+    #[arg(long = "descriptor-json", global = true, value_name = "JSON")]
+    descriptor_json: Option<String>,
+    /// The operation to perform.
+    #[command(subcommand)]
+    command: ServeCommand,
+}
+
 /// Parses one member-scope invocation, returning its connection flags and its command.
 ///
 /// # Errors
@@ -266,6 +303,60 @@ pub(crate) fn parse_operator(argv: Vec<String>) -> Result<(DescriptorArgs, Opera
         },
         parsed.command,
     ))
+}
+
+/// Parses the scope-independent `serve` command.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] carrying clap's message for an unknown flag or argument.
+pub(crate) fn parse_serve(argv: Vec<String>) -> Result<ServeCommand> {
+    let parsed = ServeCli::try_parse_from(argv).map_err(|err| clap_error(&err))?;
+    // Accepted for launcher parity; `serve` takes its identity from the environment.
+    let _ = (parsed.descriptor_file, parsed.descriptor_json);
+    Ok(parsed.command)
+}
+
+/// Renders the help text `argv` asks the `serve` parser for, or `None` when it asks for none.
+///
+/// Mirrors [`display_text`] for the scope-independent tree, so `team-member serve --help` reaches
+/// stdout and exits `0` without loading a join descriptor.
+#[must_use]
+pub(crate) fn serve_display_text(argv: Vec<String>) -> Option<String> {
+    let err = ServeCli::try_parse_from(argv).err()?;
+    match err.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            Some(err.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Returns whether `argv` names the `serve` command word.
+///
+/// The scan skips the program name, the values of the connection flags, and every other flag, so
+/// `--descriptor-file serve` is not mistaken for the command; only the first positional token
+/// decides.
+#[must_use]
+pub(crate) fn names_serve(argv: &[String]) -> bool {
+    command_word(argv).is_some_and(|word| word == SERVE_COMMAND)
+}
+
+/// Returns the first positional token after the program name, skipping flags and flag values.
+fn command_word(argv: &[String]) -> Option<&str> {
+    let mut index = 1;
+    while let Some(token) = argv.get(index).map(String::as_str) {
+        if token == "--descriptor-file" || token == "--descriptor-json" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(token);
+    }
+    None
 }
 
 /// Maps a clap parse failure onto the crate error, keeping clap's message (which names the offending
@@ -512,5 +603,55 @@ mod tests {
             err.to_string().contains("TASK_ID"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn serve_subcommand_parses() {
+        assert_eq!(parse_serve(argv(&["serve"])).unwrap(), ServeCommand::Serve);
+        assert_eq!(
+            parse_serve(argv(&["--descriptor-json", "{}", "serve"])).unwrap(),
+            ServeCommand::Serve
+        );
+    }
+
+    #[test]
+    fn serve_help_is_displayed_without_a_descriptor() {
+        let help = serve_display_text(argv(&["serve", "--help"])).expect("serve help");
+        assert!(
+            help.contains("Usage: team-member"),
+            "unexpected help: {help}"
+        );
+        assert!(serve_display_text(argv(&["inbox", "--help"])).is_none());
+        assert!(serve_display_text(argv(&["serve"])).is_none());
+    }
+
+    #[test]
+    fn serve_rejects_an_unknown_flag() {
+        let err = parse_serve(argv(&["serve", "--nope"])).unwrap_err();
+        assert!(err.to_string().starts_with("validation: "));
+        assert!(
+            err.to_string().contains("--nope"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn serve_is_detected_as_a_scope_independent_command_word() {
+        assert!(names_serve(&argv(&["serve"])));
+        assert!(names_serve(&argv(&[
+            "--descriptor-json",
+            "{\"team_name\":\"alpha\"}",
+            "serve",
+        ])));
+        assert!(names_serve(&argv(&["serve", "--help"])));
+        assert!(!names_serve(&argv(&["inbox"])));
+        assert!(!names_serve(&argv(&["--help"])));
+        assert!(
+            !names_serve(&argv(&["--descriptor-file", "serve"])),
+            "a flag value is not the command word"
+        );
+        assert!(!names_serve(&argv(&[
+            "--descriptor-json={\"team_name\":\"serve\"}"
+        ])));
     }
 }
