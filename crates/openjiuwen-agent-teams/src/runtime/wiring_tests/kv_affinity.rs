@@ -33,15 +33,13 @@ const PARENT_ENV: &str = "kv_cache_affinity_parent_session_id";
 /// Returns the cache id carried by `env`, failing the test when the key is absent.
 fn session_of(env: &BTreeMap<String, String>) -> &str {
     env.get(SESSION_ENV)
-        .map(String::as_str)
-        .unwrap_or_else(|| panic!("no '{SESSION_ENV}' in {env:?}"))
+        .map_or_else(|| panic!("no '{SESSION_ENV}' in {env:?}"), String::as_str)
 }
 
 /// Returns the lineage cache id carried by `env`, failing the test when the key is absent.
 fn parent_of(env: &BTreeMap<String, String>) -> &str {
     env.get(PARENT_ENV)
-        .map(String::as_str)
-        .unwrap_or_else(|| panic!("no '{PARENT_ENV}' in {env:?}"))
+        .map_or_else(|| panic!("no '{PARENT_ENV}' in {env:?}"), String::as_str)
 }
 
 #[tokio::test]
@@ -135,7 +133,11 @@ async fn disabled_affinity_registers_nothing() {
     }
     assert_eq!(agent.kv_cache().len(), 0);
     assert!(agent.kv_cache().is_empty());
-    assert!(agent.kv_cache().members().is_empty());
+    assert_eq!(
+        agent.kv_cache().members().len(),
+        0,
+        "a disabled registry tracks no members"
+    );
 
     let error = agent
         .kv_cache()

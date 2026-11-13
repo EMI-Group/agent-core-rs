@@ -36,12 +36,12 @@ fn silent_reader() -> Value {
 }
 
 /// A bare spawn-options object selecting the OS-process backend with `command`.
-fn process_metadata(command: Value) -> Value {
+fn process_metadata(command: &Value) -> Value {
     json!({"kind": "process", "process": {"command": command}})
 }
 
 /// A bare spawn-options object selecting the external-CLI backend with `command`.
-fn external_cli_metadata(command: Value) -> Value {
+fn external_cli_metadata(command: &Value) -> Value {
     json!({"kind": "external_cli", "external_cli": {"command": command}})
 }
 
@@ -97,7 +97,7 @@ async fn process_metadata_spawns_and_reaps_a_child() {
     let spec = with_metadata(
         one_teammate(),
         SPAWN_METADATA_KEY,
-        process_metadata(silent_reader()),
+        process_metadata(&silent_reader()),
     );
     let (agent, factory, result) = spawn_one(&spec, "dev-1").await;
     let spawner = agent.spawner();
@@ -127,7 +127,7 @@ async fn external_cli_metadata_spawns_and_reaps_a_child() {
     let spec = with_metadata(
         one_teammate(),
         SPAWN_METADATA_KEY,
-        external_cli_metadata(silent_reader()),
+        external_cli_metadata(&silent_reader()),
     );
     let (agent, factory, result) = spawn_one(&spec, "dev-1").await;
     let spawner = agent.spawner();
@@ -203,8 +203,7 @@ async fn team_level_spawn_uses_the_metadata_selected_backend() {
         .agent
         .spawn_member("dev-1")
         .await
-        .err()
-        .expect("the SSH roster spawn must fail");
+        .expect_err("the SSH roster spawn must fail");
     assert_eq!(error.kind(), ErrorKind::Config);
     assert!(error
         .to_string()

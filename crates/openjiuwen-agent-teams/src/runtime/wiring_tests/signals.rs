@@ -234,16 +234,16 @@ async fn rounds_reach_the_hooks_and_the_monitor_once() {
         metrics.duration_ms
     );
 
-    let observed = take_monitor(&mut monitor);
-    assert_eq!(monitor_kinds(&observed), vec!["member_round"]);
+    let round_events = take_monitor(&mut monitor);
+    assert_eq!(monitor_kinds(&round_events), vec!["member_round"]);
     assert!(
         matches!(
-            &observed[0],
+            &round_events[0],
             MonitorEvent::MemberRound { member_name, round: 1, outcome: RoundOutcome::Finished }
                 if member_name == "dev-1"
         ),
         "{:?}",
-        observed[0]
+        round_events[0]
     );
 }
 

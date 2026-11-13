@@ -31,7 +31,7 @@ use crate::runtime::team_agent::{SpecBuild, TeamAgent};
 use crate::schema::TeamAgentSpec;
 
 pub(crate) use crate::runtime::team_agent::test_support::{
-    blueprint, deep_spec, deps, RecordingWorkspaceProvider, ScriptedFactory, ScriptedHarness,
+    blueprint, deps, RecordingWorkspaceProvider, ScriptedFactory,
 };
 
 mod attach;
@@ -90,23 +90,6 @@ pub(crate) async fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) 
         tokio::time::sleep(POLL).await;
     }
     assert!(predicate(), "timed out waiting for {what}");
-}
-
-/// Collects monitor events until `count` arrived or [`BOUND`] expired.
-pub(crate) async fn recv_monitor(
-    receiver: &mut MonitorReceiver,
-    count: usize,
-) -> Vec<MonitorEvent> {
-    let mut events = Vec::new();
-    let deadline = Instant::now() + BOUND;
-    while events.len() < count {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, receiver.recv()).await {
-            Ok(Some(stamped)) => events.push(stamped.event),
-            _ => break,
-        }
-    }
-    events
 }
 
 /// Collects everything already queued on `receiver`.

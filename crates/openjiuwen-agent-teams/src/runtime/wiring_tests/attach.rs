@@ -38,7 +38,7 @@ const POLL: Duration = Duration::from_millis(5);
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 /// Creates a temp directory plus a short socket path inside it (`<tmp>/s`).
 ///
@@ -161,11 +161,12 @@ async fn stopping_through_the_manager_tears_the_socket_down() {
         .expect("the manager did not activate the team");
     assert_eq!(agent.attach_socket(), Some(socket.clone()));
     let mut client = connect(&socket).await;
-    assert!(!client
-        .list_members()
-        .await
-        .expect("list_members")
-        .is_empty());
+    let members = client.list_members().await.expect("list_members");
+    assert_eq!(
+        members.len(),
+        2,
+        "the socket must serve the leader and the teammate"
+    );
     assert!(
         manager.stop_team("alpha", "session-a").await.expect("stop"),
         "the owning session may stop the team"
@@ -184,11 +185,12 @@ async fn plain_stop_releases_the_socket_and_later_calls_fail() {
     let wiring = wire(&attached_team(&socket), |deps| deps).await;
     wiring.agent.start().await.expect("the team did not start");
     let mut client = connect(&socket).await;
-    assert!(!client
-        .list_members()
-        .await
-        .expect("list_members")
-        .is_empty());
+    let members = client.list_members().await.expect("list_members");
+    assert_eq!(
+        members.len(),
+        2,
+        "the socket must serve the leader and the teammate"
+    );
     wiring.agent.stop().await.expect("stop");
     assert_eq!(wiring.agent.attach_socket(), None, "the host is dropped");
     assert!(!socket.exists(), "stop must remove the socket");
