@@ -357,6 +357,16 @@ impl TranscriptBuffer {
     pub fn summary(&self) -> TranscriptSummary {
         TranscriptSummary::from_buffer(self)
     }
+    /// Drops every retained entry and returns how many were removed.
+    ///
+    /// This is not a ring eviction: `next_seq` keeps counting and `dropped()` is unchanged, so a
+    /// caller holding a cursor still sees new entries through
+    /// [`TranscriptBuffer::after`].
+    pub fn clear(&mut self) -> usize {
+        let removed = self.entries.len();
+        self.entries.clear();
+        removed
+    }
 }
 /// Digest of a [`TranscriptBuffer`]: size, evictions, and the newest entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +525,20 @@ mod tests {
         buffer.extend(Vec::new());
         assert_eq!(ids(&buffer.entries()), vec![1, 2]);
         assert_eq!(buffer.len(), 2);
+    }
+    #[test]
+    fn clear_drops_the_entries_and_keeps_the_sequence() {
+        let mut buffer = TranscriptBuffer::new(4);
+        buffer.push(TranscriptEntry::spawn("sub-1", "task", 1));
+        buffer.push(TranscriptEntry::input("sub-1", "more", 2));
+        assert_eq!(buffer.clear(), 2);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.clear(), 0);
+        assert_eq!(buffer.next_seq(), 3);
+        let stored = buffer.push(TranscriptEntry::completion("sub-1", "done", 3));
+        assert_eq!(stored.seq, 3);
+        assert_eq!(buffer.summary().count, 1);
+        assert_eq!(buffer.dropped(), 0);
     }
     #[test]
     fn summary_reports_count_drops_and_the_newest_entry() {
