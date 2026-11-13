@@ -48,15 +48,15 @@ and `operator::base` stay reachable through them, and `single_agent` also expose
 ## Routing Table
 
 - `./src/lib.rs` → module aliases, the `single_agent`, `application`, `controller`, `kv_cache`, and `operator` shims, and the Python→Rust path table in the crate docs.
-- `./tests/module_paths.rs` → resolve/identity checks for one representative item per module, plus per-area extended tests for newly implemented kernel surface.
+- `./tests/module_paths.rs` → resolve/identity checks for one representative item per module, plus per-area extended tests for the kernel's wider surface.
 
 ## Test Strategy
 
 - `tests/module_paths.rs` proves every module path resolves and aliases the same type as the source crate via `TypeId`;
   `single_agent`, `application`, and `runner` (its `Runner`, `RunOptions`, `ResourceMgr`, `CallbackEvent`, and `InMemoryMessageQueue` exports, plus a `MessageQueue` trait-object coercion) are covered explicitly.
-- Per-area identity tests cover the newly implemented kernel surface: `controller_*`, `kv_cache_*`, `operator_*`, `single_agent_extended_*`, `session_extended_*`, `runner_extended_*` (including nested module paths), `foundation_extended_*`, `memory_extended_*`, and `retrieval_extended_*`.
+- Per-area identity tests cover the extended kernel surface: `controller_*`, `kv_cache_*`, `operator_*`, `single_agent_extended_*`, `session_extended_*`, `runner_extended_*` (including nested module paths), `foundation_extended_*`, `memory_extended_*`, and `retrieval_extended_*`.
   Traits (`TaskExecutor`, `QueryRewriter`) are proved by generic bounds on the concrete trait object; function items (`abilities::parts::extract_parts`, `install_trace_sink`, `diff_snapshots`) by fn-pointer identity, and `load_mcp_abilities` by reference only.
 - The crate-level doc example compiles as a doctest (`cargo test -p openjiuwen-core`), guarding the public paths.
 - `cargo test -p openjiuwen-core --features otel` proves the forwarded session feature builds and keeps the same surface.
 - No unit tests here: the umbrella has no behavior; behavior is tested in the concrete crates.
-- `cargo clippy -p openjiuwen-core --all-targets --no-deps -- -D warnings` must stay clean.
+- `cargo clippy -p openjiuwen-core --all-targets --all-features -- -D warnings` must stay clean.
