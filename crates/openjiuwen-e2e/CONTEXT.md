@@ -107,6 +107,9 @@ Deterministic, surprising-but-correct outcomes the scenarios assert; do not "fix
 ## Known Gaps
 
 - `cli_binary.rs` cannot use `env!("CARGO_BIN_EXE_openjiuwen")`: Cargo defines that variable only for tests of the package that owns the binary. The process-level smoke test lives in `crates/openjiuwen-cli/tests/cli_smoke.rs`; the e2e suite asserts the reachable layers (`run_with_model` output formats, `CliOptions::resolve_with` validation, `Cli::dispatch`) and keeps one runtime-resolution process test `#[ignore]`d with that reason.
+That ignored test resolves `<target>/<profile>/openjiuwen` then `<profile>/deps/openjiuwen` from `std::env::current_exe()` and returns early (prints a skip line) instead of failing when neither exists — so it is not a reliable gate.
+It also spawns the binary with no `.env()`/`.env_clear()`/`.current_dir()`, so the child inherits the ambient environment (`OPENJIUWEN_HOME`, `API_KEY`, …); a new subprocess scenario must clear or pin the env explicitly.
+`openjiuwen-cli` is not a dependency of this crate, so the `openjiuwen` binary is not guaranteed in the `-p openjiuwen-e2e` build graph.
 - The clap grammar itself is not reachable from this crate: `clap` is not a dependency and `openjiuwen-harness` does not re-export `Parser`, so `--help`/`--version`/exit-code-2 verdicts cannot be asserted here. A `pub use clap;` (or a `Cli::parse_from` helper) in `openjiuwen_harness::cli` would close the gap.
 - Vendor harness providers (`claudecode`, `codex`, `dsh`) and every live-provider path (`live-tests`) need credentials/network and are out of scope; `provider_native.rs` asserts only that they report `Error::Unsupported`/`NotFound`.
 - Deferred ML/LLM-backed areas (symphony `deferred::*`, `evaluation::LlmJudgedMetric`; agent-evolving RL/judge stubs; RSI `deferred::*`) return `Error::Unsupported` and are not exercised.
