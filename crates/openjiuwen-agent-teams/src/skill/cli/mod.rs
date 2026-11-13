@@ -304,9 +304,12 @@ pub(crate) fn refuse(err_out: &mut dyn Write, reason: Option<&str>) -> i32 {
 /// The team is resolved through `crate::runtime::try_global_registry()` and the manager's
 /// `live(team_name)`, then wrapped over that team's own store, task board and messager (see
 /// [`super::live::connect_live_client`], the single wiring point this CLI shares with the
-/// `openjiuwen-team-mcp` server). A team this process does not host — including every team hosted
-/// by *another* process, since cross-process attach is deferred — resolves to `None`, which the
-/// connection stage reports as `no live team '<name>' in this process` and exit code `1`.
+/// `openjiuwen-team-mcp` server). A team hosted by *another* process is reached over that host's
+/// Unix-socket attach bridge (`crate::attach`, through
+/// [`SocketTeamClient`](crate::skill::SocketTeamClient)) when the descriptor or
+/// `OPENJIUWEN_TEAM_SOCKET` names its socket. `None` therefore means neither host answered — no
+/// team of that name here and no resolvable socket — which the connection stage reports as
+/// `no live team '<name>' in this process` and exit code `1`.
 fn live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
     super::live::connect_live_client(descriptor)
 }
@@ -315,8 +318,8 @@ fn live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
 ///
 /// This is what the `team-member` binary calls: the live team is resolved through `live_client`,
 /// output goes to stdout and diagnostics to stderr (through `writeln!`, never `println!`). Every
-/// CLI-side problem (bad flag, malformed descriptor, unknown command) exits `2`; a team this
-/// process does not host exits `1`.
+/// CLI-side problem (bad flag, malformed descriptor, unknown command) exits `2`; a team no host
+/// answers for — neither this process nor a published attach socket — exits `1`.
 /// `--help` (and `-h`) is rendered on stdout and exits `0`, even without a join descriptor.
 #[must_use]
 pub fn run_skill_cli(argv: Vec<String>) -> i32 {

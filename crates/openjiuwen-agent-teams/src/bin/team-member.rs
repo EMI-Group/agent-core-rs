@@ -15,8 +15,8 @@
 //!
 //! * `0` — success, `--help` (rendered to stdout, no descriptor needed), and `serve` ending on
 //!   `stop` or end of input;
-//! * `1` — the operation was refused, no team this process hosts could be resolved, or `serve`
-//!   could not build and start its member harness;
+//! * `1` — the operation was refused, no team could be resolved (no host in this process and no
+//!   reachable attach socket), or `serve` could not build and start its member harness;
 //! * `2` — a CLI-side error: a bad flag, a malformed descriptor, an unknown command, or anything
 //!   else that fails the connection stage or the clap parse;
 //! * `130` — the operation was cancelled or timed out.

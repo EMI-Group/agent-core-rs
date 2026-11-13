@@ -6,7 +6,7 @@
 //! `AsyncRead`/`AsyncWrite`, and `(R, W)` converts into an `rmcp` transport through the enabled
 //! `transport-async-rw` feature. Other targets report [`Error::unsupported`].
 //!
-//! The `openjiuwen-team-mcp` console entry point belongs to `openjiuwen-cli`; this module only
+//! The `openjiuwen-team-mcp` console entry point lives in this crate (`src/bin/`); this module
 //! provides the entry points it calls.
 use crate::mcp::server::TeamServerHandler;
 use crate::mcp::{ClientScope, TeamClient, TeamMcpServer, SERVER_NAME};
@@ -59,10 +59,11 @@ async fn process_streams() -> Result<(tokio::fs::File, tokio::fs::File)> {
 }
 /// Resolves the join descriptor from `OPENJIUWEN_TEAM_JOIN` and serves over stdio.
 ///
-/// The server attaches only to a team hosted in *this* process: `resolve_from_registry` goes
-/// through [`crate::skill::connect_live_client`], the process-global runtime registry. A team this
-/// process does not host is [`Error::config`] and exits `1`; cross-process attach (a shared sqlite
-/// store or a distributed transport) is deferred.
+/// The server attaches to a team hosted in *this* process through the process-global runtime
+/// registry, or to one hosted by *another* process over that host's Unix-socket attach bridge
+/// (`crate::attach`); `resolve_from_registry` goes through
+/// [`crate::skill::connect_live_client`], the single resolution point both routes share. A team
+/// neither route reaches is [`Error::config`] and exits `1`.
 ///
 /// Returns the process exit code: `0` after a clean session, `1` when the descriptor or the client
 /// cannot be resolved or the session fails.
@@ -82,7 +83,8 @@ pub async fn run_mcp_server_from_env() -> i32 {
 /// Resolves the join descriptor from the environment and serves the client `resolver` returns.
 ///
 /// `resolver` is the seam used by the CLI and by tests to inject a pre-built client. The default
-/// `resolve_from_registry` only finds teams hosted in this process.
+/// `resolve_from_registry` is [`crate::skill::connect_live_client`]: a team hosted in this process
+/// or one reachable over a published attach socket.
 ///
 /// Returns the process exit code: `0` on success, `1` on a descriptor/resolver/session failure.
 pub async fn run_mcp_server_with<F>(resolver: F) -> i32
