@@ -10,9 +10,10 @@ Only OTLP/HTTP **JSON** is available offline (`gRPC` needs `tonic`/`prost`); the
 ## API Surface
 
 - `mod.rs` — `LangfuseConfig`: `new(public_key, secret_key)`, `with_host`, `with_service_name`, `host()`, `service_name()`, `endpoint()`, `ingestion_url()`, `authorization()`, `validate()`, `otel_config()`, `from_env()`, `exporter()` behind `feature = "otel"`; constants `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`, `LANGFUSE_BASEURL`, `DEFAULT_HOST`.
-- `events.rs` — `IngestionEventType` (`trace-create`/`span-create`/`generation-create`), `IngestionEvent` (`new`, `trace`, `span`, `generation`, `with_id`, `with_timestamp`, `to_json`), and the camelCase bodies `TraceBody`, `SpanBody`, `GenerationBody`.
-- `batch.rs` — `IngestionBatch` (`new`, `with_capacity`, `push`, `extend`, `len`, `is_empty`, `events`, `into_events`) and `DEFAULT_MAX_BATCH_SIZE` (1000 events per request).
+- `events.rs` — `IngestionEventType` (`trace-create`/`span-create`/`generation-create`, `as_str`, `Display`), `IngestionEvent` (`new`, `trace`, `span`, `generation`, `with_id`, `with_timestamp`, `to_json`), and the camelCase bodies `TraceBody`, `SpanBody`, `GenerationBody` (each `new` plus `with_*` builders).
+- `batch.rs` — `IngestionBatch` (`new`, `with_capacity`, `push`, `extend`, `len`, `is_empty`, `events`, `into_events`, `max_size_hint`) and `DEFAULT_MAX_BATCH_SIZE` (1000 events per request).
 - `client.rs` — `LangfuseClient` (`new`, `from_env`, `with_http_client`, `with_max_batch_size`, `config`, `max_batch_size`, `ingest`, `ingest_events`) and `IngestionSummary { events, requests }`.
+- The default client times out each request after 30 s; `with_http_client` replaces it wholesale.
 
 ## Constraints
 

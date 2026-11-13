@@ -12,7 +12,7 @@ Only OTLP/HTTP **JSON** is available offline (`gRPC` needs `tonic`/`prost`), so 
 - `GrafanaCloudConfig` — `new(instance_id, token, zone)`, `with_service_name`, `with_zone`, `with_otlp_endpoint`, `zone()`, `service_name()`, `endpoint()`, `authorization()`, `validate()`, `otel_config()`, `from_env()`, and `exporter()` behind `feature = "otel"`.
 - `GrafanaAgentConfig` — `new(endpoint)`, `with_service_name`, `endpoint()`, `service_name()`, `otel_config()`/`exporter()`, both `Error::Unsupported` naming the external collector requirement.
 - Env constants: `GRAFANA_INSTANCE_ID`, `GRAFANA_API_TOKEN`, `GRAFANA_ZONE`, `GRAFANA_OTLP_ZONE`, `GRAFANA_OTLP_ENDPOINT`.
-- `Debug` for both presets redacts the token.
+- `Debug` for `GrafanaCloudConfig` redacts the token; `GrafanaAgentConfig` holds no credentials and derives `Debug`.
 
 ## Constraints
 
