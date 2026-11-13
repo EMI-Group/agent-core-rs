@@ -11,7 +11,7 @@ Everything is offline and deterministic by default: no environment reads, no wal
 - `Case` — `inputs`, `label`, `tools`, `case_id` (Python field names); `new` (validating), `with_tools`, `with_case_id`, `validate`.
 - `EvaluatedCase` — `case`, `answer`, `score`, `reason`; `new` (score bounds), `validate`, accessors `inputs`/`label`/`tools`/`case_id`, `From<Case>` producing score `0.0` and empty answer/reason.
 - `CaseLoader` — `new`, `size`, `is_empty`, `cases`, `into_cases`, `get`, `iter`, `shuffle` (seeded xorshift64* Fisher-Yates), `split` (floor of `ratio * size`), iteration, JSON round-trip through `{"cases":[...]}`.
-- Evaluator seam (`evaluator.rs`):
+- Evaluator seam (`evaluator/`):
   - `PromptRunner` — `async fn run(&self, prompt, case) -> Result<BTreeMap<String, Value>>`.
   - `ModelPromptRunner` — system message = candidate prompt, user message = `render_case_inputs(case)`; a fenced or whole-answer JSON object becomes the answer map, plain text becomes `{"output": text}`.
   - `ScriptedPromptRunner` — canned answers keyed by case id, optional fallback, recorded `PromptCall`s, `Error::not_found` for an unscripted case without a fallback.
@@ -33,7 +33,7 @@ Everything is offline and deterministic by default: no environment reads, no wal
   - `placeholders(prompt)` — the `{{name}}` names of a prompt.
 - Every optimizer is no-arg constructible and offers `with_config`, `with_model(Arc<dyn Model>)`, `with_evaluator(Arc<dyn CaseEvaluator>)`, plus `config()`/`has_model()` readers.
 - Constants (values unchanged from Python `TuneConstant`): `DEFAULT_EXAMPLE_NUM=1`, `DEFAULT_ITERATION_NUM=3`, `DEFAULT_PARALLEL_NUM=1`, `DEFAULT_EARLY_STOP_SCORE=1.0`, `MIN_ITERATION_NUM=1`, `MAX_ITERATION_NUM=20`, `MIN_PARALLEL_NUM=1`, `MAX_PARALLEL_NUM=20`, `MIN_EXAMPLE_NUM=0`, `MAX_EXAMPLE_NUM=20`.
-- The module root (`mod.rs`) re-exports every public type, helper, and constant; `base`, `evaluator`, `loader`, `optimizer`, and the `optimizer/*` submodules stay private.
+- The module root (`mod.rs`) re-exports every public type, helper, and constant; `base`, `evaluator`, `loader`, `optimizer`, and the `evaluator/*` and `optimizer/*` submodules stay private.
 
 ## Scoring bands (`LabelScorer`)
 
@@ -88,7 +88,7 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - Unit tests live in each file's `#[cfg(test)]` module and are entirely offline: `ScriptedModel` for model paths, fixed case ids, no network, no environment reads, no wall-clock dependence.
 - `base.rs` covers constructor validation, score bounds (`0.0`/`1.0` accepted; `-0.1`, `1.1`, `NaN`, infinities rejected), Python-field JSON round-trips, UUID defaulting, unknown-field tolerance, schema exposure, and `From<Case>` accessors.
 - `loader.rs` covers size/emptiness/get/iteration/split (including ratios `0.0`, `1.0`, `NaN`, out of range), shuffle determinism and permutation preservation, and JSON round-trip plus defaulting.
-- `evaluator.rs` covers every `LabelScorer` band and the Jaccard mapping, missing and single-entry answers, the `ModelPromptRunner` conversation and JSON parsing, provider-error propagation, scripted-runner replay and unknown cases, `RunnerEvaluator` mean scoring and custom scorers, `ModelEvaluator`, and the deterministic dimensions (placeholder loss, coverage, structure, degenerate length/repetition, case dependence, repeatability).
+- `evaluator/tests.rs` covers every `LabelScorer` band and the Jaccard mapping, missing and single-entry answers, the `ModelPromptRunner` conversation and JSON parsing, provider-error propagation, scripted-runner replay and unknown cases, `RunnerEvaluator` mean scoring and custom scorers, `ModelEvaluator`, and the deterministic dimensions (placeholder loss, coverage, structure, degenerate length/repetition, case dependence, repeatability).
 - `optimizer/instruction.rs` covers improvement over the seed, repeat-run equality, validation, early stop at the seed and after one round, iteration/beam caps, placeholder preservation, the model-rewrite path with placeholder repair, fallback on unparsable/failed/empty answers, an injected evaluator, beam ranking, and `Debug`.
 - `optimizer/example.rs` covers the Python example format, `num_examples == 0`, the case-count cap, score monotonicity, determinism, validation (including `MAX_EXAMPLE_NUM + 1`), early stop, model index lists and the order they impose, fallback on bad lists/failures, greedy completion of a short list, and an injected evaluator.
 - `optimizer/joint.rs` checks it is never worse than either coordinate alone, both coordinates contribute, `num_examples == 0`, determinism, early stop, iteration cap, validation, placeholder preservation, the model path, and a shared injected evaluator.
@@ -107,7 +107,12 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 
 - `./base.rs` → `Case`, `EvaluatedCase`, validation, JSON round-trips
 - `./loader.rs` → `CaseLoader`, seeded PRNG, shuffle, split, iteration
-- `./evaluator.rs` → runner/scorer/evaluator seams, label bands, deterministic evaluator
+- `./evaluator/` → the evaluator seam (`evaluator/mod.rs` re-exports the four submodules)
+- `./evaluator/runner.rs` → `PromptRunner`, `ModelPromptRunner`, `ScriptedPromptRunner`, case rendering, answer-map parsing
+- `./evaluator/scorer.rs` → `CaseScorer`, `LabelScorer`, band comparison, tokenization
+- `./evaluator/seam.rs` → `CaseEvaluator`, `RunnerEvaluator`, `ModelEvaluator`, score clamping
+- `./evaluator/deterministic.rs` → `DeterministicEvaluator`, `DeterministicScore`, weights and dimensions
+- `./evaluator/tests.rs` → the evaluator test suite
 - `./optimizer.rs` → facade: tuning constants, `OptimizationResult`, `mod` declarations, re-exports, `optimize_prompt`
 - `./optimizer/config.rs` → `OptimizerConfig`, bounds validation, JSON defaults
 - `./optimizer/suggestion.rs` → placeholder parsing/repair, mutation bank, model-rewrite request, tie-break, bounded scoring, worst-case selection
