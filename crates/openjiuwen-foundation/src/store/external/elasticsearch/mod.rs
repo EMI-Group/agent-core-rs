@@ -18,7 +18,7 @@
 //!
 //! Only the REST transport is used, through
 //! [`openjiuwen_common::http::HttpClient`]: no vendor SDK is involved. A non-2xx
-//! response becomes an [`Error::Transport`](openjiuwen_common::error::Error)
+//! response becomes an [`Error`] whose kind is `Transport`,
 //! naming the status code, the URL and an excerpt of the body (`failure`).
 //!
 //! # Schema round-trip
@@ -32,10 +32,6 @@
 //! an index without it (created by someone else) is reconstructed from
 //! `mappings.properties` by `schema_from_properties`, which synthesizes the
 //! `id` primary key the mapping cannot declare.
-
-// The store modules (`vector`, `document`) are the only consumers of the helpers
-// below, so this shared foundation is unreachable on its own.
-#![allow(dead_code)]
 
 use std::time::Duration;
 
@@ -53,6 +49,9 @@ use crate::store::vector::{CollectionSchema, FieldSchema, Metric, VectorDataType
 pub mod document;
 pub mod query;
 pub mod vector;
+
+pub use document::ElasticsearchDocumentStore;
+pub use vector::ElasticsearchVectorStore;
 
 /// Default total timeout of one Elasticsearch request.
 const fn default_timeout() -> Duration {
@@ -353,19 +352,6 @@ pub(crate) fn similarity_for(metric: Metric) -> &'static str {
         Metric::Dot => "dot_product",
         Metric::Euclidean => "l2_norm",
     }
-}
-
-/// The Elasticsearch mapping of one schema field, with the default similarity.
-///
-/// Use [`field_mapping_with`] to honour a configured [`Metric`].
-///
-/// # Errors
-///
-/// Returns [`Error::Validation`](openjiuwen_common::error::Error) for a vector
-/// field without a positive `dim` and for a top-level `ARRAY` field, which an
-/// Elasticsearch mapping cannot represent.
-pub(crate) fn field_mapping(field: &FieldSchema) -> Result<Value> {
-    field_mapping_with(field, Metric::default())
 }
 
 /// The Elasticsearch mapping of one schema field, using `metric` as the
@@ -904,7 +890,7 @@ mod tests {
             json!({"type": "dense_vector", "dims": 4, "index": true, "similarity": "dot_product"})
         );
         assert_eq!(
-            field_mapping(&vector).expect("mapping")["similarity"],
+            field_mapping_with(&vector, Metric::Cosine).expect("mapping")["similarity"],
             json!("cosine")
         );
 
@@ -913,11 +899,15 @@ mod tests {
             ..FieldSchema::new("title", VectorDataType::Varchar)
         };
         assert_eq!(
-            field_mapping(&varchar).expect("mapping"),
+            field_mapping_with(&varchar, Metric::Cosine).expect("mapping"),
             json!({"type": "keyword", "ignore_above": 32})
         );
         assert_eq!(
-            field_mapping(&FieldSchema::new("title", VectorDataType::Varchar)).expect("mapping"),
+            field_mapping_with(
+                &FieldSchema::new("title", VectorDataType::Varchar),
+                Metric::Cosine,
+            )
+            .expect("mapping"),
             json!({"type": "keyword"})
         );
 
@@ -930,14 +920,15 @@ mod tests {
             (VectorDataType::Json, "object"),
         ] {
             assert_eq!(
-                field_mapping(&FieldSchema::new("field", dtype)).expect("mapping"),
+                field_mapping_with(&FieldSchema::new("field", dtype), Metric::Cosine)
+                    .expect("mapping"),
                 json!({"type": expected}),
                 "dtype {dtype:?}"
             );
         }
 
         let array = FieldSchema::new("tags", VectorDataType::Array);
-        let error = field_mapping(&array).expect_err("ARRAY is rejected");
+        let error = field_mapping_with(&array, Metric::Cosine).expect_err("ARRAY is rejected");
         assert_eq!(error.kind(), ErrorKind::Validation);
         assert!(error.to_string().contains("\"tags\""), "message: {error}");
     }
@@ -949,7 +940,7 @@ mod tests {
                 dim,
                 ..FieldSchema::new("embedding", VectorDataType::FloatVector)
             };
-            let error = field_mapping(&field).expect_err("dim is required");
+            let error = field_mapping_with(&field, Metric::Cosine).expect_err("dim is required");
             assert_eq!(error.kind(), ErrorKind::Validation);
             assert!(error.to_string().contains("dim"), "message: {error}");
         }
