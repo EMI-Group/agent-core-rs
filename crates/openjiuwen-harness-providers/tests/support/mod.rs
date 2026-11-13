@@ -10,6 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // fixtures assert by panicking
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Environment variable the fake CLI receives and logs into.
@@ -97,9 +98,36 @@ impl FakeCli {
     }
 
     /// Writes `script` as the executable program.
+    ///
+    /// The script is staged under a sibling name in the same directory, made executable there, and
+    /// only then renamed onto the final path, so a concurrent `exec` can never observe a
+    /// half-written script (`rename` is atomic within one filesystem).
+    ///
+    /// The bytes are piped to a helper `cat` instead of `std::fs::write` on purpose: an executable
+    /// materialized from a descriptor opened in *this* process intermittently fails to run with
+    /// `ETXTBSY` ("Text file busy"), because a fake CLI forked by another test thread copies the
+    /// whole descriptor table — including the open write descriptor of the script being exec'd. The
+    /// tests deliberately spawn processes from many threads at once, so the helper keeps every
+    /// write descriptor of an executable out of this process entirely.
     fn write_program(&self, script: &str) {
-        std::fs::write(&self.program, script).expect("write the fake CLI script");
-        make_executable(&self.program);
+        let staged = self.dir.path().join("fake-cli.staged");
+        let mut helper = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("cat > {}", quote_shell(&staged)))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the helper that writes the fake CLI script");
+        {
+            let mut sink = helper.stdin.take().expect("piped helper stdin");
+            sink.write_all(script.as_bytes())
+                .expect("write the fake CLI script");
+        }
+        assert!(
+            helper.wait().expect("wait for the helper").success(),
+            "the fake CLI script must be written"
+        );
+        make_executable(&staged);
+        std::fs::rename(&staged, &self.program).expect("install the fake CLI script");
     }
 }
 

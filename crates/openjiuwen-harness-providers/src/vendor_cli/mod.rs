@@ -11,6 +11,8 @@
 //! - [`binary`] — locating and validating the vendor executable.
 //! - [`jsonl`] — pure NDJSON/JSON-object accessors shared by every decoder.
 //! - [`child`] — one spawned CLI process with piped stdin/stdout/stderr and a bounded stderr tail.
+//! - [`rpc`] — a JSON-RPC 2.0 client over that transport: id-correlated requests, notifications and
+//!   server-to-client requests.
 //! - [`events`] — the observation [`EventBus`] and [`EnvelopeBuilder`] that feed the harness SPI
 //!   event cursor.
 //! - [`permissions`] — host permission translation for tool approvals and user input.
@@ -31,6 +33,7 @@ pub mod events;
 pub mod harness;
 pub mod jsonl;
 pub mod permissions;
+pub mod rpc;
 pub mod session;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -48,6 +51,7 @@ pub use jsonl::{
     parse_line_labelled, snippet, string_list,
 };
 pub use permissions::{ask_tool_approval, ask_user_input, ApprovalDecision, PermissionPolicy};
+pub use rpc::{request_id_value, JsonRpcClient, RpcTransport};
 pub use session::{checkpoint_str, derive_session_id, resolve_resume_id};
 
 /// Locks `mutex`, recovering the guard when a previous holder panicked.

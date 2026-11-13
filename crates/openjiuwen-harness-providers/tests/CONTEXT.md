@@ -2,7 +2,7 @@
 
 ## Intent
 
-Offline integration suites for the provider registry, the native provider wiring, the IO adapter, the vendor stubs, the skill installer, and the shared vendor CLI subprocess transport.
+Offline integration suites for the provider registry, the native provider wiring, the IO adapter, the vendor stubs, the skill installer, and the shared vendor CLI subprocess transport (NDJSON and JSON-RPC).
 Behavior ports name their Python counterpart (`tests/unit_tests/harness_providers/<file>::<test>`) in a comment.
 
 ## API Surface
@@ -14,6 +14,7 @@ No public API; the suites exercise `openjiuwen_harness_providers` through its pu
 - Offline and deterministic: no network, no external CLIs, no sleeps (bounded `tokio::time::timeout` awaits only), `tempfile::tempdir` for every filesystem case.
 - Test doubles (`FakeHarness`, `FakeProvider`, `FakeSink`, `FakeToolGateway`) live inside the test files and double as usage examples.
 - `support::FakeCli` is the one shared fixture: a temp-directory POSIX shell script with a stdin transcript, included per binary with `mod support;` (the module carries `#![allow(dead_code)]` and `#![allow(unreachable_pub)]`).
+- `FakeCli` stages the script as `fake-cli.staged`, chmods it and renames it onto `fake-cli`, and the bytes are written by a helper `cat` process: a write descriptor opened in the test process is copied into every concurrently forked child and makes `exec` fail with `ETXTBSY` (`Text file busy`).
 - Registry tests use globally unique provider names instead of a reset hook, because the registry is process-global.
 - `#![allow(clippy::unwrap_used, clippy::expect_used)]` at the top of each suite (assert-by-panic is the intent).
 - Vendor suites are `#![cfg(feature = "vendor")]`; the default suite must pass with `--no-default-features` too.
@@ -26,4 +27,5 @@ No public API; the suites exercise `openjiuwen_harness_providers` through its pu
 - `./vendor.rs` → vendor cards/configs/model fragments/`Unsupported` create (feature `vendor`)
 - `./skills.rs` → skill normalization and conflict policies
 - `./vendor_cli.rs` → real subprocess transport: NDJSON round trip, ordered replies, EOF, stderr tail, broken pipe, malformed/over-long lines, `kill` reaping, args/cwd, cleared environment (`#![cfg(unix)]`)
-- `./support/mod.rs` → shared `FakeCli` fixture (scripted POSIX shell CLI with a stdin transcript)
+- `./vendor_rpc.rs` → real subprocess JSON-RPC path over `FakeCli`: request round trips and transcript, an unsolicited notification through `next_incoming`, a peer error with its code, notifications without an id, EOF failing the pending request, a skipped unreadable line (`#![cfg(unix)]`)
+- `./support/mod.rs` → shared `FakeCli` fixture (scripted POSIX shell CLI with a stdin transcript; helper-written, atomically installed script)
