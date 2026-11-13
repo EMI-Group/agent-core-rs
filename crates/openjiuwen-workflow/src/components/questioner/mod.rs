@@ -16,12 +16,42 @@
 //! `Workflow::resume` re-runs the component with the seeded answers. The interaction id
 //! is the component id, because the question payload is the rendered question string.
 //!
+//! # Chat history
+//!
+//! With [`QuestionerConfig::with_chat_history`] enabled the component reads and writes
+//! the session conversation through [`ComponentContext::history`] (the session global
+//! lane `__messages__`, see [`crate::context::history`]), mirroring Python's
+//! `ModelContext` reads and writes:
+//!
+//! - Each round records the *user* turn first (the input `query` on `start`, the seeded
+//!   answer on `user_interact`; a blank turn records nothing), then builds the window
+//!   that goes into the prompt's `dialogue_history` section, then records the *assistant*
+//!   turn (the question when the round asks again, the extracted fields as JSON when it
+//!   completes).
+//! - The window is the last `chat_history_max_rounds` rounds (one round = one user turn
+//!   plus the assistant turns that follow it), and the current query is appended as a
+//!   final user turn when the window is empty or ends with an assistant turn
+//!   (Python's trailing-turn rule).
+//! - With the flag off nothing is read, nothing is written, and the prompt carries the
+//!   current query as its only history line — exactly the pre-history behavior.
+//!
 //! # Deviations from Python
 //!
-//! - **No chat-history window injection.** `with_chat_history` and
-//!   `chat_history_max_rounds` are carried for configuration parity, but the extraction
-//!   conversation always contains only the current query as the user turn; there is no
-//!   context-engine window on [`ComponentContext`] to read.
+//! - **Session-backed history instead of a `ModelContext` window.** The conversation is
+//!   the session global lane `__messages__`, so every history-enabled component on one
+//!   session (the `llm` component, intent detection, another questioner) shares one
+//!   conversation. `get_context_window(dialogue_round=N)` is approximated by keeping the
+//!   last `N` rounds counted from user turns, so a leading system turn is dropped when the
+//!   window is trimmed, tool-call rounds are not distinguished, and a
+//!   `chat_history_max_rounds` of `0` is clamped to one round (Python requires `> 0`).
+//! - **Text only.** [`BaseMessage::text`] flattens history entries, and a structured
+//!   `query`/answer is stored as its JSON text instead of Python's `dict` content.
+//! - **`question_content` completion writes no assistant turn.** Python's
+//!   `_handle_user_interact_state` returns as soon as a `question_content` round is
+//!   complete, so only the user turn is recorded; the same happens here.
+//! - **Extracted-field turn formatting.** The completing assistant turn is
+//!   `serde_json::to_string` (compact) rather than Python's `json.dumps` (`, ` / `: `
+//!   separators).
 //! - **No `QuestionerExecutable`/composable split and no `model_id` Runner lookup.** The
 //!   model is injected directly through [`QuestionerConfig::with_model`]; Python resolves
 //!   `model_id` through `Runner.resource_mgr`.
@@ -38,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::{Model, ModelRequestConfig};
+use openjiuwen_foundation::{BaseMessage, Model, ModelRequestConfig, Role};
 
 use crate::ability::ComponentAbility;
 use crate::component::{Component, ComponentCard};
@@ -224,27 +254,104 @@ impl QuestionerComponent {
         .await
     }
 
+    /// Appends one user turn to the session history (Python `_write_user_message_to_context`).
+    ///
+    /// A no-op unless [`QuestionerConfig::with_chat_history`] is set; a blank turn writes
+    /// nothing, and structured content is stored as its plain text.
+    async fn record_user_turn(&self, ctx: &ComponentContext, content: &Value) {
+        if !self.config.with_chat_history {
+            return;
+        }
+        let text = python_str(content);
+        if text.is_empty() {
+            return;
+        }
+        ctx.history().append(vec![BaseMessage::user(text)]).await;
+    }
+
+    /// Appends one assistant turn to the session history
+    /// (Python `_write_assistant_message_to_context`).
+    ///
+    /// A no-op unless [`QuestionerConfig::with_chat_history`] is set; a blank turn writes
+    /// nothing.
+    async fn record_assistant_turn(&self, ctx: &ComponentContext, content: &str) {
+        if !self.config.with_chat_history || content.is_empty() {
+            return;
+        }
+        ctx.history()
+            .append(vec![BaseMessage::assistant(content)])
+            .await;
+    }
+
+    /// Records the completing assistant turn as the extracted fields' JSON text.
+    ///
+    /// Python writes `json.dumps(output.key_fields)` when a round ends without another
+    /// question; the JSON is compact here instead of Python's `", "`/`": "` separators.
+    async fn record_extracted_fields(&self, ctx: &ComponentContext, output: &OutputCache) {
+        if !self.config.with_chat_history {
+            return;
+        }
+        // Serializing a JSON object to text cannot fail (no non-finite numbers can exist
+        // in a `serde_json::Value`), so an unexpected error degrades to "no turn".
+        match serde_json::to_string(&Value::Object(output.key_fields.clone())) {
+            Ok(text) => self.record_assistant_turn(ctx, &text).await,
+            Err(error) => tracing::warn!(%error, "cannot serialize questioner key fields"),
+        }
+    }
+
+    /// Builds the conversation window that goes into the extraction prompt
+    /// (Python `_get_latest_chat_history`).
+    ///
+    /// With [`QuestionerConfig::with_chat_history`] off the window is the current query
+    /// alone and the history lane is never read. Otherwise the window is the last
+    /// [`QuestionerConfig::chat_history_max_rounds`] rounds of the session history — the
+    /// caller has already recorded the current user turn, exactly like Python — with the
+    /// current query appended as a final user turn when the window is empty or still ends
+    /// with an assistant turn.
+    async fn chat_history_window(&self, ctx: &ComponentContext, query: &Value) -> Vec<BaseMessage> {
+        let query = python_str(query);
+        if !self.config.with_chat_history {
+            return vec![BaseMessage::user(query)];
+        }
+        let mut messages = ctx.history().messages().await;
+        let ends_with_assistant = messages
+            .last()
+            .is_some_and(|message| message.role == Role::Assistant);
+        if messages.is_empty() || ends_with_assistant {
+            messages.push(BaseMessage::user(query));
+        }
+        trim_rounds(messages, self.config.chat_history_max_rounds)
+    }
+
     /// Runs one `start` round (Python `_handle_start_state`).
     async fn handle_start(
         &self,
+        ctx: &ComponentContext,
         query: &Value,
         inputs: &Value,
         state: &mut QuestionerState,
     ) -> Result<OutputCache> {
         let mut output = OutputCache::default();
+        // Python records the user message before it reads the window, so the query is
+        // already the last turn of the history it sends to the model.
+        self.record_user_turn(ctx, query).await;
         if self.has_question_content() {
             let fields = user_fields(inputs);
             output.question = format_template(&self.config.question_content, &fields);
             state.question.clone_from(&output.question);
             state.status = Status::UserInteract;
+            self.record_assistant_turn(ctx, &output.question).await;
             return Ok(output);
         }
         if self.need_extract_fields(state) {
-            if self.run_extraction(query, state, &mut output).await? {
+            let history = self.chat_history_window(ctx, query).await;
+            if self.run_extraction(&history, state, &mut output).await? {
                 state.question.clone_from(&output.question);
                 state.status = Status::UserInteract;
+                self.record_assistant_turn(ctx, &output.question).await;
             } else {
                 state.status = Status::End;
+                self.record_extracted_fields(ctx, &output).await;
             }
             return Ok(output);
         }
@@ -276,16 +383,21 @@ impl QuestionerComponent {
             question: state.question.clone(),
             key_fields: Map::new(),
         };
+        self.record_user_turn(ctx, &answer).await;
         if self.has_question_content() && !self.need_extract_fields(state) {
+            // Python returns here without recording an assistant turn.
             state.status = Status::End;
             return Ok(output);
         }
         if self.need_extract_fields(state) {
-            if self.run_extraction(&answer, state, &mut output).await? {
+            let history = self.chat_history_window(ctx, &answer).await;
+            if self.run_extraction(&history, state, &mut output).await? {
                 state.question.clone_from(&output.question);
                 state.status = Status::UserInteract;
+                self.record_assistant_turn(ctx, &output.question).await;
             } else {
                 state.status = Status::End;
+                self.record_extracted_fields(ctx, &output).await;
             }
             return Ok(output);
         }
@@ -297,11 +409,11 @@ impl QuestionerComponent {
     /// Extracts the configured fields, fills defaults, and decides whether to ask again.
     async fn run_extraction(
         &self,
-        query: &Value,
+        history: &[BaseMessage],
         state: &mut QuestionerState,
         output: &mut OutputCache,
     ) -> Result<bool> {
-        for (name, value) in self.invoke_for_extraction(query).await? {
+        for (name, value) in self.invoke_for_extraction(history).await? {
             output.key_fields.insert(name.clone(), value.clone());
             state.extracted_key_fields.insert(name, value);
         }
@@ -310,13 +422,13 @@ impl QuestionerComponent {
     }
 
     /// Calls the model and parses the extracted fields (Python `_invoke_llm_for_extraction`).
-    async fn invoke_for_extraction(&self, query: &Value) -> Result<Map<String, Value>> {
+    async fn invoke_for_extraction(&self, history: &[BaseMessage]) -> Result<Map<String, Value>> {
         let model = self
             .config
             .model
             .as_ref()
             .ok_or_else(|| input_invalid("questioner field extraction requires a model"))?;
-        let messages = extraction_messages(&self.config, query);
+        let messages = extraction_messages(&self.config, history);
         let response = model
             .invoke(&messages, &ModelRequestConfig::default())
             .await
@@ -424,6 +536,27 @@ impl QuestionerComponent {
     }
 }
 
+/// Keeps the last `max_rounds` conversation rounds of `messages`.
+///
+/// A round starts at a user turn and runs until the next user turn, so trimming cuts at
+/// the `max_rounds`-th-from-last user message. Everything before the cut is dropped
+/// (including a leading system turn); fewer rounds than the limit keeps the list intact,
+/// and `max_rounds == 0` is clamped to one round, because a window without the current
+/// query would leave the prompt without any user turn.
+fn trim_rounds(mut messages: Vec<BaseMessage>, max_rounds: u32) -> Vec<BaseMessage> {
+    let keep = usize::try_from(max_rounds.max(1)).unwrap_or(usize::MAX);
+    let starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == Role::User)
+        .map(|(index, _)| index)
+        .collect();
+    if starts.len() <= keep {
+        return messages;
+    }
+    messages.split_off(starts[starts.len() - keep])
+}
+
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Component for QuestionerComponent {
@@ -453,7 +586,7 @@ impl Component for QuestionerComponent {
             QuestionerState::default()
         };
         let output = match state.status {
-            Status::Start => self.handle_start(&query, &inputs, &mut state).await?,
+            Status::Start => self.handle_start(ctx, &query, &inputs, &mut state).await?,
             Status::UserInteract => self.handle_user_interact(ctx, &mut state).await?,
             Status::End => end_state_output(&state),
         };

@@ -27,7 +27,7 @@ use openjiuwen_workflow::components::questioner::{
 };
 use openjiuwen_workflow::{
     ComponentOptions, EndComponent, StartComponent, Workflow, WorkflowExecutionState,
-    WorkflowOutput,
+    WorkflowOutput, MESSAGES_STATE_KEY,
 };
 
 /// The questioner node id, which is also the interaction id.
@@ -54,6 +54,31 @@ fn typed_field(name: &str, description: &str, field_type: &str) -> FieldInfo {
 /// A checkpointed session through `checkpointer`.
 fn checkpointed(id: &str, checkpointer: &MemoryCheckpointer) -> Arc<dyn Session> {
     common::session_with_checkpointer(id, Arc::new(checkpointer.clone()) as Arc<dyn Checkpointer>)
+}
+
+/// Seeds the session's `__messages__` conversation lane with `messages`.
+async fn seed_history(session: &Arc<dyn Session>, messages: Value) {
+    let mut patch = serde_json::Map::new();
+    patch.insert(MESSAGES_STATE_KEY.to_owned(), messages);
+    session.update_state(Value::Object(patch)).await.unwrap();
+}
+
+/// The conversation lane of `session`, or `None` when nothing was recorded.
+async fn recorded_history(session: &Arc<dyn Session>) -> Option<Value> {
+    session.get_state(MESSAGES_STATE_KEY).await.unwrap()
+}
+
+/// The last extraction prompt sent to the model.
+///
+/// The `dialogue_history` section sits between the template's `对话历史` heading and the
+/// closing instruction, so the assertions look for distinctive turn texts inside the
+/// whole prompt.
+fn last_prompt(model: &ScriptedModel) -> String {
+    model
+        .last_call()
+        .expect("one extraction call")
+        .last_user_text()
+        .expect("the extraction prompt has a user message")
 }
 
 /// An `InteractiveInput` carrying one answer for the questioner node.
@@ -571,4 +596,267 @@ fn configuration_errors_use_the_python_codes() {
         assert!(error.message().starts_with("[101071]"), "{error}");
         assert!(error.message().contains(reason), "{error}");
     }
+}
+
+// port of Python's `QuestionerDirectReplyHandler._get_latest_chat_history` /
+// `_create_prompt_template_keywords` (chat history injected into `dialogue_history`)
+#[tokio::test]
+async fn with_chat_history_the_prior_conversation_reaches_the_extraction_prompt() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-history-prompt", &checkpointer);
+    seed_history(
+        &session,
+        json!([
+            {"role": "user", "content": "上一轮我问了杭州的天气"},
+            {"role": "assistant", "content": "上一轮我回答了晴转多云"},
+        ]),
+    )
+    .await;
+    let model = ScriptedModel::text(r#"{"location": "hangzhou"}"#);
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model.clone()))
+        .with_field_names(vec![field("location", "地点")])
+        .with_chat_history(true);
+    let workflow = questioner_workflow(
+        "questioner-history-prompt",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let output = workflow
+        .invoke(json!({"query": "那明天呢"}), Arc::clone(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    let prompt = last_prompt(&model);
+    assert!(prompt.contains("user：上一轮我问了杭州的天气"), "{prompt}");
+    assert!(
+        prompt.contains("assistant：上一轮我回答了晴转多云"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("user：那明天呢"),
+        "the current query closes the window: {prompt}"
+    );
+    assert!(
+        prompt.find("上一轮我问了杭州的天气").unwrap() < prompt.find("user：那明天呢").unwrap(),
+        "history precedes the current query: {prompt}"
+    );
+}
+
+// port of Python's `_write_user_message_to_context` + `_write_assistant_message_to_context`
+#[tokio::test]
+async fn with_chat_history_a_completed_run_records_the_user_and_assistant_turns() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-history-record", &checkpointer);
+    let model = ScriptedModel::new([
+        ScriptedTurn::text("{}"),
+        ScriptedTurn::text(r#"{"location": "hangzhou"}"#),
+    ]);
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model))
+        .with_field_names(vec![field("location", "地点")])
+        .with_chat_history(true);
+    let workflow = questioner_workflow(
+        "questioner-history-record",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let first = workflow
+        .invoke(json!({"query": "查询天气"}), Arc::clone(&session))
+        .await
+        .unwrap();
+    assert_eq!(first.state, WorkflowExecutionState::InputRequired);
+
+    let resumed = workflow
+        .resume(answer("地点是杭州"), Arc::clone(&session))
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, WorkflowExecutionState::Completed);
+
+    assert_eq!(
+        recorded_history(&session).await,
+        Some(json!([
+            {"role": "user", "content": "查询天气"},
+            {"role": "assistant", "content": "请您提供地点相关的信息"},
+            {"role": "user", "content": "地点是杭州"},
+            {"role": "assistant", "content": "{\"location\":\"hangzhou\"}"},
+        ]))
+    );
+}
+
+// regression guard: the default configuration neither reads nor records history
+#[tokio::test]
+async fn without_chat_history_nothing_is_prompted_or_recorded() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-no-history", &checkpointer);
+    let seeded = json!([
+        {"role": "user", "content": "不该出现在提示词里的历史"},
+        {"role": "assistant", "content": "也不该出现在提示词里的回答"},
+    ]);
+    seed_history(&session, seeded.clone()).await;
+    let model = ScriptedModel::text(r#"{"location": "hangzhou"}"#);
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model.clone()))
+        .with_field_names(vec![field("location", "地点")]);
+    let workflow = questioner_workflow(
+        "questioner-no-history",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let output = workflow
+        .invoke(json!({"query": "查询天气"}), Arc::clone(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    let prompt = last_prompt(&model);
+    assert!(
+        !prompt.contains("不该出现在提示词里的历史"),
+        "the seeded lane must not reach the prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("user：查询天气"),
+        "only the current query is rendered: {prompt}"
+    );
+    assert_eq!(
+        recorded_history(&session).await,
+        Some(seeded),
+        "a history-disabled component leaves the lane untouched"
+    );
+}
+
+// port of Python's `get_context_window(dialogue_round=chat_history_max_rounds)`
+#[tokio::test]
+async fn chat_history_max_rounds_keeps_only_the_recent_rounds() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-history-trim", &checkpointer);
+    seed_history(
+        &session,
+        json!([
+            {"role": "user", "content": "第一轮问题"},
+            {"role": "assistant", "content": "第一轮回答"},
+            {"role": "user", "content": "第二轮问题"},
+            {"role": "assistant", "content": "第二轮回答"},
+            {"role": "user", "content": "第三轮问题"},
+            {"role": "assistant", "content": "第三轮回答"},
+        ]),
+    )
+    .await;
+    let model = ScriptedModel::text(r#"{"location": "hangzhou"}"#);
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model.clone()))
+        .with_field_names(vec![field("location", "地点")])
+        .with_chat_history(true)
+        .with_chat_history_max_rounds(2);
+    let workflow = questioner_workflow(
+        "questioner-history-trim",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let output = workflow
+        .invoke(json!({"query": "当前问题"}), Arc::clone(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    let prompt = last_prompt(&model);
+    assert!(prompt.contains("user：第三轮问题"), "{prompt}");
+    assert!(prompt.contains("assistant：第三轮回答"), "{prompt}");
+    assert!(prompt.contains("user：当前问题"), "{prompt}");
+    assert!(
+        !prompt.contains("第二轮问题") && !prompt.contains("第一轮问题"),
+        "rounds beyond the limit are trimmed: {prompt}"
+    );
+}
+
+// port of Python's trailing-turn rule in `_get_latest_chat_history`
+#[tokio::test]
+async fn an_empty_query_still_closes_the_window_with_a_user_turn() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-history-trailing", &checkpointer);
+    seed_history(
+        &session,
+        json!([
+            {"role": "user", "content": "先前的问题"},
+            {"role": "assistant", "content": "先前的回答"},
+        ]),
+    )
+    .await;
+    let model = ScriptedModel::text("{}");
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model.clone()))
+        .with_field_names(vec![field("location", "地点")])
+        .with_chat_history(true);
+    let workflow = questioner_workflow(
+        "questioner-history-trailing",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let first = workflow
+        .invoke(json!({}), Arc::clone(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(first.state, WorkflowExecutionState::InputRequired);
+    let prompt = last_prompt(&model);
+    assert!(
+        prompt.contains("assistant：先前的回答\nuser："),
+        "a window ending with an assistant turn gains a user turn: {prompt}"
+    );
+    assert_eq!(
+        recorded_history(&session).await,
+        Some(json!([
+            {"role": "user", "content": "先前的问题"},
+            {"role": "assistant", "content": "先前的回答"},
+            {"role": "assistant", "content": "请您提供地点相关的信息"},
+        ])),
+        "a blank query records no user turn, only the asked question"
+    );
+}
+
+// a structured (non-string) query degrades to its plain JSON text
+#[tokio::test]
+async fn a_structured_query_is_recorded_as_json_text() {
+    let checkpointer = MemoryCheckpointer::new();
+    let session = checkpointed("questioner-history-structured", &checkpointer);
+    let model = ScriptedModel::text(r#"{"location": "hangzhou"}"#);
+    let config = QuestionerConfig::default()
+        .with_model(Arc::new(model.clone()))
+        .with_field_names(vec![field("location", "地点")])
+        .with_chat_history(true);
+    let workflow = questioner_workflow(
+        "questioner-history-structured",
+        config,
+        json!({"query": "${start.query}"}),
+        json!({"location": "${questioner.location}"}),
+    );
+
+    let output = workflow
+        .invoke(json!({"query": {"city": "杭州"}}), Arc::clone(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    assert!(
+        last_prompt(&model).contains(r#"user：{"city":"杭州"}"#),
+        "the object is rendered as JSON text"
+    );
+    assert_eq!(
+        recorded_history(&session).await,
+        Some(json!([
+            {"role": "user", "content": r#"{"city":"杭州"}"#},
+            {"role": "assistant", "content": "{\"location\":\"hangzhou\"}"},
+        ]))
+    );
 }
