@@ -4,8 +4,9 @@
 //! selection and adaptation*: resolving a provider by name, creating a harness from it, describing
 //! its capabilities and model-configuration hook, and projecting a harness onto the kernel IO
 //! surface. It never reimplements a harness: the native openJiuwen `DeepAgent` lives in
-//! `openjiuwen-harness`, and the vendor harnesses (Claude Code, Codex, DSH) are deferred — their
-//! cards and configuration types exist, but creating one returns `Error::Unsupported`.
+//! `openjiuwen-harness`, the team-backed harness in `openjiuwen-agent-teams`, and the vendor
+//! harnesses (Claude Code, Codex, DSH) are the vendors' own CLIs, driven over stdio by one shared
+//! subprocess transport behind a provider-specific wire-protocol adapter.
 //!
 //! # Python parity
 //!
@@ -17,12 +18,15 @@
 //! # Features
 //!
 //! - `native` (default) — the in-process native provider backed by `openjiuwen-harness`.
-//! - `vendor` — the deferred `claudecode`, `codex` and `dsh` provider modules and their
-//!   registration.
-//! - `live-tests` — opt-in, never enabled by default; gated end-to-end tests against real vendor
-//!   harnesses.
+//! - `vendor` — the `claudecode`, `codex` and `dsh` providers: one subprocess transport per vendor
+//!   CLI, each implementing the shared `VendorDriver` seam, plus their registration.
+//! - `native-v2` — the `native_v2` provider, a team runtime hosted by `openjiuwen-agent-teams`
+//!   (opt-in; it is the only dependency behind this feature).
+//! - `live-tests` — opt-in, never enabled by default; a reserved gate for end-to-end tests against
+//!   real vendor CLIs that currently enables no code.
 //!
-//! The crate builds with `--no-default-features` and with `--features vendor`.
+//! The crate builds with `--no-default-features`, with `--features vendor`, and with
+//! `--features "vendor,native-v2"`.
 //!
 //! # Module map
 //!
@@ -36,8 +40,8 @@
 //! - [`mcp_naming`] — the `<mcp-tools>` naming preamble for provider system prompts.
 //! - [`provider`] — the registered provider interface (`ProviderSpec`), its wrappers, the
 //!   registry-name constants and the introspection descriptor.
-//! - [`providers`] — the compile-time built-in provider table (`native`, plus the `vendor`-gated
-//!   stubs) and its resolution helper.
+//! - [`providers`] — the compile-time built-in provider table (`native`, plus the `vendor`- and
+//!   `native-v2`-gated providers) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation, plus the per-vendor
 //!   [`SkillInstaller`] policy (discovery layout and skill-name rule).
 //! - [`vendor_cli`] — shared plumbing for the vendor CLI harnesses: binary resolution, the NDJSON

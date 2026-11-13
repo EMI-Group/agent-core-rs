@@ -19,8 +19,7 @@ No public API; the suites exercise `openjiuwen_harness_providers` through its pu
 - `FakeCli` stages the script as `fake-cli.staged`, chmods it and renames it onto `fake-cli`, and the bytes are written by a helper `cat` process: a write descriptor opened in the test process is copied into every concurrently forked child and makes `exec` fail with `ETXTBSY` (`Text file busy`).
 - Registry tests use globally unique provider names instead of a reset hook, because the registry is process-global; the suites that also assert positional `available_providers()` order guard those cases with a per-binary mutex.
 - `#![allow(clippy::unwrap_used, clippy::expect_used)]` at the top of each suite (assert-by-panic is the intent).
-- Feature gating: `vendor.rs`, `claudecode.rs`, `codex.rs` are `#![cfg(feature = "vendor")]`; `dsh.rs` is `#![cfg(all(feature = "vendor", unix))]`; `vendor_cli.rs` and `vendor_rpc.rs` are `#![cfg(unix)]`; `native_v2.rs` is `#![cfg(feature = "native-v2")]`. The default and `--no-default-features` runs must stay green (gated binaries compile to zero tests).
-- `claudecode.rs` and `codex.rs` spawn child processes without the `unix` gate, so they would compile on a non-Unix target and fail at runtime — a known gap recorded in the crate's `## Known Issues`.
+- Feature gating: `vendor.rs` is `#![cfg(feature = "vendor")]`; `claudecode.rs`, `codex.rs` and `dsh.rs` are `#![cfg(all(unix, feature = "vendor"))]`; `vendor_cli.rs` and `vendor_rpc.rs` are `#![cfg(unix)]`; `native_v2.rs` is `#![cfg(feature = "native-v2")]`. The default and `--no-default-features` runs must stay green (gated binaries compile to zero tests).
 - Feature-dependent expectations are `#[cfg(feature = "vendor")]` / `#[cfg(feature = "native-v2")]` split: the same suite runs with and without the vendors and the team-hosted provider.
 
 ## Suite Inventory

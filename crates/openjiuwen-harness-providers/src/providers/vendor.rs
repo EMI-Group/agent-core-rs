@@ -84,8 +84,8 @@ pub(crate) fn nested_model_config(
 /// Builds a vendor card from its identity, capability sets and fork modes.
 ///
 /// The protocol version fields keep the [`HarnessCard::new`] defaults, and
-/// `required_host_capabilities` stays empty: a vendor card describes what the eventual
-/// implementation can exploit, never a hard host requirement.
+/// `required_host_capabilities` stays empty: a vendor card describes what the implemented adapter
+/// and its pinned vendor protocol can exploit, never a hard host requirement.
 #[must_use]
 pub(crate) fn vendor_card(
     name: &str,

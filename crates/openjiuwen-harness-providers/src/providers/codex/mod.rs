@@ -38,7 +38,7 @@
 //! - `turn/steer` steers, `turn/interrupt` aborts, and the thread id is the provider session id
 //!   carried by every checkpoint as `{"thread_id": …, "resumed": …}`.
 //!
-//! The full contract is documented on the [`harness`] module.
+//! The full contract is documented on the private `harness` module.
 //!
 //! # Python parity
 //!

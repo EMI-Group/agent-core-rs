@@ -11,7 +11,7 @@
 //! argv, and the missing-result failure.
 //!
 //! Python counterpart: `tests/unit_tests/harness_providers/claudecode/`.
-#![cfg(feature = "vendor")]
+#![cfg(all(unix, feature = "vendor"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -289,6 +289,11 @@ async fn a_turn_projects_outputs_tool_calls_and_lifecycle() {
     assert_eq!(chunks[2].payload["name"], json!("Read"));
     assert_eq!(chunks[2].payload["tool_call_id"], json!("tool-1"));
     assert_eq!(chunks[3].payload["tool_call_id"], json!("tool-1"));
+    assert_eq!(
+        chunks[3].payload["tool_name"],
+        json!("Read"),
+        "the result is attributed to the announced tool, not to its call id"
+    );
     assert_eq!(chunks[3].payload["result"], json!("file body"));
     assert_eq!(chunks[4].payload["kind"], json!("finished"));
     assert_eq!(chunks[4].payload["final_output"], json!("done"));

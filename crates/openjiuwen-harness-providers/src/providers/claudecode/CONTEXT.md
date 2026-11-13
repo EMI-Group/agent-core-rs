@@ -37,7 +37,7 @@ Transport contract (implemented by `harness.rs` + `wire.rs`):
 Wire frames (`frames.rs`) and their projection:
 - `system` — captures `session_id` and emits provider event `system/<subtype>`.
 - `assistant` — `text` → `Answer`/`Final` output, `thinking` → `Reasoning`/`Final`, `tool_use` → `tool_started` plus a `tool_call` content block, other block kinds kept under their own kind; `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`) is merged and emitted; the message is recorded when at least one block survives. Subagent frames (`parent_tool_use_id` non-null) are recorded but publish no outputs or tool events.
-- `user` — only `tool_result` blocks: `tool_completed` plus `tool_result` content blocks in a `Tool` role message.
+- `user` — only `tool_result` blocks: `tool_completed` (its `tool_name` resolved from the matching `tool_use` block recorded in `TurnAccumulator::tool_names`, falling back to the `tool_use_id` for a call the turn never announced) plus `tool_result` content blocks in a `Tool` role message carrying the call id.
 - `stream_event` — only when `include_partial_messages` and not a subagent frame: `message_start`/`message_stop` bracket an index, `content_block_delta` `text_delta`/`thinking_delta` emit `Delta` outputs; everything else ignored.
 - `control_request/can_use_tool` — answered from the host policy (see interactions); any other `control_request` subtype is forwarded as a provider event.
 - `control_response` — ignored.
@@ -102,15 +102,13 @@ Interactions:
 
 ## Known Issues
 
-- `TurnAccumulator::last_text` and `TurnAccumulator::tool_names` are written but never read; `tool_completed` is called with the `tool_use_id` in the tool-name slot, so tool results carry no tool name.
-- `frames.rs` and `wire.rs` have no unit tests; all coverage is `crates/openjiuwen-harness-providers/tests/claudecode.rs` (12 tests over `support::FakeCli`: creation, full turn projection, allow/deny approvals, stdio permission argv, interrupt, `--session-id`, `--resume`, missing result, error result).
-- The crate's `../CONTEXT.md` still describes `claudecode`/`codex`/`dsh` as deferred stubs and routes `claudecode.rs`; this directory owns the real adapter.
+- `wire.rs` has no unit tests; argv/env coverage comes from `crates/openjiuwen-harness-providers/tests/claudecode.rs` (12 tests over `support::FakeCli`: creation, full turn projection, allow/deny approvals, stdio permission argv, interrupt, `--session-id`, `--resume`, missing result, error result), while `frames.rs` covers only the `user`-frame tool-result projection in its 2 unit tests.
 
 ## Routing Table
 
 - `./mod.rs` → constants, config types + `from_json`/`validate`, permission/system-prompt enums, card, `provider()`, `model_config`, `ClaudeCodeHarnessProvider`, and 13 unit tests (identity constants, card, defaults, decode rules, redaction, create errors)
 - `./harness.rs` → `ClaudeDriver` (`VendorDriver`: `open`, `run_turn`, `steer`, `interrupt`, `close`, `export_checkpoint`), turn/control multiplexing, interrupt acknowledgement, checkpoint payload, session adoption; module docs hold the transport contract
-- `./frames.rs` → `dispatch` and per-frame projection (`system`, `assistant`, `user`, `stream_event`, `control_request`, `control_response`, `result`, unknown), `TurnAccumulator`, usage mapping, failure classification, `with_tail`/`compact_json`
+- `./frames.rs` → `dispatch` and per-frame projection (`system`, `assistant`, `user`, `stream_event`, `control_request`, `control_response`, `result`, unknown), `TurnAccumulator`, usage mapping, failure classification, `with_tail`/`compact_json`, and 2 unit tests of the tool-result name resolution
 - `./wire.rs` → `build_args` (argv order), `settings_json` (`--settings` env layer), `build_env`, permission-mode wire values
 - `../vendor_cli/` → shared transport this adapter depends on: `ChildProcess`, `VendorHarness`, `PermissionPolicy`, `ask_tool_approval`/`ask_user_input`, `derive_session_id`/`resolve_resume_id`/`checkpoint_str`, turn constructors
 - `crates/openjiuwen-harness-providers/tests/claudecode.rs` → offline end-to-end suite over `support::FakeCli` (`#![cfg(feature = "vendor")]`, 12 tests)

@@ -188,7 +188,6 @@ impl ClaudeDriver {
                     .get("text")
                     .and_then(JsonValue::as_str)
                     .unwrap_or_default();
-                accumulator.last_text.push_str(text);
                 if !text.is_empty() && !parent {
                     session
                         .output(
@@ -299,15 +298,15 @@ impl ClaudeDriver {
                 content: result.clone(),
                 data,
             });
+            // The name announced by the matching `tool_use` block; a result for a call the CLI
+            // never announced (for example one issued before a resume) falls back to its id.
+            let name = accumulator
+                .tool_names
+                .get(tool_use_id)
+                .cloned()
+                .unwrap_or_else(|| tool_use_id.to_owned());
             session
-                .tool_completed(
-                    turn_id,
-                    tool_use_id,
-                    Some(tool_use_id),
-                    tool_use_id,
-                    result,
-                    None,
-                )
+                .tool_completed(turn_id, tool_use_id, Some(tool_use_id), &name, result, None)
                 .await;
         }
         if blocks.is_empty() {
@@ -551,8 +550,6 @@ pub(super) struct TurnAccumulator {
     stream_open: bool,
     /// Normalized message history of the turn.
     messages: Vec<TurnMessage>,
-    /// Last joined assistant answer text.
-    last_text: String,
     /// Tool call names by call id.
     tool_names: BTreeMap<String, String>,
     /// Usage accumulated over every frame of the turn.
@@ -815,4 +812,144 @@ pub(super) fn with_tail(message: String, tail: &str) -> String {
 /// Renders a JSON value as compact JSON, falling back to the empty string.
 pub(super) fn compact_json(value: &JsonValue) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests of the `user`-frame tool-result projection.
+    //!
+    //! A `tool_result` block carries only the `tool_use_id`; the tool name has to be recovered from
+    //! the `tool_use` block the same turn announced earlier. These tests drive the projection
+    //! directly over an in-process event bus, so no child process is involved.
+    // Tests assert by panicking on failure, which is the intent of a test.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use openjiuwen_harness_protocol::{
+        HarnessEventPayload, ItemEventKind, ItemLifecycleEvent, JsonValue, MessageRole,
+    };
+    use serde_json::json;
+
+    use crate::vendor_cli::{EnvelopeBuilder, EventBus, TurnContext};
+
+    use super::super::ClaudeCodeHarnessConfig;
+    use super::{ClaudeDriver, Frame, TurnAccumulator};
+
+    /// Bounded await budget for every cursor read.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// Turn id every projected frame is reported under.
+    const TURN_ID: &str = "turn-1";
+
+    /// Builds a driver over the default configuration; no binary is resolved or spawned.
+    fn driver() -> ClaudeDriver {
+        ClaudeDriver::new(
+            ClaudeCodeHarnessConfig::default(),
+            PathBuf::from("/nonexistent/claude"),
+        )
+    }
+
+    /// Builds the turn context of one turn and the bus it publishes to.
+    fn turn() -> (Arc<EventBus>, TurnContext) {
+        let bus = EventBus::new(32);
+        let envelope = Arc::new(EnvelopeBuilder::new("host-session", "agent-a"));
+        (bus.clone(), TurnContext::new(bus, envelope))
+    }
+
+    /// Builds a decoded frame from a JSON literal.
+    fn frame(value: &JsonValue) -> Frame {
+        value
+            .as_object()
+            .cloned()
+            .expect("the test frame is a JSON object")
+    }
+
+    /// Closes the bus and returns every completed item lifecycle event it retained.
+    async fn completed_items(bus: &Arc<EventBus>) -> Vec<ItemLifecycleEvent> {
+        bus.close();
+        let mut cursor = bus.events().expect("no other consumer");
+        let mut completed = Vec::new();
+        while let Some(event) = tokio::time::timeout(BOUND, cursor.next_event())
+            .await
+            .expect("the cursor must not block")
+            .expect("the cursor must not fail")
+        {
+            if let HarnessEventPayload::ItemLifecycle(item) = event.event {
+                if item.kind == ItemEventKind::Completed {
+                    completed.push(item);
+                }
+            }
+        }
+        completed
+    }
+
+    /// The name announced by the preceding `tool_use` block reaches the completed tool item.
+    #[tokio::test]
+    async fn a_tool_result_reports_the_name_announced_by_the_tool_use_block() {
+        let (bus, session) = turn();
+        let driver = driver();
+        let mut accumulator = TurnAccumulator::default();
+        let assistant = frame(&json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "tool-1",
+                "name": "Bash",
+                "input": {"command": "ls"},
+            }]},
+        }));
+        driver
+            .handle_assistant(&assistant, TURN_ID, &session, &mut accumulator)
+            .await;
+        let user = frame(&json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "listing",
+            }]},
+        }));
+        driver
+            .handle_user(&user, TURN_ID, &session, &mut accumulator)
+            .await;
+
+        let completed = completed_items(&bus).await;
+        assert_eq!(completed.len(), 1, "one completed tool item");
+        assert_eq!(completed[0].data["tool_name"], json!("Bash"));
+        assert_eq!(completed[0].data["tool_call_id"], json!("tool-1"));
+        assert_eq!(completed[0].data["result"], json!("listing"));
+
+        let message = accumulator.messages.last().expect("the tool message");
+        assert_eq!(message.role, MessageRole::Tool);
+        assert_eq!(message.content[0].kind, "tool_result");
+        assert_eq!(message.content[0].data["call_id"], json!("tool-1"));
+    }
+
+    /// A result for a call the turn never announced falls back to the call id as the name.
+    #[tokio::test]
+    async fn an_unannounced_tool_result_falls_back_to_the_call_id() {
+        let (bus, session) = turn();
+        let driver = driver();
+        let mut accumulator = TurnAccumulator::default();
+        let user = frame(&json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-9",
+                "content": {"output": "resumed"},
+            }]},
+        }));
+        driver
+            .handle_user(&user, TURN_ID, &session, &mut accumulator)
+            .await;
+
+        let completed = completed_items(&bus).await;
+        assert_eq!(completed.len(), 1, "one completed tool item");
+        assert_eq!(completed[0].data["tool_name"], json!("tool-9"));
+        assert_eq!(completed[0].data["tool_call_id"], json!("tool-9"));
+        assert_eq!(completed[0].data["result"], json!({"output": "resumed"}));
+    }
 }

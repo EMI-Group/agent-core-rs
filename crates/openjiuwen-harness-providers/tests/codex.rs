@@ -12,7 +12,7 @@
 //! interrupt path, the resumed thread, and a stream that ends without `turn/completed`.
 //!
 //! Python counterpart: `tests/unit_tests/harness_providers/codex/`.
-#![cfg(feature = "vendor")]
+#![cfg(all(unix, feature = "vendor"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
