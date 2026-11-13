@@ -4,3 +4,13 @@
 //! the recognizer produces an intent, the task scheduler picks a registered
 //! task executor (a controller agent, an LLM router, or a workflow), and the
 //! controller returns the executor's output.
+//!
+//! # Modules
+//!
+//! The port is landing in phases. [`config`] holds the behaviour knobs and
+//! [`schema`] the data model. Later phases add `executors` (the task-executor
+//! seam and its implementations), `intent` (intent recognition), `base` (the
+//! controller loop, event queue, and scheduler), and `legacy` (the
+//! string-routed controller that predates the event queue).
+pub mod config;
+pub mod schema;
