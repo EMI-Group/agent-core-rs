@@ -253,6 +253,8 @@ pub const INTERACTION: &str = "__interaction__";
 pub const WORKFLOW_FINAL: &str = "workflow_final";
 /// Frame kind for context/token usage statistics.
 pub const CONTEXT_USAGE: &str = "context.usage";
+/// Frame kind for a model-route switch (a rail swapped the model for this call).
+pub const LLM_ROUTE: &str = "llm_route";
 impl AgentChunk {
     /// Builds a frame of `kind`.
     #[must_use]
@@ -443,6 +445,7 @@ mod tests {
         assert_eq!(LLM_OUTPUT, "llm_output");
         assert_eq!(LLM_USAGE, "llm_usage");
         assert_eq!(CONTEXT_USAGE, "context.usage");
+        assert_eq!(LLM_ROUTE, "llm_route");
     }
     #[test]
     fn usage_chunk_serializes_usage() {
