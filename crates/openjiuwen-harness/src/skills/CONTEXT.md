@@ -54,6 +54,7 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 - `tracing` only, no stdout; dot-directory and skip-set checks are pure string comparisons.
 - Files ≤1000 lines; tests live beside each module in `#[cfg(test)] mod tests` (tempfile workspaces, `#[tokio::test]`).
 - Secrets never appear here; nothing in this module touches model or network state.
+- `Skill` never stores or reads the `SKILL.md` body: callers resolve `SkillLibrary::discover` → filter by `Skill.name` → read `skill.path()` themselves → `split_skill_front_matter` (`mount.rs:60`) for the body; there is no `Skill::body()` and no skill-read tool.
 - `Skill.directory` is the walked path, not necessarily absolute: roots added via `SkillLibrary::add_root`/`SkillRootMount::mount` are normalized to absolute, but struct-literal or relative roots leave it relative.
 - `SkillResourceValidator::validate` stats the real file before consulting the `FsOperation`, so a fake backend cannot stand in for a missing file.
 - `validate`/`validate_local` read only `FRONT_MATTER_PROBE_LINES`; only `validate` has the late-fence re-read, so front matter beyond 64 lines fails `validate_local` even though discovery would find it.
