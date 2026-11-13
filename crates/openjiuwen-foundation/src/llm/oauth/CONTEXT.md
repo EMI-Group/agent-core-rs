@@ -8,7 +8,7 @@ Only the token endpoints live in this module: sending a model request with the r
 
 ## API Surface
 
-- `OAuthToken` — `access_token`, `refresh_token`, `id_token` (all `SecretString`), `expires_at: Option<DateTime<Utc>>`, `token_type` (`Bearer` by default), `scope`; `new` plus `with_refresh_token`, `with_id_token`, `with_expires_at`, `with_token_type`, `with_scope`, and `is_expired(skew)`; redacting `Debug`, canonical `Serialize`, tolerant `Deserialize` through a private `TokenPayload`.
+- `OAuthToken` — `access_token`, `refresh_token`, `id_token` (all `SecretString`), `expires_at: Option<DateTime<Utc>>`, `token_type` (`Bearer` by default), `scope`; `new` plus `with_refresh_token`, `with_id_token`, `with_expires_at`, `with_token_type`, `with_scope`, `effective_expires_at()` and `is_expired(skew)`; redacting `Debug`, canonical `Serialize`, tolerant `Deserialize` through a private `TokenPayload`.
 - `TokenStore` — async trait (`load`, `save`, `clear`) and the persistence seam above the client.
 - `InMemoryTokenStore` — process-memory backend with `new` and `Default`; the testable default.
 - `FileTokenStore` — auth-store JSON backend: `new(path)`, `with_base_url`, `path`, `base_url`, `default_path`.
