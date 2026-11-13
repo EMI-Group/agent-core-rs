@@ -6,8 +6,11 @@ The compile-and-run side of a workflow: `WorkflowDefinition` is what the builder
 definition into one compile error listing every problem, `ComponentNode` adapts a `Component` to an
 `openjiuwen_graph::Node`, and `CompiledWorkflow` maps a validated definition onto a fresh
 `openjiuwen_graph::CompiledGraph` per run and projects the result into `WorkflowOutput` / `WorkflowChunk`.
+Fan-in follows Python's `wait_for_all`: CNF barriers by default, first-arrival (trigger) channels when a node
+declares `wait_for_all = false`.
 Everything about supersteps, channels, barriers, checkpoints, and Mermaid rendering belongs to
 `openjiuwen-graph`; this module never reimplements it.
+SVG rendering is delegated to `crate::render` and only driven from here.
 
 ## API Surface
 
@@ -18,8 +21,10 @@ pub struct NodeConfig {
     pub inputs_schema: Option<Value>, pub outputs_schema: Option<Value>,
     pub stream_inputs_schema: Option<Value>, pub stream_outputs_schema: Option<Value>,
     pub abilities: Option<Vec<ComponentAbility>>,   // None = infer from topology
-    pub wait_for_all: Option<bool>,                 // accepted, cannot change CNF barriers
-    pub max_retries: u32, pub timeout_ms: Option<u64>, pub name: Option<String>,
+    pub wait_for_all: Option<bool>,                 // Some(false) + >=2 sources = first arrival
+    pub max_retries: u32, pub timeout_ms: Option<u64>,
+    pub exception_config: Option<ExceptionConfig>,  // default_outputs recovery
+    pub name: Option<String>,
 }
 pub enum EdgeKind { Regular, Stream, Barrier }
 pub struct Edge { pub sources: Vec<String>, pub target: String, pub kind: EdgeKind }
@@ -45,7 +50,8 @@ non-empty, else `Component::abilities()`), `selected_ability(id) -> ComponentAbi
 `spec()` builds the Python-compatible `WorkflowSpec`: `edges` / `stream_edges` from regular / stream edges
 (one entry per source, insertion order), `comp_configs` (`NodeSpec` per node: `io_configs`,
 `stream_io_configs`, `abilities`, `max_retries`, `timeout` in seconds — `timeout_ms / 1000.0`, `-1.0` when
-unset), `start_nodes = [start]`, and `stream_source_groups[target] = [[source]]` per stream edge.
+unset, `exception_config`), `start_nodes = [start]`, and `stream_source_groups[target] = [[source]]` per
+stream edge.
 
 ### Ability selection
 
@@ -82,12 +88,16 @@ is produced by the matching `error::*` builder so the Python code prefix survive
 ### `node.rs`
 
 ```rust
-pub(crate) struct RunScope { pub interactions: Arc<InteractionState>, pub writer: Arc<FrameWriter> }
+pub(crate) struct RunScope {
+    pub interactions: Arc<InteractionState>, pub writer: Arc<FrameWriter>,
+    pub depth: usize,                       // nesting level of this run
+    /* failures: per-node failed-attempt counters */
+}
 pub(crate) struct NodeRuntime {
     pub id: String, pub component: Arc<dyn Component>, pub node: NodeConfig,
     pub ability: ComponentAbility, pub is_end: bool,
     pub workflow_id: String,
-    pub scope: Option<Arc<RunScope>>,   // None only when compiling for `to_mermaid` (never executed)
+    pub scope: Option<Arc<RunScope>>,   // None only when compiling for `to_mermaid`/`to_svg`
 }
 pub(crate) struct ComponentNode { /* Arc<NodeRuntime> */ }
 impl Node for ComponentNode { /* run(...) */ }
@@ -100,8 +110,8 @@ impl Node for ComponentNode { /* run(...) */ }
 2. `inputs = resolve_schema(inputs_schema, &source)` when a schema exists, else the whole source object; for
    `Collect` / `Transform`, resolve `stream_inputs_schema` too and merge the objects (`stream` keys win).
 3. `ComponentContext::new(session, id, workflow_id)` + `.with_interactions(scope.interactions)` +
-   `.with_writer(scope.writer)` + `.with_cancellation(ctx.cancellation().clone())`; `run` errors with
-   `Error::workflow` when `scope` is `None` (only `to_mermaid` compiles without one).
+   `.with_writer(scope.writer)` + `.with_cancellation(...)` + `.with_depth(scope.depth)`; `run` errors with
+   `Error::workflow` when `scope` is `None` (only the diagram compiles omit it).
 4. trace, when `session.tracer()` is `Some`: `start_workflow_span(id, name)`, `set_inputs(inputs)`, then
    `finish(output)` / `interrupted(reason)` / `fail(error)`.
 5. dispatch: `component.route(&source)` first — `Ok(Some(targets))` returns `NodeOutcome::Route { targets }`
@@ -115,9 +125,12 @@ impl Node for ComponentNode { /* run(...) */ }
 8. an error carrying `find_interrupt` keeps the tracing `interrupted(reason)` marker and is propagated
    unchanged (the interaction frame itself was already written by `ComponentContext::interact`), so the graph's
    *failure* path stores the pre-superstep boundary and `resume` re-runs the interrupted superstep.
-9. any other error becomes `error::component_execution_error(component_type, ability, reason, workflow_id)`.
-
-`wait_for_all` cannot change scheduler semantics: graph channels are CNF barriers, so every fan-in waits.
+9. otherwise the failed attempt is counted; after `max_retries` are exhausted an `Invoke`/`Collect` node whose
+   `exception_config` has `default_outputs` under a `handle_type` other than `"interrupt"` recovers: the
+   defaults are projected through `outputs_schema`, written under the node id, the span records
+   `error_recovery`, and the run continues.
+10. any other error becomes `error::component_execution_error(component_type, ability, reason, workflow_id)`
+    (`[100054]`); streaming failures and `handle_type == "interrupt"` always take this path.
 
 ### `mod.rs`
 
@@ -126,14 +139,18 @@ impl Node for ComponentNode { /* run(...) */ }
 impl CompiledWorkflow {
     pub fn build(def: WorkflowDefinition) -> Result<Self>;
     pub fn card(&self) -> &WorkflowCard;  pub fn config(&self) -> &WorkflowConfig;
-    pub fn spec(&self) -> &WorkflowSpec;  pub fn end_comp_id(&self) -> &str;
-    pub fn is_streaming(&self) -> bool;   pub fn to_mermaid(&self) -> String;
+    pub fn spec(&self) -> &WorkflowSpec;
+    pub fn start_comp_id(&self) -> &str;  pub fn end_comp_id(&self) -> &str;
+    pub fn ability(&self, id: &str) -> Option<ComponentAbility>;
+    pub fn is_streaming(&self) -> bool;
+    pub fn to_mermaid(&self) -> String;   pub fn to_svg(&self) -> String;   // never fail
     pub async fn invoke(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
     pub fn stream(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> BoxStream<'static, Result<WorkflowChunk>>;
     pub async fn resume(&self, interactive: InteractiveInput, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
 }
 pub struct WorkflowRunOptions { pub cancellation, pub timeout: Option<Duration>, pub interactive: Option<InteractiveInput>,
-    pub resume: bool, pub stream_modes: Option<Vec<StreamMode>>, pub max_supersteps: Option<usize> }
+    pub resume: bool, pub stream_modes: Option<Vec<StreamMode>>, pub max_supersteps: Option<usize>,
+    pub depth: usize /* 0 at top level, child run = parent + 1 */ }
 ```
 
 `build` validates, computes `spec`, derives `is_streaming` from the end node's selected ability, and stores the
@@ -142,6 +159,17 @@ component in declaration order, `edge` / `barrier_edge` / `conditional_edges_to`
 `metadata("workflow_id")`, `metadata("end_comp_id")`) because node instances carry per-run interaction state
 and frame writers. Conditional sources get one `CombinedRouter` that runs its routers in registration order,
 unions and de-duplicates targets, and rejects a target outside the declared set with `Error::graph`.
+
+First-arrival fan-in: with a `scope` (a real run), a node whose `NodeConfig::wait_for_all` is `Some(false)` and
+that has at least two distinct regular/stream/barrier predecessors gets no static channel group. Each such
+source is wired with `GraphBuilder::conditional_edges(source, router→[join])`, which contributes no channel
+group, so `openjiuwen-graph` treats the join's channel as a trigger channel: it fires on any arrival and
+re-fires on a later one. A source that also declares conditional edges into the join merges both decisions
+into its one combined router (`conditional_edges`, target `"*"`), so the declared routers still choose. A
+declared conditional target that is *not* first-arrival keeps its `conditional_edges_to` (declared-set
+validation). Diagram compiles (`to_mermaid`/`to_svg`) skip the rewiring and keep the recorded static edges, so
+every predecessor is visible. Single-source nodes, nodes reached only through a declared conditional edge, and
+`Collect`/`Transform` nodes stay on CNF barriers.
 
 Run wiring: when `session.checkpointer()` is `Some`, compile with
 `CompileOptions { store: Some(Arc::new(CheckpointerStore::new(cp, card.id))), namespace: Some(card.id), checkpoint_every_superstep: true }`
@@ -158,7 +186,8 @@ yields exactly one `Err` on any other failure; a guard aborts the run task when 
 boundary re-runs the interrupted superstep, so the component's question is answered by the seeded answer
 instead of halting again. The stream generator drops its `RunScope` right after compiling the graph (only the
 graph's nodes keep a frame-sink clone) and before it starts reading frames; keeping the scope alive would keep
-the sink open and stall the frame loop.
+the sink open and stall the frame loop. `to_svg` renders through `crate::render::render_svg` (explicit end node,
+card name as title) and degrades to `crate::render::error_svg` when the definition does not compile.
 
 ## Constraints
 
@@ -173,27 +202,33 @@ the sink open and stall the frame loop.
 - Streaming is buffered: a `Stream` / `Transform` producer's frames are stored under its id rather than fed to
   live consumers, and end-node frames are replayed in template order — observable text and order match for
   finite streams, live interleaving does not.
-- `wait_for_all=False` first-arrival fan-in has no equivalent (CNF barriers only), so alternative branch targets merging into one node wait for every predecessor; wire each alternative path separately.
-  The graph layer's only any-of primitive is a *group-less* trigger channel, and a workflow node gets one only when every edge targeting it is dynamic: `GraphBuilder::conditional_edges` (target `"*"`) contributes no channel group, while `conditional_edges_to`, `edge` and `barrier_edge` all do.
-  A first-arrival fan-in is therefore expressible in `build_graph` by emitting `conditional_edges(source, router→[join])` per source instead of `barrier_edge`, with re-activation on a late source (Python's `TriggerChannel` behaves the same); the explicit `.entry(start_id)` keeps the join from being seeded as an implicit entry.
-- `ExceptionConfig` is spec-only: `NodeConfig` has no `exception_config` field, `node_spec` writes `None`, and `ComponentNode::run`'s `Err` branch is the only place a `default_outputs` recovery could substitute a value before `component_execution_error`.
+- Error recovery is inline: Python only substitutes `default_outputs` through a registered
+  `component_error_recovery` callback, while `ComponentNode::run` applies the declared `ExceptionConfig`
+  directly once the graph's retries are exhausted.
+- A first-arrival node whose only fan-in is a declared conditional edge stays CNF: the graph layer's
+  group-less trigger channel needs a dynamic edge per predecessor, so no static edge may target the join.
+- Diagrams render the recorded topology, not the first-arrival rewiring; `to_mermaid`/`to_svg` never fail (a
+  bad definition yields an error document or an error placeholder).
 - Interaction indices and pending frames are tracked by `InteractionState`, not a session broker.
-- `response_format` injection and `enable_history` are carried in LLM config but not applied.
+- LLM `response_format` shaping and `enable_history` insertion live in the component
+  (`src/components/llm/`), not in the engine; the engine only resolves schemas and writes node state.
 
 ## Routing Table
 
 - `./definition.rs` → `WorkflowDefinition`, `NodeConfig`, `Edge`, `ConditionalSource`, ability selection, `spec()`
 - `./validate.rs` → compile-time validation and coded problem messages
-- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation); crate-visible only (`pub(crate)`)
-- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation, `test_support` fakes
-- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection, seed/timeout helpers, `AbortOnDrop`
+- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation, error recovery); crate-visible only (`pub(crate)`)
+- `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation (CNF + first-arrival wiring), SVG entry point, `test_support` fakes
+- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection, seed/timeout/depth helpers, `AbortOnDrop`
 - `./tests.rs` → engine unit tests (stream termination, buffered frames, snapshot lifecycle, interrupt and failure resume, facade accessors)
 
 ## Test Strategy
 
 Validation is covered through `tests/builder_validation.rs`; run semantics through `tests/linear.rs`,
-`references.rs`, `branch.rs`, `streaming.rs`, `end_template.rs`, `llm_component.rs`, `tool_component.rs`,
-`retrieval_component.rs`, `loop_component.rs`, `session_state.rs`, `checkpoint_resume.rs`, and `card_spec.rs`.
+`references.rs`, `branch.rs`, `fan_in.rs`, `streaming.rs`, `end_template.rs`, `llm_component.rs`,
+`llm_semantics.rs`, `tool_component.rs`, `retrieval_component.rs`, `loop_component.rs`, `http_component.rs`,
+`questioner_component.rs`, `intent_detection.rs`, `react_agent.rs`, `sub_workflow.rs`, `exception_recovery.rs`,
+`draw.rs`, `session_state.rs`, `checkpoint_resume.rs`, and `card_spec.rs`.
 The engine's own unit tests cover termination of a stream whose run emits no frames, buffered producer frames
 versus end wires, snapshot lifecycle (deleted on completion, kept on interruption), and resume semantics for
 both an interrupted superstep and a plain node failure.
