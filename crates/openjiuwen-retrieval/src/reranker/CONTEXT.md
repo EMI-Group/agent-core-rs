@@ -10,6 +10,7 @@ Python has no default/no-op reranker and does not wire rerankers into knowledge 
 ### `mod.rs`
 - `#[async_trait] pub trait Reranker: Send + Sync { async fn rerank(&self, query: &str, documents: Vec<SearchResult>, top_n: Option<usize>) -> Result<Vec<SearchResult>>; }`
 - Re-exports `ScoreReranker`, `LlmReranker`, `LlmScorer`.
+- The trait is public, unsealed and object-safe (no generics/`Self` returns); `knowledge_base` holds `Option<Arc<dyn Reranker>>`, so external crates can implement it with public API only.
 
 ### `score.rs`
 - `ScoreReranker { top_n: Option<usize> }`; `new(top_n)`, `Default` (no truncation).
