@@ -12,6 +12,7 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 | File | Feature gate | Scope |
 | --- | --- | --- |
 | `adapters.rs` | none (per-test `redis`/`pulsar` gates) | checkpointer/store/message-queue/sys-op/context-evolver factories, deferred backends, in-memory round-trips |
+| `context_evolver.rs` | none | the `context_evolver` feature end to end: deterministic retrieve/summarize over the JSON file store, the model-driven flows against a `wiremock` peer, `ScriptedCompletion`, algorithm normalization, and the `Unsupported` deferral |
 | `otel_seam.rs` | none (per-test `otel` gates) | `init_otel_tracer` for every `ExporterType` with and without the feature; OTLP deferred |
 | `otel.rs` | `#![cfg(feature = "otel")]` | `CaptureExporter` span names/attributes/statuses through the session `Tracer`/`TraceSink` and `OtelAgentHandler` |
 | `a2a_client.rs` | `#![cfg(feature = "a2a")]` | `A2aClient` against a `wiremock` peer; folded `AgentResult` plus the received JSON-RPC envelope |
@@ -25,8 +26,8 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 - `Error::Unsupported` is a tuple variant (`Error::Unsupported(String)`); `error.message()` returns `Cow<'_, str>` and `error.kind() -> ErrorKind`.
 - Async style: plain `#[tokio::test]` (multi-thread-capable workspace tokio) and `#[test]` for pure functions; the crate takes no `test-util` feature, so `#[tokio::test(start_paused = true)]` and `tokio::time::pause` are unavailable.
 - Bounding is done through the API under test (e.g. `request_json("math", json!(21), Some(Duration::from_secs(5)))`) or short real `tokio::time::timeout` calls in the in-src unit tests — no test harness timeout.
-- `tempfile` is a dev-dependency of the crate but currently used only by in-src unit tests (`src/checkpointer/mod.rs` uses `tempfile::tempdir()`, `src/store/mod.rs` uses `tempfile::TempDir::new()`); no file-boundary test in this directory uses a temp dir yet.
-- HTTP peers: `wiremock::MockServer::start()` with `server.uri()` for the client side; `server.router().oneshot(...)` via `tower::ServiceExt` for the server side; `http_body_util::BodyExt::collect()` decodes bodies. No suite binds a real socket here.
+- `tempfile` is a dev-dependency used by in-src unit tests (`src/checkpointer/mod.rs` uses `tempfile::tempdir()`, `src/store/mod.rs` uses `tempfile::TempDir::new()`) and by `context_evolver.rs`, which roots its `JsonFileMemoryStore` in a `tempfile::tempdir()`.
+- HTTP peers: `wiremock::MockServer::start()` with `server.uri()` for the client side (`a2a_client.rs`, and `context_evolver.rs` driving the real `OpenAI`-compatible adapter); `server.router().oneshot(...)` via `tower::ServiceExt` for the server side; `http_body_util::BodyExt::collect()` decodes bodies.
 - OTel assertions always call `handle.force_flush()` before reading the in-memory `CaptureExporter`; the last re-recorded attribute value wins, hence the reversed `attribute()` helper.
 - Everything is offline and deterministic; no `live-tests` gated file exists in this directory.
 
@@ -34,4 +35,5 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 
 - No `sqlite`-gated test at the crate boundary: the SQLite checkpointer/store backends are exercised only by `src/checkpointer/mod.rs` and `src/store/mod.rs` unit tests.
 - No test pairs `A2aClient` with `A2aServer` over a real loopback socket here; the only real-socket path is `src/a2a/e2e_tests.rs`.
-- `context_evolver::MemoryVectorStore` and `sandbox` provider registration have no direct crate-boundary suite beyond `adapters.rs`.
+- No crate-boundary test exercises `context_evolver::MemoryVectorStore` directly; the vector store stays covered by its in-src unit tests while `context_evolver.rs` covers the services that use it.
+- `sandbox` provider registration has no crate-boundary suite beyond `adapters.rs`.
