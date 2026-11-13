@@ -114,10 +114,17 @@ impl A2aRemoteClient {
 }
 
 // server/ (everything re-exported at crate::a2a::server::)
+pub enum A2aTransport { JsonRpc, Rest, Both }   // serde "JSONRPC" / "HTTP+JSON" / "BOTH" + aliases
+impl A2aTransport { pub const fn mounts_json_rpc(self) -> bool; pub const fn mounts_rest(self) -> bool; }
 pub struct A2aServerConfig { pub agent_card: AgentCard, pub interface_url: Option<String>,
                              pub rpc_path /* "/a2a/jsonrpc/" */, pub card_path /* "/.well-known/agent-card.json" */,
+                             pub transport /* JsonRpc */, pub rest_path /* "/a2a/rest" */,
+                             pub rest_prefix /* "/v1" */, pub rest_interface_url: Option<String>,
                              pub protocol_version /* "1.0" */, pub host /* "127.0.0.1" */, pub port /* 8000 */ }
-pub const DEFAULT_RPC_PATH/DEFAULT_CARD_PATH/DEFAULT_PROTOCOL_VERSION/DEFAULT_HOST/DEFAULT_PORT;
+// A2aServerConfig: Serialize/Deserialize with #[serde(default)] ({} -> defaults, unknown fields tolerated),
+// Default + new(card), with_interface_url, with_bind, with_rpc_path, with_transport, with_rest_path,
+// with_rest_prefix, with_rest_interface_url, rest_base_path() -> String
+pub const DEFAULT_RPC_PATH/DEFAULT_CARD_PATH/DEFAULT_REST_PATH/DEFAULT_REST_PREFIX/DEFAULT_PROTOCOL_VERSION/DEFAULT_HOST/DEFAULT_PORT;
 #[async_trait] pub trait A2aExecutor: Send + Sync {
     async fn execute(&self, ctx: A2aExecutionContext, sink: &EventSink) -> Result<()>;
     async fn cancel(&self, ctx: A2aExecutionContext) -> Result<()>;   // default: Ok(()), server publishes CANCELED
@@ -133,7 +140,8 @@ impl A2aServer {
     pub fn new(config: A2aServerConfig, executor: Arc<dyn A2aExecutor>) -> Result<Self>;
     pub fn with_store(config: A2aServerConfig, executor: Arc<dyn A2aExecutor>, store: Arc<dyn TaskStore>) -> Result<Self>;
     pub fn config(&self) -> &A2aServerConfig; pub fn store(&self) -> Arc<dyn TaskStore>;
-    pub fn router(&self) -> axum::Router;                       // card route + JSON-RPC route
+    pub fn agent_card(&self) -> &AgentCard;                      // derived for the mounted transport
+    pub fn router(&self) -> axum::Router;                       // card route + every mounted binding
     pub async fn serve(self, shutdown: CancellationToken) -> Result<()>;
     pub async fn serve_in_background(self, shutdown: CancellationToken) -> Result<ServerHandle>; // binds 127.0.0.1:0 when port == 0
 }
@@ -161,6 +169,9 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - Streaming: one SSE `data:` frame per JSON-RPC response; `A2aClient::stream` yields one `AgentResult` per frame; `invoke` folds frames with `merge_results` (concatenate artifacts, override status when the newer one is set/known, fall back on `task_id`/`session_id`, dict-merge metadata). Frames are parsed incrementally over `bytes_stream()` by a pure `SseFramer` (comments/`event:`/`id:`/`retry:` ignored, multi-line `data:` joined, CR/LF delimiters and split CRLF handled).
 - Server event order: the server emits the Python executor prelude itself — `Task{state=SUBMITTED, history=[message]}` first, then `WORKING` with "Processing your request..." — before calling `A2aExecutor::execute`; the sink then publishes artifacts (each with `last_chunk` on terminal results), closes open artifacts with `append=true,last_chunk=true` (ascending id order), and emits the terminal state (`FAILED`/`CANCELED`/`INPUT_REQUIRED`, otherwise `COMPLETED`). Every emission also updates the `TaskStore`, so `GetTask`/`CancelTask` see coherent state. A non-terminating executor is completed by the server; a failing one emits `FAILED` and is returned as a JSON-RPC `-32603` error for non-streaming calls.
 - JSON-RPC dispatch: `SendMessage`/`SendStreamingMessage` (v0.3 aliases accepted), `GetTask` (`params.id`, also `taskId`), `CancelTask` (unknown → `-32001`, already terminal → `-32002`, best-effort `A2aExecutor::cancel` then `CANCELED`), `SubscribeToTask` (answers with the stored task snapshot plus its current status, then ends — not a live subscription), anything else → `-32601`. All non-streaming responses are HTTP 200 envelopes; streaming responses are `text/event-stream` with one JSON-RPC response per `data:` frame.
+- REST (`HTTP+JSON`, `A2aTransport::Rest`/`Both`): mounted at `rest_base_path()` (default `/a2a/rest/v1`), serving `GET {base}/card`, `POST {base}/message:send` and `{base}/messages:send`, `POST {base}/message:stream`, `GET {base}/tasks/{id}`, `POST {base}/tasks/{id}[/:]cancel`, and `GET|POST {base}/tasks/{id}[/:]subscribe`; routing is exclusive with JSON-RPC, as in Python's `a2a_server.py`.
+- REST requests carry the same params object as the JSON-RPC binding (both call `plan_send`); non-streaming replies are the stored `Task` JSON, streams carry bare `data: <json>` frames (no JSON-RPC envelope), and errors use `{"error": {"code", "status", "message"}}` with the HTTP status mapped from the A2A code (400 `INVALID_ARGUMENT`, 405 `METHOD_NOT_ALLOWED`, 404 `NOT_FOUND`, 409 `FAILED_PRECONDITION`, 501 `UNIMPLEMENTED`, 415 `UNSUPPORTED_MEDIA_TYPE`, 500 `INTERNAL`).
+- Served card derivation: `A2aTransport::JsonRpc` serves the configured card unchanged; `Rest` advertises exactly one `HTTP+JSON` interface first (configured transport interfaces removed); `Both` advertises exactly one `HTTP+JSON` and one `JSONRPC` interface, followed by every non-transport interface; derived URLs use `rest_interface_url`/`interface_url`, else `http://{host}:{port}{path}`.
 - Agent card: `description` = base description, then `[input_params] {json}` and `[output_params] {json}` sections (`json.dumps(..., sort_keys=True, ensure_ascii=False)` — keys sorted recursively, `": "`/`", "` separators, non-ASCII preserved); default input/output modes are `text/plain` and `application/json`; capabilities `streaming=true`, `push_notifications=false`; `version` deliberately left empty and no skills/provider, exactly like the Python adapter; `from_a2a` copies only `name` and `description`.
 
 ## Documented Deviations from the Python SDK
@@ -173,22 +184,25 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `A2aClient::stop` is a documented no-op (reqwest owns no persistent connection to close); it exists for Python call-sequence parity.
 - `harness_bridge` has no Python counterpart; its mapping tables (part kinds `text`/`data`/`file`/`binary`/`empty`, part conversion also normalizing empty strings via `transform::from_a2a_part`, `TurnStatus::Interrupted → InputRequired`, `AgentStatus → TaskState`) are defined in the module docs.
 - `security` on `AgentCard` is `Vec<BTreeMap<String, Vec<String>>>` because `serde_json::Map<String, Vec<String>>` has no serde impls; the JSON is identical.
+- REST deviations (documented in `server/rest.rs`): Starlette answers a known path with the wrong method with a plain-text `405`, this server emits the JSON error envelope; the `a2a-sdk` maps `UnsupportedOperation` to HTTP 400, this server uses 501 `UNIMPLEMENTED`; SSE frames end with `\n\n` (`sse_starlette` uses `\r\n\r\n`); `POST {base}/messages:send` (plural) is accepted as an extra alias for `message:send`.
+- The colon action spellings (`/tasks/{id}:cancel`) are served by one dispatcher route because `matchit` 0.8 cannot express a dynamic segment followed by a literal suffix; the dispatcher splits the segment on its last `:` (task ids are 32-hex UUIDs, so no ambiguity).
 
 ## Constraints
 
 - No `unsafe`; no blocking I/O; `reqwest` with rustls; SSE parsing is incremental over `bytes_stream` (no whole-body buffering).
 - Timeouts: per-request via `A2aClientConfig.timeout` (default 60 s); `A2aRemoteClient::invoke/stream` wrap the call in the caller timeout and stop the client on timeout/error exactly like Python (`stop()` before re-raising; `Cancelled` propagates without calling `stop`). Stream deadlines are applied per chunk against a single total budget.
-- gRPC and REST (`HTTP+JSON`) transports are **not** implemented; a gRPC `protocol_binding` yields `Error::Unsupported("gRPC transport is not supported")`; a REST/`HTTP+JSON` binding is tolerated but the REST route is not mounted.
+- gRPC is **not** implemented: a gRPC `protocol_binding` yields `Error::Unsupported("gRPC transport is not supported")`; `JSONRPC` and `HTTP+JSON` are both served, selected by `A2aServerConfig::transport`.
 - Endpoint derivation is private (`resolve_rpc_url`, `derive_interface_url`): no public base-URL→JSON-RPC-URL helper is exported, so a plain `A2aClient` caller must pass the full endpoint in `rpc_url`; only `A2aRemoteClient::new` derives it (card JSON-RPC interface, else `trim_end_matches('/')` + `/a2a/jsonrpc/`).
-- The JSON-RPC route is mounted at the literal `rpc_path` (default trailing slash), matching Python's normalization; the well-known card route serves the configured card.
-- Errors map to `Error::Transport` (HTTP/SSE), `Error::Timeout`, `Error::Validation` (card/inputs/JSON-RPC params), `Error::NotFound` (JSON-RPC `TASK_NOT_FOUND`), `Error::Unsupported` (`METHOD_NOT_FOUND`/gRPC), `Error::Config` (client construction).
+- The JSON-RPC route is mounted at the literal `rpc_path` (default trailing slash), matching Python's normalization; the well-known card route stays mounted in every mode and serves `A2aServer::agent_card()`.
+- Construction validation: `card_path`, `rpc_path`, and `rest_path` must start with `/`; a REST base must be non-empty and absolute and must not collide with `card_path`/`rpc_path` (violations are `Error::Config`, never a router panic).
+- Errors map to `Error::Transport` (HTTP/SSE), `Error::Timeout`, `Error::Validation` (card/inputs/JSON-RPC params), `Error::NotFound` (JSON-RPC `TASK_NOT_FOUND`), `Error::Unsupported` (`METHOD_NOT_FOUND`/gRPC), `Error::Config` (client construction and invalid mount paths).
 - Serde: wire structs are camelCase with unknown fields tolerated and unset `Option`s omitted; enums serialize proto strings (`ROLE_USER`, `TASK_STATE_WORKING`) and decode tolerantly (bare suffix, snake_case, camelCase, `cancelled`, unknown → `Unspecified`). Empty maps serialize as `{}`.
 - Logging: `tracing` only (targets `openjiuwen_extensions::*`); payload contents never logged above `debug`.
 - Files ≤ ~1000 lines; the server lives in `./server/` with one file per concern.
 
 ## Test Strategy
 
-- Unit tests live beside the code they own: `./types.rs`, `./jsonrpc.rs`, `./card.rs`, `./client/tests.rs`, `./transform/tests.rs`, `./harness_bridge/tests.rs`, `./server/tests.rs` (routing, dispatch, event order, store, lifecycle, plus a compile-time check that every public path resolves at `crate::a2a::server::`).
+- Unit tests live beside the code they own: `./types.rs`, `./jsonrpc.rs`, `./card.rs`, `./client/tests.rs`, `./transform/tests.rs`, `./harness_bridge/tests.rs`, `./server/tests.rs` (JSON-RPC routing/dispatch, event order, store, lifecycle, plus a compile-time check that every public path resolves at `crate::a2a::server::`), and `./server/rest_tests.rs` (config defaults/serde/`rest_base_path`, transport serde/builders, card derivation in all three modes, construction errors, and every REST route through `router()` + `ServiceExt::oneshot`).
 - `./e2e_tests.rs` holds the in-crate integration suites as two in-module submodules (`client_suite` with `wiremock`, `server_suite` with `Router::oneshot` via `tower::ServiceExt` + `http_body_util::BodyExt` and one real ephemeral socket).
 - `../tests/a2a_client.rs` and `../tests/a2a_server.rs` are the crate-boundary mirrors of those suites; they use only `openjiuwen_extensions::a2a::` public paths and are gated with `#![cfg(feature = "a2a")]`.
 - Coverage: send folds to `AgentResult`; SSE stream of three frames yields three results in order; `CancelTask` fields and `CANCELED`; JSON-RPC error → typed `Error`; non-2xx → `Transport`; remote-client protocol/card validation and card-interface invocation; card route; `message/send` + v0.3 alias; `tasks/get` unknown → `-32001`; `tasks/cancel` → `CANCELED` then `-32002`; `message/stream` frame order; executor error → `FAILED` + `-32603`; real-socket card/send round trip.
@@ -205,7 +219,10 @@ pub fn message_role_name(role: MessageRole) -> &'static str;
 - `./card.rs` → agent-card adaptation both ways, Python-style description embedding
 - `./client.rs` → `A2aClient`, `A2aRemoteClient`, JSON-RPC POST, incremental SSE framing
 - `./client/tests.rs` → client-config, endpoint-derivation, SSE-framer, and wiremock client tests
-- `./server/` → axum router, dispatch, executor SPI, event sink, task store, server handle, adapter (`server/CONTEXT.md`)
+- `./server/` → axum router for both bindings, executor SPI, event sink, task store, server handle, adapter (`server/CONTEXT.md`)
+- `./server/ops.rs` → binding-neutral send/stream/snapshot/cancel operations shared by JSON-RPC and REST
+- `./server/rest.rs` → REST (`HTTP+JSON`) routes, colon-action dispatcher, error envelope and status mapping
+- `./server/sse.rs` → SSE framing for JSON-RPC envelopes and bare REST values
 - `./harness_bridge.rs` → conversions to/from `openjiuwen_harness_protocol`
 - `./harness_bridge/tests.rs` → bridge mapping-table and round-trip tests
 - `./e2e_tests.rs` → end-to-end client/server suites (in-crate, public paths only; mirrored by `../tests/a2a_client.rs` and `../tests/a2a_server.rs`)

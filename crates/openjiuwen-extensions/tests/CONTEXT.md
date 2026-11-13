@@ -11,12 +11,17 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 
 | File | Feature gate | Scope |
 | --- | --- | --- |
-| `adapters.rs` | none (per-test `redis`/`pulsar` gates) | checkpointer/store/message-queue/sys-op/context-evolver factories, deferred backends, in-memory round-trips |
-| `context_evolver.rs` | none | the `context_evolver` feature end to end: deterministic retrieve/summarize over the JSON file store, the model-driven flows against a `wiremock` peer, `ScriptedCompletion`, algorithm normalization, and the `Unsupported` deferral |
-| `otel_seam.rs` | none (per-test `otel` gates) | `init_otel_tracer` for every `ExporterType` with and without the feature; OTLP deferred |
+| `adapters.rs` | none (per-test `pulsar` gate) | checkpointer/store/message-queue/context-evolver factories: in-memory round-trips, backend selection, the Pulsar deferral contract |
+| `context_evolver.rs` | none | the evolver end to end: deterministic retrieve/summarize over the JSON file store, the model-driven flows against a `wiremock` peer, `ScriptedCompletion`, algorithm normalization, and the `Unsupported` opt-out |
+| `redis.rs` | `#![cfg(feature = "redis")]` | RESP codec vectors, `RedisStore` KV/TTL/pipeline/prefix contracts and `RedisCheckpointer` lifecycle over the in-test RESP2 fake (`redis/fake.rs`), factory wiring, TLS/cluster deferrals |
+| `elasticsearch.rs` | none | every `VectorStore` operation of the REST backend against a `wiremock` cluster: create/exists/schema/delete/list, NDJSON bulk, k-NN search, delete-by-query, and 400/404/409/503 mapping |
+| `otel_seam.rs` | none (per-test `otel` gates) | `init_otel_tracer` for every `ExporterType` with and without the feature, including the `Otlp`/`Http` path building a real exporter |
+| `otel_otlp.rs` | `#![cfg(feature = "otel")]` | the OTLP/HTTP JSON exporter against `wiremock`: wire body shape, headers, fail-open behaviour, graceful shutdown |
+| `otel_integrations.rs` | `#![cfg(feature = "otel")]` | the Grafana OTLP preset and the Langfuse OTLP preset plus `LangfuseClient` REST ingestion |
 | `otel.rs` | `#![cfg(feature = "otel")]` | `CaptureExporter` span names/attributes/statuses through the session `Tracer`/`TraceSink` and `OtelAgentHandler` |
 | `a2a_client.rs` | `#![cfg(feature = "a2a")]` | `A2aClient` against a `wiremock` peer; folded `AgentResult` plus the received JSON-RPC envelope |
 | `a2a_server.rs` | `#![cfg(feature = "a2a")]` | `A2aServer::router()` driven by `Router::oneshot`; card route, send/get/cancel, SSE frame order |
+| `a2a_rest.rs` | `#![cfg(feature = "a2a")]` | the REST (`HTTP+JSON`) binding: card parity per transport, `message:send`/`messages:send`, raw SSE stream, `tasks/{id}`, both cancel and both subscribe spellings, REST error envelopes (400/404/405/409), transport config serde |
 | `sandbox_providers.rs` | none | the three real remote sandbox providers (`aio` gateway envelope, `jiuwenbox` REST, `yuanrong` ADX) against loopback `wiremock` gateways: registration, wire payloads, auth injection, error mapping, streams |
 | `vendor_reranker.rs` | none | the live DashScope rerank transport behind `AliyunReranker::from_config`: request shape, score/order mapping, `top_n` precedence, error mapping, `new` delegation |
 
@@ -41,5 +46,7 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 - No `sqlite`-gated test at the crate boundary: the SQLite checkpointer/store backends are exercised only by `src/checkpointer/mod.rs` and `src/store/mod.rs` unit tests.
 - No test pairs `A2aClient` with `A2aServer` over a real loopback socket here; the only real-socket path is `src/a2a/e2e_tests.rs`.
 - No crate-boundary test exercises `context_evolver::MemoryVectorStore` directly; the vector store stays covered by its in-src unit tests while `context_evolver.rs` covers the services that use it.
+- No `a2a_rest.rs` case exercises the REST `rest_prefix = ""` (v1-native) URL set or a custom `rest_path`; both are covered only by `src/a2a/server/rest_tests.rs`.
 - The sandbox suites cover success and failure wire paths but never a live container, so container lifecycle against a real JiuwenBox/ADX deployment stays an operator-side check.
 - `JIUWENBOX_API_TOKEN` resolution is only covered in-src (mutating the process environment from a parallel test binary would be racy); the crate-boundary suite supplies the bearer through `auth_headers` instead.
+- No crate-boundary case runs the Elasticsearch backend against a real cluster; `wiremock` covers the REST contract only.
