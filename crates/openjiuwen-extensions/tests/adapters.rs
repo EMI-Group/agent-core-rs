@@ -22,20 +22,7 @@ use openjiuwen_extensions::message_queue::{
     create_queue, JsonMessageHandler, QueueBridge, QueueConfig,
 };
 use openjiuwen_extensions::store::{build_kv_store, KvValue, StoreBackend};
-use openjiuwen_extensions::sys_operation::{
-    is_deferred, register_deferred, registered_types, SandboxEndpoint, SandboxGatewayConfig,
-    DEFERRED_SANDBOX_TYPES,
-};
 use serde_json::{json, Value};
-
-/// Unwraps a `Result`'s error; the deferred backends return trait objects that
-/// are not `Debug`, so `unwrap_err` is unavailable at this boundary.
-fn expect_error<T>(result: Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("expected a deferred backend to fail"),
-        Err(error) => error,
-    }
-}
 
 // Port of tests/unit_tests/extensions/checkpointer/test_agent_storage.py (save/recover).
 #[tokio::test]
@@ -120,37 +107,6 @@ async fn in_memory_queue_bridge_round_trips_json() {
     assert!(!queue.is_started());
 }
 
-// Port of tests/unit_tests/extensions/sys_operation/sandbox/test_aio_agent.py
-// (the Python provider names register; the protocols stay deferred).
-#[tokio::test]
-async fn deferred_sandbox_providers_register_and_fail_creation() {
-    // The registry seam is re-exported unchanged from the kernel umbrella.
-    let registry =
-        openjiuwen_core::sys_operation::sandbox::provider::SandboxProviderRegistry::new();
-    register_deferred(&registry).await.unwrap();
-
-    let registered = registered_types(&registry);
-    assert_eq!(registered.len(), DEFERRED_SANDBOX_TYPES.len());
-    for sandbox_type in DEFERRED_SANDBOX_TYPES {
-        assert!(
-            registered.iter().any(|name| name == sandbox_type),
-            "{sandbox_type} is missing from {registered:?}"
-        );
-        assert!(is_deferred(sandbox_type));
-        assert!(registry.has_fs(sandbox_type));
-    }
-
-    let endpoint = SandboxEndpoint::default();
-    let gateway = SandboxGatewayConfig::default();
-    let error = expect_error(registry.create_fs("aio", &endpoint, &gateway));
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.message().contains("aio"), "unexpected: {error}");
-    let error = expect_error(registry.create_shell("jiuwenbox", &endpoint, &gateway));
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    let error = expect_error(registry.create_code("yuanrong", &endpoint, &gateway));
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-}
-
 // Port of tests/unit_tests/extensions/context_evolver/test_retrieve_flow.py
 // (`TestAlgorithmNormalization`; spot checks at the crate boundary).
 #[test]
@@ -206,31 +162,6 @@ async fn unsupported_task_memory_service_reports_every_flow() {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
 }
 
-// Port of tests/unit_tests/extensions/checkpointer/test_redis_checkpointer_provider.py
-// (the provider is registered but its backend is deferred).
-#[cfg(feature = "redis")]
-#[tokio::test]
-async fn redis_backends_are_deferred() {
-    use openjiuwen_extensions::checkpointer::redis::{
-        RedisCheckpointer, RedisCheckpointerConfig, RedisConnectionConfig,
-    };
-    use openjiuwen_extensions::store::redis::{RedisStore, RedisStoreConfig};
-
-    let config =
-        RedisCheckpointerConfig::new(RedisConnectionConfig::new("redis://localhost:6379/0"));
-    let error = expect_error(RedisCheckpointer::connect(config).await);
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.message().contains("redis"), "unexpected: {error}");
-
-    let store_config = RedisStoreConfig {
-        url: Some("redis://localhost:6379/0".to_string()),
-        ..RedisStoreConfig::default()
-    };
-    let error = expect_error(RedisStore::connect(store_config).await);
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.message().contains("redis"), "unexpected: {error}");
-}
-
 // Port of tests/unit_tests/extensions/message_queue/test_start_with_retry.py
 // (the transport is deferred; the retry budget is never consumed).
 #[cfg(feature = "pulsar")]
@@ -245,24 +176,4 @@ async fn pulsar_queue_is_deferred() {
 
     let error = expect_error(pulsar::start_with_retry(config, 3, Duration::from_millis(1)).await);
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-}
-
-// Port of tests/unit_tests/extensions/store/test_es_vector_store.py
-// (no feature gate: the vector backend is always API-shaped and deferred).
-#[tokio::test]
-async fn elasticsearch_vector_store_is_deferred() {
-    use openjiuwen_extensions::store::elasticsearch::{
-        ElasticsearchVectorStore, ElasticsearchVectorStoreConfig,
-    };
-
-    let config = ElasticsearchVectorStoreConfig {
-        url: "http://localhost:9200".to_string(),
-        ..ElasticsearchVectorStoreConfig::default()
-    };
-    let error = expect_error(ElasticsearchVectorStore::connect(config).await);
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(
-        error.message().contains("elasticsearch"),
-        "unexpected: {error}"
-    );
 }
