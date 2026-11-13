@@ -19,6 +19,8 @@
 //! deterministic tie-break: higher score, then the earlier candidate, then the
 //! lexicographically smaller prompt. They are `async` because they may call a
 //! model; each one also has a fully offline path.
+//! A trainer can also report its evaluation as an [`EvaluationSummary`], which
+//! pairs the mean score and per-case results with the tool calls behind them.
 
 mod config;
 mod example;
@@ -36,7 +38,7 @@ pub use instruction::InstructionOptimizer;
 pub use joint::JointOptimizer;
 pub use search::PromptSearchOptimizer;
 pub use suggestion::placeholders;
-pub use trainer::Trainer;
+pub use trainer::{EvaluationSummary, Trainer};
 
 use crate::tune::base::Case;
 

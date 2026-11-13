@@ -120,7 +120,7 @@ impl PromptSearchOptimizer {
         let mut proposals = vec![seed.clone()];
         proposals.extend(Mutator::deterministic(&seed));
         if let Some(rewrite) = mutator
-            .model_rewrite(&seed, &worst_cases(&seed_cases, 5))
+            .model_rewrite(&seed, &worst_cases(&seed_cases, 5), cases)
             .await
         {
             proposals.push(rewrite);
@@ -154,6 +154,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use async_trait::async_trait;
+    use openjiuwen_foundation::tool::ToolInfo;
     use openjiuwen_test_support::ScriptedModel;
     use serde_json::Value;
 
@@ -269,6 +270,30 @@ mod tests {
         assert_eq!(model.call_count(), 1);
         assert_eq!(result.best_prompt, "MAGIC answer.");
         assert!((result.score - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn tool_declarations_reach_the_rewrite_prompt() {
+        let model = ScriptedModel::text("<PROMPT_OPTIMIZED>MAGIC answer.</PROMPT_OPTIMIZED>");
+        let cases = vec![
+            case("c1", "capital of France", "Paris").with_tools(vec![ToolInfo::new(
+                "lookup",
+                "Look something up",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )]),
+            case("c2", "2 + 2", "four"),
+        ];
+        PromptSearchOptimizer::new()
+            .with_model(Arc::new(model.clone()))
+            .optimize(SEED, &cases)
+            .await
+            .unwrap();
+
+        let call = model.last_call().expect("one model rewrite");
+        let user = call.messages[1].text();
+        assert!(user.contains("<tools_description>"), "{user}");
+        assert!(user.contains("lookup"), "{user}");
+        assert!(call.request.tools.is_none(), "{user}");
     }
 
     #[tokio::test]

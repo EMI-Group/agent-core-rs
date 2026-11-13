@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 
 use super::builder::AgentType;
 use super::dsl::LlmAgentDsl;
+use super::progress::{progress_for, ProgressStage};
 use super::workflow_dsl::WorkflowDsl;
 
 /// Where a session is in Python's build-state machine.
@@ -79,6 +80,18 @@ impl Default for BuildStatus {
             state: BuildState::Initial,
             resource_count: 0,
         }
+    }
+}
+
+impl BuildStatus {
+    /// The overall build progress (0-100) reported for `stage`.
+    ///
+    /// Delegates to [`progress_for`] with this snapshot's agent type, so a stage
+    /// the artifact never reaches reports `0`. The serialized snapshot is
+    /// unchanged: progress is derived, never stored.
+    #[must_use]
+    pub fn progress(&self, stage: ProgressStage) -> u8 {
+        progress_for(self.agent_type, stage)
     }
 }
 

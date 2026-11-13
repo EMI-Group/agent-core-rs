@@ -78,12 +78,66 @@ impl Case {
         self
     }
 
-    /// Checks the Python field constraints: non-empty `inputs`, non-empty
-    /// `label`, and a non-blank `case_id`.
+    /// The declared tools, when the case declared any.
+    #[must_use]
+    pub fn tools(&self) -> Option<&[ToolInfo]> {
+        self.tools.as_deref()
+    }
+
+    /// The declared tool names in declaration order, deduplicated.
+    ///
+    /// Duplicate declarations keep their first position so a report lists the
+    /// tools the way the case author wrote them.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for tool in self.tools.iter().flatten() {
+            let name = tool.function.name.as_str();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Whether the case declared any tools.
+    #[must_use]
+    pub fn has_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    }
+
+    /// Builds the common single-string case, as Python's
+    /// `PromptTaskCase.from_text(text, expected="")` does.
+    ///
+    /// The inputs are `{"query": text}` and the label is
+    /// `{"output": expected}`.
     ///
     /// # Errors
     ///
-    /// [`Error::validation`] naming the offending field.
+    /// [`Error::validation`] when `text` is blank; Python's emptiness rule is
+    /// kept, but reported as a typed error instead of an unvalidated case.
+    pub fn from_text(text: impl Into<String>, expected: impl Into<String>) -> Result<Self> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(Error::validation(
+                "Case.from_text requires a non-blank text",
+            ));
+        }
+        let mut inputs = BTreeMap::new();
+        inputs.insert("query".to_owned(), Value::String(text));
+        let mut label = BTreeMap::new();
+        label.insert("output".to_owned(), Value::String(expected.into()));
+        Self::new(inputs, label)
+    }
+
+    /// Checks the Python field constraints: non-empty `inputs`, non-empty
+    /// `label`, a non-blank `case_id`, a non-blank `function.name` on every
+    /// declared tool, and unique declared tool names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] naming the offending field (`Case.tools` for a
+    /// tool problem).
     pub fn validate(&self) -> Result<()> {
         if self.inputs.is_empty() {
             return Err(Error::validation("Case.inputs must not be empty"));
@@ -93,6 +147,21 @@ impl Case {
         }
         if self.case_id.trim().is_empty() {
             return Err(Error::validation("Case.case_id must not be empty"));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for tool in self.tools.iter().flatten() {
+            let name = tool.function.name.trim();
+            if name.is_empty() {
+                return Err(Error::validation(
+                    "Case.tools entries must declare a non-blank function.name",
+                ));
+            }
+            if seen.contains(&name) {
+                return Err(Error::validation(format!(
+                    "Case.tools must declare unique function.name values, found duplicate '{name}'"
+                )));
+            }
+            seen.push(name);
         }
         Ok(())
     }
@@ -263,6 +332,86 @@ mod tests {
             matches!(&error, Error::Validation(message) if message.contains("case_id")),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn tools_accessors_report_the_declared_tools() {
+        let plain = sample_case("case-1");
+        assert!(plain.tools().is_none());
+        assert!(!plain.has_tools());
+        assert_eq!(plain.tool_names(), Vec::<&str>::new());
+
+        let declared = plain.with_tools(vec![tool()]);
+        assert_eq!(declared.tools(), Some([tool()].as_slice()));
+        assert!(declared.has_tools());
+        assert_eq!(declared.tool_names(), vec!["lookup"]);
+    }
+
+    #[test]
+    fn tool_names_keep_declaration_order_and_deduplicate() {
+        let case = sample_case("case-1").with_tools(vec![
+            ToolInfo::new("search", "search", Value::Null),
+            ToolInfo::new("calc", "calculate", Value::Null),
+            ToolInfo::new("search", "search again", Value::Null),
+        ]);
+        assert_eq!(case.tool_names(), vec!["search", "calc"]);
+    }
+
+    #[test]
+    fn has_tools_is_false_for_an_empty_declaration() {
+        let case = sample_case("case-1").with_tools(Vec::new());
+        assert!(!case.has_tools());
+        assert_eq!(case.tool_names(), Vec::<&str>::new());
+        assert!(case.validate().is_ok(), "an empty list declares nothing");
+    }
+
+    #[test]
+    fn validate_rejects_a_blank_tool_name() {
+        let case = sample_case("case-1").with_tools(vec![ToolInfo::new("   ", "d", Value::Null)]);
+        let error = case.validate().unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation(message) if message.contains("Case.tools")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tool_names() {
+        let case = sample_case("case-1").with_tools(vec![
+            ToolInfo::new("lookup", "first", Value::Null),
+            ToolInfo::new("lookup", "second", Value::Null),
+        ]);
+        let error = case.validate().unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation(message) if message.contains("Case.tools") && message.contains("lookup")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_text_builds_the_single_string_shape() {
+        let case = Case::from_text("What is 2 + 2?", "4").unwrap();
+        assert_eq!(case.inputs, map("query", "What is 2 + 2?"));
+        assert_eq!(case.label, map("output", "4"));
+        assert!(case.validate().is_ok());
+    }
+
+    #[test]
+    fn from_text_allows_an_empty_expected_value() {
+        let case = Case::from_text("Describe the sky.", "").unwrap();
+        assert_eq!(case.label, map("output", ""));
+        assert!(case.validate().is_ok());
+    }
+
+    #[test]
+    fn from_text_rejects_blank_text() {
+        for text in ["", "   ", "\t\n"] {
+            let error = Case::from_text(text, "4").unwrap_err();
+            assert!(
+                matches!(&error, Error::Validation(message) if message.contains("text")),
+                "unexpected error for {text:?}: {error}"
+            );
+        }
     }
 
     #[test]

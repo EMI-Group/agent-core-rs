@@ -19,21 +19,58 @@
 //! Python, which requires both); an empty train split is a validation error.
 //! `train` is `async` here even though Python's is a synchronous generator loop,
 //! because the underlying optimizers may call a model.
+//!
+//! [`Trainer::evaluate_traced`] is the observable form of
+//! [`Trainer::evaluate`]: it returns the same mean score and per-case results
+//! plus an [`EvaluationSummary`] carrying the tool calls behind them, so a
+//! report can show which tools a candidate prompt actually used.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
+use serde::{Deserialize, Serialize};
 
 use crate::tune::base::{Case, EvaluatedCase};
-use crate::tune::evaluator::CaseEvaluator;
+use crate::tune::evaluator::{tool_usage, CaseEvaluator};
 use crate::tune::optimizer::config::OptimizerConfig;
 use crate::tune::optimizer::instruction::InstructionOptimizer;
 use crate::tune::optimizer::suggestion::{
     default_evaluator, describe_model, ensure_placeholders, is_better,
 };
 use crate::tune::optimizer::OptimizationResult;
+
+/// The traced outcome of scoring one prompt over a case set.
+///
+/// The score and results are exactly what [`Trainer::evaluate`] reports; the
+/// extra [`tool_usage`](Self::tool_usage) map says which tools the evaluated
+/// answers needed, summed over every case in the run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct EvaluationSummary {
+    /// The mean score over `results` (`0.0` for no cases).
+    pub mean_score: f64,
+    /// The per-case results, in case order.
+    pub results: Vec<EvaluatedCase>,
+    /// Tool name -> number of calls made while producing those results.
+    pub tool_usage: BTreeMap<String, usize>,
+}
+
+impl EvaluationSummary {
+    /// Whether no case was evaluated.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+
+    /// The tool names that were called, sorted.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tool_usage.keys().map(String::as_str).collect()
+    }
+}
 
 /// Trains a prompt on one case split and reports the validation result.
 ///
@@ -118,7 +155,35 @@ impl Trainer {
         self.evaluator_for(prompt).score_cases(prompt, cases).await
     }
 
+    /// Scores `prompt` over `cases` and reports the tool calls behind each
+    /// result.
+    ///
+    /// The mean score and the per-case results are the same as
+    /// [`evaluate`](Self::evaluate)'s; the returned [`EvaluationSummary`] adds
+    /// the per-tool call counts of the whole run. The traces themselves are not
+    /// exposed, because an [`EvaluatedCase`] keeps its wire shape. An empty
+    /// `cases` slice yields a `0.0` mean, no results, and no usage.
+    ///
+    /// # Errors
+    ///
+    /// The evaluator's own error.
+    pub async fn evaluate_traced(&self, prompt: &str, cases: &[Case]) -> Result<EvaluationSummary> {
+        let (mean_score, traced) = self
+            .evaluator_for(prompt)
+            .score_cases_traced(prompt, cases)
+            .await?;
+        let tool_usage = tool_usage(&traced);
+        Ok(EvaluationSummary {
+            mean_score,
+            results: traced.into_iter().map(|(evaluated, _)| evaluated).collect(),
+            tool_usage,
+        })
+    }
+
     /// Trains `prompt` on `train` and selects on `val`.
+    ///
+    /// Each train case keeps its declared tools, which the instruction
+    /// optimizer renders into its rewrite prompt.
     ///
     /// # Errors
     ///
@@ -197,11 +262,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use async_trait::async_trait;
-    use openjiuwen_test_support::ScriptedModel;
-    use serde_json::Value;
+    use openjiuwen_foundation::tool::ToolInfo;
+    use openjiuwen_test_support::{MockCompletion, ScriptedModel};
+    use serde_json::{json, Value};
 
     use super::*;
-    use crate::tune::evaluator::DeterministicEvaluator;
+    use crate::tune::evaluator::{DeterministicEvaluator, ModelPromptRunner, RunnerEvaluator};
+    use crate::tune::tool::{ToolCallRecord, ToolStub, ToolStubs, ToolTrace};
 
     fn case(id: &str, question: &str, answer: &str) -> Case {
         let mut inputs = BTreeMap::new();
@@ -223,6 +290,29 @@ mod tests {
     }
 
     const SEED: &str = "Answer the question.";
+
+    /// A tool-aware trainer: the model calls `lookup`, then answers `7`.
+    fn tool_trainer() -> Trainer {
+        let model = ScriptedModel::builder()
+            .model_name("test-model")
+            .completion(MockCompletion::tool_call("lookup", json!({"q": "7"})))
+            .respond_text("7")
+            .build();
+        let stubs = ToolStubs::new().with_stub(ToolStub::constant("lookup", json!("7")).unwrap());
+        let runner = Arc::new(ModelPromptRunner::new(Arc::new(model)).with_stubs(stubs));
+        Trainer::new().with_evaluator(Arc::new(RunnerEvaluator::new(runner)))
+    }
+
+    /// The one case declaring the tool [`tool_trainer`] calls.
+    fn tool_case() -> Case {
+        Case::from_text("what is 7?", "7")
+            .unwrap()
+            .with_tools(vec![ToolInfo::new(
+                "lookup",
+                "Look something up",
+                json!({"type": "object"}),
+            )])
+    }
 
     #[tokio::test]
     async fn baseline_early_stop_skips_optimization() {
@@ -390,5 +480,124 @@ mod tests {
             .unwrap()
             .0;
         assert!((score - expected).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_reports_tool_usage() {
+        let summary = tool_trainer()
+            .evaluate_traced("Answer with the tool.", &[tool_case()])
+            .await
+            .unwrap();
+        assert!(summary.mean_score > 0.0);
+        assert_eq!(summary.results.len(), 1);
+        assert_eq!(
+            summary.tool_usage,
+            BTreeMap::from([("lookup".to_owned(), 1)])
+        );
+        assert_eq!(summary.tool_names(), vec!["lookup"]);
+        assert!(!summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_matches_evaluate() {
+        let cases = [tool_case()];
+        let (mean, results) = tool_trainer()
+            .evaluate("Answer with the tool.", &cases)
+            .await
+            .unwrap();
+        let summary = tool_trainer()
+            .evaluate_traced("Answer with the tool.", &cases)
+            .await
+            .unwrap();
+        assert!((summary.mean_score - mean).abs() < 1e-12);
+        assert_eq!(summary.results, results);
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_on_no_cases_is_empty() {
+        let summary = tool_trainer()
+            .evaluate_traced("Answer with the tool.", &[])
+            .await
+            .unwrap();
+        assert!(summary.is_empty());
+        assert!(summary.mean_score.abs() < 1e-12);
+        assert!(summary.tool_usage.is_empty());
+        assert_eq!(summary.tool_names(), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_without_tools_reports_no_usage() {
+        let summary = Trainer::new()
+            .evaluate_traced(SEED, &train())
+            .await
+            .unwrap();
+        assert!(summary.tool_usage.is_empty());
+        assert_eq!(summary.tool_names(), Vec::<&str>::new());
+        assert_eq!(summary.results.len(), 2);
+        assert!(summary.mean_score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn evaluate_traced_honors_an_injected_evaluator() {
+        /// Scores every case `0.25` and reports one `search` call.
+        struct Searcher;
+
+        #[async_trait]
+        impl CaseEvaluator for Searcher {
+            async fn evaluate(&self, _prompt: &str, case: &Case) -> Result<EvaluatedCase> {
+                EvaluatedCase::new(case.clone(), BTreeMap::new(), 0.25, "searched")
+            }
+
+            async fn evaluate_traced(
+                &self,
+                prompt: &str,
+                case: &Case,
+            ) -> Result<(EvaluatedCase, ToolTrace)> {
+                let evaluated = self.evaluate(prompt, case).await?;
+                let trace =
+                    ToolTrace::new([ToolCallRecord::success("search", json!({}), json!("ok"))]);
+                Ok((evaluated, trace))
+            }
+        }
+
+        let summary = Trainer::new()
+            .with_evaluator(Arc::new(Searcher))
+            .evaluate_traced(SEED, &[case("s1", "capital of Spain", "Madrid")])
+            .await
+            .unwrap();
+        assert!((summary.mean_score - 0.25).abs() < 1e-12);
+        assert_eq!(summary.tool_usage.get("search"), Some(&1));
+        assert_eq!(summary.tool_names(), vec!["search"]);
+    }
+
+    #[test]
+    fn evaluation_summary_round_trips_through_json() {
+        let evaluated =
+            EvaluatedCase::new(case("c1", "q", "a"), BTreeMap::new(), 0.5, "half").unwrap();
+        let summary = EvaluationSummary {
+            mean_score: 0.5,
+            results: vec![evaluated],
+            tool_usage: BTreeMap::from([("search".to_owned(), 2)]),
+        };
+
+        let value = serde_json::to_value(&summary).unwrap();
+        let object = value.as_object().unwrap();
+        for key in ["mean_score", "results", "tool_usage"] {
+            assert!(object.contains_key(key), "missing field {key}");
+        }
+        let restored: EvaluationSummary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored, summary);
+
+        let mut unknown = value;
+        unknown["extra"] = json!(true);
+        let restored: EvaluationSummary = serde_json::from_value(unknown).unwrap();
+        assert_eq!(restored, summary);
+
+        let partial: EvaluationSummary =
+            serde_json::from_str(r#"{"mean_score": 0.0, "results": []}"#).unwrap();
+        assert!(partial.is_empty());
+        assert!(partial.tool_usage.is_empty());
+        let defaulted: EvaluationSummary = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted, EvaluationSummary::default());
     }
 }
