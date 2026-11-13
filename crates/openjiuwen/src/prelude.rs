@@ -8,6 +8,14 @@
 //!
 //! - There is no `InMemorySession` type in the Rust API: [`AgentSession`] (from
 //!   `openjiuwen-session`) *is* the in-memory session implementation.
+//!
+//! # Scope
+//!
+//! Python's top-level `openjiuwen/__init__.py` exports only `__version__`, mirrored by
+//! [`crate::VERSION`], so there is no further top-level import surface to forward here.
+//! Feature-gated trees (`harness_providers::providers`, `agent_teams::observability`,
+//! `extensions::store`, …) stay reachable by module path instead of through the prelude,
+//! which keeps it feature-free and capped at the agent-construction entry points.
 
 // --- errors -----------------------------------------------------------------
 pub use openjiuwen_core::common::error::{Error, Result};

@@ -16,7 +16,8 @@
 //! - consecutive `tool` turns become one `user` message of `tool_result` blocks;
 //! - `OpenAI` `image_url` parts become Anthropic `image` blocks (base64 or URL);
 //! - `OpenAI` function schemas become `{name, description, input_schema}` tools;
-//! - a provider-neutral reasoning intent in `extra["reasoning"]` is resolved for
+//! - a provider-neutral reasoning intent (`ModelRequestConfig::reasoning`, or
+//!   the legacy `extra["reasoning"]`) is resolved for
 //!   the Anthropic Messages protocol and merged as top-level body fields
 //!   (`thinking`, `output_config`), unless the caller already set a legacy
 //!   vendor control such as `extra["thinking"]`.
@@ -30,7 +31,7 @@ use serde_json::{Map, Value};
 
 use crate::llm::config::ModelRequestConfig;
 use crate::llm::reasoning::{
-    apply_reasoning_plan, resolve_reasoning_plan_for, ReasoningConfig, ReasoningProtocol,
+    apply_reasoning_plan, resolve_reasoning_plan_with_endpoint, ReasoningConfig, ReasoningProtocol,
 };
 use crate::prompt::BaseMessage;
 
@@ -105,7 +106,8 @@ pub fn build_messages_body(
 ///
 /// `provider` and `api_base` are the client's resolved provider name and
 /// endpoint; together they select the reasoning profile for a provider-neutral
-/// reasoning intent in `request.extra["reasoning"]` (see [`crate::llm::reasoning`]).
+/// reasoning intent in [`ModelRequestConfig::reasoning`] (or the legacy
+/// `request.extra["reasoning"]` spelling; see [`crate::llm::reasoning`]).
 /// A resolved plan is merged as top-level body fields — `sdk_params` first, then
 /// `extra_body` — because the Messages API takes `thinking`, `output_config` and
 /// friends at the top level. `request.extra` is merged after that, so a caller's
@@ -123,14 +125,40 @@ pub fn build_messages_body(
 /// Returns [`Error::Validation`] when the model name is empty, when a tool call
 /// has no id, when a tool result has no `tool_call_id`, when a content part
 /// cannot be represented by the Messages API (for example a non-HTTP image URL),
-/// or when `request.extra["reasoning"]` is present but is not a reasoning intent
-/// (`null`, a boolean, a mode/effort string, or an object with `mode`, `effort`
-/// and/or `budget_tokens`).
+/// or when a `reasoning` value is present but is not an intent (`null`, a
+/// boolean, a mode/effort string, or an object with `mode`, `effort` and/or
+/// `budget_tokens`).
 pub fn build_messages_body_with_provider(
     messages: &[BaseMessage],
     request: &ModelRequestConfig,
     stream: bool,
     provider: &str,
+    api_base: Option<&str>,
+) -> Result<Value> {
+    build_messages_body_with_endpoint(messages, request, stream, provider, None, api_base)
+}
+
+/// Builds the Anthropic Messages request body, resolving an endpoint profile
+/// first.
+///
+/// `endpoint_profile` names the wire dialect the configured endpoint speaks and
+/// `api_base` is the resolved base URL; together with `provider` they select the
+/// reasoning encoder for a provider-neutral reasoning intent
+/// (see [`resolve_reasoning_plan_with_endpoint`]). A non-generic profile such as
+/// `"vllm"` bypasses the profile table and writes the `enable_thinking` /
+/// `thinking_budget` keys a self-hosted gateway honors, instead of the official
+/// `thinking` object. Without an `endpoint_profile` the body is exactly the one
+/// [`build_messages_body_with_provider`] produces.
+///
+/// # Errors
+///
+/// See [`build_messages_body_with_provider`].
+pub fn build_messages_body_with_endpoint(
+    messages: &[BaseMessage],
+    request: &ModelRequestConfig,
+    stream: bool,
+    provider: &str,
+    endpoint_profile: Option<&str>,
     api_base: Option<&str>,
 ) -> Result<Value> {
     if request.model_name.trim().is_empty() {
@@ -196,9 +224,10 @@ pub fn build_messages_body_with_provider(
                  the provider-neutral reasoning intent is ignored"
             );
         } else {
-            let plan = resolve_reasoning_plan_for(
+            let plan = resolve_reasoning_plan_with_endpoint(
                 ReasoningProtocol::AnthropicMessages,
                 provider,
+                endpoint_profile,
                 api_base,
                 &request.model_name,
                 &intent,
@@ -255,14 +284,21 @@ const LEGACY_REASONING_KEYS: [&str; 6] = [
     "chat_template_kwargs",
 ];
 
-/// Reads the reasoning intent out of a request's `extra` map.
+/// Reads the reasoning intent for a request.
 ///
-/// A missing key and `null` both mean "no intent". Any other value must be an
+/// [`ModelRequestConfig::reasoning`] wins over the legacy `extra` spelling. A
+/// missing field and `null` both mean "no intent". Any other value must be an
 /// intent (a boolean, a mode/effort string, or an object with `mode`, `effort`
 /// and/or `budget_tokens`); anything else is [`Error::Validation`] rather than a
-/// silently dropped request.
+/// silently dropped request, because the Anthropic transport has no raw
+/// `reasoning` body key to forward it to.
 fn reasoning_intent(request: &ModelRequestConfig) -> Result<Option<ReasoningConfig>> {
-    match request.extra.get(REASONING_KEY) {
+    let value = request
+        .reasoning
+        .as_ref()
+        .filter(|value| !value.is_null())
+        .or_else(|| request.extra.get(REASONING_KEY));
+    match value {
         None | Some(Value::Null) => Ok(None),
         Some(value) => match ReasoningConfig::from_value(value)? {
             Some(intent) => Ok(Some(intent)),

@@ -36,11 +36,41 @@ openjiuwen-auto-harness.workspace = true
 
 [features]
 default = ["native"]
+# harness + harness providers
 native = ["openjiuwen-harness/native", "openjiuwen-harness-providers/native"]
-otel = ["openjiuwen-extensions/otel", "openjiuwen-core/otel"]
+native-v2 = ["openjiuwen-harness-providers/native-v2"]
+vendor = ["openjiuwen-harness-providers/vendor"]
+browser = ["openjiuwen-harness/browser"]
+cua = ["openjiuwen-harness/cua"]
+mobile = ["openjiuwen-harness/mobile"]
+notify = ["openjiuwen-harness/notify"]
+# storage backends
+sqlite = [
+    "openjiuwen-foundation/sqlite",
+    "openjiuwen-session/sqlite",
+    "openjiuwen-memory/sqlite",
+    "openjiuwen-extensions/sqlite",
+    "openjiuwen-symphony/sqlite",
+    "openjiuwen-agent-teams/sqlite",
+]
+# transports / remote backends
 a2a = ["openjiuwen-extensions/a2a"]
-sqlite = ["openjiuwen-extensions/sqlite", "openjiuwen-symphony/sqlite"]
+mcp = ["openjiuwen-extensions/mcp"]
+redis = ["openjiuwen-extensions/redis"]
+pulsar = ["openjiuwen-extensions/pulsar"]
+distributed = ["openjiuwen-agent-teams/distributed"]
+# observability
+otel = [
+    "openjiuwen-extensions/otel",
+    "openjiuwen-core/otel",
+    "openjiuwen-session/otel",
+    "openjiuwen-agent-teams/otel",
+]
+# sandbox execution
+sandbox = ["openjiuwen-sysop/sandbox"]
+# opt-in network/vendor test gates
 live-tests = [
+    "openjiuwen-foundation/live-tests",
     "openjiuwen-harness/live-tests",
     "openjiuwen-harness-providers/live-tests",
     "openjiuwen-agent-teams/live-tests",

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, TimeDelta, Utc};
 use openjiuwen_common::config::env;
 use openjiuwen_common::error::{Error, Result};
@@ -58,11 +59,14 @@ const MAX_EPOCH_SECONDS: f64 = 253_402_300_799.0;
 /// The type is `serde`-serializable in the shape the token endpoint and the auth
 /// store use. Deserialization is deliberately tolerant:
 ///
-/// - `expires_in` (seconds from now, as the token endpoint reports it) and an
-///   `expires_at` in either epoch seconds or RFC 3339 are both accepted;
-///   `expires_at` wins when present and a missing expiry stays unknown.
 /// - unknown fields are ignored, and an empty `refresh_token` is treated as
-///   absent, matching the reference implementation's normalization.
+///   absent, matching the reference implementation's normalization;
+/// - the expiry is resolved with the reference implementation's precedence: an
+///   `expires_at` in either epoch seconds or RFC 3339, then `expires_in` (seconds
+///   from now, clamped at zero), then — when a previous token is supplied — that
+///   token's `expires_at`, and finally the `exp` claim of a JWT `access_token`
+///   (see `parse_token_payload`); a token whose expiry cannot be resolved never
+///   expires, so it is never refreshed.
 ///
 /// Serialization always writes the canonical field set — `access_token`,
 /// `refresh_token`, `id_token`, `expires_at` (epoch seconds), `token_type`, and
@@ -139,15 +143,28 @@ impl OAuthToken {
         self
     }
 
+    /// Returns the expiry the refresh decision is based on.
+    ///
+    /// The recorded [`expires_at`](Self::expires_at) wins; when it is absent, the
+    /// `exp` claim of a JWT access token is used, so a token read from a store
+    /// that never recorded an expiry still refreshes on time (Python parity:
+    /// `OpenAIAccountTokens.is_expiring`). A token whose expiry cannot be
+    /// resolved yields `None` and therefore never expires.
+    #[must_use]
+    pub fn effective_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.expires_at
+            .or_else(|| jwt_exp(self.access_token.expose_secret()))
+    }
+
     /// Returns `true` when the token expires within `skew` (or already has).
     ///
-    /// A token with no recorded expiry returns `false`: `None` means "unknown",
+    /// A token with no resolvable expiry returns `false`: `None` means "unknown",
     /// and treating an unknown expiry as expired would make every such token
     /// trigger a refresh round-trip on each call. A `skew` too large for chrono's
     /// duration range is saturated, so it simply counts as expired.
     #[must_use]
     pub fn is_expired(&self, skew: Duration) -> bool {
-        let Some(expires_at) = self.expires_at else {
+        let Some(expires_at) = self.effective_expires_at() else {
             return false;
         };
         let skew = TimeDelta::from_std(skew).unwrap_or(TimeDelta::MAX);
@@ -214,29 +231,74 @@ struct TokenPayload {
     scope: Option<String>,
 }
 
-impl From<TokenPayload> for OAuthToken {
-    fn from(payload: TokenPayload) -> Self {
-        let expires_at = payload
+impl TokenPayload {
+    /// Resolves the payload into a token, taking every field it omits from
+    /// `previous`.
+    ///
+    /// The expiry follows the reference implementation's precedence:
+    /// `expires_at` → `now + max(expires_in, 0)` → `previous.expires_at` → the
+    /// JWT `exp` claim. Only when all four fail is the expiry unknown.
+    fn into_token(self, previous: Option<&OAuthToken>) -> OAuthToken {
+        let expires_at = self
             .expires_at
             .as_ref()
             .and_then(value_to_timestamp)
-            .or_else(|| payload.expires_in.as_ref().and_then(expiry_from_now));
-        let token_type = payload
+            .or_else(|| self.expires_in.as_ref().and_then(expiry_from_now))
+            .or_else(|| previous.and_then(|token| token.expires_at))
+            .or_else(|| jwt_exp(self.access_token.expose_secret()));
+        let token_type = self
             .token_type
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_TOKEN_TYPE)
-            .to_owned();
-        Self {
-            access_token: payload.access_token,
-            refresh_token: payload.refresh_token.filter(|token| !token.is_empty()),
-            id_token: payload.id_token.filter(|token| !token.is_empty()),
+            .map(str::to_owned)
+            .or_else(|| previous.map(|token| token.token_type.clone()))
+            .unwrap_or_else(|| DEFAULT_TOKEN_TYPE.to_owned());
+        OAuthToken {
+            access_token: self.access_token,
+            refresh_token: non_empty(self.refresh_token)
+                .or_else(|| previous.and_then(|token| non_empty(token.refresh_token.clone()))),
+            id_token: non_empty(self.id_token)
+                .or_else(|| previous.and_then(|token| non_empty(token.id_token.clone()))),
             expires_at,
             token_type,
-            scope: payload.scope.filter(|scope| !scope.trim().is_empty()),
+            scope: self
+                .scope
+                .filter(|scope| !scope.trim().is_empty())
+                .or_else(|| previous.and_then(|token| token.scope.clone())),
         }
     }
+}
+
+impl From<TokenPayload> for OAuthToken {
+    fn from(payload: TokenPayload) -> Self {
+        payload.into_token(None)
+    }
+}
+
+/// Deserializes a token endpoint payload, resolving omitted fields from
+/// `previous`.
+///
+/// [`OAuthToken`]'s own `Deserialize` is this function with no previous token;
+/// the refresh path calls it with the token being replaced, so a response that
+/// rotates only `access_token` keeps the refresh token, the identity token, the
+/// scopes, the token type, and the previous expiry.
+///
+/// # Errors
+///
+/// Returns the `serde_json` error when `payload` is not a token response (most
+/// commonly a missing `access_token`).
+pub(crate) fn parse_token_payload(
+    payload: &[u8],
+    previous: Option<&OAuthToken>,
+) -> std::result::Result<OAuthToken, serde_json::Error> {
+    let payload: TokenPayload = serde_json::from_slice(payload)?;
+    Ok(payload.into_token(previous))
+}
+
+/// Drops an empty secret, treating it as "the provider did not send the field".
+fn non_empty(token: Option<SecretString>) -> Option<SecretString> {
+    token.filter(|value| !value.is_empty())
 }
 
 /// Converts a JSON scalar holding seconds or an RFC 3339 timestamp to an expiry.
@@ -304,12 +366,40 @@ fn value_to_seconds(value: &Value) -> Option<u64> {
     }
 }
 
+/// Reads the `exp` claim out of a JWT access token.
+///
+/// The payload is the second dot-separated segment, base64url-encoded with or
+/// without padding; anything that does not decode to a JSON object carrying a
+/// positive `exp` yields `None`. The signature is deliberately **not** verified
+/// (Python parity: `_jwt_exp`): the claim only decides *when* to refresh, never
+/// whether to trust the token, so a forged `exp` can at most cause an extra
+/// refresh — and the refreshed token still has to come from the issuer.
+fn jwt_exp(access_token: &str) -> Option<DateTime<Utc>> {
+    let payload = access_token.split('.').nth(1)?.trim_end_matches('=');
+    if payload.is_empty() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("exp").and_then(value_to_timestamp)
+}
+
 /// The default polling interval advertised by the device-code endpoint.
 const fn default_interval() -> u64 {
     5
 }
 
-/// Deserializes `interval`, falling back to [`default_interval`] for a null value.
+/// Shortest polling interval accepted from the device-code endpoint.
+///
+/// The reference implementation clamps the advertised interval with
+/// `max(3, interval)`, so a provider that asks to be polled faster still gets at
+/// least three seconds.
+const MIN_ADVERTISED_INTERVAL: u64 = 3;
+
+/// Deserializes `interval`, falling back to [`default_interval`] for a null value
+/// and to [`MIN_ADVERTISED_INTERVAL`] for a smaller one.
 fn deserialize_interval<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -318,7 +408,8 @@ where
     Ok(value
         .as_ref()
         .and_then(value_to_seconds)
-        .unwrap_or_else(default_interval))
+        .unwrap_or_else(default_interval)
+        .max(MIN_ADVERTISED_INTERVAL))
 }
 
 /// Deserializes a lifetime in seconds, treating a null value as `0` (unknown).
@@ -332,7 +423,9 @@ where
 
 /// A pending device authorization started by the device-code endpoint.
 ///
-/// The type is tolerant: a missing `interval` falls back to 5 seconds, a missing
+/// The type is tolerant: a missing `interval` falls back to 5 seconds, an
+/// advertised interval below three seconds is raised to three (Python parity: the
+/// endpoint is never polled faster than the issuer allows), a missing
 /// `expires_in` becomes `0` ("the provider did not say"), and both fields accept
 /// a number or a numeric string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,7 +434,7 @@ pub struct DeviceCode {
     pub user_code: String,
     /// The server-side identifier the polling endpoint expects back.
     pub device_auth_id: String,
-    /// The advertised polling interval in seconds.
+    /// The advertised polling interval in seconds, never below three.
     #[serde(
         default = "default_interval",
         deserialize_with = "deserialize_interval"
@@ -364,6 +457,11 @@ impl DeviceCode {
     }
 
     /// Overrides the polling interval.
+    ///
+    /// Unlike deserialization this applies no floor: it is the seam tests (and a
+    /// caller driving the poll itself) use to shorten the wait, while
+    /// [`OpenAiOAuthClient::poll_device_token`](super::OpenAiOAuthClient::poll_device_token)
+    /// still enforces its own minimum delay.
     #[must_use]
     pub fn with_interval(mut self, interval: u64) -> Self {
         self.interval = interval;

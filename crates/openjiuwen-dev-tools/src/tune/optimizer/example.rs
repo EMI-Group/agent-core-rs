@@ -216,6 +216,7 @@ impl ExampleOptimizer {
                 best_prompt: seed,
                 score: seed_score,
                 iterations: 0,
+                ..OptimizationResult::default()
             });
         }
 
@@ -289,6 +290,7 @@ impl ExampleOptimizer {
             best_prompt,
             score: best_score,
             iterations,
+            ..OptimizationResult::default()
         })
     }
 

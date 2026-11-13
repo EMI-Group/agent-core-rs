@@ -6,6 +6,18 @@
 //! (`client_provider`, `model`) as aliases so a serialized Python config can be
 //! read verbatim.
 //!
+//! Python's shapes that serde would otherwise reject are decoded by the
+//! `decode` submodule, which every affected field names in its
+//! `deserialize_with` attribute:
+//!
+//! - the three timeouts are `float` seconds (`360.0`), a numeric string, or the
+//!   `{"secs", "nanos"}` object Rust used to write, and serialize as a number of
+//!   seconds;
+//! - `stop` is one optional string (or an array) and always serializes as an
+//!   array;
+//! - `custom_headers`/`headers` values may be strings, numbers, or booleans, and
+//!   `null` values are dropped.
+//!
 //! [`ModelClientConfig::resolve_for`] is the single place that turns a partially
 //! specified config into a usable one: it normalizes the provider name, applies
 //! the environment fallbacks (`API_KEY`/`OPENAI_API_KEY`/`OPENJIUWEN_API_KEY`,
@@ -41,6 +53,8 @@ use serde_json::Value;
 
 use super::provider::{normalize_provider_name, provider_names, provider_profile};
 
+mod decode;
+
 /// Default total request timeout: 360 s (Python `ModelClientConfig.timeout`).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(360);
 
@@ -63,15 +77,54 @@ fn secret_is_missing(secret: Option<&SecretString>) -> bool {
     secret.is_none_or(|secret| secret.expose_secret().trim().is_empty())
 }
 
+/// Wire protocol an `OpenAI`-family endpoint speaks.
+///
+/// Ports the Python `LLMApiMode` enum: `chat_completions` (the default for
+/// `OpenAI`-compatible vendors), `responses` (the `OpenAI` Responses API), and
+/// `anthropic_messages` (the Anthropic Messages API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMode {
+    /// `POST /chat/completions`, the OpenAI-compatible default.
+    ChatCompletions,
+    /// The `OpenAI` Responses API, `POST /responses`.
+    Responses,
+    /// The Anthropic Messages API, `POST /v1/messages`.
+    AnthropicMessages,
+}
+
+/// How a model client authenticates.
+///
+/// Ports the Python `LLMAuthMode` enum. Only [`AuthMode::ApiKey`] requires an API
+/// key: the other modes authenticate out of band (an OAuth token store, caller
+/// supplied headers) or not at all, so [`ModelClientConfig::resolve_for`] does not
+/// demand a credential for them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// A bearer API key (`api_key` or the environment), the default.
+    #[default]
+    ApiKey,
+    /// No authentication at all.
+    #[serde(rename = "none")]
+    NoneAuth,
+    /// The caller supplies authentication through [`ModelClientConfig::headers`].
+    CustomHeaders,
+    /// An `OpenAI` account OAuth access token resolved by `llm::oauth`.
+    #[serde(rename = "openai_account_oauth")]
+    OpenAiAccountOAuth,
+}
+
 /// Client-side configuration of one model connection.
 ///
 /// The type mirrors the Python `ModelClientConfig`: an identity ([`client_id`](Self::client_id)),
-/// the provider to talk to, credentials, endpoint, TLS/timeout/retry policy,
-/// extra headers, and an `extra` map for vendor-specific settings that the struct
-/// does not model.
+/// the provider to talk to, credentials, endpoint, protocol/auth modes,
+/// TLS/timeout/retry policy, extra headers, and an `extra` map for vendor-specific
+/// settings that the struct does not model.
 ///
 /// `Debug` redacts the API key through [`SecretString`], and JSON serialization
-/// keeps it so a configuration round-trips.
+/// keeps it so a configuration round-trips. The Python `custom_headers` field is
+/// accepted as an alias of [`headers`](Self::headers).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ModelClientConfig {
@@ -89,15 +142,55 @@ pub struct ModelClientConfig {
     /// Whether TLS certificates are verified.
     pub verify_ssl: bool,
     /// Total timeout of one request.
+    ///
+    /// Decoded from Python's `float` seconds (`360.0`), a numeric string, or the
+    /// `{"secs", "nanos"}` object; serialized as a number of seconds. `null`
+    /// disables the per-request timeout.
+    #[serde(
+        deserialize_with = "decode::deserialize_duration",
+        serialize_with = "decode::serialize_duration"
+    )]
     pub timeout: Option<Duration>,
     /// Maximum wait for the first streaming chunk that carries model output.
+    ///
+    /// Decoded and serialized exactly like [`timeout`](Self::timeout).
+    #[serde(
+        deserialize_with = "decode::deserialize_duration",
+        serialize_with = "decode::serialize_duration"
+    )]
     pub stream_first_chunk_timeout: Option<Duration>,
     /// Maximum wait between streaming chunks that carry model output.
+    ///
+    /// Decoded and serialized exactly like [`timeout`](Self::timeout).
+    #[serde(
+        deserialize_with = "decode::deserialize_duration",
+        serialize_with = "decode::serialize_duration"
+    )]
     pub stream_idle_timeout: Option<Duration>,
     /// Number of additional attempts after the first one; `0` disables retries.
     pub max_retries: u32,
     /// Extra request headers, merged into every call.
+    ///
+    /// The Python field name `custom_headers` is accepted as an alias. Python
+    /// types the map `dict[str, Any]`, so numbers and booleans are coerced with
+    /// `to_string()` and `null` values are dropped; serialization always writes a
+    /// string map.
+    #[serde(
+        alias = "custom_headers",
+        deserialize_with = "decode::deserialize_headers"
+    )]
     pub headers: BTreeMap<String, String>,
+    /// Wire protocol to speak, or `None` for the provider's default.
+    ///
+    /// A provider that normally speaks chat completions uses the Responses API
+    /// when this is [`ApiMode::Responses`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_mode: Option<ApiMode>,
+    /// Authentication scheme; defaults to [`AuthMode::ApiKey`].
+    pub auth_mode: AuthMode,
+    /// Provider endpoint dialect name (Python `endpoint_profile`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_profile: Option<String>,
     /// Vendor-specific settings the struct does not model.
     pub extra: Value,
 }
@@ -117,6 +210,9 @@ impl Default for ModelClientConfig {
             stream_idle_timeout: Some(DEFAULT_STREAM_IDLE_TIMEOUT),
             max_retries: 0,
             headers: BTreeMap::new(),
+            api_mode: None,
+            auth_mode: AuthMode::ApiKey,
+            endpoint_profile: None,
             extra: Value::Null,
         }
     }
@@ -207,6 +303,27 @@ impl ModelClientConfig {
         self
     }
 
+    /// Overrides the wire protocol.
+    #[must_use]
+    pub fn with_api_mode(mut self, api_mode: ApiMode) -> Self {
+        self.api_mode = Some(api_mode);
+        self
+    }
+
+    /// Overrides the authentication scheme.
+    #[must_use]
+    pub fn with_auth_mode(mut self, auth_mode: AuthMode) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    /// Overrides the provider endpoint dialect name.
+    #[must_use]
+    pub fn with_endpoint_profile(mut self, endpoint_profile: impl Into<String>) -> Self {
+        self.endpoint_profile = Some(endpoint_profile.into());
+        self
+    }
+
     /// Replaces the vendor-specific `extra` map.
     #[must_use]
     pub fn with_extra(mut self, extra: Value) -> Self {
@@ -241,7 +358,10 @@ impl ModelClientConfig {
     /// - Headers: the provider's static headers are added only when the caller did
     ///   not already set a header of the same name (case-insensitive).
     /// - Validation: a provider without a built-in base URL (`pangu`) must receive
-    ///   one, and every provider except `ollama`/`lmstudio` must receive a key.
+    ///   one, and every provider except `ollama`/`lmstudio` must receive a key when
+    ///   [`auth_mode`](Self::auth_mode) is [`AuthMode::ApiKey`]. The modes that
+    ///   authenticate out of band (OAuth, caller headers, none) are exempt, matching
+    ///   the Python config validator.
     ///
     /// TLS settings, timeouts, retries, `extra`, and `client_id` pass through
     /// unchanged.
@@ -298,7 +418,10 @@ impl ModelClientConfig {
             )));
         }
 
-        if secret_is_missing(resolved.api_key.as_ref()) && !is_keyless(&resolved.provider) {
+        if secret_is_missing(resolved.api_key.as_ref())
+            && resolved.auth_mode == AuthMode::ApiKey
+            && !is_keyless(&resolved.provider)
+        {
             return Err(Error::config(format!(
                 "provider `{}` requires an API key; set {}, {}, or {} (or `api_key`)",
                 resolved.provider,
@@ -355,6 +478,18 @@ impl ModelClientConfig {
 /// let parsed: ModelRequestConfig =
 ///     serde_json::from_value(json!({"model": "gpt-4o-mini"})).expect("alias deserializes");
 /// assert_eq!(parsed.model_name, "gpt-4o-mini");
+///
+/// // Python's single-string `stop` and typed reasoning intent decode too.
+/// let ported: ModelRequestConfig = serde_json::from_value(json!({
+///     "model": "gpt-4o-mini",
+///     "stop": "\n",
+///     "reasoning": {"mode": "enabled", "effort": "low"},
+///     "context_window": 128000,
+/// }))
+/// .expect("a Python config deserializes");
+/// assert_eq!(ported.stop, vec!["\n".to_owned()]);
+/// assert_eq!(ported.context_window, Some(128_000));
+/// assert!(ported.reasoning.is_some());
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -369,7 +504,27 @@ pub struct ModelRequestConfig {
     /// Upper bound on generated tokens.
     pub max_tokens: Option<u32>,
     /// Sequences that stop generation.
+    ///
+    /// Decoded from Python's single string, `null`, or an array of strings and
+    /// always serialized as an array.
+    #[serde(deserialize_with = "decode::deserialize_stop")]
     pub stop: Vec<String>,
+    /// Maximum context window the model supports, in tokens.
+    ///
+    /// Python's `context_window`: internal context metadata that is decoded and
+    /// serialized but never written to a provider request body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Provider-neutral reasoning intent, in the shape
+    /// [`ReasoningConfig::from_value`](super::reasoning::ReasoningConfig::from_value)
+    /// reads (a boolean, a mode/effort string, or an object with `mode`,
+    /// `effort` and/or `budget_tokens`).
+    ///
+    /// Python's `reasoning` field. The three request builders read it first and
+    /// fall back to the legacy `extra["reasoning"]` spelling; an intent is
+    /// consumed there, so it never reaches a provider body as a raw key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
     /// Tool definitions in provider wire shape.
     pub tools: Option<Value>,
     /// Tool-selection policy in provider wire shape.
@@ -450,6 +605,20 @@ impl ModelRequestConfig {
         self
     }
 
+    /// Overrides the model's context-window metadata.
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: u32) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    /// Replaces the provider-neutral reasoning intent.
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: Value) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+
     /// Replaces the vendor-specific `extra` map.
     #[must_use]
     pub fn with_extra(mut self, extra: Value) -> Self {
@@ -471,475 +640,4 @@ impl ModelRequestConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use openjiuwen_common::error::ErrorKind;
-    use serde_json::json;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Every variable the resolvers in this module may read.
-    const ENV_VARS: &[&str] = &[
-        env::OPENJIUWEN_API_KEY,
-        env::API_KEY,
-        env::OPENAI_API_KEY,
-        env::API_BASE,
-        env::OPENAI_BASE_URL,
-        env::MODEL_PROVIDER,
-        env::MODEL_NAME,
-    ];
-
-    /// Serializes tests that mutate the process environment.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Clears every variable this module reads and restores it on drop.
-    struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn clear() -> Self {
-            let lock = env_lock();
-            let saved: Vec<(&'static str, Option<String>)> = ENV_VARS
-                .iter()
-                .map(|name| (*name, std::env::var(name).ok()))
-                .collect();
-            for name in ENV_VARS {
-                std::env::remove_var(name);
-            }
-            Self { _lock: lock, saved }
-        }
-
-        #[allow(clippy::unused_self)]
-        fn set(&self, name: &str, value: &str) {
-            std::env::set_var(name, value);
-        }
-
-        #[allow(clippy::unused_self)]
-        fn remove(&self, name: &str) {
-            std::env::remove_var(name);
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.saved {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn defaults_match_the_documented_values() {
-        let config = ModelClientConfig::default();
-
-        assert!(uuid::Uuid::parse_str(&config.client_id).is_ok());
-        assert_eq!(config.provider, "");
-        assert_eq!(config.api_key, None);
-        assert_eq!(config.api_base, None);
-        assert!(config.verify_ssl);
-        assert_eq!(config.timeout, Some(Duration::from_secs(360)));
-        assert_eq!(
-            config.stream_first_chunk_timeout,
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(config.stream_idle_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(config.max_retries, 0);
-        assert!(config.headers.is_empty());
-        assert_eq!(config.extra, Value::Null);
-    }
-
-    #[test]
-    fn client_ids_are_unique_per_default() {
-        assert_ne!(
-            ModelClientConfig::default().client_id,
-            ModelClientConfig::default().client_id
-        );
-    }
-
-    #[test]
-    fn json_round_trip_preserves_every_field() {
-        let config = ModelClientConfig::new("anthropic")
-            .with_client_id("client-1")
-            .with_api_key("sk-ant-test")
-            .with_api_base("https://proxy.example/v1")
-            .with_timeout(Duration::from_secs(12))
-            .with_stream_timeouts(Some(Duration::from_secs(7)), None)
-            .with_max_retries(4)
-            .with_header("X-Org", "research")
-            .with_verify_ssl(false)
-            .with_extra(json!({"api_mode": "chat_completions"}));
-
-        let encoded = serde_json::to_string(&config).expect("serializes");
-        assert!(encoded.contains("\"provider\":\"anthropic\""));
-
-        let restored: ModelClientConfig = serde_json::from_str(&encoded).expect("round-trips");
-        assert_eq!(restored, config);
-        assert_eq!(
-            restored.api_key.as_ref().map(SecretString::expose_secret),
-            Some("sk-ant-test")
-        );
-    }
-
-    #[test]
-    fn deserialization_accepts_python_aliases_and_unknown_fields() {
-        let config: ModelClientConfig = serde_json::from_value(json!({
-            "client_provider": "OpenAI",
-            "api_key": "sk-python",
-            "timeout": {"secs": 9, "nanos": 0},
-            "custom_headers": {"ignored": "value"},
-        }))
-        .expect("python config deserializes");
-
-        assert_eq!(config.provider, "OpenAI");
-        assert_eq!(config.timeout, Some(Duration::from_secs(9)));
-        assert!(uuid::Uuid::parse_str(&config.client_id).is_ok());
-
-        let request: ModelRequestConfig =
-            serde_json::from_value(json!({"model": "gpt-4o-mini", "unknown": true}))
-                .expect("model alias deserializes");
-        assert_eq!(request.model_name, "gpt-4o-mini");
-        assert!(!request.stream);
-        assert_eq!(request.stop, Vec::<String>::new());
-    }
-
-    #[test]
-    fn builders_set_every_field() {
-        let secret = SecretString::new("sk-secret");
-        let config = ModelClientConfig::new("qwen")
-            .with_client_id("c-2")
-            .with_secret(secret.clone())
-            .with_api_base("https://example.test/v1")
-            .with_timeout(Duration::from_secs(5))
-            .with_stream_timeouts(Some(Duration::from_secs(2)), Some(Duration::from_secs(1)))
-            .with_max_retries(2)
-            .with_headers(vec![("X-A".to_owned(), "1".to_owned())])
-            .with_header("X-B", "2")
-            .with_verify_ssl(false)
-            .with_extra(json!({"request_extra_body": {"seed": 1}}));
-
-        assert_eq!(config.client_id, "c-2");
-        assert_eq!(config.provider, "qwen");
-        assert_eq!(config.api_key, Some(secret));
-        assert_eq!(config.api_base.as_deref(), Some("https://example.test/v1"));
-        assert_eq!(config.timeout, Some(Duration::from_secs(5)));
-        assert_eq!(
-            config.stream_first_chunk_timeout,
-            Some(Duration::from_secs(2))
-        );
-        assert_eq!(config.stream_idle_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(config.max_retries, 2);
-        assert_eq!(config.headers.len(), 2);
-        assert_eq!(config.headers.get("X-B").map(String::as_str), Some("2"));
-        assert!(!config.verify_ssl);
-        assert_eq!(config.extra, json!({"request_extra_body": {"seed": 1}}));
-    }
-
-    #[test]
-    fn request_builders_set_every_field() {
-        let request = ModelRequestConfig::new("gpt-4o")
-            .with_model_name("gpt-4o-2024")
-            .with_temperature(0.1)
-            .with_top_p(0.9)
-            .with_max_tokens(512)
-            .with_tools(vec![json!({"type": "function"})])
-            .with_tool_choice(json!("auto"))
-            .with_stop(vec!["STOP".to_owned()])
-            .with_stream(true)
-            .with_extra(json!({"reasoning": {"effort": "low"}}));
-
-        assert_eq!(request.model_name, "gpt-4o-2024");
-        assert_eq!(request.temperature, Some(0.1));
-        assert_eq!(request.top_p, Some(0.9));
-        assert_eq!(request.max_tokens, Some(512));
-        assert_eq!(request.tools, Some(json!([{"type": "function"}])));
-        assert_eq!(request.tool_choice, Some(json!("auto")));
-        assert_eq!(request.stop, vec!["STOP".to_owned()]);
-        assert!(request.stream);
-        assert_eq!(request.extra, json!({"reasoning": {"effort": "low"}}));
-    }
-
-    #[test]
-    fn empty_tool_list_clears_the_field() {
-        let request = ModelRequestConfig::default().with_tools(Vec::new());
-        assert_eq!(request.tools, None);
-    }
-
-    #[test]
-    fn http_client_config_maps_transport_settings() {
-        let config = ModelClientConfig::new("openai")
-            .with_timeout(Duration::from_secs(42))
-            .with_max_retries(3)
-            .with_verify_ssl(false)
-            .with_header("X-Custom", "value")
-            .with_header("Authorization", "Bearer leaked");
-
-        let http = config.http_client_config();
-        assert_eq!(http.timeout, Duration::from_secs(42));
-        assert_eq!(http.max_retries, 3);
-        assert!(!http.verify_ssl);
-        assert_eq!(http.headers.len(), 1);
-        assert_eq!(
-            http.headers.get("X-Custom").map(String::as_str),
-            Some("value")
-        );
-        assert!(!http.headers.contains_key("Authorization"));
-    }
-
-    #[test]
-    fn http_client_config_falls_back_to_the_default_timeout() {
-        let mut config = ModelClientConfig::new("openai");
-        config.timeout = None;
-        assert_eq!(
-            config.http_client_config().timeout,
-            Duration::from_secs(360)
-        );
-    }
-
-    #[test]
-    fn sanitized_headers_drop_protected_names_and_blank_values() {
-        let mut config = ModelClientConfig::new("openai");
-        for (name, value) in [
-            ("Authorization", "Bearer secret"),
-            ("Host", "api.example"),
-            ("Content-Length", "12"),
-            ("Transfer-Encoding", "chunked"),
-            ("Connection", "keep-alive"),
-            ("X-Blank", "   "),
-            ("X-Kept", "kept"),
-        ] {
-            config.headers.insert(name.to_owned(), value.to_owned());
-        }
-
-        let sanitized = config.sanitized_headers();
-        assert_eq!(sanitized.len(), 1);
-        assert_eq!(sanitized.get("X-Kept").map(String::as_str), Some("kept"));
-    }
-
-    #[test]
-    fn resolve_for_applies_the_provider_default_base_and_key() {
-        let _env = EnvGuard::clear();
-        let original = ModelClientConfig::new("OpenAI")
-            .with_api_key("sk-explicit")
-            .with_timeout(Duration::from_secs(11))
-            .with_max_retries(2)
-            .with_verify_ssl(false);
-        let resolved = original
-            .clone()
-            .resolve_for("OpenAI")
-            .expect("openai resolves");
-
-        assert_eq!(resolved.provider, "openai");
-        assert_eq!(
-            resolved.api_base.as_deref(),
-            Some("https://api.openai.com/v1")
-        );
-        assert_eq!(
-            resolved.api_key.as_ref().map(SecretString::expose_secret),
-            Some("sk-explicit")
-        );
-        assert_eq!(resolved.timeout, Some(Duration::from_secs(11)));
-        assert_eq!(
-            resolved.stream_first_chunk_timeout,
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(resolved.stream_idle_timeout, Some(Duration::from_secs(60)));
-        assert_eq!(resolved.max_retries, 2);
-        assert!(!resolved.verify_ssl);
-        assert_eq!(resolved.client_id, original.client_id);
-    }
-
-    #[test]
-    fn resolve_for_prefers_explicit_base_then_env_then_provider_default() {
-        let env = EnvGuard::clear();
-
-        let explicit = ModelClientConfig::new("openai")
-            .with_api_key("sk")
-            .with_api_base("https://explicit.example/v1")
-            .resolve_for("openai")
-            .expect("resolves");
-        assert_eq!(
-            explicit.api_base.as_deref(),
-            Some("https://explicit.example/v1")
-        );
-
-        env.set(env::API_BASE, "https://env.example/v1");
-        let from_env = ModelClientConfig::new("openai")
-            .with_api_key("sk")
-            .resolve_for("openai")
-            .expect("resolves");
-        assert_eq!(from_env.api_base.as_deref(), Some("https://env.example/v1"));
-
-        env.remove(env::API_BASE);
-        env.remove(env::OPENAI_BASE_URL);
-        let from_default = ModelClientConfig::new("deepseek")
-            .with_api_key("sk")
-            .resolve_for("deepseek")
-            .expect("resolves");
-        assert_eq!(
-            from_default.api_base.as_deref(),
-            Some("https://api.deepseek.com/v1")
-        );
-    }
-
-    #[test]
-    fn resolve_for_prefers_the_explicit_key_then_the_environment() {
-        let env = EnvGuard::clear();
-        env.set(env::OPENJIUWEN_API_KEY, "env-key");
-
-        let explicit = ModelClientConfig::new("openai")
-            .with_api_key("explicit-key")
-            .resolve_for("openai")
-            .expect("resolves");
-        assert_eq!(
-            explicit.api_key.as_ref().map(SecretString::expose_secret),
-            Some("explicit-key")
-        );
-
-        let inherited = ModelClientConfig::new("openai")
-            .resolve_for("openai")
-            .expect("resolves");
-        assert_eq!(
-            inherited.api_key.as_ref().map(SecretString::expose_secret),
-            Some("env-key")
-        );
-    }
-
-    #[test]
-    fn blank_explicit_key_is_treated_as_missing() {
-        let env = EnvGuard::clear();
-        env.set(env::OPENAI_API_KEY, "env-openai-key");
-
-        let resolved = ModelClientConfig::new("openai")
-            .with_api_key("   ")
-            .resolve_for("openai")
-            .expect("resolves");
-        assert_eq!(
-            resolved.api_key.as_ref().map(SecretString::expose_secret),
-            Some("env-openai-key")
-        );
-    }
-
-    #[test]
-    fn resolve_for_normalizes_vendor_aliases() {
-        let _env = EnvGuard::clear();
-        let resolved = ModelClientConfig::new("DashScope")
-            .with_api_key("sk")
-            .resolve_for("DashScope")
-            .expect("dashscope resolves");
-
-        assert_eq!(resolved.provider, "qwen");
-        assert_eq!(
-            resolved.api_base.as_deref(),
-            Some("https://dashscope.aliyuncs.com/compatible-mode/v1")
-        );
-    }
-
-    #[test]
-    fn local_providers_do_not_require_a_key() {
-        let _env = EnvGuard::clear();
-        for (name, base) in [
-            ("ollama", "http://localhost:11434/v1"),
-            ("lmstudio", "http://localhost:1234/v1"),
-        ] {
-            let resolved = ModelClientConfig::new(name)
-                .resolve_for(name)
-                .unwrap_or_else(|error| panic!("{name} must not need a key: {error}"));
-            assert_eq!(resolved.provider, name);
-            assert_eq!(resolved.api_base.as_deref(), Some(base));
-            assert_eq!(resolved.api_key, None);
-        }
-    }
-
-    #[test]
-    fn pangu_without_an_api_base_is_a_config_error() {
-        let _env = EnvGuard::clear();
-        let error = ModelClientConfig::new("pangu")
-            .with_api_key("sk")
-            .resolve_for("pangu")
-            .expect_err("pangu has no default base");
-
-        assert_eq!(error.kind(), ErrorKind::Config);
-        let message = error.to_string();
-        assert!(message.contains("pangu"), "message: {message}");
-        assert!(message.contains(env::API_BASE), "message: {message}");
-    }
-
-    #[test]
-    fn missing_api_key_names_the_environment_variables_without_a_secret() {
-        let _env = EnvGuard::clear();
-        let error = ModelClientConfig::new("openai")
-            .resolve_for("openai")
-            .expect_err("openai requires a key");
-
-        assert_eq!(error.kind(), ErrorKind::Config);
-        let message = error.to_string();
-        assert!(message.contains(env::API_KEY), "message: {message}");
-        assert!(message.contains(env::OPENAI_API_KEY), "message: {message}");
-        assert!(
-            message.contains(env::OPENJIUWEN_API_KEY),
-            "message: {message}"
-        );
-        assert!(!message.contains("sk-"), "message: {message}");
-    }
-
-    #[test]
-    fn unknown_provider_is_unsupported_and_lists_the_builtins() {
-        let _env = EnvGuard::clear();
-        let error = ModelClientConfig::new("acme")
-            .with_api_key("sk")
-            .resolve_for("acme")
-            .expect_err("acme is not built in");
-
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.to_string();
-        assert!(message.contains("acme"), "message: {message}");
-        assert!(message.contains("openai"), "message: {message}");
-        assert!(message.contains("anthropic"), "message: {message}");
-    }
-
-    #[test]
-    fn from_env_reads_provider_key_base_and_model_name() {
-        let env = EnvGuard::clear();
-        env.set(env::MODEL_PROVIDER, "deepseek");
-        env.set(env::API_KEY, "env-key");
-        env.set(env::OPENAI_BASE_URL, "https://env.example/v1");
-        env.set(env::MODEL_NAME, "deepseek-chat");
-
-        let client = ModelClientConfig::from_env();
-        assert_eq!(client.provider, "deepseek");
-        assert_eq!(
-            client.api_key.as_ref().map(SecretString::expose_secret),
-            Some("env-key")
-        );
-        assert_eq!(client.api_base.as_deref(), Some("https://env.example/v1"));
-        assert!(uuid::Uuid::parse_str(&client.client_id).is_ok());
-
-        assert_eq!(ModelRequestConfig::from_env().model_name, "deepseek-chat");
-    }
-
-    #[test]
-    fn from_env_defaults_the_provider_to_openai() {
-        let _env = EnvGuard::clear();
-        let client = ModelClientConfig::from_env();
-        assert_eq!(client.provider, "openai");
-        assert_eq!(client.api_key, None);
-        assert_eq!(client.api_base, None);
-        assert_eq!(ModelRequestConfig::from_env().model_name, "");
-    }
-
-    #[test]
-    fn debug_output_never_contains_the_api_key() {
-        let config = ModelClientConfig::new("openai").with_api_key("sk-super-secret");
-        let rendered = format!("{config:?}");
-        assert!(!rendered.contains("sk-super-secret"), "debug: {rendered}");
-    }
-}
+mod tests;

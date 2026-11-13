@@ -16,6 +16,11 @@
 //! last answer. Here the deterministic bank is the baseline and a model is an
 //! optional extra candidate: a model failure or an unparsable answer logs and
 //! falls back to the bank instead of failing the run.
+//!
+//! The rewrite request also carries the case set's tool declarations inside a
+//! `<tools_description>` block, matching Python's `str(tools)` rendering.
+//! The block is omitted entirely when no case declares a tool, so a tool-free
+//! case set produces the same prompt as before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -24,6 +29,7 @@ use std::sync::Arc;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::prompt::BaseMessage;
+use openjiuwen_foundation::tool::ToolInfo;
 
 use crate::tune::base::{Case, EvaluatedCase};
 use crate::tune::evaluator::CaseEvaluator;
@@ -280,17 +286,55 @@ impl Mutator {
 
     /// Asks the model to rewrite `base`, using `bad_cases` as evidence.
     ///
+    /// `cases` supplies the tool declarations described in the request, as
+    /// Python's `InstructionOptimizer` does. The declarations are rendered into
+    /// the prompt text only: `request.tools` stays unset, because Python
+    /// describes the tools instead of offering them to the model.
+    ///
     /// Returns `None` when no model is attached, the call fails, the answer has
     /// no `<PROMPT_OPTIMIZED>` block, or the rewrite equals `base`. A failure is
     /// logged and never propagated: the deterministic bank remains the baseline.
+    ///
+    /// This is [`Self::model_rewrite_with`] with no sampling temperature and no
+    /// extra policy context, so the instruction, example, and joint optimizers
+    /// keep byte-identical requests.
     pub(crate) async fn model_rewrite(
         &self,
         base: &str,
         bad_cases: &[EvaluatedCase],
+        cases: &[Case],
+    ) -> Option<String> {
+        self.model_rewrite_with(base, bad_cases, cases, None, None)
+            .await
+    }
+
+    /// Asks the model to rewrite `base`, optionally sampling with `temperature`
+    /// and appending `context` to the request.
+    ///
+    /// `temperature` is the prompt-search policy temperature
+    /// ([`PromptSearchConfig::policy_temperature`]) and is the only way that
+    /// tunable reaches the model; `context` is the multi-round policy update —
+    /// the compressed lessons plus the warm-start prompts, already rendered as
+    /// text — and appears as a `<policy_context>` block between the bad cases
+    /// and the instruction. Both default to "absent" in [`Self::model_rewrite`],
+    /// so a request without them is byte-identical to before.
+    ///
+    /// [`PromptSearchConfig::policy_temperature`]:
+    ///     crate::tune::PromptSearchConfig::policy_temperature
+    pub(crate) async fn model_rewrite_with(
+        &self,
+        base: &str,
+        bad_cases: &[EvaluatedCase],
+        cases: &[Case],
+        temperature: Option<f32>,
+        context: Option<&str>,
     ) -> Option<String> {
         let model = self.model.as_ref()?;
-        let messages = rewrite_messages(base, bad_cases);
-        let request = ModelRequestConfig::new(model.model_name());
+        let messages = rewrite_messages_with(base, bad_cases, cases, context);
+        let mut request = ModelRequestConfig::new(model.model_name());
+        if let Some(temperature) = temperature {
+            request = request.with_temperature(temperature);
+        }
         let completion = match model.invoke(&messages, &request).await {
             Ok(completion) => completion,
             Err(error) => {
@@ -315,9 +359,73 @@ impl Mutator {
     }
 }
 
-/// Renders the rewrite conversation: the prompt under revision plus the cases
-/// that scored worst.
-fn rewrite_messages(base: &str, bad_cases: &[EvaluatedCase]) -> Vec<BaseMessage> {
+/// Python's `str(tools)`: the declarations the case set shares, as compact
+/// JSON; `"None"` when no case declares a tool.
+///
+/// Declarations are flattened across `cases` in first-appearance order and
+/// deduplicated by `function.name` with the first declaration winning, so the
+/// rendering is deterministic and independent of map iteration order.
+pub(crate) fn tools_description(cases: &[Case]) -> String {
+    let mut seen = BTreeSet::new();
+    let mut declared: Vec<&ToolInfo> = Vec::new();
+    for case in cases {
+        for tool in case.tools().into_iter().flatten() {
+            if seen.insert(tool.function.name.as_str()) {
+                declared.push(tool);
+            }
+        }
+    }
+    if declared.is_empty() {
+        return "None".to_owned();
+    }
+    match serde_json::to_string(&declared) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, "tool declarations could not be rendered as JSON");
+            // One unrenderable declaration must not drop the others.
+            let rendered: Vec<String> = declared
+                .iter()
+                .map(|tool| serde_json::to_string(tool).unwrap_or_default())
+                .collect();
+            format!("[{}]", rendered.join(","))
+        }
+    }
+}
+
+/// The `<tools_description>…</tools_description>` block, or `None` when no case
+/// declares tools.
+///
+/// `None` keeps the rewrite prompt byte-identical for a tool-free case set.
+pub(crate) fn tools_block(cases: &[Case]) -> Option<String> {
+    if !cases.iter().any(Case::has_tools) {
+        return None;
+    }
+    Some(format!(
+        "<tools_description>{}</tools_description>",
+        tools_description(cases)
+    ))
+}
+
+/// Renders the rewrite conversation with no policy context.
+///
+/// Test-only: the production paths go through [`rewrite_messages_with`].
+#[cfg(test)]
+fn rewrite_messages(base: &str, bad_cases: &[EvaluatedCase], cases: &[Case]) -> Vec<BaseMessage> {
+    rewrite_messages_with(base, bad_cases, cases, None)
+}
+
+/// Renders the rewrite conversation, optionally appending the round's policy
+/// context.
+///
+/// The `<policy_context>` block sits between the bad cases and the instruction
+/// and is omitted entirely for an absent or blank `context`, so every existing
+/// caller's request stays byte-identical.
+fn rewrite_messages_with(
+    base: &str,
+    bad_cases: &[EvaluatedCase],
+    cases: &[Case],
+    context: Option<&str>,
+) -> Vec<BaseMessage> {
     let mut evidence = String::new();
     for bad in bad_cases {
         let inputs = bad
@@ -345,10 +453,20 @@ fn rewrite_messages(base: &str, bad_cases: &[EvaluatedCase]) -> Vec<BaseMessage>
             bad.reason
         );
     }
-    let user = format!(
-        "<prompt_base>\n{base}\n</prompt_base>\n\n<bad_cases>\n{evidence}</bad_cases>\n\n\
-         Rewrite the prompt so those cases are handled correctly."
-    );
+    let mut user = format!("<prompt_base>\n{base}\n</prompt_base>\n\n");
+    if let Some(block) = tools_block(cases) {
+        user.push_str(&block);
+        user.push_str("\n\n");
+    }
+    let _ = write!(user, "<bad_cases>\n{evidence}</bad_cases>");
+    if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+        let _ = write!(
+            user,
+            "\n\n<policy_context>\n{}\n</policy_context>",
+            context.trim()
+        );
+    }
+    user.push_str("\n\nRewrite the prompt so those cases are handled correctly.");
     vec![
         BaseMessage::system(REWRITE_SYSTEM_PROMPT.to_owned()),
         BaseMessage::user(user),
@@ -538,7 +656,7 @@ mod tests {
         let mutator = Mutator::new(None);
         assert_eq!(Mutator::deterministic("seed").len(), MUTATIONS.len());
         assert!(mutator
-            .model_rewrite("seed", &[EvaluatedCase::from(case("c1"))])
+            .model_rewrite("seed", &[EvaluatedCase::from(case("c1"))], &[])
             .await
             .is_none());
     }
@@ -550,7 +668,9 @@ mod tests {
         );
         let mutator = Mutator::new(Some(Arc::new(model.clone())));
         let bad = [EvaluatedCase::new(case("c1"), BTreeMap::new(), 0.0, "wrong").unwrap()];
-        let rewrite = mutator.model_rewrite("Answer {{question}}.", &bad).await;
+        let rewrite = mutator
+            .model_rewrite("Answer {{question}}.", &bad, &[])
+            .await;
         assert_eq!(rewrite.as_deref(), Some("Answer {{question}} carefully."));
 
         let call = model.last_call().expect("one model call");
@@ -564,17 +684,107 @@ mod tests {
     #[tokio::test]
     async fn mutator_degrades_on_unparsable_answers_and_failures() {
         let mutator = Mutator::new(Some(Arc::new(ScriptedModel::text("just a rewrite"))));
-        assert!(mutator.model_rewrite("seed", &[]).await.is_none());
+        assert!(mutator.model_rewrite("seed", &[], &[]).await.is_none());
 
         let identical = Mutator::new(Some(Arc::new(ScriptedModel::text(
             "<PROMPT_OPTIMIZED>seed</PROMPT_OPTIMIZED>",
         ))));
-        assert!(identical.model_rewrite("seed", &[]).await.is_none());
+        assert!(identical.model_rewrite("seed", &[], &[]).await.is_none());
 
         let failing = Mutator::new(Some(Arc::new(ScriptedModel::new([ScriptedTurn::fail(
             "provider down",
         )]))));
-        assert!(failing.model_rewrite("seed", &[]).await.is_none());
+        assert!(failing.model_rewrite("seed", &[], &[]).await.is_none());
+    }
+
+    /// A single function declaration with an empty object schema.
+    fn lookup(description: &str) -> ToolInfo {
+        ToolInfo::new(
+            "lookup",
+            description,
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    #[test]
+    fn tools_description_renders_python_parity_json() {
+        let tool = lookup("Look something up");
+        let cases = vec![case("c1").with_tools(vec![tool.clone()])];
+        assert_eq!(
+            tools_description(&cases),
+            serde_json::to_string(&vec![&tool]).unwrap(),
+            "the declaration renders as the compact JSON array Python prints"
+        );
+        assert!(tools_description(&cases).starts_with("[{\"type\":\"function\""));
+    }
+
+    #[test]
+    fn tools_description_is_none_without_declarations() {
+        assert_eq!(tools_description(&[]), "None");
+        assert_eq!(tools_description(&[case("c1")]), "None");
+        assert_eq!(tools_description(&[case("c1").with_tools(vec![])]), "None");
+    }
+
+    #[test]
+    fn tools_block_deduplicates_across_cases() {
+        let first = lookup("First declaration");
+        let replacement = lookup("Second declaration");
+        let other = ToolInfo::new("search", "Search things", serde_json::json!({}));
+        let cases = vec![
+            case("c1").with_tools(vec![first]),
+            case("c2").with_tools(vec![replacement, other]),
+        ];
+        let block = tools_block(&cases).expect("the case set declares tools");
+        assert!(block.starts_with("<tools_description>"), "{block}");
+        assert!(block.ends_with("</tools_description>"), "{block}");
+        assert_eq!(block.matches("\"lookup\"").count(), 1, "{block}");
+        assert_eq!(block.matches("\"search\"").count(), 1, "{block}");
+        assert!(
+            block.contains("First declaration"),
+            "the first declaration wins: {block}"
+        );
+        assert!(!block.contains("Second declaration"), "{block}");
+        let lookup_at = block.find("\"lookup\"").expect("lookup listed");
+        let search_at = block.find("\"search\"").expect("search listed");
+        assert!(lookup_at < search_at, "first-appearance order: {block}");
+    }
+
+    #[test]
+    fn tools_block_is_absent_without_declarations() {
+        let cases = vec![case("c1")];
+        assert_eq!(tools_block(&cases), None);
+        assert_eq!(tools_block(&[]), None);
+
+        let messages = rewrite_messages("seed", &[EvaluatedCase::from(case("c1"))], &cases);
+        let user = messages[1].text();
+        assert!(!user.contains("<tools_description>"), "{user}");
+        assert!(!user.contains("None"), "{user}");
+        assert_eq!(
+            user,
+            "<prompt_base>\nseed\n</prompt_base>\n\n<bad_cases>\n\
+             [question]: question:c1\n[expected answer]: answer:c1\n[assistant answer]: \n\
+             [reason]: \n===\n</bad_cases>\n\n\
+             Rewrite the prompt so those cases are handled correctly."
+        );
+    }
+
+    #[test]
+    fn rewrite_messages_render_the_tools_block() {
+        let cases = vec![case("c1").with_tools(vec![lookup("Look something up")])];
+        let bad = [EvaluatedCase::new(case("c1"), BTreeMap::new(), 0.0, "wrong").unwrap()];
+        let messages = rewrite_messages("Answer {{question}}.", &bad, &cases);
+        assert_eq!(messages.len(), 2);
+        let user = messages[1].text();
+        assert!(user.starts_with("<prompt_base>"), "{user}");
+        let tools_at = user.find("<tools_description>").expect("tools block");
+        assert!(user.contains("lookup"), "{user}");
+        assert!(
+            user.contains("</tools_description>"),
+            "the block is closed: {user}"
+        );
+        let bad_at = user.find("<bad_cases>").expect("bad cases block");
+        assert!(tools_at < bad_at, "tools precede the evidence: {user}");
+        assert!(user.contains("Rewrite the prompt so those cases"));
     }
 
     #[test]

@@ -55,6 +55,11 @@ use crate::interrupt::{find_interrupt, InteractionState};
 use crate::output::{FrameWriter, OutputFrame, END_NODE_STREAM};
 use crate::reference;
 
+// The interaction-wire builder sits with the invoke path that reports it in the private
+// `engine::run` module; re-export it so crate-level callers (such as `crate::single`)
+// can reuse it without a second copy.
+pub(crate) use crate::engine::run::interaction_wires;
+
 /// Trace reason recorded when a component halts the run for human input.
 const INTERRUPTED_REASON: &str = "workflow interrupted waiting for input";
 
@@ -424,7 +429,14 @@ fn merge_stream_inputs(batch: Value, streamed: Value) -> Value {
 ///
 /// The schema resolves against the full workflow state plus `{"<id>": raw, "output":
 /// raw}`, so a template can reference its own component id or the bare `output` key.
-fn project_output(schema: Option<&Value>, source: &Value, id: &str, raw: &Value) -> Value {
+/// This is the engine's state convention; `crate::single` reuses it against a
+/// single-component call's resolved inputs so both paths project outputs identically.
+pub(crate) fn project_output(
+    schema: Option<&Value>,
+    source: &Value,
+    id: &str,
+    raw: &Value,
+) -> Value {
     let Some(schema) = schema else {
         return raw.clone();
     };

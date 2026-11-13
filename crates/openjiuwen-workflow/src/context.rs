@@ -412,6 +412,17 @@ impl ComponentContext {
         self.interactions.take_answer(id)
     }
 
+    /// Answers queued in this run, used by nested components to forward them to a child
+    /// run.
+    ///
+    /// The map holds each interaction id's remaining FIFO queue; reading does not consume
+    /// the answers, so this component's own [`ComponentContext::interact`] calls still see
+    /// them.
+    #[must_use]
+    pub fn queued_answers(&self) -> BTreeMap<String, Vec<Value>> {
+        self.interactions.queued_answers()
+    }
+
     /// The next output frame index for this context.
     fn next_frame_index(&self) -> u32 {
         let current = self.frame_index.fetch_add(1, Ordering::Relaxed);

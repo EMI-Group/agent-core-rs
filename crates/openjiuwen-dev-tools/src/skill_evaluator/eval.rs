@@ -509,6 +509,62 @@ impl EvalRun {
         let text = self.to_jsonl()?;
         write_artifact(path.as_ref(), &text).await
     }
+
+    /// Renders the Python `skill_tester_report.json` artifact.
+    ///
+    /// The value carries exactly `skill_name`, `skill_path`, `timestamp`,
+    /// `summary`, `results`, and `recommendations`. Unlike
+    /// [`to_json`](Self::to_json), `results` reuses the in-memory
+    /// [`CaseResult`] serialization (`id`/`name`/`status`/`assertions`, as in the
+    /// Python report), and `recommendations` lists the names of the failed and
+    /// partial cases in input order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::external`](openjiuwen_common::error::Error::external) when a
+    /// value cannot be serialized.
+    pub fn report(
+        &self,
+        skill_name: &str,
+        skill_path: &str,
+        timestamp: &str,
+    ) -> Result<serde_json::Value> {
+        let summary = serde_json::to_value(&self.summary).map_err(Error::external)?;
+        let results = serde_json::to_value(&self.cases).map_err(Error::external)?;
+        let recommendations: Vec<String> = self
+            .cases
+            .iter()
+            .filter(|case| matches!(case.status, CaseStatus::Failed | CaseStatus::Partial))
+            .map(|case| case.name.clone())
+            .collect();
+        Ok(serde_json::json!({
+            "skill_name": skill_name,
+            "skill_path": skill_path,
+            "timestamp": timestamp,
+            "summary": summary,
+            "results": results,
+            "recommendations": recommendations,
+        }))
+    }
+
+    /// Writes the [`report`](Self::report) artifact to `path`, creating parents.
+    ///
+    /// # Errors
+    ///
+    /// As [`to_json`](Self::to_json), plus
+    /// [`Error::external`](openjiuwen_common::error::Error::external) naming the
+    /// path when a directory or file cannot be written.
+    pub async fn write_report(
+        &self,
+        path: impl AsRef<Path>,
+        skill_name: &str,
+        skill_path: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        let value = self.report(skill_name, skill_path, timestamp)?;
+        let text = serde_json::to_string_pretty(&value).map_err(Error::external)?;
+        write_artifact(path.as_ref(), &text).await
+    }
 }
 
 /// One check applied to an answer: a parsed assertion or the expected output.

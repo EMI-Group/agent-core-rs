@@ -6,6 +6,10 @@
 //! into the same row/column document scheme the [`CsvLoader`](super::CsvLoader)
 //! emits. The document-id base is the file stem, which mirrors Python's
 //! `base_id = doc_id or doc` and keeps ids readable (`people_s0_r2`).
+//!
+//! [`DocumentLoader::load_bytes`] runs the same workbook conversion over
+//! in-memory bytes ([`XlsxParser::parse_bytes`]), taking the id base from
+//! `source.name`'s file stem, so an uploaded workbook needs no temporary path.
 
 use async_trait::async_trait;
 
@@ -13,9 +17,11 @@ use openjiuwen_common::error::Result;
 use openjiuwen_common::logging::debug;
 
 use crate::common::Document;
-use crate::parsing::XlsxParser;
+use crate::parsing::{XlsxParser, XlsxWorkbook};
 
-use super::{file_extension, file_stem, DocumentLoader};
+use super::{
+    apply_load_options, file_extension, file_stem, DocumentBytes, DocumentLoader, LoadOptions,
+};
 
 /// Loads `.xlsx` workbooks as row documents followed by column documents.
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,6 +33,17 @@ impl XlsxLoader {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// Converts a parsed workbook into row/column documents keyed by `base_id`.
+///
+/// A workbook without sheets yields no documents, so callers never index an
+/// empty record set.
+fn documents_from_workbook(workbook: &XlsxWorkbook, base_id: &str) -> Vec<Document> {
+    if workbook.is_empty() {
+        return Vec::new();
+    }
+    workbook.to_documents(base_id)
 }
 
 #[async_trait]
@@ -41,11 +58,28 @@ impl DocumentLoader for XlsxLoader {
             debug!(file = source, "loaded an XLSX workbook with no sheets");
             return Ok(Vec::new());
         }
-        let documents = workbook.to_documents(&file_stem(source));
+        let documents = documents_from_workbook(&workbook, &file_stem(source));
         debug!(
             file = source,
             documents = documents.len(),
             "loaded XLSX workbook"
+        );
+        Ok(documents)
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let workbook = XlsxParser::new().parse_bytes(&source.bytes)?;
+        let base_id = file_stem(&source.name);
+        let mut documents = documents_from_workbook(&workbook, &base_id);
+        apply_load_options(&source.name, &mut documents, options);
+        debug!(
+            file = source.name.as_str(),
+            documents = documents.len(),
+            "loaded XLSX workbook from bytes"
         );
         Ok(documents)
     }
@@ -58,7 +92,8 @@ mod tests {
     use openjiuwen_common::error::ErrorKind;
     use serde_json::Value;
 
-    use crate::loaders::fixtures::build_zip;
+    use crate::loaders::fixtures::{build_zip, xlsx_workbook};
+    use crate::loaders::{DocumentBytes, LoadOptions};
 
     /// One-sheet workbook with a header row and one data row.
     const WORKBOOK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -95,6 +130,7 @@ mod tests {
             ("xl/_rels/workbook.xml.rels", RELS_XML),
             ("xl/worksheets/sheet1.xml", SHEET_XML),
         ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -134,12 +170,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_bytes_matches_the_path_loader() {
+        let bytes = workbook_archive();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("people.xlsx");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = XlsxLoader::new()
+            .load(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let from_bytes = XlsxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("people.xlsx", bytes),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(from_bytes.len(), from_path.len());
+        for (byte_doc, path_doc) in from_bytes.iter().zip(from_path.iter()) {
+            assert_eq!(byte_doc.text, path_doc.text);
+            assert_eq!(byte_doc.id, path_doc.id);
+            for (key, value) in &path_doc.metadata {
+                assert_eq!(
+                    byte_doc.metadata.get(key),
+                    Some(value),
+                    "metadata key {key}"
+                );
+            }
+            assert_eq!(
+                byte_doc.metadata.get("doc_id"),
+                Some(&Value::String(byte_doc.id.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_bytes_uses_the_name_stem_as_the_doc_id_base_prefix() {
+        let documents = XlsxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("/uploads/people.xlsx", workbook_archive()),
+                &LoadOptions::new().with_doc_id("doc-base"),
+            )
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = documents.iter().map(|doc| doc.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["doc-base_s0_r2", "doc-base_s0_c0", "doc-base_s0_c1"]
+        );
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String("doc-base_s0_r2".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("sheet_name"),
+            Some(&Value::from("People"))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_of_an_empty_workbook_yields_no_documents() {
+        let documents = XlsxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("empty.xlsx", xlsx_workbook(&[]).unwrap()),
+                &LoadOptions::new().with_doc_id("doc-empty"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 0);
+    }
+
+    #[tokio::test]
     async fn empty_workbook_yields_no_documents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.xlsx");
         std::fs::write(
             &path,
-            build_zip(&[("xl/workbook.xml", "<workbook><sheets/></workbook>")]),
+            build_zip(&[("xl/workbook.xml", "<workbook><sheets/></workbook>")]).unwrap(),
         )
         .unwrap();
 
@@ -171,7 +281,7 @@ mod tests {
         let no_workbook = dir.path().join("nopart.xlsx");
         std::fs::write(
             &no_workbook,
-            build_zip(&[("xl/sharedStrings.xml", "<sst/>")]),
+            build_zip(&[("xl/sharedStrings.xml", "<sst/>")]).unwrap(),
         )
         .unwrap();
         let error = XlsxLoader::new()
@@ -180,6 +290,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Retrieval);
         assert!(error.to_string().contains("xl/workbook.xml"));
+    }
+
+    #[tokio::test]
+    async fn load_bytes_reports_corrupt_bytes_as_validation() {
+        let source = DocumentBytes::new("corrupt.xlsx", b"not a zip".to_vec());
+        let error = XlsxLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[test]

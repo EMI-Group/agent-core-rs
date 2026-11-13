@@ -36,6 +36,24 @@ it deliberately does not glob the whole agent crate.
 per-module globs mirroring Python's top-level packages; nested paths such as `controller::schema`, `kv_cache::runtime`,
 and `operator::base` stay reachable through them, and `single_agent` also exposes the same items as an alternative spelling.
 
+## Features
+
+`default = []`; every other feature is additive and opt-in, and each one forwards to the concrete crate that owns the gated surface.
+
+| Feature | Forwards to | Effect |
+| --- | --- | --- |
+| `otel` | `openjiuwen-session/otel` | `session::install_trace_sink` really installs the sink instead of being the documented no-op |
+| `sqlite` | `openjiuwen-foundation/sqlite`, `openjiuwen-session/sqlite`, `openjiuwen-memory/sqlite` | SQLite KV/document stores (`foundation::store::{SqliteKvStore, SqliteDocumentStore}`), SQLite checkpointer (`session::SqliteCheckpointer`), FTS5 coding index (`memory::lite::fts`) |
+| `sandbox` | `openjiuwen-sysop/sandbox` | `sys_operation::sandbox::http` compiles; its remote `invoke` still returns `Error::Unsupported` |
+| `live-tests` | `openjiuwen-foundation/live-tests` | gates the concrete crate's opt-in network tests |
+
+Deliberately not forwarded:
+
+- `mcp` / `tiktoken` — `openjiuwen-foundation`'s defaults, and the dependency is taken with default features; Cargo features are additive, so an umbrella feature could never disable them.
+- `redis` — no kernel crate declares such a feature: `session::RedisCheckpointer` and foundation's `store::external::redis` always compile, and live Redis wiring is `openjiuwen-extensions`'s `redis` feature (a different layer).
+- `fts5` — memory's FTS5 index is gated by memory's `sqlite` feature, so it is covered by the umbrella `sqlite` feature.
+- `distributed` / `vendor` / `notify` / `browser` / `cua` / `mobile` — teams-, harness-, or extension-layer features, not kernel ones.
+
 ## Constraints
 
 - Re-exports only: no logic, no new public data types, and no `unsafe` (`#![forbid(unsafe_code)]`).
@@ -43,20 +61,26 @@ and `operator::base` stay reachable through them, and `single_agent` also expose
 - Concrete crates must not depend on this umbrella, except the product/harness layers and above; the crate stays acyclic.
 - Item identity is guaranteed: each alias is the same type as the concrete crate's item, verified by `TypeId` in tests.
 - Naming follows the Python tree even where it diverges from the crate name (`context_engine` → `openjiuwen-context`, `sys_operation` → `openjiuwen-sysop`, `multi_agent` → `openjiuwen-multiagent`).
-- Every dependency is taken with default features only: the crate declares `default = []` plus the single opt-in `otel` feature, which forwards `openjiuwen-session/otel` so `session::install_trace_sink` really installs the sink instead of being the documented no-op.
+- Every dependency is taken with default features only: the crate declares `default = []` plus the opt-in forwarders `otel`, `sqlite`, `sandbox`, and `live-tests` (see Features), never `default-features = false`, so foundation's `mcp`/`tiktoken` defaults always apply.
 
 ## Routing Table
 
-- `./src/lib.rs` → module aliases, the `single_agent`, `application`, `controller`, `kv_cache`, and `operator` shims, and the Python→Rust path table in the crate docs.
+- `./src/lib.rs` → module aliases, the `single_agent`, `application`, `controller`, `kv_cache`, and `operator` shims, the Python→Rust path table and the feature-forwarding section in the crate docs.
 - `./tests/module_paths.rs` → resolve/identity checks for one representative item per module, plus per-area extended tests for the kernel's wider surface.
+- `./tests/feature_forwarding.rs` → per-feature reachability and behaviour of the `otel` / `sqlite` / `sandbox` / `live-tests` forwarders.
 
 ## Test Strategy
 
 - `tests/module_paths.rs` proves every module path resolves and aliases the same type as the source crate via `TypeId`;
   `single_agent`, `application`, and `runner` (its `Runner`, `RunOptions`, `ResourceMgr`, `CallbackEvent`, and `InMemoryMessageQueue` exports, plus a `MessageQueue` trait-object coercion) are covered explicitly.
 - Per-area identity tests cover the extended kernel surface: `controller_*`, `kv_cache_*`, `operator_*`, `single_agent_extended_*`, `session_extended_*`, `runner_extended_*` (including nested module paths), `foundation_extended_*`, `memory_extended_*`, and `retrieval_extended_*`.
+  `workflow_components_paths_resolve` covers the twelve components plus the `components::sub_workflow` / `questioner` / `http_request` nested paths.
+  `memory_extended_paths_resolve` covers `lite::{CodingFact, CodingMemory}` plus `lite::markdown` and `lite::local::LocalCodingMemory`;
+  `retrieval_extended_paths_resolve` covers `sparse::bm25` on top of `sparse`.
   Traits (`TaskExecutor`, `QueryRewriter`) are proved by generic bounds on the concrete trait object; function items (`abilities::parts::extract_parts`, `install_trace_sink`, `diff_snapshots`) by fn-pointer identity, and `load_mcp_abilities` by reference only.
+- `tests/feature_forwarding.rs` proves each forwarder: `sqlite` reaches the SQLite stores/checkpointer/FTS5 index, `sandbox` reaches `HttpSandboxGateway` and keeps its `Error::Unsupported` remote contract, and `otel` really installs a `MemoryTraceSink` on a `WorkflowSession` (its `#[cfg(not(feature = "otel"))]` counterpart proves the documented no-op).
+  Its always-on tests plus the `#[cfg(not(feature = "sqlite"))]` / `#[cfg(not(feature = "sandbox"))]` tests prove the reduced configuration still builds the always-compiled card surfaces (`StoreRegistry`, `SandboxGatewayConfig`).
+- Gate commands: `cargo test -p openjiuwen-core --offline` and `--no-default-features` exercise the no-forwarder configuration; `--all-features` exercises `otel` + `sqlite` + `sandbox` + `live-tests`.
 - The crate-level doc example compiles as a doctest (`cargo test -p openjiuwen-core`), guarding the public paths.
-- `cargo test -p openjiuwen-core --features otel` proves the forwarded session feature builds and keeps the same surface.
 - No unit tests here: the umbrella has no behavior; behavior is tested in the concrete crates.
 - `cargo clippy -p openjiuwen-core --all-targets --all-features -- -D warnings` must stay clean.

@@ -23,9 +23,14 @@ pub use messager::{…};     // Messager, InProcessMessager, EventSink, create_m
 pub use experts::{…};      // ExpertCatalog/ExpertRef, package loading, template composition, process catalog slot
 pub use interaction::{…};  // InteractPayload, DeliverResult, InteractGate, inbox, approval bridge, routing grammar
 pub use runtime::{…};      // TeamAgent, TeamBackend, TeamBuildDeps, SpecBuild, runtime manager/pool,
-                           // member spawner, attach host, model allocator/router, org binding, metadata parsers
+                           // member spawner, attach host, model allocator/router, org binding, metadata parsers,
+                           // checkpoint config (CheckpointConfig, CheckpointStoreConfig, checkpoint_config),
+                           // health projection (TeamHealth, MemberHealth)
 pub use harness::{…};      // MemberHarnessFactory/Context, HarnessMemberRuntime, NativeMemberFactory,
-                           // ModelResolver/EnvModelResolver, NativeCheckpoint, mapping helpers
+                           // ModelResolver/EnvModelResolver, NativeCheckpoint, mapping helpers,
+                           // checkpoint store (MemberCheckpointPolicy, CheckpointResume, MemberCheckpointRecord,
+                           // MemberCheckpointStore, InMemoryMemberCheckpointStore, FileMemberCheckpointStore,
+                           // MemberCheckpointSink)
 pub use mcp::{…};          // TeamMcpServer, build_mcp_server, OPERATOR_INSTRUCTIONS, SERVER_NAME
 pub use skill::{…};        // TeamClient + store/socket clients, skill CLI, join descriptor, tool catalogues,
                            // connect_live_client/connect_socket_client, outcome types
@@ -46,6 +51,12 @@ Module roles beyond the kernel seams, one line each:
 - `observability` → the `ObservabilityHooks` seam and an in-memory span sink; the `otel` feature adds structured hooks over the same seam.
 - `monitor` → plain-text status stream for a live team (`TeamMonitor`, `StatusStream`, backpressure policy).
 - `attach` → the Unix-socket wire contract (`protocol`) plus `AttachClient` and `AttachServer`.
+- `harness::checkpoint_store` → `MemberCheckpointPolicy`/`CheckpointResume` capture knobs, `MemberCheckpointRecord`, the `MemberCheckpointStore` seam (`InMemoryMemberCheckpointStore`, `FileMemberCheckpointStore`) and the `MemberCheckpointSink` adapter.
+- `runtime::health` → `TeamHealth`/`MemberHealth`, the member-liveness projection behind `TeamBackend::health()` and `TeamAgent::health()`.
+
+Checkpoint and health seams: `TeamBuildDeps::with_checkpoint_store` injects a store and `has_injected_checkpoints` reports it.
+`HarnessMemberRuntime` exposes `with_card_id`, `with_checkpoint_store`, `with_checkpoint_policy`, `with_cwd`, `latest_checkpoint` and `capture_checkpoint`.
+`MemberHarnessContext` carries `card_id` alongside `member_session_id(host, member)`.
 
 Binaries: `team-member` (`src/bin/team-member.rs` → `skill::run_skill_cli`, exit `0/1/2/130`) and `openjiuwen-team-mcp` (`src/bin/openjiuwen-team-mcp.rs`, `mcp` feature, stdio MCP server).
 
@@ -84,6 +95,7 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 - `team-member` exit codes: `0` success and `--help`, `1` refused/unhosted team or a failed served member start, `2` CLI-side error (unknown command/flag, missing argument, malformed or absent descriptor), `130` a cancelled operation.
 - `team-member serve` contract: one JSON object per line on stdin/stdout (`start`/`send`/`abort`/`pause`/`resume`/`stop` in, `ready`/`state`/`round`/`chunk`/`error` out); stdout carries protocol frames only and diagnostics go to stderr; a `start` answers `ready` then one `state`; an unparsable line is answered with `error` and the loop keeps serving; `stop` or EOF exits `0`; a runtime that cannot be built or started exits `1` after one `error` frame.
 - Attach protocol: one `{"v":1,"id":<n>,"op":"…","args":{…}}` request per connection answered by one `{"v":1,"id":<n>,"ok":…}` response; an op-level error travels in band and keeps the connection, a frame-level error is answered once and ends that connection; `MAX_FRAME_BYTES` (1 MiB) bounds one line; `stop_team` answers `{"stopping": true}`; `OPENJIUWEN_TEAM_SOCKET` is the read-side fallback when the metadata names no socket (the host never sets it).
+- Run completion: a settled run publishes one `EventPayload::TeamCompleted(TeamCompletedEvent { team_name, reason: Some("settled") })` on `TeamTopic::Team` in addition to the unchanged `team.completed` stream marker, which remains the last frame, and a cancelled run publishes neither.
 - `TeamAgentSpec::metadata` keys, all optional and tolerant (a malformed value logs and keeps the default, except `organization`, where a configured-but-broken chart fails the build):
   - `spawn` → bare `MemberSpawnOptions` (`{"kind": "in_process"|"process"|"external_cli"|"ssh", …}`) or `{"options": …, "fork": …}`; selects the spawner.
   - `fork` → `{"parent": "dev-1", "task": {…}|null, "tools": {…}}`, also read from `spawn.fork`; forks a member from `parent` and registers its KV lineage.
@@ -91,6 +103,7 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
   - `organization` → `{"spec": OrganizationSpec, "rules": DelegationRules}`; installs the `OrgBinding`.
   - `kv_cache` → `{"enabled": bool, "max_entries": n}` (absent means enabled).
   - `attach` → `"/path/team.sock"` or `{"socket"|"path": "…", "required": bool}`; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins.
+  - `checkpoint` → `{"enabled", "on_turn", "on_state", "on_stop", "resume"}` policy, optionally wrapped as `{"policy": {…}, "store": "memory"|"file", "dir": "…"}`; absent means an enabled policy with a team-shared in-memory store, and a malformed value warns and keeps the default.
 
 ## Deferred (documented, `Error::Unsupported` through seams)
 
@@ -135,20 +148,21 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 
 ## Test Strategy
 
-- Unit tests live beside their modules (`#[cfg(test)]`): `cargo test --lib` reports 1322 in the default build and 1348 with `--features sqlite,otel`, concentrated in `runtime`, `member`, `skill`, `org`, `schema`, `attach`, `workspace`, `taskboard`, `monitor`, `storage`, `models`, `interaction`, `kv_cache`, `observability`, `harness`, `messager`, `mcp` and `experts`.
+- Unit tests live beside their modules (`#[cfg(test)]`): `cargo test -p openjiuwen-agent-teams --lib` reports 1411 in the default build, 1409 with `--no-default-features`, 1430 with `--features sqlite` and 1439 with `--all-features`, concentrated in `runtime`, `member`, `skill`, `org`, `schema`, `attach`, `workspace`, `taskboard`, `monitor`, `storage`, `models`, `interaction`, `kv_cache`, `observability`, `harness`, `messager`, `mcp` and `experts`.
+- Checkpoint and health suites: `src/runtime/wiring_tests/checkpoints.rs` drives the metadata-driven checkpoint wiring, `src/harness/checkpoint_store/` carries the store/policy unit tests, and `src/runtime/health.rs` covers the health projection.
 - Doctests: 37 run plus one `ignore` block (`cargo test --doc`), and two `no_run` examples that compile but are not run; 13 `text` blocks are not doctests.
-- Integration suites in `./tests/` drive the public API only: 219 tests over 15 binaries — `spec_build` (12), `team_run` (9), `member_and_mail` (14), `task_flow` (32), `hitl` (33), `protocol_adapter` (13), `cli` (39), `mcp` (21), `expert_catalog` (12), `bins` (6), `full_team_sqlite` (4), `member_process_kind` (5), `attach_e2e` (6), `org_flow` (9) and `workspace_isolation` (4).
+- Integration suites in `./tests/` drive the public API only: 219 tests over 15 binaries (215 in the default build, 219 with `--features sqlite`) — `spec_build` (12), `team_run` (9), `member_and_mail` (14), `task_flow` (32), `hitl` (33), `protocol_adapter` (13), `cli` (39), `mcp` (21), `expert_catalog` (12), `bins` (6), `full_team_sqlite` (4), `member_process_kind` (5), `attach_e2e` (6), `org_flow` (9) and `workspace_isolation` (4).
 - `full_team_sqlite` compiles only with `--features sqlite`; `attach_e2e` is `#![cfg(unix)]`; `bins`/`member_process_kind` launch the real binaries through `CARGO_BIN_EXE_*`; `workspace_isolation` needs `git` on `PATH`.
 - Fakes live in `./tests/support/` plus `openjiuwen-test-support` as a dev-dependency; nothing in the suite needs the network.
-- Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite` and `--features otel` configurations, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
+- Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite`, `--all-features` and `--features otel` configurations, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 
 ## Notes for Agents
 
 - Python `TeamAgent` is one class for both roles. Keep that: `TeamAgent` carries a `TeamRole`; the leader owns dispatch, teammates poll the board.
 - Python `spec.build()` mutates the spec (fills `language`); the Rust `build_with` takes `&self`, does not mutate, and `TeamBuildDeps::language` is `Option<String>` resolved ahead of the spec.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it, never define a second enum.
-- The runtime reads six optional `TeamAgentSpec::metadata` keys (`spawn`, `fork`, `workspace`, `organization`, `kv_cache`, `attach`); their shapes, degradation rules and wiring points are tabulated in `src/runtime/CONTEXT.md` §"Metadata-driven wiring".
-- `TeamBuildDeps` carries only injection hooks (`with_observability_hook`, `with_kv_cache`, `with_routing`); `monitor_stream` is the monitor knob, and organisation/attach come from metadata.
+- The runtime reads seven optional `TeamAgentSpec::metadata` keys (`spawn`, `fork`, `workspace`, `organization`, `kv_cache`, `attach`, `checkpoint`); their shapes, degradation rules and wiring points are tabulated in `src/runtime/CONTEXT.md` §"Metadata-driven wiring".
+- `TeamBuildDeps` carries only injection hooks (`with_checkpoint_store`, `with_observability_hook`, `with_kv_cache`, `with_routing`); `monitor_stream` is the monitor knob, and organisation/attach come from metadata.
 - Workspace lifecycle: `build_with` allocates the leader's workspace and `spawn_member` one per teammate, both retained on the handle; `shutdown_member` releases that member's workspace and `stop()` releases everything still retained, each workspace exactly once.
 - `team-member serve` lives in `src/skill/serve.rs` over the frames in `src/member/protocol.rs`; `StdioMemberRuntime` launches it with the identity in `OPENJIUWEN_TEAM_NAME`/`OPENJIUWEN_MEMBER_NAME`/`OPENJIUWEN_SESSION_ID`/`OPENJIUWEN_MEMBER_WORKSPACE`, and `serve_with_context` drives the same loop over any pipe pair.
 - Attach wiring: `metadata["attach"]` makes `start()` bind `AttachHost`, which serves `BackendAttachHandler` (backend roster/mail/board/snapshot plus `stop_team`) over `AttachServer`; `SocketTeamClient` is the dialing side, and `src/skill/live.rs` resolves the in-process registry first, then the descriptor path, then `OPENJIUWEN_TEAM_SOCKET`.
@@ -158,5 +172,12 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 - Module-level `//!` docs resolve intra-doc links in the *parent* module's scope, so a module doc needs a fully-qualified target (`[`X`](crate::schema::X)`) for anything the parent does not import; item-level `///` docs resolve in the item's module. Keep `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free (no `#[allow(rustdoc::…)]`, link private items as plain code spans).
 - Offline runs need either an injected factory (the test pattern) or `NativeMemberFactory::new(resolver)` with a resolver returning a scripted `openjiuwen_foundation::llm::Model`; `TeamAgentSpec::build()` over `TeamBuildDeps::default()` fails with `ErrorKind::Config` when no provider/model is configured.
 - The `live-tests` feature is declared in `Cargo.toml` and read by no test or module in this crate: nothing here needs the network.
-- `NativeCheckpoint` is a standalone JSON payload: nothing in `src/` outside `harness/checkpoint.rs` constructs, persists or restores it, and the runtime's `HarnessContext` carries no checkpoint/sink; a per-member checkpoint is only obtainable by calling `HarnessProtocol::export_checkpoint` on the harness directly.
+- `NativeCheckpoint` is produced at every member turn/state boundary the policy enables and on `stop`, persisted through the resolved `MemberCheckpointStore`, and restored on the next `start` for the same identity.
+- Checkpoint session convention: every member runs under the derived session id `"<team session>:<member name>"` while `TeamAgent::session_id()` stays the team session.
+- A member's harness `host_session_id` is that derived session, because runtimes start with `start(None)`.
+- Checkpoint identity is `(derived session, card id)`, where the card id is the effective spec's card id else the member name.
+- Checkpoint store resolution order: `TeamBuildDeps::with_checkpoint_store` injection, then metadata `checkpoint.store` (`FileMemberCheckpointStore`, its directory defaulting to `<workspace root>/.openjiuwen/checkpoints`), then one `InMemoryMemberCheckpointStore` shared per team.
+- A disabled checkpoint policy attaches no store at all.
+- `crates/openjiuwen-e2e/tests/team_backend.rs` still asserts completion is stream-only, so its assertion needs updating by the e2e owner; this crate cannot edit that suite.
+- `native_v2` in `openjiuwen-harness-providers` builds a team-backed `HarnessProtocol` harness over `TeamRuntimeManager`; this crate is a protocol consumer only.
 - The `openjiuwen` umbrella's `sqlite` feature does not forward to this crate (`crates/openjiuwen/Cargo.toml`), so a consumer needs `openjiuwen-agent-teams/sqlite` enabled explicitly to reach `SqliteTeamStore`; `open_store` reports the missing feature otherwise.

@@ -175,10 +175,10 @@ impl SkillEvaluator {
     /// - none pass: [`CaseStatus::Failed`];
     /// - otherwise: [`CaseStatus::Partial`].
     ///
-    /// The pass rate is `(passed + 0.5 * partial) / total`, crediting partial
-    /// cases with half a pass (a deviation from Python's strict counts); an
-    /// empty case list yields `0.0`. Recommendations list the names of failed
-    /// and partial cases in input order.
+    /// The pass rate is `passed / total` as a fraction of `1.0` (partial cases
+    /// are counted but earn no credit); an empty case list yields `0.0`.
+    /// Recommendations list the names of failed and partial cases in input
+    /// order.
     ///
     /// # Errors
     ///
@@ -295,10 +295,10 @@ impl SkillEvaluator {
     /// - none pass: [`CaseStatus::Failed`];
     /// - otherwise: [`CaseStatus::Partial`].
     ///
-    /// The pass rate is `(passed + 0.5 * partial) / total`, crediting partial
-    /// cases with half a pass (a deviation from Python's strict counts); an
-    /// empty case list yields `0.0`. Recommendations list the names of failed
-    /// and partial cases in input order.
+    /// The pass rate is `passed / total` as a fraction of `1.0` (partial cases
+    /// are counted but earn no credit); an empty case list yields `0.0`.
+    /// Recommendations list the names of failed and partial cases in input
+    /// order.
     async fn functional_report(
         &self,
         skill: &SkillDefinition,
@@ -360,6 +360,7 @@ mod tests {
     use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
 
     use crate::judge::VerdictSource;
+    use crate::skill_evaluator::report::{GATE_E3, PIPELINE_BLOCKED_AT_E3, PIPELINE_COMPLETED};
 
     fn skill() -> SkillDefinition {
         let body = concat!(
@@ -451,13 +452,12 @@ mod tests {
         assert_eq!(report.functional.timestamp, 12_345);
         assert_eq!(report.functional.recommendations, vec!["Case case-3"]);
         assert!(!report.safety.blocked);
-        assert!(report.design.design_score_pct >= 50.0);
+        assert!(report.design.design_score_pct >= 0.6);
         assert!(report.design.ready_for_functional_testing);
-        assert_eq!(report.final_score.pipeline_status, "COMPLETED");
-        assert_eq!(
-            report.final_score.gates_passed,
-            vec!["e1_llm_judge", "e2_functional", "e3_safety"]
-        );
+        assert_eq!(report.final_score.pipeline_status, PIPELINE_COMPLETED);
+        assert_eq!(report.final_score.gates_passed, vec![GATE_E3]);
+        assert!(report.safety.passes_gate());
+        assert!((report.safety.score_fraction() - 1.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(report.functional.summary.partial, 1);
         assert_eq!(report.functional.summary.passed, 0);
         assert_eq!(report.functional.summary.failed, 0);
-        assert!((report.functional.summary.pass_rate - 0.5).abs() < 1e-9);
+        assert!((report.functional.summary.pass_rate - 0.0).abs() < 1e-9);
         assert_eq!(report.functional.results[0].status, CaseStatus::Partial);
         assert_eq!(report.functional.results[0].assertions.len(), 2);
         assert_eq!(report.functional.recommendations, vec!["Mixed case"]);
@@ -548,7 +548,7 @@ mod tests {
             .expect("evaluate");
 
         assert!(report.safety.blocked);
-        assert_eq!(report.final_score.pipeline_status, "BLOCKED_AT_SAFETY");
+        assert_eq!(report.final_score.pipeline_status, PIPELINE_BLOCKED_AT_E3);
         assert!((report.final_score.final_score_pct - 0.0).abs() < 1e-9);
         assert_eq!(report.final_score.grade, "F");
     }
@@ -608,7 +608,7 @@ mod tests {
 
         assert!(json["functional"]["summary"]["pass_rate"].is_number());
         assert!(json["final_score"]["final_score_pct"].is_number());
-        assert_eq!(json["final_score"]["pipeline_status"], "COMPLETED");
+        assert_eq!(json["final_score"]["pipeline_status"], PIPELINE_COMPLETED);
         assert!(json["final_score"]["gates_passed"].is_array());
         assert!(json["final_score"]["evaluators"]["e1_llm_judge"].is_object());
         assert!(json["final_score"]["evaluators"]["e2_functional"].is_object());
@@ -646,8 +646,9 @@ mod tests {
         assert_eq!(record.design_source, VerdictSource::Model);
         assert_eq!(record.safety_source, VerdictSource::Model);
         assert!((report.design.design_score - 80.0).abs() < 1e-9);
-        assert!((report.safety.score_pct - 95.0).abs() < 1e-9);
-        assert_eq!(report.final_score.pipeline_status, "COMPLETED");
+        assert!((report.design.design_score_pct - 0.8).abs() < 1e-9);
+        assert!((report.safety.score_pct - 0.95).abs() < 1e-9);
+        assert_eq!(report.final_score.pipeline_status, PIPELINE_COMPLETED);
         assert_eq!(report.functional.timestamp, 7);
         assert_eq!(report.functional.skill_path, "skills/demo");
         assert!(!report.safety.blocked);
@@ -684,8 +685,8 @@ mod tests {
         assert_eq!(record.design_source, VerdictSource::Deterministic);
         assert_eq!(record.safety_source, VerdictSource::Deterministic);
         assert_eq!(report.design, score_design(&skill()));
-        assert!((report.safety.score_pct - 100.0).abs() < 1e-9);
-        assert_eq!(report.final_score.pipeline_status, "COMPLETED");
+        assert!((report.safety.score_pct - 1.0).abs() < 1e-9);
+        assert_eq!(report.final_score.pipeline_status, PIPELINE_COMPLETED);
     }
 
     #[tokio::test]
@@ -711,7 +712,7 @@ mod tests {
             .expect("judge");
 
         assert!(report.safety.blocked);
-        assert_eq!(report.final_score.pipeline_status, "BLOCKED_AT_SAFETY");
+        assert_eq!(report.final_score.pipeline_status, PIPELINE_BLOCKED_AT_E3);
         assert_eq!(report.safety.findings.len(), 1);
         let record = report.judge.as_ref().expect("judge record");
         assert_eq!(record.safety_source, VerdictSource::Model);

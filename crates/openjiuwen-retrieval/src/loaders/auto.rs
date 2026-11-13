@@ -1,11 +1,18 @@
 //! Automatic dispatch to the right loader by URL or file extension.
 //!
 //! Port of the Python `AutoLinkParser` / `AutoFileParser` / `AutoParser` trio: a
-//! URL goes to the [`UrlLoader`], a local path goes to the loader registered for
-//! its extension, and the resulting documents carry the provenance metadata
-//! Python stamps in `AutoFileParser.parse` (`doc_id`, `title`, `file_path`,
-//! `file_ext`). Every format without a registered loader (for example `.xls` or
-//! `.zip`) is rejected instead of returning an empty list.
+//! URL goes to the [`UrlLoader`], a local path or an in-memory [`DocumentBytes`]
+//! source goes to the loader registered for its extension, and the resulting
+//! documents carry the provenance metadata Python stamps in
+//! `AutoFileParser.parse` (`doc_id`, `title`, `file_path`, `file_ext`). Every
+//! format without a registered loader (for example `.xls` or `.zip`) is rejected
+//! instead of returning an empty list.
+//!
+//! The in-memory byte path is available both as [`AutoLoader::load_bytes`]/
+//! [`AutoLoader::load_document_bytes`] and through
+//! [`DocumentLoader::load_bytes`], so trait-object callers
+//! (`Arc<dyn DocumentLoader>`) get the same dispatch instead of the trait's
+//! [`Error::Unsupported`] default.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,8 +28,9 @@ use crate::common::Document;
 use crate::multimodal::{ImageLoader, IMAGE_EXTENSIONS};
 
 use super::{
-    file_extension, file_stem, generate_document_id, is_url, CsvLoader, DocumentLoader, DocxLoader,
-    HtmlLoader, JsonLoader, MarkdownLoader, PdfLoader, TextLoader, UrlLoader, XlsxLoader,
+    file_extension, file_stem, is_url, CsvLoader, DocumentBytes, DocumentLoader, DocxLoader,
+    HtmlLoader, JsonLoader, LoadOptions, MarkdownLoader, OdtLoader, PdfLoader, PptxLoader,
+    TextLoader, UrlLoader, XlsxLoader,
 };
 
 /// A lowercase extension map (`".txt"`) to loaders.
@@ -44,18 +52,20 @@ impl LoaderRegistry {
     }
 
     /// Creates a registry with the built-in text, Markdown, JSON, CSV/TSV, HTML,
-    /// DOCX, XLSX, PDF, and image loaders.
+    /// DOCX, ODT, XLSX, PDF, PPTX, and image loaders (19 extensions).
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
-        registry.register(&[".txt"], Arc::new(TextLoader::new()));
-        registry.register(&[".md", ".markdown"], Arc::new(MarkdownLoader::new()));
-        registry.register(&[".json"], Arc::new(JsonLoader::new()));
         registry.register(&[".csv", ".tsv"], Arc::new(CsvLoader::new()));
-        registry.register(&[".html", ".htm"], Arc::new(HtmlLoader::new()));
         registry.register(&[".docx"], Arc::new(DocxLoader::new()));
-        registry.register(&[".xlsx"], Arc::new(XlsxLoader::new()));
+        registry.register(&[".html", ".htm"], Arc::new(HtmlLoader::new()));
+        registry.register(&[".json"], Arc::new(JsonLoader::new()));
+        registry.register(&[".md", ".markdown"], Arc::new(MarkdownLoader::new()));
+        registry.register(&[".odt"], Arc::new(OdtLoader::new()));
         registry.register(&[".pdf"], Arc::new(PdfLoader::new()));
+        registry.register(&[".pptx"], Arc::new(PptxLoader::new()));
+        registry.register(&[".txt"], Arc::new(TextLoader::new()));
+        registry.register(&[".xlsx"], Arc::new(XlsxLoader::new()));
         registry.register(&IMAGE_EXTENSIONS, Arc::new(ImageLoader::new()));
         registry
     }
@@ -174,9 +184,9 @@ impl AutoLoader {
     /// file-stem title stamped on documents loaded from a file. URLs are returned
     /// untouched.
     ///
-    /// Single-document sources (text, Markdown, JSON, HTML, DOCX, PDF, image)
-    /// take `doc_id` verbatim, while multi-document file loaders (CSV/TSV, XLSX)
-    /// use it as the id base prefix — the generated ids are `"<base>_s0_r2"`/
+    /// Single-document sources (text, Markdown, JSON, HTML, DOCX, ODT, PDF, PPTX,
+    /// image) take `doc_id` verbatim, while multi-document file loaders (CSV/TSV,
+    /// XLSX) use it as the id base prefix — the generated ids are `"<base>_s0_r2"`/
     /// `"<base>_s0_c0"`, and the leading base is replaced by `doc_id`,
     /// mirroring Python's `base_id = doc_id or doc`. Every document therefore
     /// keeps a distinct id, and `metadata["doc_id"]` always equals the final id.
@@ -197,8 +207,9 @@ impl AutoLoader {
         if tokio::fs::metadata(Path::new(source)).await.is_err() {
             return Err(Error::NotFound(format!("File {source} does not exist")));
         }
-        let extension = file_extension(source);
+        let options = options_from(doc_id, title);
         let Some(loader) = self.registry.get_for_path(source) else {
+            let extension = file_extension(source);
             let supported = self.registry.extensions();
             return Err(Error::Unsupported(format!(
                 "Unsupported format: {extension}, only {supported:?} are supported"
@@ -209,56 +220,120 @@ impl AutoLoader {
             file = source,
             "delegating to the loader registered for the extension"
         );
-        let mut documents = loader.load(source).await?;
-        let doc_id = doc_id.map(str::trim).filter(|value| !value.is_empty());
-        let title = title.map_or_else(|| file_stem(source), str::to_owned);
-        for document in &mut documents {
-            if let Some(doc_id) = doc_id {
-                apply_doc_id(source, doc_id, &mut document.id);
-            }
-            if document.id.trim().is_empty() {
-                document.id = generate_document_id();
-            }
-            let id = document.id.clone();
-            document
-                .metadata
-                .insert("doc_id".to_owned(), Value::String(id));
-            document
-                .metadata
-                .insert("title".to_owned(), Value::String(title.clone()));
-            document
-                .metadata
-                .insert("file_path".to_owned(), Value::String(source.to_owned()));
-            document
-                .metadata
-                .insert("file_ext".to_owned(), Value::String(extension.clone()));
+        let mut documents = loader.load_with_options(source, &options).await?;
+        stamp_provenance(source, &mut documents, title);
+        Ok(documents)
+    }
+
+    /// Loads in-memory bytes whose file name is `name`.
+    ///
+    /// Dispatch is purely extension-based (`file_extension` plus
+    /// [`LoaderRegistry::get_for_path`]), so an in-memory source needs no
+    /// temporary file. The child loader applies `options` itself; this method only
+    /// stamps the same provenance metadata [`AutoLoader::load_as`] adds: the final
+    /// id as `doc_id`, `options.title` or the file stem as `title`, `name` as
+    /// `file_path`, and the lowercase extension as `file_ext`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for an unregistered or absent extension
+    /// (a URL name has no extension), plus the child loader's errors for
+    /// malformed bytes.
+    pub async fn load_bytes(
+        &self,
+        name: &str,
+        bytes: impl Into<Vec<u8>>,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        self.dispatch_bytes(&DocumentBytes::new(name, bytes), options)
+            .await
+    }
+
+    /// Loads an in-memory [`DocumentBytes`] source.
+    ///
+    /// # Errors
+    ///
+    /// See [`AutoLoader::load_bytes`].
+    pub async fn load_document_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        self.dispatch_bytes(source, options).await
+    }
+
+    /// Returns `true` when `source` is a URL or has a registered extension.
+    ///
+    /// The check is purely name-based (it cannot await a file check), matching
+    /// [`DocumentLoader::supports`].
+    #[must_use]
+    pub fn supports(&self, source: &str) -> bool {
+        if is_url(source) {
+            return self.url_loader.supports(source);
         }
+        self.registry.get_for_path(source).is_some()
+    }
+
+    /// Dispatches one in-memory source to the loader registered for its extension.
+    async fn dispatch_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let Some(loader) = self.registry.get_for_path(&source.name) else {
+            let extension = source.extension();
+            let supported = self.registry.extensions();
+            return Err(Error::Unsupported(format!(
+                "Unsupported format: {extension}, only {supported:?} are supported"
+            )));
+        };
+
+        debug!(
+            file = source.name.as_str(),
+            "delegating to the loader registered for the extension"
+        );
+        let mut documents = loader.load_bytes(source, options).await?;
+        stamp_provenance(&source.name, &mut documents, options.title.as_deref());
         Ok(documents)
     }
 }
 
-/// Applies the caller-supplied `doc_id` to one document id.
-///
-/// Multi-document file loaders generate ids prefixed with a base string: `CSV`/`TSV`
-/// use the whole `source` path, `XLSX` uses the file stem. Either prefix is
-/// replaced by `doc_id` (`format!("{doc_id}{rest}")`), so every generated id stays
-/// distinct. Every other loader's id is replaced verbatim.
-fn apply_doc_id(source: &str, doc_id: &str, id: &mut String) {
-    let stem = file_stem(source);
-    for base in [source, stem.as_str()] {
-        if base.is_empty() {
-            continue;
-        }
-        if let Some(rest) = id.strip_prefix(base) {
-            // Only a multi-document suffix (`_s{sheet}_r{row}` / `_s{sheet}_c{col}`)
-            // makes the prefix a base id; a single-document id is replaced whole.
-            if rest.starts_with("_s") {
-                *id = format!("{doc_id}{rest}");
-                return;
-            }
-        }
+/// Builds [`LoadOptions`] from the `load_as` arguments.
+fn options_from(doc_id: Option<&str>, title: Option<&str>) -> LoadOptions {
+    let mut options = LoadOptions::new();
+    if let Some(doc_id) = doc_id {
+        options.doc_id = Some(doc_id.to_owned());
     }
-    doc_id.clone_into(id);
+    if let Some(title) = title {
+        options.title = Some(title.to_owned());
+    }
+    options
+}
+
+/// Stamps the Python provenance metadata on the documents loaded from `name`.
+///
+/// `metadata["doc_id"]` is the final id (the child loader already applied
+/// [`LoadOptions`]), `metadata["title"]` is `title` when given and the file stem
+/// otherwise, and `file_path`/`file_ext` record the source name and its lowercase
+/// extension (which is empty for a name without one).
+fn stamp_provenance(name: &str, documents: &mut [Document], title: Option<&str>) {
+    let extension = file_extension(name);
+    let title = title.map_or_else(|| file_stem(name), str::to_owned);
+    for document in documents.iter_mut() {
+        let id = document.id.clone();
+        document
+            .metadata
+            .insert("doc_id".to_owned(), Value::String(id));
+        document
+            .metadata
+            .insert("title".to_owned(), Value::String(title.clone()));
+        document
+            .metadata
+            .insert("file_path".to_owned(), Value::String(name.to_owned()));
+        document
+            .metadata
+            .insert("file_ext".to_owned(), Value::String(extension.clone()));
+    }
 }
 
 impl Default for AutoLoader {
@@ -270,15 +345,24 @@ impl Default for AutoLoader {
 #[async_trait]
 impl DocumentLoader for AutoLoader {
     fn supports(&self, source: &str) -> bool {
-        if is_url(source) {
-            return self.url_loader.supports(source);
-        }
-        self.registry.get_for_path(source).is_some()
+        // The inherent method (not this trait method) does the check.
+        AutoLoader::supports(self, source)
     }
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         // The inherent method (not this trait method) does the dispatch.
         AutoLoader::load(self, source).await
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        // Delegates to the inherent byte dispatch (the trait method and the
+        // inherent method differ only in argument shape; inherent wins for
+        // method-call syntax).
+        AutoLoader::load_document_bytes(self, source, options).await
     }
 }
 
@@ -346,18 +430,23 @@ mod tests {
                 ".json",
                 ".markdown",
                 ".md",
+                ".odt",
                 ".pdf",
                 ".png",
+                ".pptx",
                 ".tsv",
                 ".txt",
                 ".webp",
                 ".xlsx",
             ]
         );
+        assert_eq!(registry.extensions().len(), 19);
         assert_eq!(LoaderRegistry::new().extensions(), Vec::<String>::new());
         assert!(registry.get_for_path("data.TXT").is_some());
         assert!(registry.get_for_path("data.pdf").is_some());
         assert!(registry.get_for_path("data.docx").is_some());
+        assert!(registry.get_for_path("data.odt").is_some());
+        assert!(registry.get_for_path("data.pptx").is_some());
         assert!(registry.get_for_path("data.xlsx").is_some());
         assert!(registry.get_for_path("data.PNG").is_some());
         assert!(registry.get_for_path("data.xls").is_none());
@@ -382,11 +471,317 @@ mod tests {
         assert!(DocumentLoader::supports(&loader, "notes.md"));
         assert!(DocumentLoader::supports(&loader, "notes.pdf"));
         assert!(DocumentLoader::supports(&loader, "notes.docx"));
+        assert!(DocumentLoader::supports(&loader, "notes.odt"));
+        assert!(DocumentLoader::supports(&loader, "notes.pptx"));
         assert!(DocumentLoader::supports(&loader, "notes.xlsx"));
         assert!(DocumentLoader::supports(&loader, "photo.png"));
         assert!(!DocumentLoader::supports(&loader, "notes.xls"));
         // `supports` is purely extension-based (it cannot await a file check).
         assert!(DocumentLoader::supports(&loader, "missing-file.txt"));
+    }
+
+    #[test]
+    fn the_inherent_supports_covers_the_byte_formats_and_urls() {
+        let loader = AutoLoader::new();
+        assert!(loader.supports("https://example.com/page"));
+        assert!(loader.supports("deck.pptx"));
+        assert!(loader.supports("notes.odt"));
+        assert!(loader.supports("notes.docx"));
+        assert!(loader.supports("notes.xlsx"));
+        assert!(loader.supports("notes.pdf"));
+        assert!(loader.supports("notes.txt"));
+        assert!(!loader.supports("notes.xls"));
+    }
+
+    /// Asserts the provenance metadata `AutoLoader` stamps on every document.
+    fn assert_provenance(document: &Document, name: &str, extension: &str, title: &str) {
+        assert_eq!(
+            document.metadata.get("doc_id"),
+            Some(&Value::String(document.id.clone()))
+        );
+        assert_eq!(
+            document.metadata.get("title"),
+            Some(&Value::String(title.to_owned()))
+        );
+        assert_eq!(
+            document.metadata.get("file_path"),
+            Some(&Value::String(name.to_owned()))
+        );
+        assert_eq!(
+            document.metadata.get("file_ext"),
+            Some(&Value::String(extension.to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_dispatches_text_and_csv() {
+        let loader = AutoLoader::new();
+
+        let documents = loader
+            .load_bytes("a.txt", b"hello".to_vec(), &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "hello");
+        assert_provenance(&documents[0], "a.txt", ".txt", "a");
+
+        let documents = loader
+            .load_bytes(
+                "people.csv",
+                b"Name,Age\nAlice,30\n".to_vec(),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        // The delimited loader keys multi-document ids by the source name.
+        assert_eq!(
+            ids,
+            vec!["people.csv_s0_r2", "people.csv_s0_c0", "people.csv_s0_c1"]
+        );
+        for document in &documents {
+            assert_provenance(document, "people.csv", ".csv", "people");
+        }
+    }
+
+    #[tokio::test]
+    async fn load_bytes_dispatches_the_binary_formats() {
+        use crate::loaders::fixtures;
+
+        let loader = AutoLoader::new();
+
+        let docx = fixtures::docx_document(&["Intro", "Body"]).unwrap();
+        let documents = loader
+            .load_bytes("notes.docx", docx, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "Intro\nBody");
+        assert_provenance(&documents[0], "notes.docx", ".docx", "notes");
+
+        let xlsx = fixtures::xlsx_workbook(&[("People", &["Name,City", "alice,paris"])]).unwrap();
+        let documents = loader
+            .load_bytes("people.xlsx", xlsx, &LoadOptions::new())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        // The workbook loader keys multi-document ids by the file stem.
+        assert_eq!(ids, vec!["people_s0_r2", "people_s0_c0", "people_s0_c1"]);
+        for document in &documents {
+            assert_provenance(document, "people.xlsx", ".xlsx", "people");
+        }
+
+        let pdf = fixtures::pdf_document(&fixtures::plain_stream("BT (Body) Tj ET"));
+        let documents = loader
+            .load_bytes("paper.pdf", pdf, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "Body");
+        assert_provenance(&documents[0], "paper.pdf", ".pdf", "paper");
+
+        let pptx = fixtures::pptx_slides(&[("Deck", &["Agenda"])]).unwrap();
+        let documents = loader
+            .load_bytes("talk.pptx", pptx, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "## Slide 1\nDeck\nAgenda");
+        assert_provenance(&documents[0], "talk.pptx", ".pptx", "talk");
+
+        let odt = fixtures::odt_document(&["Intro", "Body"]).unwrap();
+        let documents = loader
+            .load_bytes("memo.odt", odt, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "Intro\nBody");
+        assert_provenance(&documents[0], "memo.odt", ".odt", "memo");
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title_options() {
+        use crate::loaders::fixtures;
+
+        let loader = AutoLoader::new();
+
+        let documents = loader
+            .load_bytes(
+                "people.csv",
+                b"Name,Age\nAlice,30\n".to_vec(),
+                &LoadOptions::new().with_doc_id("doc-base"),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["doc-base_s0_r2", "doc-base_s0_c0", "doc-base_s0_c1"]
+        );
+        for document in &documents {
+            assert_eq!(
+                document.metadata.get("doc_id"),
+                Some(&Value::String(document.id.clone()))
+            );
+        }
+
+        let xlsx = fixtures::xlsx_workbook(&[("People", &["Name", "alice"])]).unwrap();
+        let documents = loader
+            .load_bytes(
+                "people.xlsx",
+                xlsx,
+                &LoadOptions::new().with_doc_id("doc-base"),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["doc-base_s0_r2", "doc-base_s0_c0"]);
+        for document in &documents {
+            assert_eq!(
+                document.metadata.get("doc_id"),
+                Some(&Value::String(document.id.clone()))
+            );
+        }
+
+        let documents = loader
+            .load_bytes(
+                "a.txt",
+                b"hello".to_vec(),
+                &LoadOptions::new().with_doc_id("verbatim"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(documents[0].id, "verbatim");
+        assert_provenance(&documents[0], "a.txt", ".txt", "a");
+
+        let documents = loader
+            .load_bytes(
+                "a.txt",
+                b"hello".to_vec(),
+                &LoadOptions::new().with_title("Custom"),
+            )
+            .await
+            .unwrap();
+        assert_provenance(&documents[0], "a.txt", ".txt", "Custom");
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_unknown_and_missing_extensions() {
+        let loader = AutoLoader::new();
+
+        let error = loader
+            .load_bytes("archive.xyz", b"unknown".to_vec(), &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("Unsupported format: .xyz"),
+            "unexpected message: {error}"
+        );
+
+        let error = loader
+            .load_bytes("README", b"text".to_vec(), &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("Unsupported format: "),
+            "unexpected message: {error}"
+        );
+
+        // A URL name has no extension, so it never dispatches to a file loader.
+        let error = loader
+            .load_bytes(
+                "https://example.com/page",
+                b"text".to_vec(),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn load_document_bytes_matches_load_bytes() {
+        use crate::loaders::fixtures;
+
+        let loader = AutoLoader::new();
+        let docx = fixtures::docx_document(&["Intro"]).unwrap();
+        // A `doc_id` makes the generated ids deterministic, so the two paths can
+        // be compared document for document.
+        let options = LoadOptions::new().with_doc_id("doc-1").with_title("Custom");
+        let source = DocumentBytes::new("notes.docx", docx.clone());
+
+        let from_bytes = loader
+            .load_bytes("notes.docx", docx, &options)
+            .await
+            .unwrap();
+        let from_document = loader.load_document_bytes(&source, &options).await.unwrap();
+        assert_eq!(from_document, from_bytes);
+
+        let missing = DocumentBytes::new("archive.xyz", b"unknown".to_vec());
+        let error = loader
+            .load_document_bytes(&missing, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn trait_object_load_bytes_reaches_the_inherent_dispatch() {
+        // `Arc<dyn DocumentLoader>` must not fall through to the trait's
+        // `Error::Unsupported` default: the override delegates to the inherent
+        // byte dispatch, so the text is loaded and provenance is stamped.
+        let loader: Arc<dyn DocumentLoader> = Arc::new(AutoLoader::new());
+        let source = DocumentBytes::new("notes.txt", b"body".to_vec());
+        let documents = loader
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "body");
+        assert_eq!(
+            documents[0].metadata.get("file_ext"),
+            Some(&Value::String(".txt".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String(documents[0].id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_load_bytes_uses_the_same_dispatch() {
+        /// Loads bytes through a generic bound, as a downstream caller would.
+        async fn load_via_trait<L: DocumentLoader + ?Sized>(
+            loader: &L,
+            source: &DocumentBytes,
+        ) -> Result<Vec<Document>> {
+            loader.load_bytes(source, &LoadOptions::new()).await
+        }
+
+        let loader = AutoLoader::new();
+        let source = DocumentBytes::new("notes.txt", b"body".to_vec());
+        let documents = load_via_trait(&loader, &source).await.unwrap();
+        assert_eq!(documents[0].text, "body");
+
+        let unsupported = DocumentBytes::new("archive.xyz", b"unknown".to_vec());
+        let error = load_via_trait(&loader, &unsupported).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Unsupported format: .xyz"));
     }
 
     #[tokio::test]

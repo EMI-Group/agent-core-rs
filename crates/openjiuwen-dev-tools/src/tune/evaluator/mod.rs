@@ -16,6 +16,17 @@
 //!   [`DeterministicEvaluator`] evaluates without any model so prompt search has
 //!   a real, repeatable landscape to climb.
 //!
+//! Each seam also has a traced form, so a run's tool use stays observable:
+//! `ModelPromptRunner` executes the tools a case declares through [`ToolStubs`]
+//! and records every call — failures included — in a [`ToolTrace`] bounded by
+//! [`DEFAULT_MAX_TOOL_ROUNDS`]; [`CaseEvaluator::evaluate_traced`] and
+//! [`CaseEvaluator::score_cases_traced`] return those traces, [`tool_usage`]
+//! aggregates them, and [`ToolUsageScorer`] requires that the declared tools
+//! were actually used.
+//!
+//! [`ToolStubs`]: crate::tune::tool::ToolStubs
+//! [`ToolTrace`]: crate::tune::tool::ToolTrace
+//!
 //! Python's `DefaultEvaluator` asks a model for a `{"result": bool, "reason": …}`
 //! verdict and gives everything the same all-or-nothing score. The port keeps
 //! the seams and the `0.0..=1.0` range but makes the default scorer
@@ -49,9 +60,10 @@ mod seam;
 pub use self::deterministic::{DeterministicEvaluator, DeterministicScore};
 pub use self::runner::{
     render_case_inputs, ModelPromptRunner, PromptCall, PromptRunner, ScriptedPromptRunner,
+    DEFAULT_MAX_TOOL_ROUNDS,
 };
-pub use self::scorer::{CaseScorer, LabelScorer};
-pub use self::seam::{CaseEvaluator, ModelEvaluator, RunnerEvaluator};
+pub use self::scorer::{CaseScorer, LabelScorer, ToolUsageScorer};
+pub use self::seam::{tool_usage, CaseEvaluator, ModelEvaluator, RunnerEvaluator};
 
 #[cfg(test)]
 mod tests;

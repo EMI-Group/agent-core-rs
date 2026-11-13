@@ -28,6 +28,17 @@
 //! real model instead of only being recorded on the roster row. A fork directive
 //! (`metadata["spawn"]["fork"]` / `metadata["fork"]`) replaces the blueprint with
 //! [`crate::org::fork_member_context`]'s child spec (parent tools filtered, identity cleared).
+//!
+//! # Member identity and checkpoints
+//!
+//! A spawned member runs under its *derived* session id,
+//! `MemberHarnessContext::member_session_id(team_session, member_name)`, so two members of one team
+//! never share a harness session (Python keys member state the same way). The request's session id
+//! stays the team session and reaches the harness as `host_session_id`.
+//! The runtime is wired through `super::checkpoints::wire_runtime`: the card id of the effective
+//! spec (else the member name), the `metadata["checkpoint"]` policy, the team-shared store the build
+//! path resolved (or a per-member fallback) and the workspace root as cwd. A `{"enabled": false}`
+//! policy attaches no store at all, so the member does no checkpoint work.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -37,9 +48,10 @@ use openjiuwen_common::error::{Error, Result};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
+use super::checkpoints::{member_card_id, wire_runtime};
 use super::deps::TeamBuildDeps;
 use super::routing::TeamModelRouter;
-use super::spec_meta::{fork_directive, spawn_options, ForkDirective};
+use super::spec_meta::{checkpoint_config, fork_directive, spawn_options, ForkDirective};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
 use crate::member::{
     ExternalCliMemberSpawner, ExternalCliRuntimeConfig, MemberRuntime, MemberSpawnKind,
@@ -59,14 +71,14 @@ const LEADER_AGENT_KEY: &str = "leader";
 ///
 /// One spawner serves one built team: it carries the roster (`spec`), the injection point for the
 /// member's brain (`deps.harness_factory`), the model router, the child-process spawners and the
-/// session id every member's harness is opened under.
+/// team session id every member's own session id is derived from.
 pub struct TeamMemberSpawner {
     /// The blueprint the roster, the teammate mode and the team name come from.
     spec: TeamAgentSpec,
-    /// The injected build dependencies; only `harness_factory`, `language`, `routing` and
-    /// `kv_cache` are consulted.
+    /// The injected build dependencies; only `harness_factory`, `language`, `routing`, `kv_cache`
+    /// and `checkpoints` are consulted.
     deps: TeamBuildDeps,
-    /// Session id every spawned harness runs under.
+    /// Team session id every member derives its own session id from.
     session_id: String,
     /// Spawn options the blueprint asks for (in-process by default).
     options: MemberSpawnOptions,
@@ -141,7 +153,7 @@ impl TeamMemberSpawner {
     pub fn deps(&self) -> &TeamBuildDeps {
         &self.deps
     }
-    /// Returns the session id every spawned member harness is opened under.
+    /// Returns the team session id a spawned member derives its own session id from.
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -291,6 +303,42 @@ impl TeamMemberSpawner {
         );
         Ok(effective)
     }
+    /// Builds one member's in-process runtime: the harness, then its identity and checkpoint wiring.
+    ///
+    /// The member runs under its *derived* session id
+    /// ([`MemberHarnessContext::member_session_id`]) while the team session stays the request's
+    /// session id, which is what the harness sees as `host_session_id`. The checkpoint card id comes
+    /// from the effective spec the factory just received, so a routed or forked blueprint checkpoints
+    /// under the card it actually runs; the store and policy come from `metadata["checkpoint"]` and
+    /// the team-shared store the build path resolved.
+    async fn build_harness_runtime(
+        &self,
+        member_name: &str,
+        spec: &DeepAgentSpec,
+        workspace_root: &std::path::Path,
+    ) -> Result<HarnessMemberRuntime> {
+        let checkpoint = checkpoint_config(&self.spec);
+        let card_id = member_card_id(spec, member_name);
+        let member_session =
+            MemberHarnessContext::member_session_id(self.session_id(), member_name);
+        let context = MemberHarnessContext::new(
+            self.team_name(),
+            member_name,
+            member_session.clone(),
+            workspace_root,
+            self.deps.resolved_language(),
+            self.spec.teammate_mode,
+        )
+        .with_card_id(card_id.clone());
+        let harness = self.deps.harness_factory.create(spec, &context).await?;
+        Ok(wire_runtime(
+            HarnessMemberRuntime::new(harness, member_session),
+            &card_id,
+            &checkpoint,
+            self.deps.checkpoints.as_ref(),
+            workspace_root,
+        ))
+    }
     /// Forwards a non-in-process request to the matching child spawner.
     async fn spawn_child(&self, mut request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>> {
         let kind = request.options.kind;
@@ -376,23 +424,16 @@ impl MemberSpawner for TeamMemberSpawner {
         }
         let forked = self.forked_context(&member_name)?;
         let spec = self.effective_spec(&member_name, blueprint, forked.as_ref())?;
-        let context = MemberHarnessContext::new(
-            self.team_name(),
-            member_name,
-            self.session_id(),
-            request.workspace_root,
-            self.deps.resolved_language(),
-            self.spec.teammate_mode,
+        let runtime: Arc<dyn MemberRuntime> = Arc::new(
+            self.build_harness_runtime(&member_name, &spec, &request.workspace_root)
+                .await?,
         );
-        let harness = self.deps.harness_factory.create(&spec, &context).await?;
-        let runtime: Arc<dyn MemberRuntime> =
-            Arc::new(HarnessMemberRuntime::new(harness, request.session_id));
         self.kinds
             .lock()
-            .insert(context.member_name.clone(), MemberSpawnKind::InProcess);
+            .insert(member_name.clone(), MemberSpawnKind::InProcess);
         debug!(
             team = self.team_name(),
-            member = %context.member_name,
+            member = %member_name,
             session = runtime.session_id(),
             factory = self.deps.harness_factory.name(),
             "spawned a member harness"
@@ -752,20 +793,24 @@ mod tests {
             .spawn(request("dev-1"))
             .await
             .expect("spawn succeeds");
-        assert_eq!(runtime.session_id(), "session-1");
+        assert_eq!(runtime.session_id(), "session-1:dev-1");
         let calls = factory.calls();
         assert_eq!(calls.len(), 1);
         let ctx = calls.first().expect("one call was recorded");
         assert_eq!(ctx.team_name, "dev_team");
         assert_eq!(ctx.member_name, "dev-1");
-        assert_eq!(ctx.session_id, "session-1");
+        assert_eq!(ctx.session_id, "session-1:dev-1");
         assert_eq!(ctx.workspace_root, PathBuf::from("/tmp/ws"));
         assert_eq!(ctx.language, "en");
         assert_eq!(ctx.mode, MemberMode::PlanMode);
+        assert_eq!(
+            ctx.card_id, "dev-1",
+            "a spec without a card falls back to the member name"
+        );
     }
 
     #[tokio::test]
-    async fn spawn_propagates_the_request_session_id_into_the_runtime() {
+    async fn spawn_derives_the_member_session_from_the_team_session() {
         let spawner = TeamMemberSpawner::new(spec(), deps(RecordingFactory::new()), "session-1");
         let runtime = spawner
             .spawn(MemberSpawnRequest::new(
@@ -776,8 +821,83 @@ mod tests {
             ))
             .await
             .expect("spawn succeeds");
-        assert_eq!(runtime.session_id(), "member-session-9");
+        assert_eq!(
+            runtime.session_id(),
+            "session-1:reviewer",
+            "the member derives its session from the team session the spawner holds"
+        );
         assert_eq!(runtime.state(), HarnessState::Idle);
+    }
+
+    /// Builds the concrete runtime of `dev-1`, which the `dyn MemberRuntime` returned by `spawn`
+    /// hides (no checkpoint accessor on the trait).
+    async fn built_runtime(spawner: &TeamMemberSpawner) -> crate::harness::HarnessMemberRuntime {
+        let spec = spawner
+            .deep_agent_spec("dev-1")
+            .cloned()
+            .expect("dev-1 has a blueprint");
+        spawner
+            .build_harness_runtime("dev-1", &spec, std::path::Path::new("/tmp/ws"))
+            .await
+            .expect("the runtime builds")
+    }
+
+    #[tokio::test]
+    async fn a_default_spec_persists_checkpoints_in_memory() {
+        let spawner = TeamMemberSpawner::new(spec(), deps(RecordingFactory::new()), "session-1");
+        let runtime = built_runtime(&spawner).await;
+        assert_eq!(runtime.session_id(), "session-1:dev-1");
+        assert_eq!(runtime.card_id(), "dev-1");
+        assert_eq!(runtime.cwd(), Some("/tmp/ws"));
+        let store = runtime
+            .checkpoint_store()
+            .expect("the default policy is enabled");
+        assert_eq!(store.name(), "memory");
+        assert!(runtime.checkpoint_policy().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_checkpoint_policy_attaches_no_store() {
+        let mut spec = spec();
+        spec.metadata.insert(
+            crate::runtime::spec_meta::CHECKPOINT_METADATA_KEY.to_owned(),
+            serde_json::json!({"enabled": false}),
+        );
+        let spawner = TeamMemberSpawner::new(spec, deps(RecordingFactory::new()), "session-1");
+        let runtime = built_runtime(&spawner).await;
+        assert!(runtime.checkpoint_store().is_none());
+        assert!(!runtime.checkpoint_policy().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn a_file_checkpoint_config_roots_the_store_on_disk() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let mut spec = spec();
+        spec.metadata.insert(
+            crate::runtime::spec_meta::CHECKPOINT_METADATA_KEY.to_owned(),
+            serde_json::json!({"store": "file", "dir": directory.path().to_string_lossy()}),
+        );
+        let spawner = TeamMemberSpawner::new(spec, deps(RecordingFactory::new()), "session-1");
+        let runtime = built_runtime(&spawner).await;
+        let store = runtime.checkpoint_store().expect("a file store");
+        assert_eq!(store.name(), "file");
+    }
+
+    #[tokio::test]
+    async fn an_injected_team_store_wins_over_the_metadata_backend() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let mut spec = spec();
+        spec.metadata.insert(
+            crate::runtime::spec_meta::CHECKPOINT_METADATA_KEY.to_owned(),
+            serde_json::json!({"store": "file", "dir": directory.path().to_string_lossy()}),
+        );
+        let injected = crate::harness::InMemoryMemberCheckpointStore::shared();
+        let deps = deps(RecordingFactory::new()).with_checkpoint_store(Arc::clone(&injected));
+        let spawner = TeamMemberSpawner::new(spec, deps, "session-1");
+        let runtime = built_runtime(&spawner).await;
+        let store = runtime.checkpoint_store().expect("the shared store");
+        assert!(Arc::ptr_eq(store, &injected));
+        assert_eq!(store.name(), "memory");
     }
 
     #[tokio::test]

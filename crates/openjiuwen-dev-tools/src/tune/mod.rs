@@ -1,6 +1,6 @@
 //! Prompt tuning: cases, evaluators, optimizers, and a training loop.
 //!
-//! Ports `openjiuwen/dev_tools/tune/` onto three cooperating layers:
+//! Ports `openjiuwen/dev_tools/tune/` onto four cooperating layers:
 //!
 //! - **Data** — [`Case`] is one tuning example (the model [`inputs`](Case::inputs),
 //!   the expected [`label`](Case::label), optional [`tools`](Case::tools), and a
@@ -16,10 +16,31 @@
 //!   replays canned answers for tests.
 //! - **Search** — [`InstructionOptimizer`] (beam search over rewrites),
 //!   [`ExampleOptimizer`] (greedy few-shot selection), [`JointOptimizer`]
-//!   (alternating both), [`PromptSearchOptimizer`] (one breadth-first sweep),
-//!   and [`Trainer`] (train/validation with early stop) share
-//!   [`OptimizerConfig`] and the tuning constants ([`DEFAULT_ITERATION_NUM`],
-//!   [`MAX_PARALLEL_NUM`], …).
+//!   (alternating both), [`ParameterSearcher`] (seeded parameter sampling), and
+//!   [`Trainer`] (train/validation with early stop) share [`OptimizerConfig`] and
+//!   the tuning constants ([`DEFAULT_ITERATION_NUM`], [`MAX_PARALLEL_NUM`], …).
+//!   A [`Trainer`] can also report its evaluation as an [`EvaluationSummary`],
+//!   which adds the per-case tool usage to the mean score and results.
+//! - **Prompt search** — [`PromptSearchOptimizer`] runs Python's bounded,
+//!   elitist multi-round search: each round starts from the best prompt so far,
+//!   adds the deterministic mutations and one model rewrite, executes every
+//!   candidate through the evaluator against visible and hidden cases, scores it
+//!   with [`CompositeReward`] (correctness gate, overfitting penalty, drift
+//!   penalty), and stops on a [`ConvergenceDetector`] rule or the early-stop
+//!   score. The domain layer it is built on — [`PromptTaskSpec`] /
+//!   [`PromptTaskCase`], [`PromptCandidate`] / [`Execution`] /
+//!   [`IterationRecord`], [`RewardBreakdown`] / [`RewardComponent`], [`DriftJudge`]
+//!   (with [`LexicalDriftJudge`] as the default), [`PromptMemory`], and
+//!   [`OptimizationHistory`] / [`HistoryCompressor`] — is re-exported here too,
+//!   [`PromptSearchConfig`] holds its budget and stopping rules, and
+//!   [`OptimizationResult`] reports the per-round records, the convergence
+//!   verdict, and a deterministic run id.
+//!
+//! A case may declare tools, and the tool layer makes them runnable and
+//! observable: [`ToolStub`] is a named in-process fixture, [`ToolStubs`] the table
+//! a runner looks them up in, [`ToolTrace`] the ordered [`ToolCallRecord`]s of one
+//! run, and [`RunOutcome`] an answer map bundled with that trace — so an
+//! evaluator can execute the tools a case declares and report what was used.
 //!
 //! Every optimizer runs offline with no arguments: the default evaluator is the
 //! deterministic one and the default candidate source is the deterministic
@@ -58,24 +79,40 @@ mod base;
 mod evaluator;
 mod loader;
 mod optimizer;
+mod prompt_search;
+mod tool;
 
 pub use base::{Case, EvaluatedCase};
 pub use evaluator::{
-    render_case_inputs, CaseEvaluator, CaseScorer, DeterministicEvaluator, DeterministicScore,
-    LabelScorer, ModelEvaluator, ModelPromptRunner, PromptCall, PromptRunner, RunnerEvaluator,
-    ScriptedPromptRunner,
+    render_case_inputs, tool_usage, CaseEvaluator, CaseScorer, DeterministicEvaluator,
+    DeterministicScore, LabelScorer, ModelEvaluator, ModelPromptRunner, PromptCall, PromptRunner,
+    RunnerEvaluator, ScriptedPromptRunner, ToolUsageScorer, DEFAULT_MAX_TOOL_ROUNDS,
 };
 pub use loader::CaseLoader;
 pub use optimizer::{
-    format_prompt, optimize_prompt, placeholders, render_examples, ExampleOptimizer,
-    InstructionOptimizer, JointOptimizer, OptimizationResult, OptimizerConfig,
-    PromptSearchOptimizer, Trainer,
+    candidate_space, format_prompt, generate_candidates, optimize_prompt, placeholders,
+    render_examples, EvaluationSummary, ExampleOptimizer, InstructionOptimizer, JointOptimizer,
+    OptimizationResult, OptimizerConfig, ParameterSearchOutcome, ParameterSearcher,
+    PromptSearchConfig, PromptSearchOptimizer, Trainer, DEFAULT_CANDIDATES_SAMPLE_NUM,
+    DEFAULT_CONVERGENCE_THRESHOLD, DEFAULT_CONVERGENCE_WINDOW, DEFAULT_DRIFT_PENALTY,
+    DEFAULT_MAX_NUM_SAMPLE_ERROR_CASES, DEFAULT_MAX_SAMPLED_EXAMPLE_NUM, DEFAULT_MIN_CORRECTNESS,
+    DEFAULT_POLICY_TEMPERATURE, DEFAULT_SEARCH_CANDIDATE_PROMPTS, DEFAULT_SEARCH_MAX_ITERATIONS,
 };
 pub use optimizer::{
     DEFAULT_EARLY_STOP_SCORE, DEFAULT_EXAMPLE_NUM, DEFAULT_ITERATION_NUM, DEFAULT_PARALLEL_NUM,
     MAX_EXAMPLE_NUM, MAX_ITERATION_NUM, MAX_PARALLEL_NUM, MIN_EXAMPLE_NUM, MIN_ITERATION_NUM,
     MIN_PARALLEL_NUM,
 };
+pub use prompt_search::{
+    candidate_id, clamp01, default_weights, min_max_normalize, population_variance, CaseResult,
+    CompletenessReward, CompositeReward, ConvergenceDetector, ConvergenceState, CorrectnessReward,
+    CostReward, CustomReward, DriftJudge, Evaluation, Execution, HistoryCompressor, HistoryEntry,
+    IterationRecord, JsonlPromptMemory, LatencyReward, LexicalDriftJudge, ModelDriftJudge,
+    NullDriftJudge, NullPromptMemory, OptimizationHistory, PromptCandidate, PromptMemory,
+    PromptRecord, PromptTaskCase, PromptTaskSpec, RewardBreakdown, RewardComponent,
+    StructuredValidationReward, TokenUsageReward, OVERFIT_MARGIN, OVERFIT_PENALTY,
+};
+pub use tool::{RunOutcome, ToolCallRecord, ToolHandler, ToolStub, ToolStubs, ToolTrace};
 
 #[cfg(test)]
 mod tests {

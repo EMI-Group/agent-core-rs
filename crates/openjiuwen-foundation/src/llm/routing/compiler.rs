@@ -382,7 +382,9 @@ fn apply_client_option(client: &mut ModelClientConfig, key: &str, value: &Value)
 /// the typed fields; a `"extra"` object is flattened into
 /// [`ModelRequestConfig::extra`] together with every unrecognized key, so vendor
 /// knobs (including a `reasoning` intent) survive untouched. `context_window` is
-/// dropped: it is core-side metadata the Rust request config does not model.
+/// not copied onto [`ModelRequestConfig::context_window`] on this path: the
+/// routed-group compiler keeps the group minimum in
+/// [`ModelRequestConfig::extra`] instead.
 pub(crate) fn request_config_for(model_name: &str, defaults: &Value) -> ModelRequestConfig {
     let mut request = ModelRequestConfig::new(model_name);
     let mut extra = Map::new();

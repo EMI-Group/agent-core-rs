@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::llm::transport::join_url;
 
-use super::store::{DeviceCode, OAuthToken, TokenStore, REFRESH_SKEW};
+use super::store::{parse_token_payload, DeviceCode, OAuthToken, TokenStore, REFRESH_SKEW};
 
 /// Default OAuth issuer for the `OpenAI` account provider.
 pub const DEFAULT_ISSUER: &str = "https://auth.openai.com";
@@ -255,15 +255,20 @@ impl OpenAiOAuthClient {
             ("client_id", &self.client_id),
             ("code_verifier", code_verifier),
         ]);
-        self.post_token(&url, body, "token exchange").await
+        self.post_token(&url, body, "token exchange", None).await
     }
 
     /// Mints a new access token from `token`'s refresh token.
     ///
+    /// The request is exactly what the reference implementation sends — a
+    /// form-encoded `POST {issuer}/oauth/token` carrying `grant_type`,
+    /// `refresh_token`, and `client_id`, with no `scope` and no `redirect_uri`.
+    ///
     /// The response may rotate the refresh token; the rotated value is honoured,
     /// and the previous one is kept when the response omits it. The same rule
-    /// applies to `id_token`, `scope`, and an omitted expiry (the previous
-    /// `expires_at` is kept, Python parity).
+    /// applies to `id_token`, `scope`, and `token_type`, and the expiry is
+    /// resolved as `expires_at` → `expires_in` → the previous `expires_at` → the
+    /// JWT `exp` claim.
     ///
     /// # Errors
     ///
@@ -289,8 +294,8 @@ impl OpenAiOAuthClient {
             ("refresh_token", refresh_token),
             ("client_id", &self.client_id),
         ]);
-        let refreshed = self.post_token(&url, body, "token refresh").await?;
-        Ok(merge_refreshed(token, refreshed))
+        self.post_token(&url, body, "token refresh", Some(token))
+            .await
     }
 
     /// Returns a usable access token, refreshing and persisting it when needed.
@@ -353,7 +358,17 @@ impl OpenAiOAuthClient {
     }
 
     /// Posts a form-encoded token request and parses the token response.
-    async fn post_token(&self, url: &str, body: String, operation: &str) -> Result<OAuthToken> {
+    ///
+    /// `previous` is the token the response replaces (the refresh path) or
+    /// `None` (the device-code exchange), and drives the field carry-over
+    /// described on [`OAuthToken`].
+    async fn post_token(
+        &self,
+        url: &str,
+        body: String,
+        operation: &str,
+        previous: Option<&OAuthToken>,
+    ) -> Result<OAuthToken> {
         let request = HttpRequest::post(url.to_owned())
             .header("content-type", "application/x-www-form-urlencoded")
             .header("accept", "application/json")
@@ -362,32 +377,16 @@ impl OpenAiOAuthClient {
         if !response.is_success() {
             return Err(operation_failed(operation, url, &response));
         }
-        serde_json::from_slice::<OAuthToken>(response.bytes()).map_err(|error| {
+        parse_token_payload(response.bytes(), previous).map_err(|error| {
+            // A successful status carrying an unusable token is a credential
+            // problem, not a transport one: the reference implementation marks
+            // every such case `relogin_required`.
             Error::llm(format!(
-                "OpenAI account {operation} response from {url} is not a token: {error}"
+                "OpenAI account {operation} response from {url} is not a token ({error}); \
+                 a re-login is required — sign in again with the device authorization flow"
             ))
         })
     }
-}
-
-/// Carries the fields a refresh response left out over from the previous token.
-///
-/// `token_type` is not carried over: deserialization already defaults a missing
-/// one to `Bearer`, which is the only type this issuer issues.
-fn merge_refreshed(previous: &OAuthToken, mut refreshed: OAuthToken) -> OAuthToken {
-    if refreshed.refresh_token.is_none() {
-        refreshed.refresh_token.clone_from(&previous.refresh_token);
-    }
-    if refreshed.id_token.is_none() {
-        refreshed.id_token.clone_from(&previous.id_token);
-    }
-    if refreshed.scope.is_none() {
-        refreshed.scope.clone_from(&previous.scope);
-    }
-    if refreshed.expires_at.is_none() {
-        refreshed.expires_at = previous.expires_at;
-    }
-    refreshed
 }
 
 /// Returns the polling delay for an advertised interval, enforcing the minimum.
@@ -414,9 +413,34 @@ fn string_field(payload: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Vendor error codes that invalidate the stored credentials.
+///
+/// The reference implementation (`_raise_oauth_failed`) marks exactly these codes
+/// — plus any `401`/`403` status — as `relogin_required`.
+const RELOGIN_CODES: [&str; 4] = [
+    "invalid_grant",
+    "invalid_token",
+    "invalid_request",
+    "refresh_token_reused",
+];
+
 /// Maps a rejected OAuth request to an error that cannot leak a credential.
+///
+/// Three outcomes are distinguished through the message, because the error
+/// taxonomy is shared with the rest of the crate:
+///
+/// - `429`: rate limited — the stored credentials are still valid and the caller
+///   should retry, not sign in again;
+/// - `401`/`403`, or a vendor code in [`RELOGIN_CODES`]: the credentials are no
+///   longer usable and the caller must run the device-authorization flow again;
+/// - anything else: a plain provider failure, retryable or not.
+///
+/// The body itself is never echoed (only the shared redaction placeholder), and a
+/// vendor code is echoed only when it is one of the known [`RELOGIN_CODES`], so an
+/// arbitrary provider string cannot smuggle a secret into a log line.
 fn operation_failed(operation: &str, url: &str, response: &HttpResponse) -> Error {
-    let detail = redacted_snippet(&response.text());
+    let body = response.text();
+    let detail = redacted_snippet(&body);
     let suffix = if detail.is_empty() {
         String::new()
     } else {
@@ -425,13 +449,40 @@ fn operation_failed(operation: &str, url: &str, response: &HttpResponse) -> Erro
     if response.status == 429 {
         return Error::llm(format!(
             "OpenAI account {operation} is rate limited (HTTP 429) for {url}; \
-             the stored credentials are still valid{suffix}"
+             the stored credentials are still valid and no re-login is required{suffix}"
+        ));
+    }
+    let code = vendor_error_code(&body);
+    let known = code.as_deref().filter(|code| RELOGIN_CODES.contains(code));
+    if known.is_some() || matches!(response.status, 401 | 403) {
+        let reason = known.map_or_else(String::new, |code| format!(" ({code})"));
+        return Error::llm(format!(
+            "OpenAI account {operation} failed with HTTP {} for {url}{reason}; the stored \
+             credentials are no longer usable and a re-login is required — sign in again with \
+             the device authorization flow{suffix}",
+            response.status
         ));
     }
     Error::llm(format!(
         "OpenAI account {operation} failed with HTTP {} for {url}{suffix}",
         response.status
     ))
+}
+
+/// Reads the vendor error code out of an OAuth error body.
+///
+/// The accepted shapes match the reference implementation: `{"error": {"code":
+/// …}}`, `{"error": {"type": …}}`, and `{"error": "<code>"}`. A body that is not
+/// JSON, or carries no `error` member in one of those shapes, yields `None`.
+fn vendor_error_code(body: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(body).ok()?;
+    let code = match payload.get("error")? {
+        Value::Object(error) => error.get("code").or_else(|| error.get("type"))?.as_str()?,
+        Value::String(error) => error.as_str(),
+        _ => return None,
+    };
+    let code = code.trim();
+    (!code.is_empty()).then(|| code.to_owned())
 }
 
 /// Renders a provider body safe for an error message.

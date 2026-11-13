@@ -7,7 +7,7 @@ path from a `TeamAgentSpec`, the leader's run loop, the organisation facade over
 the pool and process-global runtime manager used by the CLI/MCP, and the model-pool router.
 Python parity sources: `openjiuwen/agent_teams/agent/team_agent.py`, `agent/agent_configurator.py`,
 `runtime/{manager,dispatch,pool,gate}.py`, `models/allocator.py`.
-This node also owns the six **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity and attach hosting.
+This node also owns the seven **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity, attach hosting and per-member checkpoints.
 Model routing, observability signals and the monitor stream are wired at build time as well (they are not metadata keys).
 
 The module owns *policy and orchestration*: who runs, what a run means, when a team is done, how an
@@ -30,35 +30,51 @@ pub struct TeamBuildDeps {
     pub observability_hooks: Vec<Arc<dyn ObservabilityHooks>>,   // empty = no-ops
     pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,       // None = built from metadata
     pub routing: Option<Arc<TeamModelRouter>>,            // None = built from model_pool
+    pub checkpoints: Option<Arc<dyn MemberCheckpointStore>>,   // None = resolved from metadata
+    pub store_injected: bool,                             // set by `with_store`, cleared by `default()`
 }
 impl TeamBuildDeps {
     pub fn new() -> Self;                                  // == Default
     pub fn with_harness_factory(self, Arc<dyn MemberHarnessFactory>) -> Self;
-    pub fn with_store(self, Arc<dyn TeamStore>) -> Self;
+    pub fn with_store(self, Arc<dyn TeamStore>) -> Self;   // also sets `store_injected`
+    pub fn has_injected_store(&self) -> bool;              // the store-resolution switch
     pub fn with_workspace(self, Arc<dyn WorkspaceProvider>) -> Self;
     pub fn with_language(self, impl Into<String>) -> Self;
     pub fn with_observability_hook(self, Arc<dyn ObservabilityHooks>) -> Self;  // pushes
     pub fn with_kv_cache(self, Arc<TeamKvCacheAffinity>) -> Self;
     pub fn with_routing(self, Arc<TeamModelRouter>) -> Self;
+    pub fn with_checkpoint_store(self, Arc<dyn MemberCheckpointStore>) -> Self;
+    pub fn has_injected_checkpoints(&self) -> bool;        // `checkpoints.is_some()`
     pub fn resolved_language(&self) -> &'static str;       // unknown/None -> "cn"
 }
 // Default: NativeMemberFactory::from_env(), InMemoryTeamStore, LocalWorkspaceProvider rooted at
-// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing.
+// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing/checkpoints.
 
 // spec_meta.rs — the metadata parsers (all tolerant; an absent key keeps the default)
 pub const SPAWN_METADATA_KEY: &str = "spawn";        pub const FORK_METADATA_KEY: &str = "fork";
 pub const WORKSPACE_METADATA_KEY: &str = "workspace"; pub const ORGANIZATION_METADATA_KEY: &str = "organization";
 pub const KV_CACHE_METADATA_KEY: &str = "kv_cache";   pub const ATTACH_METADATA_KEY: &str = "attach";
+pub const CHECKPOINT_METADATA_KEY: &str = "checkpoint";
 pub const ATTACH_SOCKET_ENV: &str = "OPENJIUWEN_TEAM_SOCKET";
 pub struct ForkDirective { pub parent: String, pub task: Option<ForkTaskOverride>, pub tools: ForkToolPolicy }
 pub struct OrganizationBlock { pub spec: OrganizationSpec, pub rules: DelegationRules }
 pub struct AttachConfig { pub socket: PathBuf, pub required: bool }
+pub struct CheckpointConfig { pub policy: MemberCheckpointPolicy, pub store: CheckpointStoreConfig }
+pub enum CheckpointStoreConfig { Memory, File { dir: Option<PathBuf> } }   // Default = Memory
 pub fn spawn_options(&TeamAgentSpec) -> MemberSpawnOptions;              // bare or {"options":..}
 pub fn fork_directive(&TeamAgentSpec) -> Option<ForkDirective>;          // spawn.fork, else fork
 pub fn isolation_mode(&TeamAgentSpec) -> IsolationMode;                  // "worktree" | {"isolation":..}
 pub fn organization_block(&TeamAgentSpec) -> Result<Option<OrganizationBlock>>;  // Validation on a bad chart
 pub fn kv_cache_config(&TeamAgentSpec) -> KvCacheConfig;                 // enabled=true by default
 pub fn attach_config(&TeamAgentSpec) -> Option<AttachConfig>;            // metadata, else env socket
+pub fn checkpoint_config(&TeamAgentSpec) -> CheckpointConfig;            // bare policy or {"policy","store","dir"}
+// checkpoints.rs — per-member checkpoint identity and store resolution (`pub(crate)`)
+pub const CHECKPOINT_DIR: &str = ".openjiuwen/checkpoints";
+pub(crate) fn member_card_id(&DeepAgentSpec, member_name: &str) -> String;         // card id, else member name
+pub(crate) fn team_checkpoint_store(&CheckpointConfig, Option<&Arc<dyn MemberCheckpointStore>>) -> Option<Arc<dyn MemberCheckpointStore>>;
+pub(crate) fn member_checkpoint_store(&CheckpointConfig, Option<&Arc<dyn MemberCheckpointStore>>, &Path) -> Option<Arc<dyn MemberCheckpointStore>>;
+pub(crate) fn wire_runtime(HarnessMemberRuntime, card_id: &str, &CheckpointConfig,
+                           Option<&Arc<dyn MemberCheckpointStore>>, &Path) -> HarnessMemberRuntime;
 
 // routing.rs — model pool → one endpoint per member (`Arc`-shared, not `Clone`)
 pub struct ModelSelection { pub allocation: TeamModelAllocation, pub entry: Option<ModelPoolEntry> }
@@ -231,9 +247,17 @@ impl TeamAgent {
 
 // leader.rs — the coordination loop (`pub(crate)` surface)
 pub const SETTLE_POLL_INTERVAL: Duration;
-pub(crate) struct RunOutcome { pub output: AgentOutput, pub frames: Vec<AgentChunk> }
+pub(crate) type ChunkSink = UnboundedSender<Result<AgentChunk>>;
 pub(crate) async fn run(agent: TeamAgent, query: Option<String>, session: Option<Arc<dyn Session>>,
-                        deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<RunOutcome>;
+                        deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<AgentOutput>;
+
+// health.rs — the sync, read-only liveness projection (no new state, no probe)
+pub struct MemberHealth { pub name: String, pub role: TeamRole, pub status: MemberStatus,
+                          pub execution: ExecutionStatus, pub alive: bool }        // serde snake_case
+pub struct TeamHealth { pub team_name: String, pub started: bool,
+                        pub leader: Option<MemberHealth>, pub members: Vec<MemberHealth> }
+impl TeamBackend { pub fn health(&self) -> TeamHealth; }   // always `started: false`
+impl TeamAgent { pub fn health(&self) -> TeamHealth; }     // `started` from the handle
 
 // pool.rs / manager.rs / adapter.rs — listed in the routing table below
 ```
@@ -244,7 +268,7 @@ signals and forwarded chunks, so every member (not only the leader) feeds the sa
 
 ## Metadata-driven wiring
 
-Six optional keys under `TeamAgentSpec::metadata` select the wiring; `spec_meta.rs` parses them and every
+Seven optional keys under `TeamAgentSpec::metadata` tune the runtime; `spec_meta.rs` parses them and every
 parser except `organization` degrades to its default with a `warn!` on a malformed value.
 
 | key | accepted shapes | effect |
@@ -256,10 +280,18 @@ parser except `organization` degrades to its default with a `warn!` on a malform
 | `kv_cache` | `{"enabled": bool, "max_entries": n}`; absent ⇒ `enabled: true` | builds the `TeamKvCacheAffinity` used for register → env → release |
 | `attach` | `"/path/team.sock"` or `{"socket"\|"path": "…", "required": bool}`; blank ⇒ unset; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins | `start()` binds an `AttachHost` that serves `AttachOp`s over a Unix socket |
 
+| `checkpoint` | `CheckpointConfig`: `enabled`, `resume`, `policy` and `store` (`"memory"` or `{"store": "file", "dir": "…"}`); absent ⇒ enabled, in-memory, resume-if-available | the store, policy and card id every member runtime is wired with (`./checkpoints.rs`); the build path resolves the team-shared store once, and `file` roots each member under its own workspace unless `dir` is named |
 Per-kind launch shapes (`process`, `external_cli`, `ssh`) live in `src/member/CONTEXT.md`; the org chart
 shapes (`OrganizationSpec`, `DelegationRules`, `OrgTaskSpec`) live in `src/org/CONTEXT.md`.
 `TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`.
 It has no monitor/org/attach builder — those come from the metadata; `monitor_stream` is the monitor knob.
+
+### Checkpoint wiring
+
+`metadata["checkpoint"]` is parsed by `checkpoint_config`; `build_with` resolves the team-shared store once (`checkpoints::team_checkpoint_store`: an injected store wins, `memory` mints one `InMemoryMemberCheckpointStore`, `file` pins none) and every member runtime goes through `checkpoints::wire_runtime` with the card id, the policy, `cwd = workspace root` and that store.
+Identity is `(member session id, card id)`: the member session is `"<team session>:<member>"` — both the runtime session and the harness `host_session_id`, because `start(None)` makes the derived id the host session — and the card id is the effective spec's card id, else the member name.
+`start` restores a compatible record's provider envelope (a payload-only, mismatched or unreadable record starts cold), a finished turn and `stop` capture one record for the identity, and a disabled policy neither resolves a store nor attaches a sink.
+A retired (shut-down) roster row cannot be re-spawned — `MemberStatus` has no `shut_down → unstarted` edge — so a member restart is a fresh row (`TeamBackend::remove_member` + `TeamAgent::spawn_member`).
 
 ### Model routing
 
@@ -331,10 +363,21 @@ config therefore just logs.
 1. `spec.validate()` — reserved names, dispatch knob rules (the spec's own messages).
 2. `TeamSpec::from_spec(spec)` — the runtime mirror; language from `deps.language` else `spec.language`.
 3. `create_messager(&spec.transport)` — one in-process transport shared by the backend and every member.
-   The store is never opened here: the build path uses `deps.store` (default `InMemoryTeamStore`) and never reads `TeamAgentSpec::storage`, so SQLite team storage is selected by injecting `open_store(&spec.storage)?` through `TeamBuildDeps::with_store`.
+   The store comes from `resolve_store(spec, &deps)?` (in `build.rs`), never a second one:
+   an injected `deps.store` (`TeamBuildDeps::has_injected_store`, set by `with_store`) always wins — a
+   non-memory `spec.storage` kind is only `warn!`-logged as ignored, and `open_store` is never called;
+   with no injection, a blank or `memory` kind uses `deps.store` (the `InMemoryTeamStore` default);
+   with no injection and a real kind, `crate::storage::open_store(&spec.storage)?` opens it, propagating
+   `Error::Unsupported` for `postgresql`/`mysql`/unknown kinds. Before a `sqlite` open,
+   `ensure_sqlite_parent` best-effort creates the parent directory of a path-shaped target
+   (`params` keys `path`/`url`/`database`; `:memory:`, `mode=memory` and `sqlite:` URLs are left alone),
+   logging and continuing on failure — so the first write cannot fail on a missing directory.
 4. Wiring inputs: `TeamModelRouter::for_spec` (or the injected router for a direct spawner), the
-   `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the four
-   metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`).
+   `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the five
+   metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`, `checkpoint_config`).
+   `checkpoint_config` is resolved into the team store before the spawner is built
+   (`team_checkpoint_store`: the injected store wins, `memory` mints one `InMemoryMemberCheckpointStore`,
+   `file` pins none) and written back into `deps.checkpoints`, so the leader and every teammate share it.
 5. `TaskBoard::new(store, team_name, TaskBoardLimits::new().with_default_max_review_rounds(..)
    .with_max_subtask_depth(..))`, then `TeamBackend::new(..).with_signals(signals)`.
 6. `organization_block(spec)?` → `OrgBinding::build(block, store, Some(org_task_sink(backend)))` →
@@ -342,8 +385,11 @@ config therefore just logs.
 7. `TeamMemberSpawner::with_parts(spec, deps, session_id, options, fork, router)`.
 8. Team row upsert, then the leader row (`TeamRole::Leader`), then the leader's effective spec through
    `routing.effective_spec_for(leader, ..)` (memoizes the leader's allocation).
-9. Workspace allocation (`WorkspaceRequest` with `isolation`, retained keyed by the leader's name), `factory.create(effective, context)` →
-   `HarnessMemberRuntime::new(harness, session_id)` → `TeamMember::attach_runtime`.
+9. Workspace allocation (`WorkspaceRequest` with `isolation`, retained keyed by the leader's name); the
+   leader's identity is derived from it (`member_card_id(effective, leader)` and
+   `member_session_id(session_id, leader)`), the factory receives that context with `.with_card_id(..)`, and
+   `wire_runtime(HarnessMemberRuntime::new(harness, member_session), ..)` attaches the policy, the store and
+   `cwd = workspace root` before `TeamMember::attach_runtime`.
 10. `kv_cache.register_member(leader_key, model)` — the root allocation.
 11. `leader_member.observe(MemberStreamObserver::new(activity, weak leader, Leader, signals, chunk_sinks))`.
 12. `insert_teammate_rows` — one `Unstarted` row per roster teammate (`predefined_members` ∪ `agents` keys
@@ -357,8 +403,9 @@ config therefore just logs.
 2. Each delivery is handed to `deliver` without touching the leader runtime: `HumanAgent` → inbox push +
    persisted message row + `message` event; `Operator`/`GroupChat`/`GodView` → gate + leader mailbox;
    `ExternalTeam` → `DeliverResult::unsupported`.
-3. `start()` (idempotent): messager start, leader `MemberRuntime::start(None)`, attach bind (see policy),
-   `signals.team_started`.
+3. `start()` (idempotent): messager start, leader `MemberRuntime::start(None)` — which restores the stored
+   checkpoint envelope for the leader's `(derived session, card id)` when one exists — attach bind (see
+   policy), `signals.team_started`. A teammate's `spawn_member` start does the same restore before its pump.
 4. The leader query is sent with `immediate = false` (a follow-up turn).
 5. Loop on `tokio::select!`: member chunks, bus events, caller cancellation, and a settle tick.
    - teammate/leader chunks are forwarded tagged with `TeamOutputSchema{source_member, role, chunk}`;
@@ -366,9 +413,28 @@ config therefore just logs.
    - the loop ends when the leader runtime is `Idle` **and** `taskboard.is_settled()`, when the caller
      cancels, or when `stop()` fires.
 6. The org mailbox is acknowledged only for the ids whose flush succeeded; a failed flush keeps them unread.
-7. The `team.completed` frame (`schema::stream::team_completed_frame`) is emitted last; the gate closes.
+7. The `team.completed` frame (`schema::stream::team_completed_frame`) is emitted last and the gate is
+   already closed; a settled run then publishes **one** `EventPayload::TeamCompleted(TeamCompletedEvent
+   { team_name, reason: Some("settled") })` on `TeamTopic::Team` through `TeamBackend::post_event`, so a
+   caller that holds no stream still sees the completion. A publish failure is `warn!`-logged and never
+   fails the run, and a cancelled run (`RunExit::Cancelled`) publishes nothing — the bus event is
+   exactly-once per settled run.
 8. `invoke` returns `AgentOutput::answer(<concatenated leader answer>)`; `stream` yields the frames.
    A leader answer is accumulated from `llm_output` chunks (`payload.content`, else `payload.text`).
+
+## Health
+
+`TeamHealth` / `MemberHealth` (`health.rs`) are the read-only liveness projection: sync, no `.await`, no
+new state, no probe task.
+`TeamBackend::health()` projects the roster it already holds (`members()`, sorted by name; `leader` is a
+copy of the leader's entry when that row exists) and always reports `started: false`, because the backend
+does not track the run lifecycle; `TeamAgent::health()` is the caller-facing one and fills `started` from
+`is_started()`.
+`alive` means "a runtime is attached **and** that runtime's phase is not `Terminated` **and** the row is
+not still `Unstarted`" — the last clause keeps a built-but-never-started team reporting nothing alive,
+even though `build_with` already attached the leader's harness.
+`status`/`execution` are copied from the row's cached projection (`TeamMember::status`/`execution`),
+never re-read from the store.
 
 ## Dispatch truth table (`decide_run_action`)
 
@@ -423,11 +489,13 @@ a new session instead of being rebuilt.
 - `./org_bind.rs` → `OrgBinding` (chart, delegation router, org task pool, org mailbox, `org_task` events)
 - `./attach_host.rs` → `AttachHost` / `BackendAttachHandler` (Unix-socket attach server, `AttachHost::start(&AttachConfig, handler)`)
 - `./wiring_tests.rs` → wiring test root (`Wiring` harness, `with_metadata`, `wait_until`, `take_monitor`, `monitor_kinds`)
-- `./wiring_tests/` → the seven wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach)
+- `./wiring_tests/` → the eight wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach, checkpoints)
+- `./checkpoints.rs` → per-member checkpoint identity and store resolution (`member_card_id`, `team_checkpoint_store`, `member_checkpoint_store`, `wire_runtime`, `CHECKPOINT_DIR`)
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
-- `./build.rs` → the `SpecBuild` implementation and every build-only helper (leader record, harness, observer, roster rows, bus wiring, org install)
+- `./health.rs` → `TeamHealth` / `MemberHealth`, the `alive` rule and the roster projection
+- `./build.rs` → the `SpecBuild` implementation and every build-only helper (store resolution, leader record, harness, observer, roster rows, bus wiring, org install)
 - `./spawner.rs` → `TeamMemberSpawner` (`MemberSpawner` over the harness factory, spawn options, fork, routing, child spawners)
 - `./team_agent/` → the `TeamAgent` handle directory: the struct and its accessors in `mod.rs`, one file per concern below
 - `./team_agent/mod.rs` → `TeamAgent`, `TeamAgentInner`, `SpecBuild`, `ensure_leader_role`, the cheap accessors and the `pub(crate)` seams (`steer_batch_size`, `cancellation_token`, `take_events`)
@@ -452,7 +520,16 @@ Unit tests beside each file, the `./wiring_tests/` suites for the metadata-drive
 of 2 s polling every 5 ms, no `#[ignore]`).
 
 - `deps.rs`: defaults are wired (native factory name, in-memory store, temp-rooted workspace), builders
-  override one field each, `resolved_language` honours `Language::resolve`.
+  override one field each, `resolved_language` honours `Language::resolve`, and `store_injected` is false
+  by default / true after `with_store` (it survives the other overrides).
+- `build.rs`: store resolution — a memory spec reuses the dependency store, an injected store wins over a
+  `postgresql` spec (as `Arc::ptr_eq`, proving `open_store` was skipped), a `sqlite` spec
+  (`#[cfg(feature = "sqlite")]`) opens its own backend and creates the nested parent directory, and
+  `postgresql`/`mysql`/`oracle` surface `ErrorKind::Unsupported` naming the backend or kind.
+- `health.rs`: `alive` needs an attached runtime whose phase is not `Terminated` on a row that is not
+  `Unstarted`; `from_roster` sorts by name and copies the leader; missing/unknown fields and the
+  snake_case wire shape (`team_name`, `started`, `leader`, `members`; `name`, `role`, `status`,
+  `execution`, `alive`).
 - `allocator.rs`: round-robin cycles in pool order and persists its cursor; `by_name` picks the named
   entry and falls back to the first; empty pool + `Some(name)` echoes the name with `index = 0`; empty pool
   + `None` is `Error::config`; `state_dict` round-trip.
@@ -474,14 +551,15 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy, and the
   workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged).
 - `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
-  `team.completed` marker last and the leader answer in `AgentOutput.output`; an open task keeps the stream
-  open until the board settles; cancellation ends the run.
+  `team.completed` marker last, exactly one `team_completed` bus event carrying the team name and
+  `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
+  open until the board settles; cancellation ends the run and publishes no completion event.
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
   (`not_active`) and after `stop_team` (`gate_closed`/`not_active`), `finalize_member`, `shutdown`,
   `stop_team` tearing the attach socket down.
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
-`./wiring_tests/` (56 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
+`./wiring_tests/` (67 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
 `ScriptedFactory` + `RecordingWorkspaceProvider` and returns the agent, the factory and the workspace):
 
 - `spawn_modes.rs` (9): the default blueprint stays in-process; `metadata["spawn"]` selects
@@ -508,9 +586,17 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `BackendAttachHandler`; `stop_team` acknowledges and cancels the run token; an unbindable socket is not
   fatal while `required: true` fails the start; `stop` and the manager's `stop_team` remove the file and
   later calls fail.
+- `checkpoints.rs` (11): the default build pins one `"memory"` team store while a `file` config pins none;
+  the leader and a spawned teammate restore under `(derived member session, card id)` with the blueprint card
+  id and fall back to the member name for a card-less blueprint; a finished turn and a `stop` each reach the
+  store once; a restarted member `start`s with the stored provider envelope, `ResumeIfAvailable` and
+  `host_session_id == "<team session>:<member>"`; `{"enabled": false}` attaches no sink, restores nothing and
+  captures nothing; an explicit `dir` receives one `checkpoint.json` per member.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1322 lib
-tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p openjiuwen-agent-teams --no-default-features`,
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1411 lib
+tests in the default build, 1430 with `--features sqlite`, 1439 with `--all-features`, plus 219 integration
+tests over 15 binaries),
+`cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
 --all-targets -- -D warnings` and `cargo doc -p openjiuwen-agent-teams --no-deps` all green offline.
 
@@ -530,8 +616,8 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   `Error::validation("only the leader can create tasks")`.
 - The team roster is materialized as rows at build time (`unstarted` teammates); Python creates rows lazily
   on bootstrap. This makes `snapshot()` answer before the first spawn.
-- `metadata` is the only place a host tunes the runtime; `TeamBuildDeps` only injects hooks, a KV registry and
-  (for direct spawner construction) a router. Adding a new knob means a parser in `spec_meta.rs` plus a field
+- `metadata` is the only place a host tunes the runtime; `TeamBuildDeps` only injects hooks, a KV registry, a
+  checkpoint store and (for direct spawner construction) a router. Adding a new knob means a parser in `spec_meta.rs` plus a field
   on `TeamAgentInner`, never a new constructor argument.
 - Formatting/typing invariant: a member's `DeepAgentSpec.model` and its `MemberRecord::model_ref` come from the
   same `ModelSelection`, so a pool entry selects a real endpoint instead of only labelling the row.
@@ -564,7 +650,12 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   exercises a real process member writes its own `sh` script or asserts the missing-program `Error::Config`;
   attach hosting is `#[cfg(unix)]` (`AttachServer::bind`/`serve` return `Unsupported` elsewhere) and the
   worktree backend needs a real `git` binary plus a repository.
-- `team_agent/test_support.rs` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
+- `TeamHealth`/`MemberHealth` are exported from `runtime` (`runtime::mod` re-export) but **not** from the crate root: `src/lib.rs` enumerates the runtime items by name and belongs to another node, so a crate-root import needs that file updated elsewhere. `openjiuwen_agent_teams::runtime::{TeamHealth, MemberHealth}` works today.
+- `alive` is deliberately narrower than "has a harness": `build_with` already attaches the leader's harness, so an `Unstarted` row would otherwise read as alive. The predicate is `status != Unstarted && runtime attached && runtime state != Terminated`.
+- `deps.store_injected` is the only store-resolution switch: `with_store` sets it, `default()`/`new()` clear it. Adding a second way to supply a store would silently diverge from `resolve_store`.
+- `crates/openjiuwen-e2e/tests/team_backend.rs` still asserts that completion is stream-only (`all(|event| event.event_type != "team_completed")`); a settled run now also publishes `team_completed` on `TeamTopic::Team`, so that assertion belongs to the e2e owner and must be inverted there — this crate cannot edit it.
+- `src/schema/CONTEXT.md` (schema node) still says the leader loop emits no completion bus event; that node owns the correction.
+- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone sees completion strictly after the frame; a publish failure is logged and never fails the run. `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent/` is split by concern (`mod.rs` handle, `lifecycle.rs`, `members.rs` plus the small
@@ -584,6 +675,13 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   per-tool spans. The monitor stream has no TUI/consumer here.
 - The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
   swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
+- Checkpointing has no team-level resume policy, no retention/pruning or TTL, and no leader restart: only
+  `TeamAgentSpec::metadata["checkpoint"]` + `TeamBuildDeps::with_checkpoint_store` decide, and a retired
+  member row cannot be revived in place (`TeamBackend::remove_member` + `spawn_member` is the restart path).
+- Known cross-node issue: `crates/openjiuwen-agent-teams/tests/member_and_mail.rs`
+  (`the_roster_accessors_agree_and_are_sorted`, lines ~689 and ~702) still asserts that a runtime session
+  equals the team session; the leader and every teammate now run under `"<team session>:<member>"`, so the
+  assertion belongs to the crate-root node and needs `format!("{}:{}", agent.session_id(), agent.member_name())`.
 - Attach hosting serves one request/response op per connection with no subscriptions, authentication,
   streaming or non-Unix transport; a CLI or MCP process reaches a hosted team through that socket, and only
   a shared-store or brokered attach remains deferred.

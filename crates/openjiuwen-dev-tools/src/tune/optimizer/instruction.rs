@@ -17,6 +17,10 @@
 //! 4. Stop at `early_stop_score` (checked before a round, so an already-good
 //!    seed runs zero rounds) or after `iterations` rounds.
 //!
+//! The model rewrite request describes the case set's tool declarations in a
+//! `<tools_description>` block, mirroring Python's `str(tools)` rendering; a
+//! tool-free case set leaves the request unchanged.
+//!
 //! Ties are resolved deterministically — higher score, then the earlier
 //! candidate, then the lexicographically smaller prompt — so a repeated run
 //! returns the same prompt, score, and iteration count.
@@ -138,7 +142,7 @@ impl InstructionOptimizer {
                 proposals.extend(Mutator::deterministic(member));
             }
             if let Some(rewrite) = mutator
-                .model_rewrite(&best_prompt, &worst_cases(&best_cases, 5))
+                .model_rewrite(&best_prompt, &worst_cases(&best_cases, 5), cases)
                 .await
             {
                 proposals.push(rewrite);
@@ -176,6 +180,7 @@ impl InstructionOptimizer {
             best_prompt,
             score: best_score,
             iterations,
+            ..OptimizationResult::default()
         })
     }
 }
@@ -213,6 +218,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use async_trait::async_trait;
+    use openjiuwen_foundation::tool::ToolInfo;
     use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
     use serde_json::Value;
 
@@ -413,6 +419,53 @@ mod tests {
         let user = call.messages[1].text();
         assert!(user.contains("<prompt_base>"), "{user}");
         assert!(user.contains("{{topic}}"), "{user}");
+    }
+
+    #[tokio::test]
+    async fn tool_declarations_reach_the_rewrite_prompt() {
+        let model = ScriptedModel::text(
+            "<PROMPT_OPTIMIZED>Answer the question step by step in the requested output \
+             format.</PROMPT_OPTIMIZED>",
+        );
+        let optimizer = InstructionOptimizer::new()
+            .with_config(OptimizerConfig::default().with_iterations(1))
+            .with_model(Arc::new(model.clone()));
+        let cases = vec![
+            case("c1", "capital of France", "Paris").with_tools(vec![ToolInfo::new(
+                "lookup",
+                "Look something up",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )]),
+            case("c2", "2 + 2", "four"),
+        ];
+        optimizer.optimize(SEED, &cases).await.unwrap();
+
+        let call = model.last_call().expect("one model rewrite");
+        let user = call.messages[1].text();
+        assert!(user.contains("<tools_description>"), "{user}");
+        assert!(user.contains("lookup"), "{user}");
+        assert!(
+            call.request.tools.is_none(),
+            "the declarations are described, not sent as a tools array"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_free_cases_leave_the_rewrite_prompt_unchanged() {
+        let model = ScriptedModel::text(
+            "<PROMPT_OPTIMIZED>Answer the question step by step in the requested output \
+             format.</PROMPT_OPTIMIZED>",
+        );
+        let optimizer = InstructionOptimizer::new()
+            .with_config(OptimizerConfig::default().with_iterations(1))
+            .with_model(Arc::new(model.clone()));
+        optimizer.optimize(SEED, &cases()).await.unwrap();
+
+        let call = model.last_call().expect("one model rewrite");
+        let user = call.messages[1].text();
+        assert!(!user.contains("<tools_description>"), "{user}");
+        assert!(user.contains("<prompt_base>"), "{user}");
+        assert!(user.contains("<bad_cases>"), "{user}");
     }
 
     #[tokio::test]

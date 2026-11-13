@@ -6,11 +6,11 @@
 //! lifecycle) onto `reqwest`, and exposes it through the crate's spawn seam so a
 //! runner can address a remote agent exactly like a subprocess one.
 //!
-//! [`RemoteAgent`] reuses the subprocess NDJSON wire ([`SpawnMessage`]): the
-//! stream endpoint answers one frame per line, a `stream_chunk` frame carries
-//! one [`AgentChunk`], an `error` frame is the stream's only `Err`, and
-//! `done`/`output` end it. Non-JSON line noise (keep-alives, blank lines) is
-//! skipped at `trace`.
+//! [`RemoteAgent`] owns the configuration, the URL layout, and the start/stop
+//! lifecycle; every request is executed by the private `remote_io` child module,
+//! which owns client construction, the `session_id`/`inputs` body, the status
+//! mapping, and the NDJSON stream grammar of
+//! [`crate::spawn::protocol::SpawnMessage`].
 //!
 //! [`RemoteProtocol::Mq`] and [`RemoteProtocol::A2a`] are typed as
 //! [`Error::Unsupported`]: the Pulsar/ZeroMQ reply-topic transport and the A2A
@@ -35,22 +35,33 @@
 //! # }
 //! ```
 
+#[path = "remote_io.rs"]
+mod remote_io;
+
 use crate::error;
-use crate::spawn::protocol::{SpawnMessage, SpawnMessageKind};
-use crate::spawn::{AgentSpawner, SpawnSpec, SpawnedAgent};
+use crate::spawn::{AgentSpawner, SpawnBackend, SpawnSpec, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, Result};
 use parking_lot::Mutex;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+
+// The unit tests in `remote_tests.rs` reach the transport helpers through
+// `use super::*`, so they stay importable in the test build only.
+#[cfg(test)]
+use crate::spawn::protocol::{SpawnMessage, SpawnMessageKind};
+#[cfg(test)]
+use futures::StreamExt;
+#[cfg(test)]
+use remote_io::{
+    body_snippet, map_status, parse_stream_line, take_line, StreamLine, BODY_SNIPPET_CHARS,
+};
 
 /// Default invoke path, relative to [`RemoteAgentConfig::base_url`].
 pub const DEFAULT_INVOKE_PATH: &str = "agents/{agent_id}/invoke";
@@ -63,8 +74,6 @@ pub const DEFAULT_REMOTE_TIMEOUT_SECS: f64 = 60.0;
 
 /// The placeholder a configured path may use for the agent id.
 const AGENT_ID_PLACEHOLDER: &str = "{agent_id}";
-/// Longest error-body snippet echoed back in an error message.
-const BODY_SNIPPET_CHARS: usize = 256;
 
 /// Transport a remote agent is reached over (Python `ProtocolEnum`).
 ///
@@ -421,6 +430,10 @@ pub struct RemoteAgent {
 
 impl RemoteAgent {
     /// A remote agent reached over [`RemoteProtocol::Http`].
+    ///
+    /// The transport is built lazily on first use, so an agent constructed
+    /// directly reports `is_alive() == false` until it is started;
+    /// [`RemoteSpawner::spawn`] returns one that is already started.
     #[must_use]
     pub fn new(config: RemoteAgentConfig) -> Self {
         Self::with_state(config, RemoteProtocol::Http)
@@ -472,7 +485,7 @@ impl RemoteAgent {
         if started {
             return Ok(());
         }
-        let client = self.build_client()?;
+        let client = remote_io::build_client(self.config())?;
         *self.state.client.lock() = Some(client);
         Ok(())
     }
@@ -488,59 +501,6 @@ impl RemoteAgent {
             .lock()
             .clone()
             .ok_or_else(|| error::not_started("remote agent"))
-    }
-
-    /// Builds the `reqwest` client from the configured timeout and headers.
-    fn build_client(&self) -> Result<reqwest::Client> {
-        let config = self.config();
-        let mut headers = HeaderMap::new();
-        for (name, value) in &config.headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                Error::config(format!(
-                    "invalid remote agent header name '{name}': {error}"
-                ))
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|error| {
-                Error::config(format!(
-                    "invalid remote agent header value for '{name}': {error}"
-                ))
-            })?;
-            headers.insert(header_name, header_value);
-        }
-        reqwest::Client::builder()
-            .timeout(config.effective_timeout())
-            .default_headers(headers)
-            .build()
-            .map_err(|error| {
-                error::transport(format!(
-                    "cannot build the remote agent HTTP client: {error}"
-                ))
-            })
-    }
-
-    /// The JSON body of an invocation: `session_id` always, `inputs` verbatim.
-    fn request_body(&self, inputs: &Value) -> Value {
-        serde_json::json!({
-            "session_id": self.config().session_id,
-            "inputs": inputs,
-        })
-    }
-
-    /// Maps a `reqwest` failure onto the crate's error vocabulary.
-    fn transport_error(
-        &self,
-        label: &str,
-        url: &str,
-        timeout: Duration,
-        error: &reqwest::Error,
-    ) -> Error {
-        if error.is_timeout() {
-            return error::run_timeout(label, timeout);
-        }
-        error::transport(format!(
-            "{label} ('{}') to {url} failed: {error}",
-            self.agent_id()
-        ))
     }
 }
 
@@ -562,45 +522,7 @@ impl RemoteClient for RemoteAgent {
     }
 
     async fn invoke(&self, inputs: Value, timeout: Option<Duration>) -> Result<AgentOutput> {
-        let url = self.config().invoke_url()?;
-        let client = self.http_client()?;
-        let deadline = timeout.unwrap_or_else(|| self.config().effective_timeout());
-        let payload = self.request_body(&inputs);
-        tracing::debug!(
-            agent_id = %self.agent_id(),
-            url = %url,
-            "invoking a remote agent over HTTP"
-        );
-        let response = client
-            .post(&url)
-            .timeout(deadline)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| self.transport_error("remote agent invoke", &url, deadline, &error))?;
-        let status = response.status();
-        let body = response.text().await.map_err(|error| {
-            error::transport(format!(
-                "remote agent '{}' invoke body from {url} cannot be read: {error}",
-                self.agent_id()
-            ))
-        })?;
-        if !status.is_success() {
-            return Err(map_status(self.agent_id(), status.as_u16(), &url, &body));
-        }
-        let value: Value = serde_json::from_str(&body).map_err(|error| {
-            Error::validation(format!(
-                "remote agent '{}' returned a non-JSON body from {url}: {error}: {}",
-                self.agent_id(),
-                body_snippet(&body)
-            ))
-        })?;
-        AgentOutput::from_value(value).map_err(|error| {
-            Error::validation(format!(
-                "remote agent '{}' returned an invalid output object from {url}: {error}",
-                self.agent_id()
-            ))
-        })
+        remote_io::invoke_http(self, inputs, timeout).await
     }
 
     fn stream(
@@ -608,110 +530,11 @@ impl RemoteClient for RemoteAgent {
         inputs: Value,
         timeout: Option<Duration>,
     ) -> BoxStream<'static, Result<AgentChunk>> {
-        let agent = self.clone();
-        Box::pin(async_stream::stream! {
-            let url = match agent.config().stream_url() {
-                Ok(url) => url,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let client = match agent.http_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let deadline = timeout.unwrap_or_else(|| agent.config().effective_timeout());
-            let payload = agent.request_body(&inputs);
-            tracing::debug!(
-                agent_id = %agent.agent_id(),
-                url = %url,
-                "streaming a remote agent over HTTP"
-            );
-            let response = match client
-                .post(&url)
-                .timeout(deadline)
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    yield Err(agent.transport_error("remote agent stream", &url, deadline, &error));
-                    return;
-                }
-            };
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                yield Err(map_status(agent.agent_id(), status, &url, &body));
-                return;
-            }
-            let mut body = Box::pin(response.bytes_stream());
-            let mut buffer: Vec<u8> = Vec::new();
-            while let Some(chunk) = body.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        yield Err(error::transport(format!(
-                            "remote agent '{}' stream from {url} failed: {error}",
-                            agent.agent_id()
-                        )));
-                        return;
-                    }
-                };
-                buffer.extend_from_slice(&chunk);
-                while let Some(line) = take_line(&mut buffer) {
-                    match parse_stream_line(&line) {
-                        StreamLine::Skip => {}
-                        StreamLine::Chunk(chunk) => yield Ok(chunk),
-                        StreamLine::Error(error) => {
-                            yield Err(error);
-                            return;
-                        }
-                        StreamLine::End => return,
-                    }
-                }
-            }
-            if !buffer.is_empty() {
-                let line = String::from_utf8_lossy(&buffer).into_owned();
-                match parse_stream_line(&line) {
-                    StreamLine::Skip => {}
-                    StreamLine::Chunk(chunk) => yield Ok(chunk),
-                    StreamLine::Error(error) => yield Err(error),
-                    StreamLine::End => {}
-                }
-            }
-        })
+        remote_io::stream_http(self, inputs, timeout)
     }
 
     async fn cancel_task(&self, task_id: &str) -> Result<()> {
-        let Some(url) = self.config().cancel_url()? else {
-            return Err(error::unsupported(
-                "remote agent cancel_task",
-                "no cancel_path is configured for this RemoteAgent",
-            ));
-        };
-        let client = self.http_client()?;
-        let deadline = self.config().effective_timeout();
-        let response = client
-            .post(&url)
-            .timeout(deadline)
-            .json(&serde_json::json!({"task_id": task_id}))
-            .send()
-            .await
-            .map_err(|error| {
-                self.transport_error("remote agent cancel_task", &url, deadline, &error)
-            })?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let body = response.text().await.unwrap_or_default();
-        Err(map_status(self.agent_id(), status.as_u16(), &url, &body))
+        remote_io::cancel_http(self, task_id).await
     }
 }
 
@@ -731,12 +554,52 @@ impl SpawnedAgent for RemoteAgent {
         None
     }
 
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::RemoteHttp
+    }
+
+    /// The client's started state: there is no probe endpoint to ask.
+    fn is_healthy(&self) -> bool {
+        RemoteClient::is_started(self)
+    }
+
+    /// The HTTP wire contract defines only invoke/stream/cancel, so there is no
+    /// health endpoint to probe: the answer is the client's own started state. A
+    /// handle built by [`RemoteSpawner::spawn`] is started at spawn (so this is
+    /// `true` immediately), while one built with [`RemoteAgent::new`] is `false`
+    /// until the first [`RemoteClient::invoke`]/[`RemoteClient::stream`]
+    /// auto-starts it, or an explicit [`RemoteClient::start`].
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn health(&self) -> Result<bool> {
+        Ok(RemoteClient::is_started(self))
+    }
+
     async fn send(&self, inputs: Value) -> Result<AgentOutput> {
         RemoteClient::invoke(self, inputs, None).await
     }
 
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
         RemoteClient::stream(self, inputs, None)
+    }
+
+    /// Bounds this one request by `timeout`; `None` keeps the configured
+    /// `timeout_secs`.
+    async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        RemoteClient::invoke(self, inputs, timeout).await
+    }
+
+    /// Bounds this one stream's request by `timeout`; `None` keeps the configured
+    /// `timeout_secs`.
+    fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        RemoteClient::stream(self, inputs, timeout)
     }
 
     /// Releases the client and reports a graceful exit; there is nothing to kill.
@@ -748,6 +611,20 @@ impl SpawnedAgent for RemoteAgent {
     async fn force_kill(&self) -> Result<()> {
         RemoteClient::stop(self).await
     }
+
+    /// Forwards to [`RemoteClient::cancel_task`]: the cancel endpoint is the one
+    /// place a remote backend owns a real task handle.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] when no `cancel_path` is
+    /// configured, [`openjiuwen_common::error::Error::NotFound`] when the task is
+    /// unknown, [`openjiuwen_common::error::Error::Timeout`] when the deadline
+    /// elapses, and [`openjiuwen_common::error::Error::Transport`] for every other
+    /// failure.
+    async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        RemoteClient::cancel_task(self, task_id).await
+    }
 }
 
 /// An [`AgentSpawner`] that addresses remote agents over HTTP.
@@ -755,6 +632,13 @@ impl SpawnedAgent for RemoteAgent {
 /// The spawned handle is a [`RemoteAgent`]; the agent id comes from the spawn
 /// spec, so a runner registered with this spawner can route a class-agent spawn
 /// to a remote endpoint.
+///
+/// Unlike a directly constructed [`RemoteAgent`], the handle this spawner
+/// returns is already started: readiness polled through
+/// [`SpawnedAgent::is_alive`]/[`SpawnedAgent::is_healthy`]/[`SpawnedAgent::health`]
+/// is `true` immediately, and a client that cannot be built (an unusable base
+/// URL, an invalid configured header) fails the spawn rather than the first
+/// invocation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoteSpawner {
     /// Origin every spawned agent is reached at.
@@ -809,14 +693,51 @@ impl RemoteSpawner {
 
 #[async_trait]
 impl AgentSpawner for RemoteSpawner {
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::RemoteHttp
+    }
+
+    /// The origin, the default deadline, and the header *names* — never a header
+    /// value, because that is where an `Authorization` bearer token lives.
+    fn describe(&self) -> Value {
+        json!({
+            "backend": SpawnBackend::RemoteHttp.as_str(),
+            "base_url": self.base_url,
+            "timeout_secs": self.timeout.map(|timeout| timeout.as_secs_f64()),
+            "header_names": self.headers.keys().collect::<Vec<_>>(),
+        })
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let agent_id = remote_agent_id(&spec)?;
         let mut config = self.config_for(&agent_id);
         config.session_id.clone_from(&spec.session_id);
         // Fail at spawn time rather than at the first invoke.
         require_base_url(&config.base_url)?;
-        Ok(Arc::new(RemoteAgent::new(config)))
+        require_url(&config)?;
+        let agent = RemoteAgent::new(config);
+        // A spawned remote child is started, so a host that polls readiness
+        // through the seam sees a live handle, and a client that cannot be built
+        // fails here instead of inside the first invocation.
+        RemoteClient::start(&agent).await?;
+        Ok(Arc::new(agent))
     }
+}
+
+/// Rejects a base URL the invoker could never use.
+///
+/// An empty base URL is caught by [`require_base_url`]; this catches a
+/// non-empty one that is still not an absolute URL (a missing scheme, an
+/// unparsable host), which would otherwise surface only inside a request.
+fn require_url(config: &RemoteAgentConfig) -> Result<()> {
+    let url = config.invoke_url()?;
+    reqwest::Url::parse(&url).map_err(|error| {
+        Error::validation(format!(
+            "remote agent base_url '{}' is not a usable URL: {error}",
+            config.base_url
+        ))
+    })?;
+    Ok(())
 }
 
 /// The remote agent id a spawn spec addresses: `agent_class`, then
@@ -838,119 +759,42 @@ fn remote_agent_id(spec: &SpawnSpec) -> Result<String> {
     ))
 }
 
-/// Maps a non-2xx status onto an error; `404` means the agent is unknown.
-fn map_status(agent_id: &str, status: u16, url: &str, body: &str) -> Error {
-    let snippet = body_snippet(body);
-    if status == 404 {
-        return Error::NotFound(with_snippet(
-            format!("remote agent '{agent_id}' is not registered at {url}"),
-            &snippet,
-        ));
-    }
-    error::transport(with_snippet(
-        format!("remote agent '{agent_id}' returned status {status} from {url}"),
-        &snippet,
-    ))
-}
-
-/// Appends `: snippet` when there is a snippet to show.
-fn with_snippet(message: String, snippet: &str) -> String {
-    if snippet.is_empty() {
-        message
-    } else {
-        format!("{message}: {snippet}")
-    }
-}
-
-/// A whitespace-collapsed, at-most-[`BODY_SNIPPET_CHARS`]-char body snippet.
-fn body_snippet(body: &str) -> String {
-    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= BODY_SNIPPET_CHARS {
-        return collapsed;
-    }
-    let mut snippet: String = collapsed.chars().take(BODY_SNIPPET_CHARS - 1).collect();
-    snippet.push('…');
-    snippet
-}
-
-/// What one line of a remote stream means.
-#[derive(Debug)]
-enum StreamLine {
-    /// One chunk item.
-    Chunk(AgentChunk),
-    /// One `Err` item; the stream ends afterwards.
-    Error(Error),
-    /// The stream is complete.
-    End,
-    /// Noise or a frame this direction should not send: ignore it.
-    Skip,
-}
-
-/// Parses one NDJSON line of a remote stream.
-///
-/// Non-JSON noise is skipped at `trace`; valid JSON that is not a spawn frame is
-/// a [`Error::Validation`] that ends the stream.
-fn parse_stream_line(line: &str) -> StreamLine {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return StreamLine::Skip;
-    }
-    if serde_json::from_str::<Value>(trimmed).is_err() {
-        tracing::trace!(
-            target: "openjiuwen_runner::spawn",
-            line = %body_snippet(trimmed),
-            "skipping a non-JSON line of a remote agent stream"
-        );
-        return StreamLine::Skip;
-    }
-    let frame = match SpawnMessage::from_line(trimmed) {
-        Ok(frame) => frame,
-        Err(error) => return StreamLine::Error(error),
-    };
-    match frame.kind {
-        SpawnMessageKind::StreamChunk => match AgentChunk::from_value(frame.payload) {
-            Ok(chunk) => StreamLine::Chunk(chunk),
-            Err(error) => StreamLine::Error(Error::validation(format!(
-                "remote agent stream_chunk is not a valid AgentChunk frame: {error}"
-            ))),
-        },
-        SpawnMessageKind::Done | SpawnMessageKind::Output => StreamLine::End,
-        SpawnMessageKind::Error => StreamLine::Error(error::transport(format!(
-            "remote agent stream reported an error: {}",
-            frame_error_message(&frame.payload)
-        ))),
-        other => {
-            tracing::trace!(
-                target: "openjiuwen_runner::spawn",
-                kind = ?other,
-                "ignoring a remote agent stream frame"
-            );
-            StreamLine::Skip
-        }
-    }
-}
-
-/// The human-readable message of an `error` frame's payload.
-fn frame_error_message(payload: &Value) -> String {
-    match payload {
-        Value::String(text) => text.clone(),
-        Value::Object(map) => match map.get("message") {
-            Some(Value::String(text)) => text.clone(),
-            Some(other) => other.to_string(),
-            None => payload.to_string(),
-        },
-        Value::Null => "no error detail was provided".to_owned(),
-        other => other.to_string(),
-    }
-}
-
-/// Removes and returns the next complete `\n`-terminated line of `buffer`.
-fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
-    let position = buffer.iter().position(|byte| *byte == b'\n')?;
-    let line: Vec<u8> = buffer.drain(..=position).collect();
-    Some(String::from_utf8_lossy(&line).into_owned())
-}
-
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    #[test]
+    fn describe_reports_the_origin_and_header_names_only() {
+        let spawner = RemoteSpawner::new("http://127.0.0.1:8080")
+            .with_timeout(Duration::from_secs(15))
+            .with_header("Authorization", "Bearer super-secret-value")
+            .with_header("X-Tenant", "acme");
+        let described = spawner.describe();
+        assert_eq!(described["backend"], json!("remote_http"));
+        assert_eq!(described["base_url"], json!("http://127.0.0.1:8080"));
+        assert_eq!(described["timeout_secs"], json!(15.0));
+        assert_eq!(
+            described["header_names"],
+            json!(["Authorization", "X-Tenant"]),
+            "headers are reported by name only"
+        );
+        let rendered = described.to_string();
+        assert!(
+            !rendered.contains("super-secret-value") && !rendered.contains("Bearer"),
+            "no header value leaks: {rendered}"
+        );
+        assert!(
+            !rendered.contains("acme"),
+            "no header value leaks: {rendered}"
+        );
+
+        // An unset deadline is JSON null; an empty header set is [].
+        let plain = RemoteSpawner::new("http://127.0.0.1:8080").describe();
+        assert_eq!(plain["timeout_secs"], Value::Null);
+        assert_eq!(plain["header_names"], json!([]));
+    }
+}

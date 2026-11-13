@@ -13,6 +13,7 @@
 //! | [`adapter`] | [`MemberHarnessContext`], [`MemberHarnessFactory`], [`HarnessMemberRuntime`] |
 //! | [`mapping`] | state/round/chunk projections onto the team vocabulary |
 //! | [`checkpoint`] | [`NativeCheckpoint`], the portable member snapshot |
+//! | [`checkpoint_store`] | per-member checkpoint persistence, policy and the protocol sink |
 //! | [`native`] | [`NativeMemberFactory`], [`ModelResolver`], [`EnvModelResolver`] |
 //!
 //! The harness handle itself is `Arc<dyn openjiuwen_harness_protocol::HarnessProtocol>`; the
@@ -20,10 +21,15 @@
 //! that protocol. Distributed/external harness modes are not part of this module.
 pub mod adapter;
 pub mod checkpoint;
+pub mod checkpoint_store;
 pub mod mapping;
 pub mod native;
 pub use adapter::{HarnessMemberRuntime, MemberHarnessContext, MemberHarnessFactory};
 pub use checkpoint::NativeCheckpoint;
+pub use checkpoint_store::{
+    CheckpointResume, FileMemberCheckpointStore, InMemoryMemberCheckpointStore,
+    MemberCheckpointPolicy, MemberCheckpointRecord, MemberCheckpointSink, MemberCheckpointStore,
+};
 pub use mapping::{
     chunk_from_event, is_terminal_event, round_from_event, state_from_event,
     state_to_execution_status, state_to_member_status, CHUNK_LLM_OUTPUT, CHUNK_LLM_REASONING,

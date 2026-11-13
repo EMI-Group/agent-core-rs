@@ -1,9 +1,10 @@
 //! Running a compiled workflow: blocking invoke, frame streaming, and HITL resume.
 //!
 //! Both entry points share the same wiring: merge the run inputs into the session's
-//! global lane (Python's `commit_user_inputs`), seed the interaction state from
-//! [`WorkflowRunOptions::interactive`], compile one graph for the run, and execute it
-//! with a cancellation token, a superstep budget, and a timeout.
+//! global lane (Python's `commit_user_inputs`), seed the interaction state with the
+//! replayed [`WorkflowRunOptions::answers`] and then the newly supplied
+//! [`WorkflowRunOptions::interactive`] answers, compile one graph for the run, and execute
+//! it with a cancellation token, a superstep budget, and a timeout.
 //!
 //! - **invoke** waits for the run and projects it into a [`WorkflowOutput`]. An interrupt
 //!   becomes `INPUT_REQUIRED` carrying the interaction wires and keeps the pre-superstep
@@ -89,6 +90,7 @@ impl CompiledWorkflow {
                 session.update_state(inputs.clone()).await?;
             }
             let interactions = Arc::new(InteractionState::new());
+            interactions.append(&options.answers);
             if let Some(interactive) = options.interactive.as_ref() {
                 interactions.seed(interactive);
             }
@@ -209,6 +211,7 @@ async fn run_blocking(
     }
 
     let interactions = Arc::new(InteractionState::new());
+    interactions.append(&options.answers);
     if let Some(interactive) = options.interactive.as_ref() {
         interactions.seed(interactive);
     }
@@ -282,8 +285,10 @@ async fn run_blocking(
 /// The interaction wires an interrupted run reports: `{"type", "index", "payload"}` frames.
 ///
 /// Draining here (instead of in the node adapter) keeps the interrupt in the graph's
-/// failure path, which is what stores the pre-superstep boundary `resume` needs.
-fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
+/// failure path, which is what stores the pre-superstep boundary `resume` needs. The
+/// payload is `{"id", "index", "question"}` per pending interaction; `crate::single` calls
+/// this same builder so a single-component call reports identical wires.
+pub(crate) fn interaction_wires(interactions: &InteractionState) -> Vec<Value> {
     interactions
         .drain_pending()
         .into_iter()

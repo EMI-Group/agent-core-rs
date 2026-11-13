@@ -725,6 +725,40 @@ async fn a_video_task_that_never_finishes_times_out_without_hanging() {
 }
 
 #[tokio::test]
+async fn a_poll_that_outlasts_the_budget_reports_the_task_timeout() {
+    // The poll request carries the remaining budget as its own timeout, so a slow
+    // vendor response can expire client-side first; that is still "the task did
+    // not finish within the budget", never a bare transport timeout.
+    let server = MockServer::start().await;
+    mount_video_submission(&server, "PENDING").await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/task-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(json!({"output": {"task_id": "task-1", "task_status": "PENDING"}})),
+        )
+        .mount(&server)
+        .await;
+    let config = DashScopeConfig::new("test-key")
+        .with_api_base(server.uri())
+        .with_poll_interval(Duration::from_millis(5))
+        .with_task_timeout(Duration::from_millis(100));
+    let client = DashScopeMediaClient::new(config).expect("the client builds");
+    let error = client
+        .generate_video(
+            &[BaseMessage::user("a paper boat")],
+            VideoRequest::new("wan2.6-t2v"),
+        )
+        .await
+        .expect_err("the budget elapses");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(
+        error.to_string().contains("did not finish"),
+        "error: {error}"
+    );
+}
+#[tokio::test]
 async fn a_synchronously_succeeded_video_submission_skips_polling() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

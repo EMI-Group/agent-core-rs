@@ -14,8 +14,8 @@ use futures::stream::BoxStream;
 use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput};
 use openjiuwen_common::error::{ErrorKind, Result};
 use openjiuwen_runner::{
-    AgentSpawner, MessageHandler, QueueMessage, RunOptions, Runner, RunnerConfig, SpawnAgentKind,
-    SpawnSpec, SpawnedAgent,
+    AgentSpawner, MessageHandler, MessageQueueConfig, MessageQueueKind, QueueMessage, RunOptions,
+    Runner, RunnerConfig, SpawnAgentKind, SpawnSpec, SpawnedAgent,
 };
 use openjiuwen_security::{
     GuardrailContext, GuardrailPipeline, PromptInjectionGuardrail, RiskLevel, ScanStage,
@@ -292,6 +292,65 @@ async fn release_deletes_the_session_checkpoints() {
 async fn release_without_a_checkpointer_is_a_no_op() {
     let runner = Runner::new();
     runner.release("s1").await.unwrap();
+}
+
+// ---------------------------------------------------- deferred transports --
+
+/// A deferred queue backend is a typed error, never a silent in-memory
+/// downgrade: the runner reports it from construction on, and `start` refuses.
+#[tokio::test]
+async fn a_deferred_message_queue_transport_refuses_start() {
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let runner = Runner::with_config(RunnerConfig::default().with_message_queue(
+            MessageQueueConfig {
+                kind,
+                ..MessageQueueConfig::default()
+            },
+        ));
+        let error = runner
+            .message_queue()
+            .publish("inbox", QueueMessage::new(json!(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains(kind.as_str()));
+
+        let error = runner.start().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let text = error.to_string();
+        assert!(text.contains(kind.as_str()), "names the transport: {text}");
+        assert!(!runner.is_started());
+    }
+}
+
+/// `distributed_mode` is configuration a host may build and inspect, but this
+/// build has no distributed transport, so `start` refuses instead of quietly
+/// running in-process under a distributed name.
+#[tokio::test]
+async fn a_distributed_runner_refuses_to_start() {
+    let runner = Runner::with_config(RunnerConfig::default().with_distributed_mode(true));
+    assert!(runner.config().distributed_mode, "the flag is preserved");
+
+    let error = runner.start().await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let text = error.to_string();
+    assert!(text.contains("drunner"), "names the seam: {text}");
+    assert!(text.contains("distributed"), "names the mode: {text}");
+    assert!(!runner.is_started(), "a refused start leaves it stopped");
+
+    // The rest of the facade still works: execution paths never need `start`.
+    assert!(!runner.message_queue().is_started());
+    assert!(runner.resource_mgr().is_empty());
+}
+
+#[tokio::test]
+async fn with_config_accepts_a_non_distributed_config() {
+    let config = RunnerConfig::default().with_distributed_mode(false);
+    let runner = Runner::with_config(config);
+    runner.start().await.unwrap();
+    assert!(runner.is_started());
+    runner.stop().await.unwrap();
+    assert!(!runner.is_started());
 }
 
 // --------------------------------------------------------------- singleton --

@@ -28,11 +28,13 @@ The concrete crates stay canonical for documentation, semver, behavior and tests
 Every alias names the same item as the concrete crate; `tests/module_paths.rs` proves identity via `TypeId` and function-pointer equality.
 `core` is a whole-crate alias, so the kernel umbrella's `controller`, `kv_cache` and `operator` packages are reachable as `openjiuwen::core::<module>` alongside every other kernel module.
 `crate_name()` returns `"openjiuwen"` and is `#[must_use] pub const fn`.
+`VERSION: &str = env!("CARGO_PKG_VERSION")` is the mirror of Python's `openjiuwen.__version__`; Python's top-level `__init__.py` exports nothing else, so `VERSION` plus the aliases is the complete top-level surface.
 
 ### prelude
 
 `openjiuwen::prelude` re-exports the most-used items for `use openjiuwen::prelude::*;`.
 It is convenience only: no new types, no behavior, and no stability promise beyond the items it forwards.
+Beyond the `a2a` and `otel` items it forwards, the prelude is feature-free: Python's top-level `__init__.py` exports only `__version__` (mirrored by `VERSION`), so feature-gated trees are reached by module path.
 
 | Item | Canonical path |
 | --- | --- |
@@ -63,37 +65,72 @@ The prelude is capped at ~40 items so `use openjiuwen::prelude::*;` stays unpoll
 
 ### Feature matrix
 
-| Feature | Default | Enables | Effect |
+Dependencies are non-optional and taken with their own default features, so every forwarded feature is additive: `openjiuwen-harness`'s `native` and `openjiuwen-harness-providers`'s `native` always apply, and `openjiuwen-foundation`'s `mcp`/`tiktoken` defaults cannot be switched off from here.
+Every feature that is off by default keeps the default build free of network access and external services.
+
+Harness and providers:
+
+| Feature | Default | Forwards to | Effect |
 | --- | --- | --- | --- |
 | `native` | yes | `openjiuwen-harness/native`, `openjiuwen-harness-providers/native` | in-process native `DeepAgent` harness and provider |
-| `otel` | no | `openjiuwen-extensions/otel`, `openjiuwen-core/otel` | live OpenTelemetry exporters and sink, plus the kernel session trace-sink hook (`core::session::install_trace_sink` really installs the sink) |
-| `a2a` | no | `openjiuwen-extensions/a2a` | Agent-to-Agent client/server modules |
-| `sqlite` | no | `openjiuwen-extensions/sqlite`, `openjiuwen-symphony/sqlite` | optional SQLite checkpointer, stores, and asset store |
-| `live-tests` | no | `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests` | opt-in network/vendor test gates |
+| `native-v2` | no | `openjiuwen-harness-providers/native-v2` | the agent-teams-hosted `native_v2` provider at `harness_providers::providers::native_v2` |
+| `vendor` | no | `openjiuwen-harness-providers/vendor` | registers the vendor providers `claudecode`, `codex`, `dsh`, each still answering `Unsupported` when driven |
+| `browser` | no | `openjiuwen-harness/browser` | the `browser` subagent preset, which reports its missing implementation as `Unsupported` |
+| `cua` | no | `openjiuwen-harness/cua` | the `cua` subagent preset, which reports its missing implementation as `Unsupported` |
+| `mobile` | no | `openjiuwen-harness/mobile` | the `mobile` subagent preset, which reports its missing implementation as `Unsupported` |
+| `notify` | no | `openjiuwen-harness/notify` | activates the workspace file-watcher dependency; gates no source, so it has no umbrella-visible type |
 
-The default build needs no network and no external service: every feature above is additive and off by default except `native`.
+Storage:
+
+| Feature | Default | Forwards to | Effect |
+| --- | --- | --- | --- |
+| `sqlite` | no | `openjiuwen-foundation/sqlite`, `openjiuwen-session/sqlite`, `openjiuwen-memory/sqlite`, `openjiuwen-extensions/sqlite`, `openjiuwen-symphony/sqlite`, `openjiuwen-agent-teams/sqlite` | SQLite checkpointer, key-value/document stores, memory stores, capability-asset store, and team store |
+
+Transports and remote backends:
+
+| Feature | Default | Forwards to | Effect |
+| --- | --- | --- | --- |
+| `a2a` | no | `openjiuwen-extensions/a2a` | Agent-to-Agent client/server modules |
+| `mcp` | no | `openjiuwen-extensions/mcp` | the extensions' MCP adapter surface, which gates no source; agent-teams' MCP server is compiled regardless because that crate's `mcp` default applies |
+| `redis` | no | `openjiuwen-extensions/redis` | the Redis store surface, whose construction returns `Unsupported` |
+| `pulsar` | no | `openjiuwen-extensions/pulsar` | the Pulsar message-queue surface, whose construction returns `Unsupported` |
+| `distributed` | no | `openjiuwen-agent-teams/distributed` | the distributed `PyZmqMessager` seam, which rejects at construction |
+
+Observability, sandbox, test gates:
+
+| Feature | Default | Forwards to | Effect |
+| --- | --- | --- | --- |
+| `otel` | no | `openjiuwen-extensions/otel`, `openjiuwen-core/otel`, `openjiuwen-session/otel`, `openjiuwen-agent-teams/otel` | live OpenTelemetry exporters and sink, the kernel trace-sink hook (`core::session::install_trace_sink` really installs the sink), and the team OTel span sink at `agent_teams::observability::OtelSpanSink` |
+| `sandbox` | no | `openjiuwen-sysop/sandbox` | the sandbox provider transport behind `core::sys_operation::sandbox` |
+| `live-tests` | no | `openjiuwen-foundation/live-tests`, `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests` | opt-in network/vendor test gates |
+
+Deliberately not forwarded: `openjiuwen-foundation`'s `mcp` and `tiktoken` are default-on and every dependency is taken with default features, so they cannot be switched off through the umbrella.
 
 ## Constraints
 
 - Re-exports only: no logic, no new public data types, no `unsafe` (`#![forbid(unsafe_code)]`); the `thiserror`/`serde` stack is not a dependency of this crate.
 - `publish = false` until the SDK API stabilizes; sibling crates and `docs/` are never edited from here.
-- Feature names in this crate map to existing sibling features; adding a feature requires verifying the sibling's feature name first and keeping the default build offline.
+- Every feature in this crate forwards to an existing sibling feature and mirrors it under the same name where the sibling uses one; the only rename is `native-v2` → `openjiuwen-harness-providers/native-v2`.
 - `openjiuwen-harness-providers` is a non-optional dependency (`Cargo.toml:28`; workspace entry `../Cargo.toml:64` sets no `default-features = false`), so that crate's own `default = ["native"]` always applies and the umbrella's `native` feature cannot actually disable the providers' native provider (same for `openjiuwen-harness`, workspace `../Cargo.toml:63`).
-- No feature of this crate enables `openjiuwen-harness-providers/vendor`, so the vendor providers (`claudecode`, `codex`, `dsh`) are unreachable through the umbrella; a consumer must depend on `openjiuwen-harness-providers` directly with `features = ["vendor"]`.
+- The `vendor` feature enables `openjiuwen-harness-providers/vendor`, so `claudecode`, `codex` and `dsh` register through the umbrella; driving them still returns `Unsupported`.
+- `notify` and `mcp` forward to siblings whose features activate only optional dependencies (`openjiuwen-harness/notify`, `openjiuwen-extensions/mcp`), so they gate no source here or there.
+- `openjiuwen-foundation`'s `mcp` and `tiktoken` defaults are always on: the umbrella has no feature that could disable them.
 - Python package spelling (`harness_protocol`, `agent_teams`, `sys_operation`) is mirrored even where it repeats the crate suffix, so `clippy::module_name_repetitions` is allowed crate-wide.
 - The crate-level doc example is the "getting started" block: it must compile as a doctest and touch no network.
 - Concrete crates are canonical: documentation lives there; this file documents only the facade.
 
 ## Notes for Agents
 
-- `harness_providers` (`src/lib.rs:87`) and `harness` (`src/lib.rs:85`) are unconditional `pub use` aliases with no `#[cfg]`; only the prelude's `a2a` / `otel` items and the corresponding `tests/module_paths.rs` cases are feature-gated.
+- `harness_providers` (`src/lib.rs`) and `harness` (`src/lib.rs`) are unconditional `pub use` aliases with no `#[cfg]`; among the prelude items only `a2a` and `otel` carry a feature gate.
 - The provider registry is reached as `openjiuwen::harness_providers::{create_harness, resolve_provider, ...}`; `create_harness` is `openjiuwen_harness_providers::factory::create_harness` (proved by `tests/module_paths.rs::harness_providers_alias_points_at_openjiuwen_harness_providers`) and the prelude forwards it ungated (`src/prelude.rs:42`).
 - `TeamAgent` is defined in `openjiuwen_agent_teams::runtime::team_agent` and re-exported from both `agent_teams::runtime` and the crate root, so the prelude forwards the crate-root spelling.
 - Every prelude item has a verified canonical path; `Role` and `JsonObject` are intentionally not in the prelude and are addressed by their full paths in docs and tests.
 - `ReActAgent`/`ReActAgentConfig` are forwarded from `core::single_agent` (`openjiuwen_agent::react`) because examples and construction code need them without spelling the kernel path; `tests/module_paths.rs::prelude_resolves_the_agent_construction_items` proves identity for the agent-construction items and the `ContextEngine`/`LongTermMemory`/`Runner` lifecycle items.
 - `LlmAgent` is forwarded with the crate-root spelling (`openjiuwen_agent::LlmAgent`); `core::application` exposes the same type as `LLMAgent`, so the prelude deliberately carries only one of the two spellings.
 - `openjiuwen::core::session` is the whole `openjiuwen-session` crate root (`openjiuwen-core/src/lib.rs:67` re-exports the crate as `session`), so `AgentSession`, `AgentSessionOptions`, `create_agent_session`, `Session`, `SessionController`, `DiskSessionStore`, `Version`, `SessionType`, `SessionConfig`, `Checkpointer`, `MemoryCheckpointer`, `FileCheckpointer`, `Checkpoint`, `CheckpointMeta`, `CheckpointerConfig`, `create_checkpointer`, `StreamItem` and `StreamEvent` are all reachable directly at `openjiuwen::core::session::<Name>`; the nested `session_controller::*`, `vcs::*`, `checkpoint::*` and inner `session::*` modules are alternative spellings of the same items.
-- The `sqlite` feature is wired to `openjiuwen-extensions/sqlite` and `openjiuwen-symphony/sqlite`; `cargo check -p openjiuwen --features sqlite` succeeds.
+- The `sqlite` feature is wired to `openjiuwen-foundation`, `openjiuwen-session`, `openjiuwen-memory`, `openjiuwen-extensions`, `openjiuwen-symphony` and `openjiuwen-agent-teams`; `cargo check -p openjiuwen --features sqlite` succeeds.
+- Feature gates per dependency: `native-v2` and `vendor` reach `harness_providers::providers::{native_v2}` and `providers::{vendor, claudecode, codex, dsh}`; `browser`/`cua`/`mobile` reach `harness::subagents::SubAgentPreset`; `sqlite` reaches `core::session::checkpoint::SqliteCheckpointer`, `core::foundation::store::SqliteKvStore`, `extensions::store::SqliteKvStore`, `agent_teams::storage::SqliteTeamStore` and the `sqlite` constructors of `core::memory::store::MemoryStores`/`symphony::store::KvAssetStore`; `redis`/`pulsar` reach `extensions::store::redis` and `extensions::message_queue::{PulsarConfig, PulsarMessageQueue}`; `distributed` reaches `agent_teams::messager::PyZmqMessager`; `sandbox` reaches `core::sys_operation::sandbox::provider::SandboxProviderRegistry`; `otel` reaches `agent_teams::observability::{OtelSpanSink, OtelHooks, SpanRecord}` in addition to the kernel trace-sink hook.
+- The prelude stays feature-free apart from `a2a`/`otel`: Python's top-level `openjiuwen/__init__.py` exports only `__version__`, so feature-gated trees are reached by module path rather than through `prelude::*`.
 - `core` is `pub use openjiuwen_core as core` (`src/lib.rs:82`) and that crate aliases the whole foundation crate (`pub use openjiuwen_foundation as foundation`, `../openjiuwen-core/src/lib.rs:62`), so `openjiuwen::core::foundation::…` is the full `openjiuwen_foundation` module tree, not a hand-written shim.
 - Because `core` is a whole-crate alias, every kernel module tree the kernel umbrella grows is reachable without a change here: `core::{controller, kv_cache, operator}` (globbed from `openjiuwen-agent`), `core::session::{session_controller, vcs}`, `core::runner::{pool, resources, callback, hitl, monitor, spawn}`, `core::memory::{lite, analyzer, external, team, dreaming}` and the rest of the `§ Notable module trees` table in `src/lib.rs`.
 - Tools resolve at both depths: `openjiuwen::core::foundation::{Tool, ToolCard, ToolContext, ToolOutput, FunctionTool, FunctionToolBuilder, ToolHandler, schema_for, RestfulApiTool, openai_tools}` (flat, `../openjiuwen-foundation/src/lib.rs:102`) and `openjiuwen::core::foundation::tool::{…same items…}` (`../openjiuwen-foundation/src/tool/mod.rs:31`); `Tool`/`FunctionTool` are also in the prelude (`src/prelude.rs:29`).
@@ -101,17 +138,25 @@ The default build needs no network and no external service: every feature above 
 
 ## Routing Table
 
-- `./src/lib.rs` → crate docs (Python→Rust table, feature matrix, getting-started doctest), module aliases, `crate_name()`
-- `./src/prelude.rs` → curated convenience re-exports and the "prelude is convenience only" note
-- `./Cargo.toml` → dependency list and the feature mapping table
-- `./tests/module_paths.rs` → identity checks for one representative item per module alias, the `core` `controller`/`kv_cache`/`operator` packages, one item per grown module tree, prelude compile/identity checks (common, agent-construction, extended items), plus feature-gated `a2a` / `otel` checks and the `otel` kernel trace-sink hook
+- `./src/lib.rs` → crate docs (Python→Rust table, notable module trees, per-block feature matrix, getting-started doctest), module aliases, `crate_name()`, `VERSION`
+- `./src/prelude.rs` → curated convenience re-exports, the "prelude is convenience only" note, and the "why the prelude stays feature-free" paragraph
+- `./Cargo.toml` → dependency list and the feature forwarding table
+- `./tests/module_paths.rs` → identity checks for one representative item per module alias, the `core` `controller`/`kv_cache`/`operator` packages, one item per grown module tree, prelude compile/identity checks (common, agent-construction, extended items), the crate `VERSION`, plus one feature-gated test per umbrella feature (`native-v2`, `vendor`, `sqlite`, `redis`, `pulsar`, `mcp`, `distributed`, `sandbox`, `otel`, `browser`, `cua`, `mobile`)
 
 ## Test Strategy
 
-- `tests/module_paths.rs` asserts `TypeId` identity (and `std::ptr::eq` for functions) between each alias and the concrete crate, so a mis-pointed alias fails loudly; `a2a` and `otel` items are behind `#[cfg(feature = ...)]`.
-- `core_alias_exposes_the_new_kernel_modules` and `every_public_module_tree_is_reachable` walk the kernel and product-framework subtrees (`core::session::{session_controller, vcs}`, `core::runner::{pool, resources, hitl, monitor, spawn}`, `core::memory::{lite, analyzer, external, team, dreaming}`, `core::retrieval::{sparse, rewrite}`, `harness::{lsp, spec, worktree, subagents, tools}`, `agent_teams::{org, kv_cache, models, monitor, observability}`, `symphony::{discovery, experience, flow, llm, object_artifact}`, `dev_tools::{judge, tune, skill_creator, agent_builder}`, `extensions::context_evolver`), so a module tree that stops being re-exported fails there; the `same_paths!` helper keeps each check to one line.
+- `tests/module_paths.rs` asserts `TypeId` identity (and `std::ptr::eq` for functions) between each alias and the concrete crate, so a mis-pointed alias fails loudly; `a2a` and every dependency-forwarded item sit behind `#[cfg(feature = ...)]`.
+- `core_alias_exposes_the_new_kernel_modules` and `every_public_module_tree_is_reachable` walk the kernel and product-framework subtrees (`core::session::{session_controller, vcs}`, `core::runner::{pool, resources, hitl, monitor, spawn}`, `core::memory::{lite, analyzer, external, team, dreaming}`, `core::retrieval::{sparse, rewrite, parsing}`, `harness::{lsp, spec, worktree, subagents, tools}`, `agent_teams::{attach, org, kv_cache, models, monitor, observability}`, `symphony::{discovery, experience, flow, llm, object_artifact}`, `dev_tools::{judge, tune, skill_creator, agent_builder}`, `extensions::context_evolver`), so a module tree that stops being re-exported fails there; the `same_paths!` helper keeps each check to one line.
+- `rsi_alias_points_at_openjiuwen_rsi` also proves `rsi::auto_harness::{AutoHarnessConfig, AutoHarnessOrchestrator}` is `openjiuwen_rsi::harness_rsi::auto_harness::{…}`.
 - `prelude_resolves_the_common_items`, `prelude_resolves_the_agent_construction_items` and `prelude_resolves_the_extended_items` import `openjiuwen::prelude::*` and assert both usability and `TypeId` identity against the concrete crates, so a dropped or mis-pointed prelude export fails loudly.
-- `otel_feature_reaches_the_kernel_trace_sink_hook` is `#[cfg(feature = "otel")]` and proves the umbrella forwards `openjiuwen-core/otel`, so `core::session::install_trace_sink` is the session crate's installed-sink function.
+- `crate_version_is_exported` asserts `VERSION` equals `CARGO_PKG_VERSION` and is non-empty.
+- `otel_feature_reaches_the_kernel_trace_sink_hook` is `#[cfg(feature = "otel")]` and proves the umbrella forwards `openjiuwen-core/otel`, so `core::session::install_trace_sink` is the session crate's installed-sink function; `otel_feature_reaches_the_agent_teams_span_sink` proves the `openjiuwen-agent-teams/otel` half.
+- `native_v2_feature_reaches_the_agent_teams_hosted_provider` and `vendor_feature_reaches_the_vendor_providers` assert type identity *and* that `harness_providers::providers::builtin_provider` returns `Some(Ok(_))` for `native_v2`, `claudecode`, `codex` and `dsh`.
+- `sqlite_feature_reaches_every_backend` covers the checkpointer, the key-value store (both spellings), the team store, and binds the `MemoryStores::sqlite`/`KvAssetStore::sqlite` function items without opening a database.
+- `redis_feature_reaches_the_store_surface` and `pulsar_feature_reaches_the_message_queue_surface` assert type identity only; both backends reject at construction.
+- `mcp_feature_is_wired_and_the_team_mcp_surface_resolves` keeps the (currently source-free) extensions feature exercised and asserts the always-on `agent_teams::mcp` server surface matches the concrete crate.
+- `distributed_feature_reaches_the_messager_seam` and `sandbox_feature_reaches_the_provider_registry` assert the `PyZmqMessager` and `SandboxProviderRegistry` types.
+- `browser_feature_reaches_the_reporting_preset`, `cua_feature_reaches_the_reporting_preset` and `mobile_feature_reaches_the_reporting_preset` call `harness::subagents::build_preset` and assert the `Unsupported` message names the preset (`browser_agent`/`cua_agent`/`mobile_gui_agent`) and its cargo feature; they touch no network or filesystem.
 - The crate-level getting-started example is the doctest that guards the primary public paths (`cargo test -p openjiuwen`).
 - No unit tests: the facade has no behavior; behavior is tested in the concrete crates.
-- Definition of done: `cargo fmt -p openjiuwen`, `cargo test -p openjiuwen`, `cargo test -p openjiuwen --features otel,a2a,sqlite`, `cargo clippy -p openjiuwen --all-targets -- -D warnings` (default and `--all-features`), and `cargo doc -p openjiuwen --no-deps` (default and `--all-features`) all clean.
+- Definition of done: `cargo fmt -p openjiuwen`, `cargo test -p openjiuwen` (default and `--all-features`), `cargo clippy -p openjiuwen --all-targets -- -D warnings` (default and `--all-features`), `cargo doc -p openjiuwen --no-deps` (default and `--all-features`), and a `cargo check -p openjiuwen --no-default-features --features <one>` sweep over every feature.

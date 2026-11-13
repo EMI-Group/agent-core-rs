@@ -8,11 +8,16 @@
 //!    dispatch/bootstrap pairing.
 //! 2. The runtime mirror ([`TeamSpec`](crate::schema::TeamSpec)), the resolved language, the parsed
 //!    metadata knobs (spawn mode, isolation, fork, KV cache, attach).
-//! 3. One store (injected, never a second one), one in-process transport, one activity registry,
-//!    one signals bundle (observability hooks + monitor), one model router, one KV-cache registry.
+//! 3. One store — an injected store wins over `spec.storage`, while a non-memory `spec.storage`
+//!    opens its own backend through `crate::storage::open_store` (with a warning when an injected
+//!    store overrode it) — plus one in-process transport, one activity registry, one signals bundle
+//!    (observability hooks + monitor), one model router, one KV-cache registry, and the team-shared
+//!    member checkpoint store resolved from `metadata["checkpoint"]` (injected into the dependencies
+//!    so every member, leader included, persists into it).
 //! 4. [`TeamBackend`] over the store, board, transport, spawner and workspace provider; the team
 //!    row is written before any member row; the organisation layer is bound when configured.
-//! 5. The leader row, its workspace and its harness (with the pool-selected model), then the
+//! 5. The leader row, its workspace and its harness (with the pool-selected model and its own
+//!    checkpoint identity — derived member session id + card id, policy, store and cwd), then the
 //!    observer that feeds status, rounds, chunks, observability and the monitor.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
 //! 7. One bus subscription for the leader (drained only by [`leader`]) and the interaction
@@ -40,9 +45,10 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::backend::TeamBackend;
+use super::checkpoints::{member_card_id, team_checkpoint_store, wire_runtime};
 use super::deps::TeamBuildDeps;
 use super::observability_bind::TeamSignals;
 use super::observer::MemberStreamObserver;
@@ -50,8 +56,8 @@ use super::org_bind::{org_task_sink, OrgBinding};
 use super::routing::TeamModelRouter;
 use super::spawner::TeamMemberSpawner;
 use super::spec_meta::{
-    attach_config, fork_directive, isolation_mode, kv_cache_config, organization_block,
-    spawn_options,
+    attach_config, checkpoint_config, fork_directive, isolation_mode, kv_cache_config,
+    organization_block, spawn_options,
 };
 use super::team_agent::{SpecBuild, TeamAgent, TeamAgentInner};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
@@ -60,9 +66,10 @@ use crate::kv_cache::{MemberCacheKey, TeamKvCacheAffinity};
 use crate::member::{MemberActivityRegistry, MemberRuntime, MemberSpawner, TeamMember};
 use crate::messager::create_messager;
 use crate::schema::{
-    DeepAgentSpec, Language, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSpec, TeamTopic,
+    DeepAgentSpec, Language, StorageSpec, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSpec,
+    TeamTopic,
 };
-use crate::storage::{MemberRecord, TeamInfoRecord, TeamStore};
+use crate::storage::{open_store, MemberRecord, TeamInfoRecord, TeamStore, MEMORY_STORAGE_KIND};
 use crate::taskboard::{TaskBoard, TaskBoardLimits};
 use crate::workspace::WorkspaceRequest;
 
@@ -72,6 +79,10 @@ const LEADER_KEY: &str = "leader";
 const LEADER_MISSING_MESSAGE: &str = "agents dict must contain a 'leader' key";
 /// Prefix of the session id a built team mints for itself.
 const SESSION_PREFIX: &str = "session_";
+/// Storage kind of the SQLite backend (`crate::storage::open_store` accepts the same literal).
+const SQLITE_KIND: &str = "sqlite";
+/// `StorageSpec::params` keys that may name the SQLite database, in precedence order.
+const SQLITE_TARGET_PARAMS: [&str; 3] = ["path", "url", "database"];
 
 #[async_trait]
 impl SpecBuild for TeamAgentSpec {
@@ -101,7 +112,7 @@ impl SpecBuild for TeamAgentSpec {
         team_spec.language = Some(language.clone());
         let session_id = format!("{SESSION_PREFIX}{}", uuid_hex());
         let messager = create_messager(&self.transport)?;
-        let store = Arc::clone(&deps.store);
+        let store = resolve_store(self, &deps)?;
         let activity = Arc::new(MemberActivityRegistry::new());
         let routing = Arc::new(TeamModelRouter::for_spec(self)?);
         let kv_cache = deps
@@ -109,9 +120,15 @@ impl SpecBuild for TeamAgentSpec {
             .clone()
             .unwrap_or_else(|| Arc::new(TeamKvCacheAffinity::new(kv_cache_config(self))));
         let signals = TeamSignals::new(team_name.clone(), deps.observability_hooks.clone());
-        let deps = deps
+        let checkpoint = checkpoint_config(self);
+        let mut deps = deps
             .with_routing(Arc::clone(&routing))
             .with_kv_cache(Arc::clone(&kv_cache));
+        // Resolve the team-shared checkpoint store once, before the spawner is built: the cloned
+        // `deps` it receives carries the same store, so the leader and every teammate share it.
+        if let Some(store) = team_checkpoint_store(&checkpoint, deps.checkpoints.as_ref()) {
+            deps = deps.with_checkpoint_store(store);
+        }
         let options = spawn_options(self);
         let fork = fork_directive(self);
         let isolation = isolation_mode(self);
@@ -173,22 +190,28 @@ impl SpecBuild for TeamAgentSpec {
                 isolation,
             })
             .await?;
+        let card_id = member_card_id(&leader_effective, &leader_name);
+        let member_session = MemberHarnessContext::member_session_id(&session_id, &leader_name);
+        let context = MemberHarnessContext::new(
+            team_name.clone(),
+            leader_name.clone(),
+            member_session.clone(),
+            workspace.root.clone(),
+            language.clone(),
+            self.teammate_mode,
+        )
+        .with_card_id(card_id.clone());
         let harness = deps
             .harness_factory
-            .create(
-                &leader_effective,
-                &MemberHarnessContext::new(
-                    team_name.clone(),
-                    leader_name.clone(),
-                    session_id.clone(),
-                    workspace.root.clone(),
-                    language.clone(),
-                    self.teammate_mode,
-                ),
-            )
+            .create(&leader_effective, &context)
             .await?;
-        let runtime: Arc<dyn MemberRuntime> =
-            Arc::new(HarnessMemberRuntime::new(harness, session_id.clone()));
+        let runtime: Arc<dyn MemberRuntime> = Arc::new(wire_runtime(
+            HarnessMemberRuntime::new(harness, member_session),
+            &card_id,
+            &checkpoint,
+            deps.checkpoints.as_ref(),
+            &workspace.root,
+        ));
         leader_member.attach_runtime(Arc::clone(&runtime));
         let model = leader_selection.model_name().to_owned();
         let _identity = kv_cache.register_member(
@@ -264,6 +287,79 @@ impl SpecBuild for TeamAgentSpec {
 fn resolve_language(deps: &TeamBuildDeps, declared: Option<&str>) -> String {
     let value = deps.language.as_deref().or(declared);
     Language::resolve(value).to_owned()
+}
+
+/// Resolves the team store, letting an injected store win over the blueprint's [`StorageSpec`].
+///
+/// Precedence, in the order the build path applies it:
+///
+/// 1. [`TeamBuildDeps::has_injected_store`] — the injected store is used verbatim. A spec that also
+///    names a non-memory kind is logged (`warn!`) and ignored, so a host that supplied a store never
+///    trips over a backend this build cannot open.
+/// 2. A blank or `memory` spec kind — [`TeamBuildDeps::store`] is reused, exactly as the in-memory
+///    default intends.
+/// 3. Any other kind — [`open_store`] opens the named backend, so `postgresql`/`mysql`/unknown kinds
+///    propagate their typed [`Error::Unsupported`].
+///
+/// A `sqlite` spec additionally gets the parent directory of its path-shaped target created
+/// best-effort first (see [`ensure_sqlite_parent`]).
+fn resolve_store(spec: &TeamAgentSpec, deps: &TeamBuildDeps) -> Result<Arc<dyn TeamStore>> {
+    let kind = spec.storage.kind.trim();
+    if deps.has_injected_store() {
+        if !kind.is_empty() && kind != MEMORY_STORAGE_KIND {
+            warn!(
+                store = deps.store.name(),
+                spec_kind = kind,
+                "the injected team store wins over the blueprint's storage spec; the spec kind is \
+                 ignored"
+            );
+        }
+        return Ok(Arc::clone(&deps.store));
+    }
+    if kind.is_empty() || kind == MEMORY_STORAGE_KIND {
+        return Ok(Arc::clone(&deps.store));
+    }
+    if kind == SQLITE_KIND {
+        ensure_sqlite_parent(&spec.storage);
+    }
+    open_store(&spec.storage)
+}
+
+/// Creates the parent directory of a path-shaped SQLite target, best-effort.
+///
+/// SQLite creates the database file but not the directory holding it, so the first write of a
+/// freshly configured team would fail on a nested path. Only a filesystem path is touched: an empty
+/// target, an in-memory target and every `sqlite:` URL form are left to the backend. A creation
+/// failure is logged and never propagated — [`open_store`] reports the real connect error.
+fn ensure_sqlite_parent(spec: &StorageSpec) {
+    let Some(raw) = SQLITE_TARGET_PARAMS
+        .iter()
+        .find_map(|key| spec.params.get(*key)?.as_str())
+    else {
+        return;
+    };
+    let target = raw.trim();
+    if target.is_empty()
+        || target == ":memory:"
+        || target.contains("mode=memory")
+        || target.starts_with("sqlite:")
+    {
+        return;
+    }
+    let Some(parent) = std::path::Path::new(target).parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        warn!(
+            target,
+            parent = %parent.display(),
+            %error,
+            "could not create the sqlite database directory; the store will report the connect error"
+        );
+    }
 }
 
 /// Builds the persisted team row from the blueprint and its runtime mirror.
@@ -370,6 +466,7 @@ mod tests {
     use crate::runtime::team_agent::test_support::{
         blueprint, built, deps, RecordingWorkspaceProvider, ScriptedFactory,
     };
+    use crate::storage::InMemoryTeamStore;
 
     /// Builds a two-teammate blueprint for the build-path tests.
     fn two_teammates() -> TeamAgentSpec {
@@ -411,7 +508,11 @@ mod tests {
         assert_eq!(card.name, "alpha");
         assert_eq!(card.agent_cards.len(), 3);
         assert_eq!(card.agent_cards[0].name, "alpha_boss");
-        assert_eq!(agent.runtime().session_id(), agent.session_id());
+        assert_eq!(
+            agent.runtime().session_id(),
+            format!("{}:{}", agent.session_id(), agent.member_name()),
+            "the leader's runtime runs under its derived member session id"
+        );
     }
 
     #[tokio::test]
@@ -485,5 +586,99 @@ mod tests {
             requests[0].session_id, requests[1].session_id,
             "both members run under the team session"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_spec_reuses_the_dependency_store() {
+        let (agent, _factory, _workspace) = built(&blueprint("alpha", "boss", &[])).await;
+        assert_eq!(agent.backend().store().name(), "memory");
+    }
+
+    #[tokio::test]
+    async fn injected_store_wins_over_a_deferred_storage_backend() {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        let store: Arc<dyn TeamStore> = Arc::new(InMemoryTeamStore::new());
+        let mut spec = blueprint("alpha", "boss", &[]);
+        spec.storage.kind = "postgresql".to_owned();
+
+        let agent = spec
+            .build_with(deps(&factory, &workspace).with_store(Arc::clone(&store)))
+            .await
+            .expect("an injected store must bypass the spec's deferred backend");
+
+        assert_eq!(agent.backend().store().name(), "memory");
+        assert!(
+            Arc::ptr_eq(&agent.backend().store(), &store),
+            "the build must use the injected store itself"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_spec_opens_the_named_database_and_creates_its_directory() {
+        let root = std::env::temp_dir().join(format!("openjiuwen-store-{}", uuid_hex()));
+        let database = root.join("nested").join("team.db");
+        let parent = database
+            .parent()
+            .expect("the database path has a parent")
+            .to_path_buf();
+        assert!(!parent.exists(), "the parent directory must not exist yet");
+
+        let mut spec = blueprint("alpha", "boss", &[]);
+        spec.storage.kind = "sqlite".to_owned();
+        spec.storage.params.insert(
+            "path".to_owned(),
+            Value::String(database.to_string_lossy().into_owned()),
+        );
+
+        let agent = blueprint_build(&spec).await;
+        assert_eq!(agent.backend().store().name(), "sqlite");
+        assert!(
+            parent.exists(),
+            "the build creates the sqlite database directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn deferred_storage_backends_fail_with_unsupported() {
+        for kind in ["postgresql", "mysql"] {
+            let mut spec = blueprint("alpha", "boss", &[]);
+            spec.storage.kind = kind.to_owned();
+            let error = blueprint_build_error(&spec).await;
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{kind}: {error}");
+            assert!(error.to_string().contains(kind), "{kind}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_storage_kind_fails_with_unsupported() {
+        let mut spec = blueprint("alpha", "boss", &[]);
+        spec.storage.kind = "oracle".to_owned();
+        let error = blueprint_build_error(&spec).await;
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+        assert!(error.to_string().contains("oracle"), "{error}");
+    }
+
+    /// Builds `spec` over fresh scripted fakes, panicking on a build error.
+    #[cfg(feature = "sqlite")]
+    async fn blueprint_build(spec: &TeamAgentSpec) -> Arc<TeamAgent> {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        spec.build_with(deps(&factory, &workspace))
+            .await
+            .expect("the team did not build")
+    }
+
+    /// Builds `spec` over fresh scripted fakes and returns the build error.
+    async fn blueprint_build_error(spec: &TeamAgentSpec) -> Error {
+        let factory = ScriptedFactory::new();
+        let workspace = RecordingWorkspaceProvider::new();
+        match spec.build_with(deps(&factory, &workspace)).await {
+            Ok(_) => panic!("the build was expected to fail"),
+            Err(error) => error,
+        }
     }
 }

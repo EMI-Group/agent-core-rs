@@ -113,6 +113,8 @@ impl RoutingEntry {
             } else {
                 caller.stop.clone()
             },
+            context_window: caller.context_window.or(base.context_window),
+            reasoning: caller.reasoning.clone().or_else(|| base.reasoning.clone()),
             tools: caller.tools.clone().or_else(|| base.tools.clone()),
             tool_choice: caller
                 .tool_choice

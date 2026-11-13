@@ -17,17 +17,18 @@ Messages and prompts (`prompt`):
 
 Models (`llm`):
 - `Model` trait: `provider()`, `model_name()`, `invoke(&[BaseMessage], &ModelRequestConfig) -> Result<ChatResponse>`, `stream(Vec<BaseMessage>, ModelRequestConfig) -> BoxStream<'static, Result<StreamChunk>>`.
-- `ModelClientConfig`, `ModelRequestConfig` with builders and `from_env()`; `ChatResponse`, `Choice`, `FinishReason`, `StreamChunk`, `AssistantTurn`, `StreamAccumulator`, `ModelExt`.
+- `ModelClientConfig` (including `api_mode: Option<ApiMode>`, `auth_mode: AuthMode`, `endpoint_profile`, and the Python `client_provider`/`custom_headers` decode aliases), `ModelRequestConfig` (including `reasoning`, `context_window`, string-or-array `stop`) with builders and `from_env()`; `ChatResponse`, `Choice`, `FinishReason`, `StreamChunk`, `AssistantTurn`, `StreamAccumulator`, `ModelExt`.
+- A Python `model_dump(mode="json")` decodes directly: durations accept seconds numbers (or the legacy `{secs,nanos}` form) and serialize as seconds, `custom_headers` values accept strings/numbers/booleans, and a top-level `reasoning` intent is consumed by all three protocol builders.
 - `init_model(ModelClientConfig, ModelRequestConfig)`, `init_model_with(provider, model_name)`, `ModelProvider`, `ModelProviderRegistry` (`global()` plus local instances), `register_model_provider`, `provider_profile`, `normalize_provider_name`.
-- Transports: `OpenAiCompatibleClient` (`llm::openai`) and `AnthropicClient` (`llm::anthropic`); the Anthropic projection writes `system` as a block array, the three automatic `cache_control` anchors, inline-or-hoisted mid-conversation system turns, and a reasoning plan resolved from `extra["reasoning"]`.
-- `llm::reasoning`: `ReasoningConfig`, `ReasoningCapability`, `ReasoningProfile`, `ReasoningProtocol`, `ReasoningPlan`, `find_reasoning_profile`, `provider_key_for`, `resolve_reasoning_plan(_for)`, `apply_reasoning_plan(_with)`, the `REASONING_PROFILES`/`MODEL_REASONING_FALLBACKS` tables, and the wire encoders applied to the OpenAI-compatible body when a reasoning intent is present.
+- Transports: `OpenAiCompatibleClient` (`llm::openai`), `AnthropicClient` (`llm::anthropic`), and `OpenAiResponsesClient` (`llm::responses`, `POST {base}/responses` with `input_text`/`input_image`/`function_call` items and `response.*` SSE events); the Anthropic projection writes `system` as a block array, the three automatic `cache_control` anchors, inline-or-hoisted mid-conversation system turns, and a reasoning plan resolved from `extra["reasoning"]`.
+- `llm::reasoning`: `ReasoningConfig`, `ReasoningCapability`, `ReasoningProfile`, `ReasoningProtocol`, `ReasoningPlan`, `find_reasoning_profile`, `provider_key_for`/`provider_key_for_endpoint`, `reasoning_capability(_for_endpoint)`, `resolve_reasoning_plan(_for)`/`resolve_reasoning_plan_with_endpoint`, `apply_reasoning_plan(_with)`, the `REASONING_PROFILES`/`MODEL_REASONING_FALLBACKS` tables, and the wire encoders (including the `endpoint_profile: "vllm"` override) applied to the OpenAI-compatible and Anthropic bodies when a reasoning intent is present.
 - `llm::routing`: `ModelSelection`, `ResolvedModel`/`ResolvedRoute`/`ResolvedModelGroup`, `ResolvedRoutingConfig`, `RoutingStrategy`, `compile_model_selection`, `compile_route`, `resolve_model_group_routes`, `RoutingModel` (ordered-failover/tag-filtered, optional additive `priority`).
-- `llm::oauth`: `OpenAiOAuthClient` (device code, poll, exchange, refresh), `OAuthToken`, `DeviceCode`, `TokenStore` with `InMemoryTokenStore`/`FileTokenStore` and the `$OPENJIUWEN_AUTH_FILE` → `$OPENJIUWEN_HOME/auth.json` → `~/.openjiuwen/auth.json` resolution.
+- `llm::oauth`: `OpenAiOAuthClient` (device code, poll, exchange, refresh with a 120 s skew and the `expires_at` → `expires_in` → previous expiry → JWT `exp` chain; no resolvable expiry means never refresh), `OAuthToken`, `DeviceCode`, `TokenStore` with `InMemoryTokenStore`/`FileTokenStore` and the `$OPENJIUWEN_AUTH_FILE` → `$OPENJIUWEN_HOME/auth.json` → `~/.openjiuwen/auth.json` resolution.
 - `llm::dashscope`: `DashScopeMediaClient` + `DashScopeConfig` for image, speech, and video generation (async video task submission/polling); `ImageRequest`/`SpeechRequest`/`VideoRequest` and their response types.
 - Flat crate-root re-exports (`src/lib.rs`) for the long-standing call sites: `Model`, `ModelExt`, `ChatResponse`, `Choice`, `StreamChunk`, `FinishReason`, `AssistantTurn`, `StreamAccumulator`, `ModelClientConfig`, `ModelRequestConfig`, `BaseMessage`, `MessageContent`, `Role`, `Usage`, `ToolCall`, `ToolCallDelta`, `ToolCallAccumulator`; the module paths (`llm::*`, `prompt::*`) are the canonical form and the only place the new llm modules are surfaced.
 
 Tools (`tool`):
-- `ToolCard` (flat, implements `openjiuwen_common::card::Card`), `ToolInfo`, `ToolExposure`, `ToolExecution`.
+- `ToolCard` (flat, implements `openjiuwen_common::card::Card`; includes Python's `properties` map and serializes the exact Python key set by default), `ToolInfo`, `ToolExposure`, `ToolExecution`.
 - `Tool` trait: `card()`, `invoke(Value, &ToolContext)`, `stream(Value, ToolContext)` (default = single invoke), `render_for_llm(&Value)`.
 - `ToolContext { session_id, invocation_id, cancellation, metadata, timeout }`, `ToolOutput`, `render_payload_text`, `render_tool_output`.
 - `FunctionTool` + `FunctionToolBuilder` (`handler`, `typed_handler`, `input_schema`, `input_schema_for::<T>`), `schema_for::<T>`, `validate_inputs`, `apply_defaults`.
@@ -60,7 +61,7 @@ Storage (`store`):
 - **One `BaseMessage` struct** instead of Python's four role subclasses: role-specific construction lives in constructors; serde rejects nothing and providers never need downcasting. This is a deliberate deviation from the Python class hierarchy.
 - **Flat `ToolCard`** instead of nesting `CardBase` (deviation from `docs/ARCHITECTURE.md` §2.3): `id`, `name`, `description`, `input_params`, policy flags and `metadata` are direct fields and `ToolCard` implements the `Card` trait. Transport details (REST url/method, MCP server) live in the tool struct, matching the Python Card/Config split.
 - **`StreamChunk::Delta` additionally carries `finish_reason`** (deviation from §2.2): consumers need the terminal reason without a second round-trip, and providers emit it mid-stream. `StreamChunk::Done` still marks the end of the stream.
-- **Provider registry**: built-in OpenAI-compatible providers are data (`ProviderProfile`), not code; `openai`, `pangu`, `qwen`, `deepseek` and the other OpenAI-compatible aliases all resolve to one client. `anthropic` is the only distinct transport. Extension crates register `ModelProvider` impls on the global registry; tests build local registries.
+- **Provider registry**: built-in OpenAI-compatible providers are data (`ProviderProfile`), not code; `openai`, `pangu`, `qwen`, `deepseek` and the other OpenAI-compatible aliases all resolve to one client. `anthropic` uses the Messages transport; `openai_account` uses the Responses transport, and `openai` switches to it when `api_mode: responses`. Extension crates register `ModelProvider` impls on the global registry; tests build local registries.
 - **Retries** are the shared `HttpClient`'s job (`max_retries`, `RetryPolicy`, backoff). Provider clients retry only up to the connect boundary; a mid-stream failure surfaces as an error.
 - **Storage**: in-memory implementations remain the behavioral reference and the local-filesystem variants reuse the same in-memory engine with JSON persistence, so behavior cannot drift.
   The network adapters are thin REST/RESP mappings over `HttpClient` (S3 signs in-crate with SigV4 over `sha2`; Redis speaks RESP2/3 over `tokio::net::TcpStream` with AUTH/SELECT and a documented single reconnect+retry) and each normalizes vendor scores into the `Metric` `[0,1]` higher-is-better convention.
@@ -76,8 +77,9 @@ Storage (`store`):
 ## Routing Table
 
 - `./src/prompt/` → messages, content parts, tool calls, `PromptTemplate`, token helpers (`src/prompt/CONTEXT.md`)
-- `./src/llm/` → `Model` trait, configs, providers, factory, both transports, reasoning/routing/oauth/dashscope (`src/llm/CONTEXT.md`)
+- `./src/llm/` → `Model` trait, configs, providers, factory, all three transports, reasoning/routing/oauth/dashscope (`src/llm/CONTEXT.md`)
 - `./src/llm/openai/` → OpenAI-compatible client and its pure request/response/stream conversion + wiremock tests
+- `./src/llm/responses/` → OpenAI Responses client, `input` item projection, `response.*` event stream, non-stream parser (`src/llm/responses/CONTEXT.md`)
 - `./src/llm/anthropic/` → Anthropic Messages client, projection, caching anchors, reasoning plan, event stream (`src/llm/anthropic/CONTEXT.md`)
 - `./src/llm/reasoning/` → reasoning profiles, capabilities, plan resolution and wire encoders (`src/llm/reasoning/CONTEXT.md`)
 - `./src/llm/routing/` → IntelliRouter selection/route compiler and the failover `RoutingModel` (`src/llm/routing/CONTEXT.md`)
@@ -97,7 +99,8 @@ Storage (`store`):
 ## Test Strategy
 
 - Tests live beside the code they exercise, mostly as module-level `#[cfg(test)]` trees; only `tests/messages.rs` and `tests/prompt_template.rs` are standalone integration crates.
-- `wiremock` mocks every HTTP call (both clients, the REST tool, Chroma, Milvus, Elasticsearch, S3, the OpenAPI client, OAuth, DashScope, and the failover routing tests); the Redis adapter is driven by a scripted `tokio::net::TcpListener` fake server; MCP uses `FakeMcpClient` and a mocked `GET` SSE channel. No test needs the network, an API key, or a spawned MCP server.
+- `wiremock` mocks every HTTP call (all three clients including Responses, the REST tool, Chroma, Milvus, Elasticsearch, S3, the OpenAPI client, OAuth, DashScope, and the failover routing tests); the Redis adapter is driven by a scripted `tokio::net::TcpListener` fake server; MCP uses `FakeMcpClient` and a mocked `GET` SSE channel. No test needs the network, an API key, or a spawned MCP server.
+- Pure conversion suites assert exact JSON for the Responses `input` items, `response.*` events, and the vLLM reasoning encoding, so wire-shape regressions fail without a server.
 - SigV4 signing is proven by known-answer vectors (AWS `get-vanilla`, the S3 `GET /test.txt` example) plus RFC 4231 HMAC vectors and a fixed-clock self-consistency case.
 - Storage behavior is covered by one contract suite per trait (`assert_kv_contract`, `assert_document_contract`, `assert_vector_contract`, `assert_graph_contract`, `assert_object_contract`) for every backend that can run in-process; network adapters assert exact wire requests and parsed responses instead.
 - Behavior-port tests name the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/foundation/prompt/test_template_assemble.py`).
@@ -115,6 +118,7 @@ Storage (`store`):
 | `foundation/llm/schema/config.py` `ModelClientConfig`/`ModelRequestConfig` | `llm::ModelClientConfig`/`llm::ModelRequestConfig` |
 | `foundation/llm/model.py` `Model`, `init_model` | `llm::Model`, `llm::init_model`/`init_model_with` |
 | `foundation/llm/model_clients/{openai,anthropic}_model_client.py` | `llm::openai`, `llm::anthropic` |
+| `foundation/llm/utils/responses_utils.py` + `responses_transport.py` + `openai_account_model_client.py` | `llm::responses` |
 | `foundation/llm/reasoning_profiles.py` + `reasoning.py` | `llm::reasoning` |
 | `foundation/llm/routing/*` + `model_clients/intelli_router_model_client.py` | `llm::routing` (`compile_model_selection`, `RoutingModel`) |
 | `extensions/external_provider/openai_auth/*` and the account OAuth transport | `llm::oauth` (+ token store seam) |
@@ -134,7 +138,7 @@ Storage (`store`):
 
 - §2.2 message block: `BaseMessage` is one struct (no role subclasses) and lives in `prompt`, not `llm`; `prompt` is the crate's lowest module.
 - §2.2 `StreamChunk::Delta` additionally carries `finish_reason` so consumers learn the terminal reason mid-stream.
-- §2.3 `ToolCard` is flat (`id`/`name`/`description`/`input_params` + policy fields) and implements `openjiuwen_common::card::Card` instead of nesting `CardBase`; transport details live in `RestfulApiConfig`/`McpServerConfig`.
+- §2.3 `ToolCard` is flat (`id`/`name`/`description`/`input_params`/`properties` + policy fields) and implements `openjiuwen_common::card::Card` instead of nesting `CardBase`; transport details live in `RestfulApiConfig`/`McpServerConfig`.
 - §2.3 `Tool` adds `stream(self: Arc<Self>) -> BoxStream<'static, Result<Value>>`, `render_for_llm`, and `is_parallel_safe`, all with defaults so external impls stay cheap.
 - `ModelExt`/`AssistantTurn`/`StreamAccumulator` are additions (Python accumulates chunks in `AssistantMessageChunk.__add__`).
 - `init_model` and `init_model_with` are `async` without awaiting, per §2.2; the Python positional `init_model(provider, model_name, api_key, api_base, ...)` maps to `ModelClientConfig` builders or `init_model_with`.
@@ -149,9 +153,12 @@ Storage (`store`):
 - Milvus delegates duplicate-primary-key detection to the service; Chroma supports one embedding per record and scalar-only metadata; Elasticsearch document `query`/`delete` fall back to a bounded local scan (10 000 docs) for filters that do not translate to ES DSL.
 - MCP `Playwright` is a typed `Unsupported` (browser runtime absent); the OpenAPI transport resolves only local `$ref`, sends `application/json` bodies, and skips `in: cookie` parameters; the legacy SSE transport has no `Last-Event-ID` replay.
 - Anthropic: thinking blocks are still ignored in non-streaming responses; only the three automatic cache anchors exist (no per-message caller breakpoints or caching modes).
-- Reasoning: the `Responses` protocol is encoded but has no transport; `build_chat_completion_body` passes `api_base = None`, so host hints only resolve through the public resolver or the Anthropic `_with_provider` entry point; an OpenAI-compatible raw `reasoning` payload is forwarded verbatim while Anthropic rejects it with `Validation`.
+- Reasoning: an OpenAI-compatible raw `reasoning` payload is forwarded verbatim while Anthropic rejects it with `Validation`; the Responses parser drops `reasoning.encrypted_content` items instead of replaying them on the next turn.
 - Routing: TPM/RPM and group `timeout_seconds` are recorded but not enforced; no circuit breaker or cost/latency scoring; `Custom` strategies are treated as ordered failover.
-- OAuth: no Responses transport, no `/models` catalog, no login/status/logout CLI, no cross-process file lock (atomic writes, last writer wins).
+- OAuth: no `/models` catalog, no login/status/logout CLI, no cross-process file lock (atomic writes, last writer wins), and the Responses client takes an access token as `api_key` rather than reading the auth store itself.
+- `ToolInfo` is nested (`{"type":"function","function":{...}}`) rather than Python's flat `{type,name,description,parameters}`; the nested shape is load-bearing in `openjiuwen-dev-tools` and `openjiuwen-agent-evolving`, so flattening needs a cross-crate change.
+- Responses: `previous_response_id`/conversation state, `background` mode, hosted tools, and structured `text.format` validation are not ported.
+- Model-config decoding: unknown Python keys are tolerated (ignored) rather than forwarded into `extra`; `intelli_router`, `ssl_cert`, `use_shared_llm_http_client`, and `legacy_client_provider` are not typed fields.
 - DashScope: no streaming media, no result-URL byte download, no workspace scoping, no voice/language allow-lists.
 - There is no `ToolCollection`/tool-registry type: callers hold `Arc<dyn Tool>` values themselves (`FunctionTool::boxed` is the only built-in conversion).
 - `Model` has no abort/cancel or custom-invoke method; a stream is cancelled by dropping its `BoxStream`.

@@ -14,6 +14,10 @@
 //! disables the background health task (explicit probes still work), and a `0`
 //! failure count never kills on health.
 //!
+//! [`SubprocessConfig::shutdown_timeout`] is the graceful-shutdown deadline a
+//! caller asks for with `Duration::ZERO`; a non-zero caller timeout wins over
+//! it, so the configuration is the default, never a silent no-op.
+//!
 //! This is the private sibling of the `subprocess` module: the supervisor there
 //! owns the child, this module owns its settings. All configured timeouts are
 //! clamped to a representable range, so nonsense configuration means
@@ -178,6 +182,16 @@ impl SubprocessConfig {
     /// The configured request deadline, clamped to a representable range.
     pub(super) fn request_timeout(&self) -> Duration {
         secs(self.request_timeout_secs)
+    }
+
+    /// The configured graceful-shutdown deadline, clamped to a representable
+    /// range.
+    ///
+    /// [`SpawnedProcess::shutdown`](crate::spawn::SpawnedProcess::shutdown) uses
+    /// this whenever the caller passes a zero timeout; a non-zero caller timeout
+    /// wins over it.
+    pub(super) fn shutdown_timeout(&self) -> Duration {
+        secs(self.shutdown_timeout_secs)
     }
 
     /// The configured health-probe deadline, clamped to a representable range.

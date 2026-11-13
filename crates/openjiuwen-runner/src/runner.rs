@@ -21,20 +21,28 @@
 //! Runs do **not** require [`Runner::start`]: the queue is host plumbing, not a
 //! precondition for `run_agent`/`run_workflow`/`run_agent_team` (Python's global
 //! runner is lazily started for the same reason).
+//!
+//! The spawn seam is installed, not constructed: [`Runner::set_spawner`] installs
+//! one backend and [`Runner::set_spawner_registry`] hosts several with routing
+//! between them. Every successful spawn is wrapped in
+//! [`crate::spawn::MonitoredSpawnedAgent`], so a host observes the child as a
+//! [`crate::monitor::RunKind::Spawn`] status on [`Runner::monitor`] until it is
+//! shut down, killed, or dropped. The spawn accessors live in the crate's
+//! `runner_spawn` module, beside this file.
 
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
 use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
-use crate::mq::{self, InMemoryMessageQueue, MessageQueue};
-use crate::pool::{ActiveTeamInfo, PoolKey, PoolRequest, PoolRun, TeamPool};
+use crate::mq::{self, MessageQueue};
+use crate::pool::{ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, TeamPool};
 use crate::resources::ResourceMgr;
 use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
-use crate::spawn::{AgentSpawner, SpawnSpec, SpawnedAgent, UnsupportedSpawner};
+use crate::spawn::{AgentSpawner, SpawnerRegistry, UnsupportedSpawner};
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
@@ -58,8 +66,9 @@ const LOG_TARGET: &str = "openjiuwen_runner::runner";
 static GLOBAL: OnceLock<RwLock<Option<Arc<Runner>>>> = OnceLock::new();
 
 /// The process-level orchestrator: configuration, resources, callbacks, queue,
-/// checkpointer, guardrails, the spawn seam, the run monitor, the
-/// human-in-the-loop hub, and the team runtime pool.
+/// checkpointer, guardrails, the single spawn backend and its optional
+/// multi-backend registry, the run monitor, the human-in-the-loop hub, and the
+/// team runtime pool.
 ///
 /// Create an isolated instance with [`Runner::new`] / [`Runner::with_config`];
 /// [`Runner::global`] is the Python-compatible singleton for host processes.
@@ -99,8 +108,11 @@ pub struct Runner {
     guardrails: RwLock<Option<Arc<GuardrailPipeline>>>,
     /// The callback ids [`Runner::set_guardrails`] registered (for rebinding).
     guardrail_ids: RwLock<Vec<CallbackId>>,
-    /// The installed subprocess backend ([`UnsupportedSpawner`] by default).
-    spawner: RwLock<Arc<dyn AgentSpawner>>,
+    /// The installed single spawn backend ([`UnsupportedSpawner`] by default).
+    pub(crate) spawner: RwLock<Arc<dyn AgentSpawner>>,
+    /// The installed multi-backend spawn registry; routing takes precedence over
+    /// [`Runner::spawner`] while one is installed.
+    pub(crate) spawner_registry: RwLock<Option<Arc<SpawnerRegistry>>>,
     /// The run status monitor every execution path mirrors into.
     monitor: Arc<RunMonitor>,
     /// The human-in-the-loop hub every execution path registers on.
@@ -143,13 +155,24 @@ impl Runner {
     /// Builds an isolated runner from `config`.
     ///
     /// The queue is created from `config.message_queue` in the stopped state;
-    /// the checkpointer is not built until [`Runner::start`]. The monitor, the
+    /// a configuration naming a deferred transport (`pulsar` / `zeromq`) yields
+    /// the typed [`crate::mq::DeferredMessageQueue`] placeholder instead of an
+    /// in-memory queue, so [`Runner::message_queue`] never misreports the
+    /// backend (its operations are `Error::Unsupported`).
+    ///
+    /// The checkpointer is not built until [`Runner::start`]. The monitor, the
     /// human-in-the-loop hub, and the team pool are built here (from
     /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
-    /// before [`Runner::start`].
+    /// before [`Runner::start`]. No spawn registry is installed: the
+    /// [`UnsupportedSpawner`] default routes every spawn until a host installs a
+    /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
+    ///
+    /// `config.distributed_mode` is accepted and preserved, but a distributed
+    /// runner cannot start: [`Runner::start`] refuses it until a distributed
+    /// transport lands.
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
-        let queue: Arc<dyn MessageQueue> = InMemoryMessageQueue::new(config.message_queue.clone());
+        let queue: Arc<dyn MessageQueue> = mq::build_message_queue(&config.message_queue);
         let monitor = Arc::new(RunMonitor::new());
         // The hub mirrors its transitions into the same monitor the runs report
         // into, so a host renders one consistent view of both seams.
@@ -167,6 +190,7 @@ impl Runner {
             guardrails: RwLock::new(None),
             guardrail_ids: RwLock::new(Vec::new()),
             spawner: RwLock::new(Arc::new(UnsupportedSpawner)),
+            spawner_registry: RwLock::new(None),
             monitor,
             hitl,
             team_pool: RwLock::new(team_pool),
@@ -251,6 +275,12 @@ impl Runner {
     /// Before [`Runner::start`] this is the configured backend in the stopped
     /// state (operations fail with `Error::Config`); after `start` it is the
     /// started queue; after `stop` it is that queue in the stopped state.
+    ///
+    /// When the configuration names a deferred transport (`pulsar` / `zeromq`)
+    /// this is [`crate::mq::DeferredMessageQueue`] — a placeholder that reports
+    /// the configured kind and answers `Error::Unsupported` naming the missing
+    /// transport from every operation. The backend is **never** silently
+    /// downgraded to the in-memory queue.
     #[must_use]
     pub fn message_queue(&self) -> Arc<dyn MessageQueue> {
         Arc::clone(&self.queue.read())
@@ -309,6 +339,9 @@ impl Runner {
     /// [`Runner::stop`] rebuilds the queue, the checkpointer, and the pool from
     /// the current configuration, so [`Runner::set_config`] takes effect here.
     ///
+    /// The spawn seam is not part of the lifecycle: the installed spawner and
+    /// registry survive `start`/`stop` and keep routing spawns.
+    ///
     /// Rebuilding the pool **retires** the previous one: its live pooled team runs
     /// are stopped (bounded by `TeamPoolConfig::stop_timeout`) and a fresh open
     /// pool takes its place. Pooled runs do not require `start`, so a run admitted
@@ -317,10 +350,14 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns the backend's error when `create_message_queue` rejects the
-    /// configured kind (`Error::Unsupported` for the deferred broker backends)
-    /// or the checkpointer cannot be built (`Error::Validation` /
-    /// `Error::Unsupported`). The runner stays stopped on any error.
+    /// `Error::Unsupported` when the live configuration selects
+    /// `distributed_mode` — the distributed transports are deferred, so a
+    /// distributed runner refuses to start rather than running in-process under a
+    /// distributed name (see [`RunnerConfig::distributed_mode`]) — or when
+    /// `create_message_queue` rejects the configured kind (`Error::Unsupported`
+    /// for the deferred broker backends) or the checkpointer cannot be built
+    /// (`Error::Validation` / `Error::Unsupported`). The runner stays stopped on
+    /// any error.
     pub async fn start(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.is_started() {
@@ -328,7 +365,29 @@ impl Runner {
             return Ok(());
         }
         let config = self.config();
-        let queue = mq::create_message_queue(&config.message_queue).await?;
+        if config.distributed_mode {
+            tracing::warn!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id,
+                "refusing to start a distributed runner; the transports are deferred"
+            );
+            return Err(error::unsupported(
+                "distributed runner mode (`drunner`)",
+                "the distributed transports are deferred (Pulsar/ZeroMQ reply-topic \
+                 routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach); run \
+                 in-process or enable distributed execution once a transport lands",
+            ));
+        }
+        let queue = match mq::create_message_queue(&config.message_queue).await {
+            Ok(queue) => queue,
+            Err(error) => {
+                // A deferred transport is a hard error here, but the placeholder
+                // still replaces the slot so `message_queue()` keeps reporting
+                // the configured kind after a `set_config`.
+                *self.queue.write() = mq::build_message_queue(&config.message_queue);
+                return Err(error);
+            }
+        };
         queue.start().await?;
         let checkpointer = match config.checkpointer.as_ref() {
             Some(checkpointer_config) => {
@@ -539,6 +598,76 @@ impl Runner {
         self.team_pool().start(self.services(), request).await
     }
 
+    /// Starts a pooled team run only when a concurrency permit is free right now.
+    ///
+    /// The refuse-instead-of-queue counterpart of
+    /// [`Runner::start_agent_team`]: it admits through
+    /// [`crate::pool::TeamPool::try_start`], so a full pool is an `Error::Config`
+    /// naming the capacity and **no** pool entry is created — a host that would
+    /// rather reject a request than let it wait can say so. A run already live
+    /// under the same `(team name, session id)` is still the busy error
+    /// ([`crate::pool::PoolError::Busy`]).
+    ///
+    /// Kept `async` so the facade's team controls share one shape: the admission
+    /// itself never waits for a permit, so nothing is queued.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when the key already has a live run, `Error::Config`
+    /// when no permit is available, when the pool was closed, or when the call is
+    /// made outside a tokio runtime.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
+    pub async fn try_start_agent_team(
+        &self,
+        team: impl Into<TeamRef>,
+        inputs: Value,
+        options: RunOptions,
+    ) -> Result<PoolRun> {
+        let request = PoolRequest::new(team.into(), inputs).with_options(options);
+        self.team_pool().try_start(self.services(), request)
+    }
+
+    /// Starts a pooled team run and takes its first lease, or joins a live one.
+    ///
+    /// Admission goes through [`crate::pool::TeamPool::acquire`], so a host that
+    /// may already have a run under `(team name, session id)` either creates it or
+    /// receives a refcounted [`PoolLease`] on the run that exists — the in-process
+    /// form of the cross-process attach Python defers. Because a join attaches to
+    /// an existing run, **the joining request's inputs and options are ignored**:
+    /// the run keeps the inputs, session, and options of the request that created
+    /// it (the pool's documented contract). Release the lease with
+    /// [`PoolLease::release`] (or by dropping it) when the joining host is done.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Config` when the pool was closed or the call is made outside a
+    /// tokio runtime, and `Error::Cancelled` when a run was cancelled while queued
+    /// for a permit.
+    pub async fn acquire_agent_team(
+        &self,
+        team: impl Into<TeamRef>,
+        inputs: Value,
+        options: RunOptions,
+    ) -> Result<PoolLease> {
+        let request = PoolRequest::new(team.into(), inputs).with_options(options);
+        self.team_pool().acquire(self.services(), request).await
+    }
+
+    /// Drains the buffered human-in-the-loop payloads of the pooled run addressed
+    /// by `(team_name, session_id)`.
+    ///
+    /// A pooled run never suspends on an inbound payload: it buffers it (and
+    /// publishes it as a [`crate::pool::PoolFrame::Payload`]) so the host can
+    /// replay it. This is the drain for a host that delivered through
+    /// [`Runner::interact_agent_team`] but does not hold the [`PoolRun`]; the
+    /// drain is destructive, and an unknown or already-finalised key yields an
+    /// empty vector rather than an error.
+    #[must_use]
+    pub fn take_team_payloads(&self, team_name: &str, session_id: &str) -> Vec<InteractPayload> {
+        self.team_pool()
+            .take_payloads(&PoolKey::new(team_name, session_id))
+    }
+
     /// Lists the pooled team runs that are not finished, ordered by
     /// `(team_name, session_id)`.
     #[must_use]
@@ -694,26 +823,6 @@ impl Runner {
             .guardrails()
             .ok_or_else(|| error::not_started("guardrail pipeline"))?;
         Ok(pipeline.run(&ctx).await)
-    }
-
-    // -------------------------------------------------------------- spawn --
-
-    /// Installs the subprocess backend [`Runner::spawn_agent`] delegates to.
-    pub fn set_spawner(&self, spawner: Arc<dyn AgentSpawner>) {
-        *self.spawner.write() = spawner;
-    }
-
-    /// Asks the installed spawner to launch the agent described by `spec`.
-    ///
-    /// The default [`UnsupportedSpawner`] answers `Error::Unsupported` naming
-    /// the seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns the spawner's error (by default `Error::Unsupported`).
-    pub async fn spawn_agent(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
-        let spawner = Arc::clone(&self.spawner.read());
-        spawner.spawn(spec).await
     }
 
     // ----------------------------------------------------------- internals --

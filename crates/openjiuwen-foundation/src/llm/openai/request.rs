@@ -14,7 +14,8 @@ use crate::prompt::BaseMessage;
 use super::super::config::ModelRequestConfig;
 use super::super::provider::normalize_provider_name;
 use super::super::reasoning::{
-    apply_reasoning_plan, resolve_reasoning_plan, ReasoningConfig, ReasoningPlan,
+    apply_reasoning_plan, resolve_chat_completion_plan_with_endpoint, ReasoningConfig,
+    ReasoningPlan,
 };
 
 /// Suffix a caller may have left on `api_base` by pasting a full endpoint.
@@ -167,11 +168,14 @@ pub fn convert_tool_choice(choice: &Value) -> Value {
 /// [`ModelRequestConfig::extra`] is merged last at the top level, so a caller can
 /// override or extend any computed key.
 ///
-/// A provider-neutral reasoning intent in `extra.reasoning` is resolved first (see
+/// A provider-neutral reasoning intent is resolved first (see
 /// [`crate::llm::reasoning`]) and applied before that final merge, so the caller's
-/// keys still win. The intent key itself is consumed by this layer; a legacy raw
-/// payload (an object with keys outside `mode`/`effort`/`budget_tokens`) keeps being
-/// forwarded verbatim. Without a `reasoning` key the body is unchanged.
+/// keys still win. The intent comes from [`ModelRequestConfig::reasoning`] when
+/// that field is set and from `extra.reasoning` otherwise; the intent key itself
+/// is consumed by this layer (a typed intent is never re-forwarded). A legacy raw
+/// payload (an object with keys outside `mode`/`effort`/`budget_tokens`) keeps
+/// being forwarded verbatim under `reasoning`. Without an intent the body is
+/// unchanged.
 ///
 /// # Errors
 ///
@@ -179,6 +183,35 @@ pub fn convert_tool_choice(choice: &Value) -> Value {
 /// and [`Error::Validation`] when a message cannot be converted.
 pub fn build_chat_completion_body(
     provider: &str,
+    messages: &[BaseMessage],
+    request: &ModelRequestConfig,
+    stream: bool,
+) -> Result<Value> {
+    build_chat_completion_body_with_endpoint(provider, None, None, messages, request, stream)
+}
+
+/// Builds the request body for one call, resolving an endpoint profile first.
+///
+/// `endpoint_profile` names the wire dialect the configured endpoint speaks and
+/// `api_base` is the resolved base URL; together they select the reasoning
+/// encoder for a provider-neutral reasoning intent (see
+/// [`resolve_chat_completion_plan_with_endpoint`]). A non-generic profile such as
+/// `"vllm"` replaces the profile-table encoder with the `enable_thinking` /
+/// `thinking_budget` encoder, so a self-hosted gateway receives the keys it
+/// honors. Without an `endpoint_profile` this is exactly
+/// [`build_chat_completion_body`], whose body stays byte-identical.
+///
+/// Unlike [`build_chat_completion_body`], this function does pass the endpoint's
+/// API base into reasoning resolution, so a host hint is reachable from the
+/// client even when the provider name is generic.
+///
+/// # Errors
+///
+/// See [`build_chat_completion_body`].
+pub fn build_chat_completion_body_with_endpoint(
+    provider: &str,
+    endpoint_profile: Option<&str>,
+    api_base: Option<&str>,
     messages: &[BaseMessage],
     request: &ModelRequestConfig,
     stream: bool,
@@ -233,15 +266,24 @@ pub fn build_chat_completion_body(
         );
     }
 
-    let (reasoning, consumes_reasoning_key) = reasoning_intent(request)?;
+    let (reasoning, raw_reasoning, consumes_reasoning_key) = reasoning_intent(request)?;
     if let Some(intent) = &reasoning {
-        let plan = resolve_reasoning_plan(provider, None, model_name, intent);
+        let plan = resolve_chat_completion_plan_with_endpoint(
+            provider,
+            endpoint_profile,
+            api_base,
+            model_name,
+            intent,
+        );
         log_reasoning_plan(model_name, &plan);
         let mut resolved = Value::Object(std::mem::take(&mut body));
         apply_reasoning_plan(&mut resolved, &plan);
         if let Value::Object(object) = resolved {
             body = object;
         }
+    }
+    if let Some(raw) = raw_reasoning {
+        body.insert(REASONING_KEY.to_owned(), raw);
     }
 
     if let Some(extra) = request.extra.as_object() {
@@ -257,20 +299,30 @@ pub fn build_chat_completion_body(
 }
 /// Key of the provider-neutral reasoning intent inside [`ModelRequestConfig::extra`].
 const REASONING_KEY: &str = "reasoning";
-/// Reads the reasoning intent out of a request's `extra` map.
+/// Reads the reasoning intent for a request.
 ///
-/// Returns the parsed intent and whether the raw `reasoning` key must stay out of
-/// the request body. `null` and intent-shaped values are consumed by the reasoning
-/// layer; anything else (a legacy raw payload, a number) is forwarded verbatim, so
+/// [`ModelRequestConfig::reasoning`] wins over the legacy `extra` spelling.
+/// Returns the parsed intent, a legacy raw payload the caller still wants
+/// forwarded verbatim, and whether `extra["reasoning"]` must stay out of the
+/// request body. A typed value is always consumed by this layer (it is a field,
+/// not a body key); a `null` or intent-shaped `extra` value is consumed too,
+/// while anything else (a legacy raw payload, a number) is forwarded verbatim so
 /// pre-existing callers keep working unchanged.
-fn reasoning_intent(request: &ModelRequestConfig) -> Result<(Option<ReasoningConfig>, bool)> {
+fn reasoning_intent(
+    request: &ModelRequestConfig,
+) -> Result<(Option<ReasoningConfig>, Option<Value>, bool)> {
+    if let Some(value) = request.reasoning.as_ref().filter(|value| !value.is_null()) {
+        let intent = ReasoningConfig::from_value(value)?;
+        let raw = intent.is_none().then(|| value.clone());
+        return Ok((intent, raw, true));
+    }
     match request.extra.get(REASONING_KEY) {
-        None => Ok((None, false)),
-        Some(Value::Null) => Ok((None, true)),
+        None => Ok((None, None, false)),
+        Some(Value::Null) => Ok((None, None, true)),
         Some(value) => {
             let intent = ReasoningConfig::from_value(value)?;
             let consumed = intent.is_some();
-            Ok((intent, consumed))
+            Ok((intent, None, consumed))
         }
     }
 }
@@ -802,6 +854,61 @@ mod tests {
         );
     }
     #[test]
+    fn a_typed_reasoning_intent_matches_the_extra_spelling() {
+        // Python's `ModelRequestConfig.reasoning` field reaches the body exactly
+        // like the legacy `extra.reasoning` spelling.
+        let typed = ModelRequestConfig::new("gpt-5.1")
+            .with_reasoning(json!({"mode": "enabled", "effort": "high"}));
+        let legacy = ModelRequestConfig::new("gpt-5.1")
+            .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+        let typed_body = body(&[BaseMessage::user("hi")], &typed);
+        let legacy_body = body(&[BaseMessage::user("hi")], &legacy);
+
+        assert_eq!(typed_body, legacy_body);
+        assert_eq!(typed_body["reasoning_effort"], json!("high"));
+        assert!(!typed_body.as_object().unwrap().contains_key("reasoning"));
+    }
+    #[test]
+    fn the_typed_reasoning_field_wins_over_the_extra_spelling() {
+        let request = ModelRequestConfig::new("gpt-5.1")
+            .with_reasoning(json!({"mode": "enabled", "effort": "low"}))
+            .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+    }
+    #[test]
+    fn a_typed_legacy_reasoning_payload_is_forwarded_verbatim() {
+        let legacy = json!({"enabled": true});
+        let request = ModelRequestConfig::new("gpt-4o").with_reasoning(legacy.clone());
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert_eq!(body["reasoning"], legacy);
+    }
+    #[test]
+    fn an_invalid_typed_reasoning_intent_is_a_validation_error() {
+        let request =
+            ModelRequestConfig::new("gpt-5.1").with_reasoning(json!({"mode": "sometimes"}));
+        let error = build_chat_completion_body("openai", &[], &request, false)
+            .expect_err("an invalid typed intent must fail");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+    }
+    #[test]
+    fn a_typed_null_reasoning_is_no_intent() {
+        let request = ModelRequestConfig::new("gpt-5.1").with_reasoning(Value::Null);
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
+    }
+    #[test]
+    fn context_window_never_reaches_the_body() {
+        let request = ModelRequestConfig::new("gpt-4o").with_context_window(128_000);
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert!(!body.as_object().unwrap().contains_key("context_window"));
+    }
+    #[test]
     fn reasoning_is_encoded_for_the_configured_provider() {
         // DashScope-style switch, chosen from the provider name.
         let body = body_with_extra(
@@ -824,5 +931,133 @@ mod tests {
         let body = body_with_extra("openai", "gpt-5", json!({"reasoning": {"effort": "max"}}));
         assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
         assert!(!body.as_object().unwrap().contains_key("reasoning"));
+    }
+    /// Builds a body through the endpoint-aware builder.
+    fn body_with_endpoint(
+        provider: &str,
+        endpoint_profile: Option<&str>,
+        api_base: Option<&str>,
+        model: &str,
+        extra: Value,
+    ) -> Value {
+        let request = ModelRequestConfig::new(model).with_extra(extra);
+        build_chat_completion_body_with_endpoint(
+            provider,
+            endpoint_profile,
+            api_base,
+            &[BaseMessage::user("hi")],
+            &request,
+            false,
+        )
+        .expect("the body builds")
+    }
+    #[test]
+    fn a_vllm_endpoint_profile_encodes_enable_thinking() {
+        let body = body_with_endpoint(
+            "openai",
+            Some("vllm"),
+            Some("http://localhost:8000/v1"),
+            "glm-5",
+            json!({"reasoning": {"mode": "enabled", "effort": "high"}}),
+        );
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": true})
+        );
+        assert_eq!(body["thinking_budget"], json!(8192));
+        assert!(
+            !body.as_object().unwrap().contains_key("reasoning_effort"),
+            "the vLLM gateway ignores reasoning_effort: {body}"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "the intent key is consumed: {body}"
+        );
+    }
+    #[test]
+    fn a_vllm_endpoint_profile_disables_thinking_explicitly() {
+        let body = body_with_endpoint(
+            "openai",
+            Some("VLLM"),
+            None,
+            "glm-5",
+            json!({"reasoning": {"mode": "disabled"}}),
+        );
+        assert_eq!(body["enable_thinking"], json!(false));
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+        // A `qwen`-style provider without the profile would write the same
+        // switch without the nested kwargs, so assert the profile really applied.
+        assert!(body.get("thinking_budget").is_none());
+    }
+    #[test]
+    fn a_vllm_endpoint_profile_auto_intent_sends_nothing() {
+        let body = body_with_endpoint(
+            "openai",
+            Some("vllm"),
+            None,
+            "glm-5",
+            json!({"reasoning": {"mode": "auto"}}),
+        );
+        assert!(!body.as_object().unwrap().contains_key("enable_thinking"));
+        assert!(!body.as_object().unwrap().contains_key("thinking_budget"));
+    }
+    #[test]
+    fn an_explicit_budget_wins_over_the_vllm_effort_map() {
+        let body = body_with_endpoint(
+            "openai",
+            Some("vllm"),
+            None,
+            "glm-5",
+            json!({"reasoning": {"mode": "enabled", "effort": "max", "budget_tokens": 2048}}),
+        );
+        assert_eq!(body["thinking_budget"], json!(2048));
+    }
+    #[test]
+    fn a_generic_endpoint_profile_keeps_the_provider_resolution() {
+        // Without a profile the builder is byte-identical to the plain one.
+        for (provider, base) in [
+            ("openai", None),
+            ("deepseek", Some("https://api.deepseek.com/v1")),
+            (
+                "qwen",
+                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ),
+        ] {
+            let plain = body_with_extra(
+                provider,
+                "deepseek-v4-pro",
+                json!({"reasoning": {"mode": "enabled", "effort": "high"}}),
+            );
+            let endpoint = body_with_endpoint(
+                provider,
+                None,
+                base,
+                "deepseek-v4-pro",
+                json!({"reasoning": {"mode": "enabled", "effort": "high"}}),
+            );
+            assert_eq!(plain, endpoint, "{provider}");
+        }
+        // A generic profile still defers to the host hint, so the host-selected
+        // vendor encoding is the one a matching provider name produces.
+        let body = body_with_endpoint(
+            "openai",
+            Some("openai-compatible"),
+            Some("https://api.deepseek.com/v1"),
+            "deepseek-v4-pro",
+            json!({"reasoning": {"mode": "disabled"}}),
+        );
+        let named = body_with_endpoint(
+            "deepseek",
+            None,
+            None,
+            "deepseek-v4-pro",
+            json!({"reasoning": {"mode": "disabled"}}),
+        );
+        assert_eq!(body, named);
+        assert!(body.get("enable_thinking").is_none());
     }
 }

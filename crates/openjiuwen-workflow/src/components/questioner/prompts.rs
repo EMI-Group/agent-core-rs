@@ -2,7 +2,12 @@
 //!
 //! Holds the verbatim Chinese and English extraction templates ported from
 //! `questioner_comp.py`, the `{{key}}` renderer they share with the question
-//! template, and the wording used when required fields are still missing.
+//! template, the `dialogue_history` renderer, and the wording used when required
+//! fields are still missing.
+//!
+//! The `dialogue_history` keyword is one `role: content` line per message, joined with
+//! a newline (Python's `"\n".join([f"{_.role}: {_.content}" …])`); the separator is
+//! `": "` for `accept_language == "en"` and `"："` otherwise, exactly like Python.
 
 use std::collections::BTreeMap;
 
@@ -66,7 +71,14 @@ Please fully consider the above conversation history and user input, and correct
 ";
 
 /// Builds the extraction conversation from the Python prompt templates.
-pub(super) fn extraction_messages(config: &QuestionerConfig, query: &Value) -> Vec<BaseMessage> {
+///
+/// `history` is the conversation window the caller already prepared: the turns to
+/// show plus the current user query as its last entry (see
+/// [`QuestionerComponent::chat_history_window`](super::QuestionerComponent)).
+pub(super) fn extraction_messages(
+    config: &QuestionerConfig,
+    history: &[BaseMessage],
+) -> Vec<BaseMessage> {
     let english = config.accept_language == "en";
     let mut params = Vec::new();
     let mut required = Vec::new();
@@ -89,11 +101,7 @@ pub(super) fn extraction_messages(config: &QuestionerConfig, query: &Value) -> V
     } else {
         format!("{}{}个必要信息", required.join("、"), required.len())
     };
-    let dialogue_history = if english {
-        format!("user: {}", python_str(query))
-    } else {
-        format!("user：{}", python_str(query))
-    };
+    let dialogue_history = render_dialogue_history(english, history);
     let values = BTreeMap::from([
         ("required_name".to_owned(), required_name),
         ("required_params_list".to_owned(), params.join("\n")),
@@ -113,6 +121,21 @@ pub(super) fn extraction_messages(config: &QuestionerConfig, query: &Value) -> V
         BaseMessage::system(render_prompt(system, &values)),
         BaseMessage::user(render_prompt(user, &values)),
     ]
+}
+
+/// Renders a conversation window as one `role<separator>content` line per message
+/// (Python's `_create_prompt_template_keywords`).
+///
+/// Every message contributes its plain text ([`BaseMessage::text`]), so structured
+/// content never panics; the lines are joined with `"\n"` and an empty window renders
+/// as the empty string.
+fn render_dialogue_history(english: bool, history: &[BaseMessage]) -> String {
+    let separator = if english { ": " } else { "：" };
+    history
+        .iter()
+        .map(|message| format!("{}{separator}{}", message.role.as_str(), message.text()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Formats the batch question template (Python `QuestionerUtils.format_template`).

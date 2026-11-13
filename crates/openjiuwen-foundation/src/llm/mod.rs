@@ -9,6 +9,8 @@
 //!   `Qwen`/`DashScope`, `DeepSeek`, `Moonshot`, `OpenRouter`, `Ollama`,
 //!   `LM Studio`, ...).
 //! - [`anthropic`] — Anthropic Messages client.
+//! - [`responses`] — `OpenAI` Responses API client (`POST /responses`), used by
+//!   the `openai_account` provider and by `openai` with `api_mode: responses`.
 //! - [`reasoning`] — per-family reasoning/thinking profiles, capabilities, and
 //!   the wire encoders that turn a [`ReasoningConfig`] into request parameters.
 //! - [`routing`] — `IntelliRouter` model groups, route compilation, and the
@@ -31,12 +33,13 @@ pub mod openai;
 pub mod provider;
 pub mod reasoning;
 pub mod registry;
+pub mod responses;
 pub mod routing;
 pub mod sse;
 pub(crate) mod transport;
 
 pub use anthropic::AnthropicClient;
-pub use config::{ModelClientConfig, ModelRequestConfig};
+pub use config::{ApiMode, AuthMode, ModelClientConfig, ModelRequestConfig};
 pub use dashscope::{
     AudioGenerationResponse, DashScopeConfig, DashScopeMediaClient, ImageGenerationResponse,
     ImageRequest, SpeechRequest, VideoGenerationResponse, VideoRequest,
@@ -55,11 +58,15 @@ pub use provider::{
 };
 pub use reasoning::{
     apply_reasoning_plan, apply_reasoning_plan_with, find_reasoning_profile,
-    resolve_reasoning_plan, ReasoningCapability, ReasoningConfig, ReasoningMode, ReasoningPlan,
-    ReasoningProfile, ReasoningProtocol,
+    resolve_reasoning_plan, resolve_reasoning_plan_with_endpoint, ReasoningCapability,
+    ReasoningConfig, ReasoningMode, ReasoningPlan, ReasoningProfile, ReasoningProtocol,
 };
 pub use registry::{
     register_builtin_providers, register_model_provider, ModelProvider, ModelProviderRegistry,
+};
+pub use responses::{
+    build_responses_body, parse_responses_response, parse_responses_usage, OpenAiResponsesClient,
+    ResponsesStreamState,
 };
 pub use routing::{
     compile_model_selection, CompiledModelSelection, ModelSelection, ResolvedModel,

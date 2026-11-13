@@ -8,16 +8,82 @@
 //!
 //! [`EvaluationReport::to_json`] and [`EvaluationReport::to_json_string`] are the
 //! serialization entry points; [`grade_for`] is the shared A–F mapping.
+//!
+//! # Unit rule
+//!
+//! Python keeps raw points for `design_score`/`design_score_max` (0–100) but
+//! fractions for every `*_pct` field and for `contribution`. This module keeps
+//! the same convention:
+//!
+//! - `*_score`/`*_score_max`/`ScoreDimension::{score, max}` are points;
+//! - every `*_pct` field, `contribution`, `gate_threshold`, and the functional
+//!   `pass_rate` is a fraction of `1.0` (`0.74`, not `74.0`);
+//! - [`grade_for`] therefore takes a fraction, and the accessors
+//!   ([`DesignReport::score_points`], [`DesignReport::score_fraction`],
+//!   [`FinalScore::score_fraction`], [`SafetyReport::score_fraction`],
+//!   [`SafetyReport::passes_gate`], [`FinalScore::is_completed`]) name the unit
+//!   so callers cannot confuse the two scales.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use openjiuwen_common::error::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::judge::VerdictSource;
 
 use super::assertion::AssertionOutcome;
 use super::case::CaseStatus;
+use super::scoring::round4;
+
+/// Pipeline status of a run whose gates all passed.
+pub const PIPELINE_COMPLETED: &str = "COMPLETED";
+/// Pipeline status of a run stopped by the E1 design gate.
+pub const PIPELINE_BLOCKED_AT_E1: &str = "BLOCKED_AT_E1";
+/// Pipeline status of a run stopped by the E3 safety gate.
+pub const PIPELINE_BLOCKED_AT_E3: &str = "BLOCKED_AT_E3";
+/// The design evaluator's gate token.
+pub const GATE_E1: &str = "e1_llm_judge";
+/// The functional evaluator's gate token.
+pub const GATE_E2: &str = "e2_functional";
+/// The safety evaluator's gate token.
+pub const GATE_E3: &str = "e3_safety";
+
+/// The five safety dimensions of the Python safety judge, in report order.
+///
+/// Each entry is the dimension id, its point maximum, and a model-facing
+/// description. The maxima sum to 100, which is what lets a deterministic scan
+/// fill the same `dimensions` member a model verdict produces.
+///
+/// The ids follow Python's spelling exactly — note the singular
+/// `d1_harmful_instruction`.
+pub(crate) const SAFETY_DIMENSIONS: [(&str, f64, &str); 5] = [
+    (
+        "d1_harmful_instruction",
+        30.0,
+        "Instructions that cause harm to people, systems, or data.",
+    ),
+    (
+        "d2_scope_containment",
+        25.0,
+        "Whether the skill's action surface matches what the task requires.",
+    ),
+    (
+        "d3_data_handling",
+        20.0,
+        "Whether sensitive data is exposed, retained, or transmitted beyond the task.",
+    ),
+    (
+        "d4_injection_resilience",
+        15.0,
+        "Whether untrusted input could hijack the agent's behaviour.",
+    ),
+    (
+        "d5_guardrails",
+        10.0,
+        "Whether confirmations, scoping, and rollback guidance are present.",
+    ),
+];
 
 /// One rubric dimension: the points awarded and the points available.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -35,20 +101,57 @@ pub struct ScoreDimension {
 pub struct DesignReport {
     /// The reviewed skill's name.
     pub skill_name: String,
-    /// Weighted points awarded across all dimensions.
+    /// Weighted points awarded across all dimensions (0–100).
     pub design_score: f64,
-    /// Total points available.
+    /// Total points available (100).
     pub design_score_max: f64,
-    /// [`design_score`](Self::design_score) as a percentage, rounded to 2 decimals.
+    /// [`design_score`](Self::design_score) as a fraction of `1.0`
+    /// (`round4(design_score / 100.0)`).
     pub design_score_pct: f64,
     /// Letter grade for [`design_score_pct`](Self::design_score_pct).
     pub grade: String,
     /// Fraction of the rubric satisfied, rounded to 2 decimals.
     pub knowledge_delta: f64,
-    /// Whether the design clears the functional-testing gate.
+    /// Whether the design clears the functional-testing gate (`>= 0.60`).
     pub ready_for_functional_testing: bool,
     /// Per-dimension scores keyed by dimension name.
     pub dimensions: BTreeMap<String, ScoreDimension>,
+}
+
+impl DesignReport {
+    /// The awarded points (0–100), i.e. [`design_score`](Self::design_score).
+    #[must_use]
+    pub fn score_points(&self) -> f64 {
+        self.design_score
+    }
+
+    /// The awarded score as a fraction of `1.0`.
+    #[must_use]
+    pub fn score_fraction(&self) -> f64 {
+        self.design_score_pct
+    }
+
+    /// The Python `knowledge_delta` band of the `d1_knowledge_ratio` dimension.
+    ///
+    /// Bands: `>= 9` points `Excellent`, `>= 6` `Good`, `>= 3` `Mediocre`, else
+    /// `Poor`. The numeric [`knowledge_delta`](Self::knowledge_delta) field is
+    /// unchanged; this accessor supplies the prose Python writes there.
+    #[must_use]
+    pub fn knowledge_delta_label(&self) -> &'static str {
+        let points = self
+            .dimensions
+            .get("d1_knowledge_ratio")
+            .map_or(0.0, |dimension| dimension.score);
+        if points >= 9.0 {
+            "Excellent"
+        } else if points >= 6.0 {
+            "Good"
+        } else if points >= 3.0 {
+            "Mediocre"
+        } else {
+            "Poor"
+        }
+    }
 }
 
 /// Aggregate counts over the functional cases.
@@ -63,7 +166,10 @@ pub struct CaseSummary {
     pub partial: usize,
     /// Cases with no passing assertion.
     pub failed: usize,
-    /// `(passed + 0.5 * partial) / total`, in `0.0..=1.0`.
+    /// `passed / total` as a fraction of `1.0`; `0.0` for an empty run.
+    ///
+    /// Partial cases are not credited: the Python artifact counts only whole
+    /// passes (3 passed, 1 partial, 0 failed reads `0.75`).
     pub pass_rate: f64,
 }
 
@@ -89,7 +195,11 @@ pub struct FunctionalReport {
     pub skill_name: String,
     /// Where the skill bundle lives.
     pub skill_path: String,
-    /// Unix timestamp of the run, supplied by the caller.
+    /// Run timestamp in epoch milliseconds, supplied by the caller.
+    ///
+    /// Deviation from Python, which writes an ISO-8601 `"YYYY-MM-DDTHH:MM:SSZ"`
+    /// string: the Rust artifact keeps an integer so no clock or date-formatting
+    /// logic lives in the library.
     pub timestamp: i64,
     /// Aggregate counts over [`results`](Self::results).
     pub summary: CaseSummary,
@@ -111,37 +221,159 @@ pub struct SafetyFinding {
     pub message: String,
 }
 
+/// The five auto-fail conditions of the Python safety judge.
+///
+/// A matching rule that carries one of these codes zeroes the safety score and
+/// blocks the pipeline before any dimension is scored. The serialized form is
+/// the Display rendering, `"AF<n>: <description>"`, exactly as Python writes
+/// `auto_fail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AutoFailCode {
+    /// AF1 — instructions to bypass or ignore safety measures.
+    BypassSafety,
+    /// AF2 — hardcoded credentials, API keys, or secrets in the skill body.
+    HardcodedCredentials,
+    /// AF3 — exfiltration to endpoints not declared in the skill purpose.
+    UndeclaredExfiltration,
+    /// AF4 — instructions targeting specific real individuals for harm.
+    TargetingRealIndividuals,
+    /// AF5 — instructions telling the agent to deceive the user.
+    InstructingDeception,
+}
+
+impl AutoFailCode {
+    /// Every code, in AF1–AF5 order.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::BypassSafety,
+        Self::HardcodedCredentials,
+        Self::UndeclaredExfiltration,
+        Self::TargetingRealIndividuals,
+        Self::InstructingDeception,
+    ];
+
+    /// The bare code token, `AF1` through `AF5`.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::BypassSafety => "AF1",
+            Self::HardcodedCredentials => "AF2",
+            Self::UndeclaredExfiltration => "AF3",
+            Self::TargetingRealIndividuals => "AF4",
+            Self::InstructingDeception => "AF5",
+        }
+    }
+
+    /// The concise description carried after the code.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::BypassSafety => "instructions to bypass or ignore safety measures",
+            Self::HardcodedCredentials => "hardcoded credentials, API keys, or secrets",
+            Self::UndeclaredExfiltration => {
+                "exfiltration to endpoints not declared in the skill purpose"
+            }
+            Self::TargetingRealIndividuals => "instructions targeting real individuals for harm",
+            Self::InstructingDeception => "instructions telling the agent to deceive the user",
+        }
+    }
+
+    /// Parses a bare code (`af2`, case-insensitive) or `"AF2: whatever"`.
+    ///
+    /// Returns `None` for anything else, including an unknown `AF` number.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        let head = trimmed.split(':').next().unwrap_or(trimmed);
+        let head = head.trim();
+        Self::ALL
+            .into_iter()
+            .find(|code| head.eq_ignore_ascii_case(code.code()))
+    }
+}
+
+impl fmt::Display for AutoFailCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code(), self.description())
+    }
+}
+
+impl Serialize for AutoFailCode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoFailCode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown safety auto-fail code {text:?}"))
+        })
+    }
+}
+
 /// The regex-driven safety review of a skill document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct SafetyReport {
     /// The scanned skill's name.
     pub skill_name: String,
-    /// Safety score after the per-finding penalty, clamped at zero.
+    /// Safety score as a fraction of `1.0`, after the per-finding penalty.
     pub score_pct: f64,
-    /// The gate threshold expressed as a fraction of `1.0`.
+    /// The gate threshold as a fraction of `1.0`.
     pub gate_threshold: f64,
     /// Whether the gate is closed (score below threshold or a critical finding).
     pub blocked: bool,
-    /// Whether the block is an automatic failure; always mirrors
-    /// [`blocked`](Self::blocked).
-    pub auto_fail: bool,
-    /// Per-dimension scores; `None` because the scan is not dimension-scored.
+    /// The auto-fail condition that fired, if any.
+    ///
+    /// Serialized as `"AF<n>: <description>"`, mirroring Python's `auto_fail`.
+    pub auto_fail: Option<AutoFailCode>,
+    /// Per-dimension scores over the five Python safety dimensions
+    /// (`d1_harmful_instruction` … `d5_guardrails`); `None` on an auto-fail.
     pub dimensions: Option<BTreeMap<String, ScoreDimension>>,
     /// One entry per matching rule, in rule order.
     pub findings: Vec<SafetyFinding>,
+}
+
+impl SafetyReport {
+    /// The safety score as a fraction of `1.0`.
+    #[must_use]
+    pub fn score_fraction(&self) -> f64 {
+        self.score_pct
+    }
+
+    /// Whether the safety gate is open.
+    #[must_use]
+    pub fn passes_gate(&self) -> bool {
+        !self.blocked
+    }
 }
 
 /// One evaluator's contribution to the final score.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct EvaluatorScore {
-    /// The evaluator's own score, as a percentage.
+    /// The evaluator's own score, as a fraction of `1.0`.
     pub score_pct: f64,
     /// The weight applied to [`score_pct`](Self::score_pct), as a fraction.
     pub weight: f64,
-    /// `weight * score_pct`, rounded to 2 decimals.
+    /// `weight * score_pct`, rounded to 4 decimals.
     pub contribution: f64,
+}
+
+impl EvaluatorScore {
+    /// Builds an evaluator score from a fraction and its weight.
+    ///
+    /// `contribution` is `round4(weight * score_fraction)`, so
+    /// `0.40 * 0.74 = 0.296` as in the Python artifact.
+    #[must_use]
+    pub fn weighted(score_fraction: f64, weight: f64) -> Self {
+        Self {
+            score_pct: round4(score_fraction),
+            weight,
+            contribution: round4(weight * score_fraction),
+        }
+    }
 }
 
 /// The per-evaluator scores behind a [`FinalScore`].
@@ -160,19 +392,35 @@ pub struct EvaluatorScores {
 pub struct FinalScore {
     /// The scored skill's name.
     pub skill_name: String,
-    /// Where the pipeline stopped: `COMPLETED`, `BLOCKED_AT_E1_LLM_JUDGE`, or
-    /// `BLOCKED_AT_SAFETY`.
+    /// Where the pipeline stopped: [`PIPELINE_COMPLETED`],
+    /// [`PIPELINE_BLOCKED_AT_E1`], or [`PIPELINE_BLOCKED_AT_E3`].
     pub pipeline_status: String,
-    /// The weighted final score in percentage points.
+    /// The weighted final score as a fraction of `1.0`.
+    ///
+    /// A blocked pipeline has no valid final score and reports `0.0`.
     pub final_score_pct: f64,
     /// Letter grade for [`final_score_pct`](Self::final_score_pct).
     pub grade: String,
     /// The evaluator contributions.
     pub evaluators: EvaluatorScores,
-    /// The gates that passed, in evaluation order.
+    /// The gate-role evaluators that passed, in evaluation order.
     pub gates_passed: Vec<String>,
     /// The release recommendation.
     pub recommendation: String,
+}
+
+impl FinalScore {
+    /// The final score as a fraction of `1.0`.
+    #[must_use]
+    pub fn score_fraction(&self) -> f64 {
+        self.final_score_pct
+    }
+
+    /// Whether the pipeline ran to completion (`COMPLETED`).
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        self.pipeline_status == PIPELINE_COMPLETED
+    }
 }
 
 /// Where the design and safety scores of a judge-driven run came from.
@@ -224,9 +472,11 @@ pub(crate) fn status_from(assertions: &[AssertionOutcome]) -> CaseStatus {
 
 /// Aggregates per-case results into the shared functional summary.
 ///
-/// The pass rate is `(passed + 0.5 * partial) / total`; an empty result list
-/// yields `0.0`. Both the deterministic evaluator and the evaluation harness use
-/// this function so their summaries cannot drift apart.
+/// The pass rate is `passed / total`; partial cases are counted in `partial` but
+/// do not earn credit, so 3 passed, 1 partial, and 0 failed reads `0.75`, exactly
+/// as in the Python test report. An empty result list yields `0.0`. Both the
+/// deterministic evaluator and the evaluation harness use this function so their
+/// summaries cannot drift apart.
 pub(crate) fn summarize(results: &[CaseResult]) -> CaseSummary {
     let total = results.len();
     let passed = results
@@ -244,7 +494,7 @@ pub(crate) fn summarize(results: &[CaseResult]) -> CaseSummary {
     let pass_rate = if total == 0 {
         0.0
     } else {
-        (passed as f64 + 0.5 * partial as f64) / total as f64
+        passed as f64 / total as f64
     };
     CaseSummary {
         total,
@@ -277,19 +527,19 @@ impl EvaluationReport {
     }
 }
 
-/// Maps a percentage score to a letter grade.
+/// Maps a score fraction to a letter grade.
 ///
-/// `A` at 90.0, `B` at 80.0, `C` at 70.0, `D` at 60.0, otherwise `F`. The
-/// comparisons are ordered so that a negative or NaN score yields `F`.
+/// `A` at `0.90`, `B` at `0.80`, `C` at `0.70`, `D` at `0.60`, otherwise `F`.
+/// The comparisons are ordered so that a negative or NaN score yields `F`.
 #[must_use]
-pub fn grade_for(score_pct: f64) -> String {
-    let grade = if score_pct >= 90.0 {
+pub fn grade_for(score_fraction: f64) -> String {
+    let grade = if score_fraction >= 0.90 {
         "A"
-    } else if score_pct >= 80.0 {
+    } else if score_fraction >= 0.80 {
         "B"
-    } else if score_pct >= 70.0 {
+    } else if score_fraction >= 0.70 {
         "C"
-    } else if score_pct >= 60.0 {
+    } else if score_fraction >= 0.60 {
         "D"
     } else {
         "F"
@@ -303,17 +553,17 @@ mod tests {
 
     #[test]
     fn grade_boundaries() {
-        assert_eq!(grade_for(100.0), "A");
-        assert_eq!(grade_for(90.0), "A");
-        assert_eq!(grade_for(89.99), "B");
-        assert_eq!(grade_for(80.0), "B");
-        assert_eq!(grade_for(79.9), "C");
-        assert_eq!(grade_for(70.0), "C");
-        assert_eq!(grade_for(69.99), "D");
-        assert_eq!(grade_for(60.0), "D");
-        assert_eq!(grade_for(59.9), "F");
+        assert_eq!(grade_for(1.0), "A");
+        assert_eq!(grade_for(0.90), "A");
+        assert_eq!(grade_for(0.8999), "B");
+        assert_eq!(grade_for(0.80), "B");
+        assert_eq!(grade_for(0.799), "C");
+        assert_eq!(grade_for(0.70), "C");
+        assert_eq!(grade_for(0.6999), "D");
+        assert_eq!(grade_for(0.60), "D");
+        assert_eq!(grade_for(0.599), "F");
         assert_eq!(grade_for(0.0), "F");
-        assert_eq!(grade_for(-1.0), "F");
+        assert_eq!(grade_for(-0.1), "F");
         assert_eq!(grade_for(f64::NAN), "F");
     }
 
@@ -321,11 +571,11 @@ mod tests {
     fn report_round_trips_through_json() {
         let mut report = EvaluationReport::default();
         report.design.skill_name = "demo".to_string();
-        report.design.design_score_pct = 80.0;
+        report.design.design_score_pct = 0.8;
         report.design.ready_for_functional_testing = true;
         report.functional.summary.pass_rate = 0.5;
-        report.safety.score_pct = 100.0;
-        report.final_score.pipeline_status = "COMPLETED".to_string();
+        report.safety.score_pct = 1.0;
+        report.final_score.pipeline_status = PIPELINE_COMPLETED.to_string();
 
         let json = report.to_json().expect("to_json");
         let back: EvaluationReport = serde_json::from_value(json).expect("deserialize");
@@ -346,10 +596,90 @@ mod tests {
     }
 
     #[test]
-    fn safety_dimensions_serializes_null() {
+    fn safety_dimensions_serialize_as_null_without_a_scan() {
         let report = SafetyReport::default();
         let json = serde_json::to_value(&report).expect("serialize");
         assert_eq!(json["dimensions"], serde_json::Value::Null);
+        assert_eq!(json["auto_fail"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn auto_fail_codes_round_trip_through_display_and_parse() {
+        for code in AutoFailCode::ALL {
+            let rendered = code.to_string();
+            assert!(rendered.starts_with(code.code()), "{rendered}");
+            assert!(rendered.contains(code.description()), "{rendered}");
+            assert_eq!(AutoFailCode::parse(&rendered), Some(code));
+            assert_eq!(AutoFailCode::parse(code.code()), Some(code));
+            assert_eq!(AutoFailCode::parse(&code.code().to_lowercase()), Some(code));
+        }
+        assert_eq!(
+            AutoFailCode::parse(" AF2: anything "),
+            Some(AutoFailCode::HardcodedCredentials)
+        );
+        assert_eq!(AutoFailCode::parse("AF6: nope"), None);
+        assert_eq!(AutoFailCode::parse(""), None);
+        assert_eq!(AutoFailCode::parse("harmful"), None);
+    }
+
+    #[test]
+    fn auto_fail_codes_serialize_as_the_display_string() {
+        let code = AutoFailCode::HardcodedCredentials;
+        let json = serde_json::to_value(code).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!("AF2: hardcoded credentials, API keys, or secrets")
+        );
+
+        let back: AutoFailCode = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, code);
+
+        let bare: AutoFailCode = serde_json::from_str("\"af3\"").expect("bare code");
+        assert_eq!(bare, AutoFailCode::UndeclaredExfiltration);
+
+        let error = serde_json::from_str::<AutoFailCode>("\"AF9: unknown\"").expect_err("unknown");
+        assert!(error.to_string().contains("auto-fail"), "{error}");
+    }
+
+    #[test]
+    fn safety_report_serializes_the_auto_fail_string() {
+        let report = SafetyReport {
+            skill_name: "demo".to_string(),
+            score_pct: 0.0,
+            gate_threshold: 0.8,
+            blocked: true,
+            auto_fail: Some(AutoFailCode::BypassSafety),
+            dimensions: None,
+            findings: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(
+            json["auto_fail"],
+            serde_json::json!("AF1: instructions to bypass or ignore safety measures")
+        );
+        assert_eq!(json["dimensions"], serde_json::Value::Null);
+        assert_eq!(report.score_fraction(), 0.0);
+        assert!(!report.passes_gate());
+
+        let back: SafetyReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, report);
+    }
+
+    #[test]
+    fn safety_dimension_ids_are_the_python_ids() {
+        let ids: Vec<&str> = SAFETY_DIMENSIONS.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "d1_harmful_instruction",
+                "d2_scope_containment",
+                "d3_data_handling",
+                "d4_injection_resilience",
+                "d5_guardrails",
+            ]
+        );
+        let maxima: f64 = SAFETY_DIMENSIONS.iter().map(|(_, max, _)| *max).sum();
+        assert!((maxima - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -361,6 +691,73 @@ mod tests {
         let json = serde_json::to_string(&dimension).expect("serialize");
         let back: ScoreDimension = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, dimension);
+    }
+
+    #[test]
+    fn design_accessors_name_their_unit() {
+        let mut report = DesignReport {
+            design_score: 74.0,
+            design_score_max: 100.0,
+            design_score_pct: 0.74,
+            ..DesignReport::default()
+        };
+        assert!((report.score_points() - 74.0).abs() < 1e-9);
+        assert!((report.score_fraction() - 0.74).abs() < 1e-9);
+
+        report.dimensions.insert(
+            "d1_knowledge_ratio".to_string(),
+            ScoreDimension {
+                score: 10.0,
+                max: 10.0,
+            },
+        );
+        assert_eq!(report.knowledge_delta_label(), "Excellent");
+
+        for (points, expected) in [
+            (9.0, "Excellent"),
+            (6.0, "Good"),
+            (3.0, "Mediocre"),
+            (0.0, "Poor"),
+        ] {
+            report.dimensions.insert(
+                "d1_knowledge_ratio".to_string(),
+                ScoreDimension {
+                    score: points,
+                    max: 10.0,
+                },
+            );
+            assert_eq!(report.knowledge_delta_label(), expected, "{points}");
+        }
+        assert_eq!(DesignReport::default().knowledge_delta_label(), "Poor");
+    }
+
+    #[test]
+    fn final_score_accessors_name_their_unit() {
+        let completed = FinalScore {
+            pipeline_status: PIPELINE_COMPLETED.to_string(),
+            final_score_pct: 0.81,
+            ..FinalScore::default()
+        };
+        assert!((completed.score_fraction() - 0.81).abs() < 1e-9);
+        assert!(completed.is_completed());
+
+        let blocked = FinalScore {
+            pipeline_status: PIPELINE_BLOCKED_AT_E3.to_string(),
+            ..FinalScore::default()
+        };
+        assert!(!blocked.is_completed());
+    }
+
+    #[test]
+    fn evaluator_score_weighted_computes_the_python_contribution() {
+        let score = EvaluatorScore::weighted(0.74, 0.40);
+        assert!((score.score_pct - 0.74).abs() < 1e-9);
+        assert!((score.weight - 0.40).abs() < 1e-9);
+        assert!((score.contribution - 0.296).abs() < 1e-9);
+
+        let rounded = EvaluatorScore::weighted(2.0 / 3.0, 0.6);
+        assert!((rounded.score_pct - 0.6667).abs() < 1e-9);
+        assert!((rounded.contribution - 0.4).abs() < 1e-9);
     }
 
     #[test]
@@ -398,31 +795,40 @@ mod tests {
         assert_eq!(status_from(&[]), CaseStatus::Passed);
     }
 
+    fn case(id: &str, status: CaseStatus) -> CaseResult {
+        CaseResult {
+            id: id.to_string(),
+            status,
+            ..CaseResult::default()
+        }
+    }
+
     #[test]
-    fn summarize_credits_partial_cases_with_half_a_pass() {
+    fn summarize_counts_only_whole_passes() {
         let results = [
-            CaseResult {
-                id: "a".to_string(),
-                status: CaseStatus::Passed,
-                ..CaseResult::default()
-            },
-            CaseResult {
-                id: "b".to_string(),
-                status: CaseStatus::Partial,
-                ..CaseResult::default()
-            },
-            CaseResult {
-                id: "c".to_string(),
-                status: CaseStatus::Failed,
-                ..CaseResult::default()
-            },
+            case("a", CaseStatus::Passed),
+            case("b", CaseStatus::Partial),
+            case("c", CaseStatus::Failed),
         ];
         let summary = summarize(&results);
         assert_eq!(summary.total, 3);
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.partial, 1);
         assert_eq!(summary.failed, 1);
-        assert!((summary.pass_rate - 0.5).abs() < 1e-9);
+        assert!((summary.pass_rate - 1.0 / 3.0).abs() < 1e-9);
+
+        let worked_example = [
+            case("a", CaseStatus::Passed),
+            case("b", CaseStatus::Passed),
+            case("c", CaseStatus::Passed),
+            case("d", CaseStatus::Partial),
+        ];
+        let summary = summarize(&worked_example);
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.passed, 3);
+        assert_eq!(summary.partial, 1);
+        assert_eq!(summary.failed, 0);
+        assert!((summary.pass_rate - 0.75).abs() < 1e-9);
 
         let empty = summarize(&[]);
         assert_eq!(empty.total, 0);

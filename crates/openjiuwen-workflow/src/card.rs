@@ -169,6 +169,24 @@ impl Default for WorkflowConfig {
     }
 }
 
+/// Builds the storage key of one workflow version.
+///
+/// Ports Python's `generate_workflow_key`
+/// (`openjiuwen/core/workflow/base.py`): the key is `"{workflow_id}_{workflow_version}"`,
+/// so an unversioned workflow keys as `"<id>_"`. Bare concatenation is deliberate — an
+/// id that itself contains `_` is not escaped, exactly like the Python helper.
+///
+/// ```
+/// use openjiuwen_workflow::card::generate_workflow_key;
+///
+/// assert_eq!(generate_workflow_key("greeting", "1.0.0"), "greeting_1.0.0");
+/// assert_eq!(generate_workflow_key("greeting", ""), "greeting_");
+/// ```
+#[must_use]
+pub fn generate_workflow_key(workflow_id: &str, workflow_version: &str) -> String {
+    format!("{workflow_id}_{workflow_version}")
+}
+
 /// Validates a component id the way Python's `Workflow._validate_comp_id` does.
 ///
 /// An id must be non-empty, at most [`MAX_COMPONENT_ID_LEN`] characters, and consist
@@ -257,6 +275,16 @@ mod tests {
         assert_eq!(spec.stream_io_configs, None);
         assert_eq!(spec.exception_config, None);
         assert_eq!(spec.name, None);
+    }
+
+    #[test]
+    fn generate_workflow_key_concatenates_id_and_version() {
+        // Python: openjiuwen/core/workflow/base.py::generate_workflow_key
+        assert_eq!(generate_workflow_key("wf", "1.0.0"), "wf_1.0.0");
+        assert_eq!(generate_workflow_key("wf", ""), "wf_");
+        assert_eq!(generate_workflow_key("", "v1"), "_v1");
+        // Neither side is escaped or normalized.
+        assert_eq!(generate_workflow_key("a_b", "1_2"), "a_b_1_2");
     }
 
     #[test]

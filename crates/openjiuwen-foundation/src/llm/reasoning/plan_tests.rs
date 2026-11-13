@@ -479,3 +479,254 @@ fn moonshot_families_are_classified_from_the_last_segment() {
     assert_eq!(moonshot_family("Kimi-K2.6"), MoonshotFamily::K2Toggle);
     assert_eq!(moonshot_family("kimi-k1"), MoonshotFamily::Unknown);
 }
+/// Wires the resolver answers before dispatching to an encoder: `profile_plan`
+/// short-circuits them, so they deliberately have no `encode_wire` arm.
+const GUARD_WIRES: [&str; 3] = ["always_on", "minimax_m2", "unsupported"];
+#[test]
+fn every_table_wire_dispatches_to_a_real_encoder() {
+    use super::super::profiles::{MODEL_REASONING_FALLBACKS, REASONING_PROFILES};
+    for profile in REASONING_PROFILES.iter().chain(MODEL_REASONING_FALLBACKS) {
+        for (protocol, wire) in [
+            (ReasoningProtocol::ChatCompletions, profile.wire),
+            (ReasoningProtocol::AnthropicMessages, profile.anthropic_wire),
+        ] {
+            if GUARD_WIRES.contains(&wire) {
+                continue;
+            }
+            let context = format!("{}/{wire}", profile.provider);
+            let capability = profile.capability_spec_for(protocol).to_capability();
+            let effort = capability
+                .recommended
+                .clone()
+                .or_else(|| {
+                    capability
+                        .options
+                        .iter()
+                        .find(|option| option.as_str() != "off")
+                        .cloned()
+                })
+                .unwrap_or_else(|| panic!("{context}: row exposes no selectable level"));
+            let model = profile.model_patterns[0]
+                .replace('*', "sample")
+                .replace('?', "1");
+            let model_key = model.to_lowercase();
+            let intent = enabled_effort(&effort);
+            let plan = encode_wire(wire, protocol, &model, &model_key, &intent);
+            assert!(
+                !plan.is_empty(),
+                "{context}: no encoder arm produced a plan for {model}"
+            );
+        }
+    }
+}
+/// The vLLM endpoint convenience: the endpoint profile names the dialect.
+fn vllm(protocol: ReasoningProtocol, model: &str, intent: ReasoningConfig) -> ReasoningPlan {
+    resolve_reasoning_plan_with_endpoint(
+        protocol,
+        "openai",
+        Some("vllm"),
+        Some("http://localhost:8000/v1"),
+        model,
+        &intent,
+    )
+}
+#[test]
+fn endpoint_profile_precedence_follows_the_python_resolver() {
+    for (provider, profile, api_base, expected) in [
+        // A non-generic profile names the dialect.
+        (
+            "openai",
+            Some("vllm"),
+            Some("https://api.deepseek.com"),
+            "vllm",
+        ),
+        ("anthropic", Some("VLLM"), None, "vllm"),
+        ("openai", Some("dashscope"), None, "dashscope"),
+        // `_` folds onto `-`, and a generic profile without a host hint is
+        // returned as written (the Python `inferred or profile or provider`).
+        (
+            "deepseek",
+            Some("openai_compatible"),
+            None,
+            "openai-compatible",
+        ),
+        ("openai", Some(" OpenAI "), None, "openai"),
+        ("deepseek", None, None, "deepseek"),
+        // A generic profile defers to the host hint, then to the provider.
+        (
+            "openai",
+            Some("openai-compatible"),
+            Some("https://openrouter.ai/api/v1"),
+            "openrouter",
+        ),
+        // A written generic profile lets the host override a non-generic name.
+        (
+            "dashscope",
+            Some("openai-compatible"),
+            Some("openrouter.ai"),
+            "openrouter",
+        ),
+        (
+            "openai",
+            None,
+            Some("https://openrouter.ai/api/v1"),
+            "openrouter",
+        ),
+        ("qwen", None, None, "dashscope"),
+        ("", Some(""), None, ""),
+    ] {
+        assert_eq!(
+            provider_key_for_endpoint(provider, profile, api_base),
+            expected,
+            "{provider}/{profile:?}/{api_base:?}"
+        );
+        // With no profile at all the endpoint resolver is `provider_key_for`.
+        assert_eq!(
+            provider_key_for_endpoint(provider, None, api_base),
+            super::super::profiles::provider_key_for(provider, api_base),
+            "{provider}/{api_base:?}"
+        );
+    }
+}
+#[test]
+fn a_vllm_endpoint_encodes_enable_thinking_on_both_protocols() {
+    for protocol in [
+        ReasoningProtocol::ChatCompletions,
+        ReasoningProtocol::AnthropicMessages,
+    ] {
+        let plan = vllm(protocol, "glm-5", enabled_effort("high"));
+        assert_eq!(
+            plan.extra_body["enable_thinking"],
+            json!(true),
+            "{protocol:?}"
+        );
+        assert_eq!(
+            plan.extra_body["chat_template_kwargs"],
+            json!({"enable_thinking": true}),
+            "{protocol:?}"
+        );
+        assert_eq!(
+            plan.extra_body["thinking_budget"],
+            json!(8192),
+            "{protocol:?}"
+        );
+        assert!(plan.sdk_params.is_empty(), "{protocol:?}");
+        assert!(!plan.has_warnings(), "{protocol:?}");
+    }
+}
+#[test]
+fn a_vllm_endpoint_maps_every_labelled_effort_onto_a_budget() {
+    for (effort, budget) in [
+        ("minimal", 1024),
+        ("low", 1024),
+        ("medium", 4096),
+        ("high", 8192),
+        ("xhigh", 16384),
+        ("max", 32768),
+    ] {
+        let plan = vllm(
+            ReasoningProtocol::ChatCompletions,
+            "glm-5",
+            enabled_effort(effort),
+        );
+        assert_eq!(
+            plan.extra_body["thinking_budget"],
+            json!(budget),
+            "{effort}"
+        );
+    }
+    // An unknown label still switches thinking on, just without an intensity.
+    let plan = vllm(
+        ReasoningProtocol::ChatCompletions,
+        "glm-5",
+        enabled_effort("turbo"),
+    );
+    assert_eq!(plan.extra_body["enable_thinking"], json!(true));
+    assert!(plan.extra_body.get("thinking_budget").is_none());
+}
+#[test]
+fn a_vllm_endpoint_lets_an_explicit_budget_win() {
+    let plan = vllm(
+        ReasoningProtocol::ChatCompletions,
+        "glm-5",
+        enabled_effort("max").with_budget_tokens(2048),
+    );
+    assert_eq!(plan.extra_body["thinking_budget"], json!(2048));
+}
+#[test]
+fn a_vllm_endpoint_disables_thinking_and_auto_is_empty() {
+    for intent in [
+        disabled(),
+        effort("off"),
+        effort("none"),
+        effort("disabled"),
+    ] {
+        let plan = vllm(ReasoningProtocol::ChatCompletions, "glm-5", intent.clone());
+        assert_eq!(
+            plan.extra_body["enable_thinking"],
+            json!(false),
+            "{intent:?}"
+        );
+        assert_eq!(
+            plan.extra_body["chat_template_kwargs"],
+            json!({"enable_thinking": false}),
+            "{intent:?}"
+        );
+    }
+    let plan = vllm(
+        ReasoningProtocol::ChatCompletions,
+        "glm-5",
+        ReasoningConfig::new(),
+    );
+    assert!(plan.is_empty(), "{plan:?}");
+    let plan = vllm(
+        ReasoningProtocol::AnthropicMessages,
+        "glm-5",
+        ReasoningConfig::new(),
+    );
+    assert!(plan.is_empty(), "{plan:?}");
+}
+#[test]
+fn a_non_vllm_endpoint_keeps_the_profile_table_plan() {
+    for (protocol, provider, model) in [
+        (
+            ReasoningProtocol::ChatCompletions,
+            "deepseek",
+            "deepseek-v4-pro",
+        ),
+        (ReasoningProtocol::ChatCompletions, "zhipu", "glm-5.2"),
+        (
+            ReasoningProtocol::AnthropicMessages,
+            "anthropic",
+            "claude-sonnet-4-5",
+        ),
+    ] {
+        let intent = enabled_effort("high");
+        let with_profile = resolve_reasoning_plan_with_endpoint(
+            protocol,
+            provider,
+            Some(provider),
+            None,
+            model,
+            &intent,
+        );
+        let plain = resolve_reasoning_plan_for(protocol, provider, None, model, &intent);
+        assert_eq!(with_profile, plain, "{provider}/{model}");
+        assert!(with_profile.extra_body.get("enable_thinking").is_none());
+    }
+}
+#[test]
+fn the_chat_convenience_matches_the_protocol_form() {
+    let intent = enabled_effort("medium");
+    assert_eq!(
+        resolve_chat_completion_plan_with_endpoint("openai", Some("vllm"), None, "glm-5", &intent),
+        resolve_reasoning_plan_with_endpoint(
+            ReasoningProtocol::ChatCompletions,
+            "openai",
+            Some("vllm"),
+            None,
+            "glm-5",
+            &intent,
+        )
+    );
+}

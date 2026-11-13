@@ -32,15 +32,17 @@ Per-file suites:
 - `exception_recovery.rs` — `default_outputs` recovery after retries, `outputs_schema` projection of the defaults, downstream refs resolving; `interrupt` and stream failures still `[100054]`.
 - `session_state.rs` — component vs global session lanes, `dump_state`, trace spans, cancellation via `CancellationToken` + `Notify`, session stream publication.
 - `card_spec.rs` — `WorkflowCard`/`WorkflowSpec` JSON round-trip, unknown-field tolerance, `spec()` vs `config().spec`, `to_mermaid`, per-node spec defaults (including `exception_config: None`); mostly sync tests (no runtime).
-- `draw.rs` — `Workflow::draw`/`to_svg` Mermaid vs SVG, determinism, XML escaping, rounded start/end, empty/single/disconnected specs.
+- `draw.rs` — `Workflow::draw`/`to_svg` Mermaid vs SVG, determinism, XML escaping, rounded start/end, empty/single/disconnected specs, and `DrawFormat::Png` as a typed `Unsupported` rejection that leaves Mermaid/SVG untouched.
 - `retrieval_component.rs` — `SimpleKnowledgeBase` + `HashEmbedding` + `InMemoryVectorStore`; `documents` output; `101102` on blank query.
 - `tool_component.rs` — `ToolComponent` maps failures to `error_code` data (`0`, `102000`, `182012`) and resolves the tool input schema.
 - `loop_component.rs` — number/array/condition loops, session limit cap, `101040` when the bound is missing.
 - `http_component.rs` — `HttpRequestComponent` end to end against loopback `wiremock`: encoding, response projection, `response_data_property`/`response_mode`, 4xx/5xx as data, retries, `[102000]` transport failures, builtin `"http_request"` factory.
-- `questioner_component.rs` — `start → questioner → end` over a checkpointed session, `ScriptedModel` extraction, `INPUT_REQUIRED` plus `resume` per question, continue-ask wording, `max_response`.
+- `questioner_component.rs` — `start → questioner → end` over a checkpointed session, `ScriptedModel` extraction, `INPUT_REQUIRED` plus `resume` per question, continue-ask wording, `max_response`; opt-in chat history (prior turns reaching the extraction prompt, recorded user/assistant turns, round trimming, the default-off regression guard).
 - `intent_detection.rs` — model path via `ScriptedModel`, offline keyword rule path (case-insensitive distinct hits, lowest-id ties, default class), `IntentRouter` successor selection from graph state.
 - `react_agent.rs` — resolved inputs reach the `AgentRunner` unchanged, `{output, result_type}` normalization, error/interrupt data, `ModelReActRunner` tool round and every `on_max_iterations` policy.
-- `sub_workflow.rs` — child end output passthrough, isolated child state lanes for reused node ids, nesting limit, forwarded frame wires, stream cache, relayed HITL as the parent's `INPUT_REQUIRED`.
+- `sub_workflow.rs` — child end output passthrough, isolated child state lanes for reused node ids, nesting limit, forwarded frame wires, stream cache, relayed HITL as the parent's `INPUT_REQUIRED`, and resume answer forwarding (bare and dotted child interaction ids, replay of earlier answers on a second resume via the recorded parent lane).
+- `single_component.rs` — `execute_single_component[_with]`: `inputs_schema` resolution, `outputs_schema` projection, interrupt reported as `INPUT_REQUIRED` with interaction wires, seeded answer completing the call, error propagation, `generate_workflow_key`, `WorkflowChunkType` wire values.
+- `public_api.rs` — crate-root vs module-path parity (type identity for the HTTP config tree and the LLM/ReAct aliases), a Python-shaped `HttpComponentConfig` JSON round-trip with unknown keys, HTTP enum wire strings, max-iteration constants and exported status codes.
 
 ## Constraints
 

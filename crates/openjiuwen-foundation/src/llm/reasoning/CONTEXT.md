@@ -17,10 +17,12 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 - `ReasoningProfile` — one provider-scoped model family: `provider`, `model_patterns`, `capability`, `anthropic_capability`, `wire`, `anthropic_wire`, plus `new`, `with_anthropic_capability`, `wire_for`, `capability_for`, `capability_spec_for`.
 - `ReasoningPlan` — the resolved output: `sdk_params` (top-level body keys), `extra_body` (vendor extensions), `warnings`; `new`, `is_empty`, `has_warnings`, `sdk_param_names`, `extra_body_names`.
 - `provider_key_for(provider, api_base) -> String` — the table's provider vocabulary for a configured provider name.
+- `provider_key_for_endpoint(provider, endpoint_profile, api_base) -> String` — the same with a client `endpoint_profile`: a non-generic profile names the dialect and wins, a generic one defers to the host hint and then to the profile as written; `provider_key_for` delegates with no profile.
 - `matches_pattern(pattern, model) -> bool` — case-insensitive `*`/`?` glob match.
 - `find_reasoning_profile(provider, model) -> Option<&'static ReasoningProfile>` — first matching table entry.
-- `reasoning_capability(provider, model)`, `reasoning_capability_for(protocol, provider, model)`, `standard_reasoning_capability(protocol)` — user-selectable levels and their recommendation.
+- `reasoning_capability(provider, model)`, `reasoning_capability_for(protocol, provider, model)`, `reasoning_capability_for_endpoint(provider, endpoint_profile, api_base, model)` (advisory, chat completions), `standard_reasoning_capability(protocol)` — user-selectable levels and their recommendation.
 - `resolve_reasoning_plan(provider, api_base, model, &intent)` — resolve for chat completions; `resolve_reasoning_plan_for(protocol, provider, api_base, model, &intent)` for an explicit wire protocol.
+- `resolve_reasoning_plan_with_endpoint(protocol, provider, endpoint_profile, api_base, model, &intent)` and the chat convenience `resolve_chat_completion_plan_with_endpoint(provider, endpoint_profile, api_base, model, &intent)`; both profile-less entry points delegate here with `None`, so their behaviour is unchanged.
 - `apply_reasoning_plan(&mut body, &plan)` and `apply_reasoning_plan_with(&mut body, &plan, override_existing)` — write a plan into a JSON body.
 - Helpers `is_disabled_effort(effort)` and `normalize_effort(effort)` (`"none"` folds onto `"off"`).
 - Tables `REASONING_PROFILES` (provider-scoped, specific to broad) and `MODEL_REASONING_FALLBACKS` (cross-provider, model-name only).
@@ -28,6 +30,7 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 ## Wire Contract
 
 - `provider_key_for` normalizes the provider name with the `llm::provider` vocabulary (so `qwen` becomes `dashscope`) and consults the `api_base` host hint only for a generic name (`""`, `openai`, `openaicompatible`), so an explicit vendor name wins over the host.
+- `provider_key_for_endpoint` trims/lowercases the profile and folds `_` onto `-`; the generic profiles are `""`, `openai`, and `openai-compatible`, everything else is returned as the key.
 - Known hosts map to `openrouter`, `dashscope`, `deepseek`, `moonshot`, `minimax`, `modelarts`, `qianfan`, `zhipu`, `volcengine`, and `mimo`.
 - `find_reasoning_profile` scans `REASONING_PROFILES` in table order (provider equality plus model glob), then `MODEL_REASONING_FALLBACKS` against both the full model id and its last `/` segment.
 - Chat completions treats a `deepseek` key, spelling, or `deepseek.com` base as `deepseek`, falls back to the OpenRouter encoder for an unprofiled `openrouter` model, and otherwise encodes a generic effort.
@@ -43,7 +46,8 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 - `minimax_m2` always sends `reasoning_split: true`; `minimax_m3` sends `thinking` (`adaptive`) in the extension body and `minimax_m3_anthropic` at the top level.
 - `volcengine_seed` sends `reasoning_effort` and encodes disable as `minimal`; `openrouter` sends one normalized `reasoning` object (`effort`, `enabled`, `max_tokens`) in the extension body, leaving model ids with an unknown vendor prefix alone.
 - `unsupported` and `always_on` send nothing; `ReasoningProtocol::Responses` sends a nested `reasoning: {effort}` object, and `null` for an explicit `disabled`.
-- `../openai/request.rs` reads `ModelRequestConfig::extra["reasoning"]` through `ReasoningConfig::from_value`, resolves and applies the plan, consumes the intent key, and merges `extra` last so caller keys still win.
+- A resolved `vllm` endpoint bypasses the table on chat completions and Anthropic Messages: disabled (including the `disabled` effort spelling) writes `enable_thinking: false` plus `chat_template_kwargs.enable_thinking: false`, `auto` with no effort and no budget writes nothing, and anything else writes both switches on plus `thinking_budget` from an explicit budget or the map minimal/low 1024, medium 4096, high 8192, xhigh 16384, max 32768; `reasoning_effort` is never sent.
+- `../openai/request.rs` and `../anthropic/request.rs` read `ModelRequestConfig::extra["reasoning"]` through `ReasoningConfig::from_value`, resolve it with the client's `endpoint_profile` and resolved base URL, apply the plan, consume the intent key, and merge `extra` last so caller keys still win.
 
 ## Constraints
 
@@ -53,6 +57,7 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 - No new dependencies: only `serde`, `serde_json`, and `openjiuwen_common::error` on top of what the crate already uses.
 - Every public item is documented; `missing_docs`, `unreachable_pub`, and `clippy --all-targets -- -D warnings` stay clean.
 - Logging comes from the request builder with target `openjiuwen_foundation::llm::reasoning`: warnings at debug, applied parameter names at trace; model names are logged, credentials never (this module handles none).
+- `vllm.rs` holds the self-hosted-gateway encoder and its unit tests, so `plan.rs` stays the profile-table dispatcher.
 - `profiles.rs` is the largest file at ~967 lines and stays under the ~1000-line rule; the type definitions live in `mod.rs`, the encoders in `plan.rs`.
 
 ## Design Decisions
@@ -74,6 +79,8 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 - `plan_tests.rs` (declared from `plan.rs` with `#[path]`) drives every encoder through the public `resolve_reasoning_plan`/`resolve_reasoning_plan_for`, plus each normalizer table, provider resolution, warnings, Responses encoding, and Moonshot family classification.
 - `tests.rs` iterates the whole table: every entry uses a known encoder (`KNOWN_WIRES`, 25 names), every capability is lower case, unique and self-consistent, every entry is reachable by a sample model id, no provider/pattern pair is duplicated, and resolution never panics.
 - `tests.rs` also asserts end-to-end body effects: a resolved plan fills the body, an empty plan or a warning-only plan leaves it byte-identical, and caller `extra` overrides a plan key.
+- `profiles_parity_tests.rs` pins the tables to the Python reference: every row of `REASONING_PROFILES` and `MODEL_REASONING_FALLBACKS` (provider, patterns, capability options/recommended, `wire`, `anthropic_wire`) is compared in Python order against the hard-coded transcription in `profiles_python_rows.rs`, and the audited families are resolved through the public lookup API; Python is never read at test time.
+- `plan_tests.rs` proves encoder coverage: every table `wire`/`anthropic_wire` outside the guard set (`always_on`, `minimax_m2`, `unsupported`) dispatches to a real `encode_wire` arm and produces a non-empty plan for a level its capability offers.
 - Everything is offline and deterministic — pure functions, no `wiremock`, no environment mutation; `cargo test -p openjiuwen-foundation reasoning` runs the module.
 
 ## Known Gaps
@@ -89,6 +96,8 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 
 - `./mod.rs` → intent, capability, protocol, profile, and plan types plus their helpers and inline tests
 - `./profiles.rs` → static profile/fallback tables, provider-key resolution, host hints, glob matching, profile lookup, capability lookup
+- `./profiles_parity_tests.rs` → Python-parity row pins, audited-family resolution, provider-vs-fallback precedence (compiled as `profiles.rs`'s test module)
+- `./profiles_python_rows.rs` → hard-coded transcription of the Python profile and fallback tables, used only by the parity tests
 - `./plan.rs` → resolution entry points, the encoder dispatch, per-family normalizers, and intent sanitizing
 - `./apply.rs` → writing a plan into a request body without clobbering caller keys
 - `./plan_tests.rs` → per-encoder and normalizer suites (compiled as `plan.rs`'s test module)

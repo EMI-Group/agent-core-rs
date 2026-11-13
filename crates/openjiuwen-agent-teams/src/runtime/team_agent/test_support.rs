@@ -11,15 +11,18 @@ use async_trait::async_trait;
 use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_harness_protocol::{
-    AbortMode, DeliveryMode, EventBufferConfig, HarnessCard, HarnessContext, HarnessEvent,
-    HarnessEventCursor, HarnessInput, HarnessProtocol, HarnessResult, HarnessState, OutputChannel,
-    OutputEvent, OutputKind, OutputOperation, SendReceipt, VecEventCursor,
+    AbortMode, DeliveryMode, EventBufferConfig, HarnessCard, HarnessCheckpoint, HarnessContext,
+    HarnessEvent, HarnessEventCursor, HarnessInput, HarnessProtocol, HarnessResult, HarnessState,
+    OutputChannel, OutputEvent, OutputKind, OutputOperation, SendReceipt, TurnEventKind,
+    TurnLifecycleEvent, VecEventCursor,
 };
 use parking_lot::Mutex;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::harness::{MemberHarnessContext, MemberHarnessFactory};
+use crate::harness::{
+    MemberCheckpointRecord, MemberCheckpointStore, MemberHarnessContext, MemberHarnessFactory,
+};
 use crate::runtime::deps::TeamBuildDeps;
 use crate::schema::{DeepAgentSpec, TeamAgentSpec};
 use crate::workspace::{MemberWorkspace, WorkspaceProvider, WorkspaceRequest};
@@ -76,13 +79,17 @@ pub(crate) struct ScriptedHarness {
     answer: String,
     /// When set, `send` leaves the harness `Running` and emits nothing.
     hang: bool,
+    /// When set, `send` closes the turn with a terminal `turn_lifecycle` event after the answer.
+    turn_events: bool,
+    /// Start contexts received by [`HarnessProtocol::start`], in call order.
+    contexts: Mutex<Vec<HarnessContext>>,
     /// Envelope sequence counter.
     sequence: AtomicU64,
 }
 
 impl ScriptedHarness {
     /// Builds a harness that answers every input with `answer`.
-    fn new(answer: String, hang: bool) -> Arc<Self> {
+    fn new(answer: String, hang: bool, turn_events: bool) -> Arc<Self> {
         let (sender, receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             state: Mutex::new(HarnessState::Idle),
@@ -93,6 +100,8 @@ impl ScriptedHarness {
             sender,
             answer,
             hang,
+            turn_events,
+            contexts: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(0),
         })
     }
@@ -100,6 +109,11 @@ impl ScriptedHarness {
     /// Returns the recorded commands.
     pub(crate) fn calls(&self) -> Vec<Call> {
         self.calls.lock().clone()
+    }
+
+    /// Returns the start contexts the runtime handed to this harness, in call order.
+    pub(crate) fn contexts(&self) -> Vec<HarnessContext> {
+        self.contexts.lock().clone()
     }
 
     /// Returns the text of every delivered input, in order.
@@ -135,6 +149,22 @@ impl ScriptedHarness {
         )
         .with_turn_id("turn-1")
     }
+
+    /// Builds the terminal turn event that closes one scripted turn.
+    fn turn_finished_event(&self) -> HarnessEvent {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        HarnessEvent::new(
+            sequence + 1,
+            1.0,
+            TurnLifecycleEvent {
+                kind: TurnEventKind::Finished,
+                result: None,
+            },
+            "session:scripted",
+            "scripted",
+        )
+        .with_turn_id("turn-1")
+    }
 }
 
 #[async_trait]
@@ -156,8 +186,9 @@ impl HarnessProtocol for ScriptedHarness {
         &self.buffer
     }
 
-    async fn start(&self, _context: HarnessContext) -> HarnessResult<()> {
+    async fn start(&self, context: HarnessContext) -> HarnessResult<()> {
         self.calls.lock().push(Call::Start);
+        self.contexts.lock().push(context);
         *self.state.lock() = HarnessState::Idle;
         Ok(())
     }
@@ -185,6 +216,9 @@ impl HarnessProtocol for ScriptedHarness {
         *self.state.lock() = HarnessState::Running;
         if !self.hang {
             let _ = self.sender.send(self.output_event());
+            if self.turn_events {
+                let _ = self.sender.send(self.turn_finished_event());
+            }
             *self.state.lock() = HarnessState::Idle;
         }
         Ok(SendReceipt {
@@ -210,10 +244,20 @@ impl HarnessProtocol for ScriptedHarness {
         Ok(())
     }
 
-    async fn export_checkpoint(
-        &self,
-    ) -> HarnessResult<Option<openjiuwen_harness_protocol::HarnessCheckpoint>> {
-        Ok(None)
+    async fn export_checkpoint(&self) -> HarnessResult<Option<HarnessCheckpoint>> {
+        let mut data = openjiuwen_harness_protocol::JsonObject::new();
+        data.insert("state".to_owned(), json!("idle"));
+        Ok(Some(HarnessCheckpoint {
+            provider: "scripted".to_owned(),
+            schema_version: "1".to_owned(),
+            agent_id: "scripted".to_owned(),
+            host_session_id: "session:scripted".to_owned(),
+            checkpoint_id: "scripted-checkpoint".to_owned(),
+            sequence: 1,
+            data,
+            provider_session_id: None,
+            revision: None,
+        }))
     }
 }
 
@@ -228,6 +272,8 @@ pub(crate) struct ScriptedFactory {
     hanging: Mutex<BTreeSet<String>>,
     /// Harness built per member, so a test can inspect what the leader received.
     harnesses: Mutex<BTreeMap<String, Arc<ScriptedHarness>>>,
+    /// Whether harnesses built from now on close each turn with a terminal event.
+    turn_events: Mutex<bool>,
 }
 
 impl ScriptedFactory {
@@ -244,6 +290,14 @@ impl ScriptedFactory {
     /// Makes the harness of `member` hang on every input.
     pub(crate) fn hanging_for(&self, member: &str) {
         self.hanging.lock().insert(member.to_owned());
+    }
+
+    /// Makes every harness built from now on close its turns with a terminal event.
+    ///
+    /// Only the checkpoint tests need it (a finished turn is what triggers a turn capture); every
+    /// other test sees exactly the events it saw before.
+    pub(crate) fn with_turn_events(&self) {
+        *self.turn_events.lock() = true;
     }
 
     /// Returns the recorded factory contexts, in call order.
@@ -274,6 +328,7 @@ impl MemberHarnessFactory for ScriptedFactory {
         let harness = ScriptedHarness::new(
             format!("done: {}", ctx.member_name),
             self.hanging.lock().contains(&ctx.member_name),
+            *self.turn_events.lock(),
         );
         self.harnesses
             .lock()
@@ -283,6 +338,58 @@ impl MemberHarnessFactory for ScriptedFactory {
 
     fn name(&self) -> &'static str {
         "scripted"
+    }
+}
+
+/// Checkpoint store that records every `load` identity and counts the saves.
+///
+/// `load` always misses, so a runtime wired to it starts cold and a test can assert the identity the
+/// runtime asked for; `save` returns a deterministic revision.
+#[derive(Default)]
+pub(crate) struct RecordingCheckpointStore {
+    /// `(session_id, card_id)` identities passed to `load`, in call order.
+    loads: Mutex<Vec<(String, String)>>,
+    /// Number of `save` calls.
+    saves: AtomicU64,
+}
+
+impl RecordingCheckpointStore {
+    /// Builds an `Arc<dyn MemberCheckpointStore>` over a fresh recorder.
+    pub(crate) fn shared() -> Arc<dyn MemberCheckpointStore> {
+        Arc::new(Self::default())
+    }
+
+    /// Returns the identities asked for through `load`, in call order.
+    pub(crate) fn loads(&self) -> Vec<(String, String)> {
+        self.loads.lock().clone()
+    }
+
+    /// Returns how many records were saved.
+    pub(crate) fn saves(&self) -> u64 {
+        self.saves.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MemberCheckpointStore for RecordingCheckpointStore {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    async fn save(&self, _record: MemberCheckpointRecord) -> Result<String> {
+        let count = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(format!("rec-{count}"))
+    }
+
+    async fn load(
+        &self,
+        session_id: &str,
+        card_id: &str,
+    ) -> Result<Option<MemberCheckpointRecord>> {
+        self.loads
+            .lock()
+            .push((session_id.to_owned(), card_id.to_owned()));
+        Ok(None)
     }
 }
 

@@ -5,6 +5,22 @@
 //! records component configs and edges and compiling maps them onto `openjiuwen-graph`.
 //! Data flow is textual: a component's `inputs_schema` is a JSON template whose pure
 //! reference strings resolve against workflow state before the component runs.
+//!
+//! # Re-exports
+//!
+//! The crate root mirrors Python's `openjiuwen/core/workflow/__init__.py`: every built-in
+//! component, the whole `Http*` configuration tree, the component-local Python status codes,
+//! and the Python-name type aliases (`LLMComponent`, `LLMCompConfig`,
+//! `ReActAgentCompConfig`) are re-exported here, so `use openjiuwen_workflow::…` reaches the
+//! same surface as the Python package root.
+//!
+//! The per-component error *builders* are deliberately **not** re-exported at the root: names
+//! such as `config_error`, `input_param_error`, or `runtime_error` would pollute the crate
+//! namespace. They stay in their owning modules —
+//! `components::questioner::{input_param_error, config_error, …}` and
+//! `components::intent_detection::{intent_detection_config_error, …}` — while their status
+//! codes (`COMPONENT_QUESTIONER_*`, `COMPONENT_INTENT_DETECTION_*`) are available both there
+//! and at the crate root.
 
 pub mod ability;
 pub mod card;
@@ -19,6 +35,7 @@ pub mod output;
 pub mod reference;
 pub mod registry;
 pub mod render;
+pub mod single;
 pub mod workflow;
 
 /// Returns the crate name.
@@ -29,17 +46,48 @@ pub fn crate_name() -> &'static str {
 
 pub use ability::ComponentAbility;
 pub use card::{
-    validate_component_id, CompIoConfig, ExceptionConfig, NodeSpec, WorkflowCard, WorkflowConfig,
-    WorkflowSpec,
+    generate_workflow_key, validate_component_id, CompIoConfig, ExceptionConfig, NodeSpec,
+    WorkflowCard, WorkflowConfig, WorkflowSpec, INVALID_ID_CHARS_REASON, MAX_COMPONENT_ID_LEN,
 };
 pub use component::{unsupported_ability, Component, ComponentCard};
+// --- components (component + full config surface, as in the Python package root) ---
+/// The `intent_detection` status codes (Python `COMPONENT_INTENT_DETECTION_*`).
+///
+/// The matching error builders stay in [`components::intent_detection`]; see the crate docs.
+pub use components::intent_detection::{
+    COMPONENT_INTENT_DETECTION_ACCEPT_LANGUAGE_INVALID,
+    COMPONENT_INTENT_DETECTION_CATEGORY_NAME_DUPLICATE,
+    COMPONENT_INTENT_DETECTION_CATEGORY_NAME_INVALID, COMPONENT_INTENT_DETECTION_CONFIG_ERROR,
+    COMPONENT_INTENT_DETECTION_EXAMPLE_INVALID, COMPONENT_INTENT_DETECTION_HISTORY_CONFIG_ERROR,
+    COMPONENT_INTENT_DETECTION_INPUT_PARAM_ERROR, COMPONENT_INTENT_DETECTION_INVOKE_CALL_FAILED,
+    COMPONENT_INTENT_DETECTION_KEYWORD_CATEGORY_UNKNOWN,
+    COMPONENT_INTENT_DETECTION_KEYWORD_INVALID, COMPONENT_INTENT_DETECTION_LLM_INIT_FAILED,
+    COMPONENT_INTENT_DETECTION_PROMPT_INVALID, COMPONENT_INTENT_DETECTION_ROUTER_CONFIG_ERROR,
+};
+/// The `questioner` status codes (Python `COMPONENT_QUESTIONER_*`).
+///
+/// The matching error builders stay in [`components::questioner`]; see the crate docs.
+pub use components::questioner::{
+    COMPONENT_QUESTIONER_CONFIG_ERROR, COMPONENT_QUESTIONER_EXECUTION_PROCESS_ERROR,
+    COMPONENT_QUESTIONER_INPUT_INVALID, COMPONENT_QUESTIONER_INPUT_PARAM_ERROR,
+    COMPONENT_QUESTIONER_INVOKE_CALL_FAILED, COMPONENT_QUESTIONER_RUNTIME_ERROR,
+    COMPONENT_QUESTIONER_STATE_INIT_FAILED,
+};
+/// The `react_agent` `on_max_iterations` policy values.
+pub use components::react_agent::{
+    ON_MAX_ITERATIONS_ERROR, ON_MAX_ITERATIONS_FINAL_ANSWER, ON_MAX_ITERATIONS_RETURN_OBSERVATIONS,
+};
 pub use components::{
     AgentRunner, BranchComponent, BranchRouterAdapter, EndComponent, EndConfig, FieldInfo,
-    HttpComponentConfig, HttpRequestComponent, HttpRequestParamConfig, IntentDetectionCompConfig,
-    IntentDetectionComponent, IntentRouter, KnowledgeRetrievalComponent, LlmCompConfig,
-    LlmComponent, LlmResponseFormat, LoopComponent, LoopConfig, LoopType, MemoryRecall,
-    MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent, ModelReActRunner,
-    QuestionerComponent, QuestionerConfig, ReActAgentComponent, ReActAgentConfig, StartComponent,
+    HttpAdvancedOptionsConfig, HttpAuthConfig, HttpAuthIn, HttpAuthType, HttpBackoffType,
+    HttpComponentConfig, HttpContentType, HttpHeadersConfig, HttpRateLimitConfig,
+    HttpRateLimitUnit, HttpRequestBodyConfig, HttpRequestComponent, HttpRequestParamConfig,
+    HttpResponseFormat, HttpResponseHandlingConfig, HttpResponseMode, HttpRetryConfig,
+    IntentDetectionCompConfig, IntentDetectionComponent, IntentRouter, KnowledgeRetrievalComponent,
+    LLMCompConfig, LLMComponent, LlmCompConfig, LlmComponent, LlmResponseFormat, LoopComponent,
+    LoopConfig, LoopType, MemoryRecall, MemoryRecord, MemoryRetrievalComponent,
+    MemoryWriteComponent, ModelReActRunner, QuestionerComponent, QuestionerConfig,
+    ReActAgentCompConfig, ReActAgentComponent, ReActAgentConfig, StartComponent,
     SubWorkflowComponent, ToolComponent, SUB_WORKFLOW_COMPONENT,
 };
 pub use condition::{Branch, BranchRouter, Condition};
@@ -78,12 +126,14 @@ pub use interrupt::{
     find_interrupt, interrupt_error, InteractionState, WorkflowInteraction, WorkflowInterrupt,
 };
 pub use output::{
-    custom_chunk, output_chunk, trace_chunk, FrameWriter, OutputFrame, WorkflowChunk,
-    WorkflowExecutionState, WorkflowOutput, END_NODE_STREAM, OUTPUT_FRAME_TYPE, WORKFLOW_FINAL,
+    custom_chunk, frame_to_wire, output_chunk, trace_chunk, FrameCollector, FrameWriter,
+    OutputFrame, WorkflowChunk, WorkflowChunkType, WorkflowExecutionState, WorkflowOutput,
+    CUSTOM_FRAME_TYPE, END_NODE_STREAM, OUTPUT_FRAME_TYPE, TRACE_FRAME_TYPE, WORKFLOW_FINAL,
 };
 pub use reference::{
     extract_origin_key, is_ref_path, project, resolve_path, resolve_schema, split_path, PathSegment,
 };
 pub use registry::{ComponentFactory, ComponentRegistry};
 pub use render::{render_svg, to_svg, DrawFormat, LayoutDirection, SvgOptions};
+pub use single::{execute_single_component, execute_single_component_with, SingleComponentOptions};
 pub use workflow::{ComponentOptions, Workflow};

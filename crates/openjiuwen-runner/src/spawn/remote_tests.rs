@@ -440,7 +440,23 @@ async fn spawner_spawns_a_remote_agent_from_the_spec() {
     let agent = spawner.spawn(spec).await.unwrap();
     assert_eq!(agent.id(), "HelperAgent");
     assert_eq!(agent.pid(), None);
-    assert!(!agent.is_alive());
+    // The spawn starts the client, so readiness polled through the seam is true
+    // without any request having been sent.
+    assert!(agent.is_alive());
+    assert!(agent.is_healthy());
+    assert!(agent.health().await.unwrap());
+}
+
+#[tokio::test]
+async fn spawner_rejects_an_unusable_base_url() {
+    let error = RemoteSpawner::new("not a url")
+        .spawn(SpawnSpec::class_agent("pkg.mod", "HelperAgent"))
+        .await
+        .err()
+        .expect("an unusable base url cannot be spawned");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("base_url"), "{error}");
+    assert!(error.to_string().contains("usable URL"), "{error}");
 }
 
 #[tokio::test]
@@ -535,6 +551,63 @@ async fn invoke_sends_a_null_session_when_unset() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["session_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn send_with_timeout_bounds_one_request_and_none_keeps_the_configured_deadline() {
+    let server = MockServer::start().await;
+    let slow = || {
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(300))
+            .set_body_json(json!({"output": "late"}))
+    };
+    Mock::given(method("POST"))
+        .and(path("/agents/slow/invoke"))
+        .respond_with(slow())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/agents/slow/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_string(format!("{}\n", chunk_line(0, "late"))),
+        )
+        .mount(&server)
+        .await;
+    let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "slow"));
+
+    // A caller deadline on the trait object bounds the request even though the
+    // configured `timeout_secs` (60 s) would have waited.
+    let error = agent
+        .send_with_timeout(json!({"query": "hi"}), Some(Duration::from_millis(25)))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.to_string().contains("timed out"), "{error}");
+
+    // `None` means the configured deadline, so the same slow endpoint answers.
+    let output = agent
+        .send_with_timeout(json!({"query": "hi"}), None)
+        .await
+        .unwrap();
+    assert_eq!(output.output, "late");
+
+    // The stream variant honours the hint the same way: one `Timeout` item.
+    let items: Vec<_> = agent
+        .stream_with_timeout(json!({}), Some(Duration::from_millis(25)))
+        .collect()
+        .await;
+    assert_eq!(items.len(), 1, "a timed-out stream yields exactly one item");
+    assert_eq!(items[0].as_ref().unwrap_err().kind(), ErrorKind::Timeout);
+
+    // Without a hint the configured deadline applies and the frames arrive.
+    let items: Vec<_> = agent.stream_with_timeout(json!({}), None).collect().await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].as_ref().unwrap().payload,
+        json!({"content": "late"})
+    );
 }
 
 #[tokio::test]
@@ -711,7 +784,7 @@ async fn cancel_task_posts_the_task_id() {
         .mount(&server)
         .await;
     let agent = server_agent(&server, "a");
-    agent.cancel_task("task-1").await.unwrap();
+    RemoteClient::cancel_task(&agent, "task-1").await.unwrap();
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body, json!({"task_id": "task-1"}));
@@ -721,7 +794,9 @@ async fn cancel_task_posts_the_task_id() {
 async fn cancel_task_without_a_cancel_path_is_unsupported() {
     let agent =
         RemoteAgent::new(RemoteAgentConfig::new("a", "http://127.0.0.1:9").with_cancel_path(None));
-    let error = agent.cancel_task("task-1").await.unwrap_err();
+    let error = RemoteClient::cancel_task(&agent, "task-1")
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert!(
         error.to_string().contains("remote agent cancel_task"),
@@ -739,7 +814,9 @@ async fn cancel_task_maps_a_missing_task_to_not_found() {
         .mount(&server)
         .await;
     let agent = server_agent(&server, "a");
-    let error = agent.cancel_task("task-1").await.unwrap_err();
+    let error = RemoteClient::cancel_task(&agent, "task-1")
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
     assert!(error.to_string().contains("unknown task"), "{error}");
 }
@@ -758,4 +835,63 @@ async fn custom_paths_are_honoured() {
     );
     let output = agent.invoke(json!({}), None).await.unwrap();
     assert_eq!(output.output, "ok");
+}
+
+// --- the trait seam ---------------------------------------------------------
+
+#[tokio::test]
+async fn health_follows_the_clients_started_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/a/invoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"output": "ok"})))
+        .mount(&server)
+        .await;
+    let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "a"));
+
+    // Nothing has been sent yet, so the client is not started.
+    assert_eq!(agent.backend(), SpawnBackend::RemoteHttp);
+    assert!(!agent.is_alive());
+    assert!(!agent.is_healthy());
+    assert!(!agent.health().await.unwrap());
+    assert_eq!(agent.pid(), None);
+    let stopped = agent.health_snapshot();
+    assert_eq!(stopped.backend, SpawnBackend::RemoteHttp);
+    assert!(!stopped.alive);
+    assert!(!stopped.healthy);
+    assert_eq!(stopped.last_error, None);
+
+    // The first invocation auto-starts the client.
+    let output = agent.send(json!({"query": "hi"})).await.unwrap();
+    assert_eq!(output.output, "ok");
+    assert!(agent.is_alive());
+    assert!(agent.is_healthy());
+    assert!(agent.health().await.unwrap());
+    let started = agent.health_snapshot();
+    assert!(started.alive);
+    assert!(started.healthy);
+    assert_eq!(started.pid, None);
+}
+
+#[tokio::test]
+async fn cancel_task_through_the_seam_reaches_the_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/a/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "a"));
+    agent.cancel_task("task-9").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body, json!({"task_id": "task-9"}));
+}
+
+#[test]
+fn the_remote_spawner_names_its_backend() {
+    assert_eq!(
+        RemoteSpawner::new("http://127.0.0.1:9").backend(),
+        SpawnBackend::RemoteHttp
+    );
 }

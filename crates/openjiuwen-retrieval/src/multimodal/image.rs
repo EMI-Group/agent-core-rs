@@ -11,6 +11,22 @@
 //! shared `images/` directory; the Rust loader reports `NotFound`/`Unsupported`
 //! instead of swallowing them, never copies files, and defaults to the offline
 //! captioner (its metadata marks the caption as `caption_status: "offline"`).
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use openjiuwen_retrieval::loaders::{DocumentBytes, DocumentLoader, LoadOptions};
+//! # use openjiuwen_retrieval::multimodal::ImageLoader;
+//! # async fn run() -> openjiuwen_common::error::Result<()> {
+//! let source = DocumentBytes::new("cat.png", b"\x89PNG\r\n\x1a\n".to_vec());
+//! let documents = ImageLoader::new().load_bytes(&source, &LoadOptions::new()).await?;
+//! assert_eq!(documents[0].metadata["image_path"], "cat.png");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`DocumentLoader::load_bytes`] reads the same metadata as the path loader
+//! (with `image_path` set to [`DocumentBytes::name`], since bytes have no path),
+//! so in-memory uploads never need a temporary file.
 
 use std::sync::Arc;
 
@@ -20,7 +36,9 @@ use serde_json::Value;
 use openjiuwen_common::error::{Error, Result};
 
 use crate::common::{Document, Metadata};
-use crate::loaders::{file_extension, DocumentLoader};
+use crate::loaders::{
+    apply_load_options, file_extension, DocumentBytes, DocumentLoader, LoadOptions,
+};
 
 use super::caption::{ImageCaptioner, OfflineCaptioner};
 use super::document::to_data_uri;
@@ -67,6 +85,55 @@ impl ImageLoader {
     pub fn is_supported(source: &str) -> bool {
         IMAGE_EXTENSIONS.contains(&file_extension(source).as_str())
     }
+
+    /// Rejects extensions the image parser does not register.
+    fn check_extension(extension: &str) -> Result<()> {
+        if IMAGE_EXTENSIONS.contains(&extension) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "Unsupported image format: {extension}, only [{}] are supported",
+            IMAGE_EXTENSIONS.join(", ")
+        )))
+    }
+
+    /// Builds the one captioned document shared by the path and byte loaders.
+    ///
+    /// `name` is the path or in-memory source name: it seeds the caption, the
+    /// `image_path` metadata, and the MIME guess. Captioning is skipped for a
+    /// zero-byte payload, which keeps the text empty instead of describing a
+    /// file name that holds nothing (Python returns `""` when no model is set).
+    async fn captioned_document(&self, name: &str, bytes: &[u8]) -> Result<Document> {
+        let text = if bytes.is_empty() {
+            String::new()
+        } else {
+            self.captioner
+                .caption(std::slice::from_ref(&name.to_owned()))
+                .await?
+                .into_iter()
+                .filter(|caption| !caption.is_empty())
+                .collect::<Vec<String>>()
+                .join("\n")
+        };
+
+        let mime = guess_mime_type(name).unwrap_or("application/octet-stream");
+        let mut metadata = Metadata::new();
+        metadata.insert("image_path".to_owned(), Value::String(name.to_owned()));
+        metadata.insert("mime_type".to_owned(), Value::String(mime.to_owned()));
+        metadata.insert("byte_size".to_owned(), Value::from(bytes.len() as u64));
+        metadata.insert("modality".to_owned(), Value::String("image".to_owned()));
+        metadata.insert(
+            "caption_status".to_owned(),
+            Value::String(self.captioner.caption_status().to_owned()),
+        );
+        if self.include_data_uri {
+            metadata.insert(
+                "data_uri".to_owned(),
+                Value::String(to_data_uri(Modality::Image, mime, bytes)),
+            );
+        }
+        Ok(Document::new(text).with_metadata(metadata))
+    }
 }
 
 impl Default for ImageLoader {
@@ -82,13 +149,7 @@ impl DocumentLoader for ImageLoader {
     }
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
-        let extension = file_extension(source);
-        if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
-            return Err(Error::Unsupported(format!(
-                "Unsupported image format: {extension}, only [{}] are supported",
-                IMAGE_EXTENSIONS.join(", ")
-            )));
-        }
+        Self::check_extension(&file_extension(source))?;
         let bytes = match tokio::fs::read(source).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -98,38 +159,21 @@ impl DocumentLoader for ImageLoader {
                 return Err(Error::Transport(format!("reading {source}: {error}")));
             }
         };
+        Ok(vec![self.captioned_document(source, &bytes).await?])
+    }
 
-        // Python returns `""` for a missing model; a zero-byte file has nothing to
-        // caption, so it keeps an empty text instead of a file-name placeholder.
-        let text = if bytes.is_empty() {
-            String::new()
-        } else {
-            self.captioner
-                .caption(std::slice::from_ref(&source.to_owned()))
-                .await?
-                .into_iter()
-                .filter(|caption| !caption.is_empty())
-                .collect::<Vec<String>>()
-                .join("\n")
-        };
-
-        let mime = guess_mime_type(source).unwrap_or("application/octet-stream");
-        let mut metadata = Metadata::new();
-        metadata.insert("image_path".to_owned(), Value::String(source.to_owned()));
-        metadata.insert("mime_type".to_owned(), Value::String(mime.to_owned()));
-        metadata.insert("byte_size".to_owned(), Value::from(bytes.len() as u64));
-        metadata.insert("modality".to_owned(), Value::String("image".to_owned()));
-        metadata.insert(
-            "caption_status".to_owned(),
-            Value::String(self.captioner.caption_status().to_owned()),
-        );
-        if self.include_data_uri {
-            metadata.insert(
-                "data_uri".to_owned(),
-                Value::String(to_data_uri(Modality::Image, mime, &bytes)),
-            );
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        Self::check_extension(&source.extension())?;
+        if source.is_empty() {
+            return Err(Error::Validation(format!("File {} is empty", source.name)));
         }
-        Ok(vec![Document::new(text).with_metadata(metadata)])
+        let mut documents = vec![self.captioned_document(&source.name, &source.bytes).await?];
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
     }
 }
 
@@ -266,5 +310,171 @@ mod tests {
         assert!(!loader.supports("a.bmp"));
         assert!(!loader.supports("a.pdf"));
         assert!(!loader.supports("a"));
+    }
+
+    /// A real 1×1 PNG: signature plus `IHDR`, `IDAT`, and `IEND` with valid CRCs.
+    const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+
+    fn one_pixel_png() -> Vec<u8> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        STANDARD.decode(ONE_PIXEL_PNG_BASE64).unwrap()
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_image(&dir, "pixel.png", &one_pixel_png());
+
+        let from_path = ImageLoader::new().load(&path).await.unwrap();
+        let from_bytes = ImageLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("pixel.png", one_pixel_png()),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(from_bytes.len(), 1);
+        let expected = &from_path[0];
+        let actual = &from_bytes[0];
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.text, "[image] pixel.png");
+        for key in [
+            "mime_type",
+            "byte_size",
+            "modality",
+            "caption_status",
+            "data_uri",
+        ] {
+            assert_eq!(
+                actual.metadata.get(key),
+                expected.metadata.get(key),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            actual.metadata.get("mime_type"),
+            Some(&Value::String("image/png".to_owned()))
+        );
+        assert_eq!(actual.metadata.get("byte_size"), Some(&Value::from(69_u64)));
+        // The byte source has no filesystem path, so its name stands in for it.
+        assert_eq!(
+            actual.metadata.get("image_path"),
+            Some(&Value::String("pixel.png".to_owned()))
+        );
+        assert_eq!(actual.id.len(), 36);
+        assert_eq!(
+            actual.metadata.get("doc_id").and_then(Value::as_str),
+            Some(actual.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_data_uri_matches_the_path_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_image(&dir, "pixel.png", &one_pixel_png());
+
+        let from_path = ImageLoader::new()
+            .with_data_uri(true)
+            .load(&path)
+            .await
+            .unwrap();
+        let from_bytes = ImageLoader::new()
+            .with_data_uri(true)
+            .load_bytes(
+                &DocumentBytes::new("pixel.png", one_pixel_png()),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let expected = from_path[0].metadata.get("data_uri").unwrap();
+        assert_eq!(from_bytes[0].metadata.get("data_uri"), Some(expected));
+        let uri = expected.as_str().unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "{uri}");
+        assert_eq!(
+            from_bytes[0].metadata.get("mime_type"),
+            Some(&Value::String("image/png".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title() {
+        let options = LoadOptions::new()
+            .with_doc_id("img-1")
+            .with_title("Figure 1");
+        let documents = ImageLoader::new()
+            .load_bytes(&DocumentBytes::new("pixel.png", one_pixel_png()), &options)
+            .await
+            .unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, "img-1");
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String("img-1".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("title"),
+            Some(&Value::String("Figure 1".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("image_path"),
+            Some(&Value::String("pixel.png".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_never_touches_the_filesystem() {
+        let source = DocumentBytes::new("upload/absent/cat.png", one_pixel_png());
+        let documents = ImageLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents[0].text, "[image] cat.png");
+        assert_eq!(
+            documents[0].metadata.get("image_path"),
+            Some(&Value::String("upload/absent/cat.png".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_unsupported_extensions() {
+        let source = DocumentBytes::new("notes.pdf", b"bytes".to_vec());
+        let error = ImageLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("Unsupported image format: .pdf"),
+            "unexpected message: {error}"
+        );
+
+        let source = DocumentBytes::new("no-extension", b"bytes".to_vec());
+        let error = ImageLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("Unsupported image format: ,"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_empty_bytes() {
+        let source = DocumentBytes::new("empty.png", Vec::new());
+        let error = ImageLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.to_string().contains("File empty.png is empty"),
+            "unexpected message: {error}"
+        );
     }
 }

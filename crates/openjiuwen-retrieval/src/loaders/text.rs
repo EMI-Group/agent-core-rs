@@ -11,7 +11,9 @@ use openjiuwen_common::logging::debug;
 
 use crate::common::Document;
 
-use super::{file_extension, read_source, DocumentLoader};
+use super::{
+    apply_load_options, file_extension, read_source, DocumentBytes, DocumentLoader, LoadOptions,
+};
 
 /// Loads `.txt` files as a single document.
 #[derive(Debug, Default, Clone, Copy)]
@@ -32,7 +34,19 @@ impl DocumentLoader for TextLoader {
     }
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
-        load_trimmed_document(source).await
+        let content = read_source(source).await?;
+        Ok(vec![trimmed_document(source, &content)?])
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let content = String::from_utf8_lossy(&source.bytes);
+        let mut documents = vec![trimmed_document(&source.name, &content)?];
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
     }
 }
 
@@ -55,24 +69,36 @@ impl DocumentLoader for MarkdownLoader {
     }
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
-        load_trimmed_document(source).await
+        let content = read_source(source).await?;
+        Ok(vec![trimmed_document(source, &content)?])
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let content = String::from_utf8_lossy(&source.bytes);
+        let mut documents = vec![trimmed_document(&source.name, &content)?];
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
     }
 }
 
-/// Reads `source` and returns it as one document with trimmed text.
+/// Turns file content into one document with trimmed text.
+///
+/// `name` is the path or in-memory source name and appears verbatim in errors.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotFound`] for a missing file and [`Error::Validation`] when
-/// the file holds no non-whitespace content.
-async fn load_trimmed_document(source: &str) -> Result<Vec<Document>> {
-    let content = read_source(source).await?;
+/// Returns [`Error::Validation`] when the content holds no non-whitespace text.
+fn trimmed_document(name: &str, content: &str) -> Result<Document> {
     let text = content.trim();
     if text.is_empty() {
-        return Err(Error::Validation(format!("File {source} is empty")));
+        return Err(Error::Validation(format!("File {name} is empty")));
     }
-    debug!(file = source, "loaded text document");
-    Ok(vec![Document::new(text)])
+    debug!(file = name, "loaded text document");
+    Ok(Document::new(text))
 }
 
 #[cfg(test)]
@@ -114,6 +140,88 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+
+    #[tokio::test]
+    async fn text_loader_load_bytes_matches_the_path_result() {
+        let source = DocumentBytes::new("notes.txt", b"  hello\nworld  \n".to_vec());
+        let documents = TextLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "hello\nworld");
+        assert_eq!(documents[0].id.len(), 36);
+        assert_eq!(
+            documents[0]
+                .metadata
+                .get("doc_id")
+                .and_then(serde_json::Value::as_str),
+            Some(documents[0].id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn text_loader_load_bytes_applies_doc_id_and_title() {
+        let source = DocumentBytes::new("notes.txt", b"body".to_vec());
+        let options = LoadOptions::new().with_doc_id("doc-1").with_title("Custom");
+        let documents = TextLoader::new()
+            .load_bytes(&source, &options)
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, "doc-1");
+        assert_eq!(documents[0].text, "body");
+        assert_eq!(
+            documents[0]
+                .metadata
+                .get("doc_id")
+                .and_then(serde_json::Value::as_str),
+            Some("doc-1")
+        );
+        assert_eq!(
+            documents[0]
+                .metadata
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("Custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn text_and_markdown_load_bytes_reject_empty_content() {
+        let source = DocumentBytes::new("empty.txt", b" \n\t".to_vec());
+        let error = TextLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.to_string().contains("File empty.txt is empty"),
+            "unexpected message: {error}"
+        );
+
+        let source = DocumentBytes::new("empty.md", b" \n\t".to_vec());
+        let error = MarkdownLoader
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.to_string().contains("File empty.md is empty"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_loader_load_bytes_keeps_the_raw_markdown() {
+        let source = DocumentBytes::new("readme.md", b"# Title\n\ntext\n".to_vec());
+        let documents = MarkdownLoader
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "# Title\n\ntext");
     }
 
     #[test]

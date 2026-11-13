@@ -35,10 +35,14 @@
 //!   accumulated and `invoke` then returns `{"output": {}}` without running the child.
 //!   Here an empty cache falls through to a real child run, so a `cache_stream`
 //!   component can still be invoked before it ever streamed.
-//! - **Nested resume.** On a parent `resume`, this component re-runs the child from
-//!   scratch; the parent's seeded answers are not forwarded into the child's
-//!   `InteractionState`. A child session with a checkpointer can resume its own snapshot,
-//!   but a fresh child session starts over.
+//! - **Nested resume.** A parent `resume` forwards its seeded answers into the child run,
+//!   keyed by interaction id (including Python's dotted `"<sub node id>.<child id>"`
+//!   addressing, which is rewritten to the bare child id the child run reports), and
+//!   records them in the parent session's component lane under
+//!   [`NESTED_ANSWERS_KEY`]; a later resume replays that history before the newly
+//!   supplied answers, so a replayed child consumes the answers it already saw in order.
+//!   The child still starts from a *fresh* session and snapshot: state the child itself
+//!   kept (questioner rounds, component lanes) does not survive into the next resume.
 //! - **Buffered parent streams.** The engine buffers a non-end producer's frames (see
 //!   `engine::node`), so a parent `stream` run surfaces this component's frames only when
 //!   the sub-workflow node *is* the parent's end node; the frames are still buffered under
@@ -48,6 +52,7 @@
 //!   Rust relies on the engine's buffered composition, so the frames are the same but not
 //!   interleaved in real time.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -71,6 +76,13 @@ use crate::workflow::Workflow;
 /// The component type discriminator of a nested workflow (Python
 /// `SUB_WORKFLOW_COMPONENT`).
 pub const SUB_WORKFLOW_COMPONENT: &str = "sub_workflow";
+
+/// The parent session's component-state key holding the answers already forwarded to the
+/// child, per interaction id.
+///
+/// The value is a JSON object `{"<interaction id>": [<answer>, …]}`; a later resume replays
+/// it into the child run so the replayed child consumes the same answers in order.
+pub const NESTED_ANSWERS_KEY: &str = "sub_workflow_answers";
 
 /// A compiled workflow exposed as a single workflow component.
 ///
@@ -201,13 +213,55 @@ impl SubWorkflowComponent {
         }))
     }
 
-    /// The child run options: the parent's cancellation plus one nesting level.
-    fn child_options(ctx: &ComponentContext) -> WorkflowRunOptions {
-        WorkflowRunOptions::default()
+    /// The child run options: the parent's cancellation, one nesting level, and the
+    /// forwarded resume answers.
+    ///
+    /// The answers already forwarded in earlier resumes are read back from the parent
+    /// session's component lane ([`NESTED_ANSWERS_KEY`]) and merged with the ones queued in
+    /// this run ([`ComponentContext::queued_answers`]), per id in FIFO order (recorded
+    /// history first). The merged map is written back before the child runs, so the next
+    /// resume replays the whole history to the replayed child.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the component-state lane read and write failures.
+    async fn child_options(&self, ctx: &ComponentContext) -> Result<WorkflowRunOptions> {
+        let recorded = ctx.get_component_state(NESTED_ANSWERS_KEY).await?;
+        let mut answers = match recorded {
+            Some(Value::Object(recorded)) => recorded_answers(&recorded),
+            Some(Value::Null) | None => BTreeMap::new(),
+            Some(other) => {
+                tracing::warn!(
+                    workflow = ctx.workflow_id(),
+                    component = %ctx.component_id(),
+                    value = %other,
+                    "the recorded nested answers are not an object; starting without them"
+                );
+                BTreeMap::new()
+            }
+        };
+        for (id, values) in ctx.queued_answers() {
+            let bare = bare_answer_id(&id, ctx.component_id());
+            if bare != id {
+                // Python addresses a nested interaction by its dotted node path
+                // (`"sub.questioner"`); the child run reports the bare id, so the prefixed
+                // key is folded into the suffix and dropped instead of being consumed twice.
+                answers.remove(&id);
+            }
+            answers.entry(bare).or_default().extend(values);
+        }
+        let recorded = serde_json::to_value(&answers).map_err(|error| {
+            Error::workflow(format!(
+                "failed to serialize the nested workflow answers: {error}"
+            ))
+        })?;
+        ctx.update_component_state(json!({ NESTED_ANSWERS_KEY: recorded }))
+            .await?;
+        Ok(WorkflowRunOptions::default()
             .with_cancellation(ctx.cancellation().clone())
             .with_depth(ctx.depth().saturating_add(1))
+            .with_answers(answers))
     }
-
     /// The result the child `End` component produced (Python `_sub_invoke`).
     ///
     /// A `Completed` child already answers `{"output": …}`, so the value is returned
@@ -284,7 +338,7 @@ impl Component for SubWorkflowComponent {
         }
         self.check_depth(ctx)?;
         let child_session = self.child_session(ctx);
-        let child_options = Self::child_options(ctx);
+        let child_options = self.child_options(ctx).await?;
         let output = self
             .compiled
             .invoke(inputs, child_session, child_options)
@@ -300,7 +354,7 @@ impl Component for SubWorkflowComponent {
         let stream = async_stream::try_stream! {
             self.check_depth(&ctx)?;
             let child_session = self.child_session(&ctx);
-            let child_options = Self::child_options(&ctx);
+            let child_options = self.child_options(&ctx).await?;
             let mut frames = self
                 .compiled
                 .stream(inputs, child_session, child_options);
@@ -330,6 +384,44 @@ impl Component for SubWorkflowComponent {
             }
         };
         Box::pin(stream)
+    }
+}
+
+/// Parses the recorded nested answers: every array value is that id's FIFO queue.
+///
+/// A lone non-array value is read as a one-element queue (tolerating a hand-written lane),
+/// and a non-array carries no answers at all.
+fn recorded_answers(recorded: &Map<String, Value>) -> BTreeMap<String, Vec<Value>> {
+    let mut answers: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for (id, value) in recorded {
+        match value {
+            Value::Array(values) => {
+                answers
+                    .entry(id.clone())
+                    .or_default()
+                    .extend(values.iter().cloned());
+            }
+            Value::Null => {}
+            other => {
+                answers.entry(id.clone()).or_default().push(other.clone());
+            }
+        }
+    }
+    answers
+}
+
+/// Re-keys a dotted, node-addressed interaction id (`"<sub node id>.<child id>"`) under the
+/// bare child id a child run reports.
+///
+/// Python addresses a nested interaction by its dotted node path while this crate's
+/// components raise the bare child id, so both spellings must reach the same queue.
+fn bare_answer_id(id: &str, component_id: &str) -> String {
+    if component_id.is_empty() {
+        return id.to_owned();
+    }
+    match id.strip_prefix(component_id) {
+        Some(rest) if rest.len() > 1 && rest.starts_with('.') => rest[1..].to_owned(),
+        _ => id.to_owned(),
     }
 }
 

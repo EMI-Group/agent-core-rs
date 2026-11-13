@@ -48,6 +48,7 @@ use crate::storage::{MessageRecord, TeamInfoRecord, TeamStore};
 use crate::taskboard::{TaskBoard, TaskMutation};
 use crate::workspace::WorkspaceProvider;
 
+use super::health::TeamHealth;
 use super::observability_bind::TeamSignals;
 use super::org_bind::OrgBinding;
 
@@ -238,6 +239,22 @@ impl TeamBackend {
         self.members.read().keys().cloned().collect()
     }
 
+    /// Returns the member-liveness projection of the team.
+    ///
+    /// One entry per live roster handle (leader included), sorted by name, plus the leader's entry
+    /// repeated in [`TeamHealth::leader`]. The projection reads only what the handles already
+    /// track — no store read, no probe, no `.await`.
+    ///
+    /// `started` is always `false` here: the backend does not track the run lifecycle. A caller
+    /// that does (the `TeamAgent` handle) fills it in — see `TeamAgent::health`.
+    #[must_use]
+    pub fn health(&self) -> TeamHealth {
+        TeamHealth::from_roster(
+            self.team_name(),
+            self.spec().leader_member_name.as_deref(),
+            &self.members(),
+        )
+    }
     /// Returns the number of live members.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -642,6 +659,54 @@ mod tests {
         assert!(rendered.contains("alpha"), "{rendered}");
         assert!(rendered.contains("dev-1"), "{rendered}");
         assert!(rendered.contains("Autonomous"), "{rendered}");
+    }
+
+    #[test]
+    fn health_projects_the_roster_and_repeats_the_leader() {
+        let fixture = fixture_for("alpha", Some("boss"));
+        fixture.backend.add_member(member(&fixture, "dev-2"));
+        fixture.backend.add_member(member(&fixture, "dev-1"));
+        let health = fixture.backend.health();
+        assert_eq!(health.team_name, "alpha");
+        assert!(!health.started, "the backend does not track the run flag");
+        let names: Vec<&str> = health
+            .members
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["dev-1", "dev-2"], "sorted by name");
+        assert!(
+            health
+                .members
+                .iter()
+                .all(|entry| entry.status == crate::schema::MemberStatus::Unstarted),
+            "{:?}",
+            health.members
+        );
+        assert!(
+            health.members.iter().all(|entry| !entry.alive),
+            "a handle with no runtime is not alive"
+        );
+        assert!(
+            health.leader.is_none(),
+            "no row is registered for the leader yet"
+        );
+        let boss = Arc::new(TeamMember::new(
+            Arc::clone(&fixture.store) as Arc<dyn TeamStore>,
+            crate::storage::MemberRecord::new("alpha", "boss", TeamRole::Leader),
+        ));
+        fixture.backend.add_member(boss);
+        let health = fixture.backend.health();
+        let names: Vec<&str> = health
+            .members
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["boss", "dev-1", "dev-2"]);
+        let leader = health.leader.expect("the leader row is in the roster");
+        assert_eq!(leader.name, "boss");
+        assert_eq!(leader.role, TeamRole::Leader);
+        assert!(!leader.alive, "the row exists but owns no runtime");
     }
 
     #[tokio::test]

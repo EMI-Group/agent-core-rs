@@ -74,9 +74,18 @@ pub struct QuestionerConfig {
     pub field_names: Vec<FieldInfo>,
     /// How many answers one round accepts before it fails.
     pub max_response: u32,
-    /// Whether chat history is injected; deferred (see the module docs).
+    /// Whether the component reads and records the session conversation.
+    ///
+    /// Off by default (Python parity): with the flag off no history is read, no turn is
+    /// written, and the extraction prompt carries the current query as its only
+    /// `dialogue_history` line. See the module docs of
+    /// [`QuestionerComponent`](crate::components::questioner::QuestionerComponent) for the
+    /// read/write rules.
     pub with_chat_history: bool,
-    /// How many history rounds Python would inject; deferred (see the module docs).
+    /// How many conversation rounds the prompt window keeps (Python default 5).
+    ///
+    /// Only used when [`Self::with_chat_history`] is set. A round starts at a user turn;
+    /// `0` is clamped to one round, because the current query must stay in the window.
     pub chat_history_max_rounds: u32,
     /// Extra instructions rendered into the prompt's `## Constraints` section.
     pub extra_prompt_for_fields_extraction: String,
@@ -180,14 +189,14 @@ impl QuestionerConfig {
         self
     }
 
-    /// Enables (or disables) chat-history injection; deferred (see the module docs).
+    /// Enables (or disables) reading and recording the session conversation.
     #[must_use]
     pub fn with_chat_history(mut self, with_chat_history: bool) -> Self {
         self.with_chat_history = with_chat_history;
         self
     }
 
-    /// Sets how many history rounds would be injected; deferred (see the module docs).
+    /// Sets how many conversation rounds the prompt window keeps.
     #[must_use]
     pub fn with_chat_history_max_rounds(mut self, rounds: u32) -> Self {
         self.chat_history_max_rounds = rounds;

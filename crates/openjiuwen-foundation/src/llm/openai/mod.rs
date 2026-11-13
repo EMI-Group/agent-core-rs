@@ -34,14 +34,13 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::http::{HttpClient, HttpRequest, HttpStream};
+use openjiuwen_common::http::{HttpClient, HttpRequest};
 use serde_json::Value;
 
 use crate::prompt::BaseMessage;
@@ -50,18 +49,15 @@ use super::config::{ModelClientConfig, ModelRequestConfig};
 use super::model::{ChatResponse, Model, StreamChunk};
 use super::provider::{normalize_provider_name, provider_profile, ProviderFlavor, ProviderProfile};
 use super::sse::SseDecoder;
-use super::transport;
+use super::transport::{self, carries_payload, next_chunk, poll_budget, read_error_body};
 
 pub use request::{
-    build_chat_completion_body, convert_message, convert_messages, convert_tool_choice,
-    convert_tools, normalize_api_base, replays_reasoning_content,
+    build_chat_completion_body, build_chat_completion_body_with_endpoint, convert_message,
+    convert_messages, convert_tool_choice, convert_tools, normalize_api_base,
+    replays_reasoning_content,
 };
 pub use response::{parse_chat_completion, parse_finish_reason, parse_usage};
 pub use stream::{parse_stream_chunk, OpenAiStreamState};
-
-/// Upper bound on how much of a non-2xx streaming response body is read for the
-/// error message.
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// An OpenAI-compatible chat-completions client.
 ///
@@ -205,7 +201,14 @@ impl Model for OpenAiCompatibleClient {
         messages: &[BaseMessage],
         request: &ModelRequestConfig,
     ) -> Result<ChatResponse> {
-        let body = build_chat_completion_body(&self.provider, messages, request, false)?;
+        let body = build_chat_completion_body_with_endpoint(
+            &self.provider,
+            self.client.endpoint_profile.as_deref(),
+            Some(&self.base_url),
+            messages,
+            request,
+            false,
+        )?;
         let url = transport::join_url(&self.base_url, self.profile.chat_path);
         let http_request = self.build_request(url.clone()).json(&body)?;
 
@@ -242,9 +245,17 @@ impl Model for OpenAiCompatibleClient {
         let timeout = self.client.timeout;
         let first_chunk_timeout = self.client.stream_first_chunk_timeout;
         let idle_timeout = self.client.stream_idle_timeout;
+        let endpoint_profile = self.client.endpoint_profile.clone();
 
         Box::pin(try_stream! {
-            let body = build_chat_completion_body(&provider, &messages, &request, true)?;
+            let body = build_chat_completion_body_with_endpoint(
+                &provider,
+                endpoint_profile.as_deref(),
+                Some(&base_url),
+                &messages,
+                &request,
+                true,
+            )?;
             let url = transport::join_url(&base_url, chat_path);
             let mut http_request = HttpRequest::post(url.clone()).with_headers(headers);
             if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
@@ -301,81 +312,4 @@ impl Model for OpenAiCompatibleClient {
             }
         })
     }
-}
-
-/// The wait budget for the next body poll.
-///
-/// Before the first content-bearing delta the budget is the smaller of the idle
-/// timeout and what is left of the first-chunk deadline; afterwards only the idle
-/// timeout applies. `None` disables the budget.
-fn poll_budget(
-    content_seen: bool,
-    idle: Option<Duration>,
-    first_chunk_deadline: Option<Instant>,
-) -> Option<Duration> {
-    if content_seen {
-        return idle;
-    }
-    let deadline = first_chunk_deadline?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    Some(idle.map_or(remaining, |idle| idle.min(remaining)))
-}
-
-/// Whether a chunk proves the model actually started answering.
-///
-/// Role-only and finish-reason-only deltas are stream framing, not content, so
-/// they must not satisfy the first-chunk deadline.
-fn carries_payload(chunk: &StreamChunk) -> bool {
-    match chunk {
-        StreamChunk::Delta {
-            content,
-            reasoning,
-            tool_call,
-            ..
-        } => content.is_some() || reasoning.is_some() || tool_call.is_some(),
-        StreamChunk::Usage(_) | StreamChunk::Done => false,
-    }
-}
-
-/// Waits for the next body chunk within `budget`.
-///
-/// `Ok(None)` means the body ended; an elapsed budget is an [`Error::Timeout`]
-/// whose message distinguishes "nothing arrived yet" from "the stream went idle".
-async fn next_chunk(
-    body: &mut HttpStream,
-    budget: Option<Duration>,
-    url: &str,
-    content_seen: bool,
-) -> Result<Option<bytes::Bytes>> {
-    let Some(limit) = budget else {
-        return body.next().await.transpose();
-    };
-    match tokio::time::timeout(limit, body.next()).await {
-        Ok(item) => item.transpose(),
-        Err(_) => Err(Error::timeout(if content_seen {
-            format!("stream from {url} went idle for more than {limit:?}")
-        } else {
-            format!("stream from {url} produced no content within {limit:?}")
-        })),
-    }
-}
-
-/// Reads a bounded body from a failed streaming response, for the error message.
-///
-/// The response is already known to be a failure, so a read error simply ends the
-/// collection: the status and URL alone are enough to diagnose it.
-async fn read_error_body(body: &mut HttpStream) -> String {
-    let mut buffer = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let Ok(bytes) = chunk else {
-            break;
-        };
-        let free = ERROR_BODY_LIMIT.saturating_sub(buffer.len());
-        if bytes.len() >= free {
-            buffer.extend_from_slice(&bytes[..free]);
-            break;
-        }
-        buffer.extend_from_slice(&bytes);
-    }
-    String::from_utf8_lossy(&buffer).into_owned()
 }

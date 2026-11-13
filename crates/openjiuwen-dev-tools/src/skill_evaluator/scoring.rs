@@ -15,6 +15,15 @@
 //! offline. The report field names and the `0.40·design + 0.60·functional`
 //! weights are preserved.
 //!
+//! # Unit rule
+//!
+//! Points are 0–100 and only ever live in `*_score`, `*_score_max`, and
+//! [`ScoreDimension`] members. Every `*_pct` field, the safety
+//! `gate_threshold`, the functional `pass_rate`, and `contribution` are
+//! fractions of `1.0`. `fraction_from_points` and `points_from_fraction` are the
+//! only conversions between the two scales, and `round4` keeps fraction
+//! arithmetic byte-stable.
+//!
 //! # Design rubric
 //!
 //! Each dimension awards `0.0`, half its maximum, or its full maximum:
@@ -30,8 +39,16 @@
 //! | `d7_output_specification` | 10 | the body describes the output/result format |
 //!
 //! The dimension maxima sum to 100; [`DesignReport::design_score`] is the sum of
-//! the awarded points, so an all-full rubric reads as `100.0` and a half-full one
-//! as `50.0`.
+//! the awarded points, so an all-full rubric reads as `100.0` points
+//! (`design_score_pct = 1.0`) and a half-full one as `50.0` points (`0.5`).
+//!
+//! # Safety contract
+//!
+//! The scan starts at 100 points and loses 25 per finding. A rule carrying an
+//! [`AutoFailCode`] short-circuits everything: the score becomes `0.0`, the run
+//! is blocked, and no dimensions are reported. Otherwise the five
+//! [`SAFETY_DIMENSIONS`](crate::skill_evaluator::report) are filled
+//! proportionally, so a scan-only run has the same shape as a model-judged one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,31 +60,44 @@ use crate::skill_creator::definition::NAME_PATTERN;
 use crate::skill_creator::SkillDefinition;
 
 use super::report::{
-    grade_for, DesignReport, EvaluatorScore, EvaluatorScores, FinalScore, FunctionalReport,
-    SafetyFinding, SafetyReport, ScoreDimension,
+    grade_for, AutoFailCode, DesignReport, EvaluatorScore, EvaluatorScores, FinalScore,
+    FunctionalReport, SafetyFinding, SafetyReport, ScoreDimension, GATE_E1, GATE_E3,
+    PIPELINE_BLOCKED_AT_E1, PIPELINE_BLOCKED_AT_E3, PIPELINE_COMPLETED, SAFETY_DIMENSIONS,
 };
 
 /// Regex detecting a reference to a resource-like file inside instruction text.
 const RESOURCE_REFERENCE_PATTERN: &str = r"(?i)[\w./-]+\.(md|txt|json|ya?ml|py|sh|toml|rs)";
 
-/// The safety penalty applied per finding, in percentage points.
+/// The safety penalty applied per finding, in points.
 const SAFETY_PENALTY_PER_FINDING: f64 = 25.0;
+
+/// The design fraction required to keep the E1 gate open.
+///
+/// Single source of truth: the design readiness flag and the aggregation gate
+/// both read it.
+pub(crate) const DESIGN_GATE_THRESHOLD: f64 = 0.60;
+
+/// The final-score fraction at or above which a skill is release-ready.
+const RELEASE_THRESHOLD: f64 = 0.80;
 
 /// One regex-based safety rule.
 ///
 /// A rule is a pattern, the dimension it belongs to, a severity (`info`,
-/// `warning`, `critical`, …), and the message reported when it matches.
+/// `warning`, `critical`, …), the message reported when it matches, and an
+/// optional [`AutoFailCode`] that turns a match into an unconditional failure.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct SafetyRule {
     /// The regular expression matched against the rendered skill document.
     pub pattern: String,
-    /// The safety dimension the rule covers, e.g. `data_leakage`.
+    /// The safety dimension the rule covers, e.g. `data_handling`.
     pub dimension: String,
     /// The finding severity; exactly `critical` blocks unconditionally.
     pub severity: String,
     /// The message copied into a matched [`SafetyFinding`].
     pub message: String,
+    /// The auto-fail condition a match triggers, if any.
+    pub auto_fail: Option<AutoFailCode>,
 }
 
 impl SafetyRule {
@@ -84,7 +114,15 @@ impl SafetyRule {
             dimension: dimension.into(),
             severity: severity.into(),
             message: message.into(),
+            auto_fail: None,
         }
+    }
+
+    /// Marks the rule as an auto-fail condition.
+    #[must_use]
+    pub fn with_auto_fail(mut self, code: AutoFailCode) -> Self {
+        self.auto_fail = Some(code);
+        self
     }
 }
 
@@ -92,7 +130,9 @@ impl SafetyRule {
 ///
 /// The result is deterministic: no model is consulted and only
 /// [`SkillDefinition::instructions`], the skill identity, and its resources are
-/// inspected.
+/// inspected. `design_score` is in points (0–100), `design_score_pct` is the
+/// same value as a fraction of `1.0`, and the readiness flag needs at least
+/// `0.60`.
 #[must_use]
 pub fn score_design(skill: &SkillDefinition) -> DesignReport {
     let body = skill.instructions.as_str();
@@ -119,7 +159,7 @@ pub fn score_design(skill: &SkillDefinition) -> DesignReport {
     }
 
     let design_score = round2(awarded);
-    let design_score_pct = round2(design_score);
+    let design_score_pct = fraction_from_points(design_score);
     DesignReport {
         skill_name: skill.name.clone(),
         design_score,
@@ -127,7 +167,7 @@ pub fn score_design(skill: &SkillDefinition) -> DesignReport {
         design_score_pct,
         grade: grade_for(design_score_pct),
         knowledge_delta: round2(design_score / 100.0),
-        ready_for_functional_testing: design_score_pct >= 50.0,
+        ready_for_functional_testing: design_score_pct >= DESIGN_GATE_THRESHOLD,
         dimensions,
     }
 }
@@ -135,11 +175,16 @@ pub fn score_design(skill: &SkillDefinition) -> DesignReport {
 /// Scans a skill document for safety hazards.
 ///
 /// The rendered `SKILL.md` is scanned; every rule that matches contributes one
-/// [`SafetyFinding`] (duplicates are not collapsed). The score starts at 100 and
-/// loses 25 points per finding, clamped at zero.
+/// [`SafetyFinding`] (duplicates are not collapsed). The score starts at 100
+/// points and loses 25 per finding, clamped at zero, and is reported as a
+/// fraction of `1.0`.
 ///
-/// The report is blocked when the score fraction falls below `gate_threshold` or
-/// when any finding has the exact severity `critical`.
+/// The first matching rule carrying an [`AutoFailCode`] short-circuits the
+/// report: `score_pct` becomes `0.0`, `blocked` is `true`, `dimensions` is
+/// `None`, and `auto_fail` names the code. Otherwise the report is blocked when
+/// the score fraction falls below `gate_threshold` or when any finding has the
+/// exact severity `critical`, and the five safety dimensions are filled
+/// proportionally to their maxima.
 ///
 /// # Errors
 ///
@@ -153,6 +198,7 @@ pub fn scan_safety(
 ) -> Result<SafetyReport> {
     let markdown = skill.to_markdown()?;
     let mut findings = Vec::new();
+    let mut auto_fail = None;
     for rule in rules {
         let regex = Regex::new(&rule.pattern).map_err(|error| {
             Error::validation(format!(
@@ -161,6 +207,9 @@ pub fn scan_safety(
             ))
         })?;
         if regex.is_match(&markdown) {
+            if auto_fail.is_none() {
+                auto_fail = rule.auto_fail;
+            }
             findings.push(SafetyFinding {
                 dimension: rule.dimension.clone(),
                 severity: rule.severity.clone(),
@@ -169,8 +218,21 @@ pub fn scan_safety(
         }
     }
 
-    let score_pct = (100.0 - SAFETY_PENALTY_PER_FINDING * findings.len() as f64).max(0.0);
-    let blocked = score_pct / 100.0 < gate_threshold
+    if let Some(code) = auto_fail {
+        return Ok(SafetyReport {
+            skill_name: skill.name.clone(),
+            score_pct: 0.0,
+            gate_threshold,
+            blocked: true,
+            auto_fail: Some(code),
+            dimensions: None,
+            findings,
+        });
+    }
+
+    let points = (100.0 - SAFETY_PENALTY_PER_FINDING * findings.len() as f64).max(0.0);
+    let score_pct = fraction_from_points(points);
+    let blocked = score_pct < gate_threshold
         || findings
             .iter()
             .any(|finding| finding.severity == "critical");
@@ -180,22 +242,28 @@ pub fn scan_safety(
         score_pct,
         gate_threshold,
         blocked,
-        auto_fail: blocked,
-        dimensions: None,
+        auto_fail: None,
+        dimensions: Some(safety_dimensions_from_fraction(score_pct)),
         findings,
     })
 }
 
 /// Combines the design and functional results into the weighted final score.
 ///
-/// The functional pass rate is expressed as a percentage and weighted by
-/// `functional_weight`; the design percentage is weighted by `design_weight`.
-/// The pipeline stops at the first failing gate:
+/// The gate order matches the Python pipeline — E1, then E3:
 ///
-/// 1. a blocked safety report yields `BLOCKED_AT_SAFETY`;
-/// 2. a design score that is not ready for functional testing yields
-///    `BLOCKED_AT_E1_LLM_JUDGE`;
-/// 3. otherwise the run `COMPLETED` and both contributions are summed.
+/// 1. a design fraction below `DESIGN_GATE_THRESHOLD` (`0.60`) stops the run with
+///    [`PIPELINE_BLOCKED_AT_E1`];
+/// 2. otherwise a blocked safety report stops it with [`PIPELINE_BLOCKED_AT_E3`];
+/// 3. otherwise the run is [`PIPELINE_COMPLETED`] and
+///    `final_score_pct = design*design_weight + pass_rate*functional_weight`
+///    (a fraction of `1.0`).
+///
+/// A blocked run has no valid final score, so `final_score_pct` is `0.0`, the
+/// grade is `F`, and no gate is reported as passed — even though the evaluator
+/// contributions are still filled in, because the author needs the full picture.
+/// A completed run reports [`GATE_E3`] as its only passed gate: it is the only
+/// gate-role evaluator and it passed.
 #[must_use]
 pub fn aggregate(
     design: &DesignReport,
@@ -204,55 +272,50 @@ pub fn aggregate(
     design_weight: f64,
     functional_weight: f64,
 ) -> FinalScore {
+    let design_fraction = design.design_score_pct;
+    let pass_rate = functional.summary.pass_rate;
     let evaluators = EvaluatorScores {
-        e1_llm_judge: Some(EvaluatorScore {
-            score_pct: round2(design.design_score_pct),
-            weight: design_weight,
-            contribution: round2(design_weight * design.design_score_pct),
-        }),
-        e2_functional: EvaluatorScore {
-            score_pct: round2(functional.summary.pass_rate * 100.0),
-            weight: functional_weight,
-            contribution: round2(functional_weight * functional.summary.pass_rate * 100.0),
-        },
+        e1_llm_judge: Some(EvaluatorScore::weighted(design_fraction, design_weight)),
+        e2_functional: EvaluatorScore::weighted(pass_rate, functional_weight),
     };
 
-    if safety.blocked {
+    if design_fraction < DESIGN_GATE_THRESHOLD {
         return FinalScore {
             skill_name: design.skill_name.clone(),
-            pipeline_status: "BLOCKED_AT_SAFETY".to_string(),
+            pipeline_status: PIPELINE_BLOCKED_AT_E1.to_string(),
             final_score_pct: 0.0,
             grade: "F".to_string(),
             evaluators,
             gates_passed: Vec::new(),
-            recommendation: "not ready for release".to_string(),
+            recommendation: format!(
+                "blocked at the {GATE_E1} gate: design score {} is below \
+                 {DESIGN_GATE_THRESHOLD}, fix the design findings before testing",
+                design.design_score_pct
+            ),
         };
     }
 
-    if !design.ready_for_functional_testing {
+    if safety.blocked {
         return FinalScore {
             skill_name: design.skill_name.clone(),
-            pipeline_status: "BLOCKED_AT_E1_LLM_JUDGE".to_string(),
+            pipeline_status: PIPELINE_BLOCKED_AT_E3.to_string(),
             final_score_pct: 0.0,
             grade: "F".to_string(),
             evaluators,
-            gates_passed: vec!["e3_safety".to_string()],
-            recommendation: "not ready for release".to_string(),
+            gates_passed: Vec::new(),
+            recommendation: format!(
+                "blocked at the {GATE_E3} gate: safety score {} with {} finding(s) did not \
+                 pass the gate",
+                safety.score_pct,
+                safety.findings.len()
+            ),
         };
     }
 
-    let gates = vec![
-        "e1_llm_judge".to_string(),
-        "e2_functional".to_string(),
-        "e3_safety".to_string(),
-    ];
-    let final_score_pct = round2(
-        design_weight * design.design_score_pct
-            + functional_weight * functional.summary.pass_rate * 100.0,
-    );
-    let recommendation = if final_score_pct >= 80.0 {
+    let final_score_pct = round4(design_weight * design_fraction + functional_weight * pass_rate);
+    let recommendation = if final_score_pct >= RELEASE_THRESHOLD {
         "ready for release"
-    } else if final_score_pct >= 60.0 {
+    } else if final_score_pct >= DESIGN_GATE_THRESHOLD {
         "usable, refine failing cases"
     } else {
         "not ready for release"
@@ -260,21 +323,59 @@ pub fn aggregate(
 
     FinalScore {
         skill_name: design.skill_name.clone(),
-        pipeline_status: "COMPLETED".to_string(),
+        pipeline_status: PIPELINE_COMPLETED.to_string(),
         final_score_pct,
         grade: grade_for(final_score_pct),
         evaluators,
-        gates_passed: gates,
+        gates_passed: vec![GATE_E3.to_string()],
         recommendation: recommendation.to_string(),
     }
 }
 
 /// Rounds a score to two decimal places.
 ///
-/// This is the single rounding helper for the module: the runner and evaluator
-/// layers reuse it so report arithmetic stays consistent.
+/// This is the single two-decimal rounding helper for the module: point values
+/// use it, fractions use [`round4`].
 pub(crate) fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
+}
+
+/// Rounds a fraction to four decimal places.
+///
+/// Used for every `*_pct`/`contribution` value so `0.4 * 0.74` reads exactly
+/// `0.296` and two runs of the same inputs serialize byte-identically.
+pub(crate) fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+/// Converts points (0–100) into a fraction of `1.0`, rounded to 4 decimals.
+pub(crate) fn fraction_from_points(points: f64) -> f64 {
+    round4(points / 100.0)
+}
+
+/// Converts a fraction of `1.0` into points (0–100), rounded to 2 decimals.
+pub(crate) fn points_from_fraction(fraction: f64) -> f64 {
+    round2(fraction * 100.0)
+}
+
+/// Builds the five safety dimensions from a score fraction.
+///
+/// Every dimension receives `round2(fraction * max)` points, so the reported
+/// points always add up to the score itself. This is what lets a scan-only run
+/// publish the same `dimensions` shape a model verdict produces.
+pub(crate) fn safety_dimensions_from_fraction(fraction: f64) -> BTreeMap<String, ScoreDimension> {
+    SAFETY_DIMENSIONS
+        .iter()
+        .map(|(name, max, _)| {
+            (
+                (*name).to_string(),
+                ScoreDimension {
+                    score: round2(fraction * max),
+                    max: *max,
+                },
+            )
+        })
+        .collect()
 }
 
 /// `d1_knowledge_ratio`: body length in characters.
@@ -427,324 +528,4 @@ fn has_resource_reference(body: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::skill_creator::SkillResource;
-
-    use super::super::report::CaseSummary;
-
-    fn rich_skill() -> SkillDefinition {
-        let body = concat!(
-            "# Demo Skill\n\n",
-            "## Overview\n\n",
-            "This skill explains how to summarize a document end to end. It covers the input ",
-            "format, the processing steps, and the expected result structure so that a reader ",
-            "can reproduce the work without any extra guidance.\n\n",
-            "## Steps\n\n",
-            "1. Read the input document carefully.\n",
-            "2. Extract the key facts and figures.\n",
-            "3. Write the summary using the format below.\n\n",
-            "## Output\n\n",
-            "The result format is:\n\n",
-            "```text\nname: summary\n```\n\n",
-            "See references/guide.md for the full checklist."
-        );
-        SkillDefinition::new("demo", "Summarize documents", body)
-            .with_resource(SkillResource::new("references/guide.md", "# Checklist"))
-    }
-
-    fn minimal_skill() -> SkillDefinition {
-        SkillDefinition::new("min", "A minimal skill", "x")
-    }
-
-    fn report_with(design_pct: f64, ready: bool) -> DesignReport {
-        DesignReport {
-            skill_name: "demo".to_string(),
-            design_score: design_pct,
-            design_score_max: 100.0,
-            design_score_pct: design_pct,
-            grade: grade_for(design_pct),
-            knowledge_delta: round2(design_pct / 100.0),
-            ready_for_functional_testing: ready,
-            dimensions: BTreeMap::new(),
-        }
-    }
-
-    fn functional_with(pass_rate: f64) -> FunctionalReport {
-        FunctionalReport {
-            skill_name: "demo".to_string(),
-            summary: CaseSummary {
-                total: 2,
-                passed: 1,
-                partial: 0,
-                failed: 1,
-                pass_rate,
-            },
-            ..FunctionalReport::default()
-        }
-    }
-
-    fn safety_with(blocked: bool) -> SafetyReport {
-        SafetyReport {
-            skill_name: "demo".to_string(),
-            score_pct: if blocked { 50.0 } else { 100.0 },
-            gate_threshold: 0.8,
-            blocked,
-            auto_fail: blocked,
-            ..SafetyReport::default()
-        }
-    }
-
-    #[test]
-    fn rich_skill_scores_every_dimension() {
-        let report = score_design(&rich_skill());
-        assert_eq!(report.dimensions.len(), 7);
-        for (name, dimension) in &report.dimensions {
-            assert!(
-                (dimension.score - dimension.max).abs() < 1e-9,
-                "dimension {name} not full: {dimension:?}"
-            );
-        }
-        assert!((report.design_score - 100.0).abs() < 1e-9);
-        assert!((report.design_score_pct - 100.0).abs() < 1e-9);
-        assert!((report.design_score_max - 100.0).abs() < 1e-9);
-        assert_eq!(report.grade, "A");
-        assert!((report.knowledge_delta - 1.0).abs() < 1e-9);
-        assert!(report.ready_for_functional_testing);
-        assert_eq!(report.skill_name, "demo");
-    }
-
-    #[test]
-    fn rubric_maxima_sum_to_one_hundred() {
-        let report = score_design(&rich_skill());
-        let total: f64 = report
-            .dimensions
-            .values()
-            .map(|dimension| dimension.max)
-            .sum();
-        assert!((total - 100.0).abs() < 1e-9, "maxima sum to {total}");
-        assert!((report.dimensions["d5_pattern_freedom_fit"].max - 15.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn minimal_skill_scores_low_and_is_not_ready() {
-        let report = score_design(&minimal_skill());
-        assert!(report.design_score_pct < 50.0, "{report:?}");
-        assert!(!report.ready_for_functional_testing);
-        assert_eq!(report.dimensions["d1_knowledge_ratio"].score, 0.0);
-        assert_eq!(report.dimensions["d5_pattern_freedom_fit"].score, 0.0);
-    }
-
-    #[test]
-    fn invalid_name_lowers_spec_compliance_without_panicking() {
-        let skill = SkillDefinition::new("bad name!", "Has a bad name", "body");
-        let report = score_design(&skill);
-        let compliance = &report.dimensions["d3_spec_compliance"];
-        assert!(compliance.score < compliance.max);
-        // Only the non-blank description holds; the name and the markdown round
-        // trip both fail because `to_markdown` validates the name.
-        assert!((compliance.score - 0.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn knowledge_ratio_has_three_levels() {
-        assert_eq!(d1_level(&"a".repeat(199)), 1);
-        assert_eq!(d1_level(&"a".repeat(200)), 2);
-        assert_eq!(d1_level(&"a".repeat(79)), 0);
-        assert_eq!(d1_level(&"a".repeat(80)), 1);
-    }
-
-    #[test]
-    fn numbered_and_bulleted_lines_are_detected() {
-        assert!(is_numbered_step("1. first"));
-        assert!(is_numbered_step("12) twelfth"));
-        assert!(!is_numbered_step("1.first"));
-        assert!(!is_numbered_step(".first"));
-        assert!(!is_numbered_step("no digits"));
-        assert!(is_list_item("- item"));
-        assert!(is_list_item("* item"));
-        assert!(is_list_item("+ item"));
-        assert!(!is_list_item("-item"));
-    }
-
-    #[test]
-    fn quad_hashes_do_not_count_as_sections() {
-        let body = "#### Deep\n\n#### Also\n\n#### Third";
-        assert_eq!(d2_level(body), 0);
-        let body = "## A\n\n## B\n\n### C";
-        assert_eq!(d2_level(body), 1);
-    }
-
-    #[test]
-    fn resource_reference_detection() {
-        assert!(has_resource_reference("see references/guide.md"));
-        assert!(has_resource_reference("run install.sh"));
-        assert!(!has_resource_reference("no files here"));
-    }
-
-    #[test]
-    fn half_scores_when_only_some_criteria_hold() {
-        // Has a title but no section heading.
-        assert_eq!(d5_level("# Title only"), 1);
-        // "return" alone is the half level for output specification.
-        assert_eq!(d7_level("You must return an answer"), 1);
-    }
-
-    #[test]
-    fn safety_without_rules_is_clean() {
-        let report = scan_safety(&rich_skill(), &[], 0.8).expect("scan");
-        assert!((report.score_pct - 100.0).abs() < 1e-9);
-        assert!(!report.blocked);
-        assert!(!report.auto_fail);
-        assert_eq!(report.findings.len(), 0);
-        assert!(report.dimensions.is_none());
-        assert!((report.gate_threshold - 0.8).abs() < 1e-9);
-        assert_eq!(report.skill_name, "demo");
-    }
-
-    #[test]
-    fn soft_rule_match_reports_one_finding() {
-        let rules = [SafetyRule::new(
-            "checklist",
-            "content",
-            "warning",
-            "mentions a checklist",
-        )];
-        let report = scan_safety(&rich_skill(), &rules, 0.5).expect("scan");
-        assert_eq!(report.findings.len(), 1);
-        assert!((report.score_pct - 75.0).abs() < 1e-9);
-        assert!(!report.blocked);
-        assert!((report.gate_threshold - 0.5).abs() < 1e-9);
-        assert_eq!(report.findings[0].dimension, "content");
-        assert_eq!(report.findings[0].severity, "warning");
-    }
-
-    #[test]
-    fn critical_rule_blocks_unconditionally() {
-        let rules = [SafetyRule::new("checklist", "secrets", "critical", "leak")];
-        let report = scan_safety(&rich_skill(), &rules, 0.0).expect("scan");
-        assert!(report.blocked);
-        assert!(report.auto_fail);
-        assert!((report.score_pct - 75.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn two_matching_rules_halve_the_score() {
-        let rules = [
-            SafetyRule::new("checklist", "a", "info", "one"),
-            SafetyRule::new("(?i)SUMMARY", "b", "warning", "two"),
-        ];
-        let report = scan_safety(&rich_skill(), &rules, 0.8).expect("scan");
-        assert_eq!(report.findings.len(), 2);
-        assert!((report.score_pct - 50.0).abs() < 1e-9);
-        assert!(report.blocked);
-    }
-
-    #[test]
-    fn non_matching_rule_leaves_the_score_intact() {
-        let rules = [SafetyRule::new("does-not-appear", "a", "warning", "unused")];
-        let report = scan_safety(&rich_skill(), &rules, 0.8).expect("scan");
-        assert_eq!(report.findings.len(), 0);
-        assert!((report.score_pct - 100.0).abs() < 1e-9);
-        assert!(!report.blocked);
-    }
-
-    #[test]
-    fn invalid_rule_pattern_is_a_validation_error() {
-        let rules = [SafetyRule::new("[", "a", "warning", "broken")];
-        let error = scan_safety(&rich_skill(), &rules, 0.8).expect_err("invalid pattern");
-        assert!(error.to_string().contains("invalid safety rule pattern"));
-    }
-
-    #[test]
-    fn unrenderable_skill_propagates_the_error() {
-        let skill = SkillDefinition::new("demo", "", "body");
-        let error = scan_safety(&skill, &[], 0.8).expect_err("blank description");
-        assert!(error.to_string().contains("description"));
-    }
-
-    #[test]
-    fn aggregate_completes_with_both_contributions() {
-        let design = report_with(80.0, true);
-        let functional = functional_with(0.5);
-        let safety = safety_with(false);
-        let final_score = aggregate(&design, &functional, &safety, 0.4, 0.6);
-
-        assert_eq!(final_score.pipeline_status, "COMPLETED");
-        assert!((final_score.final_score_pct - 62.0).abs() < 1e-9);
-        assert_eq!(final_score.grade, "D");
-        assert_eq!(
-            final_score.gates_passed,
-            vec!["e1_llm_judge", "e2_functional", "e3_safety"]
-        );
-        assert_eq!(final_score.recommendation, "usable, refine failing cases");
-        assert_eq!(final_score.skill_name, "demo");
-
-        let judge = final_score.evaluators.e1_llm_judge.expect("judge score");
-        assert!((judge.score_pct - 80.0).abs() < 1e-9);
-        assert!((judge.weight - 0.4).abs() < 1e-9);
-        assert!((judge.contribution - 32.0).abs() < 1e-9);
-
-        let functional_score = final_score.evaluators.e2_functional;
-        assert!((functional_score.score_pct - 50.0).abs() < 1e-9);
-        assert!((functional_score.weight - 0.6).abs() < 1e-9);
-        assert!((functional_score.contribution - 30.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn aggregate_stops_at_safety() {
-        let design = report_with(90.0, true);
-        let functional = functional_with(1.0);
-        let final_score = aggregate(&design, &functional, &safety_with(true), 0.4, 0.6);
-
-        assert_eq!(final_score.pipeline_status, "BLOCKED_AT_SAFETY");
-        assert!((final_score.final_score_pct - 0.0).abs() < 1e-9);
-        assert_eq!(final_score.grade, "F");
-        assert_eq!(final_score.gates_passed.len(), 0);
-        assert_eq!(final_score.recommendation, "not ready for release");
-    }
-
-    #[test]
-    fn aggregate_stops_at_design() {
-        let design = report_with(40.0, false);
-        let functional = functional_with(1.0);
-        let final_score = aggregate(&design, &functional, &safety_with(false), 0.4, 0.6);
-
-        assert_eq!(final_score.pipeline_status, "BLOCKED_AT_E1_LLM_JUDGE");
-        assert!((final_score.final_score_pct - 0.0).abs() < 1e-9);
-        assert_eq!(final_score.grade, "F");
-        assert_eq!(final_score.gates_passed, vec!["e3_safety"]);
-        assert_eq!(final_score.recommendation, "not ready for release");
-    }
-
-    #[test]
-    fn aggregate_recommendation_boundaries() {
-        let high = aggregate(
-            &report_with(90.0, true),
-            &functional_with(1.0),
-            &safety_with(false),
-            0.4,
-            0.6,
-        );
-        assert!((high.final_score_pct - 96.0).abs() < 1e-9);
-        assert_eq!(high.grade, "A");
-        assert_eq!(high.recommendation, "ready for release");
-
-        let low = aggregate(
-            &report_with(55.0, true),
-            &functional_with(0.5),
-            &safety_with(false),
-            0.4,
-            0.6,
-        );
-        assert!((low.final_score_pct - 52.0).abs() < 1e-9);
-        assert_eq!(low.recommendation, "not ready for release");
-    }
-
-    #[test]
-    fn round2_rounds_half_up_to_cents() {
-        assert!((round2(62.004) - 62.0).abs() < 1e-9);
-        assert!((round2(62.006) - 62.01).abs() < 1e-9);
-        assert!((round2(0.0) - 0.0).abs() < 1e-9);
-    }
-}
+mod tests;

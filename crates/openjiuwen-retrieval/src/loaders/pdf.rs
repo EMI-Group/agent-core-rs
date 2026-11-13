@@ -7,6 +7,10 @@
 //! of yielding an empty document, so batch ingestion cannot silently index a
 //! blank record; encrypted documents and object streams keep the parser's own
 //! `Unsupported` messages.
+//!
+//! [`DocumentLoader::load_bytes`] extracts text from in-memory bytes
+//! ([`PdfParser::parse_bytes`]) under the same rules, so an uploaded PDF needs no
+//! temporary path.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -15,9 +19,9 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::logging::debug;
 
 use crate::common::{Document, Metadata};
-use crate::parsing::PdfParser;
+use crate::parsing::{PdfDocument, PdfParser};
 
-use super::{file_extension, DocumentLoader};
+use super::{apply_load_options, file_extension, DocumentBytes, DocumentLoader, LoadOptions};
 
 /// Loads `.pdf` files as one document holding the extracted page text.
 #[derive(Debug, Default, Clone, Copy)]
@@ -31,6 +35,26 @@ impl PdfLoader {
     }
 }
 
+/// Renders a parsed PDF as the single document the loader returns.
+///
+/// `name` is the source the caller asked for (path or in-memory file name) and
+/// only appears in the scanned-PDF error message.
+fn document_from(document: PdfDocument, name: &str) -> Result<Document> {
+    if !document.has_text {
+        return Err(Error::Unsupported(format!(
+            "PDF has no extractable text: {name}"
+        )));
+    }
+    let mut metadata = Metadata::new();
+    metadata.insert("page_count".to_owned(), Value::from(document.page_count));
+    metadata.insert("has_text".to_owned(), Value::Bool(document.has_text));
+    metadata.insert(
+        "source_type".to_owned(),
+        Value::String("document".to_owned()),
+    );
+    Ok(Document::new(document.text).with_metadata(metadata))
+}
+
 #[async_trait]
 impl DocumentLoader for PdfLoader {
     fn supports(&self, source: &str) -> bool {
@@ -39,24 +63,26 @@ impl DocumentLoader for PdfLoader {
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         let document = PdfParser::new().parse_path(source).await?;
-        if !document.has_text {
-            return Err(Error::Unsupported(format!(
-                "PDF has no extractable text: {source}"
-            )));
-        }
-        let mut metadata = Metadata::new();
-        metadata.insert("page_count".to_owned(), Value::from(document.page_count));
-        metadata.insert("has_text".to_owned(), Value::Bool(document.has_text));
-        metadata.insert(
-            "source_type".to_owned(),
-            Value::String("document".to_owned()),
-        );
+        let pages = document.page_count;
+        let document = document_from(document, source)?;
+        debug!(file = source, pages, "loaded PDF document");
+        Ok(vec![document])
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let document = PdfParser::new().parse_bytes(&source.bytes)?;
+        let document = document_from(document, &source.name)?;
+        let mut documents = vec![document];
+        apply_load_options(&source.name, &mut documents, options);
         debug!(
-            file = source,
-            pages = document.page_count,
-            "loaded PDF document"
+            file = source.name.as_str(),
+            "loaded PDF document from bytes"
         );
-        Ok(vec![Document::new(document.text).with_metadata(metadata)])
+        Ok(documents)
     }
 }
 
@@ -67,6 +93,7 @@ mod tests {
     use openjiuwen_common::error::ErrorKind;
 
     use crate::loaders::fixtures::{pdf_document, plain_stream};
+    use crate::loaders::{DocumentBytes, LoadOptions};
 
     #[tokio::test]
     async fn load_returns_one_document_with_page_metadata() {
@@ -139,6 +166,101 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_loader() {
+        let bytes = pdf_document(&plain_stream("BT (Hello PDF) Tj ET"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.pdf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = PdfLoader::new().load(path.to_str().unwrap()).await.unwrap();
+        let from_bytes = PdfLoader::new()
+            .load_bytes(&DocumentBytes::new("paper.pdf", bytes), &LoadOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(from_bytes.len(), 1);
+        assert_eq!(from_bytes[0].text, from_path[0].text);
+        assert_eq!(from_bytes[0].text, "Hello PDF");
+        for key in ["page_count", "has_text", "source_type"] {
+            assert_eq!(
+                from_bytes[0].metadata.get(key),
+                from_path[0].metadata.get(key),
+                "metadata key {key}"
+            );
+        }
+        assert_eq!(from_bytes[0].id.len(), 36);
+        assert_eq!(
+            from_bytes[0].metadata.get("doc_id"),
+            Some(&Value::String(from_bytes[0].id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title_overrides() {
+        let source = DocumentBytes::new(
+            "/uploads/paper.pdf",
+            pdf_document(&plain_stream("BT (Hello PDF) Tj ET")),
+        );
+        let documents = PdfLoader::new()
+            .load_bytes(
+                &source,
+                &LoadOptions::new().with_doc_id("doc-9").with_title("Paper"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, "doc-9");
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String("doc-9".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("title"),
+            Some(&Value::String("Paper".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("has_text"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_of_a_scanned_pdf_is_unsupported() {
+        let source = DocumentBytes::new(
+            "scanned.pdf",
+            pdf_document(
+                "4 0 obj\n<< /Filter /DCTDecode /Length 4 >>\nstream\nscan\nendstream\nendobj",
+            ),
+        );
+        let error = PdfLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "unsupported: PDF has no extractable text: scanned.pdf"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_of_an_encrypted_pdf_keeps_the_parser_message() {
+        let mut bytes = b"%PDF-1.7\n1 0 obj\n<< /Encrypt 2 0 R >>\nendobj\n".to_vec();
+        bytes.extend_from_slice(b"%%EOF\n");
+        let source = DocumentBytes::new("locked.pdf", bytes);
+        let error = PdfLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("encrypted PDF documents"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! [`ScriptedFetcher`]: one HTML page is scraped, converted into a deterministic
 //! skill definition, written as a `SKILL.md` bundle, and read back with
 //! [`SkillBundle::read`]. The suite also pins the fetcher contract (unknown URL,
-//! non-HTTP scheme) and the archive policy (tar in-process, zip/gzip deferred).
+//! non-HTTP scheme) and the archive policy (tar, zip, and gzip all unpack
+//! in-process).
 //!
 //! Everything runs offline: the fetcher is scripted, paths come from a
 //! [`TempWorkspace`], and no timestamp or environment value is read.
@@ -13,8 +14,10 @@
 use std::sync::Arc;
 
 use openjiuwen_common::error::ErrorKind;
+use openjiuwen_dev_tools::skill_creator::omni::archive::ArchiveWriter;
 use openjiuwen_dev_tools::skill_creator::omni::{
-    detect, resolve_url, slugify, ArchiveFormat, ArchiveUnpacker, HttpFetcher, ScriptedFetcher,
+    detect, resolve_url, slugify, ArchiveEntry, ArchiveFormat, ArchiveUnpacker, HttpFetcher,
+    ScriptedFetcher,
 };
 use openjiuwen_dev_tools::skill_creator::{SkillBundle, SkillCreator, SkillDefinition};
 use openjiuwen_test_support::TempWorkspace;
@@ -157,27 +160,26 @@ async fn transport_and_scheme_failures_keep_their_kinds() {
 }
 
 #[test]
-fn archives_are_detected_and_compressed_formats_are_deferred() {
-    let zip = b"PK\x03\x04\x14\x00\x00\x00";
-    assert_eq!(detect(zip), Some(ArchiveFormat::Zip));
-    let error = ArchiveUnpacker::unpack_auto(zip).expect_err("zip is deferred");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    let message = error.to_string();
-    assert!(message.contains("zip"), "got {message}");
-    assert!(message.contains("compression dependency"), "got {message}");
+fn archives_are_detected_and_compressed_formats_unpack() {
+    let zip = ArchiveWriter::write_stored(&[ArchiveEntry {
+        path: "guide.md".to_owned(),
+        bytes: b"# Guide\n".to_vec(),
+        is_dir: false,
+    }])
+    .expect("writes a zip");
+    assert_eq!(detect(&zip), Some(ArchiveFormat::Zip));
+    let entries = ArchiveUnpacker::unpack_auto(&zip).expect("zip unpacks");
+    assert_eq!(entries[0].path, "guide.md");
+    assert_eq!(entries[0].bytes, b"# Guide\n");
 
-    let gzip = [0x1f, 0x8b, 0x08, 0x00];
-    assert_eq!(detect(&gzip), Some(ArchiveFormat::Gzip));
-    let error = ArchiveUnpacker::unpack_auto(&gzip).expect_err("gzip is deferred");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    let message = error.to_string();
-    assert!(message.contains("gzip"), "got {message}");
-    assert!(message.contains("compression dependency"), "got {message}");
-
-    let unknown = ArchiveUnpacker::unpack_auto(b"not an archive at all")
-        .expect_err("unrecognized bytes are rejected");
+    let error = ArchiveUnpacker::unpack_auto(b"PK\x03\x04payload").expect_err("truncated zip");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let error =
+        ArchiveUnpacker::unpack_auto(&[0x1f, 0x8b, 0x08, 0x00]).expect_err("truncated gzip");
+    assert_eq!(detect(&[0x1f, 0x8b, 0x08, 0x00]), Some(ArchiveFormat::Gzip));
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    let unknown = ArchiveUnpacker::unpack_auto(b"not an archive at all").expect_err("unknown");
     assert_eq!(unknown.kind(), ErrorKind::Validation);
-    assert!(unknown.to_string().contains("archive"));
 }
 
 #[test]
