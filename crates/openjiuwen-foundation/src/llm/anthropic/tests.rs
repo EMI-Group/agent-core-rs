@@ -71,7 +71,14 @@ async fn invoke_posts_the_projected_body_with_the_anthropic_headers() {
         .and(header("anthropic-version", "2023-06-01"))
         .and(body_json(json!({
             "model": MODEL,
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }],
             "max_tokens": 32768,
             "stream": false,
         })))

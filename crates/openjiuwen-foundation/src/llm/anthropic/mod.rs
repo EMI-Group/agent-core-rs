@@ -5,6 +5,8 @@
 //! breakpoints) and the event-oriented SSE stream. Request, response, and stream
 //! conversion live in the private submodules and are re-exported from here.
 
+mod cache;
+mod convert;
 mod request;
 mod response;
 mod stream;
