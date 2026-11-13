@@ -1,26 +1,34 @@
-//! Offline integration suite for the deferred vendor providers (`claudecode`, `codex`, `dsh`).
+//! Offline integration suite for the vendor providers (`claudecode`, `codex`, `dsh`).
 //!
 //! Python counterparts live under `tests/unit_tests/harness_providers/<provider>/test_config.py`
 //! (configuration decoding, defaults and cross-field rules) and `test_provider.py` (identity,
-//! cards, model fragments and the `Unsupported` create path). The Python tree keeps the DSH data
+//! cards, model fragments and the `create` path). The Python tree keeps the DSH data
 //! cases in `dsh/test_harness.py`, but the split is the same.
 //!
-//! Every case is a pure data transform: no network, no external CLI, no SDK, no process spawning.
+//! Every case is a pure data transform — no network, no vendor SDK, no external CLI. The `create`
+//! cases resolve a fake executable written by [`support::FakeCli`] (or a nonexistent explicit
+//! path); resolution never starts the process, which the per-provider suites cover.
 
 #![cfg(feature = "vendor")]
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+
+mod support;
 
 use std::collections::BTreeSet;
 
 use openjiuwen_common::error::Error;
 use openjiuwen_common::security::SecretString;
 use openjiuwen_harness_protocol::{
-    HarnessCapability, HarnessErrorKind, HarnessProvider, HostCapability, JsonObject, ModelChoice,
-    ModelEndpoint,
+    HarnessCapability, HarnessErrorKind, HarnessProvider, HarnessState, HostCapability, JsonObject,
+    ModelChoice, ModelEndpoint,
 };
 use openjiuwen_harness_providers::providers::{claudecode, codex, dsh};
-use openjiuwen_harness_providers::{describe_provider, provider_model_config, SkillSource};
+use openjiuwen_harness_providers::{
+    create_harness, describe_provider, provider_model_config, SkillSource,
+};
 use serde_json::{json, Value};
+
+use support::FakeCli;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -131,6 +139,18 @@ fn claudecode_card_declares_python_capabilities() {
             HarnessCapability::AuthFallback,
         ])
     );
+    // Steering plus a graceful abort is the whole interrupt surface: the CLI has no harder stop,
+    // no pause/resume and no native-tool gateway.
+    for capability in [
+        HarnessCapability::ForceAbort,
+        HarnessCapability::PauseResume,
+        HarnessCapability::NativeTools,
+    ] {
+        assert!(
+            !card.capabilities.contains(&capability),
+            "claudecode must not declare {capability:?}"
+        );
+    }
     assert_eq!(
         card.optional_host_capabilities,
         BTreeSet::from([
@@ -167,7 +187,7 @@ fn codex_identity_matches_python() {
 }
 
 #[test]
-fn codex_card_adds_native_tools_to_the_claude_capabilities() {
+fn codex_card_declares_steering_abort_checkpoints_and_mcp_tools() {
     let card = codex::card();
     assert_eq!(
         card.capabilities,
@@ -177,13 +197,24 @@ fn codex_card_adds_native_tools_to_the_claude_capabilities() {
             HarnessCapability::PersistentSession,
             HarnessCapability::Checkpoint,
             HarnessCapability::McpTools,
-            HarnessCapability::NativeTools,
-            HarnessCapability::ModelSelection,
-            HarnessCapability::ModelDiscovery,
             HarnessCapability::EndpointModels,
             HarnessCapability::AuthFallback,
         ])
     );
+    // The app-server transport has no harder stop than `turn/interrupt`, no pause and no
+    // `HarnessModelControl` seam, so these must stay undeclared.
+    for capability in [
+        HarnessCapability::ForceAbort,
+        HarnessCapability::PauseResume,
+        HarnessCapability::ModelSelection,
+        HarnessCapability::ModelDiscovery,
+        HarnessCapability::NativeTools,
+    ] {
+        assert!(
+            !card.capabilities.contains(&capability),
+            "codex must not declare {capability:?}"
+        );
+    }
     assert_eq!(
         card.optional_host_capabilities,
         BTreeSet::from([
@@ -223,15 +254,30 @@ fn dsh_identity_matches_python() {
 }
 
 #[test]
-fn dsh_card_declares_only_mcp_tools_and_endpoint_models() {
+fn dsh_card_declares_a_persistent_session_mcp_tools_and_endpoint_models() {
     let card = dsh::card();
     assert_eq!(
         card.capabilities,
         BTreeSet::from([
+            HarnessCapability::PersistentSession,
             HarnessCapability::McpTools,
             HarnessCapability::EndpointModels,
         ])
     );
+    // The pinned DSH protocol offers no steering, no interrupt, no pause and no portable
+    // checkpoint, so none of them may be declared.
+    for capability in [
+        HarnessCapability::Steer,
+        HarnessCapability::GracefulAbort,
+        HarnessCapability::ForceAbort,
+        HarnessCapability::PauseResume,
+        HarnessCapability::Checkpoint,
+    ] {
+        assert!(
+            !card.capabilities.contains(&capability),
+            "dsh must not declare {capability:?}"
+        );
+    }
     assert_eq!(
         card.optional_host_capabilities,
         BTreeSet::from([HostCapability::McpServers])
@@ -706,50 +752,81 @@ fn factory_model_config_enforces_the_dsh_fallback_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// The deferred create path
+// The create path
 // Ports of tests/unit_tests/harness_providers/{claudecode,codex,dsh}/test_provider.py::test_create
 // ---------------------------------------------------------------------------
 
 #[test]
-fn create_reports_the_missing_vendor_sdks() {
-    let error = claudecode::provider()
-        .create(JsonObject::new())
-        .err()
-        .expect("the Claude Agent SDK is required");
-    assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.message(),
-        "claude-agent-sdk is required for the Claude Code harness; install the optional SDK"
-    );
-
-    let error = codex::provider()
-        .create(JsonObject::new())
-        .err()
-        .expect("the Codex SDK is required");
-    assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.message(),
-        "openai-codex is required for the Codex harness; install the optional SDK"
-    );
-
-    let error = dsh::provider()
-        .create(JsonObject::new())
-        .err()
-        .expect("the DSH SDK is required");
-    assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.message(),
-        "deepseek-harness-sdk is required for the DSH adapter; install the optional SDK before \
-         start()"
-    );
+fn create_reports_a_missing_binary_as_a_protocol_error() {
+    // Each provider pins its own executable key, so a nonexistent explicit path always fails the
+    // same way: a typed `Protocol` error naming the binary, never a missing-SDK claim.
+    let cases = [
+        (
+            "claude",
+            claudecode::provider().create(object(json!({"cli_path": "/nonexistent/claude"}))),
+        ),
+        (
+            "codex",
+            codex::provider().create(object(json!({"codex_bin": "/nonexistent/codex"}))),
+        ),
+        (
+            "dsh",
+            dsh::provider().create(object(json!({"dsh_bin": "/nonexistent/dsh"}))),
+        ),
+    ];
+    for (binary, result) in cases {
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("a missing {binary} must not create a harness"));
+        assert_ne!(
+            error.kind(),
+            HarnessErrorKind::UnsupportedCapability,
+            "{binary}: {}",
+            error.message()
+        );
+        assert_eq!(
+            error.kind(),
+            HarnessErrorKind::Protocol,
+            "{binary}: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains(binary),
+            "the error names {binary}: {}",
+            error.message()
+        );
+    }
 }
 
 #[test]
-fn create_surfaces_configuration_errors_before_the_sdk_requirement() {
+fn create_returns_an_unstarted_harness_for_every_vendor_provider() {
+    // The fake executable is only resolved: `create` never spawns it.
+    let cli = FakeCli::script("# a fake executable that is never started\n");
+    let home = tempfile::tempdir().expect("a temporary DSH home");
+    let binary = cli.path().to_string_lossy().into_owned();
+    let cases = [
+        (claudecode::PROVIDER_NAME, json!({"cli_path": &binary})),
+        (codex::PROVIDER_NAME, json!({"codex_bin": &binary})),
+        (
+            dsh::PROVIDER_NAME,
+            json!({"dsh_bin": &binary, "dsh_home": home.path().to_string_lossy()}),
+        ),
+    ];
+    for (name, config) in cases {
+        let harness = create_harness(name, object(config))
+            .unwrap_or_else(|error| panic!("{name} creates an unstarted harness: {error}"));
+        assert_eq!(harness.state(), HarnessState::Terminated, "{name}");
+        assert_eq!(harness.provider_session_id(), None, "{name}");
+    }
+    assert!(cli.lines().is_empty(), "create never starts the binary");
+}
+
+#[test]
+fn create_surfaces_configuration_errors_before_the_binary_check() {
     let error = claudecode::provider()
         .create(object(json!({"permission_mode": "bogus"})))
         .err()
-        .expect("an invalid configuration wins over the SDK requirement");
+        .expect("an invalid configuration wins over the binary check");
     assert_eq!(error.kind(), HarnessErrorKind::Validation);
     assert_eq!(
         error.message(),

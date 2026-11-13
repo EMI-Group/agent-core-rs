@@ -246,8 +246,23 @@ fn native_reports_the_missing_feature() {
     assert!(error.to_string().contains("unsupported"), "{error}");
 }
 
+/// `native_v2` is hosted by `openjiuwen-agent-teams`: the name resolves with the feature and
+/// reports the sibling crate as its prerequisite without it.
+#[cfg(feature = "native-v2")]
 #[test]
-fn native_v2_reports_the_sibling_crate() {
+fn native_v2_resolves_to_the_team_hosted_provider() {
+    let spec = resolve_provider("native_v2").expect("the native-v2 feature serves the name");
+    assert_eq!(spec.card().name, "native_v2");
+    assert_eq!(spec.card().implementation_version, "0.2.0");
+    assert!(
+        !spec.configures_models(),
+        "native_v2 configures no models: members get theirs from the harness factory"
+    );
+}
+
+#[cfg(not(feature = "native-v2"))]
+#[test]
+fn native_v2_reports_the_missing_feature() {
     let error = resolve_provider("native_v2")
         .err()
         .expect("native_v2 is hosted by another crate");
@@ -255,6 +270,10 @@ fn native_v2_reports_the_sibling_crate() {
     assert!(
         error.to_string().contains("openjiuwen-agent-teams"),
         "unexpected message: {error}"
+    );
+    assert!(
+        error.to_string().contains("`native-v2` feature"),
+        "the message names the enabling feature: {error}"
     );
 }
 
@@ -448,23 +467,31 @@ fn builtin_descriptors_are_declared_in_python_order() {
     assert_eq!(native.requires, None);
 }
 
+/// Every built-in descriptor reports the Card identity plus its external prerequisite.
+///
+/// `native_v2` is implemented once the `native-v2` feature hosts it; the three vendor entries stay
+/// declared with their transport requirement, which is what `requires` documents.
 #[test]
-fn deferred_descriptors_name_their_prerequisite() {
+fn builtin_descriptors_name_their_prerequisite() {
     let descriptors = provider_descriptors();
-
     let native_v2 = describe_provider("native_v2").expect("native_v2 is declared");
     assert_eq!(native_v2.card_name, "native_v2");
     assert_eq!(native_v2.implementation_version, "0.2.0");
-    assert!(native_v2.builtin && !native_v2.implemented && !native_v2.configures_models);
+    assert!(native_v2.builtin && native_v2.implemented && !native_v2.configures_models);
+    #[cfg(feature = "native-v2")]
+    assert_eq!(
+        native_v2.requires, None,
+        "the hosted provider has no remaining prerequisite"
+    );
+    #[cfg(not(feature = "native-v2"))]
     assert_eq!(
         native_v2.requires.as_deref(),
         Some("openjiuwen-agent-teams")
     );
-
     let claudecode = describe_provider("claudecode").expect("claudecode is declared");
     assert_eq!(claudecode.card_name, "claude-code");
     assert_eq!(claudecode.implementation_version, "0.1.0");
-    assert!(claudecode.builtin && !claudecode.implemented && claudecode.configures_models);
+    assert!(claudecode.builtin && claudecode.configures_models);
     assert!(
         claudecode
             .requires
@@ -473,11 +500,10 @@ fn deferred_descriptors_name_their_prerequisite() {
         "unexpected requirement: {:?}",
         claudecode.requires
     );
-
     let codex = describe_provider("codex").expect("codex is declared");
     assert_eq!(codex.card_name, "codex");
     assert_eq!(codex.implementation_version, "0.1.0");
-    assert!(codex.builtin && !codex.implemented && codex.configures_models);
+    assert!(codex.builtin && codex.configures_models);
     assert!(
         codex
             .requires
@@ -486,11 +512,10 @@ fn deferred_descriptors_name_their_prerequisite() {
         "unexpected requirement: {:?}",
         codex.requires
     );
-
     let dsh = describe_provider("dsh").expect("dsh is declared");
     assert_eq!(dsh.card_name, "deepseek-harness");
     assert_eq!(dsh.implementation_version, "0.3.0");
-    assert!(dsh.builtin && !dsh.implemented && dsh.configures_models);
+    assert!(dsh.builtin && dsh.configures_models);
     assert!(
         dsh.requires
             .as_deref()
@@ -498,7 +523,6 @@ fn deferred_descriptors_name_their_prerequisite() {
         "unexpected requirement: {:?}",
         dsh.requires
     );
-
     // `describe_provider` reports the same static entry the listing does.
     assert_eq!(descriptor_named(&descriptors, "claudecode"), claudecode);
     assert_eq!(descriptor_named(&descriptors, "native_v2"), native_v2);
