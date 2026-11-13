@@ -595,3 +595,8 @@ mod tests {
         assert_eq!(store.len().await, 0);
     }
 }
+
+pub mod completion;
+pub use completion::{
+    ChatCompletionConfig, MemoryCompletion, OpenAiChatCompletion, ScriptedCompletion,
+};
