@@ -9,11 +9,12 @@
 //! (untruncated) inputs, so two teams whose names differ only past the 14-character truncation
 //! still get distinct worktrees.
 //!
-//! The git backend itself is deferred: [`UnsupportedWorktreeBackend`] and
-//! [`crate::workspace::LocalWorkspaceProvider`] without an injected backend return
-//! [`Error::Unsupported`] naming the Python capability (`agent_teams.worktree.lifecycle`).
+//! [`GitWorktreeBackend`](crate::workspace::GitWorktreeBackend) implements the seam against a real
+//! repository (see [`crate::workspace::git`]); [`RemoteWorkspaceAdapter`](crate::workspace::RemoteWorkspaceAdapter)
+//! implements the same seam over the Python remote protocol. [`UnsupportedWorktreeBackend`] is the
+//! fail-closed backend a host injects to disable worktree isolation entirely.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -39,10 +40,10 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Prefix of every teammate worktree name and of its git branch.
-const NAME_PREFIX: &str = "agent-";
+pub const NAME_PREFIX: &str = "agent-";
 
 /// Prefix of a worktree git branch.
-const BRANCH_PREFIX: &str = "worktree-";
+pub const BRANCH_PREFIX: &str = "worktree-";
 
 /// One worktree of a teammate: its slug, its directory and its git branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,11 +188,16 @@ pub struct WorktreeCreateRequest {
     pub base_ref: Option<String>,
 }
 
-/// Creates and removes teammate worktrees.
+/// Creates, lists, locks and removes teammate worktrees.
 ///
-/// The in-process core only ships [`UnsupportedWorktreeBackend`]; a host that owns a git
-/// implementation injects its own backend into
-/// [`LocalWorkspaceProvider`](crate::workspace::LocalWorkspaceProvider).
+/// [`GitWorktreeBackend`](crate::workspace::GitWorktreeBackend) and
+/// [`RemoteWorkspaceAdapter`](crate::workspace::RemoteWorkspaceAdapter) implement the trait against
+/// a local repository and a remote node respectively; [`LocalWorkspaceProvider`](crate::workspace::LocalWorkspaceProvider)
+/// defaults to the git backend and accepts an injected one as an override.
+///
+/// [`list`](Self::list), [`lock`](Self::lock) and [`unlock`](Self::unlock) are optional: their
+/// default implementations fail closed with [`Error::Unsupported`], so a backend that only creates
+/// and removes worktrees stays implementable with two methods.
 #[async_trait]
 pub trait WorktreeBackend: Send + Sync {
     /// Returns the backend name used in logs and diagnostics.
@@ -210,13 +216,52 @@ pub trait WorktreeBackend: Send + Sync {
     ///
     /// Returns whatever the backend reports when the worktree cannot be removed.
     async fn remove(&self, worktree: &WorktreeInfo) -> Result<()>;
+
+    /// Lists the teammate worktrees registered in the repository containing `repo_root`.
+    ///
+    /// Only worktrees this crate owns (name prefix [`NAME_PREFIX`], branch prefix
+    /// [`BRANCH_PREFIX`]) are returned, sorted by path so the result is deterministic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] by default, and the backend's own error when the repository
+    /// cannot be read.
+    async fn list(&self, repo_root: &Path) -> Result<Vec<WorktreeInfo>> {
+        let _ = repo_root;
+        Err(unsupported_operation("list", "listing worktrees"))
+    }
+
+    /// Locks `worktree` so the backend refuses to remove it, recording `reason`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] by default, [`Error::NotFound`] when the worktree is not
+    /// registered, and the backend's own error otherwise.
+    async fn lock(&self, worktree: &WorktreeInfo, reason: &str) -> Result<()> {
+        let _ = (worktree, reason);
+        Err(unsupported_operation("lock", "locking a worktree"))
+    }
+
+    /// Lifts a lock created by [`Self::lock`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] by default, [`Error::NotFound`] when the worktree is not a
+    /// locked worktree of the repository, and the backend's own error otherwise.
+    async fn unlock(&self, worktree: &WorktreeInfo) -> Result<()> {
+        let _ = worktree;
+        Err(unsupported_operation("unlock", "unlocking a worktree"))
+    }
 }
 
-/// The [`WorktreeBackend`] of a runtime without git support.
+/// A [`WorktreeBackend`] that refuses every operation.
 ///
-/// Every operation fails closed with [`Error::Unsupported`] naming the Python capability, so a
-/// caller that requests worktree isolation learns it is unavailable instead of silently running in
-/// a shared directory.
+/// This is the backend a host injects to *disable* worktree isolation even where a repository
+/// exists: every operation fails closed with [`Error::Unsupported`] naming the Python capability,
+/// so a caller that requested worktree isolation learns it is unavailable instead of silently
+/// running in a shared directory. [`LocalWorkspaceProvider`](crate::workspace::LocalWorkspaceProvider)
+/// does not use it by default — its default backend is
+/// [`GitWorktreeBackend`](crate::workspace::GitWorktreeBackend).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnsupportedWorktreeBackend;
 
@@ -227,20 +272,29 @@ impl WorktreeBackend for UnsupportedWorktreeBackend {
     }
 
     async fn create(&self, _request: &WorktreeCreateRequest) -> Result<WorktreeInfo> {
-        Err(unsupported_worktree())
+        Err(unsupported_operation(
+            "create",
+            "the injected worktree backend does not implement worktrees",
+        ))
     }
 
     async fn remove(&self, _worktree: &WorktreeInfo) -> Result<()> {
-        Err(unsupported_worktree())
+        Err(unsupported_operation(
+            "remove",
+            "the injected worktree backend does not implement worktrees",
+        ))
     }
 }
 
-/// Builds the error returned by every unsupported worktree operation.
-fn unsupported_worktree() -> Error {
-    Error::unsupported(
-        "git worktree backend is not implemented \
-         (Python capability: agent_teams.worktree.lifecycle)",
-    )
+/// Builds the error returned by an unsupported worktree operation.
+///
+/// The message names the Python capability (`agent_teams.worktree.lifecycle`) so an operator can
+/// map the failure back to the reference implementation.
+pub(crate) fn unsupported_operation(operation: &str, reason: &str) -> Error {
+    Error::unsupported(format!(
+        "worktree {operation} is not supported: {reason} \
+         (Python capability: agent_teams.worktree.lifecycle)"
+    ))
 }
 
 #[cfg(test)]
