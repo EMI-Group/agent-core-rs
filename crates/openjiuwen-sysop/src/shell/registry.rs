@@ -2,13 +2,15 @@
 //!
 //! Python parity: `shell_process_registry.py` (`SHELL_PROCESS_REGISTRY`,
 //! `register_shell_process`, `unregister_shell_process`, `resolve_shell_session_id`). The
-//! Python module maps a session id to the live `asyncio` subprocesses so a session can be
-//! torn down; in Rust the backend registers a [`CancellationToken`] instead and selects on
-//! it while the child runs.
+//! Python module maps a session id to the live `asyncio` subprocesses and tears them down
+//! with `os.killpg`; here a registration holds the backend's [`CancellationToken`] and,
+//! for a child the backend does not await itself (a background command), the process group
+//! to terminate.
 //!
 //! Cancellation is **cooperative**: cancelling a token only signals the backend's run
-//! loop, which then kills the child process and reports `cancelled = true` on the result.
-//! Cancelling a session is therefore not a synchronous process kill.
+//! loop, which then kills the child's process group and reports `cancelled = true` on the
+//! result. A background registration has no run loop, so its process group is terminated
+//! directly ([`terminate_group`]).
 //!
 //! ```
 //! use openjiuwen_sysop::shell::registry::ShellProcessRegistry;
@@ -29,8 +31,30 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::shell::process;
+
+/// One registration: the token the run selects on plus the group to kill when it is a
+/// detached (background) child with no run loop of its own.
+#[derive(Debug)]
+struct Entry {
+    /// Cooperative cancellation signal.
+    token: CancellationToken,
+    /// Process group to terminate when the session is cancelled, if any.
+    group: Option<u32>,
+}
+
 /// Registrations grouped by session id.
-type SessionMap = BTreeMap<String, BTreeMap<u64, CancellationToken>>;
+type SessionMap = BTreeMap<String, BTreeMap<u64, Entry>>;
+
+/// Terminates the process group led by `pid` (Python `os.killpg(pid, SIGKILL)`).
+///
+/// The stop path for a background command: it is best-effort, and returns `true` when the
+/// signal was delivered. A group that already exited, a non-positive id, and a platform
+/// without process groups all return `false` without failing.
+#[must_use]
+pub fn terminate_group(pid: u32) -> bool {
+    process::kill_group(pid)
+}
 
 /// Session-scoped registry of live shell cancellation tokens.
 ///
@@ -55,6 +79,27 @@ impl ShellProcessRegistry {
     /// context).
     #[must_use]
     pub fn register(&self, session_id: &str, token: CancellationToken) -> Registration {
+        self.insert(session_id, token, None)
+    }
+
+    /// Registers the process group led by `pid` under `session_id`.
+    ///
+    /// Cancelling the session (or the registry) terminates that group, which is how a
+    /// background command — a child the backend does not await in the caller's run loop —
+    /// is stopped. A blank session id registers nothing, so the caller keeps using
+    /// [`terminate_group`] with the pid it was given.
+    #[must_use]
+    pub fn register_group(&self, session_id: &str, pid: u32) -> Registration {
+        self.insert(session_id, CancellationToken::new(), Some(pid))
+    }
+
+    /// Inserts one registration and returns its guard.
+    fn insert(
+        &self,
+        session_id: &str,
+        token: CancellationToken,
+        group: Option<u32>,
+    ) -> Registration {
         if session_id.trim().is_empty() {
             return Registration {
                 inner: None,
@@ -66,7 +111,7 @@ impl ShellProcessRegistry {
         self.sessions()
             .entry(session_id.to_string())
             .or_default()
-            .insert(id, token);
+            .insert(id, Entry { token, group });
         Registration {
             inner: Some(Arc::clone(&self.inner)),
             session_id: session_id.to_string(),
@@ -74,34 +119,35 @@ impl ShellProcessRegistry {
         }
     }
 
-    /// Cancels every token registered for `session_id`, removing them.
+    /// Cancels every token registered for `session_id` and terminates their groups.
     ///
-    /// Returns the number of tokens cancelled; an unknown session returns `0`.
+    /// Returns the number of registrations cancelled; an unknown session returns `0`.
     #[must_use]
     pub fn cancel_session(&self, session_id: &str) -> usize {
-        let tokens: Vec<CancellationToken> = {
+        let entries: Vec<Entry> = {
             let mut sessions = self.sessions();
             sessions
                 .remove(session_id)
                 .map(|session| session.into_values().collect())
                 .unwrap_or_default()
         };
-        cancel_all_tokens(tokens)
+        cancel_all_entries(entries)
     }
 
-    /// Cancels every registered token, removing all registrations.
+    /// Cancels every registered token, terminating their groups and removing all
+    /// registrations.
     ///
-    /// Returns the number of tokens cancelled.
+    /// Returns the number of registrations cancelled.
     #[must_use]
     pub fn cancel_all(&self) -> usize {
-        let tokens: Vec<CancellationToken> = {
+        let entries: Vec<Entry> = {
             let mut sessions = self.sessions();
             std::mem::take(&mut *sessions)
                 .into_values()
                 .flat_map(BTreeMap::into_values)
                 .collect()
         };
-        cancel_all_tokens(tokens)
+        cancel_all_entries(entries)
     }
 
     /// Session ids with at least one live registration, sorted.
@@ -189,11 +235,17 @@ impl Drop for Registration {
     }
 }
 
-/// Cancels `tokens` outside any lock and returns how many were cancelled.
-fn cancel_all_tokens(tokens: Vec<CancellationToken>) -> usize {
-    let count = tokens.len();
-    for token in tokens {
-        token.cancel();
+/// Cancels `entries` outside any lock and returns how many were cancelled.
+///
+/// Group termination happens before the tokens are dropped, so a background child is
+/// killed even though nobody awaits its token.
+fn cancel_all_entries(entries: Vec<Entry>) -> usize {
+    let count = entries.len();
+    for entry in entries {
+        if let Some(pid) = entry.group {
+            let _ = terminate_group(pid);
+        }
+        entry.token.cancel();
     }
     count
 }
@@ -301,6 +353,48 @@ mod tests {
         let second = registry.register("s", CancellationToken::new());
         assert_eq!(second.session_id(), "s");
         assert_eq!(second.id(), 1);
+    }
+
+    #[test]
+    fn group_registration_is_counted_and_stoppable() {
+        let registry = ShellProcessRegistry::new();
+        // No live group owns this pid, so the termination is attempted and not delivered.
+        let pid = u32::try_from(i32::MAX).unwrap();
+        let guard = registry.register_group("session", pid);
+        assert_eq!(guard.session_id(), "session");
+        assert!(registry.is_registered("session"));
+        assert_eq!(registry.cancel_session("session"), 1);
+        assert!(!registry.is_registered("session"));
+    }
+
+    #[test]
+    fn group_registration_cancels_with_everything_else() {
+        let registry = ShellProcessRegistry::new();
+        let token = CancellationToken::new();
+        let pid = u32::try_from(i32::MAX).unwrap();
+        let _token_guard = registry.register("session", token.clone());
+        let _group_guard = registry.register_group("session", pid);
+        assert_eq!(registry.cancel_all(), 2);
+        assert!(token.is_cancelled());
+        assert_eq!(registry.active_sessions(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn group_registration_with_a_blank_session_is_inert() {
+        let registry = ShellProcessRegistry::new();
+        let pid = u32::try_from(i32::MAX).unwrap();
+        let guard = registry.register_group("  ", pid);
+        assert_eq!(guard.session_id(), "");
+        assert_eq!(registry.active_sessions(), Vec::<String>::new());
+        drop(guard);
+        assert_eq!(registry.cancel_session(""), 0);
+    }
+
+    #[test]
+    fn terminate_group_reports_undelivered_signals() {
+        let pid = u32::try_from(i32::MAX).unwrap();
+        assert!(!terminate_group(pid), "no such process group");
+        assert!(!terminate_group(0), "pid 0 would signal the caller's group");
     }
 
     #[test]

@@ -37,6 +37,8 @@ use crate::operation::{OpStream, ShellOperation};
 use crate::result::{shell_failure, OpResult};
 use crate::shell::allowlist::CommandFilter;
 use crate::shell::plan;
+#[cfg(unix)]
+use crate::shell::pty;
 use crate::shell::registry::{Registration, ShellProcessRegistry};
 use crate::shell::types::{
     ShellArgvParams, ShellBackgroundOutput, ShellChunk, ShellExecParams, ShellOutput,
@@ -110,6 +112,14 @@ impl LocalShellOperation {
     #[must_use]
     pub fn filter(&self) -> &CommandFilter {
         &self.filter
+    }
+
+    /// Whether a spawn with `wrapping` may prepend the line-buffering wrapper.
+    ///
+    /// Both the call site (never for [`Wrapping::Plain`]) and the configuration
+    /// ([`LocalWorkConfig::line_buffered`]) must agree.
+    fn line_buffered(&self, wrapping: Wrapping) -> bool {
+        wrapping.is_line_buffered() && self.config.line_buffered
     }
 
     /// Resolves the working directory, enforcing the sandbox roots (Python `_resolve_cwd`).
@@ -202,16 +212,13 @@ impl LocalShellOperation {
         execution: &str,
         command: &str,
         prepared: Prepared,
+        wrapping: Wrapping,
         session_id: Option<&str>,
         timeout_secs: u64,
     ) -> OpResult<ShellOutput> {
         let cwd = format_path(&prepared.cwd);
-        let mut child_command = Command::new(&prepared.program);
-        child_command
-            .args(&prepared.args)
-            .current_dir(&prepared.cwd);
-        process::apply_environment(&mut child_command, &prepared.environment);
-        let child = match process::spawn_child(child_command) {
+        let line_buffered = self.line_buffered(wrapping);
+        let child = match process::spawn_child(prepared.command(line_buffered)) {
             Ok(child) => child,
             Err(error) => {
                 tracing::warn!(execution, %error, "failed to start shell command");
@@ -251,6 +258,36 @@ impl LocalShellOperation {
         }
         OpResult::success(output)
     }
+
+    /// Spawns a streaming run and returns the engine's event stream.
+    ///
+    /// The PTY path is taken only when [`LocalWorkConfig::pty_streaming`] is set and the
+    /// host can provide a terminal; a failed allocation falls back to pipes without
+    /// failing the command, and non-Unix hosts always use pipes. Both paths share the
+    /// engine, so bounded capture, timeout, and cancellation behave identically.
+    fn stream_engine(
+        &self,
+        prepared: &Prepared,
+        wrapping: Wrapping,
+        options: process::RunOptions,
+    ) -> std::result::Result<futures::stream::BoxStream<'static, process::EngineEvent>, String>
+    {
+        let argv = prepared.argv(self.line_buffered(wrapping));
+        #[cfg(unix)]
+        if self.config.pty_streaming {
+            if let Some(pty_child) = pty::try_spawn(prepared.command_for(&argv)) {
+                return Ok(pty::stream_pty_child(
+                    pty_child.child,
+                    pty_child.master,
+                    options,
+                ));
+            }
+            tracing::debug!("pseudo-terminal unavailable; streaming through pipes");
+        }
+        let child = process::spawn_child(prepared.command_for(&argv))
+            .map_err(|error| format!("failed to start command: {error}"))?;
+        Ok(process::stream_child(child, options))
+    }
 }
 
 #[async_trait]
@@ -266,8 +303,15 @@ impl ShellOperation for LocalShellOperation {
             }
         };
         let session = params.session_id.as_deref();
-        self.run_prepared("execute_cmd", &params.command, prepared, session, timeout)
-            .await
+        self.run_prepared(
+            "execute_cmd",
+            &params.command,
+            prepared,
+            Wrapping::LineBuffered,
+            session,
+            timeout,
+        )
+        .await
     }
 
     fn execute_cmd_stream(self: Arc<Self>, params: ShellExecParams) -> OpStream<ShellChunk> {
@@ -280,21 +324,16 @@ impl ShellOperation for LocalShellOperation {
                     return;
                 }
             };
-            let mut command = Command::new(&prepared.program);
-            command.args(&prepared.args).current_dir(&prepared.cwd);
-            process::apply_environment(&mut command, &prepared.environment);
-            let child = match process::spawn_child(command) {
-                Ok(child) => child,
-                Err(error) => {
-                    let reason = format!("failed to start command: {error}");
+            let (tokens, _registration) = self.cancellation_tokens(params.session_id.as_deref());
+            let max_output_bytes = self.config.max_output_bytes;
+            let options = process::RunOptions { timeout_secs: timeout, max_output_bytes, cancellation: tokens };
+            let mut events = match self.stream_engine(&prepared, Wrapping::LineBuffered, options) {
+                Ok(events) => events,
+                Err(reason) => {
                     yield stream_failure("execute_cmd_stream", &reason, 0);
                     return;
                 }
             };
-            let (tokens, _registration) = self.cancellation_tokens(params.session_id.as_deref());
-            let max_output_bytes = self.config.max_output_bytes;
-            let options = process::RunOptions { timeout_secs: timeout, max_output_bytes, cancellation: tokens };
-            let mut events = process::stream_child(child, options);
             let mut index = 0_u64;
             while let Some(event) = futures::StreamExt::next(&mut events).await {
                 let item = match event {
@@ -339,15 +378,24 @@ impl ShellOperation for LocalShellOperation {
         };
         let command = params.command;
         let cwd = format_path(&prepared.cwd);
-        let mut child = match spawn_background(&prepared) {
-            Ok(child) => child,
-            Err(error) => {
-                tracing::warn!(%error, "failed to start background command");
-                let reason = format!("background command failed: {error}");
-                return background_failure(&command, &cwd, None, Some(&reason), &reason);
-            }
-        };
+        let mut child =
+            match spawn_background(&prepared, self.line_buffered(Wrapping::LineBuffered)) {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to start background command");
+                    let reason = format!("background command failed: {error}");
+                    return background_failure(&command, &cwd, None, Some(&reason), &reason);
+                }
+            };
         let pid = child.id();
+        // A background child has no run loop of its own, so the registry kills its process
+        // group when the session is cancelled (Python's `killpg` teardown).
+        let registration = match (params.session_id.as_deref(), pid) {
+            (Some(session), Some(group)) if !session.trim().is_empty() => {
+                Some(ShellProcessRegistry::global().register_group(session, group))
+            }
+            _ => None,
+        };
         let sink = Arc::new(Mutex::new(process::StderrSink::default()));
         let limit = constants::DEFAULT_STDERR_RETENTION_BYTES;
         let stderr_task = child
@@ -357,6 +405,9 @@ impl ShellOperation for LocalShellOperation {
         let exit = match wait_grace(&mut child).await {
             Ok(exit) => exit,
             Err(error) => {
+                if let Some(group) = pid {
+                    process::kill_group(group);
+                }
                 let _ = child.start_kill();
                 let reason = format!("background command failed: {error}");
                 return background_failure(&command, &cwd, pid, Some(&reason), &reason);
@@ -373,6 +424,9 @@ impl ShellOperation for LocalShellOperation {
             None => {
                 tokio::spawn(async move {
                     let _ = child.wait().await;
+                    // Deregistering only after the reap keeps the group addressable for
+                    // as long as the child could still be killed.
+                    drop(registration);
                     if let Some(task) = stderr_task {
                         let _ = task.await;
                     }
@@ -412,8 +466,35 @@ impl ShellOperation for LocalShellOperation {
             environment: resolve_environment(&self.config, &params.environment),
         };
         let session = params.session_id.as_deref();
-        self.run_prepared("execute_argv", &command, prepared, session, timeout)
-            .await
+        self.run_prepared(
+            "execute_argv",
+            &command,
+            prepared,
+            Wrapping::Plain,
+            session,
+            timeout,
+        )
+        .await
+    }
+}
+
+/// Whether a spawn may prepend the line-buffering wrapper.
+///
+/// `execute_cmd`, `execute_cmd_stream`, and `execute_cmd_background` use
+/// [`Wrapping::LineBuffered`] (Python's `stdbuf` wrapper); `execute_argv` must not, because
+/// it never involves a shell and its arguments are data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrapping {
+    /// Wrap the plan in the line-buffering wrapper when the host provides one.
+    LineBuffered,
+    /// Launch the plan exactly as resolved.
+    Plain,
+}
+
+impl Wrapping {
+    /// Whether the line-buffering wrapper is allowed for this spawn.
+    fn is_line_buffered(self) -> bool {
+        self == Self::LineBuffered
     }
 }
 
@@ -423,6 +504,32 @@ struct Prepared {
     args: Vec<String>,
     cwd: PathBuf,
     environment: Vec<(String, String)>,
+}
+
+impl Prepared {
+    /// The argv to launch, wrapped for line buffering when `line_buffered` is set.
+    fn argv(&self, line_buffered: bool) -> Vec<String> {
+        let mut argv = Vec::with_capacity(self.args.len() + 1);
+        argv.push(self.program.clone());
+        argv.extend_from_slice(&self.args);
+        process::line_buffered_argv(argv, line_buffered)
+    }
+
+    /// A configured (not yet spawned) command, wrapped for line buffering on request.
+    fn command(&self, line_buffered: bool) -> Command {
+        self.command_for(&self.argv(line_buffered))
+    }
+
+    /// A configured (not yet spawned) command for an already-resolved `argv`.
+    fn command_for(&self, argv: &[String]) -> Command {
+        let program = argv.first().unwrap_or(&self.program);
+        let mut command = Command::new(program);
+        command
+            .args(argv.get(1..).unwrap_or_default())
+            .current_dir(&self.cwd);
+        process::apply_environment(&mut command, &self.environment);
+        command
+    }
 }
 
 /// A rejected command: Python's reason text plus the working directory when it was known.
@@ -516,18 +623,15 @@ fn stream_failure(execution: &str, reason: &str, chunk_index: u64) -> OpResult<S
 }
 
 /// Spawns a detached background child: no stdin, discarded stdout, piped stderr.
-fn spawn_background(prepared: &Prepared) -> std::io::Result<Child> {
-    let mut command = Command::new(&prepared.program);
+fn spawn_background(prepared: &Prepared, line_buffered: bool) -> std::io::Result<Child> {
+    let mut command = prepared.command(line_buffered);
     command
-        .args(&prepared.args)
-        .current_dir(&prepared.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
     #[cfg(unix)]
     command.process_group(0);
-    process::apply_environment(&mut command, &prepared.environment);
     command.spawn()
 }
 

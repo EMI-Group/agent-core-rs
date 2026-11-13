@@ -1,8 +1,16 @@
-//! Shared child-process engine used by the shell backend and (later) the code backend.
+//! Shared child-process engine used by the shell backend and the code backend.
 //!
 //! It owns the three behaviors every command or snippet run needs: a hardened spawn (no
 //! stdin, piped output, own process group), bounded output capture, and timeout or
-//! cancellation handling that kills the child exactly once and always reaps it.
+//! cancellation handling that kills the child **and its process group** exactly once and
+//! always reaps the direct child.
+//!
+//! Process-group management: [`spawn_child`] puts every child into a fresh process group
+//! whose id is the child's pid (Python's `start_new_session=True`, minus the controlling
+//! terminal detach — `setsid()` needs a `pre_exec` hook, which the crate-level
+//! `forbid(unsafe_code)` rules out). A kill therefore reaches the shell's descendants
+//! through [`kill_group`], which is what Python's `os.killpg` does in
+//! `shell_process_registry.py`/`utils.py`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,7 +36,11 @@ const READ_CHUNK_SIZE: usize = 65_536;
 /// How long to wait for a pipe reader once the child has been reaped.
 const READER_GRACE: Duration = Duration::from_secs(5);
 /// Capacity of the streamed-event channel.
-const EVENT_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 64;
+/// Program that switches a POSIX child to line buffering (Python's Linux wrapper).
+const LINE_BUFFERING_WRAPPER: &str = "stdbuf";
+/// Flags passed to [`LINE_BUFFERING_WRAPPER`]: line-buffered stdout, line-buffered stderr.
+const LINE_BUFFERING_FLAGS: [&str; 2] = ["-oL", "-eL"];
 
 /// A boxed, sendable future used for the deadline and cancellation branches.
 type EngineFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -94,6 +106,128 @@ pub(crate) fn apply_environment(command: &mut Command, pairs: &[(String, String)
     command.env_clear().envs(envs);
 }
 
+/// Kills the process group led by `pid` with `SIGKILL`, best effort.
+///
+/// Returns `true` when the signal was delivered. A group that no longer exists (`ESRCH`)
+/// is not an error: the child may have exited between the timeout firing and the kill.
+/// Non-positive ids are rejected outright — `killpg(0)` would signal the caller's own
+/// group — and non-Unix platforms have no process groups, so they return `false` and the
+/// caller's `Child::start_kill` fallback still runs.
+#[cfg(unix)]
+pub(crate) fn kill_group(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    if raw <= 0 {
+        return false;
+    }
+    match nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(raw),
+        nix::sys::signal::Signal::SIGKILL,
+    ) {
+        Ok(()) => true,
+        // The whole group is already gone: nothing left to kill.
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(error) => {
+            tracing::debug!(pid, %error, "process-group kill failed");
+            false
+        }
+    }
+}
+
+/// Kills the process group led by `pid`, best effort; always `false` without POSIX groups.
+#[cfg(not(unix))]
+pub(crate) fn kill_group(pid: u32) -> bool {
+    tracing::debug!(pid, "process groups are not available on this platform");
+    false
+}
+
+/// The process group of one child, killed at most once and never after the reap.
+///
+/// The guard exists because a pid can be recycled: signalling the group of a reaped child
+/// could hit an unrelated process. Callers therefore report whether the child was already
+/// reaped when the run ended, and the guard's kill-once flag makes a second timeout or
+/// cancellation branch a no-op.
+#[derive(Debug)]
+pub(crate) struct ProcessGroup {
+    /// Group id (= the child pid), `None` once the child has been reaped.
+    pid: Option<u32>,
+    /// Set by the first successful or attempted group kill.
+    killed: bool,
+}
+
+impl ProcessGroup {
+    /// Records the process group of `pid` (`None` when the child was already reaped).
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        Self { pid, killed: false }
+    }
+
+    /// Kills the group unless it was already killed or `reaped` is set.
+    ///
+    /// Returns `true` when a kill was attempted.
+    pub(crate) fn terminate(&mut self, reaped: bool) -> bool {
+        if reaped || self.killed {
+            return false;
+        }
+        self.killed = true;
+        let Some(pid) = self.pid.take() else {
+            return false;
+        };
+        kill_group(pid)
+    }
+}
+
+/// Prepends the line-buffering wrapper to `argv` when line buffering is on and available.
+///
+/// Python parity: `_build_shell_command` wraps Linux commands in `stdbuf -oL -eL` so a
+/// child writing to a pipe flushes per line. Wrapping happens at spawn time, after the
+/// allowlist and sandbox gates, so the filters always inspect the user's command and
+/// [`crate::shell::plan::resolve_plan`] keeps returning the plain interpreter.
+///
+/// The wrapper is skipped — never an error — when line buffering is disabled, `argv` is
+/// empty, `stdbuf` is not on `PATH`, or the host is not Unix. (`macOS` has no `stdbuf`;
+/// Python's `script -q /dev/null` alternative is not used because it changes the output
+/// transport to a terminal and would duplicate the PTY path.)
+pub(crate) fn line_buffered_argv(argv: Vec<String>, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return argv;
+    }
+    wrap_with(resolve_wrapper().as_deref(), argv)
+}
+
+/// Resolves the line-buffering wrapper on `PATH`; `None` when it is unavailable.
+#[cfg(unix)]
+fn resolve_wrapper() -> Option<String> {
+    match which::which(LINE_BUFFERING_WRAPPER) {
+        Ok(path) => Some(crate::util::format_path(&path)),
+        Err(error) => {
+            tracing::debug!(%error, "line-buffering wrapper unavailable; spawning unwrapped");
+            None
+        }
+    }
+}
+
+/// No line-buffering wrapper exists outside Unix.
+#[cfg(not(unix))]
+fn resolve_wrapper() -> Option<String> {
+    None
+}
+
+/// Applies the wrapper decision given an already-resolved wrapper path.
+fn wrap_with(wrapper: Option<&str>, mut argv: Vec<String>) -> Vec<String> {
+    let Some(wrapper) = wrapper else {
+        return argv;
+    };
+    if argv.is_empty() {
+        return argv;
+    }
+    let mut prefixed = Vec::with_capacity(argv.len() + LINE_BUFFERING_FLAGS.len() + 1);
+    prefixed.push(wrapper.to_string());
+    prefixed.extend(LINE_BUFFERING_FLAGS.iter().map(|flag| (*flag).to_string()));
+    prefixed.append(&mut argv);
+    prefixed
+}
+
 /// Runs `child` to completion, capturing bounded output.
 ///
 /// Output is drained concurrently with the wait, so a chatty child cannot deadlock on
@@ -102,19 +236,26 @@ pub(crate) fn apply_environment(command: &mut Command, pairs: &[(String, String)
 pub(crate) async fn run_captured(mut child: Child, options: RunOptions) -> RunOutcome {
     let started = Instant::now();
     let max_output_bytes = options.max_output_bytes;
+    let mut group = ProcessGroup::new(child.id());
     let stdout_task = tokio::spawn(read_bounded(child.stdout.take(), max_output_bytes));
     let stderr_task = tokio::spawn(read_bounded(child.stderr.take(), max_output_bytes));
     let deadline = deadline_future(options.timeout_secs);
     let cancel = cancellation_future(&options.cancellation);
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut reaped = false;
     // The branch handlers must not touch `child`: the wait future borrows it.
     tokio::select! {
-        _ = child.wait() => {}
+        _ = child.wait() => reaped = true,
         () = deadline => timed_out = true,
         () = cancel => cancelled = true,
     }
-    let _ = child.start_kill();
+    if !reaped {
+        // Kill the whole tree before reaping: the group is still addressable while the
+        // unreaped child leads it, so grandchildren die with it.
+        group.terminate(false);
+        let _ = child.start_kill();
+    }
     let exit_code = exit_code_of(child.wait().await);
     let stdout = join_reader(stdout_task).await;
     let stderr = join_reader(stderr_task).await;
@@ -139,19 +280,44 @@ pub(crate) fn stream_child(
     mut child: Child,
     options: RunOptions,
 ) -> BoxStream<'static, EngineEvent> {
+    let max_output_bytes = options.max_output_bytes;
+    let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    if let Some(pipe) = child.stdout.take() {
+        tokio::spawn(stream_reader(
+            pipe,
+            StreamKind::Stdout,
+            max_output_bytes,
+            sender.clone(),
+        ));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        tokio::spawn(stream_reader(
+            pipe,
+            StreamKind::Stderr,
+            max_output_bytes,
+            sender.clone(),
+        ));
+    }
+    // Only the reader tasks may keep the channel open.
+    drop(sender);
+    drive_child(child, options.timeout_secs, options.cancellation, receiver)
+}
+
+/// Forwards the events of `receiver` until it closes, then emits one terminal event.
+///
+/// The readers feeding `receiver` are already running; this driver owns the timeout, the
+/// cancellation tokens, and the process-group kill, so the pipe path and the PTY path
+/// share exactly one set of run semantics.
+pub(crate) fn drive_child(
+    mut child: Child,
+    timeout_secs: u64,
+    cancellation: Vec<CancellationToken>,
+    mut receiver: mpsc::Receiver<EngineEvent>,
+) -> BoxStream<'static, EngineEvent> {
     Box::pin(async_stream::stream! {
-        let max_output_bytes = options.max_output_bytes;
-        let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        if let Some(pipe) = child.stdout.take() {
-            tokio::spawn(stream_reader(pipe, StreamKind::Stdout, max_output_bytes, sender.clone()));
-        }
-        if let Some(pipe) = child.stderr.take() {
-            tokio::spawn(stream_reader(pipe, StreamKind::Stderr, max_output_bytes, sender.clone()));
-        }
-        // Only the reader tasks may keep the channel open.
-        drop(sender);
-        let mut deadline = deadline_future(options.timeout_secs);
-        let mut cancel = cancellation_future(&options.cancellation);
+        let mut group = ProcessGroup::new(child.id());
+        let mut deadline = deadline_future(timeout_secs);
+        let mut cancel = cancellation_future(&cancellation);
         let mut interrupted = None;
         loop {
             let mut event: Option<EngineEvent> = None;
@@ -179,6 +345,8 @@ pub(crate) fn stream_child(
             }
         }
         if interrupted.is_some() {
+            // The child has not been reaped here, so its group is still addressable.
+            group.terminate(false);
             let _ = child.start_kill();
         }
         let code = exit_code_of(child.wait().await);
@@ -245,14 +413,14 @@ async fn stream_reader<R>(
 /// Incremental UTF-8 decoder: a character split across reads is reassembled and
 /// invalid sequences decode to `U+FFFD` (Python `errors="replace"`).
 #[derive(Debug, Default, Clone)]
-struct Utf8Decoder {
+pub(crate) struct Utf8Decoder {
     /// Bytes of an incomplete trailing sequence carried to the next call.
     pending: Vec<u8>,
 }
 
 impl Utf8Decoder {
     /// Decodes as much of `bytes` as possible, keeping a partial trailing sequence.
-    fn decode(&mut self, bytes: &[u8]) -> String {
+    pub(crate) fn decode(&mut self, bytes: &[u8]) -> String {
         let mut combined = std::mem::take(&mut self.pending);
         combined.extend_from_slice(bytes);
         let mut text = String::with_capacity(combined.len());
@@ -281,7 +449,7 @@ impl Utf8Decoder {
     }
 
     /// Decodes the carried partial sequence, replacing undecodable bytes.
-    fn flush(&mut self) -> String {
+    pub(crate) fn flush(&mut self) -> String {
         let pending = std::mem::take(&mut self.pending);
         if pending.is_empty() {
             return String::new();
@@ -291,7 +459,7 @@ impl Utf8Decoder {
 }
 
 /// A future that completes when `timeout_secs` elapses (`0` = never).
-fn deadline_future(timeout_secs: u64) -> EngineFuture {
+pub(crate) fn deadline_future(timeout_secs: u64) -> EngineFuture {
     if timeout_secs == 0 {
         return Box::pin(std::future::pending());
     }
@@ -300,7 +468,7 @@ fn deadline_future(timeout_secs: u64) -> EngineFuture {
 }
 
 /// A future that completes when any of `tokens` is cancelled (`pending` when empty).
-fn cancellation_future(tokens: &[CancellationToken]) -> EngineFuture {
+pub(crate) fn cancellation_future(tokens: &[CancellationToken]) -> EngineFuture {
     let futures: Vec<EngineFuture> = tokens
         .iter()
         .map(|token| {
@@ -361,7 +529,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 /// The exit code of `status`, or `-1` when the child died from a signal.
-fn exit_code_of(status: std::io::Result<ExitStatus>) -> i32 {
+pub(crate) fn exit_code_of(status: std::io::Result<ExitStatus>) -> i32 {
     status.ok().and_then(|status| status.code()).unwrap_or(-1)
 }
 
@@ -473,5 +641,84 @@ mod tests {
         // An incomplete three-byte sequence is carried, then flushed lossily.
         assert_eq!(decoder.decode(&[0xE4, 0xB8]), "");
         assert_eq!(decoder.flush(), "\u{FFFD}");
+    }
+
+    /// The plan of `echo hi` under `/bin/sh`, as a command plan resolves it.
+    fn sh_argv() -> Vec<String> {
+        ["/bin/sh", "-c", "echo hi"]
+            .iter()
+            .map(|part| (*part).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn wrapper_is_prepended_when_a_wrapper_exists() {
+        let argv = sh_argv();
+        let wrapped = wrap_with(Some("/usr/bin/stdbuf"), argv.clone());
+        assert_eq!(
+            wrapped,
+            vec!["/usr/bin/stdbuf", "-oL", "-eL", "/bin/sh", "-c", "echo hi"]
+        );
+        // The plan's own argv is preserved verbatim after the flags.
+        assert_eq!(&wrapped[3..], &argv[..]);
+    }
+
+    #[test]
+    fn wrapper_is_skipped_without_a_wrapper_or_a_request() {
+        let argv = sh_argv();
+        assert_eq!(wrap_with(None, argv.clone()), argv);
+        assert_eq!(line_buffered_argv(argv.clone(), false), argv);
+        assert_eq!(
+            wrap_with(Some("/usr/bin/stdbuf"), Vec::new()),
+            Vec::<String>::new(),
+            "an empty argv has nothing to wrap"
+        );
+    }
+
+    #[test]
+    fn enabled_line_buffering_matches_the_resolved_wrapper() {
+        let argv = sh_argv();
+        let wrapped = line_buffered_argv(argv.clone(), true);
+        if which::which(LINE_BUFFERING_WRAPPER).is_ok() {
+            assert_eq!(wrapped.len(), argv.len() + LINE_BUFFERING_FLAGS.len() + 1);
+            assert_eq!(&wrapped[1..3], &LINE_BUFFERING_FLAGS);
+            assert_eq!(&wrapped[3..], &argv[..]);
+        } else {
+            // No wrapper on this host: the command still runs, unwrapped.
+            assert_eq!(wrapped, argv);
+        }
+    }
+
+    #[test]
+    fn process_group_is_never_killed_after_the_reap() {
+        let pid = u32::try_from(i32::MAX).unwrap();
+        let mut group = ProcessGroup::new(Some(pid));
+        assert!(!group.terminate(true), "a reaped child is never signalled");
+        assert!(
+            !group.killed,
+            "the reap guard must not consume the kill-once flag"
+        );
+        assert_eq!(group.pid, Some(pid));
+    }
+
+    #[test]
+    fn process_group_is_killed_at_most_once() {
+        // No live group can own this pid, so the signal is attempted and not delivered.
+        let pid = u32::try_from(i32::MAX).unwrap();
+        let mut group = ProcessGroup::new(Some(pid));
+        assert!(!group.terminate(false), "there is no such process group");
+        assert!(group.killed, "the attempt sets the kill-once flag");
+        assert_eq!(group.pid, None);
+        assert!(!group.terminate(false), "a group is never killed twice");
+
+        let mut reaped_twice = ProcessGroup::new(None);
+        assert!(!reaped_twice.terminate(false), "an unknown pid is a no-op");
+        assert!(reaped_twice.killed);
+    }
+
+    #[test]
+    fn kill_group_rejects_a_non_process_id() {
+        // pid 0 would signal the caller's own process group.
+        assert!(!kill_group(0));
     }
 }
