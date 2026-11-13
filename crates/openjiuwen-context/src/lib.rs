@@ -65,6 +65,8 @@ pub mod offload;
 pub mod processor;
 pub mod prompts;
 pub mod recall;
+pub mod reload;
+pub mod session_memory;
 pub mod stats;
 pub mod tokens;
 pub mod window;
@@ -96,8 +98,25 @@ pub use recall::{
     RecallOptions, RecallResult, RecallTurn, RecallTurnMatch, TurnRecord,
     COMPRESSION_RECALL_MARKER_PREFIX,
 };
+pub use reload::{
+    has_offload_markers, inject_reload_hint, reload_hint, reload_system_message, ReloadLanguage,
+    RELOAD_HINT_CN, RELOAD_HINT_EN,
+};
+pub use session_memory::{
+    boundary_message, is_boundary_message, reinject_session_memory, stamp_message_id,
+    summary_message, InMemorySessionMemoryStore, KvSessionMemoryStore, SessionMemoryNotes,
+    SessionMemoryStore, CONTEXT_MESSAGE_ID_KEY, RECENT_MESSAGES_NOTICE, SESSION_MEMORY_BOUNDARY,
+    SESSION_MEMORY_SUMMARY_INTRO,
+};
 pub use stats::{compute_stats, ContextStats, PreparedContext};
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
+pub mod tokenizers;
+
+pub use tokenizers::{
+    load_native_tokenizer, ModelEncoding, ModelTokenCounter, SelectedTokenizer, TokenMeasurement,
+    TokenizerEngine, TokenizerMatch, TokenizerMatchKind, TokenizerRegistry, TokenizerSelector,
+    TokenizerSource, TokenizerSpec,
+};
 pub use window::{
     assemble_window, dialogue_round_ranges, drop_orphan_tool_results, find_last_n_rounds_start,
     strip_leading_tool_messages, truncate_keeping_rounds, validate_tool_pairs, WindowOptions,

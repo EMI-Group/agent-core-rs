@@ -22,6 +22,7 @@ use openjiuwen_foundation::prompt::{ApproxTokenCounter, TiktokenCounter, TokenCo
 use serde::{Deserialize, Serialize};
 
 use crate::processor::{ProcessorConfig, ToolResultConfig, TruncationConfig};
+use crate::tokenizers::{TokenizerRegistry, TokenizerSelector, TokenizerSpec};
 
 /// Context budget used when [`ContextConfig::max_context_tokens`] is unset.
 ///
@@ -40,6 +41,8 @@ pub enum TokenCounterKind {
     Characters,
     /// `cl100k_base` BPE counting with foundation's heuristic fallback.
     Tiktoken,
+    /// A counter selected from the model name through the tokenizer registry.
+    Model,
 }
 
 /// Token-counter selection and its heuristic parameters.
@@ -121,8 +124,13 @@ pub struct ContextConfig {
     pub compression_recall: CompressionRecallConfig,
     /// Ordered processor pipeline; defaults to tool-result then truncation.
     pub processors: Vec<ProcessorConfig>,
-    /// Model name used for summarisation requests.
+    /// Model name used for summarisation requests and model-aware counting.
     pub model_name: Option<String>,
+    /// Provider name used to resolve [`TokenCounterKind::Model`] through the
+    /// tokenizer registry.
+    pub tokenizer_provider: Option<String>,
+    /// Declared tokenizers used by [`TokenCounterKind::Model`].
+    pub tokenizer_registry: Vec<TokenizerSpec>,
 }
 
 impl Default for ContextConfig {
@@ -140,6 +148,8 @@ impl Default for ContextConfig {
             compression_recall: CompressionRecallConfig::default(),
             processors: default_processors(),
             model_name: None,
+            tokenizer_provider: None,
+            tokenizer_registry: Vec::new(),
         }
     }
 }
@@ -183,6 +193,20 @@ impl ContextConfig {
                 self.token_counter.chars_per_token.max(1),
             )),
             TokenCounterKind::Tiktoken => Arc::new(TiktokenCounter::new()),
+            TokenCounterKind::Model => {
+                let registry = if self.tokenizer_registry.is_empty() {
+                    None
+                } else {
+                    Some(TokenizerRegistry::new(self.tokenizer_registry.clone()))
+                };
+                let selector = TokenizerSelector::new(
+                    self.tokenizer_provider.clone().unwrap_or_default(),
+                    self.model_name.clone().unwrap_or_default(),
+                    None,
+                    registry,
+                );
+                Arc::new(selector.select())
+            }
         }
     }
 
@@ -192,8 +216,9 @@ impl ContextConfig {
     ///
     /// Returns [`Error::Config`] when the compression threshold is outside
     /// `(0, 1]`, the effective maximum is zero, the `characters` counter has a
-    /// zero ratio, or compression recall is enabled with a chunk size of zero
-    /// or an overlap that is not smaller than the chunk size.
+    /// zero ratio, a tokenizer registry entry names neither a provider nor a
+    /// model, or compression recall is enabled with a chunk size of zero or an
+    /// overlap that is not smaller than the chunk size.
     pub fn validate(&self) -> Result<()> {
         let threshold = self.compression_threshold;
         if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
@@ -213,6 +238,9 @@ impl ContextConfig {
             return Err(Error::Config(
                 "token_counter.chars_per_token must be > 0 for the characters counter".to_owned(),
             ));
+        }
+        for spec in &self.tokenizer_registry {
+            spec.validate()?;
         }
         let recall = &self.compression_recall;
         if recall.enabled {
