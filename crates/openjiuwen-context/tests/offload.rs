@@ -518,6 +518,8 @@ async fn tool_result_processor_offloads_into_the_session_store() {
         trigger_tokens: 80_000,
         manual: false,
         cancellation: &cancellation,
+        recall: None,
+        session_memory: None,
     };
 
     let event = processor

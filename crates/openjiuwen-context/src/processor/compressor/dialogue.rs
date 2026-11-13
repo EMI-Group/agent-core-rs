@@ -331,6 +331,8 @@ mod tests {
                 trigger_tokens: trigger,
                 manual,
                 cancellation: &self.cancellation,
+                recall: None,
+                session_memory: None,
             }
         }
     }

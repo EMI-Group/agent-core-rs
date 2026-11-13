@@ -31,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ContextConfig;
 use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
+use crate::recall::RecallArchiveStore;
+use crate::session_memory::SessionMemoryStore;
 use crate::window::drop_orphan_tool_results;
 
 pub mod compressor;
@@ -117,6 +119,83 @@ pub struct ProcessorContext<'a> {
     pub manual: bool,
     /// Cancellation signalled by the caller.
     pub cancellation: &'a CancellationToken,
+    /// Archive store compressors use to keep the history they replaced.
+    ///
+    /// `None` when compression recall is disabled and no store was configured;
+    /// a processor that archives history must then skip archiving.
+    pub recall: Option<&'a dyn RecallArchiveStore>,
+    /// Session-memory notes full compaction can reinject instead of summarising.
+    ///
+    /// `None` when no store was configured; [`crate::processor::FullCompactProcessor`]
+    /// then falls back to the model or offline summary path.
+    pub session_memory: Option<&'a dyn SessionMemoryStore>,
+}
+
+/// The stores and seams a pipeline hands to the processors it builds.
+///
+/// Building a processor needs more than the [`ProcessorConfig`]: offloaded
+/// content, the summarisation model, recall archives, and session-memory notes
+/// all live outside the serialized configuration. [`PipelineDeps`] carries them
+/// so [`ContextPipeline::from_configs_with`] can wire every processor that uses
+/// one.
+#[derive(Clone)]
+pub struct PipelineDeps {
+    /// Store offloaded content is written to; required.
+    pub offload: Arc<dyn OffloadStore>,
+    /// Model used by processors that call one (summarisation, compaction).
+    pub model: Option<Arc<dyn Model>>,
+    /// Archive store compressors write replaced history to.
+    pub recall: Option<Arc<dyn RecallArchiveStore>>,
+    /// Session-memory notes full compaction reinjects.
+    pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+}
+
+impl std::fmt::Debug for PipelineDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineDeps")
+            .field("offload", &self.offload.kind())
+            .field("has_model", &self.model.is_some())
+            .field("has_recall", &self.recall.is_some())
+            .field("has_session_memory", &self.session_memory.is_some())
+            .finish()
+    }
+}
+
+impl PipelineDeps {
+    /// The minimum a pipeline needs: an offload store and nothing else.
+    #[must_use]
+    pub fn new(offload: Arc<dyn OffloadStore>) -> Self {
+        Self {
+            offload,
+            model: None,
+            recall: None,
+            session_memory: None,
+        }
+    }
+
+    /// Sets the summarisation model.
+    #[must_use]
+    pub fn with_model(mut self, model: Option<Arc<dyn Model>>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Sets the recall archive store.
+    #[must_use]
+    pub fn with_recall(mut self, recall: Option<Arc<dyn RecallArchiveStore>>) -> Self {
+        self.recall = recall;
+        self
+    }
+
+    /// Sets the session-memory store.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    ) -> Self {
+        self.session_memory = session_memory;
+        self
+    }
 }
 
 /// An ordered list of processors.
@@ -147,6 +226,10 @@ impl ContextPipeline {
 
     /// Builds the pipeline described by `configs`.
     ///
+    /// Delegates to [`ContextPipeline::from_configs_with`] with only the model
+    /// and the offload store set, so recall archives and session-memory notes
+    /// stay unconfigured.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Config`] when a summarisation processor is configured
@@ -160,6 +243,26 @@ impl ContextPipeline {
         model: Option<Arc<dyn Model>>,
         offload: Arc<dyn OffloadStore>,
     ) -> Result<Self> {
+        Self::from_configs_with(configs, &PipelineDeps::new(offload).with_model(model))
+    }
+
+    /// Builds the pipeline described by `configs` with the full set of stores.
+    ///
+    /// This is [`ContextPipeline::from_configs`] plus the seams that are not
+    /// part of a [`ProcessorConfig`]: [`FullCompactProcessor`] receives
+    /// [`PipelineDeps::session_memory`] and [`PipelineDeps::model`], and
+    /// [`MessageSummaryOffloader`] receives [`PipelineDeps::model`]. The recall
+    /// store is not held by a processor; it reaches them through
+    /// [`ProcessorContext::recall`] when the pipeline runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a summarisation processor is configured
+    /// without a model, and when an offloader config fails its own
+    /// [`validate`](MessageOffloaderConfig::validate) checks. The summary
+    /// offloader and full compaction never fail for a missing model: they fall
+    /// back to a deterministic offline summary.
+    pub fn from_configs_with(configs: &[ProcessorConfig], deps: &PipelineDeps) -> Result<Self> {
         let mut processors: Vec<Arc<dyn ContextProcessor>> = Vec::with_capacity(configs.len());
         for config in configs {
             match config {
@@ -171,11 +274,11 @@ impl ContextPipeline {
                 ProcessorConfig::ToolResult(config) => {
                     processors.push(Arc::new(ToolResultProcessor {
                         config: config.clone(),
-                        store: Arc::clone(&offload),
+                        store: Arc::clone(&deps.offload),
                     }));
                 }
                 ProcessorConfig::Summarization(config) => {
-                    let model = model.clone().ok_or_else(|| {
+                    let model = deps.model.clone().ok_or_else(|| {
                         Error::Config(
                             "the summarization processor requires a model, but none is configured"
                                 .to_owned(),
@@ -190,30 +293,30 @@ impl ContextPipeline {
                     config.validate()?;
                     processors.push(Arc::new(DialogueCompressor::new(
                         config.clone(),
-                        model.clone(),
+                        deps.model.clone(),
                     )));
                 }
                 ProcessorConfig::CurrentRoundCompressor(config) => {
                     config.validate()?;
                     processors.push(Arc::new(CurrentRoundCompressor::new(
                         config.clone(),
-                        model.clone(),
+                        deps.model.clone(),
                     )));
                 }
                 ProcessorConfig::RoundLevel(config) => {
                     config.validate()?;
                     processors.push(Arc::new(RoundLevelCompressor::new(
                         config.clone(),
-                        model.clone(),
+                        deps.model.clone(),
                     )));
                 }
                 ProcessorConfig::FullCompact(config) => {
-                    // The integration round wires the session-memory store; here
-                    // the processor always has the model-summary path available.
+                    // The session-memory notes are preferred over a model
+                    // summary; without notes the model or offline path runs.
                     processors.push(Arc::new(FullCompactProcessor::new(
                         config.clone(),
-                        model.clone(),
-                        None,
+                        deps.model.clone(),
+                        deps.session_memory.clone(),
                     )));
                 }
                 ProcessorConfig::MicroCompact(config) => {
@@ -224,21 +327,21 @@ impl ContextPipeline {
                     config.validate()?;
                     processors.push(Arc::new(MessageOffloader::new(
                         config.clone(),
-                        Arc::clone(&offload),
+                        Arc::clone(&deps.offload),
                     )));
                 }
                 ProcessorConfig::ToolResultBudget(config) => {
                     config.validate()?;
                     processors.push(Arc::new(ToolResultBudgetProcessor::new(
                         config.clone(),
-                        Arc::clone(&offload),
+                        Arc::clone(&deps.offload),
                     )));
                 }
                 ProcessorConfig::ToolResultWindow(config) => {
                     config.validate()?;
                     processors.push(Arc::new(ToolResultWindowProcessor::new(
                         config.clone(),
-                        Arc::clone(&offload),
+                        Arc::clone(&deps.offload),
                     )));
                 }
                 ProcessorConfig::MessageSummaryOffloader(config) => {
@@ -246,8 +349,8 @@ impl ContextPipeline {
                     // to the deterministic offline summary.
                     processors.push(Arc::new(MessageSummaryOffloader::new(
                         config.clone(),
-                        model.clone(),
-                        Arc::clone(&offload),
+                        deps.model.clone(),
+                        Arc::clone(&deps.offload),
                     )));
                 }
             }
@@ -449,6 +552,8 @@ mod tests {
             trigger_tokens: 800,
             manual: false,
             cancellation,
+            recall: None,
+            session_memory: None,
         }
     }
 
@@ -515,6 +620,8 @@ mod tests {
             trigger_tokens: 800,
             manual: false,
             cancellation: &cancelled,
+            recall: None,
+            session_memory: None,
         };
         let error = pipeline.run(&mut messages, &cx).await.unwrap_err();
         assert!(matches!(error, Error::Cancelled));

@@ -60,6 +60,7 @@ pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod config;
 pub mod context;
 pub mod engine;
+pub mod engine_options;
 pub mod events;
 pub mod offload;
 pub mod processor;
@@ -86,9 +87,16 @@ pub use offload::{
     OffloadRecord, OffloadScope, OffloadStore, SessionOffloadStore, OFFLOAD_MARKER_PREFIX,
 };
 pub use processor::{
-    ContextPipeline, ContextProcessor, ProcessorConfig, ProcessorContext, SummarizationConfig,
-    SummarizationProcessor, ToolResultConfig, ToolResultProcessor, TruncationConfig,
-    TruncationProcessor, CONTEXT_SUMMARY_PREFIX, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
+    ContextPipeline, ContextProcessor, CurrentRoundCompressor, CurrentRoundCompressorConfig,
+    DialogueCompressor, DialogueCompressorConfig, FullCompactProcessor, FullCompactProcessorConfig,
+    MemoryBlockKind, MessageOffloader, MessageOffloaderConfig, MessageSummaryOffloader,
+    MessageSummaryOffloaderConfig, MicroCompactProcessor, MicroCompactProcessorConfig,
+    PipelineDeps, ProcessorConfig, ProcessorContext, RoundLevelCompressor,
+    RoundLevelCompressorConfig, SummarizationConfig, SummarizationProcessor,
+    ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, ToolResultConfig,
+    ToolResultProcessor, ToolResultWindowProcessor, ToolResultWindowProcessorConfig,
+    TruncationConfig, TruncationProcessor, CONTEXT_SUMMARY_PREFIX, CURRENT_ROUND_MEMORY_BLOCK,
+    DIALOGUE_MEMORY_BLOCK, PERSISTED_OUTPUT_TAG, ROUND_LEVEL_MEMORY_BLOCK, TRUNCATED_MARKER,
 };
 pub use prompts::{render_summary_prompt, SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE};
 pub use recall::{

@@ -104,6 +104,8 @@ impl Fixture {
             trigger_tokens: budget,
             manual,
             cancellation: &self.cancellation,
+            recall: None,
+            session_memory: None,
         }
     }
 
@@ -122,6 +124,8 @@ impl Fixture {
             trigger_tokens: budget,
             manual: false,
             cancellation: &self.cancellation,
+            recall: None,
+            session_memory: None,
         }
     }
 }

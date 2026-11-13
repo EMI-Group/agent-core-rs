@@ -25,22 +25,24 @@ let recovered: RecoveryOutcome = engine
     .recover_from_model_exception(&ctx, &error_text, streaming, chunks_emitted).await?;
 ```
 
-- `ContextEngine` — `new`, `with_store`, `config`, `create_context`, `create_context_with`, `get_context`, `remove_context`, `prepare`, `observe`, `observe_tool_result`, `compress`, `recover_from_model_exception`, `is_context_overflow_error`, `save_contexts`, `load_contexts`.
+- `ContextEngine` — `new`, `with_store`, `with_stores(config, offload, recall, session_memory)`, `config`, `create_context`, `create_context_with`, `get_context`, `remove_context`, `prepare`, `observe`, `observe_tool_result`, `compress`, `recover_from_model_exception`, `is_context_overflow_error`, `save_contexts`, `load_contexts`.
 - `DEFAULT_SESSION_ID` — session id used when `create_context` receives no session.
 - There is no `get_context_window`: `ContextEngine::prepare` + `PreparedContext` is the window/messages getter, and `ModelContext::messages()` is the raw stored-history reader.
-- `ContextOptions` — `session`, `history`, `processors`, `token_counter: Option<Arc<dyn TokenCounter + Send + Sync>>`, `model`.
-- `PrepareOptions` — `system_messages`, `window_size`, `dialogue_rounds`, `tools: Vec<Value>` (pass-through), `cancellation: CancellationToken`, `timeout: Option<Duration>`.
+- `ContextOptions` — `session`, `history`, `processors`, `token_counter: Option<Arc<dyn TokenCounter + Send + Sync>>`, `model`, `recall: Option<Arc<dyn RecallArchiveStore>>`, `session_memory: Option<Arc<dyn SessionMemoryStore>>` (defined in `engine_options`, re-exported from `engine`).
+- `PipelineDeps` — the stores a pipeline build needs: `offload`, `model`, `recall`, `session_memory`; `new(offload)` plus `with_model`/`with_recall`/`with_session_memory` builders.
+- `ContextPipeline::from_configs_with(configs, &PipelineDeps)` — `from_configs` plus the session-memory store for `FullCompact` and the model for `MessageSummaryOffloader`; `from_configs(configs, model, offload)` delegates to it.
+- `PrepareOptions` — `system_messages`, `window_size`, `dialogue_rounds`, `tools: Vec<Value>` (pass-through), `cancellation: CancellationToken`, `timeout: Option<Duration>` (defined in `engine_options`, re-exported from `engine`).
 - `ContextConfig` — `max_context_tokens`, `reserve_tokens`, `compression_threshold` (0.85 default), `recent_messages` (6), `max_context_messages`, `default_window_messages`, `default_window_rounds`, `enable_reload`, `token_counter: TokenCounterConfig`, `compression_recall: CompressionRecallConfig`, `processors: Vec<ProcessorConfig>` (default `[ToolResult, Truncation]`), `model_name`; `effective_max_tokens()`, `compression_trigger_tokens()`, `token_counter() -> Arc<dyn TokenCounter + Send + Sync>`, `validate()`.
 - `TokenCounterConfig` — `kind: TokenCounterKind`, `chars_per_token` (4 default); `TokenCounterKind` is `Approx` | `Characters` | `Tiktoken`.
 - `CompressionRecallConfig` — `enabled`, `chunk_size_tokens`, `chunk_overlap_tokens`.
 - `DEFAULT_CONTEXT_TOKENS` — 200 000, used when `max_context_tokens` is `None`.
 - `ModelContext` trait — `context_id`, `session_id`, `messages`, `set_messages`, `add_message`, `pop_messages`, `clear_messages`, `token_counter`, `statistics`, `revision`.
-- `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state`, `prepare`; the constructor is engine-only.
+- `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `recall_store()`, `session_memory_store()`, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state`, `prepare`; the constructor is engine-only.
 - `PreparedContext` — `messages` (system first, then selected context), `tools`, `stats: ContextStats`, `token_count`, `overflow`, `window_size`, `events`.
 - `ContextStats` — total/per-role message counts and token counts, `total_dialogues`, `compressions`, `tokens_before_compression`, `tokens_after_compression`.
 - `ContextEvent` / `ContextEventKind` (`truncated`, `summarized`, `offloaded`, `tool_result_trimmed`), `CompressionStatus`, `CompressReport`, `RecoveryOutcome`, `ObserveOutcome`.
 - `ContextState` — serde `{ messages, revision }` snapshot used by session persistence.
-- Processors (`processor` module): `ContextProcessor` trait (`name`, `process`, `save_state`, `load_state`), `ProcessorContext`, `ContextPipeline::{new, from_configs, processors, run}`, `ProcessorConfig::{Truncation, ToolResult, Summarization}` with `TruncationConfig`, `ToolResultConfig`, `SummarizationConfig`; constants `TRUNCATED_MARKER`, `PERSISTED_OUTPUT_TAG`, `CONTEXT_SUMMARY_PREFIX`.
+- Processors (`processor` module): `ContextProcessor` trait (`name`, `process`, `save_state`, `load_state`), `ProcessorContext` (with `recall: Option<&dyn RecallArchiveStore>` and `session_memory: Option<&dyn SessionMemoryStore>`), `ContextPipeline::{new, from_configs, from_configs_with, processors, run}`, `ProcessorConfig::{Truncation, ToolResult, Summarization}` with `TruncationConfig`, `ToolResultConfig`, `SummarizationConfig`; constants `TRUNCATED_MARKER`, `PERSISTED_OUTPUT_TAG`, `CONTEXT_SUMMARY_PREFIX`.
 - Offload (`offload` module): `OffloadStore` trait (`kind`, `put`, `get`, `remove`), `InMemoryOffloadStore`, `KvOffloadStore` (foundation `KvStore`, `new`/`with_prefix`), `SessionOffloadStore` (`openjiuwen_session::Session`), `OffloadScope`, `OffloadRecord`, `OffloadKind`, `OffloadMarker::{to_marker_string, parse}`, `OFFLOAD_MARKER_PREFIX`, `sanitize_key`, `rehydrate`.
 - `window` module: `dialogue_round_ranges`, `find_last_n_rounds_start`, `WindowOptions`, `assemble_window`, `strip_leading_tool_messages`, `drop_orphan_tool_results`, `validate_tool_pairs`, `truncate_keeping_rounds`.
 - `tokens` module: `count_message`, `count_messages`, `TokenBudget`, `check_budget`.
@@ -84,6 +86,8 @@ let recovered: RecoveryOutcome = engine
 - `ToolResultBudgetProcessor` re-measures the round after every offload and takes the largest eligible result (oldest on a tie) until the round fits or no candidate remains; `tool_name_allowlist = None` protects nothing.
 - `ToolResultWindowProcessor` keeps one global window across all listed tools (suffix match, falling back to the message `name`); results below `min_offload_chars` are compacted in place without a store write and marked with `tool_result_window_managed`.
 - `MessageSummaryOffloader` prefers its own model, then the context model, and falls back to `summarize_text_offline`; `from_configs` never fails for a missing model, and the replacement keeps `[offloaded_info]` on its own line.
+- Store resolution per context is `ContextOptions` override → engine-level store (`with_stores`) → configuration default: an in-memory recall archive when `compression_recall.enabled`, and an in-memory session-memory store when the pipeline holds `FullCompact` or `MessageSummaryOffloader`.
+- `prepare` injects the English reload hint (`inject_reload_hint`, after the leading system messages) only when `enable_reload` is set and the assembled window carries an offload marker; `PreparedContext`'s fields are unchanged and the hint is visible in `messages`.
 
 ## Routing Table
 
@@ -94,7 +98,8 @@ let recovered: RecoveryOutcome = engine
 - `./src/events.rs` → `ContextEvent`, `ContextEventKind`, `CompressionStatus`, `CompressReport`, `RecoveryOutcome`, `ObserveOutcome`
 - `./src/window.rs` → dialogue rounds, window assembly, tool-pair helpers, round-aware truncation
 - `./src/context.rs` → `ModelContext` trait, `ConversationContext`, `ContextState` save/load, prepare runner
-- `./src/engine.rs` → `ContextEngine`, context pool, `observe`/`compress`/recovery, session persistence
+- `./src/engine.rs` → `ContextEngine`, context pool, `observe`/`compress`/recovery, session persistence, store resolution
+- `./src/engine_options.rs` → `PrepareOptions`, `ContextOptions`, `DEFAULT_SESSION_ID` (re-exported from `engine`)
 - `./src/offload.rs` → `OffloadStore` implementations, `OffloadScope`/`OffloadRecord`/markers, rehydration
 - `./src/prompts.rs` → summarisation system/user prompt templates
 - `./src/processor/mod.rs` → `ContextProcessor` trait, `ProcessorContext`, `ProcessorConfig`, `ContextPipeline`
@@ -115,10 +120,11 @@ let recovered: RecoveryOutcome = engine
 - `./tests/offload.rs` → marker wire format, key isolation across all three stores, rehydration round-trips
 - `./tests/compressors_round_level.rs` → round-level ladder: blocks per round, pair safety, merge, aggressive pass, hard truncation, events
 - `./tests/compressors_compact.rs` → full-compact boundary/kept-tail/session-memory paths and micro-compact clearing, `ProcessorConfig` tags
+- `./tests/integration.rs` → engine/context plumbing: store resolution and precedence, `from_configs_with` wiring, prepare reload injection, `ProcessorContext` store fields
 
 ## Test Strategy
 
-- Unit tests live beside each module (123 tests); integration suites live in `crates/openjiuwen-context/tests/` (216 tests); doc tests cover the crate-level example paths (9).
+- Unit tests live beside each module (123 tests); integration suites live in `crates/openjiuwen-context/tests/` (218 tests, `integration.rs` included); doc tests cover the crate-level example paths (9).
 - Deterministic offline tests use `ApproxTokenCounter::with_chars_per_token(1)` (via `TokenCounterKind::Characters`) and `openjiuwen_test_support::ScriptedModel` as the `Model`; sessions are real `openjiuwen_session::AgentSession` instances.
 - Covered behaviors: window assembly with round/message budgets, leading-tool stripping, per-role stats, overflow detection, every processor, summary replacement with system/recent preservation, tool-pair preservation, offload/rehydrate round-trip, session isolation, `noop`/`compressed`/`busy`, overflow recovery refusal after streamed chunks, config serde round-trip, cancellation, `save_contexts`/`load_contexts` round-trip, corrupt-state tolerance, and for the offloaders: trim/placeholder wire formats, keep boundaries, protection patterns, the per-round budget order, the global tool window, managed-flag idempotence, and the offline summary fallback.
 - `cargo test -p openjiuwen-context --offline` must pass; `cargo clippy -p openjiuwen-context --all-targets --offline -- -D warnings` and `cargo fmt -p openjiuwen-context -- --check` must be clean.

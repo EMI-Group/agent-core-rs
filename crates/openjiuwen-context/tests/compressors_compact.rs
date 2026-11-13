@@ -78,6 +78,8 @@ impl Fixture {
             trigger_tokens: 1_000,
             manual: false,
             cancellation: &self.cancellation,
+            recall: None,
+            session_memory: None,
         }
     }
 

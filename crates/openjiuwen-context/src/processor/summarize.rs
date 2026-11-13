@@ -275,6 +275,8 @@ mod tests {
                 trigger_tokens: trigger,
                 manual,
                 cancellation: &self.cancellation,
+                recall: None,
+                session_memory: None,
             }
         }
     }
@@ -485,6 +487,8 @@ mod tests {
             trigger_tokens: 1_000,
             manual: true,
             cancellation: &fixture.cancellation,
+            recall: None,
+            session_memory: None,
         };
         processor
             .process(&mut messages, &cx)
