@@ -3,7 +3,7 @@
 ## Intent
 
 Crate-level integration suites for `openjiuwen-agent-teams`: the contract *between* modules, driven only through the crate's public API (`openjiuwen_agent_teams::…`, never `crate::`).
-The 1351 unit tests beside the modules pin each module's internals; these suites pin what the modules promise each other and what a caller outside the crate can observe.
+The 1322 unit tests beside the modules (default build) pin each module's internals; these suites pin what the modules promise each other and what a caller outside the crate can observe.
 Every suite is offline and deterministic: scripted harnesses or a loopback mock model, an in-memory or SQLite store, tempdir workspaces, in-process transport, real Unix sockets or binaries only where the suite says so, bounded waits.
 
 ## Suite table
@@ -101,7 +101,7 @@ pub fn recorded(recorder: &Recorder) -> Vec<EventMessage>;  pub fn event_types(r
 - One file per behaviour area; a file may add private helpers but never edits `support/mod.rs` (sibling suites share it).
 - Reuse over re-implementation: drive the same seams the crate's own cross-seam suites drive, but from outside the crate.
 - Exact expectations (messages, statuses, JSON strings) are mined from the unit tests beside each module; the integration suite proves they survive across the module boundary.
-- Run `cargo test -p openjiuwen-agent-teams` (1351 unit + 219 integration + 38 doctests) in every feature configuration: default, `--no-default-features`, `--features sqlite`, `--features otel`; `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` is clean.
+- Run `cargo test -p openjiuwen-agent-teams` (1322 unit + 219 integration + 37 doctests and one `ignore` block) in every feature configuration: default, `--no-default-features`, `--features sqlite`, `--features otel`; `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` is clean.
 - `cargo test -p openjiuwen-agent-teams --doc` is green: the crate-level doctest in `src/lib.rs` exercises the flat root re-exports (`DEFAULT_LEADER_MEMBER_NAME`, `is_reserved_name`, `parse_mention`).
 
 ## Known Issues

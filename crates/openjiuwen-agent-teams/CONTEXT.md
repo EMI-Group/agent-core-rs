@@ -135,8 +135,8 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 
 ## Test Strategy
 
-- Unit tests live beside their modules (`#[cfg(test)]`): 1351 in total, concentrated in `runtime` (217), `member` (196), `skill` (136), `org` (133), `schema` (114), `attach` (84), `workspace` (68), `taskboard` (52), `monitor` (46), `storage` (45), `models` (44), `interaction` (42), `kv_cache` (38), `observability` (34), `harness` (30), `messager` (26), `mcp` (23) and `experts` (21), plus a couple in `constants.rs`.
-- Doctests: 38 listed by `cargo test -p openjiuwen-agent-teams --doc -- --list`, plus two `no_run` examples that compile but are not run (13 `text` blocks and one `ignore` block are not doctests).
+- Unit tests live beside their modules (`#[cfg(test)]`): `cargo test --lib` reports 1322 in the default build and 1348 with `--features sqlite,otel`, concentrated in `runtime`, `member`, `skill`, `org`, `schema`, `attach`, `workspace`, `taskboard`, `monitor`, `storage`, `models`, `interaction`, `kv_cache`, `observability`, `harness`, `messager`, `mcp` and `experts`.
+- Doctests: 37 run plus one `ignore` block (`cargo test --doc`), and two `no_run` examples that compile but are not run; 13 `text` blocks are not doctests.
 - Integration suites in `./tests/` drive the public API only: 219 tests over 15 binaries — `spec_build` (12), `team_run` (9), `member_and_mail` (14), `task_flow` (32), `hitl` (33), `protocol_adapter` (13), `cli` (39), `mcp` (21), `expert_catalog` (12), `bins` (6), `full_team_sqlite` (4), `member_process_kind` (5), `attach_e2e` (6), `org_flow` (9) and `workspace_isolation` (4).
 - `full_team_sqlite` compiles only with `--features sqlite`; `attach_e2e` is `#![cfg(unix)]`; `bins`/`member_process_kind` launch the real binaries through `CARGO_BIN_EXE_*`; `workspace_isolation` needs `git` on `PATH`.
 - Fakes live in `./tests/support/` plus `openjiuwen-test-support` as a dev-dependency; nothing in the suite needs the network.
