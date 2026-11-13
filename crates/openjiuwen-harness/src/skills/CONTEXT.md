@@ -54,6 +54,7 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 - `tracing` only, no stdout; dot-directory and skip-set checks are pure string comparisons.
 - Files ≤1000 lines; tests live beside each module in `#[cfg(test)] mod tests` (tempfile workspaces, `#[tokio::test]`).
 - Secrets never appear here; nothing in this module touches model or network state.
+- `Skill` never stores or reads the `SKILL.md` body: callers resolve `SkillLibrary::discover` → filter by `Skill.name` → read `skill.path()` themselves → `split_skill_front_matter` (`mount.rs:60`) for the body; there is no `Skill::body()` and no skill-read tool.
 - `Skill.directory` is the walked path, not necessarily absolute: roots added via `SkillLibrary::add_root`/`SkillRootMount::mount` are normalized to absolute, but struct-literal or relative roots leave it relative.
 - `SkillResourceValidator::validate` stats the real file before consulting the `FsOperation`, so a fake backend cannot stand in for a missing file.
 - `validate`/`validate_local` read only `FRONT_MATTER_PROBE_LINES`; only `validate` has the late-fence re-read, so front matter beyond 64 lines fails `validate_local` even though discovery would find it.
@@ -67,7 +68,8 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 
 ## Deferred
 
-- Prompt-section rendering, `auto_list`/`all` skill modes, keyword ranking with a query, front-matter `name` conflict rejection across roots, env-string root parsing (`a,b;c`), and tilde expansion — all belong to `crate::rails` / the agent factory.
+- Prompt-section rendering lives outside this module: `SkillsRail::before_model_call` (`../rails/skills.rs:173`) publishes `prompts::skills_section` (`../prompts/sections.rs:359`), which renders `## Available Skills` plus `- **name**: description` bullets — name and description only, never the `SKILL.md` body.
+- `auto_list`/`all` skill modes, keyword ranking with a query, front-matter `name` conflict rejection across roots, env-string root parsing (`a,b;c`), and tilde expansion — all belong to `crate::rails` / the agent factory.
 - Language-aware descriptions are exposed through `discover_with_language`; the language itself comes from the prompt builder, not this module.
 
 ## Routing Table

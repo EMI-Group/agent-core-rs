@@ -39,7 +39,7 @@ Card JSON is one-to-one with Python `BaseCard.model_dump()` for the shared field
 
 ### `config` — `crate::config::{env, home, load_dotenv}`
 `env`: `var`, `flag`, `truthy` (`1/true/yes/on`), `parse<T: FromStr>`, plus typed resolvers `api_key() -> Option<SecretString>` (`OPENJIUWEN_API_KEY` → `API_KEY` → `OPENAI_API_KEY`), `api_base() -> Option<String>` (`API_BASE` → `OPENAI_BASE_URL`), `model_provider() -> String` (default `"openai"`), `model_name() -> Option<String>`, `openjiuwen_home() -> Option<PathBuf>`, `server_url()`, `bash_strict() -> bool` (default false), `mcp_reconnect_attempts() -> u32` (default 3), `otel_global_instrument_enabled() -> bool` (default false), `ssrf_protect_enabled() -> bool` (default true), `http_proxy()`/`no_proxy()`.
-`home`: `OpenJiuwenHome { root: PathBuf }` with `resolve()` (`OPENJIUWEN_HOME` → `$HOME/.openjiuwen` → `./.openjiuwen`), `from_root`, `root()`, `join(rel)`, `logs_dir()`, `sessions_dir()`, `ensure() -> Result<()>`.
+`home`: `OpenJiuwenHome { root: PathBuf }` with `resolve()` (`OPENJIUWEN_HOME` → `$HOME/.openjiuwen` → `./.openjiuwen`), `from_root`, `root()`, `join(rel)`, `logs_dir()`, `sessions_dir()`, `ensure() -> Result<()>`; it is `Debug + Clone + PartialEq + Eq + Default`, has no `serde`, and no `skills_dir`/`settings_path`/`history_path` helpers.
 `load_dotenv()` is the only `.env` entry point and is documented as binary-only; library constructors never read `.env`.
 
 ### `security` — `crate::security::{SecretString, constant_time_eq, redact}`
