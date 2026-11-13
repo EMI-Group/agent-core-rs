@@ -340,7 +340,7 @@ async fn model_assisted_generation_uses_the_fenced_json() {
     let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text(answer)));
     let definition = creation
-        .generate_with_model(&page)
+        .generate_with_model(&page, &[])
         .await
         .expect("models the skill");
 
@@ -351,7 +351,15 @@ async fn model_assisted_generation_uses_the_fenced_json() {
     );
     assert_eq!(
         definition.instructions,
-        "# Install\n\n1. Download the package."
+        "# Install\n\n1. Download the package.\n\n## Reference Files\n\n\
+         - `references/sources.md` — source page provenance, links, and image references"
+    );
+    assert_eq!(
+        definition
+            .instructions
+            .matches("## Reference Files")
+            .count(),
+        1
     );
     assert_eq!(definition.resources.len(), 1);
     assert_eq!(definition.resources[0].path, SOURCES_RESOURCE);
@@ -368,7 +376,7 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
     let garbage = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
         .with_model(Arc::new(ScriptedModel::text("Sure, here you go")));
     let fallback = garbage
-        .generate_with_model(&page)
+        .generate_with_model(&page, &[])
         .await
         .expect("falls back without a fence");
     assert_eq!(fallback, deterministic);
@@ -377,7 +385,7 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
         ScriptedModel::text("```json\n{\"name\": \"bad name\"}\n```"),
     ));
     let fallback = malformed
-        .generate_with_model(&page)
+        .generate_with_model(&page, &[])
         .await
         .expect("falls back on an incomplete payload");
     assert_eq!(fallback, deterministic);
@@ -386,7 +394,7 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
         ScriptedModel::new([ScriptedTurn::fail("provider down")]),
     ));
     let fallback = failing
-        .generate_with_model(&page)
+        .generate_with_model(&page, &[])
         .await
         .expect("falls back on a model error");
     assert_eq!(fallback, deterministic);
@@ -396,7 +404,7 @@ async fn model_failures_fall_back_to_the_deterministic_skill() {
 async fn model_assisted_generation_requires_a_model() {
     let page = scraped_main().await;
     let error = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
-        .generate_with_model(&page)
+        .generate_with_model(&page, &[])
         .await
         .expect_err("no model attached");
     assert!(error.to_string().contains("with_model"), "{error}");
@@ -608,5 +616,245 @@ async fn run_lists_text_resources_before_saved_images() {
         tokio::fs::try_exists(outcome.bundle_path.join("references/img_00.png"))
             .await
             .expect("probe")
+    );
+}
+
+/// An image URL whose payload is below the 1 KiB floor, so it is filtered out.
+const TINY_URL: &str = "https://docs.example.com/guide/tiny.png";
+
+/// A fetcher serving one kept image, one filtered-out image, and one subpage.
+fn kept_and_filtered_image_fetcher() -> ScriptedFetcher {
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_html(
+        MAIN_URL,
+        format!(
+            "<!doctype html><html><head><title>Install the Widget</title></head><body>\
+             <h1>Install the Widget</h1>\
+             <p>Download the package, then run the installer.</p>\
+             <img src=\"{IMAGE_URL}\" alt=\"install screenshot\">\
+             <img src=\"{TINY_URL}\" alt=\"tiny shot\">\
+             <a href=\"{SUBPAGE_URL}\">Details</a>\
+             </body></html>"
+        ),
+    );
+    fetcher.with_page(IMAGE_URL, "image/png", png_body(2048));
+    fetcher.with_page(TINY_URL, "image/png", png_body(64));
+    fetcher.with_html(SUBPAGE_URL, subpage_html());
+    fetcher
+}
+
+/// The scraped page and its downloaded resources of [`kept_and_filtered_image_fetcher`].
+async fn kept_and_filtered_downloads() -> (ScrapedPage, Vec<DownloadedResource>) {
+    let creation = OmniCreation::new(Arc::new(kept_and_filtered_image_fetcher()));
+    let page = creation.scrape(MAIN_URL).await.expect("scrapes");
+    let downloaded = creation.download(&page).await.expect("downloads");
+    (page, downloaded)
+}
+
+/// A model returning one fenced skill definition with `instructions` verbatim.
+fn instructions_model(instructions: &str) -> ScriptedModel {
+    let answer = format!(
+        "```json\n{}\n```\n",
+        serde_json::to_string_pretty(&json!({
+            "name": "model-widget",
+            "description": "Install the widget with confidence.",
+            "instructions": instructions,
+        }))
+        .expect("payload serializes")
+    );
+    ScriptedModel::text(answer)
+}
+
+#[tokio::test]
+async fn deterministic_document_references_saved_images_by_path() {
+    let (page, downloaded) = kept_and_filtered_downloads().await;
+    assert_eq!(
+        downloaded
+            .iter()
+            .filter_map(|resource| resource.saved_path.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["references/img_00.png"],
+        "{downloaded:#?}"
+    );
+
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()));
+    let definition = creation.generate(&page, &downloaded).expect("generates");
+    let instructions = &definition.instructions;
+
+    assert!(
+        instructions.contains("![install screenshot](references/img_00.png)"),
+        "{instructions}"
+    );
+    assert!(
+        !instructions.contains(&format!("- install screenshot — {IMAGE_URL}")),
+        "a kept image is not repeated as a URL line: {instructions}"
+    );
+    assert!(
+        instructions.contains(&format!("- tiny shot — {TINY_URL}")),
+        "a filtered-out image stays a URL line: {instructions}"
+    );
+
+    assert_eq!(
+        instructions.matches("## Reference Files").count(),
+        1,
+        "{instructions}"
+    );
+    let saved = "- `references/img_00.png` — install screenshot";
+    let sources = "- `references/sources.md` — source page provenance, links, and image references";
+    let saved_at = instructions.find(saved).expect("saved image line");
+    let sources_at = instructions.find(sources).expect("sources line");
+    assert!(saved_at < sources_at, "{instructions}");
+    assert!(
+        instructions
+            .find("## Reference Images")
+            .expect("image section")
+            < instructions
+                .find("## Reference Files")
+                .expect("files section"),
+        "{instructions}"
+    );
+    definition.validate().expect("valid definition");
+}
+
+#[tokio::test]
+async fn sources_resource_names_the_saved_image_path() {
+    let (page, downloaded) = kept_and_filtered_downloads().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()));
+    let resources = creation.text_resources(&page, &downloaded);
+    let sources = resources
+        .iter()
+        .find(|resource| resource.path == SOURCES_RESOURCE)
+        .expect("sources resource");
+
+    assert!(
+        sources.content.contains(&format!(
+            "- install screenshot — {IMAGE_URL} (saved as references/img_00.png)"
+        )),
+        "{}",
+        sources.content
+    );
+    assert!(
+        sources
+            .content
+            .contains(&format!("- tiny shot — {TINY_URL}")),
+        "{}",
+        sources.content
+    );
+}
+
+#[tokio::test]
+async fn model_generation_keeps_only_saved_image_references() {
+    let (page, downloaded) = kept_and_filtered_downloads().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
+        instructions_model(
+            "# Install\n\n![ok](references/img_00.png)\n\n\
+             ![hallucinated](references/img_99.png)\n\n1. Download the package.",
+        ),
+    ));
+    let definition = creation
+        .generate_with_model(&page, &downloaded)
+        .await
+        .expect("models the skill");
+    let instructions = &definition.instructions;
+
+    assert!(
+        instructions.contains("![ok](references/img_00.png)"),
+        "{instructions}"
+    );
+    assert!(!instructions.contains("img_99.png"), "{instructions}");
+    assert_eq!(
+        instructions.matches("## Reference Files").count(),
+        1,
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("- `references/img_00.png` — install screenshot"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("- `references/sources.md` — source page provenance"),
+        "{instructions}"
+    );
+    assert_eq!(definition.resources[0].path, SOURCES_RESOURCE);
+    definition.validate().expect("valid definition");
+}
+
+#[tokio::test]
+async fn model_hallucination_only_lines_disappear_and_collapse() {
+    let (page, downloaded) = kept_and_filtered_downloads().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
+        instructions_model(
+            "# Install\n\n![hallucinated](references/img_99.png)\n\n1. Step.\n\n\
+             ![gone](references/img_98.png)",
+        ),
+    ));
+    let definition = creation
+        .generate_with_model(&page, &downloaded)
+        .await
+        .expect("models the skill");
+
+    assert!(
+        definition
+            .instructions
+            .starts_with("# Install\n\n1. Step.\n\n## Reference Files"),
+        "{}",
+        definition.instructions
+    );
+    assert!(
+        !definition.instructions.contains("\n\n\n"),
+        "{}",
+        definition.instructions
+    );
+    assert!(
+        !definition.instructions.contains("img_9"),
+        "{}",
+        definition.instructions
+    );
+}
+
+#[tokio::test]
+async fn blank_instructions_after_stripping_fall_back_to_the_deterministic_skill() {
+    let (page, downloaded) = kept_and_filtered_downloads().await;
+    let deterministic = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
+        .generate(&page, &downloaded)
+        .expect("generates");
+
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new())).with_model(Arc::new(
+        instructions_model("![hallucinated](references/img_99.png)"),
+    ));
+    let definition = creation
+        .generate_with_model(&page, &downloaded)
+        .await
+        .expect("falls back to the deterministic generator");
+
+    assert_eq!(definition, deterministic);
+    definition.validate().expect("valid definition");
+}
+
+#[tokio::test]
+async fn model_generation_without_images_has_no_image_references() {
+    let page = scraped_main().await;
+    let creation = OmniCreation::new(Arc::new(ScriptedFetcher::new()))
+        .with_model(Arc::new(instructions_model("# Install\n\n1. Step.")));
+    let definition = creation
+        .generate_with_model(&page, &[])
+        .await
+        .expect("models the skill");
+    let instructions = &definition.instructions;
+
+    assert!(!instructions.contains("!["), "{instructions}");
+    assert!(!instructions.contains("references/img_"), "{instructions}");
+    assert!(
+        !instructions.contains("## Reference Images"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("- `references/sources.md` — source page provenance"),
+        "{instructions}"
+    );
+    assert_eq!(
+        instructions.matches("## Reference Files").count(),
+        1,
+        "{instructions}"
     );
 }

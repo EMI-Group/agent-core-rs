@@ -15,6 +15,13 @@
 //! [`OmniConfig::allow_cross_host`], while the `references/` resource paths are
 //! `SOURCES_RESOURCE` and `PAGE_RESOURCE_PREFIX` so the pipeline and the
 //! document bodies cannot drift apart.
+//!
+//! Persisted images are rendered from their
+//! [`saved_path`](DownloadedResource::saved_path): the instruction body points
+//! at the bundle-relative asset instead of the source URL, and the single
+//! `## Reference Files` section — `reference_files_section` — lists the saved
+//! images beside the text resources for both the deterministic and the
+//! model-assisted path.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -52,7 +59,7 @@ You turn a scraped documentation page into a portable agent skill. Answer with e
 - metadata (optional): a string-keyed object of extra values
 
 Ground every statement in the supplied title, headings, text, code blocks, and images.
-Never invent steps, commands, or image paths; refer to an image by its URL when it matters.";
+Never invent steps, commands, or image paths; an image may only be referenced by the relative bundle path listed for it.";
 
 /// The skill-name slug of a page: title, then URL host, then the raw URL.
 pub(crate) fn skill_name(page: &ScrapedPage) -> String {
@@ -89,13 +96,25 @@ pub(crate) fn skill_description(page: &ScrapedPage) -> String {
 /// The body opens with the page title (or `name` when the page has none) and
 /// `description`, then lists the `## Steps`, `## Details`, `## Code Examples`,
 /// `## Reference Images`, `## Further Reading`, and `## Reference Files`
-/// sections that have content. Image and link references always stay URLs;
-/// `references` contributes the `## Reference Files` listing.
+/// sections that have content. Link references stay URLs.
+///
+/// `images` is the downloaded resource list of the run; its entries that carry
+/// a [`saved_path`](DownloadedResource::saved_path) are the kept images, in keep
+/// order. `## Reference Images` renders one markdown image per kept image —
+/// `![{alt}]({saved_path})`, with the trimmed alt text falling back to
+/// `screenshot` — followed by a `- {alt} — {src}` URL line for every page image
+/// that was not persisted. A page image is considered persisted when its
+/// resolved URL equals the `url` of a kept image literally (no path
+/// normalisation). `## Reference Files` appears exactly once, saved images
+/// first as `- {path} — {description}` lines, then the text `references`; it is
+/// built by [`reference_files_section`], the single renderer of that section,
+/// and is omitted when both lists are empty.
 pub(crate) fn instructions_markdown(
     page: &ScrapedPage,
     name: &str,
     description: &str,
     references: &[SkillResource],
+    images: &[DownloadedResource],
     config: &OmniConfig,
 ) -> String {
     let title = if page.title.trim().is_empty() {
@@ -137,12 +156,24 @@ pub(crate) fn instructions_markdown(
         }
     }
 
-    let images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
-    if !images.is_empty() {
+    let page_images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
+    let mut image_lines: Vec<String> = Vec::new();
+    for saved in images.iter().filter(|image| image.saved_path.is_some()) {
+        if let Some(path) = saved.saved_path.as_deref() {
+            image_lines.push(format!("![{}]({path})", saved_image_alt(saved)));
+        }
+    }
+    for image in &page_images {
+        if saved_image(page, image, images).is_some() {
+            continue;
+        }
+        let alt = image_alt(image);
+        image_lines.push(format!("- {alt} — {}", image.src));
+    }
+    if !image_lines.is_empty() {
         let _ = writeln!(out, "## Reference Images\n");
-        for image in images {
-            let alt = image_alt(image);
-            let _ = writeln!(out, "- {alt} — {}", image.src);
+        for line in image_lines {
+            let _ = writeln!(out, "{line}");
         }
         out.push('\n');
     }
@@ -157,22 +188,56 @@ pub(crate) fn instructions_markdown(
         out.push('\n');
     }
 
-    if !references.is_empty() {
-        let _ = writeln!(out, "## Reference Files\n");
-        for resource in references {
-            let description = describe_resource(&resource.path);
-            let _ = writeln!(out, "- `{}` — {description}", resource.path);
-        }
+    if let Some(section) = reference_files_section(images, references) {
+        let _ = writeln!(out, "{section}");
     }
     out.trim_end().to_owned()
+}
+
+/// Renders the single `## Reference Files` section of an instruction body.
+///
+/// The section lists, one per line, the bundle-relative paths of the saved
+/// images with their description (the trimmed alt text, else `screenshot`),
+/// then the text `references` with their [`describe_resource`] description. The
+/// line shape follows Python's `append_reference_files`: an ASCII hyphen-minus,
+/// the backtick-quoted path, an em dash, then the description. `None` means both
+/// lists are empty, so no section is rendered; the section text itself carries
+/// no trailing newline, which lets both the deterministic and the model-assisted
+/// paths append it verbatim.
+pub(crate) fn reference_files_section(
+    images: &[DownloadedResource],
+    references: &[SkillResource],
+) -> Option<String> {
+    let mut out = String::new();
+    for image in images {
+        let Some(path) = image.saved_path.as_deref() else {
+            continue;
+        };
+        let _ = writeln!(out, "- `{path}` — {}", saved_image_alt(image));
+    }
+    for resource in references {
+        let description = describe_resource(&resource.path);
+        let _ = writeln!(out, "- `{}` — {description}", resource.path);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(format!("## Reference Files\n\n{}", out.trim_end()))
 }
 
 /// Builds the `references/sources.md` body for `page`.
 ///
 /// The document holds the source URL, the title and description when present,
 /// the bounded deduplicated subpage links, and every image URL with its alt
-/// text, all reading the caps from `config`.
-pub(crate) fn sources_markdown(page: &ScrapedPage, config: &OmniConfig) -> String {
+/// text, all reading the caps from `config`. An image that was persisted to the
+/// bundle keeps its URL and gains the saved path, in the shape
+/// `- {alt} — {url} (saved as references/img_NN.<ext>)`, so the provenance
+/// document points at both the origin and the local asset.
+pub(crate) fn sources_markdown(
+    page: &ScrapedPage,
+    images: &[DownloadedResource],
+    config: &OmniConfig,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# Sources\n");
     let _ = writeln!(out, "- Source: {}", page.url);
@@ -190,12 +255,19 @@ pub(crate) fn sources_markdown(page: &ScrapedPage, config: &OmniConfig) -> Strin
             let _ = writeln!(out, "- [{label}]({})", link.href);
         }
     }
-    let images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
-    if !images.is_empty() {
+    let page_images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
+    if !page_images.is_empty() {
         let _ = writeln!(out, "\n## Images\n");
-        for image in images {
+        for image in page_images {
             let alt = image_alt(image);
-            let _ = writeln!(out, "- {alt} — {}", image.src);
+            match saved_image(page, image, images).and_then(|saved| saved.saved_path.as_deref()) {
+                Some(path) => {
+                    let _ = writeln!(out, "- {alt} — {} (saved as {path})", image.src);
+                }
+                None => {
+                    let _ = writeln!(out, "- {alt} — {}", image.src);
+                }
+            }
         }
     }
     out
@@ -251,8 +323,16 @@ pub(crate) fn render_page_resource(
 ///
 /// It carries the title, source URL, the optional description, the headings,
 /// the text truncated to 8 000 characters on a character boundary, the fenced
-/// code blocks, and the image URLs with their alt text.
-pub(crate) fn model_user_prompt(page: &ScrapedPage, config: &OmniConfig) -> String {
+/// code blocks, and the images with their alt text. A kept image (one with a
+/// [`saved_path`](DownloadedResource::saved_path)) is listed as
+/// `- {alt} — {saved_path}`, mirroring Python's `blocks_for_llm`, which drops
+/// the raw URL so the model can only cite the bundle-relative asset it was
+/// given; an image without a saved path keeps its absolute URL.
+pub(crate) fn model_user_prompt(
+    page: &ScrapedPage,
+    images: &[DownloadedResource],
+    config: &OmniConfig,
+) -> String {
     let mut prompt = String::new();
     let _ = writeln!(prompt, "Title: {}", page.title.trim());
     let _ = writeln!(prompt, "Source: {}", page.url);
@@ -281,12 +361,19 @@ pub(crate) fn model_user_prompt(page: &ScrapedPage, config: &OmniConfig) -> Stri
             let _ = writeln!(prompt, "```\n{}\n```", block.trim());
         }
     }
-    let images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
-    if !images.is_empty() {
+    let page_images: Vec<&Image> = page.images.iter().take(config.max_images).collect();
+    if !page_images.is_empty() {
         prompt.push_str("\nImages:\n");
-        for image in images {
+        for image in page_images {
             let alt = image_alt(image);
-            let _ = writeln!(prompt, "- {alt} — {}", image.src);
+            match saved_image(page, image, images).and_then(|saved| saved.saved_path.as_deref()) {
+                Some(path) => {
+                    let _ = writeln!(prompt, "- {alt} — {path}");
+                }
+                None => {
+                    let _ = writeln!(prompt, "- {alt} — {}", image.src);
+                }
+            }
         }
     }
     prompt
@@ -429,6 +516,34 @@ fn image_alt(image: &Image) -> &str {
     }
 }
 
+/// The description of a persisted image: its trimmed alt text, else
+/// `"screenshot"` (Python's `b.get("alt") or "screenshot"`).
+fn saved_image_alt(image: &DownloadedResource) -> &str {
+    let alt = image.alt.trim();
+    if alt.is_empty() {
+        "screenshot"
+    } else {
+        alt
+    }
+}
+
+/// The kept image whose `url` is the resolved URL of `image`, if any.
+///
+/// The comparison is literal, like Python's `valid_paths` set membership: no
+/// path normalisation and no query-string or fragment stripping. A page image
+/// that no saved resource matches was filtered out, so it stays a URL
+/// reference.
+fn saved_image<'a>(
+    page: &ScrapedPage,
+    image: &Image,
+    images: &'a [DownloadedResource],
+) -> Option<&'a DownloadedResource> {
+    let target = resolve_url(&page.url, &image.src).unwrap_or_else(|| image.src.trim().to_owned());
+    images
+        .iter()
+        .find(|saved| saved.saved_path.is_some() && saved.url == target)
+}
+
 /// The one-line description of a written text resource.
 fn describe_resource(path: &str) -> &'static str {
     if path == SOURCES_RESOURCE {
@@ -462,9 +577,9 @@ fn describe_resource(path: &str) -> &'static str {
 /// Line boundaries are `\n` with an optional trailing `\r`, the convention of
 /// the crate's other scanners, rather than Python's wider `str.splitlines`.
 ///
-/// The model-assisted generation path will call this; today its unit tests are
-/// the only callers.
-#[allow(dead_code)]
+/// The model-assisted generation path calls this before the drafted
+/// instructions are validated, with the `saved_path`s of the kept images as
+/// `valid_paths`.
 pub(crate) fn strip_hallucinated_images(markdown: &str, valid_paths: &[String]) -> String {
     let mut cleaned = String::with_capacity(markdown.len());
     let mut rest = markdown;

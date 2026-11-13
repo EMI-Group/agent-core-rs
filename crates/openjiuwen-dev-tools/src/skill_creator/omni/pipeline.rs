@@ -18,7 +18,12 @@
 //!
 //! Kept images are persisted beside the text assets as
 //! `references/img_NN.<ext>` by [`OmniCreation::save_with_images`], exactly like
-//! Python's `stage_04_save.py`, while the document keeps their source URLs.
+//! Python's `stage_04_save.py`; the instruction body references a kept image by
+//! that bundle-relative path, while `references/sources.md` keeps its source URL
+//! and notes the saved path. The model-assisted path is hallucination-safe: the
+//! drafted body may only cite the saved paths it was given, its invented image
+//! references are stripped, and the single `## Reference Files` section is
+//! rendered from the same helper as the deterministic path.
 //! Every [`DownloadedResource`] carries the payload's SHA-256 digest and, for a
 //! kept image, the bundle-relative
 //! [`saved_path`](DownloadedResource::saved_path) it is written to; because
@@ -44,16 +49,17 @@ use crate::skill_creator::{SkillBundle, SkillDefinition, SkillResource};
 use crate::util::extract_json_fence;
 
 use self::assets::{image_resource, image_target};
-use super::archive::{self, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
-use super::fetch::{FetchedResource, Fetcher};
+use self::page::{archive_page, html_page};
+use super::archive::{self, ArchiveFormat, ArchiveUnpacker};
+use super::fetch::Fetcher;
 use super::filter::{
     content_hash, dedupe_links, filter_images_with, same_host, ImageCandidate, ResourceFilter,
 };
-use super::html::{resolve_url, Heading, HtmlDocument, Image, Link};
+use super::html::{resolve_url, Heading, Image, Link};
 use super::render::{
-    instructions_markdown, model_user_prompt, render_page_resource, same_page, skill_description,
-    skill_name, sources_markdown, ModelSkillPayload, MODEL_SYSTEM_PROMPT, PAGE_RESOURCE_PREFIX,
-    SOURCES_RESOURCE,
+    instructions_markdown, model_user_prompt, reference_files_section, render_page_resource,
+    same_page, skill_description, skill_name, sources_markdown, strip_hallucinated_images,
+    ModelSkillPayload, MODEL_SYSTEM_PROMPT, PAGE_RESOURCE_PREFIX, SOURCES_RESOURCE,
 };
 use super::sha256;
 
@@ -69,8 +75,6 @@ const DEFAULT_MIN_IMAGE_BYTES: usize = 1024;
 const DEFAULT_MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Default upper bound for a downloaded subpage: 2 MiB.
 const DEFAULT_MAX_RESOURCE_BYTES: usize = 2 * 1024 * 1024;
-/// How many leading bytes are inspected when sniffing an archive entry for NULs.
-const BINARY_SNIFF_BYTES: usize = 512;
 /// How many leading bytes are inspected when sniffing a resource for HTML.
 const HTML_SNIFF_BYTES: usize = 1024;
 /// Caps and policy for one omni-creation run.
@@ -279,7 +283,7 @@ impl DownloadedResource {
     /// The `content-type` header wins when it names `text/html` or
     /// `application/xhtml…`; otherwise the first 1 KiB of the body is inspected
     /// for a `<!doctype html` prefix or an `<html` tag. The same rule as
-    /// [`FetchedResource::is_html`], applied to a buffered resource.
+    /// [`super::fetch::FetchedResource::is_html`], applied to a buffered resource.
     #[must_use]
     pub fn is_html(&self) -> bool {
         if let Some(content_type) = self.content_type.as_deref() {
@@ -552,10 +556,13 @@ impl OmniCreation {
     /// character boundary, else a URL-based sentence. The instruction body is an
     /// `#` title, the description, and the `## Steps`, `## Details`,
     /// `## Code Examples`, `## Reference Images`, `## Further Reading`, and
-    /// `## Reference Files` sections that have content. Image and link
-    /// references in the body stay URLs, and the definition carries every text
-    /// resource of [`OmniCreation::text_resources`] — persisted images are not
-    /// text resources, they are written beside them by
+    /// `## Reference Files` sections that have content. A kept image (one with a
+    /// [`saved_path`](DownloadedResource::saved_path)) is referenced by that
+    /// bundle-relative path, an image that did not survive filtering stays a
+    /// URL line, and `## Reference Files` lists the saved images beside the text
+    /// resources. Link references in the body stay URLs, and the definition
+    /// carries every text resource of [`OmniCreation::text_resources`] —
+    /// persisted images are not text resources, they are written beside them by
     /// [`OmniCreation::save_with_images`].
     ///
     /// # Errors
@@ -571,8 +578,14 @@ impl OmniCreation {
         let name = skill_name(page);
         let description = skill_description(page);
         let text_resources = self.text_resources(page, resources);
-        let instructions =
-            instructions_markdown(page, &name, &description, &text_resources, &self.config);
+        let instructions = instructions_markdown(
+            page,
+            &name,
+            &description,
+            &text_resources,
+            resources,
+            &self.config,
+        );
         let mut definition = SkillDefinition::new(name, description, instructions);
         definition.resources = text_resources;
         definition.validate()?;
@@ -665,11 +678,13 @@ impl OmniCreation {
     ///
     /// `references/sources.md` is always first when the cap allows it: source URL,
     /// title, description, the bounded deduplicated subpage links, and every
-    /// image URL with its alt text. Then each HTML [`DownloadedResource`] with a
-    /// non-blank document becomes `references/page-NN.md` (two-digit ordinal
-    /// among the written reference pages), rendering the page title, its
-    /// headings as `##`/`###`, and its text. The list is truncated to
-    /// [`OmniConfig::max_resources`], and a cap of zero returns nothing.
+    /// image URL with its alt text — plus the saved path of an image that was
+    /// persisted, as `(saved as references/img_NN.<ext>)`. Then each HTML
+    /// [`DownloadedResource`] with a non-blank document becomes
+    /// `references/page-NN.md` (two-digit ordinal among the written reference
+    /// pages), rendering the page title, its headings as `##`/`###`, and its
+    /// text. The list is truncated to [`OmniConfig::max_resources`], and a cap
+    /// of zero returns nothing.
     #[must_use]
     pub fn text_resources(
         &self,
@@ -682,7 +697,7 @@ impl OmniCreation {
         }
         assets.push(SkillResource::new(
             SOURCES_RESOURCE,
-            sources_markdown(page, &self.config),
+            sources_markdown(page, resources, &self.config),
         ));
         let mut page_index = 0_usize;
         for resource in resources {
@@ -705,37 +720,51 @@ impl OmniCreation {
     /// Drafts the skill with one model call, falling back to [`OmniCreation::generate`].
     ///
     /// The model receives the page title, source URL, headings, text (truncated
-    /// to 8 000 characters on a character boundary), code blocks, and image
-    /// URLs with alt text, and must answer with one fenced `json` object holding
-    /// `name`, `description`, `instructions`, and optionally `metadata`. The
-    /// resulting definition carries the provenance resource of
-    /// [`OmniCreation::text_resources`].
+    /// to 8 000 characters on a character boundary), code blocks, and the
+    /// images with their alt text — a kept image as its bundle-relative
+    /// `saved_path`, never the raw URL — and must answer with one fenced `json`
+    /// object holding `name`, `description`, `instructions`, and optionally
+    /// `metadata`.
+    ///
+    /// The drafted instructions are cleaned before they are accepted: every
+    /// `![…](…)` reference whose target is not one of the kept images'
+    /// `saved_path`s is dropped (see `strip_hallucinated_images`), and the
+    /// single `## Reference Files` section of the run
+    /// (`reference_files_section`) is appended unless the cleaned body already
+    /// carries a `## Reference Files` heading — an existing section is kept
+    /// as-is rather than merged. The definition then carries the provenance and
+    /// page resources of [`OmniCreation::text_resources`].
     ///
     /// Any failure after a model is attached — a model error, an answer without
-    /// a JSON fence, a malformed or incomplete payload, or a definition that
-    /// does not validate — is logged with [`tracing::warn`] and replaced by the
-    /// deterministic rendering, so the stage stays productive offline.
+    /// a JSON fence, a malformed or incomplete payload, instructions that are
+    /// blank once the hallucinated image references are removed, or a definition
+    /// that does not validate — is logged with [`tracing::warn`] and replaced by
+    /// the deterministic rendering, so the stage stays productive offline.
     ///
     /// # Errors
     ///
     /// The only error that escapes is
     /// [`Error::validation`](openjiuwen_common::error::Error::validation) when no
     /// model is attached (the message names `OmniCreation::with_model`).
-    pub async fn generate_with_model(&self, page: &ScrapedPage) -> Result<SkillDefinition> {
+    pub async fn generate_with_model(
+        &self,
+        page: &ScrapedPage,
+        resources: &[DownloadedResource],
+    ) -> Result<SkillDefinition> {
         let Some(model) = self.model.as_ref() else {
             return Err(Error::validation(
                 "model-assisted omni creation requires a pipeline built with \
                  OmniCreation::with_model",
             ));
         };
-        match self.model_definition(model, page).await {
+        match self.model_definition(model, page, resources).await {
             Ok(definition) => Ok(definition),
             Err(error) => {
                 tracing::warn!(
                     %error,
                     "model-assisted skill generation failed; using the deterministic generator"
                 );
-                self.generate(page, &[])
+                self.generate(page, resources)
             }
         }
     }
@@ -759,7 +788,7 @@ impl OmniCreation {
         let page = self.scrape(url).await?;
         let downloaded = self.download(&page).await?;
         let definition = if self.model.is_some() {
-            self.generate_with_model(&page).await?
+            self.generate_with_model(&page, &downloaded).await?
         } else {
             self.generate(&page, &downloaded)?
         };
@@ -784,16 +813,27 @@ impl OmniCreation {
     }
 
     /// One model round trip that must answer with a fenced skill definition.
+    ///
+    /// The drafted body is made hallucination-safe before validation: the
+    /// `saved_path`s of the kept images are the only accepted image targets, so
+    /// any other `![…](…)` reference is removed, and a body that only held such
+    /// references is rejected so the caller falls back to the deterministic
+    /// renderer. A body without a `## Reference Files` heading then receives the
+    /// run's single reference-files section, which lists the saved images and
+    /// the text resources; a body that already carries the heading is left
+    /// untouched (the section is not merged or replaced — a documented deviation
+    /// from Python, whose model answers never contain the section).
     async fn model_definition(
         &self,
         model: &Arc<dyn Model>,
         page: &ScrapedPage,
+        resources: &[DownloadedResource],
     ) -> Result<SkillDefinition> {
         let completion = model
             .invoke(
                 &[
                     BaseMessage::system(MODEL_SYSTEM_PROMPT),
-                    BaseMessage::user(model_user_prompt(page, &self.config)),
+                    BaseMessage::user(model_user_prompt(page, resources, &self.config)),
                 ],
                 &ModelRequestConfig::new(model.model_name()),
             )
@@ -812,16 +852,37 @@ impl OmniCreation {
                 "invalid omni skill definition JSON from model: {error}"
             ))
         })?;
+        let valid_paths: Vec<String> = resources
+            .iter()
+            .filter_map(|resource| resource.saved_path.clone())
+            .collect();
+        let instructions =
+            strip_hallucinated_images(&payload.required("instructions")?, &valid_paths);
+        if instructions.trim().is_empty() {
+            return Err(Error::validation(
+                "model instructions were empty once hallucinated image references were removed",
+            ));
+        }
+        let text_resources = self.text_resources(page, resources);
+        let instructions = if instructions.contains("## Reference Files") {
+            instructions
+        } else {
+            match reference_files_section(resources, &text_resources) {
+                Some(section) => format!("{instructions}\n\n{section}"),
+                None => instructions,
+            }
+        };
         let mut definition = SkillDefinition::new(
             payload.required("name")?,
             payload.required("description")?,
-            payload.required("instructions")?,
+            instructions,
         );
         definition.metadata = payload.metadata;
-        definition.resources = self.text_resources(page, &[]);
+        definition.resources = text_resources;
         definition.validate()?;
         Ok(definition)
     }
+
     /// Builds the image candidates worth fetching for `page`.
     fn image_candidates(&self, page: &ScrapedPage) -> Vec<ImageCandidate> {
         let mut seen = HashSet::new();
@@ -845,141 +906,8 @@ impl OmniCreation {
     }
 }
 
-/// Builds a page from a `tar` archive's text entries.
-fn archive_page(url: &str, entries: &[ArchiveEntry]) -> ScrapedPage {
-    let mut texts = Vec::new();
-    for entry in entries {
-        if entry.is_dir {
-            continue;
-        }
-        let text = match std::str::from_utf8(&entry.bytes) {
-            Ok(text) => text.to_owned(),
-            Err(error) => {
-                tracing::debug!(
-                    path = %entry.path,
-                    %error,
-                    "skipping a non-UTF-8 archive entry"
-                );
-                continue;
-            }
-        };
-        if looks_binary(&entry.bytes) {
-            tracing::debug!(
-                path = %entry.path,
-                "skipping a binary-looking archive entry"
-            );
-            continue;
-        }
-        texts.push(text);
-    }
-    let mut headings = Vec::new();
-    let mut code_blocks = Vec::new();
-    for text in &texts {
-        collect_markdown_headings(text, &mut headings);
-        collect_fenced_blocks(text, &mut code_blocks);
-    }
-    let title = headings
-        .iter()
-        .find(|heading| heading.level == 1)
-        .map_or_else(String::new, |heading| heading.text.clone());
-    ScrapedPage {
-        url: url.to_owned(),
-        title,
-        text: texts.join("\n\n"),
-        headings,
-        code_blocks,
-        ..ScrapedPage::default()
-    }
-}
-
-/// Whether an archive entry looks binary: a NUL byte in its first 512 bytes.
-fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
-}
-
-/// Collects markdown ATX headings (`#`…`######` plus a space) from `text`.
-fn collect_markdown_headings(text: &str, headings: &mut Vec<Heading>) {
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-        if !(1..=6).contains(&hashes) {
-            continue;
-        }
-        let Some(rest) = trimmed.get(hashes..) else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix(' ') else {
-            continue;
-        };
-        let heading = rest.trim();
-        if heading.is_empty() {
-            continue;
-        }
-        headings.push(Heading {
-            level: hashes as u8,
-            text: heading.to_owned(),
-        });
-    }
-}
-
-/// Collects triple-backtick fenced code blocks from `text`, dropping the info string.
-fn collect_fenced_blocks(text: &str, blocks: &mut Vec<String>) {
-    let mut open: Option<Vec<&str>> = None;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            if let Some(body) = open.take() {
-                let content = body.join("\n");
-                let content = content.trim();
-                if !content.is_empty() {
-                    blocks.push(content.to_owned());
-                }
-            } else {
-                open = Some(Vec::new());
-            }
-            continue;
-        }
-        if let Some(body) = open.as_mut() {
-            body.push(line);
-        }
-    }
-}
-
-/// Builds a page from an HTML resource, resolving links and images absolutely.
-fn html_page(resource: &FetchedResource, url: &str) -> ScrapedPage {
-    let document = HtmlDocument::parse(&resource.text(), url);
-    let links = document
-        .links
-        .iter()
-        .filter_map(|link| {
-            resolve_url(url, &link.href).map(|href| Link {
-                href,
-                text: link.text.clone(),
-            })
-        })
-        .collect();
-    let images = document
-        .images
-        .iter()
-        .filter_map(|image| {
-            resolve_url(url, &image.src).map(|src| Image {
-                src,
-                alt: image.alt.clone(),
-            })
-        })
-        .collect();
-    ScrapedPage {
-        url: url.to_owned(),
-        title: document.title,
-        description: document.description,
-        text: document.text,
-        headings: document.headings,
-        links,
-        images,
-        code_blocks: document.code_blocks,
-    }
-}
-
 pub(crate) mod assets;
+pub(crate) mod page;
 
 #[cfg(test)]
 mod tests;
