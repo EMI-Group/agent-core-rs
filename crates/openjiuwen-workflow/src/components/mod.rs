@@ -12,11 +12,8 @@ pub mod intent_detection;
 pub mod llm;
 pub mod loop_;
 pub mod memory;
-<<<<<<< HEAD
 pub mod questioner;
-=======
 pub mod react_agent;
->>>>>>> f771f1e96139fdf2d362c8d372f930f0822f4779
 pub mod retrieval;
 pub mod start;
 pub mod sub_workflow;
