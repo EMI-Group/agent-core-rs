@@ -315,8 +315,9 @@ async fn redis_kv_store(_url: Option<&str>) -> Result<Arc<dyn KvStore>> {
 #[cfg(test)]
 mod tests {
     // Python counterparts: `tests/unit_tests/extensions/store/test_es_vector_store.py`
-    // (Elasticsearch, deferred) and `test_gauss_db.py` (Gauss document store, not
-    // ported because the kernel document contract replaces the `SQLAlchemy` engine).
+    // (Elasticsearch vector store, now live) and `test_gauss_db.py` (Gauss document
+    // store, not ported because the kernel document contract replaces the
+    // `SQLAlchemy` engine).
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use openjiuwen_common::error::ErrorKind;
@@ -520,58 +521,47 @@ mod tests {
         store.create_collection("vectors", schema).await.unwrap();
         assert!(store.collection_exists("vectors").await.unwrap());
     }
+    /// Python counterpart: `tests/unit_tests/extensions/store/test_es_vector_store.py`.
+    ///
+    /// Elasticsearch is a vector store only: the two other factories report it
+    /// and name a backend that does implement their contract, while the vector
+    /// arm builds a live REST-backed store. `ElasticsearchVectorStore::connect`
+    /// performs no I/O at construction, so the assertions stay offline.
     #[tokio::test]
-    async fn elasticsearch_backend_is_unsupported() {
-        let elasticsearch = StoreBackend::Elasticsearch {
+    async fn elasticsearch_factories_split_key_value_document_and_vector() {
+        let backend = StoreBackend::Elasticsearch {
             url: "http://localhost:9200".to_string(),
             index_prefix: "agent_vector".to_string(),
         };
-        for backend in [&elasticsearch] {
-            let error = build_kv_store(backend)
-                .await
-                .err()
-                .expect("deferred key-value backend must fail");
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-            assert!(
-                error
-                    .message()
-                    .to_ascii_lowercase()
-                    .contains(backend_name(backend)),
-                "key-value error must name the backend: {}",
-                error.message()
-            );
-            let error = build_document_store(backend)
-                .await
-                .err()
-                .expect("deferred document backend must fail");
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-            assert!(error
-                .message()
-                .to_ascii_lowercase()
-                .contains(backend_name(backend)));
-            let error = build_vector_store(backend)
-                .await
-                .err()
-                .expect("deferred vector backend must fail");
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-            assert!(error
-                .message()
-                .to_ascii_lowercase()
-                .contains(backend_name(backend)));
-        }
-        let error = build_vector_store(&elasticsearch)
+        let error = build_kv_store(&backend)
             .await
             .err()
-            .expect("deferred vector backend must fail");
-        assert!(error.message().contains("in-memory or file"));
-    }
-    /// The lowercase name a deferred backend's error message must contain.
-    fn backend_name(backend: &StoreBackend) -> &'static str {
-        match backend.kind() {
-            StoreKind::Redis => "redis",
-            StoreKind::Elasticsearch => "elasticsearch",
-            _ => "store",
-        }
+            .expect("elasticsearch is not a key-value store");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("elasticsearch"), "{message}");
+        assert!(message.contains("in-memory"), "{message}");
+        let error = build_document_store(&backend)
+            .await
+            .err()
+            .expect("elasticsearch is not a document store");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("elasticsearch"), "{message}");
+        assert!(message.contains("in-memory"), "{message}");
+        build_vector_store(&backend)
+            .await
+            .expect("elasticsearch is a live vector store backend");
+        // The factory passes `url` and `index_prefix` straight through, so the
+        // concrete store built from them names indices the documented way.
+        let config = elasticsearch::ElasticsearchVectorStoreConfig {
+            url: "http://localhost:9200".to_string(),
+            index_prefix: "agent_vector".to_string(),
+            ..elasticsearch::ElasticsearchVectorStoreConfig::default()
+        };
+        let store = elasticsearch::ElasticsearchVectorStore::new(config)
+            .expect("a valid elasticsearch config must build without I/O");
+        assert_eq!(store.index_name("docs"), "agent_vector__docs");
     }
     #[cfg(feature = "redis")]
     #[tokio::test]
