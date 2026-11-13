@@ -8,6 +8,7 @@
 pub mod branch;
 pub mod end;
 pub mod http_request;
+pub mod intent_detection;
 pub mod llm;
 pub mod loop_;
 pub mod memory;
@@ -25,6 +26,7 @@ pub use http_request::{
     HttpRateLimitUnit, HttpRequestBodyConfig, HttpRequestComponent, HttpRequestParamConfig,
     HttpResponseFormat, HttpResponseHandlingConfig, HttpResponseMode, HttpRetryConfig,
 };
+pub use intent_detection::{IntentDetectionCompConfig, IntentDetectionComponent, IntentRouter};
 pub use llm::{LlmCompConfig, LlmComponent, LlmResponseFormat};
 pub use loop_::{LoopComponent, LoopConfig, LoopType};
 pub use memory::{MemoryRecall, MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent};
