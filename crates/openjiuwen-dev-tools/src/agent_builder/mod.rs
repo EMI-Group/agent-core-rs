@@ -36,8 +36,14 @@
 
 pub mod bridge;
 pub mod builder;
+pub mod clarifier;
+pub mod cycle_checker;
+pub mod designer;
+pub mod dl_generator;
+pub mod dl_reflector;
 pub mod dsl;
 pub mod history;
+pub mod mermaid;
 pub mod outcome;
 pub mod spec;
 pub mod workflow_dsl;
