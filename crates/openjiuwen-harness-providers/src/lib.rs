@@ -38,7 +38,8 @@
 //!   registry-name constants and the introspection descriptor.
 //! - [`providers`] — the compile-time built-in provider table (`native`, plus the `vendor`-gated
 //!   stubs) and its resolution helper.
-//! - [`skills`] — portable skill-bundle normalization and installation.
+//! - [`skills`] — portable skill-bundle normalization and installation, plus the per-vendor
+//!   [`SkillInstaller`] policy (discovery layout and skill-name rule).
 //! - [`vendor_cli`] — shared plumbing for the vendor CLI harnesses: binary resolution, the NDJSON
 //!   child transport, the JSON-RPC client over it, the observation event bus, session-id derivation,
 //!   host permission translation, and the generic supervisor shell ([`VendorHarness`]) over a
@@ -82,7 +83,8 @@ pub use provider::{
     ProviderDescriptor, ProviderSpec,
 };
 pub use skills::{
-    install_skills, normalize_skills, skill_scan_dir, SkillConflict, SkillMode, SkillSource,
+    install_for_provider, install_skills, normalize_skills, skill_scan_dir, SkillConflict,
+    SkillInstaller, SkillLayout, SkillMode, SkillSource,
 };
 pub use vendor_cli::{
     ask_tool_approval, ask_user_input, checkpoint_str, completed_turn, derive_session_id,

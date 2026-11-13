@@ -16,6 +16,12 @@
 //! `.openjiuwen-skill-<uuid>/previous`, and a failed swap restores it. The stage directory is
 //! always removed, so no partial destination is left behind.
 //!
+//! [`SkillInstaller`] adds the per-vendor policy on top of [`install_skills`]: the vendor's
+//! discovery layout ([`SkillLayout`]) and its skill-name rule. DSH additionally
+//! discovers a flat `<scan>/<name>.md` file, so a `*.md` source root is accepted there and
+//! normalized into the portable `<scan>/<name>/SKILL.md` directory form that every vendor
+//! discovers; the directory layouts reject such a source instead of guessing.
+//!
 //! # Python parity
 //!
 //! Conflict policies (`skip` / `replace` / `append`), error wording and the front-matter rewrite
@@ -37,6 +43,10 @@ use openjiuwen_harness_protocol::{JsonObject, JsonValue};
 use serde::{Deserialize, Serialize};
 
 use crate::decode::reject_unknown_keys;
+
+mod installer;
+
+pub use installer::{install_for_provider, SkillInstaller, SkillLayout};
 
 /// Which skills a source exposes to the harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,12 +403,24 @@ fn skill_name(bundle: &Path) -> Result<String> {
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
     };
-    if !is_portable_name(&name) {
-        return Err(Error::validation(format!(
-            "invalid portable skill name: '{name}'"
-        )));
-    }
+    validate_portable_name(&name)?;
     Ok(name)
+}
+
+/// Checks `name` against the shared portable-name rule.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] with `"invalid portable skill name: '<name>'"` when the name is
+/// empty, is `..`, or uses a character outside `[A-Za-z0-9._-]`.
+fn validate_portable_name(name: &str) -> Result<()> {
+    if is_portable_name(name) {
+        Ok(())
+    } else {
+        Err(Error::validation(format!(
+            "invalid portable skill name: '{name}'"
+        )))
+    }
 }
 
 /// Reads the top-level `name:` value of a bundle's front matter.
@@ -409,9 +431,21 @@ fn read_front_matter_name(bundle: &Path) -> Result<Option<String>> {
         return Err(Error::validation("SKILL.md must stay inside its bundle"));
     }
     let text = std::fs::read_to_string(&resolved)?;
+    document_front_matter_name(&text, bundle)
+}
+
+/// Returns the declared skill name of a skill document's text, if its front matter has one.
+///
+/// A byte-order mark is ignored, and a document without front matter declares no name.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] with `"unterminated skill front matter: <label>"` when the
+/// document opens a front-matter block that it never closes.
+fn document_front_matter_name(text: &str, label: &Path) -> Result<Option<String>> {
     let text = text
         .strip_prefix('\u{feff}')
-        .map_or(text.as_str(), |stripped| stripped);
+        .map_or(text, |stripped| stripped);
     let lines: Vec<&str> = text.lines().collect();
     if lines.first().is_none_or(|line| line.trim() != "---") {
         return Ok(None);
@@ -425,7 +459,7 @@ fn read_front_matter_name(bundle: &Path) -> Result<Option<String>> {
     else {
         return Err(Error::validation(format!(
             "unterminated skill front matter: {}",
-            bundle.display()
+            label.display()
         )));
     };
     Ok(front_matter_name(&lines[1..end]))

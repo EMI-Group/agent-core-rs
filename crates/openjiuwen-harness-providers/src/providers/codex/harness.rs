@@ -99,7 +99,7 @@ use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::input::harness_input_text;
-use crate::skills::install_skills;
+use crate::skills::install_for_provider;
 use crate::vendor_cli::{
     checkpoint_str, failed_turn, interrupted_turn, turn_error, ChildProcess, ChildProcessConfig,
     JsonRpcClient, PermissionPolicy, TurnContext, TurnRequest, VendorDriver,
@@ -343,7 +343,7 @@ impl VendorDriver for CodexDriver {
             let conflict = self.config.skill_conflict;
             let project = cwd.clone().unwrap_or_else(|| PathBuf::from("."));
             let installed = tokio::task::spawn_blocking(move || {
-                install_skills(&sources, "codex", &project, conflict)
+                install_for_provider(&sources, "codex", Some(&project), conflict)
             })
             .await
             .map_err(|error| {

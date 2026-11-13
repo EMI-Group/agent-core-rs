@@ -10,7 +10,8 @@ use std::str::FromStr;
 
 use openjiuwen_common::error::Error;
 use openjiuwen_harness_providers::{
-    install_skills, normalize_skills, skill_scan_dir, SkillConflict, SkillMode, SkillSource,
+    install_for_provider, install_skills, normalize_skills, skill_scan_dir, SkillConflict,
+    SkillInstaller, SkillLayout, SkillMode, SkillSource,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -735,4 +736,219 @@ fn install_replaces_a_symlinked_destination_without_mutating_the_source() {
         .is_symlink());
     assert!(destination.join("scripts").join("run.sh").is_file());
     assert!(source.join("SKILL.md").is_file());
+}
+/// Writes a flat `*.md` skill document and returns its path.
+fn write_flat_document(root: &Path, file_name: &str, name: Option<&str>) -> PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let document = root.join(file_name);
+    let text = match name {
+        Some(name) => format!("---\nname: {name}\ndescription: Flat skill\n---\nflat body\n"),
+        None => "flat body\n".to_owned(),
+    };
+    std::fs::write(&document, text).unwrap();
+    document
+}
+#[test]
+fn installer_install_targets_each_vendor_discovery_directory() {
+    let temp = tempdir().unwrap();
+    let library = temp.path().join("library");
+    write_bundle(&library.join("first"), "first", "one");
+    write_bundle(&library.join("second"), "second", "two");
+    let sources = [SkillSource::new(&library)];
+    for (provider, scan, layout) in [
+        ("claudecode", ".claude/skills", SkillLayout::Directory),
+        ("codex", ".agents/skills", SkillLayout::Directory),
+        ("dsh", ".dsh/skills", SkillLayout::DirectoryOrFlat),
+    ] {
+        let project = project_dir(&temp.path().join(provider));
+        let installer = SkillInstaller::for_provider(provider, SkillConflict::Skip).unwrap();
+        assert_eq!(installer.provider(), provider);
+        assert_eq!(installer.scan_dir(), scan);
+        assert_eq!(installer.layout(), layout);
+        assert_eq!(
+            installer.install(&sources, Some(&project)).unwrap(),
+            vec![
+                project.join(scan).join("first"),
+                project.join(scan).join("second"),
+            ]
+        );
+        for name in ["first", "second"] {
+            assert!(project.join(scan).join(name).join("SKILL.md").is_file());
+            assert!(project
+                .join(scan)
+                .join(name)
+                .join("scripts")
+                .join("run.sh")
+                .is_file());
+        }
+        assert!(!has_stage_dir(&project));
+    }
+}
+#[test]
+fn installer_keeps_the_conflict_policy() {
+    let temp = tempdir().unwrap();
+    let source = write_bundle(&temp.path().join("source"), "example", "text");
+    let project = project_dir(&temp.path().join("project"));
+    let sources = [SkillSource::new(&source)];
+    let target = project.join(".agents/skills/example");
+    let installer = SkillInstaller::for_provider("codex", SkillConflict::Skip).unwrap();
+    assert_eq!(
+        installer.install(&sources, Some(&project)).unwrap(),
+        vec![target.clone()]
+    );
+    // Skip keeps the installed copy even when the source changed.
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: example\ndescription: Test skill\n---\nupdated\n",
+    )
+    .unwrap();
+    assert_eq!(
+        installer.install(&sources, Some(&project)).unwrap(),
+        Vec::<PathBuf>::new()
+    );
+    assert!(!std::fs::read_to_string(target.join("SKILL.md"))
+        .unwrap()
+        .contains("updated"));
+    // Replace swaps the bundle wholesale.
+    let replace = SkillInstaller::for_provider("codex", SkillConflict::Replace).unwrap();
+    assert_eq!(
+        replace.install(&sources, Some(&project)).unwrap(),
+        vec![target.clone()]
+    );
+    assert!(std::fs::read_to_string(target.join("SKILL.md"))
+        .unwrap()
+        .contains("updated"));
+    // Append installs the next free name-N and rewrites the front-matter name.
+    let append = SkillInstaller::for_provider("codex", SkillConflict::Append).unwrap();
+    assert_eq!(
+        append.install(&sources, Some(&project)).unwrap(),
+        vec![project.join(".agents/skills/example-2")]
+    );
+    assert!(
+        std::fs::read_to_string(project.join(".agents/skills/example-2/SKILL.md"))
+            .unwrap()
+            .contains("name: example-2")
+    );
+    assert!(!has_stage_dir(&project));
+}
+#[test]
+fn installer_normalizes_a_dsh_flat_bundle_into_a_directory_bundle() {
+    let temp = tempdir().unwrap();
+    let document = write_flat_document(
+        &temp.path().join("source"),
+        "flat-skill.md",
+        Some("flat-skill"),
+    );
+    let project = project_dir(&temp.path().join("project"));
+    let installed = install_for_provider(
+        &[SkillSource::new(&document)],
+        "dsh",
+        Some(&project),
+        SkillConflict::Skip,
+    )
+    .unwrap();
+    let bundle = project.join(".dsh/skills/flat-skill");
+    assert_eq!(installed, vec![bundle.clone()]);
+    assert!(bundle.join("SKILL.md").is_file());
+    assert!(!project.join(".dsh/skills/flat-skill.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("SKILL.md")).unwrap(),
+        std::fs::read_to_string(&document).unwrap()
+    );
+}
+#[test]
+fn installer_rejects_flat_documents_for_the_directory_layouts() {
+    let temp = tempdir().unwrap();
+    let document = write_flat_document(
+        &temp.path().join("source"),
+        "flat-skill.md",
+        Some("flat-skill"),
+    );
+    let project = project_dir(&temp.path().join("project"));
+    for provider in ["claudecode", "codex"] {
+        let error = install_for_provider(
+            &[SkillSource::new(&document)],
+            provider,
+            Some(&project),
+            SkillConflict::Skip,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        assert_eq!(
+            error.message().as_ref(),
+            format!("the {provider} skill layout requires a SKILL.md directory bundle")
+        );
+    }
+    assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
+}
+#[test]
+fn installer_rejects_a_non_kebab_dsh_name_without_creating_the_directory() {
+    let temp = tempdir().unwrap();
+    let project = project_dir(&temp.path().join("project"));
+    let document = write_flat_document(&temp.path().join("flat"), "My_Skill.md", None);
+    let error = install_for_provider(
+        &[SkillSource::new(&document)],
+        "dsh",
+        Some(&project),
+        SkillConflict::Skip,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message().as_ref(),
+        "DSH skill names must be kebab-case: 'My_Skill'"
+    );
+    let bundle = write_bundle(&temp.path().join("bundle"), "My_Skill", "text");
+    let error = install_for_provider(
+        &[SkillSource::new(&bundle)],
+        "dsh",
+        Some(&project),
+        SkillConflict::Skip,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message().as_ref(),
+        "DSH skill names must be kebab-case: 'My_Skill'"
+    );
+    assert!(!project.join(".dsh").exists());
+    assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
+}
+#[test]
+fn installer_with_an_unknown_provider_does_no_filesystem_work() {
+    let temp = tempdir().unwrap();
+    let source = write_bundle(&temp.path().join("source"), "example", "text");
+    let project = project_dir(&temp.path().join("project"));
+    let error = install_for_provider(
+        &[SkillSource::new(&source)],
+        "native",
+        Some(&project),
+        SkillConflict::Skip,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message().as_ref(),
+        "unknown skill provider 'native'; expected one of claudecode, codex, dsh"
+    );
+    assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
+    let error = SkillInstaller::for_provider("claude-code", SkillConflict::Skip).unwrap_err();
+    assert_eq!(
+        error.message().as_ref(),
+        "unknown skill provider 'claude-code'; expected one of claudecode, codex, dsh"
+    );
+}
+#[test]
+fn installer_resolves_the_names_the_vendor_harnesses_install_with() {
+    // Wiring check: `providers::{claudecode,codex,dsh}/harness.rs` call
+    // `install_for_provider(&sources, "<registry name>", Some(&project), conflict)`, so every
+    // literal provider string used there must resolve to a vendor installer.
+    let temp = tempdir().unwrap();
+    let project = project_dir(&temp.path().join("project"));
+    for provider in ["claudecode", "codex", "dsh"] {
+        let installer = SkillInstaller::for_provider(provider, SkillConflict::Skip).unwrap();
+        assert_eq!(skill_scan_dir(provider), Some(installer.scan_dir()));
+        assert_eq!(
+            install_for_provider(&[], provider, Some(&project), SkillConflict::Skip).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+    assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
 }

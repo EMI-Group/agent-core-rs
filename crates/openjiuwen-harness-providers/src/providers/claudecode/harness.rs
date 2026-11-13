@@ -80,7 +80,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::input::harness_input_text;
-use crate::skills::install_skills;
+use crate::skills::install_for_provider;
 use crate::vendor_cli::{
     checkpoint_str, derive_session_id, failed_turn, interrupted_turn, resolve_resume_id,
     turn_error, ChildProcess, ChildProcessConfig, PermissionPolicy, TurnContext, TurnRequest,
@@ -394,7 +394,7 @@ impl VendorDriver for ClaudeDriver {
             let conflict = self.config.skill_conflict;
             let project = cwd.clone().unwrap_or_else(|| PathBuf::from("."));
             let installed = tokio::task::spawn_blocking(move || {
-                install_skills(&sources, "claudecode", &project, conflict)
+                install_for_provider(&sources, "claudecode", Some(&project), conflict)
             })
             .await
             .map_err(|error| {

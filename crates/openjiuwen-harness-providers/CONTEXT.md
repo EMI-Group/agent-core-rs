@@ -34,6 +34,7 @@ Helpers (flat re-exports):
 - `to_json_object(&JsonValue) -> JsonObject`, `to_json_safe(&JsonValue) -> JsonValue`.
 - `mcp_tool_naming_preamble(&BTreeMap<String, String>) -> String`, `TOOL_PLACEHOLDER` (`"{tool}"`).
 - Skills: `SkillSource`, `SkillMode` (`all`/`auto_list`), `SkillConflict` (`skip`/`replace`/`append`), `normalize_skills`, `install_skills`, `skill_scan_dir(provider)`.
+- `SkillInstaller` / `SkillLayout` / `install_for_provider` — the per-vendor policy over `install_skills`: `for_provider("claudecode"|"codex"|"dsh", conflict)`, `provider()`, `scan_dir()`, `layout()`, `install(sources, cwd)`, `validate_name(name)`; `SkillLayout::{Directory, DirectoryOrFlat}` (`.dsh` accepts a flat `*.md` source root and normalizes it into `<scan>/<name>/SKILL.md`), and the name rule is the shared portable rule for Claude/Codex but kebab-case for `dsh`.
 - `providers_error_to_common(HarnessError) -> openjiuwen_common::error::Error` (module `error`).
 
 Shared vendor CLI transport (module `vendor_cli`, foundation for the three CLI adapters):
@@ -82,7 +83,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, team-hosted `native_v2/` (`mod.rs` provider+config+card, `driver.rs` `VendorDriver` over `TeamAgent`), vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter/` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler` (`mod.rs`), event→chunk projection (`projection.rs`), interaction routing and the pending map (`interactions.rs`), host-answer parsing (`answers.rs`)
 - `./src/vendor_cli/` → shared vendor CLI transport and harness shell: binary resolution, NDJSON helpers, the child process, the JSON-RPC client, the observation bus, host permission translation, session-id derivation, the `VendorDriver` seam and `VendorHarness`
-- `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
+- `./src/skills/` → `mod.rs` (bundle discovery, conflict policies, portable install) + `installer.rs` (`SkillInstaller`, `SkillLayout`, per-vendor name rules, flat-`*.md` normalization)
 - `./src/decode.rs` → strict JSON mapping helpers shared by factory + vendor configs (unknown-key rejection, typed option decoding)
 - `./src/error.rs` → `HarnessError` → `openjiuwen_common::error::Error` translation
 - `./src/input.rs` → `harness_input_text`, `to_harness_input`, chunk/interaction kind constants

@@ -69,7 +69,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::input::harness_input_text;
-use crate::skills::install_skills;
+use crate::skills::install_for_provider;
 use crate::vendor_cli::{
     ChildProcess, ChildProcessConfig, JsonRpcClient, RpcTransport, TurnContext, TurnRequest,
     VendorDriver,
@@ -196,7 +196,7 @@ impl DshDriver {
         let conflict = self.config.skill_conflict;
         let project = wire::skills_cwd(&self.config, context);
         let installed = tokio::task::spawn_blocking(move || {
-            install_skills(&sources, PROVIDER_EVENT_NAME, &project, conflict)
+            install_for_provider(&sources, "dsh", Some(&project), conflict)
         })
         .await
         .map_err(|error| {
