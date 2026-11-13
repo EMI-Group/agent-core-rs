@@ -64,6 +64,12 @@ pub enum ToolExecution {
 /// default, and an entirely empty object deserializes to [`ToolCard::default`]
 /// (with a freshly generated id).
 ///
+/// The serialized key set matches Python for a default card: `id`, `name`,
+/// `description`, `input_params`, `properties`, `exposure`, `execution`,
+/// `parallel_safe`, `stateless`, `idempotent`. The Rust-only extensions
+/// `version` and `metadata` are omitted while they are unset, so a default card
+/// serializes to exactly the Python key set.
+///
 /// Cards are immutable after construction: the `with_*` builders consume and
 /// return the card, and no accessor hands out `&mut`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -78,6 +84,14 @@ pub struct ToolCard {
     pub description: String,
     /// JSON Schema of the accepted arguments; `{}` when unset.
     pub input_params: Value,
+    /// Free-form, program-only properties carried with the card; `{}` when
+    /// unset.
+    ///
+    /// Python parity: `properties: Dict[str, Any] = Field(default_factory=dict)`.
+    /// Registration and discovery bookkeeping lives here; the map never enters
+    /// the model-facing [`ToolInfo`] projection.
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
     /// Whether the tool is exposed directly or deferred behind tool search.
     pub exposure: ToolExposure,
     /// Whether the runtime or the connected client executes the call.
@@ -91,19 +105,23 @@ pub struct ToolCard {
     /// Optional version string of the tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Free-form metadata attached to the card.
+    /// Free-form metadata attached to the card; omitted when empty so a default
+    /// card serializes to exactly the Python key set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, Value>,
 }
 
 impl Default for ToolCard {
-    /// Python defaults: a fresh `uuid4().hex` id, empty name/description and
-    /// input schema, `direct`/`server` policy, parallel-safe and stateful.
+    /// Python defaults: a fresh `uuid4().hex` id, empty name/description,
+    /// input schema and properties, `direct`/`server` policy, parallel-safe and
+    /// stateful.
     fn default() -> Self {
         Self {
             id: uuid_hex(),
             name: String::new(),
             description: String::new(),
             input_params: json!({}),
+            properties: BTreeMap::new(),
             exposure: ToolExposure::Direct,
             execution: ToolExecution::Server,
             parallel_safe: true,
@@ -157,6 +175,13 @@ impl ToolCard {
     #[must_use]
     pub fn with_input_params(mut self, input_params: Value) -> Self {
         self.input_params = input_params;
+        self
+    }
+
+    /// Returns this card with `properties`, replacing the previous map.
+    #[must_use]
+    pub fn with_properties(mut self, properties: BTreeMap<String, Value>) -> Self {
+        self.properties = properties;
         self
     }
 
@@ -374,6 +399,7 @@ mod tests {
         assert_eq!(first.name, "");
         assert_eq!(first.description, "");
         assert_eq!(first.input_params, json!({}));
+        assert!(first.properties.is_empty());
         assert_eq!(first.exposure, ToolExposure::Direct);
         assert_eq!(first.execution, ToolExecution::Server);
         assert!(first.parallel_safe);
@@ -381,6 +407,99 @@ mod tests {
         assert!(!first.idempotent);
         assert_eq!(first.version, None);
         assert!(first.metadata.is_empty());
+    }
+
+    #[test]
+    fn default_card_serializes_exactly_the_python_key_set() {
+        let json = serde_json::to_value(ToolCard::default()).unwrap();
+        let object = json.as_object().unwrap();
+
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "id",
+                "name",
+                "description",
+                "input_params",
+                "properties",
+                "exposure",
+                "execution",
+                "parallel_safe",
+                "stateless",
+                "idempotent",
+            ]),
+            "a default card must serialize to the Python key set exactly"
+        );
+
+        let id = object["id"].as_str().unwrap();
+        assert_eq!(id.len(), 32, "the id is Python's uuid4().hex form");
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(object["name"], json!(""));
+        assert_eq!(object["description"], json!(""));
+        assert_eq!(object["input_params"], json!({}));
+        assert_eq!(object["properties"], json!({}));
+        assert_eq!(object["exposure"], json!("direct"));
+        assert_eq!(object["execution"], json!("server"));
+        assert_eq!(object["parallel_safe"], json!(true));
+        assert_eq!(object["stateless"], json!(false));
+        assert_eq!(object["idempotent"], json!(false));
+        assert!(
+            object.get("version").is_none(),
+            "an unset version must be omitted"
+        );
+        assert!(
+            object.get("metadata").is_none(),
+            "an empty metadata map must be omitted"
+        );
+    }
+
+    #[test]
+    fn card_round_trips_python_shaped_json() {
+        let wire = json!({
+            "id": "abc",
+            "name": "t",
+            "description": "d",
+            "input_params": {"type": "object"},
+            "properties": {"x": 1},
+            "exposure": "deferred",
+            "execution": "client",
+            "parallel_safe": false,
+            "stateless": true,
+            "idempotent": true,
+            "version": "1",
+            "metadata": {"k": "v"},
+            "unexpected": 42,
+        });
+
+        let card: ToolCard = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(card.id, "abc");
+        assert_eq!(card.name, "t");
+        assert_eq!(card.description, "d");
+        assert_eq!(card.input_params, json!({"type": "object"}));
+        assert_eq!(card.properties.len(), 1);
+        assert_eq!(card.properties["x"], json!(1));
+        assert_eq!(card.exposure, ToolExposure::Deferred);
+        assert_eq!(card.execution, ToolExecution::Client);
+        assert!(!card.parallel_safe);
+        assert!(card.stateless);
+        assert!(card.idempotent);
+        assert_eq!(card.version.as_deref(), Some("1"));
+        assert_eq!(card.metadata["k"], json!("v"));
+
+        let mut expected = wire.as_object().unwrap().clone();
+        assert!(
+            expected.remove("unexpected").is_some(),
+            "the unknown key must be dropped on the way in"
+        );
+        let reserialized = serde_json::to_value(&card).unwrap();
+        assert_eq!(Value::Object(expected), reserialized);
+
+        let again: ToolCard = serde_json::from_value(reserialized.clone()).unwrap();
+        assert_eq!(again, card);
+        assert_eq!(serde_json::to_value(&again).unwrap(), reserialized);
     }
 
     #[test]
@@ -395,6 +514,7 @@ mod tests {
         assert_eq!(json["name"], "calc");
         assert_eq!(json["description"], "does math");
         assert_eq!(json["input_params"], json!({"type": "object"}));
+        assert_eq!(json["properties"], json!({}));
         assert_eq!(json["exposure"], "deferred");
         assert_eq!(json["execution"], "client");
         assert_eq!(json["parallel_safe"], true);
@@ -473,6 +593,66 @@ mod tests {
     }
 
     #[test]
+    fn tool_info_projection_is_the_exact_function_shape() {
+        // Python's `ToolInfo` is flat (`type`/`name`/`description`/`parameters`);
+        // the documented Rust deviation nests the function fields in the OpenAI
+        // tools shape, so the model-facing projection is asserted here as-is.
+        let input_params = json!({
+            "title": "Point",
+            "type": "object",
+            "properties": {
+                "x": {"title": "X", "type": "integer"},
+                "y": {"title": "Y", "type": "integer"},
+            },
+            "required": ["x", "y"],
+        });
+        let card = ToolCard::new("calc", "does math", input_params.clone())
+            .with_properties(BTreeMap::from([("owner".to_owned(), json!("math"))]));
+
+        let json = serde_json::to_value(card.tool_info()).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "does math",
+                    "parameters": input_params,
+                },
+            }),
+            "the projection carries exactly type/function(name, description, parameters)"
+        );
+        assert!(
+            !json.to_string().contains("owner"),
+            "properties are program-only and never reach the model"
+        );
+        assert_eq!(
+            card.openai_tool(),
+            json,
+            "openai_tool must stay byte-identical to the ToolInfo projection"
+        );
+    }
+
+    #[test]
+    fn tool_info_keeps_a_pydantic_model_shaped_input_params() {
+        // Python's `input_params` may be a `BaseModel` subclass; its JSON form is
+        // the model-dumped schema, which must pass through unchanged.
+        let dumped = json!({
+            "title": "WeatherArgs",
+            "type": "object",
+            "properties": {
+                "city": {"title": "City", "type": "string"},
+                "days": {"default": 1, "title": "Days", "type": "integer"},
+            },
+            "required": ["city"],
+        });
+        let card = ToolCard::new("weather", "looks up the weather", dumped.clone());
+
+        assert_eq!(card.tool_info().function.parameters, dumped);
+        assert_eq!(card.openai_tool()["function"]["parameters"], dumped);
+    }
+
+    #[test]
     fn policy_flags_serialize_with_no_hidden_fields() {
         let deferred = ToolCard::new("t", "", json!({}))
             .with_exposure(ToolExposure::Deferred)
@@ -502,12 +682,15 @@ mod tests {
     fn builders_override_every_field() {
         let mut metadata = BTreeMap::new();
         metadata.insert("owner".to_owned(), json!("math-team"));
+        let mut properties = BTreeMap::new();
+        properties.insert("registry".to_owned(), json!("kernel"));
 
         let card = ToolCard::new("a", "b", json!({}))
             .with_id("id")
             .with_name("renamed")
             .with_description("described")
             .with_input_params(json!({"type": "string"}))
+            .with_properties(properties)
             .with_exposure(ToolExposure::Deferred)
             .with_execution(ToolExecution::Client)
             .with_parallel_safe(false)
@@ -521,6 +704,7 @@ mod tests {
         assert_eq!(card.name, "renamed");
         assert_eq!(card.description, "described");
         assert_eq!(card.input_params, json!({"type": "string"}));
+        assert_eq!(card.properties["registry"], json!("kernel"));
         assert_eq!(card.exposure, ToolExposure::Deferred);
         assert_eq!(card.execution, ToolExecution::Client);
         assert!(!card.parallel_safe);
