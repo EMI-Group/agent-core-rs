@@ -9,10 +9,17 @@
 //!   `Qwen`/`DashScope`, `DeepSeek`, `Moonshot`, `OpenRouter`, `Ollama`,
 //!   `LM Studio`, ...).
 //! - [`anthropic`] — Anthropic Messages client.
+//! - [`reasoning`] — per-family reasoning/thinking profiles, capabilities, and
+//!   the wire encoders that turn a [`ReasoningConfig`] into request parameters.
+//! - [`routing`] — `IntelliRouter` model groups, route compilation, and the
+//!   failover [`RoutingModel`].
+//! - [`oauth`] — `OpenAI` account device-authorization and token storage.
+//! - [`dashscope`] — `DashScope` image, speech, and video generation over HTTP.
 //!
 //! The module root re-exports the types call sites need most: the configs, the
 //! [`Model`] trait and its response types, both clients, the provider registry,
-//! and [`init_model`]/[`init_model_with`].
+//! [`init_model`]/[`init_model_with`], and the reasoning/routing/oauth/media
+//! entry points.
 
 pub mod anthropic;
 pub mod config;
@@ -30,16 +37,32 @@ pub(crate) mod transport;
 
 pub use anthropic::AnthropicClient;
 pub use config::{ModelClientConfig, ModelRequestConfig};
+pub use dashscope::{
+    AudioGenerationResponse, DashScopeConfig, DashScopeMediaClient, ImageGenerationResponse,
+    ImageRequest, SpeechRequest, VideoGenerationResponse, VideoRequest,
+};
 pub use factory::{init_model, init_model_with};
 pub use model::{
     AssistantTurn, ChatResponse, Choice, FinishReason, Model, ModelExt, StreamAccumulator,
     StreamChunk,
 };
+pub use oauth::{
+    DeviceCode, FileTokenStore, InMemoryTokenStore, OAuthToken, OpenAiOAuthClient, TokenStore,
+};
 pub use openai::OpenAiCompatibleClient;
 pub use provider::{
     normalize_provider_name, provider_profile, ProviderFlavor, ProviderProfile, ANTHROPIC_VERSION,
 };
+pub use reasoning::{
+    apply_reasoning_plan, apply_reasoning_plan_with, find_reasoning_profile,
+    resolve_reasoning_plan, ReasoningCapability, ReasoningConfig, ReasoningMode, ReasoningPlan,
+    ReasoningProfile, ReasoningProtocol,
+};
 pub use registry::{
     register_builtin_providers, register_model_provider, ModelProvider, ModelProviderRegistry,
+};
+pub use routing::{
+    compile_model_selection, CompiledModelSelection, ModelSelection, ResolvedModel,
+    ResolvedModelGroup, ResolvedRoute, ResolvedRoutingConfig, RoutingModel, RoutingStrategy,
 };
 pub use sse::{SseDecoder, SseEvent};
