@@ -14,15 +14,19 @@
 //! [`fact`](self)); [`CodingFact::from_record`] identifies coding records by their
 //! `coding_fact` marker and metadata `name`.
 //!
-//! # Deviations from the Python lite stack
+//! # Two paths
 //!
-//! - There is no Markdown file source of truth and no SQLite FTS5/`sqlite_vec` index:
-//!   facts are engine records and keyword recall comes from the engine's BM25 path.
-//! - There are no filesystem watchers, no cross-process rebuild lock, and no
-//!   embedding cache: [`CodingMemory::render_index`] returns a string and the caller
-//!   decides where to write it.
-//! - The instance is an explicit `Arc<CodingMemory>` over an injected engine, not a
-//!   process-global singleton.
+//! - [`CodingMemory`] is the engine-backed path: facts are ordinary engine records, and
+//!   [`CodingMemory::render_index`]/[`CodingMemory::citation`] return strings, so the
+//!   caller decides where to materialize `MEMORY.md`.
+//! - [`local`] adds the local, file-backed path: [`LocalCodingMemory`](local::LocalCodingMemory)
+//!   owns a Markdown source of truth ([`markdown`]), a derived SQLite FTS5 index
+//!   (`fts`, feature `sqlite`), a cross-process advisory lock ([`lock`]), and a
+//!   debounced filesystem watcher ([`watch`]).
+//!
+//! Both paths are explicit instances (`Arc<CodingMemory>`, cloned `LocalCodingMemory`
+//! handles) over injected state, never process-global singletons. The remainder of the
+//! Python lite stack that is not ported is listed in this module's `CONTEXT.md`.
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
@@ -39,6 +43,22 @@ mod fact;
 mod index;
 
 pub use fact::{CodingFact, CodingFactType};
+
+/// The lite memory's Markdown source of truth and its parse/render round trip.
+pub mod markdown;
+
+/// Cross-process advisory locking for the local Markdown/index pair.
+pub mod lock;
+
+/// Filesystem watching for externally edited Markdown memory files.
+pub mod watch;
+
+/// The local, file-backed coding-memory store (Markdown + derived index).
+pub mod local;
+
+/// SQLite FTS5 full-text index over coding facts (feature `sqlite`).
+#[cfg(feature = "sqlite")]
+pub mod fts;
 
 /// The tracing target of lite-memory diagnostics.
 const TARGET: &str = "openjiuwen_memory::lite";

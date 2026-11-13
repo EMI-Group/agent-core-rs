@@ -28,8 +28,10 @@ use openjiuwen_foundation::store::{
 use openjiuwen_foundation::store::{SqliteDocumentStore, SqliteKvStore};
 
 pub mod keys;
+pub mod migration;
 
 mod json;
+mod legacy;
 mod messages;
 mod storage;
 

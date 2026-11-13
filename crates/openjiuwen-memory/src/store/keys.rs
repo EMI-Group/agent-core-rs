@@ -16,6 +16,28 @@
 //! rejects `/` in `scope_id`/`session_id`, and the user id is kept verbatim so the
 //! Python-compatible layout stays inspectable.
 //!
+//! # Legacy key layout
+//!
+//! Python's `KvPrefixRegistry` (`core/memory/common/kv_prefix_registry.py`) tracks a
+//! *current* and a *legacy* prefix per memory data family so a renamed keyspace stays
+//! discoverable. Python v0.1.20 registers **no** legacy prefix (`UserMemStore.
+//! LEGACY_PREFIXES` and `VariableManager.LEGACY_PREFIXES` are both `[]`), so the
+//! compatibility seam below is declared here explicitly rather than ported:
+//!
+//! | data family | current prefix | legacy prefix |
+//! | --- | --- | --- |
+//! | records | [`RECORD_PREFIX`] (`UMD`) | [`LEGACY_RECORD_PREFIX`] (`user_mem`) |
+//! | user variables | [`VARIABLE_PREFIX`] (`user_var`) | [`LEGACY_VARIABLE_PREFIX`] (`user_variable`) |
+//! | session variables | [`SESSION_VARIABLE_PREFIX`] (`session_var`) | [`LEGACY_SESSION_VARIABLE_PREFIX`] (`session_variable`) |
+//! | scope config | [`SCOPE_CONFIG_PREFIX`] (`memory_scope_config`) | [`LEGACY_SCOPE_CONFIG_PREFIX`] (`scope_config`) |
+//!
+//! The legacy layout has the same shape as the current one, only the first segment
+//! differs (`user_mem/{user}/{scope}/{id}`, and so on). **Precedence rule: writes always
+//! use the current layout; legacy keys are read-only compatibility.** A legacy key is
+//! consulted only when the current key is absent, and deletes remove both variants.
+//! [`legacy_alternatives`] derives the legacy candidates of a current key or prefix, and
+//! [`current_equivalent`] maps back for diagnostics.
+//!
 //! [`MemoryScope::validate`]: crate::record::MemoryScope::validate
 
 use crate::record::{MemoryScope, MemoryType};
@@ -30,6 +52,26 @@ pub const SESSION_VARIABLE_PREFIX: &str = "session_var";
 pub const SCOPE_CONFIG_PREFIX: &str = "memory_scope_config";
 /// Document collection holding conversation messages.
 pub const MESSAGES_COLLECTION: &str = "messages";
+
+/// Legacy KV namespace prefix of memory records (`UMD` superseded `user_mem`).
+pub const LEGACY_RECORD_PREFIX: &str = "user_mem";
+/// Legacy KV namespace prefix of user-scoped variables.
+pub const LEGACY_VARIABLE_PREFIX: &str = "user_variable";
+/// Legacy KV namespace prefix of session-scoped variables.
+pub const LEGACY_SESSION_VARIABLE_PREFIX: &str = "session_variable";
+/// Legacy KV namespace prefix of per-scope configuration.
+pub const LEGACY_SCOPE_CONFIG_PREFIX: &str = "scope_config";
+
+/// The single `(current, legacy)` prefix table every legacy helper reads.
+///
+/// Keeping one table makes the two mapping directions ([`legacy_prefix`] and
+/// [`current_prefix`]) impossible to drift apart.
+const LEGACY_PREFIX_PAIRS: &[(&str, &str)] = &[
+    (RECORD_PREFIX, LEGACY_RECORD_PREFIX),
+    (VARIABLE_PREFIX, LEGACY_VARIABLE_PREFIX),
+    (SESSION_VARIABLE_PREFIX, LEGACY_SESSION_VARIABLE_PREFIX),
+    (SCOPE_CONFIG_PREFIX, LEGACY_SCOPE_CONFIG_PREFIX),
+];
 
 /// The 32-bit FNV-1a offset basis.
 const FNV1A_32_OFFSET_BASIS: u32 = 0x811c_9dc5;
@@ -102,6 +144,130 @@ pub fn session_variable_prefix(scope: &MemoryScope, session_id: &str) -> String 
 #[must_use]
 pub fn scope_config_key(scope_id: &str) -> String {
     format!("{SCOPE_CONFIG_PREFIX}/{scope_id}")
+}
+
+/// Legacy key of one record: `user_mem/{user_id}/{scope_id}/{id}`.
+#[must_use]
+pub fn legacy_record_key(scope: &MemoryScope, id: &str) -> String {
+    format!(
+        "{LEGACY_RECORD_PREFIX}/{}/{}/{id}",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key prefix of every record in `scope`: `user_mem/{user_id}/{scope_id}/`.
+#[must_use]
+pub fn legacy_record_prefix(scope: &MemoryScope) -> String {
+    format!(
+        "{LEGACY_RECORD_PREFIX}/{}/{}/",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key prefix of every record of `user_id`: `user_mem/{user_id}/`.
+#[must_use]
+pub fn legacy_record_prefix_for(user_id: &str) -> String {
+    format!("{LEGACY_RECORD_PREFIX}/{user_id}/")
+}
+
+/// Legacy record prefix of every record with `_scope_id`: `user_mem/`.
+///
+/// As in [`record_prefix_for_scope`], the scope id is not part of the key ahead of the
+/// user id, so the whole legacy record namespace is scanned and filtered afterwards.
+#[must_use]
+pub fn legacy_record_prefix_for_scope(_scope_id: &str) -> String {
+    format!("{LEGACY_RECORD_PREFIX}/")
+}
+
+/// Legacy key of one user-scoped variable:
+/// `user_variable/{user_id}/{scope_id}/{name}`.
+#[must_use]
+pub fn legacy_variable_key(scope: &MemoryScope, name: &str) -> String {
+    format!(
+        "{LEGACY_VARIABLE_PREFIX}/{}/{}/{name}",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key prefix of every user-scoped variable in `scope`.
+#[must_use]
+pub fn legacy_variable_prefix(scope: &MemoryScope) -> String {
+    format!(
+        "{LEGACY_VARIABLE_PREFIX}/{}/{}/",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key of one session-scoped variable:
+/// `session_variable/{user_id}/{scope_id}/{session_id}/{name}`.
+#[must_use]
+pub fn legacy_session_variable_key(scope: &MemoryScope, session_id: &str, name: &str) -> String {
+    format!(
+        "{LEGACY_SESSION_VARIABLE_PREFIX}/{}/{}/{session_id}/{name}",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key prefix of every session-scoped variable of `session_id`.
+#[must_use]
+pub fn legacy_session_variable_prefix(scope: &MemoryScope, session_id: &str) -> String {
+    format!(
+        "{LEGACY_SESSION_VARIABLE_PREFIX}/{}/{}/{session_id}/",
+        scope.user_id, scope.scope_id
+    )
+}
+
+/// Legacy key of the configuration of `scope_id`: `scope_config/{scope_id}`.
+#[must_use]
+pub fn legacy_scope_config_key(scope_id: &str) -> String {
+    format!("{LEGACY_SCOPE_CONFIG_PREFIX}/{scope_id}")
+}
+
+/// Legacy keys to try when a current-layout key or prefix misses.
+///
+/// The key is split at its first `/`; when the head is a current prefix the same key
+/// with the legacy head is returned, otherwise the result is empty. Because a prefix
+/// ends with `/` the identical first-segment rewrite works for point keys and for
+/// prefixes. Returns one candidate per matching family.
+#[must_use]
+pub fn legacy_alternatives(key: &str) -> Vec<String> {
+    let Some((head, rest)) = key.split_once('/') else {
+        return Vec::new();
+    };
+    match legacy_prefix(head) {
+        Some(legacy) => vec![format!("{legacy}/{rest}")],
+        None => Vec::new(),
+    }
+}
+
+/// The current-layout equivalent of a legacy key or prefix, for diagnostics.
+///
+/// The exact inverse of [`legacy_alternatives`]: the legacy head is replaced by its
+/// current counterpart and the rest is preserved. `None` for an unknown or head-only
+/// key.
+#[must_use]
+pub fn current_equivalent(key: &str) -> Option<String> {
+    let (head, rest) = key.split_once('/')?;
+    let current = current_prefix(head)?;
+    Some(format!("{current}/{rest}"))
+}
+
+/// The legacy prefix registered for a current prefix, when one exists.
+#[must_use]
+pub fn legacy_prefix(current_prefix: &str) -> Option<&'static str> {
+    LEGACY_PREFIX_PAIRS
+        .iter()
+        .find(|(current, _)| *current == current_prefix)
+        .map(|(_, legacy)| *legacy)
+}
+
+/// The current prefix that supersedes a legacy prefix, when one exists.
+#[must_use]
+pub fn current_prefix(legacy_prefix: &str) -> Option<&'static str> {
+    LEGACY_PREFIX_PAIRS
+        .iter()
+        .find(|(_, legacy)| *legacy == legacy_prefix)
+        .map(|(current, _)| *current)
 }
 
 /// Name of the vector collection of one `(scope, kind)` pair.
@@ -200,6 +366,93 @@ mod tests {
     #[test]
     fn scope_config_key_is_scope_wide() {
         assert_eq!(scope_config_key("ws"), "memory_scope_config/ws");
+    }
+
+    #[test]
+    fn legacy_keys_mirror_the_current_shapes() {
+        assert_eq!(
+            legacy_record_key(&scope(), "abc123"),
+            "user_mem/alice/ws/abc123"
+        );
+        assert_eq!(legacy_record_prefix(&scope()), "user_mem/alice/ws/");
+        assert_eq!(legacy_record_prefix_for("bob"), "user_mem/bob/");
+        assert_eq!(legacy_record_prefix_for_scope("ws"), "user_mem/");
+        assert_eq!(
+            legacy_variable_key(&scope(), "theme"),
+            "user_variable/alice/ws/theme"
+        );
+        assert_eq!(legacy_variable_prefix(&scope()), "user_variable/alice/ws/");
+        assert_eq!(
+            legacy_session_variable_key(&scope(), "s1", "theme"),
+            "session_variable/alice/ws/s1/theme"
+        );
+        assert_eq!(
+            legacy_session_variable_prefix(&scope(), "s1"),
+            "session_variable/alice/ws/s1/"
+        );
+        assert_eq!(legacy_scope_config_key("ws"), "scope_config/ws".to_owned());
+    }
+
+    #[test]
+    fn legacy_alternatives_rewrite_only_the_first_segment() {
+        assert_eq!(
+            legacy_alternatives("UMD/alice/ws/abc"),
+            ["user_mem/alice/ws/abc"]
+        );
+        assert_eq!(legacy_alternatives("UMD/alice/ws/"), ["user_mem/alice/ws/"]);
+        assert_eq!(
+            legacy_alternatives("UMD/bob/"),
+            ["user_mem/bob/".to_owned()]
+        );
+        // A current head without a rest still maps, and an empty rest is preserved.
+        assert_eq!(
+            legacy_alternatives("user_var/alice/ws"),
+            ["user_variable/alice/ws"]
+        );
+        assert_eq!(
+            legacy_alternatives("session_var/alice/ws/s1/"),
+            ["session_variable/alice/ws/s1/".to_owned()]
+        );
+        assert_eq!(
+            legacy_alternatives("memory_scope_config/ws"),
+            ["scope_config/ws"]
+        );
+        for unknown in ["other/x", "UMD", ""] {
+            assert_eq!(legacy_alternatives(unknown), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn current_equivalent_inverts_legacy_alternatives() {
+        for key in [
+            "UMD/alice/ws/abc",
+            "UMD/alice/ws/",
+            "user_var/alice/ws/theme",
+            "session_var/alice/ws/s1/theme",
+            "memory_scope_config/ws",
+        ] {
+            let legacy = legacy_alternatives(key);
+            assert_eq!(legacy.len(), 1, "{key}");
+            assert_eq!(current_equivalent(&legacy[0]), Some(key.to_owned()));
+        }
+        assert_eq!(current_equivalent("unknown/x"), None);
+        assert_eq!(current_equivalent("user_mem"), None);
+        assert_eq!(current_equivalent(""), None);
+    }
+
+    #[test]
+    fn prefix_tables_map_both_directions() {
+        assert_eq!(legacy_prefix("UMD"), Some("user_mem"));
+        assert_eq!(legacy_prefix("user_var"), Some("user_variable"));
+        assert_eq!(current_prefix("scope_config"), Some("memory_scope_config"));
+        assert_eq!(current_prefix("session_variable"), Some("session_var"));
+        assert_eq!(legacy_prefix("user_mem"), None);
+        assert_eq!(current_prefix("UMD"), None);
+        assert_eq!(legacy_prefix(""), None);
+        for (current, legacy) in LEGACY_PREFIX_PAIRS {
+            assert_eq!(legacy_prefix(current), Some(*legacy));
+            assert_eq!(current_prefix(legacy), Some(*current));
+        }
     }
 
     #[test]

@@ -8,6 +8,12 @@
 //! No ranking, extraction, or engine policy lives here; the module only derives keys,
 //! serializes values, and propagates store errors (a missing key/collection is never an
 //! error, it is `None`/`false`/`0`/empty).
+//!
+//! Writes always use the current key layout (`keys`). The legacy key layout is
+//! read-only compatibility: reads fall back to it only when the current key is absent
+//! and deletes remove both variants, while the fallback mechanics themselves live in
+//! `super::legacy`. A legacy hit is logged at debug level and never migrated
+//! implicitly; see the `keys` module docs for the family mapping.
 
 use std::collections::BTreeMap;
 
@@ -22,6 +28,7 @@ use crate::record::{MemoryFilter, MemoryRecord, MemoryScope, MemoryType};
 
 use super::json;
 use super::keys;
+use super::legacy;
 use super::MemoryStores;
 
 /// The `id` field of a vector collection.
@@ -58,27 +65,33 @@ impl MemoryStorage {
     ///
     /// A stored value that is not UTF-8 text or not a valid record JSON is reported as
     /// `Error::Validation`: unlike a listing, a point read must not hide corruption.
+    /// The current key wins; a record stored under the legacy layout is read only when
+    /// the current key is absent.
     pub(crate) async fn get_record(
         &self,
         scope: &MemoryScope,
         id: &str,
     ) -> Result<Option<MemoryRecord>> {
         let key = keys::record_key(scope, id);
-        let Some(value) = self.stores.kv.get(&key).await? else {
+        let Some((found, text)) = legacy::read_text(self.stores.kv.as_ref(), key).await? else {
             return Ok(None);
         };
-        let Some(text) = value.as_str() else {
-            return Err(Error::validation(format!(
-                "stored memory record `{key}` is not UTF-8 text"
-            )));
-        };
-        json::record_from_text(text).map(Some)
+        json::record_from_text(&text)
+            .map_err(|error| {
+                Error::validation(format!(
+                    "stored memory record `{found}` is not a valid record: {error}"
+                ))
+            })
+            .map(Some)
     }
 
     /// Lists every record matching `filter`, newest first and by id ascending on ties.
     ///
     /// The scan uses the narrowest key prefix the filter allows. Malformed entries are
-    /// logged and skipped: one corrupt record must not fail a whole listing.
+    /// logged and skipped: one corrupt record must not fail a whole listing. Records
+    /// found only under the legacy layout are appended after the current-layout scan,
+    /// and a record present in both layouts is reported once from the current one (see
+    /// `super::legacy::list_records`).
     pub(crate) async fn list_records(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
         let prefix = match (&filter.user_id, &filter.scope_id) {
             (Some(user_id), Some(scope_id)) => {
@@ -88,45 +101,16 @@ impl MemoryStorage {
             (None, Some(scope_id)) => keys::record_prefix_for_scope(scope_id),
             (None, None) => keys::record_prefix_for_scope(""),
         };
-        let entries = self.stores.kv.get_by_prefix(&prefix).await?;
-        let mut records = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            let Some(text) = value.as_str() else {
-                tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    key = %key,
-                    "skipping a stored memory record that is not UTF-8 text"
-                );
-                continue;
-            };
-            match json::record_from_text(text) {
-                Ok(record) => {
-                    if filter.matches(&record) {
-                        records.push(record);
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    key = %key,
-                    %error,
-                    "skipping a malformed stored memory record"
-                ),
-            }
-        }
-        records.sort_by(|left, right| {
-            right
-                .timestamp
-                .cmp(&left.timestamp)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(records)
+        legacy::list_records(self.stores.kv.as_ref(), &prefix, filter).await
     }
 
     /// Deletes `record` and its embedding, returning whether the record row existed.
+    ///
+    /// Both the current and the legacy key are removed; a legacy row therefore reports
+    /// `true` on its first delete and `false` afterwards.
     pub(crate) async fn delete_record(&self, record: &MemoryRecord) -> Result<bool> {
         let key = keys::record_key(&record.scope, &record.id);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
+        let existed = legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await?;
         self.delete_embedding(record).await?;
         Ok(existed)
     }
@@ -227,6 +211,8 @@ impl MemoryStorage {
     }
 
     /// Reads a text variable, or `None` when it is absent or not stored as text.
+    ///
+    /// The current key wins; the legacy key layout is consulted only when it is absent.
     pub(crate) async fn get_variable(
         &self,
         scope: &MemoryScope,
@@ -234,39 +220,28 @@ impl MemoryStorage {
         name: &str,
     ) -> Result<Option<String>> {
         let key = variable_key(scope, session_id, name);
-        let Some(value) = self.stores.kv.get(&key).await? else {
-            return Ok(None);
-        };
-        Ok(value.as_str().map(str::to_owned))
+        match legacy::read_text(self.stores.kv.as_ref(), key).await {
+            Ok(found) => Ok(found.map(|(_, text)| text)),
+            // A non-text value is "not a text variable", the documented contract here.
+            Err(Error::Validation(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists every variable of the scope namespace, keyed by variable name.
+    ///
+    /// The current namespace is scanned first; names found only under the legacy layout
+    /// are added afterwards, so a current-layout variable always wins on a name clash.
     pub(crate) async fn list_variables(
         &self,
         scope: &MemoryScope,
         session_id: Option<&str>,
     ) -> Result<BTreeMap<String, String>> {
         let prefix = variable_prefix(scope, session_id);
-        let entries = self.stores.kv.get_by_prefix(&prefix).await?;
-        let mut variables = BTreeMap::new();
-        for (key, value) in entries {
-            let Some(name) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Some(text) = value.as_str() else {
-                tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    key = %key,
-                    "skipping a memory variable that is not UTF-8 text"
-                );
-                continue;
-            };
-            variables.insert(name.to_owned(), text.to_owned());
-        }
-        Ok(variables)
+        legacy::list_variables(self.stores.kv.as_ref(), &prefix).await
     }
 
-    /// Deletes a variable, returning whether the key existed.
+    /// Deletes a variable, returning whether any of its keys existed.
     pub(crate) async fn delete_variable(
         &self,
         scope: &MemoryScope,
@@ -274,12 +249,12 @@ impl MemoryStorage {
         name: &str,
     ) -> Result<bool> {
         let key = variable_key(scope, session_id, name);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
-        Ok(existed)
+        legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await
     }
 
     /// Stores the configuration of `scope_id`, returning whether it replaced one.
+    ///
+    /// Writes only the current key: the legacy layout is read-only compatibility.
     pub(crate) async fn set_scope_config(
         &self,
         scope_id: &str,
@@ -297,6 +272,7 @@ impl MemoryStorage {
 
     /// Reads the configuration of `scope_id`, or `None` when it is absent.
     ///
+    /// The current key wins; the legacy layout is consulted only when it is absent.
     /// Stored JSON that is not a valid [`MemoryScopeConfig`] is `Error::Validation`,
     /// never a silent default.
     pub(crate) async fn get_scope_config(
@@ -304,28 +280,23 @@ impl MemoryStorage {
         scope_id: &str,
     ) -> Result<Option<MemoryScopeConfig>> {
         let key = keys::scope_config_key(scope_id);
-        let Some(value) = self.stores.kv.get(&key).await? else {
+        let Some((found, text)) = legacy::read_text(self.stores.kv.as_ref(), key).await? else {
             return Ok(None);
         };
-        let Some(text) = value.as_str() else {
-            return Err(Error::validation(format!(
-                "stored memory scope config `{scope_id}` is not UTF-8 text"
-            )));
-        };
-        let config = serde_json::from_str(text).map_err(|error| {
+        let config = serde_json::from_str(&text).map_err(|error| {
             Error::validation(format!(
-                "malformed memory scope config JSON for `{scope_id}`: {error}"
+                "malformed memory scope config JSON for `{found}`: {error}"
             ))
         })?;
         Ok(Some(config))
     }
 
     /// Deletes the configuration of `scope_id`, returning whether it existed.
+    ///
+    /// Both the current and the legacy key are removed.
     pub(crate) async fn delete_scope_config(&self, scope_id: &str) -> Result<bool> {
         let key = keys::scope_config_key(scope_id);
-        let existed = self.stores.kv.exists(&key).await?;
-        self.stores.kv.delete(&key).await?;
-        Ok(existed)
+        legacy::delete_with_legacy(self.stores.kv.as_ref(), &key).await
     }
 }
 

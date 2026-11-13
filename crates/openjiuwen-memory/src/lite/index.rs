@@ -65,7 +65,7 @@ const fn type_rank(fact_type: CodingFactType) -> u8 {
 }
 
 /// The capitalized label the index shows for a fact type.
-fn type_label(fact_type: CodingFactType) -> &'static str {
+pub(crate) fn type_label(fact_type: CodingFactType) -> &'static str {
     match fact_type.as_str() {
         "user" => "User",
         "feedback" => "Feedback",
