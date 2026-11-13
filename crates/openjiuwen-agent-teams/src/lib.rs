@@ -23,9 +23,17 @@
 //! | [`harness`] | harness-protocol adapter and native member factory |
 //! | [`skill`] | the `team-member` skill CLI and join descriptor |
 //! | [`mcp`] | the `openjiuwen-team-mcp` MCP server |
+//! | [`org`] | organisation roles, reporting lines, delegation rules, swarmflow, fork/compact |
+//! | [`models`] | model pool, router and per-member allocation |
+//! | [`kv_cache`] | KV-cache affinity identity and cleanup hooks |
+//! | [`observability`] | `OTel` hook seam (no-op without the `otel` feature) |
+//! | [`monitor`] | plain-text status stream for a live team |
+//! | [`attach`] | cross-process attach over Unix domain sockets |
 //!
-//! Everything is in-process and tokio-native; distributed transports, OS-process members and
-//! external CLI members are trait seams that return [`openjiuwen_common::error::Error::Unsupported`].
+//! Everything is in-process and tokio-native by default; OS-process, external-CLI and SSH members,
+//! git-worktree workspaces and Unix-socket attach are implemented locally (no distributed broker),
+//! while ZeroMQ/Pulsar transports and PostgreSQL/MySQL stores remain trait seams returning
+//! [`openjiuwen_common::error::Error::Unsupported`].
 //!
 //! ```
 //! use openjiuwen_agent_teams::{is_reserved_name, parse_mention, DEFAULT_LEADER_MEMBER_NAME};
@@ -38,13 +46,19 @@
 // Python package names (`agent_teams`, `team_agent`) repeat deliberately in module names.
 #![allow(clippy::module_name_repetitions)]
 
+pub mod attach;
 pub mod constants;
 pub mod experts;
 pub mod harness;
 pub mod interaction;
+pub mod kv_cache;
 pub mod mcp;
 pub mod member;
 pub mod messager;
+pub mod models;
+pub mod monitor;
+pub mod observability;
+pub mod org;
 pub mod runtime;
 pub mod schema;
 pub mod skill;
@@ -69,10 +83,7 @@ pub use experts::{
     ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation,
 };
 // --- persistence -----------------------------------------------------------
-pub use storage::{
-    open_store, InMemoryTeamStore, MemberPatch, MemberRecord, MessageRecord, TeamInfoRecord,
-    TeamStore,
-};
+pub use storage::*;
 // --- task board ------------------------------------------------------------
 pub use taskboard::{
     detect_cycle, ReviewTally, TaskBoard, TaskBoardLimits, TaskMutation, TaskOpResult,
@@ -85,10 +96,7 @@ pub use messager::{
 // --- workspaces ------------------------------------------------------------
 pub use workspace::*;
 // --- members ---------------------------------------------------------------
-pub use member::{
-    IdleDebounce, InProcessSpawnHandle, MemberActivityRegistry, MemberObserver, MemberRuntime,
-    MemberSpawnRequest, MemberSpawner, RecordingObserver, SpawnRegistry, TeamMember,
-};
+pub use member::*;
 // --- human-in-the-loop -----------------------------------------------------
 pub use interaction::{
     approval_result_event, parse_confirm, parse_interact_str, resolve_targets, ConfirmPayload,
@@ -118,6 +126,8 @@ pub use skill::{
     OperatorCommand, SendOutcome, SkillCli, StoreTeamClient, TaskCommand, TeamClient,
     TeamJoinDescriptor, TeamToolDef, ViewAction,
 };
+// --- organisation, routing, observability ----------------------------------
+// The flat re-exports for these modules are added once their public items land.
 // The protocol crate owns this type; agent-teams re-exports it so hosts can branch on member
 // state without depending on the protocol crate directly.
 pub use openjiuwen_harness_protocol::HarnessState;
