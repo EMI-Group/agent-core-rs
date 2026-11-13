@@ -8,6 +8,9 @@
 //! The module tree only compiles under `cfg(test)` (the parent `react` module
 //! gates `mod wiring`), so it runs in the crate's lib test binary.
 mod callbacks;
+mod client_tools;
+mod final_check;
+mod policy;
 mod steering;
 
 use std::sync::Arc;
