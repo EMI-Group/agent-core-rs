@@ -15,7 +15,7 @@ use openjiuwen_common::http::{HttpClient, HttpClientConfig, HttpRequest, HttpRes
 
 use crate::common::Document;
 
-use super::{extract_title, html_to_text, is_url, DocumentLoader};
+use super::{extract_title, html_to_text, is_url, DocumentBytes, DocumentLoader, LoadOptions};
 
 /// Default request timeout, matching Python's `DEFAULT_TIMEOUT = 30.0`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -144,6 +144,17 @@ impl DocumentLoader for UrlLoader {
             metadata,
         }])
     }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        _options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        Err(Error::Unsupported(format!(
+            "URL loader needs an HTTP(S) source; use load(): {}",
+            source.name
+        )))
+    }
 }
 
 /// Returns the response `Content-Type` header value when it is valid `ASCII`.
@@ -178,6 +189,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(error.to_string().contains("Not a valid HTTP URL"));
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_in_memory_bytes() {
+        let source = DocumentBytes::new("page.html", b"<p>hi</p>".to_vec());
+        let error = UrlLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("URL loader needs an HTTP(S) source; use load(): page.html"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

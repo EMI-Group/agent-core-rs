@@ -4,6 +4,10 @@
 //! parsed by [`DocxParser`] and the rendered body becomes the document text.
 //! Metadata mirrors what the Python parser keeps for a Word file plus the
 //! `dc:title` the core-properties part carries, when it is present.
+//!
+//! [`DocumentLoader::load_bytes`] runs the same parser over in-memory bytes
+//! ([`DocxParser::parse_bytes`]), so an uploaded Word file needs no temporary
+//! path and produces the identical document.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -12,9 +16,9 @@ use openjiuwen_common::error::Result;
 use openjiuwen_common::logging::debug;
 
 use crate::common::{Document, Metadata};
-use crate::parsing::DocxParser;
+use crate::parsing::{DocxDocument, DocxParser};
 
-use super::{file_extension, DocumentLoader};
+use super::{apply_load_options, file_extension, DocumentBytes, DocumentLoader, LoadOptions};
 
 /// Loads `.docx` files as one document holding the rendered body text.
 #[derive(Debug, Default, Clone, Copy)]
@@ -28,6 +32,24 @@ impl DocxLoader {
     }
 }
 
+/// Renders a parsed Word body as the single document the loader returns.
+fn document_from(document: DocxDocument) -> Document {
+    let mut metadata = Metadata::new();
+    if let Some(title) = &document.title {
+        metadata.insert("title".to_owned(), Value::String(title.clone()));
+    }
+    metadata.insert(
+        "paragraph_count".to_owned(),
+        Value::from(document.paragraph_count),
+    );
+    metadata.insert("table_count".to_owned(), Value::from(document.table_count));
+    metadata.insert(
+        "source_type".to_owned(),
+        Value::String("document".to_owned()),
+    );
+    Document::new(document.text).with_metadata(metadata)
+}
+
 #[async_trait]
 impl DocumentLoader for DocxLoader {
     fn supports(&self, source: &str) -> bool {
@@ -36,21 +58,23 @@ impl DocumentLoader for DocxLoader {
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         let document = DocxParser::new().parse_path(source).await?;
-        let mut metadata = Metadata::new();
-        if let Some(title) = &document.title {
-            metadata.insert("title".to_owned(), Value::String(title.clone()));
-        }
-        metadata.insert(
-            "paragraph_count".to_owned(),
-            Value::from(document.paragraph_count),
-        );
-        metadata.insert("table_count".to_owned(), Value::from(document.table_count));
-        metadata.insert(
-            "source_type".to_owned(),
-            Value::String("document".to_owned()),
-        );
         debug!(file = source, "loaded DOCX document");
-        Ok(vec![Document::new(document.text).with_metadata(metadata)])
+        Ok(vec![document_from(document)])
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let document = DocxParser::new().parse_bytes(&source.bytes)?;
+        let mut documents = vec![document_from(document)];
+        apply_load_options(&source.name, &mut documents, options);
+        debug!(
+            file = source.name.as_str(),
+            "loaded DOCX document from bytes"
+        );
+        Ok(documents)
     }
 }
 
@@ -60,7 +84,8 @@ mod tests {
     use super::*;
     use openjiuwen_common::error::ErrorKind;
 
-    use crate::loaders::fixtures::build_zip;
+    use crate::loaders::fixtures::{build_zip, docx_document};
+    use crate::loaders::{DocumentBytes, LoadOptions};
 
     /// `word/document.xml` fixture: a heading, a paragraph, and a table.
     const DOCUMENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -183,6 +208,91 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Retrieval);
         assert!(error.to_string().contains("word/document.xml"));
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_loader() {
+        let bytes = build_zip(&[
+            ("word/document.xml", DOCUMENT_XML),
+            ("docProps/core.xml", CORE_XML),
+        ])
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.docx");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let from_path = DocxLoader::new()
+            .load(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let from_bytes = DocxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("notes.docx", bytes),
+                &LoadOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(from_bytes.len(), 1);
+        assert_eq!(from_bytes[0].text, from_path[0].text);
+        assert_eq!(
+            from_bytes[0].text,
+            "## Overview\nBody text\n| Name | Notes |\n| --- | --- |\n| alice | ok |"
+        );
+        for key in ["title", "paragraph_count", "table_count", "source_type"] {
+            assert_eq!(
+                from_bytes[0].metadata.get(key),
+                from_path[0].metadata.get(key),
+                "metadata key {key}"
+            );
+        }
+        assert_eq!(
+            from_bytes[0].metadata.get("title"),
+            Some(&Value::String("Design notes".to_owned()))
+        );
+        assert_eq!(from_bytes[0].id.len(), 36);
+        assert_eq!(
+            from_bytes[0].metadata.get("doc_id"),
+            Some(&Value::String(from_bytes[0].id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title_overrides() {
+        let bytes = docx_document(&["Intro", "Body"]).unwrap();
+        let documents = DocxLoader::new()
+            .load_bytes(
+                &DocumentBytes::new("/uploads/report.docx", bytes),
+                &LoadOptions::new().with_doc_id("doc-1").with_title("Custom"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "Intro\nBody");
+        assert_eq!(documents[0].id, "doc-1");
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String("doc-1".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("title"),
+            Some(&Value::String("Custom".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("paragraph_count"),
+            Some(&Value::from(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_corrupt_bytes() {
+        let source = DocumentBytes::new("corrupt.docx", b"not a zip".to_vec());
+        let error = DocxLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
     #[test]

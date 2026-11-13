@@ -12,7 +12,9 @@ use openjiuwen_common::logging::error;
 
 use crate::common::Document;
 
-use super::{file_extension, read_source, DocumentLoader};
+use super::{
+    apply_load_options, file_extension, read_source, DocumentBytes, DocumentLoader, LoadOptions,
+};
 
 /// Loads `.json` files as one document.
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,6 +40,16 @@ impl JsonLoader {
             }
         }
     }
+
+    /// Turns raw content into the loader's single document.
+    ///
+    /// `name` is the path or in-memory source name and appears in errors.
+    fn document(name: &str, raw: &str) -> Result<Document> {
+        if raw.trim().is_empty() {
+            return Err(Error::Validation(format!("File {name} is empty")));
+        }
+        Ok(Document::new(Self::render(name, raw)))
+    }
 }
 
 #[async_trait]
@@ -48,11 +60,18 @@ impl DocumentLoader for JsonLoader {
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         let raw = read_source(source).await?;
-        if raw.trim().is_empty() {
-            return Err(Error::Validation(format!("File {source} is empty")));
-        }
-        let text = Self::render(source, &raw);
-        Ok(vec![Document::new(text)])
+        Ok(vec![Self::document(source, &raw)?])
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let raw = String::from_utf8_lossy(&source.bytes);
+        let mut documents = vec![Self::document(&source.name, &raw)?];
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
     }
 }
 
@@ -108,6 +127,65 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn load_bytes_pretty_prints_valid_json_like_the_path() {
+        let source = DocumentBytes::new(
+            "config.json",
+            br#"{"a":1,"nested":{"b":[true,null]}}"#.to_vec(),
+        );
+        let documents = JsonLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0].text.contains('\n'));
+        let parsed: Value = serde_json::from_str(&documents[0].text).unwrap();
+        assert_eq!(parsed["nested"]["b"][0], Value::Bool(true));
+        assert_eq!(
+            documents[0].metadata.get("doc_id").and_then(Value::as_str),
+            Some(documents[0].id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_keeps_malformed_json_raw() {
+        let source = DocumentBytes::new("broken.json", b"{not json}\n".to_vec());
+        let documents = JsonLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents[0].text, "{not json}\n");
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title() {
+        let source = DocumentBytes::new("config.json", b"{}".to_vec());
+        let options = LoadOptions::new().with_doc_id("doc-2").with_title("Config");
+        let documents = JsonLoader::new()
+            .load_bytes(&source, &options)
+            .await
+            .unwrap();
+        assert_eq!(documents[0].id, "doc-2");
+        assert_eq!(
+            documents[0].metadata.get("title").and_then(Value::as_str),
+            Some("Config")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_empty_content() {
+        let source = DocumentBytes::new("empty.json", b"\n \n".to_vec());
+        let error = JsonLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error.to_string().contains("File empty.json is empty"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]
