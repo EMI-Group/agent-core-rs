@@ -102,3 +102,15 @@ pub use tracer::{
     InvokeType, MemoryTraceSink, NoopTraceSink, SpanHandle, SpanStatus, StreamTraceSink,
     TraceFrame, TraceFrameType, TracePosition, TraceSink, TraceSpan, TraceSpanKind, Tracer,
 };
+
+pub mod session_controller;
+pub mod vcs;
+
+pub use session_controller::{
+    DiskSessionStore, Scope, SessionController, SessionMeta, SessionRecord, SessionScope,
+    SessionScopeKey, Subject,
+};
+pub use vcs::{
+    diff_snapshots, diff_values, ChangeKind, JsonChange, SessionHistory, Version, VersionId,
+    VersionMeta,
+};
