@@ -11,7 +11,10 @@
 //! - [`InstructionOptimizer`] — beam search over instruction rewrites.
 //! - [`ExampleOptimizer`] — greedy few-shot example selection.
 //! - [`JointOptimizer`] — alternating instruction and example ascent.
-//! - [`PromptSearchOptimizer`] — one breadth-first sweep over every candidate.
+//! - [`PromptSearchOptimizer`] — Python's bounded, multi-round prompt search
+//!   (RLAF-P): elitist rounds over the deterministic mutation bank plus one
+//!   model rewrite, scored by the composite reward with convergence, drift, and
+//!   memory.
 //! - [`Trainer`] — optimisation on a train split, early stop on a validation
 //!   split.
 //!
