@@ -67,7 +67,7 @@ use openjiuwen_graph::{
 };
 use openjiuwen_session::stream::StreamMode;
 use openjiuwen_session::InteractiveInput;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
@@ -92,6 +92,9 @@ pub struct WorkflowRunOptions {
     pub timeout: Option<Duration>,
     /// Answers seeded into the run's interaction state (used by `resume`).
     pub interactive: Option<InteractiveInput>,
+    /// Answers replayed before `interactive`, per interaction id (a nested run forwards
+    /// the answers its child already consumed so a replayed child sees them in order).
+    pub answers: BTreeMap<String, Vec<Value>>,
     /// Continue from the graph snapshot stored for this session.
     pub resume: bool,
     /// Which frame modes `stream` yields; `None` yields every mode.
@@ -110,6 +113,7 @@ impl Default for WorkflowRunOptions {
             cancellation: CancellationToken::new(),
             timeout: None,
             interactive: None,
+            answers: BTreeMap::new(),
             resume: false,
             stream_modes: None,
             max_supersteps: None,
@@ -143,6 +147,17 @@ impl WorkflowRunOptions {
     #[must_use]
     pub fn with_interactive(mut self, interactive: InteractiveInput) -> Self {
         self.interactive = Some(interactive);
+        self
+    }
+
+    /// Replay `answers` before the run's `interactive` answers.
+    ///
+    /// Each id's values are queued in order, ahead of an answer supplied through
+    /// [`WorkflowRunOptions::interactive`]; a nested run uses this to hand a replayed child
+    /// the answers it already consumed.
+    #[must_use]
+    pub fn with_answers(mut self, answers: BTreeMap<String, Vec<Value>>) -> Self {
+        self.answers = answers;
         self
     }
 
