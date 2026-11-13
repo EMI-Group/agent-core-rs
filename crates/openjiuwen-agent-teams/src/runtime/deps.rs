@@ -23,6 +23,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::harness::{MemberHarnessFactory, NativeMemberFactory};
+use crate::kv_cache::TeamKvCacheAffinity;
+use crate::observability::ObservabilityHooks;
 use crate::schema::Language;
 use crate::storage::{InMemoryTeamStore, TeamStore};
 use crate::workspace::{LocalWorkspaceProvider, MemberWorkspaceLayout, WorkspaceProvider};
@@ -49,6 +51,12 @@ pub struct TeamBuildDeps {
     pub workspace: Arc<dyn WorkspaceProvider>,
     /// Declared team language (`cn`/`cf`/`en`); `None` means the schema default.
     pub language: Option<String>,
+    /// Observability hooks installed on the team's span (empty means all no-ops).
+    pub observability_hooks: Vec<Arc<dyn ObservabilityHooks>>,
+    /// KV-cache affinity registry; `None` builds one from the spec metadata.
+    pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,
+    /// Shared model router; `None` lets the spawner build one from the blueprint.
+    pub routing: Option<Arc<super::routing::TeamModelRouter>>,
 }
 
 impl TeamBuildDeps {
@@ -96,6 +104,35 @@ impl TeamBuildDeps {
         }
     }
 
+    /// Adds one observability hook, leaving every other field untouched.
+    #[must_use]
+    pub fn with_observability_hook(self, hook: Arc<dyn ObservabilityHooks>) -> Self {
+        let mut hooks = self.observability_hooks;
+        hooks.push(hook);
+        Self {
+            observability_hooks: hooks,
+            ..self
+        }
+    }
+
+    /// Injects a shared KV-cache affinity registry (tests and hosts with one process-wide cache).
+    #[must_use]
+    pub fn with_kv_cache(self, kv_cache: Arc<TeamKvCacheAffinity>) -> Self {
+        Self {
+            kv_cache: Some(kv_cache),
+            ..self
+        }
+    }
+
+    /// Injects the shared model router the build path created for the team.
+    #[must_use]
+    pub fn with_routing(self, routing: Arc<super::routing::TeamModelRouter>) -> Self {
+        Self {
+            routing: Some(routing),
+            ..self
+        }
+    }
+
     /// Resolves the declared language to its wire value, falling back to `cn`.
     ///
     /// Python parity: `resolve_language`, which treats an absent or unknown value as the default
@@ -115,6 +152,9 @@ impl Default for TeamBuildDeps {
                 std::env::temp_dir().join(DEFAULT_WORKSPACE_DIR),
             ))),
             language: None,
+            observability_hooks: Vec::new(),
+            kv_cache: None,
+            routing: None,
         }
     }
 }
@@ -129,6 +169,9 @@ impl fmt::Debug for TeamBuildDeps {
             .field("store", &self.store.name())
             .field("workspace", &"injected")
             .field("language", &self.language)
+            .field("observability_hooks", &self.observability_hooks.len())
+            .field("kv_cache", &self.kv_cache.is_some())
+            .field("routing", &self.routing.is_some())
             .finish()
     }
 }
