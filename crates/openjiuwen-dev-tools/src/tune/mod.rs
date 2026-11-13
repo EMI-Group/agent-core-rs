@@ -77,9 +77,10 @@ pub use evaluator::{
 };
 pub use loader::CaseLoader;
 pub use optimizer::{
-    format_prompt, optimize_prompt, placeholders, render_examples, EvaluationSummary,
-    ExampleOptimizer, InstructionOptimizer, JointOptimizer, OptimizationResult, OptimizerConfig,
-    PromptSearchOptimizer, Trainer,
+    candidate_space, format_prompt, generate_candidates, optimize_prompt, placeholders,
+    render_examples, EvaluationSummary, ExampleOptimizer, InstructionOptimizer, JointOptimizer,
+    OptimizationResult, OptimizerConfig, ParameterSearchOutcome, ParameterSearcher,
+    PromptSearchOptimizer, Trainer, DEFAULT_CANDIDATES_SAMPLE_NUM,
 };
 pub use optimizer::{
     DEFAULT_EARLY_STOP_SCORE, DEFAULT_EXAMPLE_NUM, DEFAULT_ITERATION_NUM, DEFAULT_PARALLEL_NUM,
