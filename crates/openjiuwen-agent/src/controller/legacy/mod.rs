@@ -27,6 +27,28 @@
 //! wire names differ. Convert explicitly at the boundary instead of serializing
 //! one into the other, and keep the legacy types out of executor/planner
 //! signatures, which speak the new pipeline's types.
+//!
+//! # Deferred Python behaviour
+//!
+//! - The per-conversation `TaskQueue` (running task, its `asyncio.Task`, start
+//!   time) and the turn cancellation Python performs before handling a new
+//!   message: [`BaseController`] is single-turn and spawns no scheduler, so a
+//!   legacy caller loses in-flight interruption. Cancellation is per run via
+//!   the session's `CancellationToken`, not per conversation.
+//! - `IntentDetector` category-to-`Task` generation (Python's
+//!   `_generate_tasks_from_intent`): the detector reports the category name and
+//!   the controller's recognizer/planner build the new pipeline's `Intent` and
+//!   `Task`, so workflow-target selection by category is not ported.
+//! - `IntentDetectionConfig`'s chat history, `category_info`, `example_content`,
+//!   and `enable_input` knobs: [`IntentDetector`] takes a category list and a
+//!   prompt; conversation history comes from the context engine of the caller.
+//! - `ReasonerConfig`/`PlannerConfig`/`ProactiveIdentifierConfig`/
+//!   `ReflectorConfig`: the proactive identifier and reflector are not ported,
+//!   and the planner has no configuration beyond its task type.
+//! - `BaseController.group` routing (`set_group`, `send_to_agent`, `publish`)
+//!   and the `Message*` backward-compatibility aliases of `event.py`.
+//! - `reasoner/agent_reasoner.py` is an empty, unreferenced Python artifact and
+//!   is intentionally not ported.
 pub mod reasoner;
 pub mod schema;
 use super::base::{BaseController, Controller, EventHandler};
