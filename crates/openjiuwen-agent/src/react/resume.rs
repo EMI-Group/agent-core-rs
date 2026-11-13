@@ -1,4 +1,10 @@
-//! Replay of an interrupted `ReAct` turn.
+//! Resume of an interrupted `ReAct` turn and seeding of a fresh one.
+//!
+//! [`resume_or_seed`] is the loop's entry point: it replays a persisted
+//! interruption when the session has one, re-pausing the run when the caller
+//! left requests unanswered, and otherwise observes the user query and starts a
+//! fresh turn. Both branches seed the host's auto-confirm decision into the rail
+//! scratch space.
 //!
 //! A turn paused on an interrupt persists its pending requests; resuming matches
 //! the caller's [`InteractiveInput`] answers against them with
@@ -13,17 +19,29 @@
 //! - an ask-user answer becomes the tool content.
 use crate::abilities::execute::execute_calls_with;
 use crate::abilities::{ToolCallResult, ToolExecutionOptions};
+use crate::input::AgentInput;
 use crate::interrupt::{
     answer_text, match_answers, parse_approval, reject_feedback, InterruptKind, InterruptRequest,
-    InterruptionState,
+    InterruptionState, AUTO_CONFIRM_STATE_KEY,
 };
+use crate::output::{AgentChunk, AgentOutput, Observation};
 use crate::policy::{ClientToolRegistry, ToolResiliencePolicy};
+use crate::rails::RailContext;
+use crate::react::agent_loop::AgentRuntime;
+use crate::react::pause::pause_output;
 use indexmap::IndexMap;
-use openjiuwen_common::error::Result;
-use openjiuwen_foundation::{Tool, ToolCall};
-use openjiuwen_session::InteractiveInput;
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_context::ConversationContext;
+use openjiuwen_foundation::{BaseMessage, Tool, ToolCall};
+use openjiuwen_session::{InteractiveInput, Session};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+
+/// `RailContext::extra` key carrying the host's auto-confirm decision.
+const AUTO_CONFIRM_EXTRA_KEY: &str = "_interrupt_auto_confirm";
+/// `RailContext::extra` key carrying the answers matched during a resume.
+const RESUME_ANSWERS_EXTRA_KEY: &str = "_resume_interrupt_answers";
 
 /// Iteration a resumed run restarts from after replaying the interrupted calls.
 ///
@@ -31,6 +49,121 @@ use std::sync::Arc;
 /// `state.iteration + 1` itself and does not read this constant.
 #[allow(dead_code)] // used by the loop's resume path
 pub(crate) const RESUME_START_ITERATION: usize = 1;
+
+/// How a run starts: a fresh turn or a resumed interruption.
+pub(crate) enum ResumeOutcome {
+    /// Start the iteration loop at `start` with `original_query` in hand.
+    Start {
+        /// First iteration to run.
+        start: usize,
+        /// The user query that started the turn.
+        original_query: String,
+        /// Observations replayed from the interrupted tool calls.
+        observations: Vec<Observation>,
+    },
+    /// The interruption is still unanswered; the run pauses again.
+    Paused(Box<AgentOutput>),
+}
+
+/// Seeds the conversation: replays a pending interruption or observes the query.
+///
+/// A resumed turn clears the persisted state, seeds the rail scratch space with
+/// the auto-confirm decision and the matched answers, replays the interrupted
+/// tool calls, and starts at the iteration after the interruption. Requests the
+/// caller did not answer pause the run again. A fresh turn also seeds the
+/// auto-confirm decision, so a host can pre-approve tools before the first call.
+pub(crate) async fn resume_or_seed(
+    runtime: &AgentRuntime,
+    input: &AgentInput,
+    session: &Arc<dyn Session>,
+    publisher: Option<&UnboundedSender<AgentChunk>>,
+    tool_options: &ToolExecutionOptions,
+    ctx: &mut RailContext,
+    context: &Arc<ConversationContext>,
+) -> Result<ResumeOutcome> {
+    let Some(state) = InterruptionState::load(&**session).await? else {
+        let Some(text) = input.query_text() else {
+            return Err(Error::validation(
+                "interactive input requires a pending interruption to resume",
+            ));
+        };
+        seed_auto_confirm(session, ctx).await?;
+        runtime
+            .engine
+            .observe(context, BaseMessage::user(text.to_owned()))
+            .await?;
+        return Ok(ResumeOutcome::Start {
+            start: 1,
+            original_query: text.to_owned(),
+            observations: Vec::new(),
+        });
+    };
+
+    InterruptionState::clear(&**session).await?;
+    seed_auto_confirm(session, ctx).await?;
+    let interactive = input.interactive().cloned().unwrap_or_default();
+    let pending = state
+        .requests
+        .iter()
+        .map(|(call_id, request)| (call_id.clone(), request.interrupt_id.clone()))
+        .collect::<Vec<_>>();
+    let matched = match_answers(&interactive, &pending);
+    ctx.extra.insert(
+        RESUME_ANSWERS_EXTRA_KEY.to_owned(),
+        serde_json::to_value(&matched.answers)?,
+    );
+
+    let (results, unanswered) = replay_interrupted(
+        &state,
+        &interactive,
+        &runtime.tools,
+        tool_options,
+        &runtime.resilience,
+        &runtime.client_tools,
+    )
+    .await?;
+    let mut observations = Vec::with_capacity(results.len());
+    for result in results {
+        runtime.engine.observe(context, result.message()).await?;
+        observations.push(Observation {
+            content: result.text,
+            name: Some(result.call.name),
+            tool_call_id: result.call.id,
+        });
+    }
+    if !unanswered.is_empty() {
+        let paused = pause_output(
+            session,
+            publisher,
+            state.iteration,
+            &state.original_query,
+            state.assistant_message,
+            &unanswered,
+            &matched.answers,
+            observations,
+        )
+        .await?;
+        return Ok(ResumeOutcome::Paused(Box::new(paused)));
+    }
+    Ok(ResumeOutcome::Start {
+        start: state.iteration + 1,
+        original_query: state.original_query,
+        observations,
+    })
+}
+
+/// Seeds `ctx` with the host's auto-confirm decision, when the session has one.
+///
+/// Python's `BaseInterruptRail.before_tool_call` reads the decision from the
+/// session on every turn, so both the fresh and the resumed branch seed it.
+async fn seed_auto_confirm(session: &Arc<dyn Session>, ctx: &mut RailContext) -> Result<()> {
+    if let Some(value) = session.get_state(AUTO_CONFIRM_STATE_KEY).await? {
+        if !value.is_null() {
+            ctx.extra.insert(AUTO_CONFIRM_EXTRA_KEY.to_owned(), value);
+        }
+    }
+    Ok(())
+}
 
 /// Replays the interrupted tool calls of `state` using `interactive` answers.
 ///

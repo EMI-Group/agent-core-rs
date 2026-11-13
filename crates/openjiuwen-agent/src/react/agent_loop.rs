@@ -33,22 +33,22 @@ use crate::abilities::execute::execute_calls_with;
 use crate::abilities::{ToolCallResult, ToolExecutionOptions};
 use crate::callbacks::CallbackFramework;
 use crate::input::AgentInput;
-use crate::interrupt::{
-    match_answers, InterruptKind, InterruptRequest, InterruptionState, AUTO_CONFIRM_STATE_KEY,
-};
-use crate::output::{AgentChunk, AgentOutput, Observation, INTERACTION};
+use crate::interrupt::{InterruptKind, InterruptRequest};
+use crate::output::{AgentChunk, AgentOutput, Observation};
 use crate::policy::{
     ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
     ToolResiliencePolicy,
 };
 use crate::rails::{RailContext, RailEvent, RailRegistry};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
+use crate::react::pause::pause_output;
 use crate::react::prompt::build_system;
-use crate::react::{exposure, frames, hooks, resume};
+use crate::react::resume::{resume_or_seed, ResumeOutcome};
+use crate::react::{exposure, frames, hooks};
 use crate::react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
 use crate::steering::SteeringQueue;
 use indexmap::IndexMap;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 use openjiuwen_context::{ContextEngine, PrepareOptions};
 use openjiuwen_foundation::{
     BaseMessage, Model, ModelRequestConfig, Tool, ToolCall, ToolCard, Usage,
@@ -70,10 +70,6 @@ const MAX_ITERATIONS_MSG: &str = "Max iterations reached without completion";
 const TOKEN_BUDGET_MSG: &str = "Token budget exceeded";
 /// Nudge the `FinalAnswer` policy appends before its last tool-free model call.
 const FINAL_ANSWER_NUDGE: &str = "Provide your best final answer now without calling any tools.";
-/// `RailContext::extra` key carrying the host's auto-confirm decision.
-const AUTO_CONFIRM_EXTRA_KEY: &str = "_interrupt_auto_confirm";
-/// `RailContext::extra` key carrying the answers matched during a resume.
-const RESUME_ANSWERS_EXTRA_KEY: &str = "_resume_interrupt_answers";
 /// Metadata key marking the injected empty-response notice.
 const EMPTY_RESPONSE_SOURCE_KEY: &str = "_openjiuwen_message_source_kind";
 
@@ -183,21 +179,6 @@ impl AgentRuntime {
         runtime.visible_cards = visible_cards;
         Ok(runtime)
     }
-}
-
-/// How a run starts: a fresh turn or a resumed interruption.
-enum ResumeOutcome {
-    /// Start the iteration loop at `start` with `original_query` in hand.
-    Start {
-        /// First iteration to run.
-        start: usize,
-        /// The user query that started the turn.
-        original_query: String,
-        /// Observations replayed from the interrupted tool calls.
-        observations: Vec<Observation>,
-    },
-    /// The interruption is still unanswered; the run pauses again.
-    Paused(Box<AgentOutput>),
 }
 
 /// Runs one invoke of the `ReAct` loop to completion.
@@ -328,106 +309,6 @@ fn request_for(runtime: &AgentRuntime, tools: &[Value]) -> ModelRequestConfig {
         request.model_name.clone_from(&runtime.config.model_name);
     }
     request.with_tools(tools.to_vec())
-}
-
-/// Seeds `ctx` with the host's auto-confirm decision, when the session has one.
-///
-/// Python's `BaseInterruptRail.before_tool_call` reads the decision from the
-/// session on every turn, so both the fresh and the resumed branch seed it.
-async fn seed_auto_confirm(session: &Arc<dyn Session>, ctx: &mut RailContext) -> Result<()> {
-    if let Some(value) = session.get_state(AUTO_CONFIRM_STATE_KEY).await? {
-        if !value.is_null() {
-            ctx.extra.insert(AUTO_CONFIRM_EXTRA_KEY.to_owned(), value);
-        }
-    }
-    Ok(())
-}
-
-/// Seeds the conversation: replays a pending interruption or observes the query.
-///
-/// A resumed turn clears the persisted state, seeds the rail scratch space with
-/// the auto-confirm decision and the matched answers, replays the interrupted
-/// tool calls, and starts at the iteration after the interruption. Requests the
-/// caller did not answer pause the run again. A fresh turn also seeds the
-/// auto-confirm decision, so a host can pre-approve tools before the first call.
-async fn resume_or_seed(
-    runtime: &AgentRuntime,
-    input: &AgentInput,
-    session: &Arc<dyn Session>,
-    publisher: Option<&UnboundedSender<AgentChunk>>,
-    tool_options: &ToolExecutionOptions,
-    ctx: &mut RailContext,
-    context: &Arc<openjiuwen_context::ConversationContext>,
-) -> Result<ResumeOutcome> {
-    let Some(state) = InterruptionState::load(&**session).await? else {
-        let Some(text) = input.query_text() else {
-            return Err(Error::validation(
-                "interactive input requires a pending interruption to resume",
-            ));
-        };
-        seed_auto_confirm(session, ctx).await?;
-        runtime
-            .engine
-            .observe(context, BaseMessage::user(text.to_owned()))
-            .await?;
-        return Ok(ResumeOutcome::Start {
-            start: 1,
-            original_query: text.to_owned(),
-            observations: Vec::new(),
-        });
-    };
-
-    InterruptionState::clear(&**session).await?;
-    seed_auto_confirm(session, ctx).await?;
-    let interactive = input.interactive().cloned().unwrap_or_default();
-    let pending = state
-        .requests
-        .iter()
-        .map(|(call_id, request)| (call_id.clone(), request.interrupt_id.clone()))
-        .collect::<Vec<_>>();
-    let matched = match_answers(&interactive, &pending);
-    ctx.extra.insert(
-        RESUME_ANSWERS_EXTRA_KEY.to_owned(),
-        serde_json::to_value(&matched.answers)?,
-    );
-
-    let (results, unanswered) = resume::replay_interrupted(
-        &state,
-        &interactive,
-        &runtime.tools,
-        tool_options,
-        &runtime.resilience,
-        &runtime.client_tools,
-    )
-    .await?;
-    let mut observations = Vec::with_capacity(results.len());
-    for result in results {
-        runtime.engine.observe(context, result.message()).await?;
-        observations.push(Observation {
-            content: result.text,
-            name: Some(result.call.name),
-            tool_call_id: result.call.id,
-        });
-    }
-    if !unanswered.is_empty() {
-        let paused = pause_output(
-            session,
-            publisher,
-            state.iteration,
-            &state.original_query,
-            state.assistant_message,
-            &unanswered,
-            &matched.answers,
-            observations,
-        )
-        .await?;
-        return Ok(ResumeOutcome::Paused(Box::new(paused)));
-    }
-    Ok(ResumeOutcome::Start {
-        start: state.iteration + 1,
-        original_query: state.original_query,
-        observations,
-    })
 }
 
 /// Drives the iteration loop and turns its termination into an [`AgentOutput`].
@@ -815,67 +696,12 @@ async fn run_inner(
     }
 }
 
-/// Persists and renders a paused turn.
-///
-/// The pending requests are stored under their tool call id (or interrupt id
-/// when the request carries no call id), each becomes one `__interaction__`
-/// frame delivered to the publisher and mirrored into the session, and the
-/// returned output is a `result_type: "interrupt"` answer carrying those frames
-/// and ids.
-#[allow(clippy::too_many_arguments)]
-async fn pause_output(
-    session: &Arc<dyn Session>,
-    publisher: Option<&UnboundedSender<AgentChunk>>,
-    iteration: usize,
-    original_query: &str,
-    assistant_message: Option<BaseMessage>,
-    requests: &[InterruptRequest],
-    answers: &BTreeMap<String, Value>,
-    observations: Vec<Observation>,
-) -> Result<AgentOutput> {
-    let mut stored = BTreeMap::new();
-    let mut frames = Vec::with_capacity(requests.len());
-    let mut ids = Vec::with_capacity(requests.len());
-    for (index, request) in requests.iter().enumerate() {
-        let key = if request.tool_call_id.is_empty() {
-            request.interrupt_id.clone()
-        } else {
-            request.tool_call_id.clone()
-        };
-        stored.insert(key, request.clone());
-        let frame = request.to_frame(i64::try_from(index).unwrap_or(i64::MAX));
-        ids.push(request.interrupt_id.clone());
-        frames.push(frame);
-    }
-    let state = InterruptionState {
-        iteration,
-        original_query: original_query.to_owned(),
-        assistant_message,
-        requests: stored,
-        answers: answers.clone(),
-    };
-    state.save(&**session).await?;
-
-    for frame in &frames {
-        let chunk = AgentChunk::new(INTERACTION, frame.index, frame.payload.clone());
-        if let Some(publisher) = publisher {
-            let _ = publisher.send(chunk.clone());
-        }
-        if let Err(error) = session.write_stream(chunk.to_stream_item()).await {
-            tracing::warn!(%error, "failed to write an interaction frame to the session");
-        }
-    }
-
-    Ok(AgentOutput::interrupt(frames, ids)
-        .with_iterations_used(iteration)
-        .with_observations(observations))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::Agent;
     use crate::card::AgentCard;
+    use crate::interrupt::InterruptionState;
     use crate::output::ResultType;
     use crate::rails::{AskUserRail, ConfirmInterruptRail};
     use openjiuwen_context::ContextConfig;

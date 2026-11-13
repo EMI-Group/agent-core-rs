@@ -4,7 +4,8 @@
 //! model, mounted tools, rails, prompt builder, and context engine — behind
 //! interior mutability, so a single value can be shared as `Arc<dyn Agent>`.
 //! The iteration loop lives in `agent_loop`, one model call in [`model_step`],
-//! interrupt replay in `resume`, and identity prompt rendering in `prompt`.
+//! pause persistence and rendering in `pause`, interrupt replay and turn
+//! seeding in `resume`, and identity prompt rendering in `prompt`.
 //!
 //! The implemented loop semantics match Python's
 //! `openjiuwen/core/single_agent/agents/react_agent.py::_inner_invoke`:
@@ -50,7 +51,8 @@ pub(crate) mod exposure;
 pub(crate) mod frames;
 pub(crate) mod hooks;
 pub mod model_step;
-pub(crate) mod prompt;
+pub(crate) mod pause;
+pub mod prompt;
 pub(crate) mod resume;
 #[cfg(test)]
 mod wiring;
