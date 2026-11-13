@@ -13,7 +13,10 @@ Everything here is pure data plus arithmetic: no model calls, no container runti
 - `MissingDimensionPolicy` — `Zero` (count an unmeasured dimension as `0.0`), `Skip` (the default: leave it out and list it in `RewardSummary::missing`) or `Fail` (`Error::validation` naming every missing dimension).
 - `RewardAggregator` — `new`, `with_normalisation`, `with_policy`, `with_threshold`, `aggregate(signals)`; duplicate signals for one dimension combine by confidence, undeclared dimensions are counted but ignored.
 - `RewardPack` — `name`, `version`, `dimensions`, `passing_score`, `validate`, `aggregator`; `default_pack` weights correctness `0.6`, efficiency `0.2`, clarity `0.2` with a passing score of `0.6`.
+- `RewardSummary::from_signals(signals, per_dimension, missing, threshold)` — builds a summary directly; `RewardSummary::zero()`/`Default` is the empty summary.
+- `RewardAggregator` defaults: `ScoreNormalisation::Clamp`, `MissingDimensionPolicy::Skip`, threshold `0.6`; duplicate dimension names keep the last occurrence; it derives `Debug + Clone + PartialEq` only (deliberately not serde).
 - `reward_from_score`, `score_evaluated_cases`, `aggregate_scores`/`ScoreStats` — score-to-signal and batch-statistics helpers.
+- No model call, no `Error::Unsupported` path, and no `RewardFn`/`RewardRegistry` here: those live in `crate::rl` (`rl::policy`, `rl::task`); model-scored values reach this module only as `EvaluatedCase::score` from `crate::evaluator::judge::LlmJudge` via `score_evaluated_cases`.
 
 ## Constraints
 - All arithmetic is deterministic and stated: weighted mean of the declared dimensions, `0.0..=1.0` totals under the default normalisation, no silent `NaN` propagation.
