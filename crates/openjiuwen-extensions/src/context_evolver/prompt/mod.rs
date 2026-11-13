@@ -28,7 +28,7 @@
 //!   which is what the call sites actually need.
 //! * Python formats prompts with `str.format` and escapes JSON braces as `{{`/
 //!   `}}`; this port substitutes only the exact `{name}` placeholders a template
-//!   declares ([`fill`]), so the JSON examples stay literal.
+//!   declares (`fill`), so the JSON examples stay literal.
 //! * Python's retrieval steps are two or three separate LLM round-trips
 //!   (classify, rerank, rewrite). The family modules fold them into a single
 //!   prompt and document each fold.

@@ -16,7 +16,7 @@ Every module is reachable from the crate root; feature-gated modules disappear e
 - `store` — `StoreBackend` + `build_kv_store`/`build_document_store`/`build_vector_store` over `openjiuwen_foundation::store`; Redis and Elasticsearch variants deferred.
 - `message_queue` — `QueueConfig` + `create_queue` over `openjiuwen_runner::mq`, the JSON `QueueBridge`, and with `feature = "pulsar"` the `PulsarConfig`/`PulsarMessageQueue` surface (deferred).
 - `sys_operation` — `SandboxProviderSet` registration against `openjiuwen_sysop::sandbox::provider::SandboxProviderRegistry`, plus documented deferred providers for `aio`, `jiuwenbox`, `yuanrong`.
-- `context_evolver` — pure schema/vector/normalisation logic (`Algo`, `normalize_algo_name`, `AddMemoryRequest`, `MemoryVectorStore`) and the `TaskMemoryService` trait; the LLM-driven algorithms are a documented `Error::Unsupported` implementation.
+- `context_evolver` — schemas and records (`Algo`, `normalize_algo_name`, `AddMemoryRequest`, `MemoryRecord`), per-family prompts and reply parsers, `MemoryStore` persistence, `MemoryVectorStore`, and the `TaskMemoryService` trait with two services: `DeterministicTaskMemoryService` (offline) and `LlmTaskMemoryService` (model-driven over an injected `MemoryCompletion`), plus the documented `Unsupported` deferral.
 - `vendor_specific` — deprecated `AliyunReranker` adapter over an injected `openjiuwen_retrieval::Reranker` (DashScope transport deferred).
 
 ## Feature Matrix
@@ -32,7 +32,7 @@ Every module is reachable from the crate root; feature-gated modules disappear e
 | `mcp` | no | `rmcp` and `tokio-stream` dependencies only; MCP support itself is `openjiuwen_foundation::tool::mcp` (enabled by default in the kernel) | none | no module in this crate is gated on it |
 | `live-tests` | no | network/service-gated tests | live services | those tests do not exist |
 
-Deferred integrations (API-shaped, `Error::Unsupported`, documented in the module `CONTEXT.md`): Redis checkpoint/store backends, Elasticsearch vector store, Gauss/PostgreSQL document store, Pulsar message queue, ZeroMQ transports, OTLP span export, DashScope reranker transport, AIO/JiuwenBox/YuanRong sandbox providers, and the LLM-driven `context_evolver` algorithms.
+Deferred integrations (API-shaped, `Error::Unsupported`, documented in the module `CONTEXT.md`): Redis checkpoint/store backends, Elasticsearch vector store, Gauss/PostgreSQL document store, Pulsar message queue, ZeroMQ transports, OTLP span export, DashScope reranker transport, AIO/JiuwenBox/YuanRong sandbox providers, and Milvus/vector-store-backed `context_evolver` scoring.
 
 ## Constraints
 
@@ -67,6 +67,6 @@ Deferred integrations (API-shaped, `Error::Unsupported`, documented in the modul
 - `./src/store/` → key-value/document/vector store factories over the kernel plus deferred Redis/Elasticsearch backends
 - `./src/message_queue/` → queue factory over `openjiuwen_runner::mq`, JSON bridge, deferred Pulsar backend (`pulsar` feature)
 - `./src/sys_operation/` → sandbox provider registration facade and deferred provider sets
-- `./src/context_evolver/` → algorithm names, memory schema, in-memory cosine vector store, `TaskMemoryService` seam
+- `./src/context_evolver/` → algorithm names, memory records, prompts/parsers, persistence, in-memory cosine vector store, and the deterministic + model-driven `TaskMemoryService` layer
 - `./src/vendor_specific/` → deprecated vendor aliases (`AliyunReranker`)
 - `./tests/` → crate-boundary public-API suites (`a2a_client`, `a2a_server`, `otel`, `otel_seam`, `adapters`)

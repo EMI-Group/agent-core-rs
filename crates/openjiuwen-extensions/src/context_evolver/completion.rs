@@ -246,9 +246,9 @@ impl ChatCompletionConfig {
     /// Lookup order matches the Python wrapper's environment conventions:
     ///
     /// - base URL: `OPENAI_BASE_URL`, then `API_BASE`, then
-    ///   [`DEFAULT_BASE_URL`];
+    ///   `https://api.openai.com/v1`;
     /// - key: `OPENAI_API_KEY`, then `API_KEY`;
-    /// - model: `MODEL_NAME`, then `OPENAI_MODEL`, then [`DEFAULT_MODEL`];
+    /// - model: `MODEL_NAME`, then `OPENAI_MODEL`, then `gpt-4o-mini`;
     /// - timeout: `OPENJIUWEN_LLM_TIMEOUT_SECS` as a positive integer number of
     ///   seconds when present and well formed (otherwise the default stands).
     ///

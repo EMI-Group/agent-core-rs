@@ -8,7 +8,7 @@
 //! port keeps only the rerank half, so [`retrieve_prompt`] asks the model to
 //! order the candidate memories it is handed and [`parse_retrieve`] reads the
 //! usual `{"ranked_ids": [...]}` ranking through the shared
-//! [`parse_ranked_ids`](super::parse_ranked_ids).
+//! [`parse_ranked_ids`].
 //!
 //! Summarization is Python's `SummarizeMemoryOp`: one trajectory (or a batch)
 //! in, up to three memory items out, with the system prompt selected by the
@@ -125,7 +125,7 @@ Your output must strictly follow the Markdown format shown below:
 
 /// Builds the rerank prompt for the supplied candidates.
 ///
-/// The candidate block is [`render_candidates`](super::render_candidates)
+/// The candidate block is [`render_candidates`]
 /// (`Candidate i:` with the record id, title, `When to use`, and content); the
 /// reply asks for `{"ranked_ids": [...]}` so the parser can resolve ids directly.
 #[must_use]

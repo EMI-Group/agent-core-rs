@@ -5,16 +5,20 @@
 //! mixes small, dependency-free pieces — memory schemas, algorithm names, JSON
 //! persistence shapes, a prompt table, and an in-memory cosine vector store —
 //! with pipelines driven by an LLM, an embedding model, and Milvus. Rust ports
-//! the former and models the latter behind [`TaskMemoryService`], so a host can
-//! inject any model or persistence backend; the bundled
-//! [`UnsupportedTaskMemoryService`] answers [`Error::Unsupported`] for every
-//! LLM-driven flow instead of pretending to run it.
+//! the former and models the latter behind [`TaskMemoryService`]: a host can
+//! inject any model or persistence backend, and
+//! [`create_task_memory_service`] builds either the offline
+//! [`DeterministicTaskMemoryService`] or the model-driven
+//! [`LlmTaskMemoryService`]. The bundled [`UnsupportedTaskMemoryService`]
+//! answers [`Error::Unsupported`] for a configuration that defers the flow,
+//! instead of pretending to run it.
 //!
 //! Python counterparts for the ported behavior:
 //! `tests/unit_tests/extensions/context_evolver/test_retrieve_flow.py`
 //! (`TestAlgorithmNormalization`) and `test_summary_flow.py`
 //! (`test_all_algorithm_normalizations`). The live retrieve/summarize flows are
-//! skipped in Python without an API key and are deferred here.
+//! skipped in Python without an API key and run here against an injected
+//! completion backend.
 //!
 //! # Example
 //!
@@ -46,8 +50,8 @@ pub use prompt::{
 };
 pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
 pub use service::{
-    create_task_memory_service, DeterministicTaskMemoryService, HashingEmbedding, MemoryBackend,
-    MemoryEmbedding, TaskMemoryConfig,
+    create_task_memory_service, DeterministicTaskMemoryService, HashingEmbedding,
+    LlmTaskMemoryService, MemoryBackend, MemoryEmbedding, TaskMemoryConfig,
 };
 pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 

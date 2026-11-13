@@ -14,12 +14,13 @@
 //!   [`create_task_memory_service`] builds it.
 //! * [`deterministic::DeterministicTaskMemoryService`] runs retrieve/summarize
 //!   with lexical ranking only, so the crate is usable without any model.
+//! * [`llm::LlmTaskMemoryService`] drives the same flows through an injected
+//!   completion backend: prompt → completion → parse → persist.
 //!
-//! The model-driven service is a separate module in this subtree; it consumes
-//! exactly the same configuration, ranking helpers ([`ranking`]), and response
-//! helpers (`memories_json`, `finalize_hits`, `collapse`) that the deterministic
-//! service uses, so switching backends does not change the shape of a response
-//! card.
+//! The model-driven service consumes exactly the same configuration, ranking
+//! helpers ([`ranking`]), and response helpers (`memories_json`,
+//! `finalize_hits`, `collapse`) that the deterministic service uses, so
+//! switching backends does not change the shape of a response card.
 //!
 //! # Deviations from Python
 //!
@@ -55,9 +56,11 @@ use super::store::MemoryStore;
 use super::{Algo, TaskMemoryService, UnsupportedTaskMemoryService};
 
 pub mod deterministic;
+pub mod llm;
 pub mod ranking;
 
 pub use deterministic::DeterministicTaskMemoryService;
+pub use llm::LlmTaskMemoryService;
 
 /// The tracing target shared by this module tree.
 pub(crate) const LOG_TARGET: &str = "openjiuwen_extensions::context_evolver::service";
@@ -310,14 +313,9 @@ impl fmt::Debug for MemoryBackend {
 ///
 /// [`MemoryBackend::Deterministic`] builds a
 /// [`DeterministicTaskMemoryService`] over `config` and `store`;
-/// [`MemoryBackend::Unsupported`] builds the documented deferred default.
-///
-/// [`MemoryBackend::Llm`] is not wired yet: the model-driven service is a
-/// separate module in this subtree, and until it lands an `Llm` backend answers
-/// [`openjiuwen_common::error::Error::Unsupported`] instead of fabricating
-/// memories. Wiring it is a change inside that one match arm — it needs only
-/// `config`, the completion backend, and `store` — so the other arms, the
-/// public surface, and every caller stay as they are.
+/// [`MemoryBackend::Llm`] builds a [`LlmTaskMemoryService`] over `config`, the
+/// supplied completion backend, and `store`, so retrieve/summarize become model
+/// calls; [`MemoryBackend::Unsupported`] builds the documented deferred default.
 #[must_use]
 pub fn create_task_memory_service(
     config: TaskMemoryConfig,
@@ -330,11 +328,8 @@ pub fn create_task_memory_service(
             config,
             store,
         )),
-        MemoryBackend::Llm(_completion) => {
-            // The follow-up part wires `LlmTaskMemoryService` here from
-            // `_completion`, `config`, and `store`; until it lands this arm answers
-            // the documented deferral instead of fabricating memories.
-            Arc::new(UnsupportedTaskMemoryService::new(config.algo))
+        MemoryBackend::Llm(completion) => {
+            Arc::new(LlmTaskMemoryService::new(config, completion, store))
         }
         MemoryBackend::Unsupported => Arc::new(UnsupportedTaskMemoryService::new(config.algo)),
     }
@@ -580,23 +575,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_keeps_the_deferred_default_for_non_deterministic_backends() {
-        for backend in [
+    async fn factory_keeps_the_deferred_default_for_the_unsupported_backend() {
+        let service = create_task_memory_service(
+            TaskMemoryConfig::new(Algo::Refcon),
             MemoryBackend::Unsupported,
-            MemoryBackend::Llm(Arc::new(ScriptedCompletion::new(["{}"]))),
-        ] {
-            let service = create_task_memory_service(
-                TaskMemoryConfig::new(Algo::Refcon),
-                backend,
-                Arc::new(InMemoryMemoryStore::new()),
-            );
-            let error = service.load_memories("user").unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-            assert_eq!(
-                error.message().as_ref(),
-                "context_evolver 'refcon' pipeline is deferred; inject a TaskMemoryService"
-            );
-        }
+            Arc::new(InMemoryMemoryStore::new()),
+        );
+        let error = service.load_memories("user").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message().as_ref(),
+            "context_evolver 'refcon' pipeline is deferred; inject a TaskMemoryService"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_wires_the_llm_backend_to_the_model_driven_service() {
+        let service = create_task_memory_service(
+            TaskMemoryConfig::new(Algo::Refcon),
+            MemoryBackend::Llm(Arc::new(ScriptedCompletion::new([
+                r#"{"ranked_indices": [0]}"#,
+            ]))),
+            Arc::new(InMemoryMemoryStore::new()),
+        );
+        // `Refcon` shares the `ReMe` prompts; an empty store answers without a
+        // model call, which is enough to prove the arm is no longer deferred.
+        let response = service
+            .retrieve(crate::context_evolver::RetrieveRequest {
+                user_id: "user".into(),
+                query: "query".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "success");
+        assert_eq!(response.memory_string, "");
     }
 
     #[test]
