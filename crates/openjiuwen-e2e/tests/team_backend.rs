@@ -5,8 +5,9 @@
 //!
 //! 1. **Event bus** — a subscriber installed before `start()` sees the spawned teammate's
 //!    `member_status_changed`, the leader's direct `message` row and a board task's
-//!    `task_created`/`task_status_changed` pair, in publication order. Completion itself is a
-//!    *stream* marker, never a bus event: the suite pins that too.
+//!    `task_created`/`task_status_changed` pair, in publication order. A settled run additionally
+//!    announces itself once on the bus (`team_completed`) beside the `team.completed` *stream*
+//!    marker; the suite pins both halves.
 //! 2. **Mailbox and task board** — `send_message`, `unread`, `mark_read` and a board task round-trip
 //!    over the injected in-memory store.
 //! 3. **Per-member checkpoints** — a member harness exports a protocol-level [`HarnessCheckpoint`]
@@ -453,17 +454,27 @@ fn marker_count(frames: &[Result<AgentChunk>]) -> usize {
         .count()
 }
 
-/// Asserts the four bus publications the scenario's calls produce, in publication order.
+/// Asserts the four coordination bus publications the scenario's calls produce, in publication order.
+///
+/// A settled run also announces itself on the bus (`team_completed`), so that publication is
+/// optional here and checked on its own: the four coordination events keep their strict order and
+/// payloads, and a completion may appear at most once, right after the mail the run follows.
 fn assert_bus_publications(events: &[EventMessage], mail_id: &str) {
+    let mut coordination = events.to_vec();
+    coordination.retain(|event| event.event_type != "team_completed");
+    assert!(
+        events.len() - coordination.len() <= 1,
+        "a settled run publishes the completion at most once: {events:?}"
+    );
     assert_eq!(
-        event_types(events),
+        event_types(&coordination),
         [
             "member_status_changed",
             "message",
             "task_created",
             "task_status_changed"
         ],
-        "the bus carries exactly the four publications, in order: {events:?}"
+        "the bus carries exactly the four coordination publications, in order: {events:?}"
     );
 
     let status = find_event(events, "member_status_changed", |payload| {
@@ -502,6 +513,27 @@ fn assert_bus_publications(events: &[EventMessage], mail_id: &str) {
         status < message && message < created && created < moved,
         "publication order follows the calls: {events:?}"
     );
+
+    if let Some(completed) = events
+        .iter()
+        .position(|event| event.event_type == "team_completed")
+    {
+        assert_eq!(
+            events[completed].payload["team_name"],
+            json!(TEAM),
+            "the settlement names its team: {events:?}"
+        );
+        assert_eq!(
+            events[completed].payload["reason"],
+            json!("settled"),
+            "the settlement names why the team completed: {events:?}"
+        );
+        assert!(
+            message < completed && completed < created,
+            "the settled run publishes its completion after the mail and before the caller's task: \
+             {events:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -538,8 +570,8 @@ async fn event_bus_records_member_task_and_mail_publications_in_order() {
         .await
         .expect("the mail is persisted");
 
-    // The run's completion is a *stream* marker: `EventPayload::TeamCompleted` exists in the schema
-    // but the runtime publishes completion only on the result stream, never on the bus.
+    // The run's completion reaches the caller as a *stream* marker; observers holding no stream see
+    // the same settlement as one `team_completed` bus publication, asserted below.
     let frames = collect_bounded(agent.stream(json!("ship the release"), None), MAX_FRAMES).await;
     assert!(frames.iter().all(Result::is_ok), "{frames:?}");
     let last = frames.last().unwrap().as_ref().unwrap();
@@ -556,7 +588,7 @@ async fn event_bus_records_member_task_and_mail_publications_in_order() {
     );
 
     // An empty board is what let the run settle, so the task is created last; the exact type list
-    // below also proves the settled run itself published nothing.
+    // in `assert_bus_publications` covers everything the settled run itself published.
     let task = within(
         "task create",
         agent.create_task(TaskGraphSpec {
@@ -572,12 +604,20 @@ async fn event_bus_records_member_task_and_mail_publications_in_order() {
 
     let snapshot = events.lock().unwrap().clone();
     assert_bus_publications(&snapshot, &mail.message_id);
-    assert!(
-        snapshot
-            .iter()
-            .all(|event| event.event_type != "team_completed"),
-        "completion is not a bus event: {snapshot:?}"
+
+    // The settled run announces itself on the bus exactly once, beside the stream marker asserted
+    // above, so an observer with no stream still learns the team completed.
+    let completions = snapshot
+        .iter()
+        .filter(|event| event.event_type == "team_completed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "the settled run publishes the completion once: {snapshot:?}"
     );
+    assert_eq!(completions[0].payload["team_name"], json!(TEAM));
+    assert_eq!(completions[0].payload["reason"], json!("settled"));
 }
 
 #[tokio::test]
