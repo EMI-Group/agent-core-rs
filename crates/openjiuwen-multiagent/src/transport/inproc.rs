@@ -42,6 +42,16 @@ impl InProcessTransport {
         })
     }
 
+    /// Wraps an already-built `bus` without creating another one.
+    ///
+    /// This is how a [`TeamRuntime`](crate::TeamRuntime) exposes its own bus as
+    /// the default transport: outbound deliveries go through the seam while the
+    /// bus keeps owning the topic workers and the inbound dispatch.
+    #[must_use]
+    pub fn from_bus(bus: Arc<MessageBus>) -> Arc<Self> {
+        Arc::new(Self { bus })
+    }
+
     /// Returns the bus this transport delegates to.
     #[must_use]
     pub fn bus(&self) -> Arc<MessageBus> {

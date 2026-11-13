@@ -9,6 +9,16 @@
 //!
 //! The tool holds a [`Weak`] reference back to the runtime: an agent tool that
 //! outlives its team fails the call instead of keeping the team alive.
+//!
+//! # Task events
+//!
+//! Every successful dispatch through the runtime emits
+//! [`TeamEvent::task_assigned`] before the member is invoked and
+//! [`TeamEvent::task_completed`] after it answers. Both carry the child session
+//! id and a `call_id` detail with the derived tool-call/conversation id. A
+//! failed dispatch emits [`TeamEvent::error`] with an `operation` detail of
+//! `agent_tool` instead of the completion event. A dropped runtime emits
+//! nothing.
 
 use std::sync::{Arc, Weak};
 
@@ -20,6 +30,7 @@ use openjiuwen_session::{AgentSession, AgentSessionOptions, Session};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::events::TeamEvent;
 use crate::runtime::TeamRuntime;
 
 /// Metadata key carrying the model's tool-call id for this invocation.
@@ -124,6 +135,10 @@ impl AgentTool {
     }
 
     /// Runs the member once, honouring the call deadline.
+    ///
+    /// Emits the task lifecycle events: `task_assigned` before the dispatch,
+    /// then `task_completed` on success or an `agent_tool` error event on
+    /// failure.
     async fn dispatch(
         &self,
         inputs: Value,
@@ -134,9 +149,52 @@ impl AgentTool {
             .runtime
             .upgrade()
             .ok_or_else(|| Error::tool("Agent execution error: team runtime dropped".to_owned()))?;
+        let events = runtime.events();
+        let team_id = runtime.team_id().to_owned();
         let session = self.child_session(ctx.session_id.as_deref(), tool_call_id);
-        // The permit is held until the invocation finishes, so the cap counts
-        // in-flight sub-agents rather than queued tool calls.
+        let child_id = session.id().to_owned();
+        events.emit(Self::task_event(
+            TeamEvent::task_assigned(&team_id, &self.agent_id, &self.card.name),
+            &child_id,
+        ));
+        let result = self.run(runtime, inputs, session, ctx).await;
+        match &result {
+            Ok(_) => {
+                events.emit(Self::task_event(
+                    TeamEvent::task_completed(&team_id, &self.agent_id, &self.card.name),
+                    &child_id,
+                ));
+            }
+            Err(error) => {
+                events.emit(
+                    TeamEvent::error(&team_id, &self.agent_id, error.to_string())
+                        .with_session(&child_id)
+                        .with_detail("call_id", Value::String(child_id.clone()))
+                        .with_detail("operation", Value::String("agent_tool".to_owned())),
+                );
+            }
+        }
+        result
+    }
+
+    /// Stamps the child session id and the derived call id onto `event`.
+    fn task_event(event: TeamEvent, child_id: &str) -> TeamEvent {
+        event
+            .with_session(child_id)
+            .with_detail("call_id", Value::String(child_id.to_owned()))
+    }
+
+    /// Invokes the member in `session`, bounded by the limiter and the deadline.
+    ///
+    /// The permit is held until the invocation finishes, so the cap counts
+    /// in-flight sub-agents rather than queued tool calls.
+    async fn run(
+        &self,
+        runtime: Arc<TeamRuntime>,
+        inputs: Value,
+        session: Arc<dyn Session>,
+        ctx: &ToolContext,
+    ) -> Result<Value> {
         let _permit = self.acquire_permit().await?;
         let pending = runtime.invoke_agent(&self.agent_id, inputs, Some(session));
         let output = match ctx.timeout {
