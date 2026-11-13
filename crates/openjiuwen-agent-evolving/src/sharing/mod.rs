@@ -12,3 +12,16 @@
 //!
 //! The remote hub client is deferred; the backend seam is real and testable
 //! offline.
+
+mod backend;
+mod keywords;
+mod stager;
+mod types;
+
+pub use backend::{LocalFileSharingBackend, MemorySharingBackend, SharingBackend};
+pub use keywords::KeywordExtractor;
+pub use stager::{ShareStager, StagedBundle};
+pub use types::{
+    QueryKeywords, SharedExperience, SharedSkillBundle, SharingMeta, SkillPackageMeta,
+    SkillSearchResult,
+};
