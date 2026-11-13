@@ -99,10 +99,6 @@ The default build needs no network and no external service: every feature above 
 - Tools resolve at both depths: `openjiuwen::core::foundation::{Tool, ToolCard, ToolContext, ToolOutput, FunctionTool, FunctionToolBuilder, ToolHandler, schema_for, RestfulApiTool, openai_tools}` (flat, `../openjiuwen-foundation/src/lib.rs:102`) and `openjiuwen::core::foundation::tool::{…same items…}` (`../openjiuwen-foundation/src/tool/mod.rs:31`); `Tool`/`FunctionTool` are also in the prelude (`src/prelude.rs:29`).
 - The `#[tool]` proc macro is reachable through no alias of this crate: `openjiuwen` does not depend on `openjiuwen-macros` (`Cargo.toml:11-35`) and `openjiuwen-foundation` neither uses nor re-exports it, so a consumer adds `openjiuwen-macros` as its own dependency and writes `#[openjiuwen_macros::tool(...)]` (generated code also needs `async-trait` in the consumer).
 
-## Known Issues
-
-- None known: `cargo clippy -p openjiuwen --all-targets -- -D warnings` now passes without `--no-deps` because the sibling `crate_name` functions carry `#[must_use]`.
-
 ## Routing Table
 
 - `./src/lib.rs` → crate docs (Python→Rust table, feature matrix, getting-started doctest), module aliases, `crate_name()`
