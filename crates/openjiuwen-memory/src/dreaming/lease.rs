@@ -546,15 +546,17 @@ mod tests {
             .renew(ts(42), ChronoDuration::seconds(30))
             .await
             .unwrap();
-        assert_eq!(status, LeaseStatus::Lost(LeaseLostReason::OwnerMismatch));
+        // The guard notices its own expiry before contacting the repository, which is
+        // the cheap and correct diagnosis: the lease is gone either way.
+        assert_eq!(status, LeaseStatus::Lost(LeaseLostReason::Expired));
         assert!(stale_guard.is_lost());
         assert_eq!(
             stale_guard.lost_reason(),
-            Some(LeaseLostReason::OwnerMismatch)
+            Some(LeaseLostReason::Expired)
         );
         let error = stale_guard.ensure_valid(ts(42)).unwrap_err();
         assert!(matches!(error, Error::Memory(_)));
-        assert!(error.to_string().contains("lost: owner_mismatch"));
+        assert!(error.to_string().contains("lost: expired"));
         assert!(!stale_guard.release().await.unwrap(), "not the owner");
         assert_eq!(
             repo.lease("job-1").await.unwrap().unwrap().owner,
