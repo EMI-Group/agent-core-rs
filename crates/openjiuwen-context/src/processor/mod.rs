@@ -34,7 +34,9 @@ use crate::offload::{OffloadScope, OffloadStore};
 use crate::window::drop_orphan_tool_results;
 
 pub mod compressor;
+pub mod offloader;
 pub mod summarize;
+pub mod summary_offloader;
 pub mod tool_result;
 pub mod truncate;
 
@@ -44,7 +46,16 @@ pub use self::compressor::{
     CurrentRoundCompressorConfig, DialogueCompressor, DialogueCompressorConfig, MemoryBlockKind,
     CURRENT_ROUND_MEMORY_BLOCK, DIALOGUE_MEMORY_BLOCK, ROUND_LEVEL_MEMORY_BLOCK,
 };
+pub use self::offloader::{
+    wildcard_match, MessageOffloadRole, MessageOffloader, MessageOffloaderConfig,
+    ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, ToolResultWindowProcessor,
+    ToolResultWindowProcessorConfig, OMIT_STRING, WINDOWED_OUTPUT_TAG, WINDOW_MANAGED_METADATA_KEY,
+};
 pub use self::summarize::{SummarizationConfig, SummarizationProcessor, CONTEXT_SUMMARY_PREFIX};
+pub use self::summary_offloader::{
+    summarize_text_offline, MessageSummaryOffloader, MessageSummaryOffloaderConfig,
+    OFFLOADED_INFO_TAG, SUMMARY_COMPRESSION_SYSTEM_PROMPT,
+};
 pub use self::tool_result::{
     ToolResultConfig, ToolResultProcessor, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
 };
@@ -135,7 +146,11 @@ impl ContextPipeline {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when a summarisation processor is configured
-    /// without a model. Truncation and tool-result processors never fail.
+    /// without a model, and when an offloader config fails its own
+    /// [`validate`](MessageOffloaderConfig::validate) checks. The summary
+    /// offloader never fails for a missing model: it falls back to the
+    /// deterministic offline summary. Truncation and tool-result processors
+    /// never fail.
     pub fn from_configs(
         configs: &[ProcessorConfig],
         model: Option<Arc<dyn Model>>,
@@ -179,6 +194,36 @@ impl ContextPipeline {
                     processors.push(Arc::new(CurrentRoundCompressor::new(
                         config.clone(),
                         model.clone(),
+                    )));
+                }
+                ProcessorConfig::MessageOffloader(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(MessageOffloader::new(
+                        config.clone(),
+                        Arc::clone(&offload),
+                    )));
+                }
+                ProcessorConfig::ToolResultBudget(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(ToolResultBudgetProcessor::new(
+                        config.clone(),
+                        Arc::clone(&offload),
+                    )));
+                }
+                ProcessorConfig::ToolResultWindow(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(ToolResultWindowProcessor::new(
+                        config.clone(),
+                        Arc::clone(&offload),
+                    )));
+                }
+                ProcessorConfig::MessageSummaryOffloader(config) => {
+                    // A missing model is not an error: the processor falls back
+                    // to the deterministic offline summary.
+                    processors.push(Arc::new(MessageSummaryOffloader::new(
+                        config.clone(),
+                        model.clone(),
+                        Arc::clone(&offload),
                     )));
                 }
             }
@@ -244,6 +289,14 @@ pub enum ProcessorConfig {
     DialogueCompressor(DialogueCompressorConfig),
     /// Compress the earlier part of the current round into a memory block.
     CurrentRoundCompressor(CurrentRoundCompressorConfig),
+    /// Offload large messages once the history outgrows the thresholds.
+    MessageOffloader(MessageOffloaderConfig),
+    /// Enforce a per-round token budget on tool results.
+    ToolResultBudget(ToolResultBudgetProcessorConfig),
+    /// Keep only the newest results of the configured tools.
+    ToolResultWindow(ToolResultWindowProcessorConfig),
+    /// Replace an oversized message with a summary and offload the original.
+    MessageSummaryOffloader(MessageSummaryOffloaderConfig),
 }
 
 #[cfg(test)]
