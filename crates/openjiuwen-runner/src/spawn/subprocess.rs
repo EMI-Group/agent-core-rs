@@ -1253,7 +1253,19 @@ mod tests {
         assert_eq!(frame.payload["spawn_spec"]["agent_class"], json!("Helper"));
         assert_eq!(frame.payload["spawn_spec"]["session_id"], json!("s-1"));
         let line = frame.to_line().unwrap();
-        assert_eq!(SpawnMessage::from_line(&line).unwrap(), frame);
+        // `serde_json`'s float parser is not correctly rounded, so a round-tripped
+        // timestamp may differ by one ULP: compare the whole frame except the
+        // timestamp, then the timestamp with a tolerance (see `protocol.rs`).
+        let restored = SpawnMessage::from_line(&line).unwrap();
+        assert_eq!(restored.kind, frame.kind);
+        assert_eq!(restored.payload, frame.payload);
+        assert_eq!(restored.message_id, frame.message_id);
+        assert!(
+            (restored.timestamp - frame.timestamp).abs() < 1e-6,
+            "timestamp drifted: {} vs {}",
+            restored.timestamp,
+            frame.timestamp
+        );
     }
 
     #[test]
