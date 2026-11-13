@@ -37,8 +37,10 @@ impl MemoryVectorStore {
     pub async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<ScoredNode>>;
     pub async fn search_with_metadata(&self, query: &[f32], top_k: usize, metadata: &BTreeMap<String, Value>) -> Result<Vec<ScoredNode>>;
     pub async fn len(&self) -> usize;
+    pub async fn is_empty(&self) -> bool;
     pub async fn clear(&self);
 }
+impl Default for MemoryVectorStore;   // same as `new()`
 pub struct ScoredNode { pub node: VectorNode, pub score: f32 }   // raw cosine in [-1, 1], higher first; non-finite scores clamp to 0.0
 
 pub struct RetrieveRequest { pub user_id: String, pub query: String }
@@ -62,6 +64,10 @@ impl UnsupportedTaskMemoryService { pub fn new(algo: Algo) -> Self; pub fn algo(
 - `normalize_algo_name` ports Python's table exactly (case-insensitive, `-`/`_`/space tolerated): `ace` → Ace; `rb`, `reasoningbank`, `reasoning_bank` → ReasoningBank; `reme`, `refcon`, `ref_con`, `divcon`, `div_con` → Reme family (returning `Refcon`/`Divcon` for the explicit spellings); `cognition` → Cognition; anything else → `Error::Validation("unknown memory algorithm '<name>'")`.
 - `MemoryVectorStore` ports `memory_vector_store.py`: cosine similarity (`dot / (‖a‖·‖b‖)`), empty or mismatched vectors score `0.0` (empty vs empty `1.0`), results sorted descending with stable ties, `top_k` clamped to the index size; metadata filtering matches exact dotted-path equality.
 - `AddMemoryRequest` mirrors the Python dataclass defaults (`section = "general"`, everything else `None`/empty).
+- Memory serialization is snake_case with `#[serde(default)]` on the struct and `#[serde(default = "default_section")]` on `section`; a missing field, an explicit `null`, and an unknown field are all accepted, and `attributes` maps `null`/absent to an empty `BTreeMap`.
+- `attributes` is a `BTreeMap<String, Value>` via a custom `deserialize_attributes` (accepts missing map, explicit `null`, or an object), so the JSON persistence shape `{"memories": [...]}` round-trips regardless of which optional keys a stored memory carries.
+- `Algo` and `AlgoFamily` serialize `snake_case` (`reasoning_bank`, `reme`, …) and support `Hash`/`Copy`, so both work as map keys in host code.
+- `TaskMemoryService` is public and unsealed: a host implements it in its own crate to supply the LLM/embedding/persistence pipelines, and `UnsupportedTaskMemoryService` is only the deferred default.
 - Ported as pure data: `schema/io_schema.py` response cards (`RetrieveResponse`, `SummarizeResponse`), algorithm names, and the JSON persistence shape (`{"memories": [...]}`).
 - Not ported (documented, `Error::Unsupported`): LLM-driven retrieve/summarize pipelines, embedding calls, Milvus persistence, trajectory generation (MaTTS), offline L2/L3 memory-bank builders, and the Wikipedia tool (blocking `requests`).
 
