@@ -16,11 +16,15 @@
 
 pub mod anthropic;
 pub mod config;
+pub mod dashscope;
 pub mod factory;
 pub mod model;
+pub mod oauth;
 pub mod openai;
 pub mod provider;
+pub mod reasoning;
 pub mod registry;
+pub mod routing;
 pub mod sse;
 pub(crate) mod transport;
 
