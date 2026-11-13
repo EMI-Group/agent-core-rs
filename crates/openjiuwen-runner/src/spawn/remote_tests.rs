@@ -711,7 +711,7 @@ async fn cancel_task_posts_the_task_id() {
         .mount(&server)
         .await;
     let agent = server_agent(&server, "a");
-    agent.cancel_task("task-1").await.unwrap();
+    RemoteClient::cancel_task(&agent, "task-1").await.unwrap();
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body, json!({"task_id": "task-1"}));
@@ -721,7 +721,9 @@ async fn cancel_task_posts_the_task_id() {
 async fn cancel_task_without_a_cancel_path_is_unsupported() {
     let agent =
         RemoteAgent::new(RemoteAgentConfig::new("a", "http://127.0.0.1:9").with_cancel_path(None));
-    let error = agent.cancel_task("task-1").await.unwrap_err();
+    let error = RemoteClient::cancel_task(&agent, "task-1")
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert!(
         error.to_string().contains("remote agent cancel_task"),
@@ -739,7 +741,9 @@ async fn cancel_task_maps_a_missing_task_to_not_found() {
         .mount(&server)
         .await;
     let agent = server_agent(&server, "a");
-    let error = agent.cancel_task("task-1").await.unwrap_err();
+    let error = RemoteClient::cancel_task(&agent, "task-1")
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
     assert!(error.to_string().contains("unknown task"), "{error}");
 }
@@ -758,4 +762,63 @@ async fn custom_paths_are_honoured() {
     );
     let output = agent.invoke(json!({}), None).await.unwrap();
     assert_eq!(output.output, "ok");
+}
+
+// --- the trait seam ---------------------------------------------------------
+
+#[tokio::test]
+async fn health_follows_the_clients_started_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/a/invoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"output": "ok"})))
+        .mount(&server)
+        .await;
+    let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "a"));
+
+    // Nothing has been sent yet, so the client is not started.
+    assert_eq!(agent.backend(), SpawnBackend::RemoteHttp);
+    assert!(!agent.is_alive());
+    assert!(!agent.is_healthy());
+    assert!(!agent.health().await.unwrap());
+    assert_eq!(agent.pid(), None);
+    let stopped = agent.health_snapshot();
+    assert_eq!(stopped.backend, SpawnBackend::RemoteHttp);
+    assert!(!stopped.alive);
+    assert!(!stopped.healthy);
+    assert_eq!(stopped.last_error, None);
+
+    // The first invocation auto-starts the client.
+    let output = agent.send(json!({"query": "hi"})).await.unwrap();
+    assert_eq!(output.output, "ok");
+    assert!(agent.is_alive());
+    assert!(agent.is_healthy());
+    assert!(agent.health().await.unwrap());
+    let started = agent.health_snapshot();
+    assert!(started.alive);
+    assert!(started.healthy);
+    assert_eq!(started.pid, None);
+}
+
+#[tokio::test]
+async fn cancel_task_through_the_seam_reaches_the_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/a/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let agent: Arc<dyn SpawnedAgent> = Arc::new(server_agent(&server, "a"));
+    agent.cancel_task("task-9").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body, json!({"task_id": "task-9"}));
+}
+
+#[test]
+fn the_remote_spawner_names_its_backend() {
+    assert_eq!(
+        RemoteSpawner::new("http://127.0.0.1:9").backend(),
+        SpawnBackend::RemoteHttp
+    );
 }

@@ -17,7 +17,11 @@
 //! (a fair queue: callers wait instead of interleaving frames). A handle whose
 //! stream was dropped before a terminator is marked out of sync and refuses
 //! further exchanges with [`openjiuwen_common::error::Error::Validation`],
-//! because the next read would consume that abandoned exchange's frames.
+//! because the next read would consume that abandoned exchange's frames. For the
+//! same reason a child implements no task cancellation
+//! ([`SpawnedAgent::cancel_task`] keeps its unsupported default): there is no
+//! task handle to address, so the way to stop one is
+//! [`SpawnedProcess::shutdown`] or [`SpawnedProcess::force_kill`].
 //!
 //! **Timing** (`request_timeout_secs`, `shutdown_timeout_secs`,
 //! `health_check_*`) comes from [`SubprocessConfig`]; the matching [`SpawnSpec`]
@@ -42,7 +46,7 @@ use subprocess_config::{secs, MAX_TIMEOUT_SECS};
 use crate::error;
 use crate::spawn::frames;
 use crate::spawn::protocol::{SpawnMessage, SpawnMessageKind};
-use crate::spawn::{AgentSpawner, SpawnSpec, SpawnedAgent};
+use crate::spawn::{AgentSpawner, SpawnBackend, SpawnHealth, SpawnSpec, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
@@ -175,6 +179,10 @@ impl SubprocessSpawner {
 
 #[async_trait]
 impl AgentSpawner for SubprocessSpawner {
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::Subprocess
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let process = self.spawn_process(spec).await?;
         Ok(process)
@@ -317,6 +325,43 @@ impl SpawnedAgent for SpawnedProcess {
 
     fn pid(&self) -> Option<u32> {
         self.state.pid
+    }
+
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::Subprocess
+    }
+
+    /// The last observed probe result, read from the same atomic the background
+    /// health task updates.
+    fn is_healthy(&self) -> bool {
+        self.state.healthy.load(Ordering::SeqCst)
+    }
+
+    /// Named here rather than inherited so the backend is pinned to
+    /// [`SpawnBackend::Subprocess`] and no field can drift from the handle's own
+    /// accessors; `last_error` stays `None` because the backend fabricates no
+    /// failure — a failed probe is reported by [`SpawnedProcess::health`].
+    fn health_snapshot(&self) -> SpawnHealth {
+        SpawnHealth {
+            backend: SpawnBackend::Subprocess,
+            alive: is_alive_impl(&self.state),
+            healthy: self.state.healthy.load(Ordering::SeqCst),
+            pid: self.state.pid,
+            last_error: None,
+        }
+    }
+
+    /// Runs one health probe (`health_check` in, `health_check_response` out)
+    /// within the configured probe deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Timeout`] when the probe deadline
+    /// expires, [`openjiuwen_common::error::Error::Transport`] when the transport
+    /// fails, and [`openjiuwen_common::error::Error::Validation`] when the handle
+    /// is out of sync (see [`SpawnedProcess::health`]).
+    async fn health(&self) -> Result<bool> {
+        health_impl(&self.state).await
     }
 
     async fn send(&self, inputs: Value) -> Result<AgentOutput> {

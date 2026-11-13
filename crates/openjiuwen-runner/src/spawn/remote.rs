@@ -37,7 +37,7 @@
 
 use crate::error;
 use crate::spawn::protocol::{SpawnMessage, SpawnMessageKind};
-use crate::spawn::{AgentSpawner, SpawnSpec, SpawnedAgent};
+use crate::spawn::{AgentSpawner, SpawnBackend, SpawnSpec, SpawnedAgent};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -731,6 +731,24 @@ impl SpawnedAgent for RemoteAgent {
         None
     }
 
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::RemoteHttp
+    }
+
+    /// The client's started state: there is no probe endpoint to ask.
+    fn is_healthy(&self) -> bool {
+        RemoteClient::is_started(self)
+    }
+
+    /// The HTTP wire contract defines only invoke/stream/cancel, so there is no
+    /// health endpoint to probe: the answer is the client's own started state
+    /// (`false` until the first [`RemoteClient::invoke`]/[`RemoteClient::stream`]
+    /// auto-starts the client, or an explicit [`RemoteClient::start`]).
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn health(&self) -> Result<bool> {
+        Ok(RemoteClient::is_started(self))
+    }
+
     async fn send(&self, inputs: Value) -> Result<AgentOutput> {
         RemoteClient::invoke(self, inputs, None).await
     }
@@ -747,6 +765,20 @@ impl SpawnedAgent for RemoteAgent {
 
     async fn force_kill(&self) -> Result<()> {
         RemoteClient::stop(self).await
+    }
+
+    /// Forwards to [`RemoteClient::cancel_task`]: the cancel endpoint is the one
+    /// place a remote backend owns a real task handle.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] when no `cancel_path` is
+    /// configured, [`openjiuwen_common::error::Error::NotFound`] when the task is
+    /// unknown, [`openjiuwen_common::error::Error::Timeout`] when the deadline
+    /// elapses, and [`openjiuwen_common::error::Error::Transport`] for every other
+    /// failure.
+    async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        RemoteClient::cancel_task(self, task_id).await
     }
 }
 
@@ -809,6 +841,10 @@ impl RemoteSpawner {
 
 #[async_trait]
 impl AgentSpawner for RemoteSpawner {
+    fn backend(&self) -> SpawnBackend {
+        SpawnBackend::RemoteHttp
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let agent_id = remote_agent_id(&spec)?;
         let mut config = self.config_for(&agent_id);

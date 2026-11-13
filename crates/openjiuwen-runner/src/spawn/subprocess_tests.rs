@@ -205,3 +205,140 @@ fn the_spawner_exposes_its_config_including_the_frame_cap() {
         frames::DEFAULT_MAX_FRAME_BYTES
     );
 }
+
+// --- the trait seam over a real child ---------------------------------------
+
+/// Upper bound on any await here, so a broken exchange fails the test instead of
+/// stalling the harness.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// The libtest filter that selects [`fake_child`] in this very binary.
+fn child_filter() -> String {
+    let module = module_path!();
+    let relative = module
+        .split_once("::")
+        .map_or(module, |(_crate_name, rest)| rest);
+    format!("{relative}::fake_child")
+}
+
+/// A launch configuration that re-executes this test binary as the fake child.
+fn child_config() -> SubprocessConfig {
+    let program = std::env::current_exe()
+        .expect("the test binary path is available")
+        .to_string_lossy()
+        .into_owned();
+    SubprocessConfig::new(program)
+        .with_args(vec![
+            child_filter(),
+            "--exact".to_owned(),
+            "--ignored".to_owned(),
+            "--test-threads=1".to_owned(),
+            "--nocapture".to_owned(),
+        ])
+        // No background probe races the assertions; explicit probes still work.
+        .with_health_check(Duration::ZERO, Duration::from_secs(2), 3)
+        .with_request_timeout(BOUND)
+}
+
+/// Writes one protocol frame as a line and flushes it.
+fn emit(out: &mut impl std::io::Write, kind: SpawnMessageKind, payload: Value) {
+    let frame = SpawnMessage::new(kind, payload);
+    let line = frame.to_line().expect("a frame is serializable");
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// The hermetic protocol child: this test binary re-executed with the filter of
+/// this `#[ignore]`d case.
+///
+/// It answers an invocation with an `output` frame, a `health_check` with a
+/// healthy `health_check_response`, and a `shutdown` with `shutdown_ack`.
+#[test]
+#[ignore = "re-executed as the hermetic protocol child by the backend tests"]
+fn fake_child() {
+    use std::io::{BufRead, Write as _};
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    // libtest prints `running 1 test` and then `test ... ` without a trailing
+    // newline before this body runs; closing that line keeps every protocol frame
+    // on a line of its own (the parent skips the noise line).
+    let _ = writeln!(out);
+    let _ = out.flush();
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(frame) = SpawnMessage::from_line(&line) else {
+            continue;
+        };
+        match frame.kind {
+            SpawnMessageKind::Input => {
+                if frame.payload.get("spawn_spec").is_some() {
+                    continue; // the bootstrap frame carries no work
+                }
+                emit(
+                    &mut out,
+                    SpawnMessageKind::Output,
+                    AgentOutput::answer("pong").to_value(),
+                );
+            }
+            SpawnMessageKind::HealthCheck => emit(
+                &mut out,
+                SpawnMessageKind::HealthCheckResponse,
+                json!({"healthy": true}),
+            ),
+            SpawnMessageKind::Shutdown => {
+                emit(&mut out, SpawnMessageKind::ShutdownAck, Value::Null);
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_spawned_child_reports_its_backend_and_health_through_the_seam() {
+    let spawner = SubprocessSpawner::new(child_config());
+    assert_eq!(spawner.backend(), SpawnBackend::Subprocess);
+    let agent: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        spawner.spawn(SpawnSpec::class_agent("tests.spawn", "FakeAgent")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+
+    // Everything below goes through `Arc<dyn SpawnedAgent>`, which is the shape a
+    // caller actually holds.
+    assert_eq!(agent.backend(), SpawnBackend::Subprocess);
+    assert!(agent.is_alive());
+    assert!(
+        agent.is_healthy(),
+        "a fresh child is healthy before its first probe"
+    );
+    let healthy = tokio::time::timeout(BOUND, agent.health())
+        .await
+        .expect("the health probe must not hang")
+        .expect("the fake child answers a probe");
+    assert!(healthy);
+
+    let snapshot = agent.health_snapshot();
+    assert_eq!(snapshot.backend, SpawnBackend::Subprocess);
+    assert!(snapshot.alive);
+    assert!(snapshot.healthy);
+    assert_eq!(snapshot.pid, agent.pid());
+    assert!(snapshot.pid.is_some(), "a real child reports its pid");
+    assert_eq!(snapshot.last_error, None);
+
+    let output = tokio::time::timeout(BOUND, agent.send(json!({"query": "ping"})))
+        .await
+        .expect("send must not hang")
+        .expect("the fake child answers");
+    assert_eq!(output.output, "pong");
+
+    assert!(
+        tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+}

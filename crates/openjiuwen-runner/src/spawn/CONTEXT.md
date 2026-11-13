@@ -223,6 +223,8 @@ pub struct RemoteSpawner;                                  // new(base_url), wit
 ```
 
 `RemoteAgent` implements both `RemoteClient` and `SpawnedAgent`.
+Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_healthy()` = the client's started state, `health()` = `Ok(is_started)` (the HTTP wire contract defines only invoke/stream/cancel, so there is no probe endpoint; the client auto-starts on the first `invoke`/`stream`), and `cancel_task` forwards to `RemoteClient::cancel_task` (the one place a remote backend owns a real task handle).
+`RemoteSpawner::backend()` is `RemoteHttp`.
 `RemoteSpawner::spawn` derives the agent id from `agent_class`, then `agent_module`, then a non-empty `init_kwargs["agent_id"]` (`Validation` when none is usable), copies `SpawnSpec::session_id` into the config, and validates `base_url` at spawn time rather than at first invoke.
 
 URL layout: the endpoint is `{base_url}/{path}` with `{agent_id}` substituted into the path; extra slashes are collapsed outside the scheme and a missing or extra slash between base and path is tolerated, so `("http://host:8080/", "/agents/{agent_id}/invoke")` and `("http://host:8080", "agents/{agent_id}/invoke")` build the same URL.
@@ -256,7 +258,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - Errors are the crate vocabulary from `crate::error` (`transport`, `unsupported`, `run_timeout`, `not_started`) plus `Error::{Config, Validation, NotFound, Timeout, Unsupported}`; never `External`, never a panic on user input.
 - No `unsafe`, no `println!`/`eprintln!`; logging is `tracing` with target `openjiuwen_runner::spawn`.
 - `frames.rs` owns no pipe and `protocol.rs` no I/O: both are pure functions over `AsyncBufRead`/bytes.
-- Files stay ≤ ~1000 lines; the oversized inline unit-test modules live in `subprocess_tests.rs` and `remote_tests.rs`, declared with `#[cfg(test)] #[path = "….rs"] mod tests;`.
+- Files stay ≤ ~1000 lines; the oversized inline unit-test modules live in `mod_tests.rs`, `subprocess_tests.rs` and `remote_tests.rs`, declared with `#[cfg(test)] #[path = "….rs"] mod tests;`.
 - Tests are offline: unit tests inline (moved as above), the integration suites in `tests/` use a re-executed fake child and a loopback `wiremock` server.
 
 ## Design Decisions
@@ -272,7 +274,14 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **Auto-start.** The `reqwest` client is built lazily on first `invoke`/`stream` (or by `start`), so a caller need not wire a lifecycle; the built client is cloned out of the lock before any await, so no lock is held across a request.
 - **Per-call timeouts.** `invoke`/`stream` take an optional `Duration` that overrides the configured deadline for that request only.
 - **No cancel endpoint, no cancel.** `cancel_task` without a configured `cancel_path` is `Error::Unsupported`, never a silent no-op.
-- **Backends are state-free spawners.** `SubprocessSpawner` and `RemoteSpawner` hold configuration only; every `spawn` builds an independent child or client.
+- **Health is a seam-level accessor, not a downcast.** `SpawnedAgent` carries `backend`, `is_healthy`, `health_snapshot` and `health` beside `is_alive`, so a caller holding `Arc<dyn SpawnedAgent>` needs no knowledge of `SpawnedProcess`; every one of them has a default (`Unknown`, `is_alive`, the composition, and an `Unsupported` probe naming the backend), which keeps the trait object-safe and every existing implementor compiling.
+- **Only liveness-backed health is promised by default.** "No probe ⇒ liveness is the answer" is the documented fallback; a backend that can probe (`SpawnedProcess`, `RemoteAgent`) overrides `health`/`is_healthy`, and one that cannot (`InProcessAgent` has nothing to ask) answers from its alive flag rather than inventing a probe.
+- **Cancellation is per-backend, never simulated.** The NDJSON protocol has no request correlation id, so a subprocess handle keeps the `Unsupported` default for `cancel_task` and stops its child with `shutdown`/`force_kill`; only the HTTP client, which owns a real `cancel_path`, forwards it.
+- **A deferred backend is a registered answer.** `SpawnerRegistry::with_deferred` stores `DeferredSpawner`s for `RemoteMq`/`RemoteA2a`, so routing is uniform: the missing transport is named in the `Unsupported` message (`Pulsar`/`a2a`) instead of surfacing as "nothing registered".
+- **Routing never falls back silently.** A `SpawnSpec::backend` that is not registered is a deferred failure naming that backend, `spawn_with` resolves exactly what it was asked for, and only an *unspecified* backend reaches the default / sole-spawner / ambiguity rules.
+- **An external command is a resolved path, not a shell.** `ExternalCommandSpawner` refuses an empty command, a missing file, a directory, and (on unix) a file without an executable bit, then hands the absolute path to the subprocess backend; `PATH` is only a lookup, never an execution vehicle.
+- **An in-process agent is stopped, not signalled.** `shutdown` and `force_kill` both call the handler's own `shutdown`, `pid()` is `None`, and liveness is the handle's flag *and* the handler's, so a stopped handler cannot be reported alive.
+- **Backends are state-free spawners.** `SubprocessSpawner`, `ExternalCommandSpawner`, `InProcessSpawner` and `RemoteSpawner` hold configuration only; every `spawn` builds an independent child, client, or handle.
 
 ## Deferred
 
@@ -288,6 +297,10 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/frames.rs` → bounded line framing, `read_frame`, `parse_frame_line`, `frame_bytes`, `DEFAULT_MAX_FRAME_BYTES`
 - `./src/spawn/subprocess.rs` → `SubprocessSpawner`, `SpawnedProcess`, request guard/desync, health task, stderr drain, kill-on-drop, wire helpers
 - `./src/spawn/subprocess_config.rs` → `SubprocessConfig` (serde config, builders, clamped deadlines), private to the module and re-exported as `spawn::subprocess::SubprocessConfig`
+- `./src/spawn/external.rs` → `ExternalCommandSpawner` (command resolution on a search path / `PATH`, executable checks, delegation to the subprocess backend)
+- `./src/spawn/in_process.rs` → `InProcessHandler`, `InProcessFactory`, `InProcessSpawner`, `InProcessAgent` (host-bound agent, no child)
+- `./src/spawn/registry.rs` → `SpawnerRegistry` (multi-backend routing), `DeferredSpawner` (the wording table for undeferrable/undeferred backends)
+- `./src/spawn/mod_tests.rs` → inline unit tests of `mod.rs` (loaded via `#[path]`): wire names, `SpawnHealth`, `SpawnSpec::backend`, the defaulted accessors
 - `./src/spawn/subprocess_tests.rs` → inline unit tests of `subprocess.rs` (loaded via `#[path]`)
 - `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, `RemoteAgent`, `create_remote_client`, `RemoteSpawner`, URL building, stream parsing, status mapping
 - `./src/spawn/remote_tests.rs` → inline unit tests of `remote.rs` (loaded via `#[path]`)
@@ -302,3 +315,6 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
 - The reference child implementation is `tests/spawn_subprocess.rs`'s `#[ignore]`d `fake_child` libtest case re-executed with `fake_child --exact --ignored --test-threads=1 --nocapture` (`--nocapture` is mandatory or libtest redirects the child's stdout and no frame reaches the pipe).
 - `SubprocessConfig::program` empty is `Error::Config` at spawn, not at construction, so a host can build a config incrementally.
+- The lib unit tests re-execute the lib test binary as the hermetic child: `subprocess_tests.rs`'s `#[ignore]`d `fake_child` is selected by `--exact` with the filter `<module_path minus the crate>::fake_child`; the child must close libtest's partial `test … ` line with a leading newline or the parent skips its first frame as noise.
+- `ExternalCommandSpawner::with_search_path` is the hermetic form: it replaces `PATH` with one directory, so a test never depends on the machine's installed programs.
+- `SpawnerRegistry` is the multi-backend host; the runner-level wiring (`Runner::set_spawner`, flat re-exports in `src/lib.rs`) is maintained outside this node.
