@@ -151,6 +151,7 @@ impl LlmJudgeMetric {
 `LlmJudgeMetric` accepts only `{"score":0|1,"reason":"<non-empty>"}`, makes exactly one repair attempt that re-sends the request with the validation error appended, and then applies the fallback mode.
 
 The deterministic rubric gives three equal checks (described description, described input, described output) so all three score `1.0`, a description alone `0.5`, and a card without a description `0.0`, passing at `>= 0.5` with `detail` prefixed `deterministic_fallback:`.
+`evaluation::LlmJudgedMetric` is a thin delegating wrapper over `LlmJudgeMetric` (name `llm_judged`, default rubric, plus `with_model`/`with_rubric`/`with_fallback`/`rubric`/`has_model` and a delegating `Metric` impl), so the crate has exactly one judge implementation and an offline suite scores the card instead of erroring.
 
 ## Constraints
 

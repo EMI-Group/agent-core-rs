@@ -1,10 +1,25 @@
 //! Fail-soft capability evaluation with deterministic static metrics.
 //!
 //! Ports the offline subset of Python `openjiuwen.symphony.evaluation`. Python's suite
-//! mixes deterministic static checks with LLM-judged and trace-driven metrics; the
-//! Rust port keeps the static metrics and defers the model-backed ones to
-//! [`LlmJudgedMetric`](crate::evaluation::LlmJudgedMetric), which reports
-//! [`openjiuwen_common::error::Error::Unsupported`].
+//! mixes deterministic static checks with LLM-judged and trace-driven metrics; the Rust
+//! port keeps the static checks and routes the model-backed one through the crate's
+//! single LLM seam.
+//!
+//! # The LLM-judged metric
+//!
+//! [`LlmJudgedMetric`](crate::evaluation::LlmJudgedMetric) is a thin delegating wrapper
+//! over [`LlmJudgeMetric`](crate::llm::LlmJudgeMetric): it keeps the suite-facing name
+//! (`"llm_judged"`) and the default rubric, and forwards the model, rubric, fallback mode
+//! and the judgement itself to the inner metric. There is exactly one judge implementation
+//! in this crate; the wrapper only names it for the evaluation surface.
+//!
+//! Without a model the metric produces a real deterministic verdict — three equal checks
+//! (non-blank description, at least one described input, at least one described output),
+//! passing at `0.5`, with `detail` prefixed `deterministic_fallback:` — so an offline
+//! suite never records an error for it. With a model it asks for the binary
+//! `{"score":0|1,"reason":"…"}` verdict Python's `LLMJudgeEvaluator` uses, repairs one
+//! unusable reply, and then applies the configured
+//! [`FallbackMode`](crate::llm::FallbackMode).
 //!
 //! # Shapes
 //!
@@ -20,24 +35,27 @@
 //! A metric that fails does not abort the suite: the error is rendered into
 //! [`EvaluationReport::errors`](crate::evaluation::EvaluationReport::errors) (prefixed with
 //! the metric name) and the remaining metrics still run. That mirrors Python's per-evaluator
-//! isolation, and it keeps a deferred or misconfigured metric from hiding the static results.
+//! isolation, and it keeps a misconfigured metric from hiding the static results. In
+//! practice only a model-backed metric configured with
+//! [`FallbackMode::Error`](crate::llm::FallbackMode) can fail here.
 //! `overall` is the mean of the *successful* scores, so `0.0` means "nothing could be scored",
 //! not "everything failed".
 //!
 //! # Determinism
 //!
-//! Both built-in metrics are pure functions of the card: no clock, no LLM, no
-//! hash-map iteration order. Scores stay in suite order, and `detail` strings list the
+//! The static metrics are pure functions of the card: no clock, no LLM, no
+//! hash-map iteration order. The judge wrapper is equally deterministic when it has no
+//! model, which is the default. Scores stay in suite order, and `detail` strings list the
 //! offending fields in card order.
 #![allow(clippy::unused_async_trait_impl)] // the `Metric` contract is async for LLM-backed metrics
-use crate::error::{unsupported, Result};
+use crate::error::Result;
+use crate::llm::judge::{LlmJudgeMetric, DEFAULT_RUBRIC};
+use crate::llm::{CompletionModel, FallbackMode};
 use crate::model::{CapabilityDescriptor, CapabilityIo};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-/// The feature name reported by [`LlmJudgedMetric`].
-const LLM_JUDGE_FEATURE: &str = "LLM-judged capability evaluation";
 /// How many checks [`CompletenessMetric`] performs (equal weight each).
 const COMPLETENESS_CHECKS: u32 = 4;
 /// The [`CompletenessMetric`] score at or above which a capability counts as complete.
@@ -102,9 +120,10 @@ pub trait Metric: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`openjiuwen_common::error::Error`] when the metric is unavailable, for
-    /// example [`openjiuwen_common::error::Error::Unsupported`] from a deferred
-    /// model-backed metric. The suite records the error instead of aborting.
+    /// Returns [`openjiuwen_common::error::Error`] when the metric cannot produce a
+    /// verdict, for example when a model-backed metric keeps receiving unusable replies
+    /// and is configured with [`FallbackMode::Error`].
+    /// The suite records the error instead of aborting.
     async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>;
 }
 /// Scores vocabulary completeness: description, tags, and described inputs/outputs.
@@ -226,34 +245,91 @@ impl Metric for SchemaValidityMetric {
         })
     }
 }
-/// LLM-judged quality metric, deferred to a model-backed implementation.
+/// LLM-judged quality metric, delegated to [`LlmJudgeMetric`].
 ///
-/// Mirrors Python's `LLMJudgeEvaluator` in `openjiuwen.symphony.evaluation`, which asks
-/// a model to judge capability quality. That needs an LLM stack, so this metric always
-/// returns [`openjiuwen_common::error::Error::Unsupported`]; the suite records the
-/// failure and still reports every static score.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LlmJudgedMetric;
+/// Mirrors Python's `LLMJudgeEvaluator` in `openjiuwen.symphony.evaluation`, which asks a
+/// model for a binary verdict plus a reason. This type is the evaluation surface's name
+/// for that judgement: it wraps the crate's single judge implementation, keeping the
+/// metric name `"llm_judged"` and
+/// [`DEFAULT_RUBRIC`].
+///
+/// With no model it scores the card with the deterministic fallback rubric (description,
+/// described input, described output — equal weight, passing at `0.5`, `detail` prefixed
+/// `deterministic_fallback:`), so an offline suite still gets a verdict. With a model it
+/// delegates the request, the single repair retry, and the
+/// [`FallbackMode`] handling to the inner metric.
+///
+/// ```
+/// use openjiuwen_symphony::evaluation::{EvaluationSuite, LlmJudgedMetric, Metric};
+///
+/// let metric = LlmJudgedMetric::new();
+/// assert_eq!(metric.name(), "llm_judged");
+/// assert!(!metric.has_model());
+/// assert!(metric.rubric().starts_with("The capability card must be self-describing"));
+/// let _suite = EvaluationSuite::default_suite().with_llm_judge();
+/// ```
+#[derive(Debug, Clone)]
+pub struct LlmJudgedMetric {
+    /// The shared judge implementation this metric delegates to.
+    inner: LlmJudgeMetric,
+}
+impl Default for LlmJudgedMetric {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl LlmJudgedMetric {
-    /// Builds the metric; it is stateless.
+    /// Builds the metric with the `"llm_judged"` name and the default rubric, no model.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            inner: LlmJudgeMetric::new(LLM_JUDGED, DEFAULT_RUBRIC),
+        }
+    }
+    /// Sets the completion model used for judgement.
+    #[must_use]
+    pub fn with_model(mut self, model: Arc<dyn CompletionModel>) -> Self {
+        self.inner = self.inner.with_model(model);
+        self
+    }
+    /// Replaces the rubric the model is asked to apply.
+    #[must_use]
+    pub fn with_rubric(mut self, rubric: impl Into<String>) -> Self {
+        self.inner = self.inner.with_rubric(rubric);
+        self
+    }
+    /// Sets what happens when the model fails or keeps answering unusably.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: FallbackMode) -> Self {
+        self.inner = self.inner.with_fallback(fallback);
+        self
+    }
+    /// The rubric the model is asked to apply.
+    #[must_use]
+    pub fn rubric(&self) -> &str {
+        self.inner.rubric()
+    }
+    /// Whether a model is configured.
+    #[must_use]
+    pub fn has_model(&self) -> bool {
+        self.inner.has_model()
     }
 }
 #[async_trait]
 impl Metric for LlmJudgedMetric {
     fn name(&self) -> &str {
-        LLM_JUDGED
+        self.inner.name()
     }
-    /// Always fails with [`openjiuwen_common::error::Error::Unsupported`].
+    /// Delegates to [`LlmJudgeMetric`].
     ///
     /// # Errors
     ///
-    /// Always returns [`openjiuwen_common::error::Error::Unsupported`]: LLM judgement is
-    /// part of the crate's deferred scope.
-    async fn evaluate(&self, _input: &EvaluationInput) -> Result<MetricScore> {
-        Err(unsupported(LLM_JUDGE_FEATURE))
+    /// Returns [`openjiuwen_common::error::Error::Llm`] only when a model is configured,
+    /// the judgement fails twice, and the fallback mode is
+    /// [`FallbackMode::Error`]. Without a model the
+    /// deterministic rubric always answers.
+    async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore> {
+        self.inner.evaluate(input).await
     }
 }
 /// An ordered set of metrics evaluated fail-soft against one capability.
@@ -276,13 +352,27 @@ impl EvaluationSuite {
             Arc::new(SchemaValidityMetric),
         ])
     }
-    /// Appends the deferred [`LlmJudgedMetric`].
+    /// Appends the model-free [`LlmJudgedMetric`].
     ///
-    /// Every evaluation then records exactly one fail-soft error; the static metrics
-    /// still score the capability.
+    /// Every evaluation then scores the card with the judge's deterministic fallback
+    /// rubric (description, described input, described output), so the report has one
+    /// extra score and — unlike a deferred stub — no error. Use
+    /// [`with_llm_judge_model`](crate::evaluation::EvaluationSuite::with_llm_judge_model)
+    /// to judge with a model instead.
     #[must_use]
     pub fn with_llm_judge(mut self) -> Self {
-        self.metrics.push(Arc::new(LlmJudgedMetric));
+        self.metrics.push(Arc::new(LlmJudgedMetric::new()));
+        self
+    }
+    /// Appends an [`LlmJudgedMetric`] that judges with `model`.
+    ///
+    /// The metric keeps the `"llm_judged"` name and the default rubric; a model verdict
+    /// passes only on `score == 1`, one unusable reply is repaired, and a second failure
+    /// falls back to the deterministic rubric.
+    #[must_use]
+    pub fn with_llm_judge_model(mut self, model: Arc<dyn CompletionModel>) -> Self {
+        self.metrics
+            .push(Arc::new(LlmJudgedMetric::new().with_model(model)));
         self
     }
     /// The configured metrics, in evaluation order.
@@ -492,17 +582,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_llm_judge_records_one_fail_soft_error() {
+    async fn with_llm_judge_scores_offline_without_recording_an_error() {
         let suite = EvaluationSuite::default_suite().with_llm_judge();
         assert_eq!(suite.metrics().len(), 3);
         let report = suite.evaluate(&input(complete_capability())).await;
-        assert_eq!(report.errors.len(), 1);
-        let error = &report.errors[0];
-        assert!(error.starts_with(LLM_JUDGED), "{error}");
-        assert!(error.contains(LLM_JUDGE_FEATURE), "{error}");
-        assert_eq!(report.scores.len(), 2);
-        assert!(report.scores.iter().all(|score| score.passed));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.scores.len(), 3);
+        let judge = &report.scores[2];
+        assert_eq!(judge.metric, LLM_JUDGED);
+        assert_eq!(judge.score, 1.0);
+        assert!(judge.passed);
+        assert!(judge
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("deterministic_fallback:"));
         assert_eq!(report.overall, 1.0);
+    }
+
+    #[tokio::test]
+    async fn the_judge_scores_a_descriptionless_card_zero() {
+        let report = EvaluationSuite::new(vec![Arc::new(LlmJudgedMetric::new())])
+            .evaluate(&input(broken_capability()))
+            .await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.scores.len(), 1);
+        assert_eq!(report.scores[0].metric, LLM_JUDGED);
+        assert_eq!(report.scores[0].score, 0.0);
+        assert!(!report.scores[0].passed);
+        assert_eq!(report.overall, 0.0);
     }
 
     #[tokio::test]
@@ -540,7 +648,7 @@ mod tests {
                 detail: Some("missing: tags".to_string()),
             }],
             overall: 0.75,
-            errors: vec!["llm_judged: unsupported".to_string()],
+            errors: vec!["llm_judged: model unavailable".to_string()],
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["capability_id"], "tool:sum");
