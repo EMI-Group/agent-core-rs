@@ -83,6 +83,34 @@ pub(crate) fn render_payload(output: &Value, keys: &[&str]) -> String {
     render_fields(&fields)
 }
 
+/// Renders one `transcripts` map entry of a `subagent_wait` payload.
+///
+/// The first line is `transcript: <TranscriptSummary::display()>`; a non-empty transcript
+/// adds its newest entry's content on a second `last:` line. Missing keys degrade to a zero
+/// summary instead of panicking.
+pub(crate) fn render_transcript_summary(summary: &Value) -> String {
+    let count = summary
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let last_kind = summary.get("last_kind").and_then(Value::as_str);
+    let last_content = summary
+        .get("last_content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty());
+    let noun = if count == 1 { "entry" } else { "entries" };
+    let digest = match (last_kind, last_content) {
+        (Some(kind), Some(content)) => format!("{count} {noun}, last: {kind}: {content}"),
+        (Some(kind), None) => format!("{count} {noun}, last: {kind}"),
+        _ => format!("{count} {noun}"),
+    };
+    let mut rendered = format!("transcript: {digest}");
+    if let Some(content) = last_content {
+        rendered = format!("{rendered}\nlast: {content}");
+    }
+    rendered
+}
+
 /// Renders one live/closed sub-agent list, Python `_render_subagent_rows` style.
 pub(crate) fn render_subagent_rows(title: &str, rows: &[Value]) -> String {
     if rows.is_empty() {

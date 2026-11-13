@@ -1,17 +1,20 @@
 //! Port of `openjiuwen/harness/tools/subagent/subagent_tools.py`: the persistent
-//! `subagent_*` tools.
+//! `subagent_*` tools plus the additive transcript reader.
 //!
-//! These six tools are the non-blocking counterpart of [`super::task_tool::TaskTool`]:
-//! `subagent_spawn` registers an instance and returns immediately, `subagent_wait` blocks
-//! until the requested instances reach a final status, and the remaining tools list,
-//! steer, close and revive instances.
+//! The six Python parity tools are the non-blocking counterpart of
+//! [`super::task_tool::TaskTool`]: `subagent_spawn` registers an instance and returns
+//! immediately, `subagent_wait` blocks until the requested instances reach a final status,
+//! and the remaining tools list, steer, close and revive instances. [`SubagentTranscriptTool`]
+//! (`subagent_transcript`) is a Rust-port extension that reads an instance's bounded
+//! transcript; Python has no such tool, so [`subagent_tools`] keeps the six-tool parity list and
+//! [`subagent_tools_with_transcript`] mounts the seven-tool additive set.
 //!
 //! Every expected failure is a [`ToolPayload::fail`] envelope (`success = false` plus a
 //! Python-derived `error` message), never an `Err`; only an unexpected internal error
 //! escapes as `Err`.
 //!
-//! The steer/close/revive tools live in [`control`]; the parsing and rendering helpers shared
-//! by every tool live in `util`.
+//! The steer/close/revive tools live in [`control`], the transcript reader in [`transcript`],
+//! and the parsing and rendering helpers shared by every tool live in `util`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,9 +25,10 @@ use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 use serde_json::{json, Map, Value};
 
 pub use control::{SubagentCloseTool, SubagentResumeTool, SubagentSendInputTool};
+pub use transcript::SubagentTranscriptTool;
 use util::{
     new_task_id, non_empty, parse_subagent_ids, payload_error, render_payload,
-    render_subagent_rows, resolve_timeout_ms,
+    render_subagent_rows, render_transcript_summary, resolve_timeout_ms,
 };
 
 use super::runtime::{SubAgentRuntime, SubAgentSpawnRequest, SubagentStatus};
@@ -44,29 +48,54 @@ const MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
 const SPAWN_REQUIRED_MESSAGE: &str =
     "'subagent_type', 'task_description', 'display_name', and 'role' are required";
 
-/// The fields of a live/closed sub-agent row, in Python order.
-const SUBAGENT_ROW_KEYS: [&str; 9] = [
+/// The fields of a live/closed sub-agent row, in Python order plus the Rust-only
+/// `activity` and `depth` columns after `status`.
+const SUBAGENT_ROW_KEYS: [&str; 11] = [
     "subagent_id",
     "display_name",
     "subagent_type",
     "role",
     "status",
+    "activity",
+    "depth",
     "turn_outcome",
     "closed_reason",
     "error",
     "task_description",
 ];
 
-/// Builds the six runtime sub-agent tools in Python order.
+/// Builds the six Python parity runtime sub-agent tools in Python order.
 ///
 /// Order: `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_send_input`,
 /// `subagent_close`, `subagent_resume`.
+///
+/// The additive [`subagent_tools_with_transcript`] set mounts the same tools plus the
+/// Rust-only transcript reader, so this parity list stays exactly six tools.
 #[must_use]
 pub fn subagent_tools(runtime: Arc<SubAgentRuntime>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(SubagentSpawnTool::new(Arc::clone(&runtime))),
         Arc::new(SubagentWaitTool::new(Arc::clone(&runtime))),
         Arc::new(SubagentListTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentSendInputTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentCloseTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentResumeTool::new(runtime)),
+    ]
+}
+
+/// Builds the additive seven-tool set: the six parity tools plus `subagent_transcript`.
+///
+/// Order: `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_transcript`,
+/// `subagent_send_input`, `subagent_close`, `subagent_resume`. Python has no transcript
+/// tool, so this set is a Rust-port extension layered beside [`subagent_tools`], never a
+/// replacement for it.
+#[must_use]
+pub fn subagent_tools_with_transcript(runtime: Arc<SubAgentRuntime>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(SubagentSpawnTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentWaitTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentListTool::new(Arc::clone(&runtime))),
+        Arc::new(SubagentTranscriptTool::new(Arc::clone(&runtime))),
         Arc::new(SubagentSendInputTool::new(Arc::clone(&runtime))),
         Arc::new(SubagentCloseTool::new(Arc::clone(&runtime))),
         Arc::new(SubagentResumeTool::new(runtime)),
@@ -111,9 +140,10 @@ macro_rules! subagent_tool {
     };
 }
 
-// `mod control;` must stay below the `subagent_tool!` definition: `macro_rules!` macros are
-// only in scope for child modules declared after them.
+// `mod control;` and `mod transcript;` must stay below the `subagent_tool!` definition:
+// `macro_rules!` macros are only in scope for child modules declared after them.
 mod control;
+mod transcript;
 
 subagent_tool!(
     /// Spawns a persistent sub-agent and enqueues its first turn without blocking.
@@ -233,8 +263,18 @@ impl Tool for SubagentWaitTool {
             .await;
         let mut statuses = Map::new();
         let mut results = Map::new();
+        let mut transcripts = Map::new();
         let mut timed_out = false;
         for outcome in outcomes {
+            transcripts.insert(
+                outcome.subagent_id.clone(),
+                json!({
+                    "count": outcome.transcript.count,
+                    "dropped": outcome.transcript.dropped,
+                    "last_kind": outcome.transcript.last_kind,
+                    "last_content": outcome.transcript.last_content.clone(),
+                }),
+            );
             statuses.insert(
                 outcome.subagent_id.clone(),
                 Value::String(outcome.status.as_str().to_owned()),
@@ -251,6 +291,7 @@ impl Tool for SubagentWaitTool {
         Ok(ToolPayload::ok(json!({
             "statuses": statuses,
             "results": results,
+            "transcripts": transcripts,
             "output_files": {},
             "timed_out": timed_out,
         }))
@@ -265,6 +306,7 @@ impl Tool for SubagentWaitTool {
             return String::new();
         };
         let results = data.get("results").and_then(Value::as_object);
+        let transcripts = data.get("transcripts").and_then(Value::as_object);
         let mut sections = Vec::new();
         if let Some(statuses) = data.get("statuses").and_then(Value::as_object) {
             for (id, status) in statuses {
@@ -274,9 +316,12 @@ impl Tool for SubagentWaitTool {
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                     .unwrap_or("(no result)");
-                sections.push(format!(
-                    "subagent_id: {id}\nstatus: {status}\nresult:\n{result}"
-                ));
+                let mut section = format!("subagent_id: {id}\nstatus: {status}\nresult:\n{result}");
+                if let Some(summary) = transcripts.and_then(|transcripts| transcripts.get(id)) {
+                    section.push('\n');
+                    section.push_str(&render_transcript_summary(summary));
+                }
+                sections.push(section);
             }
         }
         if data.get("timed_out").and_then(Value::as_bool) == Some(true) {
@@ -327,8 +372,23 @@ impl Tool for SubagentListTool {
             .get("closed_subagents")
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice);
+        let summary = data.get("summary");
+        let evicted = summary
+            .and_then(|summary| summary.get("evicted_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let eviction = if summary
+            .and_then(|summary| summary.get("eviction"))
+            .and_then(|eviction| eviction.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            "enabled"
+        } else {
+            "disabled"
+        };
         format!(
-            "Capacity: {used}/{max} subagents in use.\n\n{}\n\n{}",
+            "Capacity: {used}/{max} subagents in use.\neviction: {eviction}, evicted: {evicted}\n\n{}\n\n{}",
             render_subagent_rows("Live subagents", live),
             render_subagent_rows("Closed subagents (resumable)", closed)
         )

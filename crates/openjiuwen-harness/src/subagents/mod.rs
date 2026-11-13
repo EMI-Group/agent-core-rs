@@ -6,7 +6,9 @@
 //!
 //! The registry owns the sub-agent definitions the parent agent can delegate to, the
 //! runtime owns the live child instances of one parent session, and [`TaskTool`] plus the
-//! six `subagent_*` tools are the model-facing surface over them. Everything is in-process
+//! six `subagent_*` tools are the model-facing surface over them; the Rust-only
+//! `subagent_transcript` tool ([`SubagentTranscriptTool`]) reads an instance's bounded
+//! transcript and is mounted by [`subagent_tools_with_transcript`]. Everything is in-process
 //! and in-memory: child agents are built lazily by a [`SubAgentFactory`], so this module
 //! never depends on [`crate::agent`].
 mod presets;
@@ -40,8 +42,9 @@ pub use runtime::{
     SubAgentSpawnRequest, SubagentMetadata, SubagentStatus, EVICTION_REASON,
 };
 pub use subagent_tools::{
-    subagent_tools, SubagentCloseTool, SubagentListTool, SubagentResumeTool, SubagentSendInputTool,
-    SubagentSpawnTool, SubagentWaitTool,
+    subagent_tools, subagent_tools_with_transcript, SubagentCloseTool, SubagentListTool,
+    SubagentResumeTool, SubagentSendInputTool, SubagentSpawnTool, SubagentTranscriptTool,
+    SubagentWaitTool,
 };
 pub use task_tool::TaskTool;
 

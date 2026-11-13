@@ -192,15 +192,45 @@ impl Tool for TaskTool {
 
 /// Returns the model-facing description of `name` in `language`.
 ///
-/// The coding-tool description table is consulted first; while it has no entry for the
-/// sub-agent tools, the prompt tool table supplies the bilingual text. Unknown names yield
-/// an empty string instead of panicking.
+/// The coding-tool description table is consulted first; the prompt tool table supplies the
+/// bilingual text of the Python sub-agent tools. Rust-port extensions that have no Python row
+/// (currently `subagent_transcript`) fall back to [`extension_description`]. Unknown names
+/// yield an empty string instead of panicking.
 pub(crate) fn description_for(name: &str, language: &str) -> &'static str {
     let description = crate::tools::descriptions::description(name, language);
-    if description.is_empty() {
-        crate::prompts::description(name, language).unwrap_or("")
+    if !description.is_empty() {
+        return description;
+    }
+    crate::prompts::description(name, language)
+        .unwrap_or_else(|| extension_description(name, language))
+}
+
+/// Descriptions of the model-facing tools that exist only in the Rust port.
+///
+/// Each row is `(name, chinese, english)`; the Python agent never sees these names, so they
+/// cannot live in the prompt description table that mirrors `openjiuwen.prompts`.
+const EXTENSION_TOOL_DESCRIPTIONS: [(&str, &str, &str); 1] = [(
+    "subagent_transcript",
+    "读取指定子代理的有界执行记录；支持 after_seq 分页与 limit 截断，返回条目、摘要以及是否还有更多。",
+    "Read the bounded transcript of a subagent instance; supports after_seq pagination and a limit, and reports the entries, the summary, and whether more remain.",
+)];
+
+/// Returns the description of the Rust-only tool `name`.
+///
+/// `language` is trimmed and lower-cased, so `en`/`en-*` select the English text and anything
+/// else the Chinese one, matching the prompt description table. Unknown names yield `""`.
+fn extension_description(name: &str, language: &str) -> &'static str {
+    let Some((_, chinese, english)) = EXTENSION_TOOL_DESCRIPTIONS
+        .iter()
+        .find(|(tool, _, _)| *tool == name)
+    else {
+        return "";
+    };
+    let key = language.trim().to_lowercase();
+    if key == "en" || key.starts_with("en-") {
+        english
     } else {
-        description
+        chinese
     }
 }
 

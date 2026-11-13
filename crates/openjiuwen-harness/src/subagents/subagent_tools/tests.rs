@@ -1,7 +1,9 @@
-//! Unit tests for the six persistent `subagent_*` tools.
+//! Unit tests for the six persistent `subagent_*` tools and the additive transcript tool.
 
 use super::*;
 use crate::subagents::test_support::{build_runtime, echo_runtime, Behavior, FakeFactory};
+
+mod transcript;
 
 async fn call(tool: &impl Tool, inputs: Value) -> Value {
     tool.invoke(inputs, &ToolContext::new()).await.unwrap()
@@ -149,6 +151,28 @@ async fn subagent_tools_returns_the_python_order() {
         .await
         .unwrap();
     assert_eq!(listed["success"], true);
+}
+
+#[tokio::test]
+async fn transcript_tools_are_additive_to_the_parity_set() {
+    let (runtime, _factory) = echo_runtime();
+    let tools = subagent_tools_with_transcript(runtime);
+    let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "subagent_spawn",
+            "subagent_wait",
+            "subagent_list",
+            "subagent_transcript",
+            "subagent_send_input",
+            "subagent_close",
+            "subagent_resume",
+        ]
+    );
+    for tool in &tools {
+        assert_ne!(tool.card().description, "");
+    }
 }
 
 #[tokio::test]
@@ -306,6 +330,52 @@ async fn list_reports_capacity_and_subagent_buckets() {
     assert!(list
         .render_for_llm(&output)
         .starts_with("Capacity: 1/10 subagents in use."));
+}
+
+#[tokio::test]
+async fn list_render_mentions_eviction_and_row_activity() {
+    let (runtime, _factory) = echo_runtime();
+    let (id, _task_id) = spawn_one(&runtime).await;
+    wait_one(&runtime, &id).await;
+
+    let list = SubagentListTool::new(runtime);
+    let output = call(&list, json!({})).await;
+    let rendered = list.render_for_llm(&output);
+    assert!(rendered.starts_with("Capacity: 1/10 subagents in use."));
+    assert!(rendered.contains("eviction: enabled"));
+    assert!(rendered.contains("evicted: 0"));
+    assert!(rendered.contains("activity: idle"));
+    assert!(rendered.contains("depth: 1"));
+}
+
+#[tokio::test]
+async fn wait_reports_transcript_summaries() {
+    let (runtime, _factory) = echo_runtime();
+    let (id, _task_id) = spawn_one(&runtime).await;
+    let tool = SubagentWaitTool::new(Arc::clone(&runtime));
+    let output = call(
+        &tool,
+        json!({"subagent_ids": [id.as_str(), "missing"], "timeout_ms": 1}),
+    )
+    .await;
+    assert_eq!(output["success"], true);
+    let data = &output["data"];
+    let summary = &data["transcripts"][id.as_str()];
+    let count = summary["count"].as_u64().unwrap();
+    assert!(count >= 1);
+    assert_eq!(summary["dropped"], 0);
+    assert_eq!(summary["last_kind"], "completion");
+    assert_eq!(summary["last_content"], "echo:task");
+    assert_eq!(data["transcripts"]["missing"]["count"], 0);
+    assert_eq!(data["transcripts"]["missing"]["last_kind"], Value::Null);
+    assert_eq!(data["statuses"]["missing"], "not_found");
+
+    let rendered = tool.render_for_llm(&output);
+    assert!(rendered.contains(&format!(
+        "transcript: {count} entries, last: completion: echo:task"
+    )));
+    assert!(rendered.contains("\nlast: echo:task"));
+    assert!(rendered.contains("transcript: 0 entries"));
 }
 
 #[tokio::test]
