@@ -454,12 +454,12 @@ mod tests {
 
     #[test]
     fn generate_candidates_yields_nothing_for_empty_input() {
-        assert!(generate_candidates(&BTreeMap::new()).is_empty());
+        assert_eq!(generate_candidates(&BTreeMap::new()).len(), 0);
 
         let mut with_empty_list = BTreeMap::new();
         with_empty_list.insert("a".to_owned(), values(&["a1"]));
         with_empty_list.insert("b".to_owned(), Vec::new());
-        assert!(generate_candidates(&with_empty_list).is_empty());
+        assert_eq!(generate_candidates(&with_empty_list).len(), 0);
     }
 
     #[test]
@@ -498,8 +498,8 @@ mod tests {
     fn candidate_space_of_an_empty_baseline_is_empty() {
         let variants = [entries(&[("a", "a1")])];
         let space = candidate_space(&BTreeMap::new(), &variants).unwrap();
-        assert!(space.is_empty());
-        assert!(generate_candidates(&space).is_empty());
+        assert_eq!(space.len(), 0);
+        assert_eq!(generate_candidates(&space).len(), 0);
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
 
         assert!((outcome.best_score - 0.4).abs() < 1e-12);
         assert_eq!(outcome.best_parameters, base);
-        assert!(outcome.best_cases.is_empty());
+        assert_eq!(outcome.best_cases.len(), 0);
         assert!((outcome.last_score - 0.4).abs() < 1e-12);
         assert_eq!(outcome.evaluated, 0);
     }
@@ -797,8 +797,8 @@ mod tests {
 
         let empty: ParameterSearchOutcome = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ParameterSearchOutcome::default());
-        assert!(empty.best_parameters.is_empty());
-        assert!(empty.best_cases.is_empty());
+        assert_eq!(empty.best_parameters.len(), 0);
+        assert_eq!(empty.best_cases.len(), 0);
         assert_eq!(empty.evaluated, 0);
         assert!(empty.best_score.abs() < f64::EPSILON);
         assert!(empty.last_score.abs() < f64::EPSILON);

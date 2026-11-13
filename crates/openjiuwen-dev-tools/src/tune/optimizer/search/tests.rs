@@ -69,7 +69,7 @@ async fn the_run_is_deterministic() {
     let second = optimizer.optimize(SEED, &cases()).await.unwrap();
     assert_eq!(first, second);
     assert_eq!(first.run_id, second.run_id);
-    assert!(!first.run_id.is_empty());
+    assert_ne!(first.run_id.len(), 0);
 }
 
 #[tokio::test]
@@ -488,7 +488,7 @@ async fn optimize_task_keeps_constraints_and_metadata() {
     assert_eq!(result.run_id, PromptSearchOptimizer::run_id(0, &task));
     assert_eq!(result.iterations, result.records.len());
     assert!(result.score > 0.0);
-    assert!(!result.best_prompt.is_empty());
+    assert_ne!(result.best_prompt.len(), 0);
 
     let seeded = PromptSearchOptimizer::new()
         .with_run_id_seed(7)

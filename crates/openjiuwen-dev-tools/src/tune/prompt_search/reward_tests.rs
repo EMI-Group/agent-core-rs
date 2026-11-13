@@ -39,7 +39,7 @@ fn clamp01_is_total() {
 
 #[test]
 fn min_max_normalization_boundaries() {
-    assert!(min_max_normalize(&[]).is_empty());
+    assert_eq!(min_max_normalize(&[]).len(), 0);
     assert_eq!(min_max_normalize(&[0.3, 0.3, 0.3]), vec![1.0, 1.0, 1.0]);
     let scaled = min_max_normalize(&[0.2, 0.6]);
     assert!((scaled[0] - 0.0).abs() < 1e-12);
@@ -252,7 +252,7 @@ fn overfit_needs_hidden_cases_and_a_correctness_component() {
         &without_hidden,
         &BTreeMap::new(),
     );
-    assert!(breakdown[0].notes.is_empty());
+    assert_eq!(breakdown[0].notes.len(), 0);
 
     let no_correctness = CompositeReward::new(
         vec![Box::new(CompletenessReward::new())],
@@ -261,7 +261,7 @@ fn overfit_needs_hidden_cases_and_a_correctness_component() {
     let task = task_with_hidden();
     let breakdown =
         no_correctness.evaluate(&[execution("a", &[1.0], &[0.0])], &task, &BTreeMap::new());
-    assert!(breakdown[0].notes.is_empty());
+    assert_eq!(breakdown[0].notes.len(), 0);
     // No correctness component: the reported correctness defaults to 1.0.
     assert!((breakdown[0].correctness - 1.0).abs() < 1e-12);
 }
@@ -309,9 +309,12 @@ fn execution_error_forces_zero_and_notes_it() {
 #[test]
 fn empty_batch_and_deterministic_repeat() {
     let composite = CompositeReward::default();
-    assert!(composite
-        .evaluate(&[], &PromptTaskSpec::default(), &BTreeMap::new())
-        .is_empty());
+    assert_eq!(
+        composite
+            .evaluate(&[], &PromptTaskSpec::default(), &BTreeMap::new())
+            .len(),
+        0
+    );
 
     let task = task_with_hidden();
     let batch = [execution("a", &[0.8], &[0.7])];

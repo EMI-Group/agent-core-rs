@@ -310,9 +310,9 @@ mod tests {
         assert_eq!(result.iterations, 1);
         assert!(!result.converged);
         assert!(result.convergence_reason.is_none());
-        assert!(result.token_usage.is_empty());
-        assert!(result.run_id.is_empty());
-        assert!(result.records.is_empty());
+        assert_eq!(result.token_usage.len(), 0);
+        assert_eq!(result.run_id.len(), 0);
+        assert_eq!(result.records.len(), 0);
     }
 
     #[test]
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn candidate_prompts_dedupe_keep_the_best_score_and_skip_empty() {
-        assert!(OptimizationResult::default().candidate_prompts().is_empty());
+        assert_eq!(OptimizationResult::default().candidate_prompts().len(), 0);
 
         let mut first = IterationRecord::new(1);
         first.push(PromptCandidate::new("draft", "seed"), 0.2);
