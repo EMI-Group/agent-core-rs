@@ -6,7 +6,7 @@ Adapt one team member to the provider-neutral harness protocol, drive it through
 Python parity source: `openjiuwen/agent_teams/harness/` (`protocol_adapter.py`, `native_harness.py`, `checkpoint.py`).
 The Python adapter downgrades `NativeHarness` to `HarnessProtocol`; in this port `openjiuwen_harness::NativeHarness` already implements `HarnessProtocol`, so this node builds handles, forwards commands, pumps observations, supplies the checkpoint sink and resume envelope, and persists a portable record.
 The team runtime sees a `MemberRuntime`; this module is the only place that knows about `HarnessProtocol`.
-Checkpointing is opt-in per runtime: a runtime built without a `MemberCheckpointStore` does no checkpoint work at all.
+Checkpointing is per runtime: a runtime built without a `MemberCheckpointStore` does no checkpoint work at all, while the team runtime supplies one to every in-process member by default (in-memory).
 
 ## API Surface
 
@@ -92,7 +92,7 @@ pub const CHUNK_LLM_OUTPUT / CHUNK_LLM_REASONING / CHUNK_TOOL_CALL / CHUNK_TOOL_
 ```
 
 Runtime behaviour:
-- `start(team_session)` closes any previous pump, sends `HarnessContext` (agent name/id = the runtime's session id; `host_session_id` = the team session id when supplied, else the runtime session id; empty system prompt because the prompt lives in the constructed agent), merges `cwd` and the checkpoint wiring, publishes the settled state to observers (this is the member's `Ready`), then spawns the pump.
+- `start(team_session)` closes any previous pump, sends `HarnessContext` (agent name/id = the runtime's session id; `host_session_id` = the team session id when supplied, else the runtime session id — the team runtime always supplies `None`; empty system prompt because the prompt lives in the constructed agent), merges `cwd` and the checkpoint wiring, publishes the settled state to observers (this is the member's `Ready`), then spawns the pump.
 - `send(content, true)` → `DeliveryMode::Steer`; `send(content, false)` → `DeliveryMode::FollowUp`.
 - `abort(true)` → `AbortMode::Force`; `abort(false)` → `AbortMode::Graceful`.
 - `resume(Some(query))` → `HarnessInput::text(query)`; `resume(None)` → `None`.
@@ -116,7 +116,12 @@ Runtime behaviour:
 - Restore is opportunistic: a record for another session/card (`NativeCheckpoint::validate_compatible`), a record without an envelope, or an unreadable store logs `warn!` and starts cold; `start` never fails because of checkpoint state.
 - Capture is best effort in the pump and in `stop` (failures logged, never failing the command or ending the pump); the recorded payload is cached so `latest_checkpoint()` reports it.
 - A record always carries the portable payload; `protocol` is `Some` only when `HarnessProtocol::export_checkpoint` returned an envelope — a payload-only record is still a valid snapshot.
-- Identity convention: records are keyed on `(member session id, card id)`; `MemberHarnessContext::member_session_id(team_session, member_name)` returns `"<team_session>:<member_name>"`, and the runtime passes that as the member's `session_id` while the team session stays the harness `host_session_id`.
+- Identity convention: records are keyed on `(member session id, card id)`, where the member session is `MemberHarnessContext::member_session_id(team_session, member_name)` (`"<team_session>:<member_name>"`) and the card id is the effective spec's card id, else the member name.
+- Every member starts through `start(None)`, so that derived id is also the harness `HarnessContext::host_session_id`; the team session is never forwarded into a live cycle.
+- The runtime wires every in-process member through `runtime::checkpoints::wire_runtime` — `build_with` for the leader, `TeamMemberSpawner::build_harness_runtime` for each teammate — with the derived session id, the effective card id, the policy from `metadata["checkpoint"]`, the member workspace root as `cwd` and the resolved store.
+- Store resolution: an injected store wins (`TeamBuildDeps::with_checkpoint_store`); otherwise `memory` mints one `InMemoryMemberCheckpointStore` shared by the whole team, while `file` roots each member at its own directory (`dir` when pinned, else `<workspace root>/.openjiuwen/checkpoints`).
+- A disabled policy resolves no store at either step, so no sink is attached and no record is written.
+- Only in-process runtimes are wired: a `team-member serve` child builds a bare `HarnessMemberRuntime` with no store, so a process member checkpoints nothing.
 - Storage is last-write-wins JSON (never pickle); the file backend sanitises both path components (alnum, `-`, `_` kept, everything else `_`) so no identity can traverse out of the root.
 
 ## State mapping
@@ -168,8 +173,8 @@ The model identity must live on the config, not only on the model handle: `DeepA
 ## Injection seam for tests and embedders
 
 `MemberHarnessFactory` is the only way a member's brain is replaced: `TeamBuildDeps::with_harness_factory` swaps the default `NativeMemberFactory::from_env()` for any `Arc<dyn MemberHarnessFactory>`, and `TeamAgentSpec::build_with` creates the leader through it while `TeamMemberSpawner::spawn` creates every teammate through it.
-Both calls pass a `&DeepAgentSpec` (leader: `agents["leader"]`; teammate: `agents[name]` else `agents["teammate"]`) plus a `MemberHarnessContext`.
-Today the runtime still passes the **team** session id as `MemberHarnessContext::session_id` for every member, so a scripted factory must key its per-member answers on `member_name`, not on `session_id`; the documented per-member id is `MemberHarnessContext::member_session_id(team_session, member_name)`.
+Both calls pass a `&DeepAgentSpec` (leader: `agents["leader"]`; teammate: `agents[name]` else `agents["teammate"]`) plus a `MemberHarnessContext` whose `session_id` is that member's derived `member_session_id(team_session, member_name)` and whose `card_id` is the effective card id.
+A scripted factory can therefore key its per-member answers on either `member_name` or the derived id; the leader receives the routed `agents["leader"]` spec and a teammate its forked/router-merged blueprint.
 No public fake harness exists: `tests/support/mod.rs::ScriptedHarness`/`FakeHarnessFactory` are crate-private test helpers, so an out-of-crate integration test copies a `HarnessProtocol` impl (13 required methods; `send_auto` and `abort_graceful` have defaults).
 The minimum viable fake: `state()` returns `Idle` after `start`, `events()` returns `VecEventCursor::new(Vec::new())` (an empty cursor ends the pump cleanly) or a scripted one, and `send` emits `turn_lifecycle` started → `output` (channel `answer`) → `turn_lifecycle` finished before settling back to `Idle`.
 All protocol types used by such a fake are reachable from an out-of-crate test through `openjiuwen::harness_protocol`; the crate itself is `openjiuwen::agent_teams`.
@@ -202,7 +207,7 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - `checkpoint_store/` (22 tests) pins policy defaults/`disabled()`/serde/unknown fields/wire strings/resume mapping; memory round-trip, newest-wins, identity independence, revisions; file round-trip, sanitised `path_for` containment, missing file, malformed JSON; sink payload/cwd/state/outputs/envelope/receipt projection and store-failure mapping.
 - `adapter.rs` drives `HarnessMemberRuntime` with a local `FakeHarness` (command recording, recorded `HarnessContext`s, channel-backed cursor, fixed state, scriptable `export_checkpoint`/failure): start publishes `Ready`, delivery/abort/pause/resume argument mapping, observer callback order, cursor drain/close, pump cancellation on `stop`, error translation, sink/restore/capture/stop wiring, a disabled policy writing nothing, and an export error leaving the pump alive. Waits are bounded `yield_now`/1 ms polls.
 - `native.rs` covers factory identity, resolver error propagation, the spec → `DeepAgentConfig` mapping (plan mode, card/language overrides), and model-identity propagation: a spec name/provider wins over the resolved one, a resolver-supplied default name reaches `NativeHarness::agent().config()`, and blank resolved names/providers neither erase a spec name nor invent a provider.
-- Default build: 1352 lib tests (plus the crate's 219 integration tests across 15 binaries, `full_team_sqlite` behind `--features sqlite`, and 37 doctests plus one `ignore`).
+- Default build: 1411 lib tests (plus the crate's 219 integration tests across 15 binaries, `full_team_sqlite` behind `--features sqlite`, and 37 doctests plus one `ignore`).
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo clippy -p openjiuwen-agent-teams --all-targets --all-features -- -D warnings`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite` and `--all-features` configurations, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 
 ## Deferred
@@ -210,12 +215,11 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - Vendor CLI harness providers (Codex, Claude Code) and distributed transports: the factory seam is generic and the vendor adapters stay `Unsupported` in `openjiuwen-harness-providers`, while a process member builds its harness in its own child process.
 - Mounting live tools, MCP servers, sub-agents, rails and approval policy from a cold spec — runtime wiring owns those handles.
 - Model-pool/IntelliRouter selection — `ModelResolver` is the seam; only the environment resolver ships.
-- Team-runtime wiring of the checkpoint knobs (store, policy, card id, per-member session id) — the adapter exposes the builders and `member_session_id`, but `src/runtime` still constructs a bare `HarnessMemberRuntime::new` and `MemberHarnessContext::new` with the team session id.
 
 ## Notes for Agents
 
 - `adapter.rs` imports `crate::member::{MemberObserver, MemberRuntime}` from the implemented `../member/` seam; import those traits, never add a second definition of them here.
-- `NativeCheckpoint` is reachable as `openjiuwen_agent_teams::harness::checkpoint::NativeCheckpoint`, `…::harness::NativeCheckpoint`, `openjiuwen_agent_teams::NativeCheckpoint` (crate root re-export) and `openjiuwen::agent_teams::…` through the umbrella; `CheckpointCapture` is the only non-test construction site in `src/`.
+- `NativeCheckpoint` is reachable as `openjiuwen_agent_teams::harness::checkpoint::NativeCheckpoint`, `…::harness::NativeCheckpoint`, `openjiuwen_agent_teams::NativeCheckpoint` (crate root re-export) and `openjiuwen::agent_teams::…` through the umbrella; the only non-test construction sites in this crate are `CheckpointCapture` (`adapter.rs`) and `MemberCheckpointSink::save` (`checkpoint_store/sink.rs`).
 - Real persistence is asserted on the store, not on the payload type: drive a runtime with `InMemoryMemberCheckpointStore::shared()` (or `FileMemberCheckpointStore::new(tempdir)`) and read `store.get(session, card)` / `FileMemberCheckpointStore::path_for`; the payload is a different type from `NativeHarness`'s `NativeCheckpointState`, which sits inside `HarnessCheckpoint::data`.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it (crate root does) — never define a second enum.
 - The pump deliberately does not end on a terminal turn event: `events()` is the cycle-long view, and a member runs many rounds per cycle. Turn boundaries are where checkpoints are captured, not where the cycle ends.
