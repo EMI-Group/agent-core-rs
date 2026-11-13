@@ -94,6 +94,12 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// The crate version as reported by Cargo.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Diagnostic signals, attribution graphs, credit assignment, and keyword rules.
+pub use attribution::{
+    reward_tier, AttributionEdge, AttributionGraph, AttributionNode, CreditAssigner, CreditRank,
+    CreditReport, DiagnosticSignal, KeywordAttributor, KeywordMatch, KeywordRule,
+    RewardStageAdapter, SignalSource,
+};
 /// Case datasets: `Case`, `EvaluatedCase`, `CaseLoader`, JSON/JSONL loading.
 pub use dataset::{
     load_cases_from_path, parse_cases_json, parse_cases_jsonl, parse_cases_str, shuffle_cases,
@@ -105,6 +111,18 @@ pub use evaluator::{
     EvaluationConfig, EvaluationReport, Evaluator, ExactMatchMetric, JudgeCriterion, JudgeRubric,
     JudgeVerdict, LlmAsJudgeMetric, LlmJudge, LlmJudgeEvaluator, MapCaseRunner, Metric,
     MetricEvaluator, MetricValue,
+};
+/// Docker + git evaluation harness over an injectable command runner.
+pub use evaluator_pipeline::{
+    container_name, find_program, parse_last_json, parse_score, parse_test_counts, CommandRunner,
+    CommandSpec, DockerEnvironment, EvaluationPipeline, EvaluationTask, ExecResult,
+    FakeCommandRunner, GitWorkspaceSpec, PipelineConfig, PipelineSummary, PreparedWorkspace,
+    ProcessCommandRunner, ScoreSpec, ScoredRun, TaskReport, TestCounts, WorkspacePreparer,
+};
+/// Experience records, archives, extraction, and lifecycle rules.
+pub use experience::{
+    ExperienceArchive, ExperienceExtractor, ExperienceLifecycle, ExperienceMatch, ExperienceQuery,
+    ExperienceRecord, ExperienceSection, ExperienceStats, LifecycleConfig, LifecycleReport,
 };
 /// Candidates, the optimizer baseline, research optimizers, and checkpoints.
 pub use optimizer::{
@@ -120,28 +138,28 @@ pub use rails::{
     registerable_rail, EvolutionEvent, EvolutionObserver, EvolutionRailSpec, HarnessEvolutionRail,
     EVOLUTION_PRIORITY,
 };
-/// Axum RL service skeleton (health/evaluate, 501 RL endpoints).
-pub use service::{
-    build_router, serve, ApiError, EvaluateRequest, EvaluateResponse, RlServiceConfig,
-};
-/// Bounded train/evaluate loop, progress, callbacks, and reports.
-pub use trainer::{
-    Callbacks, EpochReport, NoopCallbacks, Progress, StopReason, TrainableTarget, Trainer,
-    TrainerConfig, TrainerReport,
+/// Reward records, aggregation, normalisation, and reward packs.
+pub use reward::{
+    aggregate_scores, default_pack, reward_from_score, score_evaluated_cases,
+    MissingDimensionPolicy, RewardAggregator, RewardDimension, RewardPack, RewardSignal,
+    RewardSummary, ScoreNormalisation, ScoreStats,
 };
 /// RL batches, rollouts, policy seams, checkpoints, and the trainer loop.
 pub use rl::{
     token_estimate, BatchPacker, DeterministicPolicy, FakeRolloutEngine, Policy, RewardFn,
-    RewardNormalisation, RewardNormaliser, RewardRegistry, RolloutEngine, RolloutLog, RlBatch,
-    RlCheckpoint, RlEpochReport, RlSample, RlStopReason, RlTask, RlTrainReport, RlTrainer,
-    RlTrainerConfig, RlUpdate,
+    RewardNormalisation, RewardNormaliser, RewardRegistry, RlBatch, RlCheckpoint, RlEpochReport,
+    RlSample, RlStopReason, RlTask, RlTrainReport, RlTrainer, RlTrainerConfig, RlUpdate,
+    RolloutEngine, RolloutLog,
 };
-/// Docker + git evaluation harness over an injectable command runner.
-pub use evaluator_pipeline::{
-    container_name, find_program, parse_last_json, parse_score, parse_test_counts, CommandRunner,
-    CommandSpec, DockerEnvironment, EvaluationPipeline, EvaluationTask, ExecResult,
-    FakeCommandRunner, GitWorkspaceSpec, PipelineConfig, PipelineSummary, PreparedWorkspace,
-    ProcessCommandRunner, ScoreSpec, ScoredRun, TaskReport, TestCounts, WorkspacePreparer,
+/// Axum RL service skeleton (health/evaluate, 501 RL endpoints).
+pub use service::{
+    build_router, serve, ApiError, EvaluateRequest, EvaluateResponse, RlServiceConfig,
+};
+/// Shared-experience packaging, keyword extraction, and the backend seam.
+pub use sharing::{
+    KeywordExtractor, LocalFileSharingBackend, MemorySharingBackend, QueryKeywords, ShareStager,
+    SharedExperience, SharedSkillBundle, SharingBackend, SharingMeta, SkillPackageMeta,
+    SkillSearchResult, StagedBundle,
 };
 /// Evolution signals, feedback extraction, and the signal tracker.
 pub use signal::{
@@ -149,17 +167,10 @@ pub use signal::{
     signals_from_review_feedback, signals_from_team_feedback, EvolutionCategory, EvolutionSignal,
     EvolutionTarget, SignalTracker, TrackedSignal,
 };
-/// Reward records, aggregation, normalisation, and reward packs.
-pub use reward::{
-    aggregate_scores, default_pack, reward_from_score, score_evaluated_cases,
-    MissingDimensionPolicy, RewardAggregator, RewardDimension, RewardPack, RewardSignal,
-    RewardSummary, ScoreNormalisation, ScoreStats,
-};
-/// Diagnostic signals, attribution graphs, credit assignment, and keyword rules.
-pub use attribution::{
-    reward_tier, AttributionEdge, AttributionGraph, AttributionNode, CreditAssigner, CreditRank,
-    CreditReport, DiagnosticSignal, KeywordAttributor, KeywordMatch, KeywordRule,
-    RewardStageAdapter, SignalSource,
+/// Bounded train/evaluate loop, progress, callbacks, and reports.
+pub use trainer::{
+    Callbacks, EpochReport, NoopCallbacks, Progress, StopReason, TrainableTarget, Trainer,
+    TrainerConfig, TrainerReport,
 };
 /// Trajectory recording, spans, windows, grouping, and digests.
 pub use trajectory::{
@@ -168,20 +179,9 @@ pub use trajectory::{
     TrajectoryGroupSummary, TrajectoryOutcome, TrajectorySpan, TrajectoryStats, TrajectoryStep,
     TrajectoryStore, TrajectoryWindow,
 };
-/// Experience records, archives, extraction, and lifecycle rules.
-pub use experience::{
-    ExperienceArchive, ExperienceExtractor, ExperienceLifecycle, ExperienceMatch, ExperienceQuery,
-    ExperienceRecord, ExperienceSection, ExperienceStats, LifecycleConfig, LifecycleReport,
-};
-/// Shared-experience packaging, keyword extraction, and the backend seam.
-pub use sharing::{
-    KeywordExtractor, LocalFileSharingBackend, MemorySharingBackend, QueryKeywords, ShareStager,
-    SharedExperience, SharedSkillBundle, SharingBackend, SharingMeta, SkillPackageMeta,
-    SkillSearchResult, StagedBundle,
-};
 /// Test-time skill experience: banks, induction, dreaming, and consultation.
 pub use ttse::{
-    consult, render_tips, AddOutcome, ClassificationRule, ConsultResult, Dreamer, DreamReport,
+    consult, render_tips, AddOutcome, ClassificationRule, ConsultResult, DreamReport, Dreamer,
     SuccessAssessment, SuccessDetector, TipBank, TipBankStats, TipCategory, TipClassifier,
     TipInducer, TipParser, TipRecord, TtseConfig, TtseEngine,
 };

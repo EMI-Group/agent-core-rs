@@ -17,7 +17,7 @@
 //! - **Live model judge** — [`LlmJudge`] sends
 //!   [`build_judge_messages`] to a [`Model`](openjiuwen_core::foundation::llm::Model)
 //!   and parses the reply into a [`JudgeVerdict`]; [`LlmJudgeEvaluator`] and
-//!   [`DefaultEvaluator`](metrics::DefaultEvaluator) wrap that with a
+//!   [`crate::evaluator::DefaultEvaluator`] wrap that with a
 //!   deterministic fallback metric. Only this path performs I/O, and every
 //!   fallback is stated in the evaluated case's reason.
 //! - **Deterministic metrics** — [`ExactMatchMetric`] and
