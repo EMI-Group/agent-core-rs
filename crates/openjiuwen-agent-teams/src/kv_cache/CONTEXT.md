@@ -131,8 +131,8 @@ Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openji
 
 ## Routing Table
 
-- `affinity.rs` → `MemberCacheKey`, `MemberCacheEntry`, `TeamKvCacheAffinity` (registration, forked children, env/kwargs, hook, release, `release_team`, `clear`) and its 23 tests.
-- `cleanup.rs` → `CleanupReport`, `terminal_cleanup_timeout`, `cancellation_safe_release_then_dispose` and its 15 tests.
+- `affinity.rs` → `MemberCacheKey`, `MemberCacheEntry`, `TeamKvCacheAffinity` (registration, forked children, env/kwargs, hook, release, `release_team`, `clear`) and its 24 tests.
+- `cleanup.rs` → `CleanupReport`, `terminal_cleanup_timeout`, `cancellation_safe_release_then_dispose` and its 14 tests.
 - `mod.rs` → module documentation, `affinity`/`cleanup` declarations, flat re-exports, runnable doctest.
 
 ## Deferred (with reasons)
