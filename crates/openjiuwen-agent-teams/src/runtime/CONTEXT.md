@@ -401,9 +401,13 @@ a new session instead of being rebuilt.
 - No `unsafe`, no `unwrap`/`expect` outside tests.
 - Process-global state: exactly one new singleton here — the team runtime registry
   (`global_registry`), the crate's second documented singleton after the expert catalog.
-- Files ≤1000 lines; split by responsibility (`leader.rs` holds the loop so `team_agent.rs` stays a
-  surface, while `routing.rs`, `spec_meta.rs`, `observability_bind.rs`, `org_bind.rs`, `attach_host.rs` and
-  `observer.rs` each own one concern).
+- Files ≤1000 lines; split by responsibility (`leader.rs` holds the loop while `team_agent/` is one
+  directory per concern — `mod.rs` is the handle, `lifecycle.rs` the run entry points, `members.rs` the
+  member lifecycle, `attach.rs`/`signals.rs`/`org_ops.rs` their own surface — and `routing.rs`, `spec_meta.rs`,
+  `observability_bind.rs`, `org_bind.rs`, `attach_host.rs` and `observer.rs` each own one concern).
+- Inside `team_agent/`, method privacy is module-of-declaration based: a method one child module calls on
+  another's behalf is `pub(super)` (`start_attach` in `attach.rs`, `release_all_workspaces` in `members.rs`),
+  every other method stays private, and `ensure_leader_role` in `mod.rs` is reachable as `super::`.
 - `--no-default-features` must build (no feature gates in this module).
 
 ## Routing Table
@@ -424,7 +428,15 @@ a new session instead of being rebuilt.
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
 - `./build.rs` → the `SpecBuild` implementation and every build-only helper (leader record, harness, observer, roster rows, bus wiring, org install)
 - `./spawner.rs` → `TeamMemberSpawner` (`MemberSpawner` over the harness factory, spawn options, fork, routing, child spawners)
-- `./team_agent.rs` → `TeamAgent`, `SpecBuild`, lifecycle, attach start/stop, run entry points, `#[cfg(test)] test_support`
+- `./team_agent/` → the `TeamAgent` handle directory: the struct and its accessors in `mod.rs`, one file per concern below
+- `./team_agent/mod.rs` → `TeamAgent`, `TeamAgentInner`, `SpecBuild`, `ensure_leader_role`, the cheap accessors and the `pub(crate)` seams (`steer_batch_size`, `cancellation_token`, `take_events`)
+- `./team_agent/lifecycle.rs` → `start`, `run_start`, `stop`, `invoke`, `stream`, `interact`, `deliver` and `snapshot`
+- `./team_agent/members.rs` → `spawn_member`, `shutdown_member`, `auto_start_all`, `create_task`, `send_message`, `members`, `subscribe_chunks`, KV registration and the workspace bookkeeping
+- `./team_agent/attach.rs` → `start_attach` (the binding `run_start` calls) and `attach_socket`
+- `./team_agent/org_ops.rs` → `org`, `create_org_task`, `delegate_org_task`
+- `./team_agent/signals.rs` → `signals`, `monitor_stream`, `kv_cache`, `kv_env`
+- `./team_agent/test_support.rs` → the `#[cfg(test)]` offline kit (scripted factory/harness, recording workspace provider, `blueprint`/`deps`/`built`)
+- `./team_agent/tests.rs` → the handle's unit tests (build, spawn/shutdown, workspace lifecycle, delivery, gate)
 - `./leader.rs` → the coordination loop and its settle/batching/flush acknowledgement rules
 - `./pool.rs` → `TeamRuntimePool`
 - `./manager.rs` → `TeamRuntimeManager`, `global_registry`/`set_global_registry`/`clear_global_registry`
@@ -456,7 +468,7 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `{"input":{"query":…}}` and plain-string inputs.
 - `backend.rs`: mail routing (direct one row + one `message` event, broadcast one row, multicast N rows),
   member bookkeeping, task listing, snapshot ordering, `post_event` sender stamping, task signals.
-- `team_agent.rs`: build (leader card `<team>_<leader>`, missing `agents["leader"]` → validation), unknown
+- `team_agent/tests.rs`: build (leader card `<team>_<leader>`, missing `agents["leader"]` → validation), unknown
   member → `not_found`, spawn → `ready`, factory error → `unstarted`, shutdown per lifetime,
   `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy, and the
   workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged).
@@ -549,12 +561,13 @@ tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-de
   exercises a real process member writes its own `sh` script or asserts the missing-program `Error::Config`;
   attach hosting is `#[cfg(unix)]` (`AttachServer::bind`/`serve` return `Unsupported` elsewhere) and the
   worktree backend needs a real `git` binary plus a repository.
-- `team_agent::test_support` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
+- `team_agent/test_support.rs` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
-- `team_agent.rs` is the sanctioned long file of this node (1083 production lines plus
-  `test_support`/unit tests); `backend.rs` is 1040 lines. Both stay cohesive because each owns one
-  contract; extract before adding another responsibility to either.
+- `team_agent/` is split by concern (`mod.rs` handle, `lifecycle.rs`, `members.rs` plus the small
+  `attach.rs`/`signals.rs`/`org_ops.rs` surfaces), so no file carries both the handle surface and the member
+  lifecycle; `backend.rs` (1040 lines) remains the one long file of this node because it owns a single
+  contract. Extract before adding another responsibility.
 
 ## Not wired (documented gaps)
 
