@@ -8,7 +8,8 @@
 //! - the workflow DSL rejects the structural errors the builder and the
 //!   declarative generator rely on (no nodes, duplicate ids, unresolvable edge
 //!   endpoints) and names the offending id, while a well-formed document passes
-//!   and round-trips;
+//!   and round-trips.
+//!
 //! Module-local suites own the checks for capabilities that stay deliberately
 //! deferred (for example the archive formats `skill_creator::omni` cannot unpack
 //! without a compression dependency), so this binary stays focused on the DSL.
