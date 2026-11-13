@@ -33,8 +33,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod memory_store;
+pub mod record;
+pub mod store;
 
 pub use memory_store::{MemoryVectorStore, ScoredNode, VectorNode};
+pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
+pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 
 /// The memory algorithm selected for retrieval and summarization.
 ///
