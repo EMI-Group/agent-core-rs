@@ -183,8 +183,8 @@ async fn create_task_persists_the_row_and_publishes_the_created_event() {
     );
 }
 
-/// The whole roster is projected before the first start: every row is `unstarted` and only the
-/// leader owns a (build-time) runtime.
+/// The whole roster is projected before the first start: every row is `unstarted` and nothing is
+/// alive.
 #[tokio::test]
 async fn health_before_a_start_reports_the_unstarted_roster() {
     let (team, _factory, _workspace) = crate::runtime::team_agent::test_support::built(&blueprint(
@@ -202,27 +202,31 @@ async fn health_before_a_start_reports_the_unstarted_roster() {
         .map(|entry| entry.name.as_str())
         .collect();
     assert_eq!(names, ["boss", "dev-1", "dev-2"], "sorted, leader included");
-    assert!(
-        health
-            .members
-            .iter()
-            .all(|entry| entry.status == MemberStatus::Unstarted),
-        "{:?}",
-        health.members
-    );
-    // The build path materializes the leader's harness before the first start, so the leader
-    // already owns an idle runtime while every teammate row is still a bare row.
-    let alive: Vec<&str> = health
-        .members
-        .iter()
-        .filter(|entry| entry.alive)
-        .map(|entry| entry.name.as_str())
-        .collect();
-    assert_eq!(alive, ["boss"], "{:?}", health.members);
+    // The build path materializes the leader's harness before the first start, so the leader owns
+    // an idle runtime already — but its row never started, which is what keeps it out of `alive`.
+    for entry in &health.members {
+        assert_eq!(entry.status, MemberStatus::Unstarted, "{entry:?}");
+        assert!(
+            !entry.alive,
+            "{} has not started yet: {entry:?}",
+            entry.name
+        );
+    }
     let leader = health.leader.expect("the leader row is in the roster");
     assert_eq!(leader.name, "boss");
     assert_eq!(leader.status, MemberStatus::Unstarted);
-    assert!(leader.alive, "the leader harness exists before the start");
+    assert!(
+        team.backend()
+            .member("boss")
+            .expect("leader row")
+            .runtime()
+            .is_some(),
+        "the leader harness is attached before the start"
+    );
+    assert!(
+        !leader.alive,
+        "an attached harness on an unstarted row is not alive"
+    );
 }
 /// A start makes the leader (and only the leader) alive.
 #[tokio::test]

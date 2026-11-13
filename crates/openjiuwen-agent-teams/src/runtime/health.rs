@@ -15,8 +15,14 @@
 //! reads the handles it is given and returns an owned snapshot.
 //!
 //! ```text
-//! alive = a runtime is attached AND that runtime's state is not `Terminated`
+//! alive = a runtime is attached
+//!         AND that runtime's state is not `Terminated`
+//!         AND the row's status is not `Unstarted`
 //! ```
+//!
+//! The status clause matters because the build path (`TeamAgentSpec::build_with`) attaches the
+//! leader's harness before the first start: the runtime is already `Idle` while the row is still
+//! `Unstarted`. Without the clause a built-but-never-started team would report its leader alive.
 use crate::member::TeamMember;
 use crate::schema::{ExecutionStatus, HarnessState, MemberStatus, TeamRole};
 use serde::{Deserialize, Serialize};
@@ -37,7 +43,7 @@ pub struct MemberHealth {
     pub status: MemberStatus,
     /// Detail status of the member's current task execution (`idle`, `running`, …).
     pub execution: ExecutionStatus,
-    /// `true` when a runtime is attached and that runtime is not terminated.
+    /// `true` when a runtime is attached, that runtime is not terminated, and the row started.
     pub alive: bool,
 }
 /// Liveness of a whole team: the team identity, its run flag and its whole roster.
@@ -86,18 +92,22 @@ impl TeamHealth {
 }
 /// Projects one member handle into its health entry.
 ///
-/// `alive` requires both halves of the rule: a runtime attached *and* that runtime's phase not
-/// [`HarnessState::Terminated`]. A row that was never spawned therefore reads `false` even while
-/// its status is `ready`, and a torn-down member reads `false` while its handle stays in the
-/// roster.
+/// `alive` requires all three parts of the rule: a runtime is attached, that runtime's phase is not
+/// [`HarnessState::Terminated`], and the row's status is not [`MemberStatus::Unstarted`]. The last
+/// clause is what keeps a built-but-not-yet-started team honest: `TeamAgentSpec`'s build path
+/// attaches the leader's harness, so its runtime is already `Idle` while the row has never
+/// started — only the status says the run has not begun. A row that was never spawned reads
+/// `false` (no runtime), and a torn-down member reads `false` while its handle stays in the roster.
 pub(crate) fn member_health(member: &TeamMember) -> MemberHealth {
-    let alive = member
-        .runtime()
-        .is_some_and(|runtime| runtime.state() != HarnessState::Terminated);
+    let status = member.status();
+    let alive = status != MemberStatus::Unstarted
+        && member
+            .runtime()
+            .is_some_and(|runtime| runtime.state() != HarnessState::Terminated);
     MemberHealth {
         name: member.member_name().to_owned(),
         role: member.role(),
-        status: member.status(),
+        status,
         execution: member.execution(),
         alive,
     }
@@ -163,21 +173,42 @@ mod tests {
             MemberRecord::new("alpha", name, role),
         ))
     }
-    #[test]
-    fn alive_needs_a_runtime_and_a_live_phase() {
-        let member = member("dev-1", TeamRole::Teammate);
+    /// Builds one member handle whose row has already started, through the same store compare-and-set
+    /// the runtime uses (`insert_member` then `TeamMember::mark`).
+    async fn started_member(name: &str, role: TeamRole) -> Arc<TeamMember> {
+        let store: Arc<InMemoryTeamStore> = Arc::new(InMemoryTeamStore::new());
+        let record = MemberRecord::new("alpha", name, role);
+        store.insert_member(record.clone()).await.unwrap();
+        let member = Arc::new(TeamMember::new(store as Arc<dyn TeamStore>, record));
         assert!(
-            !member_health(&member).alive,
+            member.mark(MemberStatus::Ready).await.unwrap(),
+            "the store accepts unstarted -> ready"
+        );
+        assert_eq!(member.status(), MemberStatus::Ready);
+        member
+    }
+    #[tokio::test]
+    async fn alive_needs_a_runtime_a_live_phase_and_a_started_row() {
+        let unstarted = member("dev-1", TeamRole::Teammate);
+        assert!(
+            !member_health(&unstarted).alive,
             "a row with no runtime is not alive"
         );
-        member.attach_runtime(FakeRuntime::new(HarnessState::Idle) as Arc<dyn MemberRuntime>);
+        unstarted.attach_runtime(FakeRuntime::new(HarnessState::Idle) as Arc<dyn MemberRuntime>);
         assert!(
-            member_health(&member).alive,
-            "an attached idle runtime is alive"
+            !member_health(&unstarted).alive,
+            "an idle harness attached before the row started is not alive"
         );
-        member.attach_runtime(FakeRuntime::new(HarnessState::Terminated) as Arc<dyn MemberRuntime>);
+        let started = started_member("dev-1", TeamRole::Teammate).await;
+        started.attach_runtime(FakeRuntime::new(HarnessState::Idle) as Arc<dyn MemberRuntime>);
         assert!(
-            !member_health(&member).alive,
+            member_health(&started).alive,
+            "a started row with an attached idle runtime is alive"
+        );
+        started
+            .attach_runtime(FakeRuntime::new(HarnessState::Terminated) as Arc<dyn MemberRuntime>);
+        assert!(
+            !member_health(&started).alive,
             "a terminated runtime is no longer alive"
         );
     }
