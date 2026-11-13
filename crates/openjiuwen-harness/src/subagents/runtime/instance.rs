@@ -4,6 +4,8 @@
 //! here, so every state transition also bumps the activity phase and the timestamps together.
 //! Timestamps come from the injected [`super::clock::Clock`]: `created_at`/`updated_at` keep
 //! the RFC 3339 strings of the original API, while the numeric fields drive activity and LRU.
+//! `config` keeps the configuration the child was built from, so [`Instance::persisted`] can
+//! write a restorable record and [`Instance::restore`] can rebuild one without a child agent.
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -11,9 +13,11 @@ use openjiuwen_agent::Agent;
 use tokio::task::JoinHandle;
 
 use super::clock::rfc3339_from_ms;
+use super::persistence::PersistedSubAgentRecord;
 use super::quota::SubagentActivity;
 use super::transcript::{TranscriptBuffer, TranscriptChannel, TranscriptEntry};
 use super::{SubAgentId, SubAgentOutcome, SubAgentSpawnRequest, SubagentMetadata, SubagentStatus};
+use crate::schema::SubAgentConfig;
 
 /// One live (or closed-tombstone) sub-agent instance.
 pub(super) struct Instance {
@@ -31,6 +35,8 @@ pub(super) struct Instance {
     pub(super) role: Option<String>,
     /// The task the instance was spawned with.
     pub(super) task_description: String,
+    /// The configuration the child agent was built from; persistence and resume use it.
+    pub(super) config: SubAgentConfig,
     /// Lifecycle status (`SubagentStatus`).
     pub(super) status: SubagentStatus,
     /// Derived activity phase used by LRU eviction.
@@ -76,17 +82,19 @@ pub(super) struct Instance {
 }
 
 impl Instance {
-    /// Reserves a `Queued` instance at `depth` for `request`, stamped at `now_ms`.
+    /// Reserves a `Queued` instance at `depth` for `request` and `config`, stamped at `now_ms`.
     ///
     /// The transcript ring holds at most `transcript_capacity` entries and its live feed
     /// buffers `transcript_channel_capacity` per subscriber. The reservation records the first
     /// entry, [`TranscriptEntry::spawn`] with the delegated task description.
+    #[allow(clippy::too_many_arguments)] // one reservation record, straight from the runtime
     pub(super) fn new(
         seq: u64,
         request: &SubAgentSpawnRequest,
         id: SubAgentId,
         now_ms: i64,
         depth: usize,
+        config: SubAgentConfig,
         transcript_capacity: usize,
         transcript_channel_capacity: usize,
     ) -> Self {
@@ -101,6 +109,7 @@ impl Instance {
             display_name: request.display_name.clone(),
             role: request.role.clone(),
             task_description: request.task_description.clone(),
+            config,
             status: SubagentStatus::PendingInit,
             activity: SubagentActivity::Queued,
             depth,
@@ -125,6 +134,112 @@ impl Instance {
         };
         instance.record(spawn_entry);
         instance
+    }
+
+    /// Rebuilds an instance from a persisted `record` under the fresh sequence `seq`.
+    ///
+    /// `id` is the bucket key the record was stored under and becomes the instance id; a record
+    /// without a `sub_session_id` falls back to it. Everything else is the persisted identity,
+    /// configuration, status/activity, transcript and timestamps, with two rebuild-safe folds,
+    /// because no turn survives reconstruction: a `Running`/`PendingInit` status becomes
+    /// `Interrupted` and a `Running`/`Queued` activity becomes `Idle`. `closed_reason` is kept
+    /// only on a `Closed` record. There is no child agent, no running turn, no queued input and
+    /// no turn generation; the persisted transcript is replayed into a fresh ring of
+    /// `transcript_capacity` entries, so it keeps its order and the sequence numbers the ring
+    /// assigns from the oldest retained entry.
+    pub(super) fn restore(
+        seq: u64,
+        id: SubAgentId,
+        record: &PersistedSubAgentRecord,
+        transcript_capacity: usize,
+        transcript_channel_capacity: usize,
+    ) -> Self {
+        let status = match record.status {
+            SubagentStatus::Running | SubagentStatus::PendingInit => SubagentStatus::Interrupted,
+            other => other,
+        };
+        let activity = match record.activity {
+            SubagentActivity::Running | SubagentActivity::Queued => SubagentActivity::Idle,
+            other => other,
+        };
+        let closed_reason = if status == SubagentStatus::Closed {
+            record.closed_reason.clone()
+        } else {
+            None
+        };
+        let sub_session_id = if record.sub_session_id.is_empty() {
+            id.clone()
+        } else {
+            record.sub_session_id.clone()
+        };
+        let mut transcript = TranscriptBuffer::new(transcript_capacity);
+        transcript.extend(record.transcript.iter().cloned());
+        Self {
+            seq,
+            subagent_id: id,
+            sub_session_id,
+            subagent_type: record.subagent_type.clone(),
+            display_name: record.display_name.clone(),
+            role: record.role.clone(),
+            task_description: record.task_description.clone(),
+            config: record.config.clone(),
+            status,
+            activity,
+            depth: record.depth,
+            parent_subagent_id: record.parent_subagent_id.clone(),
+            created_at: rfc3339_from_ms(record.created_at_ms),
+            updated_at: rfc3339_from_ms(record.updated_at_ms),
+            created_at_ms: record.created_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            last_used_at_ms: record.last_used_at_ms,
+            last_activity_at_ms: record.last_activity_at_ms,
+            closed_reason,
+            agent_id: record.agent_id.clone(),
+            output: record.output.clone(),
+            error: record.error.clone(),
+            agent: None,
+            pending: VecDeque::new(),
+            running: false,
+            generation: 0,
+            handle: None,
+            transcript,
+            channel: TranscriptChannel::new(transcript_channel_capacity),
+        }
+    }
+
+    /// Serializes this instance into the persisted record shape.
+    ///
+    /// `spawn_seq` is the instance's sequence number, `closed_at_ms` is the close timestamp of a
+    /// tombstone (`None` while live), and the transcript is the retained ring in order.
+    pub(super) fn persisted(&self) -> PersistedSubAgentRecord {
+        PersistedSubAgentRecord {
+            subagent_id: self.subagent_id.clone(),
+            sub_session_id: self.sub_session_id.clone(),
+            subagent_type: self.subagent_type.clone(),
+            display_name: self.display_name.clone(),
+            role: self.role.clone(),
+            task_description: self.task_description.clone(),
+            status: self.status,
+            activity: self.activity,
+            depth: self.depth,
+            parent_subagent_id: self.parent_subagent_id.clone(),
+            spawn_seq: self.seq,
+            agent_id: self.agent_id.clone(),
+            output: self.output.clone(),
+            error: self.error.clone(),
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            last_used_at_ms: self.last_used_at_ms,
+            last_activity_at_ms: self.last_activity_at_ms,
+            closed_at_ms: if self.is_live() {
+                None
+            } else {
+                Some(self.updated_at_ms)
+            },
+            closed_reason: self.closed_reason.clone(),
+            config: self.config.clone(),
+            transcript: self.transcript.entries(),
+        }
     }
 
     /// Appends `entry` to the transcript and publishes it on the live feed.

@@ -38,7 +38,7 @@ pub use runtime::transcript::{
 };
 pub use runtime::{clock, persistence, quota, transcript};
 pub use runtime::{
-    ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
+    LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
     SubAgentSpawnRequest, SubagentMetadata, SubagentStatus, EVICTION_REASON,
 };
 pub use subagent_tools::{
