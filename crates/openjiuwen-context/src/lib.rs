@@ -65,6 +65,8 @@ pub mod offload;
 pub mod processor;
 pub mod prompts;
 pub mod recall;
+pub mod reload;
+pub mod session_memory;
 pub mod stats;
 pub mod tokens;
 pub mod window;
@@ -95,6 +97,16 @@ pub use recall::{
     KvRecallArchiveStore, RecallArchive, RecallArchiveStore, RecallChunk, RecallChunkMatch,
     RecallOptions, RecallResult, RecallTurn, RecallTurnMatch, TurnRecord,
     COMPRESSION_RECALL_MARKER_PREFIX,
+};
+pub use reload::{
+    has_offload_markers, inject_reload_hint, reload_hint, reload_system_message, ReloadLanguage,
+    RELOAD_HINT_CN, RELOAD_HINT_EN,
+};
+pub use session_memory::{
+    boundary_message, is_boundary_message, reinject_session_memory, stamp_message_id,
+    summary_message, InMemorySessionMemoryStore, KvSessionMemoryStore, SessionMemoryNotes,
+    SessionMemoryStore, CONTEXT_MESSAGE_ID_KEY, RECENT_MESSAGES_NOTICE, SESSION_MEMORY_BOUNDARY,
+    SESSION_MEMORY_SUMMARY_INTRO,
 };
 pub use stats::{compute_stats, ContextStats, PreparedContext};
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
