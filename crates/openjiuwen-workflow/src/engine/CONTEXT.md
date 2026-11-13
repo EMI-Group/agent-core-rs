@@ -149,6 +149,7 @@ impl CompiledWorkflow {
     pub async fn resume(&self, interactive: InteractiveInput, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
 }
 pub struct WorkflowRunOptions { pub cancellation, pub timeout: Option<Duration>, pub interactive: Option<InteractiveInput>,
+    pub answers: BTreeMap<String, Vec<Value>> /* per-id FIFO answers replayed before `interactive` */,
     pub resume: bool, pub stream_modes: Option<Vec<StreamMode>>, pub max_supersteps: Option<usize>,
     pub depth: usize /* 0 at top level, child run = parent + 1 */ }
 ```
@@ -174,8 +175,8 @@ every predecessor is visible. Single-source nodes, nodes reached only through a 
 Run wiring: when `session.checkpointer()` is `Some`, compile with
 `CompileOptions { store: Some(Arc::new(CheckpointerStore::new(cp, card.id))), namespace: Some(card.id), checkpoint_every_superstep: true }`
 and delete the namespace after a successful completed run. `invoke` merges object inputs into the session
-global lane (unless resuming), seeds `InteractionState` from `options.interactive`, and runs inside a timeout
-(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero). An interrupt error drains
+global lane (unless resuming), seeds `InteractionState` from `options.answers` (`append`, so a nested run replays what its child already consumed) before `options.interactive` (`seed`), and runs inside a timeout
+(`options.timeout`, else `SessionConfig::execute_timeout_ms` when non-zero); `stream` performs the same merge and two-step seeding but applies no timeout wrapper. An interrupt error drains
 `InteractionState::pending` into `{"type", "index", "payload"}` wires and reports `InputRequired`, keeping the
 pre-superstep snapshot; a graph that halts via `NodeOutcome::Halt` reports the same state with its halt value;
 success → the end output value, or the collected `end node stream` wires when the end streams. `stream` forwards
@@ -217,9 +218,9 @@ card name as title) and degrades to `crate::render::error_svg` when the definiti
 
 - `./definition.rs` → `WorkflowDefinition`, `NodeConfig`, `Edge`, `ConditionalSource`, ability selection, `spec()`
 - `./validate.rs` → compile-time validation and coded problem messages
-- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation, error recovery); crate-visible only (`pub(crate)`)
+- `./node.rs` → `RunScope`, `NodeRuntime`, `ComponentNode` graph adapter (schema resolution, dispatch, tracing, interrupt propagation, error recovery); crate-visible only (`pub(crate)`), and its `project_output` helper is reused by `src/single.rs`
 - `./mod.rs` → `CompiledWorkflow`, `WorkflowRunOptions`, `CombinedRouter`, graph compilation (CNF + first-arrival wiring), SVG entry point, `test_support` fakes
-- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection, seed/timeout/depth helpers, `AbortOnDrop`
+- `./run.rs` → `CompiledWorkflow::{invoke, resume, stream}`, `run_blocking`, interaction-wire projection (`pub(crate) interaction_wires`, also used by `src/single.rs`), seed/timeout/depth helpers, `AbortOnDrop`
 - `./tests.rs` → engine unit tests (stream termination, buffered frames, snapshot lifecycle, interrupt and failure resume, facade accessors)
 
 ## Test Strategy
