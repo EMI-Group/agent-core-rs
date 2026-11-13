@@ -1,1 +1,1273 @@
-//! Staged omni-creation pipeline (implementation in progress).
+//! The staged omni-creation pipeline: URL → scraped page → assets → skill bundle.
+//!
+//! Ports stages 1–5 of the Python `skill_omni_creation/scripts/` without browser
+//! automation, image decoding, or binary storage: [`OmniCreation::scrape`] turns
+//! an HTML, plain-text, or `tar` page into a [`ScrapedPage`];
+//! [`OmniCreation::download`] fetches the bounded image and subpage candidates
+//! and applies the deterministic [`super::filter`] rules there (there is no
+//! separate filtering stage that could be skipped); [`OmniCreation::generate`]
+//! renders a `SKILL.md` deterministically while [`OmniCreation::generate_with_model`]
+//! asks a model once and falls back on any failure; and
+//! [`OmniCreation::text_resources`] / [`OmniCreation::save`] write the text
+//! assets beside the document.
+//!
+//! Images are never written to disk: [`SkillResource`] content is text and a
+//! bundle reader skips non-UTF-8 files, so a kept image stays a URL in
+//! `SKILL.md` and `references/sources.md`. Playwright, Pillow, the LLM
+//! image-relevance judge, and concurrent fetching are deliberately not ported:
+//! resources are fetched sequentially in first-seen order. Every cap comes from
+//! [`OmniConfig`] (a count cap of zero disables that class), and every stage is
+//! deterministic given its inputs — no timestamps, no environment reads, no
+//! global state, and network access only through the injected [`Fetcher`].
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::{self, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
+use openjiuwen_foundation::prompt::BaseMessage;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::skill_creator::{SkillBundle, SkillDefinition, SkillResource};
+use crate::util::extract_json_fence;
+
+use super::archive::{self, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
+use super::fetch::{FetchedResource, Fetcher};
+use super::filter::{
+    self, content_hash, dedupe_links, filter_images_with, same_host, slugify, ImageCandidate,
+    ResourceFilter,
+};
+use super::html::{resolve_url, Heading, HtmlDocument, Image, Link};
+
+/// Default cap on followed subpages.
+const DEFAULT_MAX_LINKS: usize = 8;
+/// Default cap on downloaded images.
+const DEFAULT_MAX_IMAGES: usize = 16;
+/// Default cap on the combined downloaded (`images` + subpages) list.
+const DEFAULT_MAX_RESOURCES: usize = 32;
+/// Default lower bound for a downloaded image payload: 1 KiB.
+const DEFAULT_MIN_IMAGE_BYTES: usize = 1024;
+/// Default upper bound for a downloaded image payload: 8 MiB.
+const DEFAULT_MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Default upper bound for a downloaded subpage: 2 MiB.
+const DEFAULT_MAX_RESOURCE_BYTES: usize = 2 * 1024 * 1024;
+/// Longest description written into the generated document, in characters.
+const MAX_DESCRIPTION_CHARS: usize = 300;
+/// How much scraped text is offered to the model, in characters.
+const MAX_MODEL_TEXT_CHARS: usize = 8_000;
+/// How many text paragraphs the deterministic document lists.
+const MAX_DETAIL_PARAGRAPHS: usize = 20;
+/// How many fenced code blocks the deterministic document lists.
+const MAX_CODE_EXAMPLES: usize = 5;
+/// How many leading bytes are inspected when sniffing an archive entry for NULs.
+const BINARY_SNIFF_BYTES: usize = 512;
+/// How many leading bytes are inspected when sniffing a resource for HTML.
+const HTML_SNIFF_BYTES: usize = 1024;
+/// The name used when neither the title nor the URL yields a slug.
+const FALLBACK_NAME: &str = "scraped-skill";
+/// The provenance resource every generated bundle carries.
+const SOURCES_RESOURCE: &str = "references/sources.md";
+/// The prefix of the per-subpage reference resources.
+const PAGE_RESOURCE_PREFIX: &str = "references/page-";
+/// The system prompt of the model-assisted generator.
+const MODEL_SYSTEM_PROMPT: &str = "\
+You turn a scraped documentation page into a portable agent skill. Answer with exactly one ```json code block whose object has:
+- name: ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit
+- description: one to three sentences describing the skill and when to use it
+- instructions: markdown body with numbered steps
+- metadata (optional): a string-keyed object of extra values
+
+Ground every statement in the supplied title, headings, text, code blocks, and images.
+Never invent steps, commands, or image paths; refer to an image by its URL when it matters.";
+
+/// Caps and policy for one omni-creation run.
+///
+/// The defaults mirror the Python script constants: eight subpages, sixteen
+/// images, thirty-two combined resources, a 1 KiB image floor, an 8 MiB image
+/// ceiling, and a 2 MiB per-subpage ceiling. Count caps of zero are valid and
+/// disable that class of work; byte bounds must be non-zero and ordered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct OmniConfig {
+    /// Maximum number of subpages followed from the source page.
+    pub max_links: usize,
+    /// Maximum number of images downloaded from the source page.
+    pub max_images: usize,
+    /// Maximum size of the combined downloaded image and subpage list.
+    pub max_resources: usize,
+    /// Payloads smaller than this many bytes are dropped.
+    pub min_image_bytes: usize,
+    /// Image responses larger than this many bytes are ignored.
+    pub max_image_bytes: usize,
+    /// Subpage responses larger than this many bytes are ignored.
+    pub max_resource_bytes: usize,
+    /// Whether resources on hosts other than the source page are followed.
+    pub allow_cross_host: bool,
+}
+
+impl Default for OmniConfig {
+    fn default() -> Self {
+        Self {
+            max_links: DEFAULT_MAX_LINKS,
+            max_images: DEFAULT_MAX_IMAGES,
+            max_resources: DEFAULT_MAX_RESOURCES,
+            min_image_bytes: DEFAULT_MIN_IMAGE_BYTES,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            max_resource_bytes: DEFAULT_MAX_RESOURCE_BYTES,
+            allow_cross_host: false,
+        }
+    }
+}
+
+impl OmniConfig {
+    /// Returns the configuration with a different subpage cap.
+    #[must_use]
+    pub fn with_max_links(mut self, max_links: usize) -> Self {
+        self.max_links = max_links;
+        self
+    }
+
+    /// Returns the configuration with a different image cap.
+    #[must_use]
+    pub fn with_max_images(mut self, max_images: usize) -> Self {
+        self.max_images = max_images;
+        self
+    }
+
+    /// Returns the configuration with a different combined-resource cap.
+    #[must_use]
+    pub fn with_max_resources(mut self, max_resources: usize) -> Self {
+        self.max_resources = max_resources;
+        self
+    }
+
+    /// Returns the configuration with a different image-size floor.
+    #[must_use]
+    pub fn with_min_image_bytes(mut self, min_image_bytes: usize) -> Self {
+        self.min_image_bytes = min_image_bytes;
+        self
+    }
+
+    /// Returns the configuration with a different image-response ceiling.
+    #[must_use]
+    pub fn with_max_image_bytes(mut self, max_image_bytes: usize) -> Self {
+        self.max_image_bytes = max_image_bytes;
+        self
+    }
+
+    /// Returns the configuration with a different subpage-response ceiling.
+    #[must_use]
+    pub fn with_max_resource_bytes(mut self, max_resource_bytes: usize) -> Self {
+        self.max_resource_bytes = max_resource_bytes;
+        self
+    }
+
+    /// Returns the configuration with a different cross-host policy.
+    #[must_use]
+    pub fn with_allow_cross_host(mut self, allow_cross_host: bool) -> Self {
+        self.allow_cross_host = allow_cross_host;
+        self
+    }
+
+    /// Rejects a configuration whose byte bounds cannot describe a usable range.
+    ///
+    /// Count caps are allowed to be zero: they mean "disable that class".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// naming the offending field (`min_image_bytes`, `max_image_bytes`, or
+    /// `max_resource_bytes`) when it is zero, or naming both image bounds when
+    /// `min_image_bytes` exceeds `max_image_bytes`.
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("min_image_bytes", self.min_image_bytes),
+            ("max_image_bytes", self.max_image_bytes),
+            ("max_resource_bytes", self.max_resource_bytes),
+        ] {
+            if value == 0 {
+                return Err(Error::validation(format!(
+                    "{field} must be greater than zero, got 0"
+                )));
+            }
+        }
+        if self.min_image_bytes > self.max_image_bytes {
+            return Err(Error::validation(format!(
+                "min_image_bytes ({}) must not exceed max_image_bytes ({})",
+                self.min_image_bytes, self.max_image_bytes
+            )));
+        }
+        self.resource_filter().validate()
+    }
+
+    /// The image filter implied by this configuration.
+    #[must_use]
+    pub fn resource_filter(&self) -> ResourceFilter {
+        ResourceFilter {
+            min_image_bytes: self.min_image_bytes,
+            max_image_bytes: self.max_image_bytes,
+            allow_cross_host: self.allow_cross_host,
+        }
+    }
+}
+
+/// The information the pipeline needs from one scraped source.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct ScrapedPage {
+    /// The final URL that answered, or the requested URL when none was reported.
+    pub url: String,
+    /// The page title, empty for text and archive inputs without a level-1 heading.
+    pub title: String,
+    /// The page description, empty for text and archive inputs.
+    pub description: String,
+    /// The tag-free page text.
+    pub text: String,
+    /// Headings in document or archive order.
+    pub headings: Vec<Heading>,
+    /// Absolute `http(s)` anchors in document order.
+    pub links: Vec<Link>,
+    /// Absolute `http(s)` images in document order.
+    pub images: Vec<Image>,
+    /// Fenced or `<pre>`/`<code>` code blocks in document order.
+    pub code_blocks: Vec<String>,
+}
+
+impl ScrapedPage {
+    /// Reports whether the page yielded nothing worth turning into a skill.
+    ///
+    /// The check mirrors the Python scrape guard: text, headings, links, and
+    /// images must all be empty. A title or description alone does not make a
+    /// page usable, and code blocks are covered by the text.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.headings.is_empty()
+            && self.links.is_empty()
+            && self.images.is_empty()
+    }
+}
+
+/// One downloaded resource: an image payload or a followed HTML subpage.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct DownloadedResource {
+    /// The URL that answered.
+    pub url: String,
+    /// The `content-type` reported by the server, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// The raw response body.
+    pub bytes: Vec<u8>,
+}
+
+impl DownloadedResource {
+    /// Reports whether the payload is an HTML document.
+    ///
+    /// The `content-type` header wins when it names `text/html` or
+    /// `application/xhtml…`; otherwise the first 1 KiB of the body is inspected
+    /// for a `<!doctype html` prefix or an `<html` tag. The same rule as
+    /// [`FetchedResource::is_html`], applied to a buffered resource.
+    #[must_use]
+    pub fn is_html(&self) -> bool {
+        if let Some(content_type) = self.content_type.as_deref() {
+            let mime = content_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if mime.starts_with("text/html") || mime.starts_with("application/xhtml") {
+                return true;
+            }
+        }
+        let head = &self.bytes[..self.bytes.len().min(HTML_SNIFF_BYTES)];
+        let lowered = String::from_utf8_lossy(head)
+            .trim_start()
+            .to_ascii_lowercase();
+        lowered.starts_with("<!doctype html") || lowered.contains("<html")
+    }
+}
+
+/// The artifact of one successful [`OmniCreation::run`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct OmniOutcome {
+    /// The generated skill, including every text resource the pipeline wrote.
+    pub definition: SkillDefinition,
+    /// The relative paths of those resources, in write order.
+    pub resources: Vec<String>,
+    /// The skill directory under the requested root.
+    pub bundle_path: PathBuf,
+}
+
+/// The staged URL-to-skill pipeline.
+///
+/// One value carries the fetching seam, the optional drafting model, and the
+/// run policy, so every stage reads the same configuration. Construction needs
+/// a [`Fetcher`]; [`OmniCreation::with_model`] enables the model-assisted
+/// generator, and [`OmniCreation::with_config`] overrides [`OmniConfig`].
+#[derive(Clone)]
+pub struct OmniCreation {
+    /// Where pages and resources are fetched from.
+    fetcher: Arc<dyn Fetcher>,
+    /// The optional drafting model.
+    model: Option<Arc<dyn Model>>,
+    /// The caps and policy of this run.
+    config: OmniConfig,
+}
+
+impl fmt::Debug for OmniCreation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OmniCreation")
+            .field("fetcher", &"dyn Fetcher")
+            .field("has_model", &self.model.is_some())
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl OmniCreation {
+    /// Creates a deterministic pipeline over `fetcher` with [`OmniConfig::default`].
+    #[must_use]
+    pub fn new(fetcher: Arc<dyn Fetcher>) -> Self {
+        Self {
+            fetcher,
+            model: None,
+            config: OmniConfig::default(),
+        }
+    }
+
+    /// Attaches the model used by [`OmniCreation::generate_with_model`].
+    #[must_use]
+    pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Replaces the run configuration.
+    #[must_use]
+    pub fn with_config(mut self, config: OmniConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The attached drafting model, when one is configured.
+    #[must_use]
+    pub fn model(&self) -> Option<&Arc<dyn Model>> {
+        self.model.as_ref()
+    }
+
+    /// The run configuration.
+    #[must_use]
+    pub fn config(&self) -> &OmniConfig {
+        &self.config
+    }
+
+    /// Fetches `url` and extracts a [`ScrapedPage`].
+    ///
+    /// HTML pages become title, description, text, headings, links, images, and
+    /// code blocks, with every link and image resolved to an absolute `http(s)`
+    /// URL. A `tar` body is unpacked and read as markdown: file entries with
+    /// valid UTF-8 and no NUL byte in their first 512 bytes contribute text,
+    /// ATX headings (`#`…`######` plus a space), and fenced code blocks; the
+    /// title is the first level-1 heading. Any other body is treated as plain
+    /// text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// for an invalid configuration or a page with no text, headings, links, or
+    /// images; [`Error::unsupported`](openjiuwen_common::error::Error::unsupported)
+    /// for a `zip` or `gzip` page input (the message names the format); and
+    /// whatever the [`Fetcher`] reports.
+    pub async fn scrape(&self, url: &str) -> Result<ScrapedPage> {
+        self.config.validate()?;
+        let resource = self.fetcher.fetch(url).await?;
+        let final_url = if resource.final_url.is_empty() {
+            url.to_owned()
+        } else {
+            resource.final_url.clone()
+        };
+        let page = match archive::detect(&resource.body) {
+            // `tar` is unpacked in-process; `zip`/`gzip` propagate the typed
+            // `Unsupported` error naming the format from `unpack_auto`.
+            Some(ArchiveFormat::Tar | ArchiveFormat::Zip | ArchiveFormat::Gzip) => {
+                let entries = ArchiveUnpacker::unpack_auto(&resource.body)?;
+                archive_page(&final_url, &entries)
+            }
+            None if resource.is_html() => html_page(&resource, &final_url),
+            None => ScrapedPage {
+                url: final_url,
+                text: resource.text(),
+                ..ScrapedPage::default()
+            },
+        };
+        if page.is_blank() {
+            return Err(Error::validation(format!(
+                "scrape of {url} extracted no text, links, or images"
+            )));
+        }
+        Ok(page)
+    }
+
+    /// Downloads the bounded image and subpage candidates of `page`.
+    ///
+    /// Images are considered in document order, same-host only unless
+    /// [`OmniConfig::allow_cross_host`] is set, deduplicated by the [`content_hash`]
+    /// of their URL, and capped at [`OmniConfig::max_images`]. Subpages come from
+    /// [`dedupe_links`] on the page anchors, exclude the page itself, and are
+    /// capped at [`OmniConfig::max_links`] fetch attempts. Everything is fetched
+    /// sequentially so request order is reproducible: a page with `n` candidates
+    /// issues exactly `n` fetches in list order, never a concurrent swarm.
+    ///
+    /// Per-resource failures, non-success statuses, oversized bodies, and
+    /// non-HTML subpages are logged with [`tracing::warn`] and skipped instead of
+    /// failing the stage. Images are filtered once by
+    /// [`ResourceFilter`] after their payloads are known: `svg` payloads pass the
+    /// same sniff and `content-type` rules as raster formats, and every kept image
+    /// stays a URL because binary assets are never written. The result is accepted
+    /// images first (display order), then subpages (link order), truncated to
+    /// [`OmniConfig::max_resources`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// when the configuration is invalid. Fetch failures never escape.
+    pub async fn download(&self, page: &ScrapedPage) -> Result<Vec<DownloadedResource>> {
+        self.config.validate()?;
+        let mut fetched = Vec::new();
+        for mut candidate in self.image_candidates(page) {
+            match self.fetcher.fetch(&candidate.url).await {
+                Ok(response) if response.is_success() => {
+                    if response.body.len() > self.config.max_image_bytes {
+                        tracing::warn!(
+                            url = %candidate.url,
+                            bytes = response.body.len(),
+                            "skipping an oversized image response"
+                        );
+                        continue;
+                    }
+                    candidate.bytes = Some(response.body);
+                    candidate.content_type = response.content_type;
+                    fetched.push(candidate);
+                }
+                Ok(response) => tracing::warn!(
+                    url = %candidate.url,
+                    status = response.status,
+                    "skipping a non-success image response"
+                ),
+                Err(error) => tracing::warn!(
+                    url = %candidate.url,
+                    %error,
+                    "skipping a failed image fetch"
+                ),
+            }
+        }
+        let mut resources: Vec<DownloadedResource> =
+            filter_images_with(&fetched, &self.config.resource_filter())
+                .into_iter()
+                .map(|candidate| DownloadedResource {
+                    url: candidate.url,
+                    content_type: candidate.content_type,
+                    bytes: candidate.bytes.unwrap_or_default(),
+                })
+                .collect();
+
+        let mut attempted = 0;
+        for link in dedupe_links(&page.links) {
+            if attempted >= self.config.max_links {
+                break;
+            }
+            let Some(target) = resolve_url(&page.url, &link.href) else {
+                continue;
+            };
+            if !self.config.allow_cross_host && !same_host(&target, &page.url) {
+                continue;
+            }
+            if same_page(&target, &page.url) {
+                continue;
+            }
+            attempted += 1;
+            match self.fetcher.fetch(&target).await {
+                Ok(response) if response.is_success() && response.is_html() => {
+                    if response.body.len() > self.config.max_resource_bytes {
+                        tracing::warn!(
+                            url = %target,
+                            bytes = response.body.len(),
+                            "skipping an oversized subpage response"
+                        );
+                        continue;
+                    }
+                    resources.push(DownloadedResource {
+                        url: target,
+                        content_type: Some("text/html".to_owned()),
+                        bytes: response.body,
+                    });
+                }
+                Ok(response) => tracing::warn!(
+                    url = %target,
+                    status = response.status,
+                    "skipping a non-HTML subpage response"
+                ),
+                Err(error) => tracing::warn!(
+                    url = %target,
+                    %error,
+                    "skipping a failed subpage fetch"
+                ),
+            }
+        }
+        resources.truncate(self.config.max_resources);
+        Ok(resources)
+    }
+
+    /// Renders the deterministic skill for `page` and `resources`.
+    ///
+    /// The name is [`slugify`] of the title, then of the URL host (or the URL
+    /// itself), then `scraped-skill`. The description is the page description,
+    /// else the first non-empty text line, capped at 300 characters on a
+    /// character boundary, else a URL-based sentence. The instruction body is an
+    /// `#` title, the description, and the `## Steps`, `## Details`,
+    /// `## Code Examples`, `## Reference Images`, `## Further Reading`, and
+    /// `## Reference Files` sections that have content. Image and link
+    /// references always stay URLs; the definition carries every text resource
+    /// of [`OmniCreation::text_resources`], so it is self-contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// when the rendered definition does not validate (an empty name, a blank
+    /// description or body, or an unsafe resource path).
+    pub fn generate(
+        &self,
+        page: &ScrapedPage,
+        resources: &[DownloadedResource],
+    ) -> Result<SkillDefinition> {
+        let name = skill_name(page);
+        let description = skill_description(page);
+        let text_resources = self.text_resources(page, resources);
+        let instructions = self.instructions_markdown(page, &name, &description, &text_resources);
+        let mut definition = SkillDefinition::new(name, description, instructions);
+        definition.resources = text_resources;
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    /// Writes `definition` plus `resources` as a bundle under `root`.
+    ///
+    /// Resources already present in the definition are skipped, every appended
+    /// resource is validated, and the directory returned by [`SkillBundle::write`]
+    /// is handed back. Binary assets are never written: [`SkillResource`] content
+    /// is text and bundle reads skip non-UTF-8 files, so images remain URLs in
+    /// the instructions and the provenance resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// for an invalid resource path or definition, plus every filesystem failure
+    /// [`SkillBundle::write`] reports.
+    pub async fn save(
+        &self,
+        definition: &SkillDefinition,
+        resources: &[SkillResource],
+        root: &Path,
+    ) -> Result<PathBuf> {
+        let mut definition = definition.clone();
+        for resource in resources {
+            resource.validate()?;
+            if definition
+                .resources
+                .iter()
+                .any(|existing| existing.path == resource.path)
+            {
+                continue;
+            }
+            definition.resources.push(resource.clone());
+        }
+        SkillBundle::write(&definition, root).await
+    }
+
+    /// The deterministic text assets of a bundle for `page` and `resources`.
+    ///
+    /// `references/sources.md` is always first when the cap allows it: source URL,
+    /// title, description, the bounded deduplicated subpage links, and every
+    /// image URL with its alt text. Then each HTML [`DownloadedResource`] with a
+    /// non-blank document becomes `references/page-NN.md` (two-digit ordinal
+    /// among the written reference pages), rendering the page title, its
+    /// headings as `##`/`###`, and its text. The list is truncated to
+    /// [`OmniConfig::max_resources`], and a cap of zero returns nothing.
+    #[must_use]
+    pub fn text_resources(
+        &self,
+        page: &ScrapedPage,
+        resources: &[DownloadedResource],
+    ) -> Vec<SkillResource> {
+        let mut assets = Vec::new();
+        if self.config.max_resources == 0 {
+            return assets;
+        }
+        assets.push(SkillResource::new(
+            SOURCES_RESOURCE,
+            self.sources_markdown(page),
+        ));
+        let mut page_index = 0_usize;
+        for resource in resources {
+            if assets.len() >= self.config.max_resources {
+                break;
+            }
+            if !resource.is_html() {
+                continue;
+            }
+            let Some(content) = render_page_resource(page, resource) else {
+                continue;
+            };
+            let path = format!("{PAGE_RESOURCE_PREFIX}{page_index:02}.md");
+            page_index += 1;
+            assets.push(SkillResource::new(path, content));
+        }
+        assets
+    }
+
+    /// Drafts the skill with one model call, falling back to [`OmniCreation::generate`].
+    ///
+    /// The model receives the page title, source URL, headings, text (truncated
+    /// to 8 000 characters on a character boundary), code blocks, and image
+    /// URLs with alt text, and must answer with one fenced `json` object holding
+    /// `name`, `description`, `instructions`, and optionally `metadata`. The
+    /// resulting definition carries the provenance resource of
+    /// [`OmniCreation::text_resources`].
+    ///
+    /// Any failure after a model is attached — a model error, an answer without
+    /// a JSON fence, a malformed or incomplete payload, or a definition that
+    /// does not validate — is logged with [`tracing::warn`] and replaced by the
+    /// deterministic rendering, so the stage stays productive offline.
+    ///
+    /// # Errors
+    ///
+    /// The only error that escapes is
+    /// [`Error::validation`](openjiuwen_common::error::Error::validation) when no
+    /// model is attached (the message names `OmniCreation::with_model`).
+    pub async fn generate_with_model(&self, page: &ScrapedPage) -> Result<SkillDefinition> {
+        let Some(model) = self.model.as_ref() else {
+            return Err(Error::validation(
+                "model-assisted omni creation requires a pipeline built with \
+                 OmniCreation::with_model",
+            ));
+        };
+        match self.model_definition(model, page).await {
+            Ok(definition) => Ok(definition),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "model-assisted skill generation failed; using the deterministic generator"
+                );
+                self.generate(page, &[])
+            }
+        }
+    }
+
+    /// Runs scrape → download → generate → save and reports the artifact.
+    ///
+    /// The drafting model is used when attached (with its deterministic
+    /// fallback); otherwise the deterministic generator consumes the downloaded
+    /// resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error of [`OmniCreation::scrape`],
+    /// [`OmniCreation::download`], [`OmniCreation::generate`], and
+    /// [`OmniCreation::save`]; a model failure is never one of them because the
+    /// model-assisted generator falls back.
+    pub async fn run(&self, url: &str, root: &Path) -> Result<OmniOutcome> {
+        self.config.validate()?;
+        let page = self.scrape(url).await?;
+        let downloaded = self.download(&page).await?;
+        let definition = if self.model.is_some() {
+            self.generate_with_model(&page).await?
+        } else {
+            self.generate(&page, &downloaded)?
+        };
+        let bundle_path = self.save(&definition, &[], root).await?;
+        Ok(OmniOutcome {
+            resources: definition
+                .resources
+                .iter()
+                .map(|resource| resource.path.clone())
+                .collect(),
+            definition,
+            bundle_path,
+        })
+    }
+
+    /// Builds the image candidates worth fetching for `page`.
+    fn image_candidates(&self, page: &ScrapedPage) -> Vec<ImageCandidate> {
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        for image in &page.images {
+            if candidates.len() >= self.config.max_images {
+                break;
+            }
+            let Some(target) = resolve_url(&page.url, &image.src) else {
+                continue;
+            };
+            if !self.config.allow_cross_host && !same_host(&target, &page.url) {
+                continue;
+            }
+            if !seen.insert(content_hash(target.as_bytes())) {
+                continue;
+            }
+            candidates.push(ImageCandidate::new(target, image.alt.clone()));
+        }
+        candidates
+    }
+
+    /// Builds the `references/sources.md` body for `page`.
+    fn sources_markdown(&self, page: &ScrapedPage) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "# Sources\n");
+        let _ = writeln!(out, "- Source: {}", page.url);
+        if !page.title.trim().is_empty() {
+            let _ = writeln!(out, "- Title: {}", page.title.trim());
+        }
+        if !page.description.trim().is_empty() {
+            let _ = writeln!(out, "- Description: {}", page.description.trim());
+        }
+        let links = self.further_reading(page);
+        if !links.is_empty() {
+            let _ = writeln!(out, "\n## Links\n");
+            for link in &links {
+                let label = link_label(link);
+                let _ = writeln!(out, "- [{label}]({})", link.href);
+            }
+        }
+        let images: Vec<&Image> = page.images.iter().take(self.config.max_images).collect();
+        if !images.is_empty() {
+            let _ = writeln!(out, "\n## Images\n");
+            for image in images {
+                let alt = image_alt(image);
+                let _ = writeln!(out, "- {alt} — {}", image.src);
+            }
+        }
+        out
+    }
+
+    /// Renders the deterministic instruction body.
+    fn instructions_markdown(
+        &self,
+        page: &ScrapedPage,
+        name: &str,
+        description: &str,
+        references: &[SkillResource],
+    ) -> String {
+        let title = if page.title.trim().is_empty() {
+            name
+        } else {
+            page.title.trim()
+        };
+        let mut out = String::new();
+        let _ = writeln!(out, "# {title}\n");
+        let _ = writeln!(out, "{description}\n");
+
+        let steps = step_headings(page, title);
+        if !steps.is_empty() {
+            let _ = writeln!(out, "## Steps\n");
+            for heading in steps {
+                let _ = writeln!(out, "- **{}**", heading.text.trim());
+            }
+            out.push('\n');
+        }
+
+        let paragraphs = paragraphs(&page.text);
+        if !paragraphs.is_empty() {
+            let _ = writeln!(out, "## Details\n");
+            for paragraph in paragraphs.iter().take(MAX_DETAIL_PARAGRAPHS) {
+                let _ = writeln!(out, "{paragraph}\n");
+            }
+        }
+
+        let code_blocks: Vec<&String> = page
+            .code_blocks
+            .iter()
+            .filter(|block| !block.trim().is_empty())
+            .take(MAX_CODE_EXAMPLES)
+            .collect();
+        if !code_blocks.is_empty() {
+            let _ = writeln!(out, "## Code Examples\n");
+            for block in code_blocks {
+                let _ = writeln!(out, "```\n{}\n```\n", block.trim());
+            }
+        }
+
+        let images: Vec<&Image> = page.images.iter().take(self.config.max_images).collect();
+        if !images.is_empty() {
+            let _ = writeln!(out, "## Reference Images\n");
+            for image in images {
+                let alt = image_alt(image);
+                let _ = writeln!(out, "- {alt} — {}", image.src);
+            }
+            out.push('\n');
+        }
+
+        let further = self.further_reading(page);
+        if !further.is_empty() {
+            let _ = writeln!(out, "## Further Reading\n");
+            for link in &further {
+                let label = link_label(link);
+                let _ = writeln!(out, "- [{label}]({})", link.href);
+            }
+            out.push('\n');
+        }
+
+        if !references.is_empty() {
+            let _ = writeln!(out, "## Reference Files\n");
+            for resource in references {
+                let description = describe_resource(&resource.path);
+                let _ = writeln!(out, "- `{}` — {description}", resource.path);
+            }
+        }
+        out.trim_end().to_owned()
+    }
+
+    /// The bounded, same-host, non-self subpage links of `page`.
+    fn further_reading(&self, page: &ScrapedPage) -> Vec<Link> {
+        let mut links = Vec::new();
+        for link in dedupe_links(&page.links) {
+            if links.len() >= self.config.max_links {
+                break;
+            }
+            let Some(target) = resolve_url(&page.url, &link.href) else {
+                continue;
+            };
+            if !self.config.allow_cross_host && !same_host(&target, &page.url) {
+                continue;
+            }
+            if same_page(&target, &page.url) {
+                continue;
+            }
+            links.push(Link {
+                href: target,
+                text: link.text,
+            });
+        }
+        links
+    }
+
+    /// One model round trip that must answer with a fenced skill definition.
+    async fn model_definition(
+        &self,
+        model: &Arc<dyn Model>,
+        page: &ScrapedPage,
+    ) -> Result<SkillDefinition> {
+        let completion = model
+            .invoke(
+                &[
+                    BaseMessage::system(MODEL_SYSTEM_PROMPT),
+                    BaseMessage::user(self.model_user_prompt(page)),
+                ],
+                &ModelRequestConfig::new(model.model_name()),
+            )
+            .await?;
+        let answer = completion
+            .message()
+            .map(|message| message.text().into_owned())
+            .unwrap_or_default();
+        let Some(payload) = extract_json_fence(&answer) else {
+            return Err(Error::validation(
+                "model answer contained no ```json fenced skill definition",
+            ));
+        };
+        let payload: ModelSkillPayload = serde_json::from_value(payload).map_err(|error| {
+            Error::validation(format!(
+                "invalid omni skill definition JSON from model: {error}"
+            ))
+        })?;
+        let mut definition = SkillDefinition::new(
+            payload.required("name")?,
+            payload.required("description")?,
+            payload.required("instructions")?,
+        );
+        definition.metadata = payload.metadata;
+        definition.resources = self.text_resources(page, &[]);
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    /// The user message of the model-assisted generator.
+    fn model_user_prompt(&self, page: &ScrapedPage) -> String {
+        let mut prompt = String::new();
+        let _ = writeln!(prompt, "Title: {}", page.title.trim());
+        let _ = writeln!(prompt, "Source: {}", page.url);
+        if !page.description.trim().is_empty() {
+            let _ = writeln!(prompt, "Description: {}", page.description.trim());
+        }
+        if !page.headings.is_empty() {
+            prompt.push_str("\nHeadings:\n");
+            for heading in &page.headings {
+                let _ = writeln!(prompt, "- h{} {}", heading.level, heading.text.trim());
+            }
+        }
+        let text = truncate_chars(page.text.trim(), MAX_MODEL_TEXT_CHARS);
+        if !text.is_empty() {
+            let _ = writeln!(prompt, "\nText:\n{text}");
+        }
+        let code_blocks: Vec<&String> = page
+            .code_blocks
+            .iter()
+            .filter(|block| !block.trim().is_empty())
+            .take(MAX_CODE_EXAMPLES)
+            .collect();
+        if !code_blocks.is_empty() {
+            prompt.push_str("\nCode blocks:\n");
+            for block in code_blocks {
+                let _ = writeln!(prompt, "```\n{}\n```", block.trim());
+            }
+        }
+        let images: Vec<&Image> = page.images.iter().take(self.config.max_images).collect();
+        if !images.is_empty() {
+            prompt.push_str("\nImages:\n");
+            for image in images {
+                let alt = image_alt(image);
+                let _ = writeln!(prompt, "- {alt} — {}", image.src);
+            }
+        }
+        prompt
+    }
+}
+
+/// The JSON payload a drafting model is expected to return.
+#[derive(Debug, Default, Deserialize)]
+struct ModelSkillPayload {
+    /// Skill name; required once parsed.
+    #[serde(default)]
+    name: Option<String>,
+    /// Skill description; required once parsed.
+    #[serde(default)]
+    description: Option<String>,
+    /// Instruction body; required once parsed.
+    #[serde(default)]
+    instructions: Option<String>,
+    /// Optional metadata object.
+    #[serde(default)]
+    metadata: BTreeMap<String, Value>,
+}
+
+impl ModelSkillPayload {
+    /// Reads a required, non-blank field, naming it in the failure.
+    fn required(&self, field: &str) -> Result<String> {
+        let value = match field {
+            "name" => self.name.as_deref(),
+            "description" => self.description.as_deref(),
+            "instructions" => self.instructions.as_deref(),
+            other => {
+                return Err(Error::validation(format!(
+                    "unknown omni skill payload field '{other}'"
+                )));
+            }
+        };
+        match value {
+            Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
+            _ => Err(Error::validation(format!(
+                "omni skill definition JSON from model is missing a non-blank '{field}'"
+            ))),
+        }
+    }
+}
+
+/// The skill-name slug of a page: title, then URL host, then the raw URL.
+fn skill_name(page: &ScrapedPage) -> String {
+    let mut name = slugify(&page.title);
+    if name.is_empty() {
+        let source = filter::host(&page.url).unwrap_or_else(|| page.url.clone());
+        name = slugify(&source);
+    }
+    if name.is_empty() {
+        FALLBACK_NAME.to_owned()
+    } else {
+        name
+    }
+}
+
+/// The one-line description of a page, capped on a character boundary.
+fn skill_description(page: &ScrapedPage) -> String {
+    if !page.description.trim().is_empty() {
+        return truncate_chars(page.description.trim(), MAX_DESCRIPTION_CHARS);
+    }
+    if let Some(line) = page
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    {
+        return truncate_chars(line, MAX_DESCRIPTION_CHARS);
+    }
+    format!("Usage steps captured from {}", page.url)
+}
+
+/// The headings that become steps: no empty text, no title duplicate, and not
+/// the leading level-1 heading that already titles the document.
+fn step_headings<'a>(page: &'a ScrapedPage, title: &str) -> Vec<&'a Heading> {
+    page.headings
+        .iter()
+        .enumerate()
+        .filter(|(index, heading)| {
+            let text = heading.text.trim();
+            !(text.is_empty()
+                || text.eq_ignore_ascii_case(title)
+                || (*index == 0 && heading.level == 1))
+        })
+        .map(|(_, heading)| heading)
+        .collect()
+}
+
+/// Splits text into paragraphs of blank-line separated, space-joined lines.
+fn paragraphs(text: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join(" "));
+                current.clear();
+            }
+        } else {
+            current.push(trimmed);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join(" "));
+    }
+    paragraphs
+}
+
+/// Truncates `text` to at most `max_chars` characters without splitting one.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut end = 0;
+    for (count, (index, character)) in text.char_indices().enumerate() {
+        if count == max_chars {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+    text.get(..end).unwrap_or_default().to_owned()
+}
+
+/// The label of a link: its text, else its `href`.
+fn link_label(link: &Link) -> &str {
+    let text = link.text.trim();
+    if text.is_empty() {
+        link.href.trim()
+    } else {
+        text
+    }
+}
+
+/// The display text of an image: its alt text, else `"image"`.
+fn image_alt(image: &Image) -> &str {
+    let alt = image.alt.trim();
+    if alt.is_empty() {
+        "image"
+    } else {
+        alt
+    }
+}
+
+/// Whether two URLs name the same page modulo a trailing slash.
+fn same_page(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+/// The one-line description of a written text resource.
+fn describe_resource(path: &str) -> &'static str {
+    if path == SOURCES_RESOURCE {
+        "source page provenance, links, and image references"
+    } else if path.starts_with(PAGE_RESOURCE_PREFIX) {
+        "captured text of a followed subpage"
+    } else {
+        "captured reference text"
+    }
+}
+
+/// Builds a page from a `tar` archive's text entries.
+fn archive_page(url: &str, entries: &[ArchiveEntry]) -> ScrapedPage {
+    let mut texts = Vec::new();
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+        let text = match std::str::from_utf8(&entry.bytes) {
+            Ok(text) => text.to_owned(),
+            Err(error) => {
+                tracing::debug!(
+                    path = %entry.path,
+                    %error,
+                    "skipping a non-UTF-8 archive entry"
+                );
+                continue;
+            }
+        };
+        if looks_binary(&entry.bytes) {
+            tracing::debug!(
+                path = %entry.path,
+                "skipping a binary-looking archive entry"
+            );
+            continue;
+        }
+        texts.push(text);
+    }
+    let mut headings = Vec::new();
+    let mut code_blocks = Vec::new();
+    for text in &texts {
+        collect_markdown_headings(text, &mut headings);
+        collect_fenced_blocks(text, &mut code_blocks);
+    }
+    let title = headings
+        .iter()
+        .find(|heading| heading.level == 1)
+        .map_or_else(String::new, |heading| heading.text.clone());
+    ScrapedPage {
+        url: url.to_owned(),
+        title,
+        text: texts.join("\n\n"),
+        headings,
+        code_blocks,
+        ..ScrapedPage::default()
+    }
+}
+
+/// Whether an archive entry looks binary: a NUL byte in its first 512 bytes.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
+}
+
+/// Collects markdown ATX headings (`#`…`######` plus a space) from `text`.
+fn collect_markdown_headings(text: &str, headings: &mut Vec<Heading>) {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if !(1..=6).contains(&hashes) {
+            continue;
+        }
+        let Some(rest) = trimmed.get(hashes..) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(' ') else {
+            continue;
+        };
+        let heading = rest.trim();
+        if heading.is_empty() {
+            continue;
+        }
+        headings.push(Heading {
+            level: hashes as u8,
+            text: heading.to_owned(),
+        });
+    }
+}
+
+/// Collects triple-backtick fenced code blocks from `text`, dropping the info string.
+fn collect_fenced_blocks(text: &str, blocks: &mut Vec<String>) {
+    let mut open: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if let Some(body) = open.take() {
+                let content = body.join("\n");
+                let content = content.trim();
+                if !content.is_empty() {
+                    blocks.push(content.to_owned());
+                }
+            } else {
+                open = Some(Vec::new());
+            }
+            continue;
+        }
+        if let Some(body) = open.as_mut() {
+            body.push(line);
+        }
+    }
+}
+
+/// Builds a page from an HTML resource, resolving links and images absolutely.
+fn html_page(resource: &FetchedResource, url: &str) -> ScrapedPage {
+    let document = HtmlDocument::parse(&resource.text(), url);
+    let links = document
+        .links
+        .iter()
+        .filter_map(|link| {
+            resolve_url(url, &link.href).map(|href| Link {
+                href,
+                text: link.text.clone(),
+            })
+        })
+        .collect();
+    let images = document
+        .images
+        .iter()
+        .filter_map(|image| {
+            resolve_url(url, &image.src).map(|src| Image {
+                src,
+                alt: image.alt.clone(),
+            })
+        })
+        .collect();
+    ScrapedPage {
+        url: url.to_owned(),
+        title: document.title,
+        description: document.description,
+        text: document.text,
+        headings: document.headings,
+        links,
+        images,
+        code_blocks: document.code_blocks,
+    }
+}
+
+/// Renders one HTML subpage as a markdown reference document, or `None` when
+/// the payload is not UTF-8 or holds nothing worth writing.
+fn render_page_resource(page: &ScrapedPage, resource: &DownloadedResource) -> Option<String> {
+    let text = match std::str::from_utf8(&resource.bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::debug!(
+                url = %resource.url,
+                %error,
+                "skipping a non-UTF-8 reference page"
+            );
+            return None;
+        }
+    };
+    let document = HtmlDocument::parse(text, &resource.url);
+    if document.title.trim().is_empty()
+        && document.headings.is_empty()
+        && document.text.trim().is_empty()
+    {
+        return None;
+    }
+    let mut out = String::new();
+    let title = if document.title.trim().is_empty() {
+        page.title.trim()
+    } else {
+        document.title.trim()
+    };
+    let title = if title.is_empty() { "Reference" } else { title };
+    let _ = writeln!(out, "# {title}");
+    for heading in &document.headings {
+        let text = heading.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let marker = if heading.level <= 2 { "##" } else { "###" };
+        let _ = writeln!(out, "\n{marker} {text}");
+    }
+    if !document.text.trim().is_empty() {
+        let _ = writeln!(out, "\n{}", document.text.trim());
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests;
