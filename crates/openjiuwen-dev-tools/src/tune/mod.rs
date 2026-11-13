@@ -21,6 +21,12 @@
 //!   [`OptimizerConfig`] and the tuning constants ([`DEFAULT_ITERATION_NUM`],
 //!   [`MAX_PARALLEL_NUM`], …).
 //!
+//! A case may declare tools, and the tool layer makes them runnable and
+//! observable: [`ToolStub`] is a named in-process fixture, [`ToolStubs`] the table
+//! a runner looks them up in, [`ToolTrace`] the ordered [`ToolCallRecord`]s of one
+//! run, and [`RunOutcome`] an answer map bundled with that trace — so an
+//! evaluator can execute the tools a case declares and report what was used.
+//!
 //! Every optimizer runs offline with no arguments: the default evaluator is the
 //! deterministic one and the default candidate source is the deterministic
 //! mutation bank. Attaching a [`Model`] adds model rewrites without making the
@@ -58,6 +64,7 @@ mod base;
 mod evaluator;
 mod loader;
 mod optimizer;
+mod tool;
 
 pub use base::{Case, EvaluatedCase};
 pub use evaluator::{
@@ -76,6 +83,7 @@ pub use optimizer::{
     MAX_EXAMPLE_NUM, MAX_ITERATION_NUM, MAX_PARALLEL_NUM, MIN_EXAMPLE_NUM, MIN_ITERATION_NUM,
     MIN_PARALLEL_NUM,
 };
+pub use tool::{RunOutcome, ToolCallRecord, ToolHandler, ToolStub, ToolStubs, ToolTrace};
 
 #[cfg(test)]
 mod tests {
