@@ -10,6 +10,7 @@ Ports Python `core/single_agent/ability_manager.py` minus the `Runner.resource_m
 - `mod.rs` — `AbilityManager` (`new(owner_id)`, `add_tool`, `remove_tool`, `get`, `cards`, `tool_info`, `revision`, `reorder`, `len`, `is_empty`, `execute`), `AddAbilityResult { name, added, reason }` (`added_tool | refreshed_tool | duplicate_tool`), `ToolExecutionOptions`, `ToolCallResult { call, output, text, success, error }` with `ToolCallResult::message()`.
 - `arguments.rs` — `parse_tool_arguments(&str) -> Result<Value>`: empty input is `{}`; truncated JSON is repaired (bracket/quote balancing); unrepairable input is `Error::Tool`.
 - `execute.rs` — execution policy: model order, contiguous `parallel_safe` batches run concurrently (`futures::future::join_all`), non-parallel-safe tools act as barriers, per-call `tokio::time::timeout`, cancellation via `CancellationToken`; failures/timeouts/unknown tools become error results, never `Err`.
+- `execute.rs` — `execute_calls` delegates to `execute_calls_with(tools, calls, options, &ToolResiliencePolicy)`; the policy's `for_tool(name)` supplies a per-tool timeout (overrides `ToolExecutionOptions::timeout`) and an attempt budget, retrying tool errors/timeouts with `backoff_for(attempt)` and never retrying `Cancelled`/`Validation` failures.
 
 ## Constraints
 
