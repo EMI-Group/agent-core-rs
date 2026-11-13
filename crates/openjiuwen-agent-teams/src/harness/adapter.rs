@@ -60,7 +60,7 @@ pub struct MemberHarnessContext {
     pub team_name: String,
     /// Name of the member being built.
     pub member_name: String,
-    /// Host session identifier the member's harness runs under.
+    /// Per-member session identifier the member's harness runs under, derived as `"<team session>:<member name>"` and also its `host_session_id`.
     pub session_id: String,
     /// Root directory the member's tools and workspace files resolve against.
     pub workspace_root: std::path::PathBuf,
@@ -101,11 +101,12 @@ impl MemberHarnessContext {
         self.card_id = card_id.into();
         self
     }
-    /// Returns the documented per-member session id `"<host_session_id>:<member_name>"`.
+    /// Returns the per-member session id `"<team session>:<member_name>"`.
     ///
-    /// The team session id is shared by every member, so a member's own harness session id is
-    /// derived by appending the member name. The runtime wiring passes this derived id as
-    /// `MemberHarnessContext::session_id` and the team session as the harness `host_session_id`.
+    /// The team session id is shared by every member, so a member's own session id appends the member name, and the runtime passes that derived id as `MemberHarnessContext::session_id`.
+    /// In-process members start through `MemberRuntime::start(None)`, so the derived id is both `HarnessContext::agent_id` and `HarnessContext::host_session_id`.
+    /// Checkpoint records are keyed by `(derived session, card id)`.
+    /// A caller that supplies a team session replaces `host_session_id` only; the checkpoint identity stays the derived id.
     #[must_use]
     pub fn member_session_id(host_session_id: &str, member_name: &str) -> String {
         format!("{host_session_id}:{member_name}")
