@@ -39,9 +39,13 @@
 pub mod base;
 pub mod config;
 pub mod executors;
+pub mod group;
 pub mod intent;
 pub mod legacy;
+pub mod queue;
+pub mod reasoner;
 pub mod schema;
+pub mod task_manager;
 pub use base::{BaseController, Controller, EventHandler, EventHandlerOutcome, TASKS_STATE_KEY};
 pub use config::{ControllerConfig, DefaultResponse};
 pub use executors::{
