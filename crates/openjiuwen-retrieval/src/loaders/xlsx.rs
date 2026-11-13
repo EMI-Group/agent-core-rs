@@ -95,6 +95,7 @@ mod tests {
             ("xl/_rels/workbook.xml.rels", RELS_XML),
             ("xl/worksheets/sheet1.xml", SHEET_XML),
         ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -139,7 +140,7 @@ mod tests {
         let path = dir.path().join("empty.xlsx");
         std::fs::write(
             &path,
-            build_zip(&[("xl/workbook.xml", "<workbook><sheets/></workbook>")]),
+            build_zip(&[("xl/workbook.xml", "<workbook><sheets/></workbook>")]).unwrap(),
         )
         .unwrap();
 
@@ -171,7 +172,7 @@ mod tests {
         let no_workbook = dir.path().join("nopart.xlsx");
         std::fs::write(
             &no_workbook,
-            build_zip(&[("xl/sharedStrings.xml", "<sst/>")]),
+            build_zip(&[("xl/sharedStrings.xml", "<sst/>")]).unwrap(),
         )
         .unwrap();
         let error = XlsxLoader::new()

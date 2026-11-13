@@ -96,7 +96,8 @@ mod tests {
             build_zip(&[
                 ("word/document.xml", DOCUMENT_XML),
                 ("docProps/core.xml", CORE_XML),
-            ]),
+            ])
+            .unwrap(),
         )
         .unwrap();
 
@@ -132,7 +133,7 @@ mod tests {
         let path = dir.path().join("bare.docx");
         std::fs::write(
             &path,
-            build_zip(&[("word/document.xml", "<w:document><w:body/></w:document>")]),
+            build_zip(&[("word/document.xml", "<w:document><w:body/></w:document>")]).unwrap(),
         )
         .unwrap();
 
@@ -173,7 +174,7 @@ mod tests {
         let empty_document = dir.path().join("nopart.docx");
         std::fs::write(
             &empty_document,
-            build_zip(&[("docProps/core.xml", CORE_XML)]),
+            build_zip(&[("docProps/core.xml", CORE_XML)]).unwrap(),
         )
         .unwrap();
         let error = DocxLoader::new()
