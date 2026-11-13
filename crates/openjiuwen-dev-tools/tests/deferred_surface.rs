@@ -1,37 +1,25 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Crate-level honesty tests for the deferred surface and workflow DSL validation.
+//! Crate-level honesty tests for the remaining typed failure surfaces.
 //!
-//! Two invariants are checked here instead of in the module unit tests:
+//! Only capabilities that stay genuinely unported may report
+//! `ErrorKind::Unsupported`; everything else in this crate performs its work.
+//! This binary pins the two invariants that outlive individual modules:
 //!
-//! - Every deferred `tune` entry point reports the *same* honest error shape:
-//!   `ErrorKind::Unsupported`, a message naming the deferred pipeline, and a
-//!   pointer at `docs/PARITY.md`. The stubs must never pretend to succeed.
-//! - `WorkflowDsl::validate` rejects the structural errors the builder relies on
-//!   (no nodes, duplicate ids, unresolvable edge endpoints) and names the
-//!   offending id, while a well-formed document passes and round-trips.
+//! - the workflow DSL rejects the structural errors the builder and the
+//!   declarative generator rely on (no nodes, duplicate ids, unresolvable edge
+//!   endpoints) and names the offending id, while a well-formed document passes
+//!   and round-trips.
+//!
+//! Module-local suites own the checks for capabilities that stay deliberately
+//! deferred (for example the archive formats `skill_creator::omni` cannot unpack
+//! without a compression dependency), so this binary stays focused on the DSL.
 //!
 //! Everything here is offline and deterministic.
-
 use std::collections::BTreeMap;
 
-use openjiuwen_common::error::{Error, ErrorKind, Result};
+use openjiuwen_common::error::ErrorKind;
 use openjiuwen_dev_tools::agent_builder::{DslEdge, DslNode, WorkflowDsl};
-use openjiuwen_dev_tools::tune::{
-    optimize_prompt, Case, ExampleOptimizer, InstructionOptimizer, JointOptimizer,
-    OptimizationResult, PromptSearchOptimizer, Trainer,
-};
-use serde_json::{json, Value};
-
-/// A minimal valid case, enough to satisfy the stub signatures.
-fn case(id: &str) -> Case {
-    let mut inputs = BTreeMap::new();
-    inputs.insert("question".to_owned(), Value::String(id.to_owned()));
-    let mut label = BTreeMap::new();
-    label.insert("answer".to_owned(), Value::String(id.to_owned()));
-    Case::new(inputs, label)
-        .expect("a non-empty inputs and label map make a valid case")
-        .with_case_id(id)
-}
+use serde_json::json;
 
 /// A node whose id is the only field the structural validation reads.
 fn node(id: &str) -> DslNode {
@@ -40,83 +28,6 @@ fn node(id: &str) -> DslNode {
         node_type: "llm".to_owned(),
         title: id.to_owned(),
         ..DslNode::default()
-    }
-}
-
-/// Asserts that `error` is the honest deferred-pipeline error of `entry_point`.
-fn assert_deferred(entry_point: &str, pipeline: &str, error: &Error) {
-    assert_eq!(
-        error.kind(),
-        ErrorKind::Unsupported,
-        "{entry_point} must report the deferred pipeline as Unsupported, got {:?}: {error}",
-        error.kind()
-    );
-    let message = error.to_string();
-    assert!(
-        message.contains("not ported"),
-        "{entry_point} must state that the pipeline is not ported: {message}"
-    );
-    assert!(
-        message.contains(pipeline),
-        "{entry_point} must name the deferred pipeline {pipeline:?}: {message}"
-    );
-    assert!(
-        message.contains("docs/PARITY.md"),
-        "{entry_point} must point at the parity document: {message}"
-    );
-}
-
-#[tokio::test]
-async fn deferred_tuning_entry_points_report_unsupported() {
-    let prompt = "Answer the question.";
-    let cases = vec![case("case-1")];
-
-    // Every deferred entry point, labelled so a failure names the caller that
-    // broke the contract. `optimize_prompt` delegates to the instruction
-    // optimizer, so it reports that pipeline by name.
-    let results: Vec<(&str, &str, Result<OptimizationResult>)> = vec![
-        (
-            "InstructionOptimizer::optimize",
-            "InstructionOptimizer",
-            InstructionOptimizer::new().optimize(prompt, &cases).await,
-        ),
-        (
-            "ExampleOptimizer::optimize",
-            "ExampleOptimizer",
-            ExampleOptimizer::new().optimize(prompt, &cases, 2).await,
-        ),
-        (
-            "JointOptimizer::optimize",
-            "JointOptimizer",
-            JointOptimizer::new().optimize(prompt, &cases).await,
-        ),
-        (
-            "PromptSearchOptimizer::optimize",
-            "PromptSearchOptimizer",
-            PromptSearchOptimizer::new().optimize(prompt, &cases).await,
-        ),
-        (
-            "Trainer::train",
-            "Trainer",
-            Trainer::new().train(prompt, &cases, &cases),
-        ),
-        (
-            "optimize_prompt",
-            "InstructionOptimizer",
-            optimize_prompt(prompt, &cases).await,
-        ),
-    ];
-
-    assert_eq!(
-        results.len(),
-        6,
-        "the table must cover every deferred tuning entry point"
-    );
-    for (entry_point, pipeline, result) in results {
-        let error = result.expect_err(&format!(
-            "{entry_point} must fail as unsupported instead of returning a result"
-        ));
-        assert_deferred(entry_point, pipeline, &error);
     }
 }
 

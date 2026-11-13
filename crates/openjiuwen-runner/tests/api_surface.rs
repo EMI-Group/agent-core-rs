@@ -170,7 +170,21 @@ fn data_types_round_trip_through_json() {
     });
     roundtrip(&QueueMessage::new(json!({"hello": "world"})));
     roundtrip(&SpawnSpec::class_agent("pkg.agents", "HelperAgent"));
-    roundtrip(&SpawnMessage::new(SpawnMessageKind::Input, json!({"q": 1})));
+    // `SpawnMessage`'s `timestamp` is an `f64` and `serde_json`'s float parser is
+    // not correctly rounded, so the frame is compared field by field with the
+    // documented tolerance instead of through the exact `PartialEq` round-trip.
+    let frame = SpawnMessage::new(SpawnMessageKind::Input, json!({"q": 1}));
+    let text = serde_json::to_string(&frame).unwrap();
+    let restored: SpawnMessage = serde_json::from_str(&text).unwrap();
+    assert_eq!(restored.kind, frame.kind);
+    assert_eq!(restored.payload, frame.payload);
+    assert_eq!(restored.message_id, frame.message_id);
+    assert!(
+        (restored.timestamp - frame.timestamp).abs() < 1e-6,
+        "timestamp drifted by more than one part per million: {} vs {}",
+        restored.timestamp,
+        frame.timestamp
+    );
     roundtrip(&CallbackEvent::AgentInvokeOutput);
     roundtrip(&CallbackEvent::Custom("host_event".to_owned()));
 }
@@ -310,4 +324,285 @@ fn runner_debug_is_redacted() {
 fn agent_output_type_is_reachable_for_facade_results() {
     let _: fn() -> AgentOutput = AgentOutput::default;
     let _: fn() -> AgentCard = AgentCard::default;
+}
+
+#[test]
+fn spawn_backends_are_flat_on_the_crate_root() {
+    use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_runner::{
+        create_remote_client, frame_bytes, parse_frame_line, read_frame, RemoteAgent,
+        RemoteAgentConfig, RemoteClient, RemoteProtocol, RemoteSpawner, SpawnedProcess,
+        SubprocessConfig, SubprocessSpawner, DEFAULT_MAX_FRAME_BYTES,
+    };
+
+    assert_send_sync::<SubprocessSpawner>();
+    assert_send_sync::<SubprocessConfig>();
+    assert_send_sync::<SpawnedProcess>();
+    assert_send_sync::<RemoteSpawner>();
+    assert_send_sync::<RemoteAgent>();
+    assert_send_sync::<RemoteAgentConfig>();
+    assert_send_sync::<RemoteProtocol>();
+    assert_clone::<SubprocessSpawner>();
+    assert_clone::<SubprocessConfig>();
+    assert_clone::<RemoteSpawner>();
+    assert_clone::<RemoteAgentConfig>();
+    assert_clone::<RemoteProtocol>();
+    assert_serde::<SubprocessConfig>();
+    assert_serde::<RemoteAgentConfig>();
+    assert_serde::<RemoteProtocol>();
+
+    // Both implemented backends coerce to the `AgentSpawner` seam.
+    let spawners: [Arc<dyn AgentSpawner>; 2] = [
+        Arc::new(SubprocessSpawner::new(SubprocessConfig::default())),
+        Arc::new(RemoteSpawner::new("http://127.0.0.1:1")),
+    ];
+    assert_eq!(spawners.len(), 2);
+
+    // The remote agent and the client factory both hand back `RemoteClient`.
+    let clients: [Arc<dyn RemoteClient>; 2] = [
+        Arc::new(RemoteAgent::new(RemoteAgentConfig::new(
+            "remote-a1",
+            "http://127.0.0.1:1",
+        ))),
+        RemoteProtocol::Http
+            .client(RemoteAgentConfig::new("remote-a2", "http://127.0.0.1:1"))
+            .unwrap(),
+    ];
+    assert_eq!(clients.len(), 2);
+
+    let frame = SpawnMessage::new(SpawnMessageKind::Input, json!({"q": 1}));
+    let line = frame_bytes(&frame).unwrap();
+    assert_eq!(
+        parse_frame_line(&line, DEFAULT_MAX_FRAME_BYTES)
+            .unwrap()
+            .map(|parsed| parsed.kind),
+        Some(SpawnMessageKind::Input)
+    );
+    let _ = read_frame::<tokio::io::BufReader<tokio::io::Empty>>;
+    assert_eq!(DEFAULT_MAX_FRAME_BYTES, 8 * 1024 * 1024);
+
+    // The message-queue and A2A transports stay typed `Unsupported`.
+    for protocol in [RemoteProtocol::Mq, RemoteProtocol::A2a] {
+        let error = create_remote_client(
+            protocol,
+            RemoteAgentConfig::new("deferred", "http://127.0.0.1:1"),
+        )
+        .err()
+        .expect("a deferred transport never builds a client");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            serde_json::to_value(protocol).unwrap(),
+            json!(protocol.as_str())
+        );
+    }
+}
+
+#[test]
+fn callback_chains_filters_and_handler_builders_are_flat_on_the_crate_root() {
+    // `on_and_wrap_stay_under_their_modules` below pins the deliberate scoping of
+    // the free combinators; these are the types the crate root does export.
+    use openjiuwen_runner::{
+        AuthFilter, BuiltHandler, CallbackChain, ChainEntry, ChainEntryId, ChainReport,
+        CircuitBreakerFilter, Clock, ConditionalFilter, ContextModifier, EntryOutcome, EntryRecord,
+        EventFilter, FilterChain, FilterDecision, FilterFeedback, FilterInput, FilterRunOutcome,
+        HandlerBuilder, KindFilter, LoggingFilter, ManualClock, NameFilter, ParamModifyFilter,
+        PayloadTransform, PredicateFilter, RateLimitFilter, SessionFilter, TransformHandler,
+        ValidationFilter, WrapRegistry, WrappedCall,
+    };
+
+    assert_send_sync::<CallbackChain>();
+    assert_send_sync::<ChainEntry>();
+    assert_send_sync::<ChainEntryId>();
+    assert_send_sync::<ChainReport>();
+    assert_send_sync::<EntryOutcome>();
+    assert_send_sync::<EntryRecord>();
+    assert_send_sync::<FilterChain>();
+    assert_send_sync::<FilterDecision>();
+    assert_send_sync::<FilterInput<'static>>();
+    assert_send_sync::<FilterRunOutcome>();
+    assert_send_sync::<Clock>();
+    assert_send_sync::<ManualClock>();
+    assert_send_sync::<HandlerBuilder>();
+    assert_send_sync::<BuiltHandler>();
+    assert_send_sync::<TransformHandler>();
+    assert_send_sync::<WrappedCall>();
+    assert_send_sync::<WrapRegistry>();
+    assert_send_sync::<NameFilter>();
+    assert_send_sync::<KindFilter>();
+    assert_send_sync::<SessionFilter>();
+    assert_send_sync::<RateLimitFilter>();
+    assert_send_sync::<CircuitBreakerFilter>();
+    assert_send_sync::<ValidationFilter>();
+    assert_send_sync::<LoggingFilter>();
+    assert_send_sync::<AuthFilter>();
+    assert_send_sync::<ParamModifyFilter>();
+    assert_send_sync::<ConditionalFilter>();
+    assert_send_sync::<PredicateFilter>();
+    assert_clone::<Clock>();
+    assert_clone::<ManualClock>();
+    assert_clone::<ChainEntryId>();
+    assert_clone::<ContextModifier>();
+    assert_clone::<PayloadTransform>();
+
+    let _: Option<Arc<dyn EventFilter>> = None;
+    let _: Option<&'static dyn FilterFeedback> = None;
+
+    let chain = CallbackChain::new("audit");
+    assert!(chain.is_empty());
+    assert_eq!(chain.name(), "audit");
+    let _ = FilterChain::new().with(NameFilter::new().with_prefix("record"));
+    let _ = ManualClock::new().clock();
+    let _ = HandlerBuilder::new(CallbackEvent::AgentInvokeOutput).with_priority(1);
+}
+
+#[test]
+fn free_combinators_stay_under_their_modules() {
+    use openjiuwen_runner::callback::decorator::{
+        on, on_wrap, transform_io, wrap, PayloadCall, WrapHandler, WrapRegistration,
+    };
+    use openjiuwen_runner::callback::filters::{
+        and, lenient, not, or, LenientFilter, NotFilter, OrFilter,
+    };
+    use openjiuwen_runner::{
+        BuiltHandler, FilterChain, HandlerBuilder, NameFilter, TransformHandler, WrappedCall,
+    };
+
+    // The names are too generic for the crate root, so the combinators are
+    // reachable only through their modules; the builder and the handler they
+    // produce are flat.
+    let builder: HandlerBuilder = on(CallbackEvent::AgentInvokeOutput);
+    let built: BuiltHandler = builder.sync(|_: &CallbackContext| Ok(CallbackVerdict::Continue));
+    assert_eq!(built.event(), &CallbackEvent::AgentInvokeOutput);
+    let _: fn(CallbackEvent, PayloadCall) -> WrappedCall = wrap;
+    let _: fn(CallbackEvent, Arc<dyn WrapHandler>) -> WrapRegistration = on_wrap;
+    let _: TransformHandler = transform_io("suite");
+    let name = NameFilter::new().with_prefix("record");
+    let _: FilterChain = and(name.clone(), name.clone());
+    let _: OrFilter = or(name.clone(), name.clone());
+    let _: NotFilter = not(name.clone());
+    let _: LenientFilter = lenient(name);
+}
+
+#[test]
+fn monitor_hitl_and_pool_surfaces_are_flat_on_the_crate_root() {
+    use openjiuwen_runner::{
+        ActiveRunInfo, ActiveRunSpec, ActiveTeamInfo, DeliverResult, InteractKind, InteractPayload,
+        InteractionHub, PoolError, PoolFrame, PoolKey, PoolLease, PoolRequest, PoolRun,
+        PoolShutdown, RunEvent, RunHandle, RunKind, RunMonitor, RunOutcome, RunPhase, RunStart,
+        RunStatus, RunTarget, TeamPool, DEFAULT_TEAM_POOL_MAX_RUNS, EVENT_CHANNEL_CAPACITY,
+        EVENT_HISTORY_LIMIT, INBOX_CAPACITY, LIVE_RUN_LIMIT,
+    };
+
+    assert_send_sync::<RunMonitor>();
+    assert_send_sync::<RunStatus>();
+    assert_send_sync::<RunEvent>();
+    assert_send_sync::<RunStart>();
+    assert_send_sync::<RunOutcome>();
+    assert_send_sync::<RunKind>();
+    assert_send_sync::<RunPhase>();
+    assert_clone::<RunMonitor>();
+    assert_serde::<RunStatus>();
+    assert_serde::<RunEvent>();
+    assert_serde::<RunStart>();
+    assert_serde::<RunOutcome>();
+
+    assert_send_sync::<InteractionHub>();
+    assert_send_sync::<RunHandle>();
+    assert_send_sync::<ActiveRunSpec>();
+    assert_send_sync::<ActiveRunInfo>();
+    assert_send_sync::<RunTarget>();
+    assert_send_sync::<InteractPayload>();
+    assert_send_sync::<InteractKind>();
+    assert_send_sync::<DeliverResult>();
+    assert_clone::<InteractionHub>();
+    assert_clone::<RunHandle>();
+    assert_serde::<InteractPayload>();
+    assert_serde::<InteractKind>();
+
+    assert_send_sync::<TeamPool>();
+    assert_send_sync::<PoolRun>();
+    assert_send_sync::<PoolLease>();
+    assert_send_sync::<PoolRequest>();
+    assert_send_sync::<PoolKey>();
+    assert_send_sync::<PoolFrame>();
+    assert_send_sync::<PoolError>();
+    assert_send_sync::<PoolShutdown>();
+    assert_send_sync::<ActiveTeamInfo>();
+    assert_clone::<TeamPool>();
+    assert_clone::<PoolRun>();
+    assert_clone::<PoolKey>();
+    assert_serde::<PoolKey>();
+    assert_serde::<PoolFrame>();
+    assert_serde::<ActiveTeamInfo>();
+
+    let monitor = RunMonitor::new();
+    let created: RunStatus = monitor.begin(RunStart::new(RunKind::Agent, "assistant"));
+    assert_eq!(created.phase, RunPhase::Queued);
+    monitor
+        .finish(&created.run_id, RunOutcome::completed())
+        .unwrap();
+    assert_eq!(monitor.list_active().len(), 0);
+    assert_eq!(EVENT_HISTORY_LIMIT, 128);
+    assert_eq!(LIVE_RUN_LIMIT, 64);
+    assert_eq!(EVENT_CHANNEL_CAPACITY, 256);
+
+    let hub = InteractionHub::new();
+    let handle: RunHandle = hub.register(ActiveRunSpec::new("assistant"));
+    assert_eq!(hub.len(), 1);
+    assert_ne!(handle.run_id(), "");
+    assert_eq!(INBOX_CAPACITY, 64);
+
+    let pool = TeamPool::new();
+    assert!(pool.is_empty());
+    assert_eq!(pool.capacity(), DEFAULT_TEAM_POOL_MAX_RUNS);
+}
+
+#[test]
+fn resource_managers_are_flat_on_the_crate_root() {
+    use openjiuwen_runner::{
+        DefaultMcpConnector, McpConnector, McpServerInfo, McpServerMgr, McpServerState, ModelCard,
+        ModelMgr, ModelProvider, PromptCard, PromptMgr, ResourceKind, SysOperationMgr,
+        SysOperationProvider, Tag, TagMatchStrategy, TagMgr, TagUpdateStrategy, GLOBAL_TAG,
+    };
+
+    assert_send_sync::<TagMgr>();
+    assert_send_sync::<ModelMgr>();
+    assert_send_sync::<PromptMgr>();
+    assert_send_sync::<SysOperationMgr>();
+    assert_send_sync::<McpServerMgr>();
+    assert_send_sync::<ModelProvider>();
+    assert_send_sync::<SysOperationProvider>();
+    assert_send_sync::<DefaultMcpConnector>();
+    assert_send_sync::<Tag>();
+    assert_send_sync::<ResourceKind>();
+    assert_send_sync::<TagMatchStrategy>();
+    assert_send_sync::<TagUpdateStrategy>();
+    assert_send_sync::<ModelCard>();
+    assert_send_sync::<PromptCard>();
+    assert_send_sync::<McpServerInfo>();
+    assert_send_sync::<McpServerState>();
+    assert_clone::<Tag>();
+    assert_clone::<DefaultMcpConnector>();
+    assert_serde::<Tag>();
+    assert_serde::<ResourceKind>();
+    assert_serde::<TagMatchStrategy>();
+    assert_serde::<TagUpdateStrategy>();
+    assert_serde::<ModelCard>();
+    assert_serde::<PromptCard>();
+    assert_serde::<McpServerInfo>();
+    assert_serde::<McpServerState>();
+
+    let connectors: [Arc<dyn McpConnector>; 1] = [Arc::new(DefaultMcpConnector)];
+    assert_eq!(connectors.len(), 1);
+
+    let manager = ResourceMgr::new();
+    let tags: &TagMgr = manager.tags();
+    assert_eq!(tags.list_tags().len(), 0);
+    let _: &ModelMgr = manager.models();
+    let _: &PromptMgr = manager.prompts();
+    let _: &SysOperationMgr = manager.sysops();
+    let _: &McpServerMgr = manager.mcp_servers();
+    assert_eq!(GLOBAL_TAG, "__global__");
+    assert!(Tag::global().is_global());
+    assert_eq!(manager.tags().resources(ResourceKind::Tool).len(), 0);
 }

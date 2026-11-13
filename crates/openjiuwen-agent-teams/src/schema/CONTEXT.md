@@ -444,7 +444,7 @@ Crate-wide `cargo fmt`/`-D warnings` also cover `constants.rs` and the sibling m
 
 ## Notes for Agents
 
-- Rust deviations from Python, all deliberate: `spawn_mode` defaults to `inprocess` (no OS-process members), `TeamSpec.evolution_enabled` defaults to `false`, `TaskStatus` is `str`-valued, and `ToolSpec` replaces Python's undiscriminated `ToolCard | BuiltinToolSpec` union with one normalized shape.
+- Rust deviations from Python, all deliberate: `spawn_mode` defaults to `inprocess`, `TeamSpec.evolution_enabled` defaults to `false`, `TaskStatus` is `str`-valued, and `ToolSpec` replaces Python's undiscriminated `ToolCard | BuiltinToolSpec` union with one normalized shape.
 - `TASK_TRANSITIONS` is narrower than Python's: Rust rejects `planning -> planning|pending|blocked` and `in_progress -> pending|blocked` and `in_review -> pending`. Do not widen it here; the task board codes against this table.
 - Python `MemberStatus` has no methods and `RoundOutcome`/`round_transitions` do not exist in Python (`RoundOutcome` there is a dataclass). The Rust helpers are the crate contract and are the only sanctioned way to ask transition questions.
 - `LeaderSpec` keeps only `member_name`/`display_name`/`desc`/`goal`; Python's inherited `prompt`/`model_name` are read from `agents["leader"]` instead.

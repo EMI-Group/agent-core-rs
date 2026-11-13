@@ -5,36 +5,48 @@
 //! teammate `TeamAgent` from the blueprint before wrapping it in an `asyncio.Task`. The Rust port
 //! splits that in two: this spawner materializes the member's *brain* through the injected
 //! [`MemberHarnessFactory`](crate::harness::MemberHarnessFactory) and returns it as a
-//! [`MemberRuntime`](crate::member::MemberRuntime); owning the driving task is the
-//! caller's job (`InProcessSpawnHandle` / `TeamBackend`).
+//! [`MemberRuntime`](crate::member::MemberRuntime); owning the driving task is the caller's job.
 //!
-//! The spawner is deliberately stateless beyond its three injected values — the blueprint, the
-//! build dependencies and the session id — so it is cheap to share and adds no global state to
-//! the runtime node.
+//! # Spawn modes
 //!
-//! # Example
+//! The requested [`MemberSpawnOptions::kind`](crate::member::MemberSpawnOptions) decides the
+//! backend:
 //!
-//! ```
-//! use openjiuwen_agent_teams::runtime::deps::TeamBuildDeps;
-//! use openjiuwen_agent_teams::runtime::spawner::TeamMemberSpawner;
-//! use openjiuwen_agent_teams::schema::TeamAgentSpec;
+//! * `in_process` (default) — the harness factory builds the brain here, exactly as before;
+//! * `process` / `external_cli` / `ssh` — the request is forwarded to the matching member spawner
+//!   (`ProcessMemberSpawner`, `ExternalCliMemberSpawner`, `SshMemberSpawner`), which owns the child
+//!   process and reaps it on [`MemberSpawner::despawn`](crate::member::MemberSpawner::despawn).
 //!
-//! let spawner = TeamMemberSpawner::new(TeamAgentSpec::default(), TeamBuildDeps::new(), "s-1");
-//! assert_eq!(spawner.session_id(), "s-1");
-//! assert_eq!(spawner.team_name(), "agent_team");
-//! assert!(spawner.member_names().is_empty());
-//! ```
-use std::collections::BTreeSet;
+//! The mode comes from the blueprint: `metadata["spawn"]` (see [`super::spec_meta`](crate::runtime::spec_meta)) with
+//! `spawn_mode: process` as the fallback. Child spawners live for the spawner's lifetime, so a
+//! re-spawn of the same member reuses and replaces its child.
+//!
+//! # Model identity and forks
+//!
+//! Before the factory is called, the member's [`DeepAgentSpec`](crate::schema::DeepAgentSpec) is run through the team's
+//! [`TeamModelRouter`]: a pool entry rewrites `spec.model` to that endpoint, so the pool selects a
+//! real model instead of only being recorded on the roster row. A fork directive
+//! (`metadata["spawn"]["fork"]` / `metadata["fork"]`) replaces the blueprint with
+//! [`crate::org::fork_member_context`]'s child spec (parent tools filtered, identity cleared).
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
-use tracing::debug;
+use parking_lot::Mutex;
+use tracing::{debug, warn};
 
 use super::deps::TeamBuildDeps;
+use super::routing::TeamModelRouter;
+use super::spec_meta::{fork_directive, spawn_options, ForkDirective};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
-use crate::member::{MemberRuntime, MemberSpawnRequest, MemberSpawner};
+use crate::member::{
+    ExternalCliMemberSpawner, ExternalCliRuntimeConfig, MemberRuntime, MemberSpawnKind,
+    MemberSpawnOptions, MemberSpawnRequest, MemberSpawner, ProcessMemberConfig,
+    ProcessMemberSpawner, SshMemberSpawner, SshTransportSpec,
+};
+use crate::org::{fork_member_context, ForkSource, ForkedMemberSpec};
 use crate::schema::{DeepAgentSpec, TeamAgentSpec, TeamMemberSpec, TeamRole};
 
 /// Key of the leader's blueprint in [`TeamAgentSpec::agents`].
@@ -43,21 +55,36 @@ use crate::schema::{DeepAgentSpec, TeamAgentSpec, TeamMemberSpec, TeamRole};
 /// name, so the roster projection here has to know the key without widening the schema surface.
 const LEADER_AGENT_KEY: &str = "leader";
 
-/// Spawns team members from the blueprint through the injected harness factory.
+/// Spawns team members from the blueprint through the configured spawn backend.
 ///
 /// One spawner serves one built team: it carries the roster (`spec`), the injection point for the
-/// member's brain (`deps.harness_factory`) and the session id every member's harness is opened
-/// under. Building a runtime is a pure projection of those three values plus the request, which is
-/// why the same spawner can spawn every member concurrently.
+/// member's brain (`deps.harness_factory`), the model router, the child-process spawners and the
+/// session id every member's harness is opened under.
 pub struct TeamMemberSpawner {
     /// The blueprint the roster, the teammate mode and the team name come from.
     spec: TeamAgentSpec,
-    /// The injected build dependencies; only `harness_factory` and `language` are consulted.
+    /// The injected build dependencies; only `harness_factory`, `language`, `routing` and
+    /// `kv_cache` are consulted.
     deps: TeamBuildDeps,
     /// Session id every spawned harness runs under.
     session_id: String,
+    /// Spawn options the blueprint asks for (in-process by default).
+    options: MemberSpawnOptions,
+    /// Fork directive, when this team forks from another member.
+    fork: Option<ForkDirective>,
+    /// The model router (shared with the build path when deps carries one).
+    routing: Arc<TeamModelRouter>,
+    /// Child-process spawners, built lazily from the request's options.
+    process: ProcessMemberSpawner,
+    /// External-CLI spawner (vendor CLI members).
+    external_cli: ExternalCliMemberSpawner,
+    /// SSH transport spawner.
+    ssh: SshMemberSpawner,
+    /// The backend each spawned member uses, so `despawn` reaches the right child.
+    kinds: Mutex<BTreeMap<String, MemberSpawnKind>>,
+    /// Forked child contexts produced by [`MemberSpawner::spawn`], for the caller to inspect.
+    forks: Mutex<BTreeMap<String, ForkedMemberSpec>>,
 }
-
 impl TeamMemberSpawner {
     /// Builds a spawner for `spec` over `deps`, opening member harnesses under `session_id`.
     #[must_use]
@@ -66,41 +93,90 @@ impl TeamMemberSpawner {
         deps: TeamBuildDeps,
         session_id: impl Into<String>,
     ) -> Arc<Self> {
+        let routing =
+            deps.routing
+                .clone()
+                .unwrap_or_else(|| match TeamModelRouter::for_spec(&spec) {
+                    Ok(routing) => Arc::new(routing),
+                    Err(error) => {
+                        warn!(%error, "model pool is invalid; spawning without routed models");
+                        Arc::new(TeamModelRouter::empty())
+                    }
+                });
+        let options = spawn_options(&spec);
+        let fork = fork_directive(&spec);
+        Self::with_parts(spec, deps, session_id.into(), options, fork, routing)
+    }
+    /// Builds the spawner from already-parsed parts (the build path parses once and shares).
+    #[must_use]
+    pub fn with_parts(
+        spec: TeamAgentSpec,
+        deps: TeamBuildDeps,
+        session_id: String,
+        options: MemberSpawnOptions,
+        fork: Option<ForkDirective>,
+        routing: Arc<TeamModelRouter>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             spec,
             deps,
-            session_id: session_id.into(),
+            session_id,
+            options,
+            fork,
+            routing,
+            process: ProcessMemberSpawner::new(ProcessMemberConfig::default()),
+            external_cli: ExternalCliMemberSpawner::new(ExternalCliRuntimeConfig::default()),
+            ssh: SshMemberSpawner::new(SshTransportSpec::default()),
+            kinds: Mutex::new(BTreeMap::new()),
+            forks: Mutex::new(BTreeMap::new()),
         })
     }
-
     /// Returns the blueprint this spawner materializes members from.
     #[must_use]
     pub fn spec(&self) -> &TeamAgentSpec {
         &self.spec
     }
-
     /// Returns the injected build dependencies.
     #[must_use]
     pub fn deps(&self) -> &TeamBuildDeps {
         &self.deps
     }
-
     /// Returns the session id every spawned member harness is opened under.
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
-
     /// Returns the team name, copied from the blueprint.
     #[must_use]
     pub fn team_name(&self) -> &str {
         &self.spec.team_name
     }
-
+    /// Returns the spawn options the blueprint asks for.
+    #[must_use]
+    pub fn options(&self) -> &MemberSpawnOptions {
+        &self.options
+    }
+    /// Returns the fork directive, when this team forks from a parent member.
+    #[must_use]
+    pub fn fork(&self) -> Option<&ForkDirective> {
+        self.fork.as_ref()
+    }
+    /// Returns the model router shared with the build path.
+    #[must_use]
+    pub fn routing(&self) -> &Arc<TeamModelRouter> {
+        &self.routing
+    }
+    /// Returns the backend a member was spawned with (`None` before its first spawn).
+    #[must_use]
+    pub fn spawn_kind(&self, member_name: &str) -> Option<MemberSpawnKind> {
+        self.kinds.lock().get(member_name).copied()
+    }
+    /// Returns the forked context produced for `member_name`, if it was forked.
+    #[must_use]
+    pub fn forked_member(&self, member_name: &str) -> Option<ForkedMemberSpec> {
+        self.forks.lock().get(member_name).cloned()
+    }
     /// Returns the blueprint of one member: `agents[name]`, else `agents["teammate"]`.
-    ///
-    /// The teammate fallback is the shared default every unnamed roster member runs on, so a team
-    /// that declares only `agents["teammate"]` can still spawn any predefined member.
     #[must_use]
     pub fn deep_agent_spec(&self, member_name: &str) -> Option<&DeepAgentSpec> {
         self.spec
@@ -108,22 +184,12 @@ impl TeamMemberSpawner {
             .get(member_name)
             .or_else(|| self.spec.teammate_defaults())
     }
-
     /// Resolves a roster name to its [`TeamMemberSpec`], predefined entries first.
-    ///
-    /// Delegates to [`TeamAgentSpec::member_spec`], so a predefined member always wins over the
-    /// agent blueprint registered under the same name, and an unknown name derives from
-    /// `agents["teammate"]`. `None` means the name is on no roster at all.
     #[must_use]
     pub fn member_spec(&self, member_name: &str) -> Option<TeamMemberSpec> {
         self.spec.member_spec(member_name)
     }
-
     /// Returns the spawnable roster names, sorted and deduplicated.
-    ///
-    /// The roster is the predefined members plus every `agents` key, minus `agents["leader"]` and
-    /// the leader's member name: the leader is never spawned as a teammate. Sorted output keeps
-    /// `TeamAgent`'s row materialization and the CLI listing deterministic.
     #[must_use]
     pub fn member_names(&self) -> Vec<String> {
         let leader_name = self.spec.leader_member_name();
@@ -139,38 +205,160 @@ impl TeamMemberSpawner {
         }
         names.into_iter().map(str::to_owned).collect()
     }
+    /// Builds the forked child context for `member_name`, when a fork directive applies.
+    ///
+    /// The parent is resolved from the blueprint (`agents[parent]` and the roster entry), the tool
+    /// policy is applied by the org fork helper and the result is cached so callers can inspect the
+    /// child's lineage and task override. A directive that names the member itself is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when the parent has no blueprint or roster entry, and the fork helper's
+    /// validation for an illegal child name.
+    pub fn forked_context(&self, member_name: &str) -> Result<Option<ForkedMemberSpec>> {
+        let Some(directive) = self.fork.as_ref() else {
+            return Ok(None);
+        };
+        if directive.parent == member_name {
+            return Ok(None);
+        }
+        if let Some(cached) = self.forks.lock().get(member_name) {
+            return Ok(Some(cached.clone()));
+        }
+        let parent_spec = self.deep_agent_spec(&directive.parent).ok_or_else(|| {
+            Error::not_found(format!(
+                "fork parent '{}' has no blueprint in team '{}'",
+                directive.parent,
+                self.team_name()
+            ))
+        })?;
+        let parent_member = self.member_spec(&directive.parent).ok_or_else(|| {
+            Error::not_found(format!(
+                "fork parent '{}' is not on the roster of team '{}'",
+                directive.parent,
+                self.team_name()
+            ))
+        })?;
+        let child = self.member_spec(member_name).ok_or_else(|| {
+            Error::not_found(format!(
+                "member '{member_name}' not found in team '{}'",
+                self.team_name()
+            ))
+        })?;
+        let source = ForkSource::new(
+            self.team_name(),
+            directive.parent.clone(),
+            self.session_id.clone(),
+            parent_member,
+            parent_spec.clone(),
+        );
+        let forked = fork_member_context(&source, child, directive.task.clone(), &directive.tools)?;
+        debug!(
+            team = self.team_name(),
+            member = member_name,
+            parent = %directive.parent,
+            depth = forked.fork_depth,
+            "forked member context from its parent"
+        );
+        self.forks
+            .lock()
+            .insert(member_name.to_owned(), forked.clone());
+        Ok(Some(forked))
+    }
+    /// Resolves the effective blueprint for `member_name`: fork child spec, then routed model.
+    fn effective_spec(
+        &self,
+        member_name: &str,
+        blueprint: &DeepAgentSpec,
+        forked: Option<&ForkedMemberSpec>,
+    ) -> Result<DeepAgentSpec> {
+        let base = forked.map_or_else(|| blueprint.clone(), |child| child.spec.clone());
+        let requested = self
+            .member_spec(member_name)
+            .and_then(|member| member.base.model_name);
+        let (effective, selection) = self.routing.effective_spec_for(
+            member_name,
+            &base,
+            requested.as_deref(),
+            TeamRole::Teammate,
+        )?;
+        debug!(
+            team = self.team_name(),
+            member = member_name,
+            model = selection.model_name(),
+            pooled = selection.entry.is_some(),
+            "selected the member model"
+        );
+        Ok(effective)
+    }
+    /// Forwards a non-in-process request to the matching child spawner.
+    async fn spawn_child(&self, mut request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>> {
+        let kind = request.options.kind;
+        let member_name = request.member_name.clone();
+        self.apply_kv_env(&mut request);
+        let runtime = match kind {
+            MemberSpawnKind::InProcess => unreachable!("in-process is handled before dispatch"),
+            MemberSpawnKind::Process => self.process.spawn(request.clone()).await?,
+            MemberSpawnKind::ExternalCli => self.external_cli.spawn(request.clone()).await?,
+            MemberSpawnKind::Ssh => self.ssh.spawn(request.clone()).await?,
+        };
+        self.kinds.lock().insert(member_name, kind);
+        debug!(
+            team = self.team_name(),
+            member = %request.member_name,
+            mode = kind.as_str(),
+            "spawned a member through its child-process backend"
+        );
+        Ok(runtime)
+    }
+    /// Copies the KV-cache affinity env onto a child command (process/external-CLI only).
+    ///
+    /// The SSH transport carries no env bag: its identity travels in the remote command, which is
+    /// built by the SSH spawner; affinity is therefore in-process/process-only (documented).
+    fn apply_kv_env(&self, request: &mut MemberSpawnRequest) {
+        let Some(kv) = self.deps.kv_cache.as_ref() else {
+            return;
+        };
+        let Some(env) = kv.env(&request.member_name) else {
+            return;
+        };
+        if let Some(process) = request.options.process.as_mut() {
+            process.command.env.extend(env.clone());
+        }
+        if let Some(external) = request.options.external_cli.as_mut() {
+            external.command.env.extend(env);
+        }
+    }
 }
-
 impl fmt::Debug for TeamMemberSpawner {
-    /// Prints the identity that matters when a spawn is traced: the team, the session and the
-    /// factory name. The blueprint itself is omitted because it carries prompts and, through a
-    /// model reference, potential credentials.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TeamMemberSpawner")
             .field("team_name", &self.team_name())
             .field("session_id", &self.session_id)
             .field("factory", &self.deps.harness_factory.name())
+            .field("spawn_kind", &self.options.kind.as_str())
+            .field("fork", &self.fork.as_ref().map(|fork| fork.parent.clone()))
             .finish_non_exhaustive()
     }
 }
-
 #[async_trait]
 impl MemberSpawner for TeamMemberSpawner {
-    /// Materializes one member's harness and returns it as an unstarted member runtime.
+    /// Materializes one member's runtime through the backend its options select.
     ///
-    /// The caller owns the workspace root in the request: the spawner forwards it verbatim into
-    /// [`MemberHarnessContext::workspace_root`] instead of allocating its own. The runtime is
-    /// **not** started — [`MemberRuntime::start`] belongs to the member's lifecycle so a failed
-    /// start can roll the roster row back.
+    /// The in-process path builds the harness through the injected factory and returns it as an
+    /// **unstarted** runtime ([`MemberRuntime::start`] belongs to the member's lifecycle). The
+    /// process/external-CLI/SSH paths delegate to their spawners, which own the child and reap it
+    /// on [`MemberSpawner::despawn`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotFound`] when the member has no blueprint (`agents[name]` and
-    /// `agents["teammate"]` are both absent), [`Error::Unsupported`] when the resolved member role
-    /// is not [`TeamRole::Teammate`] (human, bridge and external-CLI members are not built
-    /// in-process), and propagates the harness factory's own error unchanged.
+    /// Returns [`Error::NotFound`] when the member has no blueprint, [`Error::Unsupported`] for a
+    /// role that cannot run in-process, and propagates the factory's or the child spawner's error.
     async fn spawn(&self, request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>> {
-        let member_name = request.member_name;
+        if !request.options.kind.is_in_process() {
+            return self.spawn_child(request).await;
+        }
+        let member_name = request.member_name.clone();
         let Some(blueprint) = self.deep_agent_spec(&member_name) else {
             return Err(Error::not_found(format!(
                 "member '{member_name}' not found in team '{}'",
@@ -186,6 +374,8 @@ impl MemberSpawner for TeamMemberSpawner {
                 )));
             }
         }
+        let forked = self.forked_context(&member_name)?;
+        let spec = self.effective_spec(&member_name, blueprint, forked.as_ref())?;
         let context = MemberHarnessContext::new(
             self.team_name(),
             member_name,
@@ -194,13 +384,12 @@ impl MemberSpawner for TeamMemberSpawner {
             self.deps.resolved_language(),
             self.spec.teammate_mode,
         );
-        let harness = self
-            .deps
-            .harness_factory
-            .create(blueprint, &context)
-            .await?;
+        let harness = self.deps.harness_factory.create(&spec, &context).await?;
         let runtime: Arc<dyn MemberRuntime> =
             Arc::new(HarnessMemberRuntime::new(harness, request.session_id));
+        self.kinds
+            .lock()
+            .insert(context.member_name.clone(), MemberSpawnKind::InProcess);
         debug!(
             team = self.team_name(),
             member = %context.member_name,
@@ -210,22 +399,28 @@ impl MemberSpawner for TeamMemberSpawner {
         );
         Ok(runtime)
     }
-
-    /// Does nothing and succeeds: teardown order belongs to the runner, not to the spawner.
+    /// Stops the member's child process, when its backend owns one.
     ///
-    /// A spawned member is stopped by its owner (`TeamAgent`), which calls
-    /// [`MemberRuntime::stop`] before dropping the spawn handle. There is no registry here to
-    /// unregister from, so an unknown member is not an error.
+    /// In-process members have no process to reap, so the call is a logged no-op for them. Called by
+    /// the runtime at finalize (`shutdown_member`/`stop`) so a child never outlives its team.
     async fn despawn(&self, member_name: &str) -> Result<()> {
-        debug!(
-            team = self.team_name(),
-            member = member_name,
-            "despawn is a no-op; the runner owns member teardown"
-        );
+        let kind = self.kinds.lock().remove(member_name);
+        match kind {
+            Some(MemberSpawnKind::Process) => self.process.despawn(member_name).await?,
+            Some(MemberSpawnKind::ExternalCli) => self.external_cli.despawn(member_name).await?,
+            Some(MemberSpawnKind::Ssh) => self.ssh.despawn(member_name).await?,
+            Some(MemberSpawnKind::InProcess) | None => {
+                debug!(
+                    team = self.team_name(),
+                    member = member_name,
+                    "no child process to reap; the runner owns member teardown"
+                );
+            }
+        }
+        self.forks.lock().remove(member_name);
         Ok(())
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

@@ -31,6 +31,8 @@ chrono.workspace = true
 tempfile.workspace = true
 rmcp = { workspace = true, optional = true }
 clap.workspace = true
+sqlx = { workspace = true, optional = true }
+which.workspace = true
 
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
@@ -39,6 +41,8 @@ openjiuwen-test-support.workspace = true
 default = ["mcp"]
 mcp = ["dep:rmcp"]
 distributed = []
+sqlite = ["dep:sqlx"]
+otel = []
 live-tests = []
 
 [[bin]]

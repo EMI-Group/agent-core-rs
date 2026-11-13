@@ -145,7 +145,7 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 
 ## Deferred
 
-- External harness modes (CLI/Codex/Claude Code, OS-process members, distributed transports) — a future `MemberHarnessFactory` implementation in the deferred module, not here.
+- Vendor CLI harness providers (Codex, Claude Code) and distributed transports: the factory seam is generic and the vendor adapters stay `Unsupported` in `openjiuwen-harness-providers`, while a process member builds its harness in its own child process.
 - Provider-side checkpoint export/import plumbing (`HarnessProtocol::export_checkpoint` is called only by callers that opt in; the runtime does not poll it).
 - Mounting live tools, MCP servers, sub-agents, rails and approval policy from a cold spec — runtime wiring owns those handles.
 - Model-pool/IntelliRouter selection — [`ModelResolver`] is the seam; only the environment resolver ships.

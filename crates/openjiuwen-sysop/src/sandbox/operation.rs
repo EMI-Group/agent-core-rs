@@ -20,9 +20,15 @@
 //!    (`{scope}_{launcher_type}_{sandbox_type}_{prefix}{identity}`) and every
 //!    `{session_id}` placeholder is replaced with the caller's session id (or
 //!    [`crate::sandbox::config::DEFAULT_SESSION_ID`] when none is given).
-//! 3. [`register_builtin_providers`] installs the provider shipped with this crate (the
+//! 3. The **static** path uses `launcher_config.base_url` as the endpoint: that is a
+//!    pre-deployed sandbox and no lifecycle bookkeeping is involved.
+//! 4. The **managed** path ([`sandbox_operations_with_registries`],
+//!    [`sandbox_operations_for_session_async`], [`resolve_sandbox_endpoint`]) asks the
+//!    [`SandboxLifecycle`] for an endpoint, which reuses a running container, resumes a
+//!    paused one, or launches a new one — see [`crate::sandbox::lifecycle`].
+//! 5. [`register_builtin_providers`] installs the provider shipped with this crate (the
 //!    HTTP gateway behind the `sandbox` feature); extension crates register their own.
-//! 4. `create_fs` / `create_shell` / `create_code` build the provider backends for the
+//! 6. `create_fs` / `create_shell` / `create_code` build the provider backends for the
 //!    resolved endpoint, and each is wrapped in the forwarding type below so the caller
 //!    sees one uniform [`OperationSet`] carrying the endpoint and isolation key.
 //!
@@ -55,6 +61,7 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::card::SysOperationCard;
 use crate::code::types::{CodeChunk, CodeExecParams, CodeOutput};
+use crate::constants::DEFAULT_LAUNCHER_TYPE;
 use crate::fs::types::{
     DownloadFileData, DownloadFileParams, ListDirsParams, ListFilesData, ListFilesParams,
     ReadChunkData, ReadFileData, ReadFileParams, SearchFilesData, SearchFilesParams,
@@ -62,7 +69,8 @@ use crate::fs::types::{
 };
 use crate::operation::{CodeOperation, FsOperation, OpStream, OperationSet, ShellOperation};
 use crate::result::OpResult;
-use crate::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
+use crate::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig, SandboxLauncherConfig};
+use crate::sandbox::lifecycle::SandboxLifecycle;
 use crate::sandbox::provider::SandboxProviderRegistry;
 use crate::shell::types::{
     ShellArgvParams, ShellBackgroundOutput, ShellChunk, ShellExecParams, ShellOutput,
@@ -81,6 +89,13 @@ pub fn sandbox_operations(card: &SysOperationCard) -> Result<OperationSet> {
 
 /// Builds the sandbox backends for `card`, resolving `{session_id}` in the isolation key.
 ///
+/// This is the *static* path: the endpoint is `launcher_config.base_url`, exactly how a
+/// pre-deployed sandbox is addressed. A launcher that creates containers is resolved by
+/// [`sandbox_operations_for_session_async`] (or [`sandbox_operations_with_registries`]),
+/// which drives the async [`SandboxLifecycle`]; this function reports Python's
+/// card-parameter error (199002) for such a card instead of silently targeting an empty
+/// endpoint.
+///
 /// Uses the process-global provider registry; see [`sandbox_operations`] for the errors.
 ///
 /// # Errors
@@ -93,18 +108,166 @@ pub fn sandbox_operations_for_session(
     operations_for_session_in(card, session_id, crate::sandbox::provider::global())
 }
 
+/// Builds the sandbox backends for `card`, resolving a managed container through `lifecycle`.
+///
+/// The endpoint is resolved exactly once, through [`resolve_sandbox_endpoint`], and the
+/// providers are then created from it, so a launched container's `base_url`/`sandbox_id`
+/// reach the backends (and [`SandboxFsOperation::endpoint`] reports them).
+///
+/// # Errors
+///
+/// Returns the [`resolve_sandbox_endpoint`] failures (199002, 199008, 199010,
+/// `Unsupported`) plus the provider-registration and provider-construction failures of
+/// [`sandbox_operations`].
+pub async fn sandbox_operations_with_registries(
+    card: &SysOperationCard,
+    session_id: Option<&str>,
+    providers: &SandboxProviderRegistry,
+    lifecycle: &SandboxLifecycle,
+    now_epoch_secs: u64,
+) -> Result<OperationSet> {
+    let endpoint = resolve_sandbox_endpoint(card, session_id, lifecycle, now_epoch_secs).await?;
+    operations_for_endpoint(card, endpoint, providers)
+}
+
+/// [`sandbox_operations_for_session`] over the process-global provider registry, launcher
+/// registry, and lifecycle.
+///
+/// This is the asynchronous entry point for a host that manages containers; it reads the
+/// wall clock, so pass an explicit `now` through [`sandbox_operations_with_registries`] when
+/// idle-stop must be deterministic.
+///
+/// # Errors
+///
+/// See [`sandbox_operations_with_registries`].
+pub async fn sandbox_operations_for_session_async(
+    card: &SysOperationCard,
+    session_id: Option<&str>,
+) -> Result<OperationSet> {
+    sandbox_operations_with_registries(
+        card,
+        session_id,
+        crate::sandbox::provider::global(),
+        crate::sandbox::lifecycle::global(),
+        crate::sandbox::lifecycle::now_epoch_secs(),
+    )
+    .await
+}
+
+/// Resolves the endpoint operations on `card` must target for `session_id`.
+///
+/// Three cases, in order:
+///
+/// 1. A `base_url` is configured → that URL, verbatim. This is the pre-deploy case and is
+///    today's behavior: no launch, no bookkeeping.
+/// 2. `launcher_type` is `pre_deploy` without a `base_url` → the empty base URL, again
+///    exactly as before (the provider then decides whether it can serve it).
+/// 3. Any other launcher type → [`SandboxLifecycle::ensure_endpoint`] with the resolved
+///    isolation key, which reuses, resumes, or launches a container.
+///
+/// # Errors
+///
+/// Returns `ErrorKind::SysOp` for an invalid card (199002) or a failed launch/resume
+/// (199008), Python's isolation-key error (199010) for an unusable key, and
+/// `ErrorKind::Unsupported` when the launcher type in case 3 is not registered.
+pub async fn resolve_sandbox_endpoint(
+    card: &SysOperationCard,
+    session_id: Option<&str>,
+    lifecycle: &SandboxLifecycle,
+    now_epoch_secs: u64,
+) -> Result<SandboxEndpoint> {
+    card.validate()?;
+    let gateway = card.gateway_config.as_ref().ok_or_else(|| {
+        crate::card::card_param_error("gateway_config is required when mode is 'sandbox'")
+    })?;
+    let launcher = gateway.launcher_config.as_ref().ok_or_else(|| {
+        crate::card::card_param_error("launcher_config is required when mode is 'sandbox'")
+    })?;
+    let template = crate::sandbox::config::isolation_key_template_from_config(gateway)?;
+    let isolation_key = crate::sandbox::config::resolve_isolation_key(&template, session_id);
+    if is_static_launcher(launcher) {
+        return Ok(static_endpoint(launcher, isolation_key));
+    }
+    let launchers = lifecycle.launchers();
+    if !launchers.has(&launcher.launcher_type) {
+        return Err(crate::sandbox::launcher::unknown_launcher_error(
+            &launcher.launcher_type,
+            &launchers.launcher_types(),
+        ));
+    }
+    lifecycle
+        .ensure_endpoint(gateway, &isolation_key, now_epoch_secs)
+        .await
+}
+
+/// Builds the backends of `card` for an already resolved `endpoint`.
+///
+/// # Errors
+///
+/// Returns `ErrorKind::SysOp` (199002) when the card is invalid and propagates the
+/// provider-registration and provider-construction failures.
+pub(crate) fn operations_for_endpoint(
+    card: &SysOperationCard,
+    endpoint: SandboxEndpoint,
+    registry: &SandboxProviderRegistry,
+) -> Result<OperationSet> {
+    card.validate()?;
+    let gateway = card.gateway_config.as_ref().ok_or_else(|| {
+        crate::card::card_param_error("gateway_config is required when mode is 'sandbox'")
+    })?;
+    let launcher = gateway.launcher_config.as_ref().ok_or_else(|| {
+        crate::card::card_param_error("launcher_config is required when mode is 'sandbox'")
+    })?;
+    let (fs, shell, code) = build_backends(gateway, launcher, endpoint, registry)?;
+    Ok(OperationSet {
+        fs: Some(Arc::new(fs)),
+        shell: Some(Arc::new(shell)),
+        code: Some(Arc::new(code)),
+    })
+}
+
+/// Whether `launcher` addresses a sandbox that already exists.
+///
+/// A configured `base_url` always wins, so behavior for a pre-deployed sandbox is unchanged
+/// whether or not this crate knows its launcher type. `pre_deploy` is static without a
+/// `base_url` too, because that launcher never creates a container.
+fn is_static_launcher(launcher: &SandboxLauncherConfig) -> bool {
+    let base_url = launcher.base_url.as_deref().unwrap_or_default().trim();
+    !base_url.is_empty() || launcher.launcher_type == DEFAULT_LAUNCHER_TYPE
+}
+
+/// The static endpoint of a pre-deployed sandbox (today's dispatch endpoint).
+fn static_endpoint(launcher: &SandboxLauncherConfig, isolation_key: String) -> SandboxEndpoint {
+    SandboxEndpoint {
+        base_url: launcher.base_url.clone().unwrap_or_default(),
+        sandbox_id: None,
+        isolation_key: Some(isolation_key),
+    }
+}
+
+/// The card-parameter error that points a managed-launcher card at the async seam.
+fn managed_launcher_error(launcher_type: &str) -> Error {
+    crate::card::card_param_error(&format!(
+        "launcher_type '{launcher_type}' creates sandbox containers; resolve its endpoint with \
+         sandbox_operations_with_registries (or SysOperation::sandbox_with_lifecycle) so the \
+         launch runs on the async lifecycle"
+    ))
+}
+
 /// Builds the sandbox backends for `card` against an explicit provider registry.
 ///
-/// This is the single dispatch implementation; the public entry points only choose the
-/// registry. A missing provider for the configured `sandbox_type` is reported here, so a
-/// misconfigured card fails at construction instead of on its first operation.
+/// This is the single dispatch implementation of the static path; the public entry points
+/// only choose the registry. A missing provider for the configured `sandbox_type` is
+/// reported here, so a misconfigured card fails at construction instead of on its first
+/// operation.
 ///
 /// # Errors
 ///
 /// Returns `ErrorKind::SysOp` (Python code 199002) when the card or its gateway
-/// configuration is invalid, `ErrorKind::SysOp` (199010) when a custom-scope isolation key
-/// lacks a `custom_id`, and `ErrorKind::Unsupported` when no provider is registered for
-/// the configured `sandbox_type`; provider registration errors are propagated.
+/// configuration is invalid or the launcher creates containers, `ErrorKind::SysOp` (199010)
+/// when a custom-scope isolation key lacks a `custom_id`, and `ErrorKind::Unsupported` when
+/// no provider is registered for the configured `sandbox_type`; provider registration
+/// errors are propagated.
 fn operations_for_session_in(
     card: &SysOperationCard,
     session_id: Option<&str>,
@@ -144,11 +307,32 @@ fn dispatch_in(
     })?;
     let template = crate::sandbox::config::isolation_key_template_from_config(gateway)?;
     let isolation_key = crate::sandbox::config::resolve_isolation_key(&template, session_id);
-    let endpoint = SandboxEndpoint {
-        base_url: launcher.base_url.clone().unwrap_or_default(),
-        sandbox_id: None,
-        isolation_key: Some(isolation_key),
-    };
+    if !is_static_launcher(launcher) {
+        return Err(managed_launcher_error(&launcher.launcher_type));
+    }
+    build_backends(
+        gateway,
+        launcher,
+        static_endpoint(launcher, isolation_key),
+        registry,
+    )
+}
+
+/// Installs the crate's built-in provider and creates the three forwarding backends.
+///
+/// # Errors
+///
+/// Propagates [`register_builtin_providers`] and the provider-construction failures.
+fn build_backends(
+    gateway: &SandboxGatewayConfig,
+    launcher: &SandboxLauncherConfig,
+    endpoint: SandboxEndpoint,
+    registry: &SandboxProviderRegistry,
+) -> Result<(
+    SandboxFsOperation,
+    SandboxShellOperation,
+    SandboxCodeOperation,
+)> {
     register_builtin_providers(registry, gateway)?;
     let fs = registry.create_fs(&launcher.sandbox_type, &endpoint, gateway)?;
     let shell = registry.create_shell(&launcher.sandbox_type, &endpoint, gateway)?;

@@ -8,9 +8,10 @@
 //! `build_with` materializes it. That makes the defaults here a seam — every other node inherits
 //! them, so they are pinned against literal JSON rather than derived again downstream.
 //!
-//! Deliberate deviations from Python (documented in `src/schema/CONTEXT.md`): [`SpawnMode`]
-//! defaults to `inprocess` because this port has no OS-process members, and [`TeamAgentSpec`]'s
-//! validation additionally rejects a predefined member name outside `^[a-z][a-z0-9_-]*$`.
+//! Python parity notes: [`SpawnMode`] keeps Python's `inprocess` default, and `process` selects
+//! OS-process members. One deliberate deviation from Python (documented in `src/schema/CONTEXT.md`)
+//! remains: [`TeamAgentSpec`]'s validation additionally rejects a predefined member name outside
+//! `^[a-z][a-z0-9_-]*$`.
 //!
 //! This file is long on purpose — the blueprint is one cohesive model whose defaults are a
 //! cross-node seam, and its exhaustive default/serde/validate tests belong beside it — and its
@@ -132,7 +133,8 @@ pub enum SpawnMode {
     #[default]
     #[serde(rename = "inprocess")]
     InProcess,
-    /// Teammates run as OS processes (deferred in this port); wire value `process`.
+    /// Teammates run as OS-process children over the `team-member serve` JSON-lines protocol;
+    /// wire value `process`.
     Process,
 }
 
@@ -315,8 +317,10 @@ impl Default for TeamWorkspaceSpec {
 /// `build_with`). Field names are their JSON names, so a Python-dumped spec loads unchanged;
 /// unknown fields are ignored.
 ///
-/// Only the knobs this port implements are modelled — organisation-layer, swarmflow and
-/// model-router configuration are absent rather than carried as dead fields.
+/// Only the knobs the runtime reads off the spec are modelled as fields; configuration it takes
+/// out of band is not carried as dead fields here — the organisation layer arrives through the
+/// `organization` key of [`metadata`](Self::metadata), model routing through
+/// `TeamBuildDeps::with_routing`, and swarmflow runs from its own plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TeamAgentSpec {
@@ -342,7 +346,7 @@ pub struct TeamAgentSpec {
     pub dispatch_mode: DispatchMode,
     /// Tool and prompt set non-leader members run with.
     pub teammate_mode: MemberMode,
-    /// Where teammates run; `inprocess` in this port.
+    /// Where teammates run; `inprocess` by default, `process` for OS-process members.
     pub spawn_mode: SpawnMode,
     /// Who materializes the team row.
     pub bootstrap_mode: BootstrapMode,

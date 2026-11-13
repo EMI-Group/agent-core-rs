@@ -23,9 +23,32 @@
 //! | [`harness`] | harness-protocol adapter and native member factory |
 //! | [`skill`] | the `team-member` skill CLI and join descriptor |
 //! | [`mcp`] | the `openjiuwen-team-mcp` MCP server |
+//! | [`org`] | organisation roles, reporting lines, delegation rules, swarmflow, fork/compact |
+//! | [`models`] | model pool, router and per-member allocation |
+//! | [`kv_cache`] | KV-cache affinity identity and cleanup hooks |
+//! | [`observability`] | `OTel` hook seam (no-op without the `otel` feature) |
+//! | [`monitor`] | plain-text status stream for a live team |
+//! | [`attach`] | cross-process attach over Unix domain sockets |
 //!
-//! Everything is in-process and tokio-native; distributed transports, OS-process members and
-//! external CLI members are trait seams that return [`openjiuwen_common::error::Error::Unsupported`].
+//! Feature matrix (default features `["mcp"]`):
+//!
+//! | Feature | Default | Effect |
+//! | --- | --- | --- |
+//! | `mcp` | yes | the `openjiuwen-team-mcp` stdio server and its tool catalogue |
+//! | `sqlite` | no | `SqliteTeamStore`, the persistent `TeamStore` backend |
+//! | `otel` | no | structured `OTel` hooks and the in-memory span sink in [`observability`] |
+//! | `distributed` | no | transport seams (ZeroMQ/Pulsar) that reject at construction |
+//! | `live-tests` | no | opt-in live-network test gate |
+//!
+//! Capabilities: in-process, OS-process, external-CLI and SSH members; local and git-worktree
+//! workspaces; the organisation layer (chart, delegation, org task pool, org mailbox, swarmflow,
+//! fork/compact); model-pool routing and KV-cache affinity; observability hooks plus the monitor
+//! status stream; cross-process attach over Unix domain sockets; and the `sqlite` team store.
+//!
+//! Genuinely deferred, each reached through a seam that returns
+//! [`openjiuwen_common::error::Error::Unsupported`]: ZeroMQ/Pulsar transports, PostgreSQL/MySQL
+//! stores, remote distributed workspace transport, OTLP span export, the TUI,
+//! authentication/TLS on attach, and vendor CLI harness translation.
 //!
 //! ```
 //! use openjiuwen_agent_teams::{is_reserved_name, parse_mention, DEFAULT_LEADER_MEMBER_NAME};
@@ -38,13 +61,19 @@
 // Python package names (`agent_teams`, `team_agent`) repeat deliberately in module names.
 #![allow(clippy::module_name_repetitions)]
 
+pub mod attach;
 pub mod constants;
 pub mod experts;
 pub mod harness;
 pub mod interaction;
+pub mod kv_cache;
 pub mod mcp;
 pub mod member;
 pub mod messager;
+pub mod models;
+pub mod monitor;
+pub mod observability;
+pub mod org;
 pub mod runtime;
 pub mod schema;
 pub mod skill;
@@ -69,10 +98,7 @@ pub use experts::{
     ExpertRef, LoadedAgentGroupPackage, LocalizedText, PackageLocation,
 };
 // --- persistence -----------------------------------------------------------
-pub use storage::{
-    open_store, InMemoryTeamStore, MemberPatch, MemberRecord, MessageRecord, TeamInfoRecord,
-    TeamStore,
-};
+pub use storage::*;
 // --- task board ------------------------------------------------------------
 pub use taskboard::{
     detect_cycle, ReviewTally, TaskBoard, TaskBoardLimits, TaskMutation, TaskOpResult,
@@ -85,10 +111,7 @@ pub use messager::{
 // --- workspaces ------------------------------------------------------------
 pub use workspace::*;
 // --- members ---------------------------------------------------------------
-pub use member::{
-    IdleDebounce, InProcessSpawnHandle, MemberActivityRegistry, MemberObserver, MemberRuntime,
-    MemberSpawnRequest, MemberSpawner, RecordingObserver, SpawnRegistry, TeamMember,
-};
+pub use member::*;
 // --- human-in-the-loop -----------------------------------------------------
 pub use interaction::{
     approval_result_event, parse_confirm, parse_interact_str, resolve_targets, ConfirmPayload,
@@ -99,9 +122,11 @@ pub use interaction::{
 // --- runtime ---------------------------------------------------------------
 pub use runtime::{
     clear_global_registry, decide_run_action, global_registry, parse_initial_input,
-    set_global_registry, try_global_registry, InitialInput, LiveTeamState, ModelAllocator,
-    RunAction, RunActionKind, SpecBuild, TeamAgent, TeamBackend, TeamBuildDeps, TeamMemberSpawner,
-    TeamModelAllocation, TeamRuntimeManager, TeamRuntimePool,
+    set_global_registry, try_global_registry, AttachConfig, AttachHost, BackendAttachHandler,
+    ForkDirective, InitialInput, LiveTeamState, ModelAllocator, ModelSelection, OrgBinding,
+    OrganizationBlock, RunAction, RunActionKind, SpecBuild, TeamAgent, TeamBackend, TeamBuildDeps,
+    TeamMemberSpawner, TeamModelAllocation, TeamModelRouter, TeamRuntimeManager, TeamRuntimePool,
+    TeamSignals,
 };
 // --- harness protocol ------------------------------------------------------
 pub use harness::{
@@ -113,10 +138,33 @@ pub use harness::{
 // --- CLI and MCP -----------------------------------------------------------
 pub use mcp::{build_mcp_server, TeamMcpServer, OPERATOR_INSTRUCTIONS, SERVER_NAME};
 pub use skill::{
-    connect_live_client, member_tools_for, operator_tools, run_skill_cli, ClaimStatus, CliCommand,
-    ClientScope, CreateOutcome, DescriptorArgs, MemberCommand, MemberSummary, OpOutcome,
-    OperatorCommand, SendOutcome, SkillCli, StoreTeamClient, TaskCommand, TeamClient,
-    TeamJoinDescriptor, TeamToolDef, ViewAction,
+    connect_live_client, connect_socket_client, member_tools_for, operator_tools, run_skill_cli,
+    ClaimStatus, CliCommand, ClientScope, CreateOutcome, DescriptorArgs, MemberCommand,
+    MemberSummary, OpOutcome, OperatorCommand, SendOutcome, SkillCli, SocketTeamClient,
+    StoreTeamClient, TaskCommand, TeamClient, TeamJoinDescriptor, TeamToolDef, ViewAction,
+};
+// --- organisation ----------------------------------------------------------
+pub use org::*;
+// --- model routing ---------------------------------------------------------
+pub use models::*;
+// --- KV-cache affinity -----------------------------------------------------
+pub use kv_cache::*;
+// --- observability ---------------------------------------------------------
+pub use observability::*;
+// --- live status monitor ---------------------------------------------------
+// Listed explicitly instead of `monitor::*`: the glob would re-export the `monitor::stream`
+// module, which collides with the `schema::stream` module already re-exported above.
+pub use monitor::{
+    snapshot_events, BackpressurePolicy, EmitOutcome, MonitorEmitter, MonitorEvent,
+    MonitorReceiver, StampedEvent, StatusStream, StatusStreamHandle, StreamSummary, TeamMonitor,
+    TeamMonitorConfig, TimestampPolicy,
+};
+// --- cross-process attach --------------------------------------------------
+// Listed explicitly instead of `attach::*`: the glob would re-export the `attach::protocol`
+// module, which collides with the `member::protocol` module already re-exported above.
+pub use attach::{
+    AttachClient, AttachError, AttachHandler, AttachOp, AttachResult, AttachServer, RequestFrame,
+    ResponseFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 // The protocol crate owns this type; agent-teams re-exports it so hosts can branch on member
 // state without depending on the protocol crate directly.

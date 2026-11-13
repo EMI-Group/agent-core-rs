@@ -2,71 +2,88 @@
 
 ## Intent
 
-Developer tooling for authoring openJiuwen artifacts: prompts, skills, agents.
+Developer tooling for authoring, generating, evaluating, and tuning openJiuwen artifacts: prompts, skills, agents, and workflows.
 Maps the Python package `openjiuwen.dev_tools` (`prompt_builder/`, `skill_creator/`, `agent_builder/`, `skill_evaluator/`, `tune/`).
-The crate is a layer-5 consumer of the kernel: it builds on `openjiuwen-foundation` prompts and `Model`, on `openjiuwen-agent` cards/configs, and on `openjiuwen-common` errors.
-Audience: tool authors writing Rust programs (and the CLI/dev tooling above this crate) that generate, validate, and evaluate agent assets.
-Python's dev tools are LLM-orchestration scripts with little typed surface; the Rust port keeps the observable artifacts (prompt text, skill bundles, agent DSL/configs, score reports) and replaces free-form LLM contracts with typed models plus optional `Model`-driven generation.
+The crate is a layer-5 consumer of the kernel: it builds on `openjiuwen-foundation` prompts and `Model`, on `openjiuwen-agent` cards/configs, and on `openjiuwen-common` errors and HTTP transport.
+Audience: tool authors writing Rust programs (and the CLI/dev tooling above this crate) that generate, validate, evaluate, and optimize agent assets.
+Python's dev tools are LLM-orchestration scripts with little typed surface; the Rust port keeps the observable artifacts (prompt text, skill bundles, agent DSL/configs, workflow designs, score reports, tuning traces) and replaces free-form LLM contracts with typed models, deterministic cores, and an optional `Model` seam.
 
 ## API Surface
 
-Crate root `openjiuwen_dev_tools` with one module per Python subpackage:
+Crate root `openjiuwen_dev_tools` with one module per Python subpackage plus a shared scoring module:
 
+- `judge` — rubric-driven LLM judgement shared by `skill_evaluator` and `tune`: `Rubric`/`RubricDimension` (weights, scale, validation, weighted `normalize`), `Verdict`/`VerdictSource` (tolerant structured parsing of fenced JSON, tag sections, bare JSON; percent strings; provenance), `prompt::{system_prompt, render_rubric, rubric_messages}`, `ModelJudge` + `Judge`/`JudgeRequest`, and `judge_with_fallback` returning a deterministic verdict when the model call or parsing fails.
 - `prompt_builder` — `MetaTemplateBuilder` (task description → standardized prompt), `FeedbackPromptBuilder` (feedback → rewritten prompt), `BadCasePromptBuilder` (evaluation cases → repaired prompt); bundled `zh-CN`/`en-US` prompt banks, deterministic formatting/parsing helpers.
-- `skill_creator` — `SkillDefinition` (name/description/instructions/resources/metadata), `SkillCreator` (create from `SkillSpec` or from a `Model`, template rendering, bundle write/read), `SkillBundle` (harness-compatible `SKILL.md` + resources layout).
+- `skill_creator` — `SkillDefinition` (name/description/instructions/resources/metadata), `SkillCreator` (create from `SkillSpec` or from a `Model`, template rendering, bundle write/read, `create_from_url`), `SkillBundle` (harness-compatible `SKILL.md` + resources layout), and `skill_creator::omni` — the `skill_omni_creation` pipeline: `Fetcher` seam (`HttpFetcher` over `openjiuwen_common::http`, `ScriptedFetcher`), rule-based `HtmlDocument`/`resolve_url`, `ArchiveUnpacker` (ustar; zip/gzip typed `Unsupported`), image sniffing/filtering/`slugify`, and `OmniCreation` stages scrape → download → generate → save → `OmniOutcome`.
 - `agent_builder` — programmatic `LlmAgentSpec`/`WorkflowSpec` and serialized platform DSL (`LlmAgentDsl`, `WorkflowDsl`), the `to_agent_card`/`to_llm_agent_config`/`build_llm_agent` bridge into `openjiuwen-agent`, `HistoryManager`, and the session-based `AgentBuilder`.
+  The staged pipeline is composed of `Clarifier`, `WorkflowDesigner`/`WorkflowDesign` (with `to_workflow_dsl`), `DlGenerator` (deterministic plus model), `DlReflector`/`Reflection`, `cycle_checker::{find_cycle, has_cycle}`, `mermaid::{render_mermaid, render_design}`, and `AgentBuilder::build_with_pipeline` (clarify → design → generate → reflect → validate).
 - `skill_evaluator` — `EvalCase`, deterministic `Assertion`/`CaseRunner` seams, `DesignReport`/`FunctionalReport`/`SafetyReport`/`FinalScore` models with the Python aggregation (`0.40·design + 0.60·pass_rate`, safety gate `0.80`), and `SkillEvaluator`.
-- `tune` — `Case`/`EvaluatedCase`/`CaseLoader` (ported, pure) plus API-shaped stubs (`Error::Unsupported`) for optimizers, `Trainer`, and `optimize_prompt`.
+  `judge_scoring` adds `design_rubric`/`safety_rubric`, `SkillJudge`, and `SkillEvaluator::with_judge`/`evaluate_with_judge` with deterministic fallback and `JudgeRecord` provenance.
+  `eval` is the runnable harness: `load_cases_json`/`load_cases_file` (JSON array, `{"cases": […]}` object, single object, JSONL), `EvalAgent`/`ModelAgent`/`CaseRunnerAgent`, `EvalHarness::{run, run_query}`, `EvalRun::{to_json, to_json_string, to_jsonl, write_json, write_jsonl}`, and `QueryRequest`/`QueryOutcome` mirroring `run_eval_query.py`'s output-path resolution.
+- `tune` — `Case`/`EvaluatedCase`/`CaseLoader` (Python field names) plus the evaluator seam (`PromptRunner`/`ModelPromptRunner`/`ScriptedPromptRunner`, `CaseScorer`/`LabelScorer`, `CaseEvaluator`/`RunnerEvaluator`/`ModelEvaluator`/`DeterministicEvaluator`), `OptimizerConfig`, `OptimizationResult`, the four real searches (`InstructionOptimizer` beam search, `ExampleOptimizer` greedy example selection, `JointOptimizer` alternating ascent, `PromptSearchOptimizer` pool sweep), `Trainer`, and `optimize_prompt`.
 
-Cross-module rule: `Case`/`EvaluatedCase` are owned by `tune` and consumed by `prompt_builder` (`BadCasePromptBuilder`) — never duplicated.
+Cross-module rules: `Case`/`EvaluatedCase` are owned by `tune` and consumed by `prompt_builder` (`BadCasePromptBuilder`) — never duplicated; rubric scoring lives in `judge` and is consumed, never re-implemented, by `skill_evaluator` and `tune`.
 Tool descriptors use `openjiuwen_foundation::tool::ToolInfo` (the wire `{"type":"function","function":{…}}` shape); Python's flat `ToolInfo` is not reproduced.
 
 ## Constraints
 
 - Only this crate may be edited here; workspace manifest, sibling crates, and `docs/` are out of scope.
-- Async-first: builders that call a model are `async fn` plus a `stream_build` returning `BoxStream<'static, Result<String>>`; no `block_on`/`asyncio.run` bridging — synchronous Python entry points become `async` (documented deviation).
+- No new dependencies: HTTP is `openjiuwen_common::http` (workspace `reqwest` stack); HTML, tar, image sniffing, and hashing are implemented in-crate.
+- Async-first: builders, optimizers, trainers, and the harness are `async fn`; streams return `BoxStream<'static, Result<String>>`; no `block_on`/`asyncio.run` bridging — synchronous Python entry points become `async` (documented deviation, e.g. `Trainer::train`).
 - Errors: `openjiuwen_common::error::{Error, Result}` only; invalid user input is `Error::validation`, missing capability is `Error::unsupported`, model failures propagate as `Error::llm`.
-- Serialization: public data types are `serde` (`rename_all = "snake_case", default`), snake_case, unknown-field tolerant; DSL and report JSON keep the Python field names.
+- Model failures never silently degrade: an optional model path falls back to a documented deterministic path (never an empty result), and the fallback is visible (returned value, `VerdictSource`, or `used_fallback`).
+- Serialization: public data types are `serde` (`rename_all = "snake_case", default`), unknown-field tolerant; DSL, report, `Case`, and `OptimizationResult` JSON keep the Python field names.
 - No `unsafe`; `tracing` logging via `openjiuwen_common::logging`; no `println!`/`eprintln!`; no panics on user input.
-- Files ≤1000 lines; one responsibility per file; shared helpers within a module, not duplicated across modules.
-- Tests are offline and deterministic: `openjiuwen_test_support::ScriptedModel` for model-driven paths, `TempWorkspace` for filesystem bundles, fixed ids/timestamps for DSL and reports.
-- Empty prompts, blank skill names, unknown template names, and malformed frontmatter are validation errors, never silent fallbacks (Python's "warn and degrade" behavior is a documented deviation).
+- Files ≲1000 lines; one responsibility per file; shared helpers within a module, not duplicated across modules.
+- Tests are offline and deterministic: `openjiuwen_test_support::ScriptedModel` for model-driven paths, `TempWorkspace` for filesystem bundles, `ScriptedFetcher`/loopback `TcpListener` for HTTP, fixed ids/timestamps — no wall-clock reads, no environment reads.
+- Empty prompts, blank skill names, unknown template names, malformed frontmatter, empty rubrics, and out-of-range tuning parameters are validation errors, never silent fallbacks (Python's "warn and degrade" behavior is a documented deviation).
 
 ## Design Decisions
 
-- Python builders own a `Model` constructed from configs; here every builder takes `Arc<dyn Model>` (or `ScriptedModel` in tests), so configuration stays with the caller and no builder reads the environment.
-- Deterministic cores are public: template rendering, message assembly, JSON-fence/tag parsing, skill frontmatter rendering/parsing, agent DSL transformation, and evaluation scoring are ordinary functions testable without a model; the model only supplies text.
-- `MetaTemplateBuilder`'s registry keys are uniform (`register`/`get`/`pop` share the caller-supplied name); Python's hidden `META_TEMPLATE_` prefix asymmetry is not reproduced.
-- `agent_builder` keeps Python's two artifacts (the platform DSL JSON and the kernel config) and composes them: a spec/DSL always converts into `AgentCard` + `LlmAgentConfig`, and `build_llm_agent` wires a `ReActAgent`-based `LlmAgent` when a model is supplied.
-- Model-driven agent building is one round trip that must yield DSL JSON; a non-JSON answer is returned as a clarifying `Response` (Python's state machine behavior) instead of the multi-stage clarifier/designer pipeline.
-- `skill_evaluator` replaces Python's prompt-defined rubric with deterministic structural scoring for design and expectation assertions for function, keeping the report field names and the aggregation formula; a `Model` judge can be layered on later through the same trait seams.
-- `tune`'s optimizers depend on Python optimization internals and are stubs; `Case`, `EvaluatedCase`, and `CaseLoader` are fully ported because they are pure data models shared with prompt building.
+- Python builders own a `Model`; here every builder, optimizer, judge, and stage takes an optional `Arc<dyn Model>` (or `ScriptedModel` in tests), so configuration stays with the caller and nothing reads the environment.
+- Deterministic cores are public: template rendering, message assembly, JSON-fence/tag parsing, skill frontmatter rendering/parsing, agent/workflow DSL transformation, Mermaid rendering, cycle detection, HTML/tar parsing, label comparison, and evaluation scoring are ordinary functions testable without a model; the model only supplies text.
+- Every model-driven stage is validated structurally before it is accepted (DSL must `validate`, a design must pass `WorkflowDesign::validate`, a skill definition must `validate`, a judgement must parse); an unusable answer falls back to the deterministic path instead of erroring.
+- `judge` is the single scoring LCA: `Rubric::normalize` is the only weighted-score implementation, `Verdict::parse` is the only verdict parser, and `ModelJudge::judge_with_fallback` is the only model→deterministic fallback contract.
+- `tune`'s search is deterministic by construction: fixed mutation banks, ordered candidate generation, seeded shuffle, and a total tie-break (score desc → earlier candidate index → lexicographically smaller prompt or `case_id`). `DeterministicEvaluator` scores placeholder preservation, instruction structure, case term coverage, and degenerate-prompt hygiene so an offline run has a real gradient; `ModelPromptRunner` plus `LabelScorer` replace it when a model is available.
+- Optimizer configuration is explicit (`OptimizerConfig`) and validated against the Python `TuneConstant` bounds; `optimize_prompt` is the no-config convenience over `InstructionOptimizer`.
+- `agent_builder` keeps Python's two artifacts (platform DSL JSON and kernel config) and composes them; the legacy one-round-trip `build_agent`/`build_agent_at` stays available, while `build_with_pipeline` runs the staged clarifier → designer → generator → reflector pipeline with a deterministic fallback at every stage.
+- `skill_evaluator`'s functional score stays assertion-based; the LLM judge covers design and safety only, and a `scan_safety` finding always overrides a passing model verdict (hard gate).
+- `skill_creator::omni` keeps fetch, parsing, and generation separate: `Fetcher` is injected, HTML parsing is rule-based and tolerant, and the skill document is generated deterministically unless a model is supplied.
 
 ## Test Strategy
 
-- Unit tests inside each module (`#[cfg(test)]`) cover deterministic transforms, validation errors, and serialization round-trips.
-- Model-driven paths use `ScriptedModel` with queued responses: prompt builders assert the rendered messages, skill creator asserts the parsed result, agent builder asserts DSL extraction, evaluator asserts scoring.
+- Unit tests inside each module (`#[cfg(test)]`) cover deterministic transforms, validation errors, fallbacks, model-driven paths with `ScriptedModel`, and serialization round-trips; the `judge`, `tune::evaluator`, `omni/html`, `omni/pipeline`, `skill_evaluator::eval`, and `agent_builder` modules keep their larger suites in sibling `tests.rs` files.
+- Model-driven paths assert both the result and the request: queued `ScriptedModel` turns plus recorded call inspection.
 - `crates/openjiuwen-dev-tools/tests/skill_lifecycle.rs` covers the `skill_creator`→`skill_evaluator` seam: author→bundle write/read→frontmatter re-parse in a `TempWorkspace`, then deterministic and `ModelCaseRunner` evaluation with the Python report JSON names and the safety gate.
 - `crates/openjiuwen-dev-tools/tests/prompt_assets.rs` covers the `tune`→`prompt_builder` seam: Python-field `Case`/`EvaluatedCase` JSON feeding the bad-case, meta (`Plan`), and feedback (`Insert`) builders, plus buffered-vs-streamed parity.
 - `crates/openjiuwen-dev-tools/tests/agent_assets.rs` covers the `agent_builder`→`openjiuwen_agent` seam: spec→DSL JSON→`LlmAgent`, workflow-spec validation, and session build/clarify/clear flows with the flattened `BuildResult` keys.
-- `crates/openjiuwen-dev-tools/tests/deferred_surface.rs` proves the deferred tuning entry points return `Error::Unsupported` naming their pipeline and that `WorkflowDsl::validate` rejects empty, duplicate, and dangling documents.
+- `crates/openjiuwen-dev-tools/tests/tuning_pipeline.rs` covers the tuning workflow end-to-end: loader→split→optimizers→trainer, determinism, and the public evaluator seam.
+- `crates/openjiuwen-dev-tools/tests/omni_bundle.rs` covers URL→bundle through `ScriptedFetcher`→`SkillCreator::create_from_url`→`SkillBundle::read`, plus the archive deferral.
+- `crates/openjiuwen-dev-tools/tests/judge_and_pipeline.rs` covers the judge→evaluator provenance path, the `EvalHarness` JSON/JSONL reports, and `AgentBuilder::build_with_pipeline` (workflow, clarification, Mermaid).
+- `crates/openjiuwen-dev-tools/tests/deferred_surface.rs` pins the workflow-DSL structural validation contract.
 - No network, no environment reads, no wall-clock dependence: ids and timestamps are parameters or fixed constants.
 
 ## Deferred
 
-- Python `skill_omni_creation` scraping/download stages (Playwright, bs4, image filtering) — no port; `skill_creator` starts from text/spec input.
-- Agent-builder LLM pipeline internals (LLM clarifier, workflow designer, DL generator/reflector, cycle checker, Mermaid rendering of designs) — only the DSL model plus JSON extraction are ported; Mermaid output is a stub.
-- Prompt-tuning optimizers (`InstructionOptimizer`, `ExampleOptimizer`, `JointOptimizer`, `Trainer`, `PromptSearchOptimizer`) — `Error::Unsupported`.
-- LLM-judge design/safety scoring, subagent orchestration, and the `run_eval_query.py` shell harness — superseded by the deterministic harness.
+- Python `skill_omni_creation` zip/gzip decompression — `Error::Unsupported` naming the format; unpacking needs a compression crate outside the pinned offline dependency set (plain `tar` is fully implemented).
+- Python `skill_omni_creation` Playwright/JS rendering, stealth/cookie handling, Pillow image decoding/size gates, and the multimodal image judge — replaced by static-DOM extraction, byte/format filters, and an optional text model; a browser/vision stack is out of scope.
+- Agent-builder pipeline extras: intention detector, multi-turn clarifier dialogue, three-pass (basic/branch/reflection) designer prompts, DL refine mode, reflection feedback loop into the designer, platform resource retrieval, and streaming variants — replaced by single-pass stages with deterministic fallbacks; the CLI lives in `openjiuwen-cli`.
+- `tune` dataset samplers, `tune/chat_agent` agent adapters, and the Python `optimizer/adopt`/`prompt_search` policy/memory/reward/drift services — the port keeps cases in memory and implements the observable propose→evaluate→best contract as stateless searches; the LLM-judge retry loop becomes `LabelScorer` plus `judge`.
+- `skill_evaluator`'s Python `create_subagent` ReAct/tool-execution orchestration and environment-driven model construction — replaced by the `EvalAgent` seam with caller-supplied configuration; functional scoring stays assertion-based (LLM judging covers design and safety).
+- `openjiuwen-dev-tools/tests/` integration coverage is limited to public-API seams; module internals are tested in-tree.
 
 ## Routing Table
 
-- `./prompt_builder/` → prompt template banks, meta/feedback/bad-case builders, deterministic prompt helpers (`prompt_builder/CONTEXT.md`)
-- `./skill_creator/` → skill definition model, validation, templating, `SKILL.md` bundle read/write, model-assisted creation (`skill_creator/CONTEXT.md`)
-- `./agent_builder/` → agent specs, platform DSL, kernel bridge, session history, LLM-driven builder (`agent_builder/CONTEXT.md`)
-- `./skill_evaluator/` → evaluation cases, assertion harness, report/score models, aggregation (`skill_evaluator/CONTEXT.md`)
-- `./tune/` → `Case`/`EvaluatedCase`/`CaseLoader` and unsupported-optimizer stubs (`tune/CONTEXT.md`)
-- `./src/lib.rs` → module tree, crate lints, shared crate-level re-exports
+- `./src/judge/` → rubric model, verdict parsing, judge prompt rendering, `ModelJudge` and the fallback contract (`judge/CONTEXT.md`)
+- `./src/prompt_builder/` → prompt template banks, meta/feedback/bad-case builders, deterministic prompt helpers (`prompt_builder/CONTEXT.md`)
+- `./src/skill_creator/` → skill definition model, validation, templating, `SKILL.md` bundle read/write, model-assisted creation, `create_from_url` (`skill_creator/CONTEXT.md`)
+- `./src/skill_creator/omni/` → fetcher seam, HTML extraction, archive unpacking policy, image/link filtering, the scrape→download→generate→save pipeline (`skill_creator/omni/CONTEXT.md`)
+- `./src/agent_builder/` → agent specs, platform DSL, kernel bridge, session builder, clarifier/designer/DL generator/reflector, cycle checker, Mermaid (`agent_builder/CONTEXT.md`)
+- `./src/skill_evaluator/` → evaluation cases, assertions, reports, deterministic scoring, judge rubrics/provenance, the eval harness (`skill_evaluator/CONTEXT.md`)
+- `./src/tune/` → `Case`/`EvaluatedCase`/`CaseLoader`, evaluator seam, prompt optimizers, trainer (`tune/CONTEXT.md`)
+- `./src/lib.rs` → module tree, crate lints, module-level docs
+- `./src/util.rs` → shared model-output parsing (JSON/list fences, tag extraction, truncation)
+- `./tests/` → cross-module public-API integration suites (skill lifecycle, prompt assets, agent assets, tuning pipeline, omni bundle, judge/pipeline, deferred surface)
 - `./Cargo.toml` → crate manifest; `openjiuwen-test-support` is a dev-dependency only
 - `../openjiuwen-foundation/` → `PromptTemplate`, `BaseMessage`, `Model`, `ToolInfo` (sibling — read-only, escalate writes to parent)
 - `../openjiuwen-agent/` → `AgentCard`, `LlmAgentConfig`, `LlmAgent`, `ReActAgent` (sibling — read-only, escalate writes to parent)

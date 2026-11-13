@@ -18,6 +18,13 @@ pub const DEFAULT_SHELL_ALLOWLIST: &[&str] = &[
 /// Default shell/code execution timeout in seconds (Python `timeout=300`).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// Default wait for a cross-process file lock before failing with 199003.
+///
+/// Python's SQLite lock manager blocks until the lock is free; a bounded default keeps a
+/// dead peer from wedging a workspace forever. `LocalWorkConfig::lock_timeout_secs = 0`
+/// restores the unbounded wait.
+pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 30;
+
 /// Bytes of captured stdout/stderr retained per stream before truncation.
 ///
 /// Python captures shell and code output without a limit; this crate bounds the buffer at

@@ -6,8 +6,9 @@
 //! `send_message` are dispatched through [`TeamClient::invoke_tool`] and their answers are rendered
 //! here, plus `inbox`, which is the external-only pull operation backed by the mailbox directly.
 //!
-//! `--watch` is accepted for parity but performs a single read: the event-driven re-render loop
-//! needs the runtime's watch hook, which is not wired yet (see the crate's deferred list).
+//! `--watch` is accepted for parity but performs a single read: the attach bridge is one
+//! request/response per line with no server-push channel (see `crate::attach`), so there is no
+//! event stream to re-render from.
 
 use std::io::Write;
 use std::sync::Arc;

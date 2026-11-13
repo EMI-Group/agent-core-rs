@@ -2,7 +2,7 @@
 //!
 //! Every suite under `tests/` is its own binary and only sees the crate's *public* surface, so the
 //! fakes here are deliberately a re-expression of the in-crate ones
-//! (`src/runtime/team_agent.rs` `test_support` and `src/runtime/tests/support.rs`) built from
+//! (`src/runtime/team_agent/test_support.rs` and `src/runtime/tests/support.rs`) built from
 //! `openjiuwen_agent_teams::…` imports only. Nothing here touches the network, the clock or a
 //! model: a [`ScriptedHarness`] answers every `send` with one scripted observation triple, a
 //! [`FakeHarnessFactory`] hands out one scripted harness per member and a

@@ -39,6 +39,7 @@ use openjiuwen_common::utils::id::uuid_hex;
 use crate::constants::{BROADCAST_TARGET, DEFAULT_LEADER_MEMBER_NAME, MAX_MESSAGE_CONTENT_CHARS};
 use crate::member::{MemberActivityRegistry, MemberSpawner, TeamMember};
 use crate::messager::Messager;
+use crate::monitor::{BackpressurePolicy, MonitorEvent, MonitorReceiver};
 use crate::schema::{
     BroadcastEvent, EventPayload, HarnessState, MessageEvent, TaskFilter, TaskSummary,
     TeamSnapshot, TeamSpec, TeamTopic,
@@ -46,6 +47,9 @@ use crate::schema::{
 use crate::storage::{MessageRecord, TeamInfoRecord, TeamStore};
 use crate::taskboard::{TaskBoard, TaskMutation};
 use crate::workspace::WorkspaceProvider;
+
+use super::observability_bind::TeamSignals;
+use super::org_bind::OrgBinding;
 
 /// The organisation facade of one running team.
 ///
@@ -73,6 +77,10 @@ pub struct TeamBackend {
     activity: Arc<MemberActivityRegistry>,
     /// Live roster: `member_name` → handle.
     members: RwLock<BTreeMap<String, Arc<TeamMember>>>,
+    /// Observability hooks and the optional monitor sink.
+    signals: RwLock<Option<TeamSignals>>,
+    /// The organisation binding, when the spec configures one.
+    org: RwLock<Option<Arc<OrgBinding>>>,
 }
 
 impl TeamBackend {
@@ -104,7 +112,52 @@ impl TeamBackend {
             workspace,
             activity,
             members: RwLock::new(BTreeMap::new()),
+            signals: RwLock::new(None),
+            org: RwLock::new(None),
         }
+    }
+    /// Installs the team signals, leaving every other field untouched.
+    #[must_use]
+    pub fn with_signals(self, signals: TeamSignals) -> Self {
+        *self.signals.write() = Some(signals);
+        self
+    }
+    /// Installs (or replaces) the team signals after construction.
+    pub fn install_signals(&self, signals: TeamSignals) {
+        *self.signals.write() = Some(signals);
+    }
+    /// Returns the team signals, if installed.
+    #[must_use]
+    pub fn signals(&self) -> Option<TeamSignals> {
+        self.signals.read().clone()
+    }
+    /// Installs the organisation binding.
+    pub fn install_org(&self, org: Arc<OrgBinding>) {
+        *self.org.write() = Some(org);
+    }
+    /// Returns the organisation binding, when the team participates in an organisation.
+    #[must_use]
+    pub fn org(&self) -> Option<Arc<OrgBinding>> {
+        self.org.read().clone()
+    }
+    /// Emits one monitor event best-effort (no-op without an installed sink).
+    pub fn emit_monitor(&self, event: MonitorEvent) {
+        if let Some(signals) = self.signals() {
+            signals.emit(event);
+        }
+    }
+    /// Creates a monitor queue, installs its emitter and returns the receiving end.
+    ///
+    /// A host attaches this to a [`crate::monitor::StatusStream`] writer; installing a second
+    /// stream replaces the first emitter, so events reach the newest reader only.
+    #[must_use]
+    pub fn monitor_stream(
+        &self,
+        capacity: usize,
+        policy: BackpressurePolicy,
+    ) -> Option<MonitorReceiver> {
+        self.signals()
+            .map(|signals| signals.monitor_stream(capacity, policy))
     }
 
     /// Returns the team name every row and event of this backend is scoped to.
@@ -318,8 +371,18 @@ impl TeamBackend {
     /// Stops at the first event that cannot be published and returns that error; earlier events
     /// stay published.
     pub async fn publish_mutation(&self, mutation: &TaskMutation) -> Result<()> {
+        let signals = self.signals();
         for event in &mutation.events {
             self.post_event(TeamTopic::Task, event.clone()).await?;
+            if let Some(signals) = signals.as_ref() {
+                match event {
+                    EventPayload::TaskCreated(created) => signals.task_created(created),
+                    EventPayload::TaskStatusChanged(changed) => {
+                        signals.task_status(changed, &self.spec.team_name);
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }

@@ -132,7 +132,8 @@ Every result is a single plain-text MCP content block (`is_error` is always fals
 
 - HTTP/SSE transport: remote exposure is deployment's concern; stdio is the only transport, as in Python.
 - Elicitation, prompts, resources and sampling: only the `tools` capability is advertised.
-- Live client resolution: the MCP process serves teams hosted in *this* process only, through `crate::skill::connect_live_client`; cross-process attach (a shared sqlite store or a distributed transport) is deferred and an unhosted team is reported as `Error::Config`.
+- Live client resolution: the MCP process serves a team through `crate::skill::connect_live_client` — a team this process hosts, else the attach socket the descriptor's `socket_path` or `OPENJIUWEN_TEAM_SOCKET` names; a descriptor that resolves neither is `Error::Config`.
+  Cross-process attach through a shared sqlite store or a distributed transport is deferred.
 - Structured content / annotations: results are a single text block (Python parity).
 - Resumability, progress notifications and graceful shutdown hooks.
 

@@ -6,26 +6,28 @@
 //!
 //! 1. [`TeamAgentSpec::validate`](crate::schema::TeamAgentSpec::validate) — reserved names and the
 //!    dispatch/bootstrap pairing.
-//! 2. The runtime mirror ([`TeamSpec`](crate::schema::TeamSpec)) and the resolved language.
-//! 3. One store (injected, never a second one), one in-process transport, one activity registry.
+//! 2. The runtime mirror ([`TeamSpec`](crate::schema::TeamSpec)), the resolved language, the parsed
+//!    metadata knobs (spawn mode, isolation, fork, KV cache, attach).
+//! 3. One store (injected, never a second one), one in-process transport, one activity registry,
+//!    one signals bundle (observability hooks + monitor), one model router, one KV-cache registry.
 //! 4. [`TeamBackend`] over the store, board, transport, spawner and workspace provider; the team
-//!    row is written before any member row.
-//! 5. The leader row, its workspace and its harness, then the observer that feeds the chunk
-//!    fan-out and the activity registry.
+//!    row is written before any member row; the organisation layer is bound when configured.
+//! 5. The leader row, its workspace and its harness (with the pool-selected model), then the
+//!    observer that feeds status, rounds, chunks, observability and the monitor.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
-//! 7. One bus subscription for the leader (drained only by [`leader`]) and
-//!    the interaction gate/inbox.
+//! 7. One bus subscription for the leader (drained only by [`leader`]) and the interaction
+//!    gate/inbox.
 //!
 //! The build always produces the *leader* handle: a teammate is not a second public constructor but
 //! a [`TeamMember`](crate::member::TeamMember) whose runtime is materialized by
-//! `TeamAgent::spawn_member` through the same harness-factory seam. The role field exists because
-//! the shared run loop and the adapter must know which half of the contract they are executing.
+//! `TeamAgent::spawn_member` through the same harness-factory seam.
 //!
 //! # Async build
 //!
 //! The build path awaits the store, the workspace provider and the harness factory, so
 //! [`SpecBuild`] is an `#[async_trait]` seam. The node contract sketches the trait with synchronous
 //! signatures; the build path it pins is the authority (this deviation is reported by the node).
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -33,7 +35,6 @@ use async_trait::async_trait;
 use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_hex;
-use openjiuwen_harness_protocol::HarnessState;
 use openjiuwen_multiagent::{RuntimeConfig, TeamRuntime};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -41,34 +42,34 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use super::allocator::ModelAllocator;
 use super::backend::TeamBackend;
 use super::deps::TeamBuildDeps;
+use super::observability_bind::TeamSignals;
+use super::observer::MemberStreamObserver;
+use super::org_bind::{org_task_sink, OrgBinding};
+use super::routing::TeamModelRouter;
 use super::spawner::TeamMemberSpawner;
+use super::spec_meta::{
+    attach_config, fork_directive, isolation_mode, kv_cache_config, organization_block,
+    spawn_options,
+};
 use super::team_agent::{SpecBuild, TeamAgent, TeamAgentInner};
 use crate::harness::{HarnessMemberRuntime, MemberHarnessContext};
 use crate::interaction::{HumanAgentInbox, InteractGate};
-use crate::member::{
-    MemberActivityRegistry, MemberObserver, MemberRuntime, MemberSpawner, TeamMember,
-};
+use crate::kv_cache::{MemberCacheKey, TeamKvCacheAffinity};
+use crate::member::{MemberActivityRegistry, MemberRuntime, MemberSpawner, TeamMember};
 use crate::messager::create_messager;
 use crate::schema::{
-    DeepAgentSpec, Language, RoundOutcome, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSpec,
-    TeamTopic,
+    DeepAgentSpec, Language, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSpec, TeamTopic,
 };
 use crate::storage::{MemberRecord, TeamInfoRecord, TeamStore};
 use crate::taskboard::{TaskBoard, TaskBoardLimits};
-use crate::workspace::{IsolationMode, WorkspaceRequest};
+use crate::workspace::WorkspaceRequest;
 
 /// Key of the leader's blueprint in [`TeamAgentSpec::agents`].
 const LEADER_KEY: &str = "leader";
-
 /// Error text of a blueprint that has no `agents["leader"]` entry.
-///
-/// Pinned by the spec validator, so the build path reports the same message a caller sees from
-/// [`TeamAgentSpec::validate`].
 const LEADER_MISSING_MESSAGE: &str = "agents dict must contain a 'leader' key";
-
 /// Prefix of the session id a built team mints for itself.
 const SESSION_PREFIX: &str = "session_";
 
@@ -78,7 +79,6 @@ impl SpecBuild for TeamAgentSpec {
     async fn build(&self) -> Result<Arc<TeamAgent>> {
         self.build_with(TeamBuildDeps::default()).await
     }
-
     /// Builds a leader agent over `deps`, in the order pinned by the node contract.
     ///
     /// # Errors
@@ -94,42 +94,74 @@ impl SpecBuild for TeamAgentSpec {
             .get(LEADER_KEY)
             .cloned()
             .ok_or_else(|| Error::validation(LEADER_MISSING_MESSAGE))?;
-
         let team_name = self.team_name.clone();
         let leader_name = self.leader_member_name().to_owned();
         let language = resolve_language(&deps, self.language.as_deref());
         let mut team_spec = TeamSpec::from_spec(self);
         team_spec.language = Some(language.clone());
         let session_id = format!("{SESSION_PREFIX}{}", uuid_hex());
-
         let messager = create_messager(&self.transport)?;
         let store = Arc::clone(&deps.store);
         let activity = Arc::new(MemberActivityRegistry::new());
-        let spawner = TeamMemberSpawner::new(self.clone(), deps.clone(), session_id.clone());
+        let routing = Arc::new(TeamModelRouter::for_spec(self)?);
+        let kv_cache = deps
+            .kv_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(TeamKvCacheAffinity::new(kv_cache_config(self))));
+        let signals = TeamSignals::new(team_name.clone(), deps.observability_hooks.clone());
+        let deps = deps
+            .with_routing(Arc::clone(&routing))
+            .with_kv_cache(Arc::clone(&kv_cache));
+        let options = spawn_options(self);
+        let fork = fork_directive(self);
+        let isolation = isolation_mode(self);
+        let attach = attach_config(self);
+        let spawner = TeamMemberSpawner::with_parts(
+            self.clone(),
+            deps.clone(),
+            session_id.clone(),
+            options.clone(),
+            fork.clone(),
+            Arc::clone(&routing),
+        );
         let limits = TaskBoardLimits::new()
             .with_default_max_review_rounds(
                 u32::try_from(self.default_max_review_rounds).unwrap_or(u32::MAX),
             )
             .with_max_subtask_depth(self.max_subtask_depth);
         let taskboard = Arc::new(TaskBoard::new(store.clone(), team_name.clone(), limits));
-        let backend = Arc::new(TeamBackend::new(
-            team_spec.clone(),
-            store.clone(),
-            taskboard,
-            messager.clone(),
-            Arc::clone(&spawner) as Arc<dyn MemberSpawner>,
-            deps.workspace.clone(),
-            activity.clone(),
-        ));
+        let backend = Arc::new(
+            TeamBackend::new(
+                team_spec.clone(),
+                store.clone(),
+                taskboard,
+                messager.clone(),
+                Arc::clone(&spawner) as Arc<dyn MemberSpawner>,
+                deps.workspace.clone(),
+                activity.clone(),
+            )
+            .with_signals(signals.clone()),
+        );
+        if let Some(block) = organization_block(self)? {
+            let binding = Arc::new(OrgBinding::build(
+                &block,
+                store.clone(),
+                Some(org_task_sink(Arc::clone(&backend))),
+            )?);
+            backend.install_org(binding);
+        }
         backend
             .upsert_team_info(team_info(self, &team_spec, &leader_name, &leader_spec))
             .await?;
-
-        let allocator = ModelAllocator::new(&self.model_pool, self.model_pool_strategy);
-        let leader_record = leader_record(self, &leader_name, &leader_spec, &allocator);
+        let leader_record = leader_record(self, &leader_name, &leader_spec, &routing);
         store.insert_member(leader_record.clone()).await?;
-        let leader_member = Arc::new(TeamMember::new(store.clone(), leader_record));
-
+        let leader_member = Arc::new(TeamMember::new(store.clone(), leader_record.clone()));
+        let (leader_effective, leader_selection) = routing.effective_spec_for(
+            &leader_name,
+            &leader_spec,
+            leader_spec.model_name(),
+            TeamRole::Leader,
+        )?;
         let workspace = deps
             .workspace
             .allocate(&WorkspaceRequest {
@@ -138,13 +170,13 @@ impl SpecBuild for TeamAgentSpec {
                 member_name: leader_name.clone(),
                 spec: self.workspace.clone(),
                 member_spec: leader_spec.workspace.clone(),
-                isolation: IsolationMode::None,
+                isolation,
             })
             .await?;
         let harness = deps
             .harness_factory
             .create(
-                &leader_spec,
+                &leader_effective,
                 &MemberHarnessContext::new(
                     team_name.clone(),
                     leader_name.clone(),
@@ -158,17 +190,22 @@ impl SpecBuild for TeamAgentSpec {
         let runtime: Arc<dyn MemberRuntime> =
             Arc::new(HarnessMemberRuntime::new(harness, session_id.clone()));
         leader_member.attach_runtime(Arc::clone(&runtime));
-
+        let model = leader_selection.model_name().to_owned();
+        let _identity = kv_cache.register_member(
+            MemberCacheKey::new(team_name.clone(), session_id.clone(), leader_name.clone()),
+            &model,
+        );
         let chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         leader_member.observe(Arc::new(MemberStreamObserver::new(
             activity.clone(),
+            Arc::downgrade(&leader_member),
+            TeamRole::Leader,
             leader_name.clone(),
+            signals.clone(),
             Arc::clone(&chunk_sinks),
         )));
         backend.add_member(Arc::clone(&leader_member));
-
-        insert_teammate_rows(&store, &backend, &spawner, &allocator, &leader_name).await?;
-
+        insert_teammate_rows(&store, &backend, &spawner, &routing, &leader_name).await?;
         let (tx, rx) = mpsc::unbounded_channel();
         messager.subscribe(
             &leader_name,
@@ -177,18 +214,16 @@ impl SpecBuild for TeamAgentSpec {
                 let _ = tx.send(event);
             }),
         )?;
-
         let gate = Arc::new(InteractGate::new());
         let inbox = Arc::new(HumanAgentInbox::new());
         inbox.set_enabled(self.enable_hitt);
-
         let card = AgentCard::new(format!("{team_name}_{leader_name}")).with_description(
             self.team_desc
                 .clone()
                 .unwrap_or_else(|| self.leader.desc_or_default().to_owned()),
         );
         let team_runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id(team_name));
-
+        let workspaces = BTreeMap::from([(leader_name.clone(), workspace)]);
         Ok(TeamAgent::assemble(TeamAgentInner {
             blueprint: self.clone(),
             spec: team_spec,
@@ -207,7 +242,15 @@ impl SpecBuild for TeamAgentSpec {
             activity,
             inbox,
             team_runtime,
-            allocator,
+            routing,
+            kv_cache,
+            signals,
+            isolation,
+            workspaces: Mutex::new(workspaces),
+            spawn_options: options,
+            fork,
+            attach,
+            attach_host: Mutex::new(None),
             started: AtomicBool::new(false),
             cancel: Mutex::new(CancellationToken::new()),
             chunk_sinks,
@@ -248,14 +291,14 @@ fn leader_record(
     blueprint: &TeamAgentSpec,
     leader_name: &str,
     leader_spec: &DeepAgentSpec,
-    allocator: &ModelAllocator,
+    routing: &TeamModelRouter,
 ) -> MemberRecord {
     MemberRecord {
         display_name: blueprint.leader.display_name.clone(),
         desc: blueprint.leader.desc_or_default().to_owned(),
         prompt: leader_spec.system_prompt.clone().unwrap_or_default(),
         mode: blueprint.teammate_mode,
-        model_ref: allocate_model(allocator, leader_spec.model_name()),
+        model_ref: routing.model_ref_for(leader_name, leader_spec.model_name(), TeamRole::Leader),
         ..MemberRecord::new(&blueprint.team_name, leader_name, TeamRole::Leader)
     }
 }
@@ -266,19 +309,17 @@ fn leader_record(
 pub(super) fn teammate_record(
     spawner: &TeamMemberSpawner,
     name: &str,
-    allocator: &ModelAllocator,
+    routing: &TeamModelRouter,
 ) -> MemberRecord {
     let member_spec = spawner.member_spec(name);
     let blueprint = spawner.deep_agent_spec(name);
-    let mut record = MemberRecord::new(
-        spawner.team_name(),
-        name,
-        member_spec
-            .as_ref()
-            .map_or(TeamRole::Teammate, |spec| spec.role_type),
-    );
+    let role = member_spec
+        .as_ref()
+        .map_or(TeamRole::Teammate, |spec| spec.role_type);
+    let mut record = MemberRecord::new(spawner.team_name(), name, role);
     record.mode = spawner.spec().teammate_mode;
-    record.model_ref = allocate_model(allocator, requested_model(member_spec.as_ref(), blueprint));
+    record.model_ref =
+        routing.model_ref_for(name, requested_model(member_spec.as_ref(), blueprint), role);
     if let Some(spec) = &member_spec {
         record.display_name.clone_from(&spec.base.display_name);
         record.desc.clone_from(&spec.base.desc);
@@ -296,95 +337,28 @@ fn requested_model<'a>(
         .or_else(|| blueprint.and_then(DeepAgentSpec::model_name))
 }
 
-/// Allocates a model reference, logging (never failing) when the pool cannot answer.
-///
-/// Python parity: the allocation fills `member.model_ref`; the factory's environment resolver owns
-/// the default when the pool is empty and the member names no model.
-fn allocate_model(allocator: &ModelAllocator, model_name: Option<&str>) -> Option<String> {
-    match allocator.allocate(model_name) {
-        Ok(allocation) => Some(allocation.model_name),
-        Err(error) => {
-            debug!(
-                strategy = ?allocator.strategy(),
-                error = %error,
-                "no model reference allocated for the member; the factory resolver owns the default"
-            );
-            None
-        }
-    }
-}
-
 /// Materializes one `unstarted` row per roster teammate.
 async fn insert_teammate_rows(
     store: &Arc<dyn TeamStore>,
     backend: &Arc<TeamBackend>,
     spawner: &Arc<TeamMemberSpawner>,
-    allocator: &ModelAllocator,
+    routing: &TeamModelRouter,
     leader_name: &str,
 ) -> Result<()> {
     for name in spawner.member_names() {
         if name == leader_name || backend.member(&name).is_some() {
             continue;
         }
-        let record = teammate_record(spawner, &name, allocator);
+        let record = teammate_record(spawner, &name, routing);
         store.insert_member(record.clone()).await?;
         backend.add_member(Arc::new(TeamMember::new(store.clone(), record)));
     }
+    debug!(
+        team = spawner.team_name(),
+        members = spawner.member_names().len(),
+        "materialized the teammate roster"
+    );
     Ok(())
-}
-
-/// Forwards one member runtime's phases, rounds and chunks into the team.
-///
-/// Also registered by `TeamAgent::spawn_member` for every teammate it materializes.
-pub(super) struct MemberStreamObserver {
-    /// Leader-side activity projection.
-    activity: Arc<MemberActivityRegistry>,
-    /// Member whose observations this instance carries.
-    member_name: String,
-    /// Chunk fan-out of the handle that registered this observer.
-    chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
-}
-
-impl MemberStreamObserver {
-    /// Builds the observer for `member_name`.
-    pub(super) fn new(
-        activity: Arc<MemberActivityRegistry>,
-        member_name: String,
-        chunk_sinks: Arc<Mutex<Vec<UnboundedSender<Value>>>>,
-    ) -> Self {
-        Self {
-            activity,
-            member_name,
-            chunk_sinks,
-        }
-    }
-}
-
-impl MemberObserver for MemberStreamObserver {
-    /// Marks the member busy while a round runs and idle otherwise.
-    fn on_state(&self, state: HarnessState) {
-        match state {
-            HarnessState::Running | HarnessState::Pausing => {
-                self.activity.mark_busy(&self.member_name);
-            }
-            _ => self.activity.mark_idle(&self.member_name),
-        }
-    }
-
-    /// Logs the round outcome; status transitions are the lifecycle machine's job.
-    fn on_round(&self, outcome: RoundOutcome) {
-        debug!(
-            member = %self.member_name,
-            outcome = ?outcome,
-            "member round outcome"
-        );
-    }
-
-    /// Fans one chunk out to every live subscriber, dropping dead ones.
-    fn on_chunk(&self, chunk: Value) {
-        let mut sinks = self.chunk_sinks.lock();
-        sinks.retain(|sink| sink.send(chunk.clone()).is_ok());
-    }
 }
 
 #[cfg(test)]

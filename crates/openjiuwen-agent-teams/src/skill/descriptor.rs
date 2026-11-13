@@ -28,6 +28,13 @@ use crate::constants::DEFAULT_LANGUAGE;
 pub use crate::constants::TEAM_JOIN_ENV;
 use crate::schema::{DispatchMode, MemberMode, TeamRole};
 
+/// Environment variable a hosting process publishes its attach socket path in.
+///
+/// The runtime wiring that binds the socket owns this variable; this crate only reads it as a
+/// fallback for [`TeamJoinDescriptor::resolve_socket_path`], so a descriptor without a
+/// `socket_path` still finds a team hosted elsewhere in the same process tree.
+pub const TEAM_SOCKET_ENV: &str = "OPENJIUWEN_TEAM_SOCKET";
+
 /// Which surface of a team the joining client drives.
 ///
 /// Wire values are the Python strings `operator` and `member`; [`ClientScope::Operator`] is the
@@ -110,6 +117,13 @@ pub struct TeamJoinDescriptor {
     pub workspace_config: Value,
     /// Absolute path of the member workspace, when the spawner pinned one.
     pub workspace_path: Option<String>,
+    /// Attach socket of a team hosted by another process, when the host published one.
+    ///
+    /// This is the Rust attach bridge's addition to the Python descriptor: it is what turns the
+    /// client into a cross-process one (see
+    /// [`SocketTeamClient`](crate::skill::SocketTeamClient)). When it is absent the
+    /// [`TEAM_SOCKET_ENV`] variable is consulted as a fallback.
+    pub socket_path: Option<String>,
 }
 
 impl Default for TeamJoinDescriptor {
@@ -130,6 +144,7 @@ impl Default for TeamJoinDescriptor {
             transport_config: Value::Object(Map::new()),
             workspace_config: Value::Object(Map::new()),
             workspace_path: None,
+            socket_path: None,
         }
     }
 }
@@ -214,6 +229,48 @@ impl TeamJoinDescriptor {
             self.to_json()?,
         )]))
     }
+
+    /// Returns the attach socket the descriptor itself names, if any.
+    ///
+    /// The value is trimmed and a blank one counts as absent, so a producer that emits
+    /// `"socket_path": ""` is treated exactly like one that omits the field.
+    #[must_use]
+    pub fn configured_socket_path(&self) -> Option<&str> {
+        self.socket_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+
+    /// Resolves the attach socket path for this process.
+    ///
+    /// Precedence is the descriptor's own [`socket_path`](Self::socket_path) field first, then the
+    /// [`TEAM_SOCKET_ENV`] environment variable. `None` means "no socket was published", which is
+    /// the in-process case: the caller then only looks for a team hosted in this process.
+    #[must_use]
+    pub fn resolve_socket_path(&self) -> Option<std::path::PathBuf> {
+        self.resolve_socket_path_with(|key| std::env::var(key).ok())
+    }
+
+    /// Resolves the attach socket path through an injectable environment lookup.
+    ///
+    /// This is the form used by [`Self::resolve_socket_path`]; tests call it with a map instead of
+    /// mutating the process environment. The descriptor value still wins over the lookup, and both
+    /// sides are trimmed with blank values ignored.
+    #[must_use]
+    pub fn resolve_socket_path_with(
+        &self,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Option<std::path::PathBuf> {
+        self.configured_socket_path()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                get(TEAM_SOCKET_ENV)
+                    .map(|path| path.trim().to_string())
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from)
+            })
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +297,7 @@ mod tests {
         assert_eq!(descriptor.transport_config, Value::Object(Map::new()));
         assert_eq!(descriptor.workspace_config, Value::Object(Map::new()));
         assert_eq!(descriptor.workspace_path, None);
+        assert_eq!(descriptor.socket_path, None);
     }
 
     #[test]
@@ -374,5 +432,66 @@ mod tests {
             TeamJoinDescriptor::from_json(&env[TEAM_JOIN_ENV]).unwrap(),
             descriptor
         );
+    }
+
+    #[test]
+    fn socket_path_round_trips_and_is_optional() {
+        let descriptor =
+            TeamJoinDescriptor::from_json(r#"{"socket_path": "/tmp/x.sock"}"#).unwrap();
+        assert_eq!(descriptor.socket_path.as_deref(), Some("/tmp/x.sock"));
+
+        let encoded = descriptor.to_json().unwrap();
+        assert!(
+            encoded.contains(r#""socket_path":"/tmp/x.sock""#),
+            "{encoded}"
+        );
+        assert_eq!(TeamJoinDescriptor::from_json(&encoded).unwrap(), descriptor);
+
+        // A descriptor written before the field existed still loads, with no socket.
+        let legacy = TeamJoinDescriptor::from_json(r#"{"team_name": "alpha"}"#).unwrap();
+        assert_eq!(legacy.socket_path, None);
+        assert_eq!(
+            TeamJoinDescriptor::from_json(&legacy.to_json().unwrap()).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn socket_resolution_prefers_the_descriptor_then_the_environment() {
+        let pinned = TeamJoinDescriptor {
+            socket_path: Some("  /tmp/pinned.sock  ".to_string()),
+            ..TeamJoinDescriptor::default()
+        };
+        assert_eq!(pinned.configured_socket_path(), Some("/tmp/pinned.sock"));
+        assert_eq!(
+            pinned.resolve_socket_path_with(|_| Some("/tmp/env.sock".to_string())),
+            Some(std::path::PathBuf::from("/tmp/pinned.sock")),
+            "the descriptor value wins over the environment"
+        );
+
+        let bare = TeamJoinDescriptor::default();
+        assert_eq!(bare.configured_socket_path(), None);
+        assert_eq!(
+            bare.resolve_socket_path_with(|key| {
+                (key == TEAM_SOCKET_ENV).then(|| " /tmp/env.sock ".to_string())
+            }),
+            Some(std::path::PathBuf::from("/tmp/env.sock")),
+            "the environment is the fallback"
+        );
+        assert_eq!(
+            bare.resolve_socket_path_with(|_| Some("   ".to_string())),
+            None,
+            "a blank environment value is absent"
+        );
+        assert_eq!(
+            TeamJoinDescriptor {
+                socket_path: Some("   ".to_string()),
+                ..TeamJoinDescriptor::default()
+            }
+            .resolve_socket_path_with(|_| Some("/tmp/env.sock".to_string())),
+            Some(std::path::PathBuf::from("/tmp/env.sock")),
+            "a blank descriptor value falls through to the environment"
+        );
+        assert_eq!(bare.resolve_socket_path_with(|_| None), None);
     }
 }

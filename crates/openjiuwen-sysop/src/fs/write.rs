@@ -64,7 +64,10 @@ pub(crate) async fn write_file(
             &format!("File does not exist: {}", format_path(&path)),
         );
     }
-    let guard = op.write_guard(&path).await;
+    let guard = match op.write_guard(&path).await {
+        Ok(guard) => guard,
+        Err(reason) => return fs_failure(WRITE_FILE, &reason),
+    };
     let result = write_locked(&path, &params).await;
     drop(guard);
     result

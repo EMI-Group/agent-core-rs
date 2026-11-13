@@ -13,6 +13,8 @@
 //! | --- | --- |
 //! | [`records`] | [`TeamInfoRecord`], [`MemberRecord`], [`MemberPatch`], [`MessageRecord`] |
 //! | [`memory`] | [`InMemoryTeamStore`], the deterministic in-process backend |
+//! | `stamps` | row stamping and key validation shared by both backends |
+//! | `sqlite` | `SqliteTeamStore`, the persistent backend (feature `sqlite`) |
 //! | `store_tests` | the crate-internal store suite (`#[cfg(test)]`) |
 //!
 //! The store is a *state* seam, not a policy seam: it validates keys and status transitions only.
@@ -55,6 +57,10 @@ use crate::schema::{
 
 pub mod memory;
 pub mod records;
+mod stamps;
+
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 #[cfg(test)]
 mod store_tests;
@@ -63,6 +69,9 @@ pub use memory::InMemoryTeamStore;
 pub use records::{
     MemberPatch, MemberRecord, MessageRecord, TeamInfoRecord, PLAIN_MESSAGE_PROTOCOL,
 };
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteTeamStore;
 
 /// Storage kind of the in-process backend; the `StorageSpec` default and `open_store` fallback.
 pub const MEMORY_STORAGE_KIND: &str = "memory";
@@ -329,24 +338,48 @@ pub trait TeamStore: Send + Sync {
 /// *not* a process singleton, so each call is an independent, empty backend — build one per runtime
 /// and share the `Arc`.
 ///
-/// `spec.params` is accepted silently: the in-memory backend has no parameters, and a future
-/// backend validates its own.
+/// `"sqlite"` yields a `SqliteTeamStore` (feature `sqlite`), configured from `spec.params`:
+///
+/// * `path` (preferred), `url` or `database`, each a string — `data/team.db`,
+///   `sqlite://data/team.db`, `sqlite:///abs/team.db` or `:memory:`. Without one of them the call
+///   fails with [`ErrorKind::Config`](openjiuwen_common::error::ErrorKind::Config).
+/// * The database is connected lazily, on the store's first call, because this function is
+///   synchronous; use `SqliteTeamStore::open` when construction errors must surface immediately.
+///
+/// Without the feature, `"sqlite"` reports that the feature is missing instead of degrading.
 ///
 /// # Errors
 ///
 /// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) for the
-/// deferred SQL backends (`sqlite`, `postgresql`, `mysql`) and for an unknown kind.
+/// deferred `postgresql` / `mysql` backends, for `sqlite` when the `sqlite` feature is off, and for an
+/// unknown kind; returns whatever the SQLite backend reports for an unusable parameter set.
 pub fn open_store(spec: &StorageSpec) -> Result<Arc<dyn TeamStore>> {
     let kind = spec.kind.trim();
     if kind.is_empty() || kind == MEMORY_STORAGE_KIND {
         return Ok(Arc::new(InMemoryTeamStore::new()));
     }
     match kind {
-        "sqlite" | "postgresql" | "mysql" => Err(Error::unsupported(format!(
-            "storage backend '{kind}' is not implemented; use '{MEMORY_STORAGE_KIND}'"
+        "sqlite" => open_sqlite(spec),
+        "postgresql" | "mysql" => Err(Error::unsupported(format!(
+            "storage backend '{kind}' is not implemented; the {kind} driver is not available offline"
         ))),
         other => Err(Error::unsupported(format!(
             "unknown storage backend '{other}'; use '{MEMORY_STORAGE_KIND}'"
         ))),
     }
+}
+
+/// Builds the lazily connected SQLite backend selected by `spec`.
+#[cfg(feature = "sqlite")]
+fn open_sqlite(spec: &StorageSpec) -> Result<Arc<dyn TeamStore>> {
+    Ok(Arc::new(SqliteTeamStore::lazy_from_params(&spec.params)?))
+}
+
+/// Reports the missing `sqlite` feature of a `sqlite` storage spec.
+#[cfg(not(feature = "sqlite"))]
+fn open_sqlite(_spec: &StorageSpec) -> Result<Arc<dyn TeamStore>> {
+    Err(Error::unsupported(
+        "storage backend 'sqlite' requires the 'sqlite' feature; \
+         enable 'openjiuwen-agent-teams/sqlite'",
+    ))
 }

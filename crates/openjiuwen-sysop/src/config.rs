@@ -18,7 +18,10 @@ use openjiuwen_common::error::{Error, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SHELL_ALLOWLIST, DEFAULT_TIMEOUT_SECS};
+use crate::constants::{
+    DEFAULT_LOCK_TIMEOUT_SECS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SHELL_ALLOWLIST,
+    DEFAULT_TIMEOUT_SECS,
+};
 
 /// Regular expressions that reject a dangerous command when
 /// [`LocalWorkConfig::dangerous_patterns`] enables them.
@@ -126,6 +129,10 @@ impl EnvPolicy {
 /// Configuration of the local (`OperationMode::Local`) backend.
 ///
 /// The first four fields are Python's `LocalWorkConfig` verbatim; the rest extend it.
+/// The independent booleans (`restrict_to_sandbox`, `cross_process_locks`,
+/// `line_buffered`, `pty_streaming`) are configuration switches for unrelated concerns,
+/// not a state machine, so grouping them into enums would obscure the JSON shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct LocalWorkConfig {
@@ -157,6 +164,27 @@ pub struct LocalWorkConfig {
     pub default_timeout_secs: u64,
     /// Environment scoping for shell and code subprocesses.
     pub env_policy: EnvPolicy,
+    /// Takes an advisory `flock` on a sidecar lock file for every reading, writing, or
+    /// transferring filesystem call, in addition to the in-process lock map.
+    ///
+    /// This is what makes a workspace safe to share between processes (Python's
+    /// SQLite-backed `ReadWriteLockManager`). Default `true` on Unix; a no-op where the
+    /// platform has no `flock`.
+    pub cross_process_locks: bool,
+    /// Seconds to wait for a cross-process lock before the operation fails with 199003.
+    /// `0` waits forever. Defaults to [`DEFAULT_LOCK_TIMEOUT_SECS`].
+    pub lock_timeout_secs: u64,
+    /// Wraps POSIX shell commands in `stdbuf -oL -eL` when `stdbuf` is available, so a
+    /// child that writes to a pipe flushes line by line (Python
+    /// `_build_shell_command`). Ignored on Windows and when `stdbuf` is missing.
+    pub line_buffered: bool,
+    /// Runs *streaming* shell commands attached to a pseudo-terminal so the child line
+    /// buffers its output.
+    ///
+    /// A PTY merges stdout and stderr into the terminal stream, so every chunk is
+    /// reported as `stdout`; captured (`execute_cmd`) runs keep using pipes. Falls back
+    /// to pipes when no PTY can be allocated or on non-Unix platforms. Default `false`.
+    pub pty_streaming: bool,
 }
 
 impl Default for LocalWorkConfig {
@@ -176,6 +204,10 @@ impl Default for LocalWorkConfig {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             default_timeout_secs: DEFAULT_TIMEOUT_SECS,
             env_policy: EnvPolicy::default(),
+            cross_process_locks: true,
+            lock_timeout_secs: DEFAULT_LOCK_TIMEOUT_SECS,
+            line_buffered: true,
+            pty_streaming: false,
         }
     }
 }

@@ -5,11 +5,18 @@
 //! request on a session id and receives the artifact it could parse, or a
 //! clarifying question.
 //!
-//! Python runs a multi-stage pipeline here (intention detection, clarifier,
-//! designer, DSL generator and reflector, cycle checker, Mermaid rendering);
-//! this port performs **one** model round trip and treats any unparseable answer
-//! as [`BuildOutput::Response`]. Time comes from [`now_millis`], and the only
-//! random value is the fallback DSL agent id.
+//! Two entry points share the session machinery:
+//!
+//! - [`AgentBuilder::build_agent`] / [`AgentBuilder::build_agent_at`] keep the
+//!   single-round-trip behavior: one model answer that is either a fenced JSON
+//!   artifact or a plain-text clarification.
+//! - [`AgentBuilder::build_with_pipeline`] runs the staged pipeline —
+//!   clarification, then the workflow designer/generator/reflector chain or the
+//!   LLM-agent generation plus deterministic repair — and falls back to the
+//!   deterministic stage implementations whenever a model answer is unusable.
+//!
+//! Time comes from [`now_millis`], and the only random values are the DSL agent
+//! ids.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,9 +29,14 @@ use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::BaseMessage;
 use serde::{Deserialize, Serialize};
 
+use super::clarifier::{Clarification, Clarifier};
+use super::designer::WorkflowDesigner;
+use super::dl_generator::DlGenerator;
+use super::dl_reflector::DlReflector;
 use super::dsl::LlmAgentDsl;
 use super::history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
 use super::outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
+use super::spec::LlmAgentSpec;
 use super::workflow_dsl::WorkflowDsl;
 use crate::util::extract_json_fence;
 
@@ -69,6 +81,19 @@ using these keys:
 The graph needs at least one node and every edge endpoint must be a node.
 Do not add other keys and do not wrap the document in prose.
 When the request is ambiguous, answer in plain text with one clarifying question."#;
+
+/// The clarification question used when the clarifier names no detail at all.
+const DEFAULT_CLARIFICATION_QUESTION: &str =
+    "Please describe what the agent should accomplish and what output it should produce.";
+
+/// How many whitespace-separated words of a request become the agent name.
+const MAX_NAME_WORDS: usize = 6;
+
+/// How many characters of a CJK-only request become the agent name.
+const MAX_NAME_CHARS: usize = 24;
+
+/// How many characters of a request become the agent description.
+const MAX_DESCRIPTION_CHARS: usize = 160;
 
 /// Which artifact the builder is asked to produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -268,6 +293,112 @@ impl AgentBuilder {
         })
     }
 
+    /// Builds the requested artifact through the staged pipeline.
+    ///
+    /// Stage 1 always runs [`Clarifier`]; when the request is incomplete the
+    /// session stops with a clarifying response. A ready request then runs the
+    /// workflow stages ([`WorkflowDesigner`] -> [`DlGenerator`] -> [`DlReflector`])
+    /// or the LLM-agent stage, falling back deterministically whenever a model
+    /// answer is unusable. Only a blank query is an error; use this variant when
+    /// a full artifact is wanted, and [`Self::build_agent_at`] for the legacy
+    /// single round trip.
+    ///
+    /// Sessions behave exactly like [`Self::build_agent_at`]: a blank query is
+    /// rejected before any session exists, the session is created on first use,
+    /// its `agent_type` is set, the user turn is appended, and the state becomes
+    /// [`BuildState::Processing`]. The clarifier receives the turns retained
+    /// *before* this request, so the query is not duplicated.
+    ///
+    /// A not-ready clarification becomes [`BuildOutput::Response`] holding the
+    /// question, or else the summary, or else
+    /// `DEFAULT_CLARIFICATION_QUESTION`, with state
+    /// [`BuildState::Clarifying`]. A ready workflow request designs, generates,
+    /// and reflects a document; an unusable reflection falls back to the
+    /// deterministic generation of the same design. A ready LLM-agent request
+    /// makes one model call, repairs the parsed document deterministically, and
+    /// falls back to `deterministic_agent_dsl` when the answer is unparseable
+    /// or the call fails. Both successes complete the session.
+    ///
+    /// The assistant text (the JSON document, or the clarification) is appended
+    /// to the session history and the final state is stored, so
+    /// [`Self::status`] reports two more retained turns per call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank query, which is the only error
+    /// a caller can trigger; a failing model answer never propagates. Stage
+    /// output that cannot be represented (serialization) or a structurally
+    /// impossible design would surface as [`Error::Validation`] as well.
+    pub async fn build_with_pipeline(
+        &mut self,
+        query: &str,
+        session_id: &str,
+        agent_type: AgentType,
+        timestamp_ms: i64,
+    ) -> Result<BuildResult> {
+        if query.trim().is_empty() {
+            return Err(Error::validation("query must not be blank"));
+        }
+
+        // The borrow of the session ends here so no async stage holds it.
+        let prior = {
+            let session = self
+                .sessions
+                .entry(session_id.to_owned())
+                .or_insert_with(|| SessionState {
+                    history: HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE),
+                    state: BuildState::Initial,
+                    agent_type,
+                });
+            session.agent_type = agent_type;
+            session.state = BuildState::Processing;
+            let prior = session.history.clone();
+            session.history.add_user_message(query);
+            prior
+        };
+
+        let model = Arc::clone(&self.model);
+        let clarification = Clarifier::with_model(Arc::clone(&model))
+            .clarify(query, &prior)
+            .await?;
+
+        let (output, state) = if clarification.ready {
+            match agent_type {
+                AgentType::Workflow => {
+                    let workflow = workflow_pipeline(&model, query).await?;
+                    (BuildOutput::Workflow(workflow), BuildState::Completed)
+                }
+                AgentType::LlmAgent => {
+                    let mut history = prior.clone();
+                    history.add_user_message(query);
+                    let dsl = llm_agent_pipeline(&model, query, &history, timestamp_ms).await?;
+                    (BuildOutput::Dsl(dsl), BuildState::Completed)
+                }
+            }
+        } else {
+            let text = clarification_text(clarification);
+            (BuildOutput::Response(text), BuildState::Clarifying)
+        };
+
+        let assistant_text = match &output {
+            BuildOutput::Dsl(dsl) => dsl.to_json_string()?,
+            BuildOutput::Workflow(workflow) => workflow.to_json_string()?,
+            BuildOutput::Response(text) => text.clone(),
+        };
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.history.add_assistant_message(assistant_text);
+            session.state = state;
+        }
+
+        Ok(BuildResult {
+            status: map_state_to_status(state, agent_type),
+            session_id: session_id.to_owned(),
+            agent_type,
+            output,
+        })
+    }
+
     /// Returns the retained dialogue of a session, oldest first.
     ///
     /// `k` limits the answer to the newest `k` turns ([`HistoryManager`] treats
@@ -390,339 +521,200 @@ fn parse_artifact(text: &str, agent_type: AgentType, timestamp_ms: i64) -> Optio
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use openjiuwen_common::error::ErrorKind;
-    use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
-
-    /// A model answer holding an LLM-agent document without timestamps.
-    const AGENT_FENCE: &str = r#"Here is the agent you asked for.
-```json
-{"agent_id": "agent-1", "agent_type": "react", "name": "Demo Agent", "description": "a demo agent",
- "configs": {"system_prompt": "You are helpful.", "opening_remarks": "Hi!"},
- "plugins": [{"id": "plugin-1", "name": "search"}], "dependencies": {"plugins": ["plugin-1"]}}
-```"#;
-
-    /// A model answer holding a valid two-node workflow document.
-    const WORKFLOW_FENCE: &str = r#"```json
-{"name": "demo", "description": "a demo workflow",
- "nodes": [{"id": "start", "type": "start", "title": "Start"}, {"id": "end", "type": "end"}],
- "edges": [{"source": "start", "target": "end"}]}
-```"#;
-
-    /// Coerces a scripted model into the trait object the builder takes.
-    fn dynamic(model: &Arc<ScriptedModel>) -> Arc<dyn Model> {
-        let cloned: Arc<ScriptedModel> = Arc::clone(model);
-        cloned
-    }
-
-    /// The DSL document of a successful build result.
-    fn dsl_of(result: &BuildResult) -> &LlmAgentDsl {
-        match &result.output {
-            BuildOutput::Dsl(dsl) => dsl,
-            other => panic!("expected DSL, got {other:?}"),
-        }
-    }
-
-    /// The workflow document of a successful build result.
-    fn workflow_of(result: &BuildResult) -> &WorkflowDsl {
-        match &result.output {
-            BuildOutput::Workflow(workflow) => workflow,
-            other => panic!("expected workflow, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_type_round_trips_through_display_and_from_str() {
-        for agent_type in [AgentType::LlmAgent, AgentType::Workflow] {
-            assert_eq!(agent_type.as_str(), agent_type.to_string());
-            assert_eq!(
-                agent_type
-                    .as_str()
-                    .parse::<AgentType>()
-                    .expect("round trip"),
-                agent_type
-            );
-        }
-        assert_eq!(AgentType::LlmAgent.to_string(), "llm_agent");
-        assert_eq!(AgentType::Workflow.to_string(), "workflow");
-        for value in ["", "LLMAgent", "llmagent", "workflow_dsl"] {
-            let error = value.parse::<AgentType>().expect_err("unknown name");
-            assert_eq!(error.kind(), ErrorKind::Validation);
-            assert!(error.to_string().contains("unknown agent type"));
-            assert!(error.to_string().contains("llm_agent"));
-            assert!(error.to_string().contains("workflow"));
-        }
-    }
-
-    #[tokio::test]
-    async fn build_agent_returns_the_parsed_dsl() {
-        let model = Arc::new(ScriptedModel::text(AGENT_FENCE));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        let result = builder
-            .build_agent("build me an agent", "s1", AgentType::LlmAgent)
-            .await
-            .expect("build succeeds");
-
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.session_id, "s1");
-        assert_eq!(result.agent_type, AgentType::LlmAgent);
-        let dsl = dsl_of(&result);
-        assert_eq!(dsl.agent_id, "agent-1");
-        assert_eq!(dsl.configs.opening_remarks, "Hi!");
-        assert!(dsl.create_time > 0, "the clock fills the create time");
-        assert_eq!(dsl.create_time, dsl.update_time);
-
-        assert_eq!(model.call_count(), 1);
-        let call = model.last_call().expect("one call");
-        assert_eq!(call.messages.len(), 2);
-        assert_eq!(call.messages[0].text(), LLM_AGENT_SYSTEM_PROMPT);
-        assert_eq!(call.messages[1].text(), "build me an agent");
-        assert_eq!(call.request.model_name, "scripted-model");
-
-        let status = builder.status("s1").expect("session is known");
-        assert_eq!(status.session_id, "s1");
-        assert_eq!(status.agent_type, AgentType::LlmAgent);
-        assert_eq!(status.state, BuildState::Completed);
-        assert_eq!(status.resource_count, 2);
-        let history = builder.history("s1", None);
-        assert_eq!(history.len(), 2);
-        assert_eq!(
-            history[0],
-            DialogueMessage {
-                role: "user".to_string(),
-                content: "build me an agent".to_string(),
-            }
-        );
-        assert_eq!(
-            history[1],
-            DialogueMessage {
-                role: "assistant".to_string(),
-                content: AGENT_FENCE.to_string(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn build_agent_at_stamps_missing_metadata_only() {
-        let model = Arc::new(ScriptedModel::text(AGENT_FENCE));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-        let result = builder
-            .build_agent_at("go", "s1", AgentType::LlmAgent, 1_700_000_000_000)
-            .await
-            .expect("build succeeds");
-        let dsl = dsl_of(&result);
-        assert_eq!(dsl.agent_id, "agent-1");
-        assert_eq!(dsl.create_time, 1_700_000_000_000);
-        assert_eq!(dsl.update_time, 1_700_000_000_000);
-
-        let nameless = Arc::new(ScriptedModel::text(
-            "```json\n{\"name\": \"nameless\"}\n```",
-        ));
-        let mut builder = AgentBuilder::new(dynamic(&nameless));
-        let result = builder
-            .build_agent_at("go", "s2", AgentType::LlmAgent, 42)
-            .await
-            .expect("build succeeds");
-        let dsl = dsl_of(&result);
-        assert_eq!(dsl.agent_type, "react");
-        assert!(!dsl.agent_id.is_empty(), "a fallback id is generated");
-        assert_eq!(dsl.create_time, 42);
-        assert_eq!(dsl.update_time, 42);
-    }
-
-    #[tokio::test]
-    async fn sessions_are_isolated_and_clearable() {
-        let model = Arc::new(ScriptedModel::new([
-            ScriptedTurn::text(AGENT_FENCE),
-            ScriptedTurn::text("which workflow do you want?"),
-        ]));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        builder
-            .build_agent("build me an agent", "s1", AgentType::LlmAgent)
-            .await
-            .expect("first build succeeds");
-        assert_eq!(builder.history("s2", None).len(), 0);
-        assert!(builder.status("s2").is_none());
-        assert_eq!(builder.history("s1", None).len(), 2);
-
-        let result = builder
-            .build_agent("build me a workflow", "s2", AgentType::Workflow)
-            .await
-            .expect("second build succeeds");
-        assert_eq!(result.status, "clarifying");
-        assert_eq!(result.session_id, "s2");
-        assert_eq!(builder.history("s2", None).len(), 2);
-        assert_eq!(builder.history("s1", None).len(), 2);
-        assert_eq!(model.calls()[1].messages[0].text(), WORKFLOW_SYSTEM_PROMPT);
-
-        builder.clear_session("s1");
-        assert!(builder.status("s1").is_none());
-        assert_eq!(builder.history("s1", None).len(), 0);
-        builder.clear_session("never-seen");
-        assert_eq!(builder.history("s2", None).len(), 2);
-    }
-
-    #[tokio::test]
-    async fn history_k_limits_the_returned_turns() {
-        let model = Arc::new(ScriptedModel::new([
-            ScriptedTurn::text(AGENT_FENCE),
-            ScriptedTurn::text("and now?"),
-        ]));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        for query in ["build me an agent", "add a plugin"] {
-            builder
-                .build_agent(query, "s1", AgentType::LlmAgent)
-                .await
-                .expect("build succeeds");
-        }
-        assert_eq!(builder.history("s1", None).len(), 4);
-        assert_eq!(builder.history("s1", Some(1))[0].content, "and now?");
-        assert_eq!(builder.history("s1", Some(0)).len(), 0);
-        assert_eq!(builder.history("s1", Some(99)).len(), 4);
-        assert_eq!(model.call_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn plain_text_answer_is_a_clarifying_response() {
-        let model = Arc::new(ScriptedModel::text("Which system prompt should I use?"));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        let result = builder
-            .build_agent("make an agent", "s1", AgentType::LlmAgent)
-            .await
-            .expect("build succeeds");
-
-        assert_eq!(result.status, "clarifying");
-        assert_eq!(
-            result.output,
-            BuildOutput::Response("Which system prompt should I use?".to_string())
-        );
-        let status = builder.status("s1").expect("session is known");
-        assert_eq!(status.state, BuildState::Clarifying);
-        assert_eq!(status.resource_count, 2);
-    }
-
-    #[tokio::test]
-    async fn blank_query_is_rejected_before_a_session_exists() {
-        let model = Arc::new(ScriptedModel::text(AGENT_FENCE));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        for query in ["", "   ", "\n\t "] {
-            let error = builder
-                .build_agent(query, "s1", AgentType::LlmAgent)
-                .await
-                .expect_err("blank query is invalid");
-            assert_eq!(error.kind(), ErrorKind::Validation);
-            assert!(error.to_string().contains("must not be blank"));
-        }
-        assert!(builder.status("s1").is_none());
-        assert_eq!(builder.history("s1", None).len(), 0);
-        assert_eq!(model.call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn valid_workflow_fence_completes_the_session() {
-        let model = Arc::new(ScriptedModel::text(WORKFLOW_FENCE));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        let result = builder
-            .build_agent("build a workflow", "w1", AgentType::Workflow)
-            .await
-            .expect("build succeeds");
-
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.agent_type, AgentType::Workflow);
-        let workflow = workflow_of(&result);
-        assert_eq!(workflow.nodes.len(), 2);
-        assert_eq!(workflow.edges[0].target, "end");
-        assert_eq!(
-            builder.status("w1").expect("session is known").state,
-            BuildState::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_workflow_falls_back_to_a_response() {
-        for answer in [
-            r#"```json
-{"name": "broken", "nodes": [{"id": "start", "type": "start"}], "edges": [{"source": "start", "target": "ghost"}]}
-```"#,
-            "```json\n{\"name\": \"empty\"}\n```",
-        ] {
-            let model = Arc::new(ScriptedModel::text(answer));
-            let mut builder = AgentBuilder::new(dynamic(&model));
-
-            let result = builder
-                .build_agent("build a workflow", "w1", AgentType::Workflow)
-                .await
-                .expect("build succeeds");
-
-            assert_eq!(result.status, "clarifying");
-            assert!(matches!(result.output, BuildOutput::Response(_)));
-            assert_eq!(
-                builder.status("w1").expect("session is known").state,
-                BuildState::Clarifying
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn model_failure_propagates_and_keeps_the_session_processing() {
-        let model = Arc::new(ScriptedModel::new([ScriptedTurn::fail("boom")]));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        let error = builder
-            .build_agent("build me an agent", "s1", AgentType::LlmAgent)
-            .await
-            .expect_err("the model failed");
-        assert_eq!(error.kind(), ErrorKind::Llm);
-        assert!(error.to_string().contains("boom"));
-
-        let status = builder.status("s1").expect("the session was created");
-        assert_eq!(status.state, BuildState::Processing);
-        assert_eq!(status.resource_count, 1);
-        let history = builder.history("s1", None);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "user");
-        assert_eq!(history[0].content, "build me an agent");
-    }
-
-    #[tokio::test]
-    async fn build_agent_uses_the_clock_for_missing_timestamps() {
-        let model = Arc::new(ScriptedModel::text(
-            "```json\n{\"agent_id\": \"agent-1\", \"name\": \"Demo\"}\n```",
-        ));
-        let mut builder = AgentBuilder::new(dynamic(&model));
-
-        let result = builder
-            .build_agent("go", "s1", AgentType::LlmAgent)
-            .await
-            .expect("build succeeds");
-
-        let dsl = dsl_of(&result);
-        assert!(dsl.create_time > 0);
-        assert_eq!(dsl.create_time, dsl.update_time);
-    }
-
-    #[test]
-    fn model_clock_and_debug_surface() {
-        let model = Arc::new(ScriptedModel::text("hi"));
-        let builder = AgentBuilder::new(dynamic(&model));
-        assert_eq!(builder.model().provider(), "scripted");
-        assert_eq!(builder.model().model_name(), "scripted-model");
-        assert!(now_millis() > 0);
-
-        let rendered = format!("{builder:?}");
-        assert!(rendered.contains("provider: \"scripted\""), "{rendered}");
-        assert!(
-            rendered.contains("model_name: \"scripted-model\""),
-            "{rendered}"
-        );
-        assert!(rendered.contains("sessions: 0"), "{rendered}");
+/// The text a not-ready clarification is answered with.
+///
+/// The clarifier's question wins, then its detected-signal summary, then the
+/// generic [`DEFAULT_CLARIFICATION_QUESTION`].
+fn clarification_text(clarification: Clarification) -> String {
+    if !clarification.question.is_empty() {
+        clarification.question
+    } else if !clarification.summary.is_empty() {
+        clarification.summary
+    } else {
+        DEFAULT_CLARIFICATION_QUESTION.to_string()
     }
 }
+
+/// Designs, generates, and reflects one workflow.
+///
+/// The reflector repairs the generated document with its deterministic rules; a
+/// failing reflection falls back to the generator's deterministic document for
+/// the same design rather than failing the request.
+async fn workflow_pipeline(model: &Arc<dyn Model>, query: &str) -> Result<WorkflowDsl> {
+    let design = WorkflowDesigner::with_model(Arc::clone(model))
+        .design(query)
+        .await?;
+    let generator = DlGenerator::with_model(Arc::clone(model));
+    let candidate = generator.generate_with_model(&design).await?;
+
+    match DlReflector::with_model(Arc::clone(model)).reflect(&candidate) {
+        Ok(reflection) => Ok(reflection.repaired),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "workflow reflection failed; using the deterministic document"
+            );
+            generator.generate(&design)
+        }
+    }
+}
+
+/// Asks the model for one LLM-agent document and repairs it deterministically.
+///
+/// A failed call, a choice-less answer, or an unparseable answer is logged and
+/// replaced by [`deterministic_agent_dsl`], so this entry point never reports a
+/// model problem as an error.
+async fn llm_agent_pipeline(
+    model: &Arc<dyn Model>,
+    query: &str,
+    history: &HistoryManager,
+    timestamp_ms: i64,
+) -> Result<LlmAgentDsl> {
+    let messages = conversation(history, AgentType::LlmAgent);
+    let request = ModelRequestConfig::new(model.model_name());
+    let response = match model.invoke(&messages, &request).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "LLM-agent model call failed; using the deterministic document"
+            );
+            return Ok(deterministic_agent_dsl(query, timestamp_ms));
+        }
+    };
+    let Some(choice) = response.choices.into_iter().next() else {
+        tracing::debug!("LLM-agent model returned no choices; using the deterministic document");
+        return Ok(deterministic_agent_dsl(query, timestamp_ms));
+    };
+
+    let text = choice.message.text().into_owned();
+    let parsed = extract_json_fence(&text)
+        .ok_or_else(|| Error::validation("model answer contained no JSON code fence"))
+        .and_then(LlmAgentDsl::from_value);
+    match parsed {
+        Ok(dsl) => Ok(repair_llm_dsl(dsl, query, timestamp_ms)),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "LLM-agent answer is not a DSL document; using the deterministic document"
+            );
+            Ok(deterministic_agent_dsl(query, timestamp_ms))
+        }
+    }
+}
+
+/// Fills the blanks of a parsed LLM-agent document.
+///
+/// Identity, text fields, and timestamps are each repaired only when blank or
+/// zero, so a complete model answer is returned untouched apart from a missing
+/// `agent_id`.
+fn repair_llm_dsl(mut dsl: LlmAgentDsl, query: &str, timestamp_ms: i64) -> LlmAgentDsl {
+    if dsl.agent_id.trim().is_empty() {
+        dsl.agent_id = uuid::Uuid::new_v4().to_string();
+    }
+    if dsl.agent_type.trim().is_empty() {
+        dsl.agent_type = "react".to_string();
+    }
+    if dsl.name.trim().is_empty() {
+        dsl.name = derived_agent_name(query);
+    }
+    if dsl.description.trim().is_empty() {
+        dsl.description = describe_query(query).unwrap_or_else(|| dsl.name.clone());
+    }
+    if dsl.configs.system_prompt.trim().is_empty() {
+        dsl.configs.system_prompt = default_system_prompt(query);
+    }
+    if dsl.create_time == 0 {
+        dsl.create_time = timestamp_ms;
+    }
+    if dsl.update_time == 0 {
+        dsl.update_time = timestamp_ms;
+    }
+    dsl
+}
+
+/// Builds a complete LLM-agent document from the request alone.
+///
+/// The name, description, and system prompt are derived from `query`; the agent
+/// id is a fresh `UUIDv4` and the clock is the supplied `timestamp_ms`, so two
+/// calls with the same query and timestamp differ only in the id.
+fn deterministic_agent_dsl(query: &str, timestamp_ms: i64) -> LlmAgentDsl {
+    let name = derived_agent_name(query);
+    let description = describe_query(query).unwrap_or_else(|| name.clone());
+    LlmAgentSpec::new(name, description, default_system_prompt(query))
+        .to_dsl(uuid::Uuid::new_v4().to_string(), timestamp_ms)
+}
+
+/// The fallback system prompt for a request that supplied none.
+fn default_system_prompt(query: &str) -> String {
+    format!("You are an assistant built for the following request: {query}")
+}
+
+/// A display name derived from the request: its first few words, or its first
+/// few characters when it is written without spaces in a CJK script.
+fn derived_agent_name(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return "Agent".to_string();
+    }
+
+    let candidate = if is_cjk_only(trimmed) {
+        trimmed.chars().take(MAX_NAME_CHARS).collect::<String>()
+    } else {
+        trimmed
+            .split_whitespace()
+            .take(MAX_NAME_WORDS)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        "Agent".to_string()
+    } else {
+        candidate.to_string()
+    }
+}
+
+/// The trimmed request, truncated to [`MAX_DESCRIPTION_CHARS`].
+///
+/// `None` when nothing usable remains, so callers can fall back to the name.
+fn describe_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let description: String = trimmed.chars().take(MAX_DESCRIPTION_CHARS).collect();
+    let description = description.trim();
+    (!description.is_empty()).then(|| description.to_string())
+}
+
+/// Whether `text` is written in a CJK script without ASCII letters or digits.
+fn is_cjk_only(text: &str) -> bool {
+    let mut has_cjk = false;
+    for character in text.chars() {
+        if is_cjk(character) {
+            has_cjk = true;
+        } else if character.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    has_cjk
+}
+
+/// Whether `character` belongs to a CJK block (Han, Kana, or Hangul).
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod pipeline_tests;

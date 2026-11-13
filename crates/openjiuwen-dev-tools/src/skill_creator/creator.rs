@@ -1,14 +1,17 @@
 //! Skill specs, requests, and the [`SkillCreator`] entry points.
 //!
-//! Two creation paths exist, mirroring the Python package:
+//! Three creation paths exist, mirroring the Python package:
 //!
 //! - [`SkillCreator::create`] renders a [`SkillSpec`] deterministically: the
 //!   instructions are a `{{variable}}` template, so no model is involved.
 //! - [`SkillCreator::create_with_model`] drafts a skill from a natural-language
 //!   [`SkillRequest`] with one model call that must answer with a fenced JSON
 //!   object (`{"name", "description", "instructions"}`).
+//! - [`SkillCreator::create_from_url`] runs the `skill_omni_creation` pipeline:
+//!   a URL is scraped, its assets downloaded, and a skill bundle written (a
+//!   model, when attached, drafts the document with a deterministic fallback).
 //!
-//! Both paths validate the resulting [`SkillDefinition`] before returning it, and
+//! Every path validates the resulting [`SkillDefinition`] before returning it, and
 //! [`SkillCreator::write`] / [`SkillCreator::read`] delegate to
 //! [`SkillBundle`] so callers never touch the filesystem layout themselves.
 
@@ -24,6 +27,8 @@ use serde_json::Value;
 
 use crate::skill_creator::bundle::SkillBundle;
 use crate::skill_creator::definition::{SkillDefinition, SkillResource};
+use crate::skill_creator::omni::fetch::Fetcher;
+use crate::skill_creator::omni::pipeline::{OmniCreation, OmniOutcome};
 use crate::skill_creator::template;
 use crate::util::extract_json_fence;
 
@@ -280,6 +285,33 @@ impl SkillCreator {
         Ok(definition)
     }
 
+    /// Runs the `skill_omni_creation` pipeline: URL in, skill bundle on disk.
+    ///
+    /// Builds an [`OmniCreation`] over `fetcher`, attaches this creator's model
+    /// when one is configured, and runs scrape → download → generate → save
+    /// under `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error of [`OmniCreation::run`]: an invalid configuration, a
+    /// page that yields no text, headings, links, or images, an unsupported
+    /// `zip`/`gzip` page input, a fetch failure for the source page, or a
+    /// filesystem failure while writing the bundle. Per-resource download
+    /// failures are skipped, and a model failure falls back to the deterministic
+    /// generator.
+    pub async fn create_from_url(
+        &self,
+        fetcher: Arc<dyn Fetcher>,
+        url: &str,
+        root: &Path,
+    ) -> Result<OmniOutcome> {
+        let mut creation = OmniCreation::new(fetcher);
+        if let Some(model) = self.model.clone() {
+            creation = creation.with_model(model);
+        }
+        creation.run(url, root).await
+    }
+
     /// Writes `definition` as a bundle under `root`; see [`SkillBundle::write`].
     ///
     /// # Errors
@@ -374,6 +406,7 @@ fn default_language() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skill_creator::omni::fetch::ScriptedFetcher;
     use openjiuwen_test_support::{ScriptedModel, TempWorkspace};
     use serde_json::json;
 
@@ -565,6 +598,50 @@ mod tests {
         let parsed = creator.read(&directory).await.expect("reads");
         assert_eq!(parsed.name, definition.name);
         assert_eq!(parsed.instructions, definition.instructions);
+    }
+
+    #[tokio::test]
+    async fn create_from_url_writes_a_bundle() {
+        let workspace = TempWorkspace::new().expect("temp workspace");
+        let fetcher = ScriptedFetcher::new();
+        fetcher.with_html(
+            "https://example.com/guide",
+            "<!doctype html><html><head><title>Deploy the Service</title></head>\
+             <body><h1>Deploy the Service</h1><p>Run the deploy script.</p></body></html>",
+        );
+
+        let creator = SkillCreator::new();
+        let outcome = creator
+            .create_from_url(
+                Arc::new(fetcher.clone()),
+                "https://example.com/guide",
+                workspace.root(),
+            )
+            .await
+            .expect("creates from url");
+        assert_eq!(outcome.definition.name, "deploy-the-service");
+        let parsed = creator
+            .read(&outcome.bundle_path)
+            .await
+            .expect("reads the bundle");
+        assert_eq!(parsed.name, "deploy-the-service");
+        assert_eq!(parsed.instructions, outcome.definition.instructions);
+
+        let model = ScriptedModel::text(fenced(json!({
+            "name": "model-deploy",
+            "description": "Deploy the service",
+            "instructions": "# Deploy\n\nRun the deploy script."
+        })));
+        let creator = SkillCreator::with_model(Arc::new(model));
+        let outcome = creator
+            .create_from_url(
+                Arc::new(fetcher),
+                "https://example.com/guide",
+                workspace.root(),
+            )
+            .await
+            .expect("creates with a model");
+        assert_eq!(outcome.definition.name, "model-deploy");
     }
 
     #[test]

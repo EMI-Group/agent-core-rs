@@ -6,8 +6,10 @@ Filesystem, shell, and code operations behind one card, mirroring the Python pac
 `openjiuwen.core.sys_operation` (~45 files, ~8.2k lines) from openJiuwen v0.1.20.
 A [`SysOperationCard`] selects a mode; the [`SysOperation`] facade hands out the matching
 filesystem, shell, and code backends, so agent code is agnostic of where an operation runs.
-Local mode executes in-process on tokio; sandbox mode forwards the same calls to a provider
-registered through [`sandbox::provider`].
+Local mode executes in-process on tokio with cross-process file locks, process-group
+lifecycle, optional PTY/`stdbuf` line buffering, and legacy CJK decoding.
+Sandbox mode forwards the same calls to a provider registered through
+[`sandbox::provider`], resolving the target container through a launcher lifecycle.
 
 ## API Surface
 
@@ -17,17 +19,27 @@ registered through [`sandbox::provider`].
 SysOperation::new(card: SysOperationCard) -> Result<Self>          // validates, builds backends
 SysOperation::local(config: LocalWorkConfig) -> Result<Self>
 SysOperation::sandbox(sandbox_type, gateway: SandboxGatewayConfig) -> Result<Self>
+async SysOperation::sandbox_with_lifecycle(sandbox_type, gateway, session_id: Option<&str>,
+                                           lifecycle: &SandboxLifecycle, now_epoch_secs: u64) -> Result<Self>
 fn card(&self) -> &SysOperationCard
 fn mode(&self) -> OperationMode
 fn fs(&self) -> Option<Arc<dyn FsOperation>>       // Python `fs()` returns None for an unregistered kind
 fn shell(&self) -> Option<Arc<dyn ShellOperation>>
 fn code(&self) -> Option<Arc<dyn CodeOperation>>
 fn isolation_key_template(&self) -> Option<&str>   // None in local mode
+fn sandbox_endpoint(&self) -> Option<&SandboxEndpoint>          // Some only for a lifecycle-bound service
+async fn release_sandbox(&self) -> Result<()>                   // applies launcher_config.on_stop
+async fn evict_idle_sandboxes(&self) -> Vec<String>              // deletes containers past idle_ttl_seconds
+async fn evict_idle_sandboxes_at(&self, now_epoch_secs: u64) -> Vec<String>
 fn tool_specs(&self) -> Vec<OperationToolSpec>     // 13 specs: 10 fs, 2 shell, 1 code
 fn tool_specs_for(&self, kind: OperationKind) -> Vec<OperationToolSpec>
 async fn read_file(&self, ReadFileParams) -> OpResult<ReadFileData>    // convenience
 async fn execute_code(&self, CodeExecParams) -> OpResult<CodeOutput>   // convenience
 ```
+
+`sandbox_with_lifecycle` resolves the endpoint through `SandboxLifecycle::ensure_endpoint`
+before the provider backends are built; `sandbox` keeps the static endpoint (`base_url` from
+the launcher config) and records no lifecycle binding.
 
 ### Card and configuration — `card`, `config`, `mode`, `sandbox::config`
 
@@ -37,14 +49,15 @@ async fn execute_code(&self, CodeExecParams) -> OpResult<CodeOutput>   // conven
   `tool_id(kind, method)` = `"<card>.<kind>.<method>"`.
 - `LocalWorkConfig`: Python fields `shell_allowlist`, `sandbox_root`, `restrict_to_sandbox`,
   `dangerous_patterns`; additions `workspace_root`, `max_file_size_bytes`, `max_output_bytes`,
-  `default_timeout_secs`, `env_policy`. Default allowlist = `constants::DEFAULT_SHELL_ALLOWLIST`
+  `default_timeout_secs`, `env_policy`, `cross_process_locks`, `lock_timeout_secs`,
+  `line_buffered`, `pty_streaming`. Default allowlist = `constants::DEFAULT_SHELL_ALLOWLIST`
   (30 first tokens); `null`/`[]` means allow every command.
 - `EnvPolicy { mode: All|None|Allowlist, allow, scrub }`, `BinaryPolicy::{Lossy, Reject}`.
 - `SandboxGatewayConfig { isolation, launcher_config, timeout_seconds, auth_headers,
   auth_query_params, supports_conditional_write }`, `SandboxIsolationConfig`,
-  `SandboxLauncherConfig` (single tolerant struct tagged by `launcher_type`),
-  `ContainerScope`, `OnStop`, `SandboxRunConfig`, `GatewayInvokeRequest`, `GatewayResponse`,
-  `SandboxEndpoint`.
+  `SandboxLauncherConfig` (single tolerant struct tagged by `launcher_type`, carrying
+  `on_stop`, `idle_ttl_seconds`, `extra_params`, `base_url`), `ContainerScope`, `OnStop`,
+  `SandboxRunConfig`, `GatewayInvokeRequest`, `GatewayResponse`, `SandboxEndpoint`.
 - `generate_isolation_key_template(prefix, scope, custom_id, launcher_type, sandbox_type)` →
   `"{scope}_{launcher}_{sandbox}_{prefix}{identity}"`; `resolve_isolation_key(template, session)`
   replaces every `{session_id}` (default `default_session`).
@@ -67,7 +80,9 @@ idiomatic `Result`; `into_optional_result()` keeps the payload optional.
 param, 199003 fs, 199004 shell, 199005 code, 199006 registry, 199007 sandbox gateway,
 199008 launcher, 199009 provider, 199010 isolation key, 199011 file version conflict.
 Message builders (`fs_execution_message`, `shell_execution_message`, `code_execution_message`,
-…) reproduce the Python templates character for character.
+`registry_message`, `sandbox_gateway_message`, `sandbox_launcher_message`,
+`sandbox_provider_message`, `isolation_key_message`, …) reproduce the Python templates
+character for character.
 
 ### Types
 
@@ -84,23 +99,36 @@ so [`tool`] builds tool schemas and tool-call argument parsing from the same def
 
 ### Support modules
 
-`workspace::PathPolicy` (resolution + traversal protection), `encoding` (detection, BOM,
-binary sniffing, decode/encode), `env` (`ExecutionEnvironment`, `resolve_environment`),
-`util` (timestamps, octal permissions, SHA-256, UTF-8-safe truncation), `tool`
-(`OperationToolSpec` generation), `constants`.
+`workspace::PathPolicy` (resolution + traversal protection), `env`
+(`ExecutionEnvironment`, `resolve_environment`), `util` (timestamps, octal permissions,
+SHA-256, UTF-8-safe truncation), `tool` (`OperationToolSpec` generation), `constants`.
+`encoding` — `TextEncoding` (utf-8, utf-16le/be, latin-1, gb18030, big5, shift-jis),
+`detect_text_encoding` (BOM → UTF-8 → UTF-16 heuristic → strict GB18030/Big5 with Python's
+quality scoring → Latin-1), `decode_text`, `encode_text`, `is_binary`, `bom_encoding`,
+`strip_bom`, `detected_encoding_name`; `encoding::cjk` adds `CjkEncoding`, `decode`,
+`decode_strict`, and the streaming `CjkDecoder` over generated tables in `encoding::tables`.
+`fs::lock` — `FileLockManager`, `FileLockGuard`, `LockMode`, `LockError`, `lock_path_for`,
+`default_lock_root` (cross-process advisory `flock`).
+`shell::pty` (crate-internal, Unix) — `openpty`-backed streaming spawn with a documented pipe fallback.
+`sandbox::launcher` — `SandboxLauncher`, `LaunchedSandbox`, `SandboxStatus`,
+`LauncherRegistry`, `PreDeploymentLauncher`, `global()`, error builders.
+`sandbox::lifecycle` — `SandboxRecord`, `Clock`/`SystemClock`/`FixedClock`,
+`SandboxLifecycle` (`ensure_endpoint`, `release`, `evict_idle`, `record(s)`), `global()`.
 
 ## Constraints
 
 - Errors: every backend call returns `OpResult<T>`; constructors return
   `openjiuwen_common::error::Result`. Failures never panic and never raise.
-- Async-first: tokio I/O only, no blocking calls on an async task (heavy CPU work uses
-  `spawn_blocking`); streaming is `BoxStream<'static, OpResult<T>>`.
+- Async-first: tokio I/O only, no blocking calls on an async task (heavy CPU work and the
+  `flock` syscall use `spawn_blocking`); streaming is `BoxStream<'static, OpResult<T>>`.
 - Public types are `serde`-serializable, tolerate unknown fields, and default missing
   collections; cards round-trip through JSON.
-- `tracing` logging only, no `println!`; no `unsafe`; files ≤1000 lines.
+- `tracing` logging only, no `println!`; no `unsafe` (so no `pre_exec`, `setsid`, or
+  `from_raw_fd` — see Notes for Agents); files ≤1000 lines, generated encoding tables excepted.
 - Sandbox configuration types always compile; the HTTP client is behind the `sandbox` feature.
 - Tests are offline and deterministic; they must not require `python3`/`node` to exist
-  (skip with a message when the runtime is missing) and must not touch the network.
+  (skip with a message when the runtime is missing), must not touch the network, and must not
+  depend on wall-clock ordering (lifecycle tests inject a clock).
 
 ## Python parity map
 
@@ -112,17 +140,18 @@ binary sniffing, decode/encode), `env` (`ExecutionEnvironment`, `resolve_environ
 | `fs.py`, `shell.py`, `code.py` (ABCs) | `operation.rs` traits |
 | `result/{fs,shell,code}_operation_result.py`, `result/base_result.py` | `fs::types`, `shell::types`, `code::types`, `result.rs` |
 | `local/fs_operation.py` (1755 lines) | `fs/local.rs`, `fs/read.rs`, `fs/write.rs`, `fs/transfer.rs`, `fs/slice.rs`, `fs/list.rs`, `fs/search.rs`, `fs/ext.rs` |
-| `local/shell_operation.py` (1049 lines) | `shell/local.rs`, `shell/allowlist.rs`, `shell/plan.rs` |
+| `local/shell_operation.py` (1049 lines) | `shell/local.rs`, `shell/allowlist.rs`, `shell/plan.rs`, `shell/process.rs`, `shell/pty.rs` |
 | `local/code_operation.py` | `code/local.rs` |
 | `local/utils.py` (`OperationUtils`, streaming decoding) | `env.rs`, `shell/process.rs`, `code/local.rs` |
-| `local/_text_encoding.py`, `_rw_lock_manager.py` | `encoding.rs`, `fs/local.rs` (in-process per-path locks, shared by `fs/read.rs`/`fs/write.rs`/`fs/transfer.rs`) |
+| `local/_text_encoding.py`, `_rw_lock_manager.py`, `_async_read_write_lock.py` | `encoding/` (detection + CJK tables), `fs/lock.rs` (cross-process `flock`), `fs/local.rs` (in-process lock map) |
 | `cwd.py` (`get_cwd`/`get_workspace`) | `workspace::PathPolicy` |
 | `execution_environment.py` | `env.rs` |
-| `shell_process_registry.py` | `shell/registry.rs` |
+| `shell_process_registry.py` | `shell/registry.rs` (process-group aware) |
 | `tool_adapter.py` | `tool.rs` |
-| `protocal/*.py`, `sandbox/sandbox_registry.py` | `sandbox::provider` |
-| `sandbox/{fs,shell,code}_operation.py`, `sandbox/gateway/*` | `sandbox::operation` |
-| `sandbox/launchers/*`, `providers/*`, `extensions/sys_operation` | deferred (external service) |
+| `protocal/*.py`, `sandbox/sandbox_registry.py` | `sandbox::provider` (providers), `sandbox::launcher` (launchers) |
+| `sandbox/{fs,shell,code}_operation.py`, `sandbox/gateway/*` | `sandbox::operation`, `sandbox::lifecycle`, `sandbox::http` |
+| `sandbox/launchers/{base,pre_deployment_launcher}.py` | `sandbox::launcher` |
+| `sandbox/providers/*`, `extensions/sys_operation` | external (`openjiuwen-extensions`); deferred transports |
 
 ## Behavior contract (ported from Python, verified against `tests/unit_tests/core/sys_operation`)
 
@@ -139,8 +168,9 @@ Read (`local/test_fs_operation.py`):
   reports the silent truncation Python performs. Text mode ignores `chunk_size`.
 - Text streaming emits one chunk per line; an empty file emits **zero** chunks; an invalid
   head/tail emits exactly one empty terminal chunk.
-- `encoding="auto"` detects the encoding; BOM is stripped.
-- Read failures are `OpResult` values (code 199003, `execution` = method name), never panics.
+- `encoding="auto"` detects the encoding; BOM is stripped. Legacy CJK (`gbk`/`gb18030`,
+  `big5`, `shift_jis` and their aliases) decodes with `U+FFFD` replacement; writing them stays
+  unsupported.
 
 Write:
 - `prepend_newline` defaults to **true** (a plain write gets a leading `\n`); `append_newline`
@@ -168,9 +198,9 @@ List/search:
 
 Shell (`local/test_shell_operation.py`):
 - Empty/blank command → 199004 `"command can not be empty"`, `exit_code = -1`.
-- Timeout: `timeout_secs` `None`/`0` → configured default (300). Expiry kills the child,
-  keeps partial output, sets `timed_out`, `exit_code = -1`, and returns 199004 containing
-  `"timeout"`.
+- Timeout: `timeout_secs` `None`/`0` → configured default (300). Expiry kills the **process
+  group**, keeps partial output, sets `timed_out`, `exit_code = -1`, and returns 199004
+  containing `"timeout"`.
 - Allowlist: `None` or `[]` allows every command; otherwise a command is allowed when its
   first token's normalized leaf name equals an entry or ends with `"/<entry>"` (Windows also
   drops a leading `&`, normalizes `\`→`/`, casefolds, and strips one trailing `.exe`).
@@ -187,7 +217,8 @@ Shell (`local/test_shell_operation.py`):
 - Streaming: chunks carry `type` (stdout/stderr) and `chunk_index`; the terminal chunk carries
   `exit_code`; a failure yields one error chunk.
 - Background: returns `pid`; an early non-zero exit yields
-  `"process exited early with code <n>: <stderr>"` (stderr retained up to 8192 bytes).
+  `"process exited early with code <n>: <stderr>"` (stderr retained up to 8192 bytes), and the
+  tracked process group can be stopped through `shell::registry`.
 
 Code (`local/test_code_operation.py`):
 - Empty code → 199005 `"code can not be empty"`; unsupported language → 199005
@@ -200,6 +231,52 @@ Code (`local/test_code_operation.py`):
 - Forced environment after user overrides: Python `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`;
   JavaScript `NODE_DISABLE_COLORS=1`.
 - Timeout → 199005 with partial output and `timed_out = true`.
+
+Cross-process locks (`_rw_lock_manager.py`):
+- Two layers: the in-process `tokio::sync::RwLock` map (fast path, shared for reads,
+  exclusive for writes) then an advisory `flock` on a sidecar file, acquired in one canonical
+  order (resolved path bytes, duplicates merged with `Write` winning) and released in reverse.
+- Sidecar layout: `<default_lock_root>/<sha256-hex-of-the-absolute-resolved-target>.lock`,
+  where `default_lock_root()` is `$TMPDIR/openjiuwen-sysop-locks`; a host may point the
+  manager elsewhere with `FileLockManager::with_root`.
+- `lock_timeout_secs` (default 30, `0` = wait forever) bounds the wait; expiry is `199003`
+  with the method name, the path, and a timeout reason, and **never** executes the operation
+  unlocked. A lock file that cannot be created also refuses the operation.
+- `cross_process_locks = false` restores single-layer in-process locking; reads with
+  `only_read = true` take no lock at all (Python `skip_lock`).
+- The advisory lock is per open file description, so it serialises threads of one process
+  (separate descriptors) and distinct processes alike; it is not reentrant — a second
+  acquisition of a path already held by the same operation is merged, never nested.
+
+Process groups and buffering (`shell_operation.py`, `shell_process_registry.py`):
+- Every child starts in its own process group (`Command::process_group(0)`); timeout,
+  cancellation-token fire, and background stop terminate the **group** with `SIGKILL`
+  (`killpg`), then reap the direct child exactly once. A group is never signalled after its
+  child was reaped (pid reuse), and never with a non-positive pid.
+- `line_buffered` (default true) prefixes `execute_cmd`/`execute_cmd_stream`/
+  `execute_cmd_background` with `stdbuf -oL -eL` when `stdbuf` resolves; `execute_argv` is
+  never wrapped. A missing `stdbuf`, or a non-Unix host, runs the command unwrapped rather
+  than failing it.
+- `pty_streaming` (default false) attaches *streaming* commands to a pseudo-terminal so the
+  child line-buffers: `openpty`, `ECHO`/`OPOST`/`ONLCR` cleared, slave on stdin/stdout/stderr,
+  master read asynchronously, `\r` dropped. All PTY chunks are `StreamKind::Stdout` (a
+  terminal merges stderr), and a PTY that cannot be allocated falls back to pipes silently.
+  Captured `execute_cmd` always uses pipes, keeping stdout and stderr separate.
+
+Sandbox lifecycle (`sandbox/gateway/gateway.py`, `sandbox/launchers/`):
+- `SandboxLifecycle::ensure_endpoint` reuses a running record (refreshing `last_used`),
+  resumes a paused one, relaunches a stopped one, evicts idle records when
+  `idle_ttl_seconds` is set, and stores the new record. The map mutex is never held across a
+  launcher await; a concurrent launch keeps the first record and deletes the duplicate.
+- `release(isolation_key, on_stop)`: `Delete` destroys, `Pause` suspends and keeps the record
+  (so the next lookup resumes that container), `Keep` only refreshes `last_used`; unknown keys
+  are a no-op.
+- `evict_idle(ttl, now)` deletes every record idle for at least `ttl` regardless of `on_stop`
+  and returns the evicted keys; all time is injected (`Clock`, `FixedClock` in tests).
+- Error mapping: launcher failures 199008, provider failures 199009, isolation-key problems
+  199010, gateway failures 199007 — all `ErrorKind::SysOp`. `ErrorKind::Unsupported` is
+  reserved for a genuinely absent transport: an unregistered `launcher_type`, an unregistered
+  `sandbox_type`, or the `sandbox` feature being off.
 
 ## Security Model
 
@@ -215,40 +292,48 @@ Code (`local/test_code_operation.py`):
   which is the supported way to run a command whose arguments come from untrusted input.
   Independent of the allowlist, no code path interpolates user input into a shell string.
 - **Resource limits**: `max_output_bytes` bounds capture; `max_file_size_bytes` bounds reads;
-  `default_timeout_secs` bounds runtime; `max_depth` bounds traversal. Processes are killed on
-  timeout and on cancellation through `shell::registry`.
+  `default_timeout_secs` bounds runtime; `max_depth` bounds traversal. Processes are killed as
+  a group on timeout and on cancellation through `shell::registry`.
 - **Environment**: `EnvPolicy` can switch from Python's inherit-everything default to a
   minimal allowlist and can scrub secrets; explicit values can never re-add a scrubbed name.
 - **No `unsafe`**, no panics on malformed paths/commands, no `unwrap` outside tests.
-- Sequential-consistency for concurrent writes is provided by per-path in-process locks
-  (Python uses on-disk SQLite locks shared across processes; a single process owns a
-  workspace here).
+- **Concurrency**: same-process consistency comes from the per-path `RwLock` map;
+  cross-process consistency from the advisory `flock` sidecar (a cooperative lock: another
+  program that ignores it can still write). Cross-process *reads* are shared, writes
+  exclusive, and a transfer locks both endpoints in canonical order, so two processes cannot
+  interleave a read with a write of the same path.
 
 ## Known Issues / Deferred
 
-- Remote sandbox protocol: the Python package speaks no HTTP in `core/`; its providers live in
-  `extensions/sys_operation/sandbox/providers` and talk to an external AIO container service
-  whose wire contract is unspecified here. `sandbox::http` (feature `sandbox`) carries the
-  request/response envelope, registers forwarding backends through `install`, and exposes
-  `HttpSandboxGateway::probe` as the **only** network call (a `GET` on the endpoint
-  `base_url`); `invoke` — and therefore every sandbox operation — returns `Error::Unsupported`
-  and is surfaced as `OpResult` 199007 with `sandbox_gateway_message("<method>", <reason>)`.
-  Still deferred: launcher lifecycle (create/pause/resume/delete), endpoint discovery and
-  `sandbox_id` assignment, isolation-key → container mapping, provider-specific payload
-  schemas, the streaming wire format (streams call `"<method>_stream"` and expect a JSON chunk
-  array, so in practice they yield one error chunk), and auth-header/auth-query injection.
-- Legacy CJK encodings (GBK, Big5, Shift-JIS) are not decodable; `encoding` reports
-  `Error::Unsupported` instead of producing mojibake. UTF-8/UTF-16/Latin-1 are supported.
+- Remote sandbox transports: `sandbox::launcher` (`SandboxLauncher`, `LauncherRegistry`,
+  built-in `PreDeploymentLauncher`) and `sandbox::lifecycle` (`ensure_endpoint` reuse/resume/
+  launch, `release` by `OnStop`, `evict_idle` via an injected clock) manage containers per
+  isolation key, exposed through `SysOperation::sandbox_with_lifecycle`,
+  `release_sandbox`, `evict_idle_sandboxes*`. The `aio`/`jiuwenbox`/`yuanrong` transports and
+  their launchers still live in `openjiuwen-extensions` and are not ported here: no
+  provider/launcher registered for a type, or the `sandbox` feature off, yields
+  `Error::Unsupported`; a registered launcher that fails yields 199008. Also deferred: Python's
+  `container_config_hash`/`metadata`/provider cache, endpoint discovery beyond
+  `LaunchedSandbox`, auth-header/auth-query injection, the streaming wire format
+  (`invoke` stays `Unsupported`, surfaced as 199007), and any background idle sweeper
+  (idle-stop runs on `ensure_endpoint` when `idle_ttl_seconds` is set, or on an explicit
+  `evict_idle_sandboxes*` call). Deviations: `release(Pause)` keeps the record `paused` so the
+  next lookup resumes the same container (Python forgets it), and `evict_idle` compares `>=`
+  (Python `>`).
+- Legacy CJK decoding is table driven (`encoding::cjk` over generated `encoding::tables`) and
+  covers GB18030/GBK, Big5 and Shift-JIS with `U+FFFD` replacement. Gaps by design: no
+  Big5-HKSCS or CP932 vendor extensions (the alias names decode the standard code space), no
+  Shift-JIS auto-detection (Python does not attempt it either), legacy names rejected for
+  writing, and `auto` detection strict-decodes the whole in-memory buffer where Python samples
+  files above 8 MiB.
 - Writes are always UTF-8 (or UTF-16 when explicitly requested); Python can write arbitrary
   codecs.
-- Cross-process file locks (Python's SQLite lock manager) are not ported; only in-process locks
-  are provided.
-- POSIX streaming does not apply Python's `stdbuf`/`script` buffering wrappers: output arrives
-  in pipe-sized blocks and never through a PTY.
+- Hard links to one inode map to different sidecar lock files (Python's SQLite lock manager
+  shares that limitation), and stale lock files are never swept (they are empty and reused).
+- POSIX streaming does not reproduce the macOS `script -q /dev/null` wrapper; macOS runs
+  unwrapped, and the PTY path is the supported way to get terminal semantics there.
 - Background early-exit detection uses a 100 ms grace window (Python defaults to 3 s and
   exposes `grace=`), so a command failing later than that is reported as started, with a pid.
-- Cancellation kills the direct child only (`start_kill`): Python's `killpg` process-group kill
-  and `kill_session_tree`/`consume_cancelled` are not ported (`cancel_all` covers teardown).
 - `execute_argv` applies the allowlist to `argv[0]` but not `dangerous_patterns`: arguments are
   data, never shell text.
 - Windows `Auto` uses `cmd /C`; Python's POSIX/PowerShell command classification heuristics and
@@ -263,30 +348,35 @@ Code (`local/test_code_operation.py`):
 - Shell and code behavior ports live in `#[cfg(test)]` modules beside the backends:
   allowlist acceptance/rejection, deny patterns, timeout with partial output, bounded capture,
   env overlay/scrubbing, `execute_argv` without a shell, background early exit, stream chunk
-  shape, session/instance cancellation, code language metadata and temp-file strategy.
+  shape, session/instance cancellation, the `stdbuf` wrapper decision, the process-group
+  kill-once guard, PTY fallback and `\r` stripping, code language metadata and temp-file
+  strategy.
 - `tests/` holds cross-module behavior ports, each citing the Python test it ports:
-  `card_json.rs` (card/config JSON parity), `local_fs.rs` (read/write/list/search/upload/
-  download against `tempfile` dirs), `fs_edges.rs` (conditional write, binary policy, max size,
-  line ranges), `traversal.rs` (escape attempts incl. symlinks), `shell_local.rs` (allow/deny,
-  timeout, truncation, env overlay, argv form), `code_local.rs` (Python/JavaScript, skipped when
-  the runtime is absent), `tool_specs.rs` (13 specs, ids, schemas), `sandbox_stub.rs`
-  (feature `sandbox`: unsupported remote calls, isolation keys, provider dispatch).
+  `card_json.rs` (14), `local_fs.rs` (18), `fs_edges.rs` (20), `traversal.rs` (12),
+  `shell_local.rs` (17), `code_local.rs` (10), `tool_specs.rs` (9), `encoding_cjk.rs` (16
+  offline GB18030/Big5/Shift-JIS fixtures), `file_locks.rs` (10: contention, timeout, and a
+  genuine second-process proof by re-executing the test binary), `process_group.rs` (5:
+  timeout/cancel/background-stop leave no grandchild), `pty_streaming.rs` (5: terminal
+  detection, line-buffered chunks, exit codes), `sandbox_lifecycle.rs` (23: registry,
+  reuse/resume/release/idle-stop, isolation keys, `aio`/`jiuwenbox`/`yuanrong` interop with
+  local registries), and `sandbox_stub.rs` (feature `sandbox`: unsupported remote calls,
+  isolation keys, provider dispatch).
 - `src/sandbox/http.rs` and `src/sandbox/operation.rs` keep their tests inline: fake-provider
   forwarding (exact `OpResult` and stream passthrough), dispatch + per-session isolation-key
   resolution, missing provider (`ErrorKind::Unsupported`) and missing gateway/launcher config
   (199002) paths, `install` idempotency, and one `#[ignore]`d live `probe` test.
-- Every test is offline and deterministic: `tempfile` workspaces, no network, and runtime
-  lookups (`python3`, `node`, `bash`) skip with an explanatory message when missing.
+- Every test is offline and deterministic: `tempfile` workspaces, no network, injected clocks
+  for lifecycle tests, bounded waits, and runtime lookups (`python3`, `node`, `bash`, `stdbuf`,
+  `flock(1)`) skip with an explanatory message when missing.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop`,
   `cargo test -p openjiuwen-sysop --features sandbox`,
-  `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings`,
-  `cargo clippy -p openjiuwen-sysop --all-targets --features sandbox -- -D warnings`.
-- Current counts: 245 unit tests (1 `#[ignore]`d live sandbox probe), 113 integration tests
-  (99 without the feature), 29 doc tests.
+  `cargo clippy -p openjiuwen-sysop --all-targets -- -D warnings` (both feature sets).
+- Current counts: 295 unit tests (303 with `sandbox`, 1 `#[ignore]`d live probe), 159
+  integration tests (173 with `sandbox`), 34 doc tests.
 
 ## Routing Table
 
-- `./src/sys_operation.rs` → `SysOperation` facade, mode dispatch, tool spec aggregation
+- `./src/sys_operation.rs` → `SysOperation` facade, mode dispatch, lifecycle binding, tool spec aggregation
 - `./src/card.rs` → `SysOperationCard`, validation, tool-id generation
 - `./src/config.rs` → `LocalWorkConfig`, `EnvPolicy`, `BinaryPolicy`, `DEFAULT_DANGEROUS_PATTERNS`
 - `./src/mode.rs` → `OperationMode`, `OperationKind`
@@ -294,21 +384,23 @@ Code (`local/test_code_operation.py`):
 - `./src/result.rs` → `OpResult`, failure builders, `Result` conversion
 - `./src/operation.rs` → `FsOperation`, `FsExtOperation`, `ShellOperation`, `CodeOperation`, `OpStream`, `OperationSet`
 - `./src/workspace.rs` → `PathPolicy`, path cleaning, symlink resolution, containment checks
-- `./src/encoding.rs` → encoding detection, BOM handling, binary sniffing, decode/encode
+- `./src/encoding/` → `TextEncoding`, detection/BOM/binary sniff/`decode_text`, plus `cjk` decoders and generated `tables`; module detail in `src/encoding/CONTEXT.md`
 - `./src/env.rs` → `ExecutionEnvironment`, `resolve_environment`, env-name validation
 - `./src/util.rs` → timestamp formatting, octal permissions, SHA-256, UTF-8-safe truncation
 - `./src/tool.rs` → `OperationToolSpec` generation from parameter schemas
 - `./src/constants.rs` → defaults shared by the backends
-- `./src/fs/` → filesystem types and the local backend (`local`, `read`, `write`, `transfer`, `slice`, `list`, `search`, `ext`); module layout in `src/fs/CONTEXT.md`
+- `./src/fs/` → filesystem types and the local backend (`local`, `read`, `write`, `transfer`, `slice`, `list`, `search`, `ext`) plus `lock` (cross-process `flock`); module layout in `src/fs/CONTEXT.md`
 - `./src/shell/types.rs` → `ShellType`, `ShellExecParams`, `ShellArgvParams`, `ShellOutput`, `ShellChunk`, `ShellBackgroundOutput`
 - `./src/shell/allowlist.rs` → `CommandFilter`: first-token allowlist (quote-aware splitter) and dangerous-pattern deny list
 - `./src/shell/plan.rs` → `resolve_plan` per `ShellType` and OS, absolute-path literal extraction
-- `./src/shell/registry.rs` → `ShellProcessRegistry`: per-session cancellation tokens, RAII registration, `global()`
+- `./src/shell/registry.rs` → `ShellProcessRegistry`: per-session cancellation tokens, tracked process groups, RAII registration, `global()`
+- `./src/shell/process.rs` → shared child-process engine: hardened spawn, `stdbuf` wrapper, bounded capture + truncation, timeout/cancellation, process-group kill, streaming, background stderr
+- `./src/shell/pty.rs` → `openpty` streaming spawn (termios setup, master reader, pipe fallback)
 - `./src/shell/local.rs` → `LocalShellOperation`: policy gates, spawn plan, trait impls, facade tests
-- `./src/shell/process.rs` → shared child-process engine: hardened spawn, bounded capture + truncation, timeout/cancellation, streaming, background stderr
 - `./src/code/types.rs` → `Language`, `CodeExecParams`, `CodeOutput`, `CodeChunk`
 - `./src/code/local.rs` → `LocalCodeOperation`: runtime lookup, inline/temp-file strategy, forced env
-- `./src/sandbox/` → provider seam (`SandboxProviderRegistry` + factory aliases), gateway config, dispatch + forwarding backends, HTTP gateway client (feature `sandbox`); module detail in `src/sandbox/CONTEXT.md`
+- `./src/sandbox/` → provider seam, launcher seam + lifecycle, gateway config, dispatch + forwarding backends, HTTP gateway client (feature `sandbox`); module detail in `src/sandbox/CONTEXT.md`
+- `./scripts/gen_cjk_tables.py` → authoring-time, self-verifying CJK table generator (`--check` in review); never needed by a build or test
 - `./tests/` → behavior ports (see Test Strategy)
 
 ## Notes for Agents
@@ -322,12 +414,30 @@ Code (`local/test_code_operation.py`):
   caller-supplied path is a security bug.
 - `FileContent` decides text vs bytes on write; there is no separate `mode` field, so a
   mismatch cannot occur.
+- Take locks only through `LocalFsOperation::{read_guard, write_guard, acquire_ordered}`: they
+  own the single ordering rule (sorted resolved paths, in-process guard then `flock`) and the
+  reverse-release rule. Never take a bare `flock` in a sibling module.
+- `nix::fcntl::flock` is deprecated in nix 0.30 in favour of `Flock`, whose `Drop` panics on
+  unlock failure; the crate deliberately keeps the function behind a scoped
+  `#[allow(deprecated)]` and owns the `std::fs::File` instead. `killpg` and `openpty` use the
+  supported safe APIs, and every fd conversion goes through `Stdio::from(OwnedFd)` /
+  `File::from(OwnedFd)` because `#![forbid(unsafe_code)]` rules out `pre_exec`/`setsid` and
+  `from_raw_fd`.
+- Process-group rule: kill the group only *before* reaping the direct child (an unreaped
+  leader keeps the pgid addressable), never after, never with pid 0, and at most once.
+- The `stdbuf` wrapper is applied at spawn time, never in `resolve_plan`, so allowlist and
+  sandbox path checks always see the command the caller wrote, and the plan unit tests keep
+  asserting the raw interpreter.
+- A PTY merges stderr into stdout: never route captured runs or `execute_argv` through
+  `shell::pty`, and keep `pty_streaming = false` the default.
 - `sandbox::operation` resolves everything in a private core that takes a
   `&SandboxProviderRegistry`: tests exercise dispatch against a local registry and never
   register mocks in `sandbox::provider::global()` (only `SysOperation` uses the global one).
-- `sandbox::operation::register_builtin_providers` is idempotent: it is inert without the
-  `sandbox` feature or without a launcher `base_url`, and duplicate registrations are treated
-  as success, so repeated `SysOperation::new` calls never fail.
+- Same rule for launchers: `LauncherRegistry::new()` in tests, `sandbox::launcher::global()`
+  only in production paths; `register_builtin_launchers`/`register_builtin_providers` are
+  idempotent so repeated `SysOperation::new` calls never fail.
+- `SandboxLifecycle` never holds its map mutex across a launcher await, and all time is passed
+  in (`now_epoch_secs` or a `Clock`) so idle-stop is deterministic in tests.
 - Sandbox forwarding backends (`SandboxFsOperation`, `SandboxShellOperation`,
   `SandboxCodeOperation`) never serialize, inspect, or re-map provider results: the provider
   owns the wire format. `supports_conditional_write` returns the provider's answer; the card's
@@ -335,12 +445,16 @@ Code (`local/test_code_operation.py`):
 - Streams must be `'static`; use `self: Arc<Self>` receivers and `async_stream::try_stream!`,
   yielding a single error chunk on failure instead of returning `Err`.
 - The local shell and code backends share `crate::shell::process` (`spawn_child`,
-  `apply_environment`, `run_captured`, `stream_child`); never re-implement bounded capture,
-  timeout, or cancellation inside `code/local.rs`. (`shell/local.rs` keeps a `pub(crate)` alias
-  so `crate::shell::local::process` still resolves.)
+  `apply_environment`, `run_captured`, `stream_child`, `line_buffered_argv`, `ProcessGroup`);
+  never re-implement bounded capture, timeout, cancellation, or group kill inside
+  `code/local.rs`.
 - fs `read_file`/`write_file`/upload/download live in `src/fs/{read,write,transfer}.rs`; keep the
   trait impls in `fs/local.rs` one-line delegations and share the single per-path lock map.
 - Shell gate order is blank command → deny list → allowlist → cwd/sandbox → shell plan, so a
   rejected command never spawns a child; `CommandFilter::check` reports the deny list first.
+- Encoding tables are generated: edit `scripts/gen_cjk_tables.py` and regenerate, never the
+  `encoding/tables/*.rs` data. `TextEncoding::as_str` reports the covering canonical name, so
+  `gbk` reports `gb18030`; `decode_text` accepts the alias but the reported name does not
+  round-trip.
 - `<lang> is not supported` is unrepresentable here (`Language` is a closed enum), and
   `CodeExecParams::encoding` is accepted but ignored: decoding is UTF-8 lossy.

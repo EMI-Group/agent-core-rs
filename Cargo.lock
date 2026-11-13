@@ -1749,11 +1749,13 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "uuid",
+ "which",
 ]
 
 [[package]]
@@ -2215,9 +2217,11 @@ dependencies = [
  "openjiuwen-multiagent",
  "openjiuwen-security",
  "openjiuwen-session",
+ "openjiuwen-sysop",
  "openjiuwen-test-support",
  "openjiuwen-workflow",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2226,6 +2230,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -2301,6 +2306,7 @@ dependencies = [
  "chrono",
  "futures",
  "glob",
+ "nix",
  "openjiuwen-common",
  "regex",
  "reqwest",

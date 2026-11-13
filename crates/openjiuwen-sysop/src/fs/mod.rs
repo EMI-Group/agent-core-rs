@@ -21,6 +21,7 @@ use crate::operation::FsOperation;
 pub mod ext;
 pub mod list;
 pub mod local;
+pub mod lock;
 mod read;
 pub mod search;
 pub mod slice;

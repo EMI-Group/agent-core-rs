@@ -8,6 +8,8 @@
 //! 1. **`--help` is success on stdout.** Help is answered by the scope parser *before* the join
 //!    descriptor is loaded, so `--help` (before or after the subcommand) renders clap's help on
 //!    **stdout** and exits **0** even with no descriptor — Python argparse parity.
+//!    `serve --help` is the same contract one stage earlier: the scope-independent serve stage
+//!    answers it before the descriptor scan, so it needs no descriptor either.
 //!    Every other CLI-side problem (bad flag, missing argument, malformed or absent descriptor)
 //!    still goes through `fail_cli`: diagnostic on **stderr**, exit **2**.
 //! 2. **The descriptor stage runs first for real commands.** No arguments at all reports the
@@ -82,6 +84,34 @@ fn help_exits_zero_on_stdout() {
         describe(&output)
     );
     assert!(stdout.contains("inbox"), "{}", describe(&output));
+}
+
+/// Pins that the scope-independent `serve` stage answers `--help` on stdout and exits `0`.
+///
+/// `serve` is dispatched *before* the join descriptor is scanned (it takes its identity from the
+/// environment, not from a descriptor), so its help needs no `OPENJIUWEN_TEAM_JOIN` either. The
+/// rendered usage is the serve tree's own, which is why it names the program *and* the command.
+#[test]
+fn serve_help_exits_zero_on_stdout() {
+    let output = run_team_member(&["serve", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(code_of(&output), 0, "{}", describe(&output));
+    assert!(
+        output.stderr.is_empty(),
+        "serve help belongs on stdout: {}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("Usage: team-member serve"),
+        "{}",
+        describe(&output)
+    );
+    // `serve` accepts the connection flags for launcher parity, so its usage lists them.
+    assert!(
+        stdout.contains("--descriptor-file"),
+        "{}",
+        describe(&output)
+    );
 }
 
 /// Pins that a bare invocation reports the missing descriptor, not a usage line.

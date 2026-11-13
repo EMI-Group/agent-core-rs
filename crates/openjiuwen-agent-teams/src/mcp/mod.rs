@@ -24,8 +24,8 @@
 //! | `tests` | offline `FakeClient` suite (runs with and without the `mcp` feature) |
 //!
 //! The join descriptor and its `OPENJIUWEN_TEAM_JOIN` environment variable are owned by
-//! [`crate::skill`]; the process wiring (`openjiuwen-team-mcp` console entry point) belongs to
-//! `openjiuwen-cli`.
+//! [`crate::skill`]; the process wiring is the `openjiuwen-team-mcp` binary in this crate's
+//! `src/bin/`.
 pub use crate::skill::{ClientScope, TeamClient, TeamToolDef};
 pub use dispatch::{dispatch_member, dispatch_operator};
 use serde_json::Value;

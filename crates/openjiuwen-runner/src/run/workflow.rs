@@ -19,7 +19,7 @@ use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::{Session, WorkflowSession, WorkflowSessionOptions};
 use openjiuwen_workflow::{WorkflowChunk, WorkflowOutput, WorkflowRunOptions};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
@@ -46,6 +46,7 @@ use crate::callback::{CallbackContext, CallbackEvent};
 /// handler, and whatever the workflow engine reports (compile, component,
 /// cancellation, or deadline failures).
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)] // one linear invocation; the observation seam is four lines of setup
 pub async fn invoke_workflow(
     services: RunServices,
     workflow: WorkflowRef,
@@ -67,6 +68,33 @@ pub async fn invoke_workflow(
         .callbacks
         .trigger(CallbackEvent::WorkflowInvokeInput, &context)
         .await?;
+
+    // Observation seams: registered only now that every setup step that can fail
+    // (resolution, session preparation, an aborting input handler) has succeeded.
+    // A session the runner created is attached to the hub watcher; a caller-owned
+    // one is not. The binding is declared before the status guard so the guard
+    // finalises the run before the hub entry disappears.
+    let detail = json!({"component": card.id});
+    let binding = crate::hitl::bind_run(
+        services.hitl.as_ref(),
+        crate::hitl::ActiveRunSpec::for_execution(
+            &run_id,
+            &card.id,
+            None,
+            Some(session.id()),
+            &options.cancellation,
+            detail.clone(),
+        ),
+        owned.as_ref().map(|_| Arc::clone(&session)),
+    );
+    let mut status = crate::monitor::RunStatusGuard::begin(
+        services.monitor.clone(),
+        &run_id,
+        crate::monitor::RunStart::new(crate::monitor::RunKind::Workflow, card.id.clone())
+            .with_session(session.id())
+            .with_detail(detail.clone()),
+    );
+    status.running(detail.clone());
 
     trace_start("workflow", &run_id, &card.id, session.id());
     let span = RunSpan::start(session.tracer(), "run_workflow", inputs.clone());
@@ -97,6 +125,13 @@ pub async fn invoke_workflow(
                 session.id(),
                 started.elapsed(),
             );
+            // An aborting output handler wins over the successful output, exactly
+            // as before; the status mirrors whichever outcome the run reports.
+            match &callback {
+                Ok(_) => status.ok(detail),
+                Err(error) => status.fail(error, detail),
+            }
+            binding.unregister();
             callback?;
             Ok(output)
         }
@@ -128,6 +163,8 @@ pub async fn invoke_workflow(
                 started.elapsed(),
                 &error,
             );
+            status.fail(&error, detail);
+            binding.unregister();
             Err(error)
         }
     }
@@ -177,6 +214,31 @@ pub fn stream_workflow(
             return;
         }
 
+        // An aborting `WorkflowStreamInput` handler is a setup failure, so the run
+        // is admitted only after it resolved. Only a runner-created session is
+        // attached to the hub watcher.
+        let detail = json!({"component": card.id});
+        let binding = crate::hitl::bind_run(
+            services.hitl.as_ref(),
+            crate::hitl::ActiveRunSpec::for_execution(
+                &run_id,
+                &card.id,
+                None,
+                Some(session.id()),
+                &options.cancellation,
+                detail.clone(),
+            ),
+            owned.as_ref().map(|_| Arc::clone(&session)),
+        );
+        let mut status = crate::monitor::RunStatusGuard::begin(
+            services.monitor.clone(),
+            &run_id,
+            crate::monitor::RunStart::new(crate::monitor::RunKind::Workflow, card.id.clone())
+                .with_session(session.id())
+                .with_detail(detail.clone()),
+        );
+        status.running(detail.clone());
+
         trace_start("workflow", &run_id, &card.id, session.id());
         let span = RunSpan::start(session.tracer(), "run_workflow_stream", inputs.clone());
         let teardown = workflow_teardown(owned);
@@ -220,6 +282,11 @@ pub fn stream_workflow(
             failure.as_ref(),
         );
         teardown.finish().await;
+        match &failure {
+            Some(error) => status.fail(error, detail),
+            None => status.ok(detail),
+        }
+        binding.unregister();
         if let Some(error) = failure {
             yield Err(error);
         }
@@ -292,6 +359,7 @@ mod tests {
 
     use crate::callback::{CallbackFramework, CallbackVerdict};
     use crate::config::RunnerConfig;
+    use crate::monitor::{RunEvent, RunPhase};
     use crate::resources::ResourceMgr;
 
     /// A services bundle with a recording handler for every workflow event.
@@ -447,5 +515,157 @@ mod tests {
             frames[0].as_ref().unwrap_err().to_string(),
             "not_found: workflow 'missing' is not registered"
         );
+    }
+
+    // ------------------------------------------------- observation seams --
+
+    /// Drains the transitions a monitor published, in order.
+    fn phases(events: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunPhase> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.phase)
+            .collect()
+    }
+
+    /// Drains the transitions a monitor published, polling instead of sleeping.
+    ///
+    /// A guarded drop publishes synchronously, so the first pass usually drains
+    /// everything; the bounded retry only keeps the drain from racing a mirror that
+    /// has not run yet.
+    async fn drain(events: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunEvent> {
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen.extend(std::iter::from_fn(|| events.try_recv().ok()));
+            if seen.last().is_some_and(|event| event.phase.is_terminal()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn invoke_mirrors_the_run_and_unregisters_it() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        invoke_workflow(
+            services,
+            WorkflowRef::of(Arc::new(linear_workflow())),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(hub.is_empty(), "the run was unregistered on completion");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+        assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
+    }
+
+    #[tokio::test]
+    async fn a_failing_run_is_mirrored_as_failed_and_unregistered() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        let error = invoke_workflow(
+            services,
+            WorkflowRef::of(Arc::new(Workflow::new(WorkflowCard::new("broken")))),
+            json!({}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no start component"));
+        assert!(hub.is_empty());
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Failed]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_mirrors_the_run_and_unregisters_it() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        let frames: Vec<Result<WorkflowChunk>> = stream_workflow(
+            services,
+            WorkflowRef::of(Arc::new(linear_workflow())),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+
+        assert!(!frames.is_empty());
+        assert!(hub.is_empty(), "the stream unregistered its run");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_stream_dropped_mid_flight_finishes_as_cancelled() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        let mut stream = stream_workflow(
+            services,
+            WorkflowRef::of(Arc::new(linear_workflow())),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        );
+        // One poll yields the first frame and leaves the generator suspended, so
+        // the run is still in flight when the stream goes away. The linear
+        // workflow may emit a single frame in total; dropping after it exercises
+        // the same unfinished-guard path.
+        assert!(
+            stream.next().await.is_some(),
+            "the first frame is readable before the drop"
+        );
+        drop(stream);
+
+        // Dropping the generator drops the status guard before the hub binding
+        // (reverse declaration order), so the run is already terminal when
+        // `unregister` mirrors its phase; the opposite order would report the run
+        // as `Completed` instead of `Cancelled`.
+        let published = drain(&mut transitions).await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Cancelled],
+            "a dropped stream finishes its run as cancelled"
+        );
+        let last = published.last().expect("a terminal transition");
+        assert_eq!(last.detail, json!({"reason": "run dropped"}));
+        assert!(hub.is_empty(), "the binding unregistered on drop");
+        assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
     }
 }

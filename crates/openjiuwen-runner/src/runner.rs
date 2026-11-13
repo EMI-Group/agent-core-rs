@@ -6,10 +6,17 @@
 //! instance is always explicit ([`Runner::new`]) and only [`Runner::global`]
 //! touches the documented process singleton.
 //!
-//! The facade owns the four collaborators — the [`ResourceMgr`] registries, the
-//! [`CallbackFramework`], the [`MessageQueue`], and the optional
-//! [`Checkpointer`] — and hands them to the free functions in [`crate::run`];
+//! The facade owns the collaborators — the [`ResourceMgr`] registries, the
+//! [`CallbackFramework`], the [`MessageQueue`], the optional [`Checkpointer`],
+//! and the two observation seams every run reports into ([`RunMonitor`] and
+//! [`InteractionHub`]) — and hands them to the free functions in [`crate::run`];
 //! it never reaches into a lower layer itself.
+//!
+//! The team runtime pool is the one collaborator the facade keeps behind a lock:
+//! [`Runner::start`] and [`Runner::stop`] rebuild it from the live configuration,
+//! so a [`Runner::set_config`] takes effect on restart and the pool a host
+//! addresses through [`Runner::start_agent_team`] is always the pool of the
+//! current configuration.
 //!
 //! Runs do **not** require [`Runner::start`]: the queue is host plumbing, not a
 //! precondition for `run_agent`/`run_workflow`/`run_agent_team` (Python's global
@@ -18,7 +25,10 @@
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
 use crate::error;
+use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
+use crate::monitor::{RunMonitor, RunStatus};
 use crate::mq::{self, InMemoryMessageQueue, MessageQueue};
+use crate::pool::{ActiveTeamInfo, PoolKey, PoolRequest, PoolRun, TeamPool};
 use crate::resources::ResourceMgr;
 use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
@@ -29,6 +39,7 @@ use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
 use openjiuwen_security::{GuardrailContext, GuardrailOutcome, GuardrailPipeline};
+use openjiuwen_session::interaction::InteractionResponse;
 use openjiuwen_session::Checkpointer;
 use openjiuwen_workflow::{WorkflowChunk, WorkflowOutput};
 use parking_lot::RwLock;
@@ -47,7 +58,8 @@ const LOG_TARGET: &str = "openjiuwen_runner::runner";
 static GLOBAL: OnceLock<RwLock<Option<Arc<Runner>>>> = OnceLock::new();
 
 /// The process-level orchestrator: configuration, resources, callbacks, queue,
-/// checkpointer, guardrails, and the spawn seam.
+/// checkpointer, guardrails, the spawn seam, the run monitor, the
+/// human-in-the-loop hub, and the team runtime pool.
 ///
 /// Create an isolated instance with [`Runner::new`] / [`Runner::with_config`];
 /// [`Runner::global`] is the Python-compatible singleton for host processes.
@@ -89,11 +101,18 @@ pub struct Runner {
     guardrail_ids: RwLock<Vec<CallbackId>>,
     /// The installed subprocess backend ([`UnsupportedSpawner`] by default).
     spawner: RwLock<Arc<dyn AgentSpawner>>,
+    /// The run status monitor every execution path mirrors into.
+    monitor: Arc<RunMonitor>,
+    /// The human-in-the-loop hub every execution path registers on.
+    hitl: Arc<InteractionHub>,
+    /// The team runtime pool; rebuilt from the live configuration by
+    /// [`Runner::start`] and [`Runner::stop`].
+    team_pool: RwLock<TeamPool>,
 }
 
 impl std::fmt::Debug for Runner {
     /// Prints identity, lifecycle state, and counts — never configuration
-    /// secrets or resource contents.
+    /// secrets, resource contents, or pooled payloads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runner")
             .field("runner_id", &self.runner_id())
@@ -105,6 +124,8 @@ impl std::fmt::Debug for Runner {
             .field("callbacks", &self.callbacks.len())
             .field("checkpointer", &self.checkpointer().is_some())
             .field("guardrails", &self.guardrails().is_some())
+            .field("pooled_teams", &self.team_pool().len())
+            .field("active_runs", &self.monitor().list_active().len())
             .finish_non_exhaustive()
     }
 }
@@ -122,10 +143,18 @@ impl Runner {
     /// Builds an isolated runner from `config`.
     ///
     /// The queue is created from `config.message_queue` in the stopped state;
-    /// the checkpointer is not built until [`Runner::start`].
+    /// the checkpointer is not built until [`Runner::start`]. The monitor, the
+    /// human-in-the-loop hub, and the team pool are built here (from
+    /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
+    /// before [`Runner::start`].
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
         let queue: Arc<dyn MessageQueue> = InMemoryMessageQueue::new(config.message_queue.clone());
+        let monitor = Arc::new(RunMonitor::new());
+        // The hub mirrors its transitions into the same monitor the runs report
+        // into, so a host renders one consistent view of both seams.
+        let hitl = Arc::new(InteractionHub::new().with_monitor(Arc::clone(&monitor)));
+        let team_pool = TeamPool::from_runner_config(&config);
         Arc::new(Self {
             runner_id: config.runner_id.clone().into_boxed_str(),
             config: RwLock::new(config),
@@ -138,6 +167,9 @@ impl Runner {
             guardrails: RwLock::new(None),
             guardrail_ids: RwLock::new(Vec::new()),
             spawner: RwLock::new(Arc::new(UnsupportedSpawner)),
+            monitor,
+            hitl,
+            team_pool: RwLock::new(team_pool),
         })
     }
 
@@ -230,6 +262,39 @@ impl Runner {
         self.checkpointer.read().clone()
     }
 
+    /// The run status monitor every execution path mirrors into.
+    ///
+    /// The instance is fixed at construction and shared by every run path, the
+    /// human-in-the-loop hub, and the team pool, so a host that subscribes here
+    /// observes the transitions of every run this runner executes.
+    #[must_use]
+    pub fn monitor(&self) -> &Arc<RunMonitor> {
+        &self.monitor
+    }
+
+    /// The human-in-the-loop hub every execution path registers on.
+    ///
+    /// The instance is fixed at construction and mirrors its transitions into
+    /// [`Runner::monitor`]. Use it to list the live runs, pause/resume/cancel a
+    /// registered run, and answer the interaction requests a run published; the
+    /// facade shortcuts over it are [`Runner::interact_agent_team`] and
+    /// [`Runner::answer_interaction`].
+    #[must_use]
+    pub fn hitl(&self) -> &Arc<InteractionHub> {
+        &self.hitl
+    }
+
+    /// A cheap clone of the live team runtime pool.
+    ///
+    /// The pool is `Arc`-backed, so the clone shares the entries, the
+    /// concurrency permits, and the reaper with the runner. [`Runner::start`],
+    /// [`Runner::stop`], and a restart after [`Runner::set_config`] replace the
+    /// pool; a clone taken before a restart keeps addressing the retired pool.
+    #[must_use]
+    pub fn team_pool(&self) -> TeamPool {
+        self.team_pool.read().clone()
+    }
+
     /// Whether [`Runner::start`] completed and [`Runner::stop`] has not.
     #[must_use]
     pub fn is_started(&self) -> bool {
@@ -237,10 +302,18 @@ impl Runner {
     }
 
     /// Starts the runner: builds and starts the queue from the live
-    /// configuration and builds the configured checkpointer.
+    /// configuration, builds the configured checkpointer, and rebuilds the team
+    /// pool from the live configuration.
     ///
     /// Idempotent: a second call while started is a logged no-op. Starting after
-    /// [`Runner::stop`] rebuilds the queue from the current configuration.
+    /// [`Runner::stop`] rebuilds the queue, the checkpointer, and the pool from
+    /// the current configuration, so [`Runner::set_config`] takes effect here.
+    ///
+    /// Rebuilding the pool **retires** the previous one: its live pooled team runs
+    /// are stopped (bounded by `TeamPoolConfig::stop_timeout`) and a fresh open
+    /// pool takes its place. Pooled runs do not require `start`, so a run admitted
+    /// before a `start` is stopped by it — a restart is a hard boundary for pooled
+    /// team runs.
     ///
     /// # Errors
     ///
@@ -263,6 +336,7 @@ impl Runner {
             }
             None => None,
         };
+        self.rebuild_team_pool(&config).await;
         *self.queue.write() = queue;
         *self.checkpointer.write() = checkpointer;
         self.started.store(true, Ordering::Release);
@@ -270,19 +344,28 @@ impl Runner {
         Ok(())
     }
 
-    /// Stops the runner: stops the queue (bounded by
+    /// Stops the runner: stops every pooled team run, stops the queue (bounded by
     /// [`RunnerConfig::shutdown_timeout`]), drops the checkpointer, and releases
     /// every registry entry (Python `Runner.stop`).
     ///
+    /// The pool is swept **before** the started check, so a runner that never
+    /// started (but admitted pooled runs, which do not require `start`) does not
+    /// leak them. A fresh open pool built from the live configuration replaces the
+    /// swept one, so a later [`Runner::start_agent_team`] — or a restart — can
+    /// admit runs again.
+    ///
     /// Idempotent; stopping a runner that was never started is `Ok(())`. A queue
     /// that does not stop within the grace period is logged and left to its own
-    /// shutdown rather than failing the whole stop.
+    /// shutdown rather than failing the whole stop; a pool sweep failure is
+    /// reported through `tracing` only, so the queue's result stays the return
+    /// value.
     ///
     /// # Errors
     ///
     /// Returns the queue's error when it fails to stop.
     pub async fn stop(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.sweep_team_pool().await;
         if !self.started.swap(false, Ordering::AcqRel) {
             tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
             return Ok(());
@@ -399,7 +482,9 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, or the team's error.
+    /// Returns `Error::NotFound` for an unregistered id, `Error::Cancelled` when
+    /// the run's cancellation token fires, `Error::Timeout` when the run deadline
+    /// expires, or the team's error.
     pub async fn run_agent_team(
         &self,
         team: impl Into<TeamRef>,
@@ -419,6 +504,153 @@ impl Runner {
         options: RunOptions,
     ) -> BoxStream<'static, Result<Value>> {
         stream_team(self.services(), team.into(), inputs, options)
+    }
+
+    // ------------------------------------------------------------- team pool --
+
+    /// Starts a pooled team run and hands back its handle.
+    ///
+    /// The pool-backed counterpart of [`Runner::run_agent_team`], which stays the
+    /// direct (non-pooled) entry point: this call admits the run through
+    /// [`crate::pool::TeamPool::start`], which keys it by
+    /// `(team name, session id)`, bounds how many runs are in flight, owns the
+    /// monitor and hub registration for it, and returns before the worker's first
+    /// poll. The handle can be awaited ([`PoolRun::wait`]), subscribed to, paused,
+    /// or cancelled; [`Runner::list_active_teams`] lists the live ones.
+    ///
+    /// The session id is derived by the pool from `inputs["conversation_id"]`,
+    /// then [`RunOptions::session_id`], then
+    /// [`RunnerConfig::default_session_id`](crate::config::RunnerConfig), and is
+    /// written back into the options the run sees.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when the key already has a live run
+    /// ([`crate::pool::PoolError::Busy`]), `Error::Config` when the pool was
+    /// closed or the call is made outside a tokio runtime, and
+    /// `Error::Cancelled` when the run was cancelled while queued.
+    pub async fn start_agent_team(
+        &self,
+        team: impl Into<TeamRef>,
+        inputs: Value,
+        options: RunOptions,
+    ) -> Result<PoolRun> {
+        let request = PoolRequest::new(team.into(), inputs).with_options(options);
+        self.team_pool().start(self.services(), request).await
+    }
+
+    /// Lists the pooled team runs that are not finished, ordered by
+    /// `(team_name, session_id)`.
+    #[must_use]
+    pub fn list_active_teams(&self) -> Vec<ActiveTeamInfo> {
+        self.team_pool().list_active()
+    }
+
+    /// Stops the pooled team run bound to `(team_name, session_id)`.
+    ///
+    /// Cancels the run, finalises it as cancelled, removes it from the pool, and
+    /// awaits its worker for `TeamPoolConfig::stop_timeout`. An unknown key is
+    /// `Ok(false)` rather than an error, so a host can call it unconditionally.
+    ///
+    /// # Errors
+    ///
+    /// None today (every internal failure is logged); see
+    /// [`crate::pool::TeamPool::stop`].
+    pub async fn stop_agent_team(&self, team_name: &str, session_id: &str) -> Result<bool> {
+        let key = PoolKey::new(team_name, session_id);
+        self.team_pool().stop(&key).await
+    }
+
+    /// Pauses the pooled team run bound to `(team_name, session_id)`.
+    ///
+    /// A coordination signal, not a scheduler: it closes the run's interaction
+    /// gate and reports the run as paused, but does not suspend the team loop
+    /// (Python's live `InteractGate` wake-up is deferred).
+    ///
+    /// Kept `async` so the facade's team controls share one shape and a future
+    /// gate-aware pause can await without an API change.
+    ///
+    /// # Errors
+    ///
+    /// `Error::NotFound` when no live run is pooled under the key.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
+    pub async fn pause_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
+        self.team_pool().pause(&PoolKey::new(team_name, session_id))
+    }
+
+    /// Resumes a paused pooled team run bound to `(team_name, session_id)`.
+    ///
+    /// A coordination signal; see [`Runner::pause_agent_team`].
+    ///
+    /// # Errors
+    ///
+    /// `Error::NotFound` when no live run is pooled under the key.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see `pause_agent_team`
+    pub async fn resume_agent_team(&self, team_name: &str, session_id: &str) -> Result<()> {
+        self.team_pool()
+            .resume(&PoolKey::new(team_name, session_id))
+    }
+
+    /// Delivers an inbound human payload to the run addressed by
+    /// `(team_name, session_id)`.
+    ///
+    /// Delegates to [`InteractionHub::deliver`] with a target that sets both
+    /// fields, so the payload reaches the one run carrying that pair and never
+    /// broadcasts. A pooled run buffers the payload for the host to replay (the
+    /// pool's inbound channel); a direct run receives it on its own inbox.
+    #[must_use]
+    pub fn interact_agent_team(
+        &self,
+        team_name: &str,
+        session_id: &str,
+        payload: InteractPayload,
+    ) -> DeliverResult {
+        let target = RunTarget {
+            team_name: Some(team_name.to_owned()),
+            session_id: Some(session_id.to_owned()),
+        };
+        self.hitl.deliver(target, payload)
+    }
+
+    /// Answers the interaction request published by a live run.
+    ///
+    /// Delegates to [`InteractionHub::answer`], which routes the response to the
+    /// run's session by request id.
+    ///
+    /// # Errors
+    ///
+    /// `Error::NotFound` when no active run has that request id pending.
+    pub async fn answer_interaction(&self, response: InteractionResponse) -> Result<()> {
+        self.hitl.answer(response).await
+    }
+
+    /// The monitor snapshot of the live (or retained finished) team run addressed
+    /// by `(team_name, session_id)`, when this runner knows it.
+    ///
+    /// Correlation is best effort and ordered: a retained pool entry for the key
+    /// first (a pooled run, live or recently finished), then a live hub
+    /// registration carrying that team name and session (a direct
+    /// [`Runner::run_agent_team`] invocation while it is in flight). `None` means
+    /// neither seam knows the pair — never an error, so a dashboard can poll it.
+    #[must_use]
+    pub fn agent_team_status(&self, team_name: &str, session_id: &str) -> Option<RunStatus> {
+        let key = PoolKey::new(team_name, session_id);
+        if let Some(info) = self.team_pool().get(&key) {
+            if let Ok(status) = self.monitor.snapshot(&info.run_id) {
+                return Some(status);
+            }
+        }
+        let target = RunTarget {
+            team_name: Some(team_name.to_owned()),
+            session_id: Some(session_id.to_owned()),
+        };
+        let run_id = self
+            .hitl
+            .list_active()
+            .into_iter()
+            .find(|info| target.matches(info))
+            .map(|info| info.run_id)?;
+        self.monitor.snapshot(&run_id).ok()
     }
 
     // ----------------------------------------------------------- security --
@@ -488,17 +720,73 @@ impl Runner {
 
     /// Builds the per-run execution context handed to the [`crate::run`] free
     /// functions.
+    ///
+    /// The two observation seams are always attached, so every run the facade
+    /// starts — direct or streamed, agent, workflow, or team — is listed by
+    /// [`Runner::monitor`] and registered on [`Runner::hitl`].
     fn services(&self) -> RunServices {
         let mut services = RunServices::new(
             Arc::clone(&self.resources),
             Arc::clone(&self.callbacks),
             self.config(),
             self.checkpointer(),
-        );
+        )
+        .with_monitor(Arc::clone(&self.monitor))
+        .with_hitl(Arc::clone(&self.hitl));
         if let Some(pipeline) = self.guardrails() {
             services = services.with_guardrails(pipeline);
         }
         services
+    }
+
+    /// Replaces the pool with one built from `config` and stops the previous one.
+    ///
+    /// The previous pool is swapped out before it is swept, so the write lock is
+    /// never held across the sweep's `.await`.
+    async fn rebuild_team_pool(&self, config: &RunnerConfig) {
+        let previous = {
+            let mut slot = self.team_pool.write();
+            std::mem::replace(&mut *slot, TeamPool::from_runner_config(config))
+        };
+        sweep_pool(&previous, self.runner_id()).await;
+        tracing::debug!(
+            target: LOG_TARGET,
+            runner_id = %self.runner_id,
+            capacity = self.team_pool().capacity(),
+            "team pool rebuilt from the live configuration"
+        );
+    }
+
+    /// Stops every pooled team run and installs a fresh open pool.
+    ///
+    /// The logs are the only report: [`Runner::stop`]'s return value stays the
+    /// queue's, exactly as before the pool existed.
+    async fn sweep_team_pool(&self) {
+        let previous = self.team_pool();
+        sweep_pool(&previous, self.runner_id()).await;
+        *self.team_pool.write() = TeamPool::from_runner_config(&self.config());
+    }
+}
+
+/// Stops every run of `pool` (awaited outside any lock) and logs the sweep.
+async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
+    let shutdown = pool.stop_all().await;
+    let stopped = shutdown.stopped;
+    if let Some(error) = shutdown.first_error {
+        tracing::warn!(
+            target: LOG_TARGET,
+            runner_id,
+            %error,
+            "stopping a pooled team run failed"
+        );
+    }
+    if stopped > 0 {
+        tracing::debug!(
+            target: LOG_TARGET,
+            runner_id,
+            stopped,
+            "stopped pooled team runs"
+        );
     }
 }
 
@@ -515,11 +803,25 @@ mod tests {
         assert!(runner.checkpointer().is_none());
         assert!(runner.resource_mgr().is_empty());
         assert!(runner.callbacks().is_empty());
+        // The observation seams and the pool exist from construction, open and
+        // empty, so runs do not require `start`.
+        assert_eq!(runner.monitor().list_active(), Vec::new());
+        assert!(runner.hitl().is_empty());
+        let Some(hub_monitor) = runner.hitl().monitor() else {
+            panic!("the hub mirrors its transitions into a monitor");
+        };
+        assert!(Arc::ptr_eq(&hub_monitor, runner.monitor()));
+        assert_eq!(runner.list_active_teams(), Vec::new());
+        assert_eq!(runner.team_pool().capacity(), 8);
+        assert!(!runner.team_pool().is_closed());
+        assert!(runner.agent_team_status("crew", "s-1").is_none());
         let debug = format!("{runner:?}");
         assert!(debug.starts_with("Runner {"));
         assert!(debug.contains("runner_id: \"global\""));
         assert!(debug.contains("started: false"));
         assert!(debug.contains("guardrails: false"));
+        assert!(debug.contains("pooled_teams: 0"));
+        assert!(debug.contains("active_runs: 0"));
     }
 
     #[test]

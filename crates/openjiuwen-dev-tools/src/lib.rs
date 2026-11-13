@@ -11,13 +11,19 @@
 //! - [`prompt_builder`] — standardize, rewrite, and repair prompts with bundled
 //!   `zh-CN`/`en-US` template banks, optionally driven by a [`Model`].
 //! - [`skill_creator`] — build, validate, template, and write harness-compatible
-//!   skill bundles (`SKILL.md` plus resources).
+//!   skill bundles (`SKILL.md` plus resources), including the `omni` pipeline
+//!   that turns a fetched page or tar archive into a skill via `create_from_url`.
 //! - [`agent_builder`] — programmatic and serialized agent specifications, the
-//!   platform DSL, and the bridge into [`openjiuwen_agent`].
-//! - [`skill_evaluator`] — deterministic, offline evaluation of skills against
-//!   test cases, producing design/functional/safety reports and a final score.
-//! - [`tune`] — the ported `Case`/`EvaluatedCase`/`CaseLoader` models plus
-//!   API-shaped stubs for the deferred tuning pipelines.
+//!   platform DSL, the bridge into [`openjiuwen_agent`], and the staged
+//!   clarify → design → generate → reflect pipeline with Mermaid rendering.
+//! - [`skill_evaluator`] — deterministic and judge-driven evaluation of skills
+//!   against test cases, producing design/functional/safety reports and a final
+//!   score, plus the `EvalHarness` with JSON/JSONL run artifacts.
+//! - [`tune`] — the `Case`/`EvaluatedCase`/`CaseLoader` models, the evaluator
+//!   seam, four deterministic prompt searches, the `Trainer`, and
+//!   `optimize_prompt`, each with an optional [`Model`] rewrite path.
+//! - [`judge`] — rubric-driven LLM judging over the [`Model`] seam with tolerant
+//!   structured-verdict parsing, shared by `skill_evaluator` and `tune`.
 //!
 //! [`Model`]: openjiuwen_foundation::llm::Model
 //!
@@ -49,6 +55,7 @@
     clippy::missing_const_for_fn
 )]
 pub mod agent_builder;
+pub mod judge;
 pub mod prompt_builder;
 pub mod skill_creator;
 pub mod skill_evaluator;

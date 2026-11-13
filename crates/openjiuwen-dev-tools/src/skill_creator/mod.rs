@@ -29,10 +29,14 @@
 //! - [`template`] — strict `{{name}}` rendering.
 //! - [`bundle`] — [`SkillBundle`] disk read/write.
 //! - [`creator`] — [`SkillSpec`], [`SkillRequest`], [`SkillCreator`].
+//! - [`omni`] — the `skill_omni_creation` pipeline: URL → scraped page → assets
+//!   → skill bundle ([`OmniCreation`], also reached through
+//!   [`SkillCreator::create_from_url`]).
 
 pub mod bundle;
 pub mod creator;
 pub mod definition;
+pub mod omni;
 pub mod template;
 
 pub use bundle::SkillBundle;
@@ -40,3 +44,4 @@ pub use creator::{SkillCreator, SkillRequest, SkillSpec};
 pub use definition::{
     parse_markdown, render_markdown, SkillDefinition, SkillFrontmatter, SkillResource,
 };
+pub use omni::{OmniConfig, OmniCreation, OmniOutcome};
