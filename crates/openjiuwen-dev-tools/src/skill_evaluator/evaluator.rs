@@ -8,19 +8,35 @@
 //! Python drove the same pipeline from a script with a shell harness; here the
 //! runner is a trait, so a scripted run is fully offline and a model-backed run
 //! uses the same assertions and report types.
+//!
+//! # Deterministic and judged runs
+//!
+//! `evaluate` and `evaluate_at` stay purely deterministic: they never call a
+//! model and always leave [`EvaluationReport::judge`] as `None`. Calling
+//! [`SkillEvaluator::with_judge`] attaches a `SkillJudge` and unlocks
+//! `evaluate_with_judge`/`evaluate_with_judge_at`, which score the design and
+//! safety stages with the rubric-driven judge and record the provenance of each
+//! judgement in the report. A model failure degrades to the deterministic score
+//! rather than failing the run.
+//!
+//! Everything is async-first over the existing tokio runtime and offline by
+//! default: the only side channels are the injected [`CaseRunner`] and the
+//! injected judge model.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::llm::Model;
 use serde::{Deserialize, Serialize};
 
 use crate::skill_creator::SkillDefinition;
 
 use super::assertion::Assertion;
 use super::case::{CaseStatus, EvalCase};
+use super::judge_scoring::SkillJudge;
 use super::report::{
-    status_from, summarize, CaseResult, EvaluationReport, FunctionalReport,
+    status_from, summarize, CaseResult, EvaluationReport, FunctionalReport, JudgeRecord,
 };
 use super::runner::{CaseRunner, ScriptedCaseRunner};
 use super::scoring::{aggregate, scan_safety, score_design, SafetyRule};
@@ -65,15 +81,19 @@ pub struct SkillEvaluator {
     runner: Arc<dyn CaseRunner>,
     /// Weights, safety rules, and thresholds.
     config: EvaluatorConfig,
+    /// The optional rubric-driven judge for the design and safety stages.
+    judge: Option<Arc<SkillJudge>>,
 }
 
 impl SkillEvaluator {
-    /// Creates an evaluator over `runner` with the default configuration.
+    /// Creates an evaluator over `runner` with the default configuration and no
+    /// judge.
     #[must_use]
     pub fn new(runner: Arc<dyn CaseRunner>) -> Self {
         Self {
             runner,
             config: EvaluatorConfig::default(),
+            judge: None,
         }
     }
 
@@ -81,6 +101,25 @@ impl SkillEvaluator {
     #[must_use]
     pub fn with_config(mut self, config: EvaluatorConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Attaches a model-backed judge over `model`.
+    ///
+    /// Only [`evaluate_with_judge`](Self::evaluate_with_judge) and
+    /// [`evaluate_with_judge_at`](Self::evaluate_with_judge_at) consult the judge;
+    /// [`evaluate`](Self::evaluate) and [`evaluate_at`](Self::evaluate_at) stay
+    /// deterministic.
+    #[must_use]
+    pub fn with_judge(mut self, model: Arc<dyn Model>) -> Self {
+        self.judge = Some(Arc::new(SkillJudge::new(model)));
+        self
+    }
+
+    /// Attaches a preconfigured judge.
+    #[must_use]
+    pub fn with_skill_judge(mut self, judge: SkillJudge) -> Self {
+        self.judge = Some(Arc::new(judge));
         self
     }
 
@@ -105,6 +144,12 @@ impl SkillEvaluator {
         &self.config
     }
 
+    /// The attached judge, when one was configured.
+    #[must_use]
+    pub fn judge(&self) -> Option<&Arc<SkillJudge>> {
+        self.judge.as_ref()
+    }
+
     /// Evaluates `skill` over `cases`, timestamping the report with the current
     /// UNIX epoch milliseconds.
     ///
@@ -116,12 +161,7 @@ impl SkillEvaluator {
         skill: &SkillDefinition,
         cases: &[EvalCase],
     ) -> Result<EvaluationReport> {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-            });
-        self.evaluate_at(skill, cases, timestamp_ms).await
+        self.evaluate_at(skill, cases, now_ms()).await
     }
 
     /// Evaluates `skill` over `cases` with an explicit report timestamp.
@@ -151,6 +191,120 @@ impl SkillEvaluator {
         cases: &[EvalCase],
         timestamp_ms: i64,
     ) -> Result<EvaluationReport> {
+        let functional = self.functional_report(skill, cases, timestamp_ms).await?;
+
+        let design = score_design(skill);
+        let safety = scan_safety(
+            skill,
+            &self.config.safety_rules,
+            self.config.safety_gate_threshold,
+        )?;
+        let final_score = aggregate(
+            &design,
+            &functional,
+            &safety,
+            self.config.design_weight,
+            self.config.functional_weight,
+        );
+
+        Ok(EvaluationReport {
+            design,
+            functional,
+            safety,
+            final_score,
+            judge: None,
+        })
+    }
+
+    /// Evaluates `skill` over `cases` with the attached judge, timestamping the
+    /// report with the current UNIX epoch milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every error of
+    /// [`evaluate_with_judge_at`](Self::evaluate_with_judge_at).
+    pub async fn evaluate_with_judge(
+        &self,
+        skill: &SkillDefinition,
+        cases: &[EvalCase],
+    ) -> Result<EvaluationReport> {
+        self.evaluate_with_judge_at(skill, cases, now_ms()).await
+    }
+
+    /// Evaluates `skill` over `cases` with the attached judge and an explicit
+    /// report timestamp.
+    ///
+    /// The functional half is identical to [`evaluate_at`](Self::evaluate_at),
+    /// including validation order and errors. The design and safety stages are
+    /// scored by the judge: a model verdict replaces the deterministic score,
+    /// while a model failure degrades to it. The [`JudgeRecord`] records one
+    /// [`VerdictSource`](crate::judge::VerdictSource) per judged stage, so a
+    /// degraded judgement stays visible in the persisted report. A safety rule
+    /// hit always closes the gate, whatever the model answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`] when no judge is configured or the skill,
+    /// a case, or a safety rule is invalid, and propagates the runner's and the
+    /// judge's own errors.
+    pub async fn evaluate_with_judge_at(
+        &self,
+        skill: &SkillDefinition,
+        cases: &[EvalCase],
+        timestamp_ms: i64,
+    ) -> Result<EvaluationReport> {
+        let judge = self.judge.as_ref().ok_or_else(|| {
+            Error::validation(
+                "no skill judge configured; call SkillEvaluator::with_judge before \
+                 evaluate_with_judge",
+            )
+        })?;
+
+        let functional = self.functional_report(skill, cases, timestamp_ms).await?;
+        let design = judge.design(skill).await?;
+        let safety = judge.safety(skill, &self.config.safety_rules).await?;
+        let final_score = aggregate(
+            &design.report,
+            &functional,
+            &safety.report,
+            self.config.design_weight,
+            self.config.functional_weight,
+        );
+
+        Ok(EvaluationReport {
+            design: design.report,
+            functional,
+            safety: safety.report,
+            final_score,
+            judge: Some(JudgeRecord {
+                design_source: design.verdict.source,
+                safety_source: safety.verdict.source,
+            }),
+        })
+    }
+
+    /// Validates the skill and its cases, runs them, and builds the functional
+    /// report.
+    ///
+    /// The skill is validated first, then every case, so the first invalid input
+    /// fails before any case runs. Cases are executed sequentially in input
+    /// order; a runner error aborts immediately. Each expectation is parsed into
+    /// an [`Assertion`] and checked against the answer:
+    ///
+    /// - all assertions pass: [`CaseStatus::Passed`];
+    /// - none pass: [`CaseStatus::Failed`];
+    /// - otherwise: [`CaseStatus::Partial`].
+    ///
+    /// The pass rate is `(passed + 0.5 * partial) / total`, crediting partial
+    /// cases with half a pass (a deviation from Python's strict counts); an
+    /// empty case list yields `0.0`. Recommendations list the names of failed
+    /// and partial cases in input order.
+    async fn functional_report(
+        &self,
+        skill: &SkillDefinition,
+        cases: &[EvalCase],
+        timestamp_ms: i64,
+    ) -> Result<FunctionalReport> {
         skill.validate()?;
         for case in cases {
             case.validate()?;
@@ -178,37 +332,24 @@ impl SkillEvaluator {
             .filter(|result| matches!(result.status, CaseStatus::Failed | CaseStatus::Partial))
             .map(|result| result.name.clone())
             .collect();
-        let functional = FunctionalReport {
+        Ok(FunctionalReport {
             skill_name: skill.name.clone(),
             skill_path: format!("skills/{}", skill.name),
             timestamp: timestamp_ms,
             summary,
             results,
             recommendations,
-        };
-
-        let design = score_design(skill);
-        let safety = scan_safety(
-            skill,
-            &self.config.safety_rules,
-            self.config.safety_gate_threshold,
-        )?;
-        let final_score = aggregate(
-            &design,
-            &functional,
-            &safety,
-            self.config.design_weight,
-            self.config.functional_weight,
-        );
-
-        Ok(EvaluationReport {
-            design,
-            functional,
-            safety,
-            final_score,
-            judge: None,
         })
     }
+}
+
+/// The current UNIX epoch milliseconds, or `0` when the clock is unusable.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -216,6 +357,9 @@ mod tests {
     use super::*;
 
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
+
+    use crate::judge::VerdictSource;
 
     fn skill() -> SkillDefinition {
         let body = concat!(
@@ -475,6 +619,190 @@ mod tests {
         let report = end_to_end_report().await;
         let json = report.to_json_string().expect("to_json_string");
         let back: EvaluationReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, report);
+    }
+
+    fn fenced_verdict(score: f64, passed: bool) -> String {
+        format!("```json\n{{\"score\": {score}, \"passed\": {passed}, \"reasoning\": \"ok\"}}\n```")
+    }
+
+    fn judged_evaluator(turns: impl IntoIterator<Item = ScriptedTurn>) -> SkillEvaluator {
+        evaluator(&[("case-1", "alpha answer")]).with_judge(Arc::new(ScriptedModel::new(turns)))
+    }
+
+    #[tokio::test]
+    async fn a_judged_run_records_model_provenance() {
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.95, true)),
+        ]);
+
+        let report = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 7)
+            .await
+            .expect("judge");
+
+        let record = report.judge.as_ref().expect("judge record");
+        assert_eq!(record.design_source, VerdictSource::Model);
+        assert_eq!(record.safety_source, VerdictSource::Model);
+        assert!((report.design.design_score - 80.0).abs() < 1e-9);
+        assert!((report.safety.score_pct - 95.0).abs() < 1e-9);
+        assert_eq!(report.final_score.pipeline_status, "COMPLETED");
+        assert_eq!(report.functional.timestamp, 7);
+        assert_eq!(report.functional.skill_path, "skills/demo");
+        assert!(!report.safety.blocked);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_design_answer_mixes_the_provenance() {
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text("no structure"),
+            ScriptedTurn::text(fenced_verdict(0.9, true)),
+        ]);
+
+        let report = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("judge");
+
+        let record = report.judge.as_ref().expect("judge record");
+        assert_eq!(record.design_source, VerdictSource::Deterministic);
+        assert_eq!(record.safety_source, VerdictSource::Model);
+        assert_eq!(report.design, score_design(&skill()));
+    }
+
+    #[tokio::test]
+    async fn failing_turns_leave_both_stages_deterministic() {
+        let evaluator = judged_evaluator([ScriptedTurn::fail("boom"), ScriptedTurn::fail("boom")]);
+
+        let report = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("judge");
+
+        let record = report.judge.as_ref().expect("judge record");
+        assert_eq!(record.design_source, VerdictSource::Deterministic);
+        assert_eq!(record.safety_source, VerdictSource::Deterministic);
+        assert_eq!(report.design, score_design(&skill()));
+        assert!((report.safety.score_pct - 100.0).abs() < 1e-9);
+        assert_eq!(report.final_score.pipeline_status, "COMPLETED");
+    }
+
+    #[tokio::test]
+    async fn a_critical_rule_blocks_a_passing_safety_verdict() {
+        let config = EvaluatorConfig {
+            safety_rules: vec![SafetyRule::new(
+                "demo",
+                "data_leakage",
+                "critical",
+                "leaks the name",
+            )],
+            ..EvaluatorConfig::default()
+        };
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(1.0, true)),
+        ])
+        .with_config(config);
+
+        let report = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("judge");
+
+        assert!(report.safety.blocked);
+        assert_eq!(report.final_score.pipeline_status, "BLOCKED_AT_SAFETY");
+        assert_eq!(report.safety.findings.len(), 1);
+        let record = report.judge.as_ref().expect("judge record");
+        assert_eq!(record.safety_source, VerdictSource::Model);
+    }
+
+    #[tokio::test]
+    async fn a_judged_run_without_an_answer_is_a_validation_error() {
+        let evaluator = judged_evaluator([ScriptedTurn::text(fenced_verdict(0.8, true))]);
+        let cases = [
+            passing_case("case-1", "alpha"),
+            passing_case("case-2", "beta"),
+        ];
+
+        let error = evaluator
+            .evaluate_with_judge_at(&skill(), &cases, 1)
+            .await
+            .expect_err("no scripted response");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("case-2"));
+    }
+
+    #[tokio::test]
+    async fn a_deterministic_run_rejects_the_judged_entry_point_without_a_judge() {
+        let evaluator = evaluator(&[("case-1", "alpha answer")]);
+        assert!(evaluator.judge().is_none());
+
+        let error = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect_err("no judge");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.to_string().contains("no skill judge configured"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_ignores_an_attached_judge() {
+        let model = ScriptedModel::new([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.9, true)),
+        ]);
+        let evaluator =
+            evaluator(&[("case-1", "alpha answer")]).with_judge(Arc::new(model.clone()));
+        assert!(evaluator.judge().is_some());
+
+        let report = evaluator
+            .evaluate_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("evaluate");
+
+        assert!(report.judge.is_none());
+        assert_eq!(model.call_count(), 0);
+        assert_eq!(report.design, score_design(&skill()));
+    }
+
+    #[tokio::test]
+    async fn evaluate_with_judge_uses_the_wall_clock_timestamp() {
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.9, true)),
+        ]);
+
+        let report = evaluator
+            .evaluate_with_judge(&skill(), &[passing_case("case-1", "alpha")])
+            .await
+            .expect("judge");
+        assert!(report.functional.timestamp > 0);
+        assert!(report.judge.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_judged_report_json_adds_the_judge_record() {
+        let evaluator = judged_evaluator([
+            ScriptedTurn::text(fenced_verdict(0.8, true)),
+            ScriptedTurn::text(fenced_verdict(0.9, true)),
+        ]);
+        let report = evaluator
+            .evaluate_with_judge_at(&skill(), &[passing_case("case-1", "alpha")], 1)
+            .await
+            .expect("judge");
+
+        let json = report.to_json().expect("to_json");
+        let object = json.as_object().expect("object");
+        for key in ["design", "functional", "safety", "final_score", "judge"] {
+            assert!(object.contains_key(key), "missing {key}");
+        }
+        assert_eq!(json["judge"]["design_source"], "model");
+        assert_eq!(json["judge"]["safety_source"], "model");
+        assert!((json["design"]["design_score"].as_f64().expect("number") - 80.0).abs() < 1e-9);
+
+        let back: EvaluationReport =
+            serde_json::from_str(&report.to_json_string().expect("json")).expect("deserialize");
         assert_eq!(back, report);
     }
 }
