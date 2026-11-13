@@ -152,7 +152,8 @@ pub fn convert_tools(tools: &[Value]) -> Vec<Value> {
 /// least one tool is configured. `include` asks for encrypted reasoning content
 /// when `extra.include_reasoning_encrypted_content` is `true`.
 ///
-/// A provider-neutral reasoning intent in `extra.reasoning` is resolved through
+/// A provider-neutral reasoning intent ([`ModelRequestConfig::reasoning`] first,
+/// legacy `extra.reasoning` second) is resolved through
 /// [`ReasoningProtocol::Responses`](super::super::reasoning::ReasoningProtocol) and
 /// applied before the caller's own `extra` keys, which are merged last and win.
 /// A one-level nested `extra.extra_body` object is flattened into the body root
@@ -226,8 +227,7 @@ pub fn build_responses_body(
         );
     }
 
-    let intent = reasoning_intent(request)?;
-    let consumes_reasoning = intent.is_some();
+    let (intent, raw_reasoning, consumes_reasoning) = reasoning_intent(request)?;
     if let Some(intent) = intent {
         let plan = resolve_reasoning_plan_for(
             ReasoningProtocol::Responses,
@@ -249,6 +249,9 @@ pub fn build_responses_body(
             body = object;
         }
     }
+    if let Some(raw) = raw_reasoning {
+        body.insert(REASONING_KEY.to_owned(), raw);
+    }
 
     if let Some(extra) = request.extra.as_object() {
         for (key, value) in expand_extra_body(extra, consumes_reasoning) {
@@ -261,15 +264,29 @@ pub fn build_responses_body(
     Ok(Value::Object(body))
 }
 
-/// Reads the reasoning intent out of a request's `extra` map.
+/// Reads the reasoning intent for a request.
 ///
-/// A `null` or intent-shaped value is consumed by the reasoning layer; anything
-/// else is a legacy raw payload that the caller still wants forwarded, so it is
-/// returned as [`None`] and stays in the body through the `extra` merge.
-fn reasoning_intent(request: &ModelRequestConfig) -> Result<Option<ReasoningConfig>> {
+/// [`ModelRequestConfig::reasoning`] wins over the legacy `extra` spelling.
+/// Returns the parsed intent, a legacy raw payload the caller still wants
+/// forwarded verbatim, and whether the `extra` `reasoning` key must stay out of
+/// the body. A typed value is always consumed by this layer (it is a field, not
+/// a body key); a `null` or intent-shaped `extra` value is consumed too, while
+/// anything else is a legacy raw payload that keeps its `extra` wiring.
+fn reasoning_intent(
+    request: &ModelRequestConfig,
+) -> Result<(Option<ReasoningConfig>, Option<Value>, bool)> {
+    if let Some(value) = request.reasoning.as_ref().filter(|value| !value.is_null()) {
+        let intent = ReasoningConfig::from_value(value)?;
+        let raw = intent.is_none().then(|| value.clone());
+        return Ok((intent, raw, true));
+    }
     match request.extra.get(REASONING_KEY) {
-        None => Ok(None),
-        Some(value) => ReasoningConfig::from_value(value),
+        None => Ok((None, None, false)),
+        Some(value) => {
+            let intent = ReasoningConfig::from_value(value)?;
+            let consumed = intent.is_some();
+            Ok((intent, None, consumed))
+        }
     }
 }
 
@@ -802,6 +819,47 @@ mod tests {
             body.get("include_reasoning_encrypted_content").is_none(),
             "the toggle is consumed by the body builder"
         );
+    }
+
+    #[test]
+    fn typed_reasoning_matches_the_extra_spelling() {
+        // Python's `ModelRequestConfig.reasoning` field emits the same body as
+        // the legacy `extra.reasoning` spelling.
+        let typed = plain_request().with_reasoning(json!({"mode": "enabled", "effort": "high"}));
+        let legacy = plain_request().with_extra(json!({
+            "reasoning": {"mode": "enabled", "effort": "high"},
+        }));
+        let typed_body = build_body(&[BaseMessage::user("hi")], &typed);
+        let legacy_body = build_body(&[BaseMessage::user("hi")], &legacy);
+
+        assert_eq!(typed_body, legacy_body);
+        assert_eq!(typed_body["reasoning"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn the_typed_reasoning_field_wins_over_the_extra_spelling() {
+        let request = plain_request()
+            .with_reasoning(json!({"mode": "enabled", "effort": "low"}))
+            .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+        let body = build_body(&[BaseMessage::user("hi")], &request);
+
+        assert_eq!(body["reasoning"], json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn a_typed_legacy_reasoning_payload_is_forwarded_verbatim() {
+        let legacy = json!({"enabled": true});
+        let request = plain_request().with_reasoning(legacy.clone());
+        let body = build_body(&[BaseMessage::user("hi")], &request);
+
+        assert_eq!(body["reasoning"], legacy);
+    }
+
+    #[test]
+    fn context_window_never_reaches_the_responses_body() {
+        let request = plain_request().with_context_window(200_000);
+        let body = build_body(&[BaseMessage::user("hi")], &request);
+        assert!(body.get("context_window").is_none());
     }
 
     #[test]

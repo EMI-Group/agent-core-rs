@@ -1,7 +1,8 @@
 //! Reasoning-plan wiring tests for the Anthropic request projection.
 //!
 //! These assert the exact body fields the provider-neutral reasoning intent
-//! (`extra["reasoning"]`) produces for the `anthropic_messages` protocol: the
+//! (`ModelRequestConfig::reasoning`, or the legacy `extra["reasoning"]`)
+//! produces for the `anthropic_messages` protocol: the
 //! `thinking` / `output_config` shapes, the legacy-control precedence, the fact
 //! that the intent key never reaches the wire, and that a malformed intent is a
 //! validation error instead of a silently dropped request.
@@ -371,4 +372,81 @@ fn a_non_vllm_endpoint_profile_keeps_the_profile_table_encoder() {
         Some(&json!({"type": "enabled", "budget_tokens": 2048}))
     );
     assert!(with_profile.get("enable_thinking").is_none());
+}
+
+/// Builds a body for a full request config, so the typed fields are exercised.
+fn body_for_request(request: &ModelRequestConfig) -> Value {
+    build_messages_body_with_provider(
+        &[BaseMessage::user("hello")],
+        request,
+        false,
+        "anthropic",
+        None,
+    )
+    .expect("the body builds")
+}
+
+#[test]
+fn a_typed_reasoning_intent_matches_the_extra_spelling() {
+    let typed = ModelRequestConfig::new(SONNET_45)
+        .with_reasoning(json!({"mode": "enabled", "effort": "medium"}));
+    let legacy = ModelRequestConfig::new(SONNET_45)
+        .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "medium"}}));
+    let typed_body = body_for_request(&typed);
+    let legacy_body = body_for_request(&legacy);
+
+    assert_eq!(typed_body, legacy_body);
+    assert_eq!(
+        typed_body.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 8192}))
+    );
+    assert!(typed_body.get("reasoning").is_none());
+}
+
+#[test]
+fn the_typed_reasoning_field_wins_over_the_extra_spelling() {
+    let request = ModelRequestConfig::new(UNPROFILED)
+        .with_reasoning(json!({"mode": "enabled", "effort": "low"}))
+        .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+    let body = body_for_request(&request);
+
+    assert_eq!(body.get("output_config"), Some(&json!({"effort": "low"})));
+    assert!(body.get("reasoning").is_none());
+}
+
+#[test]
+fn a_typed_null_reasoning_value_is_no_intent() {
+    let request = ModelRequestConfig::new(SONNET_45).with_reasoning(Value::Null);
+    let body = body_for_request(&request);
+
+    assert!(body.get("thinking").is_none());
+    assert!(body.get("output_config").is_none());
+}
+
+#[test]
+fn a_typed_non_intent_payload_is_a_validation_error() {
+    let request =
+        ModelRequestConfig::new(SONNET_45).with_reasoning(json!({"thinking": {"type": "enabled"}}));
+    let error = build_messages_body_with_provider(
+        &[BaseMessage::user("hello")],
+        &request,
+        false,
+        "anthropic",
+        None,
+    )
+    .expect_err("the Anthropic transport has no raw `reasoning` body key");
+    assert_eq!(
+        error.kind(),
+        openjiuwen_common::error::ErrorKind::Validation
+    );
+}
+
+#[test]
+fn context_window_never_reaches_the_messages_body() {
+    let request = ModelRequestConfig::new(SONNET_45).with_context_window(200_000);
+    let body = body_for_request(&request);
+
+    assert!(body.get("context_window").is_none());
+    let rendered = body.to_string();
+    assert!(!rendered.contains("context_window"), "body: {rendered}");
 }

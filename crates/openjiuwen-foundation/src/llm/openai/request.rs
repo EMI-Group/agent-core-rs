@@ -168,11 +168,14 @@ pub fn convert_tool_choice(choice: &Value) -> Value {
 /// [`ModelRequestConfig::extra`] is merged last at the top level, so a caller can
 /// override or extend any computed key.
 ///
-/// A provider-neutral reasoning intent in `extra.reasoning` is resolved first (see
+/// A provider-neutral reasoning intent is resolved first (see
 /// [`crate::llm::reasoning`]) and applied before that final merge, so the caller's
-/// keys still win. The intent key itself is consumed by this layer; a legacy raw
-/// payload (an object with keys outside `mode`/`effort`/`budget_tokens`) keeps being
-/// forwarded verbatim. Without a `reasoning` key the body is unchanged.
+/// keys still win. The intent comes from [`ModelRequestConfig::reasoning`] when
+/// that field is set and from `extra.reasoning` otherwise; the intent key itself
+/// is consumed by this layer (a typed intent is never re-forwarded). A legacy raw
+/// payload (an object with keys outside `mode`/`effort`/`budget_tokens`) keeps
+/// being forwarded verbatim under `reasoning`. Without an intent the body is
+/// unchanged.
 ///
 /// # Errors
 ///
@@ -191,7 +194,7 @@ pub fn build_chat_completion_body(
 ///
 /// `endpoint_profile` names the wire dialect the configured endpoint speaks and
 /// `api_base` is the resolved base URL; together they select the reasoning
-/// encoder for a provider-neutral intent in `extra.reasoning` (see
+/// encoder for a provider-neutral reasoning intent (see
 /// [`resolve_chat_completion_plan_with_endpoint`]). A non-generic profile such as
 /// `"vllm"` replaces the profile-table encoder with the `enable_thinking` /
 /// `thinking_budget` encoder, so a self-hosted gateway receives the keys it
@@ -263,7 +266,7 @@ pub fn build_chat_completion_body_with_endpoint(
         );
     }
 
-    let (reasoning, consumes_reasoning_key) = reasoning_intent(request)?;
+    let (reasoning, raw_reasoning, consumes_reasoning_key) = reasoning_intent(request)?;
     if let Some(intent) = &reasoning {
         let plan = resolve_chat_completion_plan_with_endpoint(
             provider,
@@ -279,6 +282,9 @@ pub fn build_chat_completion_body_with_endpoint(
             body = object;
         }
     }
+    if let Some(raw) = raw_reasoning {
+        body.insert(REASONING_KEY.to_owned(), raw);
+    }
 
     if let Some(extra) = request.extra.as_object() {
         for (key, value) in extra {
@@ -293,20 +299,30 @@ pub fn build_chat_completion_body_with_endpoint(
 }
 /// Key of the provider-neutral reasoning intent inside [`ModelRequestConfig::extra`].
 const REASONING_KEY: &str = "reasoning";
-/// Reads the reasoning intent out of a request's `extra` map.
+/// Reads the reasoning intent for a request.
 ///
-/// Returns the parsed intent and whether the raw `reasoning` key must stay out of
-/// the request body. `null` and intent-shaped values are consumed by the reasoning
-/// layer; anything else (a legacy raw payload, a number) is forwarded verbatim, so
+/// [`ModelRequestConfig::reasoning`] wins over the legacy `extra` spelling.
+/// Returns the parsed intent, a legacy raw payload the caller still wants
+/// forwarded verbatim, and whether `extra["reasoning"]` must stay out of the
+/// request body. A typed value is always consumed by this layer (it is a field,
+/// not a body key); a `null` or intent-shaped `extra` value is consumed too,
+/// while anything else (a legacy raw payload, a number) is forwarded verbatim so
 /// pre-existing callers keep working unchanged.
-fn reasoning_intent(request: &ModelRequestConfig) -> Result<(Option<ReasoningConfig>, bool)> {
+fn reasoning_intent(
+    request: &ModelRequestConfig,
+) -> Result<(Option<ReasoningConfig>, Option<Value>, bool)> {
+    if let Some(value) = request.reasoning.as_ref().filter(|value| !value.is_null()) {
+        let intent = ReasoningConfig::from_value(value)?;
+        let raw = intent.is_none().then(|| value.clone());
+        return Ok((intent, raw, true));
+    }
     match request.extra.get(REASONING_KEY) {
-        None => Ok((None, false)),
-        Some(Value::Null) => Ok((None, true)),
+        None => Ok((None, None, false)),
+        Some(Value::Null) => Ok((None, None, true)),
         Some(value) => {
             let intent = ReasoningConfig::from_value(value)?;
             let consumed = intent.is_some();
-            Ok((intent, consumed))
+            Ok((intent, None, consumed))
         }
     }
 }
@@ -836,6 +852,61 @@ mod tests {
             error.kind(),
             openjiuwen_common::error::ErrorKind::Validation
         );
+    }
+    #[test]
+    fn a_typed_reasoning_intent_matches_the_extra_spelling() {
+        // Python's `ModelRequestConfig.reasoning` field reaches the body exactly
+        // like the legacy `extra.reasoning` spelling.
+        let typed = ModelRequestConfig::new("gpt-5.1")
+            .with_reasoning(json!({"mode": "enabled", "effort": "high"}));
+        let legacy = ModelRequestConfig::new("gpt-5.1")
+            .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+        let typed_body = body(&[BaseMessage::user("hi")], &typed);
+        let legacy_body = body(&[BaseMessage::user("hi")], &legacy);
+
+        assert_eq!(typed_body, legacy_body);
+        assert_eq!(typed_body["reasoning_effort"], json!("high"));
+        assert!(!typed_body.as_object().unwrap().contains_key("reasoning"));
+    }
+    #[test]
+    fn the_typed_reasoning_field_wins_over_the_extra_spelling() {
+        let request = ModelRequestConfig::new("gpt-5.1")
+            .with_reasoning(json!({"mode": "enabled", "effort": "low"}))
+            .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "high"}}));
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+    }
+    #[test]
+    fn a_typed_legacy_reasoning_payload_is_forwarded_verbatim() {
+        let legacy = json!({"enabled": true});
+        let request = ModelRequestConfig::new("gpt-4o").with_reasoning(legacy.clone());
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert_eq!(body["reasoning"], legacy);
+    }
+    #[test]
+    fn an_invalid_typed_reasoning_intent_is_a_validation_error() {
+        let request =
+            ModelRequestConfig::new("gpt-5.1").with_reasoning(json!({"mode": "sometimes"}));
+        let error = build_chat_completion_body("openai", &[], &request, false)
+            .expect_err("an invalid typed intent must fail");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+    }
+    #[test]
+    fn a_typed_null_reasoning_is_no_intent() {
+        let request = ModelRequestConfig::new("gpt-5.1").with_reasoning(Value::Null);
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
+    }
+    #[test]
+    fn context_window_never_reaches_the_body() {
+        let request = ModelRequestConfig::new("gpt-4o").with_context_window(128_000);
+        let body = body(&[BaseMessage::user("hi")], &request);
+        assert!(!body.as_object().unwrap().contains_key("context_window"));
     }
     #[test]
     fn reasoning_is_encoded_for_the_configured_provider() {
