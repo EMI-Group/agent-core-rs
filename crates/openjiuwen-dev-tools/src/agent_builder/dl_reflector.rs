@@ -51,6 +51,39 @@
 //! reused as the generic "rejected revision" marker because a rejected document
 //! is not representable as a graph-level defect. Model problems are never
 //! errors, so the caller always receives a usable document.
+//!
+//! # Per-node-type DL validation
+//!
+//! [`DlReflector::validate_dl`] is the other half of Python's `Reflector`: it
+//! checks a [`DlDocument`] (the Python-shaped `SimpleIR` array) against the
+//! per-node-type field rules and reports a [`DlValidation`] without repairing
+//! anything, mutating anything, or calling a model. Nodes are reported in
+//! document order and, inside a node, in check order.
+//!
+//! The rules mirror Python's `Reflector` with the non-empty requirement
+//! strengthened: blank `id`/`type`/`description` are [`ReflectionIssueKind::MissingField`]
+//! issues, a repeated id is [`ReflectionIssueKind::DuplicateNodeId`], and a type
+//! outside the nine [`DlNodeType`] wire names is
+//! [`ReflectionIssueKind::UnknownNodeType`] (which skips the type-specific rules).
+//! Start, End, Output, LLM, Questioner, Plugin, and Code each declare the fields
+//! they need — inputs, outputs, the node's configuration keys, and `next` — and
+//! every absent or blank field is one `MissingField` issue. Links naming a
+//! missing node are [`ReflectionIssueKind::DanglingEdge`].
+//!
+//! `IntentDetection` and `Branch` additionally validate their conditions: route
+//! names and targets, a mandatory `default` branch
+//! ([`ReflectionIssueKind::MissingDefaultBranch`]), and — for Branch — the
+//! operator read from the second whitespace-separated token of the expression
+//! ([`ReflectionIssueKind::InvalidExpression`]) plus every `${...}` placeholder
+//! resolved against the outputs declared by earlier or current nodes
+//! ([`ReflectionIssueKind::InvalidReference`]). Exactly one of `expression` and
+//! `expressions` must be present ([`ReflectionIssueKind::MissingConditionExpression`]).
+//!
+//! The helpers live in the private `dl_checks` module so this file stays the
+//! graph repair plus the public vocabulary.
+//!
+//! [`DlDocument`]: crate::agent_builder::dl_transformer::model::DlDocument
+//! [`DlNodeType`]: crate::agent_builder::dl_transformer::model::DlNodeType
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -63,8 +96,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::cycle_checker::find_cycle;
+use super::dl_transformer::model::DlDocument;
 use super::workflow_dsl::{DslEdge, DslNode, WorkflowDsl};
 use crate::util::extract_json_fence;
+
+/// Python's `agent_builder.DEFAULT_MAX_RETRIES`: the bound of its
+/// generate/validate/reflect loop.
+///
+/// The constant is exposed for callers that drive their own retry loop around
+/// generation and [`DlReflector::validate_dl`]. The deterministic
+/// [`DlReflector::reflect`] never retries, so it does not read this value.
+pub const DEFAULT_MAX_RETRIES: usize = 3;
 
 /// The system prompt used for a model-assisted revision.
 ///
@@ -102,6 +144,20 @@ pub enum ReflectionIssueKind {
     InvalidNode,
     /// A node the start could not reach was connected to the graph.
     UnreachableNode,
+    /// A required node field was missing or blank.
+    ///
+    /// Reported by [`DlReflector::validate_dl`], which never repairs.
+    MissingField,
+    /// A branch expression used an unsupported or unreadable operator.
+    InvalidExpression,
+    /// A branching node declared no `default` condition.
+    MissingDefaultBranch,
+    /// A branch expression referenced a variable no earlier node declared.
+    InvalidReference,
+    /// A condition declared neither, or both, of `expression` and `expressions`.
+    MissingConditionExpression,
+    /// The node's `type` is not one of the nine DL node types.
+    UnknownNodeType,
 }
 
 /// One repair or rejection recorded while reflecting a document.
@@ -126,6 +182,19 @@ pub struct Reflection {
     pub issues: Vec<ReflectionIssue>,
     /// The repaired document; structurally valid even when `passed` is `false`.
     pub repaired: WorkflowDsl,
+}
+
+/// The outcome of the deterministic per-node-type DL format check.
+///
+/// [`DlReflector::validate_dl`] fills it; it never repairs, so a validation that
+/// does not pass simply lists what is wrong.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct DlValidation {
+    /// Whether the document passed every check, exactly `issues.is_empty()`.
+    pub passed: bool,
+    /// Every issue found, in node order then check order.
+    pub issues: Vec<ReflectionIssue>,
 }
 
 /// Repairs a workflow DSL document and optionally asks a model for a revision.
@@ -196,6 +265,22 @@ impl DlReflector {
             issues,
             repaired,
         })
+    }
+
+    /// Validates a DL document against Python's per-node-type field rules.
+    ///
+    /// The check is deterministic, offline, and side-effect free: `document` is
+    /// never mutated and no model is consulted, even on a reflector created with
+    /// [`Self::with_model`]. Nodes are reported in document order and, inside a
+    /// node, in check order.
+    ///
+    /// Every issue names the offending node in its `node_id` and its message; a
+    /// missing link target is reported as a [`ReflectionIssueKind::DanglingEdge`]
+    /// on the node holding the link, with the unknown id in the message. The
+    /// result's `passed` flag is exactly `issues.is_empty()`.
+    #[must_use]
+    pub fn validate_dl(&self, document: &DlDocument) -> DlValidation {
+        dl_checks::validate_dl(document)
     }
 
     /// Repairs `dsl`, then lets the configured model revise the result.
@@ -602,6 +687,8 @@ fn rejected(mut baseline: Reflection, reason: &str) -> Reflection {
     baseline.passed = false;
     baseline
 }
+
+mod dl_checks;
 
 #[cfg(test)]
 mod tests;
