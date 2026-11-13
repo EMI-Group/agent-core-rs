@@ -4,10 +4,13 @@
 
 The seam through which a `Runner` drives an agent that lives in another process or behind an HTTP endpoint.
 Ports the surface of Python `openjiuwen/core/runner/spawn/` (`agent_config.py`, `protocol.py`, `process_manager.py`) plus the HTTP client surface of `openjiuwen/core/runner/drunner/remote_client/` (`remote_client.py`, `remote_client_config.py`, `remote_agent.py`).
-The transport-neutral seam is `AgentSpawner` → `SpawnedAgent` over a JSON-safe `SpawnSpec`; two backends implement it.
+The transport-neutral seam is `AgentSpawner` → `SpawnedAgent` over a JSON-safe `SpawnSpec`; four backends implement it, each naming itself with a `SpawnBackend`.
 `SubprocessSpawner` launches a real child with `tokio::process` and drives it over its stdio pipes.
+`ExternalCommandSpawner` resolves a host-configured program on `PATH` and delegates to that same subprocess backend.
+`InProcessSpawner` wraps a host-bound `InProcessHandler`, so an agent living in this process looks like any other handle.
 `RemoteSpawner` / `RemoteAgent` address an agent served over HTTP with `reqwest`.
-Both speak the NDJSON frame vocabulary of `protocol` over the bounded line framing of `frames`.
+Every backend speaks the NDJSON frame vocabulary of `protocol` over the bounded line framing of `frames`.
+`SpawnerRegistry` hosts several backends side by side and routes a `SpawnSpec` to one of them; `DeferredSpawner` answers for every backend that is not registered.
 `UnsupportedSpawner` remains the documented default while no backend is installed on a runner.
 The deferred transports are typed, not silent: Pulsar/ZeroMQ reply-topic routing (`RemoteProtocol::Mq`), the A2A remote transport (`RemoteProtocol::A2a`), Python's `python -m` child, its `process_manager` pool, and the drunner reply-topic plumbing all report `Error::Unsupported` with a message naming the seam.
 
@@ -17,29 +20,56 @@ The deferred transports are typed, not silent: Pulsar/ZeroMQ reply-topic routing
 
 ```rust
 pub enum SpawnAgentKind { ClassAgent, TeamAgent }          // serde snake_case
+pub enum SpawnBackend {                                    // serde snake_case; Copy/Ord/Hash, as_str(), is_implemented()
+    Unknown,          // default; a handle or spawner that names no backend
+    Subprocess, ExternalCommand, InProcess, RemoteHttp,    // implemented
+    RemoteMq,         // Python's drunner Pulsar/ZeroMQ reply-topic transport (deferred)
+    RemoteA2a,        // the A2A remote transport, which lives in `openjiuwen-extensions` (deferred)
+}                                                          // Display == as_str()
+pub struct SpawnHealth {                                   // serde snake_case, default, unknown fields tolerated
+    pub backend: SpawnBackend,                             // Unknown
+    pub alive: bool,                                       // false
+    pub healthy: bool,                                     // false
+    pub pid: Option<u32>,                                  // None
+    pub last_error: Option<String>,                        // None
+}                                                          // + healthy(backend, pid) -> Self
 pub struct SpawnSpec {                                     // serde snake_case, default, unknown fields tolerated
     pub agent_kind: SpawnAgentKind,                        // ClassAgent
     pub agent_module: Option<String>,
     pub agent_class: Option<String>,
     pub init_kwargs: Value,                                // {}
     pub payload: Value,                                    // null
+    pub backend: Option<SpawnBackend>,                     // None; omitted from the wire object when unset
     pub session_id: Option<String>,
     pub health_check_interval_secs: f64,                   // 5.0
     pub shutdown_timeout_secs: f64,                        // 10.0
     pub envs: BTreeMap<String, String>,
 }
 impl SpawnSpec { pub fn class_agent(module, class) -> Self; pub fn team_agent(payload) -> Self;
-                 pub fn with_session_id / with_init_kwargs / with_env }
+                 pub fn with_session_id / with_init_kwargs / with_env / with_backend }
 #[async_trait] pub trait SpawnedAgent: Send + Sync {
+    // required
     fn id(&self) -> &str; fn is_alive(&self) -> bool; fn pid(&self) -> Option<u32>;
     async fn send(&self, inputs: Value) -> Result<AgentOutput>;
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>>;
     async fn shutdown(&self, timeout: Duration) -> Result<bool>;   // false when it had to be killed
     async fn force_kill(&self) -> Result<()>;
+    // defaulted (object-safe, so no implementor breaks)
+    fn backend(&self) -> SpawnBackend;                     // Unknown
+    fn is_healthy(&self) -> bool;                          // == is_alive(): no probe ⇒ liveness is the answer
+    fn health_snapshot(&self) -> SpawnHealth;              // backend/is_alive/is_healthy/pid, last_error: None
+    async fn health(&self) -> Result<bool>;                // Unsupported("agent health probe", <backend> hint)
+    async fn cancel_task(&self, task_id: &str) -> Result<()>;  // Unsupported("spawned task cancellation", <backend> hint)
 }
-#[async_trait] pub trait AgentSpawner: Send + Sync { async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>; }
+#[async_trait] pub trait AgentSpawner: Send + Sync {
+    async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
+    fn backend(&self) -> SpawnBackend;                     // Unknown
+}
 pub struct UnsupportedSpawner;                             // every spawn -> Error::Unsupported(<message naming Runner::set_spawner>)
 ```
+
+`SpawnSpec::backend` is a routing hint for `SpawnerRegistry`, not a wire change: it is additive metadata a Python child ignores (unknown fields are tolerated) and it never alters the frames.
+A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, and an `Unsupported` `health`/`cancel_task` whose message names its backend.
 
 ### Wire — `protocol.rs`
 
@@ -87,10 +117,76 @@ pub struct SpawnedProcess;                                  // id, pid, is_alive
 ```
 
 `SubprocessSpawner::spawn_process` returns the concrete `Arc<SpawnedProcess>` so hosts can call `health`/`pid`; the `AgentSpawner::spawn` impl coerces it to `Arc<dyn SpawnedAgent>`.
-`SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour.
+`SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is `Subprocess`, `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` pins the backend and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
+`cancel_task` keeps the unsupported default: the NDJSON protocol has no task handle to address, so a caller stops a child with `shutdown`/`force_kill`.
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
 Configured timeouts are clamped to `[0, 86_400]` seconds, so `Instant + Duration` cannot overflow and nonsense configuration means "no deadline".
 `SubprocessConfig` env wins over the inherited environment and `SpawnSpec::envs` wins over `SubprocessConfig` env.
+
+### External-command backend — `external.rs`
+
+```rust
+pub struct ExternalCommandSpawner { command: String, config: SubprocessConfig, search_path: Option<PathBuf> }
+impl ExternalCommandSpawner {
+    pub fn new(command) -> Self; pub fn command(&self) -> &str; pub fn config(&self) -> &SubprocessConfig;
+    pub fn with_args(Vec<String>) / with_arg / with_env / with_cwd / with_search_path(PathBuf) /
+           with_request_timeout / with_shutdown_timeout / with_health_check(interval, timeout, max_failures) /
+           with_max_frame_bytes;
+    pub fn resolve(&self) -> Result<PathBuf>;
+}
+```
+
+`resolve` is the whole backend: an empty (or whitespace-only) command is `Error::Config` naming `ExternalCommandSpawner::command`; a command containing a path separator or an absolute path must be an existing regular file and, on unix, carry an executable bit, else `Error::NotFound` naming the command and the reason; a bare name is looked up in `with_search_path` (used instead of `PATH`, unsplit, for hermetic hosts) or in `PATH` split with `std::env::split_paths`, and the first candidate passing the same checks wins.
+A bare name that matches nothing is `Error::NotFound` naming the command and how many directories were searched (or that none is configured).
+`spawn` resolves, clones the config with `program` set to the resolved path, and delegates to `SubprocessSpawner::new(config).spawn(spec)`: process handling, framing, timeouts and the health task are the subprocess backend's, and the only difference a handle sees is `SpawnBackend::ExternalCommand`.
+
+### In-process backend — `in_process.rs`
+
+```rust
+#[async_trait] pub trait InProcessHandler: Send + Sync {
+    fn is_alive(&self) -> bool;                            // true
+    async fn send(&self, inputs: Value) -> Result<AgentOutput>;
+    fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>>;
+    async fn shutdown(&self) -> Result<()>;
+}
+pub type InProcessFactory = Arc<dyn Fn(&SpawnSpec) -> Result<Arc<dyn InProcessHandler>> + Send + Sync>;
+pub struct InProcessSpawner;                               // new(factory), from_handler(Arc<dyn InProcessHandler>)
+pub struct InProcessAgent;                                 // id, spec(), handler(), the trait methods
+```
+
+`new` calls the factory once per spawn, so a spec can select the bound agent; `from_handler` shares one already-built handler across every spawn.
+Each spawn wraps its handler in a fresh `InProcessAgent` with the id `in-process-<uuid v4>`.
+`is_alive` is this handle's alive flag *and* `handler.is_alive()`, `pid()` is always `None`, `backend()` is `InProcess`, `is_healthy()`/`health()` report liveness (there is no probe in-process), and `send`/`stream` delegate to the handler.
+`shutdown` calls `handler.shutdown()` then marks the handle dead and returns `Ok(true)`; `force_kill` does the same because an in-process handler is stopped, not signalled — there is no OS process — and both are idempotent because the handler's `shutdown` must be.
+A factory `Err` propagates from `spawn` and launches nothing.
+
+### Registry — `registry.rs`
+
+```rust
+pub struct DeferredSpawner;                                // for_backend(backend), new(backend, reason, hint), backend_name()
+pub struct SpawnerRegistry;                                // Debug lists backends + default
+impl SpawnerRegistry {
+    pub fn new() -> Self; pub fn with_deferred() -> Self;   // pre-registers RemoteMq + RemoteA2a
+    pub fn register(backend, Arc<dyn AgentSpawner>) -> Option<Arc<dyn AgentSpawner>>;  // returns the replaced one
+    pub fn register_subprocess(SubprocessConfig) / register_external_command(ExternalCommandSpawner) /
+           register_in_process(InProcessSpawner) / register_remote(RemoteSpawner);
+    pub fn unregister(backend) -> Option<Arc<dyn AgentSpawner>>;  // also clears a default that pointed at it
+    pub fn get(backend) -> Option<Arc<dyn AgentSpawner>>; pub fn contains(backend) -> bool;
+    pub fn len() -> usize; pub fn is_empty() -> bool; pub fn backends() -> Vec<SpawnBackend>;  // sorted
+    pub fn set_default(backend) -> Result<()>;             // Validation when it is not registered
+    pub fn default_backend() -> Option<SpawnBackend>;
+    pub fn spawner_for(&SpawnSpec) -> Arc<dyn AgentSpawner>;   // never None
+    pub async fn spawn(SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
+    pub async fn spawn_with(SpawnBackend, SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
+}
+```
+
+`DeferredSpawner::for_backend` is the wording table: `RemoteMq` → `"Pulsar/ZeroMQ spawn transport"` with a hint naming drunner reply-topic routing; `RemoteA2a` → `"a2a spawn transport"` with a hint naming `openjiuwen-extensions`' `a2a` feature; an implemented-but-unregistered backend → `"no <name> spawner registered"` with a hint naming the matching `register_*` method; anything else → ``"spawn backend `<name>`"``.
+Every `spawn` on one is `Error::Unsupported` (`error::unsupported(reason, hint)`).
+
+Routing precedence in `spawner_for`: `spec.backend` when set (registered spawner, else the matching `DeferredSpawner` — never a fallback to another backend) → the explicit default → the sole registered spawner → a `DeferredSpawner` with reason `"no default spawn backend"` (empty) or `"ambiguous spawn backend"` (more than one), whose hint names `set_default` and `SpawnSpec::backend`.
+`spawn_with` resolves exactly the named backend and answers with `DeferredSpawner::for_backend` when it is not registered.
+The registry holds one `parking_lot::RwLock` over `{spawners: BTreeMap<SpawnBackend, Arc<dyn AgentSpawner>>, default: Option<SpawnBackend>}`; the spawner `Arc` is cloned out before any `.await`, so no guard is held across one.
 
 ### Remote backend — `remote.rs`
 
