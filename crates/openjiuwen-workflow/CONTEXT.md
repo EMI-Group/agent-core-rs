@@ -324,7 +324,7 @@ Component-local codes live beside the component: `intent_detection/error.rs` own
 
 ## Test Strategy
 
-Unit tests beside modules: `reference` (path grammar, projection, missing paths), `condition` (operator precedence, helpers, errors), `card` (JSON round-trip, defaults), `components::end` (template segmentation/rendering), `components::loop_` (bound enforcement), `components::llm::format` (instruction rewriting, schema generation, output shaping), `components::intent_detection::tests` (category model, model-reply post-processing, keyword rules, `IntentRouter`), `context::history` (lane round-trip, role filtering), `render` (layout, escaping, determinism), plus the inline suites of every component module.
+Unit tests beside modules: `reference` (path grammar, projection, missing paths), `condition` (operator precedence, helpers, errors), `card` (JSON round-trip, defaults, `generate_workflow_key`), `interrupt` (seeding order, `append`/`queued_answers`), `components::end` (template segmentation/rendering), `components::loop_` (bound enforcement), `components::llm::format` (instruction rewriting, schema generation, output shaping), `components::intent_detection::tests` (category model, model-reply post-processing, keyword rules, `IntentRouter`), `context::history` (lane round-trip, role filtering), `render` (layout, escaping, determinism), `engine` (stream termination, snapshots, resume), plus the inline suites of most component modules (the questioner's behavior is covered at crate level by `tests/questioner_component.rs`).
 
 Integration tests in `./tests/` (all offline, using `openjiuwen_test_support::ScriptedModel`, loopback `wiremock` where HTTP is involved, and `openjiuwen_session::WorkflowSession`):
 
