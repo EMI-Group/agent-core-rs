@@ -230,6 +230,7 @@ Validation is covered through `tests/builder_validation.rs`; run semantics throu
 `llm_semantics.rs`, `tool_component.rs`, `retrieval_component.rs`, `loop_component.rs`, `http_component.rs`,
 `questioner_component.rs`, `intent_detection.rs`, `react_agent.rs`, `sub_workflow.rs`, `exception_recovery.rs`,
 `draw.rs`, `session_state.rs`, `checkpoint_resume.rs`, and `card_spec.rs`.
+`tests/single_component.rs` exercises the reused `project_output` / `interaction_wires` helpers outside a graph (input/output templates, interrupt wires, seeded answer).
 The engine's own unit tests cover termination of a stream whose run emits no frames, buffered producer frames
 versus end wires, snapshot lifecycle (deleted on completion, kept on interruption), and resume semantics for
 both an interrupted superstep and a plain node failure.
