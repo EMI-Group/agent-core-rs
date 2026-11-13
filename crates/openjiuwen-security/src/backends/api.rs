@@ -5,9 +5,9 @@
 //! `{"text": ...}` to a moderation service and feeds the JSON reply to a
 //! [`ModelOutputParser`].
 //!
-//! [`ApiModelBackend::http`] installs the built-in generic transport
-//! ([`HttpModerationTransport`](super::http::HttpModerationTransport)) derived
-//! from the backend configuration, so a remote backend needs no extra wiring.
+//! [`ApiModelBackend::http`] installs the built-in
+//! [generic HTTP transport](super::http::HttpModerationTransport) derived from
+//! the backend configuration, so a remote backend needs no extra wiring.
 //! [`ApiModelBackend::with_transport`] still injects a custom transport for a
 //! vendor wire format, a different retry policy, or a fake in tests; an
 //! explicit transport takes precedence over the built-in `HTTP` default.

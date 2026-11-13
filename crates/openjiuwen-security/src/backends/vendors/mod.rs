@@ -7,8 +7,8 @@
 //! [`GuardrailPipeline`](crate::GuardrailPipeline) like any other backend.
 //!
 //! No vendor SDK is involved: the adapters use the crate-shared
-//! [`super::http`] helpers, so they stay offline-testable against recorded
-//! wire fixtures or a loopback server.
+//! [`super::http`] helpers, so they stay offline-testable against recorded wire
+//! fixtures or the loopback `wiremock` server the test suites use.
 //!
 //! Adapters never place raw matched text in `details`; vendor fields carrying
 //! the offending words (Aliyun `RiskWords`, blocklist terms) are dropped.
