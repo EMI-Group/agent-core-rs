@@ -72,6 +72,19 @@ impl ElasticsearchVectorStore {
 - Errors: `Error::Validation` (config/kind), `Error::Unsupported` (deferred backend); path/URL validation before any I/O.
 - Files ≤ ~1000 lines; one file per backend family.
 
+## Notes for a Live Backend
+
+- No Redis or Elasticsearch client crate is in the workspace or `Cargo.lock`, and the `redis` feature adds no dependency, so a live Redis backend must speak RESP itself over `tokio::net::TcpStream` (workspace `tokio` enables `net`) and a live Elasticsearch backend must use `reqwest` (already a dependency) REST.
+- `reqwest`, `url`, `sha2`, `futures`, `uuid` and `async-trait` are already crate dependencies; `src/a2a/client.rs` is the in-crate HTTP pattern (`reqwest::Client::builder()`, `Error::transport` for non-2xx, `Error::timeout` for budgets).
+- `openjiuwen_common::http::HttpClient` offers retry/backoff over `reqwest` but is not used anywhere in this crate today.
+- `openjiuwen_core::foundation::store::kv::StorePipeline` is the public shared `KvPipeline` implementation a live `KvStore` should return from `pipeline()`; it is reachable only through the `store::kv` module path, not the flat crate-root re-exports.
+- The kernel contract puts TTL only on `exclusive_set` (`Option<Duration>`, relative) and requires `set` to clear any TTL, so Redis `SET` plus `SET … NX PX` covers it without Lua.
+- `StoreBackend::Redis` carries only `url`, while `RedisStoreConfig` also exposes `cluster_mode` and `connection_args`, so the factory cannot construct a fully configured remote store as written.
+- `documents` and `vectors` factories answer `Unsupported` for `Redis`, and `RedisStore` has no document or vector surface at all.
+- The kernel `validate_collection` helper is `pub(crate)` in `openjiuwen-foundation`, so a live backend must re-implement collection-name validation.
+- Elasticsearch parity traps: `create_collection` on an existing name must fail with `Validation` (unlike document collections), `auto_id`/`default_value` filling is the store's job, `delete_docs_by_filters` with `null`/`{}` deletes everything, and `CollectionSchema` does not round-trip through an index mapping so it needs a metadata document.
+- Switching either backend to live changes the deferral contracts asserted by `tests/adapters.rs` (`redis_backends_are_deferred`, `elasticsearch_vector_store_is_deferred`), the inline `Unsupported` tests here, and the deferred tables in `../CONTEXT.md` and `docs/PARITY.md`.
+
 ## Test Strategy
 
 - Unit tests beside `mod.rs`: `StoreBackend::from_json` for every kind and an unknown kind; memory KV set/get round-trip through the factory; file KV under a `tempfile::TempDir`; sqlite branch under `--features sqlite`; `StoreBackend::Redis`/`Elasticsearch` → `ErrorKind::Unsupported` with the message naming the backend.
