@@ -6,16 +6,18 @@
 //!
 //! | Module | Responsibility |
 //! | --- | --- |
-//! | [`descriptor`] | [`TeamJoinDescriptor`]: identity, [`ClientScope`] and team settings |
+//! | [`descriptor`] | [`TeamJoinDescriptor`]: identity, [`ClientScope`], team settings and the attach socket |
 //! | [`client`] | [`TeamClient`] seam, outcome types and the tool catalogue per scope |
 //! | [`store_client`] | [`StoreTeamClient`]: the store/task-board/messager implementation |
-//! | [`live`] | live-team resolution through the process-global runtime registry |
+//! | [`socket_client`] | [`SocketTeamClient`]: the same seam over the attach socket of a team hosted elsewhere |
+//! | [`live`] | live-team resolution: this process's registry first, then a published attach socket |
 //! | `cli` | the `team-member` command tree, its two-stage parse and the process entry point |
 
 pub mod cli;
 pub mod client;
 pub mod descriptor;
 pub mod live;
+pub mod socket_client;
 pub mod store_client;
 
 pub use cli::{
@@ -27,5 +29,6 @@ pub use client::{
     TeamClient, TeamToolDef,
 };
 pub use descriptor::{ClientScope, TeamJoinDescriptor};
-pub use live::connect_live_client;
+pub use live::{connect_live_client, connect_socket_client};
+pub use socket_client::SocketTeamClient;
 pub use store_client::StoreTeamClient;

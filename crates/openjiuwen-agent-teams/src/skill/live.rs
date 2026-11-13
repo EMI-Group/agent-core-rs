@@ -1,41 +1,84 @@
-//! Live-team resolution: the bridge from a join descriptor to the team this process hosts.
+//! Live-team resolution: the bridge from a join descriptor to the team a client drives.
 //!
 //! This is the single wiring point for **both** the `team-member` skill CLI and the
 //! `openjiuwen-team-mcp` server: each of them holds a [`TeamJoinDescriptor`] naming a team and asks
-//! [`connect_live_client`] for a client over that team's own store, task board and event bus.
+//! [`connect_live_client`] for a client over that team.
 //!
-//! The team must be hosted in *this* process: the client is built from the team's
-//! [`TeamBackend`](crate::runtime::TeamBackend), which the process-global runtime registry
-//! ([`crate::runtime::try_global_registry`]) hands out for the name. Cross-process attach — an
-//! external process reaching a team hosted elsewhere through a shared sqlite database or a
-//! transport — is deferred, so a team that this process does not host simply does not resolve and
-//! the caller reports the missing team (the CLI exits `1`).
+//! Two hosts can answer, in this order:
+//!
+//! 1. **This process.** The team's [`TeamBackend`](crate::runtime::TeamBackend) is handed out by the
+//!    process-global runtime registry ([`crate::runtime::try_global_registry`]), and the client is a
+//!    [`StoreTeamClient`] over that backend's own store, task board and messager. This is the
+//!    cheapest and most direct route, so it always wins.
+//! 2. **Another process.** A hosting process publishes its attach socket (the `socket_path` field of
+//!    the descriptor, else the `OPENJIUWEN_TEAM_SOCKET` variable), and the client is a lazily
+//!    connecting [`SocketTeamClient`] over the attach bridge.
+//!
+//! # Why the socket client is lazy here
+//!
+//! [`connect_live_client`] is synchronous and may be called from inside a runtime (the MCP resolver
+//! runs on the server's task), so it must not block or await: it only probes the filesystem
+//! (`socket_present`, a cheap `stat`) and hands back a client that connects on its first
+//! operation. A socket that is unreachable therefore surfaces at the first operation as a typed
+//! [`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport) or
+//! [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout) error, which the CLI maps
+//! to exit code `1`.
+//!
+//! A descriptor that names no socket, or whose socket is not an existing Unix socket file, keeps
+//! the in-process rule unchanged: resolution is `None`, the CLI reports
+//! `no live team '<name>' in this process` and exits `1`. A host that needs the connect failure up
+//! front uses [`connect_socket_client`] instead.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::runtime::TeamRuntimeManager;
 
 use super::client::TeamClient;
 use super::descriptor::TeamJoinDescriptor;
+use super::socket_client::SocketTeamClient;
 use super::store_client::StoreTeamClient;
 
-/// Returns a client over the team `descriptor` names, when this process hosts it.
+/// Returns a client over the team `descriptor` names, or `None` when no host can be found.
 ///
-/// Resolution is `try_global_registry()` → [`TeamRuntimeManager::live`] → the live
-/// [`TeamAgent`](crate::runtime::TeamAgent)'s backend → a [`StoreTeamClient`] over that backend's
-/// store, task board and messager (see `resolve_live_client` for the registry-free half). The
-/// returned client therefore drives the *live* team: a task it creates is claimable on the team's
-/// own board and a message it sends lands in the team's own mailbox.
+/// Resolution order: a team this process hosts (the global registry →
+/// [`TeamRuntimeManager::live`] → the live [`TeamAgent`](crate::runtime::TeamAgent)'s backend → a
+/// [`StoreTeamClient`]), else a [`SocketTeamClient`] over the socket the descriptor resolves from
+/// its `socket_path` field or the `OPENJIUWEN_TEAM_SOCKET` variable.
 ///
-/// `None` means "no such team in this process" — either nothing was installed behind the registry
-/// or the installed manager hosts no team under that name.
+/// The socket route does no I/O beyond a `stat`, so this function never blocks and is safe to call
+/// from inside a runtime; the connection is established by the first operation.
+///
+/// `None` means "no such team here and no published socket": either nothing was installed behind
+/// the registry, the installed manager hosts no team under that name, and no socket path resolves
+/// (or the path is not an existing Unix socket file).
 #[must_use]
 pub fn connect_live_client(descriptor: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>> {
-    let manager = crate::runtime::try_global_registry()?;
-    resolve_live_client(&manager, descriptor)
+    connect_with_registry(
+        crate::runtime::try_global_registry().as_deref(),
+        descriptor,
+        |key| std::env::var(key).ok(),
+    )
 }
 
-/// Builds the client for `descriptor` out of the live team `manager` hosts, if any.
+/// Resolves a client against an explicit registry slot and environment lookup.
+///
+/// Split from [`connect_live_client`] so both halves are unit-testable without touching the
+/// process-global registry or the process environment: `manager` is the registry's manager (or
+/// `None` when nothing is installed) and `get` is the environment lookup the socket fallback uses.
+#[must_use]
+pub(crate) fn connect_with_registry(
+    manager: Option<&TeamRuntimeManager>,
+    descriptor: &TeamJoinDescriptor,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<Arc<dyn TeamClient>> {
+    if let Some(client) = manager.and_then(|manager| resolve_live_client(manager, descriptor)) {
+        return Some(client);
+    }
+    resolve_socket_client(descriptor, get)
+}
+
+/// Builds the [`StoreTeamClient`] for `descriptor` out of the live team `manager` hosts, if any.
 ///
 /// Split from [`connect_live_client`] so the resolution is unit-testable against a local manager
 /// without touching the process-global registry.
@@ -53,6 +96,67 @@ pub(crate) fn resolve_live_client(
         Arc::clone(backend.messager()),
     );
     Some(Arc::new(client))
+}
+
+/// Builds a lazily connecting [`SocketTeamClient`] for the socket `descriptor` resolves, if any.
+///
+/// The socket is taken from the descriptor's `socket_path` field first and from the `get` lookup
+/// ([`TEAM_SOCKET_ENV`](super::descriptor::TEAM_SOCKET_ENV)) second. Nothing is connected here: the
+/// path must exist *and* be a Unix socket file ([`socket_present`]), which keeps a stale or mistyped
+/// path from turning into a phantom client, and the bounded connect happens on the first operation.
+#[must_use]
+pub(crate) fn resolve_socket_client(
+    descriptor: &TeamJoinDescriptor,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<Arc<dyn TeamClient>> {
+    let path = descriptor.resolve_socket_path_with(get)?;
+    if !socket_present(&path) {
+        tracing::debug!(
+            path = %path.display(),
+            team = %descriptor.team_name,
+            "socket path is not an attach socket; not attaching"
+        );
+        return None;
+    }
+    Some(Arc::new(SocketTeamClient::new(descriptor.clone(), path)))
+}
+
+/// Connects to the attach socket at `path` and returns a client over the hosted team.
+///
+/// This is the eager counterpart of the socket fallback in [`connect_live_client`], for a host or a
+/// test that wants the connect failure reported up front rather than on the first operation.
+///
+/// # Errors
+///
+/// Returns the attach bridge's typed error: [`ErrorKind::Transport`](openjiuwen_common::error::ErrorKind::Transport)
+/// when the socket cannot be reached, [`ErrorKind::Timeout`](openjiuwen_common::error::ErrorKind::Timeout)
+/// when the attach deadline elapses first, and
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) on a target without
+/// Unix domain sockets.
+pub async fn connect_socket_client(
+    path: impl AsRef<Path>,
+    descriptor: TeamJoinDescriptor,
+) -> openjiuwen_common::error::Result<Arc<dyn TeamClient>> {
+    let client = SocketTeamClient::connect(descriptor, path).await?;
+    Ok(Arc::new(client))
+}
+
+/// Returns whether `path` is an existing Unix socket file.
+///
+/// Only a socket file can be connected to, so this is a cheap pre-check rather than a probe: a
+/// directory, a regular file or a missing path all report `false` without ever opening anything.
+/// Non-Unix targets have no attach transport, so the answer there is always `false`.
+#[cfg(unix)]
+fn socket_present(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+}
+
+/// Returns whether `path` is an existing Unix socket file; always `false` off Unix.
+#[cfg(not(unix))]
+fn socket_present(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -127,12 +231,34 @@ mod tests {
 
         let descriptor = TeamJoinDescriptor {
             team_name: "skill-live-not-hosted".to_string(),
+            socket_path: None,
             ..TeamJoinDescriptor::default()
         };
-        assert!(connect_live_client(&descriptor).is_none());
+        assert!(
+            connect_with_registry(try_global_registry().as_deref(), &descriptor, |_| None)
+                .is_none(),
+            "an unhosted team with no published socket does not resolve"
+        );
 
         clear_global_registry();
         assert!(try_global_registry().is_none(), "the slot is cleared");
+    }
+
+    #[test]
+    fn a_regular_file_is_not_an_attach_socket() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(!socket_present(file.path()));
+        assert!(!socket_present(std::path::Path::new(
+            "does-not-exist/attach.sock"
+        )));
+        let descriptor = TeamJoinDescriptor {
+            socket_path: Some(file.path().display().to_string()),
+            ..TeamJoinDescriptor::default()
+        };
+        assert!(
+            resolve_socket_client(&descriptor, |_| None).is_none(),
+            "only a socket file is attached to"
+        );
     }
 
     // The registry lock is held for the whole case so its install and its restore cannot be
