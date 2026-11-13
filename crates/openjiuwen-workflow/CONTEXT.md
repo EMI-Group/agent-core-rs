@@ -190,7 +190,8 @@ impl ComponentContext {
     pub async fn interact(&self, question: Value) -> Result<Value>;          // seeded answer, else halts the run
     pub fn cancellation(&self) -> &CancellationToken;
     pub fn check_cancelled(&self) -> Result<()>;
-    pub fn seeded_answer(&self, id: &str) -> Option<Value>;
+    pub fn seeded_answer(&self, id: &str) -> Option<Value>;                   // consuming pop of the next queued answer
+    pub fn queued_answers(&self) -> BTreeMap<String, Vec<Value>>;            // non-consuming; nested components forward these to a child run
 }
 ```
 
@@ -312,7 +313,7 @@ Component-local codes live beside the component: `intent_detection/error.rs` own
 - `./src/component.rs` → `Component` trait, `ComponentCard`, ability defaults, boxed helpers
 - `./src/context.rs` → `ComponentContext` session facade (state, streams, HITL, cancellation, depth, history)
 - `./src/context/history.rs` → `MessageHistory`, `SessionMessageHistory`, `__messages__` lane
-- `./src/interrupt.rs` → interaction frames, seeded answers, interrupt error
+- `./src/interrupt.rs` → interaction frames, seeded-answer queues (`seed`, `append`, `queued_answers`, `take_answer`), interrupt error
 - `./src/registry.rs` → `ComponentRegistry` and the five builtin factories
 - `./src/output.rs` → `WorkflowOutput`, `WorkflowExecutionState`, chunk/frame helpers
 - `./src/render.rs` → offline SVG renderer (`to_svg`, `render_svg`, `error_svg`, `SvgOptions`, `DrawFormat`, `LayoutDirection`)
