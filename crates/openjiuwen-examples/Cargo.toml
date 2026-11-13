@@ -31,6 +31,13 @@ schemars.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
+# The umbrella forwards `sqlite` to `openjiuwen-extensions` and
+# `openjiuwen-symphony` only, so the two examples that demonstrate the SQLite
+# backends (16 lite memory FTS, 17 team persistence) take those crates directly
+# to switch the backend feature on. Both are workspace crates, so the build stays
+# offline.
+openjiuwen-memory = { workspace = true, features = ["sqlite"] }
+openjiuwen-agent-teams = { workspace = true, features = ["sqlite"] }
 
 [features]
 default = []
@@ -93,6 +100,41 @@ required-features = ["a2a"]
 [[example]]
 name = "12_self_improvement"
 path = "examples/12_self_improvement.rs"
+
+# 13-16: deeper kernel seams (context processors, workflow components,
+# retrieval quality, lite memory with an FTS index).
+[[example]]
+name = "13_context_processors"
+path = "examples/13_context_processors.rs"
+
+[[example]]
+name = "14_workflow_components"
+path = "examples/14_workflow_components.rs"
+
+[[example]]
+name = "15_retrieval_quality"
+path = "examples/15_retrieval_quality.rs"
+
+[[example]]
+name = "16_memory_lite"
+path = "examples/16_memory_lite.rs"
+
+# 17-20: persistence, cross-process attach, and the product tooling tiers.
+[[example]]
+name = "17_team_persistence"
+path = "examples/17_team_persistence.rs"
+
+[[example]]
+name = "18_team_attach"
+path = "examples/18_team_attach.rs"
+
+[[example]]
+name = "19_symphony_skills"
+path = "examples/19_symphony_skills.rs"
+
+[[example]]
+name = "20_prompt_tuning"
+path = "examples/20_prompt_tuning.rs"
 
 [lints]
 workspace = true

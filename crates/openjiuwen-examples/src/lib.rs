@@ -6,8 +6,9 @@
 //! and the stdout narrative helpers ([`support::banner`]).
 //!
 //! Keeping the helpers in the library (rather than in an example-only module)
-//! makes them unit-testable: `cargo test -p openjiuwen-examples` exercises them
-//! without running a single example. The library has no dev-only dependencies —
+//! makes them unit-testable: `cargo test -p openjiuwen-examples` runs these unit
+//! tests and then `tests/examples_offline.rs`, which executes every example
+//! binary in a clean offline environment. The library has no dev-only dependencies —
 //! the scripted model and mock-server fakes live in `openjiuwen-test-support`,
 //! which only the example targets may use.
 //!
