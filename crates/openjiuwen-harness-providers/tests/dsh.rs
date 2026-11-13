@@ -31,7 +31,8 @@ use openjiuwen_agent::AgentChunk;
 use openjiuwen_harness_protocol::{
     AbortMode, DeliveryMode, HarnessCheckpoint, HarnessContext, HarnessErrorKind,
     HarnessEventCursor, HarnessEventPayload, HarnessInput, HarnessProtocol, HarnessState,
-    JsonObject, JsonValue, ResumePolicy, TurnEventKind, TurnStatus, TurnTerminationKind,
+    ItemEventKind, JsonObject, JsonValue, ResumePolicy, TurnEventKind, TurnStatus,
+    TurnTerminationKind,
 };
 use openjiuwen_harness_providers::{
     create_harness, HarnessIOAdapter, HarnessIOAdapterConfig, TURN_LIFECYCLE_KIND,
@@ -282,30 +283,56 @@ fn kinds(chunks: &[AgentChunk]) -> Vec<&str> {
 // Launch contract
 // ---------------------------------------------------------------------------
 
-/// A fake runtime starts the cycle, reports a `dsh-` session id and stops cleanly.
+/// A fake runtime starts the cycle, reports a `dsh-` session id, serves a prompt and stops cleanly.
 #[tokio::test]
 async fn create_and_start_open_a_dsh_session() {
     let home = tempfile::tempdir().expect("a temporary DSH home");
     let cli = FakeCli::script(&runtime(&turn_end(r#"{"kind":"completed"}"#)));
     let harness = create(base_config(&cli, home.path())).expect("the runtime resolves");
     assert_eq!(harness.state(), HarnessState::Terminated);
+    assert_eq!(harness.provider_session_id(), None);
 
-    harness.start(context()).await.expect("the runtime starts");
+    let mut cursor = started(harness.as_ref()).await;
     assert_eq!(harness.state(), HarnessState::Idle);
     let session = harness
         .provider_session_id()
-        .expect("the cycle reports its session");
+        .expect("the cycle reports its session")
+        .to_owned();
     assert!(session.starts_with("dsh-"), "{session}");
 
+    let events = one_turn(harness.as_ref(), cursor.as_mut(), "hello").await;
+    assert_eq!(terminal(&events).status, TurnStatus::Completed);
+
+    // The script dumps an `ARGV`/`HOME`/`CWD` header before it reads stdin, so the wire requests
+    // are located by content instead of by position.
     let transcript = cli.lines();
+    let initialize = transcript
+        .iter()
+        .position(|line| line.contains(r#""method":"initialize""#))
+        .unwrap_or_else(|| panic!("the runtime is initialized: {transcript:?}"));
     assert!(
-        transcript[0].contains(r#""method":"initialize""#),
-        "{transcript:?}"
-    );
-    assert!(
-        transcript[0].contains(r#""model":""#),
+        transcript[initialize].contains(r#""model":""#),
         "initialize names the model: {transcript:?}"
     );
+    let prompt = transcript
+        .iter()
+        .position(|line| line.contains(r#""method":"session/prompt""#))
+        .unwrap_or_else(|| panic!("the prompt is written: {transcript:?}"));
+    assert!(
+        prompt > initialize,
+        "the prompt follows the initialization: {transcript:?}"
+    );
+    assert!(
+        transcript[prompt].contains(&format!(r#""sessionId":"{session}""#)),
+        "the prompt carries the runtime session: {}",
+        transcript[prompt]
+    );
+    assert!(
+        transcript[prompt].contains(r#""contentBlocks":[{"type":"text","text":"hello"}]"#),
+        "the prompt carries the input: {}",
+        transcript[prompt]
+    );
+
     harness.stop().await.expect("the runtime stops");
     assert_eq!(harness.state(), HarnessState::Terminated);
 }
@@ -599,9 +626,10 @@ async fn an_unknown_turn_ending_fails() {
     let _ = harness.stop().await;
 }
 
-/// A child session's events are surfaced as provider events and never join the root turn.
+/// A subagent's lifetime is an item lifecycle; a child session's event is forwarded as a provider
+/// event and never joins the root turn.
 #[tokio::test]
-async fn child_session_events_are_provider_events() {
+async fn subagent_lifecycles_become_items_and_child_events_are_forwarded() {
     let home = tempfile::tempdir().expect("a temporary DSH home");
     let child = r#"{"type":"assistant/chunk","data":{"turn":1,"step":1,"chunk":{"type":"text-delta","index":0,"text":"child text"}}}"#;
     let events = [
@@ -610,6 +638,7 @@ async fn child_session_events_are_provider_events() {
             "      printf '{{\"jsonrpc\":\"2.0\",\"method\":\"session.event\",\
              \"params\":{{\"sessionId\":\"child-1\",\"event\":{child}}}}}\\n'"
         ),
+        format!("      notify 'subagent.finished' '{{\"childSessionId\":\"child-1\"}}'"),
         delta(0, "root"),
         turn_end(r#"{"kind":"completed"}"#),
     ]
@@ -620,14 +649,51 @@ async fn child_session_events_are_provider_events() {
     let events = one_turn(harness.as_ref(), cursor.as_mut(), "hello").await;
     assert_eq!(terminal(&events).status, TurnStatus::Completed);
     assert_eq!(outputs(&events), vec![json!("root")]);
-    let types: Vec<String> = provider_events(&events)
-        .into_iter()
-        .map(|(_, event_type)| event_type)
+
+    // `subagent.*` notifications describe one child session's lifetime, so the accumulator turns
+    // them into subagent items instead of provider events.
+    let items: Vec<(String, ItemEventKind, JsonValue)> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            HarnessEventPayload::ItemLifecycle(item) if item.item_type == "subagent" => Some((
+                item.item_type.clone(),
+                item.kind,
+                item.data
+                    .get("childSessionId")
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+            )),
+            _ => None,
+        })
         .collect();
-    assert!(types.contains(&"subagent.started".to_owned()), "{types:?}");
+    assert_eq!(
+        items,
+        vec![
+            (
+                "subagent".to_owned(),
+                ItemEventKind::Started,
+                json!("child-1")
+            ),
+            (
+                "subagent".to_owned(),
+                ItemEventKind::Completed,
+                json!("child-1")
+            ),
+        ]
+    );
+
+    // Only the child's own `session.event` frames are forwarded as provider events; the root
+    // turn additionally publishes its native `turn/end`.
+    let forwarded = provider_events(&events);
     assert!(
-        types.contains(&"child.session.event".to_owned()),
-        "{types:?}"
+        forwarded.contains(&("dsh".to_owned(), "child.session.event".to_owned())),
+        "{forwarded:?}"
+    );
+    assert!(
+        !forwarded
+            .iter()
+            .any(|(_, event_type)| event_type.starts_with("subagent.")),
+        "subagent notifications are items, not provider events: {forwarded:?}"
     );
     let surfaced = format!("{events:?}");
     assert!(
@@ -681,10 +747,35 @@ async fn a_required_resume_is_unsupported() {
 #[tokio::test]
 async fn abort_pause_and_export_are_unsupported() {
     let home = tempfile::tempdir().expect("a temporary DSH home");
-    let cli = FakeCli::script(&runtime(&turn_end(r#"{"kind":"completed"}"#)));
+    // The runtime answers the prompt, publishes one delta and then blocks on stdin, so the turn
+    // stays open while the commands are exercised.
+    let cli = FakeCli::script(&runtime(&delta(0, "partial")));
     let harness = create(base_config(&cli, home.path())).expect("the runtime resolves");
-    let _cursor = started(harness.as_ref()).await;
+    let mut cursor = started(harness.as_ref()).await;
 
+    // With no active turn there is nothing to interrupt: `abort` is a documented no-op.
+    harness
+        .abort(AbortMode::Graceful)
+        .await
+        .expect("aborting an idle harness is a no-op");
+
+    harness
+        .send(HarnessInput::text("hello"), DeliveryMode::Auto)
+        .await
+        .expect("the input is accepted");
+    let opened = until_turn_event(cursor.as_mut(), |event| {
+        matches!(&event.event, HarnessEventPayload::Output(_))
+    })
+    .await;
+    assert!(
+        opened
+            .iter()
+            .any(|event| matches!(&event.event, HarnessEventPayload::Output(_))),
+        "the turn is running before the commands are issued"
+    );
+    assert_eq!(harness.state(), HarnessState::Running);
+
+    // The capability gate only applies to a running turn, so every mode is refused here.
     for mode in [AbortMode::Graceful, AbortMode::Force] {
         let error = harness.abort(mode).await.expect_err("DSH cannot abort");
         assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
@@ -696,5 +787,11 @@ async fn abort_pause_and_export_are_unsupported() {
         .await
         .expect_err("DSH exports no checkpoint");
     assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
+    assert_eq!(
+        harness.state(),
+        HarnessState::Running,
+        "the refused commands leave the turn alone"
+    );
     harness.stop().await.expect("the runtime stops");
+    assert_eq!(harness.state(), HarnessState::Terminated);
 }
