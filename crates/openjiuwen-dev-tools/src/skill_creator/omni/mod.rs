@@ -15,6 +15,9 @@
 //!   link deduplication, and [`filter::slugify`].
 //! - [`pipeline`] — [`pipeline::OmniCreation`]: scrape → download → generate →
 //!   save, plus model-assisted generation.
+//! - [`render`] — the deterministic document and model-prompt rendering the
+//!   pipeline calls: skill name/description, `SKILL.md` body, `references/`
+//!   documents, and the drafting prompt.
 //!
 //! Stages 1–5 are implemented; Playwright browser automation, Pillow image
 //! decoding, the LLM image-relevance judge (Python stage 3), and binary image
@@ -26,6 +29,7 @@ pub mod fetch;
 pub mod filter;
 pub mod html;
 pub mod pipeline;
+pub mod render;
 
 pub use archive::{detect, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
 pub use fetch::{FetchedResource, Fetcher, HttpFetcher, ScriptedFetcher};

@@ -97,7 +97,7 @@ impl ResourceFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// Returns [`Error::Validation`]
     /// naming the offending bound (`min_image_bytes` or `max_image_bytes`) when
     /// either is zero, or when `min_image_bytes` exceeds `max_image_bytes`.
     pub fn validate(&self) -> Result<()> {

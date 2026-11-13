@@ -5,7 +5,7 @@
 //! with a timeout, a response-size cap, and the `content-type` preserved so
 //! later stages can classify the payload. The Python module silently returns
 //! `None` on every failure; here each failure is a typed
-//! [`Error`](openjiuwen_common::error::Error) and the caller decides whether to
+//! [`Error`] and the caller decides whether to
 //! skip the URL.
 //!
 //! - [`FetchedResource`] — a buffered response: requested URL, final URL after
@@ -66,7 +66,7 @@ impl FetchedResource {
     ///
     /// The `content-type` header wins when it names `text/html` or
     /// `application/xhtml…`, ignoring case and any `; charset=…` parameters.
-    /// Otherwise the first [`SNIFF_BYTES`] bytes of the body are inspected for a
+    /// Otherwise the first `SNIFF_BYTES` bytes of the body are inspected for a
     /// `<!doctype html` prefix or an `<html` tag, again ignoring case.
     #[must_use]
     pub fn is_html(&self) -> bool {
