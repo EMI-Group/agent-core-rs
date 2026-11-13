@@ -36,19 +36,33 @@ pub enum ExporterType {
     Memory,
     /// Write one `tracing` line per finished span at `debug`.
     Console,
-    /// Ship spans to an OTLP collector (deferred; the surface is stable).
+    /// Ship spans to an OTLP collector over HTTP with JSON payloads.
+    ///
+    /// The endpoint, headers, and protocol resolve from the configuration,
+    /// then from the `OPENJIUWEN_OTEL_*` variables, then from the standard
+    /// `OTEL_*` ones, then from the built-in defaults. This exporter requires
+    /// [`OtlpProtocol::Http`]; [`OtlpProtocol::Grpc`] (the default) answers
+    /// [`Error::Unsupported`] because gRPC/protobuf support (`tonic`/`prost`)
+    /// is unavailable in offline builds.
     #[default]
     Otlp,
 }
 
-/// Transport protocol used by the (deferred) OTLP exporter.
+/// Transport selector for the OTLP exporter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
     /// OTLP over gRPC.
+    ///
+    /// Retained for Python and configuration compatibility, but unsupported:
+    /// building the exporter answers [`Error::unsupported`].
     #[default]
     Grpc,
-    /// OTLP over HTTP with protobuf payloads.
+    /// OTLP over HTTP with **JSON** payloads.
+    ///
+    /// Deviation from Python, which encodes OTLP/HTTP payloads as protobuf:
+    /// the endpoint and collector contract are identical and only the payload
+    /// encoding differs, because no protobuf encoder is available offline.
     Http,
 }
 

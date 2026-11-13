@@ -224,6 +224,67 @@
 //! # }
 //! ```
 //!
+//! # Integrations
+//!
+//! [`ExporterType::Otlp`] with [`OtlpProtocol::Http`] is the transport the
+//! presets below share: finished spans leave the process as OTLP/HTTP JSON
+//! batches.
+//!
+//! - `grafana` — [`GrafanaCloudConfig`] turns a Grafana Cloud stack into the
+//!   gateway preset (`https://otlp-gateway-<zone>.grafana.net/otlp`) plus the
+//!   Basic `authorization` header built from the stack instance id and an
+//!   access-policy token. `GrafanaAgentConfig` keeps the self-hosted Grafana
+//!   Agent/Alloy push API-shaped and answers
+//!   [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported): the
+//!   collector service has to exist and run outside this process.
+//! - `langfuse` — [`LangfuseConfig`] addresses the OTLP endpoint
+//!   `{host}/api/public/otel` with the project keys as Basic credentials, and
+//!   [`LangfuseClient`] posts batched trace/span/generation events to
+//!   `POST {host}/api/public/ingestion` through [`IngestionBatch`].
+//!
+//! Neither preset contacts its backend at configuration time: requests happen
+//! when a span batch is exported, or when [`LangfuseClient`] is asked to
+//! ingest.
+//!
+//! ```
+//! use openjiuwen_extensions::otel::{
+//!     GrafanaAgentConfig, GrafanaCloudConfig, LangfuseConfig,
+//! };
+//!
+//! let grafana = GrafanaCloudConfig::new("123", "glc_token", "prod-us-east-0")
+//!     .with_service_name("checkout");
+//! assert_eq!(
+//!     grafana.endpoint(),
+//!     "https://otlp-gateway-prod-us-east-0.grafana.net/otlp",
+//! );
+//! assert!(grafana.authorization().starts_with("Basic "));
+//! let otel = grafana.otel_config()?;
+//! assert_eq!(
+//!     otel.exporter_endpoint.as_deref(),
+//!     Some(grafana.endpoint().as_str()),
+//! );
+//! assert_eq!(otel.headers["authorization"], grafana.authorization());
+//!
+//! let langfuse = LangfuseConfig::new("pk-lf-public", "sk-lf-secret")
+//!     .with_host("https://langfuse.internal");
+//! assert_eq!(
+//!     langfuse.endpoint(),
+//!     "https://langfuse.internal/api/public/otel",
+//! );
+//! assert_eq!(
+//!     langfuse.ingestion_url(),
+//!     "https://langfuse.internal/api/public/ingestion",
+//! );
+//! assert!(langfuse.otel_config()?.headers["authorization"].starts_with("Basic "));
+//!
+//! // The self-hosted Grafana Agent/Alloy push needs an external collector.
+//! let error = GrafanaAgentConfig::new("http://localhost:4318")
+//!     .otel_config()
+//!     .expect_err("a collector has to run outside the process");
+//! assert!(error.to_string().contains("collector"));
+//! # Ok::<(), openjiuwen_common::error::Error>(())
+//! ```
+//!
 //! [`TraceSink`]: openjiuwen_core::session::tracer::TraceSink
 //! [`TraceSpan`]: openjiuwen_core::session::tracer::TraceSpan
 //! [`TracerHandle::shutdown`]: self::handle::TracerHandle::shutdown
@@ -257,7 +318,12 @@ mod workflow_handler;
 
 pub use config::{global_instrument_enabled, ExporterType, OtelTracerConfig, OtlpProtocol};
 pub use env::DEFAULT_OTLP_HTTP_ENDPOINT;
+pub use grafana::{GrafanaAgentConfig, GrafanaCloudConfig};
 pub use handle::{init_otel_tracer, TracerHandle};
+pub use langfuse::{
+    GenerationBody, IngestionBatch, IngestionEvent, IngestionEventType, IngestionSummary,
+    LangfuseClient, LangfuseConfig, SpanBody, TraceBody,
+};
 pub use redaction::{hash_value, truncate, RedactionField, Redactor};
 pub use span_names::{
     chat_span_name, chat_span_name_for_model, embeddings_span_name, is_llm_component,
