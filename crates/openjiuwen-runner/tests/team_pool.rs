@@ -184,12 +184,12 @@ async fn a_pooled_run_publishes_started_output_and_completed() {
     assert!(!retained.running, "a finished run holds no permit");
     assert_eq!(retained.run_id, run.run_id());
 
-    // `stop_all` sweeps every *retained* entry, so this finished one is
-    // counted as stopped even though it was already terminal (the sweep reports
-    // entries removed, not live runs stopped).
+    // `stop_all` sweeps every *retained* entry, so this finished one is removed
+    // from the pool; it was already terminal when the sweep began, so it is not
+    // counted as a stopped run (`stopped` reports live runs stopped).
     let shutdown = pool.stop_all().await;
     assert!(shutdown.is_ok(), "no sweep failure on a finished run");
-    assert_eq!(shutdown.stopped, 1);
+    assert_eq!(shutdown.stopped, 0, "a finished entry is not a stopped run");
     assert_eq!(pool.len(), 0, "the sweep emptied the pool");
 }
 

@@ -143,7 +143,8 @@ pub(crate) fn rebuild(kind: ErrorKind, message: impl Into<String>) -> Error {
 /// one error rather than losing the others silently.
 #[derive(Debug, Default)]
 pub struct PoolShutdown {
-    /// How many live runs were stopped.
+    /// How many live (non-terminal) runs were stopped; retained finished entries
+    /// are removed from the pool but not counted.
     pub stopped: usize,
     /// The first failure of the sweep, when any.
     pub first_error: Option<Error>,

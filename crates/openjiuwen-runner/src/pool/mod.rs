@@ -47,6 +47,7 @@ mod entry;
 mod error;
 mod key;
 mod reaper;
+mod request;
 mod run;
 
 use std::collections::BTreeMap;
@@ -63,7 +64,8 @@ use crate::monitor::RunPhase;
 pub use entry::{ActiveTeamInfo, PoolFrame};
 pub use error::{PoolError, PoolShutdown};
 pub use key::PoolKey;
-pub use run::{PoolLease, PoolRequest, PoolRun};
+pub use request::PoolRequest;
+pub use run::{PoolLease, PoolRun};
 
 use entry::{select_pruned, Entry};
 use reaper::ReaperHandle;
@@ -268,18 +270,32 @@ impl TeamPool {
     /// Stops every run and closes the pool.
     ///
     /// The reaper is cancelled and joined (bounded by
-    /// `TeamPoolConfig::stop_timeout`), then each retained run is stopped. After
-    /// this call the pool is closed: `start`/`try_start`/`acquire` report
-    /// [`PoolError::Closed`], and a host that wants to run teams again builds a
-    /// fresh pool (the runner facade does exactly that when it restarts).
+    /// `TeamPoolConfig::stop_timeout`), then each retained run is stopped. Every
+    /// entry is removed, live or already finished; [`PoolShutdown::stopped`]
+    /// counts only the live ones (a retained finished entry is swept but not
+    /// counted as a stopped run). After this call the pool is closed:
+    /// `start`/`try_start`/`acquire` report [`PoolError::Closed`], and a host
+    /// that wants to run teams again builds a fresh pool (the runner facade does
+    /// exactly that when it restarts).
     pub async fn stop_all(&self) -> PoolShutdown {
         self.inner.close();
         self.stop_reaper().await;
-        let keys = self.inner.keys();
+        // Read the phases before the sweep removes the entries: `stopped` counts
+        // the runs that were live when the sweep began, never a retained finished
+        // one.
+        let sweep: Vec<(PoolKey, bool)> = self
+            .phases()
+            .into_iter()
+            .map(|(key, phase)| (key, phase.is_terminal()))
+            .collect();
         let mut shutdown = PoolShutdown::default();
-        for key in keys {
+        for (key, finished) in sweep {
             match self.stop(&key).await {
-                Ok(true) => shutdown.stopped += 1,
+                Ok(true) => {
+                    if !finished {
+                        shutdown.stopped += 1;
+                    }
+                }
                 Ok(false) => {}
                 Err(error) => {
                     warn!(
@@ -472,6 +488,54 @@ mod tests {
             assert!(pool.len() <= 2, "the retention bound holds after every run");
         }
         assert_eq!(pool.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_all_counts_only_live_runs_and_sweeps_finished_ones() {
+        let pool = TeamPool::new();
+        let keys = [
+            PoolKey::new("crew", "s-done"),
+            PoolKey::new("crew", "s-live"),
+        ];
+        let entries: Vec<Arc<Entry>> = keys
+            .iter()
+            .map(|key| {
+                Arc::new(Entry::new(entry::EntryInit {
+                    run_id: format!("run-{}", key.session_id),
+                    key: key.clone(),
+                    label: "crew".to_owned(),
+                    deadline: None,
+                    payload_capacity: 2,
+                    frame_capacity: 2,
+                    hub: None,
+                    monitor: None,
+                }))
+            })
+            .collect();
+        for (key, entry) in keys.iter().zip(&entries) {
+            pool.inner.entries().insert(key.clone(), Arc::clone(entry));
+        }
+        // One entry finished before the sweep; the other is still live (queued).
+        let seq = pool.inner.next_seq();
+        assert!(entries[0].finalise(
+            &entry::FinalOutcome::Completed(serde_json::json!("done")),
+            seq
+        ));
+
+        let shutdown = pool.stop_all().await;
+        assert!(shutdown.is_ok(), "the sweep reported no failure");
+        assert_eq!(
+            shutdown.stopped, 1,
+            "only the live run counts; the finished entry is swept but not counted"
+        );
+        for key in &keys {
+            assert!(
+                pool.get(key).is_none(),
+                "the sweep removed every entry, finished or live"
+            );
+        }
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_closed());
     }
 
     #[tokio::test]

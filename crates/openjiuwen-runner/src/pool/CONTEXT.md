@@ -10,13 +10,13 @@ Every run in the pool is driven by `crate::run::stream_team`; the pool never re-
 
 - `TeamPool` (`src/pool/mod.rs`) — cheap-clone `Arc` handle: `new`, `with_config`, `from_runner_config`, `config`, `capacity`, `available_permits`, `start`, `try_start`, `acquire`, `get`, `list_active`, `stop`, `stop_all`, `pause`, `resume`, `take_payloads`, `len`, `is_empty`, `is_closed`. `Default` = `new()`.
 - `PoolKey` (`src/pool/key.rs`) — `{ team_name, session_id }`, `new`, `for_team`, `Display` as `team@session`.
-- `PoolRequest` (`src/pool/run.rs`) — runtime-only request (`team`, `inputs`, `session_id`, `label`, `options`) with `new`, `with_session_id`, `with_label`, `with_options`, `with_cancellation`, `with_timeout`, and a `key(&RunnerConfig)` derivation.
+- `PoolRequest` (`src/pool/request.rs`) — runtime-only request (`team`, `inputs`, `session_id`, `label`, `options`) with `new`, `with_session_id`, `with_label`, `with_options`, `with_cancellation`, `with_timeout`, and a `key(&RunnerConfig)` derivation.
 - `PoolRun` — `run_id`, `key`, `team_name`, `session_id`, `state`, `subscribe`, `wait`, `output`, `cancel`, `payloads`, `is_finished`.
 - `PoolLease` — `key`, `run`, `wait`, `pause`, `resume`, `release`, `is_released`, `run_id`, `state`; `Drop` releases an unreleased lease.
 - `PoolFrame` (`src/pool/entry.rs`) — `Started`, `Paused`, `Resumed`, `Payload`, `Output`, `Completed`, `Failed`, `Cancelled`, serde-tagged by `kind`.
 - `ActiveTeamInfo` — read-only snapshot: `run_id`, `team_name`, `session_id`, `label`, `state`, `gate_closed`, `running`, `leases`, `queued`.
 - `PoolError` (`src/pool/error.rs`) — `AtCapacity`, `Busy`, `NotFound`, `Closed`, `Cancelled`, with `kind()`, `into_error()`, `From<PoolError> for Error`.
-- `PoolShutdown` — `{ stopped, first_error }` with `is_ok`, `into_result`.
+- `PoolShutdown` — `{ stopped, first_error }` with `is_ok`, `into_result`; `stopped` counts only the live runs the sweep stopped, and retained finished entries are removed from the pool but not counted.
 - `TeamPoolConfig` and the `DEFAULT_TEAM_POOL_*` constants live in `crate::config`; the pool reads them through `TeamPoolConfig`'s accessors (`max_runs`, `idle_timeout`, `run_timeout`, `payload_capacity`, `frame_capacity`, `reaper_interval`, `stop_timeout`).
 
 ## Constraints
@@ -43,8 +43,11 @@ Every run in the pool is driven by `crate::run::stream_team`; the pool never re-
 
 ## Test Strategy
 
-- Unit tests beside each module (`#[cfg(test)] mod tests`): config defaults/serde/clamping, `PoolKey` derivation and `Display`, `PoolError` kind/message mapping, `ActiveTeamInfo`/`PoolFrame` serde shape, finalisation idempotence and lease accounting, payload bounding, retention pruning, idle-deadline arithmetic (`due_at`/`is_due`), reaper install-at-most-once, admission guards (closed pool, no runtime, out of permits).
+- Unit tests beside each module (`#[cfg(test)] mod tests`): config defaults/serde/clamping, `PoolKey` derivation and `Display`, `PoolError` kind/message mapping, `ActiveTeamInfo`/`PoolFrame` serde shape, finalisation idempotence and lease accounting, payload bounding, retention pruning, idle-deadline arithmetic (`due_at`/`is_due`), reaper install-at-most-once, admission guards (closed pool, no runtime, out of permits), and the `stop_all` counting rule (a finished retained entry is swept but not counted).
 - No unit test builds a real team; the end-to-end behaviour (start/join/stop/stop_all, frames, cancellation, deadlines, payload drain, hub unbinding) belongs to the `tests/team_pool*.rs` suite.
+- Eviction deadlines are computed with `tokio::time::Instant` and `sleep`, so a paused clock drives them.
+- This crate's test build cannot enable tokio's `test-util` feature: doing so needs a `tokio` dev-dependency feature change in `Cargo.toml`, which is owned elsewhere.
+- The integration suite therefore uses short real idle timeouts and polls their effect with bounded `tokio::time::timeout` waits instead of `advance()`, so those cases are not clock-deterministic and the timeouts stay generous.
 
 ## Deferrals
 
@@ -59,5 +62,6 @@ Every run in the pool is driven by `crate::run::stream_team`; the pool never re-
 - `./key.rs` → `PoolKey` and team-name derivation
 - `./error.rs` → `PoolError`, `PoolShutdown`, kind mapping, `rebuild`
 - `./entry.rs` → `Entry`, `EntryState`, `ActiveTeamInfo`, `PoolFrame`, finalisation, leases, payload buffer
-- `./run.rs` → `PoolRequest`, `PoolRun`, `PoolLease`, admission (`start`/`try_start`/`acquire`), the worker and payload-drain tasks, `pooled_services`
+- `./request.rs` → `PoolRequest`: the runtime-only request, its builders, session-key derivation, effective options
+- `./run.rs` → `PoolRun`, `PoolLease`, admission (`start`/`try_start`/`acquire`), the worker and payload-drain tasks, `pooled_services`
 - `./reaper.rs` → idle-eviction task, `due_at`/`is_due`, `ensure_started`, `reap`
