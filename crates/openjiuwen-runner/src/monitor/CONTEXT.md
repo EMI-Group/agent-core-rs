@@ -55,7 +55,7 @@ impl Drop for RunStatusGuard // unfinished -> finish as Cancelled with detail {"
 ## Semantics
 - One event per transition: `begin`/`track` publish the `Queued` event, `update` publishes the phase it was given, `finish` publishes the outcome phase; the per-run history append and the channel publish happen in the same lock step.
 - `track` on an already-tracked id publishes nothing and returns the existing status unchanged; on an unknown id it behaves like `begin` under that id.
-- `update` on an unknown id is `Error::NotFound("run '<id>' is not tracked")`; on a run whose current phase is terminal it is `Error::Validation("run '<id>' has already finished")`.
+- `update` on an unknown id is `Error::NotFound("run '<id>' is not tracked")`; on a run whose current phase is terminal, and on a request for a terminal phase, it is `Error::Validation` — terminal phases go through `finish` so `finished_at` is stamped and the run is retained.
 - `finish` on an unknown id uses the same `NotFound` wording; a second `finish` is the same `Validation` wording; the outcome's phase is recorded as given.
 - History retains the newest `EVENT_HISTORY_LIMIT` events per run; a retained finished run keeps at least its `Queued` and terminal events.
 - Retention: every live run stays; finishing one more than `LIVE_RUN_LIMIT` finished runs evicts the oldest finished run along with its status and history, so `snapshot`/`history` of an evicted id are `NotFound`.
