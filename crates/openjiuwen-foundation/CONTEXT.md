@@ -38,6 +38,7 @@ Tools (`tool`):
 
 Storage (`store`):
 - Traits `KvStore`, `DocumentStore`, `VectorStore`, `GraphStore`, `ObjectStore` and their data types (`KvValue`, `Document`, `Query`, `CollectionSchema`, `FieldSchema`, `VectorQuery`, `VectorSearchResult`, `GraphNode`, `GraphEdge`, `ObjectMeta`).
+- `store::vector`: `CollectionSchema`, `FieldSchema`, `VectorDataType`, `VectorQuery`, `VectorSearchResult`, `Metric` (`Cosine` default; `Dot`/`Euclidean` reachable via `InMemoryVectorStore::search_with_metric`; every score normalized to `[0,1]`, higher is better), `VectorStore`, `InMemoryVectorStore`, `LocalFileVectorStore`.
 - In-process and local backends: `InMemory*`, `LocalFile*`/`Local*`, and `SqliteKvStore`/`SqliteDocumentStore` behind feature `sqlite`.
 - Network adapters (`store::external`, always compiled): `ChromaVectorStore`, `MilvusVectorStore`, `ElasticsearchVectorStore`, `ElasticsearchDocumentStore`, `RedisKvStore`, `S3ObjectStore`, each with its `*Config`.
 - Name-driven registry (`store::external::registry`): `BackendKind`, `StoreSpec`, `StoreRegistry`/`global_registry`, `create_{kv,document,vector,object,graph}_store`, `register_*_backend`, `available_backend_names`.
@@ -160,6 +161,7 @@ Storage (`store`):
 - Responses: `previous_response_id`/conversation state, `background` mode, hosted tools, and structured `text.format` validation are not ported.
 - Model-config decoding: unknown Python keys are tolerated (ignored) rather than forwarded into `extra`; `intelli_router`, `ssl_cert`, `use_shared_llm_http_client`, and `legacy_client_provider` are not typed fields.
 - DashScope: no streaming media, no result-URL byte download, no workspace scoping, no voice/language allow-lists.
+- `Metric` is reachable as `store::Metric` or `store::vector::Metric` only: the crate root re-exports the other vector types but not `Metric`.
 - There is no `ToolCollection`/tool-registry type: callers hold `Arc<dyn Tool>` values themselves (`FunctionTool::boxed` is the only built-in conversion).
 - `Model` has no abort/cancel or custom-invoke method; a stream is cancelled by dropping its `BoxStream`.
 - There is no `format_messages` helper; the provider-side projection is `llm::openai::{convert_message, convert_messages}` (public), and `BaseMessage` has no `to_openai`.
