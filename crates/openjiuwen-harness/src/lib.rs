@@ -71,7 +71,20 @@ pub use permission::{
 };
 
 // --- tools -----------------------------------------------------------------
-pub use tools::{tool_names, BuiltinTool, MemoryToolBackend, ToolRegistry, UserAsker};
+/// Names of the thirty tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the ten
+/// extended ones), in registry order.
+pub use tools::extended_tool_names;
+pub use tools::{
+    tool_names, AudioMetadata, AudioMetadataArgs, AudioMetadataTool, BuiltinTool, CronAction,
+    CronArgs, CronJob, CronSchedule, CronScheduler, CronTool, FakeMcpResourceProvider,
+    FakeSearchBackend, FetchRequest, FetchResponse, FetchWebpageArgs, FetchWebpageTool,
+    GetCurrentGoalArgs, GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord,
+    GoalStatus, GoalStore, HttpFetcher, ImageMetadata, ImageMetadataArgs, ImageMetadataTool,
+    ListMcpResourcesTool, McpResource, McpResourceContent, McpResourceProvider, MediaKind,
+    MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool, ReqwestFetcher, SearchBackend,
+    SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool, TokenUsage, ToolIndex, ToolRegistry,
+    ToolSearchArgs, ToolSearchHit, ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
+};
 
 // --- rails -----------------------------------------------------------------
 pub use rails::{
@@ -90,9 +103,23 @@ pub use prompts::{
 };
 
 // --- subagents -------------------------------------------------------------
+/// Retention bound of the persisted sub-agent bucket for `max_subagents` live instances.
+pub use subagents::max_persisted_records;
+/// Formats epoch milliseconds as an RFC 3339 UTC timestamp (the runtime's stamp format).
+pub use subagents::rfc3339_from_ms;
+/// Reason stamped on an instance closed by the LRU eviction policy.
+pub use subagents::EVICTION_REASON;
+/// Key of the persisted sub-agent bucket inside the session state.
+pub use subagents::SUBAGENTS_KEY;
 pub use subagents::{
-    subagent_tools, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentRegistry,
-    SubAgentRuntime, SubAgentSpawnRequest, SubAgentSpec, SubagentStatus, TaskTool,
+    load_bucket_file, save_bucket_file, select_lru_candidate, subagent_tools,
+    subagent_tools_with_transcript, Clock, LoadReport, LruCandidate, ManualClock,
+    PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport, SpawnBudget, SubAgentFactory,
+    SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry, SubAgentRuntime,
+    SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentMetadata, SubagentStatus,
+    SubagentTranscriptTool, SystemClock, TaskTool, TranscriptBuffer, TranscriptChannel,
+    TranscriptEntry, TranscriptKind, TranscriptSubscription, TranscriptSummary,
+    DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
 
 // --- skills ----------------------------------------------------------------

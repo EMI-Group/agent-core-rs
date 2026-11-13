@@ -627,6 +627,62 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn create_deep_agent_mounts_the_subagent_transcript_tool() {
+        let temp = TempWorkspace::new().unwrap();
+        let agent = create_deep_agent(
+            Arc::new(ScriptedModel::text("hi")),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(Workspace::for_language(temp.workspace(), "en")),
+            Vec::new(),
+            vec![SubAgentConfig::new(AgentCard::new("helper"))],
+            false,
+            None,
+            Some("en".to_string()),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<String> = agent
+            .tool_cards
+            .read()
+            .iter()
+            .map(|card| card.name.clone())
+            .collect();
+        // The six Python parity tools stay mounted and the additive transcript reader is
+        // mounted exactly once beside them.
+        for expected in [
+            "task_tool",
+            "subagent_spawn",
+            "subagent_wait",
+            "subagent_list",
+            "subagent_transcript",
+            "subagent_send_input",
+            "subagent_close",
+            "subagent_resume",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing tool {expected} in {names:?}"
+            );
+        }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "subagent_transcript")
+                .count(),
+            1
+        );
+        assert!(agent.rails().names().iter().any(|name| name == "subagent"));
+    }
+
     #[test]
     fn debug_reports_rail_names_and_tool_counts() {
         let parts =

@@ -21,8 +21,8 @@ use openjiuwen_foundation::tool::{Tool, ToolCard};
 
 use crate::schema::{DeepAgentConfig, PromptMode, SubAgentConfig};
 use crate::subagents::{
-    general_purpose_config, subagent_tools, SubAgentFactory, SubAgentRegistry, SubAgentRuntime,
-    SubAgentSpec, TaskTool,
+    general_purpose_config, subagent_tools_with_transcript, SubAgentFactory, SubAgentRegistry,
+    SubAgentRuntime, SubAgentSpec, TaskTool,
 };
 use crate::workspace::Workspace;
 
@@ -139,8 +139,10 @@ impl SubAgentFactory for DeepAgentSubAgentFactory {
 ///
 /// A wired sub-agent runtime with its model-facing tools and their cards.
 pub(crate) type SubagentWiring = (Arc<SubAgentRuntime>, Vec<Arc<dyn Tool>>, Vec<ToolCard>);
-/// The returned tools are the `task` delegation tool followed by the six
-/// persistent `subagent_*` tools, with their cards in the same order.
+/// The returned tools are the `task` delegation tool followed by the model-facing
+/// `subagent_*` tools (the seven-tool [`subagent_tools_with_transcript`] set, which keeps
+/// the six Python parity tools and adds the Rust-only `subagent_transcript` reader), with
+/// their cards in the same order.
 ///
 /// # Errors
 ///
@@ -171,7 +173,7 @@ pub(crate) fn wire_subagents(
     };
     let runtime = Arc::new(SubAgentRuntime::new(registry, factory, ""));
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(TaskTool::new(runtime.clone()))];
-    tools.extend(subagent_tools(runtime.clone()));
+    tools.extend(subagent_tools_with_transcript(runtime.clone()));
     let cards = tools.iter().map(|tool| tool.card().clone()).collect();
     Ok((runtime, tools, cards))
 }
@@ -238,9 +240,18 @@ mod tests {
         let (runtime, tools, cards) = wire_subagents(&config, &workspace, None, None).unwrap();
         // Five built-in presets plus the general-purpose fallback.
         assert_eq!(runtime.registry().len(), 6);
-        assert_eq!(tools.len(), 7);
-        assert_eq!(cards.len(), 7);
+        // `task_tool` plus the seven-tool `subagent_*` set.
+        assert_eq!(tools.len(), 8);
+        assert_eq!(cards.len(), 8);
         assert!(cards.iter().any(|card| card.name == "task_tool"));
         assert!(cards.iter().any(|card| card.name == "subagent_spawn"));
+        assert!(cards.iter().any(|card| card.name == "subagent_transcript"));
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|card| card.name.starts_with("subagent_"))
+                .count(),
+            7
+        );
     }
 }

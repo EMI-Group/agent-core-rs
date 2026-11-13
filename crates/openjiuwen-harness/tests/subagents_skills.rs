@@ -23,9 +23,10 @@ use openjiuwen_harness::skills::{
     Skill, SkillBudget, SkillLibrary, SkillRootMount, SKILL_FILENAME,
 };
 use openjiuwen_harness::subagents::{
-    subagent_tools, SubAgentFactory, SubAgentOutcome, SubAgentPreset, SubAgentRegistry,
-    SubAgentRuntime, SubAgentSpawnRequest, SubAgentSpec, SubagentMetadata, SubagentStatus,
-    TaskTool, GENERAL_PURPOSE_NAME,
+    rfc3339_from_ms, subagent_tools, subagent_tools_with_transcript, ManualClock, SubAgentFactory,
+    SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry, SubAgentRuntime,
+    SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentMetadata, SubagentStatus,
+    TaskTool, TranscriptKind, EVICTION_REASON, GENERAL_PURPOSE_NAME,
 };
 use openjiuwen_session::Session;
 use serde_json::{json, Value};
@@ -35,6 +36,12 @@ const WAIT: Duration = Duration::from_millis(500);
 
 /// Deadline for a wait whose ids are already final or unknown.
 const IMMEDIATE: Duration = Duration::from_millis(10);
+
+/// Bounded deadline of the gated turns and the lifecycle polling (never a sleep).
+const BOUND: Duration = Duration::from_secs(5);
+
+/// The frozen instant every [`ManualClock`] of this suite starts at.
+const T0: i64 = 1_700_000_000_000;
 
 /// The five Python preset names, in registry (alphabetical) order.
 const PRESET_NAMES: [&str; 5] = [
@@ -132,6 +139,72 @@ impl SubAgentFactory for FailingFactory {
     }
 }
 
+/// Factory whose child agent parks its turn until the test opens the gate.
+///
+/// `tokio::sync::watch` replaces a sleep: the turn stays `Running` for as long as the test
+/// needs to observe that phase, and the gate opens deterministically.
+struct GatedFactory {
+    gate: tokio::sync::watch::Sender<bool>,
+}
+
+impl GatedFactory {
+    /// Creates the factory and the gate the test opens to release the turn.
+    fn new() -> (tokio::sync::watch::Sender<bool>, Arc<Self>) {
+        let (gate, _receiver) = tokio::sync::watch::channel(false);
+        let sender = gate.clone();
+        (gate, Arc::new(Self { gate: sender }))
+    }
+}
+
+#[async_trait::async_trait]
+impl SubAgentFactory for GatedFactory {
+    async fn create(&self, config: &SubAgentConfig, session_id: &str) -> Result<Arc<dyn Agent>> {
+        let card = AgentCard::new(config.agent_card.name.clone())
+            .with_id(format!("child-agent-{session_id}"))
+            .with_description(config.agent_card.description.clone());
+        Ok(Arc::new(GatedAgent {
+            card,
+            gate: self.gate.clone(),
+        }))
+    }
+}
+
+/// Agent whose turn stays `Running` until its gate opens, then answers `done: <card name>`.
+struct GatedAgent {
+    card: AgentCard,
+    gate: tokio::sync::watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl Agent for GatedAgent {
+    fn card(&self) -> &AgentCard {
+        &self.card
+    }
+
+    async fn invoke(
+        &self,
+        _inputs: Value,
+        _session: Option<Arc<dyn Session>>,
+    ) -> Result<AgentOutput> {
+        let mut gate = self.gate.subscribe();
+        if !*gate.borrow_and_update() {
+            tokio::time::timeout(BOUND, gate.changed())
+                .await
+                .map_err(|_| Error::config("the gated sub-agent turn was never released"))?
+                .map_err(|error| Error::config(format!("sub-agent gate closed: {error}")))?;
+        }
+        Ok(AgentOutput::answer(format!("done: {}", self.card.name)))
+    }
+
+    fn stream(
+        &self,
+        _inputs: Value,
+        _session: Option<Arc<dyn Session>>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        Box::pin(stream::empty())
+    }
+}
+
 /// Builds a runtime over the English built-in presets.
 fn builtin_runtime(
     factory: Arc<dyn SubAgentFactory>,
@@ -143,6 +216,37 @@ fn builtin_runtime(
         SubAgentRuntime::new(registry, factory, "parent-s1")
             .with_limits(max_subagents, max_concurrent),
     )
+}
+
+/// Builds a runtime over the English built-in presets with `quota` and an injected clock.
+///
+/// Unlike [`builtin_runtime`] this keeps LRU eviction at the quota's setting, which is what
+/// the quota, activity and eviction cases below exercise.
+fn quota_runtime(
+    factory: Arc<dyn SubAgentFactory>,
+    quota: SubAgentQuota,
+    clock: Arc<ManualClock>,
+) -> Arc<SubAgentRuntime> {
+    let registry = Arc::new(SubAgentRegistry::with_builtin_presets("en"));
+    Arc::new(
+        SubAgentRuntime::new(registry, factory, "parent-s1")
+            .with_quota(quota)
+            .with_clock(clock),
+    )
+}
+
+/// Yields to the runtime until `predicate` holds, giving up at [`BOUND`].
+///
+/// The loop only yields, so the background turn task makes progress without a wall-clock sleep.
+async fn wait_until(mut predicate: impl FnMut() -> bool, what: &str) {
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while !predicate() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Returns the names of `tools` in declaration order.
@@ -171,6 +275,14 @@ fn payload_error(payload: &Value) -> String {
         .and_then(Value::as_str)
         .expect("failed payload carries an error string")
         .to_owned()
+}
+
+/// Returns the message of a quota refusal, panicking for any other error variant.
+fn config_message(error: &Error) -> &str {
+    match error {
+        Error::Config(message) => message,
+        other => panic!("expected a config error, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +838,333 @@ async fn task_tool_returns_payloads_instead_of_errors() {
         payload_error(&incomplete),
         "'subagent_type' and 'task_description' are required"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A2. Runtime quota, activity and eviction surfaces
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn quota_refusal_is_typed_and_a_freed_slot_admits_the_next_spawn() {
+    let runtime = quota_runtime(
+        Arc::new(FakeFactory::default()),
+        SubAgentQuota::default()
+            .with_max_subagents(1)
+            .with_lru_eviction(false),
+        Arc::new(ManualClock::new(T0)),
+    );
+
+    let first = runtime
+        .spawn(SubAgentSpawnRequest::new("code_agent", "one"))
+        .await
+        .expect("the first spawn fits the live cap");
+    runtime.wait(std::slice::from_ref(&first), WAIT).await;
+    assert_eq!(runtime.capacity(), (1, 1));
+
+    // The refusal is a typed config error with the Python message, never a panic.
+    let refused = runtime
+        .spawn(SubAgentSpawnRequest::new("explore_agent", "two"))
+        .await
+        .expect_err("the live cap refuses the second spawn");
+    assert_eq!(refused.kind(), ErrorKind::Config);
+    assert_eq!(
+        config_message(&refused),
+        "subagent capacity exceeded: used=1, limit=1"
+    );
+    assert_eq!(runtime.capacity(), (1, 1));
+    assert_eq!(runtime.spawned_total(), 1);
+
+    // Closing the idle instance frees the slot, so the next spawn is admitted.
+    runtime
+        .close(&first)
+        .await
+        .expect("an idle instance can be closed");
+    assert_eq!(runtime.get_status(&first), SubagentStatus::Closed);
+    assert_eq!(runtime.capacity(), (0, 1));
+
+    let second = runtime
+        .spawn(SubAgentSpawnRequest::new("explore_agent", "two"))
+        .await
+        .expect("the freed slot admits the next spawn");
+    let outcomes = runtime.wait(std::slice::from_ref(&second), WAIT).await;
+    assert_eq!(outcomes[0].status, SubagentStatus::Completed);
+    assert_eq!(outcomes[0].output.as_deref(), Some("done: explore_agent"));
+    assert_eq!(runtime.capacity(), (1, 1));
+    assert_eq!(runtime.spawned_total(), 2);
+}
+
+#[tokio::test]
+async fn per_parent_and_depth_limits_refuse_nested_spawns() {
+    let runtime = quota_runtime(
+        Arc::new(FakeFactory::default()),
+        SubAgentQuota::default()
+            .with_children_per_parent(1)
+            .with_max_depth(2),
+        Arc::new(ManualClock::new(T0)),
+    );
+
+    let root = runtime
+        .spawn(SubAgentSpawnRequest::new("code_agent", "root"))
+        .await
+        .expect("the top-level spawn succeeds");
+    runtime.wait(std::slice::from_ref(&root), WAIT).await;
+    assert_eq!(
+        runtime
+            .get_metadata(&root)
+            .expect("the root instance has metadata")
+            .depth,
+        1
+    );
+
+    // The root bucket is labelled by the parent session id.
+    let sibling = runtime
+        .spawn(SubAgentSpawnRequest::new("explore_agent", "sibling"))
+        .await
+        .expect_err("the root already holds its single live child");
+    assert_eq!(sibling.kind(), ErrorKind::Config);
+    assert_eq!(
+        config_message(&sibling),
+        "subagent child limit exceeded: parent=parent-s1, used=1, limit=1"
+    );
+
+    let mut nested = SubAgentSpawnRequest::new("plan_agent", "nested");
+    nested.parent_subagent_id = Some(root.clone());
+    let child = runtime
+        .spawn(nested)
+        .await
+        .expect("the root's first nested child is admitted");
+    runtime.wait(std::slice::from_ref(&child), WAIT).await;
+    let child_metadata = runtime
+        .get_metadata(&child)
+        .expect("the child instance has metadata");
+    assert_eq!(child_metadata.depth, 2);
+    assert_eq!(
+        child_metadata.parent_subagent_id.as_deref(),
+        Some(root.as_str())
+    );
+
+    let mut second_child = SubAgentSpawnRequest::new("plan_agent", "second child");
+    second_child.parent_subagent_id = Some(root.clone());
+    let refused_child = runtime
+        .spawn(second_child)
+        .await
+        .expect_err("the root has one live child");
+    assert_eq!(refused_child.kind(), ErrorKind::Config);
+    assert_eq!(
+        config_message(&refused_child),
+        format!("subagent child limit exceeded: parent={root}, used=1, limit=1")
+    );
+
+    let mut grandchild = SubAgentSpawnRequest::new("plan_agent", "grandchild");
+    grandchild.parent_subagent_id = Some(child.clone());
+    let too_deep = runtime
+        .spawn(grandchild)
+        .await
+        .expect_err("depth 3 exceeds the nesting limit");
+    assert_eq!(too_deep.kind(), ErrorKind::Config);
+    assert_eq!(
+        config_message(&too_deep),
+        "subagent depth limit exceeded: depth=3, limit=2"
+    );
+
+    // Neither refusal left a live instance behind.
+    assert_eq!(runtime.capacity(), (2, 10));
+    assert_eq!(runtime.list().len(), 2);
+}
+
+#[tokio::test]
+async fn activity_lifecycle_is_surfaced_by_subagent_list() {
+    let (gate, factory) = GatedFactory::new();
+    let clock = Arc::new(ManualClock::new(T0));
+    let runtime = quota_runtime(factory, SubAgentQuota::default(), clock.clone());
+    let tools = subagent_tools(Arc::clone(&runtime));
+    let list = find_tool(&tools, "subagent_list");
+    let ctx = ToolContext::new();
+
+    let id = runtime
+        .spawn(SubAgentSpawnRequest::new("code_agent", "lifecycle"))
+        .await
+        .expect("the gated spawn succeeds");
+
+    // created: reserved in the `Queued` phase, stamped by the injected clock.
+    let created = runtime
+        .get_metadata(&id)
+        .expect("the instance has metadata");
+    assert_eq!(created.activity, SubagentActivity::Queued);
+    assert_eq!(created.created_at, rfc3339_from_ms(T0));
+    let queued = list
+        .invoke(json!({}), &ctx)
+        .await
+        .expect("list tool succeeds");
+    assert!(succeeded(&queued));
+    assert_eq!(queued["data"]["subagents"][0]["activity"], "queued");
+    assert_eq!(queued["data"]["capacity"]["running"], 0);
+
+    // running: the gated turn owns the phase until the gate opens.
+    wait_until(
+        || {
+            runtime
+                .get_metadata(&id)
+                .is_some_and(|metadata| metadata.activity == SubagentActivity::Running)
+        },
+        "the running activity phase",
+    )
+    .await;
+    clock.advance(2_500);
+    let running = list
+        .invoke(json!({}), &ctx)
+        .await
+        .expect("list tool succeeds");
+    assert_eq!(running["data"]["subagents"][0]["activity"], "running");
+    assert_eq!(running["data"]["capacity"]["running"], 1);
+    assert_eq!(running["data"]["capacity"]["max_running"], 5);
+    assert_eq!(
+        running["data"]["subagents"][0]["created_at"],
+        rfc3339_from_ms(T0)
+    );
+    assert_eq!(running["data"]["summary"]["eviction"]["candidates"], 0);
+
+    // idle: the finished turn parks the instance in the evictable phase.
+    gate.send_replace(true);
+    let outcomes = runtime.wait(std::slice::from_ref(&id), BOUND).await;
+    assert_eq!(outcomes[0].status, SubagentStatus::Completed);
+    let idle = runtime
+        .get_metadata(&id)
+        .expect("the instance has metadata");
+    assert_eq!(idle.activity, SubagentActivity::Idle);
+    assert_eq!(idle.status, SubagentStatus::Completed);
+    assert_eq!(idle.last_used_at, rfc3339_from_ms(T0 + 2_500));
+    let idle_list = list
+        .invoke(json!({}), &ctx)
+        .await
+        .expect("list tool succeeds");
+    assert_eq!(idle_list["data"]["subagents"][0]["activity"], "idle");
+    assert_eq!(idle_list["data"]["capacity"]["running"], 0);
+    assert_eq!(idle_list["data"]["summary"]["eviction"]["candidates"], 1);
+
+    // closed: the terminal phase leaves a resumable tombstone.
+    runtime.close(&id).await.expect("an idle instance closes");
+    let closed = runtime
+        .get_metadata(&id)
+        .expect("the tombstone keeps its metadata");
+    assert_eq!(closed.activity, SubagentActivity::Closed);
+    assert_eq!(closed.closed_reason.as_deref(), Some("manual"));
+    let closed_list = list
+        .invoke(json!({}), &ctx)
+        .await
+        .expect("list tool succeeds");
+    assert_eq!(
+        closed_list["data"]["subagents"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        closed_list["data"]["closed_subagents"][0]["activity"],
+        "closed"
+    );
+    assert_eq!(
+        closed_list["data"]["closed_subagents"][0]["closed_reason"],
+        "manual"
+    );
+    assert_eq!(closed_list["data"]["summary"]["live_count"], 0);
+    assert_eq!(closed_list["data"]["summary"]["closed_count"], 1);
+}
+
+#[tokio::test]
+async fn lru_eviction_is_reported_with_the_transcript_summary() {
+    let clock = Arc::new(ManualClock::new(T0));
+    let runtime = quota_runtime(
+        Arc::new(FakeFactory::default()),
+        SubAgentQuota::default().with_max_subagents(1),
+        clock.clone(),
+    );
+    let tools = subagent_tools_with_transcript(Arc::clone(&runtime));
+    let list = find_tool(&tools, "subagent_list");
+    let ctx = ToolContext::new();
+
+    let evicted_id = runtime
+        .spawn(SubAgentSpawnRequest::new("code_agent", "first"))
+        .await
+        .expect("the first spawn fits the live cap");
+    runtime.wait(std::slice::from_ref(&evicted_id), WAIT).await;
+    assert_eq!(
+        runtime
+            .get_metadata(&evicted_id)
+            .expect("the instance has metadata")
+            .activity,
+        SubagentActivity::Idle
+    );
+    runtime
+        .record_tool_call(&evicted_id, "bash", "ls", Some(true))
+        .expect("the runtime records child tool calls");
+    let before = runtime
+        .transcript_summary(&evicted_id)
+        .expect("the transcript is retained");
+    // spawn, the running status, the completion, then the recorded tool call.
+    assert_eq!(before.count, 4);
+    assert_eq!(before.last_kind, Some(TranscriptKind::ToolCall));
+
+    clock.advance(1_000);
+    let live_id = runtime
+        .spawn(SubAgentSpawnRequest::new("explore_agent", "second"))
+        .await
+        .expect("the LRU policy reclaims the idle slot");
+    let evicted = runtime
+        .get_metadata(&evicted_id)
+        .expect("the tombstone keeps its metadata");
+    assert_eq!(evicted.status, SubagentStatus::Closed);
+    assert_eq!(evicted.activity, SubagentActivity::Closed);
+    assert_eq!(evicted.closed_reason.as_deref(), Some(EVICTION_REASON));
+    assert_eq!(runtime.capacity(), (1, 1));
+    assert_eq!(runtime.spawned_total(), 2);
+
+    let outcomes = runtime.wait(std::slice::from_ref(&live_id), WAIT).await;
+    assert_eq!(outcomes[0].status, SubagentStatus::Completed);
+
+    let listed = list
+        .invoke(json!({}), &ctx)
+        .await
+        .expect("list tool succeeds");
+    assert!(succeeded(&listed));
+    let data = &listed["data"];
+    assert_eq!(data["capacity"]["used"], 1);
+    assert_eq!(data["capacity"]["max"], 1);
+    assert_eq!(data["capacity"]["spawned"], 2);
+    assert_eq!(data["summary"]["live_count"], 1);
+    assert_eq!(data["summary"]["closed_count"], 1);
+    assert_eq!(data["summary"]["evicted_count"], 1);
+    assert_eq!(data["summary"]["eviction"]["enabled"], true);
+
+    let closed_row = &data["closed_subagents"][0];
+    assert_eq!(closed_row["subagent_id"], evicted_id);
+    assert_eq!(closed_row["status"], "closed");
+    assert_eq!(closed_row["closed_reason"], "evicted");
+    // The eviction entry is the newest transcript entry of the recycled instance.
+    assert_eq!(closed_row["transcript"]["count"], 5);
+    assert_eq!(closed_row["transcript"]["dropped"], 0);
+    assert_eq!(closed_row["transcript"]["last_kind"], "evicted");
+    assert_eq!(closed_row["transcript"]["last_content"], EVICTION_REASON);
+
+    let live_row = &data["live_subagents"][0];
+    assert_eq!(live_row["subagent_id"], live_id);
+    assert_eq!(live_row["transcript"]["count"], 3);
+    assert_eq!(live_row["transcript"]["last_kind"], "completion");
+    assert_eq!(
+        live_row["transcript"]["last_content"],
+        "done: explore_agent"
+    );
+
+    // The rendering states the policy, the eviction count and both ledger rows.
+    let rendered = list.render_for_llm(&listed);
+    assert!(
+        rendered.contains("Capacity: 1/1 subagents in use."),
+        "unexpected rendering: {rendered}"
+    );
+    assert!(
+        rendered.contains("eviction: enabled, evicted: 1"),
+        "unexpected rendering: {rendered}"
+    );
+    assert!(rendered.contains(&evicted_id));
+    assert!(rendered.contains(&live_id));
 }
 
 // ---------------------------------------------------------------------------
