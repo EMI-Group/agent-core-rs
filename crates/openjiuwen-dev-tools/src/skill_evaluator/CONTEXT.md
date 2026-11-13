@@ -108,6 +108,9 @@ Timestamps are caller-supplied, no clock or environment reads happen, and relati
 - The judge rubrics mirror `score_design`/`scan_safety` exactly so a model verdict and the deterministic fallback are interchangeable on the same 0–100 scale.
 - Safety combination is deliberately one-directional: the model can lower the score or add no findings, but it cannot remove a rule finding or reopen the gate.
 - `JudgeRecord` is optional and omitted from JSON so the deterministic report stays byte-compatible with the Python artifact.
+- Serialized shapes keep the Python key names but use percentage points (`81.0`, contributions `32.0`) where the Python skill artifacts use fractions (`0.81`, `0.296`); `DesignReport::knowledge_delta` is an `f64` (Python emits a prose string), `FunctionalReport::timestamp` is epoch milliseconds `i64` (Python emits ISO-8601), and `CaseResult::id` is a `String` (Python uses an integer).
+- No per-artifact file writer exists: `final_score.json`/`llm_judge_score.json`/`skill_safety_score.json`/`skill_tester_report.json` are the `final_score`/`design`/`safety`/`functional` members of one `EvaluationReport` emitted by `EvaluationReport::to_json`/`to_json_string`; the only library file writers are `EvalRun::write_json`/`write_jsonl` and `EvalHarness::run_query`.
+- `aggregate` always sets `evaluators.e1_llm_judge` to `Some`; the `Option` (serialized `null`) exists only for a future evaluator set.
 - The harness reuses `status_from`/`summarize` and the `Assertion` engine instead of re-implementing scoring, so the evaluator and the harness cannot disagree about pass rates.
 - `EvalRun`'s wire name `case_id` follows the run-artifact convention while the in-memory `CaseResult` keeps `id`; the mapping is explicit in `EvalRun::to_json`/`to_jsonl`.
 
