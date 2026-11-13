@@ -123,7 +123,9 @@ checkpoint.rs SessionState { session_id, iteration, running, best_candidate, bes
             #[async_trait] trait CheckpointStore { save/load/delete }
               — backend/deserialization failures are `Error::session`, never "no checkpoint".
             InMemoryCheckpointStore, KvCheckpointStore (over `foundation::store::kv::KvStore`,
-              key prefix "rsi:auto_harness:"), SessionCheckpointStore (over `update_component_state`).
+              one JSON-text record per session under key prefix `DEFAULT_KEY_PREFIX` = "rsi:auto_harness:",
+              so a caller with the backing store lists every session via `KvStore::get_by_prefix`),
+            SessionCheckpointStore (over `update_component_state`).
 orchestrator.rs AutoHarnessOrchestrator — `builder(config)` (a required runner **or** evaluator) with
               with_runner/with_mutator/with_selector/with_evaluator/with_checkpoint_store/with_cases/
               with_seed_body/with_session_id/with_mutation_count/build;

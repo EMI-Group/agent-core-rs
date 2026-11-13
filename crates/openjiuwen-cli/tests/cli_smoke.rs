@@ -1,104 +1,139 @@
-//! Process-level smoke tests for the `openjiuwen` binary.
+//! Process-level smoke tests for the `openjiuwen` binary: grammar and help.
 //!
-//! These pin the wiring between `src/main.rs` and `openjiuwen_harness::cli` as
-//! an operating system sees it: the exit code, and which stream each verdict
-//! lands on. `--help`, `--version` and parse errors are answered by clap before
-//! any command runs, so every case here is offline — no model, no network, no
-//! terminal.
+//! These pin the wiring between `src/main.rs`, `src/cli.rs` and
+//! `openjiuwen_harness::cli` as an operating system sees it: the exit code and
+//! which stream each verdict lands on. `--help`, `--version` and parse errors are
+//! answered by clap before any command runs, so every case here is offline — no
+//! model, no network, no terminal, and (with the exception of `run`/`chat` help,
+//! which are answered before the workspace is touched) no filesystem state.
 //!
 //! Covered:
 //!
 //! 1. `--version` prints the binary's name and version on **stdout** and exits
 //!    `0` (clap's `version` attribute, backed by the workspace version);
-//! 2. `--help` lists both subcommands (`run`, `chat`) on **stdout**, exits `0`,
-//!    and the subcommand help is reachable (`run --help` lists its output
-//!    format flag);
-//! 3. an unknown subcommand is a usage error: nonzero exit (clap uses `2`) with
-//!    the diagnostic on **stderr** and nothing on stdout.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! 2. `--help` lists all three command groups (`run`, `chat`, `auto-harness`) on
+//!    **stdout**, exits `0`, and every subcommand's help is reachable;
+//! 3. `auto-harness`'s help lists its five subcommands, and `run`/`experience`
+//!    list the flags and nested commands the port documents;
+//! 4. `--no-color` is accepted on both sides of a subcommand and is offered in
+//!    the help of the top-level grammar;
+//! 5. an unknown subcommand is a usage error: exit `2` (clap's documented code)
+//!    with the diagnostic on **stderr** and nothing on stdout.
+//!
+//! Every child is spawned through [`support::Sandbox`], so it runs in a temporary
+//! working directory with a temporary `OPENJIUWEN_HOME` and cannot read the
+//! developer's environment.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::{Command, Output};
+mod support;
 
-/// Runs the compiled binary with `args`, returning its captured output.
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_openjiuwen"))
-        .args(args)
-        .output()
-        .expect("the openjiuwen binary should run")
-}
-
-/// Returns the child's exit code, panicking when it was killed by a signal.
-fn code_of(output: &Output) -> i32 {
-    output
-        .status
-        .code()
-        .expect("the child should exit normally, not be killed by a signal")
-}
-
-/// Renders a child's streams for a failure message.
-fn describe(output: &Output) -> String {
-    format!(
-        "exit {}, stdout {:?}, stderr {:?}",
-        code_of(output),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-/// Returns whether some line of `text` starts with `word` (a clap help row).
-fn has_row(text: &str, word: &str) -> bool {
-    text.lines()
-        .any(|line| line.split_whitespace().next() == Some(word))
-}
+use support::{assert_exit, assert_success, describe, has_row, stderr, stdout, Sandbox};
 
 #[test]
 fn version_flag_reports_the_crate_version() {
-    let output = run(&["--version"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(code_of(&output), 0, "{}", describe(&output));
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["--version"]);
+    let text = assert_success(&output);
     assert!(
-        stdout.contains(env!("CARGO_PKG_VERSION")),
-        "expected version {} in {stdout:?}",
+        text.contains(env!("CARGO_PKG_VERSION")),
+        "expected version {} in {text:?}",
         env!("CARGO_PKG_VERSION")
     );
     assert!(
-        stdout.contains("openjiuwen"),
-        "expected the binary name in {stdout:?}"
+        text.contains("openjiuwen"),
+        "expected the binary name in {text:?}"
     );
 }
 
 #[test]
-fn help_lists_run_and_chat() {
-    let output = run(&["--help"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(code_of(&output), 0, "{}", describe(&output));
-    assert!(has_row(&stdout, "run"), "no `run` command in {stdout:?}");
-    assert!(has_row(&stdout, "chat"), "no `chat` command in {stdout:?}");
+fn help_lists_every_command_group() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["--help"]);
+    let text = assert_success(&output);
+    for row in ["run", "chat", "auto-harness"] {
+        assert!(has_row(&text, row), "no `{row}` command in {text:?}");
+    }
 }
 
 #[test]
 fn run_help_lists_the_output_format_flag() {
-    let output = run(&["run", "--help"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(code_of(&output), 0, "{}", describe(&output));
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["run", "--help"]);
+    let text = assert_success(&output);
     assert!(
-        stdout.contains("--output-format"),
-        "expected `--output-format` in {stdout:?}"
+        text.contains("--output-format"),
+        "expected `--output-format` in {text:?}"
     );
 }
 
 #[test]
 fn unknown_subcommand_is_a_usage_error() {
-    let output = run(&["definitely-not-a-command"]);
-    assert_ne!(code_of(&output), 0, "{}", describe(&output));
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["definitely-not-a-command"]);
+    assert_exit(&output, 2);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"),
+        stderr(&output).contains("unrecognized subcommand"),
         "{}",
         describe(&output)
     );
     assert!(
-        output.stdout.is_empty(),
+        stdout(&output).is_empty(),
         "usage errors must not write to stdout: {}",
         describe(&output)
+    );
+}
+
+#[test]
+fn auto_harness_help_lists_its_subcommands() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["auto-harness", "--help"]);
+    let text = assert_success(&output);
+    for row in ["run", "experience", "verify-ext", "gap-analyze", "history"] {
+        assert!(has_row(&text, row), "no `{row}` subcommand in {text:?}");
+    }
+}
+
+#[test]
+fn auto_harness_run_help_lists_its_flags() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["auto-harness", "run", "--help"]);
+    let text = assert_success(&output);
+    for flag in [
+        "--task",
+        "--task-file",
+        "--dry-run",
+        "--stage",
+        "--budget",
+        "--goal",
+        "--pipeline",
+    ] {
+        assert!(text.contains(flag), "expected `{flag}` in {text:?}");
+    }
+}
+
+#[test]
+fn auto_harness_experience_help_lists_search_and_list() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["auto-harness", "experience", "--help"]);
+    let text = assert_success(&output);
+    for row in ["search", "list"] {
+        assert!(has_row(&text, row), "no `{row}` subcommand in {text:?}");
+    }
+}
+
+#[test]
+fn no_color_is_a_global_flag_on_both_sides_of_a_subcommand() {
+    let sandbox = Sandbox::new();
+    // Before the subcommand.
+    let before = sandbox.run_blocking(&["--no-color", "--help"]);
+    assert_success(&before);
+    // After the subcommand, on a subcommand that reuses the harness argument type.
+    let after = sandbox.run_blocking(&["run", "--no-color", "--help"]);
+    assert_success(&after);
+    // And it is documented by the top-level grammar.
+    let text = stdout(&before);
+    assert!(
+        text.contains("--no-color"),
+        "expected `--no-color` in {text:?}"
     );
 }
