@@ -416,6 +416,8 @@ fn sse_parser_reassembles_data_split_across_chunks() {
         vec![SseFrame {
             event: None,
             data: "hello".to_owned(),
+            id: None,
+            retry: None,
         }]
     );
 }

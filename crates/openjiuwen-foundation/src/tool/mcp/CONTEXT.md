@@ -4,6 +4,7 @@
 
 Expose MCP servers as tools: a provider-neutral client trait, `rmcp`-backed stdio / streamable-HTTP / SSE transports with reconnect, and `McpTool` wrapping a remote tool as a `Tool`.
 Ports `openjiuwen/core/foundation/tool/mcp/` (`base.py`, `client/mcp_client.py`, `client/reconnect.py`, `client/{stdio,sse,streamable_http}_client.py`); the Python `openapi`/`playwright` transports are out of scope.
+The streamable-HTTP transport also opens the MCP server-initiated `GET` event stream, so server notifications and server requests reach the client.
 The whole module is compiled only with the `mcp` feature (declared on `tool::mcp` in `src/tool/mod.rs`); nothing here may be referenced from outside that gate.
 
 ## API Surface
@@ -12,9 +13,10 @@ The whole module is compiled only with the `mcp` feature (declared on `tool::mcp
 - `McpClientType { Stdio, Sse, StreamableHttp /* default */ }` — `Serialize`/`Deserialize` via `parse`, accepting `stdio`, `sse`, `streamable_http`, `streamable-http`, `http` in any ASCII case; `as_str()`, `McpClientType::parse(&str) -> Result<Self>` (`Error::Validation` on unknown names).
 - `McpServerConfig { server_id: String /* uuid_hex default */, server_name: String, server_path: String, client_type: McpClientType, params: Value, auth_headers: BTreeMap<String, String>, auth_query_params: BTreeMap<String, String>, include_image_content: bool }` with `Default`, `stdio(name, command)`, `http(name, url)`, `with_server_id`, `with_auth_header`, `with_auth_query_param`, `with_include_image_content`, and the tolerant `params` readers `command()` (`params.command`, else `server_path`), `args()`, `env()`, `cwd()`, plus `redacted_headers()`.
 - `McpRemoteTool { name, description, input_schema: Value }` with `new(name, description, input_schema)`.
-- `McpClient` (`#[async_trait]`, object-safe): `server_name() -> &str`, `server_id() -> &str` (default `""`), `include_image_content() -> bool` (default `false`), `connect()`, `disconnect()`, `is_connected()`, `list_tools() -> Result<Vec<McpRemoteTool>>`, `call_tool(name, arguments: Value, timeout: Option<Duration>) -> Result<McpToolResult>` (provided), `call_tool_with(name, arguments, timeout, include_image_content) -> Result<McpToolResult>` (required), `list_resources() -> Result<Vec<Value>>` (default `Error::Unsupported`), `read_resource(uri) -> Result<Value>` (default `Error::Unsupported`).
+- `McpClient` (`#[async_trait]`, object-safe): `server_name() -> &str`, `server_id() -> &str` (default `""`), `include_image_content() -> bool` (default `false`), `connect()`, `disconnect()`, `is_connected()`, `list_tools() -> Result<Vec<McpRemoteTool>>`, `call_tool(name, arguments: Value, timeout: Option<Duration>) -> Result<McpToolResult>` (provided), `call_tool_with(name, arguments, timeout, include_image_content) -> Result<McpToolResult>` (required), `list_resources() -> Result<Vec<Value>>` (default `Error::Unsupported`), `read_resource(uri) -> Result<Value>` (default `Error::Unsupported`), `take_notifications() -> Result<Vec<McpNotification>>` (default: empty), `supports_server_stream() -> bool` (default `false`).
+- `McpNotification { method: String, params: Value }` — one server-pushed notification; `#[serde(default)]`, snake_case.
 - `connect_mcp_server(&McpServerConfig) -> Result<Arc<dyn McpClient>>` — validates the transport and returns a lazily connecting `RmcpClient` (`Error::Validation` for a stdio config without a command or a non-http(s)/relative endpoint).
-- `RmcpClient` — `new(&McpServerConfig)`, `config()`, implements `McpClient`; one session per client, held behind a `tokio::sync::Mutex`, created on first use, dropped on disconnect or after a transport failure.
+- `RmcpClient` — `new(&McpServerConfig)`, `config()`, implements `McpClient`; one session per client, held behind a `tokio::sync::Mutex`, created on first use, dropped on disconnect or after a transport failure. Holds the session's `ServerStreamState` in a `parking_lot::Mutex<Option<ServerStreamState>>` (set on connect for `streamable_http`, cleared and `reset()` on drop), which backs `take_notifications` (drains, never connects) and `supports_server_stream` (supported and not refused).
 - Reconnect policy: `reconnect_attempt_budget() -> u32` (total attempts, `OPENJIUWEN_MCP_RECONNECT_ATTEMPTS` else 3, never < 1) and `reconnect_delay(attempt) -> Duration` (`min(120, 5 * 2^(attempt-1))` seconds, saturating at 120).
 - `FakeMcpClient` (`#[cfg(test)]`) — `new(server_id, server_name)`, `set_tools`, `set_result`, `set_failure`, `calls() -> Vec<FakeCall>`, `connect_count()`; `FakeCall { tool_name, arguments, timeout, include_image_content }`.
 
@@ -38,7 +40,7 @@ The whole module is compiled only with the `mcp` feature (declared on `tool::mcp
 ## Constraints
 
 - Feature-gated by `tool::mcp` (`#[cfg(feature = "mcp")]`); `cargo test -p openjiuwen-foundation --no-default-features` must keep passing.
-- No test spawns a process or opens a socket: transport tests cover the pure `SseParser` and endpoint validation; `McpTool` behavior is tested through `FakeMcpClient`. Any future live-transport test must be `#[ignore]`d.
+- No test spawns a process or reaches the network: `SseParser`/`SseFrame`, endpoint validation, and the stream header/delay helpers are pure, `McpTool` behavior is tested through `FakeMcpClient`, and the server-initiated-stream tests bind a loopback `wiremock` server only. Any future live-transport test must be `#[ignore]`d.
 - No `unsafe`; no `unwrap`/`expect` outside tests; every public item documented (`missing_docs` + clippy `-D warnings`); files stay well under 1000 lines.
 - Auth header/query values are never logged: only `redacted_headers()` (via `openjiuwen_common::security::redact::sanitize_headers`) reaches `tracing`.
 - Reconnect retries only `Error::Transport`; `Error::Timeout`, `Error::Cancelled`, `Error::Validation`, `Error::Unsupported`, and `Error::Mcp` (a server-level rejection) are final.
@@ -64,13 +66,15 @@ The whole module is compiled only with the `mcp` feature (declared on `tool::mcp
 ## Test Strategy
 
 - `tests.rs` (44 tests, `#[cfg(test)] mod tests;`) covers: the result-normalization matrix (text join, image placeholder vs. multimodal, audio, one vs. many resources, empty content, both `isError` paths); config serde and `params` extraction (`command`/`args`/`env`/`cwd`, transport aliases); `connect_mcp_server` validation; reconnect budget/delays; `SseParser` (chunk splitting, multi-frame chunks, multi-line data, CRLF, comments, `endpoint` events); `McpTool` through `FakeMcpClient` (success envelope, schema rejection and cancellation with zero calls, failure mapping, timeout precedence, `render_for_llm` cases); `load_mcp_tools` card projection; `FakeMcpClient` connection counting.
-- `cargo test -p openjiuwen-foundation mcp` runs 44 tests; `cargo test -p openjiuwen-foundation --no-default-features` builds and passes without the feature.
+- `stream_tests.rs` (13 tests, `#[cfg(test)] mod stream_tests;`, loopback `wiremock` only, `BOUND` = 5 s) covers the server-initiated `GET` stream end to end: a mocked handshake whose `InitializeResponder` echoes the request id and returns `Mcp-Session-Id: sess-1`, then either a `200 text/event-stream` body carrying one `notifications/tools/list_changed` frame (notification buffered with its `params`, `supports_server_stream()` true) or a `405` (capability reported false, no notification, exactly one `GET` request — never retried); plus the pure `server_stream_headers` (names, `Last-Event-ID` absent/present), `stream_reconnect_delay` (1 s default, 250 ms hint, 120 s cap at attempt 6, 5 s policy cap at attempt 1), `SseParser` `id`/`retry` capture (including an unparsable `retry`) with unchanged `event`/`data`, and the notification buffer bound.
+- `cargo test -p openjiuwen-foundation mcp` runs 57 tests; `cargo test -p openjiuwen-foundation --no-default-features` builds and passes without the feature.
 - `FakeMcpClient` lives in `client.rs` under `#[cfg(test)]`; it is not part of the public API.
 
 ## Routing Table
 
 - `./client.rs` → `McpClientType`, `McpServerConfig`, `McpRemoteTool`, `McpClient`, `connect_mcp_server`, `RmcpClient`, reconnect helpers, `FakeMcpClient`
-- `./http.rs` → `StreamableHttpTransport`, `SseTransport`, `HttpTransportError`, `validate_endpoint`, `SseParser`/`SseFrame`
+- `./http.rs` → `StreamableHttpTransport` (with the server-initiated `GET` loop), `SseTransport`, `HttpTransportError`, `validate_endpoint`, `ServerStreamState`, `server_stream_headers`, `stream_reconnect_delay`, `SseParser`/`SseFrame`
 - `./result.rs` → `McpToolResult`, `extract_content`, `normalize_call_tool_result`
 - `./tool.rs` → `McpTool`, `McpToolOptions`, `load_mcp_tools`
 - `./tests.rs` → the module's unit-test suite
+- `./stream_tests.rs` → server-initiated `GET` stream tests (loopback wiremock) plus the stream header/delay/parser helpers

@@ -6,6 +6,12 @@
 //! tool in a [`Tool`]; [`result`](crate::tool::mcp::result) normalizes MCP call
 //! results.
 //!
+//! The streamable-HTTP transport also opens the server-initiated `GET` event
+//! stream once the session id is known, so server notifications and
+//! server-initiated requests arrive: notifications are buffered and drained
+//! through [`McpClient::take_notifications`], and
+//! [`McpClient::supports_server_stream`] reports the negotiated capability.
+//!
 //! Only stdio and streamable-HTTP/SSE transports are in scope; the Python
 //! `openapi`/`playwright` transports are deliberately not ported.
 //!
@@ -21,10 +27,13 @@ pub mod result;
 pub mod tool;
 
 #[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
 mod tests;
 
 pub use client::{
-    connect_mcp_server, McpClient, McpClientType, McpRemoteTool, McpServerConfig, RmcpClient,
+    connect_mcp_server, McpClient, McpClientType, McpNotification, McpRemoteTool, McpServerConfig,
+    RmcpClient,
 };
 pub use result::{
     extract_content, normalize_call_tool_result, McpToolResult, DEFAULT_MCP_ERROR_TEXT,

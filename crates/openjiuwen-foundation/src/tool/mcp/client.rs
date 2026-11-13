@@ -31,7 +31,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::http::{SseTransport, StreamableHttpTransport};
+use super::http::{ServerStreamState, SseTransport, StreamableHttpTransport};
 use super::result::{normalize_call_tool_result, McpToolResult};
 
 /// The kind of transport used to reach an MCP server.
@@ -281,6 +281,21 @@ impl McpRemoteTool {
     }
 }
 
+/// A notification pushed by an MCP server over its server-initiated stream.
+///
+/// Python parity: the payload a transport hands to its registered notification
+/// handlers (`method` plus the raw `params`). Notifications are buffered by the
+/// client (bounded to 64 entries, the oldest dropped with a `tracing::warn!`) and
+/// drained by [`McpClient::take_notifications`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct McpNotification {
+    /// JSON-RPC method of the notification, e.g. `notifications/tools/list_changed`.
+    pub method: String,
+    /// Raw `params` object of the notification (`null` when the server sent none).
+    pub params: Value,
+}
+
 /// A provider-neutral MCP client.
 ///
 /// Python parity: `McpClient` in
@@ -383,6 +398,30 @@ pub trait McpClient: Send + Sync + 'static {
             "this MCP client does not support reading resources",
         ))
     }
+
+    /// Drains the notifications the server pushed over its server-initiated stream.
+    ///
+    /// Notifications are removed by the call, oldest first, so each one is
+    /// returned exactly once. The buffer is bounded (64 entries) and drops the
+    /// oldest notification with a `tracing::warn!` when it overflows. The default
+    /// implementation buffers nothing and returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation never fails; implementations that raise a
+    /// transport error propagate it.
+    async fn take_notifications(&self) -> Result<Vec<McpNotification>> {
+        Ok(Vec::new())
+    }
+
+    /// Reports whether the server accepted the server-initiated `GET` stream.
+    ///
+    /// This is the negotiated capability: it is `false` before a session is
+    /// established, when the server refused the channel (405/404/501), and for
+    /// transports without such a channel (the default).
+    fn supports_server_stream(&self) -> bool {
+        false
+    }
 }
 
 /// Builds a client for `config` without connecting.
@@ -464,6 +503,7 @@ pub struct RmcpClient {
     config: McpServerConfig,
     connection: Mutex<Option<RunningService<RoleClient, ()>>>,
     connect_lock: Mutex<()>,
+    server_stream: parking_lot::Mutex<Option<ServerStreamState>>,
 }
 
 impl RmcpClient {
@@ -489,6 +529,7 @@ impl RmcpClient {
             config: config.clone(),
             connection: Mutex::new(None),
             connect_lock: Mutex::new(()),
+            server_stream: parking_lot::Mutex::new(None),
         })
     }
 
@@ -499,7 +540,12 @@ impl RmcpClient {
     }
 
     /// Builds and initializes a fresh `rmcp` session.
-    async fn spawn_session(&self) -> Result<RunningService<RoleClient, ()>> {
+    ///
+    /// Returns the session together with the server-initiated stream handle when
+    /// the transport has one (`streamable_http` only).
+    async fn spawn_session(
+        &self,
+    ) -> Result<(RunningService<RoleClient, ()>, Option<ServerStreamState>)> {
         tracing::debug!(
             server_name = %self.config.server_name,
             client_type = self.config.client_type.as_str(),
@@ -509,27 +555,38 @@ impl RmcpClient {
         match self.config.client_type {
             McpClientType::Stdio => {
                 let transport = build_stdio(&self.config)?;
-                serve_client((), transport)
+                let session = serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))
+                    .map_err(|error| failure(error.to_string()))?;
+                Ok((session, None))
             }
             McpClientType::StreamableHttp => {
                 let transport = StreamableHttpTransport::new(&self.config)?;
-                serve_client((), transport)
+                let state = transport.server_stream();
+                let session = serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))
+                    .map_err(|error| failure(error.to_string()))?;
+                Ok((session, Some(state)))
             }
             McpClientType::Sse => {
                 let transport = SseTransport::new(&self.config)?;
-                serve_client((), transport)
+                let session = serve_client((), transport)
                     .await
-                    .map_err(|error| failure(error.to_string()))
+                    .map_err(|error| failure(error.to_string()))?;
+                Ok((session, None))
             }
         }
     }
 
-    /// Drops the held session, cancelling its worker.
+    /// Drops the held session, cancelling its worker and clearing the stream state.
     async fn drop_session(&self) {
+        let state = {
+            let mut guard = self.server_stream.lock();
+            guard.take()
+        };
+        if let Some(state) = state {
+            state.reset();
+        }
         let mut guard = self.connection.lock().await;
         if let Some(service) = guard.take() {
             if let Err(error) = service.cancel().await {
@@ -610,7 +667,8 @@ impl McpClient for RmcpClient {
         if self.connection.lock().await.is_some() {
             return Ok(());
         }
-        let session = self.spawn_session().await?;
+        let (session, stream_state) = self.spawn_session().await?;
+        *self.server_stream.lock() = stream_state;
         *self.connection.lock().await = Some(session);
         Ok(())
     }
@@ -698,6 +756,23 @@ impl McpClient for RmcpClient {
             }
         })
         .await
+    }
+
+    // Draining the buffer needs no I/O and never creates a session.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn take_notifications(&self) -> Result<Vec<McpNotification>> {
+        let state = self.server_stream.lock().clone();
+        match state {
+            Some(state) => Ok(state.take_notifications()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn supports_server_stream(&self) -> bool {
+        self.server_stream
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.supports_server_stream() && !state.is_refused())
     }
 }
 
