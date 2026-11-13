@@ -16,6 +16,7 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 | `otel.rs` | `#![cfg(feature = "otel")]` | `CaptureExporter` span names/attributes/statuses through the session `Tracer`/`TraceSink` and `OtelAgentHandler` |
 | `a2a_client.rs` | `#![cfg(feature = "a2a")]` | `A2aClient` against a `wiremock` peer; folded `AgentResult` plus the received JSON-RPC envelope |
 | `a2a_server.rs` | `#![cfg(feature = "a2a")]` | `A2aServer::router()` driven by `Router::oneshot`; card route, send/get/cancel, SSE frame order |
+| `a2a_rest.rs` | `#![cfg(feature = "a2a")]` | the REST (`HTTP+JSON`) binding: card parity per transport, `message:send`/`messages:send`, raw SSE stream, `tasks/{id}`, both cancel and both subscribe spellings, REST error envelopes (400/404/405/409), transport config serde |
 
 ## Constraints and Test Idioms
 
@@ -34,4 +35,5 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 
 - No `sqlite`-gated test at the crate boundary: the SQLite checkpointer/store backends are exercised only by `src/checkpointer/mod.rs` and `src/store/mod.rs` unit tests.
 - No test pairs `A2aClient` with `A2aServer` over a real loopback socket here; the only real-socket path is `src/a2a/e2e_tests.rs`.
+- No `a2a_rest.rs` case exercises the REST `rest_prefix = ""` (v1-native) URL set or a custom `rest_path`; both are covered only by `src/a2a/server/rest_tests.rs`.
 - `context_evolver::MemoryVectorStore` and `sandbox` provider registration have no direct crate-boundary suite beyond `adapters.rs`.
