@@ -25,6 +25,13 @@
 //! and the typed wrappers (`list_members`, `task_detail`, `snapshot`, …) decode the op payloads.
 //! One client holds one connection and at most one in-flight request.
 //!
+//! # Server
+//!
+//! [`AttachServer::bind`] creates the socket file (parent directories, stale-socket reclamation and
+//! mode `0600` included), [`AttachServer::serve`] answers every connection concurrently through an
+//! [`AttachHandler`], and [`AttachServer::shutdown`] stops the accept loop and removes the file.
+//! Dropping a server also removes the socket file, and only ever a path that is still a socket.
+//!
 //! # Security
 //!
 //! The protocol carries no authentication or encryption: trust comes from the filesystem.
@@ -36,18 +43,20 @@
 //! # Platform support
 //!
 //! Cross-process attach uses Unix domain sockets only.
-//! The protocol layer here is platform independent and compiles everywhere; [`AttachClient`] keeps
-//! the same public surface on every target, but its transport methods return `Error::Unsupported`
-//! with the message "cross-process attach requires Unix domain sockets" on non-Unix targets (and
-//! [`AttachClient::is_available`] is always `false` there).
+//! The protocol layer here is platform independent and compiles everywhere; [`AttachClient`] and
+//! [`AttachServer`] keep the same public surface on every target, but their transport methods return
+//! `Error::Unsupported` with the message "cross-process attach requires Unix domain sockets" on
+//! non-Unix targets (and [`AttachClient::is_available`] is always `false` there).
 pub mod client;
 pub mod protocol;
+pub mod server;
 
 pub use client::AttachClient;
 pub use protocol::{
     AttachError, AttachHandler, AttachOp, AttachResult, RequestFrame, ResponseFrame,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+pub use server::AttachServer;
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
@@ -56,3 +65,7 @@ mod client_tests;
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod server_tests;
