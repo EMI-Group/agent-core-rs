@@ -9,10 +9,10 @@
 //!   return identical values;
 //! - every call is capped at [`MAX_SIGNALS_PER_INPUT`] signals, stopping as soon
 //!   as the cap is reached;
-//! - evidence is bounded — conversation excerpts are cut to
-//!   [`MAX_EXCERPT_CHARS`], review and team excerpts are single feedback
-//!   segments, and evaluation excerpts are built from maps truncated to 80
-//!   characters each and then cut to [`MAX_EXCERPT_CHARS`];
+//! - evidence is bounded — conversation, review, team and failure-fallback
+//!   excerpts are all cut to [`MAX_EXCERPT_CHARS`], and evaluation excerpts are
+//!   built from maps truncated to 80 characters each and then cut to
+//!   [`MAX_EXCERPT_CHARS`];
 //! - nothing calls a model, reads the environment or looks at a clock.
 //!
 //! Negative feedback is recognised by the closed marker list
@@ -136,6 +136,7 @@ fn serialize_map(map: &BTreeMap<String, Value>) -> String {
 
 /// The single-signal failure helper behind review and team extraction.
 fn failure_signal(excerpt: &str, target: EvolutionTarget) -> Option<EvolutionSignal> {
+    let excerpt = truncate_excerpt(excerpt, MAX_EXCERPT_CHARS);
     let signal = EvolutionSignal::new("execution_failure", target, excerpt).ok()?;
     signal.with_confidence(0.6).ok()
 }
