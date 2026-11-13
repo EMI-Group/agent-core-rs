@@ -479,3 +479,43 @@ fn moonshot_families_are_classified_from_the_last_segment() {
     assert_eq!(moonshot_family("Kimi-K2.6"), MoonshotFamily::K2Toggle);
     assert_eq!(moonshot_family("kimi-k1"), MoonshotFamily::Unknown);
 }
+/// Wires the resolver answers before dispatching to an encoder: `profile_plan`
+/// short-circuits them, so they deliberately have no `encode_wire` arm.
+const GUARD_WIRES: [&str; 3] = ["always_on", "minimax_m2", "unsupported"];
+#[test]
+fn every_table_wire_dispatches_to_a_real_encoder() {
+    use super::super::profiles::{MODEL_REASONING_FALLBACKS, REASONING_PROFILES};
+    for profile in REASONING_PROFILES.iter().chain(MODEL_REASONING_FALLBACKS) {
+        for (protocol, wire) in [
+            (ReasoningProtocol::ChatCompletions, profile.wire),
+            (ReasoningProtocol::AnthropicMessages, profile.anthropic_wire),
+        ] {
+            if GUARD_WIRES.contains(&wire) {
+                continue;
+            }
+            let context = format!("{}/{wire}", profile.provider);
+            let capability = profile.capability_spec_for(protocol).to_capability();
+            let effort = capability
+                .recommended
+                .clone()
+                .or_else(|| {
+                    capability
+                        .options
+                        .iter()
+                        .find(|option| option.as_str() != "off")
+                        .cloned()
+                })
+                .unwrap_or_else(|| panic!("{context}: row exposes no selectable level"));
+            let model = profile.model_patterns[0]
+                .replace('*', "sample")
+                .replace('?', "1");
+            let model_key = model.to_lowercase();
+            let intent = enabled_effort(&effort);
+            let plan = encode_wire(wire, protocol, &model, &model_key, &intent);
+            assert!(
+                !plan.is_empty(),
+                "{context}: no encoder arm produced a plan for {model}"
+            );
+        }
+    }
+}

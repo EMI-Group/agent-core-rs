@@ -74,6 +74,8 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 - `plan_tests.rs` (declared from `plan.rs` with `#[path]`) drives every encoder through the public `resolve_reasoning_plan`/`resolve_reasoning_plan_for`, plus each normalizer table, provider resolution, warnings, Responses encoding, and Moonshot family classification.
 - `tests.rs` iterates the whole table: every entry uses a known encoder (`KNOWN_WIRES`, 25 names), every capability is lower case, unique and self-consistent, every entry is reachable by a sample model id, no provider/pattern pair is duplicated, and resolution never panics.
 - `tests.rs` also asserts end-to-end body effects: a resolved plan fills the body, an empty plan or a warning-only plan leaves it byte-identical, and caller `extra` overrides a plan key.
+- `profiles_parity_tests.rs` pins the tables to the Python reference: every row of `REASONING_PROFILES` and `MODEL_REASONING_FALLBACKS` (provider, patterns, capability options/recommended, `wire`, `anthropic_wire`) is compared in Python order against the hard-coded transcription in `profiles_python_rows.rs`, and the audited families are resolved through the public lookup API; Python is never read at test time.
+- `plan_tests.rs` proves encoder coverage: every table `wire`/`anthropic_wire` outside the guard set (`always_on`, `minimax_m2`, `unsupported`) dispatches to a real `encode_wire` arm and produces a non-empty plan for a level its capability offers.
 - Everything is offline and deterministic — pure functions, no `wiremock`, no environment mutation; `cargo test -p openjiuwen-foundation reasoning` runs the module.
 
 ## Known Gaps
@@ -89,6 +91,8 @@ Everything is pure data plus pure functions: no I/O, no clock, no global mutable
 
 - `./mod.rs` → intent, capability, protocol, profile, and plan types plus their helpers and inline tests
 - `./profiles.rs` → static profile/fallback tables, provider-key resolution, host hints, glob matching, profile lookup, capability lookup
+- `./profiles_parity_tests.rs` → Python-parity row pins, audited-family resolution, provider-vs-fallback precedence (compiled as `profiles.rs`'s test module)
+- `./profiles_python_rows.rs` → hard-coded transcription of the Python profile and fallback tables, used only by the parity tests
 - `./plan.rs` → resolution entry points, the encoder dispatch, per-family normalizers, and intent sanitizing
 - `./apply.rs` → writing a plan into a request body without clobbering caller keys
 - `./plan_tests.rs` → per-encoder and normalizer suites (compiled as `plan.rs`'s test module)
