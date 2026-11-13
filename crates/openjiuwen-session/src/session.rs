@@ -242,6 +242,31 @@ pub trait Session: Send + Sync {
     /// temporary), so callers can hold the reference across calls.
     fn trace(&self) -> &dyn TraceSink;
 
+    /// Installs a session-scoped trace sink (for example an `OTel` sink) for all
+    /// spans emitted after this call.
+    ///
+    /// The session keeps handing out the same [`Session::trace`] reference —
+    /// only the sink behind it changes — so a checkpointed trace position
+    /// continues to work and frames already in flight are routed to the new
+    /// sink. Concrete sessions whose tracer shares the session's swappable sink
+    /// (workflow, node, agent, and team sessions) override this to perform the
+    /// swap; read-only wrappers and minimal test doubles keep the default.
+    ///
+    /// Configuration, not capability: an implementation that cannot be traced
+    /// (a read-only router view) returns
+    /// [`openjiuwen_common::error::ErrorKind::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`openjiuwen_common::error::ErrorKind::Unsupported`] by default
+    /// (`"session does not support installing a trace sink"`), and whatever the
+    /// concrete session reports when it rejects the installation.
+    fn install_trace_sink(&self, _sink: Arc<dyn TraceSink>) -> Result<()> {
+        Err(Error::unsupported(
+            "session does not support installing a trace sink",
+        ))
+    }
+
     /// Returns descriptive metadata derived from the id, parent, and kind.
     ///
     /// Concrete sessions override this to add entity, trace, and creation

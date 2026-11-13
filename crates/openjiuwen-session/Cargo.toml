@@ -32,6 +32,9 @@ tempfile.workspace = true
 [features]
 default = []
 sqlite = ["dep:sqlx"]
+# Empty marker: enables the real trace-sink installation path in `otel` so a
+# consumer (e.g. `openjiuwen-extensions`) can wire its OTel sink through it.
+otel = []
 
 [lints]
 workspace = true

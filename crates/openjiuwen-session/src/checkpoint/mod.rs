@@ -7,6 +7,11 @@
 //! sqlite backend lives in `crate::checkpoint::sqlite` behind the `sqlite`
 //! feature).
 //!
+//! Remote checkpoints are served by [`RedisCheckpointer`], which speaks RESP2
+//! through the dependency-free client in [`resp`] (Python delegates to the
+//! `redis` client library); its key layout and behaviour are documented in
+//! [`redis`].
+//!
 //! Deviations from Python (intentional, documented in the crate `CONTEXT.md`):
 //!
 //! - Checkpoints are JSON documents, not pickles; only JSON-compatible state is
@@ -37,11 +42,14 @@ use crate::tracer::TracePosition;
 
 pub mod file;
 pub mod memory;
+pub mod redis;
+pub mod resp;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 pub use file::FileCheckpointer;
 pub use memory::MemoryCheckpointer;
+pub use redis::{RedisCheckpointer, RedisOptions};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteCheckpointer;
 
@@ -304,10 +312,11 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 
     /// Lists a session's checkpoints; an unknown session yields an empty list.
     ///
-    /// The order is backend-defined: [`MemoryCheckpointer`] and
-    /// [`FileCheckpointer`] return `(created_at, checkpoint_id)` ascending, the
-    /// sqlite backend newest first. [`Checkpointer::latest`] sorts on its own, so
-    /// callers that need a specific order must sort the result themselves.
+    /// The order is backend-defined: [`MemoryCheckpointer`],
+    /// [`FileCheckpointer`], and [`RedisCheckpointer`] return
+    /// `(created_at, checkpoint_id)` ascending, the sqlite backend newest first.
+    /// [`Checkpointer::latest`] sorts on its own, so callers that need a
+    /// specific order must sort the result themselves.
     ///
     /// # Errors
     ///
@@ -407,6 +416,10 @@ pub enum CheckpointerKind {
     File,
     /// A sqlite database (feature `sqlite`).
     Sqlite,
+    /// A Redis server ([`RedisCheckpointer`]); the URL comes from
+    /// [`CheckpointerConfig::extra`] `"url"` (or the rendered
+    /// [`CheckpointerConfig::path`]).
+    Redis,
 }
 
 /// Declarative backend selection for [`create_checkpointer`].
@@ -415,21 +428,35 @@ pub enum CheckpointerKind {
 pub struct CheckpointerConfig {
     /// The backend to construct.
     pub kind: CheckpointerKind,
-    /// The filesystem root (`file`) or database file (`sqlite`); ignored by
-    /// `in_memory`.
+    /// The filesystem root (`file`), the database file (`sqlite`), or a URL
+    /// fallback (`redis`); ignored by `in_memory`.
     pub path: Option<PathBuf>,
-    /// Backend-specific options, unused by the built-in backends.
+    /// Backend-specific options; empty for every backend except `redis`.
+    ///
+    /// [`RedisCheckpointer`] reads `"url"` (required; the rendered
+    /// [`CheckpointerConfig::path`] is the fallback URL), `"prefix"` (string,
+    /// defaulting to [`redis::DEFAULT_REDIS_KEY_PREFIX`]), `"ttl_seconds"`
+    /// (unsigned integer, applied as `EXPIRE` per checkpoint document), and
+    /// `"database"` (unsigned integer, sent as `SELECT`).
     pub extra: BTreeMap<String, Value>,
 }
 
 /// Builds a checkpointer from `config`.
 ///
+/// `redis` dials the server eagerly, so an unreachable server or a failed
+/// handshake surfaces here as [`openjiuwen_common::error::ErrorKind::Session`]
+/// rather than on the first save.
+///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `file` or
-/// `sqlite` is requested without a `path`, and
+/// `sqlite` is requested without a `path`, when `redis` is requested without a
+/// URL, and for a malformed Redis URL;
 /// [`openjiuwen_common::error::ErrorKind::Unsupported`] when `sqlite` is
-/// requested but the crate was built without the `sqlite` feature.
+/// requested but the crate was built without the `sqlite` feature, or when the
+/// Redis URL is `rediss://` (TLS); and
+/// [`openjiuwen_common::error::ErrorKind::Session`] when the Redis connection
+/// or its handshake fails.
 pub async fn create_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
     match config.kind {
         CheckpointerKind::InMemory => Ok(Arc::new(MemoryCheckpointer::new())),
@@ -439,6 +466,7 @@ pub async fn create_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn 
             })?;
             Ok(Arc::new(FileCheckpointer::new(path)))
         }
+        CheckpointerKind::Redis => create_redis_checkpointer(config).await,
         CheckpointerKind::Sqlite => {
             #[cfg(feature = "sqlite")]
             {
@@ -460,5 +488,43 @@ async fn create_sqlite_checkpointer(config: &CheckpointerConfig) -> Result<Arc<d
         Error::validation("sqlite checkpointer requires a `path` in the configuration")
     })?;
     let checkpointer = sqlite::SqliteCheckpointer::open(path).await?;
+    Ok(Arc::new(checkpointer))
+}
+
+/// Builds a [`RedisCheckpointer`] from a [`CheckpointerConfig`].
+///
+/// The URL is read from `extra["url"]`, falling back to the rendered
+/// `config.path`; the optional `extra` keys are `prefix` (string), `ttl_seconds`
+/// (unsigned integer), and `database` (unsigned integer).
+async fn create_redis_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
+    let url = config
+        .extra
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| config.path.as_ref().map(|path| path.display().to_string()))
+        .ok_or_else(|| {
+            Error::validation(
+                "redis checkpointer requires a `url` (extra.url or path) in the configuration",
+            )
+        })?;
+    let mut options = redis::RedisOptions {
+        url,
+        ..redis::RedisOptions::default()
+    };
+    if let Some(prefix) = config.extra.get("prefix").and_then(Value::as_str) {
+        options.prefix = prefix.to_string();
+    }
+    if let Some(seconds) = config.extra.get("ttl_seconds").and_then(Value::as_u64) {
+        options.ttl = Some(std::time::Duration::from_secs(seconds));
+    }
+    if let Some(database) = config.extra.get("database").and_then(Value::as_u64) {
+        options.database = Some(u32::try_from(database).map_err(|_| {
+            Error::validation(format!(
+                "redis database index {database} does not fit in a u32"
+            ))
+        })?);
+    }
+    let checkpointer = redis::RedisCheckpointer::connect_with_options(options).await?;
     Ok(Arc::new(checkpointer))
 }

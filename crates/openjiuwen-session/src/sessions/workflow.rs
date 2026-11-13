@@ -115,6 +115,15 @@ impl WorkflowSession {
         metadata
             .entry("workflow_id".to_string())
             .or_insert_with(|| Value::String(workflow_id.clone()));
+        // The workflow identity a `NodeSession` (and a `SubWorkflowSession`)
+        // reads back through `SessionMetadata`: a top-level workflow has no
+        // enclosing workflow, so it is its own main workflow at depth 0.
+        metadata
+            .entry("main_workflow_id".to_string())
+            .or_insert_with(|| Value::String(workflow_id.clone()));
+        metadata
+            .entry("workflow_nesting_depth".to_string())
+            .or_insert_with(|| Value::from(0));
         let inner = SessionInner::new(SessionInnerOptions {
             id: session_id,
             parent_id,
@@ -217,6 +226,11 @@ impl Session for WorkflowSession {
 
     fn trace(&self) -> &dyn TraceSink {
         self.inner.trace_sink.as_ref()
+    }
+
+    fn install_trace_sink(&self, sink: Arc<dyn TraceSink>) -> Result<()> {
+        self.inner.install_trace_sink(sink);
+        Ok(())
     }
 
     fn metadata(&self) -> SessionMetadata {
@@ -322,6 +336,49 @@ impl NodeSession {
         &self.component_id
     }
 
+    /// Returns the node type this view was created with, when one was supplied.
+    #[must_use]
+    pub fn node_type(&self) -> Option<&str> {
+        self.node_type.as_deref()
+    }
+
+    /// Returns the workflow id of the workflow this node belongs to.
+    ///
+    /// Read from the parent session's `workflow_id` metadata (a workflow
+    /// session stamps it at construction, and a node copies its parent's
+    /// metadata), defaulting to [`DEFAULT_WORKFLOW_ID`] when absent or empty.
+    #[must_use]
+    pub fn workflow_id(&self) -> String {
+        self.parent_workflow_key("workflow_id")
+            .unwrap_or_else(|| DEFAULT_WORKFLOW_ID.to_string())
+    }
+
+    /// Returns the id of the outermost workflow in this nesting chain.
+    ///
+    /// Read from the parent session's `main_workflow_id` metadata, falling back
+    /// to [`NodeSession::workflow_id`] for a parent that does not record one.
+    #[must_use]
+    pub fn main_workflow_id(&self) -> String {
+        self.parent_workflow_key("main_workflow_id")
+            .unwrap_or_else(|| self.workflow_id())
+    }
+
+    /// Returns how many sub-workflows enclose this node.
+    ///
+    /// Read from the parent session's `workflow_nesting_depth` metadata; a
+    /// top-level workflow's node is at depth 0, and
+    /// [`crate::sessions::SubWorkflowSession`] adds one level per nesting.
+    #[must_use]
+    pub fn workflow_nesting_depth(&self) -> u32 {
+        self.parent
+            .metadata()
+            .metadata
+            .get("workflow_nesting_depth")
+            .and_then(Value::as_u64)
+            .and_then(|depth| u32::try_from(depth).ok())
+            .unwrap_or(0)
+    }
+
     /// Returns the parent session.
     #[must_use]
     pub fn parent(&self) -> &Arc<dyn Session> {
@@ -355,6 +412,17 @@ impl NodeSession {
             executable_id,
             node_type,
         }
+    }
+
+    /// Reads a non-empty string workflow key from the parent's metadata.
+    fn parent_workflow_key(&self, key: &str) -> Option<String> {
+        self.parent
+            .metadata()
+            .metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
     }
 
     /// Joins the executable id with `component_id` (or returns it when empty).
@@ -418,6 +486,10 @@ impl Session for NodeSession {
 
     fn trace(&self) -> &dyn TraceSink {
         self.parent.trace()
+    }
+
+    fn install_trace_sink(&self, sink: Arc<dyn TraceSink>) -> Result<()> {
+        self.parent.install_trace_sink(sink)
     }
 
     fn metadata(&self) -> SessionMetadata {

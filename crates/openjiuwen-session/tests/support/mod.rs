@@ -12,6 +12,8 @@
 //! selection) is tested in those files.
 #![allow(dead_code)]
 
+pub(crate) mod resp_server;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
