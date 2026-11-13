@@ -258,6 +258,102 @@ Candidate ids come from the mutation strategy with generation `iterations + 1` (
 `"engineering_failed: …"` journal entries and never abort the loop; a baseline error marks the run failed and is
 returned.
 
+### `harness_rsi::evaluator` (`src/harness_rsi/evaluator/`)
+
+```
+case.rs    AnswerRole { Criterion /*default*/, Reference }; PenaltyMode { Ceiling /*default*/, Subtract }
+           (serde snake_case, `as_str()`, `parse()` → Error::validation)
+           BehaviorSpec { id, weight 1.0 } (+new), ForbiddenBehaviorSpec { id, penalty 0.3 } (+new)
+           CaseReference { answer, expected_output, rubric, files, required_behaviors,
+             forbidden_behaviors, answer_role, penalty_mode, solution, expected_artifacts,
+             deliverables, artifact_contract } — Default, from_json_value (strings or objects for
+             behaviours, duplicate ids rejected, penalty 0..=1)
+           SweBenchCase { instance_id, repo, base_commit, patch, test_patch, fail_to_pass,
+             pass_to_pass, split, extra } — from_json_value (id aliases instance/id, unknown keys → extra)
+           EvaluationCase { case_id, name, input, assets, reference, workspace_source_dir, swebench,
+             metadata } — from_json_value(index, value): case_id ← case_id|id|case_{index:03};
+             input ← input|inputs|task_input|query|prompt|question; unknown keys → metadata
+           Dataset { dataset_id, cases } — from_json_value (array or {dataset_id, cases}),
+             from_jsonl_str(text, dataset_id), load(path) (jsonl/ndjson by extension), case_ids, len,
+             is_empty; malformed entries → Error::validation naming the case index, duplicate ids rejected
+scoring.rs DEFAULT_SUCCESS_THRESHOLD 0.8; DEFAULT_FORBIDDEN_PENALTY 0.3; VERDICT_COMPLETED; METHOD_JUDGE
+           BehaviorVerdict { id, score 0..=1, reason, evidence }; ForbiddenHit { id, triggered, reason, evidence }
+           JudgeVerdict { status "completed", overall_reason, behaviors, forbidden_hits }
+           JudgeResult { method, score, passed, reason, metadata }; ScoringContract { required, forbidden,
+             penalty_mode, success_threshold, binary }
+           parse_judge_verdict(text) — bare/fenced/prose-wrapped, one payload only; rejects non-finite
+             numbers, duplicate ids, a non-object root, a status other than completed
+           score_verdict(contract, verdict): base = Σ(score·weight)/Σweight over required (missing → 0);
+             penalty = Σ spec penalty over triggered forbidden; Ceiling → min(base, 1−penalty),
+             Subtract → max(0, base−penalty); passed = score >= success_threshold; binary → 1.0/0.0 with
+             metadata["raw_score"]; metadata also carries base_score/penalty/penalty_mode/
+             triggered_forbidden_behaviors; empty contract → 0.0
+           verdict_from_case(reference, threshold, binary): explicit behaviours + rubric_{index:03} per
+             rubric string + reference_answer in front when answer_role = criterion; non-finite
+             threshold → 0.8
+           RequirementResult { id, weight, score, met } + requirement_results(contract, verdict)
+             (id ascending; forbidden rows carry weight 0.0 and score 1.0/0.0)
+           JudgeFailure { Truncated, RepairInvalid, RepairUnavailable, Unavailable, InvalidSchema }
+             + as_str(): repair+unavailable > repair+invalid > unavailable > truncated (unterminated
+               fence/unbalanced brackets) > invalid_schema
+runner.rs  TRANSIENT_ERROR_MARKERS (Python transport.py list) + is_transient_error(message)
+           ExecutionStatus { Passed, Failed } (as_str); CaseExecutionResult { response, execution_status,
+             error, workspace_dir, metadata } + passed(response)/failed(error)
+           CaseExecutionRequest { case, output_dir, session_id }
+           #[async_trait] CaseExecutionBackend { name, execute(request), cleanup(case_id) { Ok(()) } }
+           CaseTrace { case_id, status passed|failed|error, result: CaseResult, execution, artifacts }
+             + is_infrastructure_error() (own or execution error matches a transient marker)
+           CaseRunner { backend, threshold 0.8, binary false } new/with_threshold/with_binary/
+             threshold/binary/backend_name/run(request): backend error → status error + ungraded result;
+             failed execution → ungraded failed; verdict/score response → graded result (details carry
+             method + metadata); unusable response → ungraded with the JudgeFailure tag as error
+           CaseCommandBuilder { build(&EvaluationCase) -> CommandSpec } (sync)
+           CommandCaseBackend { runner, builder, field "response" } — runs the command, parses stdout
+             (bare JSON or ```json fence), unwraps `field` from an envelope; non-zero exit is
+             ExecutionStatus::Failed with stderr, never an Err
+           CandidateCaseRunner { inner: CaseRunner, output_dir } implements Evaluator: Case::input is the
+             EvaluationCase document, candidate body injected as metadata["candidate_body"], session_id
+             empty, result weight/case_id copied from the evolution Case
+swebench.rs SweBenchConfig { python "python3", dataset "princeton-nlp/SWE-bench_Verified", split "test",
+             namespace "swebench", instance_image_tag "latest", run_id uuid, model_name "openjiuwen",
+             timeout_secs 1800, cache_level "env", extra_args, reports_dir "swebench_reports" }
+           SweBenchClassification { Resolved, Unresolved, Error, Incomplete } + as_str
+           SweBenchOutcome { instance_id, classification, score 1.0/0.0/None, report_path, error, metadata }
+           SweBenchEvaluator { runner, config } new/config/run_command (<python> -m
+             swebench.harness.run_evaluation … --clean false -id <run> --namespace … --instance_image_tag …
+             + extras, timeout +600 s)/evaluate_case (writes predictions.jsonl, runs, locates the aggregate
+             report at <reports_dir>/<model>.<run>.json or a stdout `*.json` report token, classifies)
+           classification_from_report(report, instance_id): resolved_ids > error_ids > incomplete_ids >
+             unresolved; failure_reason(classification, exit_code, report_present) → the Python literals;
+             per_instance_failure_reason, infrastructure_failure_reason(patterns, output) with
+             DEFAULT_INFRASTRUCTURE_FAILURE_PATTERNS
+           SweBenchDatasetEvaluator implements Evaluator (resolved 1.0, unresolved 0.0, error/incomplete
+             ungraded, details = classification/instance_id/report_path/error)
+terminal_bench.rs TerminalBenchConfig { command "terminal-bench", dataset "", timeout_secs 3600,
+             task_filter, results_dir "terminal_bench_results", extra_args }
+           TerminalBenchCommandLog { command, cwd, exit_code, stdout_excerpt, stderr_excerpt, timeout_sec,
+             background } (Python field names; COMMAND_EXCERPT_LIMIT 1000 chars, "..." suffix)
+           TerminalBenchOutcome { task_id, passed, score, log, error, metadata }
+           TerminalBenchEvaluator::run_command (<command> run --dataset … --task-id … --output-path …
+             [--task-filter …] + extras, merged stderr, timeout)/evaluate_case (missing results file is
+             error "results file missing", not an Err)
+           parse_results(value, task_id) — {"results": […]} | {"tasks": {id: …}} |
+             {"resolved_ids", "unresolved_ids"}; unknown shape/missing task → Error::validation
+           TerminalBenchDatasetEvaluator implements Evaluator (task id from metadata.task_id, else case id)
+metrics.rs CaseResultRecord { case_id, status, score, error, metadata }
+           MetricsSummary { total_cases, passed_cases, failed_cases, average_score, evaluation_method,
+             case_results } (+all_passed)
+           collect_metrics(traces, method) — passed = status "passed", average over graded only
+           summary_from_results(results, method), summarize_reports(reports, method)
+           write_summary(path, summary) async — parent dirs, pretty JSON, trailing newline, Error::session
+sanitize_id(value) — Python `_safe_id`: lowercase, alnum kept, other → '-', 48-char cap, "" → "case"
+```
+
+`harness_rsi::evaluator` is the portable half of Python's evaluator package (case/dataset records, the
+judge scoring contract, the case-runner bridge, the benchmark runtimes and metrics).
+It stays offline: the benchmark evaluators take a `runtime::command::CommandRunner`, so tests inject
+`FakeCommandRunner` and write the report/results files themselves.
+
 ### `deferred` (`src/deferred/`)
 
 API-shaped stubs, all documented and all returning
@@ -266,6 +362,8 @@ API-shaped stubs, all documented and all returning
 `runtime::{SubprocessEvaluator, RuntimeExtensionLoader, CiGate, GitBackend}`,
 `evaluators::{SweBenchEvaluator, TerminalBenchEvaluator, LlmJudgeEvaluator}`,
 `paper_opt::PaperOptimizer`, `member_optimizer::MemberOptimizer`.
+The evaluator stubs keep their `Unsupported` constructors for call-site parity; the portable evaluation
+core they stood in for now lives in [`harness_rsi::evaluator`](#harness_rsievaluator-srcharness_rsievaluator).
 
 ## Constraints
 
@@ -297,7 +395,8 @@ API-shaped stubs, all documented and all returning
 | `artifact_rsi.program_opt.{puct_engine,puct_provider,runtime,execution,script_domain,probe,provision}` | stub (`deferred::agentdescent`, `deferred::runtime`) | Needs `agentdescent==0.4.6` evolve/ledger/aggregator internals, subprocess/pip execution, `Model` bridge. |
 | agentdescent itself (`selection`, `aggregator`, `ledger`, `staleness`, `filetree`, `evolution`) | deferred | Exact 0.4.6 semantics; distributed/deep-RL training has no maintained Rust equivalent. |
 | `artifact_rsi.paper_opt.auto_research` (paper optimisation, LaTeX/bibliography modules) | stub (`deferred::paper_opt`) | Six DeepAgent stage agents + a Python host toolchain (LaTeX, pyright, Pillow). |
-| `harness_rsi.evaluator.{case_backend,case_runner,team_evaluator,swebench_runtime,terminal_bench_runtime,runtime_adapters}` and `evaluator.judger.*` | stub (`deferred::evaluators`) | SWE-bench docker/WSL runtimes, guarded judge model plumbing. |
+| `harness_rsi.evaluator.{team_evaluator,runtime_adapters,trajectory_paths,trajectory_usage,baseline_context,optimization_signals}` and `evaluator.judger.*` | seam only — injected `CaseExecutionBackend` / judge text | The DeepAgent solver backend, the trajectory/observability rails, the LLM judge model and its repair turn need harness construction and guarded model plumbing; `case.rs`/`scoring.rs`/`runner.rs` own the records, verdict math and grading bridge they feed. |
+| `harness_rsi.evaluator.{swebench,terminal_bench}_runtime` container internals (docker/WSL provisioning, solver containers, per-instance reports) | out of scope — the official CLI is run through `runtime::command` | The argv, report classification and result parsing are implemented; provisioning containers needs Docker/WSL hosts. |
 | `harness_rsi.{evaluation_result_analyzer,member_optimizer,improver_evolution}` | stub (`deferred::member_optimizer`) | Agent-driven diagnosis/attribution/action planning; LLM prompts, no portable core. |
 | `harness_rsi.auto_harness.infra.{git_operations,worktree_manager,ci_gate_runner,runtime_extension_loader,runtime_extension_static_checks,github_cli,skill_source_manager}` | stub (`deferred::runtime`) | Subprocess git/pip/pytest/ruff, synthetic `sys.modules` hot-loading, GitCode HTTP. |
 | `harness_rsi.auto_harness.{stages,agents.factory,rails,tools}` live LLM orchestration | not stubbed — caller's `HarnessRunner` | DeepAgent construction and stage LLM turns belong to the caller (`openjiuwen-harness`). |
@@ -319,6 +418,8 @@ API-shaped stubs, all documented and all returning
     - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `builder.rs` (collaborator defaults/validation), `orchestrator.rs` (+ `orchestrator_tests.rs`, a `#[cfg(test)]` child module)
   - `./src/harness_rsi/single_harness/` → single-harness promotion loops
     - `promotion.rs` (pure promotion math + reason literals), `config.rs`, `state.rs` (resumable state + idempotency keys), `iterative.rs` (`IterativeSingleHarness` + the shared `SessionCore`), `continuous.rs` (`ContinuousSingleHarness`)
+  - `./src/harness_rsi/evaluator/` → evaluation records, scoring and benchmark runtimes
+    - `case.rs` (case/dataset records + JSON/JSONL loading), `scoring.rs` (verdict parsing, weighted score, penalties, failure classification), `runner.rs` (`CaseExecutionBackend`, `CaseRunner`, `CommandCaseBackend`, `CandidateCaseRunner`), `swebench.rs`, `terminal_bench.rs`, `metrics.rs`
 - `./src/artifact_rsi/` → artifact-side RSI
   - `./src/artifact_rsi/program_opt/` → `ProgramOptConfig` and the PUCT tree (`config.rs`, `tree.rs`)
 - `./src/deferred/` → documented `Error::Unsupported` stubs for ML/vendor surfaces (`agentdescent.rs`, `runtime.rs`, `evaluators.rs`, `paper_opt.rs`, `member_optimizer.rs`)
@@ -333,6 +434,8 @@ API-shaped stubs, all documented and all returning
 - `tests/single_harness_promotion.rs` — batch-filter boundaries at `min_improvement + EPSILON`, strict target improvement with missing entries, `mean_improvement`, every `stage_one_gate` reason literal, `threshold_saturated`, the four `full_evaluation_decision` outcomes (promotion, protected regression, target replay, score regression) including the retention/EPSILON boundaries, `case_scores` omission of ungraded/errored cases, fingerprint stability, state YAML round-trip, `batch_key`/`attempt_key`, and `resume_from` mismatch errors.
 - `tests/single_harness_loops.rs` — a scripted `Evaluator` plus `DeterministicMutator` drive both policies offline: promotion on an improvement, rejection on a regression, iteration/target/cancellation stops, engineering-failure recording, resume without replaying a completed batch, byte-identical journals across two runs, the legacy "beats the incumbent" override, continuous per-batch promotion, the `max_trials` cap, protected-case retention, the per-batch attempt retry, and constructor rejections.
 - `tests/program_opt.rs` — hand-computed PUCT scores (`c_puct = 1.0`, uniform priors), rank-score edges (`N = 1 → 0.5`, unscored `-inf`), ancestor visit increments, candidate limit rejection, `best()` tie-break, config validation, serde round-trip.
+- `tests/evaluator_scoring.rs` — case/dataset parsing (id and input aliases, nested `swebench`, unknown keys, JSONL, duplicate ids, malformed index), verdict parsing (fenced/prose, `NaN`/`Infinity`, duplicate ids, non-object root, unknown status, malformed JSON), hand-computed score math (weighted mean, ceiling vs subtract, inclusive threshold, missing behaviour → 0, binary raw score, empty contract), `classify_judge_failure` for every kind, `requirement_results` ordering, `is_transient_error` positive/negative markers, `collect_metrics` graded-average rules, `write_summary` round-trip, and the `CaseRunner`/`CandidateCaseRunner`/`CommandCaseBackend` bridge over scripted backends.
+- `tests/evaluator_benchmarks.rs` — SWE-bench argv (every flag/value and the `+600 s` deadline), all four report classifications, every failure literal plus the infrastructure-pattern matcher, `evaluate_case` over `FakeCommandRunner` for resolved/unresolved/error/non-zero-exit/missing-report (and the written `predictions.jsonl`), missing-instance rejection, the dataset adapter report (1.0/0.0/ungraded), terminal-bench argv with `--task-filter`, all three `parse_results` shapes plus the excerpt cap and unknown-shape errors, results-file round-trip via `evaluate_case`, and both adapters' `EvaluationReport`s.
 - `tests/deferred.rs` — every stub returns `ErrorKind::Unsupported` with a non-empty message; `EvolutionPolicy` parsing round-trips.
 - Unit tests beside modules for budget warning thresholds and stop-condition ordering.
 - All tests offline and deterministic; no network, no `#[ignore]`.
@@ -351,3 +454,7 @@ API-shaped stubs, all documented and all returning
 - Python's single-harness engine is one 200k-line driver; the Rust port keeps only its deterministic decision core (promotion math, idempotency keys, resume validation) and inverts the model halves into the crate's existing `Evaluator`/`MutationStrategy` seams, so both loops run offline and a harness run or an LLM improver plugs in without changing the orchestration.
 - Publication stays gated by the promotion rules, not by a model: the analyser/improver may propose anything, but `stage_one_gate` plus `full_evaluation_decision` decide, so a bad proposal can never replace the incumbent.
 - `SingleHarnessState` is the checkpoint unit; per-case incumbent scores travel in `state.metadata["best_case_scores"]` because the Python checkpoint has no field for them, and a resumed run therefore keeps its regression context instead of comparing against the seed again.
+- The evaluator package is split at the model boundary: `harness_rsi::evaluator` owns records, verdict parsing, score/penalty arithmetic, the grading bridge, benchmark argv/report parsing and metrics, while the solver (`CaseExecutionBackend`) and the judge model stay injected. A broken judge therefore can never manufacture a pass: an unavailable or unusable verdict is an ungraded `CaseResult`.
+- `score_verdict` sums the triggered forbidden penalties in both modes (Python's legacy `ceiling` caps with the largest single penalty); with Python's single default penalty of `0.3` the two agree, and one penalty rule keeps ceiling/subtract symmetric.
+- `verdict_from_case` is the only place that expands a reference into a contract (explicit behaviours, `rubric_NNN` per rubric string, `reference_answer` for a criterion answer), so the judge is always graded against trusted dataset weights rather than its own.
+- The benchmark evaluators never provision containers: they build the official argv, run it through `runtime::command`, and read the report/results file the harness wrote. A missing results file is a case-level error with a score of `None`, a non-zero exit carries the Python failure literal, and neither is an `Err` the caller must trap.
