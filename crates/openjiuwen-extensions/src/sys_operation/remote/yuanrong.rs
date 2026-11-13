@@ -76,6 +76,9 @@ use super::backend::{
     SandboxBackend, SearchRequest,
 };
 use super::semantics::posix_quote;
+use super::teardown::{
+    require_selection, send_delete, shared_key, SandboxSelector, TeardownReport,
+};
 use super::transport::{
     base64_decode, base64_encode, hex_decode, hex_encode, RemoteError, SandboxHttp,
 };
@@ -124,6 +127,113 @@ pub(crate) fn provider_set() -> SandboxProviderSet {
     provider_set_from(YuanRongBackend::new)
 }
 
+/// One cache entry a teardown popped.
+struct PoppedEnvironment {
+    /// Cache key the entry lived under.
+    key: String,
+    /// The environment to release.
+    instance: Instance,
+    /// Client bound to the entry's ADX base URL and auth.
+    http: SandboxHttp,
+}
+
+/// Releases cached ADX environments.
+///
+/// Python parity: `delete_yuanrong_sandbox` in
+/// `extensions/sys_operation/sandbox/providers/yuanrong.py`. The selector is
+/// applied to the process-wide cache in Python's precedence order — `delete_all`
+/// (a Rust extension: drain the whole cache), then the shared key, then the base
+/// URL — and a configured `sandbox_id` narrows the selection to that one
+/// environment. Entries leave the cache before the delete request, so a failed
+/// delete cannot leave a stale entry behind.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// when the selector names nothing to release, and
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// when it names only an environment id: an ADX environment id carries no base
+/// URL, so there is no host to send the `DELETE` to. Python has no such path
+/// either (`delete_yuanrong_sandbox` requires `shared_key` or `base_url`).
+pub(crate) async fn teardown(selector: &SandboxSelector) -> Result<TeardownReport> {
+    require_selection(PROVIDER, selector)?;
+    if selector.shared_key.is_none() && selector.base_url.is_none() && !selector.delete_all {
+        return Err(Error::unsupported(
+            "the yuanrong provider cannot delete an environment by sandbox id alone: an ADX environment id carries no base URL to send the delete to; select a shared key or a base URL instead",
+        ));
+    }
+    let mut report = TeardownReport::new(PROVIDER);
+    for entry in pop_cached(selector).await {
+        let path = format!(
+            "{ENVIRONMENTS_PATH}/{}",
+            percent_encode_path(&entry.instance.environment_id)
+        );
+        let request = entry
+            .http
+            .request(reqwest::Method::DELETE, &path)
+            .header("Accept", "application/json");
+        match send_delete(&entry.http, request, "delete_environment").await {
+            Ok(()) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    provider = PROVIDER,
+                    key = %entry.key,
+                    reason = %selector.reason,
+                    "yuanrong environment released"
+                );
+                report.record_released(entry.key, entry.instance.environment_id);
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    provider = PROVIDER,
+                    key = %entry.key,
+                    reason = %reason,
+                    "yuanrong environment release failed"
+                );
+                report.record_failure(entry.key, entry.instance.environment_id, reason);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Pops the cache entries `selector` names, in key order.
+///
+/// `selector.sandbox_id` narrows the key/base-URL selection to that one
+/// environment id.
+async fn pop_cached(selector: &SandboxSelector) -> Vec<PoppedEnvironment> {
+    let wanted = selector
+        .sandbox_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let mut shared = shared_instances().lock().await;
+    let keys: Vec<String> = shared
+        .keys()
+        .filter(|key| selector.matches_key(key))
+        .filter(|key| {
+            wanted.is_none_or(|id| {
+                shared
+                    .get(*key)
+                    .is_some_and(|entry| entry.instance.environment_id == id)
+            })
+        })
+        .cloned()
+        .collect();
+    let mut popped = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(entry) = shared.remove(&key) {
+            popped.push(PoppedEnvironment {
+                key,
+                instance: entry.instance,
+                http: entry.http,
+            });
+        }
+    }
+    popped
+}
+
 /// One ADX environment: its id and the executor it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Instance {
@@ -140,10 +250,22 @@ struct Instance {
 /// the same base URL and isolation key must share one environment, and the kernel
 /// hands each factory a fresh `SandboxEndpoint` and cannot propagate a discovered
 /// environment id back through it.
-static SHARED_INSTANCES: OnceLock<tokio::sync::Mutex<BTreeMap<String, Instance>>> = OnceLock::new();
+static SHARED_INSTANCES: OnceLock<tokio::sync::Mutex<BTreeMap<String, CachedEnvironment>>> =
+    OnceLock::new();
+
+/// One cached environment: its `(id, runtime)` pair plus the client that created
+/// it, so a teardown can issue the matching `DELETE` with the same base URL and
+/// auth.
+#[derive(Clone)]
+struct CachedEnvironment {
+    /// The environment the management plane returned.
+    instance: Instance,
+    /// Client bound to the environment's ADX base URL and auth.
+    http: SandboxHttp,
+}
 
 /// The process-global environment cache, initialized on first use.
-fn shared_instances() -> &'static tokio::sync::Mutex<BTreeMap<String, Instance>> {
+fn shared_instances() -> &'static tokio::sync::Mutex<BTreeMap<String, CachedEnvironment>> {
     SHARED_INSTANCES.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
@@ -239,11 +361,7 @@ impl YuanRongBackend {
 
     /// The shared cache key of this backend: `base_url|isolation_key`.
     fn cache_key(&self) -> String {
-        format!(
-            "{}|{}",
-            self.http.base_url(),
-            self.isolation_key.as_deref().unwrap_or("")
-        )
+        shared_key(self.http.base_url(), self.isolation_key.as_deref())
     }
 
     /// Returns the environment to invoke, creating one when needed.
@@ -266,7 +384,8 @@ impl YuanRongBackend {
         let key = self.cache_key();
         {
             let shared = shared_instances().lock().await;
-            if let Some(instance) = shared.get(&key).cloned() {
+            if let Some(entry) = shared.get(&key) {
+                let instance = entry.instance.clone();
                 drop(shared);
                 *self.instance.lock().await = Some(instance.clone());
                 return Ok(instance);
@@ -275,9 +394,15 @@ impl YuanRongBackend {
         let created = self.create_instance().await?;
         let existing = {
             let mut shared = shared_instances().lock().await;
-            let existing = shared.get(&key).cloned();
+            let existing = shared.get(&key).map(|entry| entry.instance.clone());
             if existing.is_none() {
-                shared.insert(key, created.clone());
+                shared.insert(
+                    key,
+                    CachedEnvironment {
+                        instance: created.clone(),
+                        http: self.http.clone(),
+                    },
+                );
             }
             existing
         };
@@ -354,7 +479,7 @@ impl YuanRongBackend {
         let should_delete = {
             let mut shared = shared_instances().lock().await;
             match shared.get(&key) {
-                Some(instance) if instance.environment_id == stale => {
+                Some(entry) if entry.instance.environment_id == stale => {
                     shared.remove(&key);
                     true
                 }
@@ -462,6 +587,13 @@ impl YuanRongBackend {
 impl SandboxBackend for YuanRongBackend {
     fn provider_name(&self) -> &'static str {
         PROVIDER
+    }
+
+    /// The generic wrapper evaluates `create_if_absent` /
+    /// `expected_content_sha256` host-side over `read_bytes` and `write_bytes`,
+    /// under a per-path in-process lock.
+    fn supports_conditional_write(&self) -> bool {
+        true
     }
 
     async fn read_bytes(&self, path: &str) -> std::result::Result<Vec<u8>, RemoteError> {

@@ -53,11 +53,12 @@
 //! ```
 #![allow(clippy::module_name_repetitions)] // `FsProviderFactory`/`CodeProviderFactory` are the contract's names.
 pub mod remote;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 pub use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
 use openjiuwen_core::sys_operation::sandbox::provider::{
     CodeProviderFactory, FsProviderFactory, SandboxProviderRegistry, ShellProviderFactory,
 };
+pub use remote::{SandboxSelector, TeardownFailure, TeardownReport};
 use std::sync::Arc;
 /// The sandbox types with a real HTTP transport in [`remote`].
 ///
@@ -316,6 +317,75 @@ pub fn register_gateway_provider(
         SandboxProviderSet { fs, shell, code },
     )
 }
+/// Releases the cached remote containers of one sandbox type.
+///
+/// Python parity: `delete_jiuwenbox_sandbox` / `delete_yuanrong_sandbox`. The
+/// kernel never calls a provider on release, so a host tears containers down
+/// itself through this entry point: the selected entries leave the process-wide
+/// cache and the provider issues its container-delete request (`2xx` and `404`
+/// both count as released).
+///
+/// `aio` has no container-delete API — the AIO gateway owns the container
+/// lifetime and reaps idle containers — so it answers
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// naming the gateway instead of inventing an endpoint.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// for the `aio` sandbox type and for any name outside
+/// [`REMOTE_SANDBOX_TYPES`], and
+/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// for a [`SandboxSelector`] that names nothing to release.
+/// A container whose delete fails is reported in [`TeardownReport::failed`]
+/// rather than failing the whole call.
+///
+/// # Example
+///
+/// ```no_run
+/// use openjiuwen_extensions::sys_operation::{shutdown_remote, SandboxSelector};
+///
+/// # async fn example() -> openjiuwen_common::error::Result<()> {
+/// let selector = SandboxSelector::scope("http://127.0.0.1:8080", Some("agent-1"))
+///     .with_reason("shutdown");
+/// let report = shutdown_remote("jiuwenbox", &selector).await?;
+/// assert!(report.failed.is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn shutdown_remote(
+    sandbox_type: &str,
+    selector: &SandboxSelector,
+) -> Result<TeardownReport> {
+    remote::teardown_remote(sandbox_type, selector).await
+}
+
+/// Drains the cached containers of every remote sandbox type.
+///
+/// Reports arrive in [`REMOTE_SANDBOX_TYPES`] order. A sandbox type without a
+/// teardown path (today `aio`) does not fail the call: its report carries the
+/// reason in [`TeardownReport::unsupported`], so an exit-time cleanup can drain
+/// whatever can be drained.
+///
+/// # Errors
+///
+/// Returns the underlying error when a provider fails for a reason other than
+/// the absence of a teardown path. Per-container delete failures stay in the
+/// reports.
+pub async fn shutdown_remote_all() -> Result<Vec<TeardownReport>> {
+    let mut reports = Vec::with_capacity(REMOTE_SANDBOX_TYPES.len());
+    for sandbox_type in REMOTE_SANDBOX_TYPES {
+        match remote::teardown_remote(sandbox_type, &SandboxSelector::all()).await {
+            Ok(report) => reports.push(report),
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                reports.push(TeardownReport::not_supported(sandbox_type, error.message()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(reports)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

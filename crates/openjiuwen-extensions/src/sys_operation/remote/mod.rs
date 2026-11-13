@@ -60,14 +60,17 @@
 
 mod aio;
 mod backend;
+mod conditional;
 mod jiuwenbox;
 mod local_io;
 mod semantics;
+mod teardown;
 mod transport;
 mod yuanrong;
 
 use openjiuwen_common::error::{Error, Result};
 
+pub use self::teardown::{SandboxSelector, TeardownFailure, TeardownReport};
 use crate::sys_operation::SandboxProviderSet;
 
 /// The full provider set for one supported remote sandbox type.
@@ -81,6 +84,33 @@ pub(crate) fn provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
         "aio" => Ok(aio::provider_set()),
         "jiuwenbox" => Ok(jiuwenbox::provider_set()),
         "yuanrong" => Ok(yuanrong::provider_set()),
+        other => Err(Error::unsupported(format!(
+            "sandbox provider '{other}' is not a remote provider; supported types: aio, jiuwenbox, yuanrong"
+        ))),
+    }
+}
+
+/// Releases the cached containers of one remote sandbox type.
+///
+/// `aio` has no container-delete API (the gateway reaps idle containers), so it
+/// answers [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// naming the gateway; `jiuwenbox` and `yuanrong` delete their cached
+/// containers and tolerate an already-gone container.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// for the `aio` sandbox type and for an unknown type, and
+/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// for a selector that names nothing to release.
+pub async fn teardown_remote(
+    sandbox_type: &str,
+    selector: &SandboxSelector,
+) -> Result<TeardownReport> {
+    match sandbox_type {
+        "aio" => Err(teardown::aio_teardown_error()),
+        "jiuwenbox" => jiuwenbox::teardown(selector).await,
+        "yuanrong" => yuanrong::teardown(selector).await,
         other => Err(Error::unsupported(format!(
             "sandbox provider '{other}' is not a remote provider; supported types: aio, jiuwenbox, yuanrong"
         ))),
@@ -105,6 +135,40 @@ mod tests {
             assert!(set.shell.is_some(), "{sandbox_type} needs a shell factory");
             assert!(set.code.is_some(), "{sandbox_type} needs a code factory");
         }
+    }
+
+    #[tokio::test]
+    async fn teardown_rejects_aio_and_unknown_types() {
+        let error = teardown_remote("aio", &SandboxSelector::all())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.message().contains("gateway"), "{}", error.message());
+
+        let error = teardown_remote("local", &SandboxSelector::all())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "sandbox provider 'local' is not a remote provider; supported types: aio, jiuwenbox, yuanrong"
+        );
+    }
+
+    #[test]
+    fn a_scope_key_matches_the_selector_key() {
+        assert_eq!(
+            teardown::shared_key("127.0.0.1:9/", Some("agent")),
+            "http://127.0.0.1:9|agent"
+        );
+        assert_eq!(
+            SandboxSelector::scope("127.0.0.1:9/", Some("agent"))
+                .shared_key
+                .as_deref(),
+            Some("http://127.0.0.1:9|agent")
+        );
     }
 
     #[test]

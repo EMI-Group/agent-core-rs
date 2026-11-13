@@ -49,13 +49,18 @@
 //! Python's hybrid local/remote shell routing (`plan_command_rewrite`,
 //! tree-sitter leaf classification, `exclude_commands`), the host fallback of
 //! `_run_exec_pipeline` (`fallback_on_failure`, `_run_local_subprocess`),
-//! lifecycle hooks (`before_create` / `after_create` / `before_recreate`), the
-//! `preserve_files_upload` re-upload after a recreate, Unix-domain-socket
-//! transport (`unix:///...`, `JIUWENBOX_LISTEN`), the caller-facing
-//! `force_recreate_jiuwenbox_sandbox` / `delete_jiuwenbox_sandbox` helpers, and
-//! the kernel `on_stop` release action: a provider is never called on release, so
-//! the container outlives this handle and only the server's idle reaper collects
-//! it.
+//! lifecycle hooks (`before_create` / `after_create` / `before_recreate` /
+//! `before_delete` / `after_delete`), the `preserve_files_upload` re-upload after
+//! a recreate, and Unix-domain-socket transport (`unix:///...`,
+//! `JIUWENBOX_LISTEN`).
+//!
+//! # Teardown
+//!
+//! [`teardown`] ports `delete_jiuwenbox_sandbox`: it pops the selected cache
+//! entries and issues `DELETE /api/v1/sandboxes/{id}` (`2xx` and `404` are both
+//! success). The kernel never calls a provider on release, so a host drives the
+//! teardown through `crate::sys_operation::shutdown_remote`; without it only the
+//! server's idle reaper collects the container.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -63,7 +68,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_core::sys_operation::sandbox::config::{
     SandboxEndpoint, SandboxGatewayConfig, SandboxLauncherConfig,
 };
@@ -76,6 +81,9 @@ use super::backend::{
     SandboxBackend, SearchRequest,
 };
 use super::semantics::basename;
+use super::teardown::{
+    require_selection, send_delete, shared_key, SandboxSelector, TeardownReport,
+};
 use super::transport::{base64_encode, RawResponse, RemoteError, SandboxHttp};
 use crate::sys_operation::SandboxProviderSet;
 
@@ -119,16 +127,163 @@ pub(crate) fn provider_set() -> SandboxProviderSet {
     provider_set_from(JiuwenBoxBackend::new)
 }
 
+/// One cache entry a teardown popped.
+struct PoppedSandbox {
+    /// Cache key the entry lived under.
+    key: String,
+    /// Container id to release.
+    sandbox_id: String,
+    /// Client bound to the entry's base URL and auth.
+    http: SandboxHttp,
+}
+
+/// Releases cached `JiuwenBox` containers.
+///
+/// Python parity: `delete_jiuwenbox_sandbox` in
+/// `extensions/sys_operation/sandbox/providers/jiuwenbox.py`. The selector is
+/// applied in Python's precedence order — `delete_all` (drain the whole process
+/// cache), then the shared key, then the base URL — and `sandbox_id` selects by
+/// container identity, falling back to the base URL of a given shared key when
+/// the cache no longer holds that scope.
+///
+/// Entries leave the cache before the delete request, so a failed delete cannot
+/// resurrect a stale entry; `2xx` and `404` both count as released and every
+/// other outcome lands in [`TeardownReport::failed`].
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// when the selector names nothing to release.
+pub(crate) async fn teardown(selector: &SandboxSelector) -> Result<TeardownReport> {
+    require_selection(PROVIDER, selector)?;
+    let mut report = TeardownReport::new(PROVIDER);
+    for entry in pop_cached(selector).await {
+        let request = entry
+            .http
+            .request(reqwest::Method::DELETE, &sandbox_url(&entry.sandbox_id));
+        match send_delete(&entry.http, request, "delete_sandbox").await {
+            Ok(()) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    provider = PROVIDER,
+                    key = %entry.key,
+                    reason = %selector.reason,
+                    "jiuwenbox sandbox released"
+                );
+                report.record_released(entry.key, entry.sandbox_id);
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    provider = PROVIDER,
+                    key = %entry.key,
+                    reason = %reason,
+                    "jiuwenbox sandbox release failed"
+                );
+                report.record_failure(entry.key, entry.sandbox_id, reason);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Pops the cache entries `selector` names, in key order.
+///
+/// `sandbox_id` additionally matches a cache value; when a shared key is given
+/// but its entry is gone, the id is released through a client rebuilt from that
+/// key's base URL (Python's fallback, including the environment bearer token).
+async fn pop_cached(selector: &SandboxSelector) -> Vec<PoppedSandbox> {
+    let mut popped = Vec::new();
+    {
+        let mut shared = shared_sandbox_ids().lock().await;
+        let keys: Vec<String> = shared
+            .keys()
+            .filter(|key| selector.matches_key(key))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(entry) = shared.remove(&key) {
+                popped.push(PoppedSandbox {
+                    key,
+                    sandbox_id: entry.sandbox_id,
+                    http: entry.http,
+                });
+            }
+        }
+        if let Some(id) = non_blank(selector.sandbox_id.as_deref()) {
+            if !popped.iter().any(|entry| entry.sandbox_id == id) {
+                let matching = shared
+                    .iter()
+                    .find(|(_, entry)| entry.sandbox_id == id)
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = matching {
+                    if let Some(entry) = shared.remove(&key) {
+                        popped.push(PoppedSandbox {
+                            key,
+                            sandbox_id: entry.sandbox_id,
+                            http: entry.http,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if popped.is_empty() {
+        if let (Some(key), Some(id)) = (
+            selector.shared_key.as_deref(),
+            non_blank(selector.sandbox_id.as_deref()),
+        ) {
+            if let Ok(http) = client_for_base_url(key.split('|').next().unwrap_or_default()) {
+                popped.push(PoppedSandbox {
+                    key: key.to_string(),
+                    sandbox_id: id,
+                    http,
+                });
+            }
+        }
+    }
+    popped
+}
+
+/// Rebuilds a client from a cache key's base URL, for a container no longer cached.
+///
+/// The card's auth headers are not part of the cache key, so such a delete
+/// carries only the bearer token from `JIUWENBOX_API_TOKEN` (Python behaves the
+/// same way: it builds the client from the base URL alone).
+fn client_for_base_url(base_url: &str) -> Result<SandboxHttp> {
+    let endpoint = SandboxEndpoint {
+        base_url: base_url.to_string(),
+        ..SandboxEndpoint::default()
+    };
+    SandboxHttp::new(PROVIDER, &endpoint, &SandboxGatewayConfig::default())
+        .map(|http| http.with_bearer_token(api_token_from_env()))
+        .map_err(|error| Error::config(error.message().to_string()))
+}
+
 /// The idle policy a base URL was configured with: `(idle_timeout, idle_check_interval)`.
 type IdleTimeout = (Option<u64>, Option<u64>);
 
 /// Base URL to the idle policy already written to that server.
 type IdleTimeoutCache = Mutex<BTreeMap<String, IdleTimeout>>;
 
-/// Container ids shared by every backend with the same `base_url|isolation_key`
+/// One cached container: its id plus the client that created it.
+///
+/// The client is cached with the id so a teardown can issue
+/// `DELETE /api/v1/sandboxes/{id}` with the same base URL, auth headers, and
+/// bearer token the create used (Python rebuilds a client from the base URL and
+/// the environment token, which loses the card's auth headers).
+#[derive(Clone)]
+struct CachedSandbox {
+    /// The container id the server assigned.
+    sandbox_id: String,
+    /// Client bound to the container's base URL and auth.
+    http: SandboxHttp,
+}
+
+/// Containers shared by every backend with the same `base_url|isolation_key`
 /// (Python's process-global `_shared_sandbox_ids`).
-fn shared_sandbox_ids() -> &'static Mutex<BTreeMap<String, String>> {
-    static SHARED: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+fn shared_sandbox_ids() -> &'static Mutex<BTreeMap<String, CachedSandbox>> {
+    static SHARED: OnceLock<Mutex<BTreeMap<String, CachedSandbox>>> = OnceLock::new();
     SHARED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -211,11 +366,7 @@ impl JiuwenBoxBackend {
 
     /// The shared cache key: one container per `base_url|isolation_key`.
     fn scope_key(&self) -> String {
-        format!(
-            "{}|{}",
-            self.http.base_url(),
-            self.isolation_key.as_deref().unwrap_or_default()
-        )
+        shared_key(self.http.base_url(), self.isolation_key.as_deref())
     }
 
     /// The container id, creating a sandbox when none is known.
@@ -233,14 +384,21 @@ impl JiuwenBoxBackend {
         let mut current = self.id.lock().await;
         if let Some(id) = self.configured_sandbox_id() {
             *current = Some(id.clone());
-            shared_sandbox_ids()
-                .lock()
-                .await
-                .insert(self.scope_key(), id.clone());
+            shared_sandbox_ids().lock().await.insert(
+                self.scope_key(),
+                CachedSandbox {
+                    sandbox_id: id.clone(),
+                    http: self.http.clone(),
+                },
+            );
             return Ok(id);
         }
         let scope_key = self.scope_key();
-        let cached = shared_sandbox_ids().lock().await.get(&scope_key).cloned();
+        let cached = shared_sandbox_ids()
+            .lock()
+            .await
+            .get(&scope_key)
+            .map(|entry| entry.sandbox_id.clone());
         if let Some(id) = cached {
             *current = Some(id.clone());
             return Ok(id);
@@ -250,10 +408,13 @@ impl JiuwenBoxBackend {
         }
         let id = self.create().await?;
         *current = Some(id.clone());
-        shared_sandbox_ids()
-            .lock()
-            .await
-            .insert(scope_key, id.clone());
+        shared_sandbox_ids().lock().await.insert(
+            scope_key,
+            CachedSandbox {
+                sandbox_id: id.clone(),
+                http: self.http.clone(),
+            },
+        );
         Ok(id)
     }
 
@@ -422,7 +583,10 @@ impl JiuwenBoxBackend {
         let scope_key = self.scope_key();
         {
             let mut shared = shared_sandbox_ids().lock().await;
-            if shared.get(&scope_key).is_some_and(|id| id == stale) {
+            if shared
+                .get(&scope_key)
+                .is_some_and(|entry| entry.sandbox_id == stale)
+            {
                 shared.remove(&scope_key);
             }
         }
@@ -453,6 +617,13 @@ impl JiuwenBoxBackend {
 impl SandboxBackend for JiuwenBoxBackend {
     fn provider_name(&self) -> &'static str {
         PROVIDER
+    }
+
+    /// The generic wrapper evaluates `create_if_absent` /
+    /// `expected_content_sha256` host-side over `read_bytes` and `write_bytes`,
+    /// under a per-path in-process lock.
+    fn supports_conditional_write(&self) -> bool {
+        true
     }
 
     async fn read_bytes(&self, path: &str) -> std::result::Result<Vec<u8>, RemoteError> {
