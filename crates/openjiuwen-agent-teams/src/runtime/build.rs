@@ -643,6 +643,7 @@ mod tests {
     }
 
     /// Builds `spec` over fresh scripted fakes, panicking on a build error.
+    #[cfg(feature = "sqlite")]
     async fn blueprint_build(spec: &TeamAgentSpec) -> Arc<TeamAgent> {
         let factory = ScriptedFactory::new();
         let workspace = RecordingWorkspaceProvider::new();
