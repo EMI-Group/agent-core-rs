@@ -19,14 +19,61 @@ mail. Both roles run the same type, per Python.
 ## API Surface
 
 ```rust
-// deps.rs — the injected build inputs
-pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, pub store: Arc<dyn TeamStore>,
-                           pub workspace: Arc<dyn WorkspaceProvider>, pub language: Option<String> }  // Clone
-impl TeamBuildDeps { pub fn new() -> Self; pub fn with_harness_factory(..) -> Self;
-                     pub fn with_store(..) -> Self; pub fn with_workspace(..) -> Self;
-                     pub fn with_language(..) -> Self; pub fn resolved_language(&self) -> &'static str; }
+// deps.rs — the injected build inputs (Clone)
+pub struct TeamBuildDeps {
+    pub harness_factory: Arc<dyn MemberHarnessFactory>,   // required
+    pub store: Arc<dyn TeamStore>,                        // required
+    pub workspace: Arc<dyn WorkspaceProvider>,            // required
+    pub language: Option<String>,
+    pub observability_hooks: Vec<Arc<dyn ObservabilityHooks>>,   // empty = no-ops
+    pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,       // None = built from metadata
+    pub routing: Option<Arc<TeamModelRouter>>,            // None = built from model_pool
+}
+impl TeamBuildDeps {
+    pub fn new() -> Self;                                  // == Default
+    pub fn with_harness_factory(self, Arc<dyn MemberHarnessFactory>) -> Self;
+    pub fn with_store(self, Arc<dyn TeamStore>) -> Self;
+    pub fn with_workspace(self, Arc<dyn WorkspaceProvider>) -> Self;
+    pub fn with_language(self, impl Into<String>) -> Self;
+    pub fn with_observability_hook(self, Arc<dyn ObservabilityHooks>) -> Self;  // pushes
+    pub fn with_kv_cache(self, Arc<TeamKvCacheAffinity>) -> Self;
+    pub fn with_routing(self, Arc<TeamModelRouter>) -> Self;
+    pub fn resolved_language(&self) -> &'static str;       // unknown/None -> "cn"
+}
 // Default: NativeMemberFactory::from_env(), InMemoryTeamStore, LocalWorkspaceProvider rooted at
-// std::env::temp_dir().join("openjiuwen-agent-teams"), language None.
+// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing.
+
+// spawner.rs — TeamMemberSpawner (Arc-returning constructors)
+impl TeamMemberSpawner {
+    pub fn new(TeamAgentSpec, TeamBuildDeps, impl Into<String>) -> Arc<Self>;
+    pub fn with_parts(TeamAgentSpec, TeamBuildDeps, String, MemberSpawnOptions,
+                      Option<ForkDirective>, Arc<TeamModelRouter>) -> Arc<Self>;
+    pub fn spec(&self) -> &TeamAgentSpec;   pub fn deps(&self) -> &TeamBuildDeps;
+    pub fn session_id(&self) -> &str;       pub fn team_name(&self) -> &str;
+    pub fn options(&self) -> &MemberSpawnOptions;  pub fn fork(&self) -> Option<&ForkDirective>;
+    pub fn routing(&self) -> &Arc<TeamModelRouter>;
+    pub fn spawn_kind(&self, &str) -> Option<MemberSpawnKind>;
+    pub fn forked_member(&self, &str) -> Option<ForkedMemberSpec>;
+    pub fn deep_agent_spec(&self, &str) -> Option<&DeepAgentSpec>;
+    pub fn member_spec(&self, &str) -> Option<TeamMemberSpec>;
+    pub fn member_names(&self) -> Vec<String>;                 // predefined ∪ agents keys − leader
+    pub fn forked_context(&self, &str) -> Result<Option<ForkedMemberSpec>>;
+}
+// MemberSpawner::spawn dispatch: InProcess -> factory.create + HarnessMemberRuntime; else
+// Process/ExternalCli/Ssh -> process/external_cli/ssh child spawner; kind recorded in `kinds`.
+// `TeamAgent::spawner() -> Arc<TeamMemberSpawner>` is the public handle to all of the above.
+
+// spec_meta.rs — metadata parsers (all tolerant; absent key -> default/None)
+pub const SPAWN_METADATA_KEY: &str = "spawn";        pub const FORK_METADATA_KEY: &str = "fork";
+pub const WORKSPACE_METADATA_KEY: &str = "workspace"; pub const ORGANIZATION_METADATA_KEY: &str = "organization";
+pub const KV_CACHE_METADATA_KEY: &str = "kv_cache";   pub const ATTACH_METADATA_KEY: &str = "attach";
+pub const ATTACH_SOCKET_ENV: &str = "OPENJIUWEN_TEAM_SOCKET";
+pub fn spawn_options(&TeamAgentSpec) -> MemberSpawnOptions;               // bare or {"options":..}
+pub fn fork_directive(&TeamAgentSpec) -> Option<ForkDirective>;          // spawn.fork, else fork
+pub fn isolation_mode(&TeamAgentSpec) -> IsolationMode;                  // "worktree" | {"isolation":..}
+pub fn organization_block(&TeamAgentSpec) -> Result<Option<OrganizationBlock>>;  // Validation on bad block
+pub fn kv_cache_config(&TeamAgentSpec) -> KvCacheConfig;                 // enabled=true by default
+pub fn attach_config(&TeamAgentSpec) -> Option<AttachConfig>;            // metadata, else env socket
 
 // allocator.rs — Python models/allocator.py
 pub struct TeamModelAllocation { pub model_name: String, pub index: usize }     // serde
@@ -101,6 +148,10 @@ impl TeamAgent {
     pub fn backend(&self) -> Arc<TeamBackend>;
     pub fn gate(&self) -> Arc<InteractGate>;
     pub fn activity(&self) -> Arc<MemberActivityRegistry>;
+    pub fn spawner(&self) -> Arc<TeamMemberSpawner>;   // spawn_kind / fork / routing inspection
+    pub fn kv_cache(&self) -> Arc<TeamKvCacheAffinity>;  pub fn kv_env(&self, &str) -> Option<BTreeMap<String,String>>;
+    pub fn signals(&self) -> TeamSignals;  pub fn monitor_stream(&self, usize, BackpressurePolicy) -> Option<MonitorReceiver>;
+    pub fn fork_directive(&self) -> Option<&ForkDirective>;  pub fn org(&self) -> Option<Arc<OrgBinding>>;
     pub fn member(&self) -> Arc<TeamMember>;  pub fn runtime(&self) -> Arc<dyn MemberRuntime>;
     pub fn is_started(&self) -> bool;
     pub async fn start(&self) -> Result<()>;  pub async fn stop(&self) -> Result<()>;
@@ -222,7 +273,7 @@ a new session instead of being rebuilt.
 
 ## Constraints
 
-- Only `src/runtime/**` (plus `tests/runtime.rs`) is edited; `src/lib.rs`, `Cargo.toml`, `src/schema/`,
+- Only `src/runtime/**` is edited; `src/lib.rs`, `Cargo.toml`, `src/schema/`,
   `src/member/`, `src/harness/` and the sibling modules are read-only — a missing seam is adapted here and
   reported, never widened.
 - `openjiuwen_common::error::{Error, Result}` only: `validation` for user input/bad names, `config` for a
@@ -244,6 +295,13 @@ a new session instead of being rebuilt.
 - `./mod.rs` → module map, flat re-exports
 - `./deps.rs` → `TeamBuildDeps` and its defaults/builders
 - `./allocator.rs` → `ModelAllocator`, `TeamModelAllocation`
+- `./routing.rs` → `TeamModelRouter`, `ModelSelection` (pool + router → effective member spec)
+- `./spec_meta.rs` → metadata keys and parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `organization_block`, `kv_cache_config`, `attach_config`)
+- `./observer.rs` → `MemberStreamObserver` — status/rounds/chunks/signals fan-out
+- `./observability_bind.rs` → `TeamSignals` (observability hooks + optional monitor emitter)
+- `./org_bind.rs` → `OrgBinding` (chart, delegation router, org task pool, org mailbox)
+- `./attach_host.rs` → `AttachHost` / `BackendAttachHandler` (Unix-socket attach server, `AttachHost::start(&AttachConfig, handler)`)
+- `./wiring_tests.rs` → cross-wiring test module (`#[cfg(test)]`)
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot)
@@ -258,8 +316,8 @@ a new session instead of being rebuilt.
 
 ## Test Strategy
 
-Unit tests beside each file plus `tests/runtime.rs` for the crossed seams; all offline and deterministic
-(a `FakeHarness`/`FakeMemberHarnessFactory` with scripted answers, no sleeps beyond bounded polls).
+Unit tests beside each file plus the `./tests/` crossed-seam suite; all offline and deterministic
+(scripted `HarnessProtocol` fakes from `team_agent::test_support`, no sleeps beyond bounded polls).
 
 - `deps.rs`: defaults are wired (native factory name, in-memory store, temp-rooted workspace), builders
   override one field each, `resolved_language` honours `Language::resolve`.
@@ -275,7 +333,7 @@ Unit tests beside each file plus `tests/runtime.rs` for the crossed seams; all o
 - `team_agent.rs`: build (leader card `<team>_<leader>`, missing `agents["leader"]` → validation), unknown
   member → `not_found`, spawn → `ready`, factory error → `unstarted`, shutdown per lifetime,
   `auto_start_all`, `create_task` leader-only, workspace isolation per member.
-- `leader.rs` / `tests/runtime.rs`: invoke with an immediate fake answer and an empty board → exactly one
+- `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
   `team.completed` marker last and the leader answer in `AgentOutput.output`; an open task keeps the stream
   open until the board settles; cancellation ends the run.
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
@@ -301,9 +359,15 @@ Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openji
   `Error::validation("only the leader can create tasks")`.
 - The team roster is materialized as rows at build time (`unstarted` teammates); Python creates rows lazily
   on bootstrap. This makes `snapshot()` answer before the first spawn.
-- `spawn_mode = process`, external CLI/bridge members, distributed transports, the worktree workspace
-  backend and the model router stay deferred through the injected seams (`Error::Unsupported` with the
-  Python capability name).
+- The wiring seams are live, driven from spec metadata rather than `TeamBuildDeps`: `spawn` (spawn kind +
+  per-kind launch config + fork), `workspace` (`IsolationMode::Worktree`), `organization`
+  (`{"spec", "rules"}`), `kv_cache`, `attach` (`{"socket","required"}`, else `OPENJIUWEN_TEAM_SOCKET`);
+  `TeamBuildDeps` only adds hooks (`with_observability_hook`), a kv registry (`with_kv_cache`) and a router
+  (`with_routing`) — it has no monitor/org/attach builder.
+- `kv_cache_config` defaults to `enabled: true` when the metadata key is absent, so a freshly built team
+  already answers `TeamAgent::kv_env(member)` for its leader and every spawned member.
+- Distributing a team across processes and vendor/remote worktree backends stay deferred behind the
+  member/workspace seams (`Error::Unsupported`, `src/member/`, `src/workspace/` own those messages).
 - `Team::invoke` in `openjiuwen-multiagent` carries an `AgentTeamSession`, while `Agent::invoke` takes
   `Option<Arc<dyn Session>>`; the adapter ignores the multiagent session (documented; `openjiuwen-session`'s
   `AgentTeamSession` is not a `dyn Session`).
@@ -324,5 +388,12 @@ Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openji
   `TeamMember` rows whose harness is materialized by `spawn_member` through the same factory seam.
 - `TeamRuntimeManager` keys a persistent team under the session that first activated it, even when a later
   session resumes it; `shutdown()` never clears the global registry (the caller does).
+- `member::test_child` (`FakeChild`, `#[cfg(test)]`) is private to `src/member`, so a runtime test that
+  exercises a real process member writes its own `sh` script or asserts the missing-program `Error::Config`;
+  attach hosting is `#[cfg(unix)]` (`AttachServer::bind`/`serve` return `Unsupported` elsewhere) and the
+  worktree backend needs a real `git` binary plus a repository.
+- `team_agent::test_support` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
+  `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
+  (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`).
 - `team_agent.rs` is 852 production lines plus its `test_support`/unit tests (the sanctioned long file of
   this node); the build path is split into `build.rs`.
