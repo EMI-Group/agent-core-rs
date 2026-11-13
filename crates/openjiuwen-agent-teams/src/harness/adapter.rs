@@ -219,6 +219,10 @@ impl HarnessMemberRuntime {
         self.cwd.as_deref()
     }
     /// Returns the newest checkpoint captured for this member, if any.
+    ///
+    /// The accessor is `async` on purpose: a provider that cannot expose its checkpoint in memory
+    /// would have to read it back from storage, so callers already `.await` this seam.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // the async shape is the seam
     pub async fn latest_checkpoint(&self) -> Option<NativeCheckpoint> {
         self.latest_checkpoint.lock().clone()
     }
