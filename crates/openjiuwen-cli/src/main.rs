@@ -1,17 +1,19 @@
 //! `openjiuwen` CLI binary and run/repl front-end.
 //!
-//! Every piece of behaviour lives in [`openjiuwen_harness::cli`]: the clap
-//! grammar ([`Cli`]), option resolution ([`openjiuwen_harness::cli::CliOptions`]),
-//! the one-shot runner and the interactive REPL. This `main` owns only the
-//! process boundary:
+//! The outer grammar lives in [`cli`]: it reuses the harness `run` / `chat`
+//! argument types verbatim and adds the `auto-harness` command group. Every
+//! other piece of `run`/`chat` behaviour lives in [`openjiuwen_harness::cli`]:
+//! option resolution ([`openjiuwen_harness::cli::CliOptions`]), the one-shot
+//! runner and the interactive REPL. This `main` owns only the process boundary:
 //!
 //! 1. load `.env` if one exists (a missing or malformed file is not an error);
 //! 2. install the `tracing` subscriber from `RUST_LOG` / `OPENJIUWEN_LOG_LEVEL`
 //!    and `OPENJIUWEN_LOG_FORMAT`, written to **stderr** so stdout stays a clean
 //!    result stream (`json` / `stream-json` output must not be mixed with logs);
-//! 3. parse the command line with [`Cli::parse`], letting clap answer `--help`
-//!    and `--version` (exit `0`) and reject bad input (exit `2`);
-//! 4. run the harness CLI on the tokio runtime and translate a failure into a
+//! 3. parse the command line with [`cli::Cli::parse`](clap::Parser::parse),
+//!    letting clap answer `--help` and `--version` (exit `0`) and reject bad
+//!    input (exit `2`);
+//! 4. run [`cli::run`] on the tokio runtime and translate a failure into a
 //!    diagnostic on stderr plus exit code `1`.
 //!
 //! No user input can panic: parsing is delegated to clap and errors are values,
@@ -20,13 +22,14 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use openjiuwen_common::logging::{self, LogWriter, LoggingConfig};
-use openjiuwen_harness::cli::{run_cli, Cli};
+
+mod auto_harness;
+mod cli;
 
 /// Exit code of a successful invocation (and of `--help` / `--version`).
 const EXIT_FAILURE: u8 = 1;
 
-/// Process entry point: set up the process, parse, then hand over to the
-/// harness CLI.
+/// Process entry point: set up the process, parse, then run the CLI.
 #[tokio::main]
 async fn main() -> ExitCode {
     // A `.env` in the working directory is optional; its absence is the normal
@@ -36,9 +39,9 @@ async fn main() -> ExitCode {
 
     // `parse()` exits the process itself: `0` after printing `--help` or
     // `--version`, `2` for a usage error (clap's documented exit code).
-    let cli = Cli::parse();
+    let cli = cli::Cli::parse();
 
-    match run_cli(cli).await {
+    match cli::run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
