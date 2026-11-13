@@ -116,3 +116,16 @@ pub use tracer::{
 pub use otel::install_trace_sink;
 pub use sessions::{RouterSession, SubWorkflowSession};
 pub use trace_hook::SwappableTraceSink;
+
+// Disk-backed product sessions (`session_controller`) and local VCS history.
+pub mod session_controller;
+pub mod vcs;
+
+pub use session_controller::{
+    DiskSessionStore, Scope, SessionController, SessionMeta, SessionRecord, SessionScope,
+    SessionScopeKey, Subject,
+};
+pub use vcs::{
+    diff_snapshots, diff_values, ChangeKind, JsonChange, SessionHistory, Version, VersionId,
+    VersionMeta,
+};
