@@ -6,9 +6,11 @@
 //! The contract mirrors the abstract half of the Python
 //! `openjiuwen/core/foundation/store/object/base_storage_client.py`
 //! (`BaseObjectStorageClient`): bucket lifecycle plus put/get/delete/exists/list
-//! of opaque objects. The Python S3/aioboto3 client is not ported (vendor
-//! backends are out of scope); [`InMemoryObjectStore`] and [`LocalObjectStore`]
-//! are the reference implementations.
+//! of opaque objects. The Python S3/aioboto3 client is replaced by
+//! [`S3ObjectStore`](super::external::s3::S3ObjectStore), an in-crate
+//! S3-compatible adapter with its own `SigV4` signer, so only the `aioboto3`
+//! dependency is gone; [`InMemoryObjectStore`] and [`LocalObjectStore`] stay the
+//! reference implementations.
 //!
 //! All operations on a bucket that does not exist fail with
 //! [`openjiuwen_common::error::ErrorKind::NotFound`], except `delete_bucket`
