@@ -31,6 +31,7 @@ pub mod keys;
 pub mod migration;
 
 mod json;
+mod legacy;
 mod messages;
 mod storage;
 
