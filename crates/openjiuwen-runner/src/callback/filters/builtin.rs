@@ -275,7 +275,8 @@ impl RateLimitFilter {
         }
     }
 
-    /// Replaces the clock (tests use [`ManualClock::clock`]).
+    /// Replaces the clock (tests use
+    /// [`ManualClock::clock`](crate::callback::filters::ManualClock::clock)).
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
@@ -383,7 +384,8 @@ impl CircuitBreakerFilter {
         }
     }
 
-    /// Replaces the clock (tests use [`ManualClock::clock`]).
+    /// Replaces the clock (tests use
+    /// [`ManualClock::clock`](crate::callback::filters::ManualClock::clock)).
     ///
     /// The clock lives behind the shared breaker state, so this works on a clone
     /// too and keeps any failures already recorded.
@@ -726,7 +728,8 @@ pub type ContextModifier = Arc<dyn Fn(&mut CallbackContext) -> Result<()> + Send
 /// The Rust form of `ParamModifyFilter`/`FilterAction::MODIFY`: the modifier
 /// mutates [`FilterInput::ctx`] in place, so later filters and every later handler
 /// observe the change. A modifier that fails aborts dispatch with its error
-/// (Python skipped instead); wrap it in [`lenient`] for the Python behaviour.
+/// (Python skipped instead); wrap it in
+/// [`lenient()`](crate::callback::filters::lenient) for the Python behaviour.
 pub struct ParamModifyFilter {
     name: String,
     modifier: ContextModifier,
