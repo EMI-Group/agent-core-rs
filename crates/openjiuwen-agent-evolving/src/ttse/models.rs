@@ -380,7 +380,6 @@ pub struct ConsultResult {
 /// When cut, the last kept character is replaced by `…`, so the result is
 /// exactly `max_chars` characters. `max_chars == 0` yields the empty string and
 /// text that already fits is returned unchanged; a code point is never split.
-#[allow(dead_code)]
 pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();

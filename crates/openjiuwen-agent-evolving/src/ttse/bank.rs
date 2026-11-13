@@ -349,9 +349,7 @@ impl TipBank {
     /// ties going to the lowest `tip_id`. The representative keeps its rule and
     /// category, and absorbs the union of keywords, the maximum weight, the
     /// summed counters, the earliest creation tick and the current tick as
-    /// `updated_tick`. Used by the dream pass of a later wave and by the tests
-    /// here, so it is crate-visible before its caller exists.
-    #[allow(dead_code)]
+    /// `updated_tick`.
     pub(crate) fn merge_cluster(&mut self, ids: &[String]) -> Option<String> {
         let wanted: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
         let mut members: Vec<usize> = self
