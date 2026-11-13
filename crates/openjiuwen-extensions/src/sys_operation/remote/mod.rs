@@ -20,21 +20,31 @@
 //!
 //! # Layering
 //!
-//! [`transport`] owns the HTTP client, the auth injection, the error type, and
-//! the `OpResult` mapping; [`semantics`] owns the pure host-side behavior every
+//! `transport` owns the HTTP client, the auth injection, the error type, and
+//! the `OpResult` mapping; `semantics` owns the pure host-side behavior every
 //! provider shares (line selection, newline transforms, chunking, path and
-//! quoting helpers, list sorting/filtering); [`local_io`] owns the host-side
-//! file reads and writes of transfers; `backend` owns the provider-neutral
-//! `SandboxBackend` primitives and the generic wrappers that implement the
-//! kernel operation traits once. A provider module then only translates its own
-//! wire formats and optionally overrides `code_command` / `code_cwd`.
+//! quoting helpers, list sorting/filtering); `local_io` owns the host-side
+//! file reads and writes of transfers.
+//!
+//! `backend/` owns the provider-neutral `SandboxBackend` primitives and the
+//! generic wrappers that implement the kernel operation traits once: `mod.rs`
+//! holds the request/result types, the trait, and the factory constructor,
+//! while `backend/fs.rs`, `backend/shell.rs`, and `backend/code.rs` hold the
+//! filesystem, shell, and code wrappers. A provider module then only translates
+//! its own wire formats and optionally overrides `code_command` / `code_cwd`.
+//!
+//! Each provider is its own subtree: `aio/` holds its shared envelope client in
+//! `mod.rs` and the three wrappers in `aio/fs.rs`, `aio/shell.rs`, and
+//! `aio/code.rs`; `jiuwenbox.rs` and `yuanrong.rs` stay single files built on
+//! the generic backend wrappers. Every provider keeps its tests in a sibling
+//! `tests.rs` (with per-operation child modules where the suite is large).
 //!
 //! # Lifecycle
 //!
 //! The kernel has no launcher or lifecycle API: it resolves a
-//! [`SandboxEndpoint`] from configuration and calls the factories. A provider
-//! therefore creates (and caches) its container lazily, keyed by
-//! `base_url|isolation_key` as the
+//! [`SandboxEndpoint`](crate::sys_operation::SandboxEndpoint) from configuration
+//! and calls the factories. A provider therefore creates (and caches) its
+//! container lazily, keyed by `base_url|isolation_key` as the
 //! [`SandboxProviderRegistry`](openjiuwen_core::sys_operation::sandbox::provider::SandboxProviderRegistry)
 //! seam requires, because a provider cannot feed a discovered sandbox id back
 //! into the endpoint.
@@ -48,28 +58,17 @@
 //! through `Result`. Credentials, auth query parameters, and payload contents
 //! are never logged.
 
-pub(crate) mod semantics;
-
 mod aio;
 mod backend;
 mod jiuwenbox;
 mod local_io;
+mod semantics;
 mod transport;
 mod yuanrong;
-
-pub(crate) use backend::{
-    provider_set_from, ExecCommand, ExecRequest, ExecResult, ListRequest, RemoteCode, RemoteEntry,
-    RemoteFs, RemoteShell, SandboxBackend, SearchRequest,
-};
-pub(crate) use transport::{gateway_failure, remote_error, RawResponse, RemoteError, SandboxHttp};
 
 use openjiuwen_common::error::{Error, Result};
 
 use crate::sys_operation::SandboxProviderSet;
-
-/// The three sandbox types Python registers from
-/// `extensions/sys_operation/sandbox/providers/`.
-pub(crate) const SUPPORTED_SANDBOX_TYPES: [&str; 3] = ["aio", "jiuwenbox", "yuanrong"];
 
 /// The full provider set for one supported remote sandbox type.
 ///
@@ -96,7 +95,7 @@ mod tests {
 
     #[test]
     fn every_supported_type_has_a_complete_provider_set() {
-        for sandbox_type in SUPPORTED_SANDBOX_TYPES {
+        for sandbox_type in crate::sys_operation::REMOTE_SANDBOX_TYPES {
             let set = provider_set(sandbox_type).unwrap();
             assert!(!set.is_empty(), "{sandbox_type} must register a factory");
             assert!(

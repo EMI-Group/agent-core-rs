@@ -72,7 +72,8 @@ use openjiuwen_core::sys_operation::code::types::Language;
 use serde_json::{json, Map, Value};
 
 use super::backend::{
-    ExecCommand, ExecRequest, ExecResult, ListRequest, RemoteEntry, SandboxBackend, SearchRequest,
+    provider_set_from, ExecCommand, ExecRequest, ExecResult, ListRequest, RemoteEntry,
+    SandboxBackend, SearchRequest,
 };
 use super::semantics::posix_quote;
 use super::transport::{
@@ -120,7 +121,7 @@ const SEARCH_LIMIT_MESSAGE: &str = "file search max_results exceeded; narrow the
 ///
 /// Python parity: `@SandboxRegistry.provider("yuanrong", "fs" | "shell" | "code")`.
 pub(crate) fn provider_set() -> SandboxProviderSet {
-    super::provider_set_from(YuanRongBackend::new)
+    provider_set_from(YuanRongBackend::new)
 }
 
 /// One ADX environment: its id and the executor it runs.

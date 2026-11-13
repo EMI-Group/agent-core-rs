@@ -8,12 +8,11 @@
 //! differ
 //! only in their URL shapes and payload schemas.
 //!
-//! Failures are [`RemoteError`] values: [`gateway_failure`] renders one as the
-//! kernel's `SandboxGatewayError` (code `199007`) result, while
-//! [`remote_error`] turns one into an [`openjiuwen_common::error::Error`] for
-//! providers that surface `Result`. Credentials and payload contents are never
-//! logged; request failures are logged at `debug` without the URL, because the
-//! URL carries the configured auth query parameters.
+//! Failures are [`RemoteError`] values, and [`gateway_failure`] renders one as
+//! the kernel's `SandboxGatewayError` (code `199007`) result. Credentials and
+//! payload contents are never logged; request failures are logged at `debug`
+//! without the URL, because the URL carries the configured auth query
+//! parameters.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -34,8 +33,6 @@ pub(crate) enum RemoteError {
     ContainerGone(String),
     /// The remote path does not exist.
     NotFound(String),
-    /// The remote destination already exists.
-    AlreadyExists(String),
     /// The provider answered with a non-success HTTP status.
     Status {
         /// The HTTP status code.
@@ -53,14 +50,18 @@ pub(crate) enum RemoteError {
 
 impl RemoteError {
     /// Human-readable description, including the status where relevant.
+    ///
+    /// A [`Self::Status`] with status `0` carries no HTTP answer at all (an
+    /// envelope rejection or a background-launch failure), so it is rendered
+    /// without a status prefix.
     pub(crate) fn message(&self) -> String {
         match self {
             Self::ContainerGone(message)
             | Self::NotFound(message)
-            | Self::AlreadyExists(message)
             | Self::Transport(message)
             | Self::SearchLimit(message)
-            | Self::Invalid(message) => message.clone(),
+            | Self::Invalid(message)
+            | Self::Status { status: 0, message } => message.clone(),
             Self::Status { status, message } => {
                 if message.starts_with("HTTP ") {
                     message.clone()
@@ -68,19 +69,6 @@ impl RemoteError {
                     format!("HTTP {status}: {message}")
                 }
             }
-        }
-    }
-
-    /// The HTTP status behind the failure, when one is known.
-    pub(crate) fn status(&self) -> Option<u16> {
-        match self {
-            Self::NotFound(_) => Some(404),
-            Self::Status { status, .. } => Some(*status),
-            Self::ContainerGone(_)
-            | Self::AlreadyExists(_)
-            | Self::Transport(_)
-            | Self::SearchLimit(_)
-            | Self::Invalid(_) => None,
         }
     }
 
@@ -166,11 +154,6 @@ impl SandboxHttp {
         &self.base_url
     }
 
-    /// The sandbox type this client speaks to.
-    pub(crate) fn provider(&self) -> &'static str {
-        self.provider
-    }
-
     /// The configured request timeout.
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
@@ -251,24 +234,6 @@ impl SandboxHttp {
         operation: &str,
     ) -> std::result::Result<serde_json::Value, RemoteError> {
         self.send_json(request, operation).await
-    }
-
-    /// Sends the request and returns the raw body bytes.
-    pub(crate) async fn send_bytes(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: &str,
-    ) -> std::result::Result<Vec<u8>, RemoteError> {
-        self.send_success_body(request, operation).await
-    }
-
-    /// Sends the request and discards the body.
-    pub(crate) async fn send_empty(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: &str,
-    ) -> std::result::Result<(), RemoteError> {
-        self.send_success_body(request, operation).await.map(|_| ())
     }
 
     /// Sends the request and returns the status and body without status mapping.
@@ -372,22 +337,6 @@ pub(crate) fn gateway_failure<T>(operation: &str, error: &RemoteError) -> OpResu
         SysOpStatus::SandboxGatewayError,
         sandbox_gateway_message(operation, &error.message()),
     )
-}
-
-/// Maps a [`RemoteError`] onto a plain [`openjiuwen_common::error::Error`].
-pub(crate) fn remote_error(
-    operation: &str,
-    error: &RemoteError,
-) -> openjiuwen_common::error::Error {
-    match error {
-        RemoteError::NotFound(message) => Error::not_found(format!("{operation}: {message}")),
-        RemoteError::Invalid(message) => Error::config(format!("{operation}: {message}")),
-        RemoteError::ContainerGone(_)
-        | RemoteError::AlreadyExists(_)
-        | RemoteError::Status { .. }
-        | RemoteError::Transport(_)
-        | RemoteError::SearchLimit(_) => Error::sys_op(format!("{operation}: {}", error.message())),
-    }
 }
 
 /// Lowercase hex encoding (no `hex` crate in the workspace).
@@ -551,7 +500,6 @@ mod tests {
         let http =
             SandboxHttp::new("aio", &endpoint(" http://127.0.0.1:8123/// "), &config).unwrap();
         assert_eq!(http.base_url(), "http://127.0.0.1:8123");
-        assert_eq!(http.provider(), "aio");
 
         let http = SandboxHttp::new("aio", &endpoint("127.0.0.1:8123"), &config).unwrap();
         assert_eq!(http.base_url(), "http://127.0.0.1:8123");
@@ -738,7 +686,7 @@ mod tests {
             .await;
         let http = http_for(&server);
         let error = http
-            .send_empty(
+            .send_json::<serde_json::Value>(
                 http.request(reqwest::Method::GET, "/v1/files/missing"),
                 "read_file",
             )
@@ -746,7 +694,6 @@ mod tests {
             .unwrap_err();
         assert!(error.is_not_found());
         assert!(!error.is_container_gone());
-        assert_eq!(error.status(), Some(404));
         assert_eq!(error.message(), "HTTP 404 for read_file: no such file");
     }
 
@@ -767,7 +714,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!error.is_not_found());
-        assert_eq!(error.status(), Some(503));
         assert_eq!(error.message(), r#"HTTP 503 for write_file: {"code":7}"#);
     }
 
@@ -781,7 +727,10 @@ mod tests {
             .await;
         let http = http_for(&server);
         let error = http
-            .send_empty(http.request(reqwest::Method::GET, "/v1/boom"), "list_files")
+            .send_json::<serde_json::Value>(
+                http.request(reqwest::Method::GET, "/v1/boom"),
+                "list_files",
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -797,7 +746,7 @@ mod tests {
             .await;
         let http = http_for(&server);
         let error = http
-            .send_empty(
+            .send_json::<serde_json::Value>(
                 http.request(reqwest::Method::GET, "/v1/empty"),
                 "list_files",
             )
@@ -836,7 +785,10 @@ mod tests {
         )
         .unwrap();
         let error = http
-            .send_empty(http.request(reqwest::Method::GET, "/v1/x"), "read_file")
+            .send_json::<serde_json::Value>(
+                http.request(reqwest::Method::GET, "/v1/x"),
+                "read_file",
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, RemoteError::Transport(_)));
@@ -847,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_bytes_and_send_raw_keep_the_body_verbatim() {
+    async fn send_raw_keeps_the_body_verbatim() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/blob"))
@@ -855,11 +807,11 @@ mod tests {
             .mount(&server)
             .await;
         let http = http_for(&server);
-        let bytes = http
-            .send_bytes(http.request(reqwest::Method::GET, "/v1/blob"), "read_file")
+        let raw = http
+            .send_raw(http.request(reqwest::Method::GET, "/v1/blob"), "read_file")
             .await
             .unwrap();
-        assert_eq!(bytes, vec![0_u8, 1, 2, 255]);
+        assert_eq!(raw.body, vec![0_u8, 1, 2, 255]);
     }
 
     #[tokio::test]
@@ -906,37 +858,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_error_maps_to_the_matching_error_kind() {
-        let not_found = remote_error("read_file", &RemoteError::NotFound("gone".to_string()));
-        assert_eq!(not_found.kind(), ErrorKind::NotFound);
-        assert_eq!(not_found.message(), "read_file: gone");
-
-        let invalid = remote_error("write_file", &RemoteError::Invalid("bad".to_string()));
-        assert_eq!(invalid.kind(), ErrorKind::Config);
-        assert_eq!(invalid.message(), "write_file: bad");
-
-        for error in [
-            RemoteError::ContainerGone("container gone".to_string()),
-            RemoteError::AlreadyExists("exists".to_string()),
-            RemoteError::SearchLimit("too many".to_string()),
-            RemoteError::Transport("down".to_string()),
-            RemoteError::Status {
-                status: 500,
-                message: "HTTP 500 for read_file".to_string(),
-            },
-        ] {
-            assert_eq!(remote_error("read_file", &error).kind(), ErrorKind::SysOp);
-        }
-    }
-
-    #[test]
-    fn status_message_includes_the_code_when_it_is_missing() {
+    fn status_message_includes_the_code_and_statusless_failures_do_not() {
         let error = RemoteError::Status {
             status: 429,
             message: "slow down".to_string(),
         };
         assert_eq!(error.message(), "HTTP 429: slow down");
-        assert_eq!(error.status(), Some(429));
+
+        let envelope = RemoteError::Status {
+            status: 0,
+            message: "aio gateway code -1: gone".to_string(),
+        };
+        assert_eq!(envelope.message(), "aio gateway code -1: gone");
     }
 
     #[test]
