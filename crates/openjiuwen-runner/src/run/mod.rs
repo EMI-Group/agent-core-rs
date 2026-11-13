@@ -63,8 +63,9 @@ pub(crate) const LOG_TARGET: &str = "openjiuwen_runner::run";
 /// It is cheap to clone (facts and `Arc`s only) and carries exactly what the
 /// execution paths need: the registries for id resolution, the callback
 /// framework for lifecycle events, the runner configuration (session-id and
-/// deadline defaults), the checkpointer created by `Runner::start`, and the
-/// guardrails bound for the run.
+/// deadline defaults), the checkpointer created by `Runner::start`, the
+/// guardrails bound for the run, and the two observation seams a host can
+/// attach — the run status monitor and the human-in-the-loop hub.
 #[derive(Clone)]
 pub struct RunServices {
     /// Registries resolving an id-based [`AgentRef`] / [`WorkflowRef`] /
@@ -78,6 +79,16 @@ pub struct RunServices {
     pub checkpointer: Option<Arc<dyn Checkpointer>>,
     /// Guardrails bound for the run, when any.
     pub guardrails: Option<Arc<GuardrailPipeline>>,
+    /// Run status monitor the execution paths mirror each run into, when any.
+    ///
+    /// `None` makes the status mirroring inert: a run then reports no status and
+    /// pays nothing for the seam.
+    pub monitor: Option<Arc<crate::monitor::RunMonitor>>,
+    /// Human-in-the-loop hub the execution paths register each run on, when any.
+    ///
+    /// `None` makes the HITL registration inert: the run is not observable and
+    /// cannot receive host interactions through the hub.
+    pub hitl: Option<Arc<crate::hitl::InteractionHub>>,
 }
 
 impl RunServices {
@@ -95,6 +106,8 @@ impl RunServices {
             config,
             checkpointer,
             guardrails: None,
+            monitor: None,
+            hitl: None,
         }
     }
 
@@ -102,6 +115,28 @@ impl RunServices {
     #[must_use]
     pub fn with_guardrails(mut self, pipeline: Arc<GuardrailPipeline>) -> Self {
         self.guardrails = Some(pipeline);
+        self
+    }
+
+    /// Mirrors the runs of this context into `monitor`.
+    ///
+    /// Every execution path tracks one run per invocation: it is admitted after
+    /// the setup that can fail, marked running just before the invocation, and
+    /// finished as completed, failed, or cancelled on every terminal exit.
+    #[must_use]
+    pub fn with_monitor(mut self, monitor: Arc<crate::monitor::RunMonitor>) -> Self {
+        self.monitor = Some(monitor);
+        self
+    }
+
+    /// Registers the runs of this context on the human-in-the-loop `hub`.
+    ///
+    /// A registered run is visible to a host and receives its interactions; it is
+    /// unregistered on every terminal exit or when the run's future/stream is
+    /// dropped.
+    #[must_use]
+    pub fn with_hitl(mut self, hub: Arc<crate::hitl::InteractionHub>) -> Self {
+        self.hitl = Some(hub);
         self
     }
 }
@@ -834,8 +869,24 @@ mod tests {
     fn run_services_builders() {
         let services = services();
         assert!(services.guardrails.is_none());
+        assert!(services.monitor.is_none());
+        assert!(services.hitl.is_none());
         let pipeline = Arc::new(GuardrailPipeline::new());
         let services = services.with_guardrails(Arc::clone(&pipeline));
+        assert!(Arc::ptr_eq(
+            services.guardrails.as_ref().unwrap(),
+            &pipeline
+        ));
+        assert!(services.monitor.is_none());
+        assert!(services.hitl.is_none());
+
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let services = services
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+        assert!(Arc::ptr_eq(services.monitor.as_ref().unwrap(), &monitor));
+        assert!(Arc::ptr_eq(services.hitl.as_ref().unwrap(), &hub));
         assert!(Arc::ptr_eq(
             services.guardrails.as_ref().unwrap(),
             &pipeline

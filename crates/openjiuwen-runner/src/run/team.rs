@@ -24,7 +24,7 @@ use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::Result;
 use openjiuwen_multiagent::SessionLease;
 use openjiuwen_session::Session;
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
@@ -67,6 +67,34 @@ pub async fn invoke_team(
     let card = team.card();
     let lease = SessionLease::acquire(&runtime, &card, &inputs, options.team_session.clone()).await;
     let session = Arc::clone(lease.session());
+    // Observation seams: registered once the lease has the run's session, which is
+    // the last point that does not fire a callback on this path. Teams always
+    // attach the lease session (borrowed or owned) to the hub watcher, so a host
+    // can answer the interactions the strategy publishes. The binding is declared
+    // before the status guard so the guard finalises the run before the hub entry
+    // disappears.
+    let detail = json!({"component": card.id});
+    let binding = crate::hitl::bind_run(
+        services.hitl.as_ref(),
+        crate::hitl::ActiveRunSpec::for_execution(
+            &run_id,
+            &card.id,
+            Some(card.id.as_str()),
+            Some(session.id()),
+            &options.cancellation,
+            detail.clone(),
+        ),
+        Some(Arc::clone(&session) as Arc<dyn Session>),
+    );
+    let mut status = crate::monitor::RunStatusGuard::begin(
+        services.monitor.clone(),
+        &run_id,
+        crate::monitor::RunStart::new(crate::monitor::RunKind::Team, card.id.clone())
+            .with_session(session.id())
+            .with_detail(detail.clone()),
+    );
+    status.running(detail.clone());
+
     trace_start("team", &run_id, &card.id, session.id());
     let span = RunSpan::start(session.tracer(), "run_team", inputs.clone());
     let teardown = team_teardown(lease);
@@ -77,6 +105,8 @@ pub async fn invoke_team(
             span.finish(value.clone());
             teardown.finish().await;
             trace_finish("team", &run_id, &card.id, session.id(), started.elapsed());
+            status.ok(detail);
+            binding.unregister();
             Ok(value)
         }
         Err(error) => {
@@ -90,6 +120,8 @@ pub async fn invoke_team(
                 started.elapsed(),
                 &error,
             );
+            status.fail(&error, detail);
+            binding.unregister();
             Err(error)
         }
     }
@@ -132,6 +164,32 @@ pub fn stream_team(
         let lease =
             SessionLease::acquire(&runtime, &card, &inputs, options.team_session.clone()).await;
         let session = Arc::clone(lease.session());
+        // Observation seams: registered once the lease has the run's session. Teams
+        // always attach the lease session (borrowed or owned) to the hub watcher.
+        // The strategy's frames stay forwarded verbatim; a dropped stream is
+        // finished as cancelled by the status guard.
+        let detail = json!({"component": card.id});
+        let binding = crate::hitl::bind_run(
+            services.hitl.as_ref(),
+            crate::hitl::ActiveRunSpec::for_execution(
+                &run_id,
+                &card.id,
+                Some(card.id.as_str()),
+                Some(session.id()),
+                &options.cancellation,
+                detail.clone(),
+            ),
+            Some(Arc::clone(&session) as Arc<dyn Session>),
+        );
+        let mut status = crate::monitor::RunStatusGuard::begin(
+            services.monitor.clone(),
+            &run_id,
+            crate::monitor::RunStart::new(crate::monitor::RunKind::Team, card.id.clone())
+                .with_session(session.id())
+                .with_detail(detail.clone()),
+        );
+        status.running(detail.clone());
+
         trace_start("team", &run_id, &card.id, session.id());
         let span = RunSpan::start(session.tracer(), "run_team_stream", inputs.clone());
         let teardown = team_teardown(lease);
@@ -150,6 +208,8 @@ pub fn stream_team(
                         started.elapsed(),
                         &error,
                     );
+                    status.fail(&error, detail.clone());
+                    binding.unregister();
                     teardown.finish().await;
                     yield Err(error);
                     return;
@@ -159,6 +219,8 @@ pub fn stream_team(
 
         span.finish(Value::Null);
         trace_finish("team", &run_id, &card.id, session.id(), started.elapsed());
+        status.ok(detail);
+        binding.unregister();
         teardown.finish().await;
     }
     .boxed()
@@ -175,4 +237,131 @@ fn team_teardown(lease: SessionLease) -> Teardown {
             );
         }
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use futures::stream::BoxStream;
+    use openjiuwen_agent::{Agent, AgentCard, AgentChunk, AgentOutput};
+    use openjiuwen_multiagent::{handoff_team, HandoffTeamConfig, Team, TeamAgent, TeamCard};
+    use serde_json::json;
+
+    use crate::callback::CallbackFramework;
+    use crate::config::RunnerConfig;
+    use crate::monitor::{RunEvent, RunPhase};
+    use crate::resources::ResourceMgr;
+
+    /// A team member that answers immediately, so no handoff is needed.
+    struct Answering {
+        card: AgentCard,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for Answering {
+        fn card(&self) -> &AgentCard {
+            &self.card
+        }
+
+        async fn invoke(
+            &self,
+            _inputs: Value,
+            _session: Option<Arc<dyn Session>>,
+        ) -> Result<AgentOutput> {
+            Ok(AgentOutput::answer("done"))
+        }
+
+        fn stream(
+            &self,
+            _inputs: Value,
+            _session: Option<Arc<dyn Session>>,
+        ) -> BoxStream<'static, Result<AgentChunk>> {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    /// A one-member handoff team: the member answers its first input.
+    fn one_member_team() -> Arc<dyn Team> {
+        let card = TeamCard::new("crew").with_id("crew");
+        let team = handoff_team(card, HandoffTeamConfig::default());
+        let member_card = AgentCard::new("solo").with_id("solo");
+        let member: Arc<dyn Agent> = Arc::new(Answering {
+            card: member_card.clone(),
+        });
+        team.add_agent(
+            member_card,
+            Arc::new(move || TeamAgent::new(Arc::clone(&member))),
+        )
+        .expect("the member registers");
+        Arc::new(team)
+    }
+
+    /// A services bundle observing both seams.
+    fn services(
+        monitor: &Arc<crate::monitor::RunMonitor>,
+        hub: &Arc<crate::hitl::InteractionHub>,
+    ) -> RunServices {
+        RunServices::new(
+            ResourceMgr::new(),
+            CallbackFramework::new(),
+            RunnerConfig::default(),
+            None,
+        )
+        .with_monitor(Arc::clone(monitor))
+        .with_hitl(Arc::clone(hub))
+    }
+
+    /// Drains the transitions a monitor published, in order.
+    fn phases(events: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunPhase> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.phase)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn invoke_mirrors_the_run_and_unregisters_it() {
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+
+        let value = invoke_team(
+            services(&monitor, &hub),
+            TeamRef::of(one_member_team()),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value["output"], json!("done"));
+        assert!(hub.is_empty(), "the run was unregistered on completion");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_mirrors_the_run_and_unregisters_it() {
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+
+        let frames: Vec<Result<Value>> = stream_team(
+            services(&monitor, &hub),
+            TeamRef::of(one_member_team()),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+
+        assert!(frames.iter().all(Result::is_ok), "unexpected: {frames:?}");
+        assert!(hub.is_empty(), "the stream unregistered its run");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+    }
 }

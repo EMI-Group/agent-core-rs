@@ -15,7 +15,7 @@ use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_agent::{AgentCard, AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_session::{AgentSession, AgentSessionOptions, Session};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
@@ -70,6 +70,32 @@ pub async fn invoke_agent(
         .await?;
 
     let (session, owned) = prepare_session(&services, &card, &options, &inputs).await?;
+    // Observation seams: registered only now that every setup step that can fail
+    // has succeeded. A session the runner created is attached to the hub watcher;
+    // a caller-owned one is not (the runner does not install a watcher on a
+    // session it does not own). The binding is declared before the status guard so
+    // the guard finalises the run before the hub entry disappears.
+    let detail = json!({"component": card.id});
+    let binding = crate::hitl::bind_run(
+        services.hitl.as_ref(),
+        crate::hitl::ActiveRunSpec::for_execution(
+            &run_id,
+            &card.id,
+            None,
+            Some(session.id()),
+            &options.cancellation,
+            detail.clone(),
+        ),
+        owned.as_ref().map(|_| Arc::clone(&session)),
+    );
+    let mut status = crate::monitor::RunStatusGuard::begin(
+        services.monitor.clone(),
+        &run_id,
+        crate::monitor::RunStart::new(crate::monitor::RunKind::Agent, card.id.clone())
+            .with_session(session.id())
+            .with_detail(detail.clone()),
+    );
+    status.running(detail.clone());
     trace_start("agent", &run_id, &card.id, session.id());
     let span = RunSpan::start(session.tracer(), "run_agent", inputs.clone());
 
@@ -97,6 +123,13 @@ pub async fn invoke_agent(
                 .await;
             teardown.finish().await;
             trace_finish("agent", &run_id, &card.id, session.id(), started.elapsed());
+            // The callback abort wins, exactly as before: the run reports the
+            // abort error, which the status mirrors.
+            match &callback {
+                Ok(_) => status.ok(detail),
+                Err(error) => status.fail(error, detail),
+            }
+            binding.unregister();
             callback?;
             Ok(output)
         }
@@ -111,6 +144,8 @@ pub async fn invoke_agent(
                 started.elapsed(),
                 &error,
             );
+            status.fail(&error, detail);
+            binding.unregister();
             Err(error)
         }
     }
@@ -129,6 +164,7 @@ pub async fn invoke_agent(
 /// the inner stream's own failure) and then ends; an owned session is committed
 /// after the last frame and also when the consumer drops the stream early.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)] // one linear stream loop; the observation seam is four lines of setup
 pub fn stream_agent(
     services: RunServices,
     agent: AgentRef,
@@ -154,6 +190,8 @@ pub fn stream_agent(
             }
         };
 
+        // Captured before the teardown takes ownership of the owned session.
+        let attach_session = owned.as_ref().map(|_| Arc::clone(&session));
         let teardown = agent_teardown(owned);
         let context = CallbackContext::new(CallbackEvent::AgentStreamInput)
             .with_component(card.id.clone())
@@ -168,6 +206,31 @@ pub fn stream_agent(
             yield Err(error);
             return;
         }
+
+        // An aborting `AgentStreamInput` handler is a setup failure, so the run is
+        // admitted only after it resolved. Only a runner-created session is
+        // attached to the hub watcher.
+        let detail = json!({"component": card.id});
+        let binding = crate::hitl::bind_run(
+            services.hitl.as_ref(),
+            crate::hitl::ActiveRunSpec::for_execution(
+                &run_id,
+                &card.id,
+                None,
+                Some(session.id()),
+                &options.cancellation,
+                detail.clone(),
+            ),
+            attach_session,
+        );
+        let mut status = crate::monitor::RunStatusGuard::begin(
+            services.monitor.clone(),
+            &run_id,
+            crate::monitor::RunStart::new(crate::monitor::RunKind::Agent, card.id.clone())
+                .with_session(session.id())
+                .with_detail(detail.clone()),
+        );
+        status.running(detail.clone());
 
         trace_start("agent", &run_id, &card.id, session.id());
         let span = RunSpan::start(session.tracer(), "run_agent_stream", inputs.clone());
@@ -228,6 +291,11 @@ pub fn stream_agent(
             failure.as_ref(),
         );
         teardown.finish().await;
+        match &failure {
+            Some(error) => status.fail(error, detail),
+            None => status.ok(detail),
+        }
+        binding.unregister();
         if let Some(error) = failure {
             yield Err(error);
         }
@@ -313,6 +381,7 @@ mod tests {
 
     use crate::callback::{CallbackFramework, CallbackVerdict};
     use crate::config::RunnerConfig;
+    use crate::monitor::{RunEvent, RunPhase};
     use crate::resources::ResourceMgr;
 
     /// An agent whose invoke/stream behaviour the tests script.
@@ -574,5 +643,149 @@ mod tests {
             frames[0].as_ref().unwrap_err().to_string(),
             "not_found: agent 'missing' is not registered"
         );
+    }
+
+    // ------------------------------------------------- observation seams --
+
+    /// Drains the transitions a monitor published, in order.
+    fn phases(events: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunPhase> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.phase)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn invoke_mirrors_the_run_and_unregisters_it() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        // The hub entry is live while the run is in flight.
+        let live = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&live);
+        let peek = Arc::clone(&hub);
+        services.callbacks.register_sync(
+            CallbackEvent::AgentInvokeOutput,
+            0,
+            move |_ctx: &CallbackContext| {
+                *observed.lock().unwrap() = peek.list_active();
+                Ok(CallbackVerdict::Continue)
+            },
+        );
+
+        invoke_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let active = live.lock().unwrap();
+        assert_eq!(active.len(), 1, "the run was registered while in flight");
+        assert_eq!(active[0].label, "fake");
+        assert!(active[0].session_id.is_some());
+        assert!(hub.is_empty(), "the run was unregistered on completion");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+        assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_is_mirrored_as_cancelled_and_unregistered() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let error = invoke_agent(
+            services,
+            AgentRef::of(Arc::new(
+                FakeAgent::new("slow").slowed(Duration::from_secs(60)),
+            )),
+            json!({"query": "hi"}),
+            RunOptions::default().with_cancellation(token),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(hub.is_empty());
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Cancelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_mirrors_the_run_and_unregisters_it() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(frames.len(), 2);
+        assert!(hub.is_empty(), "the stream unregistered its run");
+        assert_eq!(
+            phases(&mut transitions),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborting_stream_input_handler_registers_nothing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+        services.callbacks.register_sync(
+            CallbackEvent::AgentStreamInput,
+            0,
+            |_ctx: &CallbackContext| Ok(CallbackVerdict::Abort(Error::validation("blocked"))),
+        );
+
+        let frames: Vec<Result<AgentChunk>> = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(frames.len(), 1);
+        assert!(hub.is_empty());
+        assert!(
+            phases(&mut transitions).is_empty(),
+            "a setup failure admits no run"
+        );
+        assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
     }
 }
