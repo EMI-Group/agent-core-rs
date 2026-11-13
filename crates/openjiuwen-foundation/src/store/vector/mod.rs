@@ -8,9 +8,11 @@
 //! The contract mirrors the abstract half of the Python
 //! `openjiuwen/core/foundation/store/base_vector_store.py`
 //! (`VectorDataType`, `FieldSchema`, `CollectionSchema`, `VectorSearchResult`,
-//! `BaseVectorStore`). Vendor backends (Milvus, Chroma, Gauss, pgvector) are out
-//! of scope; [`InMemoryVectorStore`] and [`LocalFileVectorStore`] are the
-//! reference implementations.
+//! `BaseVectorStore`). The Chroma, Milvus and Elasticsearch adapters live in
+//! [`external`](super::external); `pgvector` and `Gauss` remain deferred (their
+//! drivers cannot be added to an offline build).
+//! [`InMemoryVectorStore`] and [`LocalFileVectorStore`] are the reference
+//! implementations.
 //!
 //! # Semantics
 //!

@@ -7,12 +7,14 @@
 //!
 //! Every Python consumer of the db store (message store, checkpoints, memory)
 //! reads and writes JSON rows addressed by an `id` inside a named collection, so
-//! [`Document`] is a [`serde_json::Map`] plus that id. Three backends implement
+//! [`Document`] is a [`serde_json::Map`] plus that id. Four backends implement
 //! [`DocumentStore`]:
 //!
 //! - [`InMemoryDocumentStore`] — the behavioral reference (a `BTreeMap` behind a lock).
 //! - [`LocalFileDocumentStore`] — one JSON snapshot per collection below a root.
 //! - `SqliteDocumentStore` — `SQLite` behind the `sqlite` feature.
+//! - `ElasticsearchDocumentStore` — an Elasticsearch index, in
+//!   [`external::elasticsearch`](super::external::elasticsearch).
 //!
 //! # Shared semantics
 //!

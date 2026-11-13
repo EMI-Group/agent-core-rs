@@ -4,13 +4,15 @@
 //! values, prefix scans, `mget` in input order, batch delete counts, a
 //! create-only `exclusive_set` with optional TTL, and a lightweight pipeline.
 //!
-//! Three backends implement [`KvStore`]:
+//! Four backends implement [`KvStore`]:
 //!
 //! - [`InMemoryKvStore`] — the behavioral reference (a `BTreeMap` behind a lock).
 //! - [`LocalFileKvStore`] — one JSON envelope per key below a caller-provided root.
 //! - `SqliteKvStore` — `SQLite` behind the `sqlite` feature.
+//! - `RedisKvStore` — a Redis server over RESP2, in
+//!   [`external::redis`](super::external::redis).
 //!
-//! All three share the same [`StorePipeline`], so pipeline ordering and results
+//! All four share the same [`StorePipeline`], so pipeline ordering and results
 //! cannot drift between backends.
 
 use std::collections::BTreeMap;

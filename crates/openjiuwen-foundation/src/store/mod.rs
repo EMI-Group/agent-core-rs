@@ -2,16 +2,20 @@
 //!
 //! Ports the abstract half of `openjiuwen/core/foundation/store/`: the traits and
 //! plain data types every subsystem (memory, retrieval, session, harness) stores
-//! through. Vendor backends (Redis, Milvus, Chroma, Elasticsearch, pgvector, S3)
-//! are out of scope; the in-memory and local-filesystem implementations are the
-//! reference behavior, plus SQLite behind the `sqlite` feature.
+//! through. The in-memory and local-filesystem implementations are the reference
+//! behavior, plus SQLite behind the `sqlite` feature; network-backed adapters
+//! (Redis, Chroma, Milvus, Elasticsearch, S3) live in [`external`].
 //!
 //! - [`kv`] — `KvStore` (+ `KvValue`, prefix scans, TTL, pipeline).
 //! - [`document`] — `DocumentStore` (collections of JSON documents, filtered queries).
 //! - [`vector`] — `VectorStore` (+ `CollectionSchema`, `FieldSchema`, search).
-//! - [`graph`] — `GraphStore` (+ `GraphNode`, `GraphEdge`).
+//! - [`graph`] — `GraphStore` (+ `GraphNode`, `GraphEdge`); in-process only.
 //! - [`object`] — `ObjectStore` (buckets and opaque objects).
 //! - [`filter`] — the shared equality/operator filter matcher used by every backend.
+//! - [`external`] — network-backed adapters for the contracts above
+//!   (`ChromaVectorStore`, `MilvusVectorStore`, `ElasticsearchVectorStore`,
+//!   `ElasticsearchDocumentStore`, `RedisKvStore`, `S3ObjectStore`) plus the
+//!   name-driven [`external::registry`].
 //!
 //! The crate-level seams are re-exported here so consumers (memory, retrieval,
 //! session, harness) can depend on `openjiuwen_foundation::store::{KvStore, ...}`
