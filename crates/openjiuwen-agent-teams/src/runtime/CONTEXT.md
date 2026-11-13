@@ -192,7 +192,7 @@ impl TeamMemberSpawner {
     pub fn member_names(&self) -> Vec<String>;                 // predefined ∪ agents keys − leader
 }
 
-// team_agent.rs + build.rs — the agent itself
+// team_agent/ + build.rs — the agent itself
 #[async_trait] pub trait SpecBuild { async fn build(&self) -> Result<Arc<TeamAgent>>;
                                      async fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
 impl SpecBuild for TeamAgentSpec;                 // the impl lives in build.rs
