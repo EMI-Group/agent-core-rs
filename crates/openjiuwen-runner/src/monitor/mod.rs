@@ -45,8 +45,8 @@
 //! ```
 
 mod event;
-// The execution paths adopt this guard (`crate::monitor::RunStatusGuard`); until
-// they do, the whole seam is intentionally unreferenced inside the crate.
+// The run paths and the team pool drive this guard (`crate::monitor::RunStatusGuard`);
+// the `dead_code` allow is kept as it is.
 #[allow(dead_code)]
 mod guard;
 mod status;
@@ -61,8 +61,8 @@ use tokio::sync::broadcast;
 pub use event::RunEvent;
 pub use status::{RunKind, RunOutcome, RunPhase, RunStart, RunStatus};
 
-// The execution paths adopt this guard (`crate::monitor::RunStatusGuard`); it is a
-// crate-internal seam, so the re-export is deliberately not part of the public API.
+// The run paths reach the guard through this re-export; it is a crate-internal
+// seam, so it is deliberately not part of the public API.
 #[allow(unused_imports)]
 pub(crate) use guard::RunStatusGuard;
 

@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    resolve_team, trace_failure, trace_finish, trace_start, RunOptions, RunServices, RunSpan,
-    TeamRef, Teardown, LOG_TARGET,
+    effective_deadline, resolve_team, run_with_limits, trace_failure, trace_finish, trace_start,
+    RunOptions, RunServices, RunSpan, TeamRef, Teardown, LOG_TARGET,
 };
 
 /// Runs one agent-team invocation to completion.
@@ -43,13 +43,28 @@ use super::{
 /// its stream on finish — the deliberate relaxation of Python's unconditional
 /// bind/unbind documented on this module.
 ///
+/// The invocation is bounded by the run's cancellation token
+/// ([`RunOptions::cancellation`]) and its deadline: `options.timeout`, else the
+/// runner's [`RunnerConfig::default_run_timeout`](crate::config::RunnerConfig::default_run_timeout)
+/// when one is configured — the same rule the agent path applies. A tripped token
+/// returns [`Error::Cancelled`](openjiuwen_common::error::Error::Cancelled) and an
+/// expired deadline returns [`openjiuwen_common::error::Error::Timeout`], both
+/// after the lease teardown, the span, and the mirrored run are finalised.
+///
+/// The runner can only race the invocation: a cancelled or timed-out call **drops
+/// the in-flight `Team::invoke` future**, exactly as the agent path does. The team
+/// itself is not asked to stop (the multiagent seam takes a session, not a token),
+/// so a strategy that keeps a task of its own alive continues in the background.
+///
 /// The result value is returned verbatim; no callback events are fired.
 ///
 /// # Errors
 ///
 /// `NotFound` for a missing id, whatever [`Team::start`](openjiuwen_multiagent::Team::start)
-/// reports, whatever the strategy reports, and a lease-teardown failure (logged,
-/// never replacing a successful result).
+/// reports, [`openjiuwen_common::error::Error::Cancelled`] when the token fires,
+/// [`openjiuwen_common::error::Error::Timeout`] when the deadline expires, whatever
+/// the strategy reports, and a lease-teardown failure (logged, never replacing a
+/// successful result).
 #[allow(clippy::needless_pass_by_value)]
 pub async fn invoke_team(
     services: RunServices,
@@ -99,7 +114,16 @@ pub async fn invoke_team(
     let span = RunSpan::start(session.tracer(), "run_team", inputs.clone());
     let teardown = team_teardown(lease);
 
-    let result = team.invoke(inputs, Some(Arc::clone(&session))).await;
+    // The same deadline rule as the agent path: the run's own timeout, else the
+    // runner's `default_run_timeout` when it configures one.
+    let deadline = effective_deadline(&services, &options);
+    let result = run_with_limits(
+        "run_agent_team",
+        team.invoke(inputs, Some(Arc::clone(&session))),
+        &options.cancellation,
+        deadline,
+    )
+    .await;
     match result {
         Ok(value) => {
             span.finish(value.clone());

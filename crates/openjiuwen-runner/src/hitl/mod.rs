@@ -42,8 +42,9 @@ pub use hub::{InteractionHub, INBOX_CAPACITY};
 pub use payload::{InteractKind, InteractPayload};
 pub use target::{DeliverResult, RunTarget};
 
-// The execution paths adopt this bridge (`bind_run`/`RunBinding`); until they do,
-// the seam is intentionally unreferenced inside the crate.
+// The run paths call `bind_run` and hold the binding it returns; the `RunBinding`
+// name itself is only reached through that inferred return type and the re-export
+// above, so the import stays explicitly allowed.
 #[allow(unused_imports)]
 pub(crate) use bridge::{bind_run, RunBinding};
 

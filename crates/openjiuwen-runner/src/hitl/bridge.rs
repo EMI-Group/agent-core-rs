@@ -8,8 +8,12 @@
 //! calling [`RunBinding::unregister`]) removes the run idempotently, so an
 //! `?`-returned error or a panicking task cannot leak a live entry.
 //!
-//! [`RunBinding`] and [`bind_run`] are not wired into the run paths yet, which is
-//! why they carry `#[allow(dead_code)]` inside this crate.
+//! The execution paths are wired into this bridge: the agent, workflow, and team
+//! run paths (and the team pool's runs) call [`bind_run`] to register their run, and
+//! hold the returned [`RunBinding`] so the `?`-returned error and the dropped stream
+//! paths both unregister it. Outside this module's own tests [`RunBinding::run_id`]
+//! is still unreferenced, which is why the item-level `#[allow(dead_code)]`
+//! attributes below stay as they are.
 //!
 //! The second half of the bridge is session observation: `watch_pending` turns the
 //! `__interaction__` frames a run's session publishes into the hub's pending set,
