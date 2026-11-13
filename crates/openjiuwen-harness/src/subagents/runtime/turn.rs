@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 
 use super::clock::Clock;
 use super::quota::SubagentActivity;
+use super::transcript::TranscriptEntry;
 use super::{Shared, SubagentStatus};
 
 /// One background turn worker; it runs queued queries of one instance serially.
@@ -85,6 +86,11 @@ pub(super) fn begin_turn(shared: &Shared, clock: &dyn Clock, id: &str, generatio
             {
                 instance.status = SubagentStatus::Running;
                 instance.touch(now_ms, SubagentActivity::Running);
+                instance.record(TranscriptEntry::status(
+                    id,
+                    SubagentStatus::Running.as_str(),
+                    now_ms,
+                ));
                 true
             }
             _ => false,
@@ -127,11 +133,24 @@ pub(super) fn finish_turn(
         if let Some(query) = instance.pending.pop_front() {
             instance.status = SubagentStatus::PendingInit;
             instance.touch(now_ms, SubagentActivity::Running);
+            instance.record(TranscriptEntry::input(id, query.as_str(), now_ms));
             Some(query)
         } else {
             instance.status = status;
             instance.running = false;
             instance.touch(now_ms, SubagentActivity::Idle);
+            let entry = match status {
+                SubagentStatus::Completed => TranscriptEntry::completion(
+                    id,
+                    instance.output.clone().unwrap_or_default(),
+                    now_ms,
+                ),
+                SubagentStatus::Errored => {
+                    TranscriptEntry::error(id, instance.error.clone().unwrap_or_default(), now_ms)
+                }
+                other => TranscriptEntry::status(id, other.as_str(), now_ms),
+            };
+            instance.record(entry);
             tracing::debug!(target: "openjiuwen_harness::subagents", subagent_id = %id, status = status.as_str(), "subagent turn finished");
             None
         }

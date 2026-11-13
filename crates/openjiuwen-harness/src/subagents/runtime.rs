@@ -27,6 +27,7 @@ use self::clock::Clock;
 use self::clock::SystemClock;
 use self::instance::Instance;
 use self::quota::{SpawnBudget, SubAgentQuota, SubagentActivity};
+use self::transcript::{TranscriptEntry, TranscriptSummary};
 use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
@@ -35,6 +36,7 @@ mod evict;
 mod instance;
 pub mod quota;
 pub mod transcript;
+mod transcript_api;
 mod turn;
 
 pub use self::evict::EVICTION_REASON;
@@ -147,6 +149,9 @@ pub struct SubAgentOutcome {
     pub output: Option<String>,
     /// Error message of the last failed turn, when it failed.
     pub error: Option<String>,
+    /// Digest of the instance's transcript at collection time.
+    #[serde(default)]
+    pub transcript: TranscriptSummary,
 }
 
 impl SubAgentOutcome {
@@ -189,6 +194,9 @@ pub struct SubagentMetadata {
     pub last_used_at: String,
     /// Why the instance was closed, when it was.
     pub closed_reason: Option<String>,
+    /// Digest of the instance's transcript (size, ring evictions, newest entry).
+    #[serde(default)]
+    pub transcript: TranscriptSummary,
 }
 
 /// The response of [`SubAgentRuntime::resume`] (Python `ResumeResult`).
@@ -505,6 +513,14 @@ impl SubAgentRuntime {
                 instance.pending.clear();
             }
             instance.pending.push_back(query.to_owned());
+            instance.record(TranscriptEntry::input(id, query, now_ms));
+            if interrupted {
+                instance.record(TranscriptEntry::status(
+                    id,
+                    SubagentStatus::Interrupted.as_str(),
+                    now_ms,
+                ));
+            }
             if !instance.running {
                 if let Some(agent) = instance.agent.clone() {
                     if let Some(next) = instance.pending.pop_front() {
@@ -565,6 +581,7 @@ impl SubAgentRuntime {
             instance.handle = None;
             instance.closed_reason = None;
             instance.touch(now_ms, SubagentActivity::Idle);
+            instance.record(TranscriptEntry::status(id, "idle", now_ms));
             ResumeReport {
                 status: SubagentStatus::Completed,
                 restored: true,
@@ -602,6 +619,7 @@ impl SubAgentRuntime {
             }
             let previous = instance.status;
             instance.close(now_ms, CLOSE_REASON_MANUAL);
+            instance.record(TranscriptEntry::closed(id, CLOSE_REASON_MANUAL, now_ms));
             previous
         };
         self.shared.notify.notify_waiters();
@@ -627,6 +645,11 @@ impl SubAgentRuntime {
                     continue;
                 }
                 instance.close(now_ms, CLOSE_REASON_PARENT_ENDED);
+                instance.record(TranscriptEntry::closed(
+                    id,
+                    CLOSE_REASON_PARENT_ENDED,
+                    now_ms,
+                ));
                 closed.push((instance.seq, id.clone()));
             }
             closed.sort_by_key(|(seq, _)| *seq);
@@ -639,8 +662,10 @@ impl SubAgentRuntime {
     /// Returns the Python `describe_list` payload; `subagents` aliases `live_subagents`.
     ///
     /// Every row carries the metadata fields (including `activity`, `depth`,
-    /// `parent_subagent_id`, `last_used_at` and `closed_reason`); `capacity` reports the live
-    /// usage, the cumulative spawn ledger and the running-turn count against their limits.
+    /// `parent_subagent_id`, `last_used_at`, `closed_reason` and the `transcript` digest);
+    /// `capacity` reports the live usage, the cumulative spawn ledger, the running-turn count
+    /// against their limits, and `transcript_entries`, the number of buffered transcript
+    /// entries across the live instances (`capacity.transcript_entries`).
     /// `summary` reports `live_count`, `closed_count`, `evicted_count` (closed instances whose
     /// `closed_reason` is `"evicted"`) and `eviction`, the policy in force:
     /// `{"enabled": <bool>, "candidates": <evictable live instances>}`.
@@ -653,6 +678,11 @@ impl SubAgentRuntime {
             .iter()
             .filter(|instance| instance.activity == SubagentActivity::Running)
             .count();
+        let transcript_entries = instances
+            .iter()
+            .filter(|instance| instance.is_live())
+            .map(|instance| instance.transcript.len())
+            .sum::<usize>();
         let evicted_count = instances
             .iter()
             .filter(|instance| {
@@ -682,6 +712,7 @@ impl SubAgentRuntime {
                 "max_spawned": self.quota.max_total_spawned,
                 "running": running,
                 "max_running": self.quota.max_concurrent_running,
+                "transcript_entries": transcript_entries,
             },
             "subagents": live,
             "live_subagents": live_alias,
@@ -802,7 +833,15 @@ impl SubAgentRuntime {
             state.next_seq = state.next_seq.wrapping_add(1);
             state.instances.insert(
                 id.clone(),
-                Instance::new(seq, request, id.clone(), now_ms, depth),
+                Instance::new(
+                    seq,
+                    request,
+                    id.clone(),
+                    now_ms,
+                    depth,
+                    self.quota.transcript_capacity,
+                    self.quota.transcript_channel_capacity,
+                ),
             );
             seq
         };

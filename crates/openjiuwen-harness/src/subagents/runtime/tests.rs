@@ -65,6 +65,9 @@ enum Behavior {
     Fail,
     ErrorResult,
     Blocked(watch::Sender<bool>),
+    /// Blocks inside [`SubAgentFactory::create`], so a test can queue input before the first
+    /// turn of the instance starts.
+    CreateBlocked(watch::Sender<bool>),
 }
 
 struct FakeFactory {
@@ -94,6 +97,13 @@ impl SubAgentFactory for FakeFactory {
             Behavior::Fail => return Err(Error::config("boom")),
             Behavior::ErrorResult => Mode::ErrorResult,
             Behavior::Blocked(gate) => Mode::Blocked(gate.clone()),
+            Behavior::CreateBlocked(gate) => {
+                let mut gate = gate.subscribe();
+                if !*gate.borrow_and_update() {
+                    let _ = gate.changed().await;
+                }
+                Mode::Echo
+            }
         };
         Ok(Arc::new(FakeAgent {
             card: config.agent_card.clone(),
@@ -141,6 +151,16 @@ async fn wait_running(runtime: &SubAgentRuntime, id: &str) {
 fn blocked() -> (watch::Sender<bool>, Arc<FakeFactory>) {
     let (gate, _receiver) = watch::channel(false);
     (gate.clone(), FakeFactory::new(Behavior::Blocked(gate)))
+}
+
+/// A factory whose `create` blocks until the gate opens, so a test can act between the
+/// reservation and the first turn of the instance.
+fn create_blocked() -> (watch::Sender<bool>, Arc<FakeFactory>) {
+    let (gate, _receiver) = watch::channel(false);
+    (
+        gate.clone(),
+        FakeFactory::new(Behavior::CreateBlocked(gate)),
+    )
 }
 
 #[tokio::test]
@@ -469,3 +489,4 @@ fn status_wire_strings_and_finality() {
 
 mod eviction;
 mod quota;
+mod transcript;

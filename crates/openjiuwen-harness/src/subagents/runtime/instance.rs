@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use super::clock::rfc3339_from_ms;
 use super::quota::SubagentActivity;
+use super::transcript::{TranscriptBuffer, TranscriptChannel, TranscriptEntry};
 use super::{SubAgentId, SubAgentOutcome, SubAgentSpawnRequest, SubagentMetadata, SubagentStatus};
 
 /// One live (or closed-tombstone) sub-agent instance.
@@ -68,19 +69,31 @@ pub(super) struct Instance {
     pub(super) generation: u64,
     /// Handle of the running turn task, when any.
     pub(super) handle: Option<JoinHandle<()>>,
+    /// Bounded transcript of everything that happened to this instance.
+    pub(super) transcript: TranscriptBuffer,
+    /// Live feed of the entries appended to `transcript`.
+    pub(super) channel: TranscriptChannel,
 }
 
 impl Instance {
     /// Reserves a `Queued` instance at `depth` for `request`, stamped at `now_ms`.
+    ///
+    /// The transcript ring holds at most `transcript_capacity` entries and its live feed
+    /// buffers `transcript_channel_capacity` per subscriber. The reservation records the first
+    /// entry, [`TranscriptEntry::spawn`] with the delegated task description.
     pub(super) fn new(
         seq: u64,
         request: &SubAgentSpawnRequest,
         id: SubAgentId,
         now_ms: i64,
         depth: usize,
+        transcript_capacity: usize,
+        transcript_channel_capacity: usize,
     ) -> Self {
         let now = rfc3339_from_ms(now_ms);
-        Self {
+        let spawn_entry =
+            TranscriptEntry::spawn(id.as_str(), request.task_description.clone(), now_ms);
+        let mut instance = Self {
             seq,
             sub_session_id: id.clone(),
             subagent_id: id,
@@ -107,7 +120,22 @@ impl Instance {
             running: false,
             generation: 0,
             handle: None,
-        }
+            transcript: TranscriptBuffer::new(transcript_capacity),
+            channel: TranscriptChannel::new(transcript_channel_capacity),
+        };
+        instance.record(spawn_entry);
+        instance
+    }
+
+    /// Appends `entry` to the transcript and publishes it on the live feed.
+    ///
+    /// Returns the assigned sequence number. [`TranscriptBuffer::push`] assigns it and reports
+    /// ring evictions through [`super::transcript::TranscriptSummary::dropped`]; publishing is a
+    /// non-blocking fan-out, so this is safe to call while the runtime holds its state lock.
+    pub(super) fn record(&mut self, entry: TranscriptEntry) -> u64 {
+        let stored = self.transcript.push(entry);
+        self.channel.publish(&stored);
+        stored.seq
     }
 
     /// Whether the instance still occupies a capacity slot.
@@ -149,6 +177,7 @@ impl Instance {
             status: self.status,
             output: self.output.clone(),
             error: self.error.clone(),
+            transcript: self.transcript.summary(),
         }
     }
 
@@ -169,6 +198,7 @@ impl Instance {
             parent_subagent_id: self.parent_subagent_id.clone(),
             last_used_at: rfc3339_from_ms(self.last_used_at_ms),
             closed_reason: self.closed_reason.clone(),
+            transcript: self.transcript.summary(),
         }
     }
 }

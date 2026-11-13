@@ -16,6 +16,7 @@ use openjiuwen_common::error::{Error, Result};
 use super::quota::{
     compare_lru, select_lru_candidate, LruCandidate, SubAgentQuota, SubagentActivity,
 };
+use super::transcript::TranscriptEntry;
 use super::{not_found, RuntimeState, SubAgentId, SubAgentRuntime, SubagentStatus};
 
 /// `closed_reason` recorded when an instance is evicted to free a capacity slot.
@@ -158,6 +159,7 @@ pub(super) fn evict_locked(
     }
     let previous = instance.status;
     instance.close(now_ms, EVICTION_REASON);
+    instance.record(TranscriptEntry::evicted(id, EVICTION_REASON, now_ms));
     let live = live_count(state);
     tracing::debug!(
         target: "openjiuwen_harness::subagents",
