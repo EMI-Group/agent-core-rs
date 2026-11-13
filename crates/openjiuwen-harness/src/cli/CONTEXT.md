@@ -102,7 +102,6 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 
 - Multi-turn REPL sessions go silent: the task loop's `NoProgressAnswer` guard (`max_consecutive_empty_answers = 3`, `min_answer_chars = 20`, enabled by default) keeps its streak in the reused session state, so after three consecutive short answers the next `agent.stream` returns one empty `answer` frame without calling the model. Fix belongs to the task-loop/agent area, not this module.
 - `ReplCommand`'s `Unknown skill:` branch is unreachable from `handle_input` (unknown names are rejected by `parse_skill_command` first and surface as `Unknown command: /name`).
-- `crates/openjiuwen-e2e/tests/cli_binary.rs` still builds `Cli` with a struct literal that lacks `no_color`, so that crate does not compile until `no_color: false` is added there (outside this node).
 - `crates/openjiuwen-harness/tests/cli.rs` covers the pre-extension surface only; the new features are covered by `src/cli/tests/{commands,features}.rs` instead (that file is outside this node).
 
 ## Deferred Python areas
