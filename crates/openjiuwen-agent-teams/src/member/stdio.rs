@@ -36,6 +36,7 @@
 //! ```no_run
 //! use openjiuwen_agent_teams::member::spawn_config::StdioCommand;
 //! use openjiuwen_agent_teams::member::stdio::StdioMemberRuntime;
+//! use openjiuwen_agent_teams::member::MemberRuntime;
 //!
 //! # async fn demo() -> openjiuwen_common::error::Result<()> {
 //! let runtime = StdioMemberRuntime::spawn(

@@ -1,10 +1,10 @@
 //! External-CLI member spawner: launch a third-party CLI as a protocol-speaking child process.
 //!
 //! [`ExternalCliMemberSpawner`] is the [`MemberSpawner`] for
-//! [`MemberSpawnKind::ExternalCli`](crate::member::spawn_config::MemberSpawnKind::ExternalCli).
+//! [`MemberSpawnKind::ExternalCli`].
 //! It clones the effective [`ExternalCliRuntimeConfig`] command, layers the request's identity
 //! environment on top of it, and hands the result to
-//! [`StdioMemberRuntime`](crate::member::stdio::StdioMemberRuntime) — the same JSON-lines protocol
+//! [`StdioMemberRuntime`] — the same JSON-lines protocol
 //! runtime the OS-process spawner uses.
 //! Only the launch details differ between the two kinds, so this spawner adds configuration
 //! precedence and a per-member runtime registry, nothing else.
@@ -17,8 +17,8 @@
 //!
 //! The spawner's own [`ExternalCliRuntimeConfig`] is authoritative.
 //! A request overrides it only when it explicitly asks for an external CLI
-//! ([`MemberSpawnKind::ExternalCli`](crate::member::spawn_config::MemberSpawnKind::ExternalCli))
-//! and carries [`MemberSpawnOptions::external_cli`](crate::member::spawn_config::MemberSpawnOptions::external_cli);
+//! ([`MemberSpawnKind::ExternalCli`])
+//! and carries `MemberSpawnOptions::external_cli`;
 //! a request of any other kind keeps the spawner's configuration, so a mislabelled request cannot
 //! silently change how members are launched.
 //!

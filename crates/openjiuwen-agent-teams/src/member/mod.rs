@@ -1,8 +1,10 @@
 //! The member seam: the runtime a member's brain implements, the status machine over the roster
-//! row, the leader-side activity projection and the in-process spawn handle.
+//! row, the leader-side activity projection, and the spawn seams (in-process task handle plus the
+//! three child-process spawners).
 //!
 //! Python parity sources: `openjiuwen/agent_teams/agent/member.py`, `agent/member_runtime.py`,
-//! `agent/member_activity.py` and `spawn/inprocess_spawn.py` / `spawn/inprocess_handle.py`.
+//! `agent/member_activity.py`, `spawn/inprocess_spawn.py`, `spawn/inprocess_handle.py`,
+//! `spawn/external_cli_spawn.py`, `external/cli_agent/spawn.py` and `schema/ssh_transport.py`.
 //!
 //! Module map:
 //!
@@ -12,6 +14,12 @@
 //! | [`lifecycle`] | [`TeamMember`]: status machine, start/rollback, round notes, retire |
 //! | [`activity`] | [`MemberActivityRegistry`], [`IdleDebounce`], [`DEFAULT_IDLE_DEBOUNCE`] |
 //! | [`spawn`] | [`MemberSpawner`], [`MemberSpawnRequest`], [`InProcessSpawnHandle`], [`SpawnRegistry`] |
+//! | [`spawn_config`] | [`MemberSpawnKind`], [`MemberSpawnOptions`], [`StdioCommand`], the per-kind launch configs |
+//! | [`protocol`] | [`MemberRequest`] / [`MemberResponse`]: the JSON-lines child-process protocol |
+//! | [`stdio`] | [`StdioMemberRuntime`]: drives any child process over that protocol |
+//! | [`process_spawner`] | [`ProcessMemberSpawner`]: `team-member` child processes |
+//! | [`external_cli_spawner`] | [`ExternalCliMemberSpawner`]: third-party CLI child processes |
+//! | [`ssh_spawner`] | [`SshMemberSpawner`]: the same protocol over an `ssh` pipe |
 //!
 //! The schema types this module's own signatures expose ([`RoundOutcome`], [`MemberStatus`],
 //! [`ExecutionStatus`], [`TeamRole`], [`MemberLifetime`]) are re-exported here so callers can drive
@@ -20,9 +28,8 @@
 //! The split follows Python's roles rather than its files: a runtime is the seam the coordination
 //! layer drives, a `TeamMember` is the persisted row plus its transition rules, the activity
 //! registry is the leader's projection of the whole roster, and the spawn handle owns the task
-//! that keeps a teammate alive. Everything here is in-process; OS-process and external-CLI members
-//! are deferred and surface through [`MemberSpawner`] as
-//! [`openjiuwen_common::error::Error::Unsupported`].
+//! that keeps a teammate alive. The default member is still in-process; the three child-process
+//! spawners are opt-in through [`MemberSpawnOptions`] and share one JSON-lines member protocol.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -81,9 +88,21 @@ mod stdio_tests;
 mod test_child;
 
 pub use activity::{IdleDebounce, MemberActivityRegistry, DEFAULT_IDLE_DEBOUNCE};
+pub use external_cli_spawner::ExternalCliMemberSpawner;
 pub use lifecycle::TeamMember;
+pub use process_spawner::ProcessMemberSpawner;
+pub use protocol::{MemberRequest, MemberResponse};
 pub use runtime::{MemberObserver, MemberRuntime, ObserverEvent, ObserverSet, RecordingObserver};
-pub use spawn::{InProcessSpawnHandle, MemberSpawnRequest, MemberSpawner, SpawnRegistry};
+pub use spawn::{
+    InProcessSpawnHandle, MemberSpawnRequest, MemberSpawner, SpawnRegistry, MEMBER_NAME_ENV,
+    MEMBER_WORKSPACE_ENV, SESSION_ID_ENV, TEAM_NAME_ENV,
+};
+pub use spawn_config::{
+    ExternalCliRuntimeConfig, MemberSpawnKind, MemberSpawnOptions, ProcessMemberConfig,
+    SshTransportSpec, StdioCommand,
+};
+pub use ssh_spawner::SshMemberSpawner;
+pub use stdio::{StdioMemberRuntime, StdioRuntimeOptions, DEFAULT_IO_TIMEOUT};
 
 // Re-exports of the `schema` types this module's signatures use — the schema module owns them.
 pub use crate::schema::{ExecutionStatus, MemberLifetime, MemberStatus, RoundOutcome, TeamRole};

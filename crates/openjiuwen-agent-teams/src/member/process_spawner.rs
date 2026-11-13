@@ -13,7 +13,7 @@
 //! root, and the child is expected to speak [`crate::member::protocol`] on its stdin/stdout.
 //! Spawn-mode dispatch is also not decided here: a [`MemberSpawner`] is handed a request that has
 //! already been routed to it, and this spawner spawns a process whatever
-//! [`MemberSpawnKind`](crate::member::spawn_config::MemberSpawnKind) the request names.
+//! [`MemberSpawnKind`] the request names.
 //!
 //! Launch rules, in order:
 //!

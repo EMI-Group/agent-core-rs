@@ -41,7 +41,7 @@
 //! * `error` fails the pending request with an external-style detail and is logged; it does not
 //!   change the member's lifecycle state, because the runtime decides whether to retry or fail it.
 //! * A child exit ends the member: the runtime maps the closed stdout to
-//!   [`HarnessState::Terminated`](openjiuwen_harness_protocol::HarnessState::Terminated).
+//!   [`HarnessState::Terminated`].
 //!
 //! # Transcript
 //!
