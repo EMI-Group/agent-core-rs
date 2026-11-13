@@ -1,9 +1,9 @@
-# retriever — unified retriever, four channels, rank fusion
+# retriever — unified retriever, five implementations, rank fusion
 
 ## Intent
 
 Port Python's `openjiuwen/core/retrieval/retriever/` package and `utils/fusion.py` to Rust.
-All four retrievers are implemented: dense vector, sparse BM25, hybrid (RRF), graph expansion, and agentic iteration.
+All five retrievers are implemented: dense vector, sparse BM25, hybrid (RRF), graph expansion, and agentic iteration.
 Filters reach the underlying index instead of being dropped, which is a documented fix over Python's base class.
 Retrievers are offline by default: the agentic loop uses deterministic heuristics and only calls a model when one is supplied.
 
@@ -62,7 +62,7 @@ Retrievers are offline by default: the agentic loop uses deterministic heuristic
 
 ## Test Strategy
 - Unit tests beside each module cover mode serde/defaults, result projection, mode rejection, thresholds, RRF scores, hybrid fusion/over-fetch/fallback, graph expansion and degradation, agentic config validation, trace serde, triple parsing, and sufficiency arithmetic.
-- `tests/retrievers.rs` exercises all four retrievers end to end with `HashEmbedding`, `InMemoryVectorStore`, `Bm25Index`, and `InMemoryGraphStore`, plus scripted rewriters and `StaticCompletionModel`; everything runs offline.
+- `tests/retrievers.rs` exercises all five retrievers end to end with `HashEmbedding`, `InMemoryVectorStore`, `Bm25Index`, and `InMemoryGraphStore`, plus scripted rewriters and `StaticCompletionModel`; everything runs offline.
 
 ## Routing Table
 - `./mod.rs` → `RetrieveMode`, the `Retriever` trait, query validation, and result projection

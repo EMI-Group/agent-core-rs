@@ -38,4 +38,4 @@ All tests are offline and deterministic.
 - `./multimodal.rs` → multimodal documents, image loading, table conversion
 - `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)
 - `./parsing_documents.rs` → DOCX/XLSX/PDF document parsers
-- `./retrievers.rs` → the four retrievers, rank fusion, graph expansion, and the agentic loop
+- `./retrievers.rs` → the five retriever implementations, rank fusion, graph expansion, and the agentic loop
