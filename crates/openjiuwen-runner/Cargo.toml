@@ -16,6 +16,8 @@ openjiuwen-workflow.workspace = true
 openjiuwen-agent.workspace = true
 openjiuwen-multiagent.workspace = true
 openjiuwen-security.workspace = true
+openjiuwen-sysop.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"
@@ -32,6 +34,7 @@ once_cell.workspace = true
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true
 
 [features]
 default = []

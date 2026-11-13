@@ -40,7 +40,10 @@
 pub mod callback;
 pub mod config;
 pub mod error;
+pub mod hitl;
+pub mod monitor;
 pub mod mq;
+pub mod pool;
 pub mod resources;
 pub mod run;
 pub mod runner;
