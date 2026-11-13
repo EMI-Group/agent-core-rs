@@ -32,3 +32,11 @@ pub use descriptor::{ClientScope, TeamJoinDescriptor};
 pub use live::{connect_live_client, connect_socket_client};
 pub use socket_client::SocketTeamClient;
 pub use store_client::StoreTeamClient;
+
+#[cfg(test)]
+#[path = "socket_client_tests.rs"]
+mod socket_client_tests;
+
+#[cfg(test)]
+#[path = "live_socket_tests.rs"]
+mod live_socket_tests;
