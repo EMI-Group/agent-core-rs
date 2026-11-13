@@ -98,7 +98,7 @@ Deferred areas per crate (the 16 Subset crates, plus the seam-level deferrals in
 ## Feature Flags
 
 Default builds need no network and no external service; every feature except the ones marked *default* is additive and opt-in.
-`openjiuwen-agent`, `openjiuwen-agent-evolving`, `openjiuwen-auto-harness`, `openjiuwen-common`, `openjiuwen-context`, `openjiuwen-core`, `openjiuwen-dev-tools`, `openjiuwen-graph`, `openjiuwen-harness-protocol`, `openjiuwen-macros`, `openjiuwen-multiagent`, `openjiuwen-retrieval`, `openjiuwen-rsi`, `openjiuwen-runner`, `openjiuwen-security`, `openjiuwen-test-support`, `openjiuwen-workflow` declare `default = []` and no other feature (17 crates).
+`openjiuwen-agent`, `openjiuwen-agent-evolving`, `openjiuwen-auto-harness`, `openjiuwen-common`, `openjiuwen-context`, `openjiuwen-dev-tools`, `openjiuwen-graph`, `openjiuwen-harness-protocol`, `openjiuwen-macros`, `openjiuwen-multiagent`, `openjiuwen-retrieval`, `openjiuwen-rsi`, `openjiuwen-runner`, `openjiuwen-security`, `openjiuwen-test-support`, `openjiuwen-workflow` declare `default = []` and no other feature (16 crates).
 
 | Crate | Feature | Default | Effect |
 | --- | --- | --- | --- |
@@ -128,7 +128,8 @@ Default builds need no network and no external service; every feature except the
 | `openjiuwen-extensions` | `live-tests` | no | opt-in live integration tests |
 | `openjiuwen-symphony` | `sqlite` | no | SQLite capability-asset store (`store::KvAssetStore::sqlite`) |
 | `openjiuwen` | `native` | yes | forwards `harness/native` + `harness-providers/native` |
-| `openjiuwen` | `otel`, `a2a`, `sqlite` | no | forwards the matching `openjiuwen-extensions` (and symphony `sqlite`) features |
+| `openjiuwen-core` | `otel` | no | forwards `openjiuwen-session/otel`, so `core::session::install_trace_sink` really installs the supplied sink |
+| `openjiuwen` | `otel`, `a2a`, `sqlite` | no | forwards the matching `openjiuwen-extensions` (and symphony `sqlite`, kernel `otel`) features |
 | `openjiuwen` | `live-tests` | no | forwards the harness/providers/teams/extensions live gates |
 | `openjiuwen-cli` | `live-tests` | no | opt-in live CLI tests |
 | `openjiuwen-e2e` | `a2a`, `otel` | no | enables the A2A round-trip scenario / parity forwarding |
