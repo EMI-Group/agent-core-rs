@@ -21,6 +21,14 @@
 //! Runs do **not** require [`Runner::start`]: the queue is host plumbing, not a
 //! precondition for `run_agent`/`run_workflow`/`run_agent_team` (Python's global
 //! runner is lazily started for the same reason).
+//!
+//! The spawn seam is installed, not constructed: [`Runner::set_spawner`] installs
+//! one backend and [`Runner::set_spawner_registry`] hosts several with routing
+//! between them. Every successful spawn is wrapped in
+//! [`crate::spawn::MonitoredSpawnedAgent`], so a host observes the child as a
+//! [`crate::monitor::RunKind::Spawn`] status on [`Runner::monitor`] until it is
+//! shut down, killed, or dropped. The spawn accessors live in the crate's
+//! `runner_spawn` module, beside this file.
 
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
@@ -34,7 +42,7 @@ use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
-use crate::spawn::{AgentSpawner, SpawnSpec, SpawnedAgent, UnsupportedSpawner};
+use crate::spawn::{AgentSpawner, SpawnerRegistry, UnsupportedSpawner};
 use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
@@ -58,8 +66,9 @@ const LOG_TARGET: &str = "openjiuwen_runner::runner";
 static GLOBAL: OnceLock<RwLock<Option<Arc<Runner>>>> = OnceLock::new();
 
 /// The process-level orchestrator: configuration, resources, callbacks, queue,
-/// checkpointer, guardrails, the spawn seam, the run monitor, the
-/// human-in-the-loop hub, and the team runtime pool.
+/// checkpointer, guardrails, the single spawn backend and its optional
+/// multi-backend registry, the run monitor, the human-in-the-loop hub, and the
+/// team runtime pool.
 ///
 /// Create an isolated instance with [`Runner::new`] / [`Runner::with_config`];
 /// [`Runner::global`] is the Python-compatible singleton for host processes.
@@ -99,8 +108,11 @@ pub struct Runner {
     guardrails: RwLock<Option<Arc<GuardrailPipeline>>>,
     /// The callback ids [`Runner::set_guardrails`] registered (for rebinding).
     guardrail_ids: RwLock<Vec<CallbackId>>,
-    /// The installed subprocess backend ([`UnsupportedSpawner`] by default).
-    spawner: RwLock<Arc<dyn AgentSpawner>>,
+    /// The installed single spawn backend ([`UnsupportedSpawner`] by default).
+    pub(crate) spawner: RwLock<Arc<dyn AgentSpawner>>,
+    /// The installed multi-backend spawn registry; routing takes precedence over
+    /// [`Runner::spawner`] while one is installed.
+    pub(crate) spawner_registry: RwLock<Option<Arc<SpawnerRegistry>>>,
     /// The run status monitor every execution path mirrors into.
     monitor: Arc<RunMonitor>,
     /// The human-in-the-loop hub every execution path registers on.
@@ -146,7 +158,9 @@ impl Runner {
     /// the checkpointer is not built until [`Runner::start`]. The monitor, the
     /// human-in-the-loop hub, and the team pool are built here (from
     /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
-    /// before [`Runner::start`].
+    /// before [`Runner::start`]. No spawn registry is installed: the
+    /// [`UnsupportedSpawner`] default routes every spawn until a host installs a
+    /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
         let queue: Arc<dyn MessageQueue> = InMemoryMessageQueue::new(config.message_queue.clone());
@@ -167,6 +181,7 @@ impl Runner {
             guardrails: RwLock::new(None),
             guardrail_ids: RwLock::new(Vec::new()),
             spawner: RwLock::new(Arc::new(UnsupportedSpawner)),
+            spawner_registry: RwLock::new(None),
             monitor,
             hitl,
             team_pool: RwLock::new(team_pool),
@@ -308,6 +323,9 @@ impl Runner {
     /// Idempotent: a second call while started is a logged no-op. Starting after
     /// [`Runner::stop`] rebuilds the queue, the checkpointer, and the pool from
     /// the current configuration, so [`Runner::set_config`] takes effect here.
+    ///
+    /// The spawn seam is not part of the lifecycle: the installed spawner and
+    /// registry survive `start`/`stop` and keep routing spawns.
     ///
     /// Rebuilding the pool **retires** the previous one: its live pooled team runs
     /// are stopped (bounded by `TeamPoolConfig::stop_timeout`) and a fresh open
@@ -694,26 +712,6 @@ impl Runner {
             .guardrails()
             .ok_or_else(|| error::not_started("guardrail pipeline"))?;
         Ok(pipeline.run(&ctx).await)
-    }
-
-    // -------------------------------------------------------------- spawn --
-
-    /// Installs the subprocess backend [`Runner::spawn_agent`] delegates to.
-    pub fn set_spawner(&self, spawner: Arc<dyn AgentSpawner>) {
-        *self.spawner.write() = spawner;
-    }
-
-    /// Asks the installed spawner to launch the agent described by `spec`.
-    ///
-    /// The default [`UnsupportedSpawner`] answers `Error::Unsupported` naming
-    /// the seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns the spawner's error (by default `Error::Unsupported`).
-    pub async fn spawn_agent(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
-        let spawner = Arc::clone(&self.spawner.read());
-        spawner.spawn(spec).await
     }
 
     // ----------------------------------------------------------- internals --

@@ -36,6 +36,11 @@
 //! until a host installs a backend with `Runner::set_spawner`; it reports
 //! `openjiuwen_common::error::Error::Unsupported`.
 //!
+//! [`crate::spawn::MonitoredSpawnedAgent`] decorates any handle so one spawned
+//! child's lifecycle — admission, health observations, and the terminal
+//! shutdown/kill/drop — is reported into a [`crate::monitor::RunMonitor`] as a
+//! [`crate::monitor::RunKind::Spawn`] run.
+//!
 //! Deferred transports are typed, never silent: `RemoteProtocol::Mq`
 //! (Pulsar/ZeroMQ reply-topic routing) and `RemoteProtocol::A2a` (the A2A remote
 //! transport) fail with `Unsupported` from
@@ -52,6 +57,7 @@
 pub mod external;
 pub mod frames;
 pub mod in_process;
+pub mod monitored;
 pub mod protocol;
 pub mod registry;
 pub mod remote;
@@ -60,6 +66,7 @@ pub mod subprocess;
 pub use external::ExternalCommandSpawner;
 pub use frames::{frame_bytes, parse_frame_line, read_frame, DEFAULT_MAX_FRAME_BYTES};
 pub use in_process::{InProcessAgent, InProcessFactory, InProcessHandler, InProcessSpawner};
+pub use monitored::MonitoredSpawnedAgent;
 pub use protocol::{SpawnMessage, SpawnMessageKind};
 pub use registry::{DeferredSpawner, SpawnerRegistry};
 pub use remote::{

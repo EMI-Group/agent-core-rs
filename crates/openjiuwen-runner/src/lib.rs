@@ -70,6 +70,7 @@ pub mod pool;
 pub mod resources;
 pub mod run;
 pub mod runner;
+mod runner_spawn;
 pub mod spawn;
 
 // ------------------------------------------------------- flat re-exports --
@@ -139,8 +140,10 @@ pub use run::{
 pub use runner::Runner;
 // --- spawn seam and its backends ---
 pub use spawn::{
-    create_remote_client, frame_bytes, parse_frame_line, read_frame, AgentSpawner, RemoteAgent,
-    RemoteAgentConfig, RemoteClient, RemoteProtocol, RemoteSpawner, SpawnAgentKind, SpawnMessage,
-    SpawnMessageKind, SpawnSpec, SpawnedAgent, SpawnedProcess, SubprocessConfig, SubprocessSpawner,
+    create_remote_client, frame_bytes, parse_frame_line, read_frame, AgentSpawner, DeferredSpawner,
+    ExternalCommandSpawner, InProcessAgent, InProcessFactory, InProcessHandler, InProcessSpawner,
+    MonitoredSpawnedAgent, RemoteAgent, RemoteAgentConfig, RemoteClient, RemoteProtocol,
+    RemoteSpawner, SpawnAgentKind, SpawnBackend, SpawnHealth, SpawnMessage, SpawnMessageKind,
+    SpawnSpec, SpawnedAgent, SpawnedProcess, SpawnerRegistry, SubprocessConfig, SubprocessSpawner,
     UnsupportedSpawner, DEFAULT_MAX_FRAME_BYTES,
 };

@@ -15,10 +15,12 @@ use serde_json::Value;
 
 /// The kind of entry a run is executing.
 ///
-/// The variants mirror the runner's non-streaming entry points
+/// The first three variants mirror the runner's non-streaming entry points
 /// ([`crate::Runner::run_agent`], [`crate::Runner::run_workflow`],
 /// [`crate::Runner::run_agent_team`]); a streaming call reports the kind of the
-/// invocation it streams.
+/// invocation it streams. [`Spawn`](RunKind::Spawn) reports a child the runner
+/// supervises through its spawn seam, so a spawned child is distinguishable from
+/// the agent, workflow, and team invocations in the same table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
@@ -29,6 +31,9 @@ pub enum RunKind {
     Workflow,
     /// An agent-team invocation.
     Team,
+    /// A spawned child the runner supervises through the spawn seam: a child
+    /// process, an external command, an in-process agent, or a remote endpoint.
+    Spawn,
 }
 
 /// The lifecycle phase of a run.
@@ -75,7 +80,7 @@ impl RunPhase {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct RunStart {
-    /// Which entry point is executing.
+    /// Which entry point (or spawned child) is executing.
     pub kind: RunKind,
     /// Human-readable component label (the agent/workflow/team card name).
     pub label: String,
@@ -199,7 +204,7 @@ pub struct RunStatus {
     /// The run id: minted by [`RunMonitor::begin`](crate::monitor::RunMonitor::begin),
     /// or supplied to [`RunMonitor::track`](crate::monitor::RunMonitor::track).
     pub run_id: String,
-    /// Which entry point the run executes.
+    /// Which entry point (or spawned child) the run executes.
     pub kind: RunKind,
     /// Human-readable component label (the card name).
     pub label: String,
@@ -286,6 +291,14 @@ mod tests {
             json!("workflow")
         );
         assert_eq!(serde_json::to_value(RunKind::Team).unwrap(), json!("team"));
+        assert_eq!(
+            serde_json::to_value(RunKind::Spawn).unwrap(),
+            json!("spawn")
+        );
+        assert_eq!(
+            serde_json::from_value::<RunKind>(json!("spawn")).unwrap(),
+            RunKind::Spawn
+        );
         assert_eq!(
             serde_json::to_value(RunPhase::Cancelled).unwrap(),
             json!("cancelled")

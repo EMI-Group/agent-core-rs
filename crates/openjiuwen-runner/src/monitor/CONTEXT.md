@@ -2,11 +2,12 @@
 ## Intent
 Keeps one status snapshot per run the runner is executing and publishes one event per state transition on a tokio broadcast channel, so a host can render live progress and the final outcome without polling the session.
 In-memory only: the monitor is a view of what the runner is doing, not a durable record (see Notes & Deferrals).
+A spawned child is tracked like any other run: `Spawn` is the kind `spawn::MonitoredSpawnedAgent` admits, updates on health probes, and finishes on shutdown, kill, or drop, so spawn lifecycle events travel through the same bounded per-run history and broadcast channel as agent, workflow, and team runs.
 Python parity: Python had no standalone monitor type; the fields are the union of `team_runner.py`'s active-team records (component label, session id, status) and the callback `_framework:*` event payloads (`run_id`, component, session id).
 ## API Surface
 ```rust
 // types (status.rs) — serde snake_case, tolerant of unknown/missing fields
-pub enum RunKind { Agent, Workflow, Team }                  // Copy+Eq+Hash, Default = Agent
+pub enum RunKind { Agent, Workflow, Team, Spawn }           // Copy+Eq+Hash, Default = Agent
 pub enum RunPhase { Queued, Running, Paused, Completed, Failed, Cancelled } // Default = Queued
 impl RunPhase { pub fn is_terminal(&self) -> bool; }        // Completed | Failed | Cancelled
 pub struct RunStart { pub kind: RunKind, pub label: String, pub session_id: Option<String>, pub detail: Value }
@@ -59,6 +60,7 @@ impl Drop for RunStatusGuard // unfinished -> finish as Cancelled with detail {"
 - `finish` on an unknown id uses the same `NotFound` wording; a second `finish` is the same `Validation` wording; the outcome's phase is recorded as given.
 - History retains the newest `EVENT_HISTORY_LIMIT` events per run; a retained finished run keeps at least its `Queued` and terminal events.
 - Retention: every live run stays; finishing one more than `LIVE_RUN_LIMIT` finished runs evicts the oldest finished run along with its status and history, so `snapshot`/`history` of an evicted id are `NotFound`.
+- `Spawn` runs are ordinary runs with label == the spawned handle's id: `spawn::MonitoredSpawnedAgent` admits them in `Running` (after a `Queued` track), reports each `health` probe as a `Running` update whose detail is `{backend, alive, healthy, pid}` (or `{healthy: false, error}`), and finishes them as `Completed` (`{"graceful": …}` / `{"reason": "handle_dropped"}`), `Cancelled` (`{"reason": "force_kill"}`), or `Failed`; nothing about the retention bounds or the event contract differs.
 - `list_active` excludes terminal runs and sorts by `(started_at, run_id)`, so the order is deterministic when two runs share a millisecond; `snapshot` and `history` are unaffected by ordering.
 - `subscribe` returns a receiver for events published from then on; a slow subscriber gets `Err(RecvError::Lagged(n))` (frames dropped for that subscriber only, it can keep receiving) and `RecvError::Closed` only once every `RunMonitor` clone is gone.
 - Timestamps are epoch milliseconds (`SystemTime` since `UNIX_EPOCH`), saturated at `i64::MAX` and `0` for a pre-epoch clock; no call panics on the clock.
