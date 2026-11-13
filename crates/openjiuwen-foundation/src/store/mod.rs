@@ -32,6 +32,15 @@ mod tests;
 pub use document::SqliteDocumentStore;
 pub use document::{Document, DocumentStore, Query, SortOrder};
 pub use document::{InMemoryDocumentStore, LocalFileDocumentStore};
+pub use external::{
+    available_backend_names, create_document_store, create_graph_store, create_kv_store,
+    create_object_store, create_vector_store, global_registry, register_document_backend,
+    register_graph_backend, register_kv_backend, register_object_backend, register_vector_backend,
+    BackendKind, ChromaConfig, ChromaVectorStore, Credentials, DocumentStoreFactory,
+    ElasticsearchConfig, ElasticsearchDocumentStore, ElasticsearchVectorStore, GraphStoreFactory,
+    KvStoreFactory, MilvusConfig, MilvusVectorStore, ObjectStoreFactory, RedisConfig, RedisKvStore,
+    S3Config, S3ObjectStore, StoreFamily, StoreRegistry, StoreSpec, VectorStoreFactory,
+};
 pub use filter::{matches, matches_all};
 pub use graph::{Direction, GraphEdge, GraphNode, GraphQuery, GraphStore};
 pub use graph::{InMemoryGraphStore, LocalFileGraphStore};

@@ -498,12 +498,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = LocalFileKvStore::new(store_dir(&dir)).await.unwrap();
+            // A long TTL keeps the lock held for the whole test, whatever the load.
             assert!(store
-                .exclusive_set("lock", KvValue::text("a"), Some(Duration::from_millis(20)))
+                .exclusive_set("held", KvValue::text("a"), Some(Duration::from_secs(30)))
                 .await
                 .unwrap());
             assert!(!store
-                .exclusive_set("lock", KvValue::text("b"), None)
+                .exclusive_set("held", KvValue::text("b"), None)
+                .await
+                .unwrap());
+            // A short TTL has expired by the time the store is reopened.
+            assert!(store
+                .exclusive_set("lock", KvValue::text("a"), Some(Duration::from_millis(20)))
                 .await
                 .unwrap());
         }
