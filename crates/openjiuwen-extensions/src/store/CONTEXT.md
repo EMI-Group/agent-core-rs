@@ -89,7 +89,7 @@ impl ElasticsearchVectorStore {
 
 ## Test Strategy
 
-- Unit tests beside `mod.rs`: `StoreBackend::from_json` for every kind and an unknown kind; memory KV set/get round-trip through the factory; file KV under a `tempfile::TempDir`; sqlite branch under `--features sqlite`; `StoreBackend::Redis` → `ErrorKind::Unsupported` with the message naming the backend (the vector factory keeps answering `Unsupported` for `Elasticsearch` until the factory wiring lands).
+- Unit tests beside `mod.rs`: `StoreBackend::from_json` for every kind and an unknown kind; memory KV set/get round-trip through the factory; file KV under a `tempfile::TempDir`; sqlite branch under `--features sqlite`; `StoreBackend::Redis` → `ErrorKind::Unsupported` with the message naming the backend; the vector factory's `Elasticsearch` arm is asserted in `./mod.rs`.
 - `elasticsearch` tests: `src/store/elasticsearch/tests.rs` covers configuration, index naming, the mapping builder and its schema round-trip, the filter-translation truth table, score clamping, and result ordering; `./tests/elasticsearch.rs` drives every REST operation against a `wiremock` server (create/exists/schema/delete/list, 409, NDJSON bulk, k-NN request and hit mapping, 404/503/400 mapping, dimensions, duplicate keys, delete-by-query).
 - `redis` tests: scheme validation, `cluster_mode` inference, and every `KvStore` method returning `ErrorKind::Unsupported`.
 - Python counterparts named in comments: `tests/unit_tests/extensions/store/test_es_vector_store.py`, `test_gauss_db.py` (behavior not ported — noted in the test comment).
