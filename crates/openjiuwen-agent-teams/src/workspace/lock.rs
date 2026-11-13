@@ -107,13 +107,17 @@ impl WorktreeLockGuard {
     /// Returns [`Error::SysOp`] when the file exists but cannot be removed. A file that is already
     /// gone is treated as a successful release.
     pub async fn release(mut self) -> Result<()> {
-        self.released = true;
         match tokio::fs::remove_file(&self.path).await {
             Ok(()) => {
+                self.released = true;
                 debug!(lock = %self.path.display(), "released worktree lock");
                 Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Someone else already reclaimed the file; nothing is held any more.
+                self.released = true;
+                Ok(())
+            }
             Err(error) => Err(Error::sys_op(format!(
                 "releasing worktree lock {}: {error}",
                 self.path.display()
