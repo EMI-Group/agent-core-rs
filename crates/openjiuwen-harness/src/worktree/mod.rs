@@ -30,8 +30,11 @@
 //! - [`WorktreeEvent`] / [`WorktreeEventSink`] — lifecycle events with a
 //!   broadcast sink and a recording sink.
 //! - [`WorktreeTool`] — the model-facing `worktree` tool (actions `create`,
-//!   `list`, `remove`, `lock`, `unlock`, `prune`, `status`). It is not mounted by
-//!   [`crate::tools::ToolRegistry`] yet; the registry wiring is a separate change.
+//!   `list`, `remove`, `lock`, `unlock`, `prune`, `status`), mounted by
+//!   [`crate::tools::ToolRegistry`] as
+//!   [`BuiltinTool::Worktree`](crate::tools::BuiltinTool::Worktree), the last of
+//!   the extended tools, and built from a [`WorktreeManager`] plus the registry
+//!   language and permission engine.
 //!
 //! # Constraints
 //!

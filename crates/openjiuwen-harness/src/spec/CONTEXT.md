@@ -10,7 +10,7 @@ Loading reads files only: no dynamic-library loading, no process spawn, no netwo
 
 - `DeepAgentSpec` — serde template (`yaml`, `json`, or Markdown with YAML front matter); `from_path`, `parse`, `validate`, `label`, `with_source_path`; `source_path` is skipped by serde.
 - Field types: `ModelSpec`, `PromptFragment` (default priority `100`), `SkillSpec` (default `enabled: true`), `SubAgentSpec`, `WorkspaceHints`, `SpecFormat`.
-- `KNOWN_RAILS` (accepted rail names) and `SUPPORTED_SPEC_EXTENSIONS` (`yaml`, `yml`, `json`, `md`).
+- `KNOWN_RAILS` (accepted rail names) and `SUPPORTED_SPEC_EXTENSIONS` (`yaml`, `yml`, `json`, `md`, `markdown`).
 - `SpecRegistry::{discover, from_specs, get, entry, entries, names, resolve}` with `SpecEntry { name, path, source, spec }` and `SpecSource::{Workspace, Home, Builtin}`; `AGENTS_DIR = ".openjiuwen/agents"`.
 - `PluginManifest` (`from_path`, `validate`, `label`), `PluginRegistry::{load, resolve, get, plugins, len, is_empty}`, `ResolvedPlugin`, `ResolvedPlugins::{tools, rails, skill_roots, specs, plugins, len, is_empty}`, `load_plugins`, `PLUGIN_MANIFEST_FILENAME = "plugin.yaml"`.
 - `ResolvedSpec` (+ `ResolvedSkill`) — `workspace`, `enabled_skill_roots`, `to_config`, `supplemental_tools`, `into_builder`; `resolve`, `resolve_with_source`, `SpecBuildOptions`, and async `build_agent`.

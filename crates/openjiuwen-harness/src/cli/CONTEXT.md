@@ -108,7 +108,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - Rich/prompt_toolkit TUI: panels/logo banner, `SlashCompleter`, multiline editing, markdown rendering, diff rendering in tool results (plain ANSI styling only).
 - Dollar-price `/cost` reporting (Python has none either: token/call counts only).
 - LLM-summarising `/compact` (bounded truncation instead).
-- MCP resource tools, web search/fetch tools, plugin hot-loading, `--config` command, file-based session history restore.
+- The extended built-in tools (`fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, the MCP-resource, goal, `lsp` and `worktree` tools) are not mounted by the CLI agent: `build_agent` keeps the builder's default twenty-card set and adds only the MCP tools loaded from `mcp.json`.
+- Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI), a `--config` command, and file-based session-history restore.
 - Multi-skill roots beyond `<workspace>/skills` and `<home>/skills` (`~/.claude/skills`, `~/.codex/skills` are not scanned).
 
 ## Routing Table

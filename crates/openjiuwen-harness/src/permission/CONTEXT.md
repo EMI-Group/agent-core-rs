@@ -53,7 +53,7 @@ Every public item is also re-exported flat from this module (`crate::permission:
 - `external_directory` legacy section (superseded by `file_guard` + `trusted_dirs`).
 - Literal-shell allow shortcut (`literal_shell.py`, `parse_literal_shell`).
 - `ask_presentation.py` suggestion chips/categories beyond category/title/summary and the always-allow hint.
-- YAML write-back of the `permissions:` block (`write_permissions_section_to_agent_config_yaml`) — belongs to the CLI/config layer.
+- YAML write-back into an agent config document (`write_permissions_section_to_agent_config_yaml`); the CLI persists its merged section to `<home>/permissions.yaml` through `cli::allow_rules` instead.
 - `permission_checks_active` predicate seam (`set_permission_checks_active`).
 - `skill_authorization/` (a separate security axis, not this module).
 

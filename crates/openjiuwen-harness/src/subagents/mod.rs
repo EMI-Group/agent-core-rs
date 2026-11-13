@@ -8,9 +8,10 @@
 //! runtime owns the live child instances of one parent session, and [`TaskTool`] plus the
 //! six `subagent_*` tools are the model-facing surface over them; the Rust-only
 //! `subagent_transcript` tool ([`SubagentTranscriptTool`]) reads an instance's bounded
-//! transcript and is mounted by [`subagent_tools_with_transcript`]. Everything is in-process
-//! and in-memory: child agents are built lazily by a [`SubAgentFactory`], so this module
-//! never depends on [`crate::agent`].
+//! transcript and is mounted by [`subagent_tools_with_transcript`]. Everything is in-process:
+//! child agents are built lazily by a [`SubAgentFactory`], so this module never depends on
+//! [`crate::agent`]; live instance state stays in memory and [`SubAgentRuntime`] snapshots it
+//! to a file bucket through [`persistence`].
 mod presets;
 mod runtime;
 mod subagent_tools;

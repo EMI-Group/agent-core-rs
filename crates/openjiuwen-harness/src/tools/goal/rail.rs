@@ -21,16 +21,19 @@
 //! # Events
 //!
 //! Rails have no direct event sink, so `goal.updated` events are appended to a JSON array under
-//! [`GOAL_EVENT_EXTRA_KEY`] in [`HarnessRailContext::extra_mut`]. The agent or task loop drains
-//! that key after firing the hooks and forwards every entry to the interaction output stream.
+//! [`GOAL_EVENT_EXTRA_KEY`] in [`HarnessRailContext::extra_mut`]. The host drains that key after
+//! firing the hooks and forwards every entry to the interaction output stream; the `DeepAgent`
+//! loop has no drain seam of its own, so a host that skips the drain observes no goal event.
 //! Entries use [`InteractionEvent::to_output_value`]: `{"type": "goal.updated", "index": 0,
 //! "payload": {"goal": { … }}}`.
 //!
 //! # Registration
 //!
-//! Hosts register the rail with `HarnessRailRegistry::register`. This module is the canonical
-//! path today (`crate::tools::goal::GoalRail`); a `crate::rails::goal` re-export is pending, at
-//! which point this file moves next to the other built-in rails.
+//! `DeepAgentBuilder::build` and `resolve_deep_agent_parts` register the rail automatically when
+//! a mounted tool is `get_current_goal` or `submit_goal_report` (one registration, the caller's
+//! rail of the same name wins); a host may also register it directly on a
+//! `HarnessRailRegistry`. This module is the canonical path (`crate::tools::goal::GoalRail`);
+//! `crate::rails` deliberately does not re-export it, because `rails` must not depend on `tools`.
 //!
 //! # Failure policy
 //!
@@ -57,7 +60,7 @@ use super::store::GoalStore;
 ///
 /// 90 is the Python planning/interrupt tier (`rail_priority::PLANNING` and
 /// `rail_priority::INTERRUPT`), where the goal reminder is registered. The constant is local
-/// because `src/rails/mod.rs` owns that ladder and this rail is scheduled to move there; the
+/// because `src/rails/mod.rs` owns that ladder and `rails` must not depend on `tools`; the
 /// value must stay equal to `crate::rails::rail_priority::PLANNING`.
 const GOAL_RAIL_PRIORITY: i32 = 90;
 
@@ -73,8 +76,8 @@ const GOAL_HEARTBEAT_MARKER: &str = "[goal-heartbeat]";
 /// Key in [`HarnessRailContext::extra_mut`] holding the queued `goal.updated` events.
 ///
 /// The value is a JSON array; the rail appends to it and never overwrites it, so several
-/// iterations of one invocation accumulate their events. The agent or task loop drains the key
-/// after firing the hooks and forwards each entry to the interaction stream.
+/// iterations of one invocation accumulate their events. The host drains the key after firing
+/// the hooks and forwards each entry to the interaction stream.
 pub const GOAL_EVENT_EXTRA_KEY: &str = "harness.goal_events";
 
 /// Tunables of [`GoalRail`].

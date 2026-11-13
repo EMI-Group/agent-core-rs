@@ -42,7 +42,7 @@ Upper layers only see the two tools and the dispatch functions; the per-format p
 
 ## Constraints
 
-- Only files under `src/tools/media/` belong to this node; `src/tools/mod.rs` (registry, `BuiltinTool`, `tool_names`) and `src/tools/descriptions.rs` are owned elsewhere — the tools are not registered yet and the description table has no entries, so `description("image_metadata"|"audio_metadata", lang)` returns `""` today.
+- Only files under `src/tools/media/` belong to this node; `src/tools/mod.rs` (registry, `BuiltinTool`, `tool_names`) and `src/tools/descriptions.rs` are owned elsewhere — both tools are mounted as `BuiltinTool::ImageMetadata`/`BuiltinTool::AudioMetadata` and carry bilingual description rows, so `description("image_metadata"|"audio_metadata", lang)` returns the Python text.
 - Expected failures are `success=false` payloads or `Failure` values, never `Err`/panic; `Err` is reserved for protocol violations and cancellation.
 - No `unwrap`/`expect`/`panic!` outside `#[cfg(test)]`, no `unsafe`, no `println!`/`eprintln!`; `missing_docs` applies to every public item.
 - Paths go only through `ToolEnv::resolve_path`; an absolute path inside the workspace is accepted, anything outside (`..`, outside the root, `http(s)` URLs) is refused.
@@ -66,7 +66,7 @@ Upper layers only see the two tools and the dispatch functions; the per-format p
 - URL/HTTP(S) inputs, multipart uploads and remote asset resolution.
 - Pixel/sample decoding, thumbnails, waveform or peak extraction, cover-art/ID3 frame parsing beyond the tag length.
 - Additional containers (TIFF, HEIF/AVIF, ICO, SVG, MP4/M4A, OGG-FLAC, AIFF) and MP3/VBR per-frame refinement beyond the first frame plus `Xing`.
-- Python's `AudioMetadataTool`/vision tool registration in the tool registry and their description table entries.
+- Python's model-backed multimodal tool family beyond metadata (vision question answering, image captioning, audio transcription tools) and their registry entries.
 
 ## Routing Table
 

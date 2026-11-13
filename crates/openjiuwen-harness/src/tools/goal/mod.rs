@@ -20,16 +20,19 @@
 //!
 //! # Goal rail
 //!
-//! The rail is built with `GoalRail::new(Arc<GoalStore>, GoalRailConfig)` and registered by the
-//! host on its `HarnessRailRegistry`. It publishes the prompt section named `goal` (title
+//! The rail is built with `GoalRail::new(Arc<GoalStore>, GoalRailConfig)` and registered on a
+//! `HarnessRailRegistry`. `DeepAgentBuilder::build` and `resolve_deep_agent_parts` register it
+//! automatically when a mounted tool is `get_current_goal` or `submit_goal_report`, and a host
+//! may also register it directly. It publishes the prompt section named `goal` (title
 //! `Current Goal`) and queues its interaction events in `ctx.extra` under
 //! [`GOAL_EVENT_EXTRA_KEY`] (`harness.goal_events`), because rails have no direct event sink;
-//! the agent or task loop drains that JSON array and forwards each entry to the interaction
-//! stream. A corrupt goal file is logged and skipped, never fatal.
+//! the host drains that JSON array after the task-iteration hooks and forwards each entry to the
+//! interaction stream, since the `DeepAgent` loop exposes no drain seam. A corrupt goal file is
+//! logged and skipped, never fatal.
 //!
-//! A `crate::rails::goal` re-export is pending, so `crate::tools::goal::GoalRail` is the
-//! canonical path today. This module is the one place in `crate::tools` that touches
-//! `crate::rails`; the rail moves beside the other built-in rails once that node owns it.
+//! `crate::tools::goal::GoalRail` is the only path: `crate::rails` deliberately does not
+//! re-export it, because `rails` must not depend on `tools`. This module is the one place in
+//! `crate::tools` that touches `crate::rails`.
 //!
 //! # Deviation from Python
 //!
@@ -38,9 +41,9 @@
 //! `TaskCompletionRail`. Only the data half is ported here: a file-backed [`GoalStore`] with one
 //! async lock per instance, and tools that commit the model's assessment directly. The
 //! loop-side behaviour — attempt scheduling, pause/resume/overwrite policy, event emission and
-//! the `goal.updated` interaction events — lives in the goal rail (`crate::rails::goal`), which
-//! owns the `GoalManager` role and drives these types through [`GoalStore::load`],
-//! [`GoalStore::update`] and [`GoalRecord::progress_summary`].
+//! the `goal.updated` interaction events — lives in the goal rail
+//! ([`GoalRail`]), which owns the `GoalManager` role and drives these types through
+//! [`GoalStore::load`], [`GoalStore::update`] and [`GoalRecord::progress_summary`].
 //!
 //! Two smaller differences: the persisted record is one `goal.json` instead of session state
 //! (see [`GoalStore::for_workspace`]), and an unknown persisted status degrades to `active`

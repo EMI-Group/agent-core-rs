@@ -2,7 +2,8 @@
 ## Intent
 The persisted session goal and the two model-facing goal tools, porting `openjiuwen/harness/goal/{schema,store,manager}.py` and the model-facing half of `openjiuwen/harness/tools/goal.py`.
 Python's split into session-state store + `GoalManager` + per-round `GoalReportSink` is reduced to a file-backed `GoalStore`, the two model-facing tools, and `GoalRail` (the loop-side manager role).
-`GoalRail` lives here rather than in `src/rails/` because this node owns `src/tools/**`; `src/rails/mod.rs` should re-export it when the rails node gains the wiring.
+`GoalRail` lives here rather than in `src/rails/` because this node owns `src/tools/**` and `src/rails/` must not depend on `src/tools/`: `crate::rails` deliberately does not re-export it, and `crate::tools::goal::GoalRail` is the only path.
+`DeepAgentBuilder::build` and `resolve_deep_agent_parts` register the rail automatically when a mounted tool is `get_current_goal` or `submit_goal_report`; a host may also register it itself.
 ## API Surface
 - `schema.rs` — `GoalStatus` (`active|paused|completed|blocked`), `GoalAssessmentStatus` (`continue|complete|blocked`), `GoalAssessment` (`to_dict`/`from_dict`/`new`), `TokenUsage` (`accumulate`, `to_dict`, `from_dict`), plus `now_iso(DateTime<Utc>)`, `parse_timestamp(&str)` and `DEFAULT_SESSION_ID`.
 - `record.rs` — `GoalRecord`: Python JSON keys, `new`/`with_session_id`/`with_limits`/`touch`/`bump_revision`/`start_timing`/`settle_active_time`/`record_progress`/`set_status`/`is_active`/`progress_summary`/`to_dict`/`from_dict`, plus the persisted-record integer/timestamp validators.
@@ -23,9 +24,12 @@ Python's split into session-state store + `GoalManager` + per-round `GoalReportS
 - Unknown persisted `status` degrades to `active` with a warning instead of clearing the goal (Python raises and the store drops the record).
 - `get_current_goal` returns `{goal: <record>|null, message?}` inside the six-key envelope and renders Python's flat `goal_id/objective/status/attempt_count/last_assessment` lines for the model.
 - `submit_goal_report` returns `{result: "report_accepted", status}` and adds `goal_id`/`goal_status` when a record was updated, or `message` when none exists (nothing is created).
-- Rails have no direct event sink, so the rail queues `goal.updated` events under `harness.goal_events`; the agent or task loop drains that key and forwards each entry to the interaction stream.
+- Rails have no direct event sink, so the rail queues `goal.updated` events under `harness.goal_events`; the host drains that key after the task-iteration hooks and forwards each entry to the interaction stream (see Known Issues).
 - A heartbeat nudge fires when `heartbeat_interval == Some(n)`, `n > 0` and `iteration % n == 0`; `None` and `Some(0)` both disable it.
 - `record_progress` never bumps the revision (Python parity); settling statuses close the clock and set `last_stop_reason`.
+## Known Issues
+- No goal-event drain in the agent: `GoalRail` appends `goal.updated` payloads under `harness.goal_events` on its rail context, and neither `crate::agent::round` nor `crate::task_loop` copies a rail context's `extra` into the interaction stream, so no rail-queued goal event reaches a caller.
+- A drain would be a new seam (the only interaction frames forwarded are the inner agent's own `interaction` chunks), and until then the host owns the drain after the task-iteration hooks; `src/agent/CONTEXT.md` records the same gap.
 ## Routing Table
 - `./mod.rs` → module docs, declarations, flat re-exports
 - `./schema.rs` → statuses, assessment, token usage, timestamp/value helpers, serde
