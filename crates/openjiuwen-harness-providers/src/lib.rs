@@ -39,6 +39,9 @@
 //! - [`providers`] — the compile-time built-in provider table (`native`, plus the `vendor`-gated
 //!   stubs) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation.
+//! - [`vendor_cli`] — shared plumbing for the vendor CLI harnesses: binary resolution, the NDJSON
+//!   child transport, the observation event bus, session-id derivation and host permission
+//!   translation.
 //!
 //! The crate-internal `decode` module holds the strict JSON mapping helpers (unknown-key
 //! rejection, typed option decoding) shared by the factory and the provider configuration
@@ -55,6 +58,7 @@ pub mod mcp_naming;
 pub mod provider;
 pub mod providers;
 pub mod skills;
+pub mod vendor_cli;
 
 pub use error::providers_error_to_common;
 pub use factory::{
@@ -78,4 +82,10 @@ pub use provider::{
 };
 pub use skills::{
     install_skills, normalize_skills, skill_scan_dir, SkillConflict, SkillMode, SkillSource,
+};
+pub use vendor_cli::{
+    ask_tool_approval, ask_user_input, checkpoint_str, derive_session_id, encode_line, get_array,
+    get_bool, get_f64, get_object, get_str, get_u64, is_available, parse_line, parse_line_labelled,
+    resolve_binary, resolve_resume_id, snippet, string_list, ApprovalDecision, BinarySpec,
+    ChildProcess, ChildProcessConfig, EnvelopeBuilder, EventBus, PermissionPolicy,
 };

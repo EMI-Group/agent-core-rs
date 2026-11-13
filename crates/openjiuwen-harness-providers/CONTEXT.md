@@ -36,9 +36,17 @@ Helpers (flat re-exports):
 - Skills: `SkillSource`, `SkillMode` (`all`/`auto_list`), `SkillConflict` (`skip`/`replace`/`append`), `normalize_skills`, `install_skills`, `skill_scan_dir(provider)`.
 - `providers_error_to_common(HarnessError) -> openjiuwen_common::error::Error` (module `error`).
 
+Shared vendor CLI transport (module `vendor_cli`, foundation for the three CLI adapters):
+- `binary` — `BinarySpec`, `resolve_binary`, `is_available` (explicit path validated, `PATH` fallback, actionable `Protocol` errors).
+- `jsonl` — `parse_line`, `parse_line_labelled`, `encode_line`, `get_str`, `get_object`, `get_array`, `get_bool`, `get_u64`, `get_f64`, `string_list`, `snippet`.
+- `child` — `ChildProcessConfig`, `ChildProcess` (`spawn`, `write_json`, `write_line`, `read_json`, `stderr_tail`, `close_stdin`, `kill`, `wait`, `pid`), `DEFAULT_MAX_LINE_BYTES`, `STDERR_TAIL_LINES`, `STDERR_TAIL_CHARS`, `EXIT_TIMEOUT`.
+- `events` — `EventBus` (`new`, `emit`, `events`, `turn_events`, `close`, `is_closed`, `len`, `is_empty`), `EnvelopeBuilder` (`new`, `set_provider_session_id`, `next`, `next_for_turn`, `next_for_item`).
+- `permissions` — `PermissionPolicy` (`from_context`, `interactive`), `ApprovalDecision`, `ask_tool_approval`, `ask_user_input`.
+- `session` — `derive_session_id`, `resolve_resume_id`, `checkpoint_str`.
+
 ## Constraints
 
-- Depends only on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-common`, and (for the IO adapter's shared IO types) `openjiuwen-agent` + `openjiuwen-session`; never on `openjiuwen-core`, `openjiuwen-agent-teams`, or vendor SDKs.
+- Depends only on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-common`, and (for the IO adapter's shared IO types) `openjiuwen-agent` + `openjiuwen-session`; never on `openjiuwen-core`, `openjiuwen-agent-teams`, or vendor SDKs. `which` is used only by `vendor_cli::binary`.
 - `openjiuwen-harness` owns every harness behavior; this crate wires, selects, validates and adapts — no harness logic is duplicated here.
 - Registry functions are synchronous and return `openjiuwen_common::error::Result`; provider SPI calls return `HarnessResult`; `error::providers_error_to_common` is the single translation point (UnsupportedCapability → `Error::Unsupported`, Validation → `Error::Validation`, State/Protocol → `Error::Config`, CheckpointConflict → `Error::Session`, wildcard → `Error::External`).
 - Global registry state is process-wide and documented (mirrors Python's module dict): `std::sync::RwLock` + `indexmap` for insertion order, never held across `.await`.
@@ -70,6 +78,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter/` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler` (`mod.rs`), event→chunk projection (`projection.rs`), interaction routing and the pending map (`interactions.rs`), host-answer parsing (`answers.rs`)
+- `./src/vendor_cli/` → shared vendor CLI subprocess transport: binary resolution, NDJSON helpers, the child process, the observation bus, host permission translation, session-id derivation
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
 - `./src/decode.rs` → strict JSON mapping helpers shared by factory + vendor configs (unknown-key rejection, typed option decoding)
 - `./src/error.rs` → `HarnessError` → `openjiuwen_common::error::Error` translation
@@ -121,10 +130,12 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `tests/io_adapter.rs` — chunk projection order and kinds, turn-lifecycle projection off by default, interactive-input round trip, unmatched input forwarding, auto-approve vs host approval, dynamic tool call routed through `ToolGateway`, delivery-mode selection, abort fallback, failed start cleanup; driven by an in-test `FakeHarness`.
 - `tests/vendor.rs` (`#![cfg(feature = "vendor")]`) — vendor cards/capabilities, config `from_json` strictness and defaults, `model_config` fragments and rejections, `create` returns `Error::Unsupported` with the SDK-required message, serde round-trip snapshots.
 - `tests/skills.rs` — normalize modes/errors, skip/replace/append conflict policies, `enabled_skills` selection, traversal rejection, non-regular-file rejection.
+- `tests/vendor_cli.rs` (`#![cfg(unix)]`) — the real subprocess path over `tests/support::FakeCli`: NDJSON round trip and transcript, ordered replies, EOF as `Ok(None)`, stderr tail, broken-pipe message, malformed and over-long output lines, `kill` reaping, arguments/cwd, cleared environment.
+- `tests/support/mod.rs` — `FakeCli::{script, replies, path, lines, env}`, a temp-directory POSIX shell script with a stdin transcript; included per test binary with `mod support;`.
 - Unit tests beside modules for pure helpers (`input`, `json`, `mcp_naming`, `decode`, `error`, plus factory and projection/answer unit tests).
 - All tests are offline and deterministic: no network, no sleeps beyond bounded timeouts, temporary directories for filesystem work, Python behavior tests named after their counterpart in `tests/unit_tests/harness_providers/`.
 - Registry-mutating tests share a per-binary `Mutex` guard (`registry_guard()`) because the registry is process-global; without it, positional `available_providers()` assertions race with a concurrent `unregister_harness_provider`.
-- Current suites: lib 109 unit tests, `tests/io_adapter.rs` 20, `tests/native.rs` 9, `tests/registry.rs` 23 (18 without `native`), `tests/skills.rs` 26, `tests/vendor.rs` 36.
+- Current suites: lib 166 unit tests, `tests/io_adapter.rs` 20, `tests/native.rs` 9, `tests/registry.rs` 23 (18 without `native`), `tests/skills.rs` 26, `tests/vendor.rs` 36, `tests/vendor_cli.rs` 11.
 - Definition of done: `cargo fmt -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers --features vendor`, `cargo test -p openjiuwen-harness-providers --no-default-features`, `cargo clippy -p openjiuwen-harness-providers --all-targets --features vendor -- -D warnings` all clean.
 
 ## Notes for Agents
