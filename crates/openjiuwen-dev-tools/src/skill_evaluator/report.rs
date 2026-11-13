@@ -386,9 +386,15 @@ mod tests {
 
     #[test]
     fn status_from_covers_all_and_none_and_mixed() {
-        assert_eq!(status_from(&[outcome(true), outcome(true)]), CaseStatus::Passed);
+        assert_eq!(
+            status_from(&[outcome(true), outcome(true)]),
+            CaseStatus::Passed
+        );
         assert_eq!(status_from(&[outcome(false)]), CaseStatus::Failed);
-        assert_eq!(status_from(&[outcome(true), outcome(false)]), CaseStatus::Partial);
+        assert_eq!(
+            status_from(&[outcome(true), outcome(false)]),
+            CaseStatus::Partial
+        );
         assert_eq!(status_from(&[]), CaseStatus::Passed);
     }
 
