@@ -260,7 +260,7 @@ pub fn attach_config(spec: &TeamAgentSpec) -> Option<AttachConfig> {
             _ => {}
         }
     }
-    if socket.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if socket.as_deref().is_none_or(|path| path.trim().is_empty()) {
         socket = std::env::var(ATTACH_SOCKET_ENV)
             .ok()
             .filter(|path| !path.trim().is_empty());

@@ -52,7 +52,7 @@ impl std::fmt::Debug for OrgBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OrgBinding")
             .field("organization_id", &self.organization_id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 impl OrgBinding {

@@ -237,6 +237,6 @@ impl std::fmt::Debug for TeamSignals {
             .field("team_name", &self.team_name)
             .field("hooks", &self.observability.hooks().len())
             .field("monitor", &self.monitor_emitter().is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
