@@ -11,12 +11,14 @@
 //! `tempfile` directory; the URL loader and the auto-dispatch URL branch run
 //! against a loopback `wiremock` server. Everything is offline and deterministic:
 //! generated ids are only checked for shape, never for a concrete value.
+//! Binary `DOCX`/`XLSX`/`PDF`/`PPTX`/`ODT` bytes come from the public
+//! `loaders::fixtures` builders, so the suite owns no `ZIP` writer of its own.
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{ErrorKind, Result};
-use openjiuwen_retrieval::loaders::DocxLoader;
+use openjiuwen_retrieval::loaders::{fixtures, DocxLoader};
 use openjiuwen_retrieval::{
     extract_title, html_to_text, AutoLoader, CsvLoader, Document, DocumentLoader, HtmlLoader,
     JsonLoader, LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
@@ -469,73 +471,16 @@ async fn loader_registry_is_case_insensitive_and_first_registration_wins() {
     assert!(defaults.get_for_path("photo.PNG").is_some());
     assert!(defaults.get_for_path("legacy.xls").is_none());
     assert!(defaults.get_for_path("archive.zip").is_none());
-    assert_eq!(defaults.extensions().len(), 17);
+    // Text/Markdown/JSON/CSV/TSV/HTML, DOCX, ODT, XLSX, PDF, PPTX, and the 8
+    // image extensions.
+    assert!(defaults.get_for_path("memo.odt").is_some());
+    assert!(defaults.get_for_path("deck.pptx").is_some());
+    assert_eq!(defaults.extensions().len(), 19);
 }
 
 // ---------------------------------------------------------------------------
 // Binary and image fixtures
 // ---------------------------------------------------------------------------
-
-/// Builds a `ZIP` archive with stored (uncompressed) entries.
-///
-/// `DOCX`/`XLSX` fixtures are ordinary `ZIP` containers; writing the archive by
-/// hand keeps the tests free of a compression dependency.
-fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
-    let mut data = Vec::new();
-    let mut directory = Vec::new();
-    let count = entries.len() as u16;
-    for (name, contents) in entries {
-        let name = name.as_bytes();
-        let payload = contents.as_bytes();
-        let offset = data.len() as u32;
-        let crc = openjiuwen_retrieval::parsing::crc32(payload);
-        let size = payload.len() as u32;
-        data.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
-        data.extend_from_slice(&20u16.to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(&crc.to_le_bytes());
-        data.extend_from_slice(&size.to_le_bytes());
-        data.extend_from_slice(&size.to_le_bytes());
-        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(name);
-        data.extend_from_slice(payload);
-
-        directory.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
-        directory.extend_from_slice(&20u16.to_le_bytes());
-        directory.extend_from_slice(&20u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&crc.to_le_bytes());
-        directory.extend_from_slice(&size.to_le_bytes());
-        directory.extend_from_slice(&size.to_le_bytes());
-        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u16.to_le_bytes());
-        directory.extend_from_slice(&0u32.to_le_bytes());
-        directory.extend_from_slice(&offset.to_le_bytes());
-        directory.extend_from_slice(name);
-    }
-    let directory_offset = data.len() as u32;
-    let directory_size = directory.len() as u32;
-    data.extend_from_slice(&directory);
-    data.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
-    data.extend_from_slice(&0u16.to_le_bytes());
-    data.extend_from_slice(&0u16.to_le_bytes());
-    data.extend_from_slice(&count.to_le_bytes());
-    data.extend_from_slice(&count.to_le_bytes());
-    data.extend_from_slice(&directory_size.to_le_bytes());
-    data.extend_from_slice(&directory_offset.to_le_bytes());
-    data.extend_from_slice(&0u16.to_le_bytes());
-    data
-}
 
 /// Writes raw `bytes` into `dir/name` and returns the path as a `String`.
 fn write_bytes(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
@@ -545,6 +490,10 @@ fn write_bytes(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
 }
 
 /// `word/document.xml`: heading, paragraph, and a two-row table.
+///
+/// The shared `fixtures::docx_document` builder only emits plain paragraphs, so
+/// this test keeps its own richer part and wraps it with
+/// [`fixtures::build_zip`].
 const DOCX_DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -569,62 +518,18 @@ const DOCX_CORE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <dc:title>Design notes</dc:title>
 </cp:coreProperties>"#;
 
-/// Builds the `DOCX` archive used by the loader tests.
+/// Builds the `DOCX` archive used by the loader tests with the shared writer.
 fn docx_archive() -> Vec<u8> {
-    build_zip(&[
+    fixtures::build_zip(&[
         ("word/document.xml", DOCX_DOCUMENT),
         ("docProps/core.xml", DOCX_CORE),
     ])
+    .unwrap()
 }
-
-/// Workbook with one `People` sheet.
-const XLSX_WORKBOOK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="People" sheetId="1" r:id="rId1"/></sheets>
-</workbook>"#;
-
-/// Relationship pointing at the single worksheet part.
-const XLSX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>"#;
-
-/// Worksheet with a `Name`/`City` header and one data row.
-const XLSX_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <sheetData>
-    <row r="1">
-      <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
-      <c r="B1" t="inlineStr"><is><t>City</t></is></c>
-    </row>
-    <row r="2">
-      <c r="A2" t="inlineStr"><is><t>alice</t></is></c>
-      <c r="B2" t="inlineStr"><is><t>paris</t></is></c>
-    </row>
-  </sheetData>
-</worksheet>"#;
 
 /// Builds the one-sheet `XLSX` archive used by the loader tests.
 fn xlsx_archive() -> Vec<u8> {
-    build_zip(&[
-        ("xl/workbook.xml", XLSX_WORKBOOK),
-        ("xl/_rels/workbook.xml.rels", XLSX_RELS),
-        ("xl/worksheets/sheet1.xml", XLSX_SHEET),
-    ])
-}
-
-/// Builds one uncompressed PDF content-stream object.
-fn plain_stream(content: &str) -> String {
-    format!(
-        "1 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj",
-        content.len()
-    )
-}
-
-/// Wraps `body` in a minimal `PDF` document.
-fn pdf_document(body: &str) -> Vec<u8> {
-    format!("%PDF-1.7\n{body}\n%%EOF\n").into_bytes()
+    fixtures::xlsx_workbook(&[("People", &["Name,City", "alice,paris"])]).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +664,7 @@ async fn auto_loader_reads_pdf_text_and_page_metadata() {
     let path = write_bytes(
         &dir,
         "paper.pdf",
-        &pdf_document(&plain_stream("BT (Hello PDF) Tj ET")),
+        &fixtures::pdf_document(&fixtures::plain_stream("BT (Hello PDF) Tj ET")),
     );
 
     let documents = AutoLoader::new().load(&path).await.unwrap();
@@ -781,7 +686,7 @@ async fn auto_loader_rejects_scanned_pdfs() {
     let path = write_bytes(
         &dir,
         "scanned.pdf",
-        &pdf_document(
+        &fixtures::pdf_document(
             "4 0 obj\n<< /Filter /DCTDecode /Length 4 >>\nstream\nscan\nendstream\nendobj",
         ),
     );
