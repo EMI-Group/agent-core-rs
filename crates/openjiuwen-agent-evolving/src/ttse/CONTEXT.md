@@ -26,7 +26,8 @@ Ports the offline part of Python `openjiuwen.agent_evolving.ttse`: `config.py`, 
 - Successful trajectories never produce a tip; only failures and error-carrying `unknown` runs are mined.
 
 ## Design Decisions
-- Embedding-backed retrieval and LLM-driven merging are optional seams with deterministic defaults, so the whole pipeline runs offline and the tests never need a provider.
+- Retrieval, dedupe, pruner similarity and dream clustering are token-set Jaccard over `bank::tokenize`/`bank::jaccard`; there is no embedding-provider trait, so the whole pipeline runs offline.
+- The only model seam is `TipInducer::with_model` (wrapped by `TtseEngine::with_model`, `Arc<dyn Model>`); `Dreamer` has no model hook, so LLM-driven merging stays unported (`deferred.rs` area `TTSE embedding retrieval and LLM dreaming`).
 - Connected-component clustering (rather than iterative pairwise merging) makes dreaming order-independent and idempotent.
 - Rendering groups by `TipCategory::order` and ranks by effective score inside a group, so identical inputs always produce identical prompt text.
 - Selection does not mutate observation counters; hit bookkeeping belongs to `TtseEngine`, which is the only component holding `&mut TipBank`.
