@@ -488,5 +488,6 @@ fn status_wire_strings_and_finality() {
 }
 
 mod eviction;
+mod persistence_runtime;
 mod quota;
 mod transcript;
