@@ -35,6 +35,7 @@ use serde_json::Value;
 pub mod memory_store;
 pub mod prompt;
 pub mod record;
+pub mod service;
 pub mod store;
 
 pub use memory_store::{MemoryVectorStore, ScoredNode, VectorNode};
@@ -44,6 +45,10 @@ pub use prompt::{
     TrajectoryFeedback,
 };
 pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
+pub use service::{
+    create_task_memory_service, DeterministicTaskMemoryService, HashingEmbedding, MemoryBackend,
+    MemoryEmbedding, TaskMemoryConfig,
+};
 pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 
 /// The memory algorithm selected for retrieval and summarization.

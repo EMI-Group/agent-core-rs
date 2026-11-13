@@ -60,6 +60,9 @@ use super::record::{sanitize_user, sha256_hex_prefix, MemoryRecord};
 ///   [`MemoryRecord::id`], files it under its own
 ///   [`MemoryRecord::user_id`], and rejects a blank id with
 ///   [`Error::Validation`].
+/// * [`MemoryStore::remove`] deletes at most one record, reports whether it
+///   existed, and leaves the user's other records (and every other user)
+///   untouched.
 /// * [`MemoryStore::clear`] removes every record for that user and leaves
 ///   other users untouched.
 #[async_trait]
@@ -89,6 +92,17 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
     /// [`MemoryRecord::user_id`] is blank, and the implementation's
     /// persistence error otherwise.
     async fn upsert(&self, record: MemoryRecord) -> Result<()>;
+
+    /// Removes the record with `id` from `user_id`'s set.
+    ///
+    /// Returns `true` when a record was removed and `false` when no such record
+    /// existed (an unknown user or an id that is not stored is not an error).
+    ///
+    /// # Errors
+    ///
+    /// Implementations report persistence failures; a missing file or a missing
+    /// id is not an error.
+    async fn remove(&self, user_id: &str, id: &str) -> Result<bool>;
 
     /// Removes every record for `user_id`.
     ///
@@ -146,6 +160,14 @@ impl MemoryStore for InMemoryMemoryStore {
             .or_default()
             .insert(record.id.clone(), record);
         Ok(())
+    }
+
+    async fn remove(&self, user_id: &str, id: &str) -> Result<bool> {
+        let mut users = self.users.write().await;
+        let Some(records) = users.get_mut(user_id) else {
+            return Ok(false);
+        };
+        Ok(records.remove(id).is_some())
     }
 
     async fn clear(&self, user_id: &str) -> Result<()> {
@@ -292,6 +314,18 @@ impl MemoryStore for JsonFileMemoryStore {
         records.insert(record.id.clone(), record);
         let ordered: Vec<MemoryRecord> = records.into_values().collect();
         self.write_records(&user_id, &ordered).await
+    }
+
+    async fn remove(&self, user_id: &str, id: &str) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let mut records = self.read_records(user_id).await?;
+        let before = records.len();
+        records.retain(|record| record.id != id);
+        if records.len() == before {
+            return Ok(false);
+        }
+        self.write_records(user_id, &records).await?;
+        Ok(true)
     }
 
     async fn clear(&self, user_id: &str) -> Result<()> {
@@ -452,6 +486,37 @@ mod tests {
             InMemoryMemoryStore::default().load("user-1").await.unwrap(),
             Vec::new()
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_remove_deletes_one_record() {
+        let store = InMemoryMemoryStore::new();
+        store.upsert(record("a", "user-1", "x")).await.unwrap();
+        store.upsert(record("b", "user-1", "y")).await.unwrap();
+        store.upsert(record("c", "user-2", "z")).await.unwrap();
+
+        assert!(store.remove("user-1", "b").await.unwrap());
+        assert_eq!(ids(&store.load("user-1").await.unwrap()), ["a"]);
+        assert!(!store.remove("user-1", "b").await.unwrap());
+        assert!(!store.remove("unknown", "a").await.unwrap());
+        assert_eq!(ids(&store.load("user-2").await.unwrap()), ["c"]);
+    }
+
+    #[tokio::test]
+    async fn json_store_remove_rewrites_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonFileMemoryStore::new(dir.path());
+        store.upsert(record("a", "user-1", "x")).await.unwrap();
+        store.upsert(record("b", "user-1", "y")).await.unwrap();
+
+        assert!(store.remove("user-1", "a").await.unwrap());
+        assert_eq!(ids(&store.load("user-1").await.unwrap()), ["b"]);
+        let raw = std::fs::read_to_string(store.path_for("user-1")).unwrap();
+        assert!(!raw.contains("\"a\""), "{raw}");
+
+        assert!(!store.remove("user-1", "a").await.unwrap());
+        assert!(!store.remove("unknown", "b").await.unwrap());
+        assert!(!store.path_for("unknown").exists());
     }
 
     #[tokio::test]
