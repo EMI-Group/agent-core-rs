@@ -38,11 +38,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
-use openjiuwen_foundation::prompt::{BaseMessage, Role};
+use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
-use crate::processor::compressor::{summarize, summarize_offline};
+use crate::processor::compressor::{
+    archive_replaced_messages, rollback_recall_archive, summarize, summarize_offline,
+};
 use crate::processor::{ContextProcessor, ProcessorContext};
 use crate::session_memory::{reinject_session_memory, SessionMemoryStore, RECENT_MESSAGES_NOTICE};
 use crate::tokens::count_messages;
@@ -459,11 +461,29 @@ impl ContextProcessor for FullCompactProcessor {
         }
 
         // Session memory first; a model summary only when it cannot apply.
-        let (candidate, summary) = match self.session_memory_candidate(cx, &prefix, &active).await?
-        {
-            Some(value) => value,
-            None => self.summary_candidate(cx, &prefix, &active).await,
-        };
+        let (mut candidate, summary) =
+            match self.session_memory_candidate(cx, &prefix, &active).await? {
+                Some(value) => value,
+                None => self.summary_candidate(cx, &prefix, &active).await,
+            };
+        // Both paths put the summary user message right after the boundary, so
+        // the recall marker of the replaced `active` history lands at its end.
+        let marker = archive_replaced_messages(cx, &active).await;
+        if let Some(marker) = &marker {
+            let summary_index = prefix.len() + 1;
+            if let Some(message) = candidate.get_mut(summary_index) {
+                if message.role == Role::User {
+                    let text = message.text().into_owned();
+                    message.content = MessageContent::Text(marker.append(text));
+                }
+            } else {
+                tracing::warn!(
+                    summary_index,
+                    "full compaction could not locate its summary message; no marker was written"
+                );
+                rollback_recall_archive(cx, marker).await;
+            }
+        }
         let tokens_after = count_messages(cx.counter, &candidate);
         if tokens_after >= tokens_before {
             tracing::debug!(
@@ -471,6 +491,9 @@ impl ContextProcessor for FullCompactProcessor {
                 tokens_after,
                 "full compaction left the history in place: no compression benefit"
             );
+            if let Some(marker) = &marker {
+                rollback_recall_archive(cx, marker).await;
+            }
             return Ok(None);
         }
         *messages = candidate;

@@ -17,6 +17,11 @@
 //! - [`summarize_offline`] and [`summarize`] — the deterministic fallback and
 //!   the (optional) model-backed summary. Neither ever fails, so the pipeline
 //!   keeps working offline.
+//! - [`archive_replaced_messages`] — stores the replaced history in the recall
+//!   archive and returns the [`RecallArchiveMarker`] a block carries, so the
+//!   exact dropped text stays retrievable through [`recall_compressed_context`].
+//!
+//! [`recall_compressed_context`]: crate::recall::recall_compressed_context
 pub mod compact;
 pub mod current_round;
 pub mod dialogue;
@@ -30,6 +35,9 @@ use std::sync::Arc;
 
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::prompt::{BaseMessage, Role};
+
+use crate::processor::ProcessorContext;
+use crate::recall::{archive_from_messages, recall_marker, COMPRESSION_RECALL_MARKER_PREFIX};
 
 pub use self::compact::{
     FullCompactProcessor, FullCompactProcessorConfig, FULL_COMPACT_BOUNDARY,
@@ -337,6 +345,148 @@ pub async fn summarize(
             );
             fallback()
         }
+    }
+}
+
+/// Handle of the recall archive a memory block points at.
+///
+/// Compressors write the history they replace into
+/// [`ProcessorContext::recall`] and append [`RecallArchiveMarker::marker`] as the
+/// block's final line, so a later
+/// [`recall_compressed_context`](crate::recall::recall_compressed_context) can
+/// recover the exact dropped text with
+/// [`parse_recall_marker`](crate::recall::parse_recall_marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallArchiveMarker {
+    /// Identifier of the archive holding the replaced messages.
+    pub memory_id: String,
+}
+
+impl RecallArchiveMarker {
+    /// The `[[COMPRESSION_RECALL: id=...]]` text pointing at the archive.
+    #[must_use]
+    pub fn marker(&self) -> String {
+        recall_marker(&self.memory_id)
+    }
+
+    /// Appends the marker to `block` as its final line.
+    #[must_use]
+    pub fn append(&self, block: String) -> String {
+        format!("{block}\n{}", self.marker())
+    }
+}
+
+/// Archives `replaced` and returns the marker to append, when recall is enabled.
+///
+/// Nothing happens — and no I/O is performed — unless
+/// [`CompressionRecallConfig::enabled`](crate::config::CompressionRecallConfig::enabled)
+/// is set, a store is available on [`ProcessorContext::recall`], and `replaced`
+/// holds at least one non-system message. System messages are never archived.
+///
+/// A failed write is logged and reported as `None`: compression must still
+/// proceed, and a block without a marker simply carries no recall handle.
+pub async fn archive_replaced_messages(
+    cx: &ProcessorContext<'_>,
+    replaced: &[BaseMessage],
+) -> Option<RecallArchiveMarker> {
+    if !cx.config.compression_recall.enabled {
+        return None;
+    }
+    let store = cx.recall?;
+    let payload: Vec<BaseMessage> = replaced
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .cloned()
+        .collect();
+    if payload.is_empty() {
+        return None;
+    }
+    let memory_id = uuid::Uuid::new_v4().simple().to_string();
+    let created_at = unix_created_at();
+    let archive = archive_from_messages(
+        &memory_id,
+        &cx.scope.session_id,
+        &cx.scope.context_id,
+        &created_at,
+        &payload,
+        &cx.config.compression_recall,
+    );
+    if let Err(error) = store.put(cx.scope, archive).await {
+        tracing::warn!(
+            memory_id = memory_id.as_str(),
+            error = %error,
+            "cannot archive the replaced history for compression recall; the block carries no marker"
+        );
+        return None;
+    }
+    Some(RecallArchiveMarker { memory_id })
+}
+
+/// Removes the archive a replacement wrote before that replacement was rejected.
+///
+/// A failed removal is logged and otherwise ignored: rollback must never fail a
+/// compression pass, which is itself leaving the history unchanged.
+pub async fn rollback_recall_archive(cx: &ProcessorContext<'_>, marker: &RecallArchiveMarker) {
+    let Some(store) = cx.recall else {
+        return;
+    };
+    if let Err(error) = store.remove(cx.scope, &marker.memory_id).await {
+        tracing::warn!(
+            memory_id = marker.memory_id.as_str(),
+            error = %error,
+            "cannot roll back the recall archive of a rejected replacement"
+        );
+    }
+}
+
+/// Splits `text` into the recall markers it carries and the text without them.
+///
+/// A marker is any line whose trimmed text starts with
+/// [`COMPRESSION_RECALL_MARKER_PREFIX`]. The remaining lines keep their order and
+/// the returned body is trimmed; duplicate markers are dropped.
+#[must_use]
+pub fn split_recall_markers(text: &str) -> (String, Vec<String>) {
+    let mut body: Vec<&str> = Vec::new();
+    let mut markers: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(COMPRESSION_RECALL_MARKER_PREFIX) {
+            if !markers.iter().any(|seen| seen == trimmed) {
+                markers.push(trimmed.to_owned());
+            }
+        } else {
+            body.push(line);
+        }
+    }
+    (body.join("\n").trim().to_owned(), markers)
+}
+
+/// Appends `markers` to `block`, one per line, skipping ones already present.
+///
+/// Merge stages use this to keep the recall handles of the blocks they collapse:
+/// the merged block keeps every marker exactly once, in the order given.
+#[must_use]
+pub fn append_recall_markers(block: String, markers: &[String]) -> String {
+    let mut block = block;
+    for marker in markers {
+        if block.lines().any(|line| line.trim() == marker.as_str()) {
+            continue;
+        }
+        block.push('\n');
+        block.push_str(marker);
+    }
+    block
+}
+
+/// The archive timestamp: whole seconds since the Unix epoch.
+///
+/// Recall archives record `created_at` for diagnostics only, so a
+/// deterministic-to-the-second value is enough and no formatting dependency is
+/// introduced.
+fn unix_created_at() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => format!("unix:{}", elapsed.as_secs()),
+        Err(_) => "unix:0".to_owned(),
     }
 }
 

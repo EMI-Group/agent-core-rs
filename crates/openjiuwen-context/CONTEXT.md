@@ -48,6 +48,7 @@ let recovered: RecoveryOutcome = engine
 - `tokens` module: `count_message`, `count_messages`, `TokenBudget`, `check_budget`.
 - `stats` module: `compute_stats`.
 - `prompts` module: `SUMMARY_SYSTEM_PROMPT`, `SUMMARY_USER_TEMPLATE`, `render_summary_prompt`.
+- Compressor recall (`processor::compressor` module): `archive_replaced_messages`, `rollback_recall_archive`, `RecallArchiveMarker` (`memory_id`, `marker()`, `append()`), `split_recall_markers`, `append_recall_markers`.
 - Offloaders (`offloader` module): `MessageOffloader` + `MessageOffloaderConfig`, `MessageOffloadRole` (`User`/`Assistant`/`Tool`), `ToolResultBudgetProcessor` + `ToolResultBudgetProcessorConfig`, `ToolResultWindowProcessor` + `ToolResultWindowProcessorConfig`, `wildcard_match`, `OMIT_STRING`, `WINDOWED_OUTPUT_TAG`, `WINDOW_MANAGED_METADATA_KEY`.
 - Summary offloader (`summary_offloader` module): `MessageSummaryOffloader` (`new(config, model, store)`) + `MessageSummaryOffloaderConfig`, `summarize_text_offline`, `OFFLOADED_INFO_TAG`, `SUMMARY_COMPRESSION_SYSTEM_PROMPT`.
 - `ProcessorConfig` also carries `MessageOffloader`, `ToolResultBudget`, `ToolResultWindow`, `MessageSummaryOffloader` (wire tags `message_offloader`, `tool_result_budget`, `tool_result_window`, `message_summary_offloader`).
@@ -87,6 +88,8 @@ let recovered: RecoveryOutcome = engine
 - `ToolResultWindowProcessor` keeps one global window across all listed tools (suffix match, falling back to the message `name`); results below `min_offload_chars` are compacted in place without a store write and marked with `tool_result_window_managed`.
 - `MessageSummaryOffloader` prefers its own model, then the context model, and falls back to `summarize_text_offline`; `from_configs` never fails for a missing model, and the replacement keeps `[offloaded_info]` on its own line.
 - Store resolution per context is `ContextOptions` override → engine-level store (`with_stores`) → configuration default: an in-memory recall archive when `compression_recall.enabled`, and an in-memory session-memory store when the pipeline holds `FullCompact` or `MessageSummaryOffloader`.
+- Compressors archive the history they replace through `archive_replaced_messages` (only when `compression_recall.enabled` and `ProcessorContext::recall` is set) and append `[[COMPRESSION_RECALL: id=...]]` as the block's last line; a replacement rejected by a benefit gate calls `rollback_recall_archive`.
+- Merge stages (`CurrentRoundCompressor`, `RoundLevelCompressor` phase 2) strip the individual blocks' recall markers from the joined bodies and re-append them deduplicated, so a merged block keeps every handle exactly once; markers are never treated as summary content.
 - `prepare` injects the English reload hint (`inject_reload_hint`, after the leading system messages) only when `enable_reload` is set and the assembled window carries an offload marker; `PreparedContext`'s fields are unchanged and the hint is visible in `messages`.
 
 ## Routing Table
@@ -108,7 +111,7 @@ let recovered: RecoveryOutcome = engine
 - `./src/processor/tool_result.rs` → `ToolResultProcessor` + config (per-result truncation and offload)
 - `./src/processor/offloader.rs` → `MessageOffloader`, `ToolResultBudgetProcessor`, `ToolResultWindowProcessor`, shared offloader helpers (protection patterns, placeholder, marker/event builders)
 - `./src/processor/summary_offloader.rs` → `MessageSummaryOffloader` + config, offline head/tail summary
-- `./src/processor/compressor/mod.rs` → shared compressor helpers (memory-block envelope, completed-round grouping, merge ranges, offline/LLM summarisation)
+- `./src/processor/compressor/mod.rs` → shared compressor helpers (memory-block envelope, completed-round grouping, merge ranges, offline/LLM summarisation, recall archiving and marker merge)
 - `./src/processor/compressor/dialogue.rs` → `DialogueCompressor` (whole-dialogue compaction)
 - `./src/processor/compressor/current_round.rs` → `CurrentRoundCompressor` (in-flight round compaction)
 - `./src/processor/compressor/round_level.rs` → `RoundLevelCompressor` (per-round blocks, recursive merge, aggressive pass, hard truncation)
@@ -121,6 +124,7 @@ let recovered: RecoveryOutcome = engine
 - `./tests/compressors_round_level.rs` → round-level ladder: blocks per round, pair safety, merge, aggressive pass, hard truncation, events
 - `./tests/compressors_compact.rs` → full-compact boundary/kept-tail/session-memory paths and micro-compact clearing, `ProcessorConfig` tags
 - `./tests/integration.rs` → engine/context plumbing: store resolution and precedence, `from_configs_with` wiring, prepare reload injection, `ProcessorContext` store fields
+- `./tests/recall_integration.rs` → compressor recall: archives per compressor, marker placement, merge preservation, hard-truncation prefix, full-compaction paths, rollback, disabled/absent store
 
 ## Test Strategy
 
@@ -137,4 +141,4 @@ let recovered: RecoveryOutcome = engine
 - Python's adaptive strategy selection inside the compressor family (model-chosen passes, task extraction, JSON-schema memory blocks): the Rust compressors run a fixed deterministic ladder with an optional single summary call.
 - Python's adaptive summarisation pipeline inside `MessageSummaryOffloader` (task extraction, JSON-schema output, `offload_data_explanation`, `enable_precise_step`, strategy selection): the Rust processor makes one summary call with a fixed system prompt and falls back to a deterministic head/tail summary.
 - `processor/forked/` registry monkey-patching, session-memory agent, `[SESSION_MEMORY_BOUNDARY]` reinjection, skill/tool reinjection, and compression observability hooks beyond `ContextEvent`/`tracing`.
-- Compression-recall chunking, `enable_reload` filesystem rehydration prompt injection, and per-processor `save_state`/`load_state` checkpointing (the trait hooks exist but the engine does not persist processor state).
+- `enable_reload` filesystem rehydration prompt injection and per-processor `save_state`/`load_state` checkpointing (the trait hooks exist but the engine does not persist processor state).

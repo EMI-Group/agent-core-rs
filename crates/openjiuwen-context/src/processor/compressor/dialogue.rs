@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
 use crate::processor::compressor::{
-    group_completed_rounds, summarize, summarize_offline, MemoryBlockKind,
+    archive_replaced_messages, group_completed_rounds, rollback_recall_archive, summarize,
+    summarize_offline, MemoryBlockKind,
 };
 use crate::processor::{ContextProcessor, ProcessorContext};
 use crate::tokens::{count_message, count_messages};
@@ -247,8 +248,15 @@ impl ContextProcessor for DialogueCompressor {
             })
             .await;
 
+            // The archive keeps the exact exchanged messages; its marker is part
+            // of the block, so it is rendered before the benefit gate measures it.
+            let marker = archive_replaced_messages(cx, &span_messages).await;
             let before = count_messages(cx.counter, &span_messages);
-            let replacement = BaseMessage::user(MemoryBlockKind::Dialogue.render(&summary));
+            let mut block = MemoryBlockKind::Dialogue.render(&summary);
+            if let Some(marker) = &marker {
+                block = marker.append(block);
+            }
+            let replacement = BaseMessage::user(block);
             let after = count_message(cx.counter, &replacement);
             if before == 0 || after >= before {
                 tracing::debug!(
@@ -256,6 +264,9 @@ impl ContextProcessor for DialogueCompressor {
                     after,
                     "dialogue compressor left a round in place: no compression benefit"
                 );
+                if let Some(marker) = &marker {
+                    rollback_recall_archive(cx, marker).await;
+                }
                 continue;
             }
             messages.splice(span.clone(), std::iter::once(replacement.clone()));

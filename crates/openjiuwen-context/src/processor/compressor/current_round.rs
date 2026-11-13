@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
 use crate::processor::compressor::{
-    find_last_completed_round_end, iter_summary_merge_ranges, summarize, summarize_offline,
-    MemoryBlockKind, CURRENT_ROUND_MEMORY_BLOCK, SUMMARY_JOIN_SEPARATOR,
+    append_recall_markers, archive_replaced_messages, find_last_completed_round_end,
+    iter_summary_merge_ranges, rollback_recall_archive, split_recall_markers, summarize,
+    summarize_offline, MemoryBlockKind, CURRENT_ROUND_MEMORY_BLOCK, SUMMARY_JOIN_SEPARATOR,
 };
 use crate::processor::{ContextProcessor, ProcessorContext};
 use crate::tokens::{count_message, count_messages};
@@ -206,16 +207,28 @@ impl CurrentRoundCompressor {
         if before <= gate {
             return None;
         }
+        // Bodies are merged; every recall marker the individual blocks carried is
+        // kept, deduplicated and in original order, after the merged body.
+        let mut markers: Vec<String> = Vec::new();
         let bodies: Vec<String> = blocks
             .iter()
             .map(|message| {
-                MemoryBlockKind::CurrentRound
+                let body = MemoryBlockKind::CurrentRound
                     .summary_body(&message.text())
-                    .map_or_else(|| message.text().into_owned(), str::to_owned)
+                    .map_or_else(|| message.text().into_owned(), str::to_owned);
+                let (body, found) = split_recall_markers(&body);
+                for marker in found {
+                    if !markers.contains(&marker) {
+                        markers.push(marker);
+                    }
+                }
+                body
             })
             .collect();
         let merged_body = bodies.join(SUMMARY_JOIN_SEPARATOR);
-        let merged = BaseMessage::user(MemoryBlockKind::CurrentRound.render(&merged_body));
+        let rendered =
+            append_recall_markers(MemoryBlockKind::CurrentRound.render(&merged_body), &markers);
+        let merged = BaseMessage::user(rendered);
         messages.splice(run.clone(), std::iter::once(merged));
         changed.extend(run.map(|index| Self::map_to_original(index, stage_one)));
         Some(merged_body)
@@ -276,7 +289,12 @@ impl ContextProcessor for CurrentRoundCompressor {
                 .await
                 .trim()
                 .to_owned();
-                let replacement = BaseMessage::user(MemoryBlockKind::CurrentRound.render(&summary));
+                let marker = archive_replaced_messages(cx, &span_messages).await;
+                let mut block = MemoryBlockKind::CurrentRound.render(&summary);
+                if let Some(marker) = &marker {
+                    block = marker.append(block);
+                }
+                let replacement = BaseMessage::user(block);
                 let after = count_message(cx.counter, &replacement);
                 if after < before {
                     messages.splice(span.clone(), std::iter::once(replacement));
@@ -289,6 +307,9 @@ impl ContextProcessor for CurrentRoundCompressor {
                         after,
                         "current-round compressor left the span in place: no compression benefit"
                     );
+                    if let Some(marker) = &marker {
+                        rollback_recall_archive(cx, marker).await;
+                    }
                 }
             }
         }

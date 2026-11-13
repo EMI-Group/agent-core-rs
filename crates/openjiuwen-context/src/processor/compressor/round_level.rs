@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
 use crate::processor::compressor::{
-    group_completed_rounds, is_memory_block, iter_summary_merge_ranges, summarize,
+    append_recall_markers, archive_replaced_messages, group_completed_rounds, is_memory_block,
+    iter_summary_merge_ranges, rollback_recall_archive, split_recall_markers, summarize,
     summarize_offline, MemoryBlockKind, ROUND_LEVEL_MEMORY_BLOCK, SUMMARY_JOIN_SEPARATOR,
 };
 use crate::processor::{ContextProcessor, ProcessorContext};
@@ -298,12 +299,12 @@ impl RoundLevelCompressor {
         })
         .await;
 
-        let replacement = Self::replacement(
-            &span_messages,
-            BaseMessage::user(
-                self.render_block(MemoryBlockKind::RoundLevel.default_scope(), &summary),
-            ),
-        );
+        let marker = archive_replaced_messages(cx, &transcript_messages).await;
+        let mut block = self.render_block(MemoryBlockKind::RoundLevel.default_scope(), &summary);
+        if let Some(marker) = &marker {
+            block = marker.append(block);
+        }
+        let replacement = Self::replacement(&span_messages, BaseMessage::user(block));
         let after = count_messages(cx.counter, &replacement);
         if after >= before {
             tracing::debug!(
@@ -311,9 +312,11 @@ impl RoundLevelCompressor {
                 after,
                 "round-level compressor left a round in place: no compression benefit"
             );
+            if let Some(marker) = &marker {
+                rollback_recall_archive(cx, marker).await;
+            }
             return Ok(false);
         }
-
         let block_origin = origin[span.start];
         let mut new_origins: Vec<usize> = span
             .clone()
@@ -409,9 +412,20 @@ impl RoundLevelCompressor {
             for run in runs.into_iter().rev() {
                 let blocks = messages[run.clone()].to_vec();
                 let before = count_messages(cx.counter, &blocks);
+                // Recall markers of the collapsed blocks survive after the merged
+                // body, deduplicated and in their original order.
+                let mut markers: Vec<String> = Vec::new();
                 let bodies: Vec<String> = blocks
                     .iter()
-                    .map(|message| Self::body(&message.text()).to_owned())
+                    .map(|message| {
+                        let (body, found) = split_recall_markers(Self::body(&message.text()));
+                        for marker in found {
+                            if !markers.contains(&marker) {
+                                markers.push(marker);
+                            }
+                        }
+                        body
+                    })
                     .collect();
                 let merged_body = head_tail_body(
                     &bodies.join(SUMMARY_JOIN_SEPARATOR),
@@ -421,9 +435,10 @@ impl RoundLevelCompressor {
                     self.config.truncate_head_ratio,
                     &self.config.truncated_marker,
                 );
-                let merged = BaseMessage::user(
+                let merged = BaseMessage::user(append_recall_markers(
                     self.render_block(MemoryBlockKind::RoundLevel.default_scope(), &merged_body),
-                );
+                    &markers,
+                ));
                 if count_message(cx.counter, &merged) >= before {
                     continue;
                 }
@@ -496,8 +511,9 @@ impl RoundLevelCompressor {
     /// messages and the protected tail, and is refined against the real counter
     /// so the result lands at or under
     /// [`RoundLevelCompressorConfig::target_total_tokens`] whenever the block
-    /// envelope alone fits.
-    fn hard_truncate(
+    /// envelope alone fits. The removed prefix is archived for recall, and its
+    /// marker is part of the truncated block.
+    async fn hard_truncate(
         &self,
         messages: &mut Vec<BaseMessage>,
         origin: &mut Vec<usize>,
@@ -535,15 +551,19 @@ impl RoundLevelCompressor {
         let ratio = chars_per_token(cx.counter);
         let mut allowed = budget_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
         let current_total = count_messages(cx.counter, messages);
+        let marker = archive_replaced_messages(cx, &transcript_messages).await;
 
         let mut candidate: Option<(String, Vec<BaseMessage>, Vec<usize>)> = None;
         for _ in 0..MAX_TRUNCATION_ATTEMPTS {
-            let body = head_tail_body(
+            let mut body = head_tail_body(
                 &transcript,
                 allowed,
                 self.config.truncate_head_ratio,
                 &self.config.truncated_marker,
             );
+            if let Some(marker) = &marker {
+                body = marker.append(body);
+            }
             let block = BaseMessage::user(self.render_block(TRUNCATED_FULL_CONTEXT_SCOPE, &body));
             let (next, next_origin) =
                 Self::assemble_truncated(messages, origin, compress_end, &block);
@@ -561,12 +581,20 @@ impl RoundLevelCompressor {
             allowed = allowed.saturating_sub(step);
         }
 
-        let (body, next, next_origin) = candidate?;
+        let Some((body, next, next_origin)) = candidate else {
+            if let Some(marker) = &marker {
+                rollback_recall_archive(cx, marker).await;
+            }
+            return None;
+        };
         if count_messages(cx.counter, &next) >= current_total {
             tracing::debug!(
                 current_total,
                 "round-level compressor left the prefix in place: no compression benefit"
             );
+            if let Some(marker) = &marker {
+                rollback_recall_archive(cx, marker).await;
+            }
             return None;
         }
         changed.extend(removable.iter().map(|index| origin[*index]));
@@ -607,7 +635,10 @@ impl ContextProcessor for RoundLevelCompressor {
             if cx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if let Some(body) = self.hard_truncate(messages, &mut origin, cx, &mut changed) {
+            if let Some(body) = self
+                .hard_truncate(messages, &mut origin, cx, &mut changed)
+                .await
+            {
                 summaries.push(body);
             }
         }
