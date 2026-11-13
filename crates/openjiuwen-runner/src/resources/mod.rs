@@ -11,8 +11,9 @@
 //! live `Arc<dyn Tool>`, so the built-in provider hands out a clone of that same
 //! `Arc`.
 //!
-//! Not ported (see the crate-level `## Deferred Python Behavior`): tags
-//! (`TagMgr`), MCP servers/tools, sys-operations, models, and prompts.
+//! Alongside the four run-able registries the manager owns five sub-managers,
+//! each reachable through an accessor: [`TagMgr`], [`ModelMgr`], [`PromptMgr`],
+//! [`SysOperationMgr`], and [`McpServerMgr`].
 
 pub mod mcp_server;
 pub mod model;
@@ -29,7 +30,14 @@ use openjiuwen_foundation::tool::{Tool, ToolCard};
 use openjiuwen_multiagent::{Team, TeamCard};
 use openjiuwen_workflow::{Workflow, WorkflowCard};
 
+pub use mcp_server::{
+    DefaultMcpConnector, McpConnector, McpServerInfo, McpServerMgr, McpServerState,
+};
+pub use model::{ModelCard, ModelMgr, ModelProvider};
+pub use prompt::{PromptCard, PromptMgr};
 pub use registry::{Provider, RegisterPolicy, Registration, Registry, ResourceCard};
+pub use sysop::{SysOperationMgr, SysOperationProvider};
+pub use tag::{ResourceKind, Tag, TagMatchStrategy, TagMgr, TagUpdateStrategy, GLOBAL_TAG};
 
 /// A factory for tools. Tools are registered from a live instance, so the
 /// provider returns a clone of the registered `Arc`.
@@ -44,7 +52,7 @@ pub type WorkflowProvider = Provider<Workflow>;
 /// A factory for agent teams; invoked once per lookup.
 pub type TeamProvider = Provider<Arc<dyn Team>>;
 
-/// The four typed registries the runner exposes to a host.
+/// The registries and sub-managers the runner exposes to a host.
 ///
 /// The manager is shared as `Arc<ResourceMgr>` by the owning
 /// [`Runner`](crate::Runner); every method takes `&self` and mutates through the
@@ -55,7 +63,6 @@ pub type TeamProvider = Provider<Arc<dyn Team>>;
 /// `register_*` methods use [`RegisterPolicy::Fail`], which keeps the first
 /// registration and returns
 /// [`openjiuwen_common::error::Error::Validation`].
-#[derive(Debug)]
 pub struct ResourceMgr {
     /// Registered tools, keyed on [`ToolCard::id`].
     tools: Registry<ToolCard, Arc<dyn Tool>>,
@@ -65,10 +72,20 @@ pub struct ResourceMgr {
     workflows: Registry<WorkflowCard, Workflow>,
     /// Registered teams, keyed on [`TeamCard::id`].
     teams: Registry<TeamCard, Arc<dyn Team>>,
+    /// The cross-kind tag index shared by all five resource kinds.
+    tags: TagMgr,
+    /// Model factories keyed on the model id.
+    models: ModelMgr,
+    /// Prompt templates keyed on the prompt id.
+    prompts: PromptMgr,
+    /// System operations keyed on the [`openjiuwen_sysop::SysOperationCard`] id.
+    sysops: SysOperationMgr,
+    /// MCP servers keyed on their `server_id`.
+    mcp_servers: McpServerMgr,
 }
 
 impl ResourceMgr {
-    /// Builds an empty manager with all four registries.
+    /// Builds an empty manager with all four registries and five sub-managers.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -76,6 +93,11 @@ impl ResourceMgr {
             agents: Registry::with_kind("agent"),
             workflows: Registry::with_kind("workflow"),
             teams: Registry::with_kind("team"),
+            tags: TagMgr::new(),
+            models: ModelMgr::new(),
+            prompts: PromptMgr::new(),
+            sysops: SysOperationMgr::new(),
+            mcp_servers: McpServerMgr::new(),
         })
     }
 
@@ -131,10 +153,10 @@ impl ResourceMgr {
         self.tools.card(id)
     }
 
-    /// Removes `id` and returns its card.
+    /// Removes `id`, returning its card and dropping the tool's tags.
     #[must_use]
     pub fn remove_tool(&self, id: &str) -> Option<ToolCard> {
-        self.tools.remove(id)
+        self.remove_tagged(&self.tools, ResourceKind::Tool, id)
     }
 
     /// Returns clones of the registered tool cards in registration order.
@@ -155,9 +177,9 @@ impl ResourceMgr {
         self.tools.revision()
     }
 
-    /// Removes every tool and returns how many were removed.
+    /// Removes every tool, dropping their tags, and returns how many were removed.
     pub fn clear_tools(&self) -> usize {
-        self.tools.clear()
+        self.clear_tagged(&self.tools, ResourceKind::Tool)
     }
 
     /// Returns the number of registered tools.
@@ -212,10 +234,10 @@ impl ResourceMgr {
         self.agents.card(id)
     }
 
-    /// Removes `id` and returns its card.
+    /// Removes `id`, returning its card and dropping the agent's tags.
     #[must_use]
     pub fn remove_agent(&self, id: &str) -> Option<AgentCard> {
-        self.agents.remove(id)
+        self.remove_tagged(&self.agents, ResourceKind::Agent, id)
     }
 
     /// Returns clones of the registered agent cards in registration order.
@@ -236,9 +258,9 @@ impl ResourceMgr {
         self.agents.revision()
     }
 
-    /// Removes every agent and returns how many were removed.
+    /// Removes every agent, dropping their tags, and returns how many were removed.
     pub fn clear_agents(&self) -> usize {
-        self.agents.clear()
+        self.clear_tagged(&self.agents, ResourceKind::Agent)
     }
 
     /// Returns the number of registered agents.
@@ -297,10 +319,10 @@ impl ResourceMgr {
         self.workflows.card(id)
     }
 
-    /// Removes `id` and returns its card.
+    /// Removes `id`, returning its card and dropping the workflow's tags.
     #[must_use]
     pub fn remove_workflow(&self, id: &str) -> Option<WorkflowCard> {
-        self.workflows.remove(id)
+        self.remove_tagged(&self.workflows, ResourceKind::Workflow, id)
     }
 
     /// Returns clones of the registered workflow cards in registration order.
@@ -321,9 +343,9 @@ impl ResourceMgr {
         self.workflows.revision()
     }
 
-    /// Removes every workflow and returns how many were removed.
+    /// Removes every workflow, dropping their tags, and returns how many were removed.
     pub fn clear_workflows(&self) -> usize {
-        self.workflows.clear()
+        self.clear_tagged(&self.workflows, ResourceKind::Workflow)
     }
 
     /// Returns the number of registered workflows.
@@ -378,10 +400,10 @@ impl ResourceMgr {
         self.teams.card(id)
     }
 
-    /// Removes `id` and returns its card.
+    /// Removes `id`, returning its card and dropping the team's tags.
     #[must_use]
     pub fn remove_team(&self, id: &str) -> Option<TeamCard> {
-        self.teams.remove(id)
+        self.remove_tagged(&self.teams, ResourceKind::Team, id)
     }
 
     /// Returns clones of the registered team cards in registration order.
@@ -402,9 +424,9 @@ impl ResourceMgr {
         self.teams.revision()
     }
 
-    /// Removes every team and returns how many were removed.
+    /// Removes every team, dropping their tags, and returns how many were removed.
     pub fn clear_teams(&self) -> usize {
-        self.teams.clear()
+        self.clear_tagged(&self.teams, ResourceKind::Team)
     }
 
     /// Returns the number of registered teams.
@@ -413,9 +435,43 @@ impl ResourceMgr {
         self.teams.len()
     }
 
+    // ------------------------------------------------------------- managers --
+
+    /// Returns the shared tag index (partitioned by [`ResourceKind`]); its
+    /// semantics live in [`TagMgr`].
+    #[must_use]
+    pub fn tags(&self) -> &TagMgr {
+        &self.tags
+    }
+
+    /// Returns the model factory registry; the semantics live in [`ModelMgr`].
+    #[must_use]
+    pub fn models(&self) -> &ModelMgr {
+        &self.models
+    }
+
+    /// Returns the prompt template registry; the semantics live in [`PromptMgr`].
+    #[must_use]
+    pub fn prompts(&self) -> &PromptMgr {
+        &self.prompts
+    }
+
+    /// Returns the system-operation registry; see [`SysOperationMgr`].
+    #[must_use]
+    pub fn sysops(&self) -> &SysOperationMgr {
+        &self.sysops
+    }
+
+    /// Returns the MCP-server manager; the semantics live in [`McpServerMgr`].
+    #[must_use]
+    pub fn mcp_servers(&self) -> &McpServerMgr {
+        &self.mcp_servers
+    }
+
     // ------------------------------------------------------------- lifecycle --
 
-    /// Returns whether all four registries are empty.
+    /// Returns whether all four run-able registries are empty; the sub-managers
+    /// are ignored (see [`ResourceMgr::is_pristine`] for the whole manager).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
@@ -424,15 +480,90 @@ impl ResourceMgr {
             && self.teams.is_empty()
     }
 
-    /// Clears all four registries and resets every revision counter to zero.
+    /// Returns whether the manager is pristine: all four registries **and** all
+    /// five sub-managers (including the tag index) are empty.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.is_empty()
+            && self.tags.is_empty()
+            && self.models.is_empty()
+            && self.prompts.is_empty()
+            && self.sysops.is_empty()
+            && self.mcp_servers.is_empty()
+    }
+
+    /// Clears all four registries, resets the five sub-managers (the tag index
+    /// included), and zeroes every revision counter.
     ///
-    /// Python parity: `Runner::stop` calls `ResourceMgr.release`, returning the
-    /// process to a pristine registry state.
+    /// Python parity: `Runner::stop` calls `ResourceMgr.release`.
     pub fn release(&self) {
         self.tools.reset();
         self.agents.reset();
         self.workflows.reset();
         self.teams.reset();
+        self.tags.reset();
+        self.models.reset();
+        self.prompts.reset();
+        self.sysops.reset();
+        self.mcp_servers.reset();
+    }
+
+    /// Removes `id` from `registry`, dropping its tags when it was present.
+    fn remove_tagged<C: ResourceCard, T>(
+        &self,
+        registry: &Registry<C, T>,
+        kind: ResourceKind,
+        id: &str,
+    ) -> Option<C> {
+        let card = registry.remove(id);
+        if card.is_some() {
+            let _ = self.tags.remove_resource(kind, id);
+        }
+        card
+    }
+
+    /// Clears `registry`, dropping the tags of every removed entry.
+    fn clear_tagged<C: ResourceCard, T>(
+        &self,
+        registry: &Registry<C, T>,
+        kind: ResourceKind,
+    ) -> usize {
+        let ids = registry.ids();
+        let removed = registry.clear();
+        if removed > 0 {
+            for id in &ids {
+                let _ = self.tags.remove_resource(kind, id);
+            }
+        }
+        removed
+    }
+}
+
+impl std::fmt::Debug for ResourceMgr {
+    /// Prints each registry's ids and revision, each sub-manager's count and
+    /// revision, and each MCP server's id and state.
+    ///
+    /// No configuration is rendered, so `auth_headers` and `auth_query_params`
+    /// stay private.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResourceMgr")
+            .field("tools", &(self.tool_ids(), self.tool_revision()))
+            .field("agents", &(self.agent_ids(), self.agent_revision()))
+            .field(
+                "workflows",
+                &(self.workflow_ids(), self.workflow_revision()),
+            )
+            .field("teams", &(self.team_ids(), self.team_revision()))
+            .field("tags", &(self.tags.len(), self.tags.revision()))
+            .field("models", &(self.models.len(), self.models.revision()))
+            .field("prompts", &(self.prompts.len(), self.prompts.revision()))
+            .field("sysops", &(self.sysops.len(), self.sysops.revision()))
+            .field(
+                "mcp_servers",
+                &(self.mcp_servers.list(), self.mcp_servers.revision()),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -453,9 +584,13 @@ mod tests {
     use futures::stream::BoxStream;
     use openjiuwen_agent::{AgentChunk, AgentOutput};
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_foundation::prompt::PromptTemplate;
+    use openjiuwen_foundation::tool::mcp::McpServerConfig;
     use openjiuwen_foundation::tool::{FunctionTool, ToolContext, ToolHandler};
     use openjiuwen_multiagent::{handoff_team, HandoffConfig, HandoffTeamConfig};
     use openjiuwen_session::Session;
+    use openjiuwen_sysop::{SysOperation, SysOperationCard};
+    use openjiuwen_test_support::ScriptedModel;
     use serde_json::{json, Value};
 
     /// An agent that answers with its own card id; enough to prove the seam.
@@ -535,6 +670,32 @@ mod tests {
 
     fn team_card(id: &str, name: &str) -> TeamCard {
         TeamCard::new(name).with_id(id)
+    }
+
+    /// Registers one tool, agent, workflow, and team (`t1`, `a1`, `w1`, `g1`).
+    fn one_of_each(manager: &ResourceMgr) {
+        manager
+            .register_tool(echo_tool(tool_card("t1", "echo")))
+            .unwrap();
+        let agent = agent_card("a1", "assistant");
+        manager
+            .register_agent(agent.clone(), agent_provider(agent))
+            .unwrap();
+        let flow = workflow_card("w1", "flow");
+        manager
+            .register_workflow(flow.clone(), workflow_provider(flow))
+            .unwrap();
+        let crew = team_card("g1", "crew");
+        manager
+            .register_team(crew.clone(), team_provider(crew))
+            .unwrap();
+    }
+
+    /// Tags every `(kind, id)` pair with the tag `"t"`.
+    fn tagged(manager: &ResourceMgr, pairs: &[(ResourceKind, &str)]) {
+        for &(kind, id) in pairs {
+            manager.tags().tag(kind, id, [Tag::new("t")]).unwrap();
+        }
     }
 
     // ports tests/unit_tests/core/runner/test_resource_manager.py
@@ -717,5 +878,127 @@ mod tests {
         assert_eq!(workflow_key("wf", "1.0.0"), "wf_1.0.0");
         assert_eq!(workflow_key("wf", ""), "wf_");
         assert_eq!(workflow_key("a_b", "v2"), "a_b_v2");
+    }
+
+    #[test]
+    fn removing_a_resource_drops_its_tags() {
+        let manager = ResourceMgr::new();
+        one_of_each(&manager);
+        tagged(&manager, &[(ResourceKind::Tool, "t1")]);
+        tagged(&manager, &[(ResourceKind::Agent, "a1")]);
+        tagged(&manager, &[(ResourceKind::Workflow, "w1")]);
+        tagged(&manager, &[(ResourceKind::Team, "g1")]);
+
+        assert_eq!(manager.remove_tool("t1").unwrap().id, "t1");
+        assert_eq!(manager.remove_agent("a1").unwrap().id, "a1");
+        assert_eq!(manager.remove_workflow("w1").unwrap().id, "w1");
+        assert_eq!(manager.remove_team("g1").unwrap().id, "g1");
+        assert!(manager.tags().is_empty(), "tags dropped!");
+
+        // A miss leaves the tag index untouched.
+        tagged(&manager, &[(ResourceKind::Tool, "t2")]);
+        let revision = manager.tags().revision();
+        assert!(manager.remove_tool("t2").is_none());
+        assert!(manager.remove_agent("t2").is_none());
+        assert!(manager.remove_workflow("t2").is_none());
+        assert!(manager.remove_team("t2").is_none());
+        assert_eq!(manager.tags().revision(), revision);
+        let kept = manager.tags().tags_of(ResourceKind::Tool, "t2");
+        assert_eq!(kept, vec![Tag::new("t")]);
+    }
+
+    #[test]
+    fn clearing_a_kind_drops_the_tags_of_every_removed_resource() {
+        let manager = ResourceMgr::new();
+        one_of_each(&manager);
+        manager
+            .register_tool(echo_tool(tool_card("t2", "echo2")))
+            .unwrap();
+        tagged(&manager, &[(ResourceKind::Tool, "t1")]);
+        tagged(&manager, &[(ResourceKind::Tool, "t2")]);
+        tagged(&manager, &[(ResourceKind::Agent, "a1")]);
+
+        assert_eq!(manager.clear_tools(), 2);
+        assert_eq!(manager.tags().resources(ResourceKind::Tool).len(), 0);
+        assert_eq!(manager.tags().resources(ResourceKind::Agent), vec!["a1"]);
+
+        assert_eq!(manager.clear_agents(), 1);
+        assert!(manager.tags().list_tags().is_empty(), "collected");
+        assert_eq!(manager.clear_workflows(), 1);
+        assert_eq!(manager.clear_teams(), 1);
+    }
+
+    #[test]
+    fn release_resets_every_manager() {
+        let manager = ResourceMgr::new();
+        one_of_each(&manager);
+        manager
+            .models()
+            .register_model("m1", Arc::new(ScriptedModel::default()))
+            .unwrap();
+        manager
+            .prompts()
+            .add_prompt("p1", PromptTemplate::new("hi"))
+            .unwrap();
+        let operation = SysOperation::new(SysOperationCard::new("op1")).unwrap();
+        manager.sysops().register(operation).unwrap();
+        manager
+            .mcp_servers()
+            .register(McpServerConfig::stdio("srv", "cmd"))
+            .unwrap();
+        tagged(&manager, &[(ResourceKind::Tool, "t1")]);
+
+        assert!(!manager.is_pristine());
+        manager.release();
+
+        assert!(manager.is_pristine());
+        assert_eq!(manager.tags().revision(), 0);
+        assert_eq!(manager.models().revision(), 0);
+        assert_eq!(manager.prompts().revision(), 0);
+        assert_eq!(manager.sysops().revision(), 0);
+        assert_eq!(manager.mcp_servers().revision(), 0);
+    }
+
+    #[test]
+    fn is_pristine_is_stricter_than_is_empty() {
+        let manager = ResourceMgr::new();
+        assert!(manager.is_empty() && manager.is_pristine());
+
+        manager
+            .models()
+            .register_model("m1", Arc::new(ScriptedModel::default()))
+            .unwrap();
+        assert!(manager.is_empty() && !manager.is_pristine());
+
+        manager
+            .prompts()
+            .add_prompt("p1", PromptTemplate::new("hi"))
+            .unwrap();
+        assert!(manager.is_empty() && !manager.is_pristine());
+        manager.release();
+
+        tagged(&manager, &[(ResourceKind::Agent, "a1")]);
+        assert!(manager.is_empty() && !manager.is_pristine());
+    }
+
+    #[test]
+    fn debug_output_lists_ids_and_revisions() {
+        let manager = ResourceMgr::new();
+        one_of_each(&manager);
+        manager
+            .mcp_servers()
+            .register(McpServerConfig::stdio("srv", "cmd").with_server_id("srv-1"))
+            .unwrap();
+        tagged(&manager, &[(ResourceKind::Tool, "t1")]);
+
+        let rendered = format!("{manager:?}");
+        // Each registry prints its ids followed by its revision counter.
+        assert!(rendered.contains(r#"(["t1"], 1)"#), "{rendered}");
+        assert!(rendered.contains(r#"(["a1"], 1)"#), "{rendered}");
+        assert!(rendered.contains(r#"(["w1"], 1)"#), "{rendered}");
+        assert!(rendered.contains(r#"(["g1"], 1)"#), "{rendered}");
+        // The MCP server is listed by id and state, never by configuration.
+        assert!(rendered.contains("srv-1"), "{rendered}");
+        assert!(!rendered.contains("auth_headers"), "{rendered}");
     }
 }
