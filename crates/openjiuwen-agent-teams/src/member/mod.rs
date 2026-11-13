@@ -46,12 +46,39 @@
 //! ```
 
 pub mod activity;
+pub mod external_cli_spawner;
 pub mod lifecycle;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod lifecycle_tests;
+pub mod process_spawner;
+pub mod protocol;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod protocol_tests;
 pub mod runtime;
 pub mod spawn;
+pub mod spawn_config;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod spawn_config_tests;
+pub mod ssh_spawner;
+pub mod stdio;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod stdio_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod external_cli_spawner_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod process_spawner_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ssh_spawner_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
+mod test_child;
 
 pub use activity::{IdleDebounce, MemberActivityRegistry, DEFAULT_IDLE_DEBOUNCE};
 pub use lifecycle::TeamMember;
