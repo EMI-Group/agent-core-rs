@@ -20,6 +20,10 @@
 
 use std::sync::OnceLock;
 
+
+pub mod artifacts;
+pub mod native;
+
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{ApproxTokenCounter, BaseMessage, TokenCounter};
 use serde::{Deserialize, Serialize};

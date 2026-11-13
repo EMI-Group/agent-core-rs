@@ -22,10 +22,12 @@
 //!   exact dropped text stays retrievable through [`recall_compressed_context`].
 //!
 //! [`recall_compressed_context`]: crate::recall::recall_compressed_context
+pub mod adaptive;
 pub mod compact;
 pub mod current_round;
 pub mod dialogue;
 pub mod micro_compact;
+pub mod reinjection;
 pub mod round_level;
 
 use std::collections::BTreeSet;

@@ -63,13 +63,16 @@ pub mod engine;
 pub mod engine_options;
 pub mod events;
 pub mod offload;
+pub mod policy;
 pub mod processor;
 pub mod prompts;
 pub mod recall;
 pub mod reload;
 pub mod session_memory;
 pub mod stats;
+pub mod telemetry;
 pub mod tokens;
+pub mod usage;
 pub mod window;
 
 pub use config::{

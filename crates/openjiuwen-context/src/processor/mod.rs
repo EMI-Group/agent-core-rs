@@ -38,6 +38,7 @@ use crate::window::drop_orphan_tool_results;
 
 pub mod compressor;
 pub mod offloader;
+pub mod rule_compression;
 pub mod summarize;
 pub mod summary_offloader;
 pub mod tool_result;
