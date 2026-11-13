@@ -17,7 +17,13 @@
 mod bank;
 mod classify;
 mod config;
+mod consult;
+mod dream;
+mod engine;
+mod induce;
 mod models;
+mod parse;
+mod success;
 pub use bank::{AddOutcome, TipBank, TipBankStats};
 pub use classify::{ClassificationRule, TipClassifier};
 pub use config::TtseConfig;
