@@ -57,12 +57,10 @@ pub mod deferred;
 pub mod discovery;
 /// Error constructors and helpers over [`openjiuwen_common::error`].
 pub mod error;
-/// The experience bank: distilled capability-combination knowledge with ranking.
-pub mod experience;
-/// Error constructors and helpers over [`openjiuwen_common::error`].
-pub mod error;
 /// Fail-soft capability evaluation with deterministic static metrics.
 pub mod evaluation;
+/// The experience bank: distilled capability-combination knowledge with ranking.
+pub mod experience;
 /// Flow distillation and reusable SkillPack artifacts.
 pub mod flow;
 /// The `can_feed` capability relationship graph (JGF v2 documents).
