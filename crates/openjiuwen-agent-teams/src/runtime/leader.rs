@@ -147,6 +147,7 @@ pub(crate) async fn run(
     let mut chunks_open = true;
     let mut events_open = true;
 
+    let mut org_acks: Vec<String> = Vec::new();
     let exit = loop {
         tokio::select! {
             chunk = chunks.recv(), if chunks_open => {
@@ -180,7 +181,10 @@ pub(crate) async fn run(
                     idle_ticks = 0;
                     forward_chunk(&agent, chunk, &mut index, &mut answer, sink.as_ref());
                 }
-                flush(&agent, &mut batch).await;
+                drain_org_mail(&agent, &mut batch, &mut org_acks).await;
+                if flush(&agent, &mut batch).await {
+                    acknowledge_org(&agent, &mut org_acks).await;
+                }
                 if agent.state() == HarnessState::Idle && agent.backend().tasks().is_settled().await? {
                     idle_ticks += 1;
                     if idle_ticks >= REQUIRED_SETTLE_TICKS {
@@ -194,7 +198,9 @@ pub(crate) async fn run(
     };
 
     drop(events_keeper);
-    flush(&agent, &mut batch).await;
+    if flush(&agent, &mut batch).await {
+        acknowledge_org(&agent, &mut org_acks).await;
+    }
     agent.gate().close();
 
     match exit {
@@ -266,9 +272,9 @@ fn answer_text(payload: &Value) -> Option<&str> {
 }
 
 /// Sends one batched steering message to the leader, logging (never failing) a rejection.
-async fn flush(agent: &TeamAgent, batch: &mut Vec<String>) {
+async fn flush(agent: &TeamAgent, batch: &mut Vec<String>) -> bool {
     if batch.is_empty() {
-        return;
+        return true;
     }
     let joined = batch.join("\n");
     batch.clear();
@@ -277,6 +283,56 @@ async fn flush(agent: &TeamAgent, batch: &mut Vec<String>) {
             team = agent.team_name(),
             error = %error,
             "leader runtime did not accept a steering batch"
+        );
+        return false;
+    }
+    true
+}
+
+/// Drains the organisation mailbox for this team into the current steering batch.
+///
+/// One line per unread message; the ids are remembered so they can be acknowledged only after the
+/// leader accepted the batch that carried them. A team without an organisation is a no-op, and a
+/// store failure is logged rather than ending the run.
+async fn drain_org_mail(agent: &TeamAgent, batch: &mut Vec<String>, acks: &mut Vec<String>) {
+    let Some(org) = agent.org() else {
+        return;
+    };
+    match org.unread(agent.team_name()).await {
+        Ok(messages) => {
+            for message in messages {
+                batch.push(format!(
+                    "org {}: {}",
+                    message.from_team,
+                    message.preview(160)
+                ));
+                acks.push(message.message_id);
+            }
+        }
+        Err(error) => debug!(
+            team = agent.team_name(),
+            %error,
+            "failed to read the organisation mailbox"
+        ),
+    }
+}
+
+/// Acknowledges delivered org messages after a successful leader turn.
+async fn acknowledge_org(agent: &TeamAgent, acks: &mut Vec<String>) {
+    if acks.is_empty() {
+        return;
+    }
+    let Some(org) = agent.org() else {
+        acks.clear();
+        return;
+    };
+    let ids = std::mem::take(acks);
+    if let Err(error) = org.acknowledge(agent.team_name(), &ids).await {
+        debug!(
+            team = agent.team_name(),
+            %error,
+            count = ids.len(),
+            "failed to acknowledge the organisation mailbox"
         );
     }
 }

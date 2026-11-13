@@ -40,20 +40,29 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::allocator::ModelAllocator;
+use super::attach_host::{AttachHost, BackendAttachHandler};
 use super::backend::TeamBackend;
-use super::build::{teammate_record, MemberStreamObserver};
+use super::build::teammate_record;
 use super::deps::TeamBuildDeps;
 use super::initial_input::parse_initial_input;
 use super::leader;
+use super::observability_bind::TeamSignals;
+use super::observer::MemberStreamObserver;
+use super::org_bind::OrgBinding;
+use super::routing::TeamModelRouter;
 use super::spawner::TeamMemberSpawner;
+use super::spec_meta::{AttachConfig, ForkDirective};
 use crate::constants::USER_PSEUDO_MEMBER_NAME;
 use crate::interaction::{
     DeliverResult, HumanAgentInbox, HumanAgentMessage, InteractGate, InteractPayload,
 };
+use crate::kv_cache::{MemberCacheKey, TeamKvCacheAffinity};
 use crate::member::{
-    MemberActivityRegistry, MemberRuntime, MemberSpawnRequest, MemberSpawner, TeamMember,
+    MemberActivityRegistry, MemberRuntime, MemberSpawnOptions, MemberSpawnRequest, MemberSpawner,
+    TeamMember,
 };
+use crate::monitor::{BackpressurePolicy, MonitorReceiver};
+use crate::org::{OrgTaskOpResult, OrgTaskSpec};
 use crate::schema::{
     EventMessage, EventPayload, MemberLifetime, MemberStatus, MemberStatusChangedEvent,
     TaskGraphSpec, TaskRecord, TeamAgentSpec, TeamMemberSpec, TeamRole, TeamSnapshot, TeamSpec,
@@ -158,8 +167,22 @@ pub(crate) struct TeamAgentInner {
     pub(crate) inbox: Arc<HumanAgentInbox>,
     /// The `openjiuwen_multiagent` session/registry seam.
     pub(crate) team_runtime: Arc<TeamRuntime>,
-    /// Model-pool allocator; the cursor advances per allocated member.
-    pub(crate) allocator: ModelAllocator,
+    /// Model pool + router; the cursor advances per allocated member.
+    pub(crate) routing: Arc<TeamModelRouter>,
+    /// KV-cache affinity registry shared by every member of the run.
+    pub(crate) kv_cache: Arc<TeamKvCacheAffinity>,
+    /// Observability hooks and the optional monitor sink.
+    pub(crate) signals: TeamSignals,
+    /// Workspace isolation requested by the spec (`none` by default).
+    pub(crate) isolation: IsolationMode,
+    /// Spawn options requested by the spec (in-process by default).
+    pub(crate) spawn_options: MemberSpawnOptions,
+    /// Fork directive, when this team forks a member from a parent.
+    pub(crate) fork: Option<ForkDirective>,
+    /// Attach-host settings, when a socket is configured.
+    pub(crate) attach: Option<AttachConfig>,
+    /// The bound attach server of the current run.
+    pub(crate) attach_host: Mutex<Option<AttachHost>>,
     /// Whether [`TeamAgent::start`] completed and no [`TeamAgent::stop`] followed.
     pub(crate) started: AtomicBool,
     /// Token of the current run; replaced by every `start`, cancelled by `stop`.
@@ -267,6 +290,14 @@ impl TeamAgent {
         Arc::clone(&self.inner.backend)
     }
 
+    /// Returns the fork directive the team was built with, when one is configured.
+    ///
+    /// Later teammates inherit the directive through the spawner; this accessor exposes it to
+    /// hosts inspecting the build.
+    #[must_use]
+    pub fn fork_directive(&self) -> Option<&super::spec_meta::ForkDirective> {
+        self.inner.fork.as_ref()
+    }
     /// Returns the interaction gate of the current run cycle.
     #[must_use]
     pub fn gate(&self) -> Arc<InteractGate> {
@@ -360,6 +391,8 @@ impl TeamAgent {
     async fn run_start(&self) -> Result<()> {
         self.inner.backend.messager().start().await?;
         self.inner.member.start(None).await?;
+        self.start_attach().await?;
+        self.inner.signals.team_started(Some(self.session_id()));
         debug!(
             team = self.team_name(),
             member = self.member_name(),
@@ -368,6 +401,43 @@ impl TeamAgent {
         Ok(())
     }
 
+    /// Binds the attach server when the spec (or `OPENJIUWEN_TEAM_SOCKET`) names a socket.
+    ///
+    /// Bind failures are logged and ignored unless `attach.required` is set, in which case the
+    /// error aborts the start (see `src/runtime/CONTEXT.md` §"Attach policy").
+    async fn start_attach(&self) -> Result<()> {
+        let Some(config) = self.inner.attach.clone() else {
+            return Ok(());
+        };
+        if self.inner.attach_host.lock().is_some() {
+            return Ok(());
+        }
+        let handler: Arc<dyn crate::attach::AttachHandler> = Arc::new(BackendAttachHandler::new(
+            Arc::clone(&self.inner.backend),
+            self.leader_member_name(),
+            self.cancellation_token(),
+        ));
+        match AttachHost::start(&config, handler).await {
+            Ok(host) => {
+                debug!(
+                    team = self.team_name(),
+                    socket = %host.path().display(),
+                    "serving the team over the attach socket"
+                );
+                *self.inner.attach_host.lock() = Some(host);
+            }
+            Err(error) if config.required => return Err(error),
+            Err(error) => {
+                warn!(
+                    team = self.team_name(),
+                    socket = %config.socket.display(),
+                    %error,
+                    "attach socket could not be bound; continuing without it"
+                );
+            }
+        }
+        Ok(())
+    }
     /// Stops the team: cancels the run, stops the leader runtime and closes the gate.
     ///
     /// Idempotent and never fails: teardown problems are logged so a caller's cleanup path cannot
@@ -379,6 +449,10 @@ impl TeamAgent {
     pub async fn stop(&self) -> Result<()> {
         self.inner.started.store(false, Ordering::SeqCst);
         self.inner.cancel.lock().cancel();
+        let attach_host = self.inner.attach_host.lock().take();
+        if let Some(host) = attach_host {
+            host.shutdown().await;
+        }
         if let Some(runtime) = self.inner.member.runtime() {
             if let Err(error) = runtime.stop().await {
                 warn!(team = self.team_name(), error = %error, "failed to stop the leader runtime");
@@ -396,6 +470,15 @@ impl TeamAgent {
             warn!(team = self.team_name(), error = %error, "failed to stop the team transport");
         }
         self.inner.gate.close();
+        if let Err(error) = self.inner.spawner.despawn(self.member_name()).await {
+            debug!(team = self.team_name(), error = %error, "leader has no child process to reap");
+        }
+        let released = self.inner.kv_cache.release_team(self.session_id()).await;
+        debug!(
+            team = self.team_name(),
+            released, "kv-cache affinity entries released"
+        );
+        self.inner.signals.team_finished();
         debug!(team = self.team_name(), "team agent stopped");
         Ok(())
     }
@@ -629,7 +712,7 @@ impl TeamAgent {
                 member_spec: spawner
                     .deep_agent_spec(name)
                     .and_then(|spec| spec.workspace.clone()),
-                isolation: IsolationMode::None,
+                isolation: self.inner.isolation,
             })
             .await?;
 
@@ -638,7 +721,8 @@ impl TeamAgent {
             name,
             self.session_id(),
             workspace.root.clone(),
-        );
+        )
+        .with_options(self.inner.spawn_options.clone());
         let runtime = match spawner.spawn(request).await {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -650,7 +734,7 @@ impl TeamAgent {
         let member = if let Some(member) = self.inner.backend.member(name) {
             member
         } else {
-            let record = teammate_record(&spawner, name, &self.inner.allocator);
+            let record = teammate_record(&spawner, name, &self.inner.routing);
             self.inner.store.insert_member(record.clone()).await?;
             let created = Arc::new(TeamMember::new(self.inner.store.clone(), record));
             self.inner.backend.add_member(Arc::clone(&created));
@@ -659,13 +743,18 @@ impl TeamAgent {
         if member.runtime().is_none() {
             member.observe(Arc::new(MemberStreamObserver::new(
                 Arc::clone(&self.inner.activity),
+                Arc::downgrade(&member),
+                member.role(),
                 name.to_owned(),
+                self.inner.signals.clone(),
                 Arc::clone(&self.inner.chunk_sinks),
             )));
         }
         member.attach_runtime(runtime);
+        self.register_kv_affinity(name);
         let previous = member.status();
         member.start(None).await?;
+        self.inner.signals.member_spawned(name, member.role());
         self.publish_member_status(name, previous, member.status())
             .await;
         Ok(())
@@ -676,7 +765,7 @@ impl TeamAgent {
         if self.inner.backend.member(name).is_some() {
             return;
         }
-        let record = teammate_record(&self.inner.spawner, name, &self.inner.allocator);
+        let record = teammate_record(&self.inner.spawner, name, &self.inner.routing);
         debug!(
             team = self.team_name(),
             member = name,
@@ -699,6 +788,9 @@ impl TeamAgent {
         previous: MemberStatus,
         status: MemberStatus,
     ) {
+        self.inner
+            .signals
+            .member_status(name, self.role_of(name), status);
         if previous == status {
             return;
         }
@@ -743,6 +835,13 @@ impl TeamAgent {
             }
         }
         let status = member.shutdown(lifetime, force).await?;
+        if let Err(error) = self.inner.spawner.despawn(name).await {
+            debug!(team = self.team_name(), member = name, %error, "failed to reap a member child process");
+        }
+        let _ = self.inner.kv_cache.release(name).await;
+        self.inner
+            .signals
+            .member_stopped(name, member.role(), "shutdown");
         self.publish_member_status(name, previous, status).await;
         Ok(status)
     }
@@ -823,6 +922,135 @@ impl TeamAgent {
         rx
     }
 
+    /// Returns the team lifecycle signals (observability hooks + monitor sink).
+    #[must_use]
+    pub fn signals(&self) -> TeamSignals {
+        self.inner.signals.clone()
+    }
+    /// Attaches a monitor stream to this team and returns its receiving end.
+    ///
+    /// Events are emitted best-effort from the lifecycle calls (start/stop, member spawn/stop,
+    /// rounds, task transitions); installing a second stream replaces the first emitter.
+    #[must_use]
+    pub fn monitor_stream(
+        &self,
+        capacity: usize,
+        policy: BackpressurePolicy,
+    ) -> Option<MonitorReceiver> {
+        self.inner.backend.monitor_stream(capacity, policy)
+    }
+    /// Returns the KV-cache affinity registry of the run.
+    #[must_use]
+    pub fn kv_cache(&self) -> Arc<TeamKvCacheAffinity> {
+        Arc::clone(&self.inner.kv_cache)
+    }
+    /// Returns the KV-cache identity env a member session should inherit, if registered.
+    #[must_use]
+    pub fn kv_env(&self, member_name: &str) -> Option<std::collections::BTreeMap<String, String>> {
+        self.inner.kv_cache.env(member_name)
+    }
+    /// Returns the organisation binding, when the spec configures one.
+    #[must_use]
+    pub fn org(&self) -> Option<Arc<OrgBinding>> {
+        self.inner.backend.org()
+    }
+    /// Returns the bind path of the live attach server, if one is serving.
+    #[must_use]
+    pub fn attach_socket(&self) -> Option<std::path::PathBuf> {
+        self.inner
+            .attach_host
+            .lock()
+            .as_ref()
+            .map(|host| host.path().to_path_buf())
+    }
+    /// Creates a cross-team organisation task owned by this team.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when no organisation is configured and the pool's own errors otherwise.
+    pub async fn create_org_task(&self, spec: OrgTaskSpec) -> Result<crate::org::OrgTaskMutation> {
+        let org = self
+            .org()
+            .ok_or_else(|| Error::config("team has no organisation configured"))?;
+        let mutation = org.create_task(spec).await?;
+        self.inner.signals.delegation(
+            self.leader_member_name(),
+            "",
+            &mutation.task.task_id,
+            "created",
+        );
+        Ok(mutation)
+    }
+    /// Delegates one org task after consulting the delegation router.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] without an organisation, [`Error::Validation`] when the router refuses and
+    /// the pool's own errors otherwise.
+    pub async fn delegate_org_task(
+        &self,
+        task_id: &str,
+        to_team: &str,
+        to_member: Option<&str>,
+    ) -> Result<OrgTaskOpResult> {
+        let org = self
+            .org()
+            .ok_or_else(|| Error::config("team has no organisation configured"))?;
+        let result = org
+            .delegate(
+                task_id,
+                self.team_name(),
+                self.leader_member_name(),
+                to_team,
+                to_member,
+            )
+            .await?;
+        self.inner.signals.delegation(
+            self.leader_member_name(),
+            to_member.unwrap_or(to_team),
+            task_id,
+            "allowed",
+        );
+        Ok(result)
+    }
+    /// Registers one member's KV-cache affinity, deriving a child identity for a fork.
+    fn register_kv_affinity(&self, member_name: &str) {
+        let key = MemberCacheKey::new(self.team_name(), self.session_id(), member_name.to_owned());
+        let model = self
+            .inner
+            .routing
+            .model_ref(None, self.role_of(member_name))
+            .unwrap_or_default();
+        let forked = self.inner.spawner.forked_member(member_name);
+        let identity = match forked {
+            Some(child) => self
+                .inner
+                .kv_cache
+                .register_child(&child.parent_member, key, &model),
+            None => Ok(self.inner.kv_cache.register_member(key, &model)),
+        };
+        match identity {
+            Ok(identity) => debug!(
+                team = self.team_name(),
+                member = member_name,
+                cache = %identity.session_id,
+                "registered the member's KV-cache affinity"
+            ),
+            Err(error) => debug!(
+                team = self.team_name(),
+                member = member_name,
+                %error,
+                "KV-cache affinity not registered (disabled or unknown parent)"
+            ),
+        }
+    }
+    /// Returns a roster member's role, defaulting to teammate for an unknown name.
+    fn role_of(&self, member_name: &str) -> TeamRole {
+        self.inner
+            .backend
+            .member(member_name)
+            .map_or(TeamRole::Teammate, |member| member.role())
+    }
     /// Returns the team's steering batch size.
     pub(crate) fn steer_batch_size(&self) -> usize {
         self.inner.steer_batch_size

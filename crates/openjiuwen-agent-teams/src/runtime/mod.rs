@@ -12,6 +12,12 @@
 //! | --- | --- |
 //! | [`deps`] | [`TeamBuildDeps`]: the injected build inputs and their defaults |
 //! | [`allocator`] | [`ModelAllocator`]: round-robin / by-name model-pool selection |
+//! | [`routing`] | [`TeamModelRouter`]: pool + router selection and the effective member spec |
+//! | [`spec_meta`] | the metadata keys the build path reads (spawn, workspace, org, attach, KV) |
+//! | [`observer`] | the member observer feeding status, rounds, chunks and signals |
+//! | [`observability_bind`] | [`TeamSignals`]: observability hooks + monitor fan-out |
+//! | [`org_bind`] | [`OrgBinding`]: chart, delegation router, org task pool and mailbox |
+//! | [`attach_host`] | [`AttachHost`] / [`BackendAttachHandler`]: Unix-socket attach hosting |
 //! | [`dispatch`] | [`decide_run_action`]: whether a run creates, attaches, resumes or is rejected |
 //! | [`initial_input`] | [`parse_initial_input`]: caller request → leader query + deliveries |
 //! | [`backend`] | [`TeamBackend`]: members, mail, events, task board and snapshot facade |
@@ -27,6 +33,8 @@
 pub mod adapter;
 /// Model-pool selection: round-robin or by model name.
 pub mod allocator;
+/// Attach hosting: bind, serve and shut down the Unix-socket server.
+pub mod attach_host;
 /// The organisation facade a running team exposes: members, mail, events, tasks and snapshots.
 pub mod backend;
 /// The blueprint → runtime build path (`TeamAgentSpec::build` / `build_with`).
@@ -41,17 +49,30 @@ pub mod initial_input;
 pub mod leader;
 /// Process-wide and local runtime management.
 pub mod manager;
+/// Observability hooks and the optional monitor sink, fanned out from one place.
+pub mod observability_bind;
+/// The member observer that drives status, rounds, chunks and signals.
+pub(crate) mod observer;
+/// The organisation layer bound to a running team.
+pub mod org_bind;
 /// The session → team runtime pool.
 pub mod pool;
+/// Model pool + router selection per member.
+pub mod routing;
 /// The harness-backed member spawner.
 pub mod spawner;
 /// The team agent: one type for the leader and every teammate.
 pub mod team_agent;
 
+/// Spec-metadata keys and their parsers.
+pub mod spec_meta;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wiring_tests;
 
 pub use allocator::{ModelAllocator, TeamModelAllocation};
+pub use attach_host::{AttachHost, BackendAttachHandler};
 pub use backend::TeamBackend;
 pub use deps::TeamBuildDeps;
 pub use dispatch::{decide_run_action, LiveTeamState, RunAction, RunActionKind};
@@ -61,6 +82,10 @@ pub use manager::{
     clear_global_registry, global_registry, set_global_registry, try_global_registry,
     TeamRuntimeManager,
 };
+pub use observability_bind::TeamSignals;
+pub use org_bind::OrgBinding;
 pub use pool::TeamRuntimePool;
+pub use routing::{ModelSelection, TeamModelRouter};
 pub use spawner::TeamMemberSpawner;
+pub use spec_meta::{AttachConfig, ForkDirective, OrganizationBlock};
 pub use team_agent::{SpecBuild, TeamAgent};
