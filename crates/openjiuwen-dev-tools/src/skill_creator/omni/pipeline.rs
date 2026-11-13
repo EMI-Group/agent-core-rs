@@ -16,10 +16,15 @@
 //! prompt — are rendered by [`super::render`]; this module owns the caps, the
 //! fetching, and the stage orchestration.
 //!
-//! Images are never written to disk: [`SkillResource`] content is text and a
-//! bundle reader skips non-UTF-8 files, so a kept image stays a URL in
-//! `SKILL.md` and `references/sources.md`. Playwright, Pillow, the LLM
-//! image-relevance judge, and concurrent fetching are deliberately not ported:
+//! Kept images are persisted beside the text assets as
+//! `references/img_NN.<ext>` by [`OmniCreation::save_with_images`], exactly like
+//! Python's `stage_04_save.py`, while the document keeps their source URLs.
+//! Every [`DownloadedResource`] carries the payload's SHA-256 digest and, for a
+//! kept image, the bundle-relative
+//! [`saved_path`](DownloadedResource::saved_path) it is written to; because
+//! [`SkillResource`] content is text and a bundle reader skips non-UTF-8 files,
+//! a written image never comes back as a text resource. Playwright, Pillow, the
+//! LLM image-relevance judge, and concurrent fetching are deliberately not ported:
 //! resources are fetched sequentially in first-seen order. Every cap comes from
 //! [`OmniConfig`] (a count cap of zero disables that class), and every stage is
 //! deterministic given its inputs — no timestamps, no environment reads, no
@@ -38,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::skill_creator::{SkillBundle, SkillDefinition, SkillResource};
 use crate::util::extract_json_fence;
 
+use self::assets::{image_resource, image_target};
 use super::archive::{self, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
 use super::fetch::{FetchedResource, Fetcher};
 use super::filter::{
@@ -49,6 +55,7 @@ use super::render::{
     skill_name, sources_markdown, ModelSkillPayload, MODEL_SYSTEM_PROMPT, PAGE_RESOURCE_PREFIX,
     SOURCES_RESOURCE,
 };
+use super::sha256;
 
 /// Default cap on followed subpages.
 const DEFAULT_MAX_LINKS: usize = 8;
@@ -235,6 +242,12 @@ impl ScrapedPage {
 }
 
 /// One downloaded resource: an image payload or a followed HTML subpage.
+///
+/// The payload is identified by its SHA-256 digest, the same
+/// `hashlib.sha256(data).hexdigest()` identity the download filter deduplicates
+/// on, and an image that survives filtering also carries `saved_path`, the
+/// bundle-relative asset path [`OmniCreation::save_with_images`] writes it to
+/// (`references/img_NN.<ext>`). Subpages have no `saved_path` and no `alt`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DownloadedResource {
@@ -245,6 +258,19 @@ pub struct DownloadedResource {
     pub content_type: Option<String>,
     /// The raw response body.
     pub bytes: Vec<u8>,
+    /// The scraped alt text of an image, empty for a subpage.
+    pub alt: String,
+    /// The lowercase hex SHA-256 digest of [`bytes`](Self::bytes).
+    ///
+    /// This is the payload identity: two URLs serving the same bytes have the
+    /// same digest, so the value is provenance as well as a dedupe key.
+    pub sha256: String,
+    /// The bundle-relative path a kept image is written to, if any.
+    ///
+    /// `Some("references/img_00.png")` for a kept image, `None` for a subpage
+    /// and for an image that is never persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
 }
 
 impl DownloadedResource {
@@ -281,7 +307,11 @@ impl DownloadedResource {
 pub struct OmniOutcome {
     /// The generated skill, including every text resource the pipeline wrote.
     pub definition: SkillDefinition,
-    /// The relative paths of those resources, in write order.
+    /// The relative paths of the written assets, in write order.
+    ///
+    /// The text resources of the definition come first, then the bundle-relative
+    /// paths of the persisted images ([`DownloadedResource::saved_path`] in
+    /// download order).
     pub resources: Vec<String>,
     /// The skill directory under the requested root.
     pub bundle_path: PathBuf,
@@ -411,11 +441,15 @@ impl OmniCreation {
     /// Per-resource failures, non-success statuses, oversized bodies, and
     /// non-HTML subpages are logged with [`tracing::warn`] and skipped instead of
     /// failing the stage. Images are filtered once by
-    /// [`ResourceFilter`] after their payloads are known: `svg` payloads pass the
-    /// same sniff and `content-type` rules as raster formats, and every kept image
-    /// stays a URL because binary assets are never written. The result is accepted
-    /// images first (display order), then subpages (link order), truncated to
-    /// [`OmniConfig::max_resources`].
+    /// [`ResourceFilter`] after their payloads are known: the keep policy is
+    /// PNG, JPEG, GIF, or WebP, so an `svg` payload is rejected by
+    /// [`filter_images_with`] even though [`sniff_image`](super::filter::sniff_image)
+    /// classifies it. Every kept image is given its `references/img_NN.<ext>`
+    /// [`saved_path`](DownloadedResource::saved_path), numbered from `00` in kept
+    /// order, plus the SHA-256 of its payload; a first-seen duplicate payload is
+    /// dropped by the filter, so the numbering follows the surviving order.
+    /// The result is accepted images first (display order), then subpages (link
+    /// order), truncated to [`OmniConfig::max_resources`].
     ///
     /// # Errors
     ///
@@ -451,15 +485,13 @@ impl OmniCreation {
                 ),
             }
         }
-        let mut resources: Vec<DownloadedResource> =
-            filter_images_with(&fetched, &self.config.resource_filter())
-                .into_iter()
-                .map(|candidate| DownloadedResource {
-                    url: candidate.url,
-                    content_type: candidate.content_type,
-                    bytes: candidate.bytes.unwrap_or_default(),
-                })
-                .collect();
+        let mut resources = Vec::new();
+        for (index, candidate) in filter_images_with(&fetched, &self.config.resource_filter())
+            .into_iter()
+            .enumerate()
+        {
+            resources.push(image_resource(index, candidate));
+        }
 
         let mut attempted = 0;
         for link in dedupe_links(&page.links) {
@@ -486,10 +518,14 @@ impl OmniCreation {
                         );
                         continue;
                     }
+                    let digest = sha256::hex_digest(&response.body);
                     resources.push(DownloadedResource {
                         url: target,
                         content_type: Some("text/html".to_owned()),
                         bytes: response.body,
+                        alt: String::new(),
+                        sha256: digest,
+                        saved_path: None,
                     });
                 }
                 Ok(response) => tracing::warn!(
@@ -517,8 +553,10 @@ impl OmniCreation {
     /// `#` title, the description, and the `## Steps`, `## Details`,
     /// `## Code Examples`, `## Reference Images`, `## Further Reading`, and
     /// `## Reference Files` sections that have content. Image and link
-    /// references always stay URLs; the definition carries every text resource
-    /// of [`OmniCreation::text_resources`], so it is self-contained.
+    /// references in the body stay URLs, and the definition carries every text
+    /// resource of [`OmniCreation::text_resources`] — persisted images are not
+    /// text resources, they are written beside them by
+    /// [`OmniCreation::save_with_images`].
     ///
     /// # Errors
     ///
@@ -545,9 +583,9 @@ impl OmniCreation {
     ///
     /// Resources already present in the definition are skipped, every appended
     /// resource is validated, and the directory returned by [`SkillBundle::write`]
-    /// is handed back. Binary assets are never written: [`SkillResource`] content
-    /// is text and bundle reads skip non-UTF-8 files, so images remain URLs in
-    /// the instructions and the provenance resource.
+    /// is handed back. No image payload is written; use
+    /// [`OmniCreation::save_with_images`] when downloaded images must land in the
+    /// bundle too.
     ///
     /// # Errors
     ///
@@ -558,6 +596,38 @@ impl OmniCreation {
         &self,
         definition: &SkillDefinition,
         resources: &[SkillResource],
+        root: &Path,
+    ) -> Result<PathBuf> {
+        self.save_with_images(definition, resources, &[], root)
+            .await
+    }
+
+    /// Writes `definition`, `resources`, and every kept image as one bundle.
+    ///
+    /// The text part is exactly [`OmniCreation::save`]: resources already present
+    /// in the definition are skipped, every appended resource is validated, and
+    /// [`SkillBundle::write`] produces `<root>/<name>/SKILL.md` plus the text
+    /// assets. Then every image whose
+    /// [`saved_path`](DownloadedResource::saved_path) is `Some` is written
+    /// byte-for-byte to that path beneath the bundle directory (its parent is
+    /// created first), mirroring Python's `stage_04_save.py`.
+    ///
+    /// The `saved_path` invariant is checked before anything is written: it must
+    /// be a relative, `/`-separated path whose first component is `references`
+    /// and whose other components are non-empty, free of `.`/`..`, and free of
+    /// backslashes, so an image can never escape its bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::validation`](openjiuwen_common::error::Error::validation)
+    /// for an invalid resource path, definition, or image `saved_path` (the
+    /// message names the path), plus every filesystem failure of
+    /// [`SkillBundle::write`] or of an image write.
+    pub async fn save_with_images(
+        &self,
+        definition: &SkillDefinition,
+        resources: &[SkillResource],
+        images: &[DownloadedResource],
         root: &Path,
     ) -> Result<PathBuf> {
         let mut definition = definition.clone();
@@ -572,7 +642,23 @@ impl OmniCreation {
             }
             definition.resources.push(resource.clone());
         }
-        SkillBundle::write(&definition, root).await
+        // Validate every image path up front so a rejected path writes nothing.
+        let mut image_targets = Vec::new();
+        for image in images {
+            let Some(saved_path) = image.saved_path.as_deref() else {
+                continue;
+            };
+            image_targets.push((image_target(saved_path)?, image.bytes.as_slice()));
+        }
+        let bundle_path = SkillBundle::write(&definition, root).await?;
+        for (relative, bytes) in image_targets {
+            let target = bundle_path.join(relative);
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&target, bytes).await?;
+        }
+        Ok(bundle_path)
     }
 
     /// The deterministic text assets of a bundle for `page` and `resources`.
@@ -658,14 +744,16 @@ impl OmniCreation {
     ///
     /// The drafting model is used when attached (with its deterministic
     /// fallback); otherwise the deterministic generator consumes the downloaded
-    /// resources.
+    /// resources. The bundle keeps both the text resources and every downloaded
+    /// image, and [`OmniOutcome::resources`] lists the text paths first, then the
+    /// image paths.
     ///
     /// # Errors
     ///
     /// Returns every error of [`OmniCreation::scrape`],
     /// [`OmniCreation::download`], [`OmniCreation::generate`], and
-    /// [`OmniCreation::save`]; a model failure is never one of them because the
-    /// model-assisted generator falls back.
+    /// [`OmniCreation::save_with_images`]; a model failure is never one of them
+    /// because the model-assisted generator falls back.
     pub async fn run(&self, url: &str, root: &Path) -> Result<OmniOutcome> {
         self.config.validate()?;
         let page = self.scrape(url).await?;
@@ -675,14 +763,22 @@ impl OmniCreation {
         } else {
             self.generate(&page, &downloaded)?
         };
-        let bundle_path = self.save(&definition, &[], root).await?;
-        Ok(OmniOutcome {
-            resources: definition
-                .resources
+        let bundle_path = self
+            .save_with_images(&definition, &[], &downloaded, root)
+            .await?;
+        let mut resources: Vec<String> = definition
+            .resources
+            .iter()
+            .map(|resource| resource.path.clone())
+            .collect();
+        resources.extend(
+            downloaded
                 .iter()
-                .map(|resource| resource.path.clone())
-                .collect(),
+                .filter_map(|image| image.saved_path.clone()),
+        );
+        Ok(OmniOutcome {
             definition,
+            resources,
             bundle_path,
         })
     }
@@ -882,6 +978,8 @@ fn html_page(resource: &FetchedResource, url: &str) -> ScrapedPage {
         code_blocks: document.code_blocks,
     }
 }
+
+pub(crate) mod assets;
 
 #[cfg(test)]
 mod tests;
