@@ -174,7 +174,8 @@ pub fn emit_after(framework: Arc<CallbackFramework>, event: CallbackEvent) -> Em
 ///
 /// Python's `emit_around` wrapped a function call; a handler cannot interpose on
 /// the caller's call, so the two auxiliary dispatches happen back to back. Use
-/// [`wrap`] when the "after" event must observe work done between the two.
+/// [`crate::callback::wrap()`] when the "after" event must observe work done
+/// between the two.
 #[must_use]
 pub fn emit_around(
     framework: Arc<CallbackFramework>,

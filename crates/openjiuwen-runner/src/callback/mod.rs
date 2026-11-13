@@ -15,7 +15,7 @@
 //! * [`CallbackChain`] runs an ordered group of handlers with per-entry filters,
 //!   priorities, enable flags, and fatal-vs-isolated error policy.
 //! * [`on`]/[`emit_before`]/[`emit_after`]/[`emit_around`]/[`transform_io`]/
-//!   [`wrap`] build handlers and call wrappers, the Rust equivalents of Python's
+//!   [`wrap()`] build handlers and call wrappers, the Rust equivalents of Python's
 //!   callback decorators.
 //!
 //! ```no_run

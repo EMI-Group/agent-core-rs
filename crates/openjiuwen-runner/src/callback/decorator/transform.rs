@@ -44,9 +44,10 @@ struct TransformState {
 /// Ports `create_transform_io_decorator`. Two forms, because
 /// [`CallbackHandler::handle`] receives `&CallbackContext`:
 ///
-/// * As an [`EventFilter`] (and therefore via [`HandlerBuilder::when`] or a
-///   [`ChainEntry`]) it rewrites the working context in place, so every later
-///   entry observes the transformed payloads.
+/// * As an [`EventFilter`] (and therefore via
+///   [`HandlerBuilder::when`](crate::callback::decorator::HandlerBuilder::when) or
+///   a [`ChainEntry`](crate::callback::ChainEntry)) it rewrites the working
+///   context in place, so every later entry observes the transformed payloads.
 /// * As a [`CallbackHandler`] it rewrites its own clone of the context and
 ///   publishes the result through [`Self::last_input`]/[`Self::last_output`].
 /// * [`Self::apply`] transforms a direct async call, which is the closest to

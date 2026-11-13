@@ -17,7 +17,7 @@
 //!   output payload afterwards, propagating transform errors. It works both as a
 //!   [`CallbackHandler`] and as an [`EventFilter`] (the in-place form whose
 //!   rewrites later entries observe).
-//! * [`wrap`] builds a [`WrappedCall`]: an async call surrounded by
+//! * [`wrap()`] builds a [`WrappedCall`]: an async call surrounded by
 //!   [`WrapHandler`] layers, each of which receives `call_next`, may rewrite
 //!   arguments and results, and may short-circuit by never calling it
 //!   (Python's `create_wrap_decorator`). [`on_wrap`] registers a layer on a

@@ -352,9 +352,10 @@ pub fn on_wrap(event: CallbackEvent, handler: Arc<dyn WrapHandler>) -> WrapRegis
 /// The shared store of [`WrapHandler`] layers per event.
 ///
 /// Python keeps wrap handlers in the framework's callback registry under a
-/// `"__wrap__:<event>"` key; [`CallbackFramework`] exposes only registration
-/// metadata per event and holds the handler privately, so the layers live in
-/// this dedicated, equally priority-ordered registry instead.
+/// `"__wrap__:<event>"` key;
+/// [`CallbackFramework`](crate::callback::CallbackFramework) exposes only
+/// registration metadata per event and holds the handler privately, so the
+/// layers live in this dedicated, equally priority-ordered registry instead.
 #[derive(Default)]
 pub struct WrapRegistry {
     state: RwLock<HashMap<CallbackEvent, Vec<StoredWrap>>>,
