@@ -16,7 +16,10 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::common::Document;
 
-use super::{compile_pattern, file_extension, read_source, DocumentLoader};
+use super::{
+    apply_load_options, compile_pattern, file_extension, read_source, DocumentBytes,
+    DocumentLoader, LoadOptions,
+};
 
 /// Matches a `<script>` element, including an unterminated one.
 static SCRIPT_PATTERN: LazyLock<Regex> =
@@ -225,27 +228,49 @@ impl DocumentLoader for HtmlLoader {
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         let html = read_source(source).await?;
-        let text = html_to_text(&html);
-        if text.is_empty() {
-            return Err(Error::Validation(format!(
-                "No text content found in HTML: {source}"
-            )));
-        }
-        let mut metadata = Map::new();
-        metadata.insert(
-            "title".to_owned(),
-            Value::String(extract_title(&html).unwrap_or_default()),
-        );
-        metadata.insert(
-            "source_type".to_owned(),
-            Value::String("web_page".to_owned()),
-        );
-        Ok(vec![Document {
-            id: super::generate_document_id(),
-            text,
-            metadata,
-        }])
+        Ok(vec![html_document(source, &html)?])
     }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let html = String::from_utf8_lossy(&source.bytes);
+        let mut documents = vec![html_document(&source.name, &html)?];
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
+    }
+}
+
+/// Converts one `HTML` string into its web-page document.
+///
+/// `name` is the path or in-memory source name and appears in errors.
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] when the page holds no extractable text.
+fn html_document(name: &str, html: &str) -> Result<Document> {
+    let text = html_to_text(html);
+    if text.is_empty() {
+        return Err(Error::Validation(format!(
+            "No text content found in HTML: {name}"
+        )));
+    }
+    let mut metadata = Map::new();
+    metadata.insert(
+        "title".to_owned(),
+        Value::String(extract_title(html).unwrap_or_default()),
+    );
+    metadata.insert(
+        "source_type".to_owned(),
+        Value::String("web_page".to_owned()),
+    );
+    Ok(Document {
+        id: super::generate_document_id(),
+        text,
+        metadata,
+    })
 }
 
 #[cfg(test)]
@@ -335,6 +360,72 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
         assert!(error.to_string().contains("No text content found in HTML"));
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_result() {
+        let source = DocumentBytes::new(
+            "page.html",
+            b"<html><head><title>Docs</title></head><body><p>Hello <b>there</b></p></body></html>"
+                .to_vec(),
+        );
+        let documents = HtmlLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "Docs Hello there");
+        assert_eq!(documents[0].id.len(), 36);
+        assert_eq!(
+            documents[0].metadata.get("title"),
+            Some(&Value::String("Docs".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("source_type"),
+            Some(&Value::String("web_page".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("doc_id").and_then(Value::as_str),
+            Some(documents[0].id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_applies_doc_id_and_title() {
+        let source = DocumentBytes::new(
+            "page.html",
+            b"<html><head><title>Docs</title></head><body>body</body></html>".to_vec(),
+        );
+        let options = LoadOptions::new().with_doc_id("doc-3").with_title("Custom");
+        let documents = HtmlLoader::new()
+            .load_bytes(&source, &options)
+            .await
+            .unwrap();
+        assert_eq!(documents[0].id, "doc-3");
+        assert_eq!(
+            documents[0].metadata.get("title"),
+            Some(&Value::String("Custom".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String("doc-3".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_rejects_pages_without_text() {
+        let source = DocumentBytes::new("empty.htm", b"<html><script>x</script></html>".to_vec());
+        let error = HtmlLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(
+            error
+                .to_string()
+                .contains("No text content found in HTML: empty.htm"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

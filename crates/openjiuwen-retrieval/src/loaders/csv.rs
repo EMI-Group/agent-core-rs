@@ -15,7 +15,10 @@ use openjiuwen_common::error::Result;
 
 use crate::common::Document;
 
-use super::{file_extension, file_stem, read_source, DocumentLoader};
+use super::{
+    apply_load_options, file_extension, file_stem, read_source, DocumentBytes, DocumentLoader,
+    LoadOptions,
+};
 
 /// The sheet index stamped on every document; delimited files have one sheet.
 const SHEET_INDEX: usize = 0;
@@ -66,19 +69,45 @@ impl DocumentLoader for CsvLoader {
 
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         let raw = read_source(source).await?;
-        // Python opens the file with `utf-8-sig`, which drops a leading BOM.
-        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        let rows = parse_delimited(raw, resolve_delimiter(self.delimiter, source));
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(build_documents(
-            &rows,
-            &file_stem(source),
+        Ok(documents_from_delimited(
             source,
+            &raw,
             self.include_header,
+            self.delimiter,
         ))
     }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        let raw = String::from_utf8_lossy(&source.bytes);
+        let mut documents =
+            documents_from_delimited(&source.name, &raw, self.include_header, self.delimiter);
+        apply_load_options(&source.name, &mut documents, options);
+        Ok(documents)
+    }
+}
+
+/// Turns delimited content into row documents followed by column documents.
+///
+/// `name` is the path or in-memory source name: it supplies the extension for
+/// the delimiter, the id base, and the sheet name (`file_stem(name)`), exactly
+/// as Python's `base_id = doc_id or doc` uses the source string.
+fn documents_from_delimited(
+    name: &str,
+    raw: &str,
+    include_header: bool,
+    delimiter: Option<u8>,
+) -> Vec<Document> {
+    // Python opens the file with `utf-8-sig`, which drops a leading BOM.
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let rows = parse_delimited(raw, resolve_delimiter(delimiter, name));
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    build_documents(&rows, &file_stem(name), name, include_header)
 }
 
 /// Resolves the delimiter: explicit configuration wins over the extension.
@@ -401,6 +430,100 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         let documents = CsvLoader::new().load(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(documents, Vec::<Document>::new());
+    }
+
+    #[tokio::test]
+    async fn load_bytes_matches_the_path_result() {
+        let source = DocumentBytes::new("people.CSV", b"name,city\nalice,paris\nbob,\n".to_vec());
+        let documents = CsvLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        let texts: Vec<&str> = documents.iter().map(|doc| doc.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "name: alice, city: paris",
+                "name: bob, city: ",
+                "Column name: name. Values: alice, bob",
+                "Column name: city. Values: paris",
+            ]
+        );
+        assert_eq!(documents[0].id, "people.CSV_s0_r2");
+        assert_eq!(documents[1].id, "people.CSV_s0_r3");
+        assert_eq!(documents[2].id, "people.CSV_s0_c0");
+        assert_eq!(documents[3].id, "people.CSV_s0_c1");
+        assert_eq!(
+            documents[0].metadata.get("sheet_name"),
+            Some(&Value::String("people".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("row_index"),
+            Some(&Value::from(2_u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_bytes_prefixes_multi_document_ids_with_doc_id_and_title() {
+        let source = DocumentBytes::new("people.csv", b"name,city\nalice,paris\n".to_vec());
+        let options = LoadOptions::new()
+            .with_doc_id("doc-base")
+            .with_title("People");
+        let documents = CsvLoader::new()
+            .load_bytes(&source, &options)
+            .await
+            .unwrap();
+        assert_eq!(documents[0].id, "doc-base_s0_r2");
+        assert_eq!(documents[1].id, "doc-base_s0_c0");
+        for document in &documents {
+            assert_eq!(
+                document.metadata.get("doc_id"),
+                Some(&Value::String(document.id.clone()))
+            );
+            assert_eq!(
+                document.metadata.get("title"),
+                Some(&Value::String("People".to_owned()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_bytes_strips_a_leading_bom() {
+        let source = DocumentBytes::new("bom.csv", "\u{feff}a,b\n1,2\n".as_bytes().to_vec());
+        let documents = CsvLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents[0].text, "a: 1, b: 2");
+        assert_eq!(documents[1].text, "Column name: a. Values: 1");
+    }
+
+    #[tokio::test]
+    async fn load_bytes_resolves_the_delimiter_from_the_name() {
+        let tsv = DocumentBytes::new("table.tsv", b"id\tnote\n1\thi\n".to_vec());
+        let documents = CsvLoader::new()
+            .load_bytes(&tsv, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents[0].text, "id: 1, note: hi");
+
+        let custom = DocumentBytes::new("pipes.csv", b"a|b\n1|2\n".to_vec());
+        let documents = CsvLoader::new()
+            .with_delimiter(b'|')
+            .load_bytes(&custom, &LoadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(documents[0].text, "a: 1, b: 2");
+    }
+
+    #[tokio::test]
+    async fn load_bytes_of_an_empty_file_yields_no_documents() {
+        let source = DocumentBytes::new("nothing.csv", Vec::new());
+        let documents = CsvLoader::new()
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
         assert_eq!(documents, Vec::<Document>::new());
     }
 
