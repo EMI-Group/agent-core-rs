@@ -15,7 +15,7 @@
 //! [`openjiuwen_common::error::Error::Unsupported`] naming the operation, never
 //! a panic. The orchestration itself is real: [`RlTrainer`] drives pluggable
 //! policies and rollout engines offline and deterministically, and
-//! [`OfflineRlOptimizer::train_with`] wires it to the same configuration the
+//! [`crate::rl::OfflineRlOptimizer::train_with`] wires it to the same configuration the
 //! deferred `train` entry point uses.
 // Stub entry points keep their Python `async` shape although they never await.
 #![allow(clippy::unused_async_trait_impl)]

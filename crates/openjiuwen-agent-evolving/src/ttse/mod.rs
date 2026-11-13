@@ -11,9 +11,9 @@
 //! - [`TipBank`] — record store with dedupe, clustering and pruning; [`TipBankStats`]
 //!   is its aggregate summary.
 //! - [`TipCategory`] / [`TipRecord`] — the tip schema, with [`TipClassifier`]
-//!   assigning the category and [`tip_id_for`] deriving the content-addressed id.
+//!   assigning the category and [`crate::ttse::tip_id_for`] deriving the content-addressed id.
 //! - [`SuccessDetector`] — decides whether a run counts as a successful experience.
-//! - [`TipParser`] — turns a model answer into tip records ([`DEFAULT_MAX_RULE_CHARS`]
+//! - [`TipParser`] — turns a model answer into tip records ([`crate::ttse::DEFAULT_MAX_RULE_CHARS`]
 //!   bounds each rule).
 //! - [`TipInducer`] — proposes tips from failed trajectories and evolution signals,
 //!   offline or through an injected model.
@@ -22,7 +22,7 @@
 //!   ranks tips, then renders them for prompt injection.
 //! - [`consult`] / [`render_tips`] — selects and renders the tips injected into a
 //!   prompt, producing a [`ConsultResult`]; [`DreamReport`] and
-//!   [`SuccessAssessment`] are the pass results, and [`TipEvidence`] the
+//!   [`SuccessAssessment`] are the pass results, and [`crate::ttse::TipEvidence`] the
 //!   trajectory evidence a tip was induced from.
 //!
 //! LLM-driven merging and embedding-backed retrieval are optional seams; the

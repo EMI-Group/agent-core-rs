@@ -107,7 +107,7 @@ fn is_cjk(ch: char) -> bool {
 /// Splits `text` into the lowercase tokens used for similarity.
 ///
 /// ASCII alphanumeric runs become tokens when they are at least
-/// [`MIN_ASCII_TOKEN_LEN`] characters long and not a stopword; underscores join
+/// `MIN_ASCII_TOKEN_LEN` characters long and not a stopword; underscores join
 /// a run so tool identifiers such as `read_file` stay one token; CJK characters
 /// become one token each (stopwords filtered). Every other character is a
 /// separator. The result is sorted, so downstream dedupe is order-independent.
