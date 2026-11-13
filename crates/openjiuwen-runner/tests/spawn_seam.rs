@@ -333,10 +333,14 @@ async fn the_external_command_backend_launches_a_resolved_program() {
         .await
         .expect("the resolved program launches through the seam");
 
-    // Resolution is the external backend's own step; the child itself is
-    // supervised by the subprocess backend it delegates to, so the handle
-    // reports the backend that actually owns the process.
-    assert_eq!(child.backend(), SpawnBackend::Subprocess);
+    // The child is supervised by the subprocess protocol, but it is launched by
+    // the external-command backend, so the handle, the spawner, and the runner's
+    // monitor detail all name that backend.
+    assert_eq!(child.backend(), SpawnBackend::ExternalCommand);
+    assert_eq!(
+        child.health_snapshot().backend,
+        SpawnBackend::ExternalCommand
+    );
     assert!(
         child.pid().is_some(),
         "the resolved program is a real child"

@@ -296,6 +296,51 @@ fn fake_child() {
 }
 
 #[tokio::test]
+async fn a_child_inherits_the_backend_of_the_spawner_that_launched_it() {
+    let spec = || SpawnSpec::class_agent("tests.spawn", "FakeAgent");
+
+    // The plain constructor keeps reporting the subprocess backend.
+    let plain: Arc<dyn SpawnedAgent> =
+        tokio::time::timeout(BOUND, SubprocessSpawner::new(child_config()).spawn(spec()))
+            .await
+            .expect("spawn must not hang")
+            .expect("the fake child launches");
+    assert_eq!(plain.backend(), SpawnBackend::Subprocess);
+    assert!(
+        tokio::time::timeout(BOUND, plain.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+
+    // A wrapper backend labels its children, through the concrete handle and
+    // through the trait object a caller actually holds.
+    let spawner = SubprocessSpawner::with_backend(child_config(), SpawnBackend::ExternalCommand);
+    assert_eq!(spawner.backend(), SpawnBackend::ExternalCommand);
+    let process = tokio::time::timeout(BOUND, spawner.spawn_process(spec()))
+        .await
+        .expect("spawn must not hang")
+        .expect("the fake child launches");
+    assert_eq!(process.backend(), SpawnBackend::ExternalCommand);
+    assert!(
+        format!("{process:?}").contains("ExternalCommand"),
+        "the Debug impl carries the label: {process:?}"
+    );
+    let agent: Arc<dyn SpawnedAgent> = process.into_agent();
+    assert_eq!(agent.backend(), SpawnBackend::ExternalCommand);
+    assert_eq!(
+        agent.health_snapshot().backend,
+        SpawnBackend::ExternalCommand
+    );
+    assert!(
+        tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+}
+
+#[tokio::test]
 async fn a_spawned_child_reports_its_backend_and_health_through_the_seam() {
     let spawner = SubprocessSpawner::new(child_config());
     assert_eq!(spawner.backend(), SpawnBackend::Subprocess);

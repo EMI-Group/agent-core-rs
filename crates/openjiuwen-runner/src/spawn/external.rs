@@ -8,9 +8,11 @@
 //!
 //! Resolution then delegates to the subprocess backend — the process
 //! handling, framing, timeouts, health task and kill-on-drop are
-//! [`crate::spawn::SubprocessSpawner`]'s, not reimplemented here. The only
-//! difference a handle sees is [`crate::spawn::SpawnBackend::ExternalCommand`],
-//! which the spawner reports so a registry and a host can tell the two apart.
+//! [`crate::spawn::SubprocessSpawner`]'s, not reimplemented here. This backend is
+//! therefore the subprocess protocol plus `PATH` resolution, and it labels its
+//! children [`crate::spawn::SpawnBackend::ExternalCommand`] through
+//! [`crate::spawn::SubprocessSpawner::with_backend`], so the handle, this spawner,
+//! and a runner's monitor detail all agree on the backend that produced the child.
 //!
 //! Search path: [`ExternalCommandSpawner::with_search_path`] replaces the
 //! inherited `PATH` entirely (the hermetic form, for tests and sandboxes); unset,
@@ -198,13 +200,18 @@ impl AgentSpawner for ExternalCommandSpawner {
         SpawnBackend::ExternalCommand
     }
 
+    /// Resolves the command, then spawns it through the subprocess backend
+    /// labelled [`SpawnBackend::ExternalCommand`], so the child reports the
+    /// backend that resolved it rather than the bare protocol underneath.
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let program = self.resolve()?;
         let config = SubprocessConfig {
             program: program.to_string_lossy().into_owned(),
             ..self.config.clone()
         };
-        SubprocessSpawner::new(config).spawn(spec).await
+        SubprocessSpawner::with_backend(config, SpawnBackend::ExternalCommand)
+            .spawn(spec)
+            .await
     }
 }
 
@@ -338,6 +345,56 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    /// The libtest arguments that re-execute this binary as the hermetic
+    /// protocol child of `subprocess_tests.rs`, so the delegation is exercised
+    /// against a real child rather than a stand-in.
+    fn child_args() -> Vec<String> {
+        [
+            "spawn::subprocess::tests::fake_child",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_spawned_command_is_labelled_external_command() {
+        const BOUND: Duration = Duration::from_secs(10);
+        let program = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let spawner = ExternalCommandSpawner::new(program)
+            .with_args(child_args())
+            .with_request_timeout(BOUND)
+            .with_health_check(Duration::ZERO, Duration::from_secs(2), 3);
+        assert_eq!(spawner.backend(), SpawnBackend::ExternalCommand);
+
+        let child: Arc<dyn SpawnedAgent> =
+            tokio::time::timeout(BOUND, spawner.spawn(SpawnSpec::default()))
+                .await
+                .expect("spawn must not hang")
+                .expect("the resolved program launches through the seam");
+        assert_eq!(
+            child.backend(),
+            SpawnBackend::ExternalCommand,
+            "the handle reports the backend that resolved it"
+        );
+        assert_eq!(
+            child.health_snapshot().backend,
+            SpawnBackend::ExternalCommand
+        );
+        assert!(
+            tokio::time::timeout(BOUND, child.shutdown(Duration::from_secs(5)))
+                .await
+                .expect("shutdown must not hang")
+                .expect("the child acknowledges the shutdown")
+        );
     }
 
     #[tokio::test]

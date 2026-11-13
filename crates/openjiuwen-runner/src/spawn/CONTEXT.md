@@ -6,7 +6,7 @@ The seam through which a `Runner` drives an agent that lives in another process 
 Ports the surface of Python `openjiuwen/core/runner/spawn/` (`agent_config.py`, `protocol.py`, `process_manager.py`) plus the HTTP client surface of `openjiuwen/core/runner/drunner/remote_client/` (`remote_client.py`, `remote_client_config.py`, `remote_agent.py`).
 The transport-neutral seam is `AgentSpawner` → `SpawnedAgent` over a JSON-safe `SpawnSpec`; four backends implement it, each naming itself with a `SpawnBackend`.
 `SubprocessSpawner` launches a real child with `tokio::process` and drives it over its stdio pipes.
-`ExternalCommandSpawner` resolves a host-configured program on `PATH` and delegates to that same subprocess backend.
+`ExternalCommandSpawner` resolves a host-configured program on `PATH` and delegates to that same subprocess backend, labelling its children `SpawnBackend::ExternalCommand`.
 `InProcessSpawner` wraps a host-bound `InProcessHandler`, so an agent living in this process looks like any other handle.
 `RemoteSpawner` / `RemoteAgent` address an agent served over HTTP with `reqwest`.
 Every backend speaks the NDJSON frame vocabulary of `protocol` over the bounded line framing of `frames`.
@@ -112,13 +112,16 @@ pub struct SubprocessConfig {                              // serde snake_case, 
 }
 impl SubprocessConfig { pub fn new(program); with_arg / with_args / with_cwd / with_env /
                         with_request_timeout / with_shutdown_timeout / with_health_check / with_max_frame_bytes }
-pub struct SubprocessSpawner;                              // new(config), config(), spawn_process(spec) -> Result<Arc<SpawnedProcess>>
-pub struct SpawnedProcess;                                  // id, pid, is_alive, is_healthy, health, send, stream,
+pub struct SubprocessSpawner;                              // new(config) / with_backend(config, backend), config(), backend(),
+                                                            // spawn_process(spec) -> Result<Arc<SpawnedProcess>>
+pub struct SpawnedProcess;                                  // id, backend, pid, is_alive, is_healthy, health, send, stream,
                                                             // shutdown, force_kill, into_agent(self: Arc<Self>) -> Arc<dyn SpawnedAgent>
 ```
 
 `SubprocessSpawner::spawn_process` returns the concrete `Arc<SpawnedProcess>` so hosts can call `health`/`pid`; the `AgentSpawner::spawn` impl coerces it to `Arc<dyn SpawnedAgent>`.
-`SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is `Subprocess`, `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` pins the backend and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
+`SubprocessSpawner::new(config)` labels its children `SpawnBackend::Subprocess`, while `SubprocessSpawner::with_backend(config, backend)` is the wrapper form: a backend that is this protocol plus a step of its own labels its children with its own name, and both `Spawner::backend()` (the spawner's own `backend` field) and every child's handle report that label.
+`SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is the spawner's label (not always `subprocess`), `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` carries the same label and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
+The handle's `Debug` output shows that label beside its id, pid, liveness, and health.
 `cancel_task` keeps the unsupported default: the NDJSON protocol has no task handle to address, so a caller stops a child with `shutdown`/`force_kill`.
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
 Configured timeouts are clamped to `[0, 86_400]` seconds, so `Instant + Duration` cannot overflow and nonsense configuration means "no deadline".
@@ -139,7 +142,7 @@ impl ExternalCommandSpawner {
 
 `resolve` is the whole backend: an empty (or whitespace-only) command is `Error::Config` naming `ExternalCommandSpawner::command`; a command containing a path separator or an absolute path must be an existing regular file and, on unix, carry an executable bit, else `Error::NotFound` naming the command and the reason; a bare name is looked up in `with_search_path` (used instead of `PATH`, unsplit, for hermetic hosts) or in `PATH` split with `std::env::split_paths`, and the first candidate passing the same checks wins.
 A bare name that matches nothing is `Error::NotFound` naming the command and how many directories were searched (or that none is configured).
-`spawn` resolves, clones the config with `program` set to the resolved path, and delegates to `SubprocessSpawner::new(config).spawn(spec)`: process handling, framing, timeouts and the health task are the subprocess backend's, and the only difference a handle sees is `SpawnBackend::ExternalCommand`.
+`spawn` resolves, clones the config with `program` set to the resolved path, and delegates to `SubprocessSpawner::with_backend(config, SpawnBackend::ExternalCommand).spawn(spec)`: process handling, framing, timeouts and the health task are the subprocess backend's, and the label makes it the external-command backend — so `Spawner::backend()`, the child's `backend()`/`health_snapshot()`, and a runner's monitor detail all report `external_command`.
 
 ### In-process backend — `in_process.rs`
 
@@ -320,6 +323,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
 - The reference child implementation is `tests/spawn_subprocess.rs`'s `#[ignore]`d `fake_child` libtest case re-executed with `fake_child --exact --ignored --test-threads=1 --nocapture` (`--nocapture` is mandatory or libtest redirects the child's stdout and no frame reaches the pipe).
 - `SubprocessConfig::program` empty is `Error::Config` at spawn, not at construction, so a host can build a config incrementally.
+- `SubprocessSpawner::with_backend(config, backend)` is how a wrapper backend labels its children; a `SpawnedProcess` reports its spawner's label, so `backend() == Subprocess` only for a plain `SubprocessSpawner::new`/`default`.
 - The lib unit tests re-execute the lib test binary as the hermetic child: `subprocess_tests.rs`'s `#[ignore]`d `fake_child` is selected by `--exact` with the filter `<module_path minus the crate>::fake_child`; the child must close libtest's partial `test … ` line with a leading newline or the parent skips its first frame as noise.
 - `ExternalCommandSpawner::with_search_path` is the hermetic form: it replaces `PATH` with one directory, so a test never depends on the machine's installed programs.
 - `SpawnerRegistry` is the multi-backend host; the runner-level routing lives in `src/runner_spawn.rs` (`Runner::spawner`, `spawn_backend`, `spawn_backends`, `set_spawner`, `set_spawner_registry`, `spawner_registry`, `spawn_agent`, `spawn_agent_with`, `active_spawns`).

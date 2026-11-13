@@ -8,6 +8,10 @@
 //! [`SubprocessSpawner`] launches `program` + `args` with piped
 //! stdin/stdout/stderr, writes the bootstrap frame
 //! (`{"spawn_spec": <SpawnSpec>}`), and returns a [`SpawnedProcess`] handle.
+//! Each child inherits its spawner's [`SpawnBackend`] label — `subprocess` for
+//! [`SubprocessSpawner::new`], the wrapper's own name for a spawner built with
+//! [`SubprocessSpawner::with_backend`] — so a handle, its spawner, and a runner's
+//! monitor detail agree on which backend produced the child.
 //! An exchange is one request frame down stdin followed by frames up stdout; the
 //! wire lives in [`crate::spawn::protocol`] and the bounded line framing in
 //! [`crate::spawn::frames`].
@@ -77,22 +81,59 @@ const STDERR_PREVIEW_CHARS: usize = 512;
 /// each [`SpawnSpec`].
 ///
 /// Cheap to clone and state-free: every spawn starts an independent child.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// The spawner also carries the [`SpawnBackend`] every child it launches reports:
+/// [`SpawnBackend::Subprocess`] for [`SubprocessSpawner::new`], or the wrapper's
+/// own backend when a backend reuses this protocol under another name (see
+/// [`SubprocessSpawner::with_backend`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubprocessSpawner {
     config: SubprocessConfig,
+    backend: SpawnBackend,
+}
+
+impl Default for SubprocessSpawner {
+    /// A spawner over the default [`SubprocessConfig`], labelled
+    /// [`SpawnBackend::Subprocess`].
+    fn default() -> Self {
+        Self::new(SubprocessConfig::default())
+    }
 }
 
 impl SubprocessSpawner {
     /// A spawner that launches children according to `config`.
+    ///
+    /// Children it launches report [`SpawnBackend::Subprocess`].
     #[must_use]
     pub fn new(config: SubprocessConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            backend: SpawnBackend::Subprocess,
+        }
+    }
+
+    /// A spawner that launches children according to `config` and labels them
+    /// `backend`.
+    ///
+    /// For a backend that is the subprocess protocol plus a step of its own — an
+    /// external program resolved on `PATH`, say — so its spawner, its handles, and
+    /// a runner's monitor detail all name that wrapper instead of
+    /// [`SpawnBackend::Subprocess`].
+    #[must_use]
+    pub fn with_backend(config: SubprocessConfig, backend: SpawnBackend) -> Self {
+        Self { config, backend }
     }
 
     /// The launch configuration every child inherits.
     #[must_use]
     pub fn config(&self) -> &SubprocessConfig {
         &self.config
+    }
+
+    /// The backend every child of this spawner reports.
+    #[must_use]
+    pub fn backend(&self) -> SpawnBackend {
+        self.backend
     }
 
     /// Launches one child and writes its bootstrap frame.
@@ -149,6 +190,7 @@ impl SubprocessSpawner {
         let state = Arc::new(ProcessState {
             id,
             pid,
+            backend: self.backend,
             config: self.config.clone(),
             child: Mutex::new(Some(child)),
             stdin: Mutex::new(stdin),
@@ -178,7 +220,7 @@ impl SubprocessSpawner {
 #[async_trait]
 impl AgentSpawner for SubprocessSpawner {
     fn backend(&self) -> SpawnBackend {
-        SpawnBackend::Subprocess
+        self.backend
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
@@ -191,7 +233,9 @@ impl AgentSpawner for SubprocessSpawner {
 ///
 /// Obtained from [`SubprocessSpawner::spawn_process`] (or as a [`SpawnedAgent`]
 /// through the [`AgentSpawner`] trait). The handle owns the process: dropping the
-/// last reference kills it.
+/// last reference kills it. Its [`SpawnedAgent::backend`] is the label of the
+/// spawner that launched it — [`SpawnBackend::Subprocess`] unless that spawner was
+/// built with [`SubprocessSpawner::with_backend`].
 pub struct SpawnedProcess {
     state: Arc<ProcessState>,
 }
@@ -201,6 +245,12 @@ impl SpawnedProcess {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.state.id
+    }
+
+    /// The backend that launched this child, as its spawner labelled it.
+    #[must_use]
+    pub fn backend(&self) -> SpawnBackend {
+        self.state.backend
     }
 
     /// The child's OS process id, when the platform reported one.
@@ -303,6 +353,7 @@ impl fmt::Debug for SpawnedProcess {
         formatter
             .debug_struct("SpawnedProcess")
             .field("id", &self.state.id)
+            .field("backend", &self.state.backend)
             .field("pid", &self.state.pid)
             .field("alive", &self.is_alive())
             .field("healthy", &self.is_healthy())
@@ -325,7 +376,7 @@ impl SpawnedAgent for SpawnedProcess {
     }
 
     fn backend(&self) -> SpawnBackend {
-        SpawnBackend::Subprocess
+        self.state.backend
     }
 
     /// The same atomic the background health task updates.
@@ -333,11 +384,11 @@ impl SpawnedAgent for SpawnedProcess {
         self.state.healthy.load(Ordering::SeqCst)
     }
 
-    /// Pinned to [`SpawnBackend::Subprocess`]; `last_error` stays `None` because a
+    /// Carries the handle's own backend; `last_error` stays `None` because a
     /// failed probe is an `Err` from `health`, never a fabricated field.
     fn health_snapshot(&self) -> SpawnHealth {
         SpawnHealth {
-            backend: SpawnBackend::Subprocess,
+            backend: self.state.backend,
             alive: is_alive_impl(&self.state),
             healthy: self.state.healthy.load(Ordering::SeqCst),
             pid: self.state.pid,
@@ -377,6 +428,8 @@ struct ProcessState {
     id: String,
     /// OS process id captured at spawn.
     pid: Option<u32>,
+    /// Backend label inherited from the spawner that launched the child.
+    backend: SpawnBackend,
     /// Launch/policy configuration, cloned from the spawner.
     config: SubprocessConfig,
     /// The OS process; `None` only after [`Drop`] took it for reaping.

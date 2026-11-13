@@ -14,7 +14,9 @@
 //!   kills and reaps the child.
 //! - [`crate::spawn::ExternalCommandSpawner`] resolves a host-configured program
 //!   on `PATH` and hands it to the same subprocess backend, so a vendor CLI or
-//!   any child speaking the protocol needs no separate implementation.
+//!   any child speaking the protocol needs no separate implementation; its
+//!   children are labelled
+//!   [`crate::spawn::SpawnBackend::ExternalCommand`] rather than `Subprocess`.
 //! - [`crate::spawn::InProcessSpawner`] wraps a host-bound
 //!   [`crate::spawn::InProcessHandler`]: the agent lives in this process and
 //!   there is no child to signal.
