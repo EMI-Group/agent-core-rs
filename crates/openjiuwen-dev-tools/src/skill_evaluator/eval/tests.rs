@@ -227,7 +227,8 @@ async fn harness_scores_pass_fail_and_partial_cases() {
         (3, 1, 1)
     );
     assert_eq!(run.summary.failed, 1);
-    assert!((run.summary.pass_rate - 0.5).abs() < 1e-9);
+    // Only whole passes count: 1 passed of 3 cases.
+    assert!((run.summary.pass_rate - 1.0 / 3.0).abs() < 1e-9);
     assert_eq!(agent.calls(), ["prompt-1", "prompt-2", "prompt-3"]);
 }
 
@@ -449,6 +450,78 @@ async fn write_json_and_write_jsonl_create_parents() {
     let text = workspace.read("reports/nested/run.jsonl").expect("read");
     assert_eq!(text, run.to_jsonl().expect("jsonl"));
     assert_eq!(text.lines().count(), 2);
+}
+
+#[test]
+fn report_renders_the_python_skill_tester_shape() {
+    let run = sample_run();
+
+    let report = run
+        .report("demo", "skills/demo", "2026-01-15T10:30:00Z")
+        .expect("report");
+
+    let mut keys: Vec<String> = report
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "recommendations",
+            "results",
+            "skill_name",
+            "skill_path",
+            "summary",
+            "timestamp",
+        ]
+    );
+    assert_eq!(report["skill_name"], "demo");
+    assert_eq!(report["skill_path"], "skills/demo");
+    assert_eq!(report["timestamp"], "2026-01-15T10:30:00Z");
+    assert_eq!(report["summary"]["pass_rate"], serde_json::json!(0.5));
+    assert_eq!(
+        report["results"],
+        serde_json::to_value(&run.cases).expect("cases")
+    );
+    // The Python report keeps the in-memory `id`, not the run-artifact `case_id`.
+    assert_eq!(report["results"][0]["id"], "case-1");
+    assert!(report["results"][0].get("case_id").is_none());
+    assert_eq!(report["recommendations"], serde_json::json!(["Fail"]));
+
+    let empty = EvalRun::default()
+        .report("demo", "skills/demo", "0")
+        .expect("empty report");
+    assert_eq!(empty["recommendations"], serde_json::json!([]));
+    assert_eq!(empty["results"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn write_report_creates_parents_and_writes_pretty_json() {
+    let workspace = workspace();
+    let run = sample_run();
+
+    run.write_report(
+        workspace.path("reports/nested/skill_tester_report.json"),
+        "demo",
+        "skills/demo",
+        "12345",
+    )
+    .await
+    .expect("write report");
+
+    let text = workspace
+        .read("reports/nested/skill_tester_report.json")
+        .expect("read report");
+    let value: Value = serde_json::from_str(&text).expect("parse report");
+    assert_eq!(
+        value,
+        run.report("demo", "skills/demo", "12345")
+            .expect("expected value")
+    );
+    assert!(text.contains("\n  \"skill_name\": \"demo\""));
 }
 
 #[test]

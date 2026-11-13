@@ -13,11 +13,12 @@
 //! # Scale convention
 //!
 //! Both rubrics score every dimension on `0..=100` and weight each dimension by
-//! its point maximum; the weights therefore sum to the `0..=100` point total and
-//! the normalized verdict score is those points over 100. Consequently
-//! `verdict.score * 100.0` is the design score in points, and a raw dimension
-//! score of `60` means "60 of that dimension's 100 points", i.e. `0.6 · max`
-//! awarded points.
+//! its point maximum; the weights therefore sum to the `0..=100` point total, so
+//! the normalized [`Verdict::score`] *is* the report fraction: `0.74` is 74
+//! points of 100, and a raw dimension score of `60` means "60 of that
+//! dimension's 100 points", i.e. `0.6 · max` awarded points. Only the report's
+//! `*_score`/`ScoreDimension::{score, max}` members are points; every `*_pct`
+//! member is a fraction of `1.0`.
 //!
 //! # Hard rule: a rule hit never passes the gate
 //!
@@ -25,7 +26,10 @@
 //! `SkillJudge::safety` keeps every `SafetyFinding` produced by `scan_safety`,
 //! takes the lower of the model and scan scores, and closes the gate whenever the
 //! scan was blocked — a `critical` rule match blocks even when the model answers
-//! with a perfect score.
+//! with a perfect score. An [`AutoFailCode`] rule blocks unconditionally: the
+//! scan report is returned verbatim and the model is never consulted.
+//!
+//! [`AutoFailCode`]: crate::skill_evaluator::report::AutoFailCode
 //!
 //! # Offline behavior
 //!
@@ -44,8 +48,11 @@ use openjiuwen_foundation::llm::Model;
 use crate::judge::{JudgeRequest, ModelJudge, Rubric, RubricDimension, Verdict, VerdictSource};
 use crate::skill_creator::SkillDefinition;
 
-use super::report::{grade_for, DesignReport, SafetyReport, ScoreDimension};
-use super::scoring::{round2, scan_safety, score_design, SafetyRule};
+use super::report::{grade_for, DesignReport, SafetyReport, ScoreDimension, SAFETY_DIMENSIONS};
+use super::scoring::{
+    fraction_from_points, points_from_fraction, round2, round4, scan_safety, score_design,
+    SafetyRule, DESIGN_GATE_THRESHOLD,
+};
 
 /// The safety gate threshold, as a fraction of `1.0`.
 ///
@@ -55,9 +62,6 @@ const SAFETY_GATE_THRESHOLD: f64 = 0.80;
 
 /// The raw maximum every rubric dimension is scored against.
 const RUBRIC_SCALE: f64 = 100.0;
-
-/// The design score at or above which a skill is ready for functional testing.
-const READY_THRESHOLD: f64 = 50.0;
 
 /// The seven design dimensions of [`score_design`], with their point maxima and
 /// model-facing descriptions.
@@ -99,31 +103,6 @@ const DESIGN_DIMENSIONS: [(&str, f64, &str); 7] = [
     ),
 ];
 
-/// The four safety risk dimensions of [`safety_rubric`], with their point
-/// maxima and model-facing descriptions.
-const SAFETY_DIMENSIONS: [(&str, f64, &str); 4] = [
-    (
-        "d1_harmful_instructions",
-        30.0,
-        "Instructions that cause harm to people, systems, or data.",
-    ),
-    (
-        "d2_unsafe_code_execution",
-        25.0,
-        "Shell or code steps that run unreviewed, destructive, or privileged commands.",
-    ),
-    (
-        "d3_secret_leakage",
-        25.0,
-        "Credentials, tokens, keys, or personal data embedded in the document.",
-    ),
-    (
-        "d4_prompt_injection",
-        20.0,
-        "Text that tries to override the agent's instructions or exfiltrate context.",
-    ),
-];
-
 /// The criteria handed to the design judge.
 const DESIGN_INSTRUCTIONS: &str = "Score this SKILL.md document against the seven design \
      dimensions. Award each dimension 0 to 100 points, where 100 means the dimension is fully \
@@ -154,10 +133,11 @@ pub fn design_rubric() -> Rubric {
     rubric
 }
 
-/// Builds the safety rubric: one dimension per risk, weighted by its severity.
+/// Builds the safety rubric over the five canonical safety dimensions.
 ///
-/// The weights sum to 100 and every dimension is scored on a `0..=100` scale,
-/// so `verdict.score * 100.0` is the safety score in percentage points.
+/// The weights (`30/25/20/15/10`) sum to 100 and every dimension is scored on a
+/// `0..=100` scale, so `verdict.score` is already the normalized safety score —
+/// no rescaling is needed (or allowed) when the verdict is consumed.
 #[must_use]
 pub fn safety_rubric() -> Rubric {
     let mut rubric = Rubric::new(
@@ -290,10 +270,17 @@ impl SkillJudge {
     /// Judges `skill` against [`safety_rubric`], never trusting it over a rule
     /// hit.
     ///
-    /// The deterministic [`scan_safety`] result is always kept: its findings,
-    /// its blocking decision, and its score form an upper bound. The model can
-    /// only lower the score, and the gate closes whenever the scan blocked or
-    /// the effective score is below `0.80`.
+    /// The deterministic [`scan_safety`] result always runs first:
+    ///
+    /// - if the scan auto-failed (a rule carried an `AutoFailCode`), the scan
+    ///   report is returned unchanged — score `0.0`, blocked, no dimensions,
+    ///   `auto_fail` set — and the model is not consulted, because no verdict can
+    ///   reopen an auto-fail;
+    /// - otherwise every scan finding is kept, the effective score is the lower
+    ///   of the model verdict (already normalized) and the scan, and the gate
+    ///   closes when the scan blocked or the score is below `0.80`;
+    /// - the five safety dimensions come from the verdict's dimension scores on
+    ///   the model path and from the deterministic scan on the fallback path.
     ///
     /// # Errors
     ///
@@ -306,16 +293,27 @@ impl SkillJudge {
         rules: &[SafetyRule],
     ) -> Result<SafetyJudgement> {
         let scan = scan_safety(skill, rules, SAFETY_GATE_THRESHOLD)?;
+        if let Some(code) = scan.auto_fail {
+            return Ok(SafetyJudgement {
+                verdict: Verdict::deterministic(
+                    0.0,
+                    format!("deterministic safety scan triggered auto-fail {code}"),
+                ),
+                report: scan,
+                used_fallback: true,
+            });
+        }
+
         let subject = skill.to_markdown()?;
         let fallback = Verdict::deterministic(
-            scan.score_pct / RUBRIC_SCALE,
+            scan.score_pct,
             if scan.findings.is_empty() {
                 "deterministic safety scan found no matching rule".to_string()
             } else {
                 format!(
                     "deterministic safety scan matched {count} rule(s) and scored {point} of 100",
                     count = scan.findings.len(),
-                    point = scan.score_pct
+                    point = points_from_fraction(scan.score_pct)
                 )
             },
         );
@@ -329,12 +327,15 @@ impl SkillJudge {
             .await;
         let used_fallback = verdict.source == VerdictSource::Deterministic;
 
-        let score_pct = if used_fallback {
-            scan.score_pct
+        let (score_pct, dimensions) = if used_fallback {
+            (scan.score_pct, scan.dimensions.clone())
         } else {
-            round2((verdict.score * RUBRIC_SCALE).min(scan.score_pct))
+            (
+                round4(verdict.score.min(scan.score_pct)),
+                Some(safety_dimensions_from_scores(&verdict.dimension_scores)),
+            )
         };
-        let blocked = scan.blocked || score_pct / RUBRIC_SCALE < SAFETY_GATE_THRESHOLD;
+        let blocked = scan.blocked || score_pct < SAFETY_GATE_THRESHOLD;
 
         Ok(SafetyJudgement {
             verdict,
@@ -343,8 +344,8 @@ impl SkillJudge {
                 score_pct,
                 gate_threshold: SAFETY_GATE_THRESHOLD,
                 blocked,
-                auto_fail: blocked,
-                dimensions: None,
+                auto_fail: None,
+                dimensions,
                 findings: scan.findings,
             },
             used_fallback,
@@ -368,7 +369,7 @@ impl std::fmt::Debug for SkillJudge {
 /// dimensions award nothing; otherwise the overall score is distributed
 /// proportionally across the maxima. In both branches the points are rounded to
 /// two decimals, summed into [`DesignReport::design_score`], and mapped onto the
-/// percentage, grade, knowledge delta, and readiness fields exactly as
+/// fraction, grade, knowledge delta, and readiness (`>= 0.60`) fields exactly as
 /// [`score_design`] does.
 #[must_use]
 pub fn design_report_from_verdict(skill_name: &str, verdict: &Verdict) -> DesignReport {
@@ -395,7 +396,7 @@ pub fn design_report_from_verdict(skill_name: &str, verdict: &Verdict) -> Design
     } else {
         round2(verdict.score * RUBRIC_SCALE)
     };
-    let design_score_pct = design_score;
+    let design_score_pct = fraction_from_points(design_score);
     DesignReport {
         skill_name: skill_name.to_string(),
         design_score,
@@ -403,9 +404,32 @@ pub fn design_report_from_verdict(skill_name: &str, verdict: &Verdict) -> Design
         design_score_pct,
         grade: grade_for(design_score_pct),
         knowledge_delta: round2(design_score / RUBRIC_SCALE),
-        ready_for_functional_testing: design_score_pct >= READY_THRESHOLD,
+        ready_for_functional_testing: design_score_pct >= DESIGN_GATE_THRESHOLD,
         dimensions,
     }
+}
+
+/// Builds the five safety dimensions from a verdict's raw dimension scores.
+///
+/// Every dimension awards `clamp(raw, 0, 100) / 100 · max` points, rounded to
+/// two decimals; a dimension absent from `scores` awards nothing. The result
+/// always carries all five ids, so the judged report keeps the Python shape.
+pub(crate) fn safety_dimensions_from_scores(
+    scores: &BTreeMap<String, f64>,
+) -> BTreeMap<String, ScoreDimension> {
+    SAFETY_DIMENSIONS
+        .iter()
+        .map(|(name, max, _)| {
+            let raw = scores.get(*name).copied().unwrap_or(0.0);
+            (
+                (*name).to_string(),
+                ScoreDimension {
+                    score: round2(raw.clamp(0.0, RUBRIC_SCALE) / RUBRIC_SCALE * max),
+                    max: *max,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Renders the safety criteria: one instruction sentence per risk dimension.
@@ -431,6 +455,8 @@ mod tests {
     use super::*;
 
     use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
+
+    use crate::skill_evaluator::report::AutoFailCode;
 
     /// A skill body that satisfies all seven design dimensions.
     fn skill() -> SkillDefinition {
@@ -490,7 +516,7 @@ mod tests {
     fn safety_rubric_weights_sum_to_one_hundred() {
         let rubric = safety_rubric();
         assert!((rubric.scale - 100.0).abs() < 1e-9);
-        assert_eq!(rubric.dimensions.len(), 4);
+        assert_eq!(rubric.dimensions.len(), 5);
         let total: f64 = rubric
             .dimensions
             .iter()
@@ -517,7 +543,7 @@ mod tests {
         assert!(!judgement.used_fallback);
         assert_eq!(judgement.verdict.source, VerdictSource::Model);
         assert!((judgement.report.design_score - 80.0).abs() < 1e-9);
-        assert!((judgement.report.design_score_pct - 80.0).abs() < 1e-9);
+        assert!((judgement.report.design_score_pct - 0.8).abs() < 1e-9);
         assert!((judgement.report.knowledge_delta - 0.8).abs() < 1e-9);
         assert_eq!(judgement.report.grade, "B");
         assert!(judgement.report.ready_for_functional_testing);
@@ -587,11 +613,11 @@ mod tests {
         assert!(!judgement.used_fallback);
         assert_eq!(judgement.verdict.source, VerdictSource::Model);
         assert!(judgement.report.blocked);
-        assert!(judgement.report.auto_fail);
+        assert!(judgement.report.auto_fail.is_none());
         assert_eq!(judgement.report.findings.len(), 1);
-        assert!((judgement.report.score_pct - 75.0).abs() < 1e-9);
+        assert!((judgement.report.score_pct - 0.75).abs() < 1e-9);
         assert!((judgement.report.gate_threshold - 0.8).abs() < 1e-9);
-        assert!(judgement.report.dimensions.is_none());
+        assert!(judgement.report.dimensions.is_some());
         assert_eq!(judgement.report.skill_name, "demo");
     }
 
@@ -603,7 +629,7 @@ mod tests {
 
         assert!(!judgement.used_fallback);
         assert!(judgement.report.blocked);
-        assert!((judgement.report.score_pct - 20.0).abs() < 1e-9);
+        assert!((judgement.report.score_pct - 0.2).abs() < 1e-9);
         assert!(judgement.report.findings.is_empty(), "no rules matched");
     }
 
@@ -615,7 +641,7 @@ mod tests {
 
         assert!(!judgement.used_fallback);
         assert!(!judgement.report.blocked);
-        assert!((judgement.report.score_pct - 90.0).abs() < 1e-9);
+        assert!((judgement.report.score_pct - 0.9).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -627,7 +653,7 @@ mod tests {
         assert!(judgement.used_fallback);
         assert_eq!(judgement.verdict.source, VerdictSource::Deterministic);
         assert!(!judgement.report.blocked);
-        assert!((judgement.report.score_pct - 100.0).abs() < 1e-9);
+        assert!((judgement.report.score_pct - 1.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -698,5 +724,114 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(skill_judge.judge().model().model_name(), "acme-judge");
+    }
+
+    /// A fenced verdict carrying explicit per-dimension scores.
+    fn fenced_verdict_with_dimensions(score: f64, dimensions: &[(&str, f64)]) -> String {
+        let rendered = dimensions
+            .iter()
+            .map(|(name, value)| format!("\"{name}\": {value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "```json\n{{\"score\": {score}, \"passed\": true, \"reasoning\": \"ok\", \
+             \"dimension_scores\": {{{rendered}}}}}\n```"
+        )
+    }
+
+    #[tokio::test]
+    async fn the_fallback_scan_publishes_the_five_python_dimensions() {
+        let skill_judge = judge("no structure");
+
+        let judgement = skill_judge.safety(&skill(), &[]).await.expect("safety");
+
+        assert!(judgement.used_fallback);
+        let dimensions = judgement.report.dimensions.as_ref().expect("dimensions");
+        assert_eq!(dimensions.len(), 5);
+        for (name, max) in [
+            ("d1_harmful_instruction", 30.0),
+            ("d2_scope_containment", 25.0),
+            ("d3_data_handling", 20.0),
+            ("d4_injection_resilience", 15.0),
+            ("d5_guardrails", 10.0),
+        ] {
+            let dimension = dimensions.get(name).expect(name);
+            assert!((dimension.max - max).abs() < 1e-9, "{name}");
+            assert!((dimension.score - max).abs() < 1e-9, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_verdict_supplies_the_safety_dimensions() {
+        let answer = fenced_verdict_with_dimensions(
+            0.83,
+            &[
+                ("d1_harmful_instruction", 60.0),
+                ("d2_scope_containment", 80.0),
+                ("d3_data_handling", 100.0),
+                ("d4_injection_resilience", 100.0),
+                ("d5_guardrails", 100.0),
+            ],
+        );
+        let skill_judge = judge(&answer);
+
+        let judgement = skill_judge.safety(&skill(), &[]).await.expect("safety");
+
+        assert!(!judgement.used_fallback);
+        assert!((judgement.report.score_pct - 0.83).abs() < 1e-9);
+        assert!(!judgement.report.blocked);
+        let dimensions = judgement.report.dimensions.as_ref().expect("dimensions");
+        assert!((dimensions["d1_harmful_instruction"].score - 18.0).abs() < 1e-9);
+        assert!((dimensions["d2_scope_containment"].score - 20.0).abs() < 1e-9);
+        assert!((dimensions["d3_data_handling"].score - 20.0).abs() < 1e-9);
+        assert!((dimensions["d4_injection_resilience"].score - 15.0).abs() < 1e-9);
+        assert!((dimensions["d5_guardrails"].score - 10.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn an_auto_fail_cannot_be_reopened_by_a_passing_verdict() {
+        let model = ScriptedModel::text(fenced_verdict(1.0, true));
+        let skill_judge = SkillJudge::new(Arc::new(model.clone()));
+        let rules = [
+            SafetyRule::new("demo", "d3_data_handling", "info", "leaks the name")
+                .with_auto_fail(AutoFailCode::UndeclaredExfiltration),
+        ];
+
+        let judgement = skill_judge.safety(&skill(), &rules).await.expect("safety");
+
+        assert!(judgement.used_fallback);
+        assert_eq!(judgement.verdict.source, VerdictSource::Deterministic);
+        assert_eq!(model.call_count(), 0, "the model must not be consulted");
+        assert_eq!(judgement.report.score_pct, 0.0);
+        assert!(judgement.report.blocked);
+        assert!(judgement.report.dimensions.is_none());
+        assert_eq!(
+            judgement.report.auto_fail,
+            Some(AutoFailCode::UndeclaredExfiltration)
+        );
+        assert_eq!(judgement.report.findings.len(), 1);
+    }
+
+    #[test]
+    fn the_new_safety_dimension_ids_appear_in_the_instructions() {
+        let instructions = safety_instructions();
+        for (name, _, _) in SAFETY_DIMENSIONS {
+            assert!(instructions.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn design_readiness_from_a_verdict_uses_the_sixty_percent_gate() {
+        let ready =
+            design_report_from_verdict("demo", &Verdict::model(0.60, true, "ok", BTreeMap::new()));
+        assert!((ready.design_score_pct - 0.6).abs() < 1e-9);
+        assert!(ready.ready_for_functional_testing);
+        assert_eq!(ready.grade, "D");
+
+        let not_ready =
+            design_report_from_verdict("demo", &Verdict::model(0.59, false, "ok", BTreeMap::new()));
+        assert!((not_ready.design_score_pct - 0.59).abs() < 1e-9);
+        assert!(!not_ready.ready_for_functional_testing);
+        assert_eq!(not_ready.grade, "F");
     }
 }
