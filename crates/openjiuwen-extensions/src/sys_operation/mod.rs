@@ -30,6 +30,7 @@
 //!     .is_err());
 //! ```
 #![allow(clippy::module_name_repetitions)] // `FsProviderFactory`/`CodeProviderFactory` are the contract's names.
+pub mod remote;
 use openjiuwen_common::error::{Error, Result};
 pub use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
 use openjiuwen_core::sys_operation::sandbox::provider::{
