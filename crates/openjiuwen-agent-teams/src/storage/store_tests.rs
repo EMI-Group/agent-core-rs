@@ -787,7 +787,26 @@ fn open_store_selects_memory_and_rejects_deferred_backends() {
     };
     assert!(open_store(&blank).is_ok());
 
-    for kind in ["sqlite", "postgresql", "mysql"] {
+    // Without the feature the sqlite backend is a typed deferral; with it, sqlite is a real backend
+    // and only the missing-parameter path is exercised by the crate root suite.
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let spec = StorageSpec {
+            kind: "sqlite".to_owned(),
+            ..StorageSpec::in_memory()
+        };
+        let err = open_store(&spec)
+            .err()
+            .expect("sqlite storage requires the feature");
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            err.to_string(),
+            "unsupported: storage backend 'sqlite' requires the 'sqlite' feature; \
+             enable 'openjiuwen-agent-teams/sqlite'"
+        );
+    }
+
+    for kind in ["postgresql", "mysql"] {
         let spec = StorageSpec {
             kind: kind.to_owned(),
             ..StorageSpec::in_memory()
@@ -796,7 +815,10 @@ fn open_store_selects_memory_and_rejects_deferred_backends() {
         assert_eq!(err.kind(), ErrorKind::Unsupported);
         assert_eq!(
             err.to_string(),
-            format!("unsupported: storage backend '{kind}' is not implemented; use 'memory'")
+            format!(
+                "unsupported: storage backend '{kind}' is not implemented; \
+                 the {kind} driver is not available offline"
+            )
         );
     }
 
