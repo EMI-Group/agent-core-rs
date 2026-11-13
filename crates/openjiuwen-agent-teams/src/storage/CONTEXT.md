@@ -112,6 +112,7 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - Only this directory is edited; `../lib.rs`, `../constants.rs`, `../schema/` and the sibling modules belong to other nodes.
 - `openjiuwen_common::error::{Error, Result}` only; no panic on user input; no `unwrap`/`expect` outside `#[cfg(test)]`.
 - No `unsafe`. No process-global store: `open_store` returns an independent instance per call, and the crate shares one by holding the `Arc`.
+- The runtime never opens a store from `TeamAgentSpec::storage`: `runtime::build` takes `TeamBuildDeps::store`, so a host selects a backend with `open_store(&spec.storage)` and injects the `Arc` via `TeamBuildDeps::with_store` (the `storage` spec field is otherwise unread by the crate).
 - Async-first tokio with `#[async_trait]`; `InMemoryTeamStore` holds a `parking_lot::RwLock` for the duration of one map operation only and never awaits while holding it.
 - The SQLite backend is gated by the `sqlite` feature: `--no-default-features` still builds, and nothing in `sqlite/` may be referenced without that gate.
 - `tracing` only; this module currently logs nothing (there is no recoverable anomaly a caller cannot see from a `Result`); the SQLite backend logs one `debug!` when a pool opens.
