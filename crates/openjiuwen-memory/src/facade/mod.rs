@@ -32,6 +32,7 @@
 // The constructors mirror the Python `async` call sites even when they never await.
 #![allow(clippy::unused_async_trait_impl)]
 
+mod integrations;
 mod messages;
 mod recall;
 mod records;
@@ -44,6 +45,7 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_retrieval::embedding::Embedding;
 
+use crate::analyzer::MemoryAnalyzer;
 use crate::config::MemoryEngineConfig;
 use crate::engine::MemoryEngine;
 use crate::graph::GraphMemory;
@@ -68,6 +70,8 @@ pub struct LongTermMemory {
     graph: Option<Arc<GraphMemory>>,
     /// Lite coding-memory facade, present when coding memory is enabled.
     coding: Option<CodingMemory>,
+    /// Fact extraction, classification, and consolidation planner.
+    analyzer: Arc<MemoryAnalyzer>,
 }
 
 /// Builds a [`LongTermMemory`].
@@ -85,6 +89,8 @@ pub struct LongTermMemoryBuilder {
     embedding: Option<Arc<dyn Embedding>>,
     /// Optional LLM for message-history extraction.
     model: Option<Arc<dyn Model>>,
+    /// Optional analyzer override; built from the validated config when absent.
+    analyzer: Option<Arc<MemoryAnalyzer>>,
 }
 
 impl LongTermMemoryBuilder {
@@ -110,6 +116,17 @@ impl LongTermMemoryBuilder {
         self
     }
 
+    /// Replaces the analyzer used by [`LongTermMemory::remember`](crate::facade::LongTermMemory::remember).
+    ///
+    /// The default is [`MemoryAnalyzer::from_engine`] over the validated configuration
+    /// and the attached model, so an override only needs to be supplied when a caller
+    /// wants a different extractor, classifier, or analyzer knobs.
+    #[must_use]
+    pub fn analyzer(mut self, analyzer: Arc<MemoryAnalyzer>) -> Self {
+        self.analyzer = Some(analyzer);
+        self
+    }
+
     /// Validates the configuration and builds the facade.
     ///
     /// # Errors
@@ -122,6 +139,7 @@ impl LongTermMemoryBuilder {
             stores,
             embedding,
             model,
+            analyzer,
         } = self;
         let stores = stores.unwrap_or_else(MemoryStores::in_memory);
         let mut builder = MemoryEngine::builder(config).stores(stores.clone());
@@ -132,6 +150,9 @@ impl LongTermMemoryBuilder {
             builder = builder.model(Arc::clone(model));
         }
         let engine = builder.build()?;
+        let analyzer = analyzer.unwrap_or_else(|| {
+            Arc::new(MemoryAnalyzer::from_engine(engine.config(), model.clone()))
+        });
         let graph = build_graph(&engine, &stores, embedding.as_ref(), model.as_ref());
         let coding = engine
             .config()
@@ -142,6 +163,7 @@ impl LongTermMemoryBuilder {
             engine,
             graph,
             coding,
+            analyzer,
         }))
     }
 }
@@ -155,6 +177,7 @@ impl LongTermMemory {
             stores: None,
             embedding: None,
             model: None,
+            analyzer: None,
         }
     }
 
@@ -237,6 +260,7 @@ impl std::fmt::Debug for LongTermMemory {
             .field("coding", &self.coding.is_some())
             .field("embedding", &self.engine.has_embedding())
             .field("model", &self.engine.model().is_some())
+            .field("analyzer", &self.analyzer.extractor_name())
             .finish()
     }
 }

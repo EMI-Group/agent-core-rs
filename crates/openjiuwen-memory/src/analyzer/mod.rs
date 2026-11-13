@@ -45,7 +45,7 @@
 //! provider errors and unusable answers are retried up to `model_retries` times, and once
 //! the budget is spent the deterministic implementation runs and the result records why
 //! (`ExtractionResult::degraded` for extraction, `ConflictVerdict::degraded` on every
-//! verdict for classification). A cancelled [`CallOptions`] returns
+//! verdict for classification). A cancelled [`crate::record::CallOptions`] returns
 //! [`openjiuwen_common::error::Error::Cancelled`] before the first model call.
 //!
 //! # Deviations from Python
