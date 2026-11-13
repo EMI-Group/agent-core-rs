@@ -246,9 +246,8 @@ impl ModelMgr {
 
     /// Removes every model and resets the revision counter to zero.
     ///
-    /// Python parity: `ResourceMgr.release` empties the model manager too, and
-    /// [`ResourceMgr::release`](super::ResourceMgr::release) is the caller once
-    /// the manager is wired into it; until then the method is unused in-crate.
+    /// Python parity: [`ResourceMgr::release`](super::ResourceMgr::release) calls
+    /// it to empty the model manager too.
     pub(crate) fn reset(&self) -> usize {
         self.models.reset()
     }

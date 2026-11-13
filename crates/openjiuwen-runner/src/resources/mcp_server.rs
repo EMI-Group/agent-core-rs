@@ -59,7 +59,8 @@ pub enum McpServerState {
         /// Human-readable reason, taken from the failing [`Error`]'s display.
         reason: String,
     },
-    /// Explicitly disconnected (or removed and not yet re-registered).
+    /// Explicitly disconnected by [`McpServerMgr::disconnect`]; removal drops
+    /// the entry instead of reaching this state.
     Disconnected,
 }
 
@@ -137,7 +138,8 @@ struct Inner {
     /// Server id -> position in `entries`.
     index: HashMap<String, usize>,
     /// Mutation counter; bumped on registration, replacement, removal, a
-    /// non-empty clear, and every observable state transition.
+    /// non-empty clear, and every recorded state change (see
+    /// [`McpServerMgr::revision`]).
     revision: u64,
 }
 
@@ -489,8 +491,10 @@ impl McpServerMgr {
     /// Returns the mutation counter.
     ///
     /// It increments on registration, replacement, removal, a non-empty clear,
-    /// and every observable state transition (connect success, connect failure,
-    /// disconnect).
+    /// and every state change it records: a successful connect, a failed
+    /// connect, and a disconnect. A repeated failure that leaves the entry
+    /// `Failed` with no client is not counted, though the stored reason is
+    /// refreshed.
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.inner.read().revision

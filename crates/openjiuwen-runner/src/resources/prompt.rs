@@ -187,9 +187,8 @@ impl PromptMgr {
 
     /// Removes every template and resets the revision counter to zero.
     ///
-    /// Python parity: `ResourceMgr.release` empties the prompt manager too, and
-    /// [`ResourceMgr::release`](super::ResourceMgr::release) is the caller once
-    /// the manager is wired into it; until then the method is unused in-crate.
+    /// Python parity: [`ResourceMgr::release`](super::ResourceMgr::release) calls
+    /// it to empty the prompt manager too.
     pub(crate) fn reset(&self) -> usize {
         self.prompts.reset()
     }
