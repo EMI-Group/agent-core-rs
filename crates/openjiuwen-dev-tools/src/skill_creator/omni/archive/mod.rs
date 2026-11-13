@@ -8,11 +8,11 @@
 //!
 //! Every format is parsed in-process with no compression dependency:
 //!
-//! - `tar` (POSIX `ustar` and GNU flavors) in [`tar`];
-//! - `zip` (stored and DEFLATE, plus a stored writer) in [`zip`];
-//! - `gzip` (RFC 1952, including gzip-wrapped `tar`/`zip`) in [`gzip`];
-//! - DEFLATE (RFC 1951) and CRC-32 (IEEE) live in the shared [`inflate`] and
-//!   [`crc`] modules.
+//! - `tar` (POSIX `ustar` and GNU flavors) in `tar`;
+//! - `zip` (stored and DEFLATE, plus a stored writer) in `zip`;
+//! - `gzip` (RFC 1952, including gzip-wrapped `tar`/`zip`) in `gzip`;
+//! - DEFLATE (RFC 1951) and CRC-32 (IEEE) live in the shared `inflate` and
+//!   `crc` modules.
 //!
 //! Every entry path is validated before it is returned: absolute paths, `..`
 //! components, and backslashes are rejected, so a caller can never write outside
@@ -202,14 +202,6 @@ pub(crate) fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-/// Reads a little-endian `u64` at `offset`.
-pub(crate) fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
-    let raw = slice_at(bytes, offset, 8)?;
-    Ok(u64::from_le_bytes([
-        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-    ]))
-}
-
 /// Enforces the per-entry and aggregate uncompressed-size caps.
 ///
 /// `tar` and `zip` declare entry sizes in their headers; charging a declared
@@ -253,7 +245,8 @@ impl CapTracker {
         Ok(())
     }
 
-    /// Bytes charged so far.
+    /// Bytes charged so far, for tests that assert the running total.
+    #[cfg(test)]
     pub(crate) const fn total(self) -> usize {
         self.total
     }
@@ -290,7 +283,6 @@ mod tests {
         let bytes = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
         assert_eq!(read_u16_le(&bytes, 0).expect("u16"), 0x0201);
         assert_eq!(read_u32_le(&bytes, 0).expect("u32"), 0x0403_0201);
-        assert_eq!(read_u64_le(&bytes, 0).expect("u64"), 0x0807_0605_0403_0201);
         let error = read_u32_le(&bytes, 7).expect_err("truncated");
         assert!(error.to_string().contains("offset 7"), "{error}");
         let error = slice_at(&bytes, usize::MAX, 2).expect_err("overflow");

@@ -263,6 +263,30 @@ fn a_gzip_wrapped_tar_unpacks_through_detection() {
 }
 
 #[test]
+fn a_gzip_wrapped_zip_unpacks_through_detection() {
+    use crate::skill_creator::omni::archive::ArchiveWriter;
+
+    let entries = vec![
+        ArchiveEntry {
+            path: "notes/readme.txt".to_owned(),
+            bytes: b"hello zip\n".to_vec(),
+            is_dir: false,
+        },
+        ArchiveEntry {
+            path: "assets/".to_owned(),
+            bytes: Vec::new(),
+            is_dir: true,
+        },
+    ];
+    let zip = ArchiveWriter::write_stored(&entries).expect("writes a stored zip");
+    let bytes = member_with(&zip, &Member::default());
+    assert_eq!(detect(&bytes), Some(ArchiveFormat::Gzip));
+
+    let unpacked = ArchiveUnpacker::unpack_auto(&bytes).expect("a gzip-wrapped zip unpacks");
+    assert_eq!(unpacked, entries);
+}
+
+#[test]
 fn optional_header_fields_are_skipped() {
     let tar = sample_tar();
     let all = Member {

@@ -12,7 +12,6 @@
 //!
 //! Nothing here is conditional on a compression dependency: the bit reader, the
 //! canonical Huffman tables, and the LZ77 window are implemented in this module.
-#![allow(dead_code)] // `zip` and `gzip` consume these entry points in their own work items.
 
 use openjiuwen_common::error::{Error, Result};
 use std::fmt;
