@@ -26,6 +26,7 @@ mod config;
 mod example;
 mod instruction;
 mod joint;
+mod parameter_search;
 mod search;
 mod suggestion;
 mod trainer;
@@ -36,6 +37,10 @@ pub use config::OptimizerConfig;
 pub use example::{format_prompt, render_examples, ExampleOptimizer};
 pub use instruction::InstructionOptimizer;
 pub use joint::JointOptimizer;
+pub use parameter_search::{
+    candidate_space, generate_candidates, ParameterSearchOutcome, ParameterSearcher,
+    DEFAULT_CANDIDATES_SAMPLE_NUM,
+};
 pub use search::PromptSearchOptimizer;
 pub use suggestion::placeholders;
 pub use trainer::{EvaluationSummary, Trainer};
