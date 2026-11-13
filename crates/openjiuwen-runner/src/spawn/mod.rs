@@ -15,7 +15,12 @@
 
 pub mod protocol;
 
+pub mod frames;
+pub mod subprocess;
+
+pub use frames::{frame_bytes, parse_frame_line, read_frame, DEFAULT_MAX_FRAME_BYTES};
 pub use protocol::{SpawnMessage, SpawnMessageKind};
+pub use subprocess::{SpawnedProcess, SubprocessConfig, SubprocessSpawner};
 
 use crate::error;
 use async_trait::async_trait;
