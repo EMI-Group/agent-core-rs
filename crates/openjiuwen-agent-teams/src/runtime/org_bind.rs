@@ -2,19 +2,19 @@
 //!
 //! A team participates in an organisation when its spec carries
 //! `metadata["organization"] = {"spec": OrganizationSpec, "rules": DelegationRules}`. The build
-//! path parses that block (see [`super::spec_meta`]) and stores an [`OrgBinding`] on the backend:
+//! path parses that block (see [`super::spec_meta`](crate::runtime::spec_meta)) and stores an [`OrgBinding`] on the backend:
 //! the chart, the delegation router, the cross-team task pool and the org mailbox sharing one
 //! store.
 //!
 //! Wiring rules:
 //!
-//! * every [`OrgTaskEvent`] the pool publishes is forwarded as
-//!   `EventMessage { event_type: "org_task", .. }` on [`TeamTopic::Task`], so the same bus that
+//! * every [`OrgTaskEvent`](crate::org::OrgTaskEvent) the pool publishes is forwarded as
+//!   `EventMessage { event_type: "org_task", .. }` on [`TeamTopic`](crate::schema::TeamTopic)'s task topic, so the same bus that
 //!   carries board events also carries org events; forwarding is fire-and-forget (a failed publish
 //!   is logged, never propagated into the pool);
-//! * the leader loop drains [`OrgMailbox::inbox`] each tick and acknowledges the messages only
+//! * the leader loop drains [`OrgMailbox::inbox`](crate::org::OrgMailbox::inbox) each tick and acknowledges the messages only
 //!   after a leader turn was successfully sent;
-//! * an org-level delegation is checked against [`DelegationRouter`] before the pool is asked, so a
+//! * an org-level delegation is checked against [`DelegationRouter`](crate::org::DelegationRouter) before the pool is asked, so a
 //!   refused hop never mutates the cross-team board.
 //!
 //! With no organisation block every entry point here is absent (`Option<Arc<OrgBinding>>`), which

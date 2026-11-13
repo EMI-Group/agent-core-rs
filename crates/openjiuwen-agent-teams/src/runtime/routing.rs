@@ -1,14 +1,16 @@
-//! Pool + router selection of the model a member runs on.
+//! Member-time model selection: the pool, the allocator and the effective member spec.
 //!
-//! [`TeamModelRouter`] composes the two model-layer primitives the crate already ships: a
-//! [`ModelPool`] (validated, ordered endpoints) and a [`ModelRouter`] (strategy-driven choice per
-//! request). It also keeps the [`ModelAllocator`] so a team without a pool behaves exactly as
-//! before: by-name echo, round-robin, and the persisted `(model_name, index)` reference.
+//! [`TeamModelRouter`] hands one pool entry to each member. It composes
+//! [`ModelPool`](crate::models::ModelPool) (validated, ordered endpoints) with the
+//! [`ModelAllocator`], which hands entries out in declaration order for `round_robin` and by name
+//! for `by_model_name`; a team without a pool keeps the allocator's by-name echo.
+//! Per-request routing ([`crate::models::ModelRouter`]) stays with the provider layer, because a
+//! member's endpoint is decided once per member.
 //!
 //! The selection is not just recorded — [`TeamModelRouter::effective_spec`] rewrites the member
-//! [`DeepAgentSpec`]'s `model` field with the chosen pool entry's name and provider, so the
-//! harness factory actually builds a client for that endpoint. That closes the gap where a pool
-//! entry only reached `MemberRecord::model_ref`.
+//! [`DeepAgentSpec`](crate::schema::DeepAgentSpec)'s `model` field with the chosen entry's name and
+//! provider, so the harness factory really builds a client for that endpoint, while the roster row
+//! records the same choice as `MemberRecord::model_ref`.
 use openjiuwen_common::error::Result;
 use tracing::debug;
 
@@ -63,7 +65,7 @@ impl TeamModelRouter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when the pool is invalid (blank or duplicate model name).
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation) when the pool is invalid (blank or duplicate model name).
     pub fn new(entries: &[ModelPoolEntry], strategy: ModelPoolStrategy) -> Result<Self> {
         let pool = ModelPool::from_entries(entries)?;
         let router = ModelRouter::for_pool(entries, strategy)?;
@@ -129,7 +131,7 @@ impl TeamModelRouter {
     /// With a pool, the router decides first and the result is mirrored into a
     /// [`TeamModelAllocation`] (so the persisted reference and the pool index agree). Without a
     /// pool this is exactly [`ModelAllocator::allocate`]: by-name echo or
-    /// [`Error::config`] when nothing is requested.
+    /// [`Error::config`](openjiuwen_common::error::Error::config) when nothing is requested.
     ///
     /// # Errors
     ///

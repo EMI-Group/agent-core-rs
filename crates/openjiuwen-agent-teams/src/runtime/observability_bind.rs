@@ -4,7 +4,7 @@
 //! observer. Every method is infallible and best-effort:
 //!
 //! * observability hooks are plain synchronous callbacks and may not fail a run;
-//! * monitor events are pushed with the non-blocking [`MonitorEmitter::try_emit`], so a slow or
+//! * monitor events are pushed with the non-blocking [`MonitorEmitter`](crate::monitor::MonitorEmitter)'s `try_emit`, so a slow or
 //!   absent reader never stalls the leader loop;
 //! * with no emitter installed and no hooks, every call is a no-op.
 //!

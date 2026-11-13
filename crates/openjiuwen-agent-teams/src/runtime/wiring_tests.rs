@@ -31,7 +31,7 @@ use crate::runtime::team_agent::{SpecBuild, TeamAgent};
 use crate::schema::TeamAgentSpec;
 
 pub(crate) use crate::runtime::team_agent::test_support::{
-    blueprint, deps, deep_spec, RecordingWorkspaceProvider, ScriptedFactory, ScriptedHarness,
+    blueprint, deep_spec, deps, RecordingWorkspaceProvider, ScriptedFactory, ScriptedHarness,
 };
 
 mod attach;
@@ -66,10 +66,7 @@ pub(crate) async fn wire(
     let factory = ScriptedFactory::new();
     let workspace = RecordingWorkspaceProvider::new();
     let deps = configure(deps(&factory, &workspace));
-    let agent = spec
-        .build_with(deps)
-        .await
-        .expect("the team did not build");
+    let agent = spec.build_with(deps).await.expect("the team did not build");
     Wiring {
         agent,
         factory,
@@ -96,7 +93,10 @@ pub(crate) async fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) 
 }
 
 /// Collects monitor events until `count` arrived or [`BOUND`] expired.
-pub(crate) async fn recv_monitor(receiver: &mut MonitorReceiver, count: usize) -> Vec<MonitorEvent> {
+pub(crate) async fn recv_monitor(
+    receiver: &mut MonitorReceiver,
+    count: usize,
+) -> Vec<MonitorEvent> {
     let mut events = Vec::new();
     let deadline = Instant::now() + BOUND;
     while events.len() < count {
@@ -125,7 +125,5 @@ pub(crate) fn monitor_kinds(events: &[MonitorEvent]) -> Vec<&'static str> {
 
 /// Returns the position of the first event whose kind is `kind`.
 pub(crate) fn position_of(events: &[MonitorEvent], kind: &str) -> Option<usize> {
-    events
-        .iter()
-        .position(|event| event.kind() == kind)
+    events.iter().position(|event| event.kind() == kind)
 }

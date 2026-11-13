@@ -14,7 +14,7 @@
 //! | [`allocator`] | [`ModelAllocator`]: round-robin / by-name model-pool selection |
 //! | [`routing`] | [`TeamModelRouter`]: pool + router selection and the effective member spec |
 //! | [`spec_meta`] | the metadata keys the build path reads (spawn, workspace, org, attach, KV) |
-//! | [`observer`] | the member observer feeding status, rounds, chunks and signals |
+//! | `observer` | the member observer feeding status, rounds, chunks and signals |
 //! | [`observability_bind`] | [`TeamSignals`]: observability hooks + monitor fan-out |
 //! | [`org_bind`] | [`OrgBinding`]: chart, delegation router, org task pool and mailbox |
 //! | [`attach_host`] | [`AttachHost`] / [`BackendAttachHandler`]: Unix-socket attach hosting |

@@ -1,8 +1,9 @@
 //! Unix-socket attach hosting for a running team.
 //!
 //! When the spec metadata (`attach.socket`) or `OPENJIUWEN_TEAM_SOCKET` names a path, the team
-//! binds an [`AttachServer`] on `start` and serves it with [`BackendAttachHandler`], which maps
-//! every [`AttachOp`] onto this team's [`TeamBackend`] (roster, mail, board, snapshot) and the
+//! binds an [`AttachServer`](crate::attach::AttachServer) on `start` and serves it with
+//! [`BackendAttachHandler`], which maps every [`AttachOp`](crate::attach::AttachOp) onto this
+//! team's [`TeamBackend`] (roster, mail, board, snapshot) and the
 //! caller's cancellation token (`stop_team`).
 //!
 //! Policy:
@@ -72,7 +73,7 @@ impl AttachHost {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    /// Stops serving and removes the socket, waiting at most [`SHUTDOWN_GRACE`].
+    /// Stops serving and removes the socket, waiting at most `SHUTDOWN_GRACE`.
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
         if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.task)
