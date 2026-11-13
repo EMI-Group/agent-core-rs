@@ -1,8 +1,9 @@
-//! Offline, deterministic evaluation of skills against test cases.
+//! Offline-first evaluation of skills against test cases.
 //!
 //! Ports the evaluation artifacts of `openjiuwen/dev_tools/skill_evaluator`
-//! (case model, design/functional/safety reports, aggregation formula) onto a
-//! typed Rust harness that runs without a model unless one is supplied.
+//! (case model, design/functional/safety reports, aggregation formula) plus the
+//! `skills/skill_tester/scripts/run_eval_query.py` single-query harness onto a
+//! typed Rust toolkit that runs without a model unless one is supplied.
 //!
 //! # Pipeline
 //!
@@ -23,15 +24,32 @@
 //!    `0.60`, yielding the [`FinalScore`]: `COMPLETED` when both gates pass,
 //!    otherwise `BLOCKED_AT_E1_LLM_JUDGE` or `BLOCKED_AT_SAFETY`.
 //!
+//! # Optional LLM judging
+//!
+//! [`judge_scoring`] adds the Python model-judged path: [`design_rubric`] scores
+//! the seven design dimensions and [`safety_rubric`] scores four risk
+//! dimensions, both through the shared [`crate::judge`] seam. [`SkillJudge`]
+//! degrades to the deterministic scorers on any model or parse failure and marks
+//! the verdict source, while [`SkillEvaluator::with_judge`] plus
+//! [`SkillEvaluator::evaluate_with_judge`] record that provenance in
+//! [`JudgeRecord`]. A matching [`SafetyRule`] always blocks, even when the model
+//! verdict would pass.
+//!
+//! # Evaluation harness
+//!
+//! [`eval`] loads cases from JSON or JSONL ([`load_cases_json`],
+//! [`load_cases_file`]), runs them through an [`EvalAgent`] ([`ModelAgent`] or a
+//! [`CaseRunnerAgent`]), and emits an [`EvalRun`] as JSON, JSONL, or files.
+//! [`EvalHarness::run_query`] ports `run_eval_query.py`: one agent call, an
+//! answer file, and a JSON report beside it, with caller-supplied timestamps.
+//!
 //! # Determinism and deviations
 //!
-//! Every step is a pure function of its inputs: no network, no environment
-//! reads, no wall clock. Python graded design by prompting a model with a prose
-//! rubric and ran a shell harness for cases; the Rust port uses deterministic
-//! structure checks plus expectation assertions, keeping the report field names
-//! and the weighting formula. A model-supplied design/safety judgement can be
-//! layered on later through [`score_design`]'s inputs and the [`Assertion`]
-//! traits without changing the report types.
+//! The deterministic path ([`SkillEvaluator::evaluate`]) is a pure function of
+//! its inputs: no network, no environment reads, and a report timestamp supplied
+//! by the caller or read from the wall clock only at the documented entry point.
+//! The judge and harness paths touch a model only when the caller supplies one,
+//! and both keep the Python report field names and the `0.40/0.60` weighting.
 //!
 //! [`SkillDefinition`]: crate::skill_creator::SkillDefinition
 pub mod assertion;
@@ -45,7 +63,15 @@ pub mod scoring;
 
 pub use assertion::{Assertion, AssertionOutcome};
 pub use case::{CaseStatus, EvalCase};
+pub use eval::{
+    load_cases_file, load_cases_json, resolve_output_file, CaseRunnerAgent, EvalAgent, EvalHarness,
+    EvalRun, ModelAgent, QueryOutcome, QueryRequest,
+};
 pub use evaluator::{EvaluatorConfig, SkillEvaluator};
+pub use judge_scoring::{
+    design_report_from_verdict, design_rubric, safety_rubric, DesignJudgement, SafetyJudgement,
+    SkillJudge,
+};
 pub use report::{
     grade_for, CaseResult, CaseSummary, DesignReport, EvaluationReport, EvaluatorScore,
     EvaluatorScores, FinalScore, FunctionalReport, JudgeRecord, SafetyFinding, SafetyReport,
