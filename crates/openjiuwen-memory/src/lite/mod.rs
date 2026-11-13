@@ -56,6 +56,24 @@ pub mod watch;
 /// The local, file-backed coding-memory store (Markdown + derived index).
 pub mod local;
 
+/// Chunked embedding index and content-hash embedding cache for the local store.
+pub mod embed;
+
+/// Per-fact Markdown files plus the `MEMORY.md`/`USER.md` rendered index split.
+pub mod facts;
+
+/// JSONL session logs under `sessions/` and their recall index.
+pub mod session;
+
+/// Caller-driven sync triggers and the deterministic interval scheduler.
+pub mod sync;
+
+/// Daily rollup documents under `daily_memory/`.
+pub mod daily;
+
+/// Write modes and the bounded conflict-retry checker.
+pub mod write;
+
 /// SQLite FTS5 full-text index over coding facts (feature `sqlite`).
 #[cfg(feature = "sqlite")]
 pub mod fts;
