@@ -18,6 +18,8 @@
 //!   test cases, producing design/functional/safety reports and a final score.
 //! - [`tune`] — the ported `Case`/`EvaluatedCase`/`CaseLoader` models plus
 //!   API-shaped stubs for the deferred tuning pipelines.
+//! - [`judge`] — rubric-driven LLM judging over the [`Model`] seam with tolerant
+//!   structured-verdict parsing, shared by `skill_evaluator` and `tune`.
 //!
 //! [`Model`]: openjiuwen_foundation::llm::Model
 //!
@@ -49,6 +51,7 @@
     clippy::missing_const_for_fn
 )]
 pub mod agent_builder;
+pub mod judge;
 pub mod prompt_builder;
 pub mod skill_creator;
 pub mod skill_evaluator;
