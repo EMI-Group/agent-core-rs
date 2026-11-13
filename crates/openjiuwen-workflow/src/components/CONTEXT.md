@@ -71,6 +71,8 @@ Each run gets a fresh child `WorkflowSession` whose parent is the calling sessio
 `stream` forwards the child's `{"type","index","payload"}` frame wires and drops the child's terminal `workflow_final`; with `cache_stream = true` the frames are merged (strings concatenate, arrays extend, every other type is last-wins — Python raises `TypeError` on numbers) and a later `invoke` answers from the cache.
 A child `INPUT_REQUIRED` re-publishes every interaction wire on the parent context and fails with the first one, so the parent run reports `INPUT_REQUIRED` with the same questions.
 `depth >= max_nesting_depth` fails with `[100100]` "workflow nesting hierarchy is too big, must <= {max}".
+Nested resume: `child_options` reads the answers already forwarded from the parent session component lane `sub_workflow_answers` (`NESTED_ANSWERS_KEY`, a JSON object of `id → [answer, …]`, a lone non-array read as a one-element queue), folds Python's dotted `"<sub node id>.<child id>"` ids onto the bare child id (dropping the prefixed key so it is not consumed twice), appends the answers still queued in the parent run (`ctx.queued_answers()`), records the merged map back, and passes it as `WorkflowRunOptions::answers` with `depth + 1`.
+The child still starts from a fresh session, so its own checkpoint snapshot and component lanes are not resumed; only the answers are replayed.
 
 ### `http_request/` — `HttpRequestComponent`
 
@@ -92,6 +94,7 @@ It runs a `start`/`user_interact`/`end` state machine persisted in the session c
 Field extraction calls the model, strips a code fence, parses the JSON object, filters it to the configured field names, drops empty values, converts `FieldInfo.type` (`string`/`integer`/`number`/`boolean`), and fills `default_value` for the rest.
 Missing required fields produce a continue-ask question in the configured language; exceeding `max_response` is `[101074]`.
 An open question returns the interrupt error from `ComponentContext::interact`, so the run halts as `INPUT_REQUIRED` and `resume` re-runs the component with the seeded answers.
+Chat history is opt-in (`with_chat_history`, default off) with `chat_history_max_rounds` (default 5): each round records the user turn, builds the window from the session `__messages__` lane through `ctx.history()` (the last N rounds, a round starting at a user turn), renders it as `dialogue_history` in the extraction prompt (one `role<separator>content` line per message, `": "` in English and `"："` otherwise), appends the current query when the window is empty or ends with an assistant turn, and records the assistant turn afterwards (the follow-up question, or the extracted fields as compact JSON when the round completes).
 The output is `{user_response, question, <fields>}` with empty `user_response`/`question` omitted.
 Local codes are `101070..=101076`.
 
@@ -165,7 +168,8 @@ Unit tests live beside each module and use `WorkflowSession` plus a plain `Compo
 `branch` covers first-match delegation, the `101021` no-match error, the empty invoke output, and adapter naming/`Arc` sharing; the adapter's `RouterContext` path is exercised by engine integration tests because `RouterContext` has no public constructor.
 `loop_` covers number/array/condition plans, reference-path arrays, `previous` propagation, empty and multi-component bodies, the `1001` and session-tightened caps, a zero cap, every missing parameter, non-object inputs, and `LoopConfig` JSON round-trip/defaults.
 `llm/format` covers instruction rewriting, `generate_json_schema`, fence stripping, required-field errors, and output projection; `llm/messages` covers template precedence, history splicing, and turn recording.
-`sub_workflow`, `http_request`, `questioner`, `intent_detection` and `react_agent` carry inline suites for their config, state machine, templating, category model, and runner loops.
+`start`, `end`, `branch`, `loop_`, `llm/mod`, `llm/format`, `llm/messages`, `tool`, `retrieval`, `memory`, `http_request/mod`, `http_request/config`, `intent_detection`, `react_agent` and `sub_workflow` (card identity, nesting default, opt-in cache, cache merging, interaction-wire parsing) carry inline suites.
+`questioner` has no inline suite: its state machine, `question_content` rendering and chat-history window are covered by `../tests/questioner_component.rs`.
 Crate-level suites in `../tests/` (listed in `tests/CONTEXT.md`) exercise the same components inside real workflows.
 
 ## Notes for Agents
@@ -177,9 +181,9 @@ Crate-level suites in `../tests/` (listed in `tests/CONTEXT.md`) exercise the sa
 - **Flat-mode `collect` drops `null` leaves** (matching Python's `extract_leaf_nodes` pruning of empty values) but keeps other falsy scalars such as `0`, `""`, and `false`.
 - `loop_`'s cancellation check runs once per iteration; a cancelled run surfaces `Error::Cancelled` rather than a loop error.
 - The body runs in-process: component errors propagate unchanged, while loop configuration, array-shape, and cap problems use `crate::error::loop_execution_error` (`101040`).
-- `SubWorkflowComponent` shares the parent's checkpointer, so a child session with a checkpointer can resume its own snapshot, but a parent `resume` starts a fresh child run and does not forward seeded answers.
+- `SubWorkflowComponent` builds a fresh child `WorkflowSession` (shared checkpointer, own state store) for every run, so a parent `resume` replays the child from scratch and only the answers recorded under `sub_workflow_answers` carry over; child-side state such as questioner rounds, and any stored child snapshot, does not.
 - `HttpRequestComponent` declares only `Invoke` on purpose: the engine's ability priority would otherwise drive a plain node as `Transform`.
 - `HttpRequestComponent` deviations: multipart bodies and digest/AWS authentication return `Error::Unsupported`; `throw_on_http_error`, `rate_limit_config`, `use_stream` and `max_body_length` are parsed but not enforced; binary bodies are base64; JSON string bodies use `serde_json` instead of `ast.literal_eval`.
-- `QuestionerComponent` deviations: the model is injected via `with_model` (no `model_id` runner lookup), chat-history window injection is not implemented (`with_chat_history`/`chat_history_max_rounds` are carried only), there is no `QuestionerExecutable` layer, and the state reset writes `null`s because the session lane deep-merges.
+- `QuestionerComponent` deviations: the model is injected via `with_model` (no `model_id` runner lookup), chat history lives in the session `__messages__` lane instead of Python's `ModelContext` window (so every history-enabled component on one session shares one conversation, entries are text only through `BaseMessage::text`, and a leading system turn is dropped when the window is trimmed), `chat_history_max_rounds` of `0` is clamped to one round (Python requires `> 0`), the completing assistant turn is compact JSON rather than `json.dumps` with separators, a `question_content` round writes no assistant turn, there is no `QuestionerExecutable` layer, and the state reset writes `null`s because the session lane deep-merges.
 - `IntentDetectionComponent` deviations: the model is injected, history lives in `__messages__`, and JSON parsing is strict (`{'class': 'x'}` is rejected).
 - `ReActAgentComponent` deviations: interrupts become `result_type: "interrupt"` data (the run completes), `on_max_iterations` policies return plain values instead of Python's rich dict, and the agent runtime (context engine, rails, skills, KV cache) is deferred to `AgentRunner` implementations.
