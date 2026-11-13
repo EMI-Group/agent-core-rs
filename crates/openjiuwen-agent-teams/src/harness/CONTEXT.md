@@ -146,13 +146,15 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 ## Deferred
 
 - Vendor CLI harness providers (Codex, Claude Code) and distributed transports: the factory seam is generic and the vendor adapters stay `Unsupported` in `openjiuwen-harness-providers`, while a process member builds its harness in its own child process.
-- Provider-side checkpoint export/import plumbing (`HarnessProtocol::export_checkpoint` is called only by callers that opt in; the runtime does not poll it).
+- Provider-side checkpoint export/restore plumbing: `NativeCheckpoint` is a standalone payload type — no runtime path constructs, persists, or reads it back, no member checkpoint file/directory convention exists, and `HarnessMemberRuntime` never calls `HarnessProtocol::export_checkpoint`; `start` builds a bare `HarnessContext` (no `checkpoint`, no `checkpoint_sink`), so nothing is exported or resumed; the protocol has no `import_checkpoint` at all (restore is `HarnessContext::checkpoint` + `ResumePolicy`).
 - Mounting live tools, MCP servers, sub-agents, rails and approval policy from a cold spec — runtime wiring owns those handles.
 - Model-pool/IntelliRouter selection — [`ModelResolver`] is the seam; only the environment resolver ships.
 
 ## Notes for Agents
 
 - `adapter.rs` imports `crate::member::{MemberObserver, MemberRuntime}` from the implemented `../member/` seam; import those traits, never add a second definition of them here.
+- `NativeCheckpoint` is reachable as `openjiuwen_agent_teams::harness::checkpoint::NativeCheckpoint`, `…::harness::NativeCheckpoint`, `openjiuwen_agent_teams::NativeCheckpoint` (`../lib.rs` re-export) and `openjiuwen::agent_teams::…` through the umbrella; nothing in this crate's `src/` builds one — every construction site is a test.
+- A checkpoint test that wants real persistence asserts on the protocol handle instead: `NativeMemberFactory::create` returns `Arc<dyn HarnessProtocol>` whose `NativeHarness::export_checkpoint` is already `Some` after `start` (sequence 1), with `NativeCheckpointState` (from `openjiuwen_harness`) inside `HarnessCheckpoint::data`; that is a different type from `NativeCheckpoint`.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it (crate root does) — never define a second enum.
 - The pump deliberately does not end on a terminal turn event: `events()` is the cycle-long view, and a member runs many rounds per cycle.
 - Observer callbacks are invoked outside the observer lock; a panicking observer ends the pump task (it is not caught), so observers must be cheap and non-panicking.
