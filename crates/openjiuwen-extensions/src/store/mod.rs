@@ -53,7 +53,7 @@ pub enum StoreKind {
     /// Redis key-value storage (live over the in-crate client, feature
     /// `redis`).
     Redis,
-    /// Elasticsearch vector storage (deferred).
+    /// Elasticsearch vector storage (live REST backend).
     Elasticsearch,
 }
 /// A storage backend selected from configuration.
@@ -84,8 +84,8 @@ pub enum StoreBackend {
         /// `rediss+cluster://` URL.
         url: Option<String>,
     },
-    /// Elasticsearch vector storage; deferred, so only the configuration is
-    /// kept.
+    /// Elasticsearch vector storage; the vector factory returns a live REST
+    /// backend, while the key-value and document factories reject it.
     Elasticsearch {
         /// Elasticsearch endpoint, `http://` or `https://`.
         url: String,
