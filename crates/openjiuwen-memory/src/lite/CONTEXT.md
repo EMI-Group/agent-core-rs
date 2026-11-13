@@ -292,6 +292,7 @@ impl FtsIndex {
 - The derived index is never the source of truth: it can be dropped and rebuilt from `MEMORY.md` at any time.
 - Default builds work without the `sqlite` feature: `LocalCodingMemory` then reloads and keyword-searches the Markdown document with no FTS index.
 - Errors follow the crate strategy; no panics.
+- `markdown.rs` (~1130 lines) and `local.rs` (~1130 lines) sit slightly above the ~1000-line baseline because each carries its own full unit-test module in-file; their implementation halves are ~600 and ~780 lines, so they are kept whole rather than split.
 
 ## Routing Table
 
