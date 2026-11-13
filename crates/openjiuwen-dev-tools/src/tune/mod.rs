@@ -1,6 +1,6 @@
 //! Prompt tuning: cases, evaluators, optimizers, and a training loop.
 //!
-//! Ports `openjiuwen/dev_tools/tune/` onto three cooperating layers:
+//! Ports `openjiuwen/dev_tools/tune/` onto four cooperating layers:
 //!
 //! - **Data** — [`Case`] is one tuning example (the model [`inputs`](Case::inputs),
 //!   the expected [`label`](Case::label), optional [`tools`](Case::tools), and a
@@ -16,12 +16,25 @@
 //!   replays canned answers for tests.
 //! - **Search** — [`InstructionOptimizer`] (beam search over rewrites),
 //!   [`ExampleOptimizer`] (greedy few-shot selection), [`JointOptimizer`]
-//!   (alternating both), [`PromptSearchOptimizer`] (one breadth-first sweep),
-//!   and [`Trainer`] (train/validation with early stop) share
-//!   [`OptimizerConfig`] and the tuning constants ([`DEFAULT_ITERATION_NUM`],
-//!   [`MAX_PARALLEL_NUM`], …). A [`Trainer`] can also report its evaluation as
-//!   an [`EvaluationSummary`], which adds the per-case tool usage to the mean
-//!   score and results.
+//!   (alternating both), [`ParameterSearcher`] (seeded parameter sampling), and
+//!   [`Trainer`] (train/validation with early stop) share [`OptimizerConfig`] and
+//!   the tuning constants ([`DEFAULT_ITERATION_NUM`], [`MAX_PARALLEL_NUM`], …).
+//!   A [`Trainer`] can also report its evaluation as an [`EvaluationSummary`],
+//!   which adds the per-case tool usage to the mean score and results.
+//! - **Prompt search** — [`PromptSearchOptimizer`] runs Python's bounded,
+//!   elitist multi-round search: each round starts from the best prompt so far,
+//!   adds the deterministic mutations and one model rewrite, executes every
+//!   candidate through the evaluator against visible and hidden cases, scores it
+//!   with [`CompositeReward`] (correctness gate, overfitting penalty, drift
+//!   penalty), and stops on a [`ConvergenceDetector`] rule or the early-stop
+//!   score. The domain layer it is built on — [`PromptTaskSpec`] /
+//!   [`PromptTaskCase`], [`PromptCandidate`] / [`Execution`] /
+//!   [`IterationRecord`], [`RewardBreakdown`] / [`RewardComponent`], [`DriftJudge`]
+//!   (with [`LexicalDriftJudge`] as the default), [`PromptMemory`], and
+//!   [`OptimizationHistory`] / [`HistoryCompressor`] — is re-exported here too,
+//!   [`PromptSearchConfig`] holds its budget and stopping rules, and
+//!   [`OptimizationResult`] reports the per-round records, the convergence
+//!   verdict, and a deterministic run id.
 //!
 //! A case may declare tools, and the tool layer makes them runnable and
 //! observable: [`ToolStub`] is a named in-process fixture, [`ToolStubs`] the table

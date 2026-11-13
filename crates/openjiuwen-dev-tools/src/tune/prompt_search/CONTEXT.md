@@ -3,7 +3,7 @@
 ## Intent
 
 Port the prompt-search (RLAF-P) domain layer of `openjiuwen/dev_tools/tune/optimizer/prompt_search/`: the task/execution vocabulary, the composite reward model with its anti-reward-hacking guards, convergence detection, the drift judge, the prompt memory, and the history compressor.
-The optimization loop above it (`policy`, `environment`, `optimizer`, `run_log`, `service`) is not part of this node: this module supplies the deterministic mechanics a loop composes.
+The RLAF-P optimization loop is ported above this node, in `../optimizer/search/` (`PromptSearchOptimizer`), and is built exclusively from these types; Python's `policy`, `environment`, `run_log`, and `service` modules are not ported.
 Everything is offline and deterministic — no clocks, environment reads, randomness, or global state — and it is a layer-5 consumer of `openjiuwen_foundation` models plus the shared `crate::tune::base::Case`.
 
 ## API Surface
@@ -29,6 +29,7 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - Memory (`memory.rs`): `PromptMemory` trait (`&self` methods, interior mutability) with `store`, `search_similar(&PromptTaskSpec, top_k)`, `best_for_objective`, `pending(threshold)`, `mark_applied -> Result<bool>`, `records`; `NullPromptMemory`; `JsonlPromptMemory::new(dir) -> Result<Self>` with `path()` and `skipped_lines()`.
 - History (`history.rs`): `HistoryEntry { index, reward, prompt, observations }` (`new(index, reward, prompt)`, `with_observations`, `render()`, `render_with_limit(limit)`), `OptimizationHistory { entries, compressed }` (`add`, `best_reward`, `best_prompt`, `render_recent(limit)`, `render`, `is_empty`), `HistoryCompressor { budget: 1200 }` (`new`, `with_budget`, `budget`, `compress`).
 - The module root re-exports every public item; `models`, `reward`, `convergence`, `drift`, `memory`, `history` stay private, as do the `token_set`/`jaccard` helpers shared between memory and drift.
+- How the search loop consumes this surface (`../optimizer/search/`): each round builds `PromptCandidate`s and `Execution`s, scores them into `Evaluation { execution, reward: RewardBreakdown }`, records an `IterationRecord`, compresses a `HistoryEntry` into `OptimizationHistory`, asks a `DriftJudge` for deviations (skipped at `drift_penalty == 0`), asks a `ConvergenceDetector` whether to stop, persists the elite as a `PromptRecord`, and returns `OptimizationResult::records` as `Vec<IterationRecord>`.
 
 ## Constraints
 
@@ -77,5 +78,6 @@ Everything is offline and deterministic — no clocks, environment reads, random
 - `./history.rs` → `HistoryEntry`, `OptimizationHistory`, `HistoryCompressor`
 - `./mod.rs` → module docs and the public re-export surface
 - `../../base.rs` → shared `Case` consumed by `PromptTaskCase` (outside this node — read-only, escalate writes to `src/tune`)
-- `../optimizer/` → the prompt-search result type and the existing optimizer family (sibling — read-only, other agents own it)
+- `../optimizer/search/` → `PromptSearchOptimizer`, the RLAF-P loop that consumes every type here (sibling — read-only, other agents own it)
+- `../optimizer.rs` → `OptimizationResult`, whose `records` field is `Vec<IterationRecord>` (sibling — read-only, other agents own it)
 - `../../util.rs` → `extract_json_fence` used by the model drift judge (outside this node — read-only, escalate writes to the crate root)
