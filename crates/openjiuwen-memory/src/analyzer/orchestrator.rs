@@ -14,7 +14,7 @@ use crate::analyzer::fact::{ExtractedFact, ExtractionInput, ExtractionResult, Fa
 use crate::analyzer::llm::LlmExtractor;
 use crate::analyzer::llm_classifier::LlmClassifier;
 use crate::analyzer::rule::RuleExtractor;
-use crate::config::DedupeConfig;
+use crate::config::{DedupeConfig, MemoryEngineConfig};
 use crate::recall::{find_duplicate, merge_records, Candidate};
 use crate::record::{CallOptions, DedupePolicy, MemoryRecord, MemoryScope};
 use chrono::Utc;
@@ -108,6 +108,17 @@ impl MemoryAnalyzer {
         Self { config, extractor }
     }
 
+    /// Builds the analyzer an engine configuration implies.
+    ///
+    /// The knobs shared with the engine (`max_facts`, the input length bound, the history
+    /// depth, the model retry budget, and the default importance) come from
+    /// [`AnalyzerConfig::from_engine`], so the analyzer and the engine cannot drift.
+    /// `model` only takes effect when the configuration asks for the LLM extractor.
+    #[must_use]
+    pub fn from_engine(config: &MemoryEngineConfig, model: Option<Arc<dyn Model>>) -> Self {
+        Self::from_config(AnalyzerConfig::from_engine(config), model)
+    }
+
     /// Builds an analyzer around an externally constructed extractor.
     #[must_use]
     pub fn with_extractor(config: AnalyzerConfig, extractor: Arc<dyn FactExtractor>) -> Self {
@@ -164,7 +175,7 @@ impl MemoryAnalyzer {
     ///
     /// With `dedupe.enabled == false` every fact becomes
     /// [`ConsolidationAction::Add`]. Otherwise each fact is compared with the stored
-    /// records using [`crate::recall::dedupe::find_duplicate`] and the configured
+    /// records using [`crate::recall::find_duplicate`] and the configured
     /// [`DedupePolicy`] decides between merge, replace, skip, and add. The plan is
     /// computed against the records as supplied; it does not fold earlier actions of the
     /// same batch into each other.
@@ -281,6 +292,30 @@ mod tests {
         assert_eq!(analyzer.extractor_name(), "llm");
     }
 
+    #[test]
+    fn from_engine_builds_the_rule_extractor_and_copies_the_shared_knobs() {
+        let engine = MemoryEngineConfig {
+            input_msg_max_len: 2048,
+            importance_default: 0.7,
+            ..Default::default()
+        };
+        let analyzer = MemoryAnalyzer::from_engine(&engine, None);
+        assert_eq!(analyzer.extractor_name(), "rule");
+        assert_eq!(analyzer.config(), &AnalyzerConfig::from_engine(&engine));
+        assert_eq!(analyzer.config().max_input_chars, 2048);
+        assert!((analyzer.config().default_importance - 0.7).abs() < f32::EPSILON);
+    }
+    #[test]
+    fn from_engine_keeps_rules_when_the_engine_config_does_not_request_the_llm() {
+        let engine = MemoryEngineConfig::default();
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::builder().build());
+        let analyzer = MemoryAnalyzer::from_engine(&engine, Some(model));
+        assert_eq!(analyzer.extractor_name(), "rule");
+        assert_eq!(
+            analyzer.config().extractor,
+            AnalyzerConfig::from_engine(&engine).extractor
+        );
+    }
     #[test]
     fn classifier_follows_the_classifier_kind() {
         let analyzer = MemoryAnalyzer::rule(AnalyzerConfig::default());
