@@ -1,11 +1,12 @@
 //! Model-facing description text of the built-in tools, in English and Chinese.
 //!
 //! The table covers the core twenty tools (the shell, filesystem, todo, `ask_user` and memory
-//! tools) plus the extended tool set (web, media metadata, cron, MCP resources, tool discovery
-//! and goal tracking).
+//! tools) plus the extended tool set (web, media metadata, cron, MCP resources, tool discovery,
+//! goal tracking, LSP navigation and git worktrees).
 //! Ports the bilingual description constants of `openjiuwen/harness/prompts/tools/`
 //! (`filesystem.py`, `bash.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`,
-//! `web_tools.py`, `vision.py`, `audio.py`, `cron.py`, `mcp.py`, `tool_search.py`, `goal.py`).
+//! `web_tools.py`, `vision.py`, `audio.py`, `cron.py`, `mcp.py`, `tool_search.py`, `goal.py`,
+//! `lsp_tool/`, `worktree/`).
 //! The text is prompt material seen by the model, so it is kept verbatim from the Python SDK
 //! wherever the ported tool has the same arguments, including blank lines; tools look it up
 //! through [`description`] by name and language.
@@ -625,6 +626,16 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
             "只有缺少用户输入、权限、依赖、外部服务或环境状态且无法继续任何有意义推进时才使用 blocked。",
         ),
     ),
+    (
+        "lsp",
+        "LSP (Language Server Protocol) code navigation: hover, definition, references, completion, document symbols and workspace symbols. Positions are one-based line and column. Returns short, typed text results.",
+        "LSP（语言服务器协议）代码导航工具：hover、definition、references、completion、symbols（文档符号）和 workspace_symbols。行号和列号从 1 开始，返回简短的结构化文本结果。",
+    ),
+    (
+        "worktree",
+        "Create and manage git worktrees for this repository. Worktrees live under `.worktrees/<name>` inside the project; never use `..` or paths outside it. Actions: `create` (name, optional branch/base), `list`, `remove` (name, optional force), `lock` (name, optional reason), `unlock` (name), `prune`, `status` (name).",
+        "在当前仓库中创建和管理 git worktree。worktree 位于项目内的 `.worktrees/<name>`，禁止使用 `..` 或项目之外的路径。操作：`create`（name，可选 branch/base）、`list`、`remove`（name，可选 force）、`lock`（name，可选 reason）、`unlock`（name）、`prune`、`status`（name）。",
+    ),
 ];
 
 /// Returns the description of `name` in `language`, or `""` for an unknown tool name.
@@ -645,8 +656,8 @@ pub fn description(name: &str, language: &str) -> &'static str {
 mod tests {
     use super::{description, DESCRIPTIONS, SUPPORTED_LANGUAGES};
 
-    /// The thirty model-facing tool names: the core registry order, then the extended tool set.
-    const TOOL_NAMES: [&str; 30] = [
+    /// The thirty-two model-facing tool names: the core registry order, then the extended set.
+    const TOOL_NAMES: [&str; 32] = [
         "bash",
         "read_file",
         "write_file",
@@ -677,6 +688,8 @@ mod tests {
         "tool_search",
         "get_current_goal",
         "submit_goal_report",
+        "lsp",
+        "worktree",
     ];
 
     #[test]
@@ -727,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn table_holds_exactly_the_thirty_tools_in_registry_order() {
+    fn table_holds_exactly_the_extended_tools_in_registry_order() {
         let names: Vec<&str> = DESCRIPTIONS.iter().map(|(name, ..)| *name).collect();
         assert_eq!(names, TOOL_NAMES);
     }
@@ -812,6 +825,12 @@ mod tests {
         assert!(description("submit_goal_report", "cn")
             .trim_start()
             .starts_with("仅当本次用户消息中包含 <goal_task> 标签"));
+        assert!(
+            description("lsp", "en").starts_with("LSP (Language Server Protocol) code navigation")
+        );
+        assert!(description("lsp", "cn").starts_with("LSP（语言服务器协议）代码导航工具"));
+        assert!(description("worktree", "en").starts_with("Create and manage git worktrees"));
+        assert!(description("worktree", "cn").starts_with("在当前仓库中创建和管理 git worktree"));
     }
 
     #[test]

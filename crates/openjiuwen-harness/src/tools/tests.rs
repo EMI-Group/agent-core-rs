@@ -7,6 +7,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,7 +19,11 @@ use tempfile::TempDir;
 use super::{
     descriptions, discovery, goal, mcp_resources, tool_names, web, BuiltinTool, ToolRegistry,
 };
+use crate::permission::{
+    PermissionEngine, PermissionEngineConfig, PermissionLevel, PermissionsSection,
+};
 use crate::workspace::Workspace;
+use crate::worktree::{WorktreeManager, NOT_A_REPOSITORY_MARKER, NOT_INSTALLED_MARKER};
 
 /// The twenty default Python tool names, in registry order.
 const EXPECTED_NAMES: [&str; 20] = [
@@ -44,8 +49,8 @@ const EXPECTED_NAMES: [&str; 20] = [
     "coding_memory_edit",
 ];
 
-/// The ten extended Python tool names, in registry order.
-const EXPECTED_EXTENDED_NAMES: [&str; 10] = [
+/// The twelve extended Python tool names, in registry order.
+const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
     "fetch_webpage",
     "web_search",
     "image_metadata",
@@ -56,10 +61,12 @@ const EXPECTED_EXTENDED_NAMES: [&str; 10] = [
     "tool_search",
     "get_current_goal",
     "submit_goal_report",
+    "lsp",
+    "worktree",
 ];
 
 /// The `required` list of each Python card; the empty slices have no `required` key at all.
-const EXPECTED_REQUIRED: [(&str, &[&str]); 30] = [
+const EXPECTED_REQUIRED: [(&str, &[&str]); 32] = [
     ("bash", &["command"]),
     ("read_file", &["file_path"]),
     ("write_file", &["file_path", "content"]),
@@ -90,6 +97,8 @@ const EXPECTED_REQUIRED: [(&str, &[&str]); 30] = [
     ("tool_search", &["query"]),
     ("get_current_goal", &[]),
     ("submit_goal_report", &["status", "evidence"]),
+    ("lsp", &["action"]),
+    ("worktree", &["action"]),
 ];
 
 /// Builds a registry over `dir` with English card text.
@@ -142,7 +151,7 @@ async fn invoke(tools: &[Arc<dyn Tool>], name: &str, inputs: Value) -> Value {
 fn tool_names_are_exactly_the_twenty_python_names() {
     assert_eq!(tool_names(), &EXPECTED_NAMES);
     assert_eq!(BuiltinTool::DEFAULT.len(), EXPECTED_NAMES.len());
-    assert_eq!(BuiltinTool::ALL.len(), 30);
+    assert_eq!(BuiltinTool::ALL.len(), 32);
     assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
 
     let names: Vec<&str> = BuiltinTool::DEFAULT
@@ -341,10 +350,17 @@ fn parallel_safe_flags_match_the_registry() {
                 | BuiltinTool::EditFile
                 | BuiltinTool::Cron
                 | BuiltinTool::SubmitGoalReport
+                | BuiltinTool::Worktree
         );
         assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
     }
-    for name in ["write_file", "edit_file", "cron", "submit_goal_report"] {
+    for name in [
+        "write_file",
+        "edit_file",
+        "cron",
+        "submit_goal_report",
+        "worktree",
+    ] {
         let tool = BuiltinTool::from_name(name).expect("known tool");
         assert!(!tool.parallel_safe(), "{name} must be serialised");
     }
@@ -782,7 +798,14 @@ fn default_registry_excludes_extended_tools() {
     let registry = registry(&dir);
     let tools = registry.build();
     assert_eq!(tools.len(), 20);
-    for name in ["fetch_webpage", "web_search", "cron", "submit_goal_report"] {
+    for name in [
+        "fetch_webpage",
+        "web_search",
+        "cron",
+        "submit_goal_report",
+        "lsp",
+        "worktree",
+    ] {
         assert!(
             tools.iter().all(|tool| tool.card().name != name),
             "{name} must not be mounted by default"
@@ -792,11 +815,11 @@ fn default_registry_excludes_extended_tools() {
 }
 
 #[test]
-fn extended_registry_builds_thirty_tools_in_registry_order() {
+fn extended_registry_builds_every_tool_in_registry_order() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let registry = extended_registry(&dir);
     let tools = registry.build();
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 32);
     let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
     assert_eq!(
         names,
@@ -805,7 +828,7 @@ fn extended_registry_builds_thirty_tools_in_registry_order() {
             .map(|tool| tool.name())
             .collect::<Vec<&str>>()
     );
-    assert_eq!(registry.cards("en").len(), 30);
+    assert_eq!(registry.cards("en").len(), 32);
     assert_eq!(registry.tools(), &BuiltinTool::EXTENDED);
 }
 
@@ -1035,4 +1058,327 @@ fn deferred_tools_are_hidden_until_discovered() {
         vec!["fetch_webpage", "cron"]
     );
     assert_eq!(registry.reveal(&["nope"]).len(), 0);
+}
+
+#[test]
+fn extended_names_match_the_variant_table() {
+    let names: Vec<&str> = BuiltinTool::EXTENDED
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
+    assert_eq!(names, super::extended_tool_names().to_vec());
+    assert_eq!(BuiltinTool::ALL.len(), 32);
+    for (index, name) in super::extended_tool_names().iter().enumerate() {
+        assert_eq!(
+            BuiltinTool::EXTENDED[index].name(),
+            *name,
+            "name at {index}"
+        );
+        assert_eq!(
+            BuiltinTool::from_name(name),
+            Some(BuiltinTool::EXTENDED[index]),
+            "from_name({name})"
+        );
+    }
+}
+
+#[test]
+fn lsp_and_worktree_cards_are_registry_members() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+
+    for (tool, name, parallel_safe) in [
+        (BuiltinTool::Lsp, "lsp", true),
+        (BuiltinTool::Worktree, "worktree", false),
+    ] {
+        let card = registry.card(tool, "en");
+        assert_eq!(card.name, name);
+        assert_eq!(card.id.len(), 32, "{name} card id is a uuid hex");
+        assert!(card.id.chars().all(|c| c.is_ascii_hexdigit()), "{name} id");
+        assert_eq!(card.parallel_safe, parallel_safe, "{name} parallel safety");
+        assert_eq!(card.input_params["type"], json!("object"), "{name} schema");
+        let properties = card.input_params["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} properties is not an object"));
+        assert!(properties.contains_key("action"), "{name} has no action");
+        assert_eq!(
+            card.input_params["required"],
+            json!(["action"]),
+            "{name} required"
+        );
+        assert_eq!(card.description, descriptions::description(name, "en"));
+        assert_eq!(
+            registry.card(tool, "cn").description,
+            descriptions::description(name, "cn")
+        );
+    }
+
+    let tools = registry.build();
+    let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
+    assert!(names.contains(&"lsp"), "lsp is not mounted: {names:?}");
+    assert!(
+        names.contains(&"worktree"),
+        "worktree is not mounted: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn lsp_without_a_configuration_reports_the_missing_server() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("fixture");
+    let registry = extended_registry(&dir);
+    assert!(registry.lsp_config().is_none(), "no LSP config is wired");
+
+    let tools = registry.build();
+    let out = invoke(
+        &tools,
+        "lsp",
+        json!({"action": "hover", "path": "main.rs", "line": 1, "column": 1}),
+    )
+    .await;
+
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.contains("no LSP server configured"),
+        "the failure must name the missing configuration: {error}"
+    );
+    assert!(error.contains("LspToolConfig::server"), "{error}");
+}
+
+#[tokio::test]
+async fn a_configured_lsp_server_is_reached_by_the_built_tool() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    // A command that cannot exist keeps the test offline: the spawn failure proves the built
+    // tool used the configured server descriptor instead of the "not configured" default.
+    let config = crate::lsp::LspToolConfig::default()
+        .with_language("en")
+        .with_server(crate::lsp::LspServerConfig::new(
+            "openjiuwen-definitely-missing-lsp-server",
+        ));
+    let registry = extended_registry(&dir).with_lsp_config(config);
+    assert!(registry.lsp_config().is_some(), "the config is not stored");
+
+    let tools = registry.build();
+    let out = invoke(
+        &tools,
+        "lsp",
+        json!({"action": "workspace_symbols", "query": "x"}),
+    )
+    .await;
+
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.contains("failed to start LSP server"),
+        "the configured command was not used: {error}"
+    );
+    assert!(
+        error.contains("openjiuwen-definitely-missing-lsp-server"),
+        "{error}"
+    );
+}
+
+/// A minimal in-process language server answering the `initialize` and hover requests.
+///
+/// Spawned over one half of a [`tokio::io::duplex`] pair by
+/// [`crate::lsp::ChannelTransport`], so no language server binary is needed.
+fn spawn_fake_lsp(stream: tokio::io::DuplexStream) -> tokio::task::JoinHandle<()> {
+    use crate::lsp::protocol::{error_response, response_message, write_message, MessageReader};
+
+    tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut reader = MessageReader::new(read);
+        while let Ok(Some(message)) = reader.next().await {
+            let Some(id) = message.get("id").cloned() else {
+                continue;
+            };
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let response = match method {
+                "initialize" => {
+                    response_message(id, json!({"capabilities": {"hoverProvider": true}}))
+                }
+                "textDocument/hover" => response_message(
+                    id,
+                    json!({
+                        "contents": { "kind": "markdown", "value": "**fake hover**" },
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 },
+                        },
+                    }),
+                ),
+                "shutdown" => response_message(id, Value::Null),
+                other => error_response(id, &crate::lsp::LspError::new(-32601, other)),
+            };
+            if write_message(&mut write, &response).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn lsp_tool_with_an_injected_transport_reaches_the_client() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("fixture write");
+    let (transport, peer) = crate::lsp::ChannelTransport::new(64 * 1024);
+    let server = spawn_fake_lsp(peer);
+    // The registry builds exactly this shape of tool (`LspTool::new(config)`), so the injected
+    // transport proves the model-facing call reaches the JSON-RPC client.
+    let config = crate::lsp::LspToolConfig::default()
+        .with_workspace_root(dir.path())
+        .with_language("en")
+        .with_language_id("rust");
+    let tool = crate::lsp::LspTool::new(config).with_transport(Box::new(transport));
+
+    let out = tool
+        .invoke(
+            json!({"action": "hover", "path": "main.rs", "line": 1, "column": 1}),
+            &ToolContext::new(),
+        )
+        .await
+        .expect("lsp invoke returns a payload");
+
+    assert_eq!(out["success"], true, "hover failed: {out}");
+    assert_eq!(out["data"]["action"], json!("hover"));
+    assert!(
+        out["data"]["file_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("main.rs"),
+        "unexpected file path: {out}"
+    );
+    assert_eq!(out["data"]["result"], json!("**fake hover**"));
+    server.abort();
+}
+
+/// A [`crate::worktree::GitRunner`] replaying queued responses, so no git binary is needed.
+struct ScriptedGitRunner {
+    /// Queued `Ok(stdout)`/`Err(stderr)` responses, oldest first.
+    responses: std::sync::Mutex<std::collections::VecDeque<std::result::Result<String, String>>>,
+}
+
+impl ScriptedGitRunner {
+    /// Builds a runner with no queued response.
+    fn new() -> Self {
+        Self {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Queues a successful invocation printing `stdout`.
+    fn push_ok(&self, stdout: &str) {
+        self.responses
+            .lock()
+            .expect("runner lock")
+            .push_back(Ok(stdout.to_owned()));
+    }
+}
+
+#[async_trait]
+impl crate::worktree::GitRunner for ScriptedGitRunner {
+    async fn run(
+        &self,
+        args: &[&str],
+        _cwd: &std::path::Path,
+    ) -> Result<crate::worktree::GitOutput> {
+        let next = self.responses.lock().expect("runner lock").pop_front();
+        match next {
+            Some(Ok(stdout)) => Ok(crate::worktree::GitOutput::new(stdout)),
+            Some(Err(message)) => Err(Error::tool(message)),
+            None => Err(Error::tool(format!(
+                "scripted git runner exhausted while running `git {}`",
+                args.join(" ")
+            ))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn worktree_tool_uses_the_scripted_manager() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let repo = dir.path().to_path_buf();
+    let runner = Arc::new(ScriptedGitRunner::new());
+    runner.push_ok(&repo.to_string_lossy());
+    runner.push_ok(&format!(
+        "worktree {}\nHEAD {}\nbranch refs/heads/main\n",
+        repo.display(),
+        "1".repeat(40)
+    ));
+    let manager = Arc::new(WorktreeManager::with_runner(&repo, runner));
+    let registry = extended_registry(&dir).with_worktree_manager(Arc::clone(&manager));
+    assert!(
+        registry.worktree_manager().is_some(),
+        "the manager is not stored"
+    );
+
+    let tools = registry.build();
+    let out = invoke(&tools, "worktree", json!({"action": "list"})).await;
+
+    assert_eq!(out["success"], true, "list failed: {out}");
+    assert_eq!(out["data"]["action"], json!("list"));
+    let worktrees = out["data"]["worktrees"].as_array().expect("worktree array");
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0]["branch"], json!("main"));
+}
+
+#[tokio::test]
+async fn worktree_tool_defaults_to_the_workspace_root_and_reports_git_failures() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    assert!(registry.worktree_root().is_none(), "no root override");
+
+    let tools = registry.build();
+    let out = invoke(&tools, "worktree", json!({"action": "list"})).await;
+
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.contains(NOT_A_REPOSITORY_MARKER) || error.contains(NOT_INSTALLED_MARKER),
+        "the manager's typed git failure must surface: {error}"
+    );
+}
+
+#[tokio::test]
+async fn worktree_tool_forwards_the_permission_engine() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let section = PermissionsSection {
+        package_builtin_rules: false,
+        tools: BTreeMap::from([("write_file".to_owned(), PermissionLevel::Deny)]),
+        ..PermissionsSection::default()
+    };
+    let engine = Arc::new(PermissionEngine::new(PermissionEngineConfig::new(section)));
+    let runner = Arc::new(ScriptedGitRunner::new());
+    let manager = Arc::new(WorktreeManager::with_runner(dir.path(), runner));
+    let registry = extended_registry(&dir)
+        .with_permissions(engine)
+        .with_worktree_manager(manager);
+
+    let tools = registry.build();
+    let out = invoke(
+        &tools,
+        "worktree",
+        json!({"action": "create", "name": "feature"}),
+    )
+    .await;
+
+    assert_eq!(out["success"], false, "unexpected success: {out}");
+    let error = out["error"].as_str().expect("error string");
+    assert!(
+        error.to_ascii_lowercase().contains("denied"),
+        "the deny decision must reject the worktree: {error}"
+    );
+}
+
+#[test]
+fn worktree_root_override_is_reported() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).expect("repo dir");
+    let registry = extended_registry(&dir).with_worktree_root(root.clone());
+    assert_eq!(registry.worktree_root(), Some(root.as_path()));
 }
