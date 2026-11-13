@@ -16,23 +16,42 @@
 //!
 //! Session records are append-only and best-effort: a failed write is logged and
 //! never loses the answer.
+//!
+//! The agent built here composes three CLI-owned inputs:
+//!
+//! - **instruction files** — `IDENTITY.md`/`OPENJIUWEN.md` under the workspace
+//!   and the home directory become the system prompt ([`InstructionFiles`]);
+//! - **MCP tools** — the servers declared in `mcp.json` are connected through
+//!   [`McpToolProvider`] and mounted next to the built-in coding tools;
+//! - **permission rules** — the permanent allow rules under the CLI home are
+//!   merged onto the built-in section and handed to the agent and to
+//!   [`CliPermissionHost`], which writes new "always allow" answers back.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::StreamExt;
 use openjiuwen_agent::{Agent, AgentChunk};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
+use openjiuwen_foundation::tool::mcp::{
+    connect_mcp_server, load_mcp_tools, McpServerConfig, McpTool, McpToolOptions,
+};
+use openjiuwen_foundation::tool::Tool;
 use openjiuwen_session::{AgentSession, Session};
 use serde_json::{json, Value};
 
-use super::config::{CliOptions, DEFAULT_LANGUAGE, SESSION_PREFIX};
+use super::allow_rules::AllowRules;
+use super::config::{CliOptions, ProcessEnv, DEFAULT_LANGUAGE, SESSION_PREFIX};
+use super::instruction::InstructionFiles;
 use super::io::CliIo;
+use super::mcp_config;
 use super::permissions::CliPermissionHost;
 use super::render::RenderState;
+use super::style::Style;
 use super::RunArgs;
 use crate::agent::{create_deep_agent, DeepAgent};
-use crate::permission::PermissionHost;
+use crate::permission::{PermissionHost, PermissionsSection};
 use crate::schema::DeepAgentConfig;
 use crate::workspace::Workspace;
 
@@ -115,16 +134,80 @@ pub fn new_session(session_id: &str) -> Arc<dyn Session> {
     Arc::new(AgentSession::new(session_id))
 }
 
+/// Loads MCP servers and turns them into agent tools.
+///
+/// The CLI build depends on this seam rather than on concrete MCP transports, so
+/// a test can hand [`build_agent_with`] a recording fake and assert which servers
+/// were requested without spawning a server process.
+#[async_trait]
+pub trait McpToolProvider: Send + Sync {
+    /// Returns one tool per remote tool advertised by `servers`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the provider maps the failure to. The foundation-backed
+    /// implementation never fails: it logs and skips a broken server.
+    async fn load_tools(&self, servers: &[McpServerConfig]) -> Result<Vec<Arc<dyn Tool>>>;
+}
+
+/// Connects real MCP servers through `openjiuwen-foundation`.
+///
+/// Each server is connected with
+/// [`connect_mcp_server`](openjiuwen_foundation::tool::mcp::connect_mcp_server)
+/// and its tools are loaded with
+/// [`load_mcp_tools`](openjiuwen_foundation::tool::mcp::load_mcp_tools) using
+/// [`McpToolOptions::default`].
+///
+/// A server that cannot be connected or listed is logged with `tracing::warn!`
+/// and skipped: one broken `mcp.json` entry never blocks the CLI, and the
+/// remaining servers keep working.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FoundationMcpToolProvider;
+
+impl FoundationMcpToolProvider {
+    /// Returns a provider backed by the foundation MCP clients.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl McpToolProvider for FoundationMcpToolProvider {
+    async fn load_tools(&self, servers: &[McpServerConfig]) -> Result<Vec<Arc<dyn Tool>>> {
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        for config in servers {
+            let client = match connect_mcp_server(config) {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(
+                        server = %config.server_name,
+                        %error,
+                        "skipping MCP server that could not be connected"
+                    );
+                    continue;
+                }
+            };
+            match load_mcp_tools(client, McpToolOptions::default()).await {
+                Ok(loaded) => tools.extend(loaded.into_iter().map(McpTool::boxed)),
+                Err(error) => {
+                    tracing::warn!(
+                        server = %config.server_name,
+                        %error,
+                        "skipping MCP server whose tools could not be listed"
+                    );
+                }
+            }
+        }
+        Ok(tools)
+    }
+}
+
 /// Builds the `DeepAgent` a CLI run or REPL turn executes on.
 ///
-/// The configuration comes from [`CliOptions`]: the iteration budget, the model
-/// identity (name, provider, key, base URL) and the CLI language. The working
-/// directory is the process directory so the agent reads and writes the project
-/// the user invoked it from, falling back to the workspace when the process
-/// directory cannot be determined.
-///
-/// `io` is handed to [`CliPermissionHost`], which is what makes permission asks
-/// answerable in the REPL and fail closed in a one-shot run.
+/// Delegates to [`build_agent_with`] with [`FoundationMcpToolProvider`], so the
+/// default build connects the MCP servers configured in `mcp.json` (none by
+/// default, which keeps the crate fully offline).
 ///
 /// # Errors
 ///
@@ -135,7 +218,50 @@ pub async fn build_agent(
     options: &CliOptions,
     io: &CliIo,
 ) -> Result<Arc<DeepAgent>> {
+    build_agent_with(model, options, io, &FoundationMcpToolProvider).await
+}
+
+/// Builds the `DeepAgent` of a CLI invocation with an explicit MCP provider.
+///
+/// The configuration comes from [`CliOptions`]: the iteration budget, the model
+/// identity (name, provider, key, base URL) and the CLI language. The working
+/// directory is the process directory so the agent reads and writes the project
+/// the user invoked it from, falling back to the workspace when the process
+/// directory cannot be determined.
+///
+/// Three CLI-owned inputs are folded in here:
+///
+/// - [`InstructionFiles::load`] reads `IDENTITY.md`/`OPENJIUWEN.md` from the
+///   workspace and the home directory and hands the composed text to
+///   [`DeepAgentConfig::with_system_prompt`]. That replaces the built-in identity
+///   preamble — the same way the Python CLI composes its identity and memory
+///   layers into one system section — and leaves the built-in prompt untouched
+///   when no instruction file exists.
+/// - `mcp.json` (see [`mcp_config::load_for`]) is loaded and every server entry
+///   is passed to `provider`, whose tools are mounted beside the built-in coding
+///   tools. With no configuration file the list is empty.
+/// - The permanent allow rules under the CLI home ([`AllowRules::for_home`]) are
+///   merged onto [`CliOptions::permissions`] and handed to both the agent and
+///   [`CliPermissionHost`], which writes new "always allow" answers back to
+///   `<home>/permissions.yaml`.
+///
+/// `io` is handed to [`CliPermissionHost`], which is what makes permission asks
+/// answerable in the REPL and fail closed in a one-shot run. The host prompts in
+/// colour exactly when `io` has colour enabled.
+///
+/// # Errors
+///
+/// Returns whatever agent construction reports: [`Error::Config`] for an invalid
+/// configuration or an unreadable `mcp.json`/instruction file,
+/// [`Error::Validation`] for an unusable workspace.
+pub async fn build_agent_with(
+    model: Arc<dyn Model>,
+    options: &CliOptions,
+    io: &CliIo,
+    provider: &dyn McpToolProvider,
+) -> Result<Arc<DeepAgent>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| options.workspace.clone());
+    let instructions = InstructionFiles::load(&options.workspace, &options.home)?;
     let config = DeepAgentConfig {
         enable_task_planning: true,
         max_iterations: Some(options.max_iterations),
@@ -147,19 +273,17 @@ pub async fn build_agent(
         api_key: options.api_key.clone(),
         api_base: options.api_base.clone(),
         ..DeepAgentConfig::default()
-    };
-    let permissions = options.permissions();
-    let host: Arc<dyn PermissionHost> = Arc::new(CliPermissionHost::new(
-        io.clone(),
-        session_id(),
-        options.workspace.clone(),
-        options.permissions(),
-    ));
+    }
+    .with_system_prompt(instructions.system_prompt());
+    let servers = mcp_config::load_for(&options.home, &options.workspace, &ProcessEnv)?;
+    let mcp_tools = provider.load_tools(&servers).await?;
+    let (rules, permissions) = resolve_permissions(options)?;
+    let host: Arc<dyn PermissionHost> = Arc::new(permission_host(io, options, rules, &permissions));
     create_deep_agent(
         model,
         None,
         Some(config),
-        Vec::new(),
+        mcp_tools,
         Vec::new(),
         Some(Workspace::for_language(
             &options.workspace,
@@ -176,6 +300,37 @@ pub async fn build_agent(
         Some(host),
     )
     .await
+}
+
+/// Resolves the effective permission section of `options`.
+///
+/// The permanent rules under the CLI home are merged on top of the built-in
+/// section, so a stored `write_file: allow` reaches both the agent and the
+/// permission host. Returns the rule handle too, so the host can write back.
+fn resolve_permissions(options: &CliOptions) -> Result<(AllowRules, PermissionsSection)> {
+    let rules = AllowRules::for_home(&options.home);
+    let permissions = rules.load_merged(&options.permissions())?;
+    Ok((rules, permissions))
+}
+
+/// Builds the permission host the agent answers asks through.
+///
+/// It is registered over the freshly generated CLI session id, persists
+/// "always allow" answers through `rules` and styles its prompts per `io`.
+fn permission_host(
+    io: &CliIo,
+    options: &CliOptions,
+    rules: AllowRules,
+    permissions: &PermissionsSection,
+) -> CliPermissionHost {
+    CliPermissionHost::new(
+        io.clone(),
+        session_id(),
+        options.workspace.clone(),
+        permissions.clone(),
+    )
+    .with_allow_rules(rules)
+    .with_style(Style::new(io.is_color()))
 }
 
 /// Runs one prompt and returns what happened.
@@ -222,7 +377,8 @@ pub async fn run_with_model(
         tracing::warn!(%error, "failed to create CLI session record");
     }
 
-    let mut render = RenderState::new();
+    // Plain output stays byte-identical: colour is only on when the handle says so.
+    let mut render = RenderState::styled(io.is_color());
     let mut chunks = 0_usize;
     let mut stream = agent.stream(json!({"query": prompt}), Some(session));
     while let Some(item) = stream.next().await {
@@ -290,4 +446,246 @@ async fn resolve_prompt(args: &RunArgs, io: &CliIo) -> Result<String> {
         return Err(Error::validation(EMPTY_PROMPT));
     }
     Ok(prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use openjiuwen_agent::Agent;
+    use openjiuwen_common::config::OpenJiuwenHome;
+    use openjiuwen_foundation::llm::Model;
+    use openjiuwen_foundation::tool::mcp::McpClientType;
+    use openjiuwen_foundation::tool::{ToolCard, ToolContext};
+    use openjiuwen_test_support::ScriptedModel;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::cli::config::{
+        DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER,
+    };
+    use crate::cli::{LineReader, Writer};
+    use crate::permission::PermissionLevel;
+
+    /// [`LineReader`] answering from a fixed script, then EOF.
+    struct ScriptedReader {
+        /// Lines still to hand out.
+        lines: VecDeque<String>,
+    }
+
+    #[async_trait]
+    impl LineReader for ScriptedReader {
+        async fn read_line(&mut self) -> Result<Option<String>> {
+            Ok(self.lines.pop_front())
+        }
+    }
+
+    /// [`Writer`] discarding everything it is given.
+    struct SilentWriter;
+
+    #[async_trait]
+    impl Writer for SilentWriter {
+        async fn write(&mut self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds a scripted non-interactive handle (the one-shot `run` path).
+    fn scripted_io(lines: &[&str]) -> CliIo {
+        let reader = Box::new(ScriptedReader {
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+        });
+        CliIo::new(reader, Box::new(SilentWriter))
+    }
+
+    /// Builds the resolved options of a CLI run rooted at `root`.
+    fn test_options(root: &Path) -> CliOptions {
+        CliOptions {
+            model: DEFAULT_MODEL.to_owned(),
+            provider: DEFAULT_PROVIDER.to_owned(),
+            api_key: None,
+            api_base: None,
+            workspace: root.join("workspace"),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            verbose: false,
+            home: OpenJiuwenHome::from_root(root),
+        }
+    }
+
+    /// Minimal [`Tool`] standing in for a remote MCP tool.
+    struct FakeTool {
+        /// Card the agent sees.
+        card: ToolCard,
+    }
+
+    #[async_trait]
+    impl Tool for FakeTool {
+        fn card(&self) -> &ToolCard {
+            &self.card
+        }
+
+        async fn invoke(&self, inputs: Value, _ctx: &ToolContext) -> Result<Value> {
+            Ok(inputs)
+        }
+    }
+
+    /// [`McpToolProvider`] recording its calls and returning fixed tools.
+    struct RecordingProvider {
+        /// Number of `load_tools` calls.
+        calls: AtomicUsize,
+        /// Servers of the most recent call.
+        servers: Mutex<Vec<McpServerConfig>>,
+        /// Tools handed back to the build.
+        tools: Vec<Arc<dyn Tool>>,
+    }
+
+    impl RecordingProvider {
+        /// Builds a provider returning `tools` and recording every call.
+        fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                servers: Mutex::new(Vec::new()),
+                tools,
+            }
+        }
+
+        /// Returns the server names recorded by the last call.
+        fn recorded_names(&self) -> Vec<String> {
+            self.servers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|config| config.server_name.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl McpToolProvider for RecordingProvider {
+        async fn load_tools(&self, servers: &[McpServerConfig]) -> Result<Vec<Arc<dyn Tool>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.servers.lock().unwrap() = servers.to_vec();
+            Ok(self.tools.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn build_agent_without_mcp_config_runs_one_turn() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        let io = scripted_io(&[]);
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("scripted answer"));
+
+        let agent = build_agent(model, &options, &io).await.unwrap();
+        let output = agent
+            .invoke(json!({"query": "hi"}), Some(new_session("s-1")))
+            .await
+            .unwrap();
+        assert_eq!(output.output, "scripted answer");
+    }
+
+    #[tokio::test]
+    async fn mcp_config_servers_reach_the_provider_and_its_tools_are_mounted() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        std::fs::write(
+            temp.path().join("mcp.json"),
+            r#"{"mcpServers": {"filesystem": {"command": "npx"}}}"#,
+        )
+        .unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(FakeTool {
+            card: ToolCard::new(
+                "remote_lookup",
+                "looks things up",
+                json!({"type": "object"}),
+            ),
+        });
+        let provider = RecordingProvider::new(vec![tool]);
+        let io = scripted_io(&[]);
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("done"));
+
+        let agent = build_agent_with(model, &options, &io, &provider)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.recorded_names(), vec!["filesystem".to_owned()]);
+        let recorded = provider.servers.lock().unwrap().clone();
+        assert_eq!(recorded[0].client_type, McpClientType::Stdio);
+        // The fake tool was handed to the agent build; one turn still completes.
+        let output = agent
+            .invoke(json!({"query": "hi"}), Some(new_session("s-1")))
+            .await
+            .unwrap();
+        assert_eq!(output.output, "done");
+    }
+
+    #[tokio::test]
+    async fn instruction_files_reach_the_system_prompt() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        std::fs::write(options.workspace.join("OPENJIUWEN.md"), "PROJECT RULE 42\n").unwrap();
+        let io = scripted_io(&[]);
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("done"));
+
+        let agent = build_agent_with(model, &options, &io, &FoundationMcpToolProvider)
+            .await
+            .unwrap();
+        let prompt = agent.config().system_prompt.unwrap();
+        assert!(
+            prompt.contains("PROJECT RULE 42"),
+            "the workspace memory must reach the system prompt:\n{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_allow_rules_reach_the_agent_and_the_permission_host() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        let mut stored = PermissionsSection::default();
+        stored
+            .tools
+            .insert("write_file".to_owned(), PermissionLevel::Allow);
+        AllowRules::for_home(&options.home)
+            .persist(&stored)
+            .unwrap();
+
+        let io = scripted_io(&[]);
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("done"));
+        let agent = build_agent_with(model, &options, &io, &FoundationMcpToolProvider)
+            .await
+            .unwrap();
+        let config = agent.config();
+        let permissions = config.permissions.unwrap();
+        assert_eq!(
+            permissions.tools.get("write_file"),
+            Some(&PermissionLevel::Allow),
+            "the stored allow must override the built-in ask"
+        );
+
+        let (rules, merged) = resolve_permissions(&options).unwrap();
+        let host = permission_host(&io, &options, rules, &merged);
+        let snapshot = host.permissions_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tools.get("write_file"),
+            Some(&PermissionLevel::Allow)
+        );
+        assert_eq!(
+            host.permission_yaml_path(),
+            Some(temp.path().join("permissions.yaml"))
+        );
+    }
 }
