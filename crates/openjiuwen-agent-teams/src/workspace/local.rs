@@ -3,7 +3,12 @@
 //! Python parity source: `openjiuwen/agent_teams/workspace_layout.py` plus the workspace setup in
 //! `team_agent.py` / `blueprint.py`. A member either works in its own member workspace directory
 //! (Python `enabled=False`, the default) or in a session-scoped git worktree
-//! (Python `isolation="worktree"`, deferred here).
+//! (Python `isolation="worktree"`).
+//!
+//! Worktree requests go to the injected [`WorktreeBackend`] when one serves
+//! [`IsolationMode::Worktree`], else to a [`GitWorktreeBackend`] that discovers the repository from
+//! the session tree. Allocation therefore succeeds for a team whose session tree lives inside a git
+//! repository and fails with [`Error::Config`] naming the directory when it does not.
 //!
 //! Allocation is fail-closed and release never deletes anything: Python retains member
 //! workspaces until the team is deleted or the session is cleaned, so a released workspace stays on
@@ -24,6 +29,7 @@ use super::layout::{sanitize_segment, MemberWorkspaceLayout};
 use super::worktree::{
     build_teammate_worktree_name, worktree_digest, WorktreeBackend, WorktreeCreateRequest,
 };
+use super::worktree_git::GitWorktreeBackend;
 use super::{IsolationMode, MemberWorkspace, WorkspaceProvider, WorkspaceRequest};
 
 /// The injected worktree backend and the isolation mode it is able to serve.
@@ -36,8 +42,10 @@ struct WorktreeSupport {
 
 /// Allocates member workspaces below one [`MemberWorkspaceLayout`].
 ///
-/// Without an injected [`WorktreeBackend`] the provider only serves [`IsolationMode::None`]; a
-/// worktree request fails with [`Error::Unsupported`] instead of silently sharing a directory.
+/// [`IsolationMode::None`] allocates the plain session-scoped directory.
+/// [`IsolationMode::Worktree`] allocates a git worktree through
+/// [`Self::worktree_backend`]: the injected backend when one serves worktrees, otherwise
+/// [`GitWorktreeBackend`] against the repository the session tree lives in.
 pub struct LocalWorkspaceProvider {
     /// Path layout the provider allocates into.
     layout: MemberWorkspaceLayout,
@@ -73,7 +81,10 @@ impl LocalWorkspaceProvider {
     /// Injects the worktree `backend`, which then serves `mode`.
     ///
     /// A backend is only used when `mode` is [`IsolationMode::Worktree`]; an other-mode backend is
-    /// recorded (for diagnostics) but allocation keeps rejecting worktree requests.
+    /// recorded (for diagnostics) but worktree requests keep going to
+    /// [`Self::worktree_backend`]'s default (a [`GitWorktreeBackend`]). Injecting
+    /// [`UnsupportedWorktreeBackend`](super::worktree::UnsupportedWorktreeBackend) with
+    /// [`IsolationMode::Worktree`] therefore turns worktree isolation off even inside a repository.
     #[must_use]
     pub fn with_worktree_backend(
         mut self,
@@ -90,23 +101,32 @@ impl LocalWorkspaceProvider {
         &self.layout
     }
 
+    /// Returns the backend that serves [`IsolationMode::Worktree`].
+    ///
+    /// The injected backend wins when it was registered for [`IsolationMode::Worktree`]. Otherwise a
+    /// fresh [`GitWorktreeBackend`] is returned; it holds no state beyond its (default) discovery
+    /// and lock configuration, so building one per allocation costs nothing.
+    #[must_use]
+    pub fn worktree_backend(&self) -> Arc<dyn WorktreeBackend> {
+        match self
+            .worktree
+            .as_ref()
+            .filter(|support| support.mode == IsolationMode::Worktree)
+        {
+            Some(support) => Arc::clone(&support.backend),
+            None => Arc::new(GitWorktreeBackend::new()),
+        }
+    }
+
     /// Allocates a session-scoped worktree for `request`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when no worktree backend serves [`IsolationMode::Worktree`],
-    /// [`Error::Validation`] for an unsafe team/session/member name, and whatever the backend
-    /// reports when the worktree cannot be created.
+    /// Returns [`Error::Validation`] for an unsafe team/session/member name, [`Error::Config`] when
+    /// the session tree is not inside a git repository (or `git` is missing) and no backend was
+    /// injected, and whatever the backend reports when the worktree cannot be created.
     async fn allocate_worktree(&self, request: &WorkspaceRequest) -> Result<MemberWorkspace> {
-        let Some(support) = self
-            .worktree
-            .as_ref()
-            .filter(|support| support.mode == IsolationMode::Worktree)
-        else {
-            return Err(Error::unsupported(
-                "worktree isolation is not implemented; use IsolationMode::None",
-            ));
-        };
+        let backend = self.worktree_backend();
         let seed = worktree_digest(&format!(
             "{}:{}:{}",
             request.team_name, request.member_name, request.session_id
@@ -124,9 +144,9 @@ impl LocalWorkspaceProvider {
             path,
             base_ref: None,
         };
-        let info = support.backend.create(&create).await?;
+        let info = backend.create(&create).await?;
         debug!(
-            backend = support.backend.name(),
+            backend = backend.name(),
             worktree = %info.name,
             path = %info.path.display(),
             "allocated teammate worktree"
@@ -246,9 +266,7 @@ impl WorkspaceProvider for LocalWorkspaceProvider {
 
     async fn release(&self, workspace: &MemberWorkspace) -> Result<()> {
         if let Some(info) = workspace.worktree.as_ref() {
-            if let Some(support) = self.worktree.as_ref() {
-                return support.backend.remove(info).await;
-            }
+            return self.worktree_backend().remove(info).await;
         }
         debug!(
             team = %workspace.team_name,
@@ -447,23 +465,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktree_without_a_backend_is_unsupported() {
+    async fn worktree_outside_a_repository_fails_with_config() {
         let temp = TempDir::new().unwrap();
         let provider = LocalWorkspaceProvider::new(layout(&temp));
         let request = WorkspaceRequest {
             isolation: IsolationMode::Worktree,
             ..enabled_request("my-team", "session-1", "dev-1")
         };
-        let err = provider.allocate(&request).await.expect_err("unsupported");
-        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
-        assert!(err
-            .to_string()
-            .contains("worktree isolation is not implemented"));
+        let err = provider
+            .allocate(&request)
+            .await
+            .expect_err("no repository");
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("requires a git repository"),
+            "{err}"
+        );
 
-        // A backend recorded under another mode does not serve worktree requests either.
+        // A backend recorded under another mode does not serve worktree requests either, so the
+        // default (git) backend keeps reporting the missing repository.
         let provider = provider.with_worktree_backend(FakeBackend::new(false), IsolationMode::None);
+        let err = provider
+            .allocate(&request)
+            .await
+            .expect_err("no repository");
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn injected_unsupported_backend_disables_worktrees() {
+        let temp = TempDir::new().unwrap();
+        let provider = LocalWorkspaceProvider::new(layout(&temp)).with_worktree_backend(
+            Arc::new(super::super::worktree::UnsupportedWorktreeBackend),
+            IsolationMode::Worktree,
+        );
+        let request = WorkspaceRequest {
+            isolation: IsolationMode::Worktree,
+            ..enabled_request("my-team", "session-1", "dev-1")
+        };
         let err = provider.allocate(&request).await.expect_err("unsupported");
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("agent_teams.worktree.lifecycle"));
     }
 
     #[tokio::test]

@@ -5,14 +5,22 @@
 //! - [`layout`] builds the session-scoped team tree
 //!   (`<base>/<team>/sessions/<session>/workspaces/<member>_workspace`) and sanitizes every
 //!   untrusted path segment;
-//! - [`local`] implements [`WorkspaceProvider`] against a local directory (and, when a host injects
-//!   a backend, against git worktrees);
+//! - [`local`] implements [`WorkspaceProvider`] against a local directory or a git worktree;
 //! - [`worktree`] owns deterministic worktree names, branch names, digests and the
-//!   [`WorktreeBackend`] seam.
+//!   [`WorktreeBackend`] seam;
+//! - [`git`] runs the `git` CLI (bounded, captured, credential-prompt free) and resolves the
+//!   repository a path lives in;
+//! - [`worktree_git`] implements the seam against a real repository, [`worktree_remote`] against a
+//!   remote node, and [`lock`] serializes the worktree critical sections of one repository.
 //!
-//! The git worktree backend is deferred: without an injected backend a worktree request fails
-//! with [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) instead of silently
-//! sharing a directory.
+//! Worktree isolation is real: [`IsolationMode::Worktree`] creates
+//! `<session>/worktrees/<worktree-name>` with `git worktree add`, so two members of the same team
+//! never share a working tree. It fails with
+//! [`Error::Config`](openjiuwen_common::error::Error::Config) when the session tree is not inside a
+//! git repository and with the same error when no `git` binary is installed; a host that wants to
+//! refuse worktrees outright injects
+//! [`UnsupportedWorktreeBackend`] through
+//! [`LocalWorkspaceProvider::with_worktree_backend`].
 //!
 //! # Examples
 //!
@@ -41,13 +49,35 @@ use openjiuwen_common::error::Result;
 
 use crate::schema::{TeamWorkspaceSpec, WorkspaceSpec};
 
+pub mod git;
 pub mod layout;
 pub mod local;
+pub mod lock;
 pub mod worktree;
+pub mod worktree_git;
+pub mod worktree_remote;
 
+pub use git::{GitOutput, GitRepository, WorktreeEntry};
 pub use layout::*;
 pub use local::*;
+pub use lock::{LockOptions, WorktreeLockGuard};
 pub use worktree::*;
+pub use worktree_git::{teammate_worktrees, GitWorktreeBackend};
+pub use worktree_remote::{
+    RemoteDispatch, RemoteWorkspaceAdapter, RemoteWorktreeAction, RemoteWorktreeRequest,
+    RemoteWorktreeResponse, UnavailableRemoteDispatch,
+};
+
+#[cfg(test)]
+mod git_tests;
+#[cfg(test)]
+mod lock_tests;
+#[cfg(test)]
+mod test_repo;
+#[cfg(test)]
+mod worktree_git_tests;
+#[cfg(test)]
+mod worktree_remote_tests;
 
 /// How a member workspace is isolated from the teammates of the same team.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,7 +86,7 @@ pub enum IsolationMode {
     /// One session-scoped directory per member (Python `isolation="none"`); the default.
     #[default]
     None,
-    /// One git worktree per member (Python `isolation="worktree"`); deferred.
+    /// One git worktree per member (Python `isolation="worktree"`).
     Worktree,
 }
 
