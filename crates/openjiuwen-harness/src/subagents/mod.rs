@@ -6,7 +6,9 @@
 //!
 //! The registry owns the sub-agent definitions the parent agent can delegate to, the
 //! runtime owns the live child instances of one parent session, and [`TaskTool`] plus the
-//! six `subagent_*` tools are the model-facing surface over them. Everything is in-process
+//! six `subagent_*` tools are the model-facing surface over them; the Rust-only
+//! `subagent_transcript` tool ([`SubagentTranscriptTool`]) reads an instance's bounded
+//! transcript and is mounted by [`subagent_tools_with_transcript`]. Everything is in-process
 //! and in-memory: child agents are built lazily by a [`SubAgentFactory`], so this module
 //! never depends on [`crate::agent`].
 mod presets;
@@ -22,13 +24,27 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
+pub use runtime::clock::{rfc3339_from_ms, Clock, ManualClock, SystemClock};
+pub use runtime::persistence::{
+    load_bucket_file, max_persisted_records, save_bucket_file, PersistedSubAgentBuckets,
+    PersistedSubAgentRecord, SUBAGENTS_KEY,
+};
+pub use runtime::quota::{
+    select_lru_candidate, LruCandidate, SpawnBudget, SubAgentQuota, SubagentActivity,
+};
+pub use runtime::transcript::{
+    TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription,
+    TranscriptSummary, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+};
+pub use runtime::{clock, persistence, quota, transcript};
 pub use runtime::{
-    ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
-    SubAgentSpawnRequest, SubagentMetadata, SubagentStatus,
+    LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
+    SubAgentSpawnRequest, SubagentMetadata, SubagentStatus, EVICTION_REASON,
 };
 pub use subagent_tools::{
-    subagent_tools, SubagentCloseTool, SubagentListTool, SubagentResumeTool, SubagentSendInputTool,
-    SubagentSpawnTool, SubagentWaitTool,
+    subagent_tools, subagent_tools_with_transcript, SubagentCloseTool, SubagentListTool,
+    SubagentResumeTool, SubagentSendInputTool, SubagentSpawnTool, SubagentTranscriptTool,
+    SubagentWaitTool,
 };
 pub use task_tool::TaskTool;
 

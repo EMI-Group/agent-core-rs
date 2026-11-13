@@ -63,6 +63,12 @@ The whole module is compiled only with the `mcp` feature (declared on `tool::mcp
 - `cargo test -p openjiuwen-foundation mcp` runs 44 tests; `cargo test -p openjiuwen-foundation --no-default-features` builds and passes without the feature.
 - `FakeMcpClient` lives in `client.rs` under `#[cfg(test)]`; it is not part of the public API.
 
+## Known Gaps
+
+- Client-only: nothing here plays the `rmcp` server role, so exposing local tools over MCP (the `openjiuwen-team-mcp` server) lives outside this crate.
+- There is no `mcpServers`-shaped JSON loader and no `~/.openjiuwen/mcp.json` reader; `McpServerConfig` is the only config shape (snake_case `server_id`/`server_name`/`server_path`/`client_type`/`params`/`auth_headers`/`auth_query_params`), so a CLI must parse a VS-Code-style `mcpServers` map itself and fold `command`/`args`/`env`/`cwd` into `server_path` + `params`.
+- `load_mcp_tools` yields `Vec<McpTool>`, not `Vec<Arc<dyn Tool>>`; mounting into an agent tool set is the caller's mapping through `McpTool::boxed` (no tool-registry/collection type exists).
+
 ## Routing Table
 
 - `./client.rs` → `McpClientType`, `McpServerConfig`, `McpRemoteTool`, `McpClient`, `connect_mcp_server`, `RmcpClient`, reconnect helpers, `FakeMcpClient`

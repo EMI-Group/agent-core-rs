@@ -113,6 +113,7 @@ Storage (`store`):
 ## Known Issues and Gaps
 
 - MCP streamable HTTP opens no separate server-initiated `GET` stream; server requests arrive only on a POST's SSE stream.
+- MCP is client-only and has no `mcpServers`/`~/.openjiuwen/mcp.json` config loader; `McpServerConfig` (snake_case `server_path` + `params`) is the only config shape, so a CLI parses `mcpServers` itself (see `src/tool/mcp/CONTEXT.md`).
 - There is no `ToolCollection`/tool-registry type: callers hold `Arc<dyn Tool>` values themselves (`FunctionTool::boxed` is the only built-in conversion).
 - `Model` has no abort/cancel or custom-invoke method; a stream is cancelled by dropping its `BoxStream`.
 - There is no `format_messages` helper; the provider-side projection is `llm::openai::{convert_message, convert_messages}` (public), and `BaseMessage` has no `to_openai`.

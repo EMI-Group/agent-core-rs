@@ -4,11 +4,21 @@
 //! [`openjiuwen_test_support::ScriptedModel`] and a temporary home/workspace, so
 //! nothing touches the network, the process environment or a real terminal.
 //!
-//! Covered here: the clap grammar, dispatch, option precedence (flags,
-//! `OPENJIUWEN_*`, generic SDK variables, settings, defaults), settings parsing,
-//! permission prompts and their answers, session records, the chunk renderer,
-//! the one-shot runner's three output formats, and a scripted REPL transcript.
+//! The suite is split in two files:
+//!
+//! - this one holds the shared harness (scripted reader/writer, option and agent
+//!   builders) plus the parity tests: the clap grammar, dispatch, option
+//!   precedence (flags, `OPENJIUWEN_*`, generic SDK variables, settings,
+//!   defaults), settings parsing, permission prompts and their answers, session
+//!   records, the chunk renderer, the one-shot runner's three output formats, and
+//!   a scripted REPL transcript;
+//! - `commands` covers the phase-3 REPL surface: the full slash-command table,
+//!   `/cost`, `/compact`, `/sessions`, `/clear`, the `!cmd` shell passthrough,
+//!   `/<skill>` turns and input history.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod commands;
+mod features;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

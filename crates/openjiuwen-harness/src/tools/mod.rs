@@ -1,10 +1,30 @@
 //! Model-facing coding tools, the tool registry, and shared tool helpers.
 //!
-//! Ports `openjiuwen/harness/tools/`: the shell, filesystem, todo, ask-user and memory tools
-//! exposed to the model, plus their shared payload/path helpers and the registry.
+//! Ports `openjiuwen/harness/tools/`: the shell, filesystem, todo, ask-user, memory, web,
+//! media-metadata, cron, MCP-resource, tool-discovery and goal tools, plus their shared helpers.
 //! Upper layers only see [`ToolRegistry`], [`BuiltinTool`] and the tool seam traits.
+//!
+//! # Tool sets
+//!
+//! [`BuiltinTool::DEFAULT`] is the twenty tools [`ToolRegistry::new`] mounts; [`BuiltinTool::EXTENDED`]
+//! appends the ten extended tools (web, media metadata, cron, MCP resources, tool discovery,
+//! goals) and [`BuiltinTool::ALL`] is an alias of it. [`tool_names`] names the default twenty,
+//! [`extended_tool_names`] the thirty.
+//!
+//! # Deferred tools
+//!
+//! Tools passed to [`ToolRegistry::with_deferred_tools`] are **not** mounted by
+//! [`ToolRegistry::build`] and **not** listed by [`ToolRegistry::cards`]: the model finds them
+//! with `tool_search` (or a host calls [`ToolRegistry::discover`]) and the host unions the cards
+//! of the picked names ([`ToolRegistry::reveal`]) into the next model call. A deferred tool never
+//! shadows a mounted one; with nothing deferred, `discover`/`reveal` cover every extended tool.
 mod ask_user;
+pub mod cron;
 pub mod descriptions;
+pub mod discovery;
+pub mod goal;
+pub mod mcp_resources;
+pub mod media;
 mod memory;
 mod read;
 mod read_state;
@@ -14,6 +34,7 @@ mod support;
 #[cfg(test)]
 mod tests;
 mod todo;
+pub mod web;
 mod write;
 
 use std::path::{Path, PathBuf};
@@ -36,6 +57,20 @@ pub use support::{
 };
 
 pub use ask_user::{AskOption, AskQuestion, AskUserArgs, AskUserTool, UserAsker};
+pub use cron::{CronAction, CronArgs, CronJob, CronSchedule, CronScheduler, CronTool};
+pub use discovery::{ToolIndex, ToolSearchArgs, ToolSearchHit, ToolSearchTool};
+pub use goal::{
+    GetCurrentGoalArgs, GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord,
+    GoalStatus, GoalStore, SubmitGoalReportArgs, SubmitGoalReportTool, TokenUsage,
+};
+pub use mcp_resources::{
+    FakeMcpResourceProvider, ListMcpResourcesTool, McpResource, McpResourceContent,
+    McpResourceProvider, ReadMcpResourceArgs, ReadMcpResourceTool,
+};
+pub use media::{
+    AudioMetadata, AudioMetadataArgs, AudioMetadataTool, Cursor, Failure, ImageMetadata,
+    ImageMetadataArgs, ImageMetadataTool, MediaKind, ParseResult,
+};
 pub use memory::{
     MemoryEditData, MemoryReadData, MemoryScope, MemorySearchRequest, MemoryTool,
     MemoryToolBackend, MemoryToolKind, MemoryWriteData,
@@ -48,6 +83,10 @@ pub use shell::{BashArgs, BashTool};
 pub use todo::{
     session_key, TodoAction, TodoCreateArgs, TodoCreateTool, TodoData, TodoGetArgs, TodoGetTool,
     TodoListTool, TodoModifyArgs, TodoModifyTool, TodoStore,
+};
+pub use web::{
+    FakeSearchBackend, FetchRequest, FetchResponse, FetchWebpageArgs, FetchWebpageTool,
+    HttpFetcher, ReqwestFetcher, SearchBackend, SearchResult, WebSearchArgs, WebSearchTool,
 };
 pub use write::{EditFileArgs, EditFileTool, WriteFileArgs, WriteFileTool};
 
@@ -97,11 +136,32 @@ pub enum BuiltinTool {
     CodingMemoryWrite,
     /// Edit a coding-memory file (`coding_memory_edit`).
     CodingMemoryEdit,
+    /// Fetch a web page and return its title and extracted text (`fetch_webpage`).
+    FetchWebpage,
+    /// Search the web through the injected provider (`web_search`).
+    WebSearch,
+    /// Report the dimensions and container fields of an image file (`image_metadata`).
+    ImageMetadata,
+    /// Report the duration and stream parameters of an audio file (`audio_metadata`).
+    AudioMetadata,
+    /// Create, list and cancel persisted cron jobs (`cron`).
+    Cron,
+    /// List the resources of the bound MCP server (`list_mcp_resources`).
+    ListMcpResources,
+    /// Read one resource of the bound MCP server (`read_mcp_resource`).
+    ReadMcpResource,
+    /// Search the discoverable tool set by intent (`tool_search`).
+    ToolSearch,
+    /// Read the current session goal (`get_current_goal`).
+    GetCurrentGoal,
+    /// Submit the structured result of the current goal attempt (`submit_goal_report`).
+    SubmitGoalReport,
 }
 
 impl BuiltinTool {
-    /// Every built-in tool, in registry order.
-    pub const ALL: [Self; 20] = [
+    /// The default built-in tool set, in registry order: the twenty tools [`ToolRegistry::new`]
+    /// mounts, which [`Self::EXTENDED`] extends.
+    pub const DEFAULT: [Self; 20] = [
         Self::Bash,
         Self::ReadFile,
         Self::WriteFile,
@@ -123,6 +183,43 @@ impl BuiltinTool {
         Self::CodingMemoryWrite,
         Self::CodingMemoryEdit,
     ];
+
+    /// Every built-in tool, in registry order: [`Self::DEFAULT`] then the ten extended tools.
+    pub const EXTENDED: [Self; 30] = [
+        Self::Bash,
+        Self::ReadFile,
+        Self::WriteFile,
+        Self::EditFile,
+        Self::Glob,
+        Self::ListFiles,
+        Self::Grep,
+        Self::TodoCreate,
+        Self::TodoList,
+        Self::TodoGet,
+        Self::TodoModify,
+        Self::AskUser,
+        Self::MemorySearch,
+        Self::MemoryGet,
+        Self::WriteMemory,
+        Self::ReadMemory,
+        Self::EditMemory,
+        Self::CodingMemoryRead,
+        Self::CodingMemoryWrite,
+        Self::CodingMemoryEdit,
+        Self::FetchWebpage,
+        Self::WebSearch,
+        Self::ImageMetadata,
+        Self::AudioMetadata,
+        Self::Cron,
+        Self::ListMcpResources,
+        Self::ReadMcpResource,
+        Self::ToolSearch,
+        Self::GetCurrentGoal,
+        Self::SubmitGoalReport,
+    ];
+
+    /// Every built-in tool, in registry order; an alias of [`Self::EXTENDED`].
+    pub const ALL: [Self; 30] = Self::EXTENDED;
 
     /// The model-facing name of this tool.
     #[must_use]
@@ -148,10 +245,21 @@ impl BuiltinTool {
             Self::CodingMemoryRead => "coding_memory_read",
             Self::CodingMemoryWrite => "coding_memory_write",
             Self::CodingMemoryEdit => "coding_memory_edit",
+            Self::FetchWebpage => "fetch_webpage",
+            Self::WebSearch => "web_search",
+            Self::ImageMetadata => "image_metadata",
+            Self::AudioMetadata => "audio_metadata",
+            Self::Cron => "cron",
+            Self::ListMcpResources => "list_mcp_resources",
+            Self::ReadMcpResource => "read_mcp_resource",
+            Self::ToolSearch => "tool_search",
+            Self::GetCurrentGoal => "get_current_goal",
+            Self::SubmitGoalReport => "submit_goal_report",
         }
     }
 
-    /// The tool whose model-facing name is exactly `name`, if any.
+    /// The tool whose model-facing name is exactly `name`, if any; every one of the thirty names
+    /// in [`Self::ALL`] resolves.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
@@ -159,16 +267,28 @@ impl BuiltinTool {
 
     /// Whether the tool may run concurrently with sibling tool calls.
     ///
-    /// Only the write tools are serialised; every other built-in tool is parallel-safe.
+    /// The file-write tools, `cron` (job-list mutations) and `submit_goal_report` (goal-record
+    /// mutations) are serialised; every other built-in tool is parallel-safe.
     #[must_use]
     pub const fn parallel_safe(self) -> bool {
-        !matches!(self, Self::WriteFile | Self::EditFile)
+        !matches!(
+            self,
+            Self::WriteFile | Self::EditFile | Self::Cron | Self::SubmitGoalReport
+        )
     }
 }
 
-/// The model-facing tool names, in registry order.
+/// The model-facing names of the default tool set, in registry order.
 #[must_use]
 pub fn tool_names() -> &'static [&'static str] {
+    // The default set is the prefix of the extended set, so the two cannot drift apart.
+    &extended_tool_names()[..BuiltinTool::DEFAULT.len()]
+}
+
+/// The model-facing names of every built-in tool, in [`BuiltinTool::EXTENDED`] order; the first
+/// twenty entries are exactly [`tool_names`].
+#[must_use]
+pub fn extended_tool_names() -> &'static [&'static str] {
     &[
         "bash",
         "read_file",
@@ -190,6 +310,16 @@ pub fn tool_names() -> &'static [&'static str] {
         "coding_memory_read",
         "coding_memory_write",
         "coding_memory_edit",
+        "fetch_webpage",
+        "web_search",
+        "image_metadata",
+        "audio_metadata",
+        "cron",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "tool_search",
+        "get_current_goal",
+        "submit_goal_report",
     ]
 }
 
@@ -213,11 +343,27 @@ fn memory_kind(tool: BuiltinTool) -> MemoryToolKind {
     }
 }
 
+/// The sibling-shared caches of one [`ToolRegistry::build`] pass, each populated on first use.
+#[derive(Default)]
+struct BuildCaches {
+    /// The todo store shared by the four todo tools.
+    todo_store: Option<Arc<TodoStore>>,
+    /// The cron scheduler behind the `cron` tool.
+    cron_scheduler: Option<Arc<cron::CronScheduler>>,
+    /// The goal store shared by the two goal tools.
+    goal_store: Option<Arc<goal::GoalStore>>,
+    /// The discovery index behind `tool_search`.
+    tool_index: Option<Arc<discovery::ToolIndex>>,
+}
+
 /// The built-in tool set of one agent, with its workspace, backends and shared read state.
 ///
 /// The registry owns the [`ToolEnv`] path/permission gate, the sys-operation backends, the
-/// read-before-write registry and the todo directory; [`Self::build`] materialises the tool
-/// implementations and [`Self::cards`] their model-facing cards.
+/// read-before-write registry, the todo directory and the extended tools' seams;
+/// [`Self::build`] materialises the tool implementations and [`Self::cards`] their cards.
+/// [`Self::new`] mounts [`BuiltinTool::DEFAULT`]; the extended tools are selected through
+/// [`Self::with_tools`], and tools passed to [`Self::with_deferred_tools`] stay out of both
+/// [`Self::build`] and [`Self::cards`] until the host reveals them with [`Self::reveal`].
 pub struct ToolRegistry {
     /// Path resolution, permission gate and description language.
     env: ToolEnv,
@@ -235,6 +381,18 @@ pub struct ToolRegistry {
     user_asker: Option<Arc<dyn UserAsker>>,
     /// The memory backend the eight memory tools delegate to, when one is wired.
     memory_backend: Option<Arc<dyn MemoryToolBackend>>,
+    /// The HTTP seam behind `fetch_webpage`, when one is wired.
+    http_fetcher: Option<Arc<dyn web::HttpFetcher>>,
+    /// The search provider behind `web_search`, when one is wired.
+    search: Option<Arc<dyn web::SearchBackend>>,
+    /// The MCP resource provider behind the two resource tools, when one is wired.
+    mcp_provider: Option<Arc<dyn mcp_resources::McpResourceProvider>>,
+    /// The cron scheduler behind the `cron` tool, when one is wired.
+    cron_scheduler: Option<Arc<cron::CronScheduler>>,
+    /// The goal store behind the two goal tools, when one is wired.
+    goal_store: Option<Arc<goal::GoalStore>>,
+    /// Tools held back from [`ToolRegistry::build`]/[`ToolRegistry::cards`] until discovered.
+    deferred: Vec<BuiltinTool>,
     /// The tools this registry builds, in registry order.
     tools: Vec<BuiltinTool>,
 }
@@ -272,7 +430,13 @@ impl ToolRegistry {
             todo_dir: None,
             user_asker: None,
             memory_backend: None,
-            tools: BuiltinTool::ALL.to_vec(),
+            http_fetcher: None,
+            search: None,
+            mcp_provider: None,
+            cron_scheduler: None,
+            goal_store: None,
+            deferred: Vec::new(),
+            tools: BuiltinTool::DEFAULT.to_vec(),
         }
     }
 
@@ -321,6 +485,55 @@ impl ToolRegistry {
         self
     }
 
+    /// Wires the HTTP seam behind `fetch_webpage`; without one it uses [`web::ReqwestFetcher`].
+    #[must_use]
+    pub fn with_http_fetcher(mut self, fetcher: Arc<dyn web::HttpFetcher>) -> Self {
+        self.http_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wires the search provider behind `web_search`; without one it reports a typed failure.
+    #[must_use]
+    pub fn with_search_backend(mut self, backend: Arc<dyn web::SearchBackend>) -> Self {
+        self.search = Some(backend);
+        self
+    }
+
+    /// Wires the MCP resource provider behind the two resource tools; without one they fail.
+    #[must_use]
+    pub fn with_mcp_resources(
+        mut self,
+        provider: Arc<dyn mcp_resources::McpResourceProvider>,
+    ) -> Self {
+        self.mcp_provider = Some(provider);
+        self
+    }
+
+    /// Wires the `cron` scheduler; without one it defaults to [`cron::CronScheduler::for_workspace`].
+    #[must_use]
+    pub fn with_cron_scheduler(mut self, scheduler: Arc<cron::CronScheduler>) -> Self {
+        self.cron_scheduler = Some(scheduler);
+        self
+    }
+
+    /// Wires the goal store; without one the goal tools default to [`goal::GoalStore::for_workspace`].
+    #[must_use]
+    pub fn with_goal_store(mut self, store: Arc<goal::GoalStore>) -> Self {
+        self.goal_store = Some(store);
+        self
+    }
+
+    /// Holds `tools` back as deferred tools, replacing any previous deferred list.
+    ///
+    /// They are not mounted by [`Self::build`] and not listed by [`Self::cards`]; the model finds
+    /// them with `tool_search` (or [`Self::discover`]) and the host reveals them with
+    /// [`Self::reveal`]. Deferring a mounted tool keeps it mounted.
+    #[must_use]
+    pub fn with_deferred_tools(mut self, tools: impl IntoIterator<Item = BuiltinTool>) -> Self {
+        self.deferred = tools.into_iter().collect();
+        self
+    }
+
     /// Sets the description language used for the rendered tool cards.
     #[must_use]
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
@@ -344,74 +557,172 @@ impl ToolRegistry {
 
     /// Builds the tool implementations of this registry.
     ///
-    /// Every selected [`BuiltinTool`] yields exactly one [`Tool`], in registry order. The todo
-    /// tools share one [`TodoStore`] and the filesystem tools share one [`ReadStateRegistry`],
-    /// so a registry behaves like a single agent's tool set.
+    /// Every selected [`BuiltinTool`] yields exactly one [`Tool`], in registry order; sibling
+    /// tools share one todo store, read-state registry, cron scheduler, goal store and discovery
+    /// index. Deferred tools are never mounted here.
     #[must_use]
     pub fn build(&self) -> Vec<Arc<dyn Tool>> {
         let language = self.env.language();
-        let mut todo_store: Option<Arc<TodoStore>> = None;
+        let mut caches = BuildCaches::default();
         self.tools
             .iter()
-            .map(|tool| {
-                let tool: Arc<dyn Tool> = match tool {
-                    BuiltinTool::Bash => {
-                        Arc::new(BashTool::new(self.env.clone(), self.shell.clone()))
-                    }
-                    BuiltinTool::ReadFile => Arc::new(ReadFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::WriteFile => Arc::new(WriteFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::EditFile => Arc::new(EditFileTool::new(
-                        self.env.clone(),
-                        self.fs.clone(),
-                        self.read_state.clone(),
-                    )),
-                    BuiltinTool::Glob => Arc::new(GlobTool::new(self.env.clone(), self.fs.clone())),
-                    BuiltinTool::ListFiles => {
-                        Arc::new(ListDirTool::new(self.env.clone(), self.fs.clone()))
-                    }
-                    BuiltinTool::Grep => Arc::new(GrepTool::new(self.env.clone())),
-                    BuiltinTool::TodoCreate => Arc::new(TodoCreateTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::TodoList => Arc::new(TodoListTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::TodoGet => {
-                        Arc::new(TodoGetTool::new(self.todo_store(&mut todo_store), language))
-                    }
-                    BuiltinTool::TodoModify => Arc::new(TodoModifyTool::new(
-                        self.todo_store(&mut todo_store),
-                        language,
-                    )),
-                    BuiltinTool::AskUser => {
-                        Arc::new(AskUserTool::new(self.user_asker.clone(), language))
-                    }
-                    BuiltinTool::MemorySearch
-                    | BuiltinTool::MemoryGet
-                    | BuiltinTool::WriteMemory
-                    | BuiltinTool::ReadMemory
-                    | BuiltinTool::EditMemory
-                    | BuiltinTool::CodingMemoryRead
-                    | BuiltinTool::CodingMemoryWrite
-                    | BuiltinTool::CodingMemoryEdit => Arc::new(MemoryTool::new(
-                        memory_kind(*tool),
-                        self.memory_backend.clone(),
-                        language,
-                    )),
-                };
-                tool
+            .map(|tool| match *tool {
+                BuiltinTool::Bash => Arc::new(BashTool::new(self.env.clone(), self.shell.clone())),
+                BuiltinTool::ReadFile | BuiltinTool::WriteFile | BuiltinTool::EditFile => {
+                    self.build_filesystem_tool(*tool)
+                }
+                BuiltinTool::Glob | BuiltinTool::ListFiles | BuiltinTool::Grep => {
+                    self.build_search_tool(*tool)
+                }
+                BuiltinTool::TodoCreate
+                | BuiltinTool::TodoList
+                | BuiltinTool::TodoGet
+                | BuiltinTool::TodoModify => self.build_todo_tool(*tool, language, &mut caches),
+                BuiltinTool::AskUser => {
+                    Arc::new(AskUserTool::new(self.user_asker.clone(), language))
+                }
+                BuiltinTool::MemorySearch
+                | BuiltinTool::MemoryGet
+                | BuiltinTool::WriteMemory
+                | BuiltinTool::ReadMemory
+                | BuiltinTool::EditMemory
+                | BuiltinTool::CodingMemoryRead
+                | BuiltinTool::CodingMemoryWrite
+                | BuiltinTool::CodingMemoryEdit => self.build_memory_tool(*tool, language),
+                BuiltinTool::FetchWebpage => Arc::new(web::FetchWebpageTool::new(
+                    self.env.clone(),
+                    Some(self.fetcher()),
+                    language,
+                )),
+                BuiltinTool::WebSearch => {
+                    Arc::new(web::WebSearchTool::new(self.search.clone(), language))
+                }
+                BuiltinTool::ImageMetadata => {
+                    Arc::new(media::ImageMetadataTool::new(self.env.clone(), language))
+                }
+                BuiltinTool::AudioMetadata => {
+                    Arc::new(media::AudioMetadataTool::new(self.env.clone(), language))
+                }
+                BuiltinTool::Cron => Arc::new(cron::CronTool::new(
+                    self.cron_scheduler(&mut caches.cron_scheduler),
+                    language,
+                )),
+                BuiltinTool::ListMcpResources => Arc::new(
+                    mcp_resources::ListMcpResourcesTool::new(self.mcp_provider.clone(), language),
+                ),
+                BuiltinTool::ReadMcpResource => Arc::new(mcp_resources::ReadMcpResourceTool::new(
+                    self.mcp_provider.clone(),
+                    language,
+                )),
+                BuiltinTool::ToolSearch => Arc::new(discovery::ToolSearchTool::new(
+                    self.tool_index(&mut caches.tool_index, language),
+                    language,
+                )),
+                BuiltinTool::GetCurrentGoal => Arc::new(goal::GetCurrentGoalTool::new(
+                    self.goal_store(&mut caches.goal_store),
+                    language,
+                )),
+                BuiltinTool::SubmitGoalReport => Arc::new(goal::SubmitGoalReportTool::new(
+                    self.goal_store(&mut caches.goal_store),
+                    language,
+                )),
             })
             .collect()
+    }
+
+    /// Builds one of the three filesystem tools over the registry's shared read-before-write state.
+    ///
+    /// Any variant other than `write_file`/`edit_file` falls back to `read_file`.
+    fn build_filesystem_tool(&self, tool: BuiltinTool) -> Arc<dyn Tool> {
+        let env = self.env.clone();
+        let fs = self.fs.clone();
+        let read_state = self.read_state.clone();
+        match tool {
+            BuiltinTool::WriteFile => Arc::new(WriteFileTool::new(env, fs, read_state)),
+            BuiltinTool::EditFile => Arc::new(EditFileTool::new(env, fs, read_state)),
+            _ => Arc::new(ReadFileTool::new(env, fs, read_state)),
+        }
+    }
+
+    /// Builds one of the three discovery tools (`list_files`, `grep`, else `glob`).
+    fn build_search_tool(&self, tool: BuiltinTool) -> Arc<dyn Tool> {
+        match tool {
+            BuiltinTool::ListFiles => Arc::new(ListDirTool::new(self.env.clone(), self.fs.clone())),
+            BuiltinTool::Grep => Arc::new(GrepTool::new(self.env.clone())),
+            _ => Arc::new(GlobTool::new(self.env.clone(), self.fs.clone())),
+        }
+    }
+
+    /// Builds one of the four todo tools over the store shared by this build pass.
+    ///
+    /// Any variant other than `todo_list`/`todo_get`/`todo_modify` falls back to `todo_create`.
+    fn build_todo_tool(
+        &self,
+        tool: BuiltinTool,
+        language: &str,
+        caches: &mut BuildCaches,
+    ) -> Arc<dyn Tool> {
+        let store = self.todo_store(&mut caches.todo_store);
+        match tool {
+            BuiltinTool::TodoList => Arc::new(TodoListTool::new(store, language)),
+            BuiltinTool::TodoGet => Arc::new(TodoGetTool::new(store, language)),
+            BuiltinTool::TodoModify => Arc::new(TodoModifyTool::new(store, language)),
+            _ => Arc::new(TodoCreateTool::new(store, language)),
+        }
+    }
+
+    /// Builds one of the eight memory tools, whose kind [`memory_kind`] maps from the variant.
+    fn build_memory_tool(&self, tool: BuiltinTool, language: &str) -> Arc<dyn Tool> {
+        Arc::new(MemoryTool::new(
+            memory_kind(tool),
+            self.memory_backend.clone(),
+            language,
+        ))
+    }
+
+    /// The HTTP seam of `fetch_webpage`: the wired fetcher, else a [`web::ReqwestFetcher`].
+    fn fetcher(&self) -> Arc<dyn web::HttpFetcher> {
+        self.http_fetcher
+            .clone()
+            .unwrap_or_else(|| Arc::new(web::ReqwestFetcher::new()))
+    }
+
+    /// Returns the cron scheduler of this registry, creating and caching it on first use.
+    fn cron_scheduler(
+        &self,
+        cache: &mut Option<Arc<cron::CronScheduler>>,
+    ) -> Arc<cron::CronScheduler> {
+        cache
+            .get_or_insert_with(|| match &self.cron_scheduler {
+                Some(scheduler) => Arc::clone(scheduler),
+                None => cron::CronScheduler::for_workspace(self.env.workspace()),
+            })
+            .clone()
+    }
+
+    /// Returns the goal store of this registry, creating and caching it on first use.
+    fn goal_store(&self, cache: &mut Option<Arc<goal::GoalStore>>) -> Arc<goal::GoalStore> {
+        cache
+            .get_or_insert_with(|| match &self.goal_store {
+                Some(store) => Arc::clone(store),
+                None => goal::GoalStore::for_workspace(self.env.workspace()),
+            })
+            .clone()
+    }
+
+    /// Returns the discovery index of this registry, building and caching it on first use.
+    fn tool_index(
+        &self,
+        cache: &mut Option<Arc<discovery::ToolIndex>>,
+        language: &str,
+    ) -> Arc<discovery::ToolIndex> {
+        cache
+            .get_or_insert_with(|| {
+                Arc::new(discovery::ToolIndex::from_cards(
+                    &self.discovery_cards(language),
+                ))
+            })
+            .clone()
     }
 
     /// Returns the todo store of this registry, creating and caching it on first use.
@@ -457,7 +768,80 @@ impl ToolRegistry {
             | BuiltinTool::CodingMemoryRead
             | BuiltinTool::CodingMemoryWrite
             | BuiltinTool::CodingMemoryEdit => MemoryTool::card_for(memory_kind(tool), language),
+            BuiltinTool::FetchWebpage => web::FetchWebpageTool::card_for(language),
+            BuiltinTool::WebSearch => web::WebSearchTool::card_for(language),
+            BuiltinTool::ImageMetadata => media::ImageMetadataTool::card_for(language),
+            BuiltinTool::AudioMetadata => media::AudioMetadataTool::card_for(language),
+            BuiltinTool::Cron => cron::CronTool::card_for(language),
+            BuiltinTool::ListMcpResources => {
+                mcp_resources::ListMcpResourcesTool::card_for(language)
+            }
+            BuiltinTool::ReadMcpResource => mcp_resources::ReadMcpResourceTool::card_for(language),
+            BuiltinTool::ToolSearch => discovery::ToolSearchTool::card_for(language),
+            BuiltinTool::GetCurrentGoal => goal::GetCurrentGoalTool::card_for(language),
+            BuiltinTool::SubmitGoalReport => goal::SubmitGoalReportTool::card_for(language),
         }
+    }
+
+    /// The tools the discovery API searches: the deferred set when one is configured, otherwise
+    /// every extended tool.
+    fn discovery_set(&self) -> &[BuiltinTool] {
+        if self.deferred.is_empty() {
+            &BuiltinTool::EXTENDED
+        } else {
+            &self.deferred
+        }
+    }
+
+    /// The cards the discovery index is built from, in registry order.
+    fn discovery_cards(&self, language: &str) -> Vec<ToolCard> {
+        let candidates = self.discovery_set();
+        BuiltinTool::EXTENDED
+            .iter()
+            .filter(|tool| candidates.contains(tool))
+            .map(|tool| self.card(*tool, language))
+            .collect()
+    }
+
+    /// Searches the discoverable tools with `query` and returns at most `limit` hits.
+    ///
+    /// Ranking is BM25 over `"{name} {description}"` ([`discovery::ToolIndex`]), exact-name hits
+    /// first; the index covers the deferred set when one is configured and every extended tool
+    /// otherwise. The `tool_search` tool exposes the same search to the model.
+    #[must_use]
+    pub fn discover(&self, query: &str, limit: usize) -> Vec<discovery::ToolSearchHit> {
+        discovery::ToolIndex::from_cards(&self.discovery_cards(self.env.language()))
+            .search(query, limit)
+    }
+
+    /// Returns the cards of the named discoverable tools, in registry order.
+    ///
+    /// Names outside the discoverable set are skipped, so a model cannot conjure a tool the host
+    /// did not offer. A host unions the returned cards into the next model call's tool list.
+    #[must_use]
+    pub fn reveal(&self, names: &[&str]) -> Vec<ToolCard> {
+        let candidates = self.discovery_set();
+        BuiltinTool::EXTENDED
+            .iter()
+            .filter(|tool| candidates.contains(tool) && names.contains(&tool.name()))
+            .map(|tool| self.card(*tool, self.env.language()))
+            .collect()
+    }
+
+    /// The cards of the deferred tools, in registry order; empty when nothing is deferred.
+    #[must_use]
+    pub fn deferred_cards(&self, language: &str) -> Vec<ToolCard> {
+        BuiltinTool::EXTENDED
+            .iter()
+            .filter(|tool| self.deferred.contains(tool))
+            .map(|tool| self.card(*tool, language))
+            .collect()
+    }
+
+    /// The deferred tools, in the order they were configured.
+    #[must_use]
+    pub fn deferred_tools(&self) -> &[BuiltinTool] {
+        &self.deferred
     }
 
     /// The path resolution and permission environment shared by the tools.
@@ -502,6 +886,26 @@ impl ToolRegistry {
         self.memory_backend.as_ref()
     }
 
+    /// The HTTP seam wired into `fetch_webpage`, when one is configured.
+    ///
+    /// `None` means the tool is built over a [`web::ReqwestFetcher`].
+    #[must_use]
+    pub fn http_fetcher(&self) -> Option<&Arc<dyn web::HttpFetcher>> {
+        self.http_fetcher.as_ref()
+    }
+
+    /// The search provider wired into `web_search`, when one is configured.
+    #[must_use]
+    pub fn search_backend(&self) -> Option<&Arc<dyn web::SearchBackend>> {
+        self.search.as_ref()
+    }
+
+    /// The MCP resource provider wired into the two resource tools, when one is configured.
+    #[must_use]
+    pub fn mcp_provider(&self) -> Option<&Arc<dyn mcp_resources::McpResourceProvider>> {
+        self.mcp_provider.as_ref()
+    }
+
     /// The todo directory override, when one was set.
     #[must_use]
     pub fn todo_dir(&self) -> Option<&Path> {
@@ -544,36 +948,71 @@ mod registry_tests {
     ];
 
     #[test]
-    fn builtin_tool_all_has_twenty_variants_in_registry_order() {
-        assert_eq!(BuiltinTool::ALL.len(), 20);
-        let names: Vec<&str> = BuiltinTool::ALL.iter().map(|tool| tool.name()).collect();
+    fn builtin_tool_sets_have_the_documented_shapes() {
+        assert_eq!(BuiltinTool::DEFAULT.len(), 20);
+        assert_eq!(BuiltinTool::EXTENDED.len(), 30);
+        assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
+        assert_eq!(&BuiltinTool::EXTENDED[..20], &BuiltinTool::DEFAULT[..]);
+
+        let names: Vec<&str> = BuiltinTool::DEFAULT
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
         assert_eq!(names, EXPECTED_NAMES.to_vec());
+        let extended: Vec<&str> = BuiltinTool::EXTENDED
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(extended[..20], EXPECTED_NAMES);
+        assert_eq!(extended[20], "fetch_webpage");
+        assert_eq!(extended[29], "submit_goal_report");
     }
 
     #[test]
     fn tool_names_match_registry_order() {
         assert_eq!(tool_names(), &EXPECTED_NAMES);
+        assert_eq!(&extended_tool_names()[..20], tool_names());
+        assert_eq!(extended_tool_names().len(), BuiltinTool::EXTENDED.len());
+        let names: Vec<&str> = BuiltinTool::EXTENDED
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(names, extended_tool_names().to_vec());
     }
 
     #[test]
     fn from_name_round_trips_every_name() {
-        for name in EXPECTED_NAMES {
+        for name in extended_tool_names() {
             let tool = BuiltinTool::from_name(name).expect("known tool name");
-            assert_eq!(tool.name(), name, "round-trip mismatch for {name}");
+            assert_eq!(tool.name(), *name, "round-trip mismatch for {name}");
         }
         assert_eq!(BuiltinTool::from_name("nope"), None);
     }
 
     #[test]
-    fn only_write_tools_are_not_parallel_safe() {
+    fn only_the_mutating_tools_are_not_parallel_safe() {
         for tool in BuiltinTool::ALL {
-            let expected = !matches!(tool, BuiltinTool::WriteFile | BuiltinTool::EditFile);
+            let expected = !matches!(
+                tool,
+                BuiltinTool::WriteFile
+                    | BuiltinTool::EditFile
+                    | BuiltinTool::Cron
+                    | BuiltinTool::SubmitGoalReport
+            );
             assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
         }
-        assert!(!BuiltinTool::from_name("write_file")
+        for name in ["write_file", "edit_file", "cron", "submit_goal_report"] {
+            assert!(
+                !BuiltinTool::from_name(name).unwrap().parallel_safe(),
+                "{name}"
+            );
+        }
+        assert!(BuiltinTool::from_name("fetch_webpage")
             .unwrap()
             .parallel_safe());
-        assert!(!BuiltinTool::from_name("edit_file").unwrap().parallel_safe());
+        assert!(BuiltinTool::from_name("tool_search")
+            .unwrap()
+            .parallel_safe());
     }
 
     #[test]

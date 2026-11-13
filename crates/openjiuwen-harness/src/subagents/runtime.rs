@@ -7,29 +7,51 @@
 //! created and rolled back on failure; a [`tokio::sync::Semaphore`] bounds concurrent turns.
 //! Python defaults (`config.py`): `max_subagents = 10`, `max_concurrent_running = 5`,
 //! turn timeout 2400 s.
+//!
+//! `SubAgentQuota` carries the remaining, opt-in limits (cumulative spawns, per-parent
+//! fan-out, nesting depth, LRU eviction) and every timestamp comes from an injected `Clock`,
+//! so a `ManualClock` makes the lifecycle fully deterministic in tests.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openjiuwen_agent::{Agent, AgentOutput, ResultType};
+use openjiuwen_agent::Agent;
 use openjiuwen_common::error::{Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::JoinHandle;
 
+use self::clock::Clock;
+use self::clock::SystemClock;
+use self::instance::Instance;
+use self::quota::{SpawnBudget, SubAgentQuota, SubagentActivity};
+use self::transcript::{TranscriptEntry, TranscriptSummary};
+use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
-/// Default live-instance cap (Python `max_subagents`).
-const DEFAULT_MAX_SUBAGENTS: usize = 10;
-/// Default concurrent-turn cap (Python `max_concurrent_running`).
-const DEFAULT_MAX_CONCURRENT_RUNNING: usize = 5;
+pub mod clock;
+mod evict;
+mod instance;
+mod persist_api;
+pub mod persistence;
+pub mod quota;
+pub mod transcript;
+mod transcript_api;
+mod turn;
+
+pub use self::evict::EVICTION_REASON;
+pub use self::persist_api::LoadReport;
+
 /// Default per-turn timeout (Python `TURN_TIMEOUT_S_DEFAULT`).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(2400);
 /// The sub-agent type whose id is sticky (no random suffix) across spawns.
 const STICKY_SUBAGENT_TYPE: &str = "verification_agent";
+/// Close reason recorded when the parent ends every instance (Python `parent_ended`).
+const CLOSE_REASON_PARENT_ENDED: &str = "parent_ended";
+/// Close reason recorded when a caller closes one instance (Python `manual`).
+const CLOSE_REASON_MANUAL: &str = "manual";
 
 /// Identifier of one sub-agent instance; it doubles as the child session id.
 pub type SubAgentId = String;
@@ -93,6 +115,11 @@ pub struct SubAgentSpawnRequest {
     pub role: Option<String>,
     /// Optional explicit instance id; generated when absent.
     pub subagent_id: Option<String>,
+    /// The instance spawning this one, when nested; `None` for a top-level spawn.
+    ///
+    /// A nested spawn must name a live instance: it inherits `depth(parent) + 1`, and a
+    /// missing or closed parent is rejected with [`Error::Validation`].
+    pub parent_subagent_id: Option<String>,
 }
 
 impl SubAgentSpawnRequest {
@@ -125,6 +152,9 @@ pub struct SubAgentOutcome {
     pub output: Option<String>,
     /// Error message of the last failed turn, when it failed.
     pub error: Option<String>,
+    /// Digest of the instance's transcript at collection time.
+    #[serde(default)]
+    pub transcript: TranscriptSummary,
 }
 
 impl SubAgentOutcome {
@@ -157,6 +187,19 @@ pub struct SubagentMetadata {
     pub created_at: String,
     /// Last status transition time (RFC 3339).
     pub updated_at: String,
+    /// Derived activity phase driving LRU eviction.
+    pub activity: SubagentActivity,
+    /// Nesting depth (top-level = 1).
+    pub depth: usize,
+    /// The instance that spawned this one, when nested.
+    pub parent_subagent_id: Option<String>,
+    /// Last time the instance was handed work (RFC 3339).
+    pub last_used_at: String,
+    /// Why the instance was closed, when it was.
+    pub closed_reason: Option<String>,
+    /// Digest of the instance's transcript (size, ring evictions, newest entry).
+    #[serde(default)]
+    pub transcript: TranscriptSummary,
 }
 
 /// The response of [`SubAgentRuntime::resume`] (Python `ResumeResult`).
@@ -200,85 +243,17 @@ struct Shared {
 struct RuntimeState {
     instances: BTreeMap<SubAgentId, Instance>,
     next_seq: u64,
-}
-
-/// One live (or closed-tombstone) sub-agent instance.
-struct Instance {
-    seq: u64,
-    subagent_id: SubAgentId,
-    sub_session_id: String,
-    subagent_type: String,
-    display_name: Option<String>,
-    role: Option<String>,
-    task_description: String,
-    status: SubagentStatus,
-    created_at: String,
-    updated_at: String,
-    agent_id: String,
-    output: Option<String>,
-    error: Option<String>,
-    agent: Option<Arc<dyn Agent>>,
-    pending: VecDeque<String>,
-    running: bool,
-    generation: u64,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl Instance {
-    fn new(seq: u64, request: &SubAgentSpawnRequest, id: SubAgentId, now: String) -> Self {
-        Self {
-            seq,
-            sub_session_id: id.clone(),
-            subagent_id: id,
-            subagent_type: request.subagent_type.clone(),
-            display_name: request.display_name.clone(),
-            role: request.role.clone(),
-            task_description: request.task_description.clone(),
-            status: SubagentStatus::PendingInit,
-            created_at: now.clone(),
-            updated_at: now,
-            agent_id: String::new(),
-            output: None,
-            error: None,
-            agent: None,
-            pending: VecDeque::new(),
-            running: false,
-            generation: 0,
-            handle: None,
-        }
-    }
-
-    fn outcome(&self) -> SubAgentOutcome {
-        SubAgentOutcome {
-            subagent_id: self.subagent_id.clone(),
-            sub_session_id: self.sub_session_id.clone(),
-            subagent_type: self.subagent_type.clone(),
-            agent_id: self.agent_id.clone(),
-            status: self.status,
-            output: self.output.clone(),
-            error: self.error.clone(),
-        }
-    }
-
-    fn metadata(&self) -> SubagentMetadata {
-        SubagentMetadata {
-            subagent_id: self.subagent_id.clone(),
-            sub_session_id: self.sub_session_id.clone(),
-            subagent_type: self.subagent_type.clone(),
-            display_name: self.display_name.clone(),
-            role: self.role.clone(),
-            task_description: self.task_description.clone(),
-            status: self.status,
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
-        }
-    }
+    /// Cumulative reservations that were not rolled back; never decreases on close.
+    spawned: usize,
+    /// Revision of the persisted bucket; every snapshot advances it.
+    revision: u64,
 }
 
 /// The sub-agent instances of one parent session; share it behind an `Arc`.
 pub struct SubAgentRuntime {
     shared: Arc<Shared>,
-    max_subagents: usize,
+    quota: SubAgentQuota,
+    clock: Arc<dyn Clock>,
     turn_timeout: Duration,
     semaphore: Arc<Semaphore>,
 }
@@ -286,13 +261,15 @@ pub struct SubAgentRuntime {
 impl SubAgentRuntime {
     /// Creates a runtime for `parent_session_id` over `registry` and `factory`.
     ///
-    /// Defaults match Python: 10 live instances, 5 concurrent turns, 2400 s per turn.
+    /// Defaults match Python: 10 live instances, 5 concurrent turns, 2400 s per turn, no
+    /// cumulative/per-parent/depth cap, LRU eviction policy enabled.
     #[must_use]
     pub fn new(
         registry: Arc<SubAgentRegistry>,
         factory: Arc<dyn SubAgentFactory>,
         parent_session_id: impl Into<String>,
     ) -> Self {
+        let quota = SubAgentQuota::default();
         Self {
             shared: Arc::new(Shared {
                 registry,
@@ -302,18 +279,44 @@ impl SubAgentRuntime {
                 state: Mutex::new(RuntimeState {
                     instances: BTreeMap::new(),
                     next_seq: 0,
+                    spawned: 0,
+                    revision: 0,
                 }),
             }),
-            max_subagents: DEFAULT_MAX_SUBAGENTS,
+            quota,
+            clock: Arc::new(SystemClock),
             turn_timeout: DEFAULT_TURN_TIMEOUT,
-            semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_RUNNING)),
+            semaphore: Arc::new(Semaphore::new(quota.max_concurrent_running)),
         }
     }
 
+    /// Replaces every limit and rebuilds the turn semaphore; call before sharing.
+    #[must_use]
+    pub fn with_quota(mut self, quota: SubAgentQuota) -> Self {
+        self.semaphore = Arc::new(Semaphore::new(quota.max_concurrent_running));
+        self.quota = quota;
+        self
+    }
+
+    /// Injects the clock every activity timestamp is read from.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Overrides the live-instance and concurrent-turn caps; call before sharing.
+    ///
+    /// Pre-eviction convenience constructor: it keeps the rest of the quota and forces
+    /// `enable_lru_eviction = false`, so a full runtime refuses a spawn instead of recycling
+    /// an idle instance.
     #[must_use]
     pub fn with_limits(mut self, max_subagents: usize, max_concurrent_running: usize) -> Self {
-        self.max_subagents = max_subagents;
+        self.quota = self
+            .quota
+            .with_max_subagents(max_subagents)
+            .with_concurrent_running(max_concurrent_running)
+            .with_lru_eviction(false);
         self.semaphore = Arc::new(Semaphore::new(max_concurrent_running));
         self
     }
@@ -325,6 +328,12 @@ impl SubAgentRuntime {
         self
     }
 
+    /// Returns the limits this runtime enforces.
+    #[must_use]
+    pub fn quota(&self) -> &SubAgentQuota {
+        &self.quota
+    }
+
     /// Spawns a sub-agent instance and returns its id immediately.
     ///
     /// The first turn runs on a background task; use [`SubAgentRuntime::wait`] to collect
@@ -333,8 +342,10 @@ impl SubAgentRuntime {
     ///
     /// # Errors
     ///
-    /// - [`Error::Validation`] when the type is unknown or the id is already live;
-    /// - [`Error::Config`] when the live-instance cap is reached;
+    /// - [`Error::Validation`] when the type is unknown, the id is already live, or
+    ///   [`SubAgentSpawnRequest::parent_subagent_id`] names a missing or closed instance;
+    /// - [`Error::Config`] when a quota limit (`max_subagents`, `max_total_spawned`,
+    ///   `max_children_per_parent`, `max_depth`) is reached;
     /// - the factory error when the child agent cannot be created.
     pub async fn spawn(&self, request: SubAgentSpawnRequest) -> Result<SubAgentId> {
         let spec = self
@@ -354,8 +365,6 @@ impl SubAgentRuntime {
                 is_sticky_type(&request.subagent_type),
             )
         });
-        let seq = self.reserve(&id, &request)?;
-
         let mut config = spec.config;
         if request.display_name.is_some() {
             config.display_name = request.display_name.clone();
@@ -364,6 +373,8 @@ impl SubAgentRuntime {
             config.role = request.role.clone();
         }
         config.subagent_type = Some(request.subagent_type.clone());
+        // The instance keeps the patched configuration, so a restored instance can be rebuilt.
+        let seq = self.reserve(&id, &request, config.clone())?;
         let agent = match self.shared.factory.create(&config, &id).await {
             Ok(agent) => agent,
             Err(error) => {
@@ -381,6 +392,7 @@ impl SubAgentRuntime {
             target: "openjiuwen_harness::subagents",
             subagent_id = %id,
             subagent_type = %request.subagent_type,
+            depth = self.depth_of(&id).unwrap_or(1),
             "subagent spawned"
         );
         self.start_turn(
@@ -431,16 +443,25 @@ impl SubAgentRuntime {
         state.instances.get(id).map(Instance::outcome)
     }
 
+    /// Returns the metadata of `id`, or `None` when the id is unknown.
+    ///
+    /// Closed instances still have metadata (the in-memory tombstone), so this reports them
+    /// too; use [`SubAgentRuntime::list`] for live instances only.
+    #[must_use]
+    pub fn get_metadata(&self, id: &str) -> Option<SubagentMetadata> {
+        let state = self.shared.state.lock();
+        state.instances.get(id).map(Instance::metadata)
+    }
+
     /// Returns the metadata of every live (non-`Closed`) instance in spawn order.
+    ///
+    /// Instances are ordered by creation time and then by spawn sequence, which is exactly
+    /// spawn order under a monotonic clock and stays deterministic under a frozen one.
     #[must_use]
     pub fn list(&self) -> Vec<SubagentMetadata> {
         let state = self.shared.state.lock();
-        let mut live: Vec<&Instance> = state
-            .instances
-            .values()
-            .filter(|instance| instance.status != SubagentStatus::Closed)
-            .collect();
-        live.sort_by_key(|instance| instance.seq);
+        let mut live: Vec<&Instance> = state.instances.values().filter(|i| i.is_live()).collect();
+        live.sort_by_key(|instance| (instance.created_at_ms, instance.seq));
         live.into_iter().map(Instance::metadata).collect()
     }
 
@@ -448,12 +469,18 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn capacity(&self) -> (usize, usize) {
         let state = self.shared.state.lock();
-        let used = state
-            .instances
-            .values()
-            .filter(|instance| instance.status != SubagentStatus::Closed)
-            .count();
-        (used, self.max_subagents)
+        let used = state.instances.values().filter(|i| i.is_live()).count();
+        (used, self.quota.max_subagents)
+    }
+
+    /// Returns the cumulative number of spawns (successful reservations, not rolled back).
+    ///
+    /// Closing an instance does not lower it: it is the session's spawn budget ledger, not a
+    /// live count.
+    #[must_use]
+    pub fn spawned_total(&self) -> usize {
+        let state = self.shared.state.lock();
+        state.spawned
     }
 
     /// Queues follow-up input for `id` and returns once it is queued.
@@ -464,10 +491,14 @@ impl SubAgentRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when the id is unknown or already closed.
+    /// Returns [`Error::Validation`] when the id is unknown or already closed
+    /// (`subagent closed or not found: <id>; call subagent_resume first`), and
+    /// `subagent not resumed: <id>; call subagent_resume first` when the instance has no child
+    /// agent — a restored instance, which [`SubAgentRuntime::resume`] rebuilds.
     // Kept async for parity with the Python control surface; the tools await it.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send_input(&self, id: &str, query: &str, interrupt: bool) -> Result<()> {
+        let now_ms = self.clock.now_ms();
         let mut start: Option<(u64, String, Arc<dyn Agent>, String)> = None;
         {
             let mut state = self.shared.state.lock();
@@ -476,6 +507,12 @@ impl SubAgentRuntime {
             };
             if instance.status == SubagentStatus::Closed {
                 return Err(closed_or_missing(id));
+            }
+            // A restored or tombstoned instance has no child agent, so queueing would never run:
+            // the caller has to resume first. A spawn still inside the factory keeps queueing —
+            // it is `PendingInit` and its first turn drains what was queued.
+            if instance.agent.is_none() && instance.status != SubagentStatus::PendingInit {
+                return Err(not_resumed(id));
             }
             let mut interrupted = false;
             if interrupt && instance.running {
@@ -491,7 +528,14 @@ impl SubAgentRuntime {
                 instance.pending.clear();
             }
             instance.pending.push_back(query.to_owned());
-            instance.updated_at = now_rfc3339();
+            instance.record(TranscriptEntry::input(id, query, now_ms));
+            if interrupted {
+                instance.record(TranscriptEntry::status(
+                    id,
+                    SubagentStatus::Interrupted.as_str(),
+                    now_ms,
+                ));
+            }
             if !instance.running {
                 if let Some(agent) = instance.agent.clone() {
                     if let Some(next) = instance.pending.pop_front() {
@@ -509,55 +553,18 @@ impl SubAgentRuntime {
                     }
                 }
             }
+            let activity = if instance.running {
+                SubagentActivity::Running
+            } else {
+                SubagentActivity::Queued
+            };
+            instance.touch(now_ms, activity);
         }
         self.shared.notify.notify_waiters();
         if let Some((generation, query, agent, sub_session_id)) = start {
             self.start_turn(id, generation, query, agent, sub_session_id);
         }
         Ok(())
-    }
-
-    /// Revives a closed instance so new input can be sent to it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Validation`] when the id was never registered.
-    // Kept async for parity with the Python control surface; the tools await it.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn resume(&self, id: &str) -> Result<ResumeReport> {
-        let report = {
-            let mut state = self.shared.state.lock();
-            let Some(instance) = state.instances.get_mut(id) else {
-                return Err(not_found(id));
-            };
-            if instance.status != SubagentStatus::Closed {
-                return Ok(ResumeReport {
-                    status: instance.status,
-                    restored: false,
-                    message: Some(
-                        "Instance is already live; use subagent_send_input directly.".to_owned(),
-                    ),
-                });
-            }
-            instance.status = SubagentStatus::Completed;
-            instance.running = false;
-            instance.generation = instance.generation.wrapping_add(1);
-            instance.handle = None;
-            instance.updated_at = now_rfc3339();
-            ResumeReport {
-                status: SubagentStatus::Completed,
-                restored: true,
-                message: None,
-            }
-        };
-        self.shared.notify.notify_waiters();
-        tracing::debug!(
-            target: "openjiuwen_harness::subagents",
-            subagent_id = %id,
-            status = "completed",
-            "subagent resumed"
-        );
-        Ok(report)
     }
 
     /// Closes `id` and returns its previous status.
@@ -568,6 +575,7 @@ impl SubAgentRuntime {
     // Kept async for parity with the Python control surface; the tools await it.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn close(&self, id: &str) -> Result<SubagentStatus> {
+        let now_ms = self.clock.now_ms();
         let previous = {
             let mut state = self.shared.state.lock();
             let Some(instance) = state.instances.get_mut(id) else {
@@ -579,13 +587,8 @@ impl SubAgentRuntime {
                 )));
             }
             let previous = instance.status;
-            if let Some(handle) = instance.handle.take() {
-                handle.abort();
-            }
-            instance.running = false;
-            instance.generation = instance.generation.wrapping_add(1);
-            instance.status = SubagentStatus::Closed;
-            instance.updated_at = now_rfc3339();
+            instance.close(now_ms, CLOSE_REASON_MANUAL);
+            instance.record(TranscriptEntry::closed(id, CLOSE_REASON_MANUAL, now_ms));
             previous
         };
         self.shared.notify.notify_waiters();
@@ -602,20 +605,20 @@ impl SubAgentRuntime {
     // Kept async for parity with the Python control surface; the tools await it.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn cancel_all(&self) -> Vec<SubAgentId> {
+        let now_ms = self.clock.now_ms();
         let ids = {
             let mut state = self.shared.state.lock();
             let mut closed: Vec<(u64, SubAgentId)> = Vec::new();
             for (id, instance) in &mut state.instances {
-                if instance.status == SubagentStatus::Closed {
+                if !instance.is_live() {
                     continue;
                 }
-                if let Some(handle) = instance.handle.take() {
-                    handle.abort();
-                }
-                instance.running = false;
-                instance.generation = instance.generation.wrapping_add(1);
-                instance.status = SubagentStatus::Closed;
-                instance.updated_at = now_rfc3339();
+                instance.close(now_ms, CLOSE_REASON_PARENT_ENDED);
+                instance.record(TranscriptEntry::closed(
+                    id,
+                    CLOSE_REASON_PARENT_ENDED,
+                    now_ms,
+                ));
                 closed.push((instance.seq, id.clone()));
             }
             closed.sort_by_key(|(seq, _)| *seq);
@@ -626,28 +629,72 @@ impl SubAgentRuntime {
     }
 
     /// Returns the Python `describe_list` payload; `subagents` aliases `live_subagents`.
+    ///
+    /// Every row carries the metadata fields (including `activity`, `depth`,
+    /// `parent_subagent_id`, `last_used_at`, `closed_reason` and the `transcript` digest);
+    /// `capacity` reports the live usage, the cumulative spawn ledger, the running-turn count
+    /// against their limits, and `transcript_entries`, the number of buffered transcript
+    /// entries across the live instances (`capacity.transcript_entries`).
+    /// `summary` reports `live_count`, `closed_count`, `evicted_count` (closed instances whose
+    /// `closed_reason` is `"evicted"`) and `eviction`, the policy in force:
+    /// `{"enabled": <bool>, "candidates": <evictable live instances>}`.
     #[must_use]
     pub fn describe_list(&self) -> Value {
         let state = self.shared.state.lock();
         let mut instances: Vec<&Instance> = state.instances.values().collect();
         instances.sort_by_key(|instance| instance.seq);
+        let running = instances
+            .iter()
+            .filter(|instance| instance.activity == SubagentActivity::Running)
+            .count();
+        let transcript_entries = instances
+            .iter()
+            .filter(|instance| instance.is_live())
+            .map(|instance| instance.transcript.len())
+            .sum::<usize>();
+        let evicted_count = instances
+            .iter()
+            .filter(|instance| {
+                !instance.is_live() && instance.closed_reason.as_deref() == Some(EVICTION_REASON)
+            })
+            .count();
+        let candidates = instances
+            .iter()
+            .filter(|instance| instance.is_live() && instance.activity.is_evictable())
+            .count();
         let (mut live, mut closed) = (Vec::new(), Vec::new());
         for instance in instances {
             let value = serde_json::to_value(instance.metadata()).unwrap_or(Value::Null);
-            if instance.status == SubagentStatus::Closed {
-                closed.push(value);
-            } else {
+            if instance.is_live() {
                 live.push(value);
+            } else {
+                closed.push(value);
             }
         }
         let (live_count, closed_count) = (live.len(), closed.len());
         let live_alias = live.clone();
         json!({
-            "capacity": {"used": live_count, "max": self.max_subagents},
+            "capacity": {
+                "used": live_count,
+                "max": self.quota.max_subagents,
+                "spawned": state.spawned,
+                "max_spawned": self.quota.max_total_spawned,
+                "running": running,
+                "max_running": self.quota.max_concurrent_running,
+                "transcript_entries": transcript_entries,
+            },
             "subagents": live,
             "live_subagents": live_alias,
             "closed_subagents": closed,
-            "summary": {"live_count": live_count, "closed_count": closed_count},
+            "summary": {
+                "live_count": live_count,
+                "closed_count": closed_count,
+                "evicted_count": evicted_count,
+                "eviction": {
+                    "enabled": self.quota.enable_lru_eviction,
+                    "candidates": candidates,
+                },
+            },
         })
     }
 
@@ -677,8 +724,28 @@ impl SubAgentRuntime {
         )
     }
 
-    /// Reserves the id and one capacity slot by inserting a `PendingInit` instance.
-    fn reserve(&self, id: &SubAgentId, request: &SubAgentSpawnRequest) -> Result<u64> {
+    /// Returns the depth of a known instance.
+    fn depth_of(&self, id: &str) -> Option<usize> {
+        let state = self.shared.state.lock();
+        state.instances.get(id).map(|instance| instance.depth)
+    }
+
+    /// Reserves the id and one capacity slot by inserting a `Queued` instance.
+    ///
+    /// `config` is the patched child configuration the instance keeps for persistence and
+    /// resume. When the live cap is reached with [`SubAgentQuota::enable_lru_eviction`] set, the
+    /// least-recently-used evictable instance is closed first (Python
+    /// `SubagentControl._acquire_slot`); the requesting parent is never recycled. The
+    /// cumulative, per-parent and depth limits come from [`SubAgentQuota`], and the live cap
+    /// keeps its legacy error message when nothing can be evicted.
+    #[allow(clippy::too_many_lines)]
+    fn reserve(
+        &self,
+        id: &SubAgentId,
+        request: &SubAgentSpawnRequest,
+        config: SubAgentConfig,
+    ) -> Result<u64> {
+        let now_ms = self.clock.now_ms();
         let seq = {
             let mut state = self.shared.state.lock();
             if let Some(existing) = state.instances.get(id) {
@@ -688,23 +755,69 @@ impl SubAgentRuntime {
                     )));
                 }
             }
-            let used = state
-                .instances
-                .values()
-                .filter(|instance| instance.status != SubagentStatus::Closed)
-                .count();
-            if used >= self.max_subagents {
-                return Err(Error::config(format!(
-                    "subagent capacity exceeded: used={used}, limit={}",
-                    self.max_subagents
-                )));
+            let parent = request.parent_subagent_id.as_deref();
+            let depth = if let Some(parent) = parent {
+                let Some(parent_instance) = state
+                    .instances
+                    .get(parent)
+                    .filter(|instance| instance.is_live())
+                else {
+                    return Err(Error::validation(format!(
+                        "subagent parent not found: {parent}"
+                    )));
+                };
+                parent_instance.depth.saturating_add(1)
+            } else {
+                1
+            };
+            let evicted = evict::make_room(&mut state, &self.quota, now_ms, parent);
+            let budget = SpawnBudget {
+                live: evict::live_count(&state),
+                spawned: state.spawned,
+                parent_live: state
+                    .instances
+                    .values()
+                    .filter(|instance| {
+                        instance.is_live() && instance.parent_subagent_id.as_deref() == parent
+                    })
+                    .count(),
+                depth,
+            };
+            let parent_label = parent.unwrap_or(self.shared.parent_session_id.as_str());
+            if let Err(error) = self.quota.check_spawn(&budget, parent_label) {
+                tracing::debug!(
+                    target: "openjiuwen_harness::subagents",
+                    subagent_id = %id,
+                    live = budget.live,
+                    spawned = budget.spawned,
+                    parent_live = budget.parent_live,
+                    depth = budget.depth,
+                    %error,
+                    "subagent spawn refused by quota"
+                );
+                if evicted > 0 {
+                    // The early return skips the post-reservation notify; waking here keeps a
+                    // `wait` registered on an evicted id from blocking on a stale snapshot.
+                    self.shared.notify.notify_waiters();
+                }
+                return Err(error);
             }
+            state.spawned = state.spawned.saturating_add(1);
             state.instances.remove(id);
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
             state.instances.insert(
                 id.clone(),
-                Instance::new(seq, request, id.clone(), now_rfc3339()),
+                Instance::new(
+                    seq,
+                    request,
+                    id.clone(),
+                    now_ms,
+                    depth,
+                    config,
+                    self.quota.transcript_capacity,
+                    self.quota.transcript_channel_capacity,
+                ),
             );
             seq
         };
@@ -712,7 +825,7 @@ impl SubAgentRuntime {
         Ok(seq)
     }
 
-    /// Removes a reservation that could not be completed.
+    /// Removes a reservation that could not be completed and frees its budget entry.
     fn rollback(&self, id: &str, seq: u64) {
         {
             let mut state = self.shared.state.lock();
@@ -722,6 +835,7 @@ impl SubAgentRuntime {
                 .is_some_and(|instance| instance.seq == seq)
             {
                 state.instances.remove(id);
+                state.spawned = state.spawned.saturating_sub(1);
             }
         }
         self.shared.notify.notify_waiters();
@@ -729,6 +843,7 @@ impl SubAgentRuntime {
 
     /// Attaches the created agent to the reserved instance, if it is still pending.
     fn attach_agent(&self, id: &str, seq: u64, agent: &Arc<dyn Agent>) -> Option<(u64, String)> {
+        let now_ms = self.clock.now_ms();
         let mut state = self.shared.state.lock();
         let instance = state.instances.get_mut(id)?;
         if instance.seq != seq || instance.status != SubagentStatus::PendingInit {
@@ -738,6 +853,7 @@ impl SubAgentRuntime {
         instance.agent = Some(Arc::clone(agent));
         instance.generation = instance.generation.wrapping_add(1);
         instance.running = true;
+        instance.touch(now_ms, SubagentActivity::Queued);
         Some((instance.generation, instance.sub_session_id.clone()))
     }
 
@@ -752,6 +868,7 @@ impl SubAgentRuntime {
         let runner = TurnRunner {
             shared: Arc::clone(&self.shared),
             semaphore: Arc::clone(&self.semaphore),
+            clock: Arc::clone(&self.clock),
             turn_timeout: self.turn_timeout,
             subagent_id: id.to_owned(),
             generation,
@@ -765,131 +882,6 @@ impl SubAgentRuntime {
                 instance.handle = Some(handle);
             }
         }
-    }
-}
-
-/// One background turn worker; it runs queued queries of one instance serially.
-struct TurnRunner {
-    shared: Arc<Shared>,
-    semaphore: Arc<Semaphore>,
-    turn_timeout: Duration,
-    subagent_id: String,
-    generation: u64,
-    agent: Arc<dyn Agent>,
-    sub_session_id: String,
-}
-
-impl TurnRunner {
-    async fn run(self, first_query: String) {
-        let mut next_query = Some(first_query);
-        while let Some(query) = next_query.take() {
-            let permit = match self.semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(error) => {
-                    tracing::debug!(%error, "subagent turn semaphore closed");
-                    return;
-                }
-            };
-            if !begin_turn(&self.shared, &self.subagent_id, self.generation) {
-                return;
-            }
-            let inputs = json!({"query": query, "conversation_id": self.sub_session_id});
-            let result =
-                tokio::time::timeout(self.turn_timeout, self.agent.invoke(inputs, None)).await;
-            drop(permit);
-            let (status, output, error) = map_turn_result(result, self.turn_timeout);
-            next_query = finish_turn(
-                &self.shared,
-                &self.subagent_id,
-                self.generation,
-                status,
-                output,
-                error,
-            );
-        }
-    }
-}
-
-/// Marks the instance `Running` if the turn still owns it.
-fn begin_turn(shared: &Shared, id: &str, generation: u64) -> bool {
-    let started = {
-        let mut state = shared.state.lock();
-        match state.instances.get_mut(id) {
-            Some(instance)
-                if instance.generation == generation
-                    && instance.status != SubagentStatus::Closed =>
-            {
-                instance.status = SubagentStatus::Running;
-                instance.updated_at = now_rfc3339();
-                true
-            }
-            _ => false,
-        }
-    };
-    if started {
-        shared.notify.notify_waiters();
-        tracing::debug!(target: "openjiuwen_harness::subagents", subagent_id = %id, status = "running", "subagent turn started");
-    }
-    started
-}
-
-/// Stores the turn result and returns the next queued query, if any.
-fn finish_turn(
-    shared: &Shared,
-    id: &str,
-    generation: u64,
-    status: SubagentStatus,
-    output: Option<String>,
-    error: Option<String>,
-) -> Option<String> {
-    let next = {
-        let mut state = shared.state.lock();
-        let instance = match state.instances.get_mut(id) {
-            Some(instance)
-                if instance.generation == generation
-                    && instance.status != SubagentStatus::Closed =>
-            {
-                instance
-            }
-            _ => return None,
-        };
-        instance.output = output;
-        instance.error = error;
-        instance.updated_at = now_rfc3339();
-        if let Some(query) = instance.pending.pop_front() {
-            instance.status = SubagentStatus::PendingInit;
-            Some(query)
-        } else {
-            instance.status = status;
-            instance.running = false;
-            tracing::debug!(target: "openjiuwen_harness::subagents", subagent_id = %id, status = status.as_str(), "subagent turn finished");
-            None
-        }
-    };
-    shared.notify.notify_waiters();
-    next
-}
-
-/// Maps one invocation result to the next status and its payload.
-fn map_turn_result(
-    result: std::result::Result<Result<AgentOutput>, tokio::time::error::Elapsed>,
-    turn_timeout: Duration,
-) -> (SubagentStatus, Option<String>, Option<String>) {
-    match result {
-        Ok(Ok(output)) => match output.result_type {
-            ResultType::Answer => (SubagentStatus::Completed, Some(output.output), None),
-            ResultType::Error => (SubagentStatus::Errored, None, Some(output.output)),
-            ResultType::Interrupt => (SubagentStatus::Interrupted, None, None),
-        },
-        Ok(Err(error)) => (SubagentStatus::Errored, None, Some(error.to_string())),
-        Err(_elapsed) => (
-            SubagentStatus::Errored,
-            None,
-            Some(format!(
-                "subagent turn timed out after {}s",
-                turn_timeout.as_secs()
-            )),
-        ),
     }
 }
 
@@ -909,11 +901,6 @@ fn is_sticky_type(subagent_type: &str) -> bool {
     subagent_type.trim() == STICKY_SUBAGENT_TYPE
 }
 
-/// Returns the current UTC time as an RFC 3339 string with millisecond precision.
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
 /// Collapses duplicate ids while preserving input order.
 fn dedupe(ids: &[SubAgentId]) -> Vec<SubAgentId> {
     let mut seen = HashSet::new();
@@ -930,6 +917,13 @@ fn dedupe(ids: &[SubAgentId]) -> Vec<SubAgentId> {
 fn closed_or_missing(id: &str) -> Error {
     Error::validation(format!(
         "subagent closed or not found: {id}; call subagent_resume first"
+    ))
+}
+
+/// Error for input sent to an instance that has no child agent (a restored one).
+fn not_resumed(id: &str) -> Error {
+    Error::validation(format!(
+        "subagent not resumed: {id}; call subagent_resume first"
     ))
 }
 

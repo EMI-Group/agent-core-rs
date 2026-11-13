@@ -88,6 +88,7 @@ Everything here is pure data assembly: no IO, no async, no filesystem access.
 - The completion signal is the Python `<promise>…</promise>` tag with `DEFAULT_COMPLETION_PROMISE` (`TASK_COMPLETE`) as the default token; Python requires a caller-supplied promise, the Rust default makes the marker usable without configuration.
 - Plan mode instructions are a condensed five-phase workflow (understand, design, review, write plan, exit) rather than Python's full manual; only `AgentMode::Plan` emits text.
 - `PromptCategory` is an enum instead of Python's free-form string; categories only drive report grouping.
+- `SectionName` is a unit-struct namespace of `&'static str` constants with no `Custom` variant: section names are open-ended strings, so a caller injects extra text with any own name (`PromptSection::bilingual("my_doc", cn, en, priority)` + `add_section`), and only `Minimal` mode filters by `MINIMAL_SECTIONS`.
 - `environment` is bilingual here, although Python's CLI builder emits English only.
 - `build_report` measures exactly the sections the prompt renders (mode-filtered, non-empty, in render order); in `PromptMode::None` that is the identity section alone, reported as one section, and the report is empty only when no identity section is registered or it renders blank.
 - Tool-description language selection maps `en*` to English and every other tag (including unknown ones) to Chinese; `HarnessPromptBuilder::new` normalises its language through `resolve_language`, so `en-US` becomes `en`.

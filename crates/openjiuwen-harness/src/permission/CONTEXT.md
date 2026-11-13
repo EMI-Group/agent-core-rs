@@ -32,6 +32,7 @@ Every public item is also re-exported flat from this module (`crate::permission:
 - `check_permission` is synchronous and non-blocking: no filesystem/network IO, compiled policy behind `parking_lot::RwLock`, shared as `Arc<PermissionEngine>`; locks are never held across `.await`.
 - Config types are serde snake_case, tolerate unknown fields, and derive `JsonSchema` (no `serde_json::Value` fields) because `PermissionsSection` is embedded by `crate::schema::DeepAgentConfig`; `tools` accepts both `"bash": "ask"` and legacy `"bash": {"*": "ask"}` and serializes as the plain level string.
 - No dependency on `crate::schema` or any other harness module — only kernel crates (`openjiuwen-common`, `openjiuwen-foundation`, `openjiuwen-agent`).
+- No on-disk permission YAML load or save exists in this module or the crate: `builtin_rules.yaml` is `include_str!`-embedded, sections arrive from `PermissionsSection::default()` (CLI) or provider JSON, and `PermissionHost::permission_yaml_path` has no consumer.
 - No `unsafe`, no `panic`/`unwrap`/`expect` outside `#[cfg(test)]`, `tracing` only (no stdout).
 - Files ≤1000 lines of implementation; `model.rs` and `paths.rs` exceed that only because of their inline test modules (called out in a top-of-file size note).
 

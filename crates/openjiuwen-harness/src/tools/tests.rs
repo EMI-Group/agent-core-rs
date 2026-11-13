@@ -1,21 +1,26 @@
 //! Cross-module parity tests for the tool registry, the tool cards and the rendered descriptions.
 //!
 //! Per-tool behaviour is covered beside each module; these tests wire the whole registry
-//! together: the model-facing name order, the card shapes, the parallel-safety flags, and
-//! end-to-end calls through one `build()` (so the filesystem tools share their read state).
+//! together: the model-facing name order, the card shapes, the parallel-safety flags, the
+//! deferred-tool discovery API, and end-to-end calls through one `build()` (so the filesystem
+//! tools share their read state and the extended tools share their seams).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::tool::{Tool, ToolContext};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use super::{descriptions, tool_names, BuiltinTool, ToolRegistry};
+use super::{
+    descriptions, discovery, goal, mcp_resources, tool_names, web, BuiltinTool, ToolRegistry,
+};
 use crate::workspace::Workspace;
 
-/// The twenty Python tool names, in registry order.
+/// The twenty default Python tool names, in registry order.
 const EXPECTED_NAMES: [&str; 20] = [
     "bash",
     "read_file",
@@ -39,8 +44,22 @@ const EXPECTED_NAMES: [&str; 20] = [
     "coding_memory_edit",
 ];
 
+/// The ten extended Python tool names, in registry order.
+const EXPECTED_EXTENDED_NAMES: [&str; 10] = [
+    "fetch_webpage",
+    "web_search",
+    "image_metadata",
+    "audio_metadata",
+    "cron",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "tool_search",
+    "get_current_goal",
+    "submit_goal_report",
+];
+
 /// The `required` list of each Python card; the empty slices have no `required` key at all.
-const EXPECTED_REQUIRED: [(&str, &[&str]); 20] = [
+const EXPECTED_REQUIRED: [(&str, &[&str]); 30] = [
     ("bash", &["command"]),
     ("read_file", &["file_path"]),
     ("write_file", &["file_path", "content"]),
@@ -61,6 +80,16 @@ const EXPECTED_REQUIRED: [(&str, &[&str]); 20] = [
     ("coding_memory_read", &["path"]),
     ("coding_memory_write", &["path", "content"]),
     ("coding_memory_edit", &["path", "old_text", "new_text"]),
+    ("fetch_webpage", &["url"]),
+    ("web_search", &["query"]),
+    ("image_metadata", &["image_path"]),
+    ("audio_metadata", &["audio_path"]),
+    ("cron", &["action"]),
+    ("list_mcp_resources", &[]),
+    ("read_mcp_resource", &["uri"]),
+    ("tool_search", &["query"]),
+    ("get_current_goal", &[]),
+    ("submit_goal_report", &["status", "evidence"]),
 ];
 
 /// Builds a registry over `dir` with English card text.
@@ -68,9 +97,19 @@ fn registry(dir: &TempDir) -> ToolRegistry {
     ToolRegistry::new(Workspace::new(dir.path())).with_language("en")
 }
 
+/// Builds a registry over `dir` mounting every built-in tool, with English card text.
+fn extended_registry(dir: &TempDir) -> ToolRegistry {
+    registry(dir).with_tools(BuiltinTool::EXTENDED)
+}
+
 /// Builds the full tool set of a registry over `dir`.
 fn built(dir: &TempDir) -> Vec<Arc<dyn Tool>> {
     registry(dir).build()
+}
+
+/// Builds the tool set of every built-in tool over `dir`.
+fn built_extended(dir: &TempDir) -> Vec<Arc<dyn Tool>> {
+    extended_registry(dir).build()
 }
 
 /// Looks a built tool up by its model-facing name.
@@ -102,17 +141,35 @@ async fn invoke(tools: &[Arc<dyn Tool>], name: &str, inputs: Value) -> Value {
 #[test]
 fn tool_names_are_exactly_the_twenty_python_names() {
     assert_eq!(tool_names(), &EXPECTED_NAMES);
-    assert_eq!(BuiltinTool::ALL.len(), EXPECTED_NAMES.len());
+    assert_eq!(BuiltinTool::DEFAULT.len(), EXPECTED_NAMES.len());
+    assert_eq!(BuiltinTool::ALL.len(), 30);
+    assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
 
-    let names: Vec<&str> = BuiltinTool::ALL.iter().map(|tool| tool.name()).collect();
+    let names: Vec<&str> = BuiltinTool::DEFAULT
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
     assert_eq!(names, EXPECTED_NAMES.to_vec());
+    let extended: Vec<&str> = BuiltinTool::EXTENDED
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
+    assert_eq!(
+        extended,
+        EXPECTED_NAMES
+            .iter()
+            .chain(EXPECTED_EXTENDED_NAMES.iter())
+            .copied()
+            .collect::<Vec<&str>>()
+    );
 }
 
 #[test]
 fn from_name_round_trips_every_name_and_rejects_unknown_tools() {
-    for name in EXPECTED_NAMES {
-        let tool = BuiltinTool::from_name(name).unwrap_or_else(|| panic!("unknown name {name}"));
-        assert_eq!(tool.name(), name, "round-trip mismatch for {name}");
+    for tool in BuiltinTool::EXTENDED {
+        let found = BuiltinTool::from_name(tool.name())
+            .unwrap_or_else(|| panic!("unknown name {}", tool.name()));
+        assert_eq!(found, tool, "round-trip mismatch for {}", tool.name());
     }
     assert_eq!(BuiltinTool::from_name("task"), None);
     assert_eq!(BuiltinTool::from_name(""), None);
@@ -125,11 +182,11 @@ fn cards_match_the_python_names_schemas_and_languages() {
     let registry = registry(&dir);
 
     let cards = registry.cards("en");
-    assert_eq!(cards.len(), BuiltinTool::ALL.len());
+    assert_eq!(cards.len(), BuiltinTool::DEFAULT.len());
     let names: Vec<&str> = cards.iter().map(|card| card.name.as_str()).collect();
     assert_eq!(names, tool_names().to_vec());
 
-    for tool in BuiltinTool::ALL {
+    for tool in BuiltinTool::DEFAULT {
         let card = registry.card(tool, "en");
         assert_eq!(card.name, tool.name(), "card name mismatch");
 
@@ -181,6 +238,34 @@ fn cards_match_the_python_names_schemas_and_languages() {
 }
 
 #[test]
+fn extended_cards_have_bilingual_descriptions() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+
+    let cards = registry.cards("en");
+    assert_eq!(cards.len(), BuiltinTool::EXTENDED.len());
+    let names: Vec<&str> = cards.iter().map(|card| card.name.as_str()).collect();
+    assert_eq!(names, super::extended_tool_names().to_vec());
+
+    for tool in BuiltinTool::EXTENDED {
+        let english = descriptions::description(tool.name(), "en");
+        let chinese = descriptions::description(tool.name(), "cn");
+        assert!(!english.is_empty(), "{} has no English text", tool.name());
+        assert!(!chinese.is_empty(), "{} has no Chinese text", tool.name());
+
+        let card = registry.card(tool, "en");
+        assert_eq!(card.name, tool.name());
+        assert_eq!(card.description, english, "{} card text", tool.name());
+        assert_eq!(
+            registry.card(tool, "cn").description,
+            chinese,
+            "{} Chinese card text",
+            tool.name()
+        );
+    }
+}
+
+#[test]
 fn required_lists_match_the_python_cards() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let registry = registry(&dir);
@@ -210,7 +295,7 @@ fn no_card_schema_has_a_dangling_reference() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let registry = registry(&dir);
 
-    for tool in BuiltinTool::ALL {
+    for tool in BuiltinTool::EXTENDED {
         let card = registry.card(tool, "en");
         let serialized = serde_json::to_string(&card.input_params).expect("schema json");
         // A reference can only appear as a `"$ref"` key; the quoted form keeps prose that
@@ -248,26 +333,36 @@ fn no_card_schema_has_a_dangling_reference() {
 }
 
 #[test]
-fn only_the_write_tools_are_not_parallel_safe() {
-    for tool in BuiltinTool::ALL {
-        let expected = !matches!(tool, BuiltinTool::WriteFile | BuiltinTool::EditFile);
+fn parallel_safe_flags_match_the_registry() {
+    for tool in BuiltinTool::EXTENDED {
+        let expected = !matches!(
+            tool,
+            BuiltinTool::WriteFile
+                | BuiltinTool::EditFile
+                | BuiltinTool::Cron
+                | BuiltinTool::SubmitGoalReport
+        );
         assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
     }
+    for name in ["write_file", "edit_file", "cron", "submit_goal_report"] {
+        let tool = BuiltinTool::from_name(name).expect("known tool");
+        assert!(!tool.parallel_safe(), "{name} must be serialised");
+    }
 
+    // The mounted default tools report the same flag through the built tool and its card.
     let dir = tempfile::tempdir().expect("temp workspace");
     let tools = built(&dir);
-    for tool in BuiltinTool::ALL {
-        let expected = !matches!(tool, BuiltinTool::WriteFile | BuiltinTool::EditFile);
+    for tool in BuiltinTool::DEFAULT {
         let built_tool = tool_by_name(&tools, tool.name());
         assert_eq!(
             built_tool.is_parallel_safe(),
-            expected,
+            tool.parallel_safe(),
             "{} built parallel safety",
             tool.name()
         );
         assert_eq!(
             built_tool.card().parallel_safe,
-            expected,
+            tool.parallel_safe(),
             "{} card parallel safety",
             tool.name()
         );
@@ -621,4 +716,323 @@ async fn memory_search_without_a_backend_reports_the_python_failure() {
     assert_eq!(out["success"], false);
     assert_eq!(out["error"], "memory tool backend is not configured");
     assert_eq!(out["data"], Value::Null);
+}
+
+/// An [`web::HttpFetcher`] returning one canned HTML page.
+struct StaticFetcher {
+    /// The HTML body handed back for every request.
+    body: Vec<u8>,
+}
+
+#[async_trait]
+impl web::HttpFetcher for StaticFetcher {
+    async fn fetch(&self, request: web::FetchRequest) -> Result<web::FetchResponse> {
+        if !request.url.starts_with("https://") {
+            return Err(Error::transport("unexpected scheme"));
+        }
+        Ok(web::FetchResponse {
+            status: 200,
+            final_url: request.url,
+            headers: vec![(
+                "content-type".to_owned(),
+                "text/html; charset=utf-8".to_owned(),
+            )],
+            body: self.body.clone(),
+        })
+    }
+}
+
+/// A minimal 2x2 RGBA PNG header (`IHDR` only), built inline so no fixture is shared.
+fn png_header() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
+/// A minimal 1 kHz 16-bit mono WAV header with a one-second `data` chunk.
+fn wav_header() -> Vec<u8> {
+    let mut body = b"WAVE".to_vec();
+    body.extend_from_slice(b"fmt ");
+    body.extend_from_slice(&16u32.to_le_bytes());
+    for value in [1u16, 1, 0, 0] {
+        let _ = value;
+    }
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&1_000u32.to_le_bytes());
+    body.extend_from_slice(&2_000u32.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(b"data");
+    body.extend_from_slice(&2_000u32.to_le_bytes());
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or_default().to_le_bytes());
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
+#[test]
+fn default_registry_excludes_extended_tools() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = registry(&dir);
+    let tools = registry.build();
+    assert_eq!(tools.len(), 20);
+    for name in ["fetch_webpage", "web_search", "cron", "submit_goal_report"] {
+        assert!(
+            tools.iter().all(|tool| tool.card().name != name),
+            "{name} must not be mounted by default"
+        );
+        assert!(registry.cards("en").iter().all(|card| card.name != name));
+    }
+}
+
+#[test]
+fn extended_registry_builds_thirty_tools_in_registry_order() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    let tools = registry.build();
+    assert_eq!(tools.len(), 30);
+    let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
+    assert_eq!(
+        names,
+        BuiltinTool::EXTENDED
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<&str>>()
+    );
+    assert_eq!(registry.cards("en").len(), 30);
+    assert_eq!(registry.tools(), &BuiltinTool::EXTENDED);
+}
+
+#[tokio::test]
+async fn fetch_webpage_uses_the_injected_fetcher() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir).with_http_fetcher(Arc::new(StaticFetcher {
+        body: b"<html><head><title>Doc</title></head><body><p>Hello</p></body></html>".to_vec(),
+    }));
+    assert!(registry.http_fetcher().is_some());
+    let tools = registry.build();
+    let out = invoke(
+        &tools,
+        "fetch_webpage",
+        json!({"url": "https://example.com"}),
+    )
+    .await;
+    assert_eq!(out["success"], true, "fetch failed: {out}");
+    assert_eq!(out["data"]["title"], json!("Doc"));
+    assert_eq!(out["data"]["content"], json!("Hello"));
+    assert_eq!(out["data"]["status"], json!(200));
+}
+
+#[tokio::test]
+async fn web_search_returns_the_provider_results() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let backend = web::FakeSearchBackend::with_results(vec![web::SearchResult::new(
+        "Rust",
+        "https://rust.example",
+        "a language",
+    )]);
+    let registry = extended_registry(&dir).with_search_backend(Arc::new(backend));
+    assert!(registry.search_backend().is_some());
+    let tools = registry.build();
+    let out = invoke(&tools, "web_search", json!({"query": "rust"})).await;
+    assert_eq!(out["success"], true, "search failed: {out}");
+    assert_eq!(out["data"]["success"], true);
+    assert_eq!(out["data"]["results"][0]["title"], json!("Rust"));
+    assert_eq!(
+        out["data"]["results"][0]["url"],
+        json!("https://rust.example")
+    );
+    assert_eq!(out["data"]["results"][0]["snippet"], json!("a language"));
+}
+
+#[tokio::test]
+async fn media_tools_report_the_image_and_audio_headers() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    std::fs::write(dir.path().join("pic.png"), png_header()).expect("png fixture");
+    std::fs::write(dir.path().join("clip.wav"), wav_header()).expect("wav fixture");
+    let tools = built_extended(&dir);
+    let image = invoke(&tools, "image_metadata", json!({"image_path": "pic.png"})).await;
+    assert_eq!(image["success"], true, "image failed: {image}");
+    assert!(image["data"].is_object(), "unexpected: {image}");
+    let audio = invoke(&tools, "audio_metadata", json!({"audio_path": "clip.wav"})).await;
+    assert_eq!(audio["success"], true, "audio failed: {audio}");
+    assert!(audio["data"].is_object(), "unexpected: {audio}");
+}
+
+#[tokio::test]
+async fn cron_creates_lists_and_cancels_a_job() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let tools = built_extended(&dir);
+    let created = invoke(
+        &tools,
+        "cron",
+        json!({"action": "create", "cron": "0 9 * * *", "prompt": "morning"}),
+    )
+    .await;
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let job_id = created["data"]["job"]["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let listed = invoke(&tools, "cron", json!({"action": "list"})).await;
+    assert_eq!(listed["success"], true, "list failed: {listed}");
+    assert_eq!(listed["data"]["jobs"].as_array().map(Vec::len), Some(1));
+    let cancelled = invoke(
+        &tools,
+        "cron",
+        json!({"action": "cancel", "job_id": job_id}),
+    )
+    .await;
+    assert_eq!(cancelled["success"], true, "cancel failed: {cancelled}");
+    assert_eq!(cancelled["data"]["job_id"], json!(job_id));
+    let empty = invoke(&tools, "cron", json!({"action": "list"})).await;
+    assert_eq!(empty["data"]["jobs"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn goal_tools_round_trip_a_report() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let workspace = Workspace::new(dir.path());
+    let store = goal::GoalStore::for_workspace(&workspace);
+    store
+        .start("ship the release", chrono::Utc::now())
+        .await
+        .expect("goal start");
+    let tools = extended_registry(&dir).with_goal_store(store).build();
+
+    let empty_dir = tempfile::tempdir().expect("second workspace");
+    let empty = built_extended(&empty_dir);
+    let no_goal = invoke(&empty, "get_current_goal", json!({})).await;
+    assert_eq!(no_goal["success"], true, "goal read failed: {no_goal}");
+    assert_eq!(no_goal["data"]["goal"], Value::Null);
+
+    let current = invoke(&tools, "get_current_goal", json!({})).await;
+    assert_eq!(current["success"], true, "goal read failed: {current}");
+    assert_eq!(
+        current["data"]["goal"]["objective"],
+        json!("ship the release")
+    );
+
+    let reported = invoke(
+        &tools,
+        "submit_goal_report",
+        json!({"status": "complete", "evidence": "shipped"}),
+    )
+    .await;
+    assert_eq!(reported["success"], true, "report failed: {reported}");
+    assert_eq!(reported["data"]["status"], json!("complete"));
+
+    let after = invoke(&tools, "get_current_goal", json!({})).await;
+    assert_eq!(
+        after["data"]["goal"]["last_assessment"]["status"],
+        json!("complete")
+    );
+}
+
+#[tokio::test]
+async fn mcp_resource_tools_use_the_provider() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let provider = mcp_resources::FakeMcpResourceProvider::new();
+    provider.set_resources(vec![mcp_resources::McpResource {
+        uri: "mem://notes".to_owned(),
+        name: "notes".to_owned(),
+        mime_type: Some("text/markdown".to_owned()),
+        description: None,
+    }]);
+    provider.set_resource(mcp_resources::McpResourceContent {
+        uri: "mem://notes".to_owned(),
+        mime_type: Some("text/markdown".to_owned()),
+        text: Some("# notes".to_owned()),
+        blob_base64: None,
+        byte_size: 7,
+    });
+    let tools = extended_registry(&dir)
+        .with_mcp_resources(Arc::new(provider))
+        .build();
+
+    let listed = invoke(&tools, "list_mcp_resources", json!({})).await;
+    assert_eq!(listed["success"], true, "list failed: {listed}");
+    assert_eq!(listed["data"]["resources"][0]["uri"], json!("mem://notes"));
+    let read = invoke(&tools, "read_mcp_resource", json!({"uri": "mem://notes"})).await;
+    assert_eq!(read["success"], true, "read failed: {read}");
+    assert_eq!(read["data"]["resource"]["text"], json!("# notes"));
+}
+
+#[tokio::test]
+async fn mcp_resource_tools_without_a_provider_report_the_typed_failure() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let tools = built_extended(&dir);
+    let listed = invoke(&tools, "list_mcp_resources", json!({})).await;
+    assert_eq!(listed["success"], false);
+    assert_eq!(
+        listed["error"],
+        json!("mcp resource provider is not configured")
+    );
+    let read = invoke(&tools, "read_mcp_resource", json!({"uri": "mem://x"})).await;
+    assert_eq!(read["success"], false);
+    assert_eq!(
+        read["error"],
+        json!("mcp resource provider is not configured")
+    );
+}
+
+#[tokio::test]
+async fn tool_search_finds_the_deferred_tool() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let tools = extended_registry(&dir)
+        .with_deferred_tools([BuiltinTool::FetchWebpage, BuiltinTool::Cron])
+        .build();
+    let out = invoke(&tools, "tool_search", json!({"query": "fetch web page"})).await;
+    assert_eq!(out["success"], true, "search failed: {out}");
+    assert_eq!(out["data"]["results"][0]["name"], json!("fetch_webpage"));
+    assert_eq!(out["data"]["count"], json!(1));
+}
+
+#[test]
+fn deferred_tools_are_hidden_until_discovered() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry =
+        registry(&dir).with_deferred_tools([BuiltinTool::FetchWebpage, BuiltinTool::Cron]);
+
+    assert_eq!(
+        registry.deferred_tools(),
+        &[BuiltinTool::FetchWebpage, BuiltinTool::Cron]
+    );
+    let tools = registry.build();
+    assert_eq!(tools.len(), 20);
+    for name in ["fetch_webpage", "cron"] {
+        assert!(tools.iter().all(|tool| tool.card().name != name));
+        assert!(registry.cards("en").iter().all(|card| card.name != name));
+    }
+
+    let hits = registry.discover("fetch a web page", 5);
+    assert_eq!(
+        hits.first().map(|hit| hit.name.as_str()),
+        Some("fetch_webpage")
+    );
+    let revealed = registry.reveal(&["fetch_webpage"]);
+    assert_eq!(revealed.len(), 1);
+    assert_eq!(revealed[0].name, "fetch_webpage");
+    assert_eq!(
+        revealed[0].description,
+        descriptions::description("fetch_webpage", "en")
+    );
+    let _: &discovery::ToolSearchHit = &hits[0];
+
+    let deferred = registry.deferred_cards("en");
+    assert_eq!(deferred.len(), 2);
+    assert_eq!(
+        deferred
+            .iter()
+            .map(|card| card.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["fetch_webpage", "cron"]
+    );
+    assert_eq!(registry.reveal(&["nope"]).len(), 0);
 }
