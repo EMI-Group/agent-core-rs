@@ -331,6 +331,7 @@ config therefore just logs.
 1. `spec.validate()` — reserved names, dispatch knob rules (the spec's own messages).
 2. `TeamSpec::from_spec(spec)` — the runtime mirror; language from `deps.language` else `spec.language`.
 3. `create_messager(&spec.transport)` — one in-process transport shared by the backend and every member.
+   The store is never opened here: the build path uses `deps.store` (default `InMemoryTeamStore`) and never reads `TeamAgentSpec::storage`, so SQLite team storage is selected by injecting `open_store(&spec.storage)?` through `TeamBuildDeps::with_store`.
 4. Wiring inputs: `TeamModelRouter::for_spec` (or the injected router for a direct spawner), the
    `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the four
    metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`).
