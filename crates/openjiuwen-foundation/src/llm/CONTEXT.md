@@ -104,15 +104,15 @@ They are independent of each other; `reasoning` is the only one the request buil
 - Request: `POST {base}/v1/messages` with `x-api-key` (never `authorization`) and `anthropic-version: 2023-06-01`; `normalize_api_base` strips a pasted `/v1/messages` or `/v1` before the client appends the profile path.
 - Body `{model, messages, max_tokens, stream}` plus `temperature`/`top_p`/`stop_sequences` when set, `tools`/`tool_choice` when applicable, and `extra` merged last (caller wins).
   `max_tokens` is required: `request.max_tokens` else 32768, capped at 8192 for `claude-3-5*`/`claude-3.5*` and 4096 for `claude-3-opus|sonnet|haiku`; an explicit larger value is capped too.
-  All `system` turns are hoisted into a top-level `system` string joined with `\n\n` (non-text parts skipped, field omitted when empty); mid-conversation system messages are not supported.
+  The top-level `system` field is a block array with one `{"type":"text","text":…}` per non-empty `system`/developer turn, in order (non-text parts skipped, field omitted when no system turn exists); a mid-conversation system turn is hoisted as its own block, or kept inline for the model families that accept it — the full placement and cache-anchor rules live in `./anthropic/CONTEXT.md`.
+  `build_messages_body_with_provider(messages, request, stream, provider, api_base)` resolves an `extra["reasoning"]` intent through `ReasoningProtocol::AnthropicMessages` and merges the plan's `thinking`/`output_config` into the body; `build_messages_body` delegates with provider `"anthropic"`.
   `MessageContent::Text` goes out as a plain JSON string for user/assistant turns; part lists become block arrays.
   Assistant `tool_calls` → `{"type":"tool_use","id","name","input":<parsed JSON>}` (unparseable arguments → `{"_raw_arguments": "..."}`, a missing id is `Error::Validation`); consecutive `tool` messages merge into one `user` message of `{"type":"tool_result","tool_use_id","content":<text>}` blocks (a missing `tool_call_id` is `Error::Validation`).
   Images: `data:<mime>;base64,<payload>` → base64 `source`; `http(s)` urls → url `source`; any other URL is `Error::Validation`. Audio/file/unknown parts pass through verbatim.
   Tools: OpenAI-shaped `{"type":"function","function":{...}}` → `{name, description, input_schema}` (other shapes pass through); `tool_choice` mapping `auto`→omitted, `required`/`any`→`{"type":"any"}`, `none`→`{"type":"none"}`, `{"function":{"name":N}}`→`{"type":"tool","name":N}`; `stop` → `stop_sequences`.
 - Response: `content` text blocks concatenated into `message.content`, `tool_use` → `ToolCall` with `arguments = json.dumps(input)` and index = position among tool_use blocks, thinking blocks ignored; `stop_reason` mapping `tool_use` → `ToolCalls`, `end_turn`/`stop_sequence` → `Stop`, `max_tokens` → `Length`, else `Other`; usage `input_tokens` = `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`, `cache_tokens` = cache read.
 - Stream: `message_start` (role + first usage), `content_block_start` (text or `tool_use` with id/name), `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta` buffered per index), `content_block_stop` (emit the accumulated `ToolCallDelta` for `tool_use`, `"{}"` when empty), `message_delta` (`stop_reason` + merged usage), `message_stop` (one `Done`), `ping`/unknown events ignored, `error` events → `Error::Llm` with only the redacted error type/message.
-- Not implemented: `cache_control` breakpoints; thinking blocks are not surfaced as `reasoning` in non-streaming responses.
-
+- Three `cache_control: {"type":"ephemeral"}` anchors are always written (last tool, last system block, last cacheable block of the last stable message), with `extra.disable_cache_control` and `extra.cache_control_ttl` as the only knobs; thinking blocks are still not surfaced as `reasoning` in non-streaming responses.
 ## Rust Seams (implemented signatures)
 
 Every item below is public unless marked `pub(crate)`; these are the names and shapes the module exposes and consumers compile against.
@@ -153,7 +153,7 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 
 `anthropic/mod.rs`:
 - `pub struct AnthropicClient` with the same inherent surface as `OpenAiCompatibleClient` plus `impl Model`.
-- Re-exports: `pub use request::{build_messages_body, normalize_api_base};`, `pub use response::{parse_anthropic_usage, parse_messages_response};`, `pub use stream::AnthropicStreamState;`.
+- Re-exports: `pub use request::{build_messages_body, build_messages_body_with_provider, normalize_api_base};`, `pub use response::{parse_anthropic_usage, parse_messages_response};`, `pub use stream::AnthropicStreamState;`.
 
 `factory.rs`:
 - `pub async fn init_model(client: ModelClientConfig, request: ModelRequestConfig) -> Result<Arc<dyn Model>>`, `pub async fn init_model_with(provider: impl Into<String>, model_name: impl Into<String>) -> Result<Arc<dyn Model>>`.
@@ -181,12 +181,12 @@ The full per-module signatures, wire contracts and gaps live in the child `CONTE
 - There is no `response_format`/`ResponseFormat` type, field, or helper and no history/`enable_history` flag anywhere in the crate: structured output and every vendor knob go through `ModelRequestConfig::extra`, which `build_chat_completion_body` merges last at the top level.
 - There is no `BoxModel`/`type Model = …` alias; `Arc<dyn Model>` is the convention (`init_model`, `init_model_with`, `ModelProvider::create`) and `impl Model for Arc<dyn Model>` makes it callable directly.
 - `Model` exposes only `provider()`, `model_name()`, `invoke()` and `stream()`: there is no `name()`, `config()`, or cancellation method on the trait.
-- Reasoning: `build_chat_completion_body` passes `api_base = None`, so api-base host hints are only reachable through the public `resolve_reasoning_plan`/`provider_key_for`; the Anthropic client does not apply reasoning plans (that wiring is owned by `./anthropic/`), and the `Responses` protocol is encoded but has no transport.
+- Reasoning: `build_chat_completion_body` passes `api_base = None`, so api-base host hints are only reachable through the public `resolve_reasoning_plan`/`provider_key_for` and the Anthropic `build_messages_body_with_provider`; the `Responses` protocol is encoded but has no transport, and an OpenAI-compatible raw (`non-intent`) `reasoning` payload is forwarded verbatim while the Anthropic transport rejects it with `Error::Validation`.
 - Routing: TPM/RPM are recorded but not enforced (no rate limiter), there is no cross-request circuit breaker or tag-based cost/latency scoring, a group `timeout_seconds` is recorded but not enforced, `Custom` strategies are rejected by the compiler and treated as ordered failover by `RoutingModel`, and the Python `extra_body` flattening/health-probe options are not ported.
 - OAuth: no `Responses` transport for OAuth-backed calls, no `/models` catalog or cache, no `login|status|logout` CLI and no `AuthStatus` type, no cross-process file lock (atomic writes, last writer wins), `token_type` is not carried over on refresh, and a refresh response without an expiry keeps the previous `expires_at`.
 - DashScope: no streaming media, no result-URL byte download, no `X-DashScope-WorkSpace` scoping, no voice/language allow-lists, no local-file/`oss://` inputs, and no per-call `**kwargs` escape hatch.
 - OpenAI-compatible: Python drops one of `temperature`/`top_p` for `openai.com` bases; this module sends both when the caller sets both.
-- Anthropic: no `cache_control` breakpoints, no mid-conversation `system` turns, and thinking blocks are ignored in non-streaming responses.
+- Anthropic: thinking blocks are ignored in non-streaming responses, and only the three automatic cache anchors are exposed (no per-message caller breakpoints, no `clear`/`auto` caching modes).
 - A provider that keeps sending framing-only stream events can hold a stream open indefinitely when `stream_idle_timeout` is `None`.
 
 ## Routing Table
