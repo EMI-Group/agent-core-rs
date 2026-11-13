@@ -24,6 +24,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
+use openjiuwen_agent_teams::harness::MemberHarnessContext;
 use openjiuwen_agent_teams::schema::{
     MemberLifetime, MemberStatus, TaskGraphSpec, TaskStatus, TeamRole, TeamTopic,
 };
@@ -689,8 +690,8 @@ async fn the_roster_accessors_agree_and_are_sorted() {
     assert_eq!(leader.role(), TeamRole::Leader);
     assert_eq!(
         agent.runtime().session_id(),
-        agent.session_id(),
-        "the leader runtime runs under the team session"
+        MemberHarnessContext::member_session_id(agent.session_id(), agent.member_name()),
+        "the leader runtime runs under its derived per-member session"
     );
 
     timeout(BOUND, agent.spawn_member("dev-1"))
@@ -701,8 +702,8 @@ async fn the_roster_accessors_agree_and_are_sorted() {
     let runtime = member.runtime().expect("dev-1 owns a brain");
     assert_eq!(
         runtime.session_id(),
-        agent.session_id(),
-        "a spawned member runs under the team session"
+        MemberHarnessContext::member_session_id(agent.session_id(), "dev-1"),
+        "a spawned member runs under its derived per-member session"
     );
     assert_eq!(member.status(), MemberStatus::Ready);
     let stored = fixture
