@@ -18,6 +18,7 @@
 //! without importing the module paths.
 
 pub mod document;
+pub mod external;
 pub mod filter;
 pub mod graph;
 pub mod kv;
