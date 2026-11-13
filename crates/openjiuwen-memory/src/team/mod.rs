@@ -13,11 +13,18 @@
 //! [`crate::record::MemoryRecord`] so team memory can flow through the same recall and
 //! prompt paths as long-term memory — a view derived from the store, never a second copy
 //! of it.
+pub mod extractor;
+pub mod hooks;
+pub mod markdown;
 pub mod model;
+pub mod observe;
 pub mod projection;
+pub mod prompts;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+pub mod toolkit;
+
 pub use model::*;
 pub use projection::*;
 #[cfg(feature = "sqlite")]
