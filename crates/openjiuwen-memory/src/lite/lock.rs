@@ -1,25 +1,29 @@
 //! Cross-process advisory locking for the lite memory files.
 //!
 //! The lite memory keeps a Markdown source of truth and a derived index on the local
-//! filesystem, so two processes can race on the same files. [`FileLock`] is the
+//! filesystem, so two processes can race on the same files.
+//! [`FileLock`](crate::lite::lock::FileLock) is the
 //! cooperative mutex over that pair: a writer takes the lock, rewrites the files, and
 //! drops the lock.
 //!
 //! # Semantics
 //!
 //! - The Unix implementation is `flock(2)` on the lock file's open file description, so
-//!   the lock belongs to the description and not to the process: two [`FileLock`]s for
+//!   the lock belongs to the description and not to the process: two
+//!   [`FileLock`](crate::lite::lock::FileLock)s for
 //!   the same path inside one process conflict exactly like two processes do (which is
 //!   what makes single-process tests meaningful). Closing or dropping the handle
 //!   releases the lock.
-//! - The lock is advisory: only processes that call [`FileLock`] take part. Nothing
+//! - The lock is advisory: only processes that call
+//!   [`FileLock`](crate::lite::lock::FileLock) take part. Nothing
 //!   stops an unrelated program from writing the lock file or the files it guards.
-//! - It is released when the [`FileLock`] drops (including when an owning task unwinds)
+//! - It is released when the [`FileLock`](crate::lite::lock::FileLock) drops (including when an owning task unwinds)
 //!   and, at the latest, when the process exits; the kernel drops `flock` locks with the
 //!   file, so there is no stale lock to recover from.
-//! - [`FileLock::try_acquire`] never waits: when another holder owns the lock it returns
+//! - [`FileLock::try_acquire`](crate::lite::lock::FileLock::try_acquire) never waits: when another holder owns the lock it returns
 //!   `Ok(None)` rather than an error, so a caller can back off, do other work, or report
-//!   contention its own way. [`FileLock::acquire`] waits for as long as the holder keeps
+//!   contention its own way.
+//!   [`FileLock::acquire`](crate::lite::lock::FileLock::acquire) waits for as long as the holder keeps
 //!   the lock.
 //! - The blocking `flock` call always runs on tokio's blocking thread pool, including
 //!   the file open, so waiting for a lock never stalls the async reactor.
@@ -28,9 +32,11 @@
 //!
 //! # Platform support
 //!
-//! Only Unix is implemented. On other platforms [`FileLock`] still exists — so callers
-//! compile — but [`FileLock::acquire`] and [`FileLock::try_acquire`] return
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the
+//! Only Unix is implemented. On other platforms
+//! [`FileLock`](crate::lite::lock::FileLock) still exists — so callers
+//! compile — but [`FileLock::acquire`](crate::lite::lock::FileLock::acquire) and
+//! [`FileLock::try_acquire`](crate::lite::lock::FileLock::try_acquire) return
+//! [`Error::Unsupported`] naming the
 //! platform instead of degrading silently.
 use std::path::{Path, PathBuf};
 
@@ -69,7 +75,7 @@ impl FileLock {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::External`](openjiuwen_common::error::Error::External) when the
+    /// Returns [`Error::External`] when the
     /// parent directory cannot be created, the lock file cannot be opened, or the
     /// `flock` call fails for a reason other than contention.
     pub async fn acquire(path: impl AsRef<Path>) -> Result<Self> {
@@ -90,7 +96,7 @@ impl FileLock {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::External`](openjiuwen_common::error::Error::External) when the
+    /// Returns [`Error::External`] when the
     /// parent directory cannot be created, the lock file cannot be opened, or the
     /// `flock` call fails for a reason other than contention.
     pub async fn try_acquire(path: impl AsRef<Path>) -> Result<Option<Self>> {
@@ -116,7 +122,7 @@ impl FileLock {
     /// # Errors
     ///
     /// Always returns
-    /// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the
+    /// [`Error::Unsupported`] naming the
     /// current platform; nothing is created on disk.
     pub async fn acquire(path: impl AsRef<Path>) -> Result<Self> {
         Err(unsupported(path.as_ref()))
@@ -127,7 +133,7 @@ impl FileLock {
     /// # Errors
     ///
     /// Always returns
-    /// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the
+    /// [`Error::Unsupported`] naming the
     /// current platform; nothing is created on disk.
     pub async fn try_acquire(path: impl AsRef<Path>) -> Result<Option<Self>> {
         Err(unsupported(path.as_ref()))

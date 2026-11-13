@@ -1,9 +1,10 @@
 //! Debounced filesystem watching that feeds the lite reindex pipeline.
 //!
 //! Python's lite memory watches its Markdown sources and rebuilds the derived index on a
-//! debounce timer. This module is the Rust equivalent of that seam: [`MemoryWatcher`]
+//! debounce timer. This module is the Rust equivalent of that seam:
+//! [`MemoryWatcher`](crate::lite::watch::MemoryWatcher)
 //! watches files or directories, keeps only Markdown memory paths, coalesces a burst of
-//! changes into a single [`WatchEvent`], and hands it to the caller over a channel. It
+//! changes into a single [`WatchEvent`](crate::lite::watch::WatchEvent), and hands it to the caller over a channel. It
 //! never reads or writes memory content — the reindex pipeline (`lite::local`) decides
 //! what to do with an event.
 //!
@@ -18,15 +19,19 @@
 //! - **Only Markdown paths, coalesced within `debounce`.** Events are filtered to paths
 //!   with a case-insensitive `md` extension that are not directories and not inside a
 //!   directory component named `.memory`. Everything collected until the internal channel
-//!   has been quiet for `debounce` becomes exactly one [`WatchEvent`] with deduplicated,
-//!   sorted paths and deduplicated kinds in [`WatchKind`] declaration order. An empty
+//!   has been quiet for `debounce` becomes exactly one
+//!   [`WatchEvent`](crate::lite::watch::WatchEvent) with deduplicated,
+//!   sorted paths and deduplicated kinds in
+//!   [`WatchKind`](crate::lite::watch::WatchKind) declaration order. An empty
 //!   burst is never emitted, and a burst without a single Markdown path is not an event.
 //! - **Watcher errors never abort the watch loop.** `notify` errors (kernel or filesystem
 //!   failures, possibly per path) are logged with `tracing::warn!` and dropped: they can
-//!   be transient and the watch stays registered. [`MemoryWatcher::start`] returns
+//!   be transient and the watch stays registered.
+//!   [`MemoryWatcher::start`](crate::lite::watch::MemoryWatcher::start) returns
 //!   [`Error::external`] only when the watcher cannot be created or a requested path
 //!   cannot be watched, with that path in the message.
-//! - **Shutdown is explicit or by drop.** [`MemoryWatcher::stop`] cancels the debounce
+//! - **Shutdown is explicit or by drop.**
+//!   [`MemoryWatcher::stop`](crate::lite::watch::MemoryWatcher::stop) cancels the debounce
 //!   task, awaits it, and drops the `notify` watcher (which stops its thread); dropping
 //!   the watcher performs the same cancellation and watcher drop without awaiting, so
 //!   `stop()` is the clean, awaitable shutdown.

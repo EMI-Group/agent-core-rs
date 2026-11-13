@@ -1,6 +1,6 @@
 //! The Markdown source of truth of the lite coding memory.
 //!
-//! A [`MarkdownMemory`] is one human-editable document holding every coding fact of a
+//! A [`MarkdownMemory`](crate::lite::markdown::MarkdownMemory) is one human-editable document holding every coding fact of a
 //! scope, mirroring the shape of Python's `MEMORY.md`: a `---` front-matter block, a
 //! title, and one section per fact type. Each fact is an `### name` entry carrying a
 //! bullet attribute block (`description`, `tags`, `path`, `updated_at`, plus any
@@ -26,8 +26,8 @@
 //! ```
 //!
 //! The renderer output is the only shape the parser is required to round-trip, and it
-//! does so byte for byte ([`MarkdownMemory::render`] is idempotent under
-//! [`MarkdownMemory::parse`]). Human edits outside that shape never fail the parse:
+//! does so byte for byte ([`MarkdownMemory::render`](crate::lite::markdown::MarkdownMemory::render) is idempotent under
+//! [`MarkdownMemory::parse`](crate::lite::markdown::MarkdownMemory::parse)). Human edits outside that shape never fail the parse:
 //! unknown front-matter keys, unknown sections, text inside a known section that is not
 //! a fact entry, and non-`key: value` front-matter lines are all preserved verbatim,
 //! and the order of fact sections is stable.

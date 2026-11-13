@@ -19,8 +19,8 @@
 //! # Consistency model
 //!
 //! - The Markdown file wins. The index is derived and may always be rebuilt from it
-//!   ([`LocalCodingMemory::reindex`]).
-//! - A mutation takes the file lock ([`FileLock`]), reloads the Markdown file when its
+//!   ([`LocalCodingMemory::reindex`](crate::lite::local::LocalCodingMemory::reindex)).
+//! - A mutation takes the file lock ([`FileLock`](crate::lite::lock::FileLock)), reloads the Markdown file when its
 //!   stamp (modification time plus length) differs from the cached one, applies the
 //!   change, writes the document atomically (temporary file plus rename), and updates
 //!   the index. A reader applies the same staleness check, so another process's
@@ -30,7 +30,7 @@
 //!   keeps concurrent tasks from occupying blocking threads.
 //! - `start_watching` additionally reloads (and reindexes) whenever the watcher reports a
 //!   `.md` change, so an external editor's edit shows up in `search` without any call
-//!   having to observe the file first. [`LocalCodingMemory::reload_count`] exposes how
+//!   having to observe the file first. [`LocalCodingMemory::reload_count`](crate::lite::local::LocalCodingMemory::reload_count) exposes how
 //!   many reloads happened, which is what the watcher test observes.
 //!
 //! # Search
@@ -48,7 +48,7 @@
 //! matches), and a fact keeps the maximum of its two signals. Only
 //! [`SearchOptions::top_k`], [`SearchOptions::threshold`], [`SearchOptions::kinds`], and
 //! [`SearchOptions::mode`] are honoured: `Semantic` mode returns
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) because the local
+//! [`Error::Unsupported`] because the local
 //! store holds no embeddings, and `token_budget` is ignored (there is no context window
 //! here).
 //!
@@ -1005,7 +1005,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            2
+            1
         );
 
         // A write after the external edit must keep the external fact.

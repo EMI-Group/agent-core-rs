@@ -4,7 +4,7 @@
 //! FTS5 + trigram index) to one contentful FTS5 table: facts are copied into
 //! `coding_facts_fts` and recalled with a BM25-ranked `MATCH` query and snippets.
 //! The index is derived state — the engine stays the source of truth — so
-//! [`FtsIndex::rebuild`] can always reconstruct the whole table from
+//! [`FtsIndex::rebuild`](crate::lite::fts::FtsIndex::rebuild) can always reconstruct the whole table from
 //! [`CodingMemory::list`](super::CodingMemory::list).
 //!
 //! # Schema
@@ -15,8 +15,10 @@
 //! )
 //! ```
 //!
-//! Every constructor ([`FtsIndex::open`], [`FtsIndex::open_path`],
-//! [`FtsIndex::from_pool`], [`FtsIndex::in_memory`]) applies this DDL idempotently.
+//! Every constructor ([`FtsIndex::open`](crate::lite::fts::FtsIndex::open),
+//! [`FtsIndex::open_path`](crate::lite::fts::FtsIndex::open_path),
+//! [`FtsIndex::from_pool`](crate::lite::fts::FtsIndex::from_pool),
+//! [`FtsIndex::in_memory`](crate::lite::fts::FtsIndex::in_memory)) applies this DDL idempotently.
 //!
 //! - `name` is `UNINDEXED`: it is the row key (upsert target, removal key, and the
 //!   identifier reported on every hit) and, like every unindexed column, it is *not*
@@ -29,7 +31,7 @@
 //! # Query safety
 //!
 //! A user query is never interpolated into SQL and never reaches FTS5 as an
-//! expression: [`FtsIndex::search`] tokenizes it with `\w+`, keeps at most ten tokens
+//! expression: [`FtsIndex::search`](crate::lite::fts::FtsIndex::search) tokenizes it with `\w+`, keeps at most ten tokens
 //! that contain at least one alphanumeric character, and binds
 //! `"tok1" OR "tok2"` as a statement parameter (embedded `"` doubled). FTS5 syntax
 //! (`NEAR`, `AND`, `#`, `*`, `^`, parentheses) is therefore inert, and a query with
