@@ -654,6 +654,23 @@ mod tests {
             .collect()
     }
 
+    /// Drains the transitions a monitor published, polling instead of sleeping.
+    ///
+    /// A guarded drop publishes synchronously, so the first pass usually drains
+    /// everything; the bounded retry only keeps the drain from racing a mirror that
+    /// has not run yet.
+    async fn drain(events: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunEvent> {
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen.extend(std::iter::from_fn(|| events.try_recv().ok()));
+            if seen.last().is_some_and(|event| event.phase.is_terminal()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        seen
+    }
+
     #[tokio::test]
     async fn invoke_mirrors_the_run_and_unregisters_it() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -754,6 +771,49 @@ mod tests {
             phases(&mut transitions),
             vec![RunPhase::Queued, RunPhase::Running, RunPhase::Completed]
         );
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_mid_flight_finishes_as_cancelled() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let monitor = Arc::new(crate::monitor::RunMonitor::new());
+        let hub = Arc::new(crate::hitl::InteractionHub::new());
+        let mut transitions = monitor.subscribe();
+        let services = services(&events)
+            .with_monitor(Arc::clone(&monitor))
+            .with_hitl(Arc::clone(&hub));
+
+        let mut stream = stream_agent(
+            services,
+            fake("fake"),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        );
+        // One poll yields frame 1 and leaves the generator suspended between
+        // frames, so the run is still in flight when the stream goes away.
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first frame is readable before the drop"
+        );
+        drop(stream);
+
+        // Dropping the generator drops the status guard before the hub binding
+        // (reverse declaration order), so the run is already terminal when
+        // `unregister` mirrors its phase; the opposite order would report the run
+        // as `Completed` instead of `Cancelled`.
+        let published = drain(&mut transitions).await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![RunPhase::Queued, RunPhase::Running, RunPhase::Cancelled],
+            "a dropped stream finishes its run as cancelled"
+        );
+        let last = published.last().expect("a terminal transition");
+        assert_eq!(last.detail, json!({"reason": "run dropped"}));
+        assert!(hub.is_empty(), "the binding unregistered on drop");
+        assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
     }
 
     #[tokio::test]
