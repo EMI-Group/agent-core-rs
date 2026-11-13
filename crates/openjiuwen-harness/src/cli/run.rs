@@ -17,10 +17,16 @@
 //! Session records are append-only and best-effort: a failed write is logged and
 //! never loses the answer.
 //!
-//! The agent built here composes three CLI-owned inputs:
+//! The agent built here composes four CLI-owned inputs:
 //!
 //! - **instruction files** — `IDENTITY.md`/`OPENJIUWEN.md` under the workspace
 //!   and the home directory become the system prompt ([`InstructionFiles`]);
+//! - **built-in tools** — the builder mounts the twenty default coding tools and
+//!   this module adds the eleven extended tools it can drive (`fetch_webpage`,
+//!   `web_search`, `image_metadata`, `audio_metadata`, `cron`, the two MCP
+//!   resource tools, `tool_search`, the two goal tools and `worktree`); `lsp`
+//!   stays out because it needs a per-workspace server configuration the CLI
+//!   does not resolve yet;
 //! - **MCP tools** — the servers declared in `mcp.json` are connected through
 //!   [`McpToolProvider`] and mounted next to the built-in coding tools;
 //! - **permission rules** — the permanent allow rules under the CLI home are
@@ -51,8 +57,11 @@ use super::render::RenderState;
 use super::style::Style;
 use super::RunArgs;
 use crate::agent::{create_deep_agent, DeepAgent};
-use crate::permission::{PermissionHost, PermissionsSection};
+use crate::permission::{
+    PermissionEngine, PermissionEngineConfig, PermissionHost, PermissionsSection,
+};
 use crate::schema::DeepAgentConfig;
+use crate::tools::{BuiltinTool, ToolRegistry};
 use crate::workspace::Workspace;
 
 /// Message shown when a run has no prompt at all.
@@ -229,7 +238,7 @@ pub async fn build_agent(
 /// the user invoked it from, falling back to the workspace when the process
 /// directory cannot be determined.
 ///
-/// Three CLI-owned inputs are folded in here:
+/// Four CLI-owned inputs are folded in here:
 ///
 /// - [`InstructionFiles::load`] reads `IDENTITY.md`/`OPENJIUWEN.md` from the
 ///   workspace and the home directory and hands the composed text to
@@ -237,6 +246,12 @@ pub async fn build_agent(
 ///   preamble — the same way the Python CLI composes its identity and memory
 ///   layers into one system section — and leaves the built-in prompt untouched
 ///   when no instruction file exists.
+/// - The eleven extended built-in tools the CLI can drive (`fetch_webpage`,
+///   `web_search`, `image_metadata`, `audio_metadata`, `cron`, the two MCP resource
+///   tools, `tool_search`, the two goal tools and `worktree`) are mounted on top of
+///   [`ToolRegistry`]'s default set, so a CLI turn can fetch pages, search, report
+///   media metadata, schedule cron jobs, search the tool index, read MCP resources,
+///   track a goal and manage worktrees. `lsp` is left out.
 /// - `mcp.json` (see [`mcp_config::load_for`]) is loaded and every server entry
 ///   is passed to `provider`, whose tools are mounted beside the built-in coding
 ///   tools. With no configuration file the list is empty.
@@ -278,17 +293,17 @@ pub async fn build_agent_with(
     let servers = mcp_config::load_for(&options.home, &options.workspace, &ProcessEnv)?;
     let mcp_tools = provider.load_tools(&servers).await?;
     let (rules, permissions) = resolve_permissions(options)?;
+    let workspace = Workspace::for_language(&options.workspace, DEFAULT_LANGUAGE);
+    let mut tools = cli_extended_tools(&workspace, &permissions);
+    tools.extend(mcp_tools);
     let host: Arc<dyn PermissionHost> = Arc::new(permission_host(io, options, rules, &permissions));
     create_deep_agent(
         model,
         None,
         Some(config),
-        mcp_tools,
+        tools,
         Vec::new(),
-        Some(Workspace::for_language(
-            &options.workspace,
-            DEFAULT_LANGUAGE,
-        )),
+        Some(workspace),
         Vec::new(),
         Vec::new(),
         true,
@@ -300,6 +315,50 @@ pub async fn build_agent_with(
         Some(host),
     )
     .await
+}
+
+/// The extended built-in tools a CLI run or REPL turn mounts.
+///
+/// These are [`BuiltinTool::EXTENDED`] minus `lsp`, which needs a per-workspace server
+/// configuration the CLI does not resolve yet: mounting it would only offer the model a tool that
+/// always answers "no LSP server configured". The builder keeps [`BuiltinTool::DEFAULT`] as its
+/// baseline, so the CLI mounts this set on top of it rather than in place of it.
+const CLI_EXTENDED_TOOLS: [BuiltinTool; 11] = [
+    BuiltinTool::FetchWebpage,
+    BuiltinTool::WebSearch,
+    BuiltinTool::ImageMetadata,
+    BuiltinTool::AudioMetadata,
+    BuiltinTool::Cron,
+    BuiltinTool::ListMcpResources,
+    BuiltinTool::ReadMcpResource,
+    BuiltinTool::ToolSearch,
+    BuiltinTool::GetCurrentGoal,
+    BuiltinTool::SubmitGoalReport,
+    BuiltinTool::Worktree,
+];
+
+/// Builds [`CLI_EXTENDED_TOOLS`] over `workspace` for a CLI run.
+///
+/// The tools come from a [`ToolRegistry`] restricted to that set, which reuses the builder's
+/// seams: the permission engine of `permissions` folds the network guard of `fetch_webpage`, the
+/// worktree tool's guard and the metadata tools' path checks. `web_search`, the two MCP resource
+/// tools and `lsp` need a host-supplied backend; without one the mounted tools answer with their
+/// documented `success=false` payload instead of failing the run, and no network default is added
+/// here. Mounting a goal tool also makes the factory register the goal rail.
+fn cli_extended_tools(
+    workspace: &Workspace,
+    permissions: &PermissionsSection,
+) -> Vec<Arc<dyn Tool>> {
+    let mut registry = ToolRegistry::new(workspace.clone())
+        .with_tools(CLI_EXTENDED_TOOLS)
+        .with_language(DEFAULT_LANGUAGE);
+    if permissions.enabled {
+        registry = registry.with_permissions(Arc::new(PermissionEngine::new(
+            PermissionEngineConfig::new(permissions.clone())
+                .with_workspace_root(workspace.root_path.clone()),
+        )));
+    }
+    registry.build()
 }
 
 /// Resolves the effective permission section of `options`.
@@ -462,14 +521,15 @@ mod tests {
     use openjiuwen_foundation::llm::Model;
     use openjiuwen_foundation::tool::mcp::McpClientType;
     use openjiuwen_foundation::tool::{ToolCard, ToolContext};
-    use openjiuwen_test_support::ScriptedModel;
+    use openjiuwen_foundation::Role;
+    use openjiuwen_test_support::{MockCompletion, ScriptedModel};
     use tempfile::TempDir;
 
     use super::*;
     use crate::cli::config::{
         DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER,
     };
-    use crate::cli::{LineReader, Writer};
+    use crate::cli::{LineReader, OutputFormat, Writer};
     use crate::permission::PermissionLevel;
 
     /// [`LineReader`] answering from a fixed script, then EOF.
@@ -686,6 +746,208 @@ mod tests {
         assert_eq!(
             host.permission_yaml_path(),
             Some(temp.path().join("permissions.yaml"))
+        );
+    }
+
+    /// The model-facing names of [`CLI_EXTENDED_TOOLS`], in registry order.
+    const CLI_EXTENDED_NAMES: [&str; 11] = [
+        "fetch_webpage",
+        "web_search",
+        "image_metadata",
+        "audio_metadata",
+        "cron",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "tool_search",
+        "get_current_goal",
+        "submit_goal_report",
+        "worktree",
+    ];
+
+    #[test]
+    fn cli_extended_tools_are_the_extended_set_minus_lsp() {
+        let expected: Vec<BuiltinTool> = BuiltinTool::EXTENDED
+            .into_iter()
+            .filter(|tool| *tool != BuiltinTool::Lsp && !BuiltinTool::DEFAULT.contains(tool))
+            .collect();
+        assert_eq!(
+            CLI_EXTENDED_TOOLS.to_vec(),
+            expected,
+            "the CLI mounts every extended tool it can serve"
+        );
+        let names: Vec<&str> = CLI_EXTENDED_TOOLS.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, CLI_EXTENDED_NAMES.to_vec());
+        assert!(
+            !CLI_EXTENDED_TOOLS.contains(&BuiltinTool::Lsp),
+            "lsp needs a per-workspace server config the CLI does not resolve"
+        );
+        assert!(
+            CLI_EXTENDED_TOOLS
+                .iter()
+                .all(|tool| !BuiltinTool::DEFAULT.contains(tool)),
+            "the builder already mounts the default twenty"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_agent_mounts_the_extended_tools_and_skips_lsp() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        let io = scripted_io(&[]);
+        let model = ScriptedModel::text("done");
+        let scripted = model.clone();
+
+        let agent = build_agent(Arc::new(model), &options, &io).await.unwrap();
+        let output = agent
+            .invoke(json!({"query": "hi"}), Some(new_session("s-tools")))
+            .await
+            .unwrap();
+        assert_eq!(output.output, "done");
+
+        // The tools section of the first model call lists every mounted card.
+        let prompt = scripted.calls()[0]
+            .messages
+            .iter()
+            .find(|message| message.role.is_system())
+            .map(|message| message.text().into_owned())
+            .expect("the first model call must carry the system prompt");
+        for name in CLI_EXTENDED_NAMES {
+            assert!(
+                prompt.contains(&format!("- **{name}**: ")),
+                "the CLI agent must mount {name}:\n{prompt}"
+            );
+        }
+        for name in crate::tools::tool_names() {
+            assert!(
+                prompt.contains(&format!("- **{name}**: ")),
+                "the builder baseline must stay mounted ({name}):\n{prompt}"
+            );
+        }
+        assert!(
+            !prompt.contains("- **lsp**: "),
+            "the CLI must not mount lsp:\n{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_tools_register_the_goal_rail() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        let io = scripted_io(&[]);
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("done"));
+
+        let agent = build_agent(model, &options, &io).await.unwrap();
+        assert!(
+            agent.rails().names().iter().any(|name| name == "goal"),
+            "mounting a goal tool must register the goal rail: {:?}",
+            agent.rails().names()
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_run_without_a_backend_reports_the_typed_payload() {
+        let temp = TempDir::new().unwrap();
+        let options = test_options(temp.path());
+        std::fs::create_dir_all(&options.workspace).unwrap();
+        // The default section answers every tool with `ask`, and a one-shot run fails
+        // closed; an interactive handle approves the call so the tool itself runs.
+        let io = CliIo::with_interactive(
+            Box::new(ScriptedReader {
+                lines: VecDeque::from(["a".to_owned()]),
+            }),
+            Box::new(SilentWriter),
+        );
+        let model = ScriptedModel::builder()
+            .completion(MockCompletion::tool_call(
+                "web_search",
+                json!({"query": "rust"}),
+            ))
+            .respond_text("searched")
+            .build();
+        let scripted = model.clone();
+        let args = RunArgs {
+            prompt: Some("find the rust docs".to_owned()),
+            output_format: OutputFormat::Json,
+        };
+
+        let outcome = run_with_model(&options, &args, &io, Arc::new(model))
+            .await
+            .unwrap();
+        assert_eq!(outcome.answer, "searched");
+        let calls = scripted.calls();
+        assert_eq!(calls.len(), 2, "the tool round must reach the model again");
+        let result = calls[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .map(|message| message.text().into_owned())
+            .expect("the tool result must reach the second model call");
+        assert!(
+            result.contains("web search backend is not configured"),
+            "the run must surface the documented payload, not panic: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_online_tools_report_their_typed_not_configured_payloads() {
+        let temp = TempDir::new().unwrap();
+        let workspace = Workspace::for_language(temp.path(), DEFAULT_LANGUAGE);
+        let tools = cli_extended_tools(&workspace, &PermissionsSection::default());
+        let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
+        assert_eq!(names, CLI_EXTENDED_NAMES.to_vec());
+
+        let ctx = ToolContext::new();
+        // `web_search` has no backend in the CLI: the documented payload, never a panic.
+        let search = tools
+            .iter()
+            .find(|tool| tool.card().name == "web_search")
+            .unwrap()
+            .invoke(json!({"query": "rust"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(search["success"], json!(false));
+        assert!(
+            search["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("web search backend is not configured"),
+            "{search}"
+        );
+
+        // `list_mcp_resources` has no server either.
+        let resources = tools
+            .iter()
+            .find(|tool| tool.card().name == "list_mcp_resources")
+            .unwrap()
+            .invoke(json!({}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(resources["success"], json!(false));
+        assert!(
+            resources["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not configured"),
+            "{resources}"
+        );
+
+        // `fetch_webpage` rejects a non-http(s) URL before any socket is opened.
+        let fetch = tools
+            .iter()
+            .find(|tool| tool.card().name == "fetch_webpage")
+            .unwrap()
+            .invoke(json!({"url": "file:///etc/passwd"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(fetch["success"], json!(false));
+        assert!(
+            fetch["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported URL scheme"),
+            "{fetch}"
         );
     }
 }

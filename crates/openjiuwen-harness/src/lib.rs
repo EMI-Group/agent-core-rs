@@ -74,6 +74,12 @@ pub use permission::{
 /// Names of the thirty-two tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
 /// twelve extended ones), in registry order.
 pub use tools::extended_tool_names;
+/// The goal rail, its tunables, and the `ctx.extra` key under which it queues its events.
+///
+/// [`GoalRail`] is a [`HarnessRail`] registered like the rails in [`rails`], but it is reachable
+/// only as `tools::goal::GoalRail`: [`rails`] must not depend on [`tools`], so the goal rail is
+/// exported from the module that owns it instead.
+pub use tools::goal::{GoalRail, GoalRailConfig, GOAL_EVENT_EXTRA_KEY};
 pub use tools::{
     tool_names, AudioMetadata, AudioMetadataArgs, AudioMetadataTool, BuiltinTool, CronAction,
     CronArgs, CronJob, CronSchedule, CronScheduler, CronTool, FakeMcpResourceProvider,

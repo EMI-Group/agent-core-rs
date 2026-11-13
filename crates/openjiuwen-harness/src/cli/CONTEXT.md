@@ -37,7 +37,8 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 
 `./run.rs`:
 - `RunOutcome` (`to_json`, `stream_json_line`, `result_json_line`), `session_id()`, `new_session()`, `run_once`, `run_with_model` (plain/text shapes unchanged).
-- `build_agent(model, options, io)` and `build_agent_with(model, options, io, &dyn McpToolProvider)`: load `InstructionFiles` into the system prompt, mount MCP tools, merge persisted allow rules, install `CliPermissionHost`.
+- `build_agent(model, options, io)` and `build_agent_with(model, options, io, &dyn McpToolProvider)`: load `InstructionFiles` into the system prompt, mount the eleven extended built-in tools on top of the builder's default twenty, mount MCP tools, merge persisted allow rules, install `CliPermissionHost`.
+- `CLI_EXTENDED_TOOLS` / `cli_extended_tools(workspace, permissions)`: the mounted extra set — `fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, `list_mcp_resources`, `read_mcp_resource`, `tool_search`, `get_current_goal`, `submit_goal_report`, `worktree` — built from a `ToolRegistry` restricted to it and wired with the agent's permission engine.
 - `trait McpToolProvider` + `FoundationMcpToolProvider` (real `mcp` connect/list, a failing server is warned and skipped).
 
 `./repl.rs`: `Repl` (`new`, `with_io_and_signals`, `with_io`, plus builders `with_history`, `with_history_replay`, `with_shell`, `with_skills`), `run`, `run_turn`, `handle_input`, `on_interrupt`, `session_id`; `ReplCommand::{Prompt, Exit, New, Clear, Help, Status, Cost, Compact, Sessions, Mode, Shell, Skill, Usage, Unknown, Empty}`; `TurnOutcome`, `InterruptCounter`, `InterruptAction`.
@@ -93,6 +94,9 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - **Colour resolution**: `paths::color_enabled(flag, env, stdout_is_tty())` gates `CliIo::with_color`; `NO_COLOR` and `--no-color` both opt out, non-terminals are always plain.
 - **History replay is opt-in**: `OPENJIUWEN_HISTORY_REPLAY` seeds `CliIo` with stored lines (the offline analogue of a pre-filled line editor); submitted lines are always appended best-effort and never fail a turn.
 - **`run_with_model`/`build_agent` signatures are frozen** (an out-of-crate e2e suite calls them); richer wiring goes through `build_agent_with` and the builder methods.
+- **CLI tool set**: the CLI mounts `CLI_EXTENDED_TOOLS` (every `BuiltinTool::EXTENDED` entry except `lsp`, which needs a per-workspace server configuration the CLI does not resolve) through `ToolRegistry::with_tools`, so the builder baseline stays the default twenty for library users.
+- **No backend defaults for the online tools**: `web_search` and the two MCP resource tools stay backend-less and answer with their documented `success=false` payload, `fetch_webpage` keeps the workspace `reqwest` fetcher, and no search key or endpoint is configured by the CLI.
+- **Goal tools register the goal rail**: mounting `get_current_goal`/`submit_goal_report` makes the factory register `tools::goal::GoalRail`, so a CLI agent publishes the goal prompt section and its `goal.updated` events.
 
 ## Known Issues
 
@@ -108,7 +112,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - Rich/prompt_toolkit TUI: panels/logo banner, `SlashCompleter`, multiline editing, markdown rendering, diff rendering in tool results (plain ANSI styling only).
 - Dollar-price `/cost` reporting (Python has none either: token/call counts only).
 - LLM-summarising `/compact` (bounded truncation instead).
-- The extended built-in tools (`fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, the MCP-resource, goal, `lsp` and `worktree` tools) are not mounted by the CLI agent: `build_agent` keeps the builder's default twenty-card set and adds only the MCP tools loaded from `mcp.json`.
+- The `lsp` built-in tool is not mounted by the CLI: a language server needs a per-workspace configuration the CLI does not resolve yet.
 - Plugin hot-loading (templates are loaded by `crate::spec`, not by the CLI), a `--config` command, and file-based session-history restore.
 - Multi-skill roots beyond `<workspace>/skills` and `<home>/skills` (`~/.claude/skills`, `~/.codex/skills` are not scanned).
 
@@ -120,7 +124,7 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `./io.rs` → `LineReader`/`Writer` traits, `CliIo` (colour flag, seed lines), stdio implementations
 - `./style.rs` → ANSI `Style` helpers
 - `./render.rs` → `RenderState`: chunk-to-terminal rendering shared by `run` and the REPL
-- `./run.rs` → one-shot execution, agent construction (instructions/MCP/permissions), output formats, `RunOutcome`
+- `./run.rs` → one-shot execution, agent construction (instructions, extended built-in tools, MCP, permissions), output formats, `RunOutcome`
 - `./repl.rs` → `Repl`, slash commands, history integration, skill/shell dispatch, Ctrl-C handling, per-turn streaming
 - `./permissions.rs` → approval prompt text/styling, answer mapping, `CliPermissionHost` with persistent rules
 - `./allow_rules.rs` → `permissions.yaml` persistence and merge
@@ -144,5 +148,6 @@ Module root (`./mod.rs`), every item also re-exported flat from `crate::cli`:
 - `tests/commands.rs` drives each slash command end to end: `handle_input` table, `/help` (with and without skills), `/cost`/`/status` usage, `/clear`, `/compact` (no-op and truncating), `/sessions` (empty and populated), `!cmd` (stdout/stderr/exit line, model untouched, failure keeps the loop alive), skill turn prompt wrapping, history recording and replay seeding.
 - `tests/features.rs` proves the wiring from the public API: `--no-color` parsing + `color_enabled`, styled-vs-plain prompt bytes, history round-trip/cap, onboarding interactive vs non-interactive, instruction precedence, `mcp.json` loading and malformed-file error, allow-rule persistence through the host, and escape-free `text`/single-object `json` output.
 - `run.rs`/`permissions.rs` carry inline tests for `build_agent_with` (no MCP config → offline turn, recording provider, instruction prompt, persisted rules) and the styled/fail-closed permission host.
+- `run.rs` also pins the CLI tool set: the `CLI_EXTENDED_TOOLS` shape (extended minus `lsp`, disjoint from the default twenty), the mounted card names in the rendered prompt, the automatic `goal` rail, the typed `success=false` payloads of the backend-less `web_search`/`list_mcp_resources`/`fetch_webpage` tools, and a scripted `web_search` run whose tool result carries "web search backend is not configured".
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` all clean.
 - Parity references (read-only): `openjiuwen/harness/cli/{cli.py,ui/repl.py,ui/renderer.py,ui/runner.py,ui/tool_display.py,storage/session_store.py,prompts/builder.py,rails/{token_tracker,tool_tracker}.py,agent/{config,factory}.py}`.
