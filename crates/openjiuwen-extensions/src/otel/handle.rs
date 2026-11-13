@@ -12,12 +12,31 @@
 //! - without `feature = "otel"`, [`init_otel_tracer`] validates the
 //!   configuration and returns an inactive handle for *every*
 //!   [`ExporterType`]; nothing is built and nothing fails;
-//! - with `feature = "otel"`, `Memory`/`Console`/`None` build a real private
-//!   provider and `Otlp` answers `Error::Unsupported` because OTLP export is
-//!   deferred.
+//! - with `feature = "otel"`, every [`ExporterType`] builds a real private
+//!   provider: `Memory` keeps finished spans in memory, `Console` logs one
+//!   `tracing` line per span, `None` records nothing, and `Otlp` posts batches
+//!   to a collector over OTLP/HTTP with JSON payloads.
+//!
+//! # OTLP transport
+//!
+//! `Otlp` first resolves the transport with
+//! [`env::resolve_protocol`](super::env::resolve_protocol):
+//! [`OtlpProtocol::Http`] builds an `OtlpHttpExporter`, while
+//! [`OtlpProtocol::Grpc`] — the configuration default — answers
+//! `Error::Unsupported`, because gRPC framing needs `opentelemetry-otlp`,
+//! `prost` and `tonic`, none of which the offline build can reach. A
+//! configuration or an `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` variable selects
+//! the supported transport; nothing is downgraded silently. The endpoint, the
+//! headers, and the request timeout come from the configuration first, then the
+//! `OPENJIUWEN_OTEL_*` variables, then the `OTEL_*` ones, then the built-in
+//! defaults described in [`super::env`].
 //!
 //! [`ExporterType`]: super::config::ExporterType
+//! [`OtlpProtocol::Http`]: super::config::OtlpProtocol::Http
+//! [`OtlpProtocol::Grpc`]: super::config::OtlpProtocol::Grpc
 //! [`init_otel_tracer`]: self::init_otel_tracer
+
+use std::time::Duration;
 
 #[cfg(feature = "otel")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,18 +50,22 @@ use opentelemetry::trace::TracerProvider as _;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider, SpanExporter};
 
-#[cfg(feature = "otel")]
-use super::config::ExporterType;
 use super::config::OtelTracerConfig;
+#[cfg(feature = "otel")]
+use super::config::{ExporterType, OtlpProtocol};
+#[cfg(feature = "otel")]
+use super::otlp::OtlpHttpExporter;
 #[cfg(feature = "otel")]
 use super::provider::{
     build_provider, build_provider_without_exporter, CaptureExporter, ConsoleExporter,
 };
 
-/// Message returned when the deferred OTLP exporter is requested.
+/// Reason reported when the configuration asks for OTLP/gRPC.
 #[cfg(feature = "otel")]
-const OTLP_DEFERRED: &str =
-    "OTLP span export is deferred; use ExporterType::Memory/Console or inject a SpanExporter";
+const OTLP_GRPC_UNSUPPORTED: &str = "OTLP/gRPC span export is unsupported: gRPC with protobuf \
+     payloads needs opentelemetry-otlp, prost, and tonic, which are unavailable offline; use \
+     OTLP/HTTP with JSON payloads instead (OtlpProtocol::Http or \
+     OTEL_EXPORTER_OTLP_PROTOCOL=http/json)";
 
 /// `tracing` target for handle-level failures.
 #[cfg(feature = "otel")]
@@ -119,22 +142,54 @@ impl TracerHandle {
 
     /// Shuts the private provider down; safe to call twice and from `&self`.
     ///
-    /// A no-op for an inactive handle.
+    /// Flushes pending spans and then shuts the provider down, both bounded by
+    /// [`OtelTracerConfig::export_timeout_ms`] (minimum 1 ms). A no-op for an
+    /// inactive handle.
     pub fn shutdown(&self) {
+        self.shutdown_with_timeout(Duration::from_millis(self.config.export_timeout_ms.max(1)));
+    }
+
+    /// Flushes pending spans and shuts the private provider down within
+    /// `timeout`.
+    ///
+    /// The flush runs first so spans still sitting in the batch processor are
+    /// handed to the exporter (an OTLP batch would otherwise be dropped), then
+    /// the provider stops its processors and waits at most `timeout` for them.
+    /// Every failure is logged at `warn` on target
+    /// `openjiuwen_extensions::otel::handle` and never panics.
+    ///
+    /// Idempotent: only the first call does any work, and further calls return
+    /// immediately. A no-op for an inactive handle, including the handle the
+    /// no-feature seam returns.
+    pub fn shutdown_with_timeout(&self, timeout: Duration) {
         #[cfg(feature = "otel")]
         {
             if self.is_shutdown() || self.shutdown.swap(true, Ordering::AcqRel) {
                 return;
             }
-            if let Some(provider) = self.provider.as_ref() {
-                if let Err(error) = provider.shutdown() {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        %error,
-                        "failed to shut the otel tracer provider down"
-                    );
-                }
+            let Some(provider) = self.provider.as_ref() else {
+                return;
+            };
+            if let Err(error) = provider.force_flush() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %error,
+                    "failed to flush the otel tracer provider"
+                );
             }
+            if let Err(error) = provider.shutdown_with_timeout(timeout) {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %error,
+                    "failed to shut the otel tracer provider down"
+                );
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            // The no-feature seam owns no provider, so there is nothing to flush
+            // or stop; keep the signature identical in both builds.
+            let _ = (self, timeout);
         }
     }
 
@@ -223,21 +278,29 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
 /// Initializes the tracer and returns its private provider handle.
 ///
 /// `Memory` attaches a [`CaptureExporter`], `Console` exports one `tracing`
-/// line per span at `debug`, and `None` builds a provider whose spans are
-/// dropped. OTLP export is deferred and answers
-/// [`openjiuwen_common::error::Error::unsupported`].
+/// line per span at `debug`, `None` builds a provider whose spans are dropped,
+/// and `Otlp` builds an [`OtlpHttpExporter`] against the resolved collector
+/// endpoint (see [`super::env`] for the precedence).
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::Error::validation`] when the
 /// configuration is invalid, and
-/// [`openjiuwen_common::error::Error::Unsupported`] for
-/// [`ExporterType::Otlp`].
+/// [`openjiuwen_common::error::Error::Unsupported`] when `Otlp` resolves to
+/// [`OtlpProtocol::Grpc`] — gRPC needs `tonic`/`prost`, which are unavailable
+/// offline; OTLP/HTTP with JSON payloads
+/// ([`OtlpProtocol::Http`]) is the supported transport. A rejected endpoint or
+/// header surfaces as [`openjiuwen_common::error::Error::Validation`].
 #[cfg(feature = "otel")]
 pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
     config.validate()?;
     match config.exporter_type {
-        ExporterType::Otlp => Err(otlp_deferred()),
+        ExporterType::Otlp => {
+            let exporter = otlp_exporter(&config)?;
+            let provider = build_provider(&config, exporter)?;
+            let tracer = provider.tracer(config.tracer_name.clone());
+            Ok(TracerHandle::active(config, provider, tracer, None))
+        }
         ExporterType::Memory => {
             let capture = Arc::new(CaptureExporter::new());
             let provider = build_provider(&config, capture.as_ref().clone())?;
@@ -264,17 +327,18 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
 
 /// Initializes the tracer around a caller-supplied [`SpanExporter`].
 ///
-/// Useful for hosts that already own an exporter (OTLP, a test sink, a vendor
-/// bridge) and for tests that need to observe spans directly. The provider is
-/// still private to the returned handle and [`TracerHandle::capture`] stays
-/// `None`, because the handle cannot see inside a foreign exporter.
+/// Useful for hosts that already own an exporter (a vendor bridge, a test sink)
+/// and for tests that need to observe spans directly. The provider is still
+/// private to the returned handle and [`TracerHandle::capture`] stays `None`,
+/// because the handle cannot see inside a foreign exporter. The injected
+/// exporter wins for every [`ExporterType`], including `Otlp`: the
+/// configuration's protocol and endpoint are not consulted, so a `Grpc`
+/// configuration still builds a provider around the caller's exporter.
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::Error::validation`] when the
-/// configuration is invalid, and
-/// [`openjiuwen_common::error::Error::Unsupported`] when the configuration
-/// still asks for the deferred [`ExporterType::Otlp`].
+/// configuration is invalid.
 #[cfg(feature = "otel")]
 pub fn init_otel_tracer_with_exporter<E>(
     config: OtelTracerConfig,
@@ -284,18 +348,33 @@ where
     E: SpanExporter + 'static,
 {
     config.validate()?;
-    if config.exporter_type == ExporterType::Otlp {
-        return Err(otlp_deferred());
-    }
     let provider = build_provider(&config, exporter)?;
     let tracer = provider.tracer(config.tracer_name.clone());
     Ok(TracerHandle::active(config, provider, tracer, None))
 }
 
-/// The error returned for the deferred OTLP exporter.
+/// Builds the OTLP/HTTP exporter described by `config`.
+///
+/// The transport is resolved first: an explicit [`OtlpProtocol::Http`] wins,
+/// and the `http/json`/`http` variables select it too, while a configuration
+/// that still asks for [`OtlpProtocol::Grpc`] is rejected instead of being
+/// downgraded silently. The endpoint, headers, and request timeout follow the
+/// precedence documented in [`super::env`]; `export_timeout_ms` bounds one HTTP
+/// request.
 #[cfg(feature = "otel")]
-fn otlp_deferred() -> openjiuwen_common::error::Error {
-    openjiuwen_common::error::Error::unsupported(OTLP_DEFERRED)
+fn otlp_exporter(config: &OtelTracerConfig) -> Result<OtlpHttpExporter> {
+    match super::env::resolve_protocol(config.protocol)? {
+        OtlpProtocol::Http => {}
+        OtlpProtocol::Grpc => {
+            return Err(openjiuwen_common::error::Error::unsupported(
+                OTLP_GRPC_UNSUPPORTED,
+            ));
+        }
+    }
+    let endpoint = super::env::resolve_endpoint(config.exporter_endpoint.as_deref());
+    let headers = super::env::resolve_headers(&config.headers);
+    let timeout = Duration::from_millis(config.export_timeout_ms.max(1));
+    OtlpHttpExporter::new(endpoint, headers, timeout)
 }
 
 #[cfg(test)]
@@ -303,12 +382,30 @@ fn otlp_deferred() -> openjiuwen_common::error::Error {
 mod tests {
     use super::*;
     use crate::otel::config::ExporterType;
+    #[cfg(feature = "otel")]
+    use crate::otel::config::OtlpProtocol;
 
     // port of tests/unit_tests/extensions/tracer_otel/test_setup.py
 
     /// Configuration that selects a capturing provider.
     fn memory_config() -> OtelTracerConfig {
         OtelTracerConfig::default().with_exporter_type(ExporterType::Memory)
+    }
+
+    /// Configuration that selects the supported OTLP transport.
+    ///
+    /// `127.0.0.1:9` is a valid, local, and reliably closed endpoint: building
+    /// the exporter never connects, and no test creates a span, so the suite
+    /// stays offline.
+    #[cfg(feature = "otel")]
+    fn otlp_http_config() -> OtelTracerConfig {
+        OtelTracerConfig {
+            protocol: OtlpProtocol::Http,
+            exporter_endpoint: Some("http://127.0.0.1:9".to_owned()),
+            export_timeout_ms: 500,
+            ..OtelTracerConfig::default()
+        }
+        .with_exporter_type(ExporterType::Otlp)
     }
 
     #[test]
@@ -320,23 +417,27 @@ mod tests {
     }
 
     #[test]
-    fn every_exporter_initializes_without_the_feature() {
+    fn memory_console_and_none_initialize_in_both_builds() {
         for exporter_type in [
             ExporterType::None,
             ExporterType::Memory,
             ExporterType::Console,
-            ExporterType::Otlp,
         ] {
             let config = OtelTracerConfig::default().with_exporter_type(exporter_type);
-            let result = init_otel_tracer(config);
-            if cfg!(feature = "otel") && exporter_type == ExporterType::Otlp {
-                assert!(result.is_err(), "OTLP must stay deferred");
-            } else {
-                let handle = result.unwrap();
-                assert_eq!(handle.is_active(), cfg!(feature = "otel"));
-                assert_eq!(handle.config().exporter_type, exporter_type);
-            }
+            let handle = init_otel_tracer(config).unwrap();
+            assert_eq!(handle.is_active(), cfg!(feature = "otel"));
+            assert_eq!(handle.config().exporter_type, exporter_type);
         }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn otlp_returns_an_inactive_handle_without_the_feature() {
+        // The seam stays inert: the default `Otlp` + `Grpc` configuration is
+        // accepted because nothing is built without the SDK.
+        let handle = init_otel_tracer(OtelTracerConfig::default()).unwrap();
+        assert_eq!(handle.config().exporter_type, ExporterType::Otlp);
+        assert!(!handle.is_active());
     }
 
     #[test]
@@ -372,6 +473,7 @@ mod tests {
         handle.force_flush();
         handle.shutdown();
         handle.shutdown();
+        handle.shutdown_with_timeout(Duration::from_millis(50));
         assert!(!handle.is_active());
         // Post-shutdown calls stay harmless.
         handle.force_flush();
@@ -380,17 +482,50 @@ mod tests {
 
     #[cfg(feature = "otel")]
     #[test]
-    fn otlp_exporter_is_deferred() {
+    fn otlp_http_exporter_builds_an_active_handle_without_capture() {
+        // A guard keeps every OTLP variable clean, so the resolved endpoint and
+        // protocol are the ones asserted here. No span is created, so no HTTP
+        // request is ever made.
+        let _guard = crate::otel::env::test_support::EnvGuard::new();
+        let handle = init_otel_tracer(otlp_http_config()).unwrap();
+        assert!(handle.is_active());
+        assert!(handle.provider().is_some());
+        assert!(handle.tracer().is_some());
+        assert!(
+            handle.capture().is_none(),
+            "the OTLP exporter exposes no capture API"
+        );
+        assert_eq!(handle.config().exporter_type, ExporterType::Otlp);
+
+        handle.shutdown_with_timeout(Duration::from_millis(200));
+        assert!(!handle.is_active(), "shutdown deactivates the handle");
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_grpc_is_rejected_with_the_http_alternative() {
+        let _guard = crate::otel::env::test_support::EnvGuard::new();
         let config = OtelTracerConfig::default().with_exporter_type(ExporterType::Otlp);
+        assert_eq!(
+            config.protocol,
+            OtlpProtocol::Grpc,
+            "the configuration default is the unsupported transport"
+        );
+
         let error = init_otel_tracer(config).unwrap_err();
         assert_eq!(
             error.kind(),
             openjiuwen_common::error::ErrorKind::Unsupported
         );
-        assert_eq!(
-            error.to_string(),
-            "unsupported: OTLP span export is deferred; use ExporterType::Memory/Console or \
-             inject a SpanExporter"
+        let message = error.to_string();
+        assert!(message.contains("gRPC"), "unexpected message: {message}");
+        assert!(
+            message.contains("protobuf"),
+            "the reason must name the payload encoding: {message}"
+        );
+        assert!(
+            message.contains("http/json"),
+            "the reason must name the supported alternative: {message}"
         );
     }
 
@@ -428,14 +563,36 @@ mod tests {
 
     #[cfg(feature = "otel")]
     #[test]
-    fn injected_exporter_still_rejects_otlp() {
+    fn injected_exporter_is_accepted_for_otlp() {
         use crate::otel::provider::CaptureExporter;
+        use opentelemetry::trace::{Span as _, Tracer as _};
 
+        // An injected exporter owns the export path, so the `Grpc` protocol in
+        // the default configuration is never consulted.
+        let capture = CaptureExporter::new();
         let config = OtelTracerConfig::default().with_exporter_type(ExporterType::Otlp);
-        let error = init_otel_tracer_with_exporter(config, CaptureExporter::new()).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            openjiuwen_common::error::ErrorKind::Unsupported
-        );
+        let handle = init_otel_tracer_with_exporter(config, capture.clone()).unwrap();
+        assert!(handle.is_active());
+        assert!(handle.capture().is_none());
+
+        handle.tracer().unwrap().start("otlp.injected").end();
+        handle.force_flush();
+        assert_eq!(capture.names(), vec!["otlp.injected".to_owned()]);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn shutdown_with_timeout_is_idempotent() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+
+        let handle = init_otel_tracer(memory_config()).unwrap();
+        handle.tracer().unwrap().start("before.shutdown").end();
+
+        handle.shutdown_with_timeout(Duration::from_millis(250));
+        assert!(!handle.is_active());
+        // A second call, of either shutdown flavour, is harmless.
+        handle.shutdown_with_timeout(Duration::from_millis(250));
+        handle.shutdown();
+        assert!(!handle.is_active());
     }
 }
