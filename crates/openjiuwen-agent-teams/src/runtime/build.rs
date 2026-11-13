@@ -27,6 +27,7 @@
 //! The build path awaits the store, the workspace provider and the harness factory, so
 //! [`SpecBuild`] is an `#[async_trait]` seam. The node contract sketches the trait with synchronous
 //! signatures; the build path it pins is the authority (this deviation is reported by the node).
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -222,6 +223,7 @@ impl SpecBuild for TeamAgentSpec {
                 .unwrap_or_else(|| self.leader.desc_or_default().to_owned()),
         );
         let team_runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id(team_name));
+        let workspaces = BTreeMap::from([(leader_name.clone(), workspace)]);
         Ok(TeamAgent::assemble(TeamAgentInner {
             blueprint: self.clone(),
             spec: team_spec,
@@ -244,6 +246,7 @@ impl SpecBuild for TeamAgentSpec {
             kv_cache,
             signals,
             isolation,
+            workspaces: Mutex::new(workspaces),
             spawn_options: options,
             fork,
             attach,

@@ -23,6 +23,7 @@
 //! `team_agent`/`leader` must await the store, the workspace provider and the harness factory, so
 //! [`SpecBuild`] is an `#[async_trait]` seam. The node contract sketches the trait with synchronous
 //! signatures; the build path it pins is the authority (this deviation is reported by the node).
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -69,7 +70,7 @@ use crate::schema::{
     TeamTopic,
 };
 use crate::storage::TeamStore;
-use crate::workspace::{IsolationMode, WorkspaceRequest};
+use crate::workspace::{IsolationMode, MemberWorkspace, WorkspaceRequest};
 
 /// Error text of a `create_task` call on a non-leader handle.
 const LEADER_ONLY_TASKS_MESSAGE: &str = "only the leader can create tasks";
@@ -175,6 +176,13 @@ pub(crate) struct TeamAgentInner {
     pub(crate) signals: TeamSignals,
     /// Workspace isolation requested by the spec (`none` by default).
     pub(crate) isolation: IsolationMode,
+    /// Workspaces this team allocated, keyed by member name (leader included).
+    ///
+    /// The build path records the leader's workspace and `spawn_member` records each teammate's;
+    /// [`TeamAgent::shutdown_member`] and [`TeamAgent::stop`] take them back out and hand them to
+    /// [`WorkspaceProvider::release`](crate::workspace::WorkspaceProvider::release), so a worktree
+    /// is unregistered exactly once instead of leaking for the team's lifetime.
+    pub(crate) workspaces: Mutex<BTreeMap<String, MemberWorkspace>>,
     /// Spawn options requested by the spec (in-process by default).
     pub(crate) spawn_options: MemberSpawnOptions,
     /// Fork directive, when this team forks a member from a parent.
@@ -441,7 +449,9 @@ impl TeamAgent {
     /// Stops the team: cancels the run, stops the leader runtime and closes the gate.
     ///
     /// Idempotent and never fails: teardown problems are logged so a caller's cleanup path cannot
-    /// be blocked by them. The member's row settles on the `shutdown` retire target.
+    /// be blocked by them. The member's row settles on the `shutdown` retire target, and every
+    /// workspace still retained by the team (the leader's plus every remaining member's, including
+    /// rows already shut down) is released exactly once.
     ///
     /// # Errors
     ///
@@ -478,9 +488,72 @@ impl TeamAgent {
             team = self.team_name(),
             released, "kv-cache affinity entries released"
         );
+        self.release_all_workspaces().await;
         self.inner.signals.team_finished();
         debug!(team = self.team_name(), "team agent stopped");
         Ok(())
+    }
+
+    /// Releases one workspace through the injected provider, logging (never failing) a problem.
+    async fn release_workspace(&self, name: &str, workspace: MemberWorkspace) {
+        match self
+            .inner
+            .spawner
+            .deps()
+            .workspace
+            .release(&workspace)
+            .await
+        {
+            Ok(()) => debug!(
+                team = self.team_name(),
+                member = name,
+                root = %workspace.root.display(),
+                "released the member workspace"
+            ),
+            Err(error) => warn!(
+                team = self.team_name(),
+                member = name,
+                root = %workspace.root.display(),
+                %error,
+                "failed to release the member workspace"
+            ),
+        }
+    }
+
+    /// Retains `workspace` as `name`'s current workspace, releasing a stale one first.
+    ///
+    /// Retaining happens only after a member runtime exists: a failed spawn hands its workspace
+    /// straight back instead of holding it until the team stops.
+    async fn retain_workspace(&self, name: &str, workspace: MemberWorkspace) {
+        let stale = self
+            .inner
+            .workspaces
+            .lock()
+            .insert(name.to_owned(), workspace);
+        if let Some(stale) = stale {
+            self.release_workspace(name, stale).await;
+        }
+    }
+
+    /// Releases and forgets `name`'s retained workspace; a second call releases nothing.
+    async fn release_member_workspace(&self, name: &str) {
+        let workspace = self.inner.workspaces.lock().remove(name);
+        if let Some(workspace) = workspace {
+            self.release_workspace(name, workspace).await;
+        }
+    }
+
+    /// Releases every retained workspace, taking them all out of the map before the first await.
+    ///
+    /// Draining first keeps a concurrent second teardown from releasing the same workspace twice.
+    async fn release_all_workspaces(&self) {
+        let retained: Vec<(String, MemberWorkspace)> = {
+            let mut guard = self.inner.workspaces.lock();
+            std::mem::take(&mut *guard).into_iter().collect()
+        };
+        for (name, workspace) in retained {
+            self.release_workspace(&name, workspace).await;
+        }
     }
 
     /// Runs the team for one caller request and returns the leader's answer.
@@ -727,9 +800,14 @@ impl TeamAgent {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.ensure_row(name, &member_spec).await;
+                // The member never got a runtime, so nothing owns its workspace: hand it back now
+                // rather than retaining it until a `stop` that may never come.
+                self.release_workspace(name, workspace).await;
                 return Err(error);
             }
         };
+        // A live member owns its workspace until its shutdown or the team's stop.
+        self.retain_workspace(name, workspace).await;
 
         let member = if let Some(member) = self.inner.backend.member(name) {
             member
@@ -814,6 +892,10 @@ impl TeamAgent {
 
     /// Retires one member and returns the status its row settles on.
     ///
+    /// After the runtime is stopped and the child despawned, the member's retained workspace is
+    /// released through the injected provider (a release failure is logged, never propagated).
+    /// Idempotent: a second shutdown of the same member releases nothing.
+    ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for an unknown member, the member runtime's teardown error (logged, not
@@ -841,6 +923,7 @@ impl TeamAgent {
             debug!(team = self.team_name(), member = name, %error, "failed to reap a member child process");
         }
         let _ = self.inner.kv_cache.release(name).await;
+        self.release_member_workspace(name).await;
         self.inner
             .signals
             .member_stopped(name, member.role(), "shutdown");
@@ -1090,7 +1173,7 @@ pub(crate) mod test_support {
     //! `Idle` unless it is configured to hang (state stays `Running`, no output), which is what the
     //! settle and cancellation tests need. No model, socket or clock is involved.
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1376,11 +1459,16 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Workspace provider that hands out one distinct directory per member and records requests.
+    /// Workspace provider that hands out one distinct directory per member, recording every
+    /// allocation and release.
     #[derive(Default)]
     pub(crate) struct RecordingWorkspaceProvider {
         /// Allocation requests, in call order.
         requests: Mutex<Vec<WorkspaceRequest>>,
+        /// Workspaces handed to [`WorkspaceProvider::release`], in call order.
+        releases: Mutex<Vec<MemberWorkspace>>,
+        /// When set, every release fails (the teardown-logs-and-continues cases).
+        failing: AtomicBool,
     }
 
     impl RecordingWorkspaceProvider {
@@ -1392,6 +1480,25 @@ pub(crate) mod test_support {
         /// Returns the recorded requests.
         pub(crate) fn requests(&self) -> Vec<WorkspaceRequest> {
             self.requests.lock().clone()
+        }
+
+        /// Returns the released workspaces, in release order.
+        pub(crate) fn releases(&self) -> Vec<MemberWorkspace> {
+            self.releases.lock().clone()
+        }
+
+        /// Returns the member name of every released workspace, in release order.
+        pub(crate) fn released_names(&self) -> Vec<String> {
+            self.releases
+                .lock()
+                .iter()
+                .map(|workspace| workspace.member_name.clone())
+                .collect()
+        }
+
+        /// Makes every subsequent release fail with [`Error::config`].
+        pub(crate) fn fail_releases(&self) {
+            self.failing.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1412,7 +1519,14 @@ pub(crate) mod test_support {
             ))
         }
 
-        async fn release(&self, _workspace: &MemberWorkspace) -> Result<()> {
+        async fn release(&self, workspace: &MemberWorkspace) -> Result<()> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(Error::config(format!(
+                    "scripted release failure for '{}'",
+                    workspace.member_name
+                )));
+            }
+            self.releases.lock().push(workspace.clone());
             Ok(())
         }
     }
@@ -1701,6 +1815,119 @@ mod tests {
         assert_eq!(
             requests[0].session_id, requests[1].session_id,
             "both members run under the team session"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_releases_every_member_workspace_exactly_once() {
+        let (agent, _factory, workspace) = built(&two_teammates()).await;
+        agent.start().await.unwrap();
+        agent.auto_start_all().await.unwrap();
+        assert!(
+            workspace.releases().is_empty(),
+            "nothing is released while the team is live"
+        );
+
+        agent.stop().await.unwrap();
+
+        let mut released = workspace.released_names();
+        released.sort();
+        assert_eq!(
+            released,
+            ["boss", "dev-1", "dev-2"],
+            "the leader and every spawned member is released"
+        );
+
+        agent.stop().await.unwrap();
+        assert_eq!(
+            workspace.released_names().len(),
+            3,
+            "a second stop releases nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_member_releases_only_that_members_workspace() {
+        let (agent, _factory, workspace) = built(&two_teammates()).await;
+        agent.start().await.unwrap();
+        agent.auto_start_all().await.unwrap();
+
+        agent
+            .shutdown_member("dev-1", MemberLifetime::Shutdown, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace.released_names(),
+            ["dev-1"],
+            "only the retired member's workspace is handed back"
+        );
+
+        agent
+            .shutdown_member("dev-1", MemberLifetime::Shutdown, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace.released_names(),
+            ["dev-1"],
+            "a second shutdown of the same member releases nothing"
+        );
+
+        agent.stop().await.unwrap();
+        let mut released = workspace.released_names();
+        released.sort();
+        assert_eq!(
+            released,
+            ["boss", "dev-1", "dev-2"],
+            "stop releases the members that are still retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_is_logged_and_does_not_fail_teardown() {
+        let (agent, _factory, workspace) = built(&two_teammates()).await;
+        agent.start().await.unwrap();
+        agent.auto_start_all().await.unwrap();
+        workspace.fail_releases();
+
+        agent
+            .shutdown_member("dev-1", MemberLifetime::Shutdown, true)
+            .await
+            .expect("a release failure does not fail shutdown_member");
+        agent
+            .stop()
+            .await
+            .expect("a release failure does not fail stop");
+        assert!(workspace.releases().is_empty(), "every release failed");
+        assert_eq!(
+            agent.backend().member("boss").unwrap().status(),
+            MemberStatus::ShutDown,
+            "the leader row still settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_hands_its_workspace_back() {
+        let (agent, factory, workspace) = built(&two_teammates()).await;
+        agent.start().await.unwrap();
+        factory.failing_for("dev-1");
+
+        let error = agent.spawn_member("dev-1").await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(
+            workspace.released_names(),
+            ["dev-1"],
+            "the workspace of a member that never got a runtime is released at once"
+        );
+        agent.stop().await.unwrap();
+        assert_eq!(
+            workspace
+                .released_names()
+                .iter()
+                .filter(|name| name.as_str() == "dev-1")
+                .count(),
+            1,
+            "the failed member's workspace is released exactly once"
         );
     }
 

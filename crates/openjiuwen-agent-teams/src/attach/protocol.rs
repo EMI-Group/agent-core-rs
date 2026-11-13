@@ -76,7 +76,7 @@
 //! | `update_task`, `claim_task`, `complete_task` | `{"ok": bool, "reason": string|null}` |
 //! | `invoke_tool` | the tool's own result JSON |
 //! | `snapshot` | a `TeamSnapshot` |
-//! | `stop_team` | `{"stopped": true}` |
+//! | `stop_team` | `{"stopping": true}` |
 //!
 //! # Security
 //!

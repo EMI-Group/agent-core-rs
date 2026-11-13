@@ -10,10 +10,10 @@
 //! 2. `git worktree list` in the repository registers one entry per member, and the harness of
 //!    each member is created with exactly that worktree as its workspace root;
 //! 3. two members built from the same teammate blueprint still get distinct worktrees;
-//! 4. teardown releases the worktrees through the provider seam the runtime allocates from: the
-//!    member directories are gone, `git worktree list` no longer registers them and their
-//!    `worktree-*` branches are deleted (the runtime stops the members and hands cleanup to the
-//!    provider holder, so this suite releases what it recorded after `stop_team`);
+//! 4. teardown releases the worktrees through the product path: `stop_team` ends in
+//!    `TeamAgent::stop`, which hands every retained workspace back to the provider it allocated
+//!    from, so the member directories are gone, `git worktree list` no longer registers them and
+//!    their `worktree-*` branches are deleted without any manual release;
 //! 5. a team without the metadata key stays on plain local directories — no `.git` marker, no
 //!    repository entry, and a release that retains the directory (Python keeps shared
 //!    workspaces until the team is deleted).
@@ -450,7 +450,7 @@ async fn a_bare_worktree_string_isolates_the_leader_too() {
 }
 
 #[tokio::test]
-async fn releasing_the_member_worktrees_unregisters_them_from_git() {
+async fn stopping_the_team_releases_the_member_worktrees_and_unregisters_them() {
     let repo = TempRepo::init();
     let layout = TempDir::new().expect("a temporary layout directory");
     let provider = worktree_provider(layout.path(), repo.path());
@@ -468,35 +468,33 @@ async fn releasing_the_member_worktrees_unregisters_them_from_git() {
     );
     assert!(allocations.len() >= 3, "leader plus two teammates");
     let roots: Vec<PathBuf> = allocations.iter().map(|w| w.root.clone()).collect();
+    assert!(
+        provider.releases().is_empty(),
+        "the team holds its worktrees while it is live"
+    );
 
     timeout(BOUND, manager.stop_team(TEAM, SESSION))
         .await
         .expect("stopping the team did not finish within the bound")
         .expect("stopping the team failed");
 
-    // Teardown goes through the provider seam the runtime allocates from: releasing a worktree
-    // removes it with `git worktree remove` and deletes its branch.
-    for workspace in &allocations {
-        timeout(BOUND, provider.release(workspace))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "releasing {}'s worktree did not finish within the bound",
-                    workspace.member_name
-                )
-            })
-            .unwrap_or_else(|error| {
-                panic!(
-                    "releasing {}'s worktree failed: {error}",
-                    workspace.member_name
-                )
-            });
-    }
-
+    // Teardown is the product path: `TeamAgent::stop` hands every retained workspace back to the
+    // provider it allocated from, which removes the worktree and deletes its branch. Nothing here
+    // releases anything itself.
+    let mut released: Vec<String> = provider
+        .releases()
+        .iter()
+        .map(|workspace| workspace.member_name.clone())
+        .collect();
+    released.sort();
+    let mut allocated: Vec<String> = allocations
+        .iter()
+        .map(|workspace| workspace.member_name.clone())
+        .collect();
+    allocated.sort();
     assert_eq!(
-        provider.releases().len(),
-        allocations.len(),
-        "every worktree must be released exactly once"
+        released, allocated,
+        "the runtime releases every member worktree exactly once"
     );
     wait_until("every member worktree to be removed from disk", || {
         roots.iter().all(|root| !root.exists())

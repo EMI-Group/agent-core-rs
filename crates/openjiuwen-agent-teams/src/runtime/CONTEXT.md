@@ -282,6 +282,12 @@ Registration is register → env → release: the build registers the leader und
 identity through its session).
 The identity is `MemberCacheKey::new(team, session, member)`; a fork child is registered with `register_child(parent_key, child_key, model)` so it inherits the parent's cache lineage.
 
+### Workspace lifecycle
+`build_with` allocates the leader's workspace and `spawn_member` allocates one per teammate, both through `deps.workspace`.
+Every allocated `MemberWorkspace` is retained on the agent handle, keyed by member name (leader included), for the team's lifetime.
+`shutdown_member` releases that member's workspace after its runtime is stopped and its child despawned; `stop()` drains and releases every workspace still retained (leader plus members whose row is already shut down) before `team_finished`.
+A release failure is `warn!`-logged and never propagated, and both teardown paths are idempotent: each workspace is released exactly once.
+A failed spawn hands its freshly allocated workspace straight back instead of retaining it for a member that never got a runtime.
 ### Observability and monitor
 
 `TeamSignals` fans one event out to a `TeamObservability` built from the `ObservabilityHooks` in
@@ -335,7 +341,7 @@ config therefore just logs.
 7. `TeamMemberSpawner::with_parts(spec, deps, session_id, options, fork, router)`.
 8. Team row upsert, then the leader row (`TeamRole::Leader`), then the leader's effective spec through
    `routing.effective_spec_for(leader, ..)` (memoizes the leader's allocation).
-9. Workspace allocation (`WorkspaceRequest` with `isolation`), `factory.create(effective, context)` →
+9. Workspace allocation (`WorkspaceRequest` with `isolation`, retained keyed by the leader's name), `factory.create(effective, context)` →
    `HarnessMemberRuntime::new(harness, session_id)` → `TeamMember::attach_runtime`.
 10. `kv_cache.register_member(leader_key, model)` — the root allocation.
 11. `leader_member.observe(MemberStreamObserver::new(activity, weak leader, Leader, signals, chunk_sinks))`.
@@ -452,7 +458,8 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   member bookkeeping, task listing, snapshot ordering, `post_event` sender stamping, task signals.
 - `team_agent.rs`: build (leader card `<team>_<leader>`, missing `agents["leader"]` → validation), unknown
   member → `not_found`, spawn → `ready`, factory error → `unstarted`, shutdown per lifetime,
-  `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy.
+  `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy, and the
+  workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged).
 - `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
   `team.completed` marker last and the leader answer in `AgentOutput.output`; an open task keeps the stream
   open until the board settles; cancellation ends the run.
@@ -544,7 +551,7 @@ tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-de
   worktree backend needs a real `git` binary plus a repository.
 - `team_agent::test_support` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
-  (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`).
+  (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent.rs` is the sanctioned long file of this node (1083 production lines plus
   `test_support`/unit tests); `backend.rs` is 1040 lines. Both predate this node's split pass and stay
   cohesive; extract before adding another responsibility to either.
