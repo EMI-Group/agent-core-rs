@@ -4,8 +4,8 @@
 //! URL goes to the [`UrlLoader`], a local path goes to the loader registered for
 //! its extension, and the resulting documents carry the provenance metadata
 //! Python stamps in `AutoFileParser.parse` (`doc_id`, `title`, `file_path`,
-//! `file_ext`). Unsupported formats are rejected instead of returning an empty
-//! list.
+//! `file_ext`). Every format without a registered loader (for example `.xls` or
+//! `.zip`) is rejected instead of returning an empty list.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,10 +18,11 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::logging::{debug, warn};
 
 use crate::common::Document;
+use crate::multimodal::{ImageLoader, IMAGE_EXTENSIONS};
 
 use super::{
-    file_extension, file_stem, generate_document_id, is_url, CsvLoader, DocumentLoader, HtmlLoader,
-    JsonLoader, MarkdownLoader, TextLoader, UrlLoader,
+    file_extension, file_stem, generate_document_id, is_url, CsvLoader, DocumentLoader, DocxLoader,
+    HtmlLoader, JsonLoader, MarkdownLoader, PdfLoader, TextLoader, UrlLoader, XlsxLoader,
 };
 
 /// A lowercase extension map (`".txt"`) to loaders.
@@ -42,7 +43,8 @@ impl LoaderRegistry {
         }
     }
 
-    /// Creates a registry with the built-in text/Markdown/JSON/CSV/HTML loaders.
+    /// Creates a registry with the built-in text, Markdown, JSON, CSV/TSV, HTML,
+    /// DOCX, XLSX, PDF, and image loaders.
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
@@ -51,6 +53,10 @@ impl LoaderRegistry {
         registry.register(&[".json"], Arc::new(JsonLoader::new()));
         registry.register(&[".csv", ".tsv"], Arc::new(CsvLoader::new()));
         registry.register(&[".html", ".htm"], Arc::new(HtmlLoader::new()));
+        registry.register(&[".docx"], Arc::new(DocxLoader::new()));
+        registry.register(&[".xlsx"], Arc::new(XlsxLoader::new()));
+        registry.register(&[".pdf"], Arc::new(PdfLoader::new()));
+        registry.register(&IMAGE_EXTENSIONS, Arc::new(ImageLoader::new()));
         registry
     }
 
@@ -168,12 +174,12 @@ impl AutoLoader {
     /// file-stem title stamped on documents loaded from a file. URLs are returned
     /// untouched.
     ///
-    /// Single-document sources (text, Markdown, JSON, HTML) take `doc_id`
-    /// verbatim, while multi-document file loaders (CSV/TSV) use it as the id
-    /// base prefix — the generated ids are `"<source>_s0_r2"`/`"<source>_s0_c0"`,
-    /// and the leading `source` is replaced by `doc_id`, mirroring Python's
-    /// `base_id = doc_id or doc`. Every document therefore keeps a distinct id,
-    /// and `metadata["doc_id"]` always equals the final id.
+    /// Single-document sources (text, Markdown, JSON, HTML, DOCX, PDF, image)
+    /// take `doc_id` verbatim, while multi-document file loaders (CSV/TSV, XLSX)
+    /// use it as the id base prefix — the generated ids are `"<base>_s0_r2"`/
+    /// `"<base>_s0_c0"`, and the leading base is replaced by `doc_id`,
+    /// mirroring Python's `base_id = doc_id or doc`. Every document therefore
+    /// keeps a distinct id, and `metadata["doc_id"]` always equals the final id.
     ///
     /// # Errors
     ///
@@ -233,14 +239,26 @@ impl AutoLoader {
 
 /// Applies the caller-supplied `doc_id` to one document id.
 ///
-/// Multi-document file loaders (CSV/TSV) generate ids prefixed with the `source`
-/// string, so `doc_id` becomes the base prefix (`format!("{doc_id}{rest}")`).
-/// Every other loader's id is replaced verbatim.
+/// Multi-document file loaders generate ids prefixed with a base string: `CSV`/`TSV`
+/// use the whole `source` path, `XLSX` uses the file stem. Either prefix is
+/// replaced by `doc_id` (`format!("{doc_id}{rest}")`), so every generated id stays
+/// distinct. Every other loader's id is replaced verbatim.
 fn apply_doc_id(source: &str, doc_id: &str, id: &mut String) {
-    match id.strip_prefix(source) {
-        Some(rest) => *id = format!("{doc_id}{rest}"),
-        None => doc_id.clone_into(id),
+    let stem = file_stem(source);
+    for base in [source, stem.as_str()] {
+        if base.is_empty() {
+            continue;
+        }
+        if let Some(rest) = id.strip_prefix(base) {
+            // Only a multi-document suffix (`_s{sheet}_r{row}` / `_s{sheet}_c{col}`)
+            // makes the prefix a base id; a single-document id is replaced whole.
+            if rest.starts_with("_s") {
+                *id = format!("{doc_id}{rest}");
+                return;
+            }
+        }
     }
+    doc_id.clone_into(id);
 }
 
 impl Default for AutoLoader {
@@ -318,18 +336,31 @@ mod tests {
             registry.extensions(),
             vec![
                 ".csv",
+                ".docx",
+                ".gif",
                 ".htm",
                 ".html",
+                ".jfif",
+                ".jpeg",
+                ".jpg",
                 ".json",
                 ".markdown",
                 ".md",
+                ".pdf",
+                ".png",
                 ".tsv",
                 ".txt",
+                ".webp",
+                ".xlsx",
             ]
         );
         assert_eq!(LoaderRegistry::new().extensions(), Vec::<String>::new());
         assert!(registry.get_for_path("data.TXT").is_some());
-        assert!(registry.get_for_path("data.pdf").is_none());
+        assert!(registry.get_for_path("data.pdf").is_some());
+        assert!(registry.get_for_path("data.docx").is_some());
+        assert!(registry.get_for_path("data.xlsx").is_some());
+        assert!(registry.get_for_path("data.PNG").is_some());
+        assert!(registry.get_for_path("data.xls").is_none());
     }
 
     #[test]
@@ -349,7 +380,11 @@ mod tests {
             "https://example.com/page"
         ));
         assert!(DocumentLoader::supports(&loader, "notes.md"));
-        assert!(!DocumentLoader::supports(&loader, "notes.pdf"));
+        assert!(DocumentLoader::supports(&loader, "notes.pdf"));
+        assert!(DocumentLoader::supports(&loader, "notes.docx"));
+        assert!(DocumentLoader::supports(&loader, "notes.xlsx"));
+        assert!(DocumentLoader::supports(&loader, "photo.png"));
+        assert!(!DocumentLoader::supports(&loader, "notes.xls"));
         // `supports` is purely extension-based (it cannot await a file check).
         assert!(DocumentLoader::supports(&loader, "missing-file.txt"));
     }
@@ -445,14 +480,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
 
-        let pdf = dir.path().join("paper.pdf");
-        std::fs::write(&pdf, "not really a pdf").unwrap();
+        let unknown = dir.path().join("archive.xyz");
+        std::fs::write(&unknown, "unknown bytes").unwrap();
         let error = AutoLoader::new()
-            .load(pdf.to_str().unwrap())
+            .load(unknown.to_str().unwrap())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(error.to_string().contains("Unsupported format: .pdf"));
+        assert!(error.to_string().contains("Unsupported format: .xyz"));
     }
 
     #[tokio::test]

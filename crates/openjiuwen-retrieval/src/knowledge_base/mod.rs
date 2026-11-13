@@ -3,14 +3,24 @@
 //! Port of the Python `openjiuwen/core/retrieval/simple_knowledge_base.py`
 //! `SimpleKnowledgeBase`. Python wires this class to an `IndexManager`, a
 //! `Retriever`, and a separate graph index; the Rust port keeps the same
-//! composition story with one [`VectorStore`] as the only index and performs the
-//! search inline, so every stage is visible on a single struct.
+//! composition story with one [`VectorStore`] as the canonical index and
+//! performs the search inline, so every stage is visible on a single struct.
+//!
+//! Retrieval dispatches on [`KnowledgeBaseConfig::index_type`]:
+//! `vector` uses the dense channel, `bm25` uses the BM25 channel once a sparse
+//! index is enabled, and `hybrid` fuses both channels with reciprocal rank
+//! fusion. Optional layers wrap the channel: a [`crate::retriever::GraphRetriever`]
+//! when a [`crate::graph::GraphStore`] is attached, and a
+//! [`crate::retriever::AgenticRetriever`] when `RetrievalConfig::agentic` is set.
+//! See the private `retrieve` submodule for the dispatch itself.
 //!
 //! The knowledge base owns its collaborators as trait objects, which keeps the
 //! pipeline testable offline (see [`crate::embedding::HashEmbedding`] and
 //! [`crate::vector_store::InMemoryVectorStore`]).
 mod multi;
+mod retrieve;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use indexmap::IndexSet;
@@ -23,16 +33,30 @@ use openjiuwen_common::logging::warn;
 
 use crate::chunking::{CharChunker, Chunker};
 use crate::common::{
-    Document, KnowledgeBaseConfig, MetadataFilter, RetrievalConfig, RetrievalResult,
+    Document, KnowledgeBaseConfig, MetadataFilter, RetrievalConfig, RetrievalResult, TextChunk,
+    INDEX_TYPE_BM25,
 };
 use crate::embedding::Embedding;
+use crate::graph::{GraphStore, RuleTripleExtractor};
 use crate::loaders::{is_url, AutoLoader, DocumentLoader};
 use crate::reranker::Reranker;
-use crate::vector_store::{VectorQuery, VectorRecord, VectorStore, DOC_ID_FIELD};
+use crate::retriever::agentic::DEFAULT_MAX_ITER;
+use crate::retriever::graph::DEFAULT_MAX_HOPS;
+use crate::rewrite::QueryRewriter;
+use crate::sparse::Bm25Index;
+use crate::vector_store::{VectorRecord, VectorStore, DOC_ID_FIELD};
 
 pub use multi::{retrieve_multi_kb, retrieve_multi_kb_with_source};
 
+/// Default iteration budget of the agentic retrieval loop ([`DEFAULT_MAX_ITER`]).
+pub const DEFAULT_AGENTIC_ITERATIONS: usize = DEFAULT_MAX_ITER;
+/// Default number of graph hops explored per entity ([`DEFAULT_MAX_HOPS`]).
+pub const DEFAULT_GRAPH_HOPS: usize = DEFAULT_MAX_HOPS;
+
 /// Statistics describing a [`SimpleKnowledgeBase`].
+// A statistics snapshot is a flat record of independent flags by design; the
+// Python dictionary it ports has the same shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeBaseStatistics {
     /// Knowledge base identifier (`KnowledgeBaseConfig::kb_id`).
@@ -47,6 +71,18 @@ pub struct KnowledgeBaseStatistics {
     pub has_reranker: bool,
     /// Whether a document loader is attached (always `true`; the default is [`AutoLoader`]).
     pub has_loader: bool,
+    /// Number of chunks in the BM25 sparse index (`0` when the index is disabled).
+    #[serde(default)]
+    pub sparse_index_size: usize,
+    /// Whether a graph store is attached for triple indexing and expansion.
+    #[serde(default)]
+    pub has_graph: bool,
+    /// Whether a query rewriter was injected (the default heuristic one is not counted).
+    #[serde(default)]
+    pub has_rewriter: bool,
+    /// Whether agentic retrieval is the default for this knowledge base.
+    #[serde(default)]
+    pub agentic_enabled: bool,
 }
 
 /// A single-collection knowledge base composed of a chunker, an embedder, a
@@ -70,6 +106,18 @@ pub struct SimpleKnowledgeBase {
     reranker: Option<Arc<dyn Reranker>>,
     /// Ids of the documents added through this instance, in insertion order.
     document_ids: RwLock<IndexSet<String>>,
+    /// Optional BM25 lexical index, kept in step with the vector store.
+    sparse: Option<Arc<RwLock<Bm25Index>>>,
+    /// Optional injected rewriter for the agentic path.
+    rewriter: Option<Arc<dyn QueryRewriter>>,
+    /// Whether agentic retrieval runs by default for this knowledge base.
+    agentic: bool,
+    /// Iteration budget of the agentic loop.
+    agentic_iterations: usize,
+    /// Optional triple store for indexing and graph-expanded retrieval.
+    graph_store: Option<Arc<dyn GraphStore>>,
+    /// Hop count used when expanding graph entities.
+    graph_hops: usize,
 }
 
 impl SimpleKnowledgeBase {
@@ -77,13 +125,18 @@ impl SimpleKnowledgeBase {
     ///
     /// The loader defaults to [`AutoLoader`] and no reranker is attached; use
     /// [`SimpleKnowledgeBase::with_loader`] and
-    /// [`SimpleKnowledgeBase::with_reranker`] to override them.
+    /// [`SimpleKnowledgeBase::with_reranker`] to override them. The BM25 sparse
+    /// index starts enabled exactly when `config.index_type` is
+    /// [`INDEX_TYPE_BM25`]; the other index types
+    /// start dense-only and opt in through
+    /// [`SimpleKnowledgeBase::with_sparse_index`].
     pub fn new(
         config: KnowledgeBaseConfig,
         store: Arc<dyn VectorStore>,
         embedder: Arc<dyn Embedding>,
         chunker: Arc<dyn Chunker>,
     ) -> Self {
+        let sparse = initial_sparse_index(&config.index_type);
         Self {
             config,
             store,
@@ -92,6 +145,12 @@ impl SimpleKnowledgeBase {
             loader: Arc::new(AutoLoader::new()),
             reranker: None,
             document_ids: RwLock::new(IndexSet::new()),
+            sparse,
+            rewriter: None,
+            agentic: false,
+            agentic_iterations: DEFAULT_AGENTIC_ITERATIONS,
+            graph_store: None,
+            graph_hops: DEFAULT_GRAPH_HOPS,
         }
     }
 
@@ -125,6 +184,92 @@ impl SimpleKnowledgeBase {
         self
     }
 
+    /// Enables or disables the BM25 sparse index.
+    ///
+    /// The index starts enabled for the `bm25` index type and disabled for
+    /// `vector`/`hybrid`. Enabling it later only indexes chunks added afterwards:
+    /// the builder is synchronous, so it cannot backfill the vector store.
+    #[must_use]
+    pub fn with_sparse_index(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.sparse.get_or_insert_with(new_sparse_index);
+        } else {
+            self.sparse = None;
+        }
+        self
+    }
+
+    /// Whether a BM25 sparse index is attached (it may still be empty).
+    #[must_use]
+    pub fn has_sparse_index(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// Number of chunks in the BM25 sparse index (`0` when it is disabled).
+    #[must_use]
+    pub fn sparse_index_len(&self) -> usize {
+        self.sparse.as_ref().map_or(0, |index| index.read().len())
+    }
+
+    /// Injects the rewriter used by the agentic retrieval path.
+    ///
+    /// Without one, agentic retrieval builds a
+    /// [`crate::rewrite::HeuristicQueryRewriter`] whose keyword ranking uses the
+    /// document frequency of the knowledge base's own chunk vocabulary.
+    #[must_use]
+    pub fn with_rewriter(mut self, rewriter: Arc<dyn QueryRewriter>) -> Self {
+        self.rewriter = Some(rewriter);
+        self
+    }
+
+    /// Makes agentic retrieval the default for this knowledge base.
+    ///
+    /// A per-call [`RetrievalConfig::agentic`] still enables it for a single query.
+    #[must_use]
+    pub fn with_agentic(mut self, enabled: bool) -> Self {
+        self.agentic = enabled;
+        self
+    }
+
+    /// Sets the agentic iteration budget (default [`DEFAULT_AGENTIC_ITERATIONS`]).
+    ///
+    /// `0` is rejected at retrieval time with [`Error::Validation`], matching
+    /// Python's `max_iter` validation.
+    #[must_use]
+    pub fn with_agentic_iterations(mut self, iterations: usize) -> Self {
+        self.agentic_iterations = iterations;
+        self
+    }
+
+    /// The agentic iteration budget in force.
+    #[must_use]
+    pub fn agentic_iterations(&self) -> usize {
+        self.agentic_iterations
+    }
+
+    /// Attaches a triple store for graph indexing and graph-expanded retrieval.
+    ///
+    /// Triples are extracted from every added chunk while a store is attached, so
+    /// a per-query [`RetrievalConfig::graph_expansion`] always finds them.
+    #[must_use]
+    pub fn with_graph_store(mut self, graph_store: Arc<dyn GraphStore>) -> Self {
+        self.graph_store = Some(graph_store);
+        self
+    }
+
+    /// Sets the graph hop count (default [`DEFAULT_GRAPH_HOPS`]).
+    #[must_use]
+    pub fn with_graph_hops(mut self, hops: usize) -> Self {
+        self.graph_hops = hops;
+        self
+    }
+
+    /// The attached triple store, when one is configured.
+    #[must_use]
+    pub fn graph_store(&self) -> Option<&Arc<dyn GraphStore>> {
+        self.graph_store.as_ref()
+    }
+
     /// Returns the configured knowledge base id.
     pub fn id(&self) -> &str {
         &self.config.kb_id
@@ -139,7 +284,9 @@ impl SimpleKnowledgeBase {
     ///
     /// Documents with a blank id receive a fresh `uuid4`. A document that
     /// produces no chunks is still recorded as known, so statistics stay
-    /// accurate, but it contributes nothing to the store.
+    /// accurate, but it contributes nothing to the store. Every stored chunk is
+    /// also added to the BM25 sparse index, and mined for triples when a graph
+    /// store is attached.
     ///
     /// # Errors
     ///
@@ -198,6 +345,7 @@ impl SimpleKnowledgeBase {
             .await
             .map_err(|error| error.with_context("upserting chunks"))?;
 
+        self.index_chunks(&chunks).await?;
         self.remember_documents(&document_ids);
         Ok(document_ids)
     }
@@ -218,6 +366,10 @@ impl SimpleKnowledgeBase {
 
     /// Deletes every chunk whose `doc_id` is in `doc_ids`.
     ///
+    /// The BM25 sparse index drops the deleted chunks with them. Graph triples
+    /// are **not** purged: triples have no document ownership beyond the chunk
+    /// metadata they carry, and stale triples only widen a later expansion.
+    ///
     /// # Errors
     ///
     /// Propagates vector-store failures.
@@ -225,8 +377,11 @@ impl SimpleKnowledgeBase {
         if doc_ids.is_empty() {
             return Ok(0);
         }
+        // Resolve the chunk ids before the delete, while the store still has them.
+        let chunk_ids = self.chunk_ids_of(doc_ids).await?;
         let filter = MetadataFilter::in_values(DOC_ID_FIELD, doc_ids.iter().cloned());
         let removed = self.store.delete_by_filter(&filter).await?;
+        self.drop_indexed_chunks(&chunk_ids);
         self.forget_documents(doc_ids);
         Ok(removed)
     }
@@ -268,67 +423,22 @@ impl SimpleKnowledgeBase {
 
     /// Retrieves documents relevant to `query`, honoring `config`.
     ///
-    /// The store applies `filters` and the inclusive `score_threshold`; the
-    /// optional reranker then reorders (and usually truncates) the hits. Results
-    /// are always truncated to `config.top_k`.
+    /// The configured channel applies `filters` and the inclusive
+    /// `score_threshold`, the optional graph layer expands entities, the optional
+    /// agentic layer rewrites and re-retrieves, and the optional reranker then
+    /// reorders the hits. Results are always truncated to `config.top_k`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] for a blank `query` or `config.top_k == 0`,
-    /// and the embedder/store/reranker errors with the stage contexts
-    /// `"embedding query"`, `"searching vector store"`, and `"reranking results"`.
+    /// and propagates the retriever/store/embedder/reranker failures with stage
+    /// contexts. See the private `retrieve` submodule for the dispatch details.
     pub async fn retrieve_with_config(
         &self,
         query: &str,
         config: &RetrievalConfig,
     ) -> Result<Vec<RetrievalResult>> {
-        if query.trim().is_empty() {
-            return Err(Error::validation("retrieval query must not be empty"));
-        }
-        if config.top_k == 0 {
-            return Err(Error::validation("retrieval top_k must be greater than 0"));
-        }
-
-        let vector = self
-            .embedder
-            .embed_query(query)
-            .await
-            .map_err(|error| error.with_context("embedding query"))?;
-        let vector_query = VectorQuery {
-            vector,
-            top_k: config.top_k,
-            filter: config.filters.clone(),
-            score_threshold: config.score_threshold,
-        };
-        let mut hits = self
-            .store
-            .search(vector_query)
-            .await
-            .map_err(|error| error.with_context("searching vector store"))?;
-
-        if let Some(reranker) = &self.reranker {
-            hits = reranker
-                .rerank(query, hits, Some(config.top_k))
-                .await
-                .map_err(|error| error.with_context("reranking results"))?;
-        }
-
-        let mut results: Vec<RetrievalResult> = hits
-            .into_iter()
-            .map(|hit| RetrievalResult {
-                doc_id: hit
-                    .metadata
-                    .get(DOC_ID_FIELD)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                text: hit.text,
-                score: hit.score,
-                metadata: hit.metadata,
-                chunk_id: Some(hit.id),
-            })
-            .collect();
-        results.truncate(config.top_k);
-        Ok(results)
+        retrieve::retrieve_with_config(self, query, config).await
     }
 
     /// Loads documents from file paths, skipping sources that fail to load.
@@ -406,7 +516,60 @@ impl SimpleKnowledgeBase {
             document_count: self.document_ids.read().len(),
             has_reranker: self.reranker.is_some(),
             has_loader: true,
+            sparse_index_size: self.sparse_index_len(),
+            has_graph: self.graph_store.is_some(),
+            has_rewriter: self.rewriter.is_some(),
+            agentic_enabled: self.agentic,
         })
+    }
+
+    /// Indexes freshly stored chunks in the BM25 index and the triple store.
+    ///
+    /// Graph extraction is unconditional for a configured store (not gated on
+    /// `KnowledgeBaseConfig::use_graph`) so a later per-query
+    /// [`RetrievalConfig::graph_expansion`] always finds triples.
+    async fn index_chunks(&self, chunks: &[TextChunk]) -> Result<()> {
+        if let Some(index) = &self.sparse {
+            index.write().add_chunks(chunks);
+        }
+        if let Some(graph_store) = &self.graph_store {
+            let triples = RuleTripleExtractor::new().extract_chunks(chunks);
+            if !triples.is_empty() {
+                graph_store
+                    .add_triples(triples)
+                    .await
+                    .map_err(|error| error.with_context("indexing graph triples"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The ids of the stored chunks belonging to `doc_ids`.
+    ///
+    /// Only needed when the BM25 index must mirror a delete, so a knowledge base
+    /// without a sparse index never lists the store.
+    async fn chunk_ids_of(&self, doc_ids: &[String]) -> Result<Vec<String>> {
+        if self.sparse.is_none() {
+            return Ok(Vec::new());
+        }
+        let requested: BTreeSet<&str> = doc_ids.iter().map(String::as_str).collect();
+        let records = self.store.list(None).await?;
+        Ok(records
+            .into_iter()
+            .filter(|record| record_doc_id(record).is_some_and(|doc_id| requested.contains(doc_id)))
+            .map(|record| record.id)
+            .collect())
+    }
+
+    /// Removes `chunk_ids` from the BM25 index; a no-op when it is disabled.
+    fn drop_indexed_chunks(&self, chunk_ids: &[String]) {
+        let Some(index) = &self.sparse else {
+            return;
+        };
+        let mut index = index.write();
+        for id in chunk_ids {
+            index.remove(id);
+        }
     }
 
     /// Records `ids` as known documents; the lock is never held across an await.
@@ -424,6 +587,26 @@ impl SimpleKnowledgeBase {
             tracked.shift_remove(id);
         }
     }
+}
+
+/// The document a stored record belongs to, from its field or its metadata.
+fn record_doc_id(record: &VectorRecord) -> Option<&str> {
+    record.doc_id.as_deref().or_else(|| {
+        record
+            .metadata
+            .get(DOC_ID_FIELD)
+            .and_then(serde_json::Value::as_str)
+    })
+}
+
+/// The initial sparse index: enabled exactly for the `bm25` index type.
+fn initial_sparse_index(index_type: &str) -> Option<Arc<RwLock<Bm25Index>>> {
+    (index_type == INDEX_TYPE_BM25).then(new_sparse_index)
+}
+
+/// A fresh, empty BM25 index with the default scoring parameters.
+fn new_sparse_index() -> Arc<RwLock<Bm25Index>> {
+    Arc::new(RwLock::new(Bm25Index::default()))
 }
 
 /// Fills blank document ids with fresh `uuid4` values, matching Python's
