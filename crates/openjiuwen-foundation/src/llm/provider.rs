@@ -32,6 +32,9 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// Path of the Anthropic Messages endpoint.
 const MESSAGES_PATH: &str = "/v1/messages";
 
+/// Path of the `OpenAI` Responses endpoint.
+pub(crate) const RESPONSES_PATH: &str = "/responses";
+
 /// Wire protocol spoken by a built-in provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +43,8 @@ pub enum ProviderFlavor {
     OpenAiCompatible,
     /// Anthropic Messages API, `POST {base}/v1/messages`.
     Anthropic,
+    /// `OpenAI` Responses API, `POST {base}/responses`.
+    OpenAiResponses,
 }
 
 /// Static description of one built-in provider.
@@ -149,6 +154,13 @@ const PROFILES: &[ProviderProfile] = &[
         chat_path: CHAT_COMPLETIONS_PATH,
         extra_headers: &[],
     },
+    ProviderProfile {
+        name: "openai_account",
+        flavor: ProviderFlavor::OpenAiResponses,
+        default_api_base: Some("https://chatgpt.com/backend-api/codex"),
+        chat_path: RESPONSES_PATH,
+        extra_headers: &[],
+    },
 ];
 
 /// Canonical provider names, in the same order as the profile table.
@@ -165,6 +177,7 @@ const PROVIDER_NAMES: &[&str] = &[
     "lmstudio",
     "anthropic",
     "pangu",
+    "openai_account",
 ];
 
 /// Vendor aliases mapped to a canonical provider name.
@@ -184,6 +197,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("zhipuai", "zhipu"),
     ("silicon", "siliconflow"),
     ("siliconcloud", "siliconflow"),
+    ("openaiaccount", "openai_account"),
 ];
 
 /// Canonical names of every built-in provider, in profile-table order.
@@ -239,7 +253,7 @@ mod tests {
     fn canonical_names_match_the_profile_table() {
         let names: Vec<&str> = PROFILES.iter().map(|profile| profile.name).collect();
         assert_eq!(provider_names(), names.as_slice());
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
     }
 
     #[test]
@@ -308,6 +322,11 @@ mod tests {
                 "anthropic",
                 "https://api.anthropic.com",
                 ProviderFlavor::Anthropic,
+            ),
+            (
+                "openai_account",
+                "https://chatgpt.com/backend-api/codex",
+                ProviderFlavor::OpenAiResponses,
             ),
         ];
         for (name, base, flavor) in expected {
@@ -411,6 +430,30 @@ mod tests {
             provider_profile("kimi").map(|profile| profile.name),
             Some("moonshot")
         );
+    }
+
+    #[test]
+    fn openai_account_uses_the_responses_path() {
+        let profile = provider_profile("openai_account").expect("openai_account resolves");
+        assert_eq!(profile.flavor, ProviderFlavor::OpenAiResponses);
+        assert_eq!(profile.chat_path, "/responses");
+        assert_eq!(
+            profile.default_api_base,
+            Some("https://chatgpt.com/backend-api/codex")
+        );
+
+        for spelling in [
+            "OpenAIAccount",
+            "openai-account",
+            "openai_account",
+            "Open AI Account",
+        ] {
+            assert_eq!(
+                normalize_provider_name(spelling),
+                "openai_account",
+                "normalizing {spelling}"
+            );
+        }
     }
 
     #[test]

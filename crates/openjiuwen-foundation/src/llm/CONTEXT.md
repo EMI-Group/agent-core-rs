@@ -2,18 +2,23 @@
 
 ## Intent
 
-Provider-neutral model invocation: the `Model` trait, the two transports (OpenAI-compatible chat completions, Anthropic Messages), the serializable configs, and the provider registry/factory.
+Provider-neutral model invocation: the `Model` trait, the three transports (OpenAI-compatible chat completions, OpenAI Responses, Anthropic Messages), the serializable configs, and the provider registry/factory.
 Ports `openjiuwen/core/foundation/llm/` (`model.py`, `schema/config.py`, `model_clients/*`).
-Four side surfaces sit beside the chat clients: `reasoning/` (provider/model thinking profiles and wire encoders), `routing/` (IntelliRouter model groups, route compilation, ordered failover), `oauth/` (`OpenAI` account device authorization and token storage), and `dashscope/` (`DashScope` image, speech and video generation over HTTP).
+Four side surfaces sit beside the transports: `reasoning/` (provider/model thinking profiles and wire encoders), `routing/` (IntelliRouter model groups, route compilation, ordered failover), `oauth/` (`OpenAI` account device authorization and token storage), and `dashscope/` (`DashScope` image, speech and video generation over HTTP).
 They are independent of each other; `reasoning` is the only one the request builders call, and `routing` is the only one that builds models.
 
 ## API Surface
 
 `config`:
-- `ModelClientConfig { client_id, provider, api_key: Option<SecretString>, api_base: Option<String>, verify_ssl: bool /* true */, timeout: Option<Duration> /* 360s */, stream_first_chunk_timeout: Option<Duration> /* 300s */, stream_idle_timeout: Option<Duration> /* 60s */, max_retries: u32 /* 0 */, headers: BTreeMap<String,String>, extra: Value }`
-  Builders `new(provider)`, `with_api_key`, `with_api_base`, `with_timeout`, `with_max_retries`, `with_header`, `with_verify_ssl`, `from_env()`; `resolve_for(provider)` applies env fallbacks and provider defaults; `sanitized_headers()` drops protected names (`host`, `content-length`, `transfer-encoding`, `connection`, `authorization`) and returns the rest.
-  serde aliases: `client_provider` → `provider`.
+- `ModelClientConfig { client_id, provider, api_key: Option<SecretString>, api_base: Option<String>, verify_ssl: bool /* true */, timeout: Option<Duration> /* 360s */, stream_first_chunk_timeout: Option<Duration> /* 300s */, stream_idle_timeout: Option<Duration> /* 60s */, max_retries: u32 /* 0 */, headers: BTreeMap<String,String>, api_mode: Option<ApiMode>, auth_mode: AuthMode /* ApiKey */, endpoint_profile: Option<String>, extra: Value }`
+  Builders `new(provider)`, `with_api_key`, `with_api_base`, `with_timeout`, `with_max_retries`, `with_header`, `with_verify_ssl`, `with_api_mode`, `with_auth_mode`, `with_endpoint_profile`, `from_env()`; `resolve_for(provider)` applies env fallbacks and provider defaults; `sanitized_headers()` drops protected names (`host`, `content-length`, `transfer-encoding`, `connection`, `authorization`) and returns the rest.
+  serde aliases: `client_provider` → `provider`, `custom_headers` → `headers`; `ApiMode` (`chat_completions`/`responses`/`anthropic_messages`) and `AuthMode` (`api_key`/`none`/`custom_headers`/`openai_account_oauth`) use the Python wire spellings.
+  Only `AuthMode::ApiKey` requires a credential; the other modes authenticate through caller headers, an account token, or not at all.
 - `ModelRequestConfig { model_name, temperature, top_p, max_tokens, stop: Vec<String>, tools: Option<Value>, tool_choice: Option<Value>, stream: bool, extra: Value }` with builders (`with_temperature`, `with_max_tokens`, `with_tools(Vec<Value>)`, `with_tool_choice`, `with_stop`, `with_stream`, `with_extra`) and `from_env()`; serde alias `model` → `model_name`.
+
+`responses`:
+- `OpenAiResponsesClient` (`new`, `with_http_client`, `client_config`, `request_config`, `base_url`, `chat_path`, `impl Model`), `build_responses_body`, `convert_messages`, `convert_tools`, `normalize_api_base`, `parse_responses_response`, `parse_responses_usage`, `ResponsesStreamState`.
+  `invoke` forces `stream: true` and aggregates the SSE events, because the account endpoint only answers event streams.
 
 `model`:
 - `Model` trait: `provider()`, `model_name()`, `invoke(&[BaseMessage], &ModelRequestConfig)`, `stream(Vec<BaseMessage>, ModelRequestConfig) -> BoxStream<'static, Result<StreamChunk>>`.
@@ -24,7 +29,9 @@ They are independent of each other; `reasoning` is the only one the request buil
 - `ChatResponse` exposes `message()` (first choice) and `finish_reason()`; `FinishReason` has string serde (`"stop"`, `"length"`, `"tool_calls"`, `"content_filter"`, unknown values in `Other`).
 
 `provider` / `registry` / `factory`:
-- `ProviderProfile { name, flavor: ProviderFlavor (OpenAiCompatible | Anthropic), default_api_base: Option<&'static str>, chat_path: &'static str, extra_headers: &'static [(&'static str, &'static str)] }`, `provider_profile(name)`, `normalize_provider_name(name)`, `ANTHROPIC_VERSION`.
+- `ProviderProfile { name, flavor: ProviderFlavor (OpenAiCompatible | OpenAiResponses | Anthropic), default_api_base: Option<&'static str>, chat_path: &'static str, extra_headers: &'static [(&'static str, &'static str)] }`, `provider_profile(name)`, `normalize_provider_name(name)` (folds `OpenAIAccount`/`openai-account`/`openai_account` to `openai_account`), `ANTHROPIC_VERSION`.
+  The `openai_account` profile defaults to `https://chatgpt.com/backend-api/codex` with chat path `/responses`.
+  A built-in `openai` provider builds a Responses client when `client.api_mode == Some(ApiMode::Responses)` and a chat-completions client otherwise; `openai_account` always builds Responses.
 - `ModelProvider` trait: `name()`, `aliases()`, `default_api_base()`, `create(&ModelClientConfig, &ModelRequestConfig) -> Result<Arc<dyn Model>>`.
 - `ModelProviderRegistry` (`new`, `register`, `get`, `resolve`, `names`, `global`), `register_model_provider`, `register_builtin_providers`.
 - `init_model(ModelClientConfig, ModelRequestConfig) -> Result<Arc<dyn Model>>`, `init_model_with(provider, model_name) -> Result<Arc<dyn Model>>`.
@@ -70,7 +77,9 @@ They are independent of each other; `reasoning` is the only one the request buil
 - **Environment fallbacks** (Python has none in this package, `docs/ARCHITECTURE.md` §4 requires them) come from `openjiuwen_common::config::env`: `MODEL_PROVIDER` (default `openai`), `OPENJIUWEN_API_KEY` → `API_KEY` → `OPENAI_API_KEY`, `API_BASE` → `OPENAI_BASE_URL` → provider default, `MODEL_NAME`. Explicit config always wins; the key precedence is the common helper's, not llm-specific.
 - **Provider table is data, not code**: `openai` `https://api.openai.com/v1`, `qwen`/`dashscope` `https://dashscope.aliyuncs.com/compatible-mode/v1`, `deepseek` `https://api.deepseek.com/v1`, `moonshot` `https://api.moonshot.cn/v1`, `openrouter` `https://openrouter.ai/api/v1`, `siliconflow` `https://api.siliconflow.cn/v1`, `zhipu` `https://open.bigmodel.cn/api/paas/v4`, `minimax` `https://api.minimax.chat/v1`, `ollama` `http://localhost:11434/v1`, `lmstudio` `http://localhost:1234/v1`, `anthropic` `https://api.anthropic.com`.
   `pangu` is OpenAI-compatible but has **no** built-in base URL (air-gapped deployments), so it requires `api_base` and fails with `Error::Config` otherwise.
+  `openai_account` is the one Responses-flavored entry (`https://chatgpt.com/backend-api/codex`, path `/responses`).
   No default model names are invented; `MODEL_NAME` or an explicit `model_name` is required.
+- **The wire protocol is selected by data, not by the caller's class**: `ApiMode::Responses` on an `openai` provider flips the built-in factory to `OpenAiResponsesClient`, and `openai_account` always uses it; every other provider keeps its declared transport. `AuthMode` is recorded and only relaxes the credential requirement, so an account deployment can authenticate through caller headers instead of `api_key`.
 - **`Model::stream` takes ownership** of messages/request so the returned stream is `'static`; `invoke` borrows. `BoxStream<'static, Result<StreamChunk>>` is built with `async_stream::try_stream!`.
 - **Retries** are delegated to `HttpClient` (`RetryPolicy`, exponential backoff, retryable statuses); clients therefore set the retry budget from `max_retries` and do not implement their own loop. Streams retry only up to the connect boundary.
 - **Timeouts**: per-request `timeout` on the HTTP request; streaming applies `stream_first_chunk_timeout` and `stream_idle_timeout` with `tokio::time::timeout`, yielding `Error::Timeout` (Python uses the same two budgets).
@@ -118,9 +127,9 @@ They are independent of each other; `reasoning` is the only one the request buil
 Every item below is public unless marked `pub(crate)`; these are the names and shapes the module exposes and consumers compile against.
 
 `config.rs`:
-- `pub struct ModelClientConfig { pub client_id: String, pub provider: String, pub api_key: Option<SecretString>, pub api_base: Option<String>, pub verify_ssl: bool, pub timeout: Option<Duration>, pub stream_first_chunk_timeout: Option<Duration>, pub stream_idle_timeout: Option<Duration>, pub max_retries: u32, pub headers: BTreeMap<String, String>, pub extra: Value }`.
+- `pub struct ModelClientConfig { pub client_id: String, pub provider: String, pub api_key: Option<SecretString>, pub api_base: Option<String>, pub verify_ssl: bool, pub timeout: Option<Duration>, pub stream_first_chunk_timeout: Option<Duration>, pub stream_idle_timeout: Option<Duration>, pub max_retries: u32, pub headers: BTreeMap<String, String>, pub api_mode: Option<ApiMode>, pub auth_mode: AuthMode, pub endpoint_profile: Option<String>, pub extra: Value }`.
   `Default` generates a UUID v4 `client_id` (as Python's `default_factory`), sets `verify_ssl: true`, `timeout`/first-chunk/idle to 360/300/60 s and `max_retries: 0`.
-- Builders: `new(impl Into<String>)`, `with_client_id`, `with_api_key(impl Into<String>)`, `with_secret(SecretString)`, `with_api_base`, `with_timeout(Duration)`, `with_stream_timeouts(Option<Duration>, Option<Duration>)`, `with_max_retries(u32)`, `with_header`, `with_headers`, `with_verify_ssl(bool)`, `with_extra(Value)`.
+- Builders: `new(impl Into<String>)`, `with_client_id`, `with_api_key(impl Into<String>)`, `with_secret(SecretString)`, `with_api_base`, `with_timeout(Duration)`, `with_stream_timeouts(Option<Duration>, Option<Duration>)`, `with_max_retries(u32)`, `with_header`, `with_headers`, `with_verify_ssl(bool)`, `with_api_mode(ApiMode)`, `with_auth_mode(AuthMode)`, `with_endpoint_profile(impl Into<String>)`, `with_extra(Value)`.
 - `from_env() -> Self`, `resolve_for(&self, provider: &str) -> Result<Self>`, `sanitized_headers(&self) -> BTreeMap<String, String>`, `http_client_config(&self) -> HttpClientConfig`.
 - `pub struct ModelRequestConfig { pub model_name: String, pub temperature: Option<f32>, pub top_p: Option<f32>, pub max_tokens: Option<u32>, pub stop: Vec<String>, pub tools: Option<Value>, pub tool_choice: Option<Value>, pub stream: bool, pub extra: Value }` plus the builders listed in API Surface and `from_env() -> Self`.
 
@@ -132,7 +141,7 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 - `pub trait ModelExt: Model` with `async fn complete(&self, messages: &[BaseMessage], request: &ModelRequestConfig) -> Result<AssistantTurn>` (default body: force `stream = true` on a clone of the request, drive `Model::stream`, feed a `StreamAccumulator`) and a blanket `impl<T: Model + ?Sized> ModelExt for T`.
 
 `provider.rs`:
-- `pub enum ProviderFlavor { OpenAiCompatible, Anthropic }` (serde snake_case).
+- `pub enum ProviderFlavor { OpenAiCompatible, OpenAiResponses, Anthropic }` (serde snake_case), `pub(crate) const RESPONSES_PATH: &str = "/responses"`.
 - `pub struct ProviderProfile { pub name: &'static str, pub flavor: ProviderFlavor, pub default_api_base: Option<&'static str>, pub chat_path: &'static str, pub extra_headers: &'static [(&'static str, &'static str)] }`.
 - `pub fn normalize_provider_name(name: &str) -> String`, `pub fn provider_profile(name: &str) -> Option<ProviderProfile>`, `pub const ANTHROPIC_VERSION: &str = "2023-06-01";`.
 
@@ -144,12 +153,16 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 `sse.rs`:
 - `pub struct SseEvent { pub event: Option<String>, pub data: String }`; `pub struct SseDecoder` with `new()`, `push(&mut self, chunk: &[u8]) -> Vec<SseEvent>`, `finish(&mut self) -> Option<SseEvent>`.
 
-`transport.rs` (`pub(crate)`, shared by both clients):
-- `pub(crate) fn join_url(base: &str, path: &str) -> String`, `pub(crate) fn error_for_status(status: u16, url: &str, body: &str) -> Error`, `pub(crate) fn redacted_body(body: &str) -> String` (redact + truncate to 1000 chars).
+`transport.rs` (`pub(crate)`, shared by all three clients):
+- `pub(crate) fn join_url(base: &str, path: &str) -> String`, `pub(crate) fn error_for_status(status: u16, url: &str, body: &str) -> Error`, `pub(crate) fn redacted_body(body: &str) -> String` (redact + truncate to 1000 chars), plus the streaming helpers `carries_payload`, `next_chunk`, `poll_budget`, and `read_error_body`.
 
 `openai/mod.rs`:
 - `pub struct OpenAiCompatibleClient` with `new(ModelClientConfig, ModelRequestConfig) -> Result<Self>`, `with_http_client(HttpClient) -> Self`, `client_config() -> &ModelClientConfig`, `request_config() -> &ModelRequestConfig`, `base_url() -> &str`, and `impl Model`.
 - Re-exports: `pub use request::{build_chat_completion_body, normalize_api_base, convert_message, convert_messages, convert_tool_choice, convert_tools};`, `pub use response::{parse_chat_completion, parse_finish_reason, parse_usage};`, `pub use stream::{parse_stream_chunk, OpenAiStreamState};`.
+
+`responses/mod.rs`:
+- `pub struct OpenAiResponsesClient` with the same inherent surface as `OpenAiCompatibleClient` (`new`, `with_http_client`, `client_config`, `request_config`, `base_url`, `chat_path`) plus `impl Model`.
+- Re-exports: `pub use request::{build_responses_body, convert_messages, convert_tools, normalize_api_base};`, `pub use response::{parse_responses_response, parse_responses_usage};`, `pub use stream::ResponsesStreamState;`.
 
 `anthropic/mod.rs`:
 - `pub struct AnthropicClient` with the same inherent surface as `OpenAiCompatibleClient` plus `impl Model`.
@@ -168,6 +181,7 @@ The full per-module signatures, wire contracts and gaps live in the child `CONTE
 - Streaming timeout budgets are tested against a loopback stalling server, never a real provider.
 - No test touches the network or a real credential; `MODEL_PROVIDER`/`API_KEY`/`API_BASE` mutations are serialized by a module mutex and restored.
 - `cargo test -p openjiuwen-foundation llm` covers the whole module in both feature sets; the module has no feature-gated code.
+- `responses` tests live in `./responses/{request,response,stream}.rs` (pure projection/parsing/event tests) and `./responses/tests.rs` (wiremock end-to-end for request shape, headers, streaming assembly, error mapping, and factory dispatch).
 - `reasoning` is covered by table-driven tests (`./reasoning/tests.rs`, `./reasoning/plan_tests.rs`): glob matching, provider/alias/host-hint precedence, fallback on the full id and its last `/` segment, and the exact JSON of every encoder in enabled/disabled/effort/budget shapes, plus capability rejection and apply merge/no-overwrite rules.
 - `openai/request.rs` additionally asserts that a body with no `reasoning` intent carries no reasoning keys at all and stays byte-identical.
 - `oauth` tests drive every endpoint through `wiremock` (device code, `403`→`404`→`200` polling, exchange, refresh with and without rotation) and exercise `FileTokenStore` round trips, envelope merging, unix `0600`, atomic-write leftovers and `default_path` env precedence with `tempfile`.
@@ -181,9 +195,10 @@ The full per-module signatures, wire contracts and gaps live in the child `CONTE
 - There is no `response_format`/`ResponseFormat` type, field, or helper and no history/`enable_history` flag anywhere in the crate: structured output and every vendor knob go through `ModelRequestConfig::extra`, which `build_chat_completion_body` merges last at the top level.
 - There is no `BoxModel`/`type Model = …` alias; `Arc<dyn Model>` is the convention (`init_model`, `init_model_with`, `ModelProvider::create`) and `impl Model for Arc<dyn Model>` makes it callable directly.
 - `Model` exposes only `provider()`, `model_name()`, `invoke()` and `stream()`: there is no `name()`, `config()`, or cancellation method on the trait.
-- Reasoning: `build_chat_completion_body` passes `api_base = None`, so api-base host hints are only reachable through the public `resolve_reasoning_plan`/`provider_key_for` and the Anthropic `build_messages_body_with_provider`; the `Responses` protocol is encoded but has no transport, and an OpenAI-compatible raw (`non-intent`) `reasoning` payload is forwarded verbatim while the Anthropic transport rejects it with `Error::Validation`.
+- Reasoning: `build_chat_completion_body` passes `api_base = None`, so api-base host hints are only reachable through the public `resolve_reasoning_plan`/`provider_key_for` and the Anthropic `build_messages_body_with_provider`; the `Responses` protocol is encoded and used by `responses/`, and an OpenAI-compatible raw (`non-intent`) `reasoning` payload is forwarded verbatim while the Anthropic transport rejects it with `Error::Validation`.
 - Routing: TPM/RPM are recorded but not enforced (no rate limiter), there is no cross-request circuit breaker or tag-based cost/latency scoring, a group `timeout_seconds` is recorded but not enforced, `Custom` strategies are rejected by the compiler and treated as ordered failover by `RoutingModel`, and the Python `extra_body` flattening/health-probe options are not ported.
-- OAuth: no `Responses` transport for OAuth-backed calls, no `/models` catalog or cache, no `login|status|logout` CLI and no `AuthStatus` type, no cross-process file lock (atomic writes, last writer wins), `token_type` is not carried over on refresh, and a refresh response without an expiry keeps the previous `expires_at`.
+- OAuth: no `/models` catalog or cache, no `login|status|logout` CLI and no `AuthStatus` type, no cross-process file lock (atomic writes, last writer wins), `token_type` is not carried over on refresh, and a refresh response without an expiry keeps the previous `expires_at`; `openai_account` clients still authenticate with a static bearer key even when configured with `AuthMode::OpenAiAccountOAuth`.
+- Responses: `invoke` always streams, so a provider that answers one JSON object instead of an event stream cannot be decoded; `previous_response_id`, `background` mode, hosted tools, and replay of encrypted reasoning items are not implemented; `File`/`Audio` input parts are dropped.
 - DashScope: no streaming media, no result-URL byte download, no `X-DashScope-WorkSpace` scoping, no voice/language allow-lists, no local-file/`oss://` inputs, and no per-call `**kwargs` escape hatch.
 - OpenAI-compatible: Python drops one of `temperature`/`top_p` for `openai.com` bases; this module sends both when the caller sets both.
 - Anthropic: thinking blocks are ignored in non-streaming responses, and only the three automatic cache anchors are exposed (no per-message caller breakpoints, no `clear`/`auto` caching modes).
@@ -199,6 +214,7 @@ The full per-module signatures, wire contracts and gaps live in the child `CONTE
 - `./factory.rs` → `init_model`, `init_model_with`
 - `./sse.rs` → incremental SSE decoder shared by both clients
 - `./openai/` → OpenAI-compatible client (`request.rs`, `response.rs`, `stream.rs`)
+- `./responses/` → OpenAI Responses client (`request.rs`, `response.rs`, `stream.rs`) (`responses/CONTEXT.md`)
 - `./anthropic/` → Anthropic Messages client (`request.rs`, `response.rs`, `stream.rs`)
 - `./reasoning/` → `ReasoningConfig`, profile tables, plan resolution and wire encoders, body application (`reasoning/CONTEXT.md`)
 - `./routing/` → IntelliRouter selection/route schema, route compiler, `RoutingModel` ordered failover (`routing/CONTEXT.md`)

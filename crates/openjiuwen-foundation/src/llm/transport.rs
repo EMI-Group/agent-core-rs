@@ -1,18 +1,27 @@
-//! Transport helpers shared by the OpenAI-compatible and Anthropic clients.
+//! Transport helpers shared by the OpenAI-compatible, Anthropic, and Responses clients.
 //!
-//! The two clients differ in their wire bodies and stream events but share the
+//! The clients differ in their wire bodies and stream events but share the
 //! same URL joining, status-to-error mapping, and log-safe error bodies. Keeping
 //! those three in one place guarantees that neither client can leak a credential
 //! or report a timeout as a generic provider failure.
 //!
 //! Everything here is `pub(crate)`: it is an implementation seam between
-//! [`crate::llm::openai`], [`crate::llm::anthropic`], and their tests.
+//! [`crate::llm::openai`], [`crate::llm::anthropic`], [`crate::llm::responses`], and
+//! their tests.
 
-use openjiuwen_common::error::Error;
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::http::HttpStream;
 use openjiuwen_common::security::redact_str;
 
 /// Maximum number of characters of a provider body kept in an error message.
 const MAX_BODY_CHARS: usize = 1000;
+
+/// Upper bound on how much of a non-2xx streaming response body is read for the
+/// error message.
+pub(crate) const ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// Appended to a body that had to be truncated.
 const TRUNCATION_MARKER: char = '…';
@@ -83,6 +92,84 @@ fn truncate_chars(text: &str, max: usize) -> String {
         truncated.push(TRUNCATION_MARKER);
     }
     truncated
+}
+
+/// The wait budget for the next body poll.
+///
+/// Before the first content-bearing delta the budget is the smaller of the idle
+/// timeout and what is left of the first-chunk deadline; afterwards only the idle
+/// timeout applies. `None` disables the budget.
+pub(crate) fn poll_budget(
+    content_seen: bool,
+    idle: Option<Duration>,
+    first_chunk_deadline: Option<Instant>,
+) -> Option<Duration> {
+    if content_seen {
+        return idle;
+    }
+    let deadline = first_chunk_deadline?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    Some(idle.map_or(remaining, |idle| idle.min(remaining)))
+}
+
+/// Whether a chunk proves the model actually started answering.
+///
+/// Role-only and finish-reason-only deltas are stream framing, not content, so
+/// they must not satisfy the first-chunk deadline. Usage and the terminal `Done`
+/// are framing too.
+pub(crate) fn carries_payload(chunk: &super::model::StreamChunk) -> bool {
+    match chunk {
+        super::model::StreamChunk::Delta {
+            content,
+            reasoning,
+            tool_call,
+            ..
+        } => content.is_some() || reasoning.is_some() || tool_call.is_some(),
+        super::model::StreamChunk::Usage(_) | super::model::StreamChunk::Done => false,
+    }
+}
+
+/// Waits for the next body chunk within `budget`.
+///
+/// `Ok(None)` means the body ended; an elapsed budget is an [`Error::Timeout`]
+/// whose message distinguishes "nothing arrived yet" from "the stream went idle".
+pub(crate) async fn next_chunk(
+    body: &mut HttpStream,
+    budget: Option<Duration>,
+    url: &str,
+    content_seen: bool,
+) -> Result<Option<bytes::Bytes>> {
+    let Some(limit) = budget else {
+        return body.next().await.transpose();
+    };
+    match tokio::time::timeout(limit, body.next()).await {
+        Ok(item) => item.transpose(),
+        Err(_) => Err(Error::timeout(if content_seen {
+            format!("stream from {url} went idle for more than {limit:?}")
+        } else {
+            format!("stream from {url} produced no content within {limit:?}")
+        })),
+    }
+}
+
+/// Reads a bounded body from a failed streaming response, for the error message.
+///
+/// The response is already known to be a failure, so a read error simply ends the
+/// collection: the status and URL alone are enough to diagnose it.
+pub(crate) async fn read_error_body(body: &mut HttpStream) -> String {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let Ok(bytes) = chunk else {
+            break;
+        };
+        let free = ERROR_BODY_LIMIT.saturating_sub(buffer.len());
+        if bytes.len() >= free {
+            buffer.extend_from_slice(&bytes[..free]);
+            break;
+        }
+        buffer.extend_from_slice(&bytes);
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 #[cfg(test)]

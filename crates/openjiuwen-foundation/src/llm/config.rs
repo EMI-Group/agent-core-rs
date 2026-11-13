@@ -63,15 +63,54 @@ fn secret_is_missing(secret: Option<&SecretString>) -> bool {
     secret.is_none_or(|secret| secret.expose_secret().trim().is_empty())
 }
 
+/// Wire protocol an `OpenAI`-family endpoint speaks.
+///
+/// Ports the Python `LLMApiMode` enum: `chat_completions` (the default for
+/// `OpenAI`-compatible vendors), `responses` (the `OpenAI` Responses API), and
+/// `anthropic_messages` (the Anthropic Messages API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMode {
+    /// `POST /chat/completions`, the OpenAI-compatible default.
+    ChatCompletions,
+    /// The `OpenAI` Responses API, `POST /responses`.
+    Responses,
+    /// The Anthropic Messages API, `POST /v1/messages`.
+    AnthropicMessages,
+}
+
+/// How a model client authenticates.
+///
+/// Ports the Python `LLMAuthMode` enum. Only [`AuthMode::ApiKey`] requires an API
+/// key: the other modes authenticate out of band (an OAuth token store, caller
+/// supplied headers) or not at all, so [`ModelClientConfig::resolve_for`] does not
+/// demand a credential for them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// A bearer API key (`api_key` or the environment), the default.
+    #[default]
+    ApiKey,
+    /// No authentication at all.
+    #[serde(rename = "none")]
+    NoneAuth,
+    /// The caller supplies authentication through [`ModelClientConfig::headers`].
+    CustomHeaders,
+    /// An `OpenAI` account OAuth access token resolved by `llm::oauth`.
+    #[serde(rename = "openai_account_oauth")]
+    OpenAiAccountOAuth,
+}
+
 /// Client-side configuration of one model connection.
 ///
 /// The type mirrors the Python `ModelClientConfig`: an identity ([`client_id`](Self::client_id)),
-/// the provider to talk to, credentials, endpoint, TLS/timeout/retry policy,
-/// extra headers, and an `extra` map for vendor-specific settings that the struct
-/// does not model.
+/// the provider to talk to, credentials, endpoint, protocol/auth modes,
+/// TLS/timeout/retry policy, extra headers, and an `extra` map for vendor-specific
+/// settings that the struct does not model.
 ///
 /// `Debug` redacts the API key through [`SecretString`], and JSON serialization
-/// keeps it so a configuration round-trips.
+/// keeps it so a configuration round-trips. The Python `custom_headers` field is
+/// accepted as an alias of [`headers`](Self::headers).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ModelClientConfig {
@@ -97,7 +136,21 @@ pub struct ModelClientConfig {
     /// Number of additional attempts after the first one; `0` disables retries.
     pub max_retries: u32,
     /// Extra request headers, merged into every call.
+    ///
+    /// The Python field name `custom_headers` is accepted as an alias.
+    #[serde(alias = "custom_headers")]
     pub headers: BTreeMap<String, String>,
+    /// Wire protocol to speak, or `None` for the provider's default.
+    ///
+    /// A provider that normally speaks chat completions uses the Responses API
+    /// when this is [`ApiMode::Responses`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_mode: Option<ApiMode>,
+    /// Authentication scheme; defaults to [`AuthMode::ApiKey`].
+    pub auth_mode: AuthMode,
+    /// Provider endpoint dialect name (Python `endpoint_profile`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_profile: Option<String>,
     /// Vendor-specific settings the struct does not model.
     pub extra: Value,
 }
@@ -117,6 +170,9 @@ impl Default for ModelClientConfig {
             stream_idle_timeout: Some(DEFAULT_STREAM_IDLE_TIMEOUT),
             max_retries: 0,
             headers: BTreeMap::new(),
+            api_mode: None,
+            auth_mode: AuthMode::ApiKey,
+            endpoint_profile: None,
             extra: Value::Null,
         }
     }
@@ -207,6 +263,27 @@ impl ModelClientConfig {
         self
     }
 
+    /// Overrides the wire protocol.
+    #[must_use]
+    pub fn with_api_mode(mut self, api_mode: ApiMode) -> Self {
+        self.api_mode = Some(api_mode);
+        self
+    }
+
+    /// Overrides the authentication scheme.
+    #[must_use]
+    pub fn with_auth_mode(mut self, auth_mode: AuthMode) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    /// Overrides the provider endpoint dialect name.
+    #[must_use]
+    pub fn with_endpoint_profile(mut self, endpoint_profile: impl Into<String>) -> Self {
+        self.endpoint_profile = Some(endpoint_profile.into());
+        self
+    }
+
     /// Replaces the vendor-specific `extra` map.
     #[must_use]
     pub fn with_extra(mut self, extra: Value) -> Self {
@@ -241,7 +318,10 @@ impl ModelClientConfig {
     /// - Headers: the provider's static headers are added only when the caller did
     ///   not already set a header of the same name (case-insensitive).
     /// - Validation: a provider without a built-in base URL (`pangu`) must receive
-    ///   one, and every provider except `ollama`/`lmstudio` must receive a key.
+    ///   one, and every provider except `ollama`/`lmstudio` must receive a key when
+    ///   [`auth_mode`](Self::auth_mode) is [`AuthMode::ApiKey`]. The modes that
+    ///   authenticate out of band (OAuth, caller headers, none) are exempt, matching
+    ///   the Python config validator.
     ///
     /// TLS settings, timeouts, retries, `extra`, and `client_id` pass through
     /// unchanged.
@@ -298,7 +378,10 @@ impl ModelClientConfig {
             )));
         }
 
-        if secret_is_missing(resolved.api_key.as_ref()) && !is_keyless(&resolved.provider) {
+        if secret_is_missing(resolved.api_key.as_ref())
+            && resolved.auth_mode == AuthMode::ApiKey
+            && !is_keyless(&resolved.provider)
+        {
             return Err(Error::config(format!(
                 "provider `{}` requires an API key; set {}, {}, or {} (or `api_key`)",
                 resolved.provider,
@@ -554,6 +637,9 @@ mod tests {
         assert_eq!(config.stream_idle_timeout, Some(Duration::from_secs(60)));
         assert_eq!(config.max_retries, 0);
         assert!(config.headers.is_empty());
+        assert_eq!(config.api_mode, None);
+        assert_eq!(config.auth_mode, AuthMode::ApiKey);
+        assert_eq!(config.endpoint_profile, None);
         assert_eq!(config.extra, Value::Null);
     }
 
@@ -602,6 +688,11 @@ mod tests {
         assert_eq!(config.provider, "OpenAI");
         assert_eq!(config.timeout, Some(Duration::from_secs(9)));
         assert!(uuid::Uuid::parse_str(&config.client_id).is_ok());
+        assert_eq!(
+            config.headers.get("ignored").map(String::as_str),
+            Some("value"),
+            "`custom_headers` is the Python spelling of `headers`"
+        );
 
         let request: ModelRequestConfig =
             serde_json::from_value(json!({"model": "gpt-4o-mini", "unknown": true}))
@@ -609,6 +700,88 @@ mod tests {
         assert_eq!(request.model_name, "gpt-4o-mini");
         assert!(!request.stream);
         assert_eq!(request.stop, Vec::<String>::new());
+    }
+
+    #[test]
+    fn python_wire_modes_decode() {
+        let config: ModelClientConfig = serde_json::from_value(json!({
+            "client_provider": "openai",
+            "api_mode": "responses",
+            "auth_mode": "openai_account_oauth",
+            "endpoint_profile": "codex",
+            "custom_headers": {"X-Tenant": "acme"},
+            "unknown_field": {"kept": false},
+        }))
+        .expect("a Python-serialized config decodes");
+
+        assert_eq!(config.api_mode, Some(ApiMode::Responses));
+        assert_eq!(config.auth_mode, AuthMode::OpenAiAccountOAuth);
+        assert_eq!(config.endpoint_profile.as_deref(), Some("codex"));
+        assert_eq!(
+            config.headers.get("X-Tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(config.api_key, None, "an omitted key stays missing");
+    }
+
+    #[test]
+    fn api_and_auth_modes_use_the_python_wire_values() {
+        let decode = |value: &str| serde_json::from_str::<ApiMode>(value).expect("api mode");
+        assert_eq!(decode("\"chat_completions\""), ApiMode::ChatCompletions);
+        assert_eq!(decode("\"responses\""), ApiMode::Responses);
+        assert_eq!(decode("\"anthropic_messages\""), ApiMode::AnthropicMessages);
+
+        let decode = |value: &str| serde_json::from_str::<AuthMode>(value).expect("auth mode");
+        assert_eq!(decode("\"api_key\""), AuthMode::ApiKey);
+        assert_eq!(decode("\"none\""), AuthMode::NoneAuth);
+        assert_eq!(decode("\"custom_headers\""), AuthMode::CustomHeaders);
+        assert_eq!(
+            decode("\"openai_account_oauth\""),
+            AuthMode::OpenAiAccountOAuth
+        );
+        assert_eq!(AuthMode::default(), AuthMode::ApiKey);
+
+        assert_eq!(
+            serde_json::to_value(ApiMode::Responses).expect("serializes"),
+            json!("responses")
+        );
+        assert_eq!(
+            serde_json::to_value(AuthMode::NoneAuth).expect("serializes"),
+            json!("none")
+        );
+    }
+
+    #[test]
+    fn non_api_key_auth_modes_do_not_require_a_credential() {
+        for auth_mode in [
+            AuthMode::NoneAuth,
+            AuthMode::CustomHeaders,
+            AuthMode::OpenAiAccountOAuth,
+        ] {
+            let config = ModelClientConfig::new("openai_account")
+                .with_auth_mode(auth_mode)
+                .with_api_base("https://example.test/backend-api/codex");
+            let resolved = config
+                .resolve_for("openai_account")
+                .unwrap_or_else(|error| panic!("{auth_mode:?} must not need a key: {error}"));
+            assert_eq!(resolved.auth_mode, auth_mode);
+        }
+    }
+
+    #[test]
+    fn new_builders_set_the_protocol_fields() {
+        let config = ModelClientConfig::new("openai")
+            .with_api_mode(ApiMode::Responses)
+            .with_auth_mode(AuthMode::CustomHeaders)
+            .with_endpoint_profile("codex");
+        assert_eq!(config.api_mode, Some(ApiMode::Responses));
+        assert_eq!(config.auth_mode, AuthMode::CustomHeaders);
+        assert_eq!(config.endpoint_profile.as_deref(), Some("codex"));
+
+        let restored: ModelClientConfig =
+            serde_json::from_value(serde_json::to_value(&config).expect("serializes"))
+                .expect("round-trips");
+        assert_eq!(restored, config);
     }
 
     #[test]

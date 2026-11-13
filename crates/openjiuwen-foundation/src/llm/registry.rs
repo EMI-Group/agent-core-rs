@@ -29,10 +29,11 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use openjiuwen_common::error::Result;
 
 use super::anthropic::AnthropicClient;
-use super::config::{ModelClientConfig, ModelRequestConfig};
+use super::config::{ApiMode, ModelClientConfig, ModelRequestConfig};
 use super::model::Model;
 use super::openai::OpenAiCompatibleClient;
 use super::provider::{normalize_provider_name, provider_names, provider_profile, ProviderFlavor};
+use super::responses::OpenAiResponsesClient;
 
 /// Builds model clients for one provider.
 ///
@@ -207,6 +208,10 @@ impl ModelProviderRegistry {
                     name: profile.name,
                     default_api_base: profile.default_api_base,
                 }),
+                ProviderFlavor::OpenAiResponses => Arc::new(ResponsesProvider {
+                    name: profile.name,
+                    default_api_base: profile.default_api_base,
+                }),
             };
             self.register(provider);
         }
@@ -298,7 +303,42 @@ impl ModelProvider for OpenAiProvider {
         request: &ModelRequestConfig,
     ) -> Result<Arc<dyn Model>> {
         let client = with_provider(client, self.name);
-        let model = OpenAiCompatibleClient::new(client, request.clone())?;
+        // An OpenAI-compatible provider switches transports when the caller asks
+        // for the Responses API; every other vendor keeps chat completions.
+        let model: Arc<dyn Model> = if client.api_mode == Some(ApiMode::Responses) {
+            Arc::new(OpenAiResponsesClient::new(client, request.clone())?)
+        } else {
+            Arc::new(OpenAiCompatibleClient::new(client, request.clone())?)
+        };
+        Ok(model)
+    }
+}
+
+/// Built-in provider speaking the `OpenAI` Responses API.
+#[derive(Debug, Clone, Copy)]
+struct ResponsesProvider {
+    /// Canonical provider name from the static table.
+    name: &'static str,
+    /// Default endpoint advertised by the table.
+    default_api_base: Option<&'static str>,
+}
+
+impl ModelProvider for ResponsesProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn default_api_base(&self) -> Option<&str> {
+        self.default_api_base
+    }
+
+    fn create(
+        &self,
+        client: &ModelClientConfig,
+        request: &ModelRequestConfig,
+    ) -> Result<Arc<dyn Model>> {
+        let client = with_provider(client, self.name);
+        let model = OpenAiResponsesClient::new(client, request.clone())?;
         Ok(Arc::new(model))
     }
 }
