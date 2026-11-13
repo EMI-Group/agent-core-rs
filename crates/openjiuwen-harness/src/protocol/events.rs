@@ -592,6 +592,7 @@ mod tests {
             content: "42".to_owned(),
             name: Some("bash".to_owned()),
             tool_call_id: Some("call-1".to_owned()),
+            ..Observation::default()
         }]);
         let events = item_events(&output);
         assert_eq!(events.len(), 2);
@@ -634,6 +635,7 @@ mod tests {
             content: "tool said hi".to_owned(),
             name: Some("bash".to_owned()),
             tool_call_id: Some("call-9".to_owned()),
+            ..Observation::default()
         }];
         let messages = messages_from_output(&output, "turn-3");
         assert_eq!(messages.len(), 2);

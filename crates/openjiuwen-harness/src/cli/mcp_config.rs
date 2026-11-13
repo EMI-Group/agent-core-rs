@@ -64,9 +64,12 @@ impl McpServerSpec {
         let client_type = self.client_type(name)?;
         match client_type {
             McpClientType::Stdio => self.stdio_server(name, client_type),
-            McpClientType::Sse | McpClientType::StreamableHttp => {
+            McpClientType::Sse | McpClientType::StreamableHttp | McpClientType::OpenApi => {
                 self.http_server(name, client_type)
             }
+            McpClientType::Playwright => Err(Error::config(format!(
+                "mcp server {name}: playwright transport is not supported"
+            ))),
         }
     }
 

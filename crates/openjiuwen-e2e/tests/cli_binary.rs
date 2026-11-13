@@ -126,6 +126,7 @@ fn blank_cli() -> Cli {
         api_base: None,
         workspace: None,
         verbose: false,
+        no_color: false,
         command: None,
     }
 }

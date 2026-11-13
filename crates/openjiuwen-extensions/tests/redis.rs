@@ -1,5 +1,3 @@
-#![cfg(feature = "redis")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Crate-boundary integration suite for the Redis adapters.
 //!
 //! Every assertion enters through a public path (`openjiuwen_extensions::redis`,
@@ -11,6 +9,8 @@
 //!
 //! One section per surface: codec, store, checkpointer, TTL, factory/deferrals.
 //! Without the `redis` feature this file compiles to an empty test binary.
+#![cfg(feature = "redis")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "redis/fake.rs"]
 mod fake;
 use fake::Server;
