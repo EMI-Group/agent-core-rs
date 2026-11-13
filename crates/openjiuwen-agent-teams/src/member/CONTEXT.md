@@ -168,6 +168,7 @@ Response frames: `{"type":"ready","session_id":…}`, `{"type":"state","state":"
 The child must flush after every line; blank lines are skipped; unknown JSON fields are ignored; a garbage stdout line is logged and skipped, and a child that produces 100 consecutive garbage lines is treated as terminated.
 Frame mapping: `ready` completes the pending `start` handshake only, `state` → `MemberObserver::on_state` (and the stored `HarnessState`), `round` → `on_round`, `chunk` → `on_chunk`, `error` fails the pending `start` and is otherwise logged without touching the lifecycle state.
 Child exit stores `HarnessState::Terminated`, notifies observers exactly once and turns every later runtime call into a typed `member process … exited` error.
+The child end is the `team-member serve` subcommand (`../skill/serve.rs`): it reads request frames on stdin, writes response frames on stdout, keeps every diagnostic on stderr, and exits `0` on `stop` or end of input, or `1` after an `error` frame when its runtime cannot be built or started.
 The full framing rules, transcript and mapping table are the `//!` docs of [`protocol`], which is the single source of truth for this wire format.
 
 ## Spawners
@@ -251,7 +252,6 @@ Definition of done for this node: `cargo fmt -p openjiuwen-agent-teams`, `cargo 
 ## Known gaps and deferred
 
 - `MemberRuntime::send` returns `Result<()>` and therefore drops any transport-level `SendReceipt`: harness-level receipts are not surfaced through the member seam, and a consumer that needs one must wrap the runtime in its own `MemberRuntime`.
-- The `team-member` binary's `serve` subcommand — the child end of the member protocol — is not wired yet; `ProcessMemberConfig::default()` already launches `team-member serve`, so process mode needs that subcommand at the crate root (`../skill/`, outside this node).
 - External-CLI protocol translation is deferred: Python's `external/cli_agent/*` adapters (`format_input`/`summarize_output_line`, `StdinPipeInjector` plain-text or `INPUT_CODEX_PROTO`, `task_complete`/`turn.completed` markers) and `model_compat.py` provider/model negotiation are not ported; a third-party CLI must speak the member protocol itself or be wrapped by a script.
 - Python implements the SSH transport with `asyncssh` and never runs the `ssh` binary; the Rust port shells out to `ssh` instead. SSH attach to a team hosted in another process (shared store or remote runtime) stays deferred, as do remote team stores and distributed transports.
 - Vendor CLI SDKs (`claude`, `codex`, `dsh` harnesses) remain deferred in `../harness/` and `openjiuwen-harness-providers`; this node only carries a generic stdio child.

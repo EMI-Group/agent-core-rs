@@ -144,7 +144,7 @@ Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo te
 ## Deferred
 
 - IntelliRouter client-side reliable router and the `intelli_router` provider (`IntelliRouterConfig`, `IntelliRouterDeployment`, `INTELLI_ROUTER_PROVIDER`, `INTELLI_ROUTER_UNIFIED_MODEL` as public API, `RouterAllocator`, `IntelliRouterAllocator`, `CliModelCatalog`): needs the vendor router SDK/client and its deployment-probing loop, which this port does not carry; the model-group *label* is kept because it is display-only.
-- Vendor CLI model catalogs (`resolve_cli_models`, `CliModelAllocation`): requires invoking external `claude`/`codex` binaries, which are deferred crate-wide (`spawn_mode = "process"` / external CLI members).
+- Vendor CLI model catalogs (`resolve_cli_models`, `CliModelAllocation`): requires invoking the vendor `claude`/`codex` binaries, whose harness providers are deferred in `openjiuwen-harness-providers`.
 - `ModelRouterConfig` expansion (one endpoint serving many names) and `inherit_pool_ids` (bit-exact `model_id` carry-over on pool refresh): both are spec-build/pool-refresh concerns of `schema`/`runtime`, not request routing; the pool here validates and preserves entries only.
-- Weighted, LRU and affinity/KV-cache strategies: no persisted weight or affinity model exists in this port (KV-cache affinity is deferred to `../kv_cache/`), so the four shipped strategies are the full surface.
+- Weighted, LRU and affinity/KV-cache strategies: no persisted weight or affinity model exists in this module (cache identity and its registry live in `../kv_cache/`), so the four shipped strategies are the full surface.
 - Persisting router state (`cursor`, in-flight counters) across restarts: deliberately not persisted — like Python, only the allocator's cursor is session state, and in-flight counts are meaningless after a restart.

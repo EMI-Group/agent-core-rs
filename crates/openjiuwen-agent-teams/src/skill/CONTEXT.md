@@ -105,6 +105,7 @@ pub enum ClaimStatus { Claimed, Completed }         // const fn as_str(self) -> 
 The command enums are re-exported from `src/skill/mod.rs`; the clap root structs (`MemberCli`/`OperatorCli`/`ServeCli`), `PROG`, `parse_member`, `parse_operator`, `parse_serve` and `names_serve` stay crate-private.
 
 `serve` is scope-independent: it is the child end of the JSON-lines member protocol (see `../member/protocol.rs`), takes its identity from the environment (the same variables `member::spawn` exports), needs no join descriptor, and is dispatched before the descriptor is loaded.
+It reads one `MemberRequest` per line from stdin, writes `MemberResponse` frames (`ready`, `state`, `round`, `chunk`, `error`) to stdout, and keeps every diagnostic on stderr.
 
 `TeamJoinDescriptor` (serde snake_case, `#[serde(default)]`, unknown fields ignored):
 
@@ -135,7 +136,7 @@ All async methods are `#[async_trait]`.
 
 1. the process-global runtime registry → `TeamRuntimeManager::live(team_name)` → the live team's backend → a `StoreTeamClient`;
 2. otherwise the descriptor's `socket_path` field (then `OPENJIUWEN_TEAM_SOCKET`) when that path is an existing Unix socket → a lazily connecting `SocketTeamClient`;
-3. otherwise `None`, which keeps today's `no live team '<name>' in this process` message on stderr and exit code `1`.
+3. otherwise `None`, which keeps the `no live team '<name>' in this process` message on stderr and exit code `1`.
 
 The socket connect is lazy because the resolver is synchronous and may run inside a runtime (the MCP server's task), so it only `stat`s the path.
 An unreachable or hung socket therefore surfaces as a typed `Transport`/`Timeout` error on the first operation, which the CLI still maps to exit `1`.
@@ -242,7 +243,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - No cross-process attach through a shared sqlite DB; a descriptor whose team is hosted elsewhere and whose socket path does not resolve reports `no live team '<name>' in this process` and exits `1`.
 - `serve` reopens the process streams as `/dev/stdin` and `/dev/stdout` (the workspace does not enable tokio's `io-std` feature), so on non-Unix targets it reports `Unsupported` and exits `1`.
 - `serve` builds the member from `DeepAgentSpec::default()`: only identity (team/member/session/workspace) and the model environment cross the process boundary, so per-member tools, rails, MCP servers and prompts configured on the leader side are not carried into the child yet.
-- External CLI members (`claude`/`codex`), hybrid WebSocket publishing, file-backed SQLite descriptors and workspace metadata tools are not ported (see the crate "Deferred" list).
+- Vendor CLI member adapters (`claude`/`codex` protocol translation), hybrid WebSocket publishing, file-backed SQLite descriptors and workspace metadata tools are not ported (see the crate "Deferred" list).
 
 ## Notes for Agents
 

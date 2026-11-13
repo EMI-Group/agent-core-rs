@@ -3,6 +3,7 @@
 ## Intent
 
 Let a process drive a team hosted by another process over a Unix domain socket: the `openjiuwen` host binds the socket, and the `team-member` CLI or the `openjiuwen-team-mcp` server connects to it.
+`TeamAgent::start()` binds the server when `metadata["attach"]` (or `OPENJIUWEN_TEAM_SOCKET`) names a path (`../runtime/attach_host.rs`), and `crate::skill::SocketTeamClient` dials it.
 Python parity source: `openjiuwen/agent_teams/external/` (descriptor/client) and `openjiuwen/agent_teams/organization/transport_api.py`; Python reaches a team through shared storage and pyzmq, so the socket protocol is the Rust equivalent of that cross-process seam.
 The layer is deliberately split: [`protocol`] owns the platform-independent wire contract, [`client`] drives a hosted team, [`server`] hosts one.
 This module never imports `crate::skill` or `crate::mcp`; those layers adapt their own `TeamClient` onto [`AttachHandler`], which keeps the dependency direction one-way and lets the wiring change without touching the protocol.
@@ -180,7 +181,7 @@ The cfg split is per method block, not per file: the public API is identical on 
 - `./protocol_tests.rs` → contract unit tests (`#[cfg(test)]`, no sockets)
 - `./client_tests.rs` → client tests against a raw in-test Unix listener (`#![cfg(unix)]`)
 - `./server_tests.rs` → server tests driven through `AttachClient` plus raw streams (`#![cfg(unix)]`)
-- `../skill/` → `TeamClient`/`TeamJoinDescriptor` the adapter will implement over `AttachHandler` (sibling node, read-only here)
+- `../skill/` → `TeamJoinDescriptor` and the `SocketTeamClient` that dials `AttachHandler` (sibling node, read-only here)
 - `../mcp/` → MCP server that consumes a `TeamClient` (sibling node, read-only here)
 
 ## Test Strategy
@@ -197,13 +198,12 @@ Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openji
 - Windows named pipes (and any non-Unix transport); both socket types keep API shape but return `Error::Unsupported`.
 - Multi-writer fan-out, subscriptions and streaming events: one request/response per line, no server-push channel, so the CLI's `--watch` and event streaming stay in-process.
 - Connection caps, per-request deadlines and backpressure on the server side (the client side is bounded).
-- Cross-process wiring itself: `crate::skill::connect_live_client` and the MCP resolver still resolve only teams hosted in the current process, so the socket client/server exist but nothing constructs them yet.
 
 ## Notes for Agents
 
 - The consumer contract is a single trait impl: `impl AttachHandler for TeamClientHandler` holding an `Arc<dyn TeamClient>`, matching `AttachOp` to the corresponding `TeamClient`/runtime call, returning `protocol::to_data(&value)` (or `Ok(Value::Null)` for a `task_detail` miss) and mapping failures through `AttachError::from(error)` so the kind survives the wire.
 - Host it with `AttachServer::bind(path)` → `tokio::spawn(server.serve(Arc::new(handler)))` → stop with `server.shutdown()` or a clone of `server.cancellation_token()`; `serve` shares one `Arc<dyn AttachHandler>` across all connections, so the adapter must be `Send + Sync` and must not hold a lock across an `await`.
-- The socket path has to come from the join descriptor (`transport_config`/`workspace_config` are the natural carriers) and must stay short; the CLI/MCP resolver should try the socket first and fall back to the in-process registry with the existing "no live team '<name>' hosted in this process" error.
+- The socket path comes from the join descriptor's `socket_path` field (else `OPENJIUWEN_TEAM_SOCKET`) and must stay short; `crate::skill::connect_live_client` prefers a team this process hosts and falls back to that socket.
 - Use `Error::validation` for user-supplied path/op problems, `Error::config` for an occupied socket, `Error::transport` for socket IO, and `Error::sys_op` when the bound socket's mode cannot be set.
 - `RequestFrame::decode` deliberately does not interpret `op`; unknown ops surface at `RequestFrame::op()`/`AttachOp::from_parts`, which is where the server turns them into a frame-level fault.
 - `AttachError` is the wire form of `openjiuwen_common::error::Error`: `From<Error>` keeps `kind()`/`message()`, and `into_error()` maps every kind back (`External` becomes `Error::external(io::Error::other(message))`).

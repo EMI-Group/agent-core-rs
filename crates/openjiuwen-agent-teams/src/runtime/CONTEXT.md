@@ -7,7 +7,7 @@ path from a `TeamAgentSpec`, the leader's run loop, the organisation facade over
 the pool and process-global runtime manager used by the CLI/MCP, and the model-pool router.
 Python parity sources: `openjiuwen/agent_teams/agent/team_agent.py`, `agent/agent_configurator.py`,
 `runtime/{manager,dispatch,pool,gate}.py`, `models/allocator.py`.
-This node also owns the six **metadata-driven wiring points** that used to be deferred: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity and attach hosting.
+This node also owns the six **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity and attach hosting.
 Model routing, observability signals and the monitor stream are wired at build time as well (they are not metadata keys).
 
 The module owns *policy and orchestration*: who runs, what a run means, when a team is done, how an
@@ -235,7 +235,7 @@ pub(crate) struct RunOutcome { pub output: AgentOutput, pub frames: Vec<AgentChu
 pub(crate) async fn run(agent: TeamAgent, query: Option<String>, session: Option<Arc<dyn Session>>,
                         deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<RunOutcome>;
 
-// pool.rs / manager.rs / adapter.rs — unchanged from the previous revision
+// pool.rs / manager.rs / adapter.rs — listed in the routing table below
 ```
 
 `observer.rs`: `MemberStreamObserver::new(activity, Weak<TeamMember>, role, member_name, TeamSignals, chunk_sinks)`
@@ -309,7 +309,7 @@ count and then publishes the hop, `TeamAgent::delegate_org_task` records the del
 delegation emits an `org_task` payload on `TeamTopic::Task` through the installed sink.
 Mail is acknowledged only after the leader flush succeeded: `flush` restores the batch on a send error, so the
 message ids stay unread and are retried on the next run/settle.
-A team with no organisation block keeps the flat board (`org()` is `None`, `create_org_task` is `Validation`).
+A team with no organisation block keeps the flat board (`org()` is `None`, `create_org_task` and `delegate_org_task` are `Error::Config`, while a hop the router refuses inside a configured organisation is `Validation`).
 
 ### Attach policy
 
@@ -402,8 +402,8 @@ a new session instead of being rebuilt.
 - Process-global state: exactly one new singleton here — the team runtime registry
   (`global_registry`), the crate's second documented singleton after the expert catalog.
 - Files ≤1000 lines; split by responsibility (`leader.rs` holds the loop so `team_agent.rs` stays a
-  surface; `routing.rs`, `spec_meta.rs`, `observability_bind.rs`, `org_bind.rs`, `attach_host.rs` and
-  `observer.rs` were split out of it).
+  surface, while `routing.rs`, `spec_meta.rs`, `observability_bind.rs`, `org_bind.rs`, `attach_host.rs` and
+  `observer.rs` each own one concern).
 - `--no-default-features` must build (no feature gates in this module).
 
 ## Routing Table
@@ -522,9 +522,9 @@ tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-de
   same `ModelSelection`, so a pool entry selects a real endpoint instead of only labelling the row.
 - `kv_cache_config` defaults to `enabled: true` when the metadata key is absent, so a freshly built team
   already answers `TeamAgent::kv_env(member)` for its leader and every spawned member.
-- Distributing a team across processes, vendor/remote worktree backends, cross-process attach and the
-  cross-team org layer stay deferred behind the member/workspace/attach seams (`Error::Unsupported` with the
-  Python capability name, or a logged warning for the attach socket).
+- Distributing a team across processes, vendor/remote worktree backends and the cross-team org
+  federation stay deferred behind the member/workspace/attach seams (`Error::Unsupported` with the Python
+  capability name, or a logged warning for the attach socket).
 - `Team::invoke` in `openjiuwen-multiagent` carries an `AgentTeamSession`, while `Agent::invoke` takes
   `Option<Arc<dyn Session>>`; the adapter ignores the multiagent session (documented; `openjiuwen-session`'s
   `AgentTeamSession` is not a `dyn Session`).
@@ -534,7 +534,7 @@ tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-de
   runtime (a missing runtime is `Error::config`).
 - `SpecBuild` is `#[async_trait]` (async `build`/`build_with`): the pinned build order awaits the store,
   the workspace provider, the harness factory and the team-row upsert, so a synchronous trait cannot hold
-  it. The crate-level document still sketches synchronous signatures.
+  it.
 - `leader::run` returns the `AgentOutput` directly; frames flow through a `ChunkSink`, so `stream` yields
   them live and `invoke` ignores them.
 - One run at a time per team: the bus receiver is single-consumer (`TeamAgent::take_events`), so a second
@@ -553,23 +553,24 @@ tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-de
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent.rs` is the sanctioned long file of this node (1083 production lines plus
-  `test_support`/unit tests); `backend.rs` is 1040 lines. Both predate this node's split pass and stay
-  cohesive; extract before adding another responsibility to either.
+  `test_support`/unit tests); `backend.rs` is 1040 lines. Both stay cohesive because each owns one
+  contract; extract before adding another responsibility to either.
 
 ## Not wired (documented gaps)
 
-- Model routing is member-level only: no per-request routing, `IntelliRouter` or builtin-model selection, and
-  only `MemberRecord::model_ref` is persisted (`ModelSelection` itself is not stored or restored from a
-  checkpoint, so a resumed team re-allocates from the pool).
+- Model routing is decided per member: there is no per-request routing, `IntelliRouter` or builtin-model
+  selection.
+  The router's cursor and per-member memo are not checkpointed, so a rebuilt team re-allocates from the
+  pool while an in-process resume keeps its memoized endpoints.
 - KV-cache affinity records identity only: no cache-hit telemetry, no eviction policy beyond `max_entries`,
   no provider-side reuse, and the SSH transport carries no env bag.
 - Observability hooks are in-process: no OTel exporter (that lives in `openjiuwen-extensions`) and no
   per-tool spans. The monitor stream has no TUI/consumer here.
-- The organisation layer is in-process: no cross-team org messaging, summary teams, swarmflow or org-level
-  observability; the chart shapes and their semantics belong to `src/org/`.
-- Attach hosting serves one request/response op per connection with no subscriptions, authentication or
-  streaming, and only for a team this process hosts (the client in `src/skill/` reads the process-global
-  runtime registry); cross-process attach is deferred.
+- The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
+  swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
+- Attach hosting serves one request/response op per connection with no subscriptions, authentication,
+  streaming or non-Unix transport; a CLI or MCP process reaches a hosted team through that socket, and only
+  a shared-store or brokered attach remains deferred.
 - Spawn backends beyond in-process are the `src/member/` transports; this node only selects among them and
   forwards the KV env (vendor CLI protocols, remote SSH daemons and OS-process pooling stay there).
 - Worktree isolation is delegated to `src/workspace/`; the remote worktree backend and team-workspace

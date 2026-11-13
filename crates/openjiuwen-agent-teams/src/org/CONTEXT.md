@@ -176,7 +176,8 @@ First refusal wins, in this order (the module docs carry the same table):
 - The organisation workspace manager and write policy (`teams/<id>/`, `shared/`, `summary/`, git init/commit lock, conflict strategy) plus `workspace_rail.py` enforcement.
 - `TransportAPI` negotiation/handshake and the organisation event bus beyond the in-process `OrgTaskEvent`/`OrgMessage` values.
 - The LLM-facing organisation tool wrappers (`tools.py`: control, task-pool, summary and inbox tools) and their prompt packs.
-- LLM-generated compaction: Python asks the model to summarise; this port emits the deterministic template summary line instead.
+- LLM-generated compaction: Python asks the model to summarise; `compact_transcript` emits the deterministic template summary line instead.
+- Harness-side compaction and a runtime swarmflow lane: `compact_transcript` and `SwarmflowRunner` are pure seams of this module, and `src/harness/`/`src/runtime/` do not call them yet.
 - Swarmflow's external host/bridge (`external_swarmflow_host.py`), worktree lanes and in-runner review gate (`tool_swarmflow.py`).
 - Org-level task lease/expiry: `TaskRecord` carries no lease column, so staleness stays the board's `updated_at` policy.
 
@@ -204,16 +205,14 @@ First refusal wins, in this order (the module docs carry the same table):
 - `fork_compact_tests.rs` (25): inheritance of session/workspace/cwd/project_root/model, identity clearing, tool deny/allow/additive ordering, invalid/reserved/self fork, two-level lineage, serde shape, exact summary lines, system front-keeping and `keep_system = false`, `keeping_last(0)`, multibyte truncation on a char boundary, tool-only truncation, losslessness, monotonicity, idempotence, empty transcript.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --offline org::`, `cargo test -p openjiuwen-agent-teams --offline --no-default-features org::`, `cargo clippy -p openjiuwen-agent-teams --all-targets --offline -- -D warnings`, `cargo doc -p openjiuwen-agent-teams --no-deps --offline`.
 
-## Runtime integration points (next step, outside this node)
+## Runtime integration (owned by the sibling nodes)
 
-1. Spec adoption: `TeamAgentSpec` is closed to this node, so an organisation is carried as JSON — suggested `TeamAgentSpec.metadata["organization"] = {"spec": OrganizationSpec, "rules": DelegationRules}` — and the runtime parses it with `serde_json::from_value`, then builds `Arc<OrgChart>` and `Arc<DelegationRouter>`.
-2. `TeamBackend` (`src/runtime/backend.rs`) is the natural owner of the organisation handles (`Arc<OrgChart>`, `Arc<DelegationRouter>`, `Arc<OrgTaskPool>`, `Arc<OrgMailbox>`), mirroring Python's `_bind_team`; `TeamAgent::backend()` already hands that facade to tools, CLI and MCP.
-3. Task-pool events: construct the pool with `OrgTaskPool::with_event_sink`, wrap each `OrgTaskEvent` into `EventMessage { event_type: "org_task", payload, sender_id: team }` and publish it on `TeamTopic::Task` through `TeamBackend::post_event`.
-4. Mailbox drain: the leader loop in `src/runtime/leader.rs` should read `OrgMailbox::inbox(team)` per tick, fold each `OrgMessage` into the existing batched leader `send` (respecting `steer_batch_size`), and call `acknowledge` only after a successful leader turn — Python's ack gate.
-5. Fork: `TeamMemberSpawner` (`src/runtime/spawner.rs`) should call `fork_member_context` when a spawn directive carries a parent and a task override, feeding `ForkedMemberSpec` into `MemberHarnessContext` and turning the override into a `TaskGraphSpec` with `parent_task_id`.
-6. Compact: the harness adapter (`src/harness/`) converts the DeepAgent context into `TranscriptMessage`s and calls `compact_transcript` at Python's split point instead of the model-generated summary.
-7. Swarmflow: implement `SwarmLane` in `src/runtime/` over `TeamAgent::invoke` (leader-side fan-out) or `MemberRuntime::send` (member-side), building the plan from `TaskGraphSpec` children.
-8. Crate root (`src/lib.rs`, parent node): add `pub use org::{...}` for the types listed under API Surface so the layer mirrors the other flat re-exports; `openjiuwen-agent-teams/src/org` already re-exports its six submodules flat.
+The runtime adopts this layer through one optional metadata block: `TeamAgentSpec.metadata["organization"] = {"spec": OrganizationSpec, "rules": DelegationRules}` is parsed in `src/runtime/spec_meta.rs` and installed by `build_with` as an `OrgBinding` on `TeamBackend`.
+`OrgBinding` owns the `Arc<OrgChart>`, `Arc<DelegationRouter>`, `Arc<OrgTaskPool>` and `Arc<OrgMailbox>`, and `TeamAgent::org()` hands it to callers.
+`OrgTaskPool::with_event_sink` receives `runtime::org_task_sink`, which publishes each `OrgTaskEvent` as an `"org_task"` payload on `TeamTopic::Task`.
+The leader loop in `src/runtime/leader.rs` reads `OrgBinding::unread(team)` (over `OrgMailbox::inbox`) per tick, folds each message into the batched leader `send`, and acknowledges only after a successful flush (Python's ack gate).
+`TeamMemberSpawner::forked_context` calls `fork_member_context` for a forked member and feeds the `ForkedMemberSpec` into the spawn path.
+`src/lib.rs` re-exports this module flat (`pub use org::*;`).
 
 ## Notes for Agents
 

@@ -130,7 +130,7 @@ A member with `runtime = "external"` is flagged `external_cli = true`; its launc
 - `AgentTemplateSpec` materialization, prompt sections, skill mounting, `agent_group_instruction` injection, leader `AGENT.md` mounting: the member runtime owns these; the package loader exposes cards and persona text only.
 - `display_description` / `avatar` on the group card, and localized tag objects as structured values (kept as resolved `String`s).
 - Hub install/builtin package discovery: `ExpertCatalog` implementations are host-owned.
-- YAML manifests, external CLI launch (`ExternalCliAgentSpec`), remote workspaces.
+- YAML manifests, remote workspaces and the expert-package launch of a vendor CLI agent (`ExternalCliAgentSpec`): the package loader exposes cards and persona text only, and vendor CLI harness providers are deferred crate-wide.
 
 ## Routing Table
 
