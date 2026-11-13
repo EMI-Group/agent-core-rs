@@ -57,8 +57,14 @@ pub struct NodeConfig {
     pub stream_outputs_schema: Option<Value>,
     /// Declared abilities; `None` (or empty) means "infer from topology".
     pub abilities: Option<Vec<ComponentAbility>>,
-    /// Accepted for compatibility; graph channels are CNF barriers, so a fan-in always
-    /// waits for every predecessor and `false` is rejected for collect/transform nodes.
+    /// Whether a fan-in waits for every predecessor (Python's `wait_for_all`).
+    ///
+    /// `Some(true)` or `None` keeps the all-predecessors CNF barrier every edge compiles
+    /// to. `Some(false)` on a node with at least two distinct regular/stream/barrier
+    /// predecessors compiles Python's first-arrival fan-in instead: the node fires per
+    /// arrival and a key whose producer has not run yet resolves to `null`. A node with a
+    /// single inbound source is unaffected (one source is one barrier). `Collect` and
+    /// `Transform` nodes must keep it `true`; `false` is rejected with `[100011]`.
     pub wait_for_all: Option<bool>,
     /// How many times a failing invocation is retried.
     pub max_retries: u32,

@@ -431,3 +431,57 @@ async fn a_collect_node_still_rejects_wait_for_all_false() {
         "{message}"
     );
 }
+/// The Mermaid node number the renderer assigned to `id`.
+///
+/// A rendered node is `node_<n>["<id>"]`, or `node_<n>("<id>")` for the entry/exit shapes.
+fn mermaid_node(mermaid: &str, id: &str) -> usize {
+    let shapes = [format!("[\"{id}\"]"), format!("(\"{id}\")")];
+    let line = mermaid
+        .lines()
+        .find(|line| shapes.iter().any(|shape| line.contains(shape)))
+        .unwrap_or_else(|| panic!("no node '{id}' in:\n{mermaid}"));
+    line.trim()
+        .strip_prefix("node_")
+        .and_then(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("no node number in '{line}'"))
+}
+
+#[test]
+fn to_mermaid_draws_every_predecessor_of_a_first_arrival_node() {
+    let LayeredFanIn { workflow, .. } = layered_fan_in(Some(false));
+    let mermaid = workflow.to_mermaid().unwrap();
+    let join = mermaid_node(&mermaid, "join");
+    for source in ["a2", "b", "c", "d"] {
+        let from = mermaid_node(&mermaid, source);
+        let edge = format!("node_{from} --> node_{join}");
+        assert!(
+            mermaid.contains(&edge),
+            "expected '{edge}' (render-only compiles keep the recorded CNF edges):\n{mermaid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rendering_a_first_arrival_workflow_leaves_the_run_path_unchanged() {
+    let LayeredFanIn { workflow, join, .. } = layered_fan_in(Some(false));
+    // The render path compiles the recorded topology; it must not affect what `invoke`
+    // compiles afterwards.
+    let mermaid = workflow.to_mermaid().unwrap();
+    assert!(!mermaid.contains("could not be compiled"), "{mermaid}");
+    let output = workflow
+        .invoke(json!({"query": "hi"}), session("fan-in-first-rendered"))
+        .await
+        .unwrap();
+    assert_eq!(output.state, WorkflowExecutionState::Completed);
+    let calls = join.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the join still fires once per arriving layer: {calls:?}"
+    );
+    assert_eq!(calls[0], json!({"a2": null, "b": "b", "c": "c", "d": "d"}));
+    assert_eq!(calls[1], json!({"a2": "a2", "b": "b", "c": "c", "d": "d"}));
+}

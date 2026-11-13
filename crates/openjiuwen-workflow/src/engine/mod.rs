@@ -307,7 +307,9 @@ impl CompiledWorkflow {
     ///
     /// Compilation for rendering has no run scope and no snapshot store; a definition
     /// that cannot be compiled yields a Mermaid comment naming the problem instead of
-    /// panicking.
+    /// panicking. Because that compile is render-only, the diagram shows the recorded
+    /// topology: a `wait_for_all = false` fan-in is drawn with an edge from every
+    /// predecessor instead of the dynamic router edges the run path compiles.
     #[must_use]
     pub fn to_mermaid(&self) -> String {
         match self.build_graph(None, None, None) {
@@ -367,7 +369,9 @@ impl CompiledWorkflow {
     /// Compiles a fresh graph for one run (or for rendering, when `scope` is `None`).
     ///
     /// Node instances carry the run's interaction state and frame writer, so a graph is
-    /// never reused across runs.
+    /// never reused across runs. A scope-less compile is render-only: it exists solely so
+    /// [`CompiledWorkflow::to_mermaid`] and [`CompiledWorkflow::to_svg`] can shape the
+    /// diagram, and the resulting graph is never executed.
     fn build_graph(
         &self,
         scope: Option<&Arc<RunScope>>,
@@ -375,6 +379,7 @@ impl CompiledWorkflow {
         max_supersteps: Option<usize>,
     ) -> Result<CompiledGraph> {
         let inner = &self.inner;
+        let render_only = scope.is_none();
         let card_id = inner.card.id.clone();
         let mut builder = GraphBuilder::new(card_id.clone());
 
@@ -404,7 +409,7 @@ impl CompiledWorkflow {
             );
         }
 
-        wire_edges(builder, &inner.definition)
+        wire_edges(builder, &inner.definition, render_only)
             .entry(inner.start_id.clone())
             .exit(inner.end_id.clone())
             .metadata("workflow_id", json!(card_id))
@@ -425,8 +430,22 @@ impl CompiledWorkflow {
 /// activate the node through the dynamic router edges registered by
 /// [`wire_conditional`] and by the unconditional-arrival loop below, which leaves its
 /// channel without a CNF group.
-fn wire_edges(builder: GraphBuilder, definition: &WorkflowDefinition) -> GraphBuilder {
-    let first_arrival = first_arrival_nodes(definition);
+///
+/// `render_only` compiles the *recorded* topology for a diagram instead of a run, so the
+/// first-arrival rewiring is skipped and every regular/stream/barrier edge is wired as
+/// recorded (`edge`/`barrier_edge`). A dynamic edge targets `"*"`, which the graph
+/// renderer skips (`openjiuwen-graph`'s visualize), so the CNF shape is the faithful
+/// picture of the builder's edges; the graph is never executed on this path.
+fn wire_edges(
+    builder: GraphBuilder,
+    definition: &WorkflowDefinition,
+    render_only: bool,
+) -> GraphBuilder {
+    let first_arrival = if render_only {
+        BTreeSet::new()
+    } else {
+        first_arrival_nodes(definition)
+    };
     let arrivals = first_arrival_arrivals(definition, &first_arrival);
     let mut builder = builder;
 
