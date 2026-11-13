@@ -2080,6 +2080,7 @@ dependencies = [
  "futures",
  "indexmap",
  "openjiuwen-agent",
+ "openjiuwen-agent-teams",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "openjiuwen-harness",

@@ -76,8 +76,15 @@ pub const PROVIDER_NAMES: [&str; 5] = [
 const NATIVE_V2_CARD_NAME: &str = "native_v2";
 /// Implementation version declared for `native_v2`.
 const NATIVE_V2_VERSION: &str = "0.2.0";
-/// External prerequisite of `native_v2`.
+/// External prerequisite of `native_v2` when this build has the provider compiled out.
+#[cfg(not(feature = "native-v2"))]
 const NATIVE_V2_REQUIRES: &str = "openjiuwen-agent-teams";
+/// External prerequisite reported for `native_v2`: none once the feature is compiled in.
+#[cfg(feature = "native-v2")]
+const NATIVE_V2_REQUIREMENT: Option<&str> = None;
+/// External prerequisite reported for `native_v2` in a build without the feature.
+#[cfg(not(feature = "native-v2"))]
+const NATIVE_V2_REQUIREMENT: Option<&str> = Some(NATIVE_V2_REQUIRES);
 /// Card name of the deferred Claude Code provider.
 const CLAUDE_CODE_CARD_NAME: &str = "claude-code";
 /// Card name of the deferred Codex provider.
@@ -316,9 +323,9 @@ fn builtin_descriptor(name: &str) -> Option<ProviderDescriptor> {
             card_name: NATIVE_V2_CARD_NAME.to_owned(),
             implementation_version: NATIVE_V2_VERSION.to_owned(),
             builtin: true,
-            implemented: false,
+            implemented: true,
             configures_models: false,
-            requires: Some(NATIVE_V2_REQUIRES.to_owned()),
+            requires: NATIVE_V2_REQUIREMENT.map(str::to_owned),
         },
         provider_names::CLAUDE_CODE => ProviderDescriptor {
             name: name.to_owned(),

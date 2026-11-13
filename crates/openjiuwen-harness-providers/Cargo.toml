@@ -14,6 +14,8 @@ openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-agent.workspace = true
 openjiuwen-session.workspace = true
+# Only the `native-v2` provider reaches into the team runtime; the default build never compiles it.
+openjiuwen-agent-teams = { workspace = true, default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
@@ -33,6 +35,8 @@ tempfile.workspace = true
 default = ["native"]
 native = []
 vendor = []
+# The `native_v2` provider: an in-process harness hosted by `openjiuwen-agent-teams`.
+native-v2 = ["dep:openjiuwen-agent-teams"]
 live-tests = []
 
 [lints]

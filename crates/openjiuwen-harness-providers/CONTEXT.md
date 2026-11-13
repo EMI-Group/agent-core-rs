@@ -67,7 +67,7 @@ Shared vendor CLI transport (module `vendor_cli`, foundation for the three CLI a
 | Registry name | Card name | Impl version | Status | Model config hook | External requirement |
 |---|---|---|---|---|---|
 | `native` | `openjiuwen-native` (Python: `deepagent`) | `openjiuwen-harness` crate version | implemented | yes (`model`, effort→`temperature`) | none |
-| `native_v2` | `native_v2` | — | deferred (lives in `openjiuwen-agent-teams`) | no | `openjiuwen-agent-teams` wiring |
+| `native_v2` | `native_v2` | `0.2.0` | implemented behind `native-v2` (hosts an `openjiuwen-agent-teams` team through `VendorHarness`) | no | none with the feature; `openjiuwen-agent-teams` when compiled out |
 | `claudecode` | `claude-code` | `0.1.0` | deferred stub (`vendor`) | yes (`{"model": {…}}`, `fallback_model`) | `claude` CLI + Claude Agent SDK over NDJSON stdio |
 | `codex` | `codex` | `0.1.0` | deferred stub (`vendor`) | yes (`{"model": {…}}`, `fallback_model`) | `codex` app-server + `openai-codex` SDK over JSON-RPC stdio |
 | `dsh` | `deepseek-harness` | `0.3.0` | deferred stub (`vendor`) | yes (flat `model`/`base_url`/`api_key`; rejects effort + fallback) | `deepseek-harness-sdk` + DSH runtime subprocess |
@@ -79,7 +79,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `./src/lib.rs` → crate docs, module declarations, feature flags, flat re-exports
 - `./src/provider.rs` → `ProviderSpec`, wrappers, `ProviderDescriptor`, provider-name constants
 - `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
-- `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
+- `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, team-hosted `native_v2/` (`mod.rs` provider+config+card, `driver.rs` `VendorDriver` over `TeamAgent`), vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter/` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler` (`mod.rs`), event→chunk projection (`projection.rs`), interaction routing and the pending map (`interactions.rs`), host-answer parsing (`answers.rs`)
 - `./src/vendor_cli/` → shared vendor CLI transport and harness shell: binary resolution, NDJSON helpers, the child process, the JSON-RPC client, the observation bus, host permission translation, session-id derivation, the `VendorDriver` seam and `VendorHarness`
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
@@ -125,7 +125,8 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `claudecode`: Claude Agent SDK / `claude` CLI (NDJSON over stdio), `lifecycle.py` delivery receipts, `observation.py` OTLP model-request logs, `failure_classifier.py`.
 - `codex`: `codex` app-server JSON-RPC, rollout-trace tailing, raw-event observation, dynamic-tool registration, MCP override rendering.
 - `dsh`: `deepseek-harness-sdk` runtime, Cordis plugin overlays, notification mapping.
-- `native_v2`: `openjiuwen-agent-teams::harness::protocol_adapter::NativeV2HarnessProvider`.
+- `native_v2` checkpoint export: the card declares no `Checkpoint` capability, so `VendorHarness` rejects `export_checkpoint`; the team runtime exposes no portable snapshot.
+- `native_v2` passthrough of team lifecycle events beyond `llm_output`/`llm_reasoning`/`tool_call`/`tool_result` (projected as `ProviderEvent`).
 - `trajectory.py` (OTel span recorder) — belongs to `openjiuwen-extensions`; `telemetry/otlp_receiver.py` — external receiver, not ported.
 - Manifest/agent-template loading and `HarnessContext` persona rendering — deferred with the agent-template spec.
 - Installed entry-point discovery (`importlib.metadata`) has no Rust analogue; providers are registered in-process or compiled in.

@@ -7,9 +7,9 @@
 //! "not found".
 //!
 //! Feature gating is expressed here, not in the provider modules: without the `native` feature the
-//! native entry point is compiled out, and without `vendor` the three vendor stubs stay
-//! unregistered. The module itself is always declared because the factory consults it in every
-//! feature combination.
+//! native entry point is compiled out, without `vendor` the three vendor stubs stay unregistered,
+//! and without `native-v2` the agent-teams-hosted provider is absent. The module itself is always
+//! declared because the factory consults it in every feature combination.
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
@@ -32,9 +32,15 @@ pub mod codex;
 #[cfg(feature = "vendor")]
 pub mod dsh;
 
-/// Message of a `native_v2` resolution: the provider lives outside this crate.
+/// The `native_v2` provider: an in-process harness hosted by `openjiuwen-agent-teams`.
+#[cfg(feature = "native-v2")]
+pub mod native_v2;
+
+/// Message of a `native_v2` resolution when this build has the feature compiled out.
+#[cfg(not(feature = "native-v2"))]
 const NATIVE_V2_DEFERRED: &str =
-    "harness provider 'native_v2' lives in openjiuwen-agent-teams and is not wired into this build";
+    "harness provider 'native_v2' is disabled; rebuild with the `native-v2` feature to register \
+     the openjiuwen-agent-teams provider";
 
 /// Resolves a built-in registry name to its provider.
 ///
@@ -44,12 +50,28 @@ const NATIVE_V2_DEFERRED: &str =
 pub fn builtin_provider(name: &str) -> Option<Result<Arc<dyn ProviderSpec>>> {
     match name {
         provider_names::NATIVE => Some(native_provider()),
-        provider_names::NATIVE_V2 => Some(Err(Error::unsupported(NATIVE_V2_DEFERRED))),
+        provider_names::NATIVE_V2 => Some(native_v2_provider()),
         provider_names::CLAUDE_CODE | provider_names::CODEX | provider_names::DSH => {
             Some(vendor_provider(name))
         }
         _ => None,
     }
+}
+
+/// The `native_v2` provider, or the reason this build has it compiled out.
+///
+/// The provider has no model-configuration hook, so it registers through
+/// [`plain_provider`](crate::provider::plain_provider), not the model-configuring wrapper.
+#[cfg(feature = "native-v2")]
+#[allow(clippy::unnecessary_wraps)]
+fn native_v2_provider() -> Result<Arc<dyn ProviderSpec>> {
+    Ok(crate::provider::plain_provider(native_v2::provider()))
+}
+
+/// The `native_v2` provider, or the reason this build has it compiled out.
+#[cfg(not(feature = "native-v2"))]
+fn native_v2_provider() -> Result<Arc<dyn ProviderSpec>> {
+    Err(Error::unsupported(NATIVE_V2_DEFERRED))
 }
 
 /// The native provider, or the reason this build has it compiled out.
@@ -108,16 +130,33 @@ mod tests {
         assert!(builtin_provider("").is_none());
     }
 
+    #[cfg(not(feature = "native-v2"))]
     #[test]
-    fn native_v2_reports_the_sibling_crate() {
+    fn native_v2_reports_the_missing_feature() {
         let error = builtin_provider(provider_names::NATIVE_V2)
             .expect("native_v2 is a declared name")
             .err()
-            .expect("native_v2 is not wired into this build");
+            .expect("the native-v2 feature is disabled");
         assert!(matches!(error, Error::Unsupported(_)));
         assert!(
-            error.to_string().contains("openjiuwen-agent-teams"),
+            error
+                .to_string()
+                .contains("rebuild with the `native-v2` feature"),
             "unexpected message: {error}"
+        );
+    }
+
+    #[cfg(feature = "native-v2")]
+    #[test]
+    fn native_v2_resolves_to_the_team_hosted_provider() {
+        let spec = builtin_provider(provider_names::NATIVE_V2)
+            .expect("native_v2 is a declared name")
+            .expect("the native-v2 feature is enabled");
+        assert_eq!(spec.card().name, "native_v2");
+        assert_eq!(spec.card().implementation_version, "0.2.0");
+        assert!(
+            !spec.configures_models(),
+            "native_v2 configures no models: members get theirs from the harness factory"
         );
     }
 
