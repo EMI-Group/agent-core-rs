@@ -398,6 +398,174 @@ fn spawn_backends_are_flat_on_the_crate_root() {
 }
 
 #[test]
+fn the_spawn_seam_extensions_are_flat_on_the_crate_root() {
+    use openjiuwen_runner::{
+        DeferredSpawner, ExternalCommandSpawner, InProcessAgent, InProcessFactory,
+        InProcessHandler, InProcessSpawner, MonitoredSpawnedAgent, RemoteSpawner, RunMonitor,
+        SpawnBackend, SpawnHealth, SpawnerRegistry, SubprocessConfig, SubprocessSpawner,
+    };
+
+    /// The admitted-and-wrapped constructor as a plain function pointer.
+    type TrackFn =
+        fn(Arc<dyn SpawnedAgent>, Arc<RunMonitor>, Option<&str>, Value) -> MonitoredSpawnedAgent;
+
+    assert_send_sync::<SpawnBackend>();
+    assert_send_sync::<SpawnHealth>();
+    assert_send_sync::<SpawnerRegistry>();
+    assert_send_sync::<DeferredSpawner>();
+    assert_send_sync::<ExternalCommandSpawner>();
+    assert_send_sync::<InProcessSpawner>();
+    assert_send_sync::<InProcessAgent>();
+    assert_send_sync::<InProcessFactory>();
+    assert_send_sync::<MonitoredSpawnedAgent>();
+    assert_send_sync::<Arc<dyn InProcessHandler>>();
+
+    assert_clone::<SpawnBackend>();
+    assert_clone::<SpawnHealth>();
+    assert_clone::<DeferredSpawner>();
+    assert_clone::<ExternalCommandSpawner>();
+    assert_clone::<InProcessSpawner>();
+    assert_clone::<InProcessFactory>();
+
+    assert_serde::<SpawnBackend>();
+    assert_serde::<SpawnHealth>();
+    roundtrip(&SpawnBackend::ExternalCommand);
+    roundtrip(&SpawnHealth::healthy(SpawnBackend::InProcess, None));
+
+    // All four implemented backends coerce to the spawner seam, and every
+    // backend name is its `snake_case` wire name.
+    let in_process: InProcessFactory = Arc::new(|_spec: &SpawnSpec| {
+        Err(openjiuwen_common::error::Error::unsupported(
+            "this suite builds no hosted handler",
+        ))
+    });
+    let spawners: [Arc<dyn AgentSpawner>; 4] = [
+        Arc::new(SubprocessSpawner::new(SubprocessConfig::default())),
+        Arc::new(ExternalCommandSpawner::new("agent")),
+        Arc::new(InProcessSpawner::new(in_process)),
+        Arc::new(RemoteSpawner::new("http://127.0.0.1:1")),
+    ];
+    assert_eq!(spawners.len(), 4);
+    let deferred: Arc<dyn AgentSpawner> =
+        Arc::new(DeferredSpawner::for_backend(SpawnBackend::RemoteA2a));
+    assert_eq!(deferred.backend(), SpawnBackend::RemoteA2a);
+    let registry = SpawnerRegistry::with_deferred();
+    assert_eq!(registry.len(), 2);
+
+    let _: Option<TrackFn> = Some(MonitoredSpawnedAgent::track);
+}
+
+#[test]
+fn spawn_backend_names_implemented_flags_and_display_are_pinned() {
+    use openjiuwen_runner::{DeferredSpawner, SpawnBackend};
+
+    let implemented = [
+        SpawnBackend::Subprocess,
+        SpawnBackend::ExternalCommand,
+        SpawnBackend::InProcess,
+        SpawnBackend::RemoteHttp,
+    ];
+    let deferred = [SpawnBackend::RemoteMq, SpawnBackend::RemoteA2a];
+    for backend in implemented {
+        assert!(backend.is_implemented(), "{}", backend.as_str());
+    }
+    for backend in deferred {
+        assert!(!backend.is_implemented(), "{}", backend.as_str());
+        assert_eq!(
+            DeferredSpawner::for_backend(backend).backend_name(),
+            backend
+        );
+    }
+    assert!(!SpawnBackend::Unknown.is_implemented());
+
+    let every = [
+        SpawnBackend::Unknown,
+        SpawnBackend::Subprocess,
+        SpawnBackend::ExternalCommand,
+        SpawnBackend::InProcess,
+        SpawnBackend::RemoteHttp,
+        SpawnBackend::RemoteMq,
+        SpawnBackend::RemoteA2a,
+    ];
+    for backend in every {
+        assert_eq!(
+            serde_json::to_value(backend).unwrap(),
+            json!(backend.as_str()),
+            "{}",
+            backend.as_str()
+        );
+        assert_eq!(backend.to_string(), backend.as_str());
+    }
+    assert_eq!(SpawnBackend::default(), SpawnBackend::Unknown);
+}
+
+/// A handle implementing only the required seam methods, so the defaulted
+/// accessors are reachable through the trait object.
+struct SeamChild {
+    /// Whether the handle reports itself alive.
+    alive: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unused_async_trait_impl)]
+impl SpawnedAgent for SeamChild {
+    fn id(&self) -> &'static str {
+        "seam-child"
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    async fn send(&self, _inputs: Value) -> Result<AgentOutput> {
+        Ok(AgentOutput::default())
+    }
+
+    fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    async fn shutdown(&self, _timeout: Duration) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn force_kill(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_seam_accessors_are_callable_through_the_trait_object() {
+    use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_runner::{SpawnBackend, SpawnHealth};
+
+    let child: Arc<dyn SpawnedAgent> = Arc::new(SeamChild {
+        alive: std::sync::atomic::AtomicBool::new(true),
+    });
+
+    assert_eq!(child.backend(), SpawnBackend::Unknown);
+    assert!(child.is_alive());
+    assert!(child.is_healthy());
+    let snapshot: SpawnHealth = child.health_snapshot();
+    assert_eq!(snapshot.backend, SpawnBackend::Unknown);
+    assert!(snapshot.alive && snapshot.healthy);
+    assert_eq!(snapshot.last_error, None);
+
+    assert_eq!(
+        child.health().await.unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+    assert_eq!(
+        child.cancel_task("t-1").await.unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+}
+
+#[test]
 fn callback_chains_filters_and_handler_builders_are_flat_on_the_crate_root() {
     // `on_and_wrap_stay_under_their_modules` below pins the deliberate scoping of
     // the free combinators; these are the types the crate root does export.
