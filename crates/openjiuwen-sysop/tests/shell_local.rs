@@ -365,3 +365,57 @@ async fn background_returns_a_pid() {
         "no early-exit error for a running command"
     );
 }
+
+/// Environment probe: how many `stdbuf` wrapper variables the child inherited.
+const WRAPPER_PROBE: &str = "env | grep -c -E '_STDBUF_|libstdbuf'";
+
+/// `true` when a command run through `stdbuf` really exports the wrapper marker.
+fn stdbuf_is_effective() -> bool {
+    if which::which("stdbuf").is_err() {
+        return false;
+    }
+    std::process::Command::new("stdbuf")
+        .args(["-oL", "-eL", "sh", "-c", WRAPPER_PROBE])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() != "0")
+}
+
+#[tokio::test]
+async fn line_buffering_wraps_by_default_and_can_be_disabled() {
+    if !require_sh() {
+        return;
+    }
+    let dir = workspace();
+    let default_config = config(&dir);
+    assert!(
+        default_config.line_buffered,
+        "line buffering defaults to on"
+    );
+    let wrapped = local_shell(default_config)
+        .unwrap()
+        .execute_cmd(ShellExecParams::new(WRAPPER_PROBE))
+        .await;
+    assert_eq!(wrapped.code, 0, "{}", wrapped.message);
+    let wrapped_marker = wrapped.data.expect("captured run").stdout;
+
+    let mut plain_config = config(&dir);
+    plain_config.line_buffered = false;
+    let plain = local_shell(plain_config)
+        .unwrap()
+        .execute_cmd(ShellExecParams::new(WRAPPER_PROBE))
+        .await;
+    assert_eq!(plain.code, 0, "{}", plain.message);
+    assert_eq!(
+        plain.data.expect("captured run").stdout.trim(),
+        "0",
+        "line_buffered = false must spawn the plan unwrapped"
+    );
+
+    if stdbuf_is_effective() && std::env::var_os("LD_PRELOAD").is_none() {
+        assert_ne!(
+            wrapped_marker.trim(),
+            "0",
+            "the default configuration should be wrapped in stdbuf"
+        );
+    }
+}

@@ -18,6 +18,8 @@ pub mod allowlist;
 pub mod local;
 pub mod plan;
 pub(crate) mod process;
+#[cfg(unix)]
+pub(crate) mod pty;
 pub mod registry;
 pub mod types;
 
