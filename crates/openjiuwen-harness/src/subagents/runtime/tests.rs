@@ -1,5 +1,5 @@
 use futures::stream::BoxStream;
-use openjiuwen_agent::{AgentCard, AgentChunk};
+use openjiuwen_agent::{AgentCard, AgentChunk, AgentOutput};
 use openjiuwen_session::Session;
 use tokio::sync::watch;
 
@@ -458,3 +458,5 @@ fn status_wire_strings_and_finality() {
     };
     assert!(outcome.is_final());
 }
+
+mod quota;

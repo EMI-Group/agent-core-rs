@@ -1,0 +1,504 @@
+//! Runtime limits, activity phases, and deterministic LRU candidate selection for subagents.
+//!
+//! Ports the limits of `openjiuwen/harness/subagent_runtime/config.py`
+//! (`SubagentRuntimeConfig`) and the quota ledger of `subagent_runtime/registry.py`.
+//! [`SubAgentQuota`] is the immutable policy the runtime consults before reserving a slot;
+//! [`SpawnBudget`] is the demand a queued spawn would add, counted by the runtime;
+//! [`SubagentActivity`] is the derived lifecycle phase that drives eviction; and
+//! [`select_lru_candidate`] is the pure, deterministic least-recently-used pick.
+use serde::{Deserialize, Serialize};
+
+use openjiuwen_common::error::{Error, Result};
+
+use super::transcript::{DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY};
+
+/// Default live-instance cap (Python `max_subagents`).
+const DEFAULT_MAX_SUBAGENTS: usize = 10;
+/// Default concurrent-turn cap (Python `max_concurrent_running`).
+const DEFAULT_MAX_CONCURRENT_RUNNING: usize = 5;
+
+/// Tunable limits of one subagent runtime (Python `SubagentRuntimeConfig`).
+///
+/// The three `Option` fields are unlimited by default: Python only bounds the live instance
+/// count and the concurrent turns, so nesting, cumulative spawns and per-parent fan-out stay
+/// unbounded unless a caller opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct SubAgentQuota {
+    /// Maximum live (non-closed) instances.
+    pub max_subagents: usize,
+    /// Maximum concurrently running turns.
+    pub max_concurrent_running: usize,
+    /// Maximum cumulative spawns of the session; `None` = unlimited.
+    pub max_total_spawned: Option<usize>,
+    /// Maximum live instances per spawning parent; `None` = unlimited.
+    pub max_children_per_parent: Option<usize>,
+    /// Maximum nesting depth of spawned instances (top-level = 1); `None` = unlimited.
+    pub max_depth: Option<usize>,
+    /// Evict the least-recently-used idle instance when the live cap is hit.
+    ///
+    /// Python parity: enabled by default (`SubagentRuntimeConfig.enable_lru_eviction`). The
+    /// runtime exposes the policy inputs but the eviction pass itself is a later step.
+    pub enable_lru_eviction: bool,
+    /// Ring-buffer cap of one subagent transcript.
+    pub transcript_capacity: usize,
+    /// Broadcast capacity of one subagent transcript feed.
+    pub transcript_channel_capacity: usize,
+}
+
+impl Default for SubAgentQuota {
+    fn default() -> Self {
+        Self {
+            max_subagents: DEFAULT_MAX_SUBAGENTS,
+            max_concurrent_running: DEFAULT_MAX_CONCURRENT_RUNNING,
+            max_total_spawned: None,
+            max_children_per_parent: None,
+            max_depth: None,
+            enable_lru_eviction: true,
+            transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
+            transcript_channel_capacity: DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+        }
+    }
+}
+
+impl SubAgentQuota {
+    /// Replaces the live-instance cap.
+    #[must_use]
+    pub fn with_max_subagents(mut self, max: usize) -> Self {
+        self.max_subagents = max;
+        self
+    }
+
+    /// Replaces the concurrent-turn cap.
+    #[must_use]
+    pub fn with_concurrent_running(mut self, max: usize) -> Self {
+        self.max_concurrent_running = max;
+        self
+    }
+
+    /// Bounds the cumulative spawns of the session.
+    #[must_use]
+    pub fn with_total_spawned(mut self, max: usize) -> Self {
+        self.max_total_spawned = Some(max);
+        self
+    }
+
+    /// Bounds the live instances of one spawning parent.
+    #[must_use]
+    pub fn with_children_per_parent(mut self, max: usize) -> Self {
+        self.max_children_per_parent = Some(max);
+        self
+    }
+
+    /// Bounds the nesting depth of spawned instances (top-level = 1).
+    #[must_use]
+    pub fn with_max_depth(mut self, max: usize) -> Self {
+        self.max_depth = Some(max);
+        self
+    }
+
+    /// Enables or disables LRU eviction of idle instances.
+    #[must_use]
+    pub fn with_lru_eviction(mut self, enable: bool) -> Self {
+        self.enable_lru_eviction = enable;
+        self
+    }
+
+    /// Replaces the transcript ring-buffer cap.
+    #[must_use]
+    pub fn with_transcript_capacity(mut self, capacity: usize) -> Self {
+        self.transcript_capacity = capacity;
+        self
+    }
+
+    /// Replaces the transcript broadcast capacity.
+    #[must_use]
+    pub fn with_transcript_channel_capacity(mut self, capacity: usize) -> Self {
+        self.transcript_channel_capacity = capacity;
+        self
+    }
+
+    /// Checks one spawn demand against every limit.
+    ///
+    /// Checks run in a fixed order so a caller sees the most fundamental refusal first:
+    /// nesting depth, per-parent fan-out, cumulative spawns, then the live-instance cap.
+    /// `parent` labels the requesting parent in the per-parent message (the parent instance id,
+    /// or the parent session id for a top-level spawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the limit that would be exceeded.
+    pub fn check_spawn(&self, budget: &SpawnBudget, parent: &str) -> Result<()> {
+        if let Some(limit) = self.max_depth {
+            if budget.depth > limit {
+                return Err(Error::config(format!(
+                    "subagent depth limit exceeded: depth={}, limit={limit}",
+                    budget.depth
+                )));
+            }
+        }
+        if let Some(limit) = self.max_children_per_parent {
+            if budget.parent_live >= limit {
+                return Err(Error::config(format!(
+                    "subagent child limit exceeded: parent={parent}, used={}, limit={limit}",
+                    budget.parent_live
+                )));
+            }
+        }
+        if let Some(limit) = self.max_total_spawned {
+            if budget.spawned >= limit {
+                return Err(Error::config(format!(
+                    "subagent spawn budget exhausted: spawned={}, limit={limit}",
+                    budget.spawned
+                )));
+            }
+        }
+        if budget.live >= self.max_subagents {
+            return Err(Error::config(format!(
+                "subagent capacity exceeded: used={}, limit={}",
+                budget.live, self.max_subagents
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The spawn demand a queued spawn would add, as counted by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnBudget {
+    /// Live instances right now.
+    pub live: usize,
+    /// Cumulative spawns so far.
+    pub spawned: usize,
+    /// Live instances whose parent is the requesting parent.
+    pub parent_live: usize,
+    /// Depth the new instance would have (top-level = 1).
+    pub depth: usize,
+}
+
+/// Derived lifecycle phase of one instance; drives LRU eviction.
+///
+/// The phase advances `Queued -> Running -> Idle`, and `Closed` is terminal: only `Idle` and
+/// `Queued` instances may ever be evicted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentActivity {
+    /// Reserved, no turn has started yet.
+    #[default]
+    Queued,
+    /// A turn is executing right now.
+    Running,
+    /// Started at least one turn and is not running one.
+    Idle,
+    /// Closed; only an in-memory tombstone remains.
+    Closed,
+}
+
+impl SubagentActivity {
+    /// Returns the `snake_case` wire string of this phase.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Idle => "idle",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Whether an instance in this phase may be evicted to free a slot.
+    #[must_use]
+    pub fn is_evictable(&self) -> bool {
+        matches!(self, Self::Idle | Self::Queued)
+    }
+}
+
+/// One eviction candidate seen by the LRU policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LruCandidate {
+    /// Instance id.
+    pub subagent_id: String,
+    /// Derived lifecycle phase of the instance.
+    pub activity: SubagentActivity,
+    /// Milliseconds since the Unix epoch of the instance's last state transition.
+    pub last_activity_ms: i64,
+    /// Spawn sequence number of the instance (stable ordering tie-break).
+    pub spawn_seq: u64,
+}
+
+/// Deterministic LRU pick: never a `Running`/`Closed` instance, prefer `Idle` over `Queued`,
+/// then the oldest `last_activity_ms`, then the smallest `subagent_id`.
+#[must_use]
+pub fn select_lru_candidate(candidates: &[LruCandidate]) -> Option<&LruCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.activity.is_evictable())
+        .min_by(|left, right| {
+            activity_rank(left.activity)
+                .cmp(&activity_rank(right.activity))
+                .then_with(|| left.last_activity_ms.cmp(&right.last_activity_ms))
+                .then_with(|| left.subagent_id.cmp(&right.subagent_id))
+        })
+}
+
+/// Eviction preference: `Idle` first, then `Queued`; non-evictable phases sort last.
+fn activity_rank(activity: SubagentActivity) -> u8 {
+    match activity {
+        SubagentActivity::Idle => 0,
+        SubagentActivity::Queued => 1,
+        SubagentActivity::Running | SubagentActivity::Closed => u8::MAX,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{select_lru_candidate, LruCandidate, SpawnBudget, SubAgentQuota, SubagentActivity};
+
+    fn budget(live: usize, spawned: usize, parent_live: usize, depth: usize) -> SpawnBudget {
+        SpawnBudget {
+            live,
+            spawned,
+            parent_live,
+            depth,
+        }
+    }
+
+    fn candidate(
+        id: &str,
+        activity: SubagentActivity,
+        last_activity_ms: i64,
+        spawn_seq: u64,
+    ) -> LruCandidate {
+        LruCandidate {
+            subagent_id: id.to_owned(),
+            activity,
+            last_activity_ms,
+            spawn_seq,
+        }
+    }
+
+    #[test]
+    fn defaults_match_python() {
+        let quota = SubAgentQuota::default();
+        assert_eq!(quota.max_subagents, 10);
+        assert_eq!(quota.max_concurrent_running, 5);
+        assert_eq!(quota.max_total_spawned, None);
+        assert_eq!(quota.max_children_per_parent, None);
+        assert_eq!(quota.max_depth, None);
+        assert!(quota.enable_lru_eviction);
+        assert_eq!(quota.transcript_capacity, 256);
+        assert_eq!(quota.transcript_channel_capacity, 256);
+    }
+
+    #[test]
+    fn fluent_setters_replace_every_field() {
+        let quota = SubAgentQuota::default()
+            .with_max_subagents(2)
+            .with_concurrent_running(3)
+            .with_total_spawned(4)
+            .with_children_per_parent(5)
+            .with_max_depth(6)
+            .with_lru_eviction(false)
+            .with_transcript_capacity(7)
+            .with_transcript_channel_capacity(8);
+        assert_eq!(
+            quota,
+            SubAgentQuota {
+                max_subagents: 2,
+                max_concurrent_running: 3,
+                max_total_spawned: Some(4),
+                max_children_per_parent: Some(5),
+                max_depth: Some(6),
+                enable_lru_eviction: false,
+                transcript_capacity: 7,
+                transcript_channel_capacity: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn live_cap_reports_the_legacy_message() {
+        let quota = SubAgentQuota::default().with_max_subagents(1);
+        let error = quota
+            .check_spawn(&budget(1, 0, 0, 1), "parent")
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message == "subagent capacity exceeded: used=1, limit=1"
+        ));
+        assert!(quota.check_spawn(&budget(0, 0, 0, 1), "parent").is_ok());
+    }
+
+    #[test]
+    fn cumulative_spawn_budget_reports_its_message() {
+        let quota = SubAgentQuota::default().with_total_spawned(2);
+        assert!(quota.check_spawn(&budget(0, 1, 0, 1), "parent").is_ok());
+        let error = quota
+            .check_spawn(&budget(0, 2, 0, 1), "parent")
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message == "subagent spawn budget exhausted: spawned=2, limit=2"
+        ));
+    }
+
+    #[test]
+    fn per_parent_limit_reports_its_message() {
+        let quota = SubAgentQuota::default().with_children_per_parent(1);
+        assert!(quota
+            .check_spawn(&budget(0, 0, 0, 1), "parent-session")
+            .is_ok());
+        let error = quota
+            .check_spawn(&budget(0, 0, 1, 2), "parent-session")
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message == "subagent child limit exceeded: parent=parent-session, used=1, limit=1"
+        ));
+    }
+
+    #[test]
+    fn depth_limit_reports_its_message() {
+        let quota = SubAgentQuota::default().with_max_depth(2);
+        assert!(quota.check_spawn(&budget(0, 0, 0, 2), "parent").is_ok());
+        let error = quota
+            .check_spawn(&budget(0, 0, 0, 3), "parent")
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message == "subagent depth limit exceeded: depth=3, limit=2"
+        ));
+    }
+
+    #[test]
+    fn unlimited_fields_never_fire() {
+        let quota = SubAgentQuota::default();
+        assert!(quota
+            .check_spawn(&budget(0, 10_000, 10_000, 1_000), "p")
+            .is_ok());
+    }
+
+    #[test]
+    fn checks_run_depth_then_parent_then_spawns_then_live() {
+        let quota = SubAgentQuota::default()
+            .with_max_subagents(0)
+            .with_total_spawned(1)
+            .with_children_per_parent(1)
+            .with_max_depth(1);
+        let error = quota.check_spawn(&budget(0, 1, 1, 2), "p").unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message.starts_with("subagent depth limit exceeded:")
+        ));
+        let error = quota.check_spawn(&budget(0, 1, 1, 1), "p").unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message.starts_with("subagent child limit exceeded:")
+        ));
+        let error = quota.check_spawn(&budget(0, 1, 0, 1), "p").unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message.starts_with("subagent spawn budget exhausted:")
+        ));
+        let error = quota.check_spawn(&budget(0, 0, 0, 1), "p").unwrap_err();
+        assert!(matches!(
+            &error,
+            openjiuwen_common::error::Error::Config(message)
+                if message.starts_with("subagent capacity exceeded:")
+        ));
+    }
+
+    #[test]
+    fn activity_wire_strings_and_evictability() {
+        let cases = [
+            (SubagentActivity::Queued, "queued", true),
+            (SubagentActivity::Running, "running", false),
+            (SubagentActivity::Idle, "idle", true),
+            (SubagentActivity::Closed, "closed", false),
+        ];
+        for (activity, wire, evictable) in cases {
+            assert_eq!(activity.as_str(), wire);
+            assert_eq!(activity.is_evictable(), evictable);
+        }
+        assert_eq!(SubagentActivity::default(), SubagentActivity::Queued);
+    }
+
+    #[test]
+    fn quota_and_activity_round_trip_through_json() {
+        let quota = SubAgentQuota::default()
+            .with_max_subagents(3)
+            .with_total_spawned(9)
+            .with_lru_eviction(false);
+        let json = serde_json::to_string(&quota).unwrap();
+        assert_eq!(serde_json::from_str::<SubAgentQuota>(&json).unwrap(), quota);
+        let lenient: SubAgentQuota =
+            serde_json::from_str(r#"{"max_subagents": 2, "unknown": true}"#).unwrap();
+        assert_eq!(lenient.max_subagents, 2);
+        assert_eq!(lenient.max_concurrent_running, 5);
+        let activity = serde_json::to_string(&SubagentActivity::Idle).unwrap();
+        assert_eq!(activity, "\"idle\"");
+        assert_eq!(
+            serde_json::from_str::<SubagentActivity>("\"running\"").unwrap(),
+            SubagentActivity::Running
+        );
+    }
+
+    #[test]
+    fn no_candidates_select_nothing() {
+        assert!(select_lru_candidate(&[]).is_none());
+        assert!(select_lru_candidate(&[
+            candidate("running", SubagentActivity::Running, 0, 0),
+            candidate("closed", SubagentActivity::Closed, 0, 1),
+        ])
+        .is_none());
+    }
+
+    #[test]
+    fn idle_is_preferred_over_an_older_queued_instance() {
+        let candidates = [
+            candidate("queued", SubagentActivity::Queued, 10, 1),
+            candidate("idle", SubagentActivity::Idle, 20, 2),
+            candidate("running", SubagentActivity::Running, 0, 3),
+        ];
+        let picked = select_lru_candidate(&candidates).unwrap();
+        assert_eq!(picked.subagent_id, "idle");
+    }
+
+    #[test]
+    fn oldest_wins_within_one_activity_class() {
+        let candidates = [
+            candidate("newer", SubagentActivity::Idle, 50, 1),
+            candidate("oldest", SubagentActivity::Idle, 10, 2),
+            candidate("middle", SubagentActivity::Idle, 30, 3),
+        ];
+        assert_eq!(
+            select_lru_candidate(&candidates).unwrap().subagent_id,
+            "oldest"
+        );
+        let queued = [
+            candidate("b", SubagentActivity::Queued, 10, 4),
+            candidate("a", SubagentActivity::Queued, 10, 5),
+        ];
+        assert_eq!(select_lru_candidate(&queued).unwrap().subagent_id, "a");
+    }
+
+    #[test]
+    fn spawn_seq_does_not_override_the_documented_preference() {
+        let candidates = [
+            candidate("first", SubagentActivity::Queued, 10, 0),
+            candidate("second", SubagentActivity::Idle, 99, 9),
+        ];
+        assert_eq!(
+            select_lru_candidate(&candidates).unwrap().subagent_id,
+            "second"
+        );
+    }
+}

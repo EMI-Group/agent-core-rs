@@ -164,6 +164,7 @@ impl Tool for SubagentSpawnTool {
             display_name: Some(display_name),
             role: Some(role),
             subagent_id: None,
+            parent_subagent_id: None,
         };
         match self.runtime.spawn(request).await {
             Ok(id) => {

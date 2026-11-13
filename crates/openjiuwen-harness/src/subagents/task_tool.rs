@@ -139,6 +139,7 @@ impl Tool for TaskTool {
             display_name: None,
             role: None,
             subagent_id: resume_task_id,
+            parent_subagent_id: None,
         };
         let id = match self.runtime.spawn(request).await {
             Ok(id) => id,
