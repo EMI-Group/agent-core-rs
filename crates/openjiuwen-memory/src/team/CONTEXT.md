@@ -16,7 +16,7 @@ Mapping to the Python runtime:
 
 ## API Surface
 
-Crate path: `openjiuwen_memory::team` (the crate root declares `pub mod team;` but does not yet `pub use team::*`, so reach items through the module path).
+Crate path: `openjiuwen_memory::team` (also re-exported at the crate root as `openjiuwen_memory::TeamMemoryRecord` etc.).
 
 Model (`team::model`, plain `serde` data, no I/O):
 - `TeamMemoryScope { team_id, member_id: Option<String>, session_id: Option<String> }` with `new`, `member`, `with_member`, `with_session`, `validate`, and `allows(&record)` (the read rule).
@@ -167,7 +167,7 @@ The projection is a view: it is not a second source of truth, and writing it bac
 
 ## Notes for Agents
 
-- `openjiuwen_memory::lib.rs` declares `pub mod team;` but has no `pub use team::*;`, so team types are reachable only through `openjiuwen_memory::team::…`; adding the re-export is a crate-root change owned by the parent node.
+- The crate root re-exports this module (`pub use team::*;`), so team types are reachable at `openjiuwen_memory::…` as well as `openjiuwen_memory::team::…`.
 - `TeamMemoryKind::Custom` preserves the original string verbatim; only the known aliases are normalized, so a custom kind's case is significant.
 - `TeamMemoryFilter` is always team-scoped: there is no cross-team listing by design (`prune_expired` is the only cross-team operation).
 - `TeamMemory::in_memory()` is the offline reference backend; `TeamMemory::sqlite(path)` is the durable one and shares the trait.
