@@ -67,7 +67,8 @@ Everything is re-exported flat from this module (`crate::skills::*`).
 
 ## Deferred
 
-- Prompt-section rendering, `auto_list`/`all` skill modes, keyword ranking with a query, front-matter `name` conflict rejection across roots, env-string root parsing (`a,b;c`), and tilde expansion — all belong to `crate::rails` / the agent factory.
+- Prompt-section rendering lives outside this module: `SkillsRail::before_model_call` (`../rails/skills.rs:173`) publishes `prompts::skills_section` (`../prompts/sections.rs:359`), which renders `## Available Skills` plus `- **name**: description` bullets — name and description only, never the `SKILL.md` body.
+- `auto_list`/`all` skill modes, keyword ranking with a query, front-matter `name` conflict rejection across roots, env-string root parsing (`a,b;c`), and tilde expansion — all belong to `crate::rails` / the agent factory.
 - Language-aware descriptions are exposed through `discover_with_language`; the language itself comes from the prompt builder, not this module.
 
 ## Routing Table
