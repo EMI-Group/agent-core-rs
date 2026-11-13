@@ -47,6 +47,15 @@ pub struct TeamBuildDeps {
     pub harness_factory: Arc<dyn MemberHarnessFactory>,
     /// Persists the team row, roster, task board and mailbox.
     pub store: Arc<dyn TeamStore>,
+    /// Whether [`TeamBuildDeps::with_store`] injected [`TeamBuildDeps::store`].
+    ///
+    /// The build path resolves the store in this order: an injected store wins over
+    /// [`TeamAgentSpec::storage`](crate::schema::TeamAgentSpec::storage); without one, a blank or
+    /// `memory` spec reuses [`TeamBuildDeps::store`] and a named backend is opened through
+    /// [`crate::storage::open_store`]. The flag is public so an out-of-crate builder that uses
+    /// struct-update syntax (`..TeamBuildDeps::default()`) keeps working; hosts normally construct
+    /// dependencies through [`TeamBuildDeps::new`] and the `with_*` overrides.
+    pub store_injected: bool,
     /// Allocates the directory a member writes artifacts into.
     pub workspace: Arc<dyn WorkspaceProvider>,
     /// Declared team language (`cn`/`cf`/`en`); `None` means the schema default.
@@ -81,9 +90,25 @@ impl TeamBuildDeps {
     }
 
     /// Replaces the store, leaving every other field untouched.
+    ///
+    /// Also marks the store as injected, so the build path uses it even when the blueprint names a
+    /// different [`StorageSpec`](crate::schema::StorageSpec) kind.
     #[must_use]
     pub fn with_store(self, store: Arc<dyn TeamStore>) -> Self {
-        Self { store, ..self }
+        Self {
+            store,
+            store_injected: true,
+            ..self
+        }
+    }
+
+    /// Returns `true` when [`TeamBuildDeps::with_store`] supplied the store.
+    ///
+    /// The build path uses it to decide between the injected store and the blueprint's
+    /// [`StorageSpec`](crate::schema::StorageSpec).
+    #[must_use]
+    pub fn has_injected_store(&self) -> bool {
+        self.store_injected
     }
 
     /// Replaces the workspace provider, leaving every other field untouched.
@@ -148,6 +173,7 @@ impl Default for TeamBuildDeps {
         Self {
             harness_factory: Arc::new(NativeMemberFactory::from_env()),
             store: Arc::new(InMemoryTeamStore::new()),
+            store_injected: false,
             workspace: Arc::new(LocalWorkspaceProvider::new(MemberWorkspaceLayout::new(
                 std::env::temp_dir().join(DEFAULT_WORKSPACE_DIR),
             ))),
@@ -167,6 +193,7 @@ impl fmt::Debug for TeamBuildDeps {
         f.debug_struct("TeamBuildDeps")
             .field("harness_factory", &self.harness_factory.name())
             .field("store", &self.store.name())
+            .field("store_injected", &self.store_injected)
             .field("workspace", &"injected")
             .field("language", &self.language)
             .field("observability_hooks", &self.observability_hooks.len())
@@ -212,6 +239,10 @@ mod tests {
         assert_eq!(deps.harness_factory.name(), "native");
         assert_eq!(deps.store.name(), MEMORY_STORAGE_KIND);
         assert_eq!(deps.store.name(), "memory");
+        assert!(
+            !deps.has_injected_store(),
+            "the default store is not injected"
+        );
         assert_eq!(deps.language, None);
         assert_eq!(deps.resolved_language(), "cn");
     }
@@ -234,9 +265,26 @@ mod tests {
         let deps = base.clone().with_store(Arc::clone(&store));
         assert!(Arc::ptr_eq(&deps.store, &store));
         assert!(!Arc::ptr_eq(&deps.store, &base.store));
+        assert!(
+            deps.has_injected_store(),
+            "with_store marks the store as injected"
+        );
         assert!(Arc::ptr_eq(&deps.harness_factory, &base.harness_factory));
         assert!(Arc::ptr_eq(&deps.workspace, &base.workspace));
         assert_eq!(deps.language, base.language);
+    }
+
+    #[test]
+    fn injected_store_flag_survives_the_other_overrides() {
+        let store: Arc<dyn TeamStore> = Arc::new(InMemoryTeamStore::new());
+        let deps = TeamBuildDeps::new()
+            .with_store(Arc::clone(&store))
+            .with_language("en")
+            .with_workspace(Arc::new(LocalWorkspaceProvider::new(
+                MemberWorkspaceLayout::new(std::env::temp_dir().join("other-base")),
+            )));
+        assert!(deps.has_injected_store());
+        assert!(Arc::ptr_eq(&deps.store, &store));
     }
 
     #[test]
@@ -291,6 +339,7 @@ mod tests {
         assert!(debug.contains("native"), "{debug}");
         assert!(debug.contains("memory"), "{debug}");
         assert!(debug.contains("injected"), "{debug}");
+        assert!(debug.contains("store_injected: false"), "{debug}");
         assert!(debug.contains("language: None"), "{debug}");
     }
 }
