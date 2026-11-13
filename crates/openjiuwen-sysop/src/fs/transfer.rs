@@ -16,7 +16,10 @@
 //!
 //! A transfer locks the source `Read` and the destination `Write` through
 //! [`LocalFsOperation::acquire_ordered`], which sorts the paths so two transfers can never
-//! deadlock. The guards are held until the last byte is flushed.
+//! deadlock and takes both lock layers (in-process `RwLock` and the cross-process `flock` in
+//! [`crate::fs::lock`]) in that same order. The guards are held until the last byte is
+//! flushed. A lock that cannot be taken (timeout or an unusable sidecar file) fails the
+//! transfer with code `199003` instead of copying unlocked.
 //!
 //! # Failures
 //!
@@ -216,7 +219,8 @@ async fn prepare_download(
 ///
 /// # Errors
 ///
-/// Returns the I/O error message when the copy fails.
+/// Returns the reason when a cross-process lock times out or its sidecar file cannot be
+/// opened, or the I/O error message when the copy fails.
 async fn transfer(
     op: &LocalFsOperation,
     source: &Path,
@@ -229,7 +233,7 @@ async fn transfer(
             (source.to_path_buf(), LockMode::Read),
             (destination.to_path_buf(), LockMode::Write),
         ])
-        .await;
+        .await?;
     let metadata = source_metadata(source, preserve_permissions).await;
     let copied = copy_file(source, destination, chunk_size).await;
     drop(guards);
@@ -249,12 +253,19 @@ fn transfer_stream(
     execution: &'static str,
 ) -> OpStream<TransferChunkData> {
     Box::pin(async_stream::stream! {
-        let guards = op
+        let guards = match op
             .acquire_ordered(vec![
                 (source.clone(), LockMode::Read),
                 (destination.clone(), LockMode::Write),
             ])
-            .await;
+            .await
+        {
+            Ok(guards) => guards,
+            Err(reason) => {
+                yield fs_failure(execution, &reason);
+                return;
+            }
+        };
         let mut chunks = copy_chunks(source, destination, chunk_size, preserve_permissions, execution);
         while let Some(chunk) = chunks.next().await {
             yield chunk;
