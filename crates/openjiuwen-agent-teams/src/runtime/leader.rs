@@ -6,7 +6,8 @@
 //! kernel is an event-driven supervisor with batching, idle debounce and escalation heuristics;
 //! this port keeps the *observable* contract and simplifies the policy:
 //!
-//! * exactly one `team.completed` marker, emitted last;
+//! * exactly one `team.completed` marker, emitted last, plus one `team_completed` bus event for
+//!   observers that hold no stream;
 //! * deliveries never reach the leader runtime (they are persisted and routed elsewhere);
 //! * the run ends when the leader is idle **and** the task board is settled, on two consecutive
 //!   settle ticks so a between-turn idle does not finish the run;
@@ -19,7 +20,8 @@
 //!     bus event         -> one steering line, batched and flushed per `steer_batch_size`
 //!     cancelled         -> flush, close the gate, Error::cancelled()
 //!     settle tick       -> flush a partial batch, evaluate "idle && settled" twice
-//! } -> flush -> close the gate -> team.completed marker -> AgentOutput::answer(answer)
+//! } -> flush -> close the gate -> team.completed marker -> team_completed bus event
+//!   -> AgentOutput::answer(answer)
 //! ```
 //!
 //! One run per team is supported: the bus receiver is a single-consumer value
@@ -37,7 +39,10 @@ use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use super::team_agent::TeamAgent;
-use crate::schema::{tag_chunk, team_completed_frame, EventMessage, EventPayload, TEAM_COMPLETED};
+use crate::schema::{
+    tag_chunk, team_completed_frame, EventMessage, EventPayload, TeamCompletedEvent, TeamTopic,
+    TEAM_COMPLETED,
+};
 
 /// How often an idle run re-reads the task board before concluding the team is done.
 pub const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -53,6 +58,9 @@ const CHUNK_LLM_OUTPUT: &str = "llm_output";
 
 /// Chunk kind used when a forwarded chunk carries no `type` field.
 const CHUNK_FALLBACK: &str = "chunk";
+
+/// Reason carried by the `team_completed` bus event a settled run publishes.
+const SETTLED_REASON: &str = "settled";
 
 /// Sink the run loop forwards tagged frames into, when a streaming caller asked for them.
 pub(crate) type ChunkSink = UnboundedSender<Result<AgentChunk>>;
@@ -216,6 +224,20 @@ pub(crate) async fn run(
             );
             if let Some(sink) = &sink {
                 let _ = sink.send(Ok(marker));
+            }
+            // The stream marker is the caller-facing signal; the bus event carries the same
+            // settlement to observers holding no stream. A publish failure is logged only: the run
+            // itself succeeded.
+            let completed = EventPayload::TeamCompleted(TeamCompletedEvent {
+                team_name: agent.team_name().to_owned(),
+                reason: Some(SETTLED_REASON.to_owned()),
+            });
+            if let Err(error) = agent.backend().post_event(TeamTopic::Team, completed).await {
+                warn!(
+                    team = agent.team_name(),
+                    %error,
+                    "failed to publish team_completed on the bus"
+                );
             }
             debug!(
                 team = agent.team_name(),

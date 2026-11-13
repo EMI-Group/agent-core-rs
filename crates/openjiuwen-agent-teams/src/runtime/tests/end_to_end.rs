@@ -20,7 +20,9 @@ use tokio::time::timeout;
 use crate::runtime::manager::{
     clear_global_registry, global_registry, set_global_registry, try_global_registry,
 };
-use crate::schema::{is_team_event_marker, HarnessState, TaskGraphSpec, TeamTopic, TEAM_COMPLETED};
+use crate::schema::{
+    is_team_event_marker, EventPayload, HarnessState, TaskGraphSpec, TeamTopic, TEAM_COMPLETED,
+};
 use crate::storage::TeamStore;
 
 use super::support::{blueprint, drain, marker_count, subscribe_observer, wait_until, Fixture};
@@ -331,4 +333,36 @@ async fn a_member_status_change_reaches_the_team_topic() {
     assert_eq!(started.sender_id, "alpha");
     assert_eq!(started.payload["member_name"], "dev-1");
     assert_eq!(started.payload["status"], "ready");
+}
+
+#[tokio::test]
+async fn a_settled_run_publishes_one_team_completed_event_on_the_bus() {
+    let fixture = Fixture::new();
+    let team = fixture
+        .activate(&blueprint("alpha", "boss", &[]), "session-a")
+        .await;
+    let recorder = subscribe_observer(team.backend().messager(), &[TeamTopic::Team]);
+
+    let frames = drain(team.stream(json!("hello"), None)).await;
+    assert!(frames.iter().all(Result::is_ok), "{frames:?}");
+
+    let last = frames.last().unwrap().as_ref().unwrap();
+    assert_eq!(last.kind, TEAM_COMPLETED);
+    assert!(is_team_event_marker(&last.payload));
+    assert_eq!(marker_count(&frames), 1, "exactly one marker: {frames:?}");
+
+    // The bus carries member/board events too, so count only the settlement.
+    let completed: Vec<_> = super::support::recorded(&recorder)
+        .into_iter()
+        .filter(|event| event.event_type == "team_completed")
+        .collect();
+    assert_eq!(completed.len(), 1, "one settlement event: {completed:?}");
+    assert_eq!(completed[0].sender_id, "alpha");
+    match EventPayload::from_message(&completed[0]).unwrap() {
+        EventPayload::TeamCompleted(payload) => {
+            assert_eq!(payload.team_name, "alpha");
+            assert_eq!(payload.reason.as_deref(), Some("settled"));
+        }
+        other => panic!("expected team_completed, got {other:?}"),
+    }
 }
