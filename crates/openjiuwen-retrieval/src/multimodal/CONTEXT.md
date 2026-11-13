@@ -41,6 +41,9 @@ Free helpers: `to_data_uri(modality, mime, bytes)` (repairs a foreign top-level 
 Document text is the captions joined by newlines (empty for a zero-byte file); metadata holds `image_path` (the caller's path), `mime_type`, `byte_size`, `modality: "image"`, and `caption_status` from the captioner, plus `data_uri` when enabled.
 Missing file → `Error::NotFound("File X does not exist")`; unsupported extension → `Error::Unsupported("Unsupported image format: ...")`.
 `IMAGE_EXTENSIONS` and `ImageLoader::is_supported(path)` expose the accepted extension set.
+`load_bytes(&DocumentBytes, &LoadOptions)` loads one image from memory with no filesystem access: `DocumentBytes::name` drives extension dispatch, the caption, and `image_path` (bytes have no path), `byte_size` is the payload length, and the `data_uri` payload matches the path loader when `with_data_uri(true)` was set.
+Byte loading rejects unsupported/missing extensions with the same `Error::Unsupported` message as path loading and rejects empty bytes with `Error::Validation("File X is empty")`.
+Byte loading then applies `LoadOptions` through the shared `loaders::apply_load_options` helper: `doc_id` replaces the generated id verbatim, `title` is stamped into metadata, and every document carries `metadata["doc_id"]` equal to its final id.
 
 ### `table.rs`
 
@@ -68,7 +71,7 @@ Files stay under 900 lines and one responsibility per file.
 
 ## Test Strategy
 
-Unit tests beside each module cover the wire names and MIME table, data-URI round trips and malformed input, `content()` shapes per modality, `add_field` validation, `add_file` success/missing/unknown-extension paths, offline caption determinism, Markdown round trips with escaped pipes and newlines, row/column text parity, document ids/metadata, and chunk metadata.
+Unit tests beside each module cover the wire names and MIME table, data-URI round trips and malformed input, `content()` shapes per modality, `add_field` validation, `add_file` success/missing/unknown-extension paths, offline caption determinism, image byte/path metadata parity (including `data_uri`), `load_bytes` doc_id/title stamping and its extension/empty-byte errors, Markdown round trips with escaped pipes and newlines, row/column text parity, document ids/metadata, and chunk metadata.
 `tests/multimodal.rs` exercises the same surface through `openjiuwen_retrieval::multimodal` end to end with `tempfile` images only.
 Everything is offline and deterministic; generated ids are checked for shape, never for a value.
 
