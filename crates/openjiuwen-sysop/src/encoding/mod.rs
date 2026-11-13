@@ -1,19 +1,28 @@
-//! Text encoding detection, BOM handling, and binary sniffing.
+//! Text encoding detection, BOM handling, binary sniffing, and decoding.
 //!
 //! Python parity: `local/_text_encoding.py` (`detect_text_encoding`) plus the
 //! `errors="replace"` decoding every read uses. Rust additions: an explicit
 //! [`BinaryPolicy`] so a caller can refuse binary content instead of decoding it.
 //!
 //! Supported encodings: UTF-8 (with or without BOM), UTF-16 LE/BE (BOM or heuristic),
-//! US-ASCII, and Latin-1. Legacy CJK encodings (GBK, Big5, Shift-JIS) are reported as
-//! [`openjiuwen_common::error::Error::Unsupported`] instead of being decoded incorrectly —
-//! see `CONTEXT.md` for the rationale.
+//! US-ASCII, Latin-1, and the legacy CJK encodings GB18030/GBK, Big5 and Shift-JIS.
+//! The CJK decoders are table driven ([`cjk`]); their tables are generated offline from
+//! Python's codecs by `scripts/gen_cjk_tables.py`, so decoding matches the Python
+//! reference byte for byte, including `U+FFFD` replacement of invalid sequences.
+//! Writes stay UTF-8: [`encode_text`] still rejects the legacy names.
+//!
+//! `auto` detection follows Python: BOM, valid UTF-8, a UTF-16 NUL-parity heuristic, then a
+//! quality-scored choice between strict GB18030 and strict Big5, and Latin-1 as the last
+//! resort. Shift-JIS is **never** auto-detected (decoding it explicitly is supported):
+//! Shift-JIS bytes are usually also valid GB18030 or Big5, and Python's detector does not
+//! consider the encoding either.
 //!
 //! ```
 //! use openjiuwen_sysop::encoding::{TextEncoding, detect_text_encoding};
 //!
 //! assert_eq!(detect_text_encoding(b"hello"), TextEncoding::Utf8);
 //! assert_eq!(detect_text_encoding(&[0xFF, 0xFE, b'h', 0]), TextEncoding::Utf16Le);
+//! assert_eq!(detect_text_encoding(&[0xD6, 0xD0, 0xCE, 0xC4]), TextEncoding::Gb18030);
 //! ```
 
 use openjiuwen_common::error::{Error, Result};
@@ -21,8 +30,13 @@ use openjiuwen_common::error::{Error, Result};
 use crate::config::BinaryPolicy;
 use crate::constants::AUTO_ENCODING;
 
+pub mod cjk;
+mod tables;
+
+pub use cjk::{CjkDecoder, CjkEncoding};
+
 /// A text encoding this crate can decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextEncoding {
     /// UTF-8, optionally with a byte-order mark.
     Utf8,
@@ -32,6 +46,16 @@ pub enum TextEncoding {
     Utf16Be,
     /// ISO-8859-1 / Latin-1 (every byte maps to one character).
     Latin1,
+    /// GB18030, the superset of GBK/GB2312 (lead `0x81..=0xFE`).
+    ///
+    /// Name aliases `gbk`, `gb2312`, `cp936` and `gb18030` all select this variant, which
+    /// reports itself as `gb18030`; GBK text therefore decodes correctly under either name.
+    Gb18030,
+    /// Big5 (Python's `big5` codec, lead `0xA1..=0xF9`); Big5-HKSCS extensions are not
+    /// included and decode as `U+FFFD`.
+    Big5,
+    /// Shift-JIS / JIS X 0208 (Python's `shift_jis`, not the CP932 vendor extension).
+    ShiftJis,
 }
 
 impl TextEncoding {
@@ -43,10 +67,18 @@ impl TextEncoding {
             Self::Utf16Le => "utf-16le",
             Self::Utf16Be => "utf-16be",
             Self::Latin1 => "latin-1",
+            Self::Gb18030 => "gb18030",
+            Self::Big5 => "big5",
+            Self::ShiftJis => "shift-jis",
         }
     }
 
     /// Parses a case-insensitive encoding name.
+    ///
+    /// Legacy aliases collapse onto the canonical variant (`gbk`/`gb2312`/`cp936` →
+    /// [`TextEncoding::Gb18030`], `big5-hkscs`/`cp950` → [`TextEncoding::Big5`],
+    /// `sjis`/`cp932` → [`TextEncoding::ShiftJis`]) because the decoder accepts the whole
+    /// covering code space.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
@@ -55,8 +87,17 @@ impl TextEncoding {
             "utf-16" | "utf-16le" | "utf16" | "utf16le" => Some(Self::Utf16Le),
             "utf-16be" | "utf16be" => Some(Self::Utf16Be),
             "latin-1" | "latin1" | "iso-8859-1" | "l1" => Some(Self::Latin1),
+            "gb18030" | "gbk" | "gb2312" | "cp936" => Some(Self::Gb18030),
+            "big5" | "big5-hkscs" | "cp950" => Some(Self::Big5),
+            "shift-jis" | "shiftjis" | "sjis" | "cp932" => Some(Self::ShiftJis),
             _ => None,
         }
+    }
+
+    /// Returns `true` for the legacy CJK encodings decoded through [`cjk`].
+    #[must_use]
+    pub const fn is_cjk(self) -> bool {
+        matches!(self, Self::Gb18030 | Self::Big5 | Self::ShiftJis)
     }
 }
 
@@ -84,6 +125,12 @@ const BINARY_CONTROL_NUMERATOR: usize = 3;
 
 /// Denominator of the control-byte ratio (30%).
 const BINARY_CONTROL_DENOMINATOR: usize = 10;
+
+/// Characters inspected when scoring a CJK candidate (Python `_QUALITY_SAMPLE_LIMIT`).
+const QUALITY_SAMPLE_CHARS: usize = 2 * 1024 * 1024;
+
+/// The encodings `auto` detection considers after UTF-8 fails, in Python's order.
+const CJK_CANDIDATES: [CjkEncoding; 2] = [CjkEncoding::Gb18030, CjkEncoding::Big5];
 
 /// Returns the encoding declared by a byte-order mark, if any.
 #[must_use]
@@ -113,8 +160,15 @@ pub fn strip_bom(bytes: &[u8]) -> (&[u8], Option<TextEncoding>) {
 
 /// Detects the encoding of `bytes` (Python `detect_text_encoding`).
 ///
-/// The decision order is: BOM, valid UTF-8, UTF-16 heuristic (interleaved NUL bytes),
-/// Latin-1.
+/// The decision order is: BOM, UTF-16 heuristic (interleaved NUL bytes), valid UTF-8,
+/// quality-scored strict GB18030/Big5, Latin-1.
+///
+/// The CJK step decodes the whole input strictly with GB18030 and then Big5
+/// and scores the result like Python's `_text_quality`: CJK characters add 2, private-use
+/// characters subtract 20 and control characters subtract 10. Only a positive score is
+/// trusted, and GB18030 wins ties, so ambiguous Simplified Chinese stays GB18030 while
+/// Big5-only text (which decodes to private-use characters under GB18030) is reported as
+/// Big5. Shift-JIS is never auto-detected, matching Python.
 #[must_use]
 pub fn detect_text_encoding(bytes: &[u8]) -> TextEncoding {
     if let Some(encoding) = bom_encoding(bytes) {
@@ -136,7 +190,52 @@ pub fn detect_text_encoding(bytes: &[u8]) -> TextEncoding {
     if let Some(encoding) = detect_utf16_without_bom(bytes) {
         return encoding;
     }
+    if let Some(encoding) = detect_cjk(bytes) {
+        return encoding;
+    }
     TextEncoding::Latin1
+}
+
+/// Chooses between strict GB18030 and strict Big5 decodes, preferring GB18030 on a tie.
+fn detect_cjk(bytes: &[u8]) -> Option<TextEncoding> {
+    let mut best: Option<(TextEncoding, i64)> = None;
+    for encoding in CJK_CANDIDATES {
+        let Some(text) = cjk::decode_strict(bytes, encoding) else {
+            continue;
+        };
+        let score = text_quality(&text);
+        // Strictly greater, so the first candidate in Python's order wins a tie.
+        if best.is_none_or(|(_, current)| score > current) {
+            best = Some((encoding.text_encoding(), score));
+        }
+    }
+    best.filter(|(_, score)| *score > 0).map(|(kind, _)| kind)
+}
+
+/// Scores decoded text by CJK content and suspicious characters (Python `_text_quality`).
+///
+/// At most 2 Mi characters are inspected (the first and last half), mirroring Python.
+fn text_quality(text: &str) -> i64 {
+    let total = text.chars().count();
+    if total <= QUALITY_SAMPLE_CHARS {
+        return text.chars().map(character_weight).sum();
+    }
+    let half = QUALITY_SAMPLE_CHARS / 2;
+    text.chars()
+        .enumerate()
+        .filter(|(index, _)| *index < half || *index >= total - half)
+        .map(|(_, character)| character_weight(character))
+        .sum()
+}
+
+/// Weight of one decoded character: CJK counts for text, private-use and control subtract.
+const fn character_weight(character: char) -> i64 {
+    match character as u32 {
+        0x3000..=0x303F | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => 2,
+        0xE000..=0xF8FF => -20,
+        0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F..=0x9F => -10,
+        _ => 0,
+    }
 }
 
 /// Detects BOM-less UTF-16 by looking at NUL-byte parity in the first few units.
@@ -168,9 +267,12 @@ fn detect_utf16_without_bom(bytes: &[u8]) -> Option<TextEncoding> {
 
 /// Returns `true` when `bytes` look like binary data.
 ///
-/// Heuristic: a NUL byte, an invalid UTF-8 byte sequence that is not valid UTF-16, or
-/// more than 30% control bytes in the sniffed prefix. Only the first 8 KiB are inspected,
-/// so detection is cheap and deterministic.
+/// Heuristic: a NUL byte (outside recognized UTF-16), more than 30% control bytes in the
+/// sniffed prefix, or valid UTF-8 with unusual control characters. Only the first 8 KiB are
+/// inspected, so detection is cheap and deterministic.
+///
+/// Bytes `0x80..=0xFF` are not control characters here, so legacy CJK text (whose lead and
+/// trail bytes all live above `0x7F`) is never classified as binary.
 #[must_use]
 pub fn is_binary(bytes: &[u8]) -> bool {
     let sample = &bytes[..bytes.len().min(SNIFF_LIMIT)];
@@ -195,7 +297,9 @@ pub fn is_binary(bytes: &[u8]) -> bool {
     ratio_exceeds(control, sample.len())
 }
 
-/// Decodes `bytes` into text.
+/// Decodes `bytes` into text, replacing undecodable sequences with `U+FFFD`.
+///
+/// `encoding` accepts `"auto"` plus every name [`TextEncoding::parse`] understands.
 ///
 /// # Errors
 ///
@@ -208,7 +312,8 @@ pub fn decode_text(bytes: &[u8], encoding: &str, policy: BinaryPolicy) -> Result
     } else {
         TextEncoding::parse(encoding).ok_or_else(|| {
             Error::unsupported(format!(
-                "encoding '{encoding}' is not supported; supported encodings are utf-8, utf-16le, utf-16be, latin-1, and 'auto'"
+                "encoding '{encoding}' is not supported; supported encodings are utf-8, \
+                 utf-16le, utf-16be, latin-1, gb18030 (gbk), big5, shift-jis, and 'auto'"
             ))
         })?
     };
@@ -222,6 +327,9 @@ pub fn decode_text(bytes: &[u8], encoding: &str, policy: BinaryPolicy) -> Result
         TextEncoding::Latin1 => payload.iter().map(|byte| char::from(*byte)).collect(),
         TextEncoding::Utf16Le => decode_utf16(payload, true),
         TextEncoding::Utf16Be => decode_utf16(payload, false),
+        TextEncoding::Gb18030 => cjk::decode(payload, CjkEncoding::Gb18030),
+        TextEncoding::Big5 => cjk::decode(payload, CjkEncoding::Big5),
+        TextEncoding::ShiftJis => cjk::decode(payload, CjkEncoding::ShiftJis),
     })
 }
 
@@ -235,22 +343,26 @@ pub fn detected_encoding_name(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// Encodes text as UTF-8, the only encoding this crate writes.
+/// Encodes text for writing.
 ///
-/// Writing in a legacy encoding is not supported (Python lets the caller pick one); the
-/// resulting bytes are always UTF-8, which keeps the written file round-trippable.
+/// UTF-8 is the only encoding this crate writes; UTF-16 LE/BE are also available because
+/// they round-trip exactly, and Latin-1 (like every other single-byte request) falls back
+/// to UTF-8 bytes.
 ///
 /// # Errors
 ///
-/// Returns `ErrorKind::Unsupported` when `encoding` is neither UTF-8 nor ASCII.
+/// Returns `ErrorKind::Unsupported` for the legacy CJK names: decoding them is supported,
+/// but writing GB18030/Big5/Shift-JIS bytes is not (Python lets the caller pick a codec).
 pub fn encode_text(text: &str, encoding: &str) -> Result<Vec<u8>> {
     match TextEncoding::parse(encoding) {
-        Some(TextEncoding::Utf8) => Ok(text.as_bytes().to_vec()),
-        Some(other) => Ok(match other {
-            TextEncoding::Utf16Le => encode_utf16(text, true),
-            TextEncoding::Utf16Be => encode_utf16(text, false),
-            _ => text.as_bytes().to_vec(),
-        }),
+        Some(TextEncoding::Utf16Le) => Ok(encode_utf16(text, true)),
+        Some(TextEncoding::Utf16Be) => Ok(encode_utf16(text, false)),
+        Some(TextEncoding::Gb18030 | TextEncoding::Big5 | TextEncoding::ShiftJis) => {
+            Err(Error::unsupported(format!(
+                "encoding '{encoding}' is not supported for writing; use utf-8"
+            )))
+        }
+        Some(TextEncoding::Utf8 | TextEncoding::Latin1) => Ok(text.as_bytes().to_vec()),
         None => Err(Error::unsupported(format!(
             "encoding '{encoding}' is not supported for writing; use utf-8"
         ))),
@@ -298,7 +410,7 @@ fn is_whitespace(byte: u8) -> bool {
 
 /// Returns `true` when `part / total` exceeds the binary threshold.
 ///
-/// Compares `part * 10 > total * 3` to avoid floating-point conversion.
+/// Compares `part * 10 > total * 3` on integers to avoid floating-point conversion.
 fn ratio_exceeds(part: usize, total: usize) -> bool {
     if total == 0 {
         return false;
@@ -344,10 +456,18 @@ mod tests {
     #[test]
     fn latin1_round_trip() {
         let bytes = [0xE9_u8, 0xE8];
-        assert_eq!(detect_text_encoding(&bytes), TextEncoding::Latin1);
+        // Python's detector reports GB18030 for byte pairs that decode as CJK text; the
+        // explicit name still decodes as Latin-1.
+        assert_eq!(detect_text_encoding(&bytes), TextEncoding::Gb18030);
         assert_eq!(
             decode_text(&bytes, "latin-1", BinaryPolicy::Lossy).unwrap(),
             "éè"
+        );
+        // Bytes that no CJK codec accepts fall back to Latin-1, as before.
+        assert_eq!(detect_text_encoding(&[0x80]), TextEncoding::Latin1);
+        assert_eq!(
+            decode_text(&[0x80], "auto", BinaryPolicy::Lossy).unwrap(),
+            "\u{80}"
         );
     }
 
@@ -360,12 +480,66 @@ mod tests {
 
     #[test]
     fn unknown_encoding_is_unsupported() {
-        let error = decode_text(b"x", "gbk", BinaryPolicy::Lossy).unwrap_err();
+        let error = decode_text(b"x", "koi8-r", BinaryPolicy::Lossy).unwrap_err();
         assert_eq!(
             error.kind(),
             openjiuwen_common::error::ErrorKind::Unsupported
         );
-        assert!(error.message().contains("gbk"));
+        assert!(error.message().contains("koi8-r"));
+    }
+
+    #[test]
+    fn legacy_cjk_names_decode() {
+        assert_eq!(
+            decode_text(&[0xD6, 0xD0, 0xCE, 0xC4], "gbk", BinaryPolicy::Lossy).unwrap(),
+            "中文"
+        );
+        assert_eq!(
+            decode_text(&[0xD6, 0xD0, 0xCE, 0xC4], "gb18030", BinaryPolicy::Lossy).unwrap(),
+            "中文"
+        );
+        assert_eq!(
+            decode_text(
+                &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA],
+                "sjis",
+                BinaryPolicy::Lossy
+            )
+            .unwrap(),
+            "日本語"
+        );
+        // A caller asking for `gbk` gets the canonical `gb18030` name back.
+        assert_eq!(detected_encoding_name(&[0xD6, 0xD0, 0xCE, 0xC4]), "gb18030");
+    }
+
+    #[test]
+    fn legacy_cjk_names_are_rejected_for_writing() {
+        let error = encode_text("中文", "gbk").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Unsupported
+        );
+        assert!(error.message().contains("not supported for writing"));
+        assert_eq!(encode_text("hello", "ascii").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn auto_detection_prefers_big5_only_for_big5_text() {
+        // Ambiguous Simplified Chinese: both codecs decode, so GB18030 wins the tie.
+        assert_eq!(
+            detect_text_encoding(&[0xD6, 0xD0, 0xCE, 0xC4]),
+            TextEncoding::Gb18030
+        );
+        // Traditional characters decode to private-use code points under GB18030.
+        assert_eq!(
+            detect_text_encoding(&[0xC0, 0x73, 0xAA, 0xF9]),
+            TextEncoding::Big5
+        );
+        assert_eq!(detected_encoding_name(&[0xC0, 0x73, 0xAA, 0xF9]), "big5");
+        // Shift-JIS is deliberately not auto-detected.
+        assert_eq!(
+            detect_text_encoding(&[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]),
+            TextEncoding::Gb18030
+        );
     }
 
     #[test]
@@ -375,6 +549,9 @@ mod tests {
         assert!(is_binary(&[0x00, 0x01, 0x02, 0x03]));
         assert!(is_binary(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
         assert!(!is_binary(&[]));
+        // Legacy CJK bytes are high bytes, never control bytes.
+        assert!(!is_binary(&[0xD6, 0xD0, 0xCE, 0xC4]));
+        assert!(!is_binary(&[0xA4, 0xA4, 0xA4, 0xE5]));
     }
 
     #[test]
@@ -385,6 +562,8 @@ mod tests {
             openjiuwen_common::error::ErrorKind::Validation
         );
         assert!(decode_text(&[0x00, 0x01], "utf-8", BinaryPolicy::Lossy).is_ok());
+        // CJK content is text, so the reject policy accepts it.
+        assert!(decode_text(&[0xD6, 0xD0], "gbk", BinaryPolicy::Reject).is_ok());
     }
 
     #[test]
@@ -407,13 +586,34 @@ mod tests {
             TextEncoding::parse("iso-8859-1"),
             Some(TextEncoding::Latin1)
         );
-        assert_eq!(TextEncoding::parse("gbk"), None);
+        for name in ["gbk", "GB2312", "cp936", "GB18030"] {
+            assert_eq!(TextEncoding::parse(name), Some(TextEncoding::Gb18030));
+        }
+        for name in ["big5", "big5_hkscs", "cp950"] {
+            assert_eq!(TextEncoding::parse(name), Some(TextEncoding::Big5));
+        }
+        for name in ["shift_jis", "shift-jis", "sjis", "cp932"] {
+            assert_eq!(TextEncoding::parse(name), Some(TextEncoding::ShiftJis));
+        }
+        assert_eq!(TextEncoding::parse("koi8-r"), None);
         assert_eq!(TextEncoding::Latin1.to_string(), "latin-1");
+        assert_eq!(TextEncoding::Gb18030.to_string(), "gb18030");
+        assert_eq!(TextEncoding::ShiftJis.as_str(), "shift-jis");
+        assert!(TextEncoding::Big5.is_cjk());
+        assert!(!TextEncoding::Utf8.is_cjk());
     }
 
     #[test]
     fn detected_encoding_name_reports_bom() {
         assert_eq!(detected_encoding_name(&[0xFF, 0xFE, b'h', 0]), "utf-16le");
         assert_eq!(detected_encoding_name(b"plain"), "utf-8");
+    }
+
+    #[test]
+    fn quality_scores_cjk_private_use_and_controls() {
+        assert_eq!(text_quality("中文"), 4);
+        assert_eq!(text_quality("abc"), 0);
+        assert_eq!(text_quality("\u{E000}"), -20);
+        assert_eq!(text_quality("\u{1}"), -10);
     }
 }
