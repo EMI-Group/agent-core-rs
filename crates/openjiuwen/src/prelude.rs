@@ -15,11 +15,16 @@ pub use openjiuwen_core::common::error::{Error, Result};
 // The agent-construction surface: the `ReAct` loop and its config, the
 // caller-facing input/output types, and the two application agents.
 pub use openjiuwen_core::single_agent::{
-    Agent, AgentCard, AgentChunk, AgentInput, AgentOutput, LlmAgent, ReActAgent, ReActAgentConfig,
-    ResultType, WorkflowAgent,
+    Agent, AgentCard, AgentChunk, AgentInput, AgentOutput, LlmAgent, Observation, ReActAgent,
+    ReActAgentConfig, ResultType, WorkflowAgent,
 };
+// --- controller stack -------------------------------------------------------
+// The turn-loop executor that routes tasks to agents and workflows.
+pub use openjiuwen_core::controller::ControllerAgent;
 // --- sessions ---------------------------------------------------------------
-pub use openjiuwen_core::session::{AgentSession, Session};
+// The session lifecycle: the in-memory session plus the disk-backed product
+// session controller.
+pub use openjiuwen_core::session::{AgentSession, Session, SessionController};
 // --- models, messages, tools -----------------------------------------------
 pub use openjiuwen_core::foundation::{BaseMessage, FunctionTool, Model, Tool};
 // --- graph / workflow / context --------------------------------------------
@@ -27,8 +32,10 @@ pub use openjiuwen_core::context_engine::ContextEngine;
 pub use openjiuwen_core::graph::CompiledGraph;
 pub use openjiuwen_core::workflow::Workflow;
 // --- memory / runner --------------------------------------------------------
+// Memory plus the run orchestration surface: the process-global runner, the
+// team runtime pool, and run observability.
 pub use openjiuwen_core::memory::LongTermMemory;
-pub use openjiuwen_core::runner::Runner;
+pub use openjiuwen_core::runner::{RunMonitor, Runner, TeamPool};
 // --- harness ----------------------------------------------------------------
 pub use openjiuwen_harness::{create_deep_agent, DeepAgent, DeepAgentBuilder, DeepAgentConfig};
 pub use openjiuwen_harness_protocol::{HarnessCard, HarnessProtocol};

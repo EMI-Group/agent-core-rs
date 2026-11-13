@@ -37,7 +37,7 @@ openjiuwen-auto-harness.workspace = true
 [features]
 default = ["native"]
 native = ["openjiuwen-harness/native", "openjiuwen-harness-providers/native"]
-otel = ["openjiuwen-extensions/otel"]
+otel = ["openjiuwen-extensions/otel", "openjiuwen-core/otel"]
 a2a = ["openjiuwen-extensions/a2a"]
 sqlite = ["openjiuwen-extensions/sqlite", "openjiuwen-symphony/sqlite"]
 live-tests = [
