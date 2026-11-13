@@ -204,7 +204,7 @@ Every other crate — `openjiuwen-common`, `openjiuwen-macros`, `openjiuwen-grap
 
 ## Verification
 
-- `cargo test --workspace --offline` — the full offline gate over all 30 crates; per-runner pass/fail/ignore totals are recorded by CI and every runner is green.
+- `cargo test --workspace --offline --no-fail-fast` — 14 907 passed, 0 failed, 6 ignored across 366 runners (exit 0) over all 30 crates; the 6 ignored are the 3 `#[ignore]` tests below plus 3 doctest `ignore` blocks.
 - `cargo test -p openjiuwen-e2e --offline` — 30 passing plus 1 ignored with default features; `a2a_roundtrip` is `#![cfg(feature = "a2a")]` and compiles empty.
 - `cargo test -p openjiuwen-e2e --features a2a --offline` — 34 passing plus 1 ignored; this is the `openjiuwen-e2e` line of `make test-all`.
 - `cargo build -p openjiuwen-examples --examples` and `cargo build -p openjiuwen-examples --examples --features a2a,mcp` — compile all 12 examples (the second form is the only one that builds example 11).
@@ -212,7 +212,9 @@ Every other crate — `openjiuwen-common`, `openjiuwen-macros`, `openjiuwen-grap
 - `cargo test -p openjiuwen-test-support` — 149 tests, offline and loopback-only, with waits bounded at ≤2 s.
 - Feature suites: `cargo test -p openjiuwen-harness --no-default-features`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo test -p openjiuwen-harness-providers --features vendor`, `cargo test -p openjiuwen-symphony --features sqlite`, `cargo test -p openjiuwen-sysop --features sandbox`, `cargo test -p openjiuwen-extensions --features a2a,otel` — the six feature suites of `make test-all`.
 - `make verify` — runs `fmt-check`, `clippy`, `test`, `test-all` and both example builds in that order.
-- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo doc --workspace --no-deps` — style, lint and rustdoc gates.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings` — clean, zero warnings (exit 0).
+- `cargo doc --workspace --no-deps` (and `--all-features`) — the rustdoc gate; private or feature-gated items are linked as plain code spans instead of widening visibility.
 - A bare `cargo test` uses the 27 `default-members` and therefore skips `openjiuwen-e2e`, `openjiuwen-examples` and `openjiuwen-test-support`; use `--workspace` or name those packages explicitly.
 - 3 tests are `#[ignore]`d: `openjiuwen-sysop/src/sandbox/http.rs::probe_against_live_gateway` needs a live sandbox gateway (`--features sandbox -- --ignored`); `openjiuwen-e2e/tests/cli_binary.rs::binary_version_over_the_process_boundary` cannot use `CARGO_BIN_EXE_openjiuwen` because that variable exists only for the package owning the binary (the process-level smoke lives in `openjiuwen-cli/tests/cli_smoke.rs`); `openjiuwen-runner/tests/spawn_subprocess.rs::fake_child` is the stdio protocol child that sibling tests re-execute through a libtest filter selected by `FAKE_CHILD_MODE`.
 - No test requires the network, credentials, or a wall clock: 7 manifests declare `live-tests`, no `.rs` file references it, and `OPENJIUWEN_LIVE` only switches the examples from offline to live.
