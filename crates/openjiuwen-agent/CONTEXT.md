@@ -6,6 +6,8 @@ Agent runtime of the kernel: the `Agent` seam, `ReActAgent` (model → tools →
 Ports Python `openjiuwen.core.single_agent` (`base.py`, `agents/react_agent.py`, `ability_manager.py`, `rail/`, `interrupt/`, `schema/`) and `openjiuwen.core.application` (`llm_agent/`, `workflow_agent/`) onto `openjiuwen-foundation` (`Model`, `BaseMessage`, `Tool`), `openjiuwen-session` (`Session`, `AgentSession`, `StreamItem`, `InteractionRequest`), `openjiuwen-context` (`ContextEngine`), `openjiuwen-workflow` (`Workflow`), `openjiuwen-memory` and `openjiuwen-security`.
 The crate is the only place that owns the ReAct control flow; it never resolves tools or models from a global registry (the `Runner` injects them via `AbilityManager`/`set_model`).
 Python's legacy controller machinery (`ControllerAgent`, `LLMController`, `WorkflowController`, intent-detection controllers, `Runner.resource_mgr` lookup) is NOT ported: `LLMAgent` is a thin configured `ReActAgent` composition and `WorkflowAgent` owns its `Workflow` values directly.
+It also hosts the seams Python keeps beside the loop: tool exposure/MCP allowlists, client tools, per-tool resilience, the final-request check (`policy`), the lifecycle callback framework (`callbacks`), the steering queue (`steering`), and the Markdown skill library (`skills`).
+`controller`, `evolve`, `kv_cache`, `operator`, and `prompt_pack` are documentation-only placeholder modules — `pub mod` declarations in `lib.rs` with no items.
 See `docs/PARITY.md` for the port status of each area.
 
 ## API Surface
@@ -293,6 +295,16 @@ Streaming: every frame is `AgentChunk`; when a session is present the loop also 
 Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`), model spans (`Llm`), and tool spans (`Plugin`), finishing with outputs/status.
 `prompt::SystemPromptBuilder` holds `PromptSection { name, content, priority, category }`; `build()` joins sections by `"\n\n"` in ascending priority (identity = 10), matching Python's builder ordering.
 
+### Loop side-seams (`policy/`, `callbacks/`, `steering/`, `skills/`)
+
+These modules are `pub mod` in `lib.rs` but not re-exported from the crate root; reach them by module path.
+
+- `policy` — `ToolExposurePolicy`/`ToolExposureMode`/`McpToolAllowlist` (which tools reach the model), `ClientToolRegistry`/`ClientToolHandler`/`FnClientToolHandler` (tools the connected client executes), `ToolResilience`/`ToolResiliencePolicy` (per-tool timeout/attempts/backoff), `FinalRequestCheck`/`DefaultFinalRequestCheck`/`FinalRequestContext`/`FinalRequestDecision`.
+- `callbacks` — `AgentCallbackEvent` (six events), typed payloads, the `AgentCallback` trait, and `CallbackFramework` (priority-ordered registry); a failing handler is logged, never fatal.
+- `steering` — `SteeringMessage` and the cloneable `SteeringQueue` (`push`/`push_text`/`drain`/`drain_messages`/`drain_prompt`); the loop drains the backlog at the top of every iteration as one batch of `user` messages.
+- `skills` — `Skill` (+ YAML front matter), `SkillManager` (`tokio::fs` discovery), `SkillUtil`, and `SkillRail` (renders the catalog as the first system message on `BeforeModelCall`).
+- `ReActAgent` seam setters: `set_callback_framework`, `callbacks`, `register_callback`, `steering`, `set_tool_exposure_policy`, `set_mcp_tool_allowlist`, `set_client_tools`, `client_tools`, `set_tool_resilience`, `set_final_request_check` (details in `react/CONTEXT.md`).
+
 ## Constraints
 
 - Follows the shared contracts in `docs/ARCHITECTURE.md`: async-first tokio I/O, `openjiuwen_common::error` results, serde-serializable public types, no `unsafe`, `tracing` logging (no stdout).
@@ -332,27 +344,25 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 - `LlmAgentConfig::agent_memory_config` is host-visible only: `ReActAgentConfig` has no memory-toggle field, so it does not change the composed `ReAct` configuration.
 - `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`.
 - `react::model_step::ModelReply` is public because `RailContext::response` exposes it; the loop calls the model through `call_model_streaming` (the session-scoped path that emits `llm_reasoning`/`llm_output`/`llm_usage` frames) and uses `call_model` only for the tool-free `FinalAnswer` finalization call.
+- `controller`, `evolve`, `kv_cache`, `operator`, and `prompt_pack` are `pub mod` declarations with a `//!` doc block and no items — they mark deferred Python areas; nothing else in the crate references types from them.
+- Test models are `openjiuwen_test_support::ScriptedModel` (aliased nowhere); the construction and inspection idioms are catalogued in `tests/CONTEXT.md`.
 
 ## Deferred Python Behavior
 
 - Not ported: the legacy controller stack (`ControllerAgent`, `LLMController`, `WorkflowController`, intent-detection controllers, and `Runner.resource_mgr` lookups) — `LLMAgent` is a composition over `ReActAgent` and `WorkflowAgent` owns its workflows directly.
-- Not ported: steering queues and the `before_steering_drain` hook.
-- Not ported: KV-cache affinity for model requests.
-- Not ported: skill utilities (`SkillUtil`, `register_skill`).
-- Not ported: the agent callback framework (`register_callback`, the global `Runner.callback_framework`) — rails are this crate's only extension seam.
+- Not ported: the `before_steering_drain` rail hook (`RailEvent` has no variant for it and `openjiuwen-harness` matches that enum exhaustively; the loop drains the `SteeringQueue` at its own safe point).
+- Not ported: KV-cache affinity on model requests — `kv_cache` is a documentation-only placeholder with no request-affinity hook.
+- Not ported: the process-global `Runner.callback_framework`; `CallbackFramework` is a per-agent value owned by the host.
 - Not ported: sub-agent, workflow, and MCP abilities — `AbilityManager` holds plain `Tool` instances only.
-- Not ported: tool exposure policy, MCP tool allowlists, and client tools (`InterruptKind::ClientTool` exists as a wire kind only).
-- Not ported: per-tool `resilience` timeouts — only the run-level `ToolExecutionOptions::timeout` exists.
-- Not ported: `FinalRequestCheck`.
 - Not ported: image/multimodal tool results and deferred image payloads — tool output is text plus an optional JSON value.
-- Not ported: `ReActAgentEvolve` operators.
-- Not ported: `context.usage` and `llm_route` frames — `CONTEXT_USAGE` is a declared kind with no emitter.
+- Not ported: `ReActAgentEvolve` operators and the controller stack — `evolve`, `operator`, and `controller` are documentation-only placeholders.
 - Not ported: memory-variable prompt injection keys.
-- Not ported: prompt-file/YAML prompt packs — prompts are `BaseMessage` templates and `SystemPromptBuilder` sections.
+- Not ported: prompt-file/YAML prompt packs — `prompt_pack` is a documentation-only placeholder; prompts are `BaseMessage` templates and `SystemPromptBuilder` sections.
 
 ## Test Strategy
 
-- Unit tests beside every module (232) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection, model-backup ordering, interrupt rail flows, tool-argument repair, and parallel tool batching.
+- Unit tests beside every module (406) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection, model-backup ordering, interrupt rail flows, tool-argument repair, and parallel tool batching.
+- `src/react/wiring/` holds the loop-integration suites for the six side seams (callbacks, steering, exposure/MCP/resilience, client tools, final-request check); they live under `src/` to observe crate-internal state (`react/wiring/CONTEXT.md`).
 - `tests/agent_card.rs` (16) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
 - `tests/react_agent.rs` (12) drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
 - `tests/streaming.rs` (4) assembles `llm_output`/`llm_reasoning`/`llm_usage`/`answer` frames and checks the session mirror.
@@ -360,13 +370,18 @@ Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`)
 - `tests/interrupt.rs` (8) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, two pending calls pausing once and resuming individually, and the streaming pause path emitting and mirroring its `__interaction__` frame.
 - `tests/llm_agent.rs` (7) covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
 - `tests/workflow_agent.rs` (5) covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
-- The crate suite (291 tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
+- The crate suite (465 tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
 
 ## Routing Table
 
-- `./src/react/` → `ReActAgent`, config, iteration loop, model step (`react/CONTEXT.md`)
+- `./src/react/` → `ReActAgent`, config, iteration loop, model step, exposure, frames, hooks, pause/resume (`react/CONTEXT.md`)
+- `./src/react/wiring/` → `#[cfg(test)]` loop-integration suites for the six side seams (`react/wiring/CONTEXT.md`)
 - `./src/abilities/` → ability manager, argument repair, tool execution (`abilities/CONTEXT.md`)
 - `./src/rails/` → rail trait/context/registry and built-in rails (`rails/CONTEXT.md`)
+- `./src/policy/` → tool exposure, MCP allowlist, client tools, per-tool resilience, final-request check (`policy/CONTEXT.md`)
+- `./src/callbacks/` → lifecycle callback events, payloads, framework (`callbacks/CONTEXT.md`)
+- `./src/steering/` → steering queue drained by the loop (`steering/CONTEXT.md`)
+- `./src/skills/` → Markdown skill library, manager, `SkillRail` (`skills/CONTEXT.md`)
 - `./src/workflow_agent/` → `WorkflowAgent` and workflow selection (`workflow_agent/CONTEXT.md`)
 - `./src/interrupt.rs` → interrupt data model and resume matching
 - `./src/output.rs` → `AgentOutput`, `AgentChunk`, `Observation`, `OutputFrame`
