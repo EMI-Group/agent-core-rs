@@ -63,6 +63,8 @@
 //!   local to the team that owns it.
 
 pub mod hooks;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod span;
 
 pub use hooks::{
@@ -70,6 +72,8 @@ pub use hooks::{
     RecordedEvent, RecordingHooks, RoundObservableEvent, TaskTransitionEvent, TeamObservability,
     TurnMetrics,
 };
+#[cfg(feature = "otel")]
+pub use otel::{OtelHooks, OtelSpanSink, SpanRecord};
 pub use span::{
     SpanContext, TeamSpan, AT_MEMBER_NAME, AT_MEMBER_ROLE, AT_TASK_ID, AT_TEAM_ID, AT_TEAM_NAME,
     GEN_AI_CONVERSATION_ID, OJ_AGENT_MODE,
@@ -84,7 +88,9 @@ pub const OTLP_EXPORT_AVAILABLE: bool = false;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "otel"))]
     use crate::schema::{MemberStatus, TeamRole};
+    #[cfg(not(feature = "otel"))]
     use std::sync::Arc;
 
     #[test]
