@@ -40,6 +40,7 @@ Accepted forms: `data/team.db`, `sqlite://data/team.db` (relative), `sqlite:///a
 ## Behaviour
 
 - Connect: file pools use `create_if_missing`, WAL, `synchronous=NORMAL`, a 5 s busy timeout, `foreign_keys=ON` and at most 4 connections; the in-memory pool is pinned to one connection (`:memory:` is private to its connection) with no idle/lifetime timeout.
+- A file database therefore materializes `team.db` plus the WAL sidecars `team.db-wal`/`team.db-shm` in its directory; a tempdir test must expect those, while an in-memory store creates no file at all.
 - Lazy: `open_store` is synchronous, so the pool lives in a `tokio::sync::OnceCell` and every trait method starts with `self.pool().await?`; `open`/`in_memory` connect eagerly so construction errors surface immediately.
 - Schema: seven tables (`team_info`, `team_member`, `team_task`, `team_task_dependency`, `team_review_vote`, `team_message`, `team_read_watermark`) plus seven indexes, all `CREATE ... IF NOT EXISTS`; `PRAGMA user_version` is `1` (`0` is stamped, `> 1` is `Error::unsupported`).
 - No foreign keys are declared on purpose: the trait allows a member, task, dependency or message row before its team row.
