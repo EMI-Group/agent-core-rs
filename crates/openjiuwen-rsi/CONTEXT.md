@@ -3,10 +3,11 @@
 ## Intent
 
 Recursive self-improvement (RSI) for the openJiuwen runtime, ported from the Python package `openjiuwen.rsi` (v0.1.20, ~97k lines / 313 files) with the ML/vendor half explicitly deferred.
-The crate owns exactly three things:
+The crate owns exactly four things:
 1. `harness_rsi::auto_harness` — a bounded, resumable self-optimisation session loop: propose candidate configurations, evaluate each one through a harness run, keep the elite, checkpoint every iteration, and stop on convergence, budget, or cancellation.
-2. `artifact_rsi::program_opt` — the portable PUCT tree search that ranks candidate programs by rank score plus visit-count exploration, as pure data structures and algorithms.
-3. `evolution` — the crate-wide candidate/mutation/evaluation/selection protocol shared by both halves, so a fake harness or a different search strategy plugs in without touching the orchestrator.
+2. `harness_rsi::single_harness` — the deterministic evaluate→gate→promote core of Python's single-harness engine: exact promotion math, resumable epoch state with idempotency keys, and the iterative (epoch-checkpointed) and continuous (two-stage, attempt-based) loops.
+3. `artifact_rsi::program_opt` — the portable PUCT tree search that ranks candidate programs by rank score plus visit-count exploration, as pure data structures and algorithms.
+4. `evolution` — the crate-wide candidate/mutation/evaluation/selection protocol shared by all halves, so a fake harness or a different search strategy plugs in without touching the orchestrator.
 
 Everything that needs Python ML runtime, a vendor harness SDK, subprocess/git execution, or distributed evolution is an API-shaped stub returning `Error::Unsupported` — never a silent stub and never a panic.
 
@@ -185,6 +186,78 @@ tree.rs     Program { program_id, iteration, parent_id: Option<String>, code, ch
               first maximum wins (stable ties).
 ```
 
+### `harness_rsi::single_harness` (`src/harness_rsi/single_harness/`)
+
+```
+promotion.rs  EPSILON = 1e-9; type CaseScores = BTreeMap<String, f64>
+              case_scores(&EvaluationReport) -> CaseScores      // graded, error-free results only
+              is_batch_improvement(before, after) -> bool        // after > before + EPSILON
+              batch_filter(&CaseScores, min_improvement) -> Vec<String>
+                  // ids whose satisfaction gap 1.0 - score > min_improvement + EPSILON, ascending
+              threshold_saturated(&CaseScores) -> bool           // non-empty and every case >= 1.0 - EPSILON
+              targets_improved(before, after) -> Vec<String>
+                  // strict after > before + EPSILON; missing before counts as improved, missing after not
+              mean_improvement(before, after) -> f64             // mean delta over the improved targets, 0.0 if none
+              StageOneDecision { passed, improved, reason } + stage_one_gate(before, after, content_changed, engineering_failed)
+                  // precedence: candidate_content_unchanged > "engineering_failed: <detail>" >
+                  //   target_threshold_saturated > candidate_failed_target_replay_checkpoint >
+                  //   candidate_passed_batch_gate_pending_epoch_checkpoint
+              FullEvaluationDecision { promoted, reason, failed_targets, regressed_others, mean_improvement } +
+              full_evaluation_decision(before, after, improved_targets, protected_cases, min_improvement, max_regression)
+                  // first match wins: protected_case_regressed (loss > max_regression + EPSILON, missing after = total
+                  //   loss) > candidate_failed_target_replay_checkpoint (empty targets, a target that lost its margin
+                  //   or vanished) > selected_score_regressed (retention mean not > -max_regression, or overall mean
+                  //   delta not > EPSILON) > selected_global_non_regression (promoted)
+                  // min_improvement is diagnostic only (the batch gate already enforced it); regressed_others is
+                  //   diagnostic; mean_improvement is the mean delta over the union of before/after ids
+              Reason literals are pub consts: REASON_CONTENT_UNCHANGED, REASON_ENGINEERING_FAILED,
+              REASON_THRESHOLD_SATURATED, REASON_TARGET_REPLAY_FAILED, REASON_BATCH_GATE_PASSED,
+              REASON_SELECTED, REASON_SELECTED_SCORE_REGRESSED, REASON_PROTECTED_CASE_REGRESSED.
+config.rs     SingleHarnessConfig { mode: PromotionPolicyMode /*ContinuousTwoStageV2*/, max_epochs 5,
+                max_iterations 10, batch_size 5, min_improvement 0.05, max_regression 0.05, patience 2,
+                target_score: Option<f64>, max_attempts_per_batch 2, max_trials 8, promote_on_best_found true,
+                protected_cases, evaluation_protocol_signature "v1", extra } — Default, validate()
+                (Error::config for zero batch_size/max_iterations, non-finite or out-of-range margins),
+                fingerprint(&[String]) -> String (FNV-1a 64-bit hex over dataset ids + signature + mode token),
+                protected_case_set()
+state.rs      PromotionPolicyMode { LegacyEpochV1, ContinuousTwoStageV2 } (serde snake_case, token())
+              SingleHarnessStatus { Running, Completed, Failed, Cancelled } (is_terminal())
+              UsageState { calls, cost_usd }; CandidateGateRecord { batch_key, candidate_id, passed, reason, round }
+              JournalEntry { epoch, batch_index, reason, score, promoted }
+              SingleHarnessState { version 7, status, mode, fingerprint, dataset, best_harness_refs_path,
+                best_score, best_body, baseline_score, completed_batches, candidate_gates, optimization_journal,
+                historical_peak_score, continuous_attempts, continuous_trials, max_iteration, task_id,
+                evaluation_protocol_signature, stop_reason: Option<StopReason>, usage, metadata }
+                new(task_id, fingerprint, dataset, max_iteration, mode), is_batch_completed, mark_batch_completed,
+                iterations(), consecutive_non_promotions(), resume_from(previous, fingerprint, task_id,
+                max_iteration, signature) (Error::validation naming the mismatched field; resets status/stop),
+                save(path)/load(path) async YAML (Error::session on IO/parse failure)
+              batch_key(epoch, batch_index) = "epoch_{epoch:03}:batch_{batch_index:03}";
+              attempt_key(batch_key, attempt) = "<batch_key>:attempt_{attempt:03}";
+              state_path(output_dir) = <dir>/single_harness_state.yaml
+iterative.rs  SessionCore (crate-internal: config, Arc<dyn Evaluator>, Arc<dyn MutationStrategy>, state,
+                best_body, best_scores, Budget, CancellationToken, cases, seed_body, counters)
+                ensure_baseline (seed over ALL cases; only what the state lacks is recomputed),
+                select_batch(epoch) (batch_filter over dataset scores, epoch-offset slice, wraps),
+                batch_cases, scores_for, evaluate (cost-accounted), propose, record_gate, record_outcome,
+                apply_promotion, stop_reason (cancellation > budget > max_iterations > target > converged),
+                run_attempt (batch gate -> full evaluation -> optional legacy override)
+              IterativeSingleHarness { new(config, evaluator, improver, task_id, dataset, cases, seed_body),
+                with_state, with_budget, state, best_body, is_cancelled, run, run_epoch(epoch) -> bool, stop }
+              IterativeResult { state, best_score, best_body, promotions, evaluations }
+continuous.rs ContinuousSingleHarness (same surface; always the continuous policy) + type ContinuousResult
+              run_epoch: up to max_attempts_per_batch attempts per batch, at most one promotion per batch,
+              max_trials cap across the run (persisted as continuous_trials), no legacy override, batch marked
+              completed after the attempts; trials cap reports StopReason::MaxIterations.
+```
+
+Both loops: one journal entry per attempted batch, one gate record per evaluated candidate, per-case incumbent
+scores persisted in `state.metadata["best_case_scores"]`, `promotions`/`evaluations` counted per process.
+Candidate ids come from the mutation strategy with generation `iterations + 1` (iterative) / `continuous_trials + 1`
+(continuous), so ids, ordering and tie-breaks are deterministic. Evaluation errors on a candidate become
+`"engineering_failed: …"` journal entries and never abort the loop; a baseline error marks the run failed and is
+returned.
+
 ### `deferred` (`src/deferred/`)
 
 API-shaped stubs, all documented and all returning
@@ -229,7 +302,7 @@ API-shaped stubs, all documented and all returning
 | `harness_rsi.auto_harness.infra.{git_operations,worktree_manager,ci_gate_runner,runtime_extension_loader,runtime_extension_static_checks,github_cli,skill_source_manager}` | stub (`deferred::runtime`) | Subprocess git/pip/pytest/ruff, synthetic `sys.modules` hot-loading, GitCode HTTP. |
 | `harness_rsi.auto_harness.{stages,agents.factory,rails,tools}` live LLM orchestration | not stubbed — caller's `HarnessRunner` | DeepAgent construction and stage LLM turns belong to the caller (`openjiuwen-harness`). |
 | `rsi.schema/events/usage` run ledger, `harness_rsi.progress` | deferred | No in-repo consumer in Python either (auto_harness never emits them). |
-| `single_harness.{iterative,continuous}` evaluation/analyzer/optimizer bodies | deferred | Orchestration over the deferred evaluator/analyzer/optimizer above. |
+| `single_harness.{source_evidence,behavior_check,candidate_feedback,events_translate}` and the LLM analyser/improver turns | seam only — injected `Evaluator` / `MutationStrategy` | Evidence materialisation reads harness snapshots from disk and the analyser/improver are agent-driven LLM prompts; the loops themselves are implemented in `single_harness` and never build a model call. |
 | Process-global state (`program_opt/state._DIRECTORIES`, `_MODEL_ENV_LOCK`, logging/checkpointer singletons) | not ported by design | Replaced by explicit per-session `SessionState` + injected stores. |
 | `live-tests` (network/LLM) | never enabled by default | `docs/ARCHITECTURE.md` §5. |
 
@@ -244,6 +317,8 @@ API-shaped stubs, all documented and all returning
 - `./src/harness_rsi/` → harness-side RSI
   - `./src/harness_rsi/auto_harness/` → bounded self-optimisation session loop
     - `config.rs`, `budget.rs`, `task.rs`, `event.rs`, `runner.rs`, `checkpoint.rs`, `builder.rs` (collaborator defaults/validation), `orchestrator.rs` (+ `orchestrator_tests.rs`, a `#[cfg(test)]` child module)
+  - `./src/harness_rsi/single_harness/` → single-harness promotion loops
+    - `promotion.rs` (pure promotion math + reason literals), `config.rs`, `state.rs` (resumable state + idempotency keys), `iterative.rs` (`IterativeSingleHarness` + the shared `SessionCore`), `continuous.rs` (`ContinuousSingleHarness`)
 - `./src/artifact_rsi/` → artifact-side RSI
   - `./src/artifact_rsi/program_opt/` → `ProgramOptConfig` and the PUCT tree (`config.rs`, `tree.rs`)
 - `./src/deferred/` → documented `Error::Unsupported` stubs for ML/vendor surfaces (`agentdescent.rs`, `runtime.rs`, `evaluators.rs`, `paper_opt.rs`, `member_optimizer.rs`)
@@ -255,6 +330,8 @@ API-shaped stubs, all documented and all returning
 - `tests/orchestrator.rs` — a scripted fake `HarnessRunner` drives: one accepted improvement across iterations, elite retention, convergence stop after `patience` flat iterations, target-score stop, budget stop (zero cost limit), `stop()` → cancelled iteration, and event-stream ordering (`session_started` … `harness_session_finished`).
 - `tests/checkpoint.rs` — state save/load round-trip through `InMemoryCheckpointStore` and `KvCheckpointStore` over `openjiuwen_foundation::store::kv::InMemoryKvStore`/`LocalFileKvStore` (tempdir), plus `resume()` continuing at the persisted iteration.
 - `tests/evolution.rs` — `EvaluationReport` aggregation (total/passed, ungraded never averaged, weighted score), `ElitistSelection` determinism and tie-breaking, `DeterministicMutator` stable output/ids, duplicate-id skip.
+- `tests/single_harness_promotion.rs` — batch-filter boundaries at `min_improvement + EPSILON`, strict target improvement with missing entries, `mean_improvement`, every `stage_one_gate` reason literal, `threshold_saturated`, the four `full_evaluation_decision` outcomes (promotion, protected regression, target replay, score regression) including the retention/EPSILON boundaries, `case_scores` omission of ungraded/errored cases, fingerprint stability, state YAML round-trip, `batch_key`/`attempt_key`, and `resume_from` mismatch errors.
+- `tests/single_harness_loops.rs` — a scripted `Evaluator` plus `DeterministicMutator` drive both policies offline: promotion on an improvement, rejection on a regression, iteration/target/cancellation stops, engineering-failure recording, resume without replaying a completed batch, byte-identical journals across two runs, the legacy "beats the incumbent" override, continuous per-batch promotion, the `max_trials` cap, protected-case retention, the per-batch attempt retry, and constructor rejections.
 - `tests/program_opt.rs` — hand-computed PUCT scores (`c_puct = 1.0`, uniform priors), rank-score edges (`N = 1 → 0.5`, unscored `-inf`), ancestor visit increments, candidate limit rejection, `best()` tie-break, config validation, serde round-trip.
 - `tests/deferred.rs` — every stub returns `ErrorKind::Unsupported` with a non-empty message; `EvolutionPolicy` parsing round-trips.
 - Unit tests beside modules for budget warning thresholds and stop-condition ordering.
@@ -271,3 +348,6 @@ API-shaped stubs, all documented and all returning
 - `SessionState` is the single checkpoint unit (candidates + history + counters), which makes resume a full state restore instead of a separate replay protocol.
 - The only injected traits are `HarnessRunner`, `Evaluator`, `MutationStrategy`, `SelectionStrategy`, `CheckpointStore`; there is no task-source or scoring trait.
 - `task.rs` is data-only: the loop consumes `IterationRecord`, `SessionSummary`, `StopConditions`, `StopDecision`; `OptimizationTask`, `Gap`, `StageResult`, `TaskStatus`, `StageStatus` are unused by the orchestrator (kept for Python interface parity).
+- Python's single-harness engine is one 200k-line driver; the Rust port keeps only its deterministic decision core (promotion math, idempotency keys, resume validation) and inverts the model halves into the crate's existing `Evaluator`/`MutationStrategy` seams, so both loops run offline and a harness run or an LLM improver plugs in without changing the orchestration.
+- Publication stays gated by the promotion rules, not by a model: the analyser/improver may propose anything, but `stage_one_gate` plus `full_evaluation_decision` decide, so a bad proposal can never replace the incumbent.
+- `SingleHarnessState` is the checkpoint unit; per-case incumbent scores travel in `state.metadata["best_case_scores"]` because the Python checkpoint has no field for them, and a resumed run therefore keeps its regression context instead of comparing against the seed again.
