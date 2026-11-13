@@ -98,6 +98,13 @@ pub use recall::{
 };
 pub use stats::{compute_stats, ContextStats, PreparedContext};
 pub use tokens::{check_budget, count_message, count_messages, TokenBudget};
+pub mod tokenizers;
+
+pub use tokenizers::{
+    load_native_tokenizer, ModelEncoding, ModelTokenCounter, SelectedTokenizer, TokenMeasurement,
+    TokenizerEngine, TokenizerMatch, TokenizerMatchKind, TokenizerRegistry, TokenizerSelector,
+    TokenizerSource, TokenizerSpec,
+};
 pub use window::{
     assemble_window, dialogue_round_ranges, drop_orphan_tool_results, find_last_n_rounds_start,
     strip_leading_tool_messages, truncate_keeping_rounds, validate_tool_pairs, WindowOptions,
