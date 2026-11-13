@@ -439,3 +439,184 @@ fn describe_resource(path: &str) -> &'static str {
         "captured reference text"
     }
 }
+
+/// Removes the image references whose target is not one of `valid_paths`.
+///
+/// Ports `strip_hallucinated_images` from the Python `common.py` of the
+/// `skill_omni_creation` scripts: a drafting model likes to invent image paths,
+/// so a `![alt](target)` reference is kept only when its trimmed `target` equals
+/// one of `valid_paths` exactly (no path normalisation, no query-string or
+/// fragment stripping). Every other reference is deleted in place, leaving the
+/// surrounding text and any enclosing link untouched, and the blank-line runs
+/// the deletion leaves behind collapse back to at most one blank line before
+/// the result is trimmed.
+///
+/// The scanner is hand-written, like the rest of this module, and mirrors the
+/// Python regular expression `!\[([^\]]*)\]\(([^)]+)\)`: it looks for `![`, takes
+/// the first `]` as the end of the alt text, requires the `](` pair immediately,
+/// and takes the first `)` as the end of a non-empty target. An attempt that
+/// does not complete (no `]`, no `](`, or an empty `()`) is left literal and
+/// scanning resumes after the `![`, so a reference nested inside the unfinished
+/// text still matches.
+///
+/// Line boundaries are `\n` with an optional trailing `\r`, the convention of
+/// the crate's other scanners, rather than Python's wider `str.splitlines`.
+///
+/// The model-assisted generation path will call this; today its unit tests are
+/// the only callers.
+#[allow(dead_code)]
+pub(crate) fn strip_hallucinated_images(markdown: &str, valid_paths: &[String]) -> String {
+    let mut cleaned = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(start) = rest.find("![") {
+        cleaned.push_str(&rest[..start]);
+        if let Some((target, length)) = image_reference(&rest[start + 1..]) {
+            if valid_paths.iter().any(|path| path == target.trim()) {
+                cleaned.push_str(&rest[start..start + 1 + length]);
+            }
+            rest = &rest[start + 1 + length..];
+        } else {
+            cleaned.push_str("![");
+            rest = &rest[start + 2..];
+        }
+    }
+    cleaned.push_str(rest);
+    collapse_blank_lines(&cleaned)
+}
+
+/// The target and byte length (from `[` through `)`) of the image reference a
+/// `![` just opened, or `None` when the reference does not complete.
+fn image_reference(after_bang: &str) -> Option<(&str, usize)> {
+    let alt_end = after_bang.find(']')?;
+    if after_bang.as_bytes().get(alt_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let target_start = alt_end + 2;
+    let target_len = after_bang.get(target_start..)?.find(')')?;
+    if target_len == 0 {
+        return None;
+    }
+    let target = after_bang.get(target_start..target_start + target_len)?;
+    Some((target, target_start + target_len + 1))
+}
+
+/// Drops every blank line that starts the document or follows another blank
+/// line, then trims the joined result.
+fn collapse_blank_lines(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let content = !line.trim().is_empty();
+        let previous_is_content = kept.last().is_some_and(|last| !last.trim().is_empty());
+        if content || previous_is_content {
+            kept.push(line);
+        }
+    }
+    kept.join("\n").trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_hallucinated_images;
+
+    /// The valid-path list handed to [`strip_hallucinated_images`].
+    fn paths(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn text_without_images_keeps_its_content_and_loses_stray_blank_lines() {
+        assert_eq!(
+            strip_hallucinated_images("# Title\n\nJust text\n\n\n", &[]),
+            "# Title\n\nJust text"
+        );
+        assert_eq!(strip_hallucinated_images("", &[]), "");
+        assert_eq!(
+            strip_hallucinated_images("\n\nText ![x](y.png)\n\n\n", &[]),
+            "Text"
+        );
+    }
+
+    #[test]
+    fn a_valid_reference_survives_with_alt_spaces_and_unicode() {
+        let document = "Before ![a diagram with spaces — ünïcode](references/img_00.png) after";
+        assert_eq!(
+            strip_hallucinated_images(document, &paths(&["references/img_00.png"])),
+            document
+        );
+        assert_eq!(
+            strip_hallucinated_images(document, &paths(&["references/other.png"])),
+            "Before  after"
+        );
+    }
+
+    #[test]
+    fn targets_are_trimmed_before_the_exact_comparison() {
+        let document = "![logo]( references/img_00.png )";
+        assert_eq!(
+            strip_hallucinated_images(document, &paths(&["references/img_00.png"])),
+            document
+        );
+        assert_eq!(
+            strip_hallucinated_images(document, &paths(&["./references/img_00.png"])),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_query_string_target_is_not_the_valid_path() {
+        assert_eq!(
+            strip_hallucinated_images(
+                "![shot](references/img_00.png?x=1)",
+                &paths(&["references/img_00.png"]),
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_reference_nested_in_a_link_loses_only_the_reference() {
+        assert_eq!(
+            strip_hallucinated_images("[![a](x.png)](https://example.com/docs)", &[]),
+            "[](https://example.com/docs)"
+        );
+        let kept = "[![a](x.png)](https://example.com/docs)";
+        assert_eq!(strip_hallucinated_images(kept, &paths(&["x.png"])), kept);
+    }
+
+    #[test]
+    fn an_empty_alt_still_matches() {
+        assert_eq!(
+            strip_hallucinated_images("![](x.png)", &paths(&["x.png"])),
+            "![](x.png)"
+        );
+        assert_eq!(strip_hallucinated_images("![](x.png)", &[]), "");
+    }
+
+    #[test]
+    fn incomplete_references_stay_literal() {
+        for document in [
+            "Text ![unterminated alt\nmore text",
+            "Text ![alt](missing-close",
+            "Text ![alt] (not-an-image)",
+            "Text ![alt]()",
+        ] {
+            assert_eq!(strip_hallucinated_images(document, &[]), document);
+        }
+    }
+
+    #[test]
+    fn two_references_on_one_line_keep_the_surviving_line() {
+        assert_eq!(
+            strip_hallucinated_images("![keep](a.png) and ![drop](b.png)", &paths(&["a.png"])),
+            "![keep](a.png) and"
+        );
+    }
+
+    #[test]
+    fn a_line_emptied_by_a_stripped_reference_disappears() {
+        assert_eq!(
+            strip_hallucinated_images("# Title\n\n![drop](b.png)\n\nAfter", &[]),
+            "# Title\n\nAfter"
+        );
+    }
+}

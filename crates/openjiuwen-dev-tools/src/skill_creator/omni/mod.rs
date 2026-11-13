@@ -9,8 +9,15 @@
 //!   `openjiuwen_common::http`, and [`fetch::ScriptedFetcher`] for tests.
 //! - [`html`] — rule-based HTML extraction into headings, links, images, code
 //!   blocks, title, description, and text ([`html::HtmlDocument`]).
-//! - [`archive`] — archive sniffing plus ustar unpacking; zip/gzip are deferred
-//!   with a typed [`Error::unsupported`](openjiuwen_common::error::Error::unsupported).
+//! - [`archive`] — archive sniffing plus in-process unpacking of `tar`, `zip`,
+//!   and `gzip` (including gzip-wrapped `tar`/`zip`), bounded by
+//!   [`archive::MAX_ENTRY_UNCOMPRESSED_BYTES`] per entry and
+//!   [`archive::MAX_ARCHIVE_UNCOMPRESSED_BYTES`] per archive; ZIP64, encrypted
+//!   entries, and compression methods other than stored/DEFLATE stay a typed
+//!   [`Error::unsupported`](openjiuwen_common::error::Error::unsupported).
+//! - [`sha256`] — the in-crate SHA-256 (FIPS 180-4) whose hex digest keys the
+//!   payload deduplication of [`filter`], matching Python's
+//!   `hashlib.sha256(data).hexdigest()` identity.
 //! - [`filter`] — image sniffing, icon heuristics, content/url deduplication,
 //!   link deduplication, and [`filter::slugify`].
 //! - [`pipeline`] — [`pipeline::OmniCreation`]: scrape → download → generate →

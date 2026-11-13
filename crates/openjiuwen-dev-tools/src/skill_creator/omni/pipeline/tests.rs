@@ -10,6 +10,7 @@ use openjiuwen_test_support::{ScriptedModel, ScriptedTurn, TempWorkspace};
 use serde_json::json;
 
 use super::*;
+use crate::skill_creator::omni::archive::{ArchiveEntry, ArchiveWriter};
 use crate::skill_creator::omni::fetch::ScriptedFetcher;
 use crate::skill_creator::SkillBundle;
 
@@ -105,6 +106,39 @@ fn tar_archive() -> Vec<u8> {
     archive
 }
 
+/// CRC-32 (IEEE) of `bytes`, in the form a gzip trailer stores it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut state = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        state ^= u32::from(byte);
+        for _ in 0..8 {
+            state = if state & 1 == 1 {
+                (state >> 1) ^ 0xEDB8_8320
+            } else {
+                state >> 1
+            };
+        }
+    }
+    !state
+}
+
+/// One gzip member holding `payload` as a single stored (uncompressed) DEFLATE
+/// block: the fixed empty header, `BFINAL=1`/`BTYPE=00`, `LEN`/`NLEN`, the raw
+/// payload, then the CRC-32 and `ISIZE` trailer. No gzip writer exists because
+/// nothing in the crate needs to write one outside this test.
+fn gzip_stored(payload: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(payload.len()).expect("a stored block payload fits 16 bits");
+    let size = u32::try_from(payload.len()).expect("the payload length fits 32 bits");
+    let mut member = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+    member.push(0x01);
+    member.extend_from_slice(&length.to_le_bytes());
+    member.extend_from_slice(&(!length).to_le_bytes());
+    member.extend_from_slice(payload);
+    member.extend_from_slice(&crc32(payload).to_le_bytes());
+    member.extend_from_slice(&size.to_le_bytes());
+    member
+}
+
 #[tokio::test]
 async fn url_to_bundle_end_to_end() {
     let workspace = TempWorkspace::new().expect("temp workspace");
@@ -167,18 +201,55 @@ async fn tar_page_input_yields_markdown_entries() {
 }
 
 #[tokio::test]
-async fn zip_and_gzip_page_inputs_are_unsupported() {
-    let fetcher = ScriptedFetcher::new();
+async fn zip_and_gzip_page_inputs_unpack() {
     let zip_url = "https://example.com/skill.zip";
     let gzip_url = "https://example.com/skill.tar.gz";
-    fetcher.with_page(zip_url, "application/zip", b"PK\x03\x04payload".to_vec());
-    fetcher.with_page(gzip_url, "application/gzip", vec![0x1f, 0x8b, 0x08, 0x00]);
+    let zip_bytes = ArchiveWriter::write_stored(&[ArchiveEntry {
+        path: "guide.md".to_owned(),
+        bytes: b"# Zip Guide\n\nbody text\n".to_vec(),
+        is_dir: false,
+    }])
+    .expect("writes the zip");
+
+    let fetcher = ScriptedFetcher::new();
+    fetcher.with_page(zip_url, "application/zip", zip_bytes);
+    fetcher.with_page(gzip_url, "application/gzip", gzip_stored(&tar_archive()));
     let creation = OmniCreation::new(Arc::new(fetcher));
 
-    let error = creation.scrape(zip_url).await.expect_err("zip input");
-    assert!(error.to_string().contains("zip"), "{error}");
-    let error = creation.scrape(gzip_url).await.expect_err("gzip input");
-    assert!(error.to_string().contains("gzip"), "{error}");
+    let page = creation
+        .scrape(zip_url)
+        .await
+        .expect("unpacks the zip input");
+    assert_eq!(page.title, "Zip Guide");
+    assert!(page.text.contains("body text"), "{:?}", page.text);
+
+    let page = creation
+        .scrape(gzip_url)
+        .await
+        .expect("unpacks the gzip-wrapped tar input");
+    assert_eq!(
+        page.headings,
+        vec![Heading {
+            level: 1,
+            text: "Install".to_owned(),
+        }]
+    );
+    assert!(page.text.contains("Run the installer."), "{:?}", page.text);
+    assert!(!page.text.contains("logo"), "binary entry must be skipped");
+
+    // A truncated container is unusable input, not a deferred capability.
+    let truncated = ScriptedFetcher::new();
+    truncated.with_page(zip_url, "application/zip", b"PK\x03\x04payload".to_vec());
+    truncated.with_page(gzip_url, "application/gzip", vec![0x1f, 0x8b, 0x08, 0x00]);
+    let creation = OmniCreation::new(Arc::new(truncated));
+    for url in [zip_url, gzip_url] {
+        let error = creation.scrape(url).await.expect_err("truncated container");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation,
+            "{url}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
