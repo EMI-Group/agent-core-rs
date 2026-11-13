@@ -269,6 +269,7 @@ mod tests {
             text: text.to_owned(),
             success: true,
             error: None,
+            parts: Vec::new(),
             call,
         });
         ctx

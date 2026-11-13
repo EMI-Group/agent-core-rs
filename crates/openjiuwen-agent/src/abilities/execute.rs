@@ -19,7 +19,10 @@
 //! - a call is retried up to its budget's attempt count when the tool errors or
 //!   times out, sleeping the budget's exponential backoff between attempts;
 //!   cancellation and validation failures are never retried, and cancellation
-//!   stops retrying immediately.
+//!   stops retrying immediately;
+//! - a successful result keeps the tool's text rendering plus the multimodal
+//!   content parts [`extract_parts`](super::parts::extract_parts) finds in its
+//!   raw output; failures carry no parts.
 use super::{parse_tool_arguments, ToolCallResult, ToolExecutionOptions};
 use crate::policy::ToolResiliencePolicy;
 use futures::future::join_all;
@@ -149,7 +152,8 @@ async fn execute_one(
         match invoke_once(tool.as_ref(), arguments.clone(), &ctx, timeout).await {
             Ok(output) => {
                 let text = Arc::clone(tool).render_for_llm(&output);
-                return ToolCallResult::success(call.clone(), output, text);
+                let parts = super::parts::extract_parts(&output);
+                return ToolCallResult::success(call.clone(), output, text).with_parts(parts);
             }
             Err(failure) => {
                 let retry = attempt < attempts
@@ -226,7 +230,7 @@ mod tests {
     use crate::policy::ToolResilience;
     use async_trait::async_trait;
     use openjiuwen_common::error::{Error, Result as ToolResult};
-    use openjiuwen_foundation::{Role, ToolCard};
+    use openjiuwen_foundation::{ContentPart, ImageUrl, Role, ToolCard};
     use parking_lot::Mutex;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -391,6 +395,67 @@ mod tests {
         let results = execute_calls(&tools, &calls, &options).await;
         assert_eq!(results.len(), 2);
         assert!(position(&log, "end:a") < position(&log, "start:b"));
+    }
+
+    #[tokio::test]
+    async fn multimodal_tool_output_keeps_its_text_and_parts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(&[recording_tool("shot", &log, Duration::ZERO, true)]);
+        let output = json!({"content": [
+            {"type": "text", "text": "ok"},
+            {"type": "image", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]});
+        let calls = vec![ToolCall::new("shot")
+            .with_id("call-1")
+            .with_arguments(output.clone())];
+        let results = execute_calls(&tools, &calls, &ToolExecutionOptions::default()).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(
+            results[0].text,
+            r#"[{"type":"text","text":"ok"},{"type":"image","image_url":{"url":"data:image/png;base64,AAA"}}]"#
+        );
+        assert_eq!(results[0].parts.len(), 2);
+        assert_eq!(
+            results[0].parts[0],
+            ContentPart::Text {
+                text: "ok".to_owned()
+            }
+        );
+        assert_eq!(
+            results[0].parts[1],
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAA".to_owned(),
+                    detail: None,
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_tool_output_has_no_parts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(&[recording_tool("echo", &log, Duration::ZERO, true)]);
+        let calls = vec![ToolCall::new("echo").with_arguments(json!({"x": 1}))];
+        let results = execute_calls(&tools, &calls, &ToolExecutionOptions::default()).await;
+        assert!(results[0].success);
+        assert_eq!(results[0].parts, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn failures_carry_no_parts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(&[recording_tool("echo", &log, Duration::ZERO, true)]);
+        let calls = vec![
+            ToolCall::new("missing"),
+            ToolCall {
+                arguments: "not json".to_owned(),
+                ..ToolCall::new("echo")
+            },
+        ];
+        let results = execute_calls(&tools, &calls, &ToolExecutionOptions::default()).await;
+        assert!(results.iter().all(|result| result.parts.is_empty()));
     }
 
     #[tokio::test]

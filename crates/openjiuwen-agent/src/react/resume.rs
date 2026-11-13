@@ -129,6 +129,7 @@ pub(crate) async fn resume_or_seed(
             content: result.text,
             name: Some(result.call.name),
             tool_call_id: result.call.id,
+            parts: result.parts,
         });
     }
     if !unanswered.is_empty() {
@@ -277,11 +278,17 @@ fn text_of(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card::AgentCard;
     use crate::interrupt::{InterruptKind, InterruptRequest};
     use crate::policy::ClientToolHandler;
+    use crate::rails::{RailContext, RailEvent};
+    use crate::react::agent_loop::AgentRuntime;
+    use crate::react::ReActAgent;
     use async_trait::async_trait;
     use openjiuwen_common::error::Error;
-    use openjiuwen_foundation::{Tool, ToolCard, ToolContext};
+    use openjiuwen_foundation::{Model, Tool, ToolCard, ToolContext};
+    use openjiuwen_session::AgentSession;
+    use openjiuwen_test_support::ScriptedModel;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -518,5 +525,86 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("client boom")));
+    }
+
+    /// Answers with a text part plus an image part, like a screenshot tool.
+    struct ShotTool {
+        card: ToolCard,
+    }
+
+    #[async_trait]
+    impl Tool for ShotTool {
+        fn card(&self) -> &ToolCard {
+            &self.card
+        }
+
+        async fn invoke(&self, _inputs: Value, _ctx: &ToolContext) -> Result<Value> {
+            Ok(json!({"content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ]}))
+        }
+    }
+
+    /// An agent owning `ShotTool`, snapshot into a runtime for `resume_or_seed`.
+    fn shot_runtime() -> AgentRuntime {
+        let agent = ReActAgent::new(AgentCard::new("react"));
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::text("done"));
+        agent.set_model(model);
+        agent.add_tool(Arc::new(ShotTool {
+            card: ToolCard::new("shot", "captures the screen", json!({"type": "object"}))
+                .with_id("shot-1"),
+        }));
+        AgentRuntime::snapshot(&agent).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_replayed_result_keeps_its_parts_in_the_observation() {
+        let runtime = shot_runtime();
+        let session: Arc<dyn Session> = Arc::new(AgentSession::new("s1"));
+        state(vec![("call-1", request("call-1", "shot", "{}"))])
+            .save(&*session)
+            .await
+            .unwrap();
+        let input =
+            AgentInput::parse(&json!({"query": {"user_inputs": {"call-1": {"approved": true}}}}))
+                .unwrap();
+        let context = runtime
+            .engine
+            .create_context("main", Some(Arc::clone(&session)))
+            .await
+            .unwrap();
+        let mut ctx = RailContext::new(RailEvent::BeforeInvoke).with_agent_id("agent");
+
+        let outcome = resume_or_seed(
+            &runtime,
+            &input,
+            &session,
+            None,
+            &ToolExecutionOptions::default(),
+            &mut ctx,
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let ResumeOutcome::Start { observations, .. } = outcome else {
+            panic!("the approved call must replay");
+        };
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].content.contains("ok"));
+        assert_eq!(observations[0].parts.len(), 2);
+        assert_eq!(
+            observations[0].parts[0],
+            openjiuwen_foundation::ContentPart::Text {
+                text: "ok".to_owned()
+            }
+        );
+        assert_eq!(
+            observations[0].parts[1]
+                .image_url()
+                .map(|image| image.url.as_str()),
+            Some("data:image/png;base64,AAA")
+        );
     }
 }

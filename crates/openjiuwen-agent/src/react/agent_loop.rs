@@ -619,6 +619,8 @@ async fn run_inner(
                 result.output = Some(Value::String(text.clone()));
                 result.text = text;
                 result.success = true;
+                // The substituted text has no multimodal payload behind it.
+                result.parts.clear();
             }
             hooks::tool_call_end(runtime, session, iteration, &result).await;
             runtime.engine.observe(&context, result.message()).await?;
@@ -626,6 +628,7 @@ async fn run_inner(
                 content: result.text,
                 name: Some(call.name.clone()),
                 tool_call_id: call.id.clone(),
+                parts: result.parts,
             });
         }
 
@@ -705,7 +708,7 @@ mod tests {
     use crate::output::ResultType;
     use crate::rails::{AskUserRail, ConfirmInterruptRail};
     use openjiuwen_context::ContextConfig;
-    use openjiuwen_foundation::ToolContext;
+    use openjiuwen_foundation::{MessageContent, Role, ToolContext};
     use openjiuwen_session::AgentSession;
     use openjiuwen_test_support::{MockCompletion, ScriptedModel};
 
@@ -936,6 +939,73 @@ mod tests {
             None,
             "a resumed turn clears the persisted interruption"
         );
+    }
+
+    /// Answers with a text part plus an image part, like a screenshot tool.
+    struct Shot(ToolCard);
+
+    #[async_trait::async_trait]
+    impl Tool for Shot {
+        fn card(&self) -> &ToolCard {
+            &self.0
+        }
+
+        async fn invoke(&self, _inputs: Value, _ctx: &ToolContext) -> Result<Value> {
+            Ok(serde_json::json!({"content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ]}))
+        }
+    }
+
+    #[tokio::test]
+    async fn multimodal_tool_output_reaches_the_observation_and_the_next_request() {
+        let model = ScriptedModel::builder()
+            .completion(MockCompletion::tool_call("shot", serde_json::json!({})))
+            .respond_text("done")
+            .build();
+        let agent = ReActAgent::new(AgentCard::new("react"));
+        let model_arc: Arc<dyn Model> = Arc::new(model.clone());
+        agent.set_model(model_arc);
+        agent.add_tool(Arc::new(Shot(ToolCard::new(
+            "shot",
+            "captures the screen",
+            serde_json::json!({"type": "object"}),
+        ))));
+
+        let output = agent
+            .invoke(Value::String("hi".to_owned()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(output.result_type, ResultType::Answer);
+        assert_eq!(output.output, "done");
+        assert_eq!(output.observations.len(), 1);
+        assert!(output.observations[0].content.contains("ok"));
+        assert_eq!(output.observations[0].parts.len(), 2);
+        assert_eq!(
+            output.observations[0].parts[0],
+            openjiuwen_foundation::ContentPart::Text {
+                text: "ok".to_owned()
+            }
+        );
+        assert_eq!(
+            output.observations[0].parts[1]
+                .image_url()
+                .map(|image| image.url.as_str()),
+            Some("data:image/png;base64,AAA")
+        );
+
+        let last = model.last_call().expect("the answer call is recorded");
+        let tool_message = last
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the request carries the tool message");
+        let MessageContent::Parts(parts) = &tool_message.content else {
+            panic!("a multimodal tool message carries parts");
+        };
+        assert!(parts.iter().any(|part| part.image_url().is_some()));
     }
 
     #[tokio::test]
