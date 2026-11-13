@@ -24,8 +24,10 @@
 //! the `OpResult` mapping; [`semantics`] owns the pure host-side behavior every
 //! provider shares (line selection, newline transforms, chunking, path and
 //! quoting helpers, list sorting/filtering); [`local_io`] owns the host-side
-//! file reads and writes of transfers. A provider module then only knows its own
-//! URL shapes and payload schemas.
+//! file reads and writes of transfers; `backend` owns the provider-neutral
+//! `SandboxBackend` primitives and the generic wrappers that implement the
+//! kernel operation traits once. A provider module then only translates its own
+//! wire formats and optionally overrides `code_command` / `code_cwd`.
 //!
 //! # Lifecycle
 //!
@@ -49,11 +51,16 @@
 pub(crate) mod semantics;
 
 mod aio;
+mod backend;
 mod jiuwenbox;
 mod local_io;
 mod transport;
 mod yuanrong;
 
+pub(crate) use backend::{
+    provider_set_from, ExecCommand, ExecRequest, ExecResult, ListRequest, RemoteCode, RemoteEntry,
+    RemoteFs, RemoteShell, SandboxBackend, SearchRequest,
+};
 pub(crate) use transport::{gateway_failure, remote_error, RawResponse, RemoteError, SandboxHttp};
 
 use openjiuwen_common::error::{Error, Result};
