@@ -113,9 +113,9 @@ fn scripted_runner() -> ScriptedCaseRunner {
         .respond("case-audience", "A brief written for the leadership team.")
 }
 
-/// Mirrors the evaluator's two-decimal rounding for the weighted formula.
-fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+/// Mirrors the evaluator's four-decimal rounding for fraction values.
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 /// Asserts that the Python artifact field names are present at their documented
@@ -300,7 +300,7 @@ async fn evaluated_skill_reports_pipeline_status_and_python_json_fields() {
     );
     assert!(
         (summary.pass_rate - 2.0 / 3.0).abs() < 1e-9,
-        "the pass rate must be (passed + 0.5 * partial) / total, i.e. 2 of 3 here"
+        "the pass rate must be passed / total, i.e. 2 of 3 here"
     );
     assert_eq!(
         report.functional.recommendations,
@@ -318,27 +318,24 @@ async fn evaluated_skill_reports_pipeline_status_and_python_json_fields() {
     );
     assert_eq!(
         report.final_score.gates_passed,
-        vec![
-            "e1_llm_judge".to_owned(),
-            "e2_functional".to_owned(),
-            "e3_safety".to_owned(),
-        ],
-        "a completed pipeline must report all three gates in evaluation order"
+        vec!["e3_safety".to_owned()],
+        "a completed pipeline reports the single gate-role evaluator (E3 safety)"
     );
 
-    let expected_final = round2(
-        0.40 * report.design.design_score_pct + 0.60 * report.functional.summary.pass_rate * 100.0,
-    );
+    let expected_final =
+        round4(0.40 * report.design.design_score_pct + 0.60 * report.functional.summary.pass_rate);
     assert!(
-        (report.final_score.final_score_pct - expected_final).abs() < 1e-9,
-        "the final score must be round2(0.40 * design_score_pct + 0.60 * pass_rate * 100)"
+        (report.final_score.final_score_pct - expected_final).abs() < 1e-4,
+        "the final score must be round4(0.40 * design_score_pct + 0.60 * pass_rate) over fractions, \
+         got {}",
+        report.final_score.final_score_pct
     );
     assert!(
         (report.final_score.evaluators.e2_functional.contribution
-            - round2(0.60 * report.functional.summary.pass_rate * 100.0))
+            - round4(0.60 * report.functional.summary.pass_rate))
         .abs()
-            < 1e-9,
-        "the functional contribution must be the weighted pass rate percentage"
+            < 1e-4,
+        "the functional contribution must be the weighted pass rate fraction"
     );
 
     assert_python_json_fields(&report);
@@ -359,8 +356,8 @@ async fn evaluated_skill_reports_pipeline_status_and_python_json_fields() {
         .expect("a matching safety rule blocks the verdict without failing the run");
 
     assert!(
-        blocked.safety.blocked && blocked.safety.auto_fail,
-        "a critical safety finding must close the gate and mark the run as an automatic failure"
+        blocked.safety.blocked && blocked.safety.auto_fail.is_none(),
+        "a critical safety finding must close the gate without claiming a coded auto-fail"
     );
     assert_eq!(
         blocked.safety.findings.len(),
@@ -368,8 +365,8 @@ async fn evaluated_skill_reports_pipeline_status_and_python_json_fields() {
         "exactly the one matching rule must produce a finding"
     );
     assert_eq!(
-        blocked.final_score.pipeline_status, "BLOCKED_AT_SAFETY",
-        "the blocked pipeline must report the BLOCKED_AT_SAFETY status"
+        blocked.final_score.pipeline_status, "BLOCKED_AT_E3",
+        "the blocked pipeline must report the BLOCKED_AT_E3 status"
     );
     assert!(
         blocked.final_score.gates_passed.is_empty(),

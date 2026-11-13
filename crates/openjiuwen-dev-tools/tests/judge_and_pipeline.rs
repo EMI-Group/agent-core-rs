@@ -163,7 +163,7 @@ async fn a_judged_evaluation_records_model_provenance() {
     assert_eq!(record.design_source, VerdictSource::Model);
     assert_eq!(record.safety_source, VerdictSource::Model);
     assert!((report.design.design_score - 80.0).abs() < 1e-9);
-    assert!((report.safety.score_pct - 95.0).abs() < 1e-9);
+    assert!((report.safety.score_pct - 0.95).abs() < 1e-9);
     assert_eq!(report.functional.timestamp, STAMP);
     assert_eq!(report.final_score.pipeline_status, "COMPLETED");
     assert_eq!(model.call_count(), 2, "one design and one safety call");
@@ -185,7 +185,7 @@ async fn a_garbage_judge_answer_falls_back_to_the_deterministic_report() {
     assert_eq!(record.design_source, VerdictSource::Deterministic);
     assert_eq!(record.safety_source, VerdictSource::Deterministic);
     assert_eq!(report.design, score_design(&skill()));
-    assert!((report.safety.score_pct - 100.0).abs() < 1e-9);
+    assert!((report.safety.score_pct - 1.0).abs() < 1e-9);
     assert_eq!(report.final_score.pipeline_status, "COMPLETED");
     assert_eq!(garbage.call_count(), 2);
 }
@@ -326,21 +326,26 @@ async fn the_builder_pipeline_generates_a_mermaid_workflow() {
 
     let mermaid = render_mermaid(workflow);
     let lines: Vec<&str> = mermaid.lines().collect();
-    assert_eq!(lines.first(), Some(&"flowchart TD"));
+    assert_eq!(lines.first(), Some(&"graph TD"));
     assert_eq!(
         lines.len(),
         1 + workflow.nodes.len() + workflow.edges.len(),
         "one line per node then one per edge"
     );
-    for node in &workflow.nodes {
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.trim_start().starts_with(node.id.as_str())),
-            "missing node {}",
-            node.id
-        );
-    }
+    assert_eq!(
+        &lines[1..=workflow.nodes.len()],
+        [
+            "  start[Nodestart: start]",
+            "  llm_1[Nodellm_1: llm_1]",
+            "  end[Nodeend: end]",
+        ],
+        "every node renders in document order as `  {{id}}[Node{{id}}: {{label}}]`"
+    );
+    assert_eq!(
+        &lines[1 + workflow.nodes.len()..],
+        ["  start --> llm_1", "  llm_1 --> end"],
+        "a single-successor edge renders unlabelled as `  {{src}} --> {{dst}}`"
+    );
     assert_eq!(model.call_count(), 3, "clarify, design, and generate");
     assert_eq!(
         builder
@@ -348,6 +353,63 @@ async fn the_builder_pipeline_generates_a_mermaid_workflow() {
             .expect("the session exists")
             .state,
         BuildState::Completed
+    );
+}
+
+#[test]
+fn a_mermaid_branch_labels_only_the_multi_successor_edges() {
+    let document = WorkflowDsl {
+        name: "branch".to_string(),
+        description: "two paths".to_string(),
+        nodes: vec![
+            DslNode {
+                id: "start".to_string(),
+                node_type: "start".to_string(),
+                title: "Start".to_string(),
+                ..DslNode::default()
+            },
+            DslNode {
+                id: "yes".to_string(),
+                node_type: "end".to_string(),
+                title: "Yes".to_string(),
+                description: "Yes path".to_string(),
+                ..DslNode::default()
+            },
+            DslNode {
+                id: "no".to_string(),
+                node_type: "end".to_string(),
+                title: "No".to_string(),
+                description: "No path".to_string(),
+                ..DslNode::default()
+            },
+        ],
+        edges: vec![
+            DslEdge {
+                source: "start".to_string(),
+                target: "yes".to_string(),
+                condition: Some("score > 0.5".to_string()),
+            },
+            DslEdge {
+                source: "start".to_string(),
+                target: "no".to_string(),
+                condition: Some("score <= 0.5".to_string()),
+            },
+        ],
+    };
+
+    let mermaid = render_mermaid(&document);
+    let lines: Vec<&str> = mermaid.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "graph TD",
+            "  start[Nodestart: start]",
+            "  yes[Nodeyes: Yes path]",
+            "  no[Nodeno: No path]",
+            "  start -- score > 0.5 --> yes",
+            "  start -- score <= 0.5 --> no",
+        ],
+        "a multi-successor source renders `  {{src}} -- {{label}} --> {{dst}}` per edge"
     );
 }
 
