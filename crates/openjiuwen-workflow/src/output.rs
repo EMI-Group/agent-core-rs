@@ -75,6 +75,41 @@ impl std::fmt::Display for WorkflowExecutionState {
     }
 }
 
+/// The kind of chunk a workflow produces.
+///
+/// Ports Python's `WorkflowChunkType` (`openjiuwen/core/workflow/base.py`), the `str, Enum`
+/// whose wire values are `"interaction"`, `"output"`, and `"error"`. It classifies a
+/// [`WorkflowChunk`] for consumers that only need the coarse category; the frame itself
+/// keeps the finer `type`/`index`/`payload` shape and is unchanged by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowChunkType {
+    /// A chunk from a user/agent interaction (human-in-the-loop question or answer).
+    Interaction,
+    /// A chunk from the workflow's output node.
+    Output,
+    /// A chunk carrying error information.
+    Error,
+}
+
+impl WorkflowChunkType {
+    /// The wire name of this chunk type.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Interaction => "interaction",
+            Self::Output => "output",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowChunkType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Final output container of a workflow execution.
 ///
 /// `result` is the end component's value, or the list of collected frames when
@@ -298,6 +333,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(parsed, output);
+    }
+
+    #[test]
+    fn chunk_type_uses_python_wire_names() {
+        // Python: openjiuwen/core/workflow/base.py::WorkflowChunkType
+        assert_eq!(
+            serde_json::to_value(WorkflowChunkType::Interaction).unwrap(),
+            json!("interaction")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowChunkType::Output).unwrap(),
+            json!("output")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowChunkType::Error).unwrap(),
+            json!("error")
+        );
+        assert_eq!(WorkflowChunkType::Interaction.as_str(), "interaction");
+        assert_eq!(WorkflowChunkType::Output.to_string(), "output");
+        assert_eq!(WorkflowChunkType::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn chunk_type_round_trips_through_json() {
+        for chunk_type in [
+            WorkflowChunkType::Interaction,
+            WorkflowChunkType::Output,
+            WorkflowChunkType::Error,
+        ] {
+            let wire = serde_json::to_string(&chunk_type).unwrap();
+            let parsed: WorkflowChunkType = serde_json::from_str(&wire).unwrap();
+            assert_eq!(parsed, chunk_type);
+        }
+        assert!(serde_json::from_str::<WorkflowChunkType>("\"unknown\"").is_err());
     }
 
     #[test]
