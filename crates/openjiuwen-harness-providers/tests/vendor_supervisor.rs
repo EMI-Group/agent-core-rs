@@ -16,10 +16,8 @@
 //!
 //! No network, no vendor CLI, no `tokio::time::sleep`: ordering that matters is observed through
 //! the cycle cursor, and every await that could hang is wrapped in a five-second timeout as a pure
-//! safety net.
-//!
-//! Python counterpart: `tests/unit_tests/harness_providers/` (there is no Python supervisor; the
-//! shell replaces the per-vendor lifecycle code duplicated in the three Python adapters).
+//! safety net. Python has no supervisor: this shell replaces the per-vendor lifecycle code the three
+//! adapters each duplicate.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,10 +48,6 @@ const QUIET: Duration = Duration::from_millis(100);
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
-
-// ---------------------------------------------------------------------------
-// Test double
-// ---------------------------------------------------------------------------
 
 /// Behaviour the fake driver reports for the next turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,10 +300,6 @@ fn fake_checkpoint() -> HarnessCheckpoint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Harness helpers
-// ---------------------------------------------------------------------------
-
 /// Builds a card declaring exactly `capabilities`.
 fn card(capabilities: &[HarnessCapability]) -> HarnessCard {
     let mut card = HarnessCard::new("fake-harness", "0.1.0");
@@ -362,6 +352,17 @@ async fn take(cursor: &mut dyn HarnessEventCursor, count: usize) -> Vec<HarnessE
     .expect("the harness must publish the expected events in time")
 }
 
+/// Starts `harness` and consumes its `Terminated → Idle` transition.
+async fn started(harness: &VendorHarness) -> Box<dyn HarnessEventCursor> {
+    harness
+        .start(context())
+        .await
+        .expect("the host is compatible");
+    let mut cursor = harness.events();
+    let _ = take(cursor.as_mut(), 1).await;
+    cursor
+}
+
 /// Returns the turn lifecycle kinds of `events`, in order.
 fn turn_kinds(events: &[HarnessEvent]) -> Vec<TurnEventKind> {
     events
@@ -393,10 +394,6 @@ fn terminal_result(events: &[HarnessEvent]) -> Option<&TurnResult> {
         _ => None,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 
 /// A card that requires a host capability the context lacks must refuse to start.
 #[tokio::test]
@@ -448,12 +445,8 @@ async fn start_publishes_one_transition_and_settles_idle() {
         events[0].provider_session_id.as_deref(),
         Some("fake-session")
     );
-    assert!(
-        tokio::time::timeout(QUIET, cursor.next_event())
-            .await
-            .is_err(),
-        "start publishes exactly one event"
-    );
+    let quiet = tokio::time::timeout(QUIET, cursor.next_event()).await;
+    assert!(quiet.is_err(), "start publishes exactly one event");
 
     let error = harness.start(context()).await.expect_err("already started");
     assert_eq!(error.kind(), HarnessErrorKind::State);
@@ -462,18 +455,12 @@ async fn start_publishes_one_transition_and_settles_idle() {
     harness.stop().await.expect("stop");
 }
 
-// ---------------------------------------------------------------------------
-// Turns
-// ---------------------------------------------------------------------------
-
 /// One accepted input produces the documented event sequence.
 #[tokio::test]
 async fn one_turn_publishes_the_documented_sequence() {
     let driver = FakeDriver::new(Mode::Answer);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     let receipt = harness
         .send(HarnessInput::text("hello"), DeliveryMode::Auto)
@@ -548,9 +535,7 @@ async fn one_turn_publishes_the_documented_sequence() {
 async fn queued_turns_run_one_at_a_time_in_order() {
     let driver = FakeDriver::new(Mode::Answer);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     let first = harness
         .send(HarnessInput::text("one"), DeliveryMode::Auto)
@@ -614,9 +599,7 @@ async fn queued_turns_run_one_at_a_time_in_order() {
 async fn a_driver_error_fails_the_turn_and_keeps_the_harness_usable() {
     let driver = FakeDriver::new(Mode::Error);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     harness
         .send(HarnessInput::text("boom"), DeliveryMode::Auto)
@@ -654,9 +637,7 @@ async fn a_driver_error_fails_the_turn_and_keeps_the_harness_usable() {
 async fn a_provider_failure_result_is_reported_as_a_failed_turn() {
     let driver = FakeDriver::new(Mode::Fail);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     harness
         .send(HarnessInput::text("ask"), DeliveryMode::Auto)
@@ -676,18 +657,12 @@ async fn a_provider_failure_result_is_reported_as_a_failed_turn() {
     harness.stop().await.expect("stop");
 }
 
-// ---------------------------------------------------------------------------
-// Steering, abort, pause/resume, checkpoints
-// ---------------------------------------------------------------------------
-
 /// Steering needs an active turn and reaches the driver once one runs.
 #[tokio::test]
 async fn steer_needs_an_active_turn_and_reaches_the_driver() {
     let driver = FakeDriver::new(Mode::Hang);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     let error = harness
         .send(HarnessInput::text("early"), DeliveryMode::Steer)
@@ -737,9 +712,7 @@ async fn steer_needs_an_active_turn_and_reaches_the_driver() {
 async fn abort_reaches_a_hanging_turn() {
     let driver = FakeDriver::new(Mode::Hang);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     let turn = harness
         .send(HarnessInput::text("hello"), DeliveryMode::Auto)
@@ -839,9 +812,7 @@ async fn abort_without_an_active_turn_drains_the_queue() {
 async fn a_bare_card_rejects_the_gated_commands() {
     let driver = FakeDriver::new(Mode::Hang);
     let harness = harness(card(&[HarnessCapability::GracefulAbort]), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     harness
         .send(HarnessInput::text("hello"), DeliveryMode::Auto)
@@ -887,9 +858,7 @@ async fn a_bare_card_rejects_the_gated_commands() {
 async fn pause_and_resume_reach_the_driver() {
     let driver = FakeDriver::new(Mode::Hang);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     let turn = harness
         .send(HarnessInput::text("hello"), DeliveryMode::Auto)
@@ -944,10 +913,6 @@ async fn export_checkpoint_delegates_and_returns_the_driver_snapshot() {
     harness.stop().await.expect("stop");
 }
 
-// ---------------------------------------------------------------------------
-// Observation lease and teardown
-// ---------------------------------------------------------------------------
-
 /// The cycle cursor is single-consumer.
 #[tokio::test]
 async fn the_observation_lease_is_single_consumer() {
@@ -975,9 +940,7 @@ async fn the_observation_lease_is_single_consumer() {
 async fn stop_aborts_queued_turns_and_is_idempotent() {
     let driver = FakeDriver::new(Mode::Hang);
     let harness = harness(full_card(), &driver);
-    harness.start(context()).await.expect("start");
-    let mut cursor = harness.events();
-    let _ = take(cursor.as_mut(), 1).await;
+    let mut cursor = started(&harness).await;
 
     harness
         .send(HarnessInput::text("running"), DeliveryMode::Auto)
