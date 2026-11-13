@@ -35,6 +35,16 @@ impl AliyunReranker {
 - The DashScope HTTP transport (`AliyunReranker::from_config`) is deferred: `Error::Unsupported("AliyunReranker HTTP transport is deferred; wrap a configured reranker with AliyunReranker::new")`.
 - Deprecation is expressed in docs and an optional `tracing::warn!` on construction (target `openjiuwen_extensions::vendor_specific`), matching Python's import-time warning without logging on every call.
 
+## Kernel Trait Contract
+
+- The ported trait is `openjiuwen_retrieval::Reranker` (`crates/openjiuwen-retrieval/src/reranker/mod.rs`), `#[async_trait] pub trait Reranker: Send + Sync` with the single method `async fn rerank(&self, query: &str, documents: Vec<SearchResult>, top_n: Option<usize>) -> Result<Vec<SearchResult>>`.
+- It is unsealed and object-safe (the kernel stores it as `Option<Arc<dyn Reranker>>` in `knowledge_base`), so a DashScope transport can implement it here using public API only.
+- `SearchResult { id: String, text: String, score: f32, metadata: serde_json::Map<String, Value> }` is public, `Default`, and `Deserialize` (wire field names are not renamed), so provider JSON can be mapped straight onto it.
+- There is no `RerankRequest`/`RerankResponse` type in the kernel: `Vec<SearchResult>` in/out plus `top_n` is the whole protocol.
+- `Reranker::rerank`'s contract is a stable descending `f32::total_cmp` sort with per-call `top_n` winning over any configured limit, `Some(0)` → empty; the kernel's `sort_and_truncate` helper is private, so an implementation here must replicate that ordering itself or delegate to `ScoreReranker`/`LlmReranker`.
+- A transport can alternatively implement `openjiuwen_retrieval::LlmScorer` (`async fn score(&self, query: &str, documents: &[String]) -> Result<Vec<f32>>`) and wrap it in `LlmReranker`, which supplies the sorting, truncation, length-mismatch, and non-finite-score validation.
+- The kernel also exposes `RerankerConfig { api_key: Option<SecretString>, api_base, model_name (alias "model"), timeout, temperature, top_p }`; `AliyunRerankerConfig` here is the local, smaller shape and does not reference it.
+
 ## Constraints
 
 - No vendor SDK or HTTP client code; `reqwest` is not used here.
