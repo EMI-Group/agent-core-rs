@@ -61,6 +61,8 @@ impl SpawnSpec { pub fn class_agent(module, class) -> Self; pub fn team_agent(pa
     fn health_snapshot(&self) -> SpawnHealth;              // backend/is_alive/is_healthy/pid, last_error: None
     async fn health(&self) -> Result<bool>;                // Unsupported("agent health probe", <backend> hint)
     async fn cancel_task(&self, task_id: &str) -> Result<()>;  // Unsupported("spawned task cancellation", <backend> hint)
+    async fn send_with_timeout(&self, inputs, timeout: Option<Duration>) -> Result<AgentOutput>;   // default: send(inputs)
+    fn stream_with_timeout(&self, inputs, timeout: Option<Duration>) -> BoxStream<...>;            // default: stream(inputs)
 }
 #[async_trait] pub trait AgentSpawner: Send + Sync {
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
@@ -70,7 +72,8 @@ pub struct UnsupportedSpawner;                             // every spawn -> Err
 ```
 
 `SpawnSpec::backend` is a routing hint for `SpawnerRegistry`, not a wire change: it is additive metadata a Python child ignores (unknown fields are tolerated) and it never alters the frames.
-A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, and an `Unsupported` `health`/`cancel_task` whose message names its backend.
+A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`cancel_task` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
+The deadline on the bounded variants is advisory and never reaches the wire: `None` means "the backend's own default", `SpawnedProcess` and `RemoteAgent` honour a `Some(..)`, and `InProcessAgent` keeps the defaults.
 
 ### Wire — `protocol.rs`
 
@@ -115,7 +118,8 @@ impl SubprocessConfig { pub fn new(program); with_arg / with_args / with_cwd / w
 pub struct SubprocessSpawner;                              // new(config) / with_backend(config, backend), config(), backend(),
                                                             // spawn_process(spec) -> Result<Arc<SpawnedProcess>>
 pub struct SpawnedProcess;                                  // id, backend, pid, is_alive, is_healthy, health, send, stream,
-                                                            // shutdown, force_kill, into_agent(self: Arc<Self>) -> Arc<dyn SpawnedAgent>
+                                                            // send_with_timeout, stream_with_timeout, shutdown, force_kill,
+                                                            // into_agent(self: Arc<Self>) -> Arc<dyn SpawnedAgent>
 ```
 
 `SubprocessSpawner::spawn_process` returns the concrete `Arc<SpawnedProcess>` so hosts can call `health`/`pid`; the `AgentSpawner::spawn` impl coerces it to `Arc<dyn SpawnedAgent>`.
@@ -123,6 +127,8 @@ pub struct SpawnedProcess;                                  // id, backend, pid,
 `SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is the spawner's label (not always `subprocess`), `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` carries the same label and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
 The handle's `Debug` output shows that label beside its id, pid, liveness, and health.
 `cancel_task` keeps the unsupported default: the NDJSON protocol has no task handle to address, so a caller stops a child with `shutdown`/`force_kill`.
+`send_with_timeout(inputs, timeout)`/`stream_with_timeout(inputs, timeout)` bound one exchange: `Some(..)` is that exchange's deadline and `None` falls back to the configured `request_timeout_secs` (`send`/`stream` are the `None` form), so a host holding `Arc<dyn SpawnedAgent>` can bound a single invocation.
+`shutdown(timeout)` treats `Duration::ZERO` as "the configured `shutdown_timeout_secs`" (read through the clamped `SubprocessConfig::shutdown_timeout()`); a non-zero caller timeout wins over the configuration, and a child that does not exit within it is killed and reported `false`.
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
 Configured timeouts are clamped to `[0, 86_400]` seconds, so `Instant + Duration` cannot overflow and nonsense configuration means "no deadline".
 `SubprocessConfig` env wins over the inherited environment and `SpawnSpec::envs` wins over `SubprocessConfig` env.
@@ -227,9 +233,11 @@ pub struct RemoteSpawner;                                  // new(base_url), wit
 ```
 
 `RemoteAgent` implements both `RemoteClient` and `SpawnedAgent`.
-Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_healthy()` = the client's started state, `health()` = `Ok(is_started)` (the HTTP wire contract defines only invoke/stream/cancel, so there is no probe endpoint; the client auto-starts on the first `invoke`/`stream`), and `cancel_task` forwards to `RemoteClient::cancel_task` (the one place a remote backend owns a real task handle).
+Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_healthy()` = the client's started state, `health()` = `Ok(is_started)` (the HTTP wire contract defines only invoke/stream/cancel, so there is no probe endpoint), and `cancel_task` forwards to `RemoteClient::cancel_task` (the one place a remote backend owns a real task handle).
+`send_with_timeout`/`stream_with_timeout` forward the deadline to `RemoteClient::invoke`/`RemoteClient::stream`, so a bounded invocation is real on this backend while `send`/`stream` keep the configured `timeout_secs`.
+`RemoteAgent::new` stays lazy (the `reqwest` client is built on first `invoke`/`stream` or by `start`, so a directly constructed handle reports itself not alive until then), but `RemoteSpawner::spawn` calls `RemoteClient::start` before returning: a spawned remote child is started, so `is_alive()`/`is_healthy()`/`health()` are `true` immediately with no request sent (Python's `remote_agent.py` starts the child too), and a client that cannot be built fails the spawn.
 `RemoteSpawner::backend()` is `RemoteHttp`.
-`RemoteSpawner::spawn` derives the agent id from `agent_class`, then `agent_module`, then a non-empty `init_kwargs["agent_id"]` (`Validation` when none is usable), copies `SpawnSpec::session_id` into the config, and validates `base_url` at spawn time rather than at first invoke.
+`RemoteSpawner::spawn` derives the agent id from `agent_class`, then `agent_module`, then a non-empty `init_kwargs["agent_id"]` (`Validation` when none is usable), copies `SpawnSpec::session_id` into the config, and validates the endpoint at spawn time rather than at first invoke: an empty `base_url` and a non-empty one that is still not an absolute URL both fail there (`Validation`), as does a client that cannot be built (an invalid configured header).
 
 URL layout: the endpoint is `{base_url}/{path}` with `{agent_id}` substituted into the path; extra slashes are collapsed outside the scheme and a missing or extra slash between base and path is tolerated, so `("http://host:8080/", "/agents/{agent_id}/invoke")` and `("http://host:8080", "agents/{agent_id}/invoke")` build the same URL.
 A path that contains `{agent_id}` requires a non-empty agent id (`Validation`), and an empty `base_url` is `Validation`.
@@ -274,9 +282,11 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **The health task holds a `Weak`.** It upgrades per tick, so it can never outlive or resurrect the handle; it is aborted on drop and on shutdown, and an interval of `0` disables it entirely (`health()` still works).
 - **Health escalation.** `max_health_failures` consecutive failed probes kill the child and mark it unhealthy; `0` disables killing; a healthy probe resets the run.
 - **A failed bootstrap is fatal.** When the bootstrap frame cannot be written, the child is killed and the error returned instead of handing back a broken handle.
+- **Caller deadlines are hints that two backends honour.** `send_with_timeout`/`stream_with_timeout` are defaulted on the trait (the default is plain `send`/`stream`), so adding the capability breaks no implementor; the subprocess backend falls back to `request_timeout_secs` for `None`, the remote backend to `timeout_secs`, and both are bounded per exchange rather than per handle.
+- **A zero shutdown timeout means the configuration.** `SpawnedProcess::shutdown(Duration::ZERO)` uses the clamped `SubprocessConfig::shutdown_timeout()` (the `shutdown_timeout_secs` builder finally has an effect); a non-zero caller timeout wins. `ExternalCommandSpawner` inherits the rule because it delegates, and its docs say so.
 - **Remote liveness is client state.** `RemoteAgent::pid()` is always `None`, `is_alive` is "the client is started", and `shutdown`/`force_kill` are just `stop()` (a remote agent always reports a graceful exit, `true`).
-- **Auto-start.** The `reqwest` client is built lazily on first `invoke`/`stream` (or by `start`), so a caller need not wire a lifecycle; the built client is cloned out of the lock before any await, so no lock is held across a request.
-- **Per-call timeouts.** `invoke`/`stream` take an optional `Duration` that overrides the configured deadline for that request only.
+- **Auto-start, and start-at-spawn.** The `reqwest` client is built lazily on first `invoke`/`stream` (or by `start`), so a directly constructed `RemoteAgent` needs no lifecycle wiring; `RemoteSpawner::spawn` starts it immediately, so a host polling readiness through `Arc<dyn SpawnedAgent>` never sees a freshly spawned remote child as dead, and a client-construction failure surfaces at spawn. The built client is cloned out of the lock before any await, so no lock is held across a request.
+- **Per-call timeouts.** `invoke`/`stream` take an optional `Duration` that overrides the configured deadline for that request only, and the seam's `send_with_timeout`/`stream_with_timeout` forward it; `None` everywhere means "the configured default".
 - **No cancel endpoint, no cancel.** `cancel_task` without a configured `cancel_path` is `Error::Unsupported`, never a silent no-op.
 - **Health is a seam-level accessor, not a downcast.** `SpawnedAgent` carries `backend`, `is_healthy`, `health_snapshot` and `health` beside `is_alive`, so a caller holding `Arc<dyn SpawnedAgent>` needs no knowledge of `SpawnedProcess`; every one of them has a default (`Unknown`, `is_alive`, the composition, and an `Unsupported` probe naming the backend), which keeps the trait object-safe and every existing implementor compiling.
 - **Only liveness-backed health is promised by default.** "No probe ⇒ liveness is the answer" is the documented fallback; a backend that can probe (`SpawnedProcess`, `RemoteAgent`) overrides `health`/`is_healthy`, and one that cannot (`InProcessAgent` has nothing to ask) answers from its alive flag rather than inventing a probe.
@@ -320,6 +330,9 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - Integration suites: `tests/spawn_subprocess.rs` re-executes the test binary as the fake child (`FAKE_CHILD_MODE` selects echo/stream/crash/silent/malformed/oversized/health-failure/shutdown modes), and `tests/spawn_remote.rs` drives a loopback `wiremock` server.
 - The crate-level `## Deferred Python Behavior` and `tests/CONTEXT.md` still describe the pre-backend deferral and are reconciled by the parent node.
 - A handle is single-use once desynchronized: respawn rather than retry, and never assume a timed-out exchange can be recovered.
+- `send_with_timeout`/`stream_with_timeout` are the only way to bound *one* exchange: `send`/`stream` always use the backend's configured deadline, and the trait defaults ignore the hint (so an in-process handle or a host's own backend simply behaves like `send`/`stream`).
+- `shutdown(Duration::ZERO)` is not "kill now": it means "use the configured `shutdown_timeout_secs`". Pass a non-zero duration to override the configuration for one shutdown.
+- `RemoteSpawner::spawn` returns a *started* `RemoteAgent` (readiness is `true` without a request); `RemoteAgent::new` is lazy, so a directly constructed handle reports not-alive until its first request or an explicit `RemoteClient::start`.
 - There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
 - The reference child implementation is `tests/spawn_subprocess.rs`'s `#[ignore]`d `fake_child` libtest case re-executed with `fake_child --exact --ignored --test-threads=1 --nocapture` (`--nocapture` is mandatory or libtest redirects the child's stdout and no frame reaches the pipe).
 - `SubprocessConfig::program` empty is `Error::Config` at spawn, not at construction, so a host can build a config incrementally.

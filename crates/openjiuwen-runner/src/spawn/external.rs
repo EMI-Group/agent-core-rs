@@ -8,7 +8,9 @@
 //!
 //! Resolution then delegates to the subprocess backend — the process
 //! handling, framing, timeouts, health task and kill-on-drop are
-//! [`crate::spawn::SubprocessSpawner`]'s, not reimplemented here. This backend is
+//! [`crate::spawn::SubprocessSpawner`]'s, not reimplemented here. That includes
+//! the shutdown rule: a [`SpawnedAgent::shutdown`] with a zero timeout uses the
+//! configured `shutdown_timeout_secs`, a non-zero one wins over it. This backend is
 //! therefore the subprocess protocol plus `PATH` resolution, and it labels its
 //! children [`crate::spawn::SpawnBackend::ExternalCommand`] through
 //! [`crate::spawn::SubprocessSpawner::with_backend`], so the handle, this spawner,
@@ -111,6 +113,10 @@ impl ExternalCommandSpawner {
     }
 
     /// Sets the deadline for a graceful shutdown before a kill.
+    ///
+    /// Children are supervised by the subprocess backend, so this is the
+    /// deadline a caller gets by passing [`Duration::ZERO`] to
+    /// [`SpawnedAgent::shutdown`]; a non-zero caller timeout wins over it.
     #[must_use]
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.config.shutdown_timeout_secs = timeout.as_secs_f64();

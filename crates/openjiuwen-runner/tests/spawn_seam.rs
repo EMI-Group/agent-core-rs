@@ -564,18 +564,28 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
     let child: Arc<dyn SpawnedAgent> = spawner
         .spawn(spec())
         .await
-        .expect("building a remote handle needs no server call");
+        .expect("a remote handle is built and started at spawn");
     assert_eq!(child.backend(), SpawnBackend::RemoteHttp);
     assert_eq!(child.id(), "echo");
     assert_eq!(child.pid(), None, "a remote agent has no OS process");
-
     assert!(
-        !health_bounded(&child)
+        child.is_alive() && child.is_healthy(),
+        "a spawned remote handle is started, so it reports itself live"
+    );
+    assert!(
+        health_bounded(&child)
             .await
             .expect("the remote handle answers its own probe"),
-        "no request has started the client yet"
+        "a spawned remote handle is healthy before any request"
     );
-    assert!(!child.is_healthy());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock server recorded its requests")
+            .is_empty(),
+        "the spawn itself makes no request"
+    );
 
     let output = send_bounded(&child, json!({"query": "hi"}))
         .await
@@ -585,7 +595,7 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
         health_bounded(&child)
             .await
             .expect("the started client answers the probe"),
-        "a successful request starts the client"
+        "the client stays started across a request"
     );
 
     // The client ships with a cancel path configured, so cancellation works
@@ -617,6 +627,44 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
         .await
         .expect("a remote handle shuts its client down"));
     assert!(!child.is_alive());
+}
+
+#[tokio::test]
+async fn a_spawned_remote_handle_is_started_at_spawn_and_validates_its_url() {
+    let server = MockServer::start().await;
+
+    // Readiness polled through the seam is true right after the spawn, without
+    // any request having been made: the client is built and started by `spawn`.
+    let child: Arc<dyn SpawnedAgent> = RemoteSpawner::new(server.uri())
+        .spawn(spec())
+        .await
+        .expect("a remote spawn starts its client");
+    assert!(child.is_alive());
+    assert!(child.is_healthy());
+    assert!(tokio::time::timeout(BOUND, child.health())
+        .await
+        .expect("the probe must not hang")
+        .expect("the started handle answers its own probe"));
+    let snapshot = child.health_snapshot();
+    assert!(snapshot.alive && snapshot.healthy);
+    assert_eq!(snapshot.backend, SpawnBackend::RemoteHttp);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock server recorded its requests")
+            .is_empty(),
+        "no request is made just to become ready"
+    );
+
+    // A base URL that is not an absolute URL fails at spawn, not at first invoke.
+    let error = RemoteSpawner::new("not a url")
+        .spawn(spec())
+        .await
+        .err()
+        .expect("an unusable base url cannot be spawned");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("base_url"), "{error}");
 }
 
 // --- seam defaults ----------------------------------------------------------

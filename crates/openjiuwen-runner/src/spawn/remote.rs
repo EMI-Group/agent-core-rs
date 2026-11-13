@@ -421,6 +421,10 @@ pub struct RemoteAgent {
 
 impl RemoteAgent {
     /// A remote agent reached over [`RemoteProtocol::Http`].
+    ///
+    /// The transport is built lazily on first use, so an agent constructed
+    /// directly reports `is_alive() == false` until it is started;
+    /// [`RemoteSpawner::spawn`] returns one that is already started.
     #[must_use]
     pub fn new(config: RemoteAgentConfig) -> Self {
         Self::with_state(config, RemoteProtocol::Http)
@@ -741,9 +745,11 @@ impl SpawnedAgent for RemoteAgent {
     }
 
     /// The HTTP wire contract defines only invoke/stream/cancel, so there is no
-    /// health endpoint to probe: the answer is the client's own started state
-    /// (`false` until the first [`RemoteClient::invoke`]/[`RemoteClient::stream`]
-    /// auto-starts the client, or an explicit [`RemoteClient::start`]).
+    /// health endpoint to probe: the answer is the client's own started state. A
+    /// handle built by [`RemoteSpawner::spawn`] is started at spawn (so this is
+    /// `true` immediately), while one built with [`RemoteAgent::new`] is `false`
+    /// until the first [`RemoteClient::invoke`]/[`RemoteClient::stream`]
+    /// auto-starts it, or an explicit [`RemoteClient::start`].
     #[allow(clippy::unused_async_trait_impl)]
     async fn health(&self) -> Result<bool> {
         Ok(RemoteClient::is_started(self))
@@ -755,6 +761,26 @@ impl SpawnedAgent for RemoteAgent {
 
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
         RemoteClient::stream(self, inputs, None)
+    }
+
+    /// Bounds this one request by `timeout`; `None` keeps the configured
+    /// `timeout_secs`.
+    async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        RemoteClient::invoke(self, inputs, timeout).await
+    }
+
+    /// Bounds this one stream's request by `timeout`; `None` keeps the configured
+    /// `timeout_secs`.
+    fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        RemoteClient::stream(self, inputs, timeout)
     }
 
     /// Releases the client and reports a graceful exit; there is nothing to kill.
@@ -787,6 +813,13 @@ impl SpawnedAgent for RemoteAgent {
 /// The spawned handle is a [`RemoteAgent`]; the agent id comes from the spawn
 /// spec, so a runner registered with this spawner can route a class-agent spawn
 /// to a remote endpoint.
+///
+/// Unlike a directly constructed [`RemoteAgent`], the handle this spawner
+/// returns is already started: readiness polled through
+/// [`SpawnedAgent::is_alive`]/[`SpawnedAgent::is_healthy`]/[`SpawnedAgent::health`]
+/// is `true` immediately, and a client that cannot be built (an unusable base
+/// URL, an invalid configured header) fails the spawn rather than the first
+/// invocation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoteSpawner {
     /// Origin every spawned agent is reached at.
@@ -851,8 +884,30 @@ impl AgentSpawner for RemoteSpawner {
         config.session_id.clone_from(&spec.session_id);
         // Fail at spawn time rather than at the first invoke.
         require_base_url(&config.base_url)?;
-        Ok(Arc::new(RemoteAgent::new(config)))
+        require_url(&config)?;
+        let agent = RemoteAgent::new(config);
+        // A spawned remote child is started, so a host that polls readiness
+        // through the seam sees a live handle, and a client that cannot be built
+        // fails here instead of inside the first invocation.
+        RemoteClient::start(&agent).await?;
+        Ok(Arc::new(agent))
     }
+}
+
+/// Rejects a base URL the invoker could never use.
+///
+/// An empty base URL is caught by [`require_base_url`]; this catches a
+/// non-empty one that is still not an absolute URL (a missing scheme, an
+/// unparsable host), which would otherwise surface only inside a request.
+fn require_url(config: &RemoteAgentConfig) -> Result<()> {
+    let url = config.invoke_url()?;
+    reqwest::Url::parse(&url).map_err(|error| {
+        Error::validation(format!(
+            "remote agent base_url '{}' is not a usable URL: {error}",
+            config.base_url
+        ))
+    })?;
+    Ok(())
 }
 
 /// The remote agent id a spawn spec addresses: `agent_class`, then
