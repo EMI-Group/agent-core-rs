@@ -341,7 +341,10 @@ impl CallbackChain {
         // first while both keep insertion order within their own block.
         let sequence = if front {
             let step = self.prepend_sequence.fetch_add(1, Ordering::Relaxed);
-            -i64::try_from(step).unwrap_or(i64::MAX).saturating_sub(1)
+            i64::try_from(step)
+                .unwrap_or(i64::MAX)
+                .wrapping_neg()
+                .saturating_sub(1)
         } else {
             i64::try_from(self.append_sequence.fetch_add(1, Ordering::Relaxed)).unwrap_or(i64::MAX)
         };
