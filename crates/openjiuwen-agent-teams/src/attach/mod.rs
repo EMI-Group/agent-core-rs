@@ -4,7 +4,8 @@
 //! skill CLI or the `openjiuwen-team-mcp` server — through a small request/response protocol on a
 //! Unix socket.
 //! This directory owns the platform-independent half of that bridge:
-//! the wire contract in [`protocol`], which the socket server and client are built on top of.
+//! the wire contract in [`protocol`], which the socket server and client are built on top of, and
+//! [`AttachClient`], the client that drives a hosted team over one connection.
 //!
 //! # Framing
 //!
@@ -17,6 +18,13 @@
 //! A frame-level failure closes the connection; an op-level failure is returned in-band and keeps
 //! it open.
 //!
+//! # Client
+//!
+//! [`AttachClient::connect`] opens the socket (no handshake — connecting is the availability
+//! contract), [`AttachClient::call`] performs one request/response exchange with a bounded deadline,
+//! and the typed wrappers (`list_members`, `task_detail`, `snapshot`, …) decode the op payloads.
+//! One client holds one connection and at most one in-flight request.
+//!
 //! # Security
 //!
 //! The protocol carries no authentication or encryption: trust comes from the filesystem.
@@ -28,15 +36,22 @@
 //! # Platform support
 //!
 //! Cross-process attach uses Unix domain sockets only.
-//! The protocol layer here is platform independent and compiles everywhere; the socket server and
-//! client constructors built on top of it return `Error::Unsupported` with the message
-//! "cross-process attach requires Unix domain sockets" on non-Unix targets.
+//! The protocol layer here is platform independent and compiles everywhere; [`AttachClient`] keeps
+//! the same public surface on every target, but its transport methods return `Error::Unsupported`
+//! with the message "cross-process attach requires Unix domain sockets" on non-Unix targets (and
+//! [`AttachClient::is_available`] is always `false` there).
+pub mod client;
 pub mod protocol;
 
+pub use client::AttachClient;
 pub use protocol::{
     AttachError, AttachHandler, AttachOp, AttachResult, RequestFrame, ResponseFrame,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod client_tests;
 
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
