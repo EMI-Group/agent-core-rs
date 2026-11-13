@@ -121,23 +121,25 @@ The server answers an unparseable frame with `id: 0`; a frame whose envelope par
 
 ## Op Table
 
-| `op` | args | `data` |
-| --- | --- | --- |
-| `list_members` | — | array of `MemberSnapshot` |
-| `member_status` | `member_name` | one `MemberSnapshot`; `not_found` when the member is unknown |
-| `read_inbox` | — | a string |
-| `send_member` | `to`, `content` | `{"ok": bool, "message_id": string|null, "reason": string|null}` |
-| `broadcast` | `content` | same as `send_member` (`to = "*"`) |
-| `list_tasks` | `status?` | array of `TaskSummary` |
-| `claimable_tasks` | — | array of `TaskSummary` |
-| `task_detail` | `task_id` | a `TaskDetail` or `null` |
-| `create_task` | `title`, `content`, `task_id?`, `dependencies` | `{"ok": bool, "task_id": string|null, "reason": string|null}` |
-| `update_task` | `task_id`, `title?`, `content?` | `{"ok": bool, "reason": string|null}` |
-| `claim_task` | `task_id` | `{"ok": bool, "reason": string|null}` |
-| `complete_task` | `task_id` | `{"ok": bool, "reason": string|null}` |
-| `invoke_tool` | `name`, `arguments` | the tool's own result JSON |
-| `snapshot` | — | a `TeamSnapshot` |
-| `stop_team` | — | `{"stopped": true}` |
+The `data` column is what the in-repo `BackendAttachHandler` (`../runtime/attach_host.rs`) answers; the protocol itself only requires valid JSON, so a custom `AttachHandler` may answer differently and a client decoding with the typed wrappers must match that handler.
+
+| `op` | args | `data` (`BackendAttachHandler`) | source |
+| --- | --- | --- | --- |
+| `list_members` | — | array of `MemberSnapshot` | attach_host.rs:126 |
+| `member_status` | `member_name` | one `MemberSnapshot`; `not_found` when the member is unknown | attach_host.rs:136 |
+| `read_inbox` | — | string, one `sender: content` line per unread mail | attach_host.rs:146 |
+| `send_member` | `to`, `content` | a serialized `MessageRecord` (the persisted row) | attach_host.rs:159 |
+| `broadcast` | `content` | same as `send_member` (`to = "*"`) | attach_host.rs:159 |
+| `list_tasks` | `status?` | array of `TaskSummary` | attach_host.rs:168 |
+| `claimable_tasks` | — | array of `TaskSummary` | attach_host.rs:184 |
+| `task_detail` | `task_id` | a `TaskDetail`; an unknown id is a **`not_found` error**, never `null` | attach_host.rs:198 |
+| `create_task` | `title`, `content`, `task_id?`, `dependencies` | the persisted `TaskRecord` | attach_host.rs:211 |
+| `update_task` | `task_id`, `title?`, `content?` | the refreshed `TaskDetail`; unknown id is `not_found` | attach_host.rs:240 |
+| `claim_task` | `task_id` | a `TaskOpResult` (`{"ok", "reason"}`) | attach_host.rs:277 |
+| `complete_task` | `task_id` | the completed `TaskRecord` | attach_host.rs:287 |
+| `invoke_tool` | `name`, `arguments` | always an `unsupported` error — in-process tool invocation is not in the contract | attach_host.rs:300 |
+| `snapshot` | — | a `TeamSnapshot` carrying members and tasks | attach_host.rs:308 |
+| `stop_team` | — | `{"stopping": true}` | attach_host.rs:317 |
 
 Op coverage is at parity with `crate::skill::TeamClient` ops plus the runtime's member-status, snapshot and stop operations.
 `TeamClient::tools()` has no op: the tool catalogue is local metadata the adapter already holds, so sending it over the socket would add nothing.
@@ -172,6 +174,9 @@ The cfg split is per method block, not per file: the public API is identical on 
 - Errors are `AttachError` inside the module and `openjiuwen_common::error::{Error, Result}` at the socket boundary; no `anyhow`, no panic on input.
 - Async-first tokio; locks are never held across `.await`; `tracing` only (no `println!`/`eprintln!` in library code); no `unsafe`.
 - Every public item is documented (workspace `missing_docs`); files stay around ≤1000 lines, with the test files as the largest files (legitimately long: one contract, one scenario per test).
+- No feature gate: `pub mod attach;` is unconditional (`src/lib.rs:64`) and no attach item carries `#[cfg(feature = ...)]`; the `distributed` feature gates `messager` transports only, so an offline test needs no feature flags.
+- The only cfg is `#[cfg(unix)]`: it selects the real transport impl blocks (client.rs:51/78/108, server.rs:85/120/131, `Drop` at server.rs:240) and their non-Unix stubs, while the typed `AttachClient` wrappers (client.rs:315) and the whole `protocol` layer compile on every target.
+- One call shape: `AttachClient::call(&mut self, op: AttachOp) -> AttachResult<Value>` (client.rs:187) — there is no `call(op, args)` overload and no `AttachResponse` type; the response is `ResponseFrame`, collapsed to `Value` by `ResponseFrame::into_result` (protocol.rs:619).
 
 ## Routing Table
 
