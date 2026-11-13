@@ -118,7 +118,7 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `./evaluator/tests.rs` → the evaluator test suite
 - `./optimizer.rs` → facade: tuning constants, `OptimizationResult`, `mod` declarations, re-exports, `optimize_prompt`
 - `./optimizer/config.rs` → `OptimizerConfig`, bounds validation, JSON defaults
-- `./optimizer/suggestion.rs` → placeholder parsing/repair, mutation bank, model-rewrite request, tie-break, bounded scoring, worst-case selection
+- `./optimizer/suggestion.rs` → placeholder parsing/repair, mutation bank, model-rewrite request (including the `<tools_description>` render of the case set's declared tools), tie-break, bounded scoring, worst-case selection
 - `./optimizer/instruction.rs` → `InstructionOptimizer` beam search
 - `./optimizer/example.rs` → `ExampleOptimizer`, `render_examples`, `format_prompt`
 - `./optimizer/joint.rs` → `JointOptimizer` alternating ascent
