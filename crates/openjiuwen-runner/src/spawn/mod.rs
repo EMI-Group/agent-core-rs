@@ -338,3 +338,12 @@ mod tests {
         );
     }
 }
+
+// --- remote (HTTP) backend --------------------------------------------------
+
+pub mod remote;
+
+pub use remote::{
+    create_remote_client, RemoteAgent, RemoteAgentConfig, RemoteClient, RemoteProtocol,
+    RemoteSpawner,
+};
