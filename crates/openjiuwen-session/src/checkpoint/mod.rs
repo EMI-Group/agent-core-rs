@@ -312,10 +312,11 @@ pub trait Checkpointer: Send + Sync + std::fmt::Debug {
 
     /// Lists a session's checkpoints; an unknown session yields an empty list.
     ///
-    /// The order is backend-defined: [`MemoryCheckpointer`] and
-    /// [`FileCheckpointer`] return `(created_at, checkpoint_id)` ascending, the
-    /// sqlite backend newest first. [`Checkpointer::latest`] sorts on its own, so
-    /// callers that need a specific order must sort the result themselves.
+    /// The order is backend-defined: [`MemoryCheckpointer`],
+    /// [`FileCheckpointer`], and [`RedisCheckpointer`] return
+    /// `(created_at, checkpoint_id)` ascending, the sqlite backend newest first.
+    /// [`Checkpointer::latest`] sorts on its own, so callers that need a
+    /// specific order must sort the result themselves.
     ///
     /// # Errors
     ///
@@ -427,21 +428,35 @@ pub enum CheckpointerKind {
 pub struct CheckpointerConfig {
     /// The backend to construct.
     pub kind: CheckpointerKind,
-    /// The filesystem root (`file`) or database file (`sqlite`); ignored by
-    /// `in_memory`.
+    /// The filesystem root (`file`), the database file (`sqlite`), or a URL
+    /// fallback (`redis`); ignored by `in_memory`.
     pub path: Option<PathBuf>,
-    /// Backend-specific options, unused by the built-in backends.
+    /// Backend-specific options; empty for every backend except `redis`.
+    ///
+    /// [`RedisCheckpointer`] reads `"url"` (required; the rendered
+    /// [`CheckpointerConfig::path`] is the fallback URL), `"prefix"` (string,
+    /// defaulting to [`redis::DEFAULT_REDIS_KEY_PREFIX`]), `"ttl_seconds"`
+    /// (unsigned integer, applied as `EXPIRE` per checkpoint document), and
+    /// `"database"` (unsigned integer, sent as `SELECT`).
     pub extra: BTreeMap<String, Value>,
 }
 
 /// Builds a checkpointer from `config`.
 ///
+/// `redis` dials the server eagerly, so an unreachable server or a failed
+/// handshake surfaces here as [`openjiuwen_common::error::ErrorKind::Session`]
+/// rather than on the first save.
+///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when `file` or
 /// `sqlite` is requested without a `path`, when `redis` is requested without a
-/// URL, and [`openjiuwen_common::error::ErrorKind::Unsupported`] when `sqlite`
-/// is requested but the crate was built without the `sqlite` feature.
+/// URL, and for a malformed Redis URL;
+/// [`openjiuwen_common::error::ErrorKind::Unsupported`] when `sqlite` is
+/// requested but the crate was built without the `sqlite` feature, or when the
+/// Redis URL is `rediss://` (TLS); and
+/// [`openjiuwen_common::error::ErrorKind::Session`] when the Redis connection
+/// or its handshake fails.
 pub async fn create_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
     match config.kind {
         CheckpointerKind::InMemory => Ok(Arc::new(MemoryCheckpointer::new())),
