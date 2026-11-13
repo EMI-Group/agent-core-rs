@@ -1,7 +1,8 @@
 //! [`DreamRepository`]: the queue seam plus the in-memory backend.
 //!
-//! The repository is the contract the deferred scheduler and the stage-2 SQLite backend
-//! implement. It keeps the claim transition atomic and deterministic: a single
+//! The repository is the contract both backends implement — the process-local
+//! [`InMemoryDreamRepository`] and the feature-gated `SqliteDreamRepository`. It keeps
+//! the claim transition atomic and deterministic: a single
 //! `claim_next` call picks the head of the queue by `(priority DESC, created_at ASC,
 //! id ASC)` and moves it from `Pending` to `Running` (or reports that there is nothing
 //! eligible). The caller passes the clock in, so retries and backoff are reproducible in
@@ -15,7 +16,8 @@ use std::collections::BTreeMap;
 
 use crate::record::MemoryScope;
 
-use super::model::{DreamJob, DreamKind, DreamOutcome, DreamState, DreamTrigger};
+use super::model::{DreamJob, DreamKind, DreamState, DreamTrigger};
+use super::outcome::DreamOutcome;
 
 /// A conjunction of job predicates used by [`DreamRepository::list`].
 ///
@@ -247,7 +249,7 @@ fn is_claimable(job: &DreamJob, now: DateTime<Utc>) -> bool {
 /// A process-local [`DreamRepository`] backed by a `BTreeMap`.
 ///
 /// Suitable for tests, single-process applications, and the default build (which has no
-/// SQLite feature). Jobs are lost on process exit; the stage-2 backend makes them
+/// SQLite feature). Jobs are lost on process exit; the SQLite backend makes them
 /// durable.
 #[derive(Debug, Default)]
 pub struct InMemoryDreamRepository {

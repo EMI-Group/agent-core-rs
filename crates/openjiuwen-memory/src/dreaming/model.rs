@@ -1,10 +1,12 @@
-//! Dream job data model: states, kinds, triggers, jobs, outcomes, and run summaries.
+//! Dream job data model: states, kinds, triggers, jobs, and metrics.
 //!
 //! Everything here is plain `serde` data. The types are tolerant on JSON input
 //! (`default` at the container level, unknown fields ignored) so a persisted job can
 //! gain new fields without breaking older readers. Validation is a pure method
-//! ([`DreamJob::validate`], [`DreamOutcome::validate`]) that the repository runs before
-//! it persists anything.
+//! ([`DreamJob::validate`]) that the repository runs before it persists anything.
+//! [`DreamOutcome`](crate::dreaming::DreamOutcome) and
+//! [`DreamRunSummary`](crate::dreaming::DreamRunSummary) live in
+//! [`outcome`](crate::dreaming) alongside this model.
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,8 +21,8 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 ///
 /// The wire and database names are the `snake_case` variant names. Parsing is
 /// deliberately strict: [`DreamState::parse`] is the tolerant, case-insensitive entry
-/// point, while `serde` deserialization only accepts the canonical names (the SQL
-/// backend in stage 2 owns tolerant parsing of legacy rows).
+/// point, while `serde` deserialization only accepts the canonical names (the SQLite
+/// backend owns tolerant parsing of legacy rows).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
 )]
@@ -534,156 +536,8 @@ impl DreamJob {
     }
 }
 
-/// The result of one completed dream attempt.
-///
-/// A [`DreamRepository::complete`](crate::dreaming::DreamRepository::complete) call
-/// stores the outcome's state and metrics on the job; the notes stay with the caller
-/// (they may be logged or merged into a [`DreamRunSummary`]).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-pub struct DreamOutcome {
-    /// Id of the job this outcome belongs to.
-    pub job_id: String,
-    /// Terminal state the job finished in.
-    pub state: DreamState,
-    /// Counters describing the attempt.
-    pub metrics: DreamMetrics,
-    /// Human-readable notes, e.g. why the job was skipped.
-    pub notes: Vec<String>,
-}
-
-impl DreamOutcome {
-    /// Builds an outcome for `job_id` in `state`.
-    #[must_use]
-    pub fn new(job_id: impl Into<String>, state: DreamState) -> Self {
-        Self {
-            job_id: job_id.into(),
-            state,
-            ..Self::default()
-        }
-    }
-
-    /// Builds a successful outcome carrying `metrics`.
-    #[must_use]
-    pub fn succeeded(job_id: impl Into<String>, metrics: DreamMetrics) -> Self {
-        Self::new(job_id, DreamState::Succeeded).with_metrics(metrics)
-    }
-
-    /// Builds a skipped outcome with one explanatory note.
-    #[must_use]
-    pub fn skipped(job_id: impl Into<String>, note: impl Into<String>) -> Self {
-        Self::new(job_id, DreamState::Skipped).with_note(note)
-    }
-
-    /// Builds a cancelled outcome.
-    #[must_use]
-    pub fn cancelled(job_id: impl Into<String>) -> Self {
-        Self::new(job_id, DreamState::Cancelled)
-    }
-
-    /// Builds a failed outcome with one explanatory note.
-    #[must_use]
-    pub fn failed(job_id: impl Into<String>, note: impl Into<String>) -> Self {
-        Self::new(job_id, DreamState::Failed).with_note(note)
-    }
-
-    /// Returns the outcome carrying `metrics`.
-    #[must_use]
-    pub const fn with_metrics(mut self, metrics: DreamMetrics) -> Self {
-        self.metrics = metrics;
-        self
-    }
-
-    /// Returns the outcome with one more note.
-    #[must_use]
-    pub fn with_note(mut self, note: impl Into<String>) -> Self {
-        self.notes.push(note.into());
-        self
-    }
-
-    /// Checks that this is a usable completion: a non-empty NUL-free job id and a
-    /// terminal state.
-    ///
-    /// `Pending`/`Running` are rejected because a completed run must describe where the
-    /// job ended up; use [`DreamRepository::fail`](crate::dreaming::DreamRepository::fail)
-    /// for an attempt that should be retried.
-    pub fn validate(&self) -> Result<()> {
-        validate_non_empty("dream outcome `job_id`", &self.job_id)?;
-        if !self.state.is_terminal() {
-            return Err(Error::validation(format!(
-                "dream outcome state `{}` is not terminal: a completed run needs a terminal state",
-                self.state
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Aggregate over one [`DreamRepository`](crate::dreaming::DreamRepository) sweep.
-///
-/// `failed` counts failed *attempts*, including attempts that were rescheduled for a
-/// retry, so it can exceed the number of jobs that ended up in
-/// [`DreamState::Failed`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-pub struct DreamRunSummary {
-    /// Attempts recorded by the sweep.
-    pub scanned: usize,
-    /// Attempts that finished successfully.
-    pub succeeded: usize,
-    /// Attempts that failed (including retries that were requeued).
-    pub failed: usize,
-    /// Attempts that found nothing to do.
-    pub skipped: usize,
-    /// Attempts that were cancelled.
-    pub cancelled: usize,
-    /// The individual outcomes, in recording order.
-    pub outcomes: Vec<DreamOutcome>,
-}
-
-impl DreamRunSummary {
-    /// Builds an empty summary.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns `true` when no outcome has been recorded.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.scanned == 0
-    }
-
-    /// Records one outcome, updating the counters and appending it to
-    /// [`DreamRunSummary::outcomes`].
-    ///
-    /// Non-terminal outcomes (which [`DreamOutcome::validate`] rejects) only bump
-    /// `scanned`, since there is no counter to attribute them to.
-    pub fn record(&mut self, outcome: DreamOutcome) {
-        self.scanned = self.scanned.saturating_add(1);
-        match outcome.state {
-            DreamState::Succeeded => self.succeeded = self.succeeded.saturating_add(1),
-            DreamState::Failed => self.failed = self.failed.saturating_add(1),
-            DreamState::Skipped => self.skipped = self.skipped.saturating_add(1),
-            DreamState::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
-            DreamState::Pending | DreamState::Running => {}
-        }
-        self.outcomes.push(outcome);
-    }
-
-    /// Folds `other` into `self`, concatenating the outcome lists.
-    pub fn merge(&mut self, other: Self) {
-        self.scanned = self.scanned.saturating_add(other.scanned);
-        self.succeeded = self.succeeded.saturating_add(other.succeeded);
-        self.failed = self.failed.saturating_add(other.failed);
-        self.skipped = self.skipped.saturating_add(other.skipped);
-        self.cancelled = self.cancelled.saturating_add(other.cancelled);
-        self.outcomes.extend(other.outcomes);
-    }
-}
-
 /// Rejects an empty or NUL-containing identifier, naming `label` and the value.
-fn validate_non_empty(label: &str, value: &str) -> Result<()> {
+pub(super) fn validate_non_empty(label: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::validation(format!("{label} must not be empty")));
     }
@@ -776,7 +630,7 @@ mod tests {
             assert_eq!(encoded, format!("\"{}\"", state.as_str()));
             assert_eq!(serde_json::from_str::<DreamState>(&encoded).unwrap(), state);
         }
-        // Tolerant parsing of persisted rows belongs to the stage-2 SQL layer.
+        // Tolerant parsing of persisted rows belongs to the SQLite backend.
         assert!(serde_json::from_str::<DreamState>("\"weird\"").is_err());
     }
 
@@ -1074,109 +928,5 @@ mod tests {
         let mut bad = running_job();
         bad.last_error = Some("boom\0".to_owned());
         assert_validation(bad.validate().unwrap_err(), "NUL");
-    }
-
-    #[test]
-    fn outcome_constructors_validate_and_serde() {
-        let metrics = DreamMetrics {
-            records_scanned: 1,
-            ..DreamMetrics::default()
-        };
-        assert_eq!(
-            DreamOutcome::succeeded("j", metrics),
-            DreamOutcome::new("j", DreamState::Succeeded).with_metrics(metrics)
-        );
-        assert_eq!(
-            DreamOutcome::skipped("j", "nothing to do"),
-            DreamOutcome::new("j", DreamState::Skipped).with_note("nothing to do")
-        );
-        assert_eq!(
-            DreamOutcome::failed("j", "boom"),
-            DreamOutcome::new("j", DreamState::Failed).with_note("boom")
-        );
-        assert_eq!(
-            DreamOutcome::cancelled("j"),
-            DreamOutcome::new("j", DreamState::Cancelled)
-        );
-        assert_eq!(
-            DreamOutcome::cancelled("j")
-                .with_note("first")
-                .with_note("second")
-                .notes,
-            vec!["first".to_owned(), "second".to_owned()]
-        );
-        for state in [DreamState::Pending, DreamState::Running] {
-            assert_validation(
-                DreamOutcome::new("j", state).validate().unwrap_err(),
-                "not terminal",
-            );
-        }
-        assert_validation(
-            DreamOutcome::new("", DreamState::Succeeded)
-                .validate()
-                .unwrap_err(),
-            "job_id",
-        );
-        assert_validation(
-            DreamOutcome::new("a\0b", DreamState::Succeeded)
-                .validate()
-                .unwrap_err(),
-            "NUL",
-        );
-        assert!(DreamOutcome::succeeded("j", DreamMetrics::default())
-            .validate()
-            .is_ok());
-
-        let restored: DreamOutcome = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(restored, DreamOutcome::default());
-        let outcome = DreamOutcome::failed("j", "boom").with_metrics(DreamMetrics {
-            records_deleted: 2,
-            ..DreamMetrics::default()
-        });
-        let value = serde_json::to_value(&outcome).unwrap();
-        assert_eq!(value["state"], json!("failed"));
-        assert_eq!(value["metrics"]["records_deleted"], json!(2));
-        assert_eq!(
-            serde_json::from_value::<DreamOutcome>(value).unwrap(),
-            outcome
-        );
-    }
-
-    #[test]
-    fn summary_records_merges_and_serde() {
-        let mut summary = DreamRunSummary::new();
-        assert!(summary.is_empty());
-        summary.record(DreamOutcome::succeeded("a", DreamMetrics::default()));
-        summary.record(DreamOutcome::failed("b", "boom"));
-        summary.record(DreamOutcome::skipped("c", "nothing"));
-        summary.record(DreamOutcome::cancelled("d"));
-        assert_eq!(
-            (summary.scanned, summary.succeeded, summary.failed),
-            (4, 1, 1)
-        );
-        assert_eq!((summary.skipped, summary.cancelled), (1, 1));
-        assert_eq!(summary.outcomes.len(), 4);
-
-        // Non-terminal outcomes only move `scanned`.
-        summary.record(DreamOutcome::new("e", DreamState::Running));
-        assert_eq!(summary.scanned, 5);
-        assert_eq!(
-            summary.succeeded + summary.failed + summary.skipped + summary.cancelled,
-            4
-        );
-
-        let mut right = DreamRunSummary::new();
-        right.record(DreamOutcome::failed("f", "boom"));
-        right.record(DreamOutcome::cancelled("g"));
-        summary.merge(right);
-        assert_eq!(
-            (summary.scanned, summary.failed, summary.cancelled),
-            (7, 2, 2)
-        );
-        assert_eq!(summary.outcomes.len(), 7);
-        assert_eq!(
-            serde_json::from_value::<DreamRunSummary>(json!({})).unwrap(),
-            DreamRunSummary::default()
-        );
     }
 }
