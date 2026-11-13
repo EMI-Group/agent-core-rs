@@ -1,46 +1,73 @@
-//! Sandbox provider registration facade.
+//! Remote sandbox providers and the registration facade for them.
 //!
-//! Python parity: `openjiuwen/extensions/sys_operation/sandbox/providers/`. In the
-//! reference implementation, importing `providers` registers the `aio`, `jiuwenbox`, and
-//! `yuanrong` sandbox providers into `SandboxRegistry` at import time
-//! (`@SandboxRegistry.provider("<type>", "fs" | "shell" | "code")`).
+//! Python parity: `openjiuwen/extensions/sys_operation/sandbox/providers/`.
+//! In the reference implementation, importing `providers` registers the `aio`, `jiuwenbox`, and `yuanrong` sandbox providers into `SandboxRegistry` at import time (`@SandboxRegistry.provider("<type>", "fs" | "shell" | "code")`).
 //!
-//! This module keeps that registration seam and drops the protocol implementations: a
-//! host builds a [`SandboxProviderSet`] (any subset of filesystem, shell, and code
-//! factories) and registers it with [`register`]; Python's three providers are available
-//! as documented deferred sets through [`register_deferred`], whose factories answer
-//! [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) with a
-//! message naming the sandbox type.
+//! # Providers
 //!
-//! The provider seam itself is the kernel's
-//! (`openjiuwen_sysop::sandbox::provider`, reachable as
-//! `openjiuwen_core::sys_operation::sandbox::provider`), so a backend registered here is
-//! the same one a `SysOperation` card resolves.
+//! [`remote`] implements those three sandbox types as real HTTP transports:
+//!
+//! - `aio` drives an AIO container through the kernel gateway envelope (`GatewayInvokeRequest` / `GatewayResponse`).
+//! - `jiuwenbox` drives the `JiuwenBox` container through its native REST API under `/api/v1/...`.
+//! - `yuanrong` drives the `YuanRong` ADX API under `/api/environment/v1/...` plus `/direct/{id}/invoke`.
+//!
+//! [`REMOTE_SANDBOX_TYPES`] lists them.
+//! A host installs all three, in order, with [`register_remote_providers`], or a single type with [`register_remote`]; [`remote_provider_set`] returns a factory set without registering it.
+//!
+//! # Registration
+//!
+//! Registration is the kernel seam: [`register`] installs any [`SandboxProviderSet`] under one sandbox type, keyed by `(sandbox_type, operation)`.
+//! [`SandboxProviderSet::deferred`] remains available for a host that wants an explicit `Unsupported` set, for example to reserve a sandbox type before its transport exists.
+//! [`is_deferred`] reports whether a sandbox type has no remote provider.
+//!
+//! The kernel resolves the providers of a sandbox-mode `SysOperation` only from its process-global registry (`openjiuwen_sysop::sandbox::provider::global()`), while [`register_remote_providers`] takes any registry, so a host that drives `SysOperation` registers on `global()`.
+//! [`registered_types`] reports what a given registry holds.
+//!
+//! [`register_deferred`] used to install placeholder providers for the Python types; it is now a compatibility no-op that registers nothing and returns `Ok(())`.
+//!
+//! # Errors
+//!
+//! An unknown sandbox type is [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported), naming the supported types.
+//! A duplicate registration is the kernel's [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp).
+//!
+//! # Example
 //!
 //! ```
 //! use openjiuwen_core::sys_operation::sandbox::provider::SandboxProviderRegistry;
-//! use openjiuwen_extensions::sys_operation::{SandboxProviderSet, is_deferred, register};
+//! use openjiuwen_extensions::sys_operation::{
+//!     SandboxProviderSet, is_deferred, register, remote_provider_set,
+//! };
 //!
 //! let registry = SandboxProviderRegistry::new();
-//! register(&registry, "aio", SandboxProviderSet::deferred("aio")).unwrap();
-//! assert!(registry.has_fs("aio"));
-//! assert!(is_deferred("aio"));
+//! register(&registry, "custom", SandboxProviderSet::deferred("custom")).unwrap();
+//! assert!(registry.has_fs("custom"));
+//! assert!(is_deferred("custom"));
 //! assert!(registry
-//!     .create_fs("aio", &Default::default(), &Default::default())
+//!     .create_fs("custom", &Default::default(), &Default::default())
 //!     .is_err());
+//!
+//! // `aio`, `jiuwenbox`, and `yuanrong` are real providers now: registration needs
+//! // no base URL and contacts nothing.
+//! assert!(remote_provider_set("aio").is_ok());
+//! assert!(!is_deferred("aio"));
 //! ```
 #![allow(clippy::module_name_repetitions)] // `FsProviderFactory`/`CodeProviderFactory` are the contract's names.
+pub mod remote;
 use openjiuwen_common::error::{Error, Result};
 pub use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
 use openjiuwen_core::sys_operation::sandbox::provider::{
     CodeProviderFactory, FsProviderFactory, SandboxProviderRegistry, ShellProviderFactory,
 };
 use std::sync::Arc;
-/// The sandbox types Python registers from `extensions/sys_operation/sandbox/providers/`.
+/// The sandbox types with a real HTTP transport in [`remote`].
 ///
-/// Every name stays usable in configuration written for Python; the providers behind
-/// them are deferred, so creation reports `Unsupported` instead of contacting a sandbox.
-pub const DEFERRED_SANDBOX_TYPES: [&str; 3] = ["aio", "jiuwenbox", "yuanrong"];
+/// Python's `extensions/sys_operation/sandbox/providers/` package registers exactly these three names, so configuration written for Python keeps working.
+pub const REMOTE_SANDBOX_TYPES: [&str; 3] = ["aio", "jiuwenbox", "yuanrong"];
+/// Sandbox types Python registers but this build cannot provide: none.
+///
+/// Every type Python ships has a transport in [`remote`]; see [`REMOTE_SANDBOX_TYPES`].
+/// The constant stays so call sites that iterate the unsupported set keep compiling.
+pub const DEFERRED_SANDBOX_TYPES: [&str; 0] = [];
 /// The factories Python registers per sandbox type (any subset may be present).
 ///
 /// A set is the unit of registration: [`register`] installs each present factory under
@@ -95,8 +122,9 @@ impl SandboxProviderSet {
     }
     /// A complete set whose three factories answer `Unsupported` naming `sandbox_type`.
     ///
-    /// This keeps Python's provider names registered (so `sandbox_type = "aio"` in a card
-    /// still resolves) while making the missing protocol explicit at call time.
+    /// This keeps a sandbox type registered (so an existing card still resolves) while
+    /// making the missing transport explicit at call time.
+    /// The three Python sandbox types no longer need it; use [`remote_provider_set`] for them.
     #[must_use]
     pub fn deferred(sandbox_type: impl Into<String>) -> Self {
         let sandbox_type: Arc<str> = Arc::from(sandbox_type.into());
@@ -122,11 +150,53 @@ impl SandboxProviderSet {
         }
     }
 }
-/// Python's provider is documented as deferred rather than silently missing.
+/// A sandbox type without a transport is documented as deferred rather than silently missing.
 fn deferred_error(sandbox_type: &str) -> Error {
     Error::unsupported(format!(
         "sandbox provider '{sandbox_type}' is deferred; register a provider with sys_operation::register"
     ))
+}
+/// The factory set of one remote sandbox type.
+///
+/// This is the in-memory half of [`register_remote`]: build (or inspect) the set without
+/// touching a registry.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) when
+/// `sandbox_type` is not one of [`REMOTE_SANDBOX_TYPES`], with a message naming them.
+pub fn remote_provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
+    remote::provider_set(sandbox_type)
+}
+/// Registers the remote provider set of one sandbox type.
+///
+/// Registration is synchronous and offline: the provider contacts its container only when
+/// an operation is created through the kernel registry.
+///
+/// # Errors
+///
+/// Propagates [`remote_provider_set`]'s `Unsupported` error for an unknown sandbox type and
+/// [`register`]'s errors (a duplicate registration is
+/// [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp)).
+pub fn register_remote(registry: &SandboxProviderRegistry, sandbox_type: &str) -> Result<()> {
+    register(registry, sandbox_type, remote_provider_set(sandbox_type)?)
+}
+/// Registers the remote providers of every type in [`REMOTE_SANDBOX_TYPES`].
+///
+/// Types are installed in declaration order, `aio`, `jiuwenbox`, `yuanrong`, and
+/// registration stops at the first failure.
+/// As with [`register`], registration is not transactional: the types installed before the
+/// failure stay registered.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) when a type is
+/// already registered in `registry`.
+pub fn register_remote_providers(registry: &SandboxProviderRegistry) -> Result<()> {
+    for sandbox_type in REMOTE_SANDBOX_TYPES {
+        register_remote(registry, sandbox_type)?;
+    }
+    Ok(())
 }
 /// Registers every factory present in `providers` under `sandbox_type`.
 ///
@@ -156,28 +226,26 @@ pub fn register(
     }
     Ok(())
 }
-/// Registers the deferred Python providers ([`DEFERRED_SANDBOX_TYPES`]).
+/// Compatibility no-op kept for call sites that used to install the deferred providers.
 ///
-/// This is the Rust stand-in for importing the Python `providers` package: every type
-/// keeps a filesystem, shell, and code factory that answers `Unsupported`.
+/// The Python types are real providers now, so registration belongs to
+/// [`register_remote_providers`] / [`register_remote`].
+/// This function registers nothing, logs one `debug` line under
+/// `openjiuwen_extensions::sys_operation`, and returns `Ok(())`, so calling it repeatedly
+/// (or after [`register_remote_providers`]) never fails.
 ///
-/// The function is `async` to mirror the Python async setup path that registers
+/// The function stays `async` to mirror the Python async setup path that registers
 /// providers; it performs no I/O.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) when any of
-/// the types is already registered, leaving the types registered earlier in
-/// [`DEFERRED_SANDBOX_TYPES`] in place.
+/// Never returns an error; the `Result` keeps the historical signature.
 #[allow(clippy::unused_async)] // Python parity: registration happens in the async setup path.
-pub async fn register_deferred(registry: &SandboxProviderRegistry) -> Result<()> {
-    for sandbox_type in DEFERRED_SANDBOX_TYPES {
-        register(
-            registry,
-            sandbox_type,
-            SandboxProviderSet::deferred(sandbox_type),
-        )?;
-    }
+pub async fn register_deferred(_registry: &SandboxProviderRegistry) -> Result<()> {
+    tracing::debug!(
+        target: "openjiuwen_extensions::sys_operation",
+        "register_deferred is a compatibility no-op; use register_remote_providers"
+    );
     Ok(())
 }
 /// The sandbox types with at least one registered provider, sorted.
@@ -192,9 +260,12 @@ pub fn registered_types(registry: &SandboxProviderRegistry) -> Vec<String> {
 }
 /// Whether the sandbox type is deferred (documented, not implemented) rather than
 /// available.
+///
+/// The three Python sandbox types are remote providers now, so they are not deferred;
+/// any other name is.
 #[must_use]
 pub fn is_deferred(sandbox_type: &str) -> bool {
-    DEFERRED_SANDBOX_TYPES.contains(&sandbox_type)
+    !REMOTE_SANDBOX_TYPES.contains(&sandbox_type)
 }
 /// Registers a provider set bound to a shared [`SandboxGatewayConfig`].
 ///
@@ -314,8 +385,29 @@ mod tests {
     }
     fn expect_unsupported<T>(result: Result<T>) -> Error {
         match result {
-            Ok(_) => panic!("expected the deferred provider to refuse the call"),
+            Ok(_) => panic!("expected the call to be refused as unsupported"),
             Err(error) => error,
+        }
+    }
+    #[test]
+    fn deferred_types_are_empty() {
+        assert_eq!(DEFERRED_SANDBOX_TYPES, [] as [&str; 0]);
+    }
+    #[test]
+    fn remote_types_match_the_python_provider_package() {
+        assert_eq!(REMOTE_SANDBOX_TYPES, ["aio", "jiuwenbox", "yuanrong"]);
+    }
+    #[test]
+    fn every_remote_type_yields_a_complete_set() {
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
+            let set = remote_provider_set(sandbox_type).unwrap();
+            assert!(!set.is_empty(), "{sandbox_type} must provide factories");
+            assert!(
+                set.fs.is_some(),
+                "{sandbox_type} needs a filesystem factory"
+            );
+            assert!(set.shell.is_some(), "{sandbox_type} needs a shell factory");
+            assert!(set.code.is_some(), "{sandbox_type} needs a code factory");
         }
     }
     #[test]
@@ -334,31 +426,30 @@ mod tests {
         // tests/unit_tests/extensions/sys_operation/sandbox/ are registered but their
         // behavior is integration-gated; registration itself is the ported surface.
         let registry = SandboxProviderRegistry::new();
-        register(&registry, "aio", SandboxProviderSet::deferred("aio")).unwrap();
-        assert!(registry.has_fs("aio"));
-        assert!(registry.has_shell("aio"));
-        assert!(registry.has_code("aio"));
-        assert!(!registry.has_fs("jiuwenbox"));
+        register(&registry, "custom", SandboxProviderSet::deferred("custom")).unwrap();
+        assert!(registry.has_fs("custom"));
+        assert!(registry.has_shell("custom"));
+        assert!(registry.has_code("custom"));
+        assert!(!registry.has_fs("aio"));
         let endpoint = SandboxEndpoint::default();
         let config = SandboxGatewayConfig::default();
         for error in [
-            expect_unsupported(registry.create_fs("aio", &endpoint, &config)),
-            expect_unsupported(registry.create_shell("aio", &endpoint, &config)),
-            expect_unsupported(registry.create_code("aio", &endpoint, &config)),
+            expect_unsupported(registry.create_fs("custom", &endpoint, &config)),
+            expect_unsupported(registry.create_shell("custom", &endpoint, &config)),
+            expect_unsupported(registry.create_code("custom", &endpoint, &config)),
         ] {
             assert_eq!(error.kind(), ErrorKind::Unsupported);
             assert!(error
                 .message()
-                .contains("sandbox provider 'aio' is deferred"));
+                .contains("sandbox provider 'custom' is deferred"));
             assert!(error.message().contains("sys_operation::register"));
         }
     }
-    #[tokio::test]
-    async fn register_deferred_populates_the_python_types() {
+    #[test]
+    fn register_remote_providers_installs_every_type() {
         let registry = SandboxProviderRegistry::new();
-        register_deferred(&registry).await.unwrap();
-        for sandbox_type in DEFERRED_SANDBOX_TYPES {
-            assert!(is_deferred(sandbox_type));
+        register_remote_providers(&registry).unwrap();
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
             assert!(registry.has_fs(sandbox_type));
             assert!(registry.has_shell(sandbox_type));
             assert!(registry.has_code(sandbox_type));
@@ -371,13 +462,53 @@ mod tests {
                 "yuanrong".to_string()
             ]
         );
-        assert!(!is_deferred("local"));
+    }
+    #[test]
+    fn register_remote_providers_stops_at_the_first_error() {
+        let registry = SandboxProviderRegistry::new();
+        registry.register_fs("jiuwenbox", mock_factory()).unwrap();
+        let error = register_remote_providers(&registry).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::SysOp);
+        assert!(error.message().contains("jiuwenbox"));
+        assert!(registry.has_fs("aio"));
+        assert!(!registry.has_fs("yuanrong"));
+    }
+    #[test]
+    fn register_remote_rejects_unknown_types() {
+        let registry = SandboxProviderRegistry::new();
+        let error = register_remote(&registry, "local").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error
+            .message()
+            .contains("supported types: aio, jiuwenbox, yuanrong"));
+        assert!(!registry.has_fs("local"));
+    }
+    #[test]
+    fn remote_provider_set_reports_the_unsupported_message() {
+        let error = expect_unsupported(remote_provider_set("local"));
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "sandbox provider 'local' is not a remote provider; supported types: aio, jiuwenbox, yuanrong"
+        );
     }
     #[tokio::test]
-    async fn duplicate_registration_surfaces_sys_op() {
+    async fn register_deferred_is_a_no_op() {
         let registry = SandboxProviderRegistry::new();
         register_deferred(&registry).await.unwrap();
-        let error = register_deferred(&registry).await.unwrap_err();
+        assert_eq!(registry.sandbox_types(), Vec::<String>::new());
+        // Idempotent, and it never collides with a previous registration.
+        register_deferred(&registry).await.unwrap();
+        assert_eq!(registry.sandbox_types(), Vec::<String>::new());
+        register_remote(&registry, "aio").unwrap();
+        register_deferred(&registry).await.unwrap();
+        assert_eq!(registered_types(&registry), vec!["aio".to_string()]);
+    }
+    #[test]
+    fn duplicate_remote_registration_surfaces_sys_op() {
+        let registry = SandboxProviderRegistry::new();
+        register_remote(&registry, "aio").unwrap();
+        let error = register_remote(&registry, "aio").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::SysOp);
         assert!(error.message().contains("aio"));
     }
@@ -429,6 +560,27 @@ mod tests {
         assert_eq!(registered_types(&registry), vec!["mock".to_string()]);
         registry.unregister("mock");
         assert_eq!(registered_types(&registry), Vec::<String>::new());
+    }
+    #[test]
+    fn is_deferred_marks_everything_outside_the_remote_set() {
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
+            assert!(!is_deferred(sandbox_type));
+        }
+        assert!(is_deferred("local"));
+        assert!(is_deferred(""));
+    }
+    #[test]
+    fn a_remote_provider_needs_a_base_url() {
+        // The provider implementations land separately; only the failure is asserted here.
+        let registry = SandboxProviderRegistry::new();
+        register_remote(&registry, "aio").unwrap();
+        assert!(registry
+            .create_fs(
+                "aio",
+                &SandboxEndpoint::default(),
+                &SandboxGatewayConfig::default()
+            )
+            .is_err());
     }
     #[test]
     fn gateway_provider_binds_the_shared_configuration() {
