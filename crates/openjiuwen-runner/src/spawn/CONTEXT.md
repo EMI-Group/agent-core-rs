@@ -244,6 +244,17 @@ Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_heal
 URL layout: the endpoint is `{base_url}/{path}` with `{agent_id}` substituted into the path; extra slashes are collapsed outside the scheme and a missing or extra slash between base and path is tolerated, so `("http://host:8080/", "/agents/{agent_id}/invoke")` and `("http://host:8080", "agents/{agent_id}/invoke")` build the same URL.
 A path that contains `{agent_id}` requires a non-empty agent id (`Validation`), and an empty `base_url` is `Validation`.
 
+### Monitored decorator — `monitored.rs`
+
+```rust
+pub struct MonitoredSpawnedAgent;                           // new(inner, monitor, run_id),
+                                                            // track(inner, monitor, session_id, detail),
+                                                            // inner(), run_id(), is_finished()
+```
+
+`MonitoredSpawnedAgent` implements `SpawnedAgent` and forwards the whole seam surface to the wrapped handle: `id`, `is_alive`, `pid`, `backend`, `is_healthy`, `health_snapshot`, `send`, `stream`, `shutdown`, `force_kill`, `cancel_task`, and the bounded `send_with_timeout`/`stream_with_timeout` (the caller's `Option<Duration>` deadline reaches the inner handle verbatim, so a bounded invocation stays bounded through the decorator instead of falling back to the trait's `send`/`stream` default).
+Only its own observation differs: `track`/`new` admit the run, `health` records the probe, `shutdown`/`force_kill`/`Drop` finish it, and an error from `send`, `stream`, `send_with_timeout` or `stream_with_timeout` finishes it as failed when the inner handle reports `is_alive() == false` (the shared `SpawnWatch`/`finish_if_child_exited` latch, never a second latch path); a failure against a live child — a caller deadline that elapsed, for instance — leaves the run `Running`.
+
 ## Wire Contract
 
 Frames travel one JSON object per line.
@@ -297,7 +308,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **Routing never falls back silently.** A `SpawnSpec::backend` that is not registered is a deferred failure naming that backend, `spawn_with` resolves exactly what it was asked for, and only an *unspecified* backend reaches the default / sole-spawner / ambiguity rules.
 - **A hint a runner cannot honour is a configuration error.** With only a single spawner installed, a `SpawnSpec::backend` that contradicts the spawner's own `backend()` is `Error::Config` naming both sides and both remedies (`Runner::set_spawner_registry`, `Runner::spawn_agent_with`); an unlabelled `Unknown` spawner cannot contradict the hint and keeps it as the run's label.
 - **Observation is a decorator, not a backend.** `MonitoredSpawnedAgent` wraps whatever handle a backend returned, so every backend — including a host's own `AgentSpawner` — reports the same `RunKind::Spawn` lifecycle without knowing the monitor exists; `is_healthy` stays a pure read and only `health` records, which keeps the poll path free of monitor churn.
-- **A dead child is terminal.** After a `health` probe, and after a `send`/`stream` that returned an error, a child reporting `is_alive() == false` finishes the run as failed with `{"reason": "child_exited", "backend": …}` (latched once), while the same failure against a live child only observes — so `Runner::active_spawns` stops listing an exited child once something probes or calls it, and never mistakes a desync for an exit.
+- **A dead child is terminal.** After a `health` probe, and after a `send`/`stream` (or a bounded `send_with_timeout`/`stream_with_timeout`) that returned an error, a child reporting `is_alive() == false` finishes the run as failed with `{"reason": "child_exited", "backend": …}` (latched once), while the same failure against a live child only observes — so `Runner::active_spawns` stops listing an exited child once something probes or calls it, and never mistakes a desync or an elapsed caller deadline for an exit.
 - **Runner routing is registry-first and last-install-wins.** A `Runner` holds one spawner and an optional registry beside it: a registry routes `spawn_agent` through its `route` (resolved key + spawner), `spawn_agent_with` requires the registry and refuses to fall back, and `set_spawner` clears the registry while `set_spawner_registry` leaves the single spawner installed for `spawn_backend`/`spawn_agent`-without-registry reporting.
 - **An external command is a resolved path, not a shell.** `ExternalCommandSpawner` refuses an empty command, a missing file, a directory, and (on unix) a file without an executable bit, then hands the absolute path to the subprocess backend; `PATH` is only a lookup, never an execution vehicle.
 - **An in-process agent is stopped, not signalled.** `shutdown` and `force_kill` both call the handler's own `shutdown`, `pid()` is `None`, and liveness is the handle's flag *and* the handler's, so a stopped handler cannot be reported alive.
@@ -334,7 +345,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - Integration suites: `tests/spawn_subprocess.rs` re-executes the test binary as the fake child (`FAKE_CHILD_MODE` selects echo/stream/crash/silent/malformed/oversized/health-failure/shutdown modes), and `tests/spawn_remote.rs` drives a loopback `wiremock` server.
 - The crate-level `## Deferred Python Behavior` and `tests/CONTEXT.md` still describe the pre-backend deferral and are reconciled by the parent node.
 - A handle is single-use once desynchronized: respawn rather than retry, and never assume a timed-out exchange can be recovered.
-- `send_with_timeout`/`stream_with_timeout` are the only way to bound *one* exchange: `send`/`stream` always use the backend's configured deadline, and the trait defaults ignore the hint (so an in-process handle or a host's own backend simply behaves like `send`/`stream`).
+- `send_with_timeout`/`stream_with_timeout` are the only way to bound *one* exchange: `send`/`stream` always use the backend's configured deadline, and the trait defaults ignore the hint (so an in-process handle or a host's own backend simply behaves like `send`/`stream`). `MonitoredSpawnedAgent` forwards both bounded variants, so a handle from `Runner::spawn_agent` keeps a caller's per-request deadline.
 - `shutdown(Duration::ZERO)` is not "kill now": it means "use the configured `shutdown_timeout_secs`". Pass a non-zero duration to override the configuration for one shutdown.
 - `RemoteSpawner::spawn` returns a *started* `RemoteAgent` (readiness is `true` without a request); `RemoteAgent::new` is lazy, so a directly constructed handle reports not-alive until its first request or an explicit `RemoteClient::start`.
 - There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.

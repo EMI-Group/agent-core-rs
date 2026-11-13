@@ -3,9 +3,10 @@
 //! spawned child.
 //!
 //! The handles here are the ones the real backends hand out (an in-process
-//! handler) plus local fakes that count their calls, so routing decisions are
-//! observable as call counts rather than inferred from ids. Offline and
-//! deterministic: no child process, no network, no sleeps for ordering.
+//! handler, and a remote agent served by a loopback `wiremock` server) plus local
+//! fakes that count their calls, so routing decisions are observable as call
+//! counts rather than inferred from ids. Offline and deterministic: no child
+//! process, no external network, no sleeps for ordering.
 //!
 //! Ports the facade surface of Python `openjiuwen/core/runner/runner.py`
 //! (`set_spawner`/`spawn_agent`) and the routing rules this crate documents on
@@ -22,10 +23,15 @@ use futures::{stream::BoxStream, StreamExt};
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_runner::{
-    AgentSpawner, InProcessHandler, InProcessSpawner, RunKind, RunPhase, Runner, SpawnBackend,
-    SpawnSpec, SpawnedAgent, SpawnerRegistry,
+    AgentSpawner, InProcessHandler, InProcessSpawner, RemoteSpawner, RunKind, RunPhase, Runner,
+    SpawnBackend, SpawnSpec, SpawnedAgent, SpawnerRegistry,
 };
 use serde_json::{json, Value};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Deadline for a whole scenario: only proves termination, never ordering.
+const BOUND: Duration = Duration::from_secs(10);
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -800,4 +806,75 @@ async fn spawning_without_a_registry_is_a_config_error() {
         "the message names the fix: {error}"
     );
     assert_eq!(runner.active_spawns().len(), 0);
+}
+
+// --- caller deadlines through a real backend --------------------------------
+
+#[tokio::test]
+async fn a_spawned_remote_child_honours_a_caller_deadline_and_survives_it() {
+    tokio::time::timeout(BOUND, async {
+        // The first invoke answers late, every later one immediately, so the same
+        // handle proves both the bounded and the configured deadline.
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/agents/SlowAgent/invoke"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(250))
+                        .set_body_json(json!({"output": "late"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"output": "fast"}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let registry = Arc::new(SpawnerRegistry::new());
+        registry.register_remote(RemoteSpawner::new(server.uri()));
+        let runner = Runner::new();
+        runner.set_spawner_registry(registry);
+
+        let child = runner
+            .spawn_agent(
+                SpawnSpec::class_agent("pkg.mod", "SlowAgent")
+                    .with_backend(SpawnBackend::RemoteHttp),
+            )
+            .await
+            .expect("the registry hosts the remote backend");
+        assert_eq!(child.backend(), SpawnBackend::RemoteHttp);
+
+        let error = child
+            .send_with_timeout(json!({}), Some(Duration::from_millis(25)))
+            .await
+            .expect_err("the delayed answer outlives the caller's deadline");
+        assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+        assert!(
+            runner
+                .active_spawns()
+                .iter()
+                .any(|status| status.run_id == child.id()),
+            "a timed-out request is not child death: the spawn stays live"
+        );
+
+        // `None` keeps the configured deadline (`DEFAULT_REMOTE_TIMEOUT_SECS`), so
+        // the same handle completes against the fast answer.
+        let output = child
+            .send_with_timeout(json!({}), None)
+            .await
+            .expect("a fast answer completes within the configured deadline");
+        assert_eq!(output.output, "fast");
+        assert_eq!(
+            runner.active_spawns().len(),
+            1,
+            "a bounded exchange does not end the spawn run"
+        );
+        assert_eq!(
+            runner.monitor().snapshot(child.id()).unwrap().phase,
+            RunPhase::Running
+        );
+    })
+    .await
+    .expect("the bounded spawn scenario finishes within BOUND");
 }

@@ -26,8 +26,9 @@
 //!
 //! **A dead child is terminal.** Liveness is the one thing the decorator can
 //! decide without a backend-specific probe, so it is what ends a run whose child
-//! exited on its own: after every probe, and after a `send`/`stream` that returned
-//! an error, a child reporting [`crate::spawn::SpawnedAgent::is_alive`] `false`
+//! exited on its own: after every probe, and after a `send`/`stream` (or their
+//! bounded `send_with_timeout`/`stream_with_timeout` forms) that returned an
+//! error, a child reporting [`crate::spawn::SpawnedAgent::is_alive`] `false`
 //! finishes the run as failed with `{"reason": "child_exited", "backend": …}`.
 //! The call itself is unaffected — the probe result and the error are returned
 //! unchanged — and a failure against a *live* child (a protocol desync, a
@@ -113,6 +114,28 @@ impl SpawnWatch {
             json!({"reason": "child_exited", "backend": self.inner.backend().as_str()}),
         ));
     }
+}
+
+/// Wraps `inner` so a terminal error frame from a dead child finishes the run.
+///
+/// Shared by both stream overrides ([`SpawnedAgent::stream`] and
+/// [`SpawnedAgent::stream_with_timeout`]), so the bounded form is observed
+/// exactly like the unbounded one: frames pass through unchanged, and an `Err`
+/// frame only ends the run when the child is no longer alive.
+fn observed_stream(
+    inner: BoxStream<'static, Result<AgentChunk>>,
+    watch: SpawnWatch,
+) -> BoxStream<'static, Result<AgentChunk>> {
+    Box::pin(futures::stream::unfold(
+        (inner, watch),
+        |(mut inner, watch)| async move {
+            let frame = futures::StreamExt::next(&mut inner).await?;
+            if frame.is_err() {
+                watch.finish_if_child_exited();
+            }
+            Some((frame, (inner, watch)))
+        },
+    ))
 }
 
 impl MonitoredSpawnedAgent {
@@ -266,18 +289,47 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
     /// frame from a child that is no longer alive finishes the run, while an `Err`
     /// from a live child is forwarded as-is.
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
-        let watch = self.watch();
-        let inner = self.inner.stream(inputs);
-        Box::pin(futures::stream::unfold(
-            (inner, watch),
-            |(mut inner, watch)| async move {
-                let frame = futures::StreamExt::next(&mut inner).await?;
-                if frame.is_err() {
-                    watch.finish_if_child_exited();
-                }
-                Some((frame, (inner, watch)))
-            },
-        ))
+        observed_stream(self.inner.stream(inputs), self.watch())
+    }
+
+    /// Forwards the bounded send, including the caller's deadline.
+    ///
+    /// The deadline reaches the wrapped handle unchanged (a backend that honours
+    /// it bounds that one exchange; the trait default ignores it), and the
+    /// observation rule is `send`'s: an error from a child that is no longer alive
+    /// finishes the run as failed with `{"reason": "child_exited"}`, while an error
+    /// from a live child — a timed-out request, for instance — leaves it running.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner handle reports, including
+    /// [`openjiuwen_common::error::Error::Timeout`] from a backend that honours the
+    /// deadline.
+    async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        let result = self.inner.send_with_timeout(inputs, timeout).await;
+        if result.is_err() {
+            self.finish_if_child_exited();
+        }
+        result
+    }
+
+    /// Forwards the bounded stream, including the caller's deadline.
+    ///
+    /// Frames and the terminal error are observed exactly as `stream` observes
+    /// them; the deadline is only passed on to the wrapped handle.
+    fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        observed_stream(
+            self.inner.stream_with_timeout(inputs, timeout),
+            self.watch(),
+        )
     }
 
     /// Forwards the graceful shutdown and records its result.
@@ -409,6 +461,7 @@ mod tests {
     use super::*;
     use openjiuwen_common::error::{Error, Result};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Mutex;
 
     /// A child handle with configurable identity, backend and probe behaviour.
     struct FakeChild {
@@ -424,6 +477,12 @@ mod tests {
         cancelled: Arc<AtomicUsize>,
         /// Whether the handle reports itself alive.
         alive: AtomicBool,
+        /// Deadlines `send_with_timeout` received, in call order.
+        send_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        /// Deadlines `stream_with_timeout` received, in call order.
+        stream_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        /// How many frames `stream`/`stream_with_timeout` yield.
+        stream_frames: i64,
     }
 
     impl FakeChild {
@@ -436,6 +495,9 @@ mod tests {
                 send_fails: false,
                 cancelled: Arc::new(AtomicUsize::new(0)),
                 alive: AtomicBool::new(true),
+                send_timeouts: Arc::new(Mutex::new(Vec::new())),
+                stream_timeouts: Arc::new(Mutex::new(Vec::new())),
+                stream_frames: 0,
             }
         }
     }
@@ -465,7 +527,28 @@ mod tests {
         }
 
         fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
-            Box::pin(futures::stream::empty())
+            let frames: Vec<Result<AgentChunk>> = (0..self.stream_frames)
+                .map(|index| Ok(AgentChunk::llm_output(index, "tick")))
+                .collect();
+            Box::pin(futures::stream::iter(frames))
+        }
+
+        async fn send_with_timeout(
+            &self,
+            inputs: Value,
+            timeout: Option<Duration>,
+        ) -> Result<AgentOutput> {
+            self.send_timeouts.lock().unwrap().push(timeout);
+            self.send(inputs).await
+        }
+
+        fn stream_with_timeout(
+            &self,
+            inputs: Value,
+            timeout: Option<Duration>,
+        ) -> BoxStream<'static, Result<AgentChunk>> {
+            self.stream_timeouts.lock().unwrap().push(timeout);
+            self.stream(inputs)
         }
 
         async fn shutdown(&self, _timeout: Duration) -> Result<bool> {
@@ -539,6 +622,116 @@ mod tests {
 
         handle.cancel_task("task-7").await.unwrap();
         assert_eq!(child.cancelled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn forwards_the_bounded_invocation_deadlines_verbatim() {
+        let (handle, child, _monitor) = tracked("child-14", true);
+
+        handle
+            .send_with_timeout(json!({}), Some(Duration::from_millis(25)))
+            .await
+            .unwrap();
+        handle.send_with_timeout(json!({}), None).await.unwrap();
+        assert_eq!(
+            *child.send_timeouts.lock().unwrap(),
+            vec![Some(Duration::from_millis(25)), None],
+            "both deadlines reached the wrapped handle, so the decorator's own \
+             overrides ran instead of the defaulting trait bodies"
+        );
+
+        let _: Vec<Result<AgentChunk>> = futures::StreamExt::collect(
+            handle.stream_with_timeout(json!({}), Some(Duration::from_millis(25))),
+        )
+        .await;
+        let _: Vec<Result<AgentChunk>> =
+            futures::StreamExt::collect(handle.stream_with_timeout(json!({}), None)).await;
+        assert_eq!(
+            *child.stream_timeouts.lock().unwrap(),
+            vec![Some(Duration::from_millis(25)), None],
+            "the stream variant forwards its deadline too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_stream_forwards_frames_and_terminates_like_stream() {
+        let monitor = Arc::new(RunMonitor::new());
+        let child = Arc::new(FakeChild {
+            stream_frames: 2,
+            ..FakeChild::new("child-15", SpawnBackend::InProcess)
+        });
+        let handle = MonitoredSpawnedAgent::track(
+            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
+            Arc::clone(&monitor),
+            None,
+            json!({"backend": "in_process"}),
+        );
+
+        let plain: Vec<Result<AgentChunk>> =
+            futures::StreamExt::collect(handle.stream(json!({}))).await;
+        let bounded: Vec<Result<AgentChunk>> = futures::StreamExt::collect(
+            handle.stream_with_timeout(json!({}), Some(Duration::from_millis(25))),
+        )
+        .await;
+
+        assert_eq!(plain.len(), 2);
+        assert_eq!(
+            bounded.len(),
+            plain.len(),
+            "the bounded stream terminates exactly like `stream`"
+        );
+        for (bounded, plain) in bounded.iter().zip(&plain) {
+            assert_eq!(
+                bounded.as_ref().unwrap().payload,
+                plain.as_ref().unwrap().payload
+            );
+        }
+        assert_eq!(
+            monitor.snapshot(handle.run_id()).unwrap().phase,
+            RunPhase::Running,
+            "a bounded stream is not a terminal transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_bounded_send_from_a_dead_child_finishes_the_run() {
+        let monitor = Arc::new(RunMonitor::new());
+        let child = Arc::new(FakeChild {
+            send_fails: true,
+            ..FakeChild::new("child-16", SpawnBackend::InProcess)
+        });
+        let handle = MonitoredSpawnedAgent::track(
+            Arc::clone(&child) as Arc<dyn SpawnedAgent>,
+            Arc::clone(&monitor),
+            None,
+            json!({"backend": "in_process"}),
+        );
+
+        // A live child's failed bounded request — a timed-out exchange — only
+        // observes.
+        let error = handle
+            .send_with_timeout(json!({}), Some(Duration::from_millis(25)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
+        assert_eq!(
+            monitor.snapshot(handle.run_id()).unwrap().phase,
+            RunPhase::Running,
+            "a live child's failure only observes"
+        );
+        assert!(!handle.is_finished());
+
+        child.alive.store(false, Ordering::Release);
+        let error = handle.send_with_timeout(json!({}), None).await.unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Transport);
+        let status = monitor.snapshot(handle.run_id()).unwrap();
+        assert_eq!(status.phase, RunPhase::Failed);
+        assert_eq!(
+            status.detail,
+            json!({"reason": "child_exited", "backend": "in_process"})
+        );
+        assert!(handle.is_finished());
+        assert_eq!(monitor.list_active().len(), 0);
     }
 
     #[test]
