@@ -523,6 +523,8 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   the `src/member/` child-process spawners for `process`/`external_cli`/`ssh`; nothing in this module builds a
   DeepAgent directly.
 - `TeamSpec` (not `TeamAgentSpec`) is what the running team carries, mirroring Python's runtime mirror.
+- `TeamAgent` has no direct `store()` accessor: a test or host reaches the store through `TeamAgent::backend().store()` (`backend.rs:177`), reads mail through `TeamBackend::unread`/`mark_read` and the board through `TeamBackend::tasks()`/`list_tasks`.
+- `TeamBuildDeps.store` is an `Arc<dyn TeamStore>` field (`deps.rs:49`), set by `with_store`; the default is `InMemoryTeamStore` (`deps.rs:150`) and `--features sqlite` users inject `SqliteTeamStore` instead of a `StorageSpec`-like value.
 - A teammate runs the same loop but creates no tasks and never dispatches: `create_task` on a teammate is
   `Error::validation("only the leader can create tasks")`.
 - The team roster is materialized as rows at build time (`unstarted` teammates); Python creates rows lazily
