@@ -30,11 +30,13 @@ pub struct TeamBuildDeps {
     pub observability_hooks: Vec<Arc<dyn ObservabilityHooks>>,   // empty = no-ops
     pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,       // None = built from metadata
     pub routing: Option<Arc<TeamModelRouter>>,            // None = built from model_pool
+    pub store_injected: bool,                             // set by `with_store`, cleared by `default()`
 }
 impl TeamBuildDeps {
     pub fn new() -> Self;                                  // == Default
     pub fn with_harness_factory(self, Arc<dyn MemberHarnessFactory>) -> Self;
-    pub fn with_store(self, Arc<dyn TeamStore>) -> Self;
+    pub fn with_store(self, Arc<dyn TeamStore>) -> Self;   // also sets `store_injected`
+    pub fn has_injected_store(&self) -> bool;              // the store-resolution switch
     pub fn with_workspace(self, Arc<dyn WorkspaceProvider>) -> Self;
     pub fn with_language(self, impl Into<String>) -> Self;
     pub fn with_observability_hook(self, Arc<dyn ObservabilityHooks>) -> Self;  // pushes
@@ -231,9 +233,17 @@ impl TeamAgent {
 
 // leader.rs — the coordination loop (`pub(crate)` surface)
 pub const SETTLE_POLL_INTERVAL: Duration;
-pub(crate) struct RunOutcome { pub output: AgentOutput, pub frames: Vec<AgentChunk> }
+pub(crate) type ChunkSink = UnboundedSender<Result<AgentChunk>>;
 pub(crate) async fn run(agent: TeamAgent, query: Option<String>, session: Option<Arc<dyn Session>>,
-                        deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<RunOutcome>;
+                        deliver: Vec<InteractPayload>, sink: Option<ChunkSink>) -> Result<AgentOutput>;
+
+// health.rs — the sync, read-only liveness projection (no new state, no probe)
+pub struct MemberHealth { pub name: String, pub role: TeamRole, pub status: MemberStatus,
+                          pub execution: ExecutionStatus, pub alive: bool }        // serde snake_case
+pub struct TeamHealth { pub team_name: String, pub started: bool,
+                        pub leader: Option<MemberHealth>, pub members: Vec<MemberHealth> }
+impl TeamBackend { pub fn health(&self) -> TeamHealth; }   // always `started: false`
+impl TeamAgent { pub fn health(&self) -> TeamHealth; }     // `started` from the handle
 
 // pool.rs / manager.rs / adapter.rs — listed in the routing table below
 ```
@@ -331,7 +341,15 @@ config therefore just logs.
 1. `spec.validate()` — reserved names, dispatch knob rules (the spec's own messages).
 2. `TeamSpec::from_spec(spec)` — the runtime mirror; language from `deps.language` else `spec.language`.
 3. `create_messager(&spec.transport)` — one in-process transport shared by the backend and every member.
-   The store is never opened here: the build path uses `deps.store` (default `InMemoryTeamStore`) and never reads `TeamAgentSpec::storage`, so SQLite team storage is selected by injecting `open_store(&spec.storage)?` through `TeamBuildDeps::with_store`.
+   The store comes from `resolve_store(spec, &deps)?` (in `build.rs`), never a second one:
+   an injected `deps.store` (`TeamBuildDeps::has_injected_store`, set by `with_store`) always wins — a
+   non-memory `spec.storage` kind is only `warn!`-logged as ignored, and `open_store` is never called;
+   with no injection, a blank or `memory` kind uses `deps.store` (the `InMemoryTeamStore` default);
+   with no injection and a real kind, `crate::storage::open_store(&spec.storage)?` opens it, propagating
+   `Error::Unsupported` for `postgresql`/`mysql`/unknown kinds. Before a `sqlite` open,
+   `ensure_sqlite_parent` best-effort creates the parent directory of a path-shaped target
+   (`params` keys `path`/`url`/`database`; `:memory:`, `mode=memory` and `sqlite:` URLs are left alone),
+   logging and continuing on failure — so the first write cannot fail on a missing directory.
 4. Wiring inputs: `TeamModelRouter::for_spec` (or the injected router for a direct spawner), the
    `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the four
    metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`).
@@ -366,9 +384,28 @@ config therefore just logs.
    - the loop ends when the leader runtime is `Idle` **and** `taskboard.is_settled()`, when the caller
      cancels, or when `stop()` fires.
 6. The org mailbox is acknowledged only for the ids whose flush succeeded; a failed flush keeps them unread.
-7. The `team.completed` frame (`schema::stream::team_completed_frame`) is emitted last; the gate closes.
+7. The `team.completed` frame (`schema::stream::team_completed_frame`) is emitted last and the gate is
+   already closed; a settled run then publishes **one** `EventPayload::TeamCompleted(TeamCompletedEvent
+   { team_name, reason: Some("settled") })` on `TeamTopic::Team` through `TeamBackend::post_event`, so a
+   caller that holds no stream still sees the completion. A publish failure is `warn!`-logged and never
+   fails the run, and a cancelled run (`RunExit::Cancelled`) publishes nothing — the bus event is
+   exactly-once per settled run.
 8. `invoke` returns `AgentOutput::answer(<concatenated leader answer>)`; `stream` yields the frames.
    A leader answer is accumulated from `llm_output` chunks (`payload.content`, else `payload.text`).
+
+## Health
+
+`TeamHealth` / `MemberHealth` (`health.rs`) are the read-only liveness projection: sync, no `.await`, no
+new state, no probe task.
+`TeamBackend::health()` projects the roster it already holds (`members()`, sorted by name; `leader` is a
+copy of the leader's entry when that row exists) and always reports `started: false`, because the backend
+does not track the run lifecycle; `TeamAgent::health()` is the caller-facing one and fills `started` from
+`is_started()`.
+`alive` means "a runtime is attached **and** that runtime's phase is not `Terminated` **and** the row is
+not still `Unstarted`" — the last clause keeps a built-but-never-started team reporting nothing alive,
+even though `build_with` already attached the leader's harness.
+`status`/`execution` are copied from the row's cached projection (`TeamMember::status`/`execution`),
+never re-read from the store.
 
 ## Dispatch truth table (`decide_run_action`)
 
@@ -427,7 +464,8 @@ a new session instead of being rebuilt.
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
-- `./build.rs` → the `SpecBuild` implementation and every build-only helper (leader record, harness, observer, roster rows, bus wiring, org install)
+- `./health.rs` → `TeamHealth` / `MemberHealth`, the `alive` rule and the roster projection
+- `./build.rs` → the `SpecBuild` implementation and every build-only helper (store resolution, leader record, harness, observer, roster rows, bus wiring, org install)
 - `./spawner.rs` → `TeamMemberSpawner` (`MemberSpawner` over the harness factory, spawn options, fork, routing, child spawners)
 - `./team_agent/` → the `TeamAgent` handle directory: the struct and its accessors in `mod.rs`, one file per concern below
 - `./team_agent/mod.rs` → `TeamAgent`, `TeamAgentInner`, `SpecBuild`, `ensure_leader_role`, the cheap accessors and the `pub(crate)` seams (`steer_batch_size`, `cancellation_token`, `take_events`)
