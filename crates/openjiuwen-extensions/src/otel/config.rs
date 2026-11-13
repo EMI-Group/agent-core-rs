@@ -15,6 +15,8 @@ use openjiuwen_common::config::env::{flag, OPENJIUWEN_OTEL_GLOBAL_INSTRUMENT_ENA
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+use super::env;
+
 /// Default tracer instrumentation name: `"openjiuwen.tracer.otel"`.
 const DEFAULT_TRACER_NAME: &str = "openjiuwen.tracer.otel";
 /// Default `service.name` resource attribute: `"openjiuwen"`.
@@ -165,6 +167,72 @@ impl OtelTracerConfig {
         self.service_version = version;
         self
     }
+
+    /// Builds a configuration from the environment.
+    ///
+    /// Equivalent to [`OtelTracerConfig::default`] followed by
+    /// [`Self::apply_env`]: the OTLP endpoint, headers, protocol, and
+    /// `service.name` are taken from the environment when the matching variable
+    /// is set. `OPENJIUWEN_OTEL_*` variables win over the standard `OTEL_*`
+    /// ones, and blank values count as unset.
+    ///
+    /// Infallible by design: a `*_PROTOCOL` value that cannot be honoured
+    /// (`grpc`, `http/protobuf`, or an unknown string) is ignored here, leaving
+    /// the default [`OtlpProtocol::Grpc`] in place. Building the exporter
+    /// reports the requested protocol with [`Error::unsupported`] or
+    /// [`Error::validation`], so a typo cannot make configuration loading fail.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::default().apply_env()
+    }
+
+    /// Applies environment overrides to `self`, leaving explicitly configured
+    /// fields untouched.
+    ///
+    /// Only fields still at their default are filled:
+    ///
+    /// - an absent (or blank) [`Self::exporter_endpoint`] takes the value of
+    ///   `env_endpoint()`,
+    /// - an empty [`Self::headers`] map takes `env_headers()`,
+    /// - [`OtlpProtocol::Grpc`] (the default) takes the parsed environment
+    ///   protocol when that protocol is supported — an unusable value is
+    ///   ignored and the default is kept,
+    /// - the default `service.name` (`"openjiuwen"`) takes `env_service_name()`.
+    ///
+    /// Variables that are unset, blank, or unparsable leave their field alone,
+    /// so the result never carries an empty endpoint or an unparsed protocol.
+    #[must_use]
+    pub fn apply_env(mut self) -> Self {
+        if self
+            .exporter_endpoint
+            .as_deref()
+            .is_none_or(|endpoint| endpoint.trim().is_empty())
+        {
+            self.exporter_endpoint = env::env_endpoint();
+        }
+        if self.headers.is_empty() {
+            self.headers = env::env_headers().unwrap_or_default();
+        }
+        let service_name_is_default =
+            self.service_name.trim().is_empty() || self.service_name == DEFAULT_SERVICE_NAME;
+        let env_protocol = if self.protocol == OtlpProtocol::Grpc {
+            env::env_protocol_value().and_then(|raw| env::parse_protocol(&raw).ok())
+        } else {
+            None
+        };
+        let env_service_name = if service_name_is_default {
+            env::env_service_name()
+        } else {
+            None
+        };
+        if let Some(protocol) = env_protocol {
+            self.protocol = protocol;
+        }
+        if let Some(service_name) = env_service_name {
+            self.service_name = service_name;
+        }
+        self
+    }
 }
 
 /// Reports whether process-wide HTTP instrumentation is enabled.
@@ -182,6 +250,13 @@ pub fn global_instrument_enabled(config: &OtelTracerConfig) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::otel::env::test_support::{set_env, EnvGuard};
+    use crate::otel::env::{
+        OPENJIUWEN_OTEL_EXPORTER_OTLP_ENDPOINT, OPENJIUWEN_OTEL_EXPORTER_OTLP_HEADERS,
+        OPENJIUWEN_OTEL_EXPORTER_OTLP_PROTOCOL, OPENJIUWEN_OTEL_SERVICE_NAME,
+        OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, OTEL_EXPORTER_OTLP_PROTOCOL,
+        OTEL_SERVICE_NAME,
+    };
     use openjiuwen_common::error::ErrorKind;
     use serde_json::{json, Value};
 
@@ -368,5 +443,132 @@ mod tests {
             ..OtelTracerConfig::default()
         };
         assert!(global_instrument_enabled(&enabled));
+    }
+
+    // port of tests/unit_tests/extensions/tracer_otel/test_setup.py (env cases)
+
+    #[test]
+    fn from_env_defaults_when_environment_is_empty() {
+        let _guard = EnvGuard::new();
+        assert_eq!(OtelTracerConfig::from_env(), OtelTracerConfig::default());
+    }
+
+    #[test]
+    fn from_env_picks_up_every_knob() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_ENDPOINT, "http://collector:4318");
+        set_env(OTEL_EXPORTER_OTLP_HEADERS, "authorization=Bearer token");
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "http/json");
+        set_env(OTEL_SERVICE_NAME, "agent-service");
+
+        let config = OtelTracerConfig::from_env();
+        assert_eq!(
+            config.exporter_endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
+        assert_eq!(config.headers["authorization"], "Bearer token");
+        assert_eq!(config.protocol, OtlpProtocol::Http);
+        assert_eq!(config.service_name, "agent-service");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn from_env_prefers_the_openjiuwen_variables() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_ENDPOINT, "http://otel:4318");
+        set_env(
+            OPENJIUWEN_OTEL_EXPORTER_OTLP_ENDPOINT,
+            "http://openjiuwen:4318",
+        );
+        set_env(OTEL_EXPORTER_OTLP_HEADERS, "a=otel");
+        set_env(OPENJIUWEN_OTEL_EXPORTER_OTLP_HEADERS, "a=openjiuwen");
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "grpc");
+        set_env(OPENJIUWEN_OTEL_EXPORTER_OTLP_PROTOCOL, "http");
+        set_env(OTEL_SERVICE_NAME, "otel-service");
+        set_env(OPENJIUWEN_OTEL_SERVICE_NAME, "openjiuwen-service");
+
+        let config = OtelTracerConfig::from_env();
+        assert_eq!(
+            config.exporter_endpoint.as_deref(),
+            Some("http://openjiuwen:4318")
+        );
+        assert_eq!(config.headers["a"], "openjiuwen");
+        assert_eq!(config.protocol, OtlpProtocol::Http);
+        assert_eq!(config.service_name, "openjiuwen-service");
+    }
+
+    #[test]
+    fn apply_env_leaves_explicit_fields_untouched() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_ENDPOINT, "http://env:4318");
+        set_env(OTEL_EXPORTER_OTLP_HEADERS, "a=env");
+        set_env(OTEL_SERVICE_NAME, "env-service");
+
+        let explicit = OtelTracerConfig {
+            headers: BTreeMap::from([("authorization".to_owned(), "Bearer x".to_owned())]),
+            ..OtelTracerConfig::default()
+                .with_endpoint("http://explicit:4318")
+                .with_service("explicit-service", None)
+        };
+        let config = explicit.clone().apply_env();
+        assert_eq!(
+            config.exporter_endpoint.as_deref(),
+            Some("http://explicit:4318")
+        );
+        assert_eq!(config.headers, explicit.headers);
+        assert_eq!(config.service_name, "explicit-service");
+        // Everything else survives untouched as well.
+        assert_eq!(config.sample_rate, explicit.sample_rate);
+        assert_eq!(config.tracer_name, explicit.tracer_name);
+    }
+
+    #[test]
+    fn apply_env_keeps_an_explicit_http_protocol() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "grpc");
+
+        let config = OtelTracerConfig {
+            protocol: OtlpProtocol::Http,
+            ..OtelTracerConfig::default()
+        }
+        .apply_env();
+        assert_eq!(config.protocol, OtlpProtocol::Http);
+    }
+
+    #[test]
+    fn apply_env_ignores_an_unusable_protocol() {
+        let _guard = EnvGuard::new();
+        for raw in ["grpc", "http/protobuf", "carrier-pigeon"] {
+            set_env(OTEL_EXPORTER_OTLP_PROTOCOL, raw);
+            let config = OtelTracerConfig::default().apply_env();
+            assert_eq!(config.protocol, OtlpProtocol::Grpc, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn apply_env_ignores_blank_and_unparsable_values() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_ENDPOINT, "   ");
+        set_env(OTEL_EXPORTER_OTLP_HEADERS, "not-a-pair");
+        set_env(OTEL_SERVICE_NAME, "  ");
+
+        let config = OtelTracerConfig::default().apply_env();
+        assert_eq!(config.exporter_endpoint, None);
+        assert!(config.headers.is_empty());
+        assert_eq!(config.service_name, "openjiuwen");
+        assert_eq!(config.protocol, OtlpProtocol::Grpc);
+    }
+
+    #[test]
+    fn apply_env_normalises_a_blank_explicit_endpoint_to_the_environment() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_ENDPOINT, "http://env:4318");
+
+        let blank = OtelTracerConfig {
+            exporter_endpoint: Some("   ".to_owned()),
+            ..OtelTracerConfig::default()
+        }
+        .apply_env();
+        assert_eq!(blank.exporter_endpoint.as_deref(), Some("http://env:4318"));
     }
 }
