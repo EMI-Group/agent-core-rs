@@ -3,8 +3,9 @@
 ## Intent
 
 Teams of agents: team cards/configs, an in-process message bus and runtime, and the three strategies the Python SDK ships (`handoff`, supervisor-over-message-bus, agents-as-tools).
-Ports Python `openjiuwen.core.multi_agent` (v0.1.20, 31 files / ~4.1k lines) plus the team-session helpers from `core.session.agent_team`; distributed transports and the product-level `agent_teams` package (leader/teammate, worktrees) are out of scope (see `docs/PARITY.md`).
-Everything is in-process and tokio-native: the Python `MessageQueueInMemory` transport becomes a per-topic FIFO worker with oneshot request/response correlation.
+Ports Python `openjiuwen.core.multi_agent` (v0.1.20, 31 files / ~4.1k lines) plus the team-session helpers from `core.session.agent_team`; the product-level `agent_teams` package (leader/teammate, worktrees) is out of scope (see `docs/PARITY.md`), and of the distributed transports only Redis is implemented (`Pulsar` is a typed `Unsupported`).
+tokio-native throughout: the Python `MessageQueueInMemory` transport becomes a per-topic FIFO worker with oneshot request/response correlation inside `InProcessTransport`, and `TeamTransport` is the seam a Redis-backed deployment swaps in.
+Team events, card-driven auto-subscription, a resource-manager seam, per-member checkpoint identity, `P2PAbilityManager` and Python-literal rendering are implemented here rather than left to the runner.
 The crate never depends on `openjiuwen-runner` (runner depends on it): members are resolved from the team's own runtime registry, and the `Team` trait is the seam the runner drives.
 
 ## API Surface
@@ -12,7 +13,9 @@ The crate never depends on `openjiuwen-runner` (runner depends on it): members a
 ### Crate root (`lib.rs`)
 
 Re-exports: `TeamCard`, `EventDrivenTeamCard`, `TeamConfig`, `TeamError`; `Team`, `BaseTeam`, `TeamStrategy`, `StrategyContext`, `MemberOptions`; `TeamAgent`, `AgentProvider`, `ToolHost`, `BindHook`; `MessageEnvelope`, `MessageBus`, `MessageBusConfig`, `MessageHandler`, `SubscriptionManager`; `TeamRuntime`, `RuntimeConfig`, `SessionLease`, `make_team_session`; `AgentTool`.
-Strategy trees: `handoff::*` (`HandoffTeamConfig`, `HandoffConfig`, `HandoffRoute`, `HandoffSignal`, `HandoffRequest`, `HandoffHistoryEntry`, `HandoffTool`, `HandoffOrchestrator`, `ContainerAgent`, `TeamInterruptSignal`, `extract_interrupt_signal`, `flush_team_session`, `handoff_team`, `HandoffStrategy`, the `HANDOFF_*` constants) and `hierarchical::*` (`HierarchicalMsgbusConfig`, `HierarchicalMsgbusStrategy`, `hierarchical_msgbus_team`, `SupervisorAgent`, `SupervisorConfig`, `create_supervisor`, `HierarchicalToolsConfig`, `HierarchicalToolsStrategy`, `hierarchical_tools_team`).
+Extended re-exports: `TeamEvent`, `TeamEventBus`, `TeamEventFilter`, `TeamEventKind`, `TeamEventListener`, the `TEAM_EVENT_SCOPE`/`AGENT_P2P_RECEIVED_EVENT`/`AGENT_PUBSUB_RECEIVED_EVENT` constants; `AutoSubscriptionMode`, `AutoSubscriptionPlan`, `derive`, `derive_with_overrides`, `derive_from_event_card`, `derived_for_member`, `apply`, `apply_agent`, `SUBSCRIBE_TAG_PREFIX`; `parse_python_literal`, `literal_or_json`, `render_python_value`, `MAX_LITERAL_DEPTH`; `TeamResourceMgr`, `LocalResourceMgr`; `MemberCheckpointer`, `member_checkpoint_key`, `member_checkpoint_id`, `MEMBER_CHECKPOINT_NAMESPACE`; `TeamTransport`, `TransportKind`, `TransportConfig`, `RedisTransportConfig`, `InProcessTransport`, `RedisTransport`, `build_transport`; `AbilityCall`, `AbilityRoute`, `AbilityResult`, `AbilityExecutor`, `P2PAbilityManager`.
+Each extended subsystem is also a public module (`openjiuwen_multiagent::events`, `::autosubscribe`, `::pyrepr`, `::resources`, `::member_checkpoint`, `::transport`, `::ability`); the module path and the root re-export name the same item.
+Strategy trees: `pub mod handoff` (private module, re-exported at the root: `HandoffTeamConfig`, `HandoffConfig`, `HandoffRoute`, `HandoffSignal`, `HandoffRequest`, `HandoffHistoryEntry`, `HandoffTool`, `HandoffOrchestrator`, `ContainerAgent`, `TeamInterruptSignal`, `extract_interrupt_signal`, `flush_team_session`, `handoff_team`, `HandoffStrategy`, the `HANDOFF_*` constants) and `pub mod hierarchical` (`HierarchicalMsgbusConfig`, `HierarchicalMsgbusStrategy`, `hierarchical_msgbus_team`, `SupervisorAgent`, `SupervisorConfig`, `create_supervisor`, `HierarchicalToolsConfig`, `HierarchicalToolsStrategy`, `hierarchical_tools_team`, plus the Python-shaped path `hierarchical::P2PAbilityManager`/`AbilityCall`/`AbilityResult`/`AbilityRoute`).
 Both hierarchical configs expose `new(entry_agent_card)` and both strategies expose `new(config) -> Arc<Self>`.
 
 ### Cards and configs (`card.rs`, `config.rs`)
@@ -121,9 +124,10 @@ Transport topics: P2P `"{team_id}__p2p__"` without a session, `"{team_id}_{sessi
 ```rust
 pub struct RuntimeConfig { pub team_id: String /*"default"*/, pub message_bus: Option<MessageBusConfig>,
                            pub p2p_timeout: f64 /*1800.0*/ }
-pub struct TeamRuntime { /* Arc<RuntimeState> + Arc<MessageBus> */ }
+pub struct TeamRuntime { /* Arc<RuntimeState> + Arc<MessageBus> + Arc<dyn TeamTransport> */ }
 impl TeamRuntime {
     pub fn new(config: RuntimeConfig) -> Arc<Self>;
+    pub fn new_with_resource_mgr(config: RuntimeConfig, resource_mgr: Arc<dyn TeamResourceMgr>) -> Arc<Self>;
     pub fn team_id(&self) -> &str;
     pub fn config(&self) -> &RuntimeConfig;
     pub fn has_agent(&self, agent_id: &str) -> bool;
@@ -139,8 +143,23 @@ impl TeamRuntime {
     pub fn team_session(&self, session_id: &str) -> Option<Arc<AgentTeamSession>>;
     pub fn p2p_timeout(&self) -> Duration;
     pub fn set_p2p_timeout(&self, timeout: Duration);
-    pub async fn start(&self) -> Result<()>;
-    pub async fn stop(&self) -> Result<()>;
+    // resource seam (Python `Runner.resource_mgr` shape) — src/runtime/seams.rs
+    pub fn set_resource_mgr(&self, resource_mgr: Arc<dyn TeamResourceMgr>);
+    pub fn resource_mgr(&self) -> Option<Arc<dyn TeamResourceMgr>>;
+    pub fn resolve_tool(&self, tool_id: &str) -> Option<Arc<dyn Tool>>;          // local instance first, then the manager
+    pub fn resolve_tool_by_name(&self, name: &str) -> Option<Arc<dyn Tool>>;
+    pub fn resolve_model(&self, model_id: &str) -> Option<Arc<dyn Model>>;
+    pub fn resolve_team_session(&self, session_id: &str) -> Option<Arc<AgentTeamSession>>;
+    pub fn resolve_agent_card(&self, agent_id: &str) -> Option<AgentCard>;
+    pub fn resolve_agent_provider(&self, agent_id: &str) -> Option<AgentProvider>;
+    // events / member checkpoints / transport
+    pub fn events(&self) -> Arc<TeamEventBus>;
+    pub fn set_member_checkpointer(&self, checkpointer: Arc<MemberCheckpointer>);
+    pub fn member_checkpointer(&self) -> Option<Arc<MemberCheckpointer>>;
+    pub fn transport(&self) -> Arc<dyn TeamTransport>;
+    pub fn set_transport(&self, transport: Arc<dyn TeamTransport>) -> Result<()>;  // Validation on team-id mismatch
+    pub async fn start(&self) -> Result<()>;                      // idempotent; delegates to the transport
+    pub async fn stop(&self) -> Result<()>;                       // idempotent; delegates to the transport
     pub async fn send(&self, message: Value, recipient: &str, sender: &str, session_id: Option<&str>,
                       timeout: Option<Duration>) -> Result<Value>;
     pub async fn publish(&self, message: Value, topic_id: &str, sender: &str, session_id: Option<&str>) -> Result<()>;
@@ -152,7 +171,9 @@ impl TeamRuntime {
 }
 ```
 `send` validates a non-empty sender (`"sender is required for message tracing"`), a non-empty recipient (`"recipient is required"`), and registration (`"Recipient '<id>' not registered in runtime"`); an empty P2P response is an error (`TeamError::EmptyResponse`). The P2P handler builds a child `AgentSession` from the bound team session (`create_agent_session(recipient)`), else an `AgentSession` keyed by `session_id`, else `None`; pub/sub builds the same and discards the output.
-`invoke_agent` resolves the pinned instance or invokes the provider, calls the member's bind hook, and invokes `Agent::invoke`.
+`invoke_agent` resolves the pinned instance or invokes the provider, calls the member's bind hook, restores that member's checkpoint when a `MemberCheckpointer` is configured (before the call), invokes `Agent::invoke`, then saves the member's state after success; a member error propagates unsaved.
+Lookups fall back to the resource manager: `agent_card`/`agent_provider` consult the runtime registry first, then `TeamResourceMgr`; `resolve_tool`/`resolve_tool_by_name`/`resolve_model`/`resolve_team_session` consult the runtime's own instance-scoped stores first and the manager second, so a runner that registers nothing behaves exactly as before. `start`/`stop` delegate to `transport()` (`InProcessTransport` over the message bus by default).
+Events are emitted from the runtime itself: `register_agent` → `member_joined` (repeat registration carries `detail.replaced = true`), `pin_agent` of an unknown id → `member_joined`, `unregister_agent` of a known id → `member_left`, `send`/`publish` → `message_sent` (with `topic_id` for pub/sub), `dispatch_p2p`/`dispatch_pubsub` → `message_received`/`pubsub_received` before invoke, and every error path → `error` with `detail.operation` (`"send"`, `"publish"`, `"p2p_dispatch"`, `"pubsub_dispatch"`).
 
 ### Strategy seam and team (`strategy.rs`, `team.rs`)
 
@@ -205,10 +226,20 @@ impl BaseTeam {
     pub fn with_runtime(card: TeamCard, config: TeamConfig, runtime: Arc<TeamRuntime>,
                         strategy: Arc<dyn TeamStrategy>) -> Self;
     pub fn strategy(&self) -> Arc<dyn TeamStrategy>;
+    // card-driven auto-subscription
+    pub fn with_auto_subscriptions(self, mode: AutoSubscriptionMode) -> Self;     // default Merge
+    pub fn auto_subscriptions(&self) -> AutoSubscriptionMode;
+    pub fn set_auto_subscriptions(&self, mode: AutoSubscriptionMode);
+    pub fn with_subscription_overrides(self, overrides: BTreeMap<String, Vec<String>>) -> Self;
+    pub fn subscription_overrides(&self) -> BTreeMap<String, Vec<String>>;
+    pub fn subscription_plan(&self) -> AutoSubscriptionPlan;     // derived from the card + overrides
+    pub fn apply_subscriptions(&self) -> usize;                  // whole plan; returns patterns applied
+    pub fn apply_member_subscriptions(&self, agent_id: &str) -> usize;   // just one member
 }
 impl Team for BaseTeam { .. }
 ```
 `add_agent` enforces `max_agents` with `"Agent count exceeds max_agents ({n})"`, registers the provider in the runtime, appends the card to `card.agent_cards`, and calls `TeamStrategy::on_member_added`. `send`/`publish` validate registration like Python (`"Sender '<id>' not found in team '<team_id>'"`, `"Recipient '<id>' not found in team '<team_id>'"`).
+Auto-subscription runs in `Merge` mode at member insert (`add_agent`, `add_member`, and the duplicate-add no-op path), at `Team::start` for the whole plan, and in reverse on `remove_agent`/`remove_member` (that member's derived patterns are unsubscribed). `Include`-style explicit overrides (`with_subscription_overrides`) replace a member's derived pattern set inside `subscription_plan`; `AutoSubscriptionMode::Disabled` leaves the logical registry untouched.
 
 ### Sessions and streaming (`session.rs`)
 
@@ -240,7 +271,8 @@ impl AgentTool {
 }
 impl Tool for AgentTool { .. }
 ```
-Card: `id = name = AgentCard::name`, `description = AgentCard::description`, `input_params = AgentCard::input_params` or `{"type":"object","properties":{}}`, `parallel_safe = true`. On invoke it derives `conversation_id = "{parent_sid}:{tool_call_id}"` (the tool-call id from `ToolContext::metadata["tool_call_id"]`, falling back to `invocation_id`), creates a child `AgentSession`, invokes the member through the runtime, and returns the `AgentOutput` value; failures become a tool error string (`"Agent execution error: {e}"`).
+Card: `id = name = AgentCard::name`, `description = AgentCard::description`, `input_params = AgentCard::input_params` or `{"type":"object","properties":{}}`, `parallel_safe = true`. On invoke it derives `conversation_id = "{parent_sid}:{tool_call_id}"` (the tool-call id from `ToolContext::metadata["tool_call_id"]`, falling back to `invocation_id`), creates a child `AgentSession`, invokes the member through the runtime, and returns the `AgentOutput` value; failures become a tool error string (`"Agent execution error: {e}"`). Every dispatch emits `task_assigned` before the member runs and `task_completed` after it returns, or `error` with `detail.operation = "agent_tool"` when it fails.
+`Tool::render_for_llm` mirrors Python's `str(result)` conversion: a bare string passes through unchanged, an object whose only meaningful key is `content` renders that string, `Null` keeps the trait's default empty text, and any other JSON value renders through `pyrepr::render_python_value` (single-quoted dict/list/string repr rather than JSON).
 
 ### Handoff strategy (`handoff/`)
 
@@ -291,6 +323,8 @@ pub fn extract_interrupt_signal(result: &Value) -> Option<TeamInterruptSignal>;
 pub async fn flush_team_session(session: Option<&Arc<AgentTeamSession>>);
 ```
 Handoff flow: `setup` registers one endpoint per member (`AgentCard{id: name: "__handoff_ep_{team_id}_{agent_id}"}`) whose provider returns a `ContainerAgent`, and subscribes the endpoint to `container_{agent_id}`. `invoke` restores the coordinator from `__handoff_coordinator__`, publishes a `HandoffRequest` to `container_{current}`, and awaits the coordinator with `message_timeout` when non-zero; teardown drops the coordinator and calls `cleanup_session`. The container resolves its target through the provider, mounts one `transfer_to_<target>` tool per allowed target on the target's `ToolHost` (silent skip when absent, flag set first — Python parity), invokes the target in a team child session, appends `{"agent", "output"}` to history, then either completes, publishes the next hop, or forwards an interrupt (`save_to_session` + `__handoff_history__` + `flush_team_session` + complete). A blocked hop completes with the current result; a failing member reports `coordinator.error` and returns `{}` (never raises).
+Signal extraction accepts Python literals as well as JSON: `extract_handoff_signal*` run the content through `pyrepr::literal_or_json`, so a member that returns `{'__handoff_to__': 'b'}` (single quotes, `True`/`None`) still routes.
+The container emits team events: `handoff_started` per hop (`detail.hop`, 1-based; `peer_id` = the member about to run), `handoff_completed` once on the winning completion (`detail.handoffs`, `detail.interrupted = true` for an interrupt forward), and `error` with `detail.operation = "handoff"` when a hop fails. A dropped runtime emits nothing: the hop cannot locate the team session/coordinator any more, so the caller surfaces the pre-existing `External` error.
 
 ### Hierarchical strategies (`hierarchical/`)
 
@@ -312,9 +346,15 @@ pub fn hierarchical_tools_team(card: TeamCard, config: HierarchicalToolsConfig) 
 `hierarchical_tools_team` wires pending `(parent, child)` pairs by mounting an `AgentTool` for each child on the parent's `ToolHost`, pins the parent instance so later sends reach the wired instance, then sends the input verbatim to the root.
 Its stream bypasses the bus: it calls the root agent's `stream` with `{conversation_id, sender}` merged into the input, forwards each `AgentChunk::to_stream_item()` as a team frame, and turns an agent stream failure into a single `{"type": "message", "index": 0, "payload": {"output": <message>, "result_type": "error"}}` frame.
 
+### Extended subsystems
+
+The event bus, auto-subscription, Python literals, resource seam, member checkpoints, transport seam and `P2PAbilityManager` are documented at module depth in `./src/CONTEXT.md`.
+In one line each: `events` delivers typed `TeamEvent`s in sequence order to filtered, unsubscribable listeners; `autosubscribe` derives deterministic per-member patterns from the card (broadcast topic, `{topic}.*`, directed `{topic}.{member}`, `subscribe:` tags) and applies them in `Merge`/`Replace`/`Disabled` mode with explicit per-agent overrides; `pyrepr` is the `ast.literal_eval`/`str()` fallback used by signal extraction and tool-result rendering; `resources` is the all-defaulted `TeamResourceMgr` seam `resolve_*` falls back to; `member_checkpoint` scopes one shared checkpointer per `(team_session_id, agent_id)` under the `agent` namespace; `transport` is the `TeamTransport` seam with in-process and Redis backends (`Pulsar` = `Unsupported`); `ability` dispatches a supervisor's calls as P2P agent calls or local executor calls, in input order, bounded by a semaphore.
+
 ### Errors
 
-`openjiuwen_common::error::{Error, Result}` everywhere. Empty sender/recipient/subscription args and `max_agents` violations are `Validation`; unknown members are `NotFound`; deadlines are `Timeout`; missing strategy configuration (supervisor/root not registered) is `Config`; a strategy-free team, deferred transport, or unimplemented strategy is `Unsupported`; an empty P2P response is `Error::External(TeamError::EmptyResponse)`.
+`openjiuwen_common::error::{Error, Result}` everywhere. Empty sender/recipient/subscription args and `max_agents` violations are `Validation`; unknown members are `NotFound`; deadlines are `Timeout`; missing strategy configuration (supervisor/root not registered) is `Config`; a strategy-free team, a `Pulsar` transport, or an unimplemented strategy is `Unsupported`; an empty P2P response is `Error::External(TeamError::EmptyResponse)`.
+Transport selection adds `Error::Config` for `TransportKind::Redis` without `TransportConfig::redis`, `Error::Validation` for `set_transport` with a foreign team id or an empty `RedisTransport::watch_agent` id, and `Error::Timeout` for a backend deadline (`"Message from '<sender>' to '<recipient>' timed out after <t>s"`). An ability-call failure never escapes `execute` as `Err`; it becomes an `AbilityResult` with `AbilityRoute::Error` and the message in `error`.
 Members' errors propagate unchanged over P2P; pub/sub delivery failures and handoff member failures are logged and never abort the publisher.
 
 ## Constraints
@@ -340,9 +380,16 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - **Pinned instances for wired hierarchies**: `hierarchical_tools` mounts child tools on a parent instance obtained from the provider and pins it in the runtime, so the later `send` reaches the wired instance (fixes the Python fresh-provider trap; documented divergence).
 - **`SupervisorAgent::create` takes an `Arc<dyn Model>`** instead of client/request configs: model construction stays with the caller (`init_model`), which keeps this crate provider-agnostic and lets tests pass a scripted model.
 - **Streams yield wire frames** (`StreamItem::to_wire()`), matching Python consumers that see `OutputSchema` objects, with `type="message"` as the default team frame kind.
+- **Events are a typed bus, not Python's callback names**: `TeamEventBus` carries `TeamEventKind` values, an ordering `sequence`, and data (`agent_id`, `peer_id`, `detail`); `TeamEvent::python_event_name` maps the two Python callback events onto their scope names so a bridge can register under `_framework:agent_p2p_received`. `emit` is sync so any runtime method can publish without holding a lock across an await; listeners are addressed by subscription id (unsubscribe).
+- **Card-driven subscription is a pure derivation plus an apply step**: `autosubscribe::derive*` computes the plan from `TeamCard` data with no side effects (deterministic BTreeMap, sorted patterns), and `apply` mutates the runtime's logical registry under a mode (`Merge` default, `Replace`, `Disabled`). Explicit overrides live next to the mode on `BaseTeam`, so the override is visible at the wiring point rather than buried in the card.
+- **The resource manager is a trait with all-default methods**: `openjiuwen-runner` depends on this crate, so the crate cannot name the runner's concrete manager. `TeamResourceMgr` is implemented by the runner; `LocalResourceMgr` is the standalone instance-scoped implementation; `resolve_*` is local-first, manager-second, which keeps every existing in-process code path intact.
+- **Member checkpoint identity is `(team_session_id, agent_id)` at the `agent` namespace**: the team session id comes from the child session's parent, the agent id from its metadata, so two members sharing one `MemoryCheckpointer` cannot overwrite each other and a resumed team run restores each member's own state. Checkpoint ids are append-only (`{key}:{sequence:06}`), so history is total-ordered per member.
+- **Transport is the seam, the message bus is one implementation**: `TeamTransport` abstracts `send`/`publish`/subscriptions so `InProcessTransport` (message-bus FIFO workers) and `RedisTransport` (RESP2 lists + pollers) are interchangeable; `Pulsar` is a typed `Unsupported`. The runtime delegates and never depends on a backend detail.
+- **Python-repr rendering is opt-in per call site**: `pyrepr` parses and renders Python literals only where Python itself does `ast.literal_eval`/`str()` (handoff signal extraction, tool-result rendering), so ordinary JSON handling stays serde-based and lossless.
 
 ## Routing Table
 
+- `./src/CONTEXT.md` → module-level detail for the event bus, auto-subscription, Python literals, resource seam, member checkpoints, transport seam and `P2PAbilityManager`, plus the per-file map
 - `./src/card.rs` → `TeamCard`, `EventDrivenTeamCard`, member list
 - `./src/config.rs` → `TeamConfig` defaults, builders, timeout semantics
 - `./src/member.rs` → `TeamAgent`, `AgentProvider`, `ToolHost`, bind hook
@@ -350,17 +397,25 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `./src/subscription.rs` → topic-pattern registry (`*`/`?`), per-agent index
 - `./src/message_bus.rs` → topics, FIFO workers, timeouts, fan-out, lifecycle, `MessageHandler`
 - `./src/runtime.rs` → `TeamRuntime`, registration, session binding, P2P/public dispatch, pinned instances
+- `./src/runtime/seams.rs` → resource-manager seam, member-checkpointer attachment, transport field, `start`/`stop` delegation
 - `./src/session.rs` → team session construction, `SessionLease`, stream driver
 - `./src/strategy.rs` → `TeamStrategy`, `StrategyContext`, `MemberOptions`
 - `./src/team.rs` → `Team` trait, `BaseTeam` machinery and validation
-- `./src/agent_tool.rs` → `AgentTool` (agent as a `Tool`)
+- `./src/agent_tool.rs` → `AgentTool` (agent as a `Tool`), tool-result rendering
+- `./src/events.rs` → `TeamEvent`, `TeamEventKind`, `TeamEventFilter`, `TeamEventBus`, Python callback names
+- `./src/autosubscribe.rs` → card/tag/event-card subscription derivation, modes, overrides, apply to the runtime
+- `./src/pyrepr.rs` → Python literal parsing and `str()`-style rendering (the `ast.literal_eval` fallback)
+- `./src/resources.rs` → `TeamResourceMgr` trait and `LocalResourceMgr`
+- `./src/member_checkpoint.rs` → per-member checkpoint identity over one shared checkpointer
+- `./src/ability.rs` → `P2PAbilityManager`, `AbilityCall`, `AbilityResult`, `AbilityExecutor`
 - `./src/handoff/` → handoff config/signal/tool/orchestrator/container/interrupt and `HandoffStrategy` (`handoff/CONTEXT.md`)
-- `./src/hierarchical/` → msgbus supervisor team, supervisor factory, agents-as-tools team (`hierarchical/CONTEXT.md`)
+- `./src/hierarchical/` → msgbus supervisor team, supervisor factory, agents-as-tools team, `P2PAbilityManager` (`hierarchical/CONTEXT.md`)
+- `./src/transport/` → `TeamTransport` seam, `TransportKind`/`TransportConfig`, in-process and Redis backends, `Pulsar` `Unsupported`
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
-- Unit tests beside each module: card/config serde defaults and unknown-field tolerance; envelope P2P/pub-sub classification; wildcard matching and subscription indexing; bus duplicate-subscribe, cleanup/re-subscribe, timeout, fan-out failure isolation, start/stop idempotence; runtime registration/pinning/unregistration; team validation messages and `max_agents`; orchestrator route graph/cap/termination/first-wins; signal precedence; handoff tool card shape and never-raise; `AgentTool` card and dispatch.
+- Unit tests beside each module: card/config serde defaults and unknown-field tolerance; envelope P2P/pub-sub classification; wildcard matching and subscription indexing; bus duplicate-subscribe, cleanup/re-subscribe, timeout, fan-out failure isolation, start/stop idempotence; runtime registration/pinning/unregistration; team validation messages and `max_agents`; orchestrator route graph/cap/termination/first-wins; signal precedence; handoff tool card shape and never-raise; `AgentTool` card and dispatch; event filter combination and sequence stamping; subscription derivation rules; Python-literal parsing and rendering; resource-manager duplicates; member checkpoint key/id layout; transport construction and key naming; ability routing.
 - `tests/team_card.rs` pins the wire contract: JSON field names, `version: "1.0.0"`, `agent_cards`, `subscriptions`, `TeamConfig` defaults 10/100/30.0.
 - `tests/message_bus.rs` drives the bus directly with a recording handler: P2P ordering per sender, concurrent fan-out to sorted subscribers, missing-subscriber publish no-op, timeout error text, session cleanup, graceful shutdown.
 - `tests/runtime.rs` covers registration, provider binding, P2P session construction from a bound team session, empty-response error, and P2P timeout override.
@@ -368,22 +423,32 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/handoff.rs` covers the full chain with scripted member agents: direct handoff, routed handoff, blocked hop completes, max-handoffs, timeout, interrupt forwarding, history resume, and streaming frames.
 - `tests/hierarchical.rs` covers supervisor-over-bus single hop + single stream frame, sub-agent tool cards and ordered parallel dispatch with the limiter, agents-as-tools wiring (`ToolHost` mount + pinned instance), and the error chunk.
 - `tests/streaming.rs` covers `team_stream` frame order, caller-owned vs standalone teardown, and producer-error-after-drain.
-- `tests/agent_tool.rs` covers the tool card shape, dispatch through the runtime (`tool_call_id` child session), the dropped-runtime and agent-failure tool errors, the `invocation_id` fallback, and the concurrency limiter.
+- `tests/agent_tool.rs` covers the tool card shape, dispatch through the runtime (`tool_call_id` child session), the dropped-runtime and agent-failure tool errors, the `invocation_id` fallback, the concurrency limiter, tool-result rendering, and the task events.
+- `tests/events.rs` covers wire names and the Python parity constants, filtered synchronous delivery, unsubscribe, bounded history, serde/schema contracts, and concurrent emission from several tasks.
+- `tests/autosubscribe.rs` pins the derivation rules (broadcast, directed topics, tag-carried capability topics, overrides), the sorted/deduped plan shape, and the three reconciliation modes against a real runtime registry.
+- `tests/autosubscribe_team.rs` pins the `BaseTeam` wiring points: tags applied on `add_agent`/`add_member`, per-agent overrides, `Merge`/`Replace`/`Disabled`, removal cleanup, whole-plan application on `start`, and one end-to-end pub/sub delivery to an auto-subscribed member.
+- `tests/pyrepr.rs` covers the two call sites: recovering a handoff payload from a `str()`-rendered tool message (`json.loads` first, `ast.literal_eval` second) and rendering a tool result for a model prompt.
+- `tests/resources.rs` covers `LocalResourceMgr` and the `TeamResourceMgr` trait object: first-registration-wins, sorted id listings, registration-ordered agent ids, the revision counter, and `clear`.
+- `tests/member_checkpoint.rs` is the headline identity scenario: two members of one team sharing a single `MemoryCheckpointer`, each saving different state, then a second team session object with the same id and fresh children restoring exactly its own state.
+- `tests/transport.rs` runs the in-process backend over a recording handler and the Redis backend over a loopback fake RESP2 server (`TcpListener` on `127.0.0.1:0`): key names, P2P round-trip, pub/sub fan-out, deadlines, duplicate `watch_agent`, `Pulsar`/missing-config errors, shutdown.
+- `tests/ability.rs` covers agent-tool routing over P2P, local executor routing, input-order results, the parallel cap, the error results (`"P2P dispatch to '<name>' failed: ..."`, missing executor), and the empty batch.
+- `tests/runtime_integration.rs` covers the runtime seams together: event emission, resource-manager fallback, member-scoped checkpoints across a resume, the outbound transport, and `AgentTool` task events.
+- `tests/handoff_events.rs` covers one `handoff_started` per hop, `handoff_completed` with `interrupted`, the `handoff` error event, and silence when the runtime was dropped.
 - `tests/api_surface.rs` pins the public contract at compile time: every crate-root re-export, inherent constructor and free-function signature, trait-object coercion (`Team`, `TeamStrategy`, `MessageHandler`, `ToolHost`, `Tool`), `Team` method reachability, the `Card` impl, serde round-trips and `schemars` property names, and the `TeamError` → `ErrorKind::External` mapping.
 - All tests are offline and deterministic: fake agents are local closures, models come from `openjiuwen-test-support::ScriptedModel`, timeouts use short durations only.
 
 ## Deferred Python Behavior
 
-- Distributed transports (Pulsar/Redis message queues, `drunner` factories) — in-process only; `MessageBus` is the seam a distributed backend would implement.
-- `AgentTeamEvents` callbacks (`agent_p2p_received`, `agent_pubsub_received`) — no callback framework in this crate.
-- `EventDrivenTeamCard.subscriptions` is data only; event-driven routing via `BaseTeam.subscribe` is supported, card-driven auto-subscription is not wired.
-- Python's `Runner.resource_mgr` global registry path: strategies resolve members from the team runtime only (the runner registers its members with the team).
-- Per-member checkpoint/cache identity (`team:{team}:member:{id}`, shared session ids) — Rust uses parented child `AgentSession`s.
-- Python-repr fallback (`ast.literal_eval`) in signal extraction — JSON only.
+- `Pulsar` transport — `build_transport` returns `Error::Unsupported` naming Pulsar; no Pulsar client exists in the workspace and none may be added offline.
+- Redis delivery is poll-based and per-transport-instance: two processes do not share a subscription registry, and an agent's inbox is only consumed after `RedisTransport::watch_agent` (the `RPOP` is destructive, so the poller owns the queue).
+- Redis cluster/Sentinel topologies and Redis Streams consumer groups — the backend speaks plain RESP2 to a single node.
+- Python's `drunner` distributed factories, reply-topic routing and `RemoteAgent` — `TeamTransport` is the seam a distributed backend implements.
+- The team event bus is in-process: events are delivered to local listeners and recorded in local history, not published over a transport.
+- Python's process-global `Runner.resource_mgr` lookup — the seam is the `TeamResourceMgr` trait the runner implements and injects; this crate never reads a global registry, and an unconfigured runtime resolves from its own instance-scoped stores.
 - `TeamConfig` re-wiring after `configure` (Python only applies it at default-runtime construction) — the config snapshot at construction is authoritative.
-- `P2PAbilityManager` subclassing — replaced by mounted `AgentTool`s with a shared semaphore.
 - `SupervisorAgent`'s exact ReAct config surface (prompt template names, context engine wiring) — only card, model, system prompt, max iterations, parallel cap.
 - No round-robin/selector/scheduled strategies exist in Python's `core.multi_agent`; custom strategies plug in through `TeamStrategy`.
+- `P2PAbilityManager` subclassing — replaced by a shared-semaphore dispatcher with an injectable `AbilityExecutor`.
 
 ## Notes for Agents
 
@@ -402,3 +467,12 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - A member invoked over P2P receives a child `AgentSession` whose `parent_id()` is the bound team session id, so a container agent resolves the team session with `runtime.team_session(session.parent_id()?)` rather than from the envelope (the `Agent` seam has no envelope parameter).
 - Re-entrancy: a member runs inline in its topic's FIFO worker, so a handler must never await a `publish`/`send` on the same session's transport topic. The handoff container therefore spawns its next-hop publish (failures are logged; the chain still ends via `HandoffOrchestrator::wait`'s deadline) — the first hop publish is awaited normally from the caller's task.
 - Bus transport topics are created lazily by `send`/`publish`, so `TeamRuntime::subscribe` only updates the logical pattern registry; a strategy registers every endpoint agent before sending to it, because `send` validates registration up front.
+- `TeamEventBus::emit` is synchronous and runs listeners inline on the emitting task: keep listeners short and never re-enter a runtime method that emits (a listener that calls `send` would emit from inside an emission). Emission sites take no runtime lock across the call, but a listener that locks the registry while a runtime method holds it would deadlock, so listeners should only inspect the event.
+- `emit` stamps `sequence` itself; construct events with the `TeamEventKind` constructors and let the bus assign ordering. History is bounded (default 256, `with_capacity(0)` disables it) and ordered oldest-first.
+- `autosubscribe::apply` in `Merge` mode is additive and tolerant of re-application; `Replace` clears the agent's current patterns first, so it is the mode to use when a card changed. `Disabled` is the switch that reproduces the pre-auto-subscription behaviour.
+- Overrides are keyed by `agent_id` (card id), not by name; a `TeamCard` with one member listed twice derives the same plan for both entries because the map is keyed by id.
+- `resolve_tool`/`resolve_model`/`resolve_team_session` are local-first: the runtime's own registry wins over the resource manager, so a manager entry can never shadow an instance pinned in the team.
+- `set_member_checkpointer` is optional; without it `invoke_agent` neither saves nor restores. `MemberCheckpointer::save` needs the member session to have a team parent (`parent_id()`) and a resolvable agent id (`metadata().entity_id`, then `agent_id`), which the runtime's child sessions always provide.
+- `set_transport` requires a transport whose `team_id()` equals the runtime's; the default is the in-process transport wrapping the runtime's own `MessageBus`, so `MessageBus` and transport are one object until a caller swaps it in.
+- `RedisTransport` keys embed the team id (`{prefix}:{team}:...`) but not the session id; a shared prefix across teams is safe, a shared prefix across *deployments* is not.
+- `pyrepr` deviates from CPython only in cosmetics: strings always render single-quoted and floats without exponent padding; it parses literals, it never evaluates names or calls.
