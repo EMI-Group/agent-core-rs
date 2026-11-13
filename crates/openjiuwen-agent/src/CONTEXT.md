@@ -17,7 +17,7 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 | `interrupt.rs` | interrupt data model and resume matching |
 | `abilities/` | tool registry, argument repair, tool execution |
 | `rails/` | rail trait/context/registry and built-in rails |
-| `react/` | `ReActAgent`, config, iteration loop, model step, resume replay |
+| `react/` | `ReActAgent`, config, iteration loop, model step, resume replay, loop hooks (callbacks/steering/final check), frame emission, tool-exposure projection, wiring behaviour tests |
 | `llm_agent.rs` | `LlmAgent` over `ReActAgent` |
 | `workflow_agent/` | `WorkflowAgent` and workflow selection |
 | `callbacks/` | lifecycle callback events, payloads, `CallbackFramework` |
