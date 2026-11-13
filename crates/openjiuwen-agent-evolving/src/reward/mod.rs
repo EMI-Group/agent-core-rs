@@ -12,3 +12,13 @@
 //!
 //! Everything here is pure data plus arithmetic: no model calls, no container
 //! runtime, no wall clock.
+
+mod models;
+mod pack;
+mod scoring;
+
+pub use models::{DimensionScore, RewardDimension, RewardSignal, RewardSummary};
+pub use pack::{default_pack, reward_from_score, score_evaluated_cases, RewardPack};
+pub use scoring::{
+    aggregate_scores, MissingDimensionPolicy, RewardAggregator, ScoreNormalisation, ScoreStats,
+};
