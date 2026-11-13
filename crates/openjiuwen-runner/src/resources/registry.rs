@@ -24,6 +24,7 @@ use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::Result;
 use openjiuwen_foundation::tool::ToolCard;
 use openjiuwen_multiagent::TeamCard;
+use openjiuwen_sysop::SysOperationCard;
 use openjiuwen_workflow::WorkflowCard;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,10 @@ use crate::error::{already_registered, invalid_id};
 
 /// The card-like identity a [`Registry`] keys on.
 ///
-/// Implemented for [`ToolCard`], [`AgentCard`], [`WorkflowCard`], and
-/// [`TeamCard`]. A card is cheap to clone and immutable after construction; the
-/// registry stores a clone and never mutates it.
+/// Implemented for [`ToolCard`], [`AgentCard`], [`WorkflowCard`],
+/// [`TeamCard`], and [`SysOperationCard`]. A card is cheap to clone and
+/// immutable after construction; the registry stores a clone and never mutates
+/// it.
 pub trait ResourceCard: Clone + Send + Sync + 'static {
     /// Returns the unique identifier the registry keys on.
     fn id(&self) -> &str;
@@ -74,6 +76,16 @@ impl ResourceCard for WorkflowCard {
 }
 
 impl ResourceCard for TeamCard {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ResourceCard for SysOperationCard {
     fn id(&self) -> &str {
         &self.id
     }

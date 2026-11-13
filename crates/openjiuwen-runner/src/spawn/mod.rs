@@ -1,21 +1,53 @@
-//! The subprocess spawn seam: data and traits only.
+//! The spawn seam of the runner: drive an agent that lives behind a process or
+//! an HTTP endpoint.
 //!
-//! Nothing in this module starts a process, reads stdin, or writes stdout. It
-//! pins the contract a future subprocess teammate/agent backend implements
-//! ([`AgentSpawner`] producing a [`SpawnedAgent`]) and the JSON-safe
-//! configuration that crosses the process boundary ([`SpawnSpec`]); the NDJSON
-//! wire itself lives in [`protocol`].
+//! The seam is transport-neutral. [`crate::spawn::AgentSpawner`] turns a
+//! JSON-safe [`crate::spawn::SpawnSpec`] into a
+//! [`crate::spawn::SpawnedAgent`] handle that sends one invocation, streams its
+//! `AgentChunk` frames, reports liveness and a process id, and shuts down. Two
+//! backends implement it:
 //!
-//! Ports the *shape* of Python `openjiuwen/core/runner/spawn/` (v0.1.20):
-//! `agent_config.py`'s `SpawnAgentKind`/`SpawnAgentConfig`/`ClassAgentSpawnConfig`
-//! and `process_manager.py`'s handle surface. Python's `child_process.py` (the
-//! real `python -m ...` child, health checks, graceful-to-force escalation) is
-//! deliberately not ported; [`UnsupportedSpawner`] is the built-in backend and
-//! reports [`openjiuwen_common::error::Error::Unsupported`].
+//! - [`crate::spawn::SubprocessSpawner`] launches a real child with
+//!   `tokio::process`, writes a bootstrap frame to its stdin, and returns a
+//!   [`crate::spawn::SpawnedProcess`] handle; dropping the last handle reference
+//!   kills and reaps the child.
+//! - [`crate::spawn::RemoteSpawner`] and [`crate::spawn::RemoteAgent`] address an
+//!   agent served over HTTP with `reqwest`, reusing the same frame vocabulary on
+//!   an NDJSON stream endpoint.
+//!
+//! Both speak the wire in [`crate::spawn::protocol`] (one JSON object per line,
+//! [`crate::spawn::SpawnMessage`]) over the bounded line framing in
+//! [`crate::spawn::frames`]: non-JSON stdout/body lines are skipped as noise,
+//! while a line that is JSON but not a frame — or that is not UTF-8, or that
+//! exceeds the frame cap — is a validation error.
+//!
+//! [`crate::spawn::UnsupportedSpawner`] stays the documented default until a host
+//! installs a backend with `Runner::set_spawner`; it reports
+//! `openjiuwen_common::error::Error::Unsupported`.
+//!
+//! Deferred transports are typed, never silent: `RemoteProtocol::Mq`
+//! (Pulsar/ZeroMQ reply-topic routing) and `RemoteProtocol::A2a` (the A2A remote
+//! transport) fail with `Unsupported` from
+//! [`crate::spawn::create_remote_client`]. Python's `python -m ...` child, its
+//! `process_manager` pool and health-check escalation machinery, and the drunner
+//! reply-topic plumbing are not ported.
+//!
+//! Ports the surface of Python `openjiuwen/core/runner/spawn/` (`agent_config.py`,
+//! `protocol.py`, `process_manager.py`) plus the HTTP surface of
+//! `openjiuwen/core/runner/drunner/remote_client/`.
 
+pub mod frames;
 pub mod protocol;
+pub mod remote;
+pub mod subprocess;
 
+pub use frames::{frame_bytes, parse_frame_line, read_frame, DEFAULT_MAX_FRAME_BYTES};
 pub use protocol::{SpawnMessage, SpawnMessageKind};
+pub use remote::{
+    create_remote_client, RemoteAgent, RemoteAgentConfig, RemoteClient, RemoteProtocol,
+    RemoteSpawner,
+};
+pub use subprocess::{SpawnedProcess, SubprocessConfig, SubprocessSpawner};
 
 use crate::error;
 use async_trait::async_trait;
