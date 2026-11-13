@@ -308,7 +308,7 @@ Code (`local/test_code_operation.py`):
 - `./src/shell/process.rs` → shared child-process engine: hardened spawn, bounded capture + truncation, timeout/cancellation, streaming, background stderr
 - `./src/code/types.rs` → `Language`, `CodeExecParams`, `CodeOutput`, `CodeChunk`
 - `./src/code/local.rs` → `LocalCodeOperation`: runtime lookup, inline/temp-file strategy, forced env
-- `./src/sandbox/` → gateway config, provider registry, sandbox dispatch + forwarding backends, HTTP gateway client (feature `sandbox`)
+- `./src/sandbox/` → provider seam (`SandboxProviderRegistry` + factory aliases), gateway config, dispatch + forwarding backends, HTTP gateway client (feature `sandbox`); module detail in `src/sandbox/CONTEXT.md`
 - `./tests/` → behavior ports (see Test Strategy)
 
 ## Notes for Agents
