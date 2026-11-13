@@ -11,8 +11,9 @@
 //!   and round-trips.
 //!
 //! Module-local suites own the checks for capabilities that stay deliberately
-//! deferred (for example the archive formats `skill_creator::omni` cannot unpack
-//! without a compression dependency), so this binary stays focused on the DSL.
+//! deferred (for example the archive variants `skill_creator::omni` rejects:
+//! ZIP64, encrypted entries, and compression methods beyond stored/DEFLATE), so
+//! this binary stays focused on the DSL.
 //!
 //! Everything here is offline and deterministic.
 use std::collections::BTreeMap;
