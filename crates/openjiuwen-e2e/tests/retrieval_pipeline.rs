@@ -227,10 +227,10 @@ async fn load_office_corpus(dir: &TempDir) -> Vec<Document> {
     let loader = AutoLoader::new();
     let mut documents = Vec::new();
     for path in [docx, xlsx, pdf] {
-        let loaded = within("loading a fixture", loader.load(&path))
+        let batch = within("loading a fixture", loader.load(&path))
             .await
             .unwrap();
-        documents.extend(loaded);
+        documents.extend(batch);
     }
     documents
 }
@@ -484,7 +484,8 @@ async fn sparse_retriever_serves_bm25_and_rejects_other_modes() {
     )
     .await
     .unwrap();
-    assert!(above_all.is_empty());
+    // Nothing clears a threshold above every score.
+    assert_eq!(above_all, Vec::new());
 
     // A lexical retriever has no dense channel, so it rejects every other mode
     // instead of silently returning the sparse results.
@@ -571,7 +572,9 @@ async fn knowledge_base_parses_files_and_retrieves_through_bm25() {
     let hits = within("knowledge-base retrieval", kb.retrieve("alice"))
         .await
         .unwrap();
-    assert!(!hits.is_empty());
+    // The `DOCX` body, the spreadsheet row, and the `Name` column mention
+    // `alice`; the `City` column does not, so exactly three chunks qualify.
+    assert_eq!(hits.len(), 3);
     for hit in &hits {
         assert!(
             hit.text.to_lowercase().contains("alice"),
