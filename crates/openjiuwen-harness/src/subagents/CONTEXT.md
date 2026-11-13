@@ -10,7 +10,7 @@ A child agent is built lazily by a [`SubAgentFactory`] so this module never depe
 
 ## API Surface
 
-Re-exports (`mod.rs`): `SubAgentConfig` (from `crate::schema`), `SubAgentSpec`, `SubAgentRegistry`, `SubAgentPreset`, `build_preset`, `general_purpose_config`, `GENERAL_PURPOSE_NAME`, `SubAgentRuntime`, `SubAgentFactory`, `SubAgentId`, `SubAgentSpawnRequest`, `SubAgentOutcome`, `SubagentMetadata`, `SubagentStatus`, `ResumeReport`, `TaskTool`, the six subagent tools plus `subagent_tools(runtime)`.
+Re-exports (`mod.rs`): `SubAgentConfig` (from `crate::schema`), `SubAgentSpec`, `SubAgentRegistry`, `SubAgentPreset`, `build_preset`, `general_purpose_config`, `GENERAL_PURPOSE_NAME`, `SubAgentRuntime`, `SubAgentFactory`, `SubAgentId`, `SubAgentSpawnRequest`, `SubAgentOutcome`, `SubagentMetadata`, `SubagentStatus`, `ResumeReport`, `TaskTool`, the six subagent parity tools plus `subagent_tools(runtime)`, and the additive `SubagentTranscriptTool` plus `subagent_tools_with_transcript(runtime)`.
 Runtime support re-exports (`mod.rs`): `runtime::{clock, quota, transcript}` modules, `Clock`, `SystemClock`, `ManualClock`, `rfc3339_from_ms`, `SubAgentQuota`, `SpawnBudget`, `SubagentActivity`, `LruCandidate`, `select_lru_candidate`, and the transcript types.
 
 - `SubAgentSpec { config: SubAgentConfig, preset: Option<SubAgentPreset> }` with `new(config)`, `with_preset(config, preset)`, `name()` (`agent_card.name`).
@@ -36,14 +36,15 @@ Runtime support re-exports (`mod.rs`): `runtime::{clock, quota, transcript}` mod
 - `LruCandidate { subagent_id, activity, last_activity_ms, spawn_seq }` and `select_lru_candidate(&[LruCandidate]) -> Option<&LruCandidate>` (skips `Running`/`Closed`, prefers `Idle` over `Queued`, then oldest `last_activity_ms`, then smallest id); `SubAgentRuntime::{evict, evict_lru, eviction_candidates}` are the wired eviction surface and `EVICTION_REASON` (`"evicted"`) is the recorded `closed_reason`.
 - Clock: `Clock { now_ms(), now_rfc3339() }` with `SystemClock` and `ManualClock::new/advance/set`; every runtime timestamp is read through it.
 - `TaskTool` (`foundation::Tool`, name `task_tool`): inputs `subagent_type` (required), `task_description` (required), `resume_task_id` (optional); output `{output, agent_id, subagent_type}`; `new(runtime)`, `with_timeout(Duration)`, `card_for(language)`, `timeout()`; default timeout 720 s, overridable via `OPENJIUWEN_SUBAGENT_TASK_TIMEOUT_S` (invalid/non-positive keeps 720 s).
-- Six tools, each `new(runtime: Arc<SubAgentRuntime>)`, `with_language(&str)`, `card_for(language)`; `new` builds the card in `crate::prompts::DEFAULT_LANGUAGE` (`cn`):
+- Six parity tools, each `new(runtime: Arc<SubAgentRuntime>)`, `with_language(&str)`, `card_for(language)`; `new` builds the card in `crate::prompts::DEFAULT_LANGUAGE` (`cn`):
   - `subagent_spawn`: `subagent_type`, `task_description`, `display_name`, `role` (all required) → `{subagent_id, sub_session_id, task_id, status}`.
-  - `subagent_wait`: `subagent_ids` (required, non-empty array, singular `subagent_id` accepted as fallback), `timeout_ms` (integer, default 2_400_000, clamped to 10_000..=3_600_000) → `{statuses, results, output_files, timed_out}`.
+  - `subagent_wait`: `subagent_ids` (required, non-empty array, singular `subagent_id` accepted as fallback), `timeout_ms` (integer, default 2_400_000, clamped to 10_000..=3_600_000) → `{statuses, results, transcripts, output_files, timed_out}`, where `transcripts[<id>]` is `{count, dropped, last_kind, last_content}` (default summary for `not_found` ids).
   - `subagent_list` (no inputs) → `describe_list()` including `capacity`, `subagents`, `live_subagents`, `closed_subagents`, `summary`.
+  - `subagent_transcript` (Rust-only extension): `subagent_id` (required), `limit` (integer, default 20, clamped to 1..=200), `after_seq` (integer, default 0) → `{subagent_id, status, activity, entries, count, total, dropped, last_kind, has_more}`; expected failures are payloads (`'subagent_id' must be a non-empty string`, `subagent not found: <id>`, `'limit' must be an integer`, `'after_seq' must be a non-negative integer`).
   - `subagent_send_input`: `subagent_id`, `query` (required), `interrupt` (bool, default false) → `{subagent_id, task_id, status}`.
   - `subagent_close`: `subagent_id` → `{subagent_id, previous_status}`.
   - `subagent_resume`: `subagent_id` → `{subagent_id, status, restored}` plus `message` when present.
-  `subagent_tools(runtime) -> Vec<Arc<dyn Tool>>` returns spawn, wait, list, send_input, close, resume in that order.
+  `subagent_tools(runtime) -> Vec<Arc<dyn Tool>>` returns spawn, wait, list, send_input, close, resume in that order (the Python parity list); `subagent_tools_with_transcript(runtime)` returns the additive seven-tool set spawn, wait, list, transcript, send_input, close, resume.
 
 ## Constraints
 
@@ -81,11 +82,11 @@ Runtime support re-exports (`mod.rs`): `runtime::{clock, quota, transcript}` mod
 - `TaskTool` awaits `spawn` + `wait` inline (Python sync delegation path) and reports `agent_id` from the child `Agent::card().id`.
 - Task ids are a tool-layer concept: `TaskTool`/`subagent_*` payloads carry a fresh uuid hex `task_id` generated by the tool, because the Rust runtime models work as instance turns, not as a task queue.
 - Tool descriptions resolve through `description_for` in `task_tool.rs`: `crate::tools::descriptions::description` first, then the `crate::prompts::description` table (which owns the `task_tool`/`subagent_*` rows today).
-- `subagent_tools` is a directory module: the parent file keeps the constants, the `subagent_tool!` macro, `subagent_tools()` and the spawn/wait/list tools, while `control.rs` holds the send_input/close/resume tools and `util.rs` the helpers both share. `mod control;` must stay below the `subagent_tool!` definition, because a `macro_rules!` macro is only in scope for child modules declared after it.
+- `subagent_tools` is a directory module: the parent file keeps the constants, the `subagent_tool!` macro, `subagent_tools()`/`subagent_tools_with_transcript()` and the spawn/wait/list tools, while `control.rs` holds the send_input/close/resume tools, `transcript.rs` the additive transcript reader and `util.rs` the helpers all share. `mod control;` and `mod transcript;` must stay below the `subagent_tool!` definition, because a `macro_rules!` macro is only in scope for child modules declared after it.
 
 ## Known Issues
 
-- `crate::tools::descriptions` has no rows for `task_tool` or the six `subagent_*` names, so their descriptions fall back to the `crate::prompts::tool_descriptions` table; adding the rows belongs to `crate::tools` (sibling module).
+- `crate::tools::descriptions` has no rows for `task_tool`, the six parity `subagent_*` names or `subagent_transcript`, so their descriptions fall back to the `crate::prompts::tool_descriptions` table; `subagent_transcript` (a Rust-port extension with no Python row) is described by `EXTENSION_TOOL_DESCRIPTIONS` in `task_tool.rs`, and moving these rows into `crate::tools` belongs to that sibling module.
 
 ## Deferred Python areas
 
@@ -112,10 +113,12 @@ Runtime support re-exports (`mod.rs`): `runtime::{clock, quota, transcript}` mod
 - `./runtime/tests/eviction.rs` → LRU eviction tests (cap reclaim, running guard, Idle-before-Queued, age/id order, `evict`/`evict_lru`/`eviction_candidates`, budget interplay)
 - `./runtime/tests/transcript.rs` → transcript tests (lifecycle event order and clock stamps, error/interrupt/close/resume/evict events, ring cap + `dropped`, `record_tool_call`/`record_transcript`, pagination + `clear_transcript`, live subscription, metadata/outcome/`describe_list` digests)
 - `./task_tool.rs` → `TaskTool`, timeout resolution, shared tool description lookup
-- `./subagent_tools.rs` → module docs, constants, the `subagent_tool!` macro, `subagent_tools()`, and the spawn/wait/list tools; re-exports the control tools
+- `./subagent_tools.rs` → module docs, constants, the `subagent_tool!` macro, `subagent_tools()`/`subagent_tools_with_transcript()`, and the spawn/wait/list tools; re-exports the control and transcript tools
 - `./subagent_tools/control.rs` → `subagent_send_input`, `subagent_close`, `subagent_resume` tools
-- `./subagent_tools/util.rs` → shared parsing, task-id and payload-rendering helpers (`pub(crate)`)
-- `./subagent_tools/tests.rs` → unit tests for the six tools
+- `./subagent_tools/transcript.rs` → `subagent_transcript` tool: bounded page read, `has_more` probe, payload and rendered text
+- `./subagent_tools/util.rs` → shared parsing, task-id and payload-rendering helpers (`pub(crate)`), including `render_transcript_summary`
+- `./subagent_tools/tests.rs` → unit tests for the six parity tools plus the wait/list transcript-and-eviction reporting
+- `./subagent_tools/tests/transcript.rs` → unit tests for `subagent_transcript` (card, payload keys, clamping/pagination, unknown ids, rendered text)
 - `./test_support.rs` → `#[cfg(test)]` fake agent/factory and runtime fixture shared by the tool tests
 
 ## Test Strategy
@@ -132,5 +135,5 @@ Runtime support re-exports (`mod.rs`): `runtime::{clock, quota, transcript}` mod
 - Every new test is deterministic: `#[tokio::test]` (current-thread) plus the `watch`-gated blocked fake and `ManualClock`; no sleeps.
 - Tools: exact names, exact `required` lists and property keys; `task_tool` success payload shape, unknown-type failure, env-var timeout resolution via a pure helper; `subagent_wait` validation and clamp helper; every expected failure returns `success=false` (never `Err`).
 - Transcript tests: `runtime/tests/transcript.rs` drives the runtime with a `ManualClock` frozen at `1_700_000_000_000` (exact `at_ms` assertions) plus the `blocked` gate for `Running` states and the `create_blocked` factory gate to act between the reservation and the first turn; assert exact `(kind, content)` sequences, monotone `seq`, ring-cap `dropped`, `Error::Validation` unknowns, broadcast delivery with a ≤5 s bounded `tokio::time::timeout`, and `transcript` digests on metadata/outcome/`describe_list`; no sleeps.
-- Current suite: 124 unit tests under `subagents`, of which 10 are the `runtime/tests/eviction.rs` cases, 10 the `runtime/tests/transcript.rs` cases, 11 the `runtime/tests/quota.rs` cases and 14 the `runtime/quota.rs` cases (crate total 1157 unit + 80 integration + 8 doc tests), green with default and `--no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
+- Current suite: 152 unit tests under `subagents`, of which 10 are the `runtime/tests/eviction.rs` cases, 10 the `runtime/tests/transcript.rs` cases, 11 the `runtime/tests/quota.rs` cases, 14 the `runtime/quota.rs` cases and 24 the `subagent_tools` tool cases (8 of them in `subagent_tools/tests/transcript.rs`) (crate total 1182 unit + 88 integration + 8 doc tests), green with default and `--no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
 - Parity references: `tests/unit_tests/harness/test_plan_agent.py`, `test_explore_agent.py`, `test_deep_agent.py`, `subagent_runtime/test_control.py`, `tools/subagent/test_task_tool.py`.
