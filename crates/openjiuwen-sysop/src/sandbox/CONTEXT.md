@@ -79,6 +79,6 @@ Two endpoint sources are supported: a static, pre-deployed `launcher_config.base
 - `./provider.rs` → factory type aliases, `SandboxProviderRegistry`, `global()`
 - `./config.rs` → isolation/launcher/gateway/endpoint types and isolation-key helpers
 - `./launcher.rs` → `SandboxLauncher` trait, `PreDeploymentLauncher`, `LauncherRegistry`, `global()`, error builders
-- `./lifecycle.rs` → `SandboxRecord`, `Clock`/`FixedClock`, `SandboxLifecycle` (`ensure_endpoint`/`release`/`evict_idle`), `global()`
+- `./lifecycle/` → `SandboxRecord`, `Clock`/`FixedClock`, `SandboxLifecycle` (`ensure_endpoint`/`release`/`evict_idle`), `global()`; layout in `lifecycle/CONTEXT.md`
 - `./operation.rs` → dispatch (`sandbox_operations*`, `resolve_sandbox_endpoint`, `register_builtin_providers`) and the three forwarding wrappers
 - `./http.rs` → feature-gated `HttpSandboxGateway` (invoke = `Unsupported`, probe = the only network call), HTTP forwarding backends, `install`
