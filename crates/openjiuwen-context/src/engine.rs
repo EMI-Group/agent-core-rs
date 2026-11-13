@@ -22,89 +22,27 @@
 //! only operation that persists a rewritten history.
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::llm::Model;
-use openjiuwen_foundation::prompt::{BaseMessage, Role, TokenCounter};
+use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use openjiuwen_session::Session;
 use serde_json::{Map, Value};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 
 use crate::config::ContextConfig;
 use crate::context::{ContextState, ConversationContext, ModelContext};
 use crate::events::{CompressReport, CompressionStatus, ObserveOutcome, RecoveryOutcome};
 use crate::offload::{InMemoryOffloadStore, OffloadStore};
-use crate::processor::{ContextPipeline, ProcessorConfig};
+use crate::processor::{ContextPipeline, PipelineDeps, ProcessorConfig};
+use crate::recall::{InMemoryRecallArchiveStore, RecallArchiveStore};
+use crate::session_memory::{InMemorySessionMemoryStore, SessionMemoryStore};
 use crate::stats::PreparedContext;
 use crate::tokens::count_messages;
 
-/// Session id used when a context is created without a session.
-pub const DEFAULT_SESSION_ID: &str = "default_session_id";
+pub use crate::engine_options::{ContextOptions, PrepareOptions, DEFAULT_SESSION_ID};
 
 /// Session key the engine persists every context under.
 const STATE_KEY: &str = "context";
-
-/// Per-request overrides for [`ContextEngine::prepare`].
-#[derive(Debug, Clone)]
-pub struct PrepareOptions {
-    /// System messages, placed before the selected context messages.
-    pub system_messages: Vec<BaseMessage>,
-    /// Maximum messages to send, system messages included.
-    pub window_size: Option<usize>,
-    /// Maximum dialogue rounds to send.
-    pub dialogue_rounds: Option<usize>,
-    /// Tool schemas passed through to the provider untouched.
-    pub tools: Vec<Value>,
-    /// Token the caller cancels to abandon preparation.
-    pub cancellation: CancellationToken,
-    /// Deadline for the whole preparation, when one is required.
-    pub timeout: Option<Duration>,
-}
-
-impl Default for PrepareOptions {
-    fn default() -> Self {
-        Self {
-            system_messages: Vec::new(),
-            window_size: None,
-            dialogue_rounds: None,
-            tools: Vec::new(),
-            cancellation: CancellationToken::new(),
-            timeout: None,
-        }
-    }
-}
-
-/// Everything [`ContextEngine::create_context_with`] accepts besides the id.
-#[derive(Default, Clone)]
-pub struct ContextOptions {
-    /// Session the context belongs to; `None` uses [`DEFAULT_SESSION_ID`].
-    pub session: Option<Arc<dyn Session>>,
-    /// Initial message history.
-    pub history: Vec<BaseMessage>,
-    /// Pipeline override; `None` uses [`ContextConfig::processors`].
-    pub processors: Option<Vec<ProcessorConfig>>,
-    /// Counter override; `None` builds the configured one.
-    pub token_counter: Option<Arc<dyn TokenCounter + Send + Sync>>,
-    /// Model handed to summarisation processors.
-    pub model: Option<Arc<dyn Model>>,
-}
-
-impl std::fmt::Debug for ContextOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ContextOptions")
-            .field(
-                "session_id",
-                &self.session.as_ref().map(|session| session.id()),
-            )
-            .field("history", &self.history.len())
-            .field("processors", &self.processors)
-            .field("has_token_counter", &self.token_counter.is_some())
-            .field("has_model", &self.model.is_some())
-            .finish_non_exhaustive()
-    }
-}
 
 /// The context-service entry point.
 ///
@@ -115,6 +53,10 @@ pub struct ContextEngine {
     config: Arc<ContextConfig>,
     /// Store processors write offloaded content to.
     store: Arc<dyn OffloadStore>,
+    /// Default recall archive store handed to new contexts.
+    recall: Option<Arc<dyn RecallArchiveStore>>,
+    /// Default session-memory store handed to new contexts.
+    session_memory: Option<Arc<dyn SessionMemoryStore>>,
     /// `(session_id, normalized context_id)` → context.
     contexts: RwLock<HashMap<(String, String), Arc<ConversationContext>>>,
 }
@@ -124,6 +66,8 @@ impl std::fmt::Debug for ContextEngine {
         f.debug_struct("ContextEngine")
             .field("config", &self.config)
             .field("store", &self.store.kind())
+            .field("has_recall", &self.recall.is_some())
+            .field("has_session_memory", &self.session_memory.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -141,11 +85,34 @@ impl ContextEngine {
     }
 
     /// Creates an engine that offloads into `store`.
+    ///
+    /// No recall or session-memory store is configured, so contexts fall back to
+    /// the configuration defaults: an in-memory recall archive when
+    /// [`CompressionRecallConfig::enabled`](crate::config::CompressionRecallConfig::enabled)
+    /// is set, and an in-memory session-memory store when the pipeline holds a
+    /// full-compaction or summary-offload processor.
     #[must_use]
     pub fn with_store(config: ContextConfig, store: Arc<dyn OffloadStore>) -> Self {
+        Self::with_stores(config, store, None, None)
+    }
+
+    /// Creates an engine with explicit default recall and session-memory stores.
+    ///
+    /// Contexts created afterwards use these stores unless
+    /// [`ContextOptions::recall`] or [`ContextOptions::session_memory`] override
+    /// them, which keeps distinct contexts of one engine consistent.
+    #[must_use]
+    pub fn with_stores(
+        config: ContextConfig,
+        store: Arc<dyn OffloadStore>,
+        recall: Option<Arc<dyn RecallArchiveStore>>,
+        session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    ) -> Self {
         Self {
             config: Arc::new(config),
             store,
+            recall,
+            session_memory,
             contexts: RwLock::new(HashMap::new()),
         }
     }
@@ -221,8 +188,35 @@ impl ContextEngine {
         let configs = options
             .processors
             .unwrap_or_else(|| self.config.processors.clone());
-        let pipeline =
-            ContextPipeline::from_configs(&configs, model.clone(), Arc::clone(&self.store))?;
+        // An explicit per-context store wins over the engine default, which in
+        // turn wins over the configuration-derived fallback.
+        let recall = options.recall.or_else(|| self.recall.clone()).or_else(|| {
+            self.config
+                .compression_recall
+                .enabled
+                .then(|| Arc::new(InMemoryRecallArchiveStore::new()) as Arc<dyn RecallArchiveStore>)
+        });
+        let needs_session_memory = configs.iter().any(|config| {
+            matches!(
+                config,
+                ProcessorConfig::FullCompact(_) | ProcessorConfig::MessageSummaryOffloader(_)
+            )
+        });
+        let session_memory = options
+            .session_memory
+            .or_else(|| self.session_memory.clone())
+            .or_else(|| {
+                needs_session_memory.then(|| {
+                    Arc::new(InMemorySessionMemoryStore::new()) as Arc<dyn SessionMemoryStore>
+                })
+            });
+        let pipeline = ContextPipeline::from_configs_with(
+            &configs,
+            &PipelineDeps::new(Arc::clone(&self.store))
+                .with_model(model.clone())
+                .with_recall(recall.clone())
+                .with_session_memory(session_memory.clone()),
+        )?;
         let context = Arc::new(ConversationContext::new(
             context_id,
             session_id,
@@ -232,6 +226,8 @@ impl ContextEngine {
             Arc::clone(&self.store),
             model,
             options.session,
+            recall,
+            session_memory,
         ));
         if !options.history.is_empty() {
             context.set_messages(options.history).await?;

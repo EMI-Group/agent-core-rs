@@ -28,8 +28,10 @@ use openjiuwen_foundation::store::{
 use openjiuwen_foundation::store::{SqliteDocumentStore, SqliteKvStore};
 
 pub mod keys;
+pub mod migration;
 
 mod json;
+mod legacy;
 mod messages;
 mod storage;
 
@@ -110,6 +112,29 @@ impl MemoryStores {
             document: Arc::new(SqliteDocumentStore::connect(&url).await?),
             graph: Some(Arc::new(LocalFileGraphStore::new(&graph_root).await?)),
         })
+    }
+
+    /// Builds SQLite-backed stores at `path` after applying the schema migrations.
+    ///
+    /// [`migration::migrate_sqlite`] runs first, so the version table and every builtin
+    /// DDL step are in place before the backends open the database. Migrations are
+    /// forward-only and idempotent, so reopening an already migrated path is a no-op.
+    /// The migration error keeps its kind and is annotated with `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the migration error annotated with the database path, or the
+    /// [`MemoryStores::sqlite`] error when the backends cannot be opened.
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite_migrated(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        migration::migrate_sqlite(path).await.map_err(|error| {
+            error.with_context(format!(
+                "migrating the memory SQLite database at `{}`",
+                path.display()
+            ))
+        })?;
+        Self::sqlite(path).await
     }
 
     /// Builds a bundle from explicit stores; graph memory starts disabled.

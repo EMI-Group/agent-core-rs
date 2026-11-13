@@ -39,6 +39,11 @@ The complete per-package matrix, deviations, and deferred list live in `docs/PAR
 - **Size**: files around ≤1000 lines; split by responsibility; shared types live at the lowest common ancestor crate.
 - **Tests**: unit tests beside modules and in `crates/<crate>/tests/`; cross-crate tests in `openjiuwen-e2e`; fake LLM server in `openjiuwen-test-support`; `cargo test --workspace` passes offline.
 - **Deferred features are typed**: unimplemented capability paths return `Error::Unsupported` with a reason and are listed in `docs/PARITY.md`; silent no-ops are not acceptable.
+- **HTTP stack** is pinned once in `[workspace.dependencies]`: `reqwest 0.12` (default-features off, `json`/`stream`/`rustls-tls`/`multipart`), `axum 0.8` (`json`/`tokio`/`http1`), `http = "1"`, `url 2` (`serde`), `bytes = "1"`; tests use `wiremock 0.6`.
+- `hyper`, `tower` and `tower-http` have **no** `[workspace.dependencies]` entry — crates that need them pin inline (`tower = { version = "0.5", features = ["util"] }` as a dev-dependency in `openjiuwen-extensions` and `openjiuwen-agent-evolving`).
+- `http` is a workspace entry but no crate declares it directly; consumers reach it through `axum::http` (e.g. `openjiuwen-extensions/tests/a2a_server.rs`) or via `reqwest::StatusCode`.
+- `mockito` and `httpmock` are absent from the workspace, `Cargo.lock`, and the local registry cache — adding them would break `--offline` builds.
+- **Offline builds**: every locked dependency (`reqwest 0.12.28`, `axum 0.8.9`, `wiremock 0.6.5`, `http 1.5.0`, `url 2.5.8`, `hyper 1.12.0`, `tower 0.5.3`, `bytes 1.12.1`) is present in `~/.cargo/registry/{cache,src}/index.crates.io-*/`, and `make test` (Makefile:7) runs the workspace offline.
 - **Foreign repo** is read-only; never modify it. Delegate investigation to read-only investigators.
 
 ## Routing Table

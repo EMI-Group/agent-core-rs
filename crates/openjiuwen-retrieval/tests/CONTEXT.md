@@ -13,6 +13,11 @@ All tests are offline and deterministic.
 - `loaders.rs` → text/JSON/CSV/HTML file loaders with `tempfile`, URL loader with `wiremock`, `AutoLoader` dispatch/stamping/errors.
 - `knowledge_base.rs` → add/retrieve/filter/rerank/delete/statistics with `HashEmbedding`, multi-KB helpers.
 - `embedding.rs` → `OpenAiEmbedding` request/response behavior with `wiremock`.
+- `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
+- `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
+- `parsing_zip.rs` → the ZIP container reader against archives assembled byte by byte (stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
+- `parsing_documents.rs` → DOCX/XLSX/PDF parsers against byte-built stored ZIP fixtures and `zlib_stored` PDF streams (blocks/headings/tables/title, sheets and row/column documents, content-stream operators, `FlateDecode`, unsupported variants, `parse_path`).
+- `retrievers.rs` → vector/hybrid/graph/agentic retrievers with `HashEmbedding`, `InMemoryVectorStore`, `Bm25Index`, `InMemoryGraphStore`, scripted rewriters, and `StaticCompletionModel`.
 
 ## Constraints
 
@@ -29,3 +34,8 @@ All tests are offline and deterministic.
 - `./loaders.rs` → loader behavior
 - `./knowledge_base.rs` → pipeline end to end
 - `./embedding.rs` → OpenAI-compatible embedding client
+- `./graph.rs` → triple extraction and graph store
+- `./multimodal.rs` → multimodal documents, image loading, table conversion
+- `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)
+- `./parsing_documents.rs` → DOCX/XLSX/PDF document parsers
+- `./retrievers.rs` → the five retriever implementations, rank fusion, graph expansion, and the agentic loop

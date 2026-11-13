@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
 //! End-to-end tests for the document loaders exposed by the crate root.
 //!
 //! Ports the behavior of the Python parser tests in
@@ -12,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_retrieval::loaders::DocxLoader;
 use openjiuwen_retrieval::{
     extract_title, html_to_text, AutoLoader, CsvLoader, Document, DocumentLoader, HtmlLoader,
     JsonLoader, LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
@@ -373,22 +378,29 @@ async fn auto_loader_rejects_unknown_formats_and_missing_files() {
     let dir = tempfile::tempdir().unwrap();
     let loader = AutoLoader::new();
 
-    let missing = dir.path().join("missing.txt");
-    let error = loader.load(missing.to_str().unwrap()).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::NotFound);
-
-    for name in ["paper.pdf", "doc.docx", "sheet.xlsx"] {
-        let path = write_file(&dir, name, "binary-ish");
-        let error = loader.load(&path).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "{name}");
-        let extension = name.rsplit_once('.').unwrap().1;
+    for name in [
+        "missing.txt",
+        "missing.docx",
+        "missing.xlsx",
+        "missing.pdf",
+        "missing.png",
+    ] {
+        let missing = dir.path().join(name);
+        let error = loader.load(missing.to_str().unwrap()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{name}");
         assert!(
-            error
-                .to_string()
-                .contains(&format!("Unsupported format: .{extension}")),
+            error.to_string().contains("does not exist"),
             "unexpected message: {error}"
         );
     }
+
+    let unknown = write_file(&dir, "archive.xyz", "unknown bytes");
+    let error = loader.load(&unknown).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error.to_string().contains("Unsupported format: .xyz"),
+        "unexpected message: {error}"
+    );
 }
 
 #[tokio::test]
@@ -451,6 +463,333 @@ async fn loader_registry_is_case_insensitive_and_first_registration_wins() {
     let loader = custom.get_for_path(&path).unwrap();
     assert_eq!(loader.load(&path).await.unwrap()[0].text, "fixed");
 
-    assert!(defaults.get_for_path("archive.pdf").is_none());
-    assert_eq!(defaults.extensions().len(), 8);
+    assert!(defaults.get_for_path("archive.pdf").is_some());
+    assert!(defaults.get_for_path("notes.docx").is_some());
+    assert!(defaults.get_for_path("sheet.xlsx").is_some());
+    assert!(defaults.get_for_path("photo.PNG").is_some());
+    assert!(defaults.get_for_path("legacy.xls").is_none());
+    assert!(defaults.get_for_path("archive.zip").is_none());
+    assert_eq!(defaults.extensions().len(), 17);
+}
+
+// ---------------------------------------------------------------------------
+// Binary and image fixtures
+// ---------------------------------------------------------------------------
+
+/// Builds a `ZIP` archive with stored (uncompressed) entries.
+///
+/// `DOCX`/`XLSX` fixtures are ordinary `ZIP` containers; writing the archive by
+/// hand keeps the tests free of a compression dependency.
+fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut directory = Vec::new();
+    let count = entries.len() as u16;
+    for (name, contents) in entries {
+        let name = name.as_bytes();
+        let payload = contents.as_bytes();
+        let offset = data.len() as u32;
+        let crc = openjiuwen_retrieval::parsing::crc32(payload);
+        let size = payload.len() as u32;
+        data.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+        data.extend_from_slice(&20u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&crc.to_le_bytes());
+        data.extend_from_slice(&size.to_le_bytes());
+        data.extend_from_slice(&size.to_le_bytes());
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(payload);
+
+        directory.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+        directory.extend_from_slice(&20u16.to_le_bytes());
+        directory.extend_from_slice(&20u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&crc.to_le_bytes());
+        directory.extend_from_slice(&size.to_le_bytes());
+        directory.extend_from_slice(&size.to_le_bytes());
+        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u16.to_le_bytes());
+        directory.extend_from_slice(&0u32.to_le_bytes());
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(name);
+    }
+    let directory_offset = data.len() as u32;
+    let directory_size = directory.len() as u32;
+    data.extend_from_slice(&directory);
+    data.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&count.to_le_bytes());
+    data.extend_from_slice(&count.to_le_bytes());
+    data.extend_from_slice(&directory_size.to_le_bytes());
+    data.extend_from_slice(&directory_offset.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data
+}
+
+/// Writes raw `bytes` into `dir/name` and returns the path as a `String`.
+fn write_bytes(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// `word/document.xml`: heading, paragraph, and a two-row table.
+const DOCX_DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Overview</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Body text</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Notes</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>alice</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>ok</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+
+/// `docProps/core.xml` carrying `dc:title`.
+const DOCX_CORE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="urn:cp" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>Design notes</dc:title>
+</cp:coreProperties>"#;
+
+/// Builds the `DOCX` archive used by the loader tests.
+fn docx_archive() -> Vec<u8> {
+    build_zip(&[
+        ("word/document.xml", DOCX_DOCUMENT),
+        ("docProps/core.xml", DOCX_CORE),
+    ])
+}
+
+/// Workbook with one `People` sheet.
+const XLSX_WORKBOOK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="People" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+
+/// Relationship pointing at the single worksheet part.
+const XLSX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+
+/// Worksheet with a `Name`/`City` header and one data row.
+const XLSX_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>City</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>alice</t></is></c>
+      <c r="B2" t="inlineStr"><is><t>paris</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+
+/// Builds the one-sheet `XLSX` archive used by the loader tests.
+fn xlsx_archive() -> Vec<u8> {
+    build_zip(&[
+        ("xl/workbook.xml", XLSX_WORKBOOK),
+        ("xl/_rels/workbook.xml.rels", XLSX_RELS),
+        ("xl/worksheets/sheet1.xml", XLSX_SHEET),
+    ])
+}
+
+/// Builds one uncompressed PDF content-stream object.
+fn plain_stream(content: &str) -> String {
+    format!(
+        "1 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj",
+        content.len()
+    )
+}
+
+/// Wraps `body` in a minimal `PDF` document.
+fn pdf_document(body: &str) -> Vec<u8> {
+    format!("%PDF-1.7\n{body}\n%%EOF\n").into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Binary and image dispatch through AutoLoader
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auto_loader_reads_docx_headings_and_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(&dir, "notes.docx", &docx_archive());
+
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    assert_eq!(documents.len(), 1);
+    let document = &documents[0];
+    assert_eq!(
+        document.text,
+        "## Overview\nBody text\n| Name | Notes |\n| --- | --- |\n| alice | ok |"
+    );
+    let metadata = &document.metadata;
+    assert_eq!(metadata.get("paragraph_count"), Some(&Value::from(2)));
+    assert_eq!(metadata.get("table_count"), Some(&Value::from(1)));
+    assert_eq!(metadata.get("source_type"), Some(&Value::from("document")));
+    // AutoLoader stamps its provenance keys over the loader's own metadata.
+    assert_eq!(
+        metadata.get("doc_id"),
+        Some(&Value::from(document.id.as_str()))
+    );
+    assert_eq!(metadata.get("title"), Some(&Value::from("notes")));
+    assert_eq!(metadata.get("file_ext"), Some(&Value::from(".docx")));
+    assert_eq!(metadata.get("file_path"), Some(&Value::from(path.as_str())));
+}
+
+#[tokio::test]
+async fn docx_loader_keeps_the_core_properties_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(&dir, "notes.docx", &docx_archive());
+
+    let documents = DocxLoader::new().load(&path).await.unwrap();
+    assert_eq!(
+        documents[0].metadata.get("title"),
+        Some(&Value::from("Design notes"))
+    );
+}
+
+#[tokio::test]
+async fn auto_loader_reads_xlsx_row_and_column_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(&dir, "people.xlsx", &xlsx_archive());
+
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    let texts: Vec<&str> = documents.iter().map(|doc| doc.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "Name: alice, City: paris",
+            "Column name: Name. Values: alice",
+            "Column name: City. Values: paris",
+        ]
+    );
+    // Ids are keyed by the file stem, mirroring Python's `base_id = doc`.
+    let ids: Vec<&str> = documents
+        .iter()
+        .map(|document| document.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["people_s0_r2", "people_s0_c0", "people_s0_c1"]);
+
+    let row = &documents[0].metadata;
+    assert_eq!(row.get("sheet_name"), Some(&Value::from("People")));
+    assert_eq!(row.get("row_index"), Some(&Value::from(2_u64)));
+    assert_eq!(row.get("source_type"), Some(&Value::from("row")));
+    assert_eq!(row.get("file_ext"), Some(&Value::from(".xlsx")));
+    assert_eq!(row.get("doc_id"), Some(&Value::from("people_s0_r2")));
+
+    let column = &documents[1].metadata;
+    assert_eq!(column.get("column_name"), Some(&Value::from("Name")));
+    assert_eq!(column.get("source_type"), Some(&Value::from("column")));
+    assert_eq!(column.get("doc_id"), Some(&Value::from("people_s0_c0")));
+}
+
+#[tokio::test]
+async fn auto_loader_uses_the_doc_id_as_the_base_prefix_for_xlsx() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(&dir, "people.xlsx", &xlsx_archive());
+
+    let documents = AutoLoader::new()
+        .load_as(&path, Some("doc-base"), None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = documents
+        .iter()
+        .map(|document| document.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["doc-base_s0_r2", "doc-base_s0_c0", "doc-base_s0_c1"]
+    );
+    for document in &documents {
+        assert_eq!(
+            document.metadata.get("doc_id"),
+            Some(&Value::from(document.id.as_str()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_loader_reads_images_as_captioned_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(&dir, "cat.png", b"\x89PNG\r\n");
+
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    assert_eq!(documents.len(), 1);
+    let document = &documents[0];
+    assert_eq!(document.text, "[image] cat.png");
+    let metadata = &document.metadata;
+    assert_eq!(
+        metadata.get("image_path"),
+        Some(&Value::from(path.as_str()))
+    );
+    assert_eq!(metadata.get("mime_type"), Some(&Value::from("image/png")));
+    assert_eq!(metadata.get("modality"), Some(&Value::from("image")));
+    assert_eq!(metadata.get("file_ext"), Some(&Value::from(".png")));
+    assert_eq!(metadata.get("title"), Some(&Value::from("cat")));
+    assert_eq!(
+        metadata.get("doc_id"),
+        Some(&Value::from(document.id.as_str()))
+    );
+}
+
+#[tokio::test]
+async fn auto_loader_reads_pdf_text_and_page_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(
+        &dir,
+        "paper.pdf",
+        &pdf_document(&plain_stream("BT (Hello PDF) Tj ET")),
+    );
+
+    let documents = AutoLoader::new().load(&path).await.unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].text, "Hello PDF");
+    assert_eq!(
+        documents[0].metadata.get("page_count"),
+        Some(&Value::from(1))
+    );
+    assert_eq!(
+        documents[0].metadata.get("has_text"),
+        Some(&Value::from(true))
+    );
+}
+
+#[tokio::test]
+async fn auto_loader_rejects_scanned_pdfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(
+        &dir,
+        "scanned.pdf",
+        &pdf_document(
+            "4 0 obj\n<< /Filter /DCTDecode /Length 4 >>\nstream\nscan\nendstream\nendobj",
+        ),
+    );
+
+    let error = AutoLoader::new().load(&path).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error.to_string().contains("PDF has no extractable text"),
+        "unexpected message: {error}"
+    );
 }

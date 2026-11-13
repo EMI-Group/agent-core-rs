@@ -40,7 +40,8 @@ Storage (`store`):
 - Error type is `openjiuwen_common::error::{Error, Result}`; no panics on user input, no ad-hoc error enums across the public surface.
 - Async-first on tokio; public streams are `Send + 'static`; cancellation via `tokio_util::sync::CancellationToken`; no blocking I/O on async tasks.
 - Every public data type is `serde`-serializable, snake_case, tolerant of unknown fields; `#[serde(default)]` on structs; secrets use `openjiuwen_common::security::SecretString` and are never logged or `Debug`-printed.
-- HTTP goes through `openjiuwen_common::http::HttpClient` (retry/backoff, TLS, auth headers) — never raw `reqwest` calls in this crate.
+- Model clients perform all HTTP through `openjiuwen_common::http::HttpClient` (a concrete `reqwest` wrapper: retry/backoff, TLS, auth headers); `reqwest.workspace = true` resolves to 0.12 with `json`/`stream`/`rustls-tls`/`multipart` and default features off.
+- Two exception sites use `reqwest` directly: `src/tool/mcp/http.rs` builds its own `reqwest::Client::builder()` for the streamable-HTTP MCP transport, and `src/tool/restful/tool.rs` uses `reqwest::StatusCode` for reason phrases.
 - `tracing` only; no `println!`/`eprintln!`; logging targets are `openjiuwen_foundation::<module>`.
 - No `unsafe`; workspace lints are `deny`, and `cargo clippy --all-targets -- -D warnings` must pass, so every public item needs a doc comment.
 - Files stay around ≤1000 lines; shared helpers live at the lowest common module (`prompt` types for the clients, `store::filter` for all backends).

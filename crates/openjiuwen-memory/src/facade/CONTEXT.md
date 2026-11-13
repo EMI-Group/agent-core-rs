@@ -8,13 +8,14 @@ Everything here is wiring and argument adaptation; ranking, dedupe, and persiste
 ## API Surface
 
 ```rust
-pub struct LongTermMemory { /* engine: Arc<MemoryEngine>, graph: Option<Arc<GraphMemory>>, coding: Option<CodingMemory> */ }
+pub struct LongTermMemory { /* engine: Arc<MemoryEngine>, graph: Option<Arc<GraphMemory>>, coding: Option<CodingMemory>, analyzer: Arc<MemoryAnalyzer> */ }
 
-pub struct LongTermMemoryBuilder { /* config, stores?, embedding?, model? */ }
+pub struct LongTermMemoryBuilder { /* config, stores?, embedding?, model?, analyzer? */ }
 impl LongTermMemoryBuilder {
     pub fn stores(self, MemoryStores) -> Self;
     pub fn embedding(self, Arc<dyn Embedding>) -> Self;
     pub fn model(self, Arc<dyn Model>) -> Self;
+    pub fn analyzer(self, Arc<MemoryAnalyzer>) -> Self;
     pub fn build(self) -> Result<Arc<LongTermMemory>>;
 }
 
@@ -74,6 +75,18 @@ impl LongTermMemory {
     pub async fn user_mem_total_num(&self, user_id: &str, scope_id: &str) -> Result<usize>;
     pub async fn get_user_mem_by_page(&self, user_id: &str, scope_id: &str, page_size: usize,
                                       page_idx: usize, kind: MemoryType) -> Result<Vec<MemoryRecord>>;
+
+    // --- subsystem wiring (`integrations.rs`) ---
+    pub fn analyzer(&self) -> &Arc<MemoryAnalyzer>;
+    pub async fn remember(&self, scope: &MemoryScope, input: &ExtractionInput, options: &AddOptions) -> Result<RememberReport>;
+    pub async fn consolidate(&self, scope: &MemoryScope, incoming: &NewMemory, options: &CallOptions) -> Result<ConsolidationPlan>;
+    pub fn provider(&self) -> Arc<dyn MemoryProvider>;
+    pub fn team_memory(&self) -> TeamMemory;
+    #[cfg(feature = "sqlite")] pub async fn team_memory_sqlite(&self, path: impl AsRef<Path>) -> Result<TeamMemory>;
+    pub fn dreaming_in_memory(&self) -> Result<DreamPlanner>;
+    #[cfg(feature = "sqlite")] pub async fn dreaming_sqlite(&self, path: impl AsRef<Path>) -> Result<DreamPlanner>;
+    #[cfg(feature = "sqlite")] pub async fn sqlite_migrated(path: impl AsRef<Path>, config: MemoryEngineConfig) -> Result<Arc<Self>>;
+    pub async fn open_local_coding(&self, root: impl AsRef<Path>) -> Result<LocalCodingMemory>;
 }
 ```
 
@@ -100,6 +113,14 @@ impl LongTermMemory {
 - `clear_messages` deletes conversation history rows matching the filter (records and variables are untouched); cancellation is checked before the delete.
 - Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` lists all user-scope variables (not session variables); session variables are addressed by `scope.session_id`.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
+- `analyzer` defaults to `MemoryAnalyzer::from_engine(config, model)`: rules unless `config.extraction.extractor` asks for the LLM *and* a model is attached; `builder().analyzer(...)` replaces it (tests use this to inject a scripted extractor).
+- `remember(scope, input, options)`: `ExtractionInput` carries no scope, so the scope is an explicit parameter. Runs `analyzer.analyze(input, &options.call)`, writes every fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces `ExtractionResult::degraded` on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
+- `consolidate(scope, incoming, options)` validates the content, recalls candidates at `dedupe.candidate_top_k` with threshold `0.0` (a keyword-only blended score never clears a positive floor), converts `incoming` into one `ExtractedFact`, and delegates to `MemoryAnalyzer::consolidate` with `config.dedupe`. It returns a plan only; nothing is applied.
+- `provider()` returns an `EngineProvider` over the same engine — a stable SPI view, capabilities reflecting the attached embedding model.
+- `team_memory` / `team_memory_sqlite` build a team facade over its own store; `dreaming_in_memory` / `dreaming_sqlite` build a `DreamPlanner` with `NoopConsolidator` and `DreamConfig::default()` (they return `Result` because construction validates the config).
+- Nothing here starts a background task, timer, watcher, or purge: the caller owns `run_due`/`run_once`/`purge`, and no cross-process lease exists.
+- `sqlite_migrated(path, config)` runs `MemoryStores::sqlite_migrated` (migration first, then the stores) and fails with the path plus the migration reason; never open a SQLite facade through `sqlite` when the migration gate must hold.
+- `open_local_coding(root)` bridges to `LocalCodingMemory` with the engine's `coding` config; the local stack keeps Markdown as its own source of truth (FTS5 index, lock, watcher) and is not mirrored into the engine record path — pick one path per workspace.
 
 ## Constraints
 
@@ -116,8 +137,9 @@ impl LongTermMemory {
 - `./recall.rs` → `search`, `recall`, `search_all`
 - `./messages.rs` → `add_messages`, `get_recent_messages`, `clear_messages`, extraction/fallback
 - `./variables.rs` → variable and scope-config methods
+- `./integrations.rs` → analyzer/remember/consolidate, provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
 
 ## Test Strategy
 
 - Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails.
-- The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `sqlite.rs`).
+- The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `lite_local.rs`, `sqlite.rs`, `analyzer_wiring.rs`, `external_provider.rs`, `team_memory.rs`, `dreaming.rs`, `migration.rs`).

@@ -19,6 +19,7 @@
 //! })]);
 //! assert_eq!(pipeline.processors().len(), 1);
 //! ```
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,17 +32,192 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ContextConfig;
 use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
+use crate::recall::RecallArchiveStore;
+use crate::session_memory::SessionMemoryStore;
 use crate::window::drop_orphan_tool_results;
 
+pub mod compressor;
+pub mod offloader;
 pub mod summarize;
+pub mod summary_offloader;
 pub mod tool_result;
+pub mod tool_result_window;
 pub mod truncate;
 
+pub use self::compressor::{
+    find_last_completed_round_end, group_completed_rounds, is_memory_block,
+    iter_summary_merge_ranges, summarize, summarize_offline, CurrentRoundCompressor,
+    CurrentRoundCompressorConfig, DialogueCompressor, DialogueCompressorConfig,
+    FullCompactProcessor, FullCompactProcessorConfig, MemoryBlockKind, MicroCompactProcessor,
+    MicroCompactProcessorConfig, RoundLevelCompressor, RoundLevelCompressorConfig,
+    CURRENT_ROUND_MEMORY_BLOCK, DIALOGUE_MEMORY_BLOCK, FULL_COMPACT_BOUNDARY,
+    FULL_COMPACT_BOUNDARY_TEXT, FULL_COMPACT_SUMMARY_INTRO, MICRO_COMPACT_CLEARED_MARKER,
+    ROUND_LEVEL_MEMORY_BLOCK, TRUNCATED_FULL_CONTEXT_SCOPE,
+};
+pub use self::offloader::{
+    wildcard_match, MessageOffloadRole, MessageOffloader, MessageOffloaderConfig,
+    ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, OMIT_STRING, WINDOWED_OUTPUT_TAG,
+    WINDOW_MANAGED_METADATA_KEY,
+};
 pub use self::summarize::{SummarizationConfig, SummarizationProcessor, CONTEXT_SUMMARY_PREFIX};
+pub use self::summary_offloader::{
+    summarize_text_offline, MessageSummaryOffloader, MessageSummaryOffloaderConfig,
+    OFFLOADED_INFO_TAG, SUMMARY_COMPRESSION_SYSTEM_PROMPT,
+};
 pub use self::tool_result::{
     ToolResultConfig, ToolResultProcessor, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
 };
+pub use self::tool_result_window::{ToolResultWindowProcessor, ToolResultWindowProcessorConfig};
 pub use self::truncate::{TruncationConfig, TruncationProcessor};
+
+/// Implements the checkpoint hooks of a processor whose cross-run counters live
+/// in its `state` field.
+///
+/// Both hooks are just the [`ProcessorState`] snapshot and restore, so every
+/// stateful processor spells them the same way.
+macro_rules! impl_processor_state {
+    ($processor:ty) => {
+        fn save_state(&self) -> serde_json::Value {
+            self.state.snapshot()
+        }
+
+        fn load_state(&self, state: &serde_json::Value) {
+            self.state.restore(state);
+        }
+    };
+}
+pub(crate) use impl_processor_state;
+
+/// A small, thread-safe JSON bag a processor keeps its cross-run counters in.
+///
+/// The bag is the persisted side of [`ContextProcessor::save_state`]: a
+/// processor counts what it did while it ran, and [`ContextPipeline::save_state`]
+/// writes the snapshot into the session checkpoint through
+/// [`ContextState`](crate::ContextState), so the counters survive a restart.
+/// Counters are observability only — they never influence a transform, and a
+/// processor that changed nothing does not advance them.
+///
+/// Values are read back through the typed accessors; a corrupt or foreign entry
+/// restored with [`ProcessorState::restore`] is ignored rather than trusted.
+///
+/// ```
+/// use openjiuwen_context::ProcessorState;
+///
+/// let state = ProcessorState::default();
+/// assert_eq!(state.snapshot(), serde_json::Value::Null);
+/// state.bump("compressions");
+/// state.set_u64("blocks", 4);
+/// assert_eq!(state.counter("compressions"), 1);
+/// assert_eq!(state.counter("blocks"), 4);
+/// assert_eq!(state.counter("missing"), 0);
+/// ```
+#[derive(Debug, Default)]
+pub struct ProcessorState {
+    /// The counters; `Value::Null` until the first write.
+    inner: std::sync::Mutex<serde_json::Value>,
+}
+
+impl ProcessorState {
+    /// Creates an empty state bag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A snapshot of the counters, [`serde_json::Value::Null`] when nothing was
+    /// written yet.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        lock_state(&self.inner).clone()
+    }
+
+    /// Replaces the counters with a snapshot taken by [`ProcessorState::snapshot`].
+    ///
+    /// A `Null` or non-object value is ignored, so corrupt or foreign entries
+    /// leave the current counters intact.
+    pub fn restore(&self, state: &serde_json::Value) {
+        if !state.is_object() {
+            return;
+        }
+        *lock_state(&self.inner) = state.clone();
+    }
+
+    /// Increments the integer counter `key`, creating it when absent.
+    pub fn bump(&self, key: &str) {
+        self.add(key, 1);
+    }
+
+    /// The value of `key`, `0` when it is absent or not a non-negative integer.
+    #[must_use]
+    pub fn counter(&self, key: &str) -> u64 {
+        lock_state(&self.inner)
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// Sets the integer counter `key` to `value`.
+    pub fn set_u64(&self, key: &str, value: u64) {
+        with_object(&self.inner, |object| {
+            object.insert(key.to_owned(), serde_json::Value::from(value));
+        });
+    }
+
+    /// Records a token count under `key`.
+    ///
+    /// Counts are u64 counters too, so a size that does not fit saturates
+    /// instead of wrapping.
+    pub fn record_tokens(&self, key: &str, value: usize) {
+        self.set_u64(key, u64::try_from(value).unwrap_or(u64::MAX));
+    }
+
+    /// Adds `delta` to the integer counter `key`, creating it when absent.
+    pub(crate) fn add(&self, key: &str, delta: u64) {
+        with_object(&self.inner, |object| {
+            let current = object
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            object.insert(
+                key.to_owned(),
+                serde_json::Value::from(current.saturating_add(delta)),
+            );
+        });
+    }
+}
+
+impl Clone for ProcessorState {
+    /// Clones the snapshot, so the copy and the original advance independently.
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(self.snapshot()),
+        }
+    }
+}
+
+/// Locks the bag, recovering from a poisoned mutex.
+fn lock_state(
+    state: &std::sync::Mutex<serde_json::Value>,
+) -> std::sync::MutexGuard<'_, serde_json::Value> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Applies `f` to the object of the bag, which is created when it is not an
+/// object yet.
+fn with_object(
+    state: &std::sync::Mutex<serde_json::Value>,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let mut guard = lock_state(state);
+    if !guard.is_object() {
+        *guard = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(object) = guard.as_object_mut() {
+        f(object);
+    }
+}
 
 /// One transform applied to a conversation history.
 #[async_trait]
@@ -63,11 +239,18 @@ pub trait ContextProcessor: Send + Sync {
     ) -> Result<Option<ContextEvent>>;
 
     /// Serializes any state the processor keeps across runs.
+    ///
+    /// The default is [`serde_json::Value::Null`], which
+    /// [`ContextPipeline::save_state`] omits from the checkpoint. A stateful
+    /// processor returns its [`ProcessorState`] snapshot instead.
     fn save_state(&self) -> serde_json::Value {
         serde_json::Value::Null
     }
 
     /// Restores state previously returned by [`ContextProcessor::save_state`].
+    ///
+    /// The default ignores the state; a stateful processor hands it to
+    /// [`ProcessorState::restore`].
     fn load_state(&self, _state: &serde_json::Value) {}
 }
 
@@ -95,6 +278,83 @@ pub struct ProcessorContext<'a> {
     pub manual: bool,
     /// Cancellation signalled by the caller.
     pub cancellation: &'a CancellationToken,
+    /// Archive store compressors use to keep the history they replaced.
+    ///
+    /// `None` when compression recall is disabled and no store was configured;
+    /// a processor that archives history must then skip archiving.
+    pub recall: Option<&'a dyn RecallArchiveStore>,
+    /// Session-memory notes full compaction can reinject instead of summarising.
+    ///
+    /// `None` when no store was configured; [`crate::processor::FullCompactProcessor`]
+    /// then falls back to the model or offline summary path.
+    pub session_memory: Option<&'a dyn SessionMemoryStore>,
+}
+
+/// The stores and seams a pipeline hands to the processors it builds.
+///
+/// Building a processor needs more than the [`ProcessorConfig`]: offloaded
+/// content, the summarisation model, recall archives, and session-memory notes
+/// all live outside the serialized configuration. [`PipelineDeps`] carries them
+/// so [`ContextPipeline::from_configs_with`] can wire every processor that uses
+/// one.
+#[derive(Clone)]
+pub struct PipelineDeps {
+    /// Store offloaded content is written to; required.
+    pub offload: Arc<dyn OffloadStore>,
+    /// Model used by processors that call one (summarisation, compaction).
+    pub model: Option<Arc<dyn Model>>,
+    /// Archive store compressors write replaced history to.
+    pub recall: Option<Arc<dyn RecallArchiveStore>>,
+    /// Session-memory notes full compaction reinjects.
+    pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+}
+
+impl std::fmt::Debug for PipelineDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineDeps")
+            .field("offload", &self.offload.kind())
+            .field("has_model", &self.model.is_some())
+            .field("has_recall", &self.recall.is_some())
+            .field("has_session_memory", &self.session_memory.is_some())
+            .finish()
+    }
+}
+
+impl PipelineDeps {
+    /// The minimum a pipeline needs: an offload store and nothing else.
+    #[must_use]
+    pub fn new(offload: Arc<dyn OffloadStore>) -> Self {
+        Self {
+            offload,
+            model: None,
+            recall: None,
+            session_memory: None,
+        }
+    }
+
+    /// Sets the summarisation model.
+    #[must_use]
+    pub fn with_model(mut self, model: Option<Arc<dyn Model>>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Sets the recall archive store.
+    #[must_use]
+    pub fn with_recall(mut self, recall: Option<Arc<dyn RecallArchiveStore>>) -> Self {
+        self.recall = recall;
+        self
+    }
+
+    /// Sets the session-memory store.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    ) -> Self {
+        self.session_memory = session_memory;
+        self
+    }
 }
 
 /// An ordered list of processors.
@@ -125,15 +385,43 @@ impl ContextPipeline {
 
     /// Builds the pipeline described by `configs`.
     ///
+    /// Delegates to [`ContextPipeline::from_configs_with`] with only the model
+    /// and the offload store set, so recall archives and session-memory notes
+    /// stay unconfigured.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Config`] when a summarisation processor is configured
-    /// without a model. Truncation and tool-result processors never fail.
+    /// without a model, and when an offloader config fails its own
+    /// [`validate`](MessageOffloaderConfig::validate) checks. The summary
+    /// offloader never fails for a missing model: it falls back to the
+    /// deterministic offline summary. Truncation and tool-result processors
+    /// never fail.
     pub fn from_configs(
         configs: &[ProcessorConfig],
         model: Option<Arc<dyn Model>>,
         offload: Arc<dyn OffloadStore>,
     ) -> Result<Self> {
+        Self::from_configs_with(configs, &PipelineDeps::new(offload).with_model(model))
+    }
+
+    /// Builds the pipeline described by `configs` with the full set of stores.
+    ///
+    /// This is [`ContextPipeline::from_configs`] plus the seams that are not
+    /// part of a [`ProcessorConfig`]: [`FullCompactProcessor`] receives
+    /// [`PipelineDeps::session_memory`] and [`PipelineDeps::model`], and
+    /// [`MessageSummaryOffloader`] receives [`PipelineDeps::model`]. The recall
+    /// store is not held by a processor; it reaches them through
+    /// [`ProcessorContext::recall`] when the pipeline runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a summarisation processor is configured
+    /// without a model, and when an offloader config fails its own
+    /// [`validate`](MessageOffloaderConfig::validate) checks. The summary
+    /// offloader and full compaction never fail for a missing model: they fall
+    /// back to a deterministic offline summary.
+    pub fn from_configs_with(configs: &[ProcessorConfig], deps: &PipelineDeps) -> Result<Self> {
         let mut processors: Vec<Arc<dyn ContextProcessor>> = Vec::with_capacity(configs.len());
         for config in configs {
             match config {
@@ -145,11 +433,11 @@ impl ContextPipeline {
                 ProcessorConfig::ToolResult(config) => {
                     processors.push(Arc::new(ToolResultProcessor {
                         config: config.clone(),
-                        store: Arc::clone(&offload),
+                        store: Arc::clone(&deps.offload),
                     }));
                 }
                 ProcessorConfig::Summarization(config) => {
-                    let model = model.clone().ok_or_else(|| {
+                    let model = deps.model.clone().ok_or_else(|| {
                         Error::Config(
                             "the summarization processor requires a model, but none is configured"
                                 .to_owned(),
@@ -160,6 +448,70 @@ impl ContextPipeline {
                         model,
                     }));
                 }
+                ProcessorConfig::DialogueCompressor(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(DialogueCompressor::new(
+                        config.clone(),
+                        deps.model.clone(),
+                    )));
+                }
+                ProcessorConfig::CurrentRoundCompressor(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(CurrentRoundCompressor::new(
+                        config.clone(),
+                        deps.model.clone(),
+                    )));
+                }
+                ProcessorConfig::RoundLevel(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(RoundLevelCompressor::new(
+                        config.clone(),
+                        deps.model.clone(),
+                    )));
+                }
+                ProcessorConfig::FullCompact(config) => {
+                    // The session-memory notes are preferred over a model
+                    // summary; without notes the model or offline path runs.
+                    processors.push(Arc::new(FullCompactProcessor::new(
+                        config.clone(),
+                        deps.model.clone(),
+                        deps.session_memory.clone(),
+                    )));
+                }
+                ProcessorConfig::MicroCompact(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(MicroCompactProcessor::new(config.clone())));
+                }
+                ProcessorConfig::MessageOffloader(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(MessageOffloader::new(
+                        config.clone(),
+                        Arc::clone(&deps.offload),
+                    )));
+                }
+                ProcessorConfig::ToolResultBudget(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(ToolResultBudgetProcessor::new(
+                        config.clone(),
+                        Arc::clone(&deps.offload),
+                    )));
+                }
+                ProcessorConfig::ToolResultWindow(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(ToolResultWindowProcessor::new(
+                        config.clone(),
+                        Arc::clone(&deps.offload),
+                    )));
+                }
+                ProcessorConfig::MessageSummaryOffloader(config) => {
+                    // A missing model is not an error: the processor falls back
+                    // to the deterministic offline summary.
+                    processors.push(Arc::new(MessageSummaryOffloader::new(
+                        config.clone(),
+                        deps.model.clone(),
+                        Arc::clone(&deps.offload),
+                    )));
+                }
             }
         }
         Ok(Self::new(processors))
@@ -169,6 +521,70 @@ impl ContextPipeline {
     #[must_use]
     pub fn processors(&self) -> &[Arc<dyn ContextProcessor>] {
         &self.processors
+    }
+
+    /// Serializes the checkpoint state of every processor that keeps any.
+    ///
+    /// Entries are keyed by [`ContextProcessor::name`] in pipeline order; a
+    /// second processor with the same name becomes `"<name>#2"`, a third
+    /// `"<name>#3"`. Processors that report [`serde_json::Value::Null`] are
+    /// omitted, so the map only holds real checkpoints.
+    #[must_use]
+    pub fn save_state(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut state = BTreeMap::new();
+        for (processor, key) in self.state_keys() {
+            let value = processor.save_state();
+            if !value.is_null() {
+                state.insert(key, value);
+            }
+        }
+        state
+    }
+
+    /// Restores the processor checkpoints a [`ContextPipeline::save_state`] map
+    /// carries.
+    ///
+    /// Every entry is handed to the processor its key names, using the same key
+    /// scheme [`ContextPipeline::save_state`] used. A key that matches no
+    /// processor is ignored and logged at debug level, so a checkpoint written
+    /// by a different pipeline configuration still loads.
+    pub fn load_state(&self, state: &BTreeMap<String, serde_json::Value>) {
+        let keys = self.state_keys();
+        for (processor, key) in &keys {
+            if let Some(value) = state.get(key) {
+                processor.load_state(value);
+            }
+        }
+        for key in state.keys() {
+            if !keys.iter().any(|(_, known)| known == key) {
+                tracing::debug!(
+                    processor = %key,
+                    "ignored checkpoint state for an unknown processor"
+                );
+            }
+        }
+    }
+
+    /// `(processor, checkpoint key)` pairs in pipeline order.
+    ///
+    /// The counter is positional, so save and load always agree on a key even
+    /// when a processor in between keeps no state.
+    fn state_keys(&self) -> Vec<(&Arc<dyn ContextProcessor>, String)> {
+        let mut seen: HashMap<&'static str, usize> = HashMap::new();
+        self.processors
+            .iter()
+            .map(|processor| {
+                let name = processor.name();
+                let count = seen.entry(name).or_insert(0);
+                *count += 1;
+                let key = if *count == 1 {
+                    name.to_owned()
+                } else {
+                    format!("{name}#{count}")
+                };
+                (processor, key)
+            })
+            .collect()
     }
 
     /// Runs every processor in order and returns the events they produced.
@@ -219,6 +635,24 @@ pub enum ProcessorConfig {
     ToolResult(ToolResultConfig),
     /// Replace older rounds with an LLM summary.
     Summarization(SummarizationConfig),
+    /// Replace older complete rounds with historical memory blocks.
+    DialogueCompressor(DialogueCompressorConfig),
+    /// Compress the earlier part of the current round into a memory block.
+    CurrentRoundCompressor(CurrentRoundCompressorConfig),
+    /// Compress a history down to a total token target with the fallback ladder.
+    RoundLevel(RoundLevelCompressorConfig),
+    /// Replace an exhausted conversation with one boundary and summary.
+    FullCompact(FullCompactProcessorConfig),
+    /// Clear the text of stale tool results, keeping the newest ones per tool.
+    MicroCompact(MicroCompactProcessorConfig),
+    /// Offload large messages once the history outgrows the thresholds.
+    MessageOffloader(MessageOffloaderConfig),
+    /// Enforce a per-round token budget on tool results.
+    ToolResultBudget(ToolResultBudgetProcessorConfig),
+    /// Keep only the newest results of the configured tools.
+    ToolResultWindow(ToolResultWindowProcessorConfig),
+    /// Replace an oversized message with a summary and offload the original.
+    MessageSummaryOffloader(MessageSummaryOffloaderConfig),
 }
 
 #[cfg(test)]
@@ -341,6 +775,8 @@ mod tests {
             trigger_tokens: 800,
             manual: false,
             cancellation,
+            recall: None,
+            session_memory: None,
         }
     }
 
@@ -407,6 +843,8 @@ mod tests {
             trigger_tokens: 800,
             manual: false,
             cancellation: &cancelled,
+            recall: None,
+            session_memory: None,
         };
         let error = pipeline.run(&mut messages, &cx).await.unwrap_err();
         assert!(matches!(error, Error::Cancelled));

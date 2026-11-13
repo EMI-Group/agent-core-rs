@@ -135,6 +135,9 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 ## Known Gaps
 
 - There is no `ModelInputs`/`ChatParams`/`ModelIo`-style wrapper or inbound/outbound conversion trait: callers pass `&[BaseMessage]` to `invoke`/`ModelExt::complete` and an owned `Vec<BaseMessage>` to `stream`.
+- There is no `response_format`/`ResponseFormat` type, field, or helper and no history/`enable_history` flag anywhere in the crate: structured output and every vendor knob go through `ModelRequestConfig::extra`, which `build_chat_completion_body` merges last at the top level.
+- There is no `BoxModel`/`type Model = …` alias; `Arc<dyn Model>` is the convention (`init_model`, `init_model_with`, `ModelProvider::create`) and `impl Model for Arc<dyn Model>` makes it callable directly.
+- `Model` exposes only `provider()`, `model_name()`, `invoke()` and `stream()`: there is no `name()`, `config()`, or cancellation method on the trait.
 - Reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, and DashScope media generation are not ported (see `docs/PARITY.md`).
 - OpenAI-compatible: Python drops one of `temperature`/`top_p` for `openai.com` bases; this module sends both when the caller sets both.
 - Anthropic: no `cache_control` breakpoints, no mid-conversation `system` turns, and thinking blocks are ignored in non-streaming responses.

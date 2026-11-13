@@ -33,11 +33,12 @@ use openjiuwen_session::{InteractiveInput, Session};
 use serde_json::Value;
 
 use crate::ability::ComponentAbility;
-use crate::card::{WorkflowCard, WorkflowConfig, WorkflowSpec};
+use crate::card::{ExceptionConfig, WorkflowCard, WorkflowConfig, WorkflowSpec};
 use crate::component::Component;
 use crate::engine::definition::{EdgeKind, NodeConfig, WorkflowDefinition};
 use crate::engine::{CompiledWorkflow, WorkflowRunOptions};
 use crate::output::{WorkflowChunk, WorkflowOutput};
+use crate::render::DrawFormat;
 
 /// The per-component configuration [`Workflow`] records for one registration.
 ///
@@ -74,6 +75,8 @@ pub struct ComponentOptions {
     pub max_retries: u32,
     /// The per-node timeout in milliseconds; `None` means no timeout.
     pub timeout_ms: Option<u64>,
+    /// How a node's failure is handled after every retry (Python's `exception_config`).
+    pub exception_config: Option<ExceptionConfig>,
     /// An optional display name used by tracing and the spec.
     pub name: Option<String>,
 }
@@ -149,6 +152,13 @@ impl ComponentOptions {
         self
     }
 
+    /// Sets the failure policy applied after every retry is exhausted.
+    #[must_use]
+    pub fn with_exception_config(mut self, exception_config: Option<ExceptionConfig>) -> Self {
+        self.exception_config = exception_config;
+        self
+    }
+
     /// Marks a streaming registration (Python's `response_mode="streaming"`).
     ///
     /// The abilities become `[Invoke, Stream]`, plus `Transform` when a stream input
@@ -178,6 +188,7 @@ impl ComponentOptions {
             wait_for_all: self.wait_for_all,
             max_retries: self.max_retries,
             timeout_ms: self.timeout_ms,
+            exception_config: self.exception_config,
             name: self.name,
         }
     }
@@ -385,6 +396,33 @@ impl Workflow {
         self.build().map(|compiled| compiled.to_mermaid())
     }
 
+    /// Renders the workflow as a standalone SVG document.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same compile error as [`Workflow::build`]; once a workflow compiles,
+    /// [`CompiledWorkflow::to_svg`] always returns a document.
+    pub fn to_svg(&self) -> Result<String> {
+        self.build().map(|compiled| compiled.to_svg())
+    }
+
+    /// Renders the workflow in `format`.
+    ///
+    /// This is the Rust stand-in for Python's `Workflow.draw(..., output_format=...)`:
+    /// [`DrawFormat`] replaces the format string. PNG is intentionally not provided —
+    /// Python renders both PNG and SVG through the mermaid.ink network service, whereas
+    /// [`DrawFormat::Svg`] is rendered locally and deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same compile error as [`Workflow::build`]; rendering itself cannot fail.
+    pub fn draw(&self, format: DrawFormat) -> Result<String> {
+        match format {
+            DrawFormat::Mermaid => self.to_mermaid(),
+            DrawFormat::Svg => self.to_svg(),
+        }
+    }
+
     /// Compiles the workflow and runs it to completion.
     ///
     /// # Errors
@@ -504,6 +542,15 @@ mod tests {
         Arc::new(WorkflowSession::new("session-1"))
     }
 
+    /// A `defaultOutputs` policy carrying one recovery value.
+    fn recovery_config() -> ExceptionConfig {
+        ExceptionConfig {
+            handle_type: "defaultOutputs".to_string(),
+            default_outputs: Some(json!({"result": "recovered"})),
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
     /// start → end, both built-in components.
     fn workflow() -> Workflow {
         let mut workflow = Workflow::new(WorkflowCard::new("wf"));
@@ -535,6 +582,7 @@ mod tests {
         assert_eq!(options.wait_for_all, None);
         assert_eq!(options.max_retries, 0);
         assert_eq!(options.timeout_ms, None);
+        assert_eq!(options.exception_config, None);
         assert_eq!(options.name, None);
         assert_eq!(ComponentOptions::default().max_retries, 0);
     }
@@ -550,6 +598,7 @@ mod tests {
             .with_wait_for_all(true)
             .with_max_retries(3)
             .with_timeout_ms(1500)
+            .with_exception_config(Some(recovery_config()))
             .with_name("Node");
 
         assert_eq!(options.inputs_schema, Some(json!({"a": 1})));
@@ -560,6 +609,7 @@ mod tests {
         assert_eq!(options.wait_for_all, Some(true));
         assert_eq!(options.max_retries, 3);
         assert_eq!(options.timeout_ms, Some(1500));
+        assert_eq!(options.exception_config, Some(recovery_config()));
         assert_eq!(options.name.as_deref(), Some("Node"));
     }
 
@@ -574,6 +624,7 @@ mod tests {
             .with_wait_for_all(true)
             .with_max_retries(1)
             .with_timeout_ms(250)
+            .with_exception_config(Some(recovery_config()))
             .with_name("Node")
             .into_node_config();
 
@@ -585,6 +636,7 @@ mod tests {
         assert_eq!(node.wait_for_all, Some(true));
         assert_eq!(node.max_retries, 1);
         assert_eq!(node.timeout_ms, Some(250));
+        assert_eq!(node.exception_config, Some(recovery_config()));
         assert_eq!(node.name.as_deref(), Some("Node"));
     }
 

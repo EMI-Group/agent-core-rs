@@ -16,6 +16,9 @@
 //! as buffered frames, the `${start.query}` reference feeding the user prompt, and two
 //! LLM nodes composing in one workflow.
 //!
+//! Conversation history (`enable_history`) and response-format semantics live in
+//! `tests/llm_semantics.rs`; this file stays the prompt-assembly and streaming suite.
+//!
 //! Ports of `tests/unit_tests/core/component/test_llm_comp.py`, rewritten against
 //! `Workflow`/`ComponentOptions`. Every test is offline and deterministic: the only model
 //! is `ScriptedModel`, which records every call for assertions and never sleeps.
@@ -139,7 +142,7 @@ async fn output_config_names_the_answer_field() {
     let llm = LlmComponent::new(LlmCompConfig {
         model: Some(model),
         user_prompt_template: Some("{{query}}".to_owned()),
-        output_config: Some(json!({"answer": {"type": "string"}, "other": {}})),
+        output_config: Some(json!({"answer": {"type": "string"}})),
         ..LlmCompConfig::default()
     })
     .unwrap();

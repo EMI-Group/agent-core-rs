@@ -2114,11 +2114,14 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "nix",
+ "notify",
  "openjiuwen-common",
  "openjiuwen-foundation",
  "openjiuwen-retrieval",
  "openjiuwen-test-support",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
@@ -2157,6 +2160,7 @@ name = "openjiuwen-retrieval"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "indexmap",
  "openjiuwen-common",
@@ -2333,6 +2337,8 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
+ "bytes",
  "futures",
  "openjiuwen-common",
  "openjiuwen-foundation",

@@ -12,6 +12,25 @@
 //! carry per-run interaction state and frame writers) and projects the result into a
 //! [`WorkflowOutput`](crate::output::WorkflowOutput) or a frame stream.
 //!
+//! # Fan-in
+//!
+//! A regular, stream, or barrier edge compiles to a CNF channel, so a node with several
+//! inbound edges waits for every predecessor — Python's `wait_for_all = True`.
+//!
+//! A component registered with `wait_for_all = false` that has at least two distinct
+//! regular/stream/barrier predecessors instead uses Python's *first-arrival* fan-in: its
+//! static edges are compiled as dynamic router edges, so the node keeps no CNF group and
+//! `openjiuwen-graph` treats its channel as a trigger channel. The node runs as soon as
+//! any predecessor arrives and runs again when a later one does; a template key whose
+//! producer has not run yet resolves to `null`. A source that also has declared
+//! conditional edges into the node keeps its routing decision: it reaches the node only
+//! when its router selects it.
+//!
+//! Nodes left on CNF barriers: a single-source node (byte-identical to a plain edge, so
+//! `wait_for_all = false` changes nothing), a node whose only fan-in is a declared
+//! conditional edge, and `Collect`/`Transform` nodes, which validation rejects with
+//! `[100011]` because buffered stream composition needs every producer.
+//!
 //! ```no_run
 //! use std::sync::Arc;
 //!
@@ -38,7 +57,7 @@ pub mod node;
 mod run;
 pub mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +98,10 @@ pub struct WorkflowRunOptions {
     pub stream_modes: Option<Vec<StreamMode>>,
     /// Maximum number of supersteps; `None` uses the graph default.
     pub max_supersteps: Option<usize>,
+    /// Nesting level of this run: `0` for a top-level run, `1` for a sub-workflow, and
+    /// so on. A [`crate::components::sub_workflow::SubWorkflowComponent`] sets it on the
+    /// child run; every other caller leaves it at the default.
+    pub depth: usize,
 }
 
 impl Default for WorkflowRunOptions {
@@ -90,6 +113,7 @@ impl Default for WorkflowRunOptions {
             resume: false,
             stream_modes: None,
             max_supersteps: None,
+            depth: 0,
         }
     }
 }
@@ -140,6 +164,13 @@ impl WorkflowRunOptions {
     #[must_use]
     pub fn with_max_supersteps(mut self, max_supersteps: usize) -> Self {
         self.max_supersteps = Some(max_supersteps);
+        self
+    }
+
+    /// Declare this run as the `depth`-th nested level (`0` is a top-level run).
+    #[must_use]
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
         self
     }
 }
@@ -276,7 +307,9 @@ impl CompiledWorkflow {
     ///
     /// Compilation for rendering has no run scope and no snapshot store; a definition
     /// that cannot be compiled yields a Mermaid comment naming the problem instead of
-    /// panicking.
+    /// panicking. Because that compile is render-only, the diagram shows the recorded
+    /// topology: a `wait_for_all = false` fan-in is drawn with an edge from every
+    /// predecessor instead of the dynamic router edges the run path compiles.
     #[must_use]
     pub fn to_mermaid(&self) -> String {
         match self.build_graph(None, None, None) {
@@ -295,6 +328,39 @@ impl CompiledWorkflow {
         }
     }
 
+    /// Renders the workflow as an inline SVG document.
+    ///
+    /// Like [`CompiledWorkflow::to_mermaid`] this never fails: a definition that cannot be
+    /// compiled yields an SVG document naming the problem instead of panicking. The end
+    /// component is passed explicitly so the renderer shapes it as an exit node, and the
+    /// card name becomes the document title when it is not empty.
+    #[must_use]
+    pub fn to_svg(&self) -> String {
+        match self.build_graph(None, None, None) {
+            Ok(_) => crate::render::render_svg(
+                self.spec(),
+                self.card(),
+                &crate::render::SvgOptions {
+                    title: Some(self.inner.card.name.clone())
+                        .filter(|name| !name.trim().is_empty()),
+                    end_nodes: vec![self.inner.end_id.clone()],
+                    ..crate::render::SvgOptions::default()
+                },
+            ),
+            Err(failure) => {
+                tracing::warn!(
+                    workflow = self.inner.card.id.as_str(),
+                    error = %failure,
+                    "failed to compile the workflow graph for SVG rendering"
+                );
+                crate::render::error_svg(&format!(
+                    "workflow '{}' could not be compiled: {failure}",
+                    self.inner.card.id
+                ))
+            }
+        }
+    }
+
     /// The ability recorded for `id`, defaulting to `Invoke`.
     fn ability_or_default(&self, id: &str) -> ComponentAbility {
         self.inner.abilities.get(id).copied().unwrap_or_default()
@@ -303,7 +369,9 @@ impl CompiledWorkflow {
     /// Compiles a fresh graph for one run (or for rendering, when `scope` is `None`).
     ///
     /// Node instances carry the run's interaction state and frame writer, so a graph is
-    /// never reused across runs.
+    /// never reused across runs. A scope-less compile is render-only: it exists solely so
+    /// [`CompiledWorkflow::to_mermaid`] and [`CompiledWorkflow::to_svg`] can shape the
+    /// diagram, and the resulting graph is never executed.
     fn build_graph(
         &self,
         scope: Option<&Arc<RunScope>>,
@@ -311,6 +379,7 @@ impl CompiledWorkflow {
         max_supersteps: Option<usize>,
     ) -> Result<CompiledGraph> {
         let inner = &self.inner;
+        let render_only = scope.is_none();
         let card_id = inner.card.id.clone();
         let mut builder = GraphBuilder::new(card_id.clone());
 
@@ -340,32 +409,7 @@ impl CompiledWorkflow {
             );
         }
 
-        for edge in &inner.definition.edges {
-            match edge.kind {
-                DefinitionEdgeKind::Barrier => {
-                    builder = builder.barrier_edge(edge.sources.clone(), edge.target.clone());
-                }
-                DefinitionEdgeKind::Regular | DefinitionEdgeKind::Stream => {
-                    for source in &edge.sources {
-                        builder = builder.edge(source.clone(), edge.target.clone());
-                    }
-                }
-            }
-        }
-
-        for (from, conditional) in &inner.definition.conditional {
-            builder = builder.conditional_edges_to(
-                from.clone(),
-                conditional.targets.clone(),
-                CombinedRouter {
-                    from: from.clone(),
-                    allowed: conditional.targets.clone(),
-                    routers: conditional.routers.clone(),
-                },
-            );
-        }
-
-        builder
+        wire_edges(builder, &inner.definition, render_only)
             .entry(inner.start_id.clone())
             .exit(inner.end_id.clone())
             .metadata("workflow_id", json!(card_id))
@@ -380,17 +424,199 @@ impl CompiledWorkflow {
     }
 }
 
+/// Wires every recorded edge onto `builder`.
+///
+/// A static or barrier edge into a first-arrival node is skipped: those predecessors
+/// activate the node through the dynamic router edges registered by
+/// [`wire_conditional`] and by the unconditional-arrival loop below, which leaves its
+/// channel without a CNF group.
+///
+/// `render_only` compiles the *recorded* topology for a diagram instead of a run, so the
+/// first-arrival rewiring is skipped and every regular/stream/barrier edge is wired as
+/// recorded (`edge`/`barrier_edge`). A dynamic edge targets `"*"`, which the graph
+/// renderer skips (`openjiuwen-graph`'s visualize), so the CNF shape is the faithful
+/// picture of the builder's edges; the graph is never executed on this path.
+fn wire_edges(
+    builder: GraphBuilder,
+    definition: &WorkflowDefinition,
+    render_only: bool,
+) -> GraphBuilder {
+    let first_arrival = if render_only {
+        BTreeSet::new()
+    } else {
+        first_arrival_nodes(definition)
+    };
+    let arrivals = first_arrival_arrivals(definition, &first_arrival);
+    let mut builder = builder;
+
+    for edge in &definition.edges {
+        if first_arrival.contains(&edge.target) {
+            continue;
+        }
+        builder = match edge.kind {
+            DefinitionEdgeKind::Barrier => {
+                builder.barrier_edge(edge.sources.clone(), edge.target.clone())
+            }
+            DefinitionEdgeKind::Regular | DefinitionEdgeKind::Stream => {
+                edge.sources.iter().fold(builder, |builder, source| {
+                    builder.edge(source.clone(), edge.target.clone())
+                })
+            }
+        };
+    }
+
+    let mut builder = wire_conditional(builder, definition, &first_arrival, &arrivals);
+
+    // A source that reaches a first-arrival node only through regular/stream/barrier edges
+    // is otherwise a source with no selection logic: it always activates every such node.
+    for (source, targets) in &arrivals {
+        if definition.conditional.contains_key(source) {
+            continue;
+        }
+        builder = builder.conditional_edges(
+            source.clone(),
+            CombinedRouter {
+                from: source.clone(),
+                allowed: targets.clone(),
+                always: targets.clone(),
+                routers: Vec::new(),
+            },
+        );
+    }
+
+    builder
+}
+
+/// Wires every source's declared conditional edges.
+///
+/// A source that also reaches a first-arrival node merges both decisions into one router:
+/// the dynamic edge it registers carries the declared routers' results *and* the
+/// unconditional first-arrival targets, so no static edge is left on those targets. Its
+/// remaining declared targets keep their static conditional edges (and therefore their CNF
+/// channels) through `DeclaredEdgesOnly`.
+fn wire_conditional(
+    builder: GraphBuilder,
+    definition: &WorkflowDefinition,
+    first_arrival: &BTreeSet<String>,
+    arrivals: &BTreeMap<String, Vec<String>>,
+) -> GraphBuilder {
+    let mut builder = builder;
+    for (from, conditional) in &definition.conditional {
+        let unconditional = arrivals.get(from).map_or_else(Vec::new, Clone::clone);
+        let routes_to_first_arrival = conditional
+            .targets
+            .iter()
+            .any(|target| first_arrival.contains(target));
+        if unconditional.is_empty() && !routes_to_first_arrival {
+            builder = builder.conditional_edges_to(
+                from.clone(),
+                conditional.targets.clone(),
+                CombinedRouter {
+                    from: from.clone(),
+                    allowed: conditional.targets.clone(),
+                    always: Vec::new(),
+                    routers: conditional.routers.clone(),
+                },
+            );
+            continue;
+        }
+
+        let mut allowed = conditional.targets.clone();
+        for target in &unconditional {
+            if !allowed.contains(target) {
+                allowed.push(target.clone());
+            }
+        }
+        builder = builder.conditional_edges(
+            from.clone(),
+            CombinedRouter {
+                from: from.clone(),
+                allowed,
+                always: unconditional,
+                routers: conditional.routers.clone(),
+            },
+        );
+
+        let declared: Vec<String> = conditional
+            .targets
+            .iter()
+            .filter(|target| !first_arrival.contains(*target))
+            .cloned()
+            .collect();
+        if !declared.is_empty() {
+            builder = builder.conditional_edges_to(from.clone(), declared, DeclaredEdgesOnly);
+        }
+    }
+    builder
+}
+
+/// The node ids compiled with Python's first-arrival fan-in.
+///
+/// A node qualifies when it recorded `wait_for_all = false` *and* at least two distinct
+/// regular/stream/barrier edges feed it. A single inbound source is deliberately excluded:
+/// its channel then stays a plain one-source CNF group, byte-identical to a node that
+/// never asked for first arrival.
+fn first_arrival_nodes(definition: &WorkflowDefinition) -> BTreeSet<String> {
+    let mut inbound: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for edge in &definition.edges {
+        let sources = inbound.entry(edge.target.as_str()).or_default();
+        for source in &edge.sources {
+            sources.insert(source.as_str());
+        }
+    }
+    definition
+        .component_ids()
+        .into_iter()
+        .filter(|id| {
+            definition
+                .component(id)
+                .is_some_and(|entry| entry.node.wait_for_all == Some(false))
+                && inbound.get(id).is_some_and(|sources| sources.len() >= 2)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The unconditional first-arrival targets of every source, in edge declaration order.
+///
+/// Only regular/stream/barrier edges contribute: a declared conditional edge into a
+/// first-arrival node stays conditional, so its source still reaches the node only when
+/// its router selects it.
+fn first_arrival_arrivals(
+    definition: &WorkflowDefinition,
+    first_arrival: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut arrivals: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in &definition.edges {
+        if !first_arrival.contains(&edge.target) {
+            continue;
+        }
+        for source in &edge.sources {
+            let targets = arrivals.entry(source.clone()).or_default();
+            if !targets.contains(&edge.target) {
+                targets.push(edge.target.clone());
+            }
+        }
+    }
+    arrivals
+}
+
 /// The single router attached to one conditional source.
 ///
 /// Every router the builder registered for that source runs in registration order; the
 /// results are unioned with duplicates removed, so two routers agreeing on a target
 /// activate it once. A target the builder did not declare for this source is an error,
 /// mirroring the graph crate's "router routed to an unknown node" policy.
+///
+/// `always` holds the first-arrival targets reached through regular/stream/barrier edges:
+/// those activate on every arrival, before any router consults the run state.
 struct CombinedRouter {
     /// The source component id, used in error messages.
     from: String,
-    /// The targets the builder declared for this source.
+    /// The targets a declared router may return (declared targets plus `always`).
     allowed: Vec<String>,
+    /// The first-arrival targets this source always activates.
+    always: Vec<String>,
     /// The routers to run, in registration order.
     routers: Vec<Arc<dyn Router>>,
 }
@@ -400,6 +626,7 @@ impl std::fmt::Debug for CombinedRouter {
         f.debug_struct("CombinedRouter")
             .field("from", &self.from)
             .field("allowed", &self.allowed)
+            .field("always", &self.always)
             .field(
                 "routers",
                 &self
@@ -420,6 +647,11 @@ impl Router for CombinedRouter {
 
     async fn route(&self, ctx: &RouterContext) -> Result<Vec<String>> {
         let mut targets: Vec<String> = Vec::new();
+        for target in &self.always {
+            if !targets.contains(target) {
+                targets.push(target.clone());
+            }
+        }
         for router in &self.routers {
             for target in router.route(ctx).await? {
                 if !self.allowed.iter().any(|allowed| allowed == &target) {
@@ -434,6 +666,32 @@ impl Router for CombinedRouter {
             }
         }
         Ok(targets)
+    }
+}
+
+/// A router that activates nothing.
+///
+/// It exists so [`GraphBuilder::conditional_edges_to`] records a source's declared
+/// conditional edges after its real routing decision moved into a merged
+/// [`CombinedRouter`]: those edges are what give the declared targets their CNF channels.
+/// Returning an empty target list keeps this registration from taking a second routing
+/// decision.
+struct DeclaredEdgesOnly;
+
+impl std::fmt::Debug for DeclaredEdgesOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeclaredEdgesOnly")
+    }
+}
+
+#[async_trait]
+impl Router for DeclaredEdgesOnly {
+    fn name(&self) -> &'static str {
+        "workflow_declared_edges"
+    }
+
+    async fn route(&self, _ctx: &RouterContext) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 

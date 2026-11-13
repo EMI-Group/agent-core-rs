@@ -43,6 +43,9 @@ use crate::engine::PrepareOptions;
 use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
 use crate::processor::{ContextPipeline, ContextProcessor, ProcessorContext};
+use crate::recall::RecallArchiveStore;
+use crate::reload::{inject_reload_hint, ReloadLanguage};
+use crate::session_memory::SessionMemoryStore;
 use crate::stats::{compute_stats, ContextStats, PreparedContext};
 use crate::tokens::count_messages;
 use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
@@ -109,6 +112,13 @@ pub struct ContextState {
     pub messages: Vec<BaseMessage>,
     /// The revision the messages were saved at.
     pub revision: u64,
+    /// Process-level checkpoint state, keyed by processor name.
+    ///
+    /// Filled from [`ContextPipeline::save_state`] and restored through
+    /// [`ContextPipeline::load_state`], so a processor's cross-run counters
+    /// survive the process that wrote them. Empty when no processor keeps
+    /// counters, and when the state was written before processors had any.
+    pub processors: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Whether a message carries no payload at all.
@@ -158,6 +168,10 @@ pub struct ConversationContext {
     compression_totals: Mutex<(usize, usize, usize)>,
     /// Session handle this context was created with, when one was given.
     session: Option<Arc<dyn Session>>,
+    /// Archive store compressors keep replaced history in, when configured.
+    recall: Option<Arc<dyn RecallArchiveStore>>,
+    /// Session-memory notes full compaction reinjects, when configured.
+    session_memory: Option<Arc<dyn SessionMemoryStore>>,
 }
 
 impl std::fmt::Debug for ConversationContext {
@@ -176,7 +190,8 @@ impl ConversationContext {
     ///
     /// The offload scope is keyed by the raw `(session_id, context_id)` pair so
     /// handles stay unique per context, while the pool identity is normalized by
-    /// the engine.
+    /// the engine. `recall` and `session_memory` are the stores the pipeline
+    /// hands to processors; both are optional.
     pub(crate) fn new(
         context_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -186,6 +201,8 @@ impl ConversationContext {
         offload: Arc<dyn OffloadStore>,
         model: Option<Arc<dyn Model>>,
         session: Option<Arc<dyn Session>>,
+        recall: Option<Arc<dyn RecallArchiveStore>>,
+        session_memory: Option<Arc<dyn SessionMemoryStore>>,
     ) -> Self {
         let context_id = context_id.into();
         let session_id = session_id.into();
@@ -206,6 +223,8 @@ impl ConversationContext {
             stats_cache: Mutex::new(None),
             compression_totals: Mutex::new((0, 0, 0)),
             session,
+            recall,
+            session_memory,
         }
     }
 
@@ -231,6 +250,25 @@ impl ConversationContext {
     #[must_use]
     pub fn offload_store(&self) -> &Arc<dyn OffloadStore> {
         &self.offload
+    }
+
+    /// The recall archive store compressors write replaced history to.
+    ///
+    /// `None` when compression recall is disabled and no store was configured
+    /// on the engine or through [`ContextOptions`](crate::engine::ContextOptions).
+    #[must_use]
+    pub fn recall_store(&self) -> Option<&Arc<dyn RecallArchiveStore>> {
+        self.recall.as_ref()
+    }
+
+    /// The session-memory store full compaction reinjects notes from.
+    ///
+    /// `None` when neither the engine nor [`ContextOptions`](crate::engine::ContextOptions)
+    /// configured a store and the processor pipeline has no full compaction or
+    /// summary-offload processor.
+    #[must_use]
+    pub fn session_memory_store(&self) -> Option<&Arc<dyn SessionMemoryStore>> {
+        self.session_memory.as_ref()
     }
 
     /// The offload scope of this context.
@@ -285,19 +323,23 @@ impl ConversationContext {
             trigger_tokens: self.config.compression_trigger_tokens(),
             manual,
             cancellation: &self.cancellation,
+            recall: self.recall.as_deref(),
+            session_memory: self.session_memory.as_deref(),
         };
         self.pipeline.run(messages, &cx).await
     }
 
-    /// Serializes the history for persistence.
+    /// Serializes the history and the processor checkpoints for persistence.
     pub async fn save_state(&self) -> ContextState {
         ContextState {
             messages: self.messages().await,
             revision: self.revision(),
+            processors: self.pipeline.save_state(),
         }
     }
 
-    /// Replaces the history with `state`.
+    /// Replaces the history with `state` and restores the processor counters it
+    /// carries.
     ///
     /// The revision stored in `state` becomes the context's revision, so a
     /// restored context continues the sequence the saved one used.
@@ -307,9 +349,15 @@ impl ConversationContext {
     /// Currently infallible; the signature keeps the door open for
     /// implementations that persist eagerly.
     pub async fn load_state(&self, state: ContextState) -> Result<()> {
-        *self.messages.write().await = state.messages;
-        self.revision.store(state.revision, Ordering::SeqCst);
+        let ContextState {
+            messages,
+            revision,
+            processors,
+        } = state;
+        *self.messages.write().await = messages;
+        self.revision.store(revision, Ordering::SeqCst);
         self.invalidate_stats().await;
+        self.pipeline.load_state(&processors);
         Ok(())
     }
 
@@ -358,6 +406,13 @@ impl ConversationContext {
             &self.config,
         );
         drop_orphan_tool_results(&mut messages);
+        if self.config.enable_reload {
+            let injected = inject_reload_hint(&mut messages, ReloadLanguage::En);
+            tracing::debug!(
+                injected,
+                "reload hint injection for a prepared context window"
+            );
+        }
         let stats = compute_stats(&messages, self.counter.as_ref());
         let token_count = count_messages(self.counter.as_ref(), &messages);
         Ok(PreparedContext {
@@ -532,6 +587,8 @@ mod tests {
             store,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -632,6 +689,8 @@ mod tests {
             counter(),
             ContextPipeline::new(vec![Arc::new(Sleeper)]),
             store,
+            None,
+            None,
             None,
             None,
         );

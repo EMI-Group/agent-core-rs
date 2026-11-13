@@ -3,8 +3,10 @@
 ## Intent
 
 Built-in `Component` implementations that the workflow engine drives for control flow and leaf work.
-Each file ports one Python `openjiuwen.core.workflow.components` module onto `crate::component::Component`.
-The control-flow components (`start`, `end`, `branch`, `loop`) have no external dependencies and are offline-testable.
+Each module ports one Python `openjiuwen.core.workflow.components` area onto `crate::component::Component`.
+The control-flow components (`start`, `end`, `branch`, `loop`, `http_request`) have no runtime collaborators and are offline-testable.
+The leaf components take their collaborators through constructors: a `Model`, an `Arc<dyn Tool>`, a `SimpleKnowledgeBase`, the memory trait seams, or (for ReAct) an injected `AgentRunner`.
+The `questioner` and `intent_detection` components persist their state and conversation in the session lanes, not in the component.
 
 ## API Surface
 
@@ -35,7 +37,7 @@ Flat-mode `collect` returns `{"output": {"a.b[0].c": <leaf>, …}}`, a flattened
 ### `loop_.rs` — `LoopComponent`
 
 `LoopType { Number, Array, Condition }` is serde snake_case, `Default = Number`, with `as_str()`/`Display` returning `"number"`, `"array"`, `"condition"`.
-`LoopConfig { loop_type, loop_number: Option<u64>, loop_array: Option<String>, bool_expression: Option<String>, max_iterations: u64 }` is serde snake_case with defaults (`max_iterations = 1000`) and chainable `new`/`with_loop_number`/`with_loop_array`/`with_bool_expression`/`with_max_iterations` builders.
+`LoopConfig { loop_type, loop_number: Option<u64>, loop_array: Option<String>, bool_expression: Option<String>, max_iterations: u64 }` is serde snake_case with defaults (`max_iterations = 1000`) and chainable builders.
 `LoopComponent` has a manual `Debug`, `new(LoopConfig, Vec<Arc<dyn Component>>)`, `config()`, and `body_len()`; `component_type()` = `"loop"`; abilities `[Invoke]`.
 `invoke` accepts an object or `null` and returns `{"loop_results": [<per-iteration output>, …]}`.
 The effective cap is `min(config.max_iterations, session.config().loop_number_max_limit)`, falling back to `config.max_iterations` when the session exposes no configuration.
@@ -45,15 +47,72 @@ Each iteration starts from the input object overlaid with `{"index": <u64>, "ite
 `Condition` parses `bool_expression` once, re-evaluates it before every iteration against that iteration's inputs, stops on the first `false`, and fails with the exceeded-limit error when it would run past the cap.
 The body runs sequentially per iteration, each later component receives the previous component's output, and the last output becomes both the iteration result and the next `previous`; an empty body echoes the iteration inputs.
 
-### `llm.rs` — `LlmComponent`
+### `llm/` — `LlmComponent`
 
+`mod.rs` holds the component, `format.rs` the prompt rewrite plus answer shaping, `messages.rs` the conversation assembly and turn recording.
 `LlmResponseFormat { Text, Markdown, Json }` is serde snake_case with `Default = Text`.
-`LlmCompConfig` carries `model`, `model_id`, `request` (`ModelRequestConfig`), the two prompt templates, `template_content`, `response_format`, `output_config`, and `enable_history`; all fields are reachable through chainable builders.
+`LlmCompConfig` carries `model`, `model_id`, `request` (`ModelRequestConfig`), the two prompt templates, `template_content`, `response_format`, `markdown_instruction`/`json_instruction`, `output_config`, and `enable_history`; all fields have chainable builders.
 `LlmComponent::new(LlmCompConfig) -> Result<Self>` returns `Error::Validation("llm component requires a model")` when no model is configured; `component_type()` = `"llm"`; abilities `[Invoke, Stream]`.
 Prompt assembly: system-only yields `[system(rendered), user("")]`, user-only yields one rendered user message, both yield `[system, user]`, and otherwise `template_content` is rendered message by message (empty content falls back to one empty user message).
 Rendering substitutes `{{var}}` placeholders from a map of the input object's top-level keys plus the whole input under `"inputs"`; single braces stay literal.
-`invoke` returns `{<output_key>: <assistant text>}` where `output_key()` is the first key of `output_config` or `"result"`.
-`stream` yields one `{<output_key>: <delta>}` frame per non-empty content delta and one wrapped `101003` error on provider failure; `response_format` instruction injection and `enable_history` history insertion are deferred.
+`format_prompt` rewrites only the **last** user message for `Markdown`/`Json` using the verbatim `DEFAULT_MARKDOWN_INSTRUCTION` / `DEFAULT_JSON_INSTRUCTION` (`${query}`, `${json_schema}` substitution; overrides via `markdown_instruction`/`json_instruction`); `Text` leaves the conversation untouched.
+`shape_output` shapes the answer from `output_config`: `Text`/`Markdown` require exactly one configured key (`101002`), `Json` strips a fenced block, parses, projects the configured keys and reports `101004` for invalid JSON or a missing required field.
+`invoke` returns `{<output_key>: <shaped answer>}` where `output_key()` is the first key of `output_config` or `"result"`.
+`stream` yields one `{<output_key>: <delta>}` frame per non-empty content delta; a JSON-format stream is one non-streaming `Model::invoke` call yielded as a single frame; provider failures are a wrapped `101003` error.
+`enable_history` inserts `[system?] + history + [current prompt]` and, after a successful call, appends the sent user text and the raw assistant reply (a streamed run records the accumulated text once); with it off nothing is read from or written to the history store.
+No provider-side `response_format` parameter is ever sent.
+
+### `sub_workflow.rs` — `SubWorkflowComponent`
+
+`SUB_WORKFLOW_COMPONENT` = `"sub_workflow"`; `new(&Workflow) -> Result<Self>` compiles the child, `from_compiled(CompiledWorkflow)` wraps an existing one and takes `workflow_max_nesting_depth` from its config, and `with_cache_stream(bool)` / `with_max_nesting_depth(u32)` tune it; accessors `cache_stream()`, `max_nesting_depth()`, `compiled()`, `stream_output()`.
+Abilities are `[Invoke, Stream]`; `component_type()` = `"sub_workflow"`.
+Each run gets a fresh child `WorkflowSession` whose parent is the calling session (config, stream hub, tracer and checkpointer shared; its own state store, so child and parent node ids never collide) and `depth + 1` run options.
+`invoke` returns the child end output unchanged, so downstream references read `${sub.output.<key>}`.
+`stream` forwards the child's `{"type","index","payload"}` frame wires and drops the child's terminal `workflow_final`; with `cache_stream = true` the frames are merged (strings concatenate, arrays extend, every other type is last-wins — Python raises `TypeError` on numbers) and a later `invoke` answers from the cache.
+A child `INPUT_REQUIRED` re-publishes every interaction wire on the parent context and fails with the first one, so the parent run reports `INPUT_REQUIRED` with the same questions.
+`depth >= max_nesting_depth` fails with `[100100]` "workflow nesting hierarchy is too big, must <= {max}".
+
+### `http_request/` — `HttpRequestComponent`
+
+`config.rs` ports Python's configuration tree: `HttpComponentConfig`, `HttpRequestParamConfig`, `HttpHeadersConfig` (map or JSON template string), `HttpRequestBodyConfig`, `HttpAuthConfig` with `HttpAuthType`/`HttpAuthIn`, `HttpResponseHandlingConfig` with `HttpResponseFormat` (`autodetect`/`json`/`text`/`binary`/`buffer`) and `HttpResponseMode` (`full`/`on-success`/`on-error`), `HttpAdvancedOptionsConfig`, `HttpRetryConfig` with `HttpBackoffType` (`fixed`/`exponential`/`linear`), `HttpRateLimitConfig` with `HttpRateLimitUnit`, and `HttpContentType`.
+`HttpRequestComponent::new(HttpComponentConfig)`; `config() -> &HttpComponentConfig`; `component_type()` = `"http_request"`; abilities `[Invoke]` only (it still implements `stream`/`collect`/`transform` as single-result frames) so a plain node is never driven as `Transform`.
+Requests run through `openjiuwen_common::http::HttpClient`.
+`invoke` merges `inputs.method`/`headers`/`query_parameters` over the configuration and a non-null `inputs.body` into a JSON body, then templates `{{key}}` over `url`, `method`, header values, string query-parameter values, `body.json_data` (string form) and `body.text_data`; embedded `${path}` references resolve against the node inputs first (a Rust extension; auth secrets are left untouched).
+The output is `{statusCode, headers, body, url, ok}` with Python's success logic, `response_data_property` narrowing, and `response_mode` gating the object.
+4xx/5xx responses are ordinary data (`ok = false`); transport, timeout, cancellation, size and client-build failures become `[102000]`.
+Retries are enabled by `retry_config.enabled` and run inside `HttpClient` (`fixed` caps at `retry_delay`, `exponential` at `retry_delay * 2^max_retries`, `linear` is approximated by `fixed`).
+Registered as the builtin `"http_request"` factory.
+
+### `questioner/` — `QuestionerComponent`
+
+`config.rs` ports `QuestionerConfig` (`model`/`model_id`, `response_type` — only `"reply_directly"`, `question_content`, `extract_fields_from_response`, `field_names`, `max_response` default 3, `with_chat_history`, `chat_history_max_rounds`, `extra_prompt_for_fields_extraction`, `example_content`, `accept_language`) and `FieldInfo` (`field_name`, `description`, `type`, `cn_field_name`, `required`, `default_value`); `prompts.rs` holds the verbatim zh/en extraction templates plus the continue-ask wording.
+The component is `Debug` with `new(QuestionerConfig) -> Result<Self>`, `config()`, `component_type()` = `"questioner"`, abilities `[Invoke]`.
+It runs a `start`/`user_interact`/`end` state machine persisted in the session component lane under `questioner_state` and reset after a completed round.
+`question_content` is rendered with `{{field}}` placeholders over the node inputs (an unresolved placeholder renders `"None"`).
+Field extraction calls the model, strips a code fence, parses the JSON object, filters it to the configured field names, drops empty values, converts `FieldInfo.type` (`string`/`integer`/`number`/`boolean`), and fills `default_value` for the rest.
+Missing required fields produce a continue-ask question in the configured language; exceeding `max_response` is `[101074]`.
+An open question returns the interrupt error from `ComponentContext::interact`, so the run halts as `INPUT_REQUIRED` and `resume` re-runs the component with the seeded answers.
+The output is `{user_response, question, <fields>}` with empty `user_response`/`question` omitted.
+Local codes are `101070..=101076`.
+
+### `intent_detection.rs` (+ `intent_detection/`) — `IntentDetectionComponent` / `IntentRouter`
+
+`IntentDetectionCompConfig` carries `model_id`, `category_name_list`, `user_prompt`, `example_content: Vec<String>`, `enable_history`, `chat_history_max_turn` (default 3), `accept_language`, plus the non-serde `model` and `keywords`.
+The category model matches Python: index 0 is the default class (`Category0`/`分类0`, displayed `默认意图`/`Default intent`) followed by one class per configured name.
+The model path asks the model and post-processes the outermost `{…}` block: the `class` field is sanitised and matched against `Category\d+`/`分类\d+`, with Python's unparsable/missing-class/out-of-list fallbacks to the default class plus a language-specific `reason`.
+The rule path (no model configured) scores each category's keywords case-insensitively, counts distinct hits, breaks ties by the lowest class id, and reports `no keyword matched` for the default class; a category without keywords uses its display name.
+The output is `{classification_id, category_name, reason}` with an empty `reason` omitted; abilities `[Invoke]`; local codes `101050..=101062` in `intent_detection/error.rs`.
+`IntentRouter::new(component_id, Vec<(i64, Vec<String>)>, fallback)` implements `openjiuwen_graph::Router` for `add_conditional_connection`: it reads `classification_id` from the node output, routes the matching target list, and falls back for an unknown or absent id (an empty target list legally ends the run).
+The component deliberately does **not** implement `Component::route`, because dispatch would then suppress the state write the router needs.
+History is the session `__messages__` lane.
+
+### `react_agent.rs` — `ReActAgentComponent` / `AgentRunner` / `ModelReActRunner`
+
+`AgentRunner` is the async seam (`async fn invoke(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value>`) that `openjiuwen-agent` and `openjiuwen-harness` adapt to; this crate never depends on them.
+`ReActAgentComponent::new(Arc<dyn AgentRunner>)`, `runner()`, and `from_model(ReActAgentConfig) -> Result<Self>`; `component_type()` = `"react_agent"`, abilities `[Invoke]` (one node frame per run).
+`invoke` forwards the resolved inputs to the runner unchanged and normalizes the result to `{"output", "result_type"}`: `answer` for an ordinary value (an object's `output` key is unwrapped), `error` for a runner failure (`"Error in ReAct execution: <reason>"`, logged, Python parity, run completes), and `interrupt` for a workflow interrupt (the question becomes output data, a documented deviation).
+`ReActAgentConfig` carries `max_iterations` (5), `on_max_iterations` (`error`/`final_answer`/`return_observations`), the system/user prompt templates, and the non-serde `model`, `tools` and `request`; `validate()` rejects bad policy/prompt configuration.
+`ModelReActRunner` is the bundled runner: a bounded tool-calling loop over `Model` + `Arc<dyn Tool>` that feeds each tool result back as one tool message, runs tool calls sequentially, and reports `final_answer` as the last assistant text and `return_observations` as a plain observation array.
 
 ### `tool.rs` — `ToolComponent`
 
@@ -77,9 +136,10 @@ Local seams `MemoryRecall { async fn recall(&self, query, scope_id, user_id) -> 
 
 - Components implement `crate::component::Component`; they never reimplement graph scheduling, state resolution, or stream framing.
 - Errors use `openjiuwen_common::error`; user-data problems become coded workflow errors and never panics.
+- Component-specific error codes live beside the component, not in `crate::error`.
 - Missing references resolve to `null`; the control-flow components keep running or omit the frame rather than failing.
-- Every type is serde-serializable where it is public configuration (`EndConfig`, `LoopType`, `LoopConfig`), snake_case, and tolerant of unknown fields.
-- Public items are documented; files stay around or below 1000 lines; tests are deterministic and offline.
+- Every public configuration type is serde-serializable, snake_case, and tolerant of unknown fields; runtime handles (`Model`, `Tool`, `AgentRunner`) are `#[serde(skip)]`.
+- Public items are documented; files stay around or below 1000 lines; tests are deterministic and offline (loopback `wiremock` for HTTP).
 
 ## Routing Table
 
@@ -87,7 +147,12 @@ Local seams `MemoryRecall { async fn recall(&self, query, scope_id, user_id) -> 
 - `./end.rs` → `EndComponent`/`EndConfig`, the exit node with flat and template output modes
 - `./branch.rs` → `BranchComponent`/`BranchRouterAdapter`, condition-driven routing to successor ids
 - `./loop_.rs` → `LoopComponent`/`LoopConfig`/`LoopType`, bounded number/array/condition iteration over a body list
-- `./llm.rs` → LLM prompt assembly and model invocation component
+- `./llm/` → `mod.rs` (component + abilities + invoke/stream), `format.rs` (instruction rewrite, schema generation, output shaping), `messages.rs` (prompt assembly + history insertion)
+- `./sub_workflow.rs` → `SubWorkflowComponent`, a compiled child workflow as one node
+- `./http_request/` → `HttpRequestComponent` and its Python configuration tree
+- `./questioner/` → `QuestionerComponent`, `QuestionerConfig`/`FieldInfo`, the zh/en extraction prompts
+- `./intent_detection.rs` → `IntentDetectionComponent`/`IntentDetectionCompConfig`/`IntentRouter`; `./intent_detection/` → local codes and the inline test suite
+- `./react_agent.rs` → `ReActAgentComponent`, the `AgentRunner` seam, `ModelReActRunner`
 - `./tool.rs` → tool invocation component
 - `./retrieval.rs` → knowledge-retrieval component
 - `./memory.rs` → memory recall and write components
@@ -99,6 +164,9 @@ Unit tests live beside each module and use `WorkflowSession` plus a plain `Compo
 `end` covers template segmentation (literals, adjacent variables, unclosed braces), flat filtering and null/scalar inputs, batch JSON-text stringification, missing variables, frame order and array expansion, `transform` parity with `stream`, nested flattening, the `responseTemplate` alias, and abilities.
 `branch` covers first-match delegation, the `101021` no-match error, the empty invoke output, and adapter naming/`Arc` sharing; the adapter's `RouterContext` path is exercised by engine integration tests because `RouterContext` has no public constructor.
 `loop_` covers number/array/condition plans, reference-path arrays, `previous` propagation, empty and multi-component bodies, the `1001` and session-tightened caps, a zero cap, every missing parameter, non-object inputs, and `LoopConfig` JSON round-trip/defaults.
+`llm/format` covers instruction rewriting, `generate_json_schema`, fence stripping, required-field errors, and output projection; `llm/messages` covers template precedence, history splicing, and turn recording.
+`sub_workflow`, `http_request`, `questioner`, `intent_detection` and `react_agent` carry inline suites for their config, state machine, templating, category model, and runner loops.
+Crate-level suites in `../tests/` (listed in `tests/CONTEXT.md`) exercise the same components inside real workflows.
 
 ## Notes for Agents
 
@@ -109,3 +177,9 @@ Unit tests live beside each module and use `WorkflowSession` plus a plain `Compo
 - **Flat-mode `collect` drops `null` leaves** (matching Python's `extract_leaf_nodes` pruning of empty values) but keeps other falsy scalars such as `0`, `""`, and `false`.
 - `loop_`'s cancellation check runs once per iteration; a cancelled run surfaces `Error::Cancelled` rather than a loop error.
 - The body runs in-process: component errors propagate unchanged, while loop configuration, array-shape, and cap problems use `crate::error::loop_execution_error` (`101040`).
+- `SubWorkflowComponent` shares the parent's checkpointer, so a child session with a checkpointer can resume its own snapshot, but a parent `resume` starts a fresh child run and does not forward seeded answers.
+- `HttpRequestComponent` declares only `Invoke` on purpose: the engine's ability priority would otherwise drive a plain node as `Transform`.
+- `HttpRequestComponent` deviations: multipart bodies and digest/AWS authentication return `Error::Unsupported`; `throw_on_http_error`, `rate_limit_config`, `use_stream` and `max_body_length` are parsed but not enforced; binary bodies are base64; JSON string bodies use `serde_json` instead of `ast.literal_eval`.
+- `QuestionerComponent` deviations: the model is injected via `with_model` (no `model_id` runner lookup), chat-history window injection is not implemented (`with_chat_history`/`chat_history_max_rounds` are carried only), there is no `QuestionerExecutable` layer, and the state reset writes `null`s because the session lane deep-merges.
+- `IntentDetectionComponent` deviations: the model is injected, history lives in `__messages__`, and JSON parsing is strict (`{'class': 'x'}` is rejected).
+- `ReActAgentComponent` deviations: interrupts become `result_type: "interrupt"` data (the run completes), `on_max_iterations` policies return plain values instead of Python's rich dict, and the agent runtime (context engine, rails, skills, KV cache) is deferred to `AgentRunner` implementations.
