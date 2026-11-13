@@ -1,0 +1,146 @@
+# Built-in agent templates of the DeepAgent harness.
+#
+# This catalog mirrors the intent of the Python `harness/resources/builtin_rules.yaml`
+# (the rules and templates shipped inside the wheel) as declarative
+# `DeepAgentSpec` entries. It is embedded at compile time and parsed into the same
+# `DeepAgentSpec` type a workspace template uses, so a built-in template and a
+# user template are indistinguishable to `SpecRegistry`/`resolve`.
+#
+# The registry layers these *under* a workspace or home template: a file with the
+# same `name` shadows the built-in entry.
+#
+# Every tool is selected by its model-facing name (`BuiltinTool::from_name`);
+# every rail must be a known Rust rail seam. Unknown names fail validation with a
+# typed error instead of being ignored.
+
+- id: builtin.deepagent
+  name: deepagent
+  description: Default general-purpose coding agent with the full built-in tool set.
+  language: en
+  prompt_mode: full
+  task_loop: true
+  restrict_to_work_dir: true
+  system_prompt: |
+    You are DeepAgent, a coding agent operating inside the user's workspace.
+    Inspect the workspace before editing, keep changes focused, and verify your
+    work with the available tools.
+  prompt_sections:
+    - name: operating_rules
+      priority: 90
+      content: |
+        1. Prefer reading existing files before writing new ones.
+        2. Keep every change inside the workspace root.
+        3. Report commands you ran and their outcome.
+        4. Ask the user when a permission-confirmation or a destructive action is required.
+  model:
+    provider: openai
+    model: gpt-4.1
+    temperature: 0.2
+    max_tokens: 8192
+  tools:
+    - bash
+    - read_file
+    - write_file
+    - edit_file
+    - glob
+    - list_files
+    - grep
+    - todo_create
+    - todo_list
+    - todo_get
+    - todo_modify
+    - ask_user
+  skills:
+    - root: .openjiuwen/skills
+      enabled: true
+  subagents:
+    - name: explore_agent
+      preset: explore
+      description: Read-only codebase navigation agent.
+    - name: plan_agent
+      preset: plan
+      description: Read-only implementation-planning agent.
+  rails:
+    - security
+    - skills
+    - subagent
+  workspace:
+    root: ./
+    language: en
+    directories:
+      - notes
+      - artifacts
+  metadata:
+    category: general
+    tags:
+      - coding
+      - general-purpose
+
+- id: builtin.explorer
+  name: explorer
+  description: Read-only exploration agent for codebase navigation and reporting.
+  language: en
+  prompt_mode: full
+  task_loop: false
+  restrict_to_work_dir: true
+  system_prompt: |
+    You are an exploration agent. Read the workspace, trace the relevant code,
+    and report findings. Never modify files and never run destructive commands.
+  tools:
+    - read_file
+    - glob
+    - list_files
+    - grep
+  skills:
+    - root: .openjiuwen/skills
+      enabled: true
+  rails:
+    - security
+    - skills
+  workspace:
+    root: ./
+    language: en
+    directories:
+      - notes
+  metadata:
+    category: exploration
+    read_only: true
+
+- id: builtin.reviewer
+  name: reviewer
+  description: Code-review agent that inspects a change and reports defects and risks.
+  language: en
+  prompt_mode: full
+  task_loop: false
+  restrict_to_work_dir: true
+  system_prompt: |
+    You are a code reviewer. Inspect the requested change, identify correctness,
+    security and maintenance risks, and report concrete findings with file and
+    line references. Do not change files unless explicitly asked.
+  prompt_sections:
+    - name: review_format
+      priority: 80
+      content: |
+        Report each finding as:
+        - severity: critical | high | medium | low
+        - location: path:line
+        - problem: one sentence
+        - suggested fix: one sentence
+  tools:
+    - read_file
+    - glob
+    - list_files
+    - grep
+    - bash
+  skills:
+    - root: .openjiuwen/skills
+      enabled: true
+  rails:
+    - security
+    - skills
+  workspace:
+    root: ./
+    language: en
+  metadata:
+    category: review
+    read_only: false
