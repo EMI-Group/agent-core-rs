@@ -65,14 +65,14 @@ pub use config::{
     OPENJIUWEN_MODEL, OPENJIUWEN_PROVIDER, OPENJIUWEN_WORKSPACE, SESSION_PREFIX,
 };
 pub use io::{CliIo, LineReader, StdioReader, StdoutWriter, Writer};
-pub use permissions::{render_prompt, CliPermissionHost, PermissionAnswer};
+pub use permissions::{render_prompt, render_prompt_styled, CliPermissionHost, PermissionAnswer};
 pub use render::RenderState;
 pub use repl::{InterruptAction, InterruptCounter, Repl, ReplCommand, TurnOutcome};
 pub use run::{
-    build_agent, new_session, result_json_line, run_once, run_with_model, session_id,
-    stream_json_line, RunOutcome,
+    build_agent, build_agent_with, new_session, result_json_line, run_once, run_with_model,
+    session_id, stream_json_line, FoundationMcpToolProvider, McpToolProvider, RunOutcome,
 };
-pub use session_store::{MessageRecord, SessionRecord, SessionStore};
+pub use session_store::{MessageRecord, SessionRecord, SessionStore, SessionSummary};
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -218,35 +218,56 @@ pub fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Returns whether standard output is a terminal.
+///
+/// Colour gating uses this probe; like [`stdin_is_tty`] it lives here so the
+/// decision itself stays a pure function of the parsed flags and the
+/// environment (see [`paths::color_enabled`]).
+#[must_use]
+pub fn stdout_is_tty() -> bool {
+    std::io::stdout().is_terminal()
+}
+
 /// Runs the CLI end to end: resolve options, dispatch, then run or chat.
 ///
 /// This is the canonical entry point of the `openjiuwen` binary. The workspace
 /// directory is created only once a command is going to run, so `--help` and
 /// parse errors never touch the disk.
 ///
-/// The one-shot `run` uses [`CliIo::stdio_non_interactive`], so permission
-/// prompts fail closed; the REPL builds one [`CliIo::stdio`] handle, gives it to
-/// the agent (permission host) and reuses it for rendering through
-/// [`Repl::with_io_and_signals`].
+/// The one-shot `run` stays uncoloured and non-interactive: it uses
+/// [`CliIo::stdio_non_interactive`], so permission prompts fail closed and the
+/// first-run wizard never runs.
+///
+/// `chat` builds one [`CliIo::stdio`] handle, enables colour only on a terminal
+/// with `--no-color` and `NO_COLOR` unset (see [`paths::color_enabled`]), runs the
+/// onboarding wizard when the home has no settings file yet
+/// ([`onboarding::maybe_run`] is a no-op otherwise), and then hands the same
+/// handle to the agent (permission host) and to [`Repl::with_io_and_signals`].
+/// The REPL self-wires its history, skills and shell commands from
+/// `options.home`/`options.workspace`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Config`](openjiuwen_common::error::Error::Config) when the
 /// options cannot be resolved or the workspace cannot be created, and whatever
-/// the one-shot run or the REPL reports.
+/// onboarding, model construction, the one-shot run or the REPL reports.
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let options = CliOptions::resolve(&cli)?;
-    let dispatch = cli.dispatch(stdin_is_tty());
-    tracing::debug!(?dispatch, "dispatching CLI command");
-    match dispatch {
+    match cli.dispatch(stdin_is_tty()) {
         Dispatch::Run(args) => {
+            tracing::debug!(?args, "dispatching one-shot run");
             options.ensure_workspace()?;
             let io = CliIo::stdio_non_interactive();
             run::run_once(&options, &args, &io).await.map(|_| ())
         }
         Dispatch::Chat => {
+            tracing::debug!("dispatching interactive chat");
             options.ensure_workspace()?;
-            let io = CliIo::stdio();
+            let color = paths::color_enabled(cli.no_color, &ProcessEnv, stdout_is_tty());
+            let io = CliIo::stdio().with_color(color);
+            // First-run setup: a no-op unless the home has no settings file and
+            // the terminal is interactive (see `onboarding::maybe_run`).
+            onboarding::maybe_run(&io, &options.home, &ProcessEnv).await?;
             let model = options.build_model().await?;
             let agent = run::build_agent(model, &options, &io).await?;
             Repl::with_io_and_signals(agent, options, io).run().await
