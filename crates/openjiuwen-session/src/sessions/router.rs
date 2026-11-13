@@ -11,8 +11,9 @@
 //!
 //! | Operation | Behavior |
 //! | --- | --- |
-//! | `id`, `parent_id`, `get_state`, `get_component_state`, `trace`, `subscribe`, `snapshot` | delegate to the inner session |
+//! | `id`, `parent_id`, `get_state`, `get_component_state`, `trace`, `snapshot` | delegate to the inner session |
 //! | `update_state`, `update_component_state`, `write_stream`, `restore` | deliberate no-ops returning `Ok(())` (logged at debug) |
+//! | `subscribe` | an immediately empty stream (a router never consumes the run's output) |
 //! | `request_interaction` | `ErrorKind::Unsupported` (`"router sessions cannot interact"`) |
 //! | `install_trace_sink` | `ErrorKind::Unsupported` (`"router sessions are read-only"`) |
 //! | `config`, `writers`, `checkpointer`, `tracer` | `None` |
