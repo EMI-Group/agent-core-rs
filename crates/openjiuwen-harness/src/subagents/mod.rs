@@ -22,6 +22,12 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
+pub use runtime::clock::{rfc3339_from_ms, Clock, ManualClock, SystemClock};
+pub use runtime::transcript::{
+    TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription,
+    TranscriptSummary, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+};
+pub use runtime::{clock, transcript};
 pub use runtime::{
     ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
     SubAgentSpawnRequest, SubagentMetadata, SubagentStatus,
