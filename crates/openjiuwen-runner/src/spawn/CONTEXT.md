@@ -190,7 +190,8 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/mod.rs` → `SpawnAgentKind`, `SpawnSpec`, `SpawnedAgent`, `AgentSpawner`, `UnsupportedSpawner`, module re-exports, seam docs
 - `./src/spawn/protocol.rs` → `SpawnMessage`, `SpawnMessageKind`, NDJSON line serialization
 - `./src/spawn/frames.rs` → bounded line framing, `read_frame`, `parse_frame_line`, `frame_bytes`, `DEFAULT_MAX_FRAME_BYTES`
-- `./src/spawn/subprocess.rs` → `SubprocessConfig`, `SubprocessSpawner`, `SpawnedProcess`, request guard/desync, health task, stderr drain, kill-on-drop
+- `./src/spawn/subprocess.rs` → `SubprocessSpawner`, `SpawnedProcess`, request guard/desync, health task, stderr drain, kill-on-drop, wire helpers
+- `./src/spawn/subprocess_config.rs` → `SubprocessConfig` (serde config, builders, clamped deadlines), private to the module and re-exported as `spawn::subprocess::SubprocessConfig`
 - `./src/spawn/subprocess_tests.rs` → inline unit tests of `subprocess.rs` (loaded via `#[path]`)
 - `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, `RemoteAgent`, `create_remote_client`, `RemoteSpawner`, URL building, stream parsing, status mapping
 - `./src/spawn/remote_tests.rs` → inline unit tests of `remote.rs` (loaded via `#[path]`)
