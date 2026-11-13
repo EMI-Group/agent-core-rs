@@ -73,6 +73,10 @@ See `./src/mq/CONTEXT.md`.
 `RunOptions`, `AgentRef`, `WorkflowRef`, `TeamRef`, session resolution, per-run cancellation/timeout, teardown, and tracing spans.
 See `./src/run/CONTEXT.md`.
 
+### `src/pool/` — the team runtime pool
+`TeamPool` (`new`, `with_config`, `from_runner_config`, `start`/`try_start`/`acquire`, `get`/`list_active`, `stop`/`stop_all`, `pause`/`resume`, `take_payloads`, `capacity`/`available_permits`, `len`/`is_empty`/`is_closed`), `PoolRun`, `PoolLease`, `PoolRequest`, `PoolKey`, `PoolFrame`, `ActiveTeamInfo`, `PoolError`, `PoolShutdown`, and `TeamPoolConfig` (in `src/config.rs`).
+See `./src/pool/CONTEXT.md`.
+
 ### `src/spawn/` — subprocess seam
 `SpawnAgentKind`, `SpawnSpec`, `SpawnedAgent`, `AgentSpawner`, `UnsupportedSpawner`, and the NDJSON protocol types (`SpawnMessage`, `SpawnMessageKind`).
 See `./src/spawn/CONTEXT.md`.
@@ -113,13 +117,16 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - `./src/callback/` → `CallbackEvent`, `CallbackContext`, handlers, `CallbackFramework`, guardrail binding (`callback/CONTEXT.md`)
 - `./src/mq/` → `QueueMessage`, `MessageQueue`, `InMemoryMessageQueue`, backend factory (`mq/CONTEXT.md`)
 - `./src/run/` → `RunOptions`, `AgentRef`/`WorkflowRef`/`TeamRef`, session resolution, cancellation/timeouts, teardown, spans (`run/CONTEXT.md`)
+- `./src/pool/` → `TeamPool` admission, leases, bounded concurrency, idle eviction, HITL payloads (`pool/CONTEXT.md`)
+- `./src/monitor/` → `RunMonitor` run phase/outcome mirroring and events (`monitor/CONTEXT.md`)
+- `./src/hitl/` → `InteractionHub` live-run registry, inbox delivery, pause/cancel signals (`hitl/CONTEXT.md`)
 - `./src/spawn/` → spawn traits, `SpawnSpec`, NDJSON protocol (`spawn/CONTEXT.md`)
 - `./tests/` → integration suites (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
 - Unit tests beside every module: config defaults/serde, error wording, registry insert/lookup/policy/revision, event-name mapping, framework ordering/isolation/verdicts, guardrail stage mapping, queue delivery ordering/errors/timeouts, spawn protocol round-trip, session-id resolution, ref parsing.
-- Integration suites in `./tests/`: `resources.rs`, `callbacks.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `api_surface.rs`.
+- Integration suites in `./tests/`: `resources.rs`, `callbacks.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `api_surface.rs`, and the team-pool suites `team_pool.rs`, `team_pool_lifecycle.rs`, `team_pool_leases.rs`, `team_pool_hitl.rs`.
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/runner/test_resource_manager.py`).
 - Deterministic and offline: `ScriptedModel` for agents, `MockLlmServer` only when HTTP is under test, no sleeps used for ordering, `tempfile` for file checkpoints.
 - Gates: `cargo fmt -p openjiuwen-runner`, `cargo test -p openjiuwen-runner`, `cargo clippy -p openjiuwen-runner --all-targets -- -D warnings`, all clean and offline.
@@ -128,7 +135,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 
 - **Distributed mode**: `drunner/` entirely (Pulsar backend, `FakeMQ` wire envelopes, reply-topic subscription, `ResponseCollector`, `MqRemoteClient`/`MqServerAdapter`, `RemoteAgent`, A2A adapter bootstrap). `RunnerConfig::distributed` is data only; `create_message_queue` returns `Unsupported` for `pulsar`/`zeromq`.
 - **Subprocess spawn**: `spawn/process_manager.py` and `child_process.py` (real `python -m ...` child, health checks, graceful→force escalation, Windows stdio emulation, spawn logging config). The trait, spec, and NDJSON protocol are ported; `UnsupportedSpawner` is the built-in.
-- **Team product surface**: `team_runner.py`'s pool (`TeamRuntimeManager.activate/finalize`, reject kinds, orphan reclaim), `interact_agent_team`, monitor/`list_active_teams`/`delete_agent_team`, `register_human_agent_inbound`, pause/stop, `start_agent_team_streaming`, `TeamStreamLogger`, `run_context`, and `member=True` spawn routing. In-process `Team::invoke`/`Team::stream` over the multiagent seam IS implemented.
+- **Team product surface**: the in-process pool IS implemented in `./src/pool/` (admission with the reject-kind vocabulary, acquire/release leases, bounded concurrency, idle eviction and orphan reclaim, `list_active`, pause/resume/stop, HITL payload buffering). Still deferred: `delete_agent_team`, `register_human_agent_inbound`, `start_agent_team_streaming`, `TeamStreamLogger`/monitor TUI, `run_context`, the live `InteractGate` wake-up, and `member=True` spawn routing. In-process `Team::invoke`/`Team::stream` over the multiagent seam IS implemented.
 - **Resource managers beyond the four registries**: tags (`TagMgr`, `Tag`, `TagMatchStrategy`), MCP servers/tools, sys-operations, models, prompts. Models/prompts are host concerns in Rust (`init_model`, prompt values are passed at call sites).
 - **Callback framework extras**: decorators (`emit_before/after/around`, `transform_io`, `wrap`/`on_wrap`), `EventFilter` implementations (rate limit, circuit breaker, validation, auth, conditional, param modify), hooks, `CallbackChain` (retry/rollback), `trigger_parallel`/`trigger_until`/`trigger_delayed`/`trigger_stream`/`trigger_generator`, metrics/history/state dump, `lazy_callback_framework`. Every event name is preserved so these can land without a wire change.
 - **Runner internals**: `ReadWriteLockManager`, root task group / `ContextVar` task manager, `ModelContext`, `envs` forwarding (accepted in `RunOptions` and applied to created sessions' config only), remote-agent detection, `LegacyBaseAgent` handling, `enable_session_controller`, `enable_a2a`.
