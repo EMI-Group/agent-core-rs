@@ -213,14 +213,17 @@ A missing `ssh`, `team-member` or CLI binary is `ErrorKind::Config` from `StdioC
 - `./external_cli_spawner_tests.rs` → config labels, launch, identity env, despawn suite
 - `./ssh_spawner.rs` → `SshMemberSpawner`, the remote `export` prologue and `argv_for`/`command_for`
 - `./ssh_spawner_tests.rs` → literal argv assertions plus protocol-over-fake-ssh process cases
-- `./test_child.rs` → `FakeChild` (`serve`, `silent`, `failing_start`, `with_body`): POSIX `sh` children that speak the protocol (`#[cfg(test)]`)
+- `./test_child.rs` → `FakeChild` (`serve`, `silent`, `failing_start`, `with_body`, `path`, `program`, `sh_command`) plus `spawn_with_retry`, `SPAWN_ATTEMPTS`/`SPAWN_RETRY_BACKOFF`, `is_text_file_busy`: POSIX `sh` children that speak the protocol (`#[cfg(test)]`)
 
 ## Test Strategy
 
-Unit tests live beside each file under `#[cfg(test)]`; `cargo test -p openjiuwen-agent-teams --lib` runs them offline and deterministically (810 crate tests, **191 in this node**).
+Unit tests live beside each file under `#[cfg(test)]`; `cargo test -p openjiuwen-agent-teams --lib` runs them offline and deterministically (1245 crate tests, **196 in this node**).
 `lifecycle_tests.rs` (28) covers the status machine; `runtime.rs` (3) recording order and fan-out; `activity.rs` (14) movement, settled members, idempotent markers, sorted snapshots and the `IdleDebounce` boundary; `spawn.rs` (17) handle cancel/join/abort, registry bookkeeping, request serde and the identity-env contract; `spawn_config_tests.rs` (30) serde wire values, `resolve_program` failures, literal ssh argv shapes, quoting/escaping and options builders; `protocol_tests.rs` (31) every frame's exact JSON, defaults, unknown fields, error kinds and accessors; `stdio_tests.rs` (21) handshake, ordered frame fan-out, pause/resume/abort, refused start, immediate exit, garbage-line tolerance, stderr tail, idempotent stop of a silent child, termination notified exactly once, drop-kills-child (`kill -0` poll), cancellation, missing program, short-IO-timeout, fail-fast after exit and concurrent-write serialization; `process_spawner_tests.rs` (17), `external_cli_spawner_tests.rs` (14) and `ssh_spawner_tests.rs` (16) cover launch, per-request precedence, identity env (written to a temp file by the child and polled), missing binaries, despawn idempotence, re-spawn replacement, sorted `live_members` and object safety.
-`FakeChild` writes a `#!/bin/sh` script into a `tempfile::TempDir`; the child-process suites run it as `sh <path>` because executing a freshly written temp script directly can hit `ETXTBSY` while parallel tests fork.
-Every await in the child-process suites is bounded (`timeout(Duration::from_secs(10), …)` with 20 ms polling), there is no network, no `#[ignore]` and no fixed long sleep.
+`FakeChild` writes a `#!/bin/sh` script with a unique name per fixture into a `tempfile::TempDir`, flushes it, `sync_all`s it and closes the descriptor before any test can spawn it.
+The stdio, process and external-CLI suites launch it through `FakeChild::sh_command` (`sh <path>`): `sh` itself is never written, so those execs cannot be refused with `ETXTBSY` while parallel tests fork.
+The SSH suite must exec the script directly (it stands in for the `ssh` binary and the spawner renders the whole argv), so its spawns go through `spawn_with_retry` — three attempts, 20 ms apart, retried only on a `Transport`-level `Text file busy` — and take the forgiving `SPAWN_BOUND` (30 s) while protocol awaits keep `BOUND` (10 s).
+`test_child.rs` (5) proves the fixture's file shape and uniqueness, the `sh_command` shape, the `ETXTBSY` predicate, retry-then-succeed, no retry for a config error, and the bounded attempt count.
+Every await in the child-process suites is bounded (`timeout` with 20 ms polling), there is no network, no `#[ignore]` and no fixed long sleep.
 Every file has a doctest; all pass.
 Definition of done for this node: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --offline` (also `--no-default-features`), `cargo clippy -p openjiuwen-agent-teams --all-targets --offline -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 

@@ -28,7 +28,7 @@ const BOUND: Duration = Duration::from_secs(10);
 /// in one process, and a freshly written script executed directly can fail with `ETXTBSY` when a
 /// concurrently forking thread inherits its still-open write descriptor.
 fn command(child: &FakeChild) -> StdioCommand {
-    StdioCommand::new("sh").with_arg(child.program())
+    child.sh_command()
 }
 
 /// Polls `condition` until it holds or the bound expires.

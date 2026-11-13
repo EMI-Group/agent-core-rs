@@ -5,7 +5,15 @@
 //! `program` at a [`FakeChild`](super::test_child::FakeChild) script that ignores the `ssh`
 //! arguments and behaves as the remote member, so the JSON-lines protocol is exercised without any
 //! network.
-//! Every await is bounded by [`BOUND`] and polling uses short sleeps against a deadline.
+//! Every await is bounded by [`BOUND`] (spawns use the more forgiving [`SPAWN_BOUND`]) and polling
+//! uses short sleeps against a deadline.
+//!
+//! Unlike the other child-process suites, this one cannot run the fixture through `sh <script>`: the
+//! SSH spawner renders its own argv and the script stands in for the `ssh` binary, so it *is* the
+//! program. Executing a just-written script can be refused with `ETXTBSY` while another test thread
+//! forks, so every spawn goes through
+//! [`spawn_with_retry`](super::test_child::spawn_with_retry), which repeats that transport refusal a
+//! few times with a short backoff. The retry is test-side only; the spawner itself never retries.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,11 +26,18 @@ use super::runtime::{MemberObserver, MemberRuntime, ObserverEvent, RecordingObse
 use super::spawn::{MemberSpawnRequest, MemberSpawner};
 use super::spawn_config::{MemberSpawnKind, MemberSpawnOptions, SshTransportSpec};
 use super::ssh_spawner::SshMemberSpawner;
-use super::test_child::FakeChild;
+use super::test_child::{spawn_with_retry, FakeChild};
 use crate::schema::RoundOutcome;
 
-/// Upper bound for any single await in this suite.
+/// Upper bound for any single protocol await in this suite.
 const BOUND: Duration = Duration::from_secs(10);
+
+/// Upper bound for one spawn attempt.
+///
+/// Generous on purpose: under `--test-threads=8` the test binary forks and execs a child for every
+/// other test in this module, so a launch can be delayed far beyond its steady-state cost. It stays
+/// bounded, and only a failing run ever pays it.
+const SPAWN_BOUND: Duration = Duration::from_secs(30);
 
 /// The smallest spec that passes validation: default `ssh` program, port 22, a 15 s connect
 /// timeout and `exec` enabled.
@@ -61,14 +76,20 @@ fn ssh_request(host: &str, remote_command: &str) -> MemberSpawnRequest {
 }
 
 /// Spawns `request` with a bound and returns the member runtime.
+///
+/// The direct exec of the fixture script can be refused with `ETXTBSY` while another test thread
+/// forks; `spawn_with_retry` repeats that refusal a few times before it fails the test.
 async fn spawn_member(
     spawner: &SshMemberSpawner,
     request: MemberSpawnRequest,
 ) -> Arc<dyn MemberRuntime> {
-    tokio::time::timeout(BOUND, spawner.spawn(request))
-        .await
-        .expect("spawn did not return within the bound")
-        .expect("spawn failed")
+    spawn_with_retry(|| async {
+        tokio::time::timeout(SPAWN_BOUND, spawner.spawn(request.clone()))
+            .await
+            .expect("spawn did not return within the bound")
+    })
+    .await
+    .expect("spawn failed")
 }
 
 /// Despawns `member_name` with a bound.
@@ -342,7 +363,7 @@ async fn a_missing_ssh_binary_is_a_config_error() {
         program: "openjiuwen-no-such-ssh-xyz".to_string(),
         ..minimal_spec()
     });
-    let Err(error) = tokio::time::timeout(BOUND, spawner.spawn(request()))
+    let Err(error) = tokio::time::timeout(SPAWN_BOUND, spawner.spawn(request()))
         .await
         .expect("spawn did not return within the bound")
     else {

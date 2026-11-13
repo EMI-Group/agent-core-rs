@@ -33,7 +33,7 @@ const POLL: Duration = Duration::from_millis(20);
 /// Builds a launch configuration that runs `child` through `sh`.
 fn external_config(child: &FakeChild) -> ExternalCliRuntimeConfig {
     ExternalCliRuntimeConfig {
-        command: StdioCommand::new("sh").with_arg(child.program()),
+        command: child.sh_command(),
         ..ExternalCliRuntimeConfig::default()
     }
 }

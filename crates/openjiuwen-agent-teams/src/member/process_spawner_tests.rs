@@ -5,6 +5,9 @@
 //! sleep against a deadline instead of a fixed wait.
 //! The script is run through `sh <path>` rather than executed directly, because a freshly written
 //! script executed directly can fail with `ETXTBSY` while another test thread forks.
+//! Spawns go through
+//! [`spawn_with_retry`](super::test_child::spawn_with_retry) as a belt-and-braces measure, and use
+//! the more forgiving [`SPAWN_BOUND`]; the retry is test-side only.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,17 +20,23 @@ use super::process_spawner::ProcessMemberSpawner;
 use super::runtime::MemberRuntime;
 use super::spawn::{MemberSpawnRequest, MemberSpawner, MEMBER_NAME_ENV};
 use super::spawn_config::{MemberSpawnKind, MemberSpawnOptions, ProcessMemberConfig, StdioCommand};
-use super::test_child::FakeChild;
+use super::test_child::{spawn_with_retry, FakeChild};
 
-/// Upper bound for any single await in this suite.
+/// Upper bound for any single protocol await in this suite.
 const BOUND: Duration = Duration::from_secs(10);
+
+/// Upper bound for one spawn attempt.
+///
+/// Generous on purpose: a launch can be delayed while the other test threads fork and exec at the
+/// same time. It is still bounded, and only a failing run pays it.
+const SPAWN_BOUND: Duration = Duration::from_secs(30);
 
 /// The program name no test host has installed, used for the configuration-error cases.
 const MISSING_PROGRAM: &str = "openjiuwen-no-such-team-member-xyz";
 
 /// The command that runs `child` through `sh`.
 fn sh_command(child: &FakeChild) -> StdioCommand {
-    StdioCommand::new("sh").with_arg(child.program())
+    child.sh_command()
 }
 
 /// A launch configuration running `child`.
@@ -53,10 +62,13 @@ async fn spawn_ok(
     spawner: &ProcessMemberSpawner,
     request: MemberSpawnRequest,
 ) -> Arc<dyn MemberRuntime> {
-    tokio::time::timeout(BOUND, spawner.spawn(request))
-        .await
-        .expect("spawn did not return within the bound")
-        .expect("spawn failed")
+    spawn_with_retry(|| async {
+        tokio::time::timeout(SPAWN_BOUND, spawner.spawn(request.clone()))
+            .await
+            .expect("spawn did not return within the bound")
+    })
+    .await
+    .expect("spawn failed")
 }
 
 /// Starts `runtime`, bounded.
