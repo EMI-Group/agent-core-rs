@@ -38,6 +38,7 @@ use crate::component::Component;
 use crate::engine::definition::{EdgeKind, NodeConfig, WorkflowDefinition};
 use crate::engine::{CompiledWorkflow, WorkflowRunOptions};
 use crate::output::{WorkflowChunk, WorkflowOutput};
+use crate::render::DrawFormat;
 
 /// The per-component configuration [`Workflow`] records for one registration.
 ///
@@ -383,6 +384,33 @@ impl Workflow {
     /// (an uncompilable graph renders as a Mermaid comment).
     pub fn to_mermaid(&self) -> Result<String> {
         self.build().map(|compiled| compiled.to_mermaid())
+    }
+
+    /// Renders the workflow as a standalone SVG document.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same compile error as [`Workflow::build`]; once a workflow compiles,
+    /// [`CompiledWorkflow::to_svg`] always returns a document.
+    pub fn to_svg(&self) -> Result<String> {
+        self.build().map(|compiled| compiled.to_svg())
+    }
+
+    /// Renders the workflow in `format`.
+    ///
+    /// This is the Rust stand-in for Python's `Workflow.draw(..., output_format=...)`:
+    /// [`DrawFormat`] replaces the format string. PNG is intentionally not provided —
+    /// Python renders both PNG and SVG through the mermaid.ink network service, whereas
+    /// [`DrawFormat::Svg`] is rendered locally and deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same compile error as [`Workflow::build`]; rendering itself cannot fail.
+    pub fn draw(&self, format: DrawFormat) -> Result<String> {
+        match format {
+            DrawFormat::Mermaid => self.to_mermaid(),
+            DrawFormat::Svg => self.to_svg(),
+        }
     }
 
     /// Compiles the workflow and runs it to completion.
