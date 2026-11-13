@@ -14,7 +14,12 @@
 //! Not ported (see the crate-level `## Deferred Python Behavior`): tags
 //! (`TagMgr`), MCP servers/tools, sys-operations, models, and prompts.
 
+pub mod mcp_server;
+pub mod model;
+pub mod prompt;
 mod registry;
+pub mod sysop;
+pub mod tag;
 
 use std::sync::Arc;
 
