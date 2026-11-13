@@ -41,11 +41,13 @@
 //! - ML-based salience/importance scoring for deciding which memories are worth
 //!   consolidating.
 mod config;
+mod lease;
 mod model;
 mod outcome;
 mod planner;
 mod repository;
 pub use config::*;
+pub use lease::*;
 pub use model::*;
 pub use outcome::*;
 pub use planner::*;

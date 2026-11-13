@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use crate::record::MemoryScope;
 
+use super::lease::{DreamLease, LeaseRequest, LeaseStatus, LeasedJob};
 use super::model::{DreamJob, DreamKind, DreamState, DreamTrigger};
 use super::outcome::DreamOutcome;
 
@@ -190,6 +191,10 @@ impl DreamFilter {
 /// - **`delete_finished(older_than)`** removes terminal jobs whose finish time
 ///   (`finished_at`, falling back to `updated_at`) is strictly earlier than
 ///   `older_than`, and returns how many rows were removed.
+/// - **Leases** are optional: backends that support cross-process ownership override
+///   `claim_next_leased`, `renew_lease`, `release_lease`, and `lease`; the default bodies
+///   report [`Error::Unsupported`]. `delete_job` is the single-row retention hook and is
+///   also optional.
 ///
 /// Implementations must not hold a lock guard across `.await`.
 #[async_trait]
@@ -199,6 +204,73 @@ pub trait DreamRepository: Send + Sync {
 
     /// Claims the next eligible job, stamping it with `now`.
     async fn claim_next(&self, now: DateTime<Utc>) -> Result<Option<DreamJob>>;
+
+    /// Claims the next eligible job and records a [`DreamLease`] for it.
+    ///
+    /// The eligible set is the [`Self::claim_next`] head plus any `Running` job whose
+    /// stored lease expired at or before `now` (a crashed worker's job). A `Running` job
+    /// without a lease record is never claimed, because it may have been claimed without
+    /// leasing. The transition sets `state = Running`, increments `attempts`, stamps
+    /// `started_at = updated_at = now`, and stores
+    /// `DreamLease::new(job.id, request.owner, now, request.ttl)`.
+    ///
+    /// Backends that cannot persist leases return [`Error::Unsupported`].
+    async fn claim_next_leased(
+        &self,
+        _now: DateTime<Utc>,
+        _request: &LeaseRequest,
+    ) -> Result<Option<LeasedJob>> {
+        Err(Error::unsupported(
+            "this dream repository does not support leased claims",
+        ))
+    }
+
+    /// Extends a lease owned by `owner` to `now + ttl`.
+    ///
+    /// Returns [`LeaseStatus::Renewed`] with the updated lease, or
+    /// [`LeaseStatus::Lost`] when the job is no longer running, the lease is missing, it
+    /// expired at or before `now`, or another owner holds it. Backends that cannot
+    /// persist leases return [`Error::Unsupported`].
+    async fn renew_lease(
+        &self,
+        _job_id: &str,
+        _owner: &str,
+        _now: DateTime<Utc>,
+        _ttl: chrono::Duration,
+    ) -> Result<LeaseStatus> {
+        Err(Error::unsupported(
+            "this dream repository does not support leases",
+        ))
+    }
+
+    /// Deletes the lease when `owner` still holds it.
+    ///
+    /// Returns `true` when a matching lease was removed; a missing lease or a different
+    /// owner is `false`, because either way there is nothing of the caller's to release.
+    async fn release_lease(&self, _job_id: &str, _owner: &str) -> Result<bool> {
+        Err(Error::unsupported(
+            "this dream repository does not support leases",
+        ))
+    }
+
+    /// Returns the stored lease for `job_id`, if one exists.
+    async fn lease(&self, _job_id: &str) -> Result<Option<DreamLease>> {
+        Err(Error::unsupported(
+            "this dream repository does not support leases",
+        ))
+    }
+
+    /// Removes one job (and its lease) by id.
+    ///
+    /// This is the retention hook: [`Self::delete_finished`] enforces an age cutoff,
+    /// while a per-state count cap has to remove individual rows. Returns `true` when the
+    /// job existed; a missing id is `false` so repeated purges are idempotent. Backends
+    /// that do not implement it return [`Error::Unsupported`].
+    async fn delete_job(&self, _job_id: &str) -> Result<bool> {
+        Err(Error::unsupported(
+            "this dream repository does not support deleting a single job",
+        ))
+    }
 
     /// Marks a running job finished with `outcome`'s state and metrics.
     async fn complete(&self, job_id: &str, outcome: DreamOutcome) -> Result<DreamJob>;
@@ -254,6 +326,7 @@ fn is_claimable(job: &DreamJob, now: DateTime<Utc>) -> bool {
 #[derive(Debug, Default)]
 pub struct InMemoryDreamRepository {
     jobs: parking_lot::RwLock<BTreeMap<String, DreamJob>>,
+    leases: parking_lot::RwLock<BTreeMap<String, DreamLease>>,
 }
 
 impl InMemoryDreamRepository {
@@ -331,6 +404,127 @@ impl DreamRepository for InMemoryDreamRepository {
             "claimed dream job"
         );
         Ok(Some(claimed))
+    }
+
+    async fn claim_next_leased(
+        &self,
+        now: DateTime<Utc>,
+        request: &LeaseRequest,
+    ) -> Result<Option<LeasedJob>> {
+        request.validate()?;
+        let mut jobs = self.jobs.write();
+        let mut leases = self.leases.write();
+        // A pending head always wins; only when the queue has none does a crashed
+        // worker's expired lease become a takeover candidate.
+        let mut candidate = {
+            let mut eligible: Vec<&DreamJob> =
+                jobs.values().filter(|job| is_claimable(job, now)).collect();
+            eligible.sort_by(|left, right| queue_order(left, right));
+            eligible.first().map(|job| job.id.clone())
+        };
+        if candidate.is_none() {
+            let mut expired: Vec<&DreamJob> = jobs
+                .values()
+                .filter(|job| {
+                    job.state == DreamState::Running && job.attempts < job.max_attempts
+                })
+                .filter(|job| {
+                    leases
+                        .get(&job.id)
+                        .is_some_and(|lease| lease.is_expired(now))
+                })
+                .collect();
+            expired.sort_by(|left, right| queue_order(left, right));
+            candidate = expired.first().map(|job| job.id.clone());
+        }
+        let Some(job_id) = candidate else {
+            return Ok(None);
+        };
+        let lease = DreamLease::new(job_id.clone(), request.owner.clone(), now, request.ttl);
+        let job = stored_job(&mut jobs, &job_id)?;
+        job.state = DreamState::Running;
+        job.attempts = job.attempts.saturating_add(1);
+        job.started_at = Some(now);
+        job.updated_at = now;
+        let claimed = job.clone();
+        leases.insert(job_id, lease.clone());
+        tracing::debug!(
+            target: "openjiuwen_memory::dreaming::repository",
+            job_id = %claimed.id,
+            owner = %lease.owner,
+            attempts = claimed.attempts,
+            "claimed dream job under a lease"
+        );
+        Ok(Some(LeasedJob { job: claimed, lease }))
+    }
+
+    async fn renew_lease(
+        &self,
+        job_id: &str,
+        owner: &str,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<LeaseStatus> {
+        if ttl <= chrono::Duration::zero() {
+            return Err(Error::validation(format!(
+                "dream lease `ttl` must be positive (got {}s)",
+                ttl.num_seconds()
+            )));
+        }
+        let jobs = self.jobs.read();
+        let mut leases = self.leases.write();
+        let Some(lease) = leases.get(job_id) else {
+            return Ok(LeaseStatus::Lost(super::lease::LeaseLostReason::Missing));
+        };
+        match jobs.get(job_id) {
+            None => {
+                leases.remove(job_id);
+                return Ok(LeaseStatus::Lost(super::lease::LeaseLostReason::Missing));
+            }
+            Some(job) if job.state != DreamState::Running => {
+                leases.remove(job_id);
+                return Ok(LeaseStatus::Lost(super::lease::LeaseLostReason::NotRunning));
+            }
+            Some(_) => {}
+        }
+        if lease.owner != owner {
+            return Ok(LeaseStatus::Lost(
+                super::lease::LeaseLostReason::OwnerMismatch,
+            ));
+        }
+        if lease.is_expired(now) {
+            return Ok(LeaseStatus::Lost(super::lease::LeaseLostReason::Expired));
+        }
+        let renewed = DreamLease {
+            acquired_at: lease.acquired_at,
+            expires_at: now
+                .checked_add_signed(ttl)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+            ..lease.clone()
+        };
+        leases.insert(job_id.to_owned(), renewed.clone());
+        Ok(LeaseStatus::Renewed(renewed))
+    }
+
+    async fn release_lease(&self, job_id: &str, owner: &str) -> Result<bool> {
+        let mut leases = self.leases.write();
+        match leases.get(job_id) {
+            Some(lease) if lease.owner == owner => {
+                leases.remove(job_id);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn lease(&self, job_id: &str) -> Result<Option<DreamLease>> {
+        Ok(self.leases.read().get(job_id).cloned())
+    }
+
+    async fn delete_job(&self, job_id: &str) -> Result<bool> {
+        let removed = self.jobs.write().remove(job_id).is_some();
+        self.leases.write().remove(job_id);
+        Ok(removed)
     }
 
     async fn complete(&self, job_id: &str, outcome: DreamOutcome) -> Result<DreamJob> {
@@ -424,6 +618,9 @@ impl DreamRepository for InMemoryDreamRepository {
             let finished = job.finished_at.unwrap_or(job.updated_at);
             finished >= older_than
         });
+        self.leases
+            .write()
+            .retain(|job_id, _| jobs.contains_key(job_id));
         Ok(before - jobs.len())
     }
 }
