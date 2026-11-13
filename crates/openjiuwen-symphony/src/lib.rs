@@ -53,14 +53,26 @@ pub use openjiuwen_common::error::{Error, Result};
 pub mod artifact;
 /// API-shaped stubs for the Python areas that require an LLM/ML stack or external services.
 pub mod deferred;
+/// Skill-folder discovery: `SKILL.md` scanning and lexical skill search.
+pub mod discovery;
+/// Error constructors and helpers over [`openjiuwen_common::error`].
+pub mod error;
+/// The experience bank: distilled capability-combination knowledge with ranking.
+pub mod experience;
 /// Error constructors and helpers over [`openjiuwen_common::error`].
 pub mod error;
 /// Fail-soft capability evaluation with deterministic static metrics.
 pub mod evaluation;
+/// Flow distillation and reusable SkillPack artifacts.
+pub mod flow;
 /// The `can_feed` capability relationship graph (JGF v2 documents).
 pub mod graph;
+/// LLM-guided stages with deterministic offline fallbacks.
+pub mod llm;
 /// Capability cards, fingerprints, data-type vocabulary, and naming helpers.
 pub mod model;
+/// Object-store backed graph artifact persistence.
+pub mod object_artifact;
 /// Deterministic relation candidates, planning, and plan execution.
 pub mod orchestration;
 /// The in-memory capability registry with write-through persistence.
