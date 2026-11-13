@@ -51,6 +51,31 @@
 //! than routing through this umbrella. Layers that already depend on the kernel
 //! crates directly (for example `openjiuwen-core`'s siblings) must not depend on this
 //! crate, which keeps the dependency graph acyclic.
+//!
+//! # Feature forwarding
+//!
+//! The default feature set is empty: with no feature enabled the umbrella builds the
+//! kernel exactly as the concrete crates' defaults do. Four opt-in features forward to
+//! the crate that owns the gated surface, so a consumer can enable it here instead of
+//! adding a direct dependency on that crate:
+//!
+//! - `otel` → `openjiuwen-session/otel`, which makes `session::install_trace_sink`
+//!   really install the supplied sink (without it the helper is a documented no-op).
+//! - `sqlite` → `openjiuwen-foundation/sqlite`, `openjiuwen-session/sqlite`, and
+//!   `openjiuwen-memory/sqlite`, which add the SQLite key-value and document stores,
+//!   the SQLite checkpointer, and memory's FTS5 coding index (`memory::lite::fts`).
+//! - `sandbox` → `openjiuwen-sysop/sandbox`, which compiles the sandbox HTTP gateway
+//!   client in `sys_operation::sandbox::http`; its remote calls still report
+//!   `openjiuwen_common::error::Error::Unsupported`.
+//! - `live-tests` → `openjiuwen-foundation/live-tests`, the concrete crate's opt-in
+//!   network tests.
+//!
+//! `mcp` and `tiktoken` are deliberately **not** exposed: they are
+//! `openjiuwen-foundation`'s default features and the dependency is taken with default
+//! features, so Cargo's additive feature model means an umbrella feature could never
+//! turn them off. Harness, teams, and extension features (`distributed`, `vendor`,
+//! `notify`, `browser`/`cua`/`mobile`) belong to higher layers and are out of scope
+//! here.
 #![forbid(unsafe_code)]
 // The `core`/`common`, `foundation`/`…_foundation` naming of the aliases below
 // intentionally mirrors the Python package tree.

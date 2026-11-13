@@ -368,8 +368,15 @@ fn foundation_extended_paths_resolve() {
 #[test]
 fn memory_extended_paths_resolve() {
     use openjiuwen_core::memory::{
-        analyzer::MemoryAnalyzer, dreaming::DreamJob, external::ProviderRegistry,
-        lite::CodingMemory, team::TeamMemoryRecord,
+        analyzer::MemoryAnalyzer,
+        dreaming::DreamJob,
+        external::ProviderRegistry,
+        lite::{
+            local::LocalCodingMemory,
+            markdown::{FrontMatter, MarkdownMemory},
+            CodingFact, CodingMemory,
+        },
+        team::TeamMemoryRecord,
     };
 
     // Nested module paths.
@@ -378,6 +385,14 @@ fn memory_extended_paths_resolve() {
     assert_same_type::<ProviderRegistry, openjiuwen_memory::external::ProviderRegistry>();
     assert_same_type::<TeamMemoryRecord, openjiuwen_memory::team::TeamMemoryRecord>();
     assert_same_type::<DreamJob, openjiuwen_memory::dreaming::DreamJob>();
+
+    // The lite coding-memory stack: typed facts, the Markdown source of truth, and
+    // the local file-backed store. (`lite::fts` is sqlite-gated; it is proved in
+    // `tests/feature_forwarding.rs`.)
+    assert_same_type::<CodingFact, openjiuwen_memory::lite::CodingFact>();
+    assert_same_type::<MarkdownMemory, openjiuwen_memory::lite::markdown::MarkdownMemory>();
+    assert_same_type::<FrontMatter, openjiuwen_memory::lite::markdown::FrontMatter>();
+    assert_same_type::<LocalCodingMemory, openjiuwen_memory::lite::local::LocalCodingMemory>();
 
     // Crate-root re-exports of the same items.
     assert_same_type::<CodingMemory, openjiuwen_memory::CodingMemory>();
@@ -403,7 +418,53 @@ fn retrieval_extended_paths_resolve() {
     assert_same_type::<MultimodalDocument, openjiuwen_retrieval::multimodal::MultimodalDocument>();
     assert_same_type::<PdfParser, openjiuwen_retrieval::parsing::PdfParser>();
 
+    // The sparse/BM25 surface is reachable through its nested module as well.
+    assert_same_type::<Bm25Index, openjiuwen_retrieval::sparse::bm25::Bm25Index>();
+    assert_eq!(
+        openjiuwen_core::retrieval::sparse::bm25::DEFAULT_STOPWORDS,
+        openjiuwen_retrieval::sparse::bm25::DEFAULT_STOPWORDS
+    );
+
     // `QueryRewriter` is a trait: prove the concrete trait object satisfies the
     // umbrella trait's bound.
     assert_query_rewriter::<dyn openjiuwen_retrieval::rewrite::QueryRewriter>();
+}
+
+#[test]
+fn workflow_components_paths_resolve() {
+    use openjiuwen_core::workflow::{
+        BranchComponent, HttpRequestComponent, IntentDetectionComponent,
+        KnowledgeRetrievalComponent, LlmComponent, LoopComponent, MemoryRetrievalComponent,
+        MemoryWriteComponent, QuestionerComponent, ReActAgentComponent, SubWorkflowComponent,
+        ToolComponent,
+    };
+
+    // Crate-root re-exports through the umbrella alias.
+    assert_same_type::<SubWorkflowComponent, openjiuwen_workflow::SubWorkflowComponent>();
+    assert_same_type::<QuestionerComponent, openjiuwen_workflow::QuestionerComponent>();
+    assert_same_type::<IntentDetectionComponent, openjiuwen_workflow::IntentDetectionComponent>();
+    assert_same_type::<ReActAgentComponent, openjiuwen_workflow::ReActAgentComponent>();
+    assert_same_type::<MemoryRetrievalComponent, openjiuwen_workflow::MemoryRetrievalComponent>();
+    assert_same_type::<MemoryWriteComponent, openjiuwen_workflow::MemoryWriteComponent>();
+    assert_same_type::<KnowledgeRetrievalComponent, openjiuwen_workflow::KnowledgeRetrievalComponent>(
+    );
+    assert_same_type::<LlmComponent, openjiuwen_workflow::LlmComponent>();
+    assert_same_type::<BranchComponent, openjiuwen_workflow::BranchComponent>();
+    assert_same_type::<LoopComponent, openjiuwen_workflow::LoopComponent>();
+    assert_same_type::<ToolComponent, openjiuwen_workflow::ToolComponent>();
+    assert_same_type::<HttpRequestComponent, openjiuwen_workflow::HttpRequestComponent>();
+
+    // Nested component module paths stay reachable through the umbrella.
+    assert_same_type::<
+        SubWorkflowComponent,
+        openjiuwen_workflow::components::sub_workflow::SubWorkflowComponent,
+    >();
+    assert_same_type::<
+        QuestionerComponent,
+        openjiuwen_workflow::components::questioner::QuestionerComponent,
+    >();
+    assert_same_type::<
+        HttpRequestComponent,
+        openjiuwen_workflow::components::http_request::HttpRequestComponent,
+    >();
 }

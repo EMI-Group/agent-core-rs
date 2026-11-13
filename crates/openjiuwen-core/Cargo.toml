@@ -30,6 +30,26 @@ default = []
 # Forwards `openjiuwen-session/otel`: `session::install_trace_sink` then really installs the sink
 # instead of being the documented no-op.
 otel = ["openjiuwen-session/otel"]
+# Forwards the SQLite backends of the three crates that gate one: foundation's KV/document
+# stores, session's checkpointer, and memory's FTS5 coding index (`lite::fts`).
+sqlite = ["openjiuwen-foundation/sqlite", "openjiuwen-session/sqlite", "openjiuwen-memory/sqlite"]
+# Forwards `openjiuwen-sysop/sandbox`: `sys_operation::sandbox::http` (the gateway client that
+# reports `Unsupported` for remote calls) then really compiles.
+sandbox = ["openjiuwen-sysop/sandbox"]
+# Forwards `openjiuwen-foundation/live-tests` so the umbrella's own gate can opt into the
+# concrete crate's network tests.
+live-tests = ["openjiuwen-foundation/live-tests"]
+# Deliberately not forwarded:
+# - `mcp` / `tiktoken` are foundation's *defaults*, and the dependency below is declared with
+#   default features. Cargo features are additive, so an umbrella feature could never turn them
+#   off; exposing them would imply otherwise.
+# - there is no kernel `redis` feature: `session::RedisCheckpointer` and foundation's
+#   `store::external::redis` always compile. Live Redis wiring belongs to
+#   `openjiuwen-extensions`'s `redis` feature, a different layer.
+# - there is no kernel `fts5` feature: memory's FTS5 index (`memory::lite::fts`) is gated by
+#   memory's `sqlite` feature and is therefore covered by the umbrella `sqlite` feature.
+# - `distributed`, `vendor`, `notify`, and `browser`/`cua`/`mobile` are teams-, harness-, or
+#   extension-layer features, not kernel ones.
 
 [lints]
 workspace = true
