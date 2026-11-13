@@ -12,8 +12,12 @@
 //! through [`McpClient::take_notifications`], and
 //! [`McpClient::supports_server_stream`] reports the negotiated capability.
 //!
-//! Only stdio and streamable-HTTP/SSE transports are in scope; the Python
-//! `openapi`/`playwright` transports are deliberately not ported.
+//! [`openapi`](crate::tool::mcp::openapi) adds the OpenAPI transport: one MCP
+//! tool per operation of an OpenAPI document, called over plain HTTP instead of
+//! JSON-RPC. Its Playwright sibling stays deferred — a browser runtime is not
+//! shipped here, so [`McpClientType::Playwright`] is rejected with
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) and the
+//! streamable-HTTP/SSE transports remain the only Playwright-compatible ones.
 //!
 //! The HTTP transports are implemented directly on `reqwest` and implement
 //! [`rmcp::transport::Transport`] themselves: the workspace enables `rmcp`
@@ -23,9 +27,12 @@
 //! through [`RmcpClient`].
 pub mod client;
 mod http;
+pub mod openapi;
 pub mod result;
 pub mod tool;
 
+#[cfg(test)]
+mod openapi_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
@@ -35,6 +42,7 @@ pub use client::{
     connect_mcp_server, McpClient, McpClientType, McpNotification, McpRemoteTool, McpServerConfig,
     RmcpClient,
 };
+pub use openapi::{OpenApiClient, OpenApiOperation, OpenApiParameter, OpenApiSpec};
 pub use result::{
     extract_content, normalize_call_tool_result, McpToolResult, DEFAULT_MCP_ERROR_TEXT,
 };

@@ -37,10 +37,10 @@ use super::result::{normalize_call_tool_result, McpToolResult};
 /// The kind of transport used to reach an MCP server.
 ///
 /// Python parity: the `client_type` string of `McpServerConfig`
-/// (`"stdio"`, `"sse"`, `"streamable-http"`). Values are matched
-/// case-insensitively and both dash and underscore spellings are accepted;
-/// `"http"` is an accepted alias for [`McpClientType::StreamableHttp`], which is
-/// the default.
+/// (`"stdio"`, `"sse"`, `"streamable-http"`, `"openapi"`, `"playwright"`).
+/// Values are matched case-insensitively and both dash and underscore spellings
+/// are accepted; `"http"` is an accepted alias for
+/// [`McpClientType::StreamableHttp`], which is the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpClientType {
@@ -51,6 +51,12 @@ pub enum McpClientType {
     /// Connect to a streamable-HTTP MCP endpoint (the default).
     #[default]
     StreamableHttp,
+    /// Derive one tool per operation from an `OpenAPI` document (no JSON-RPC).
+    #[serde(rename = "openapi")]
+    OpenApi,
+    /// Drive a Playwright browser session — deferred, construction is unsupported.
+    #[serde(rename = "playwright")]
+    Playwright,
 }
 
 impl McpClientType {
@@ -61,13 +67,15 @@ impl McpClientType {
             Self::Stdio => "stdio",
             Self::Sse => "sse",
             Self::StreamableHttp => "streamable_http",
+            Self::OpenApi => "openapi",
+            Self::Playwright => "playwright",
         }
     }
 
     /// Resolves a transport name, accepting the Python aliases.
     ///
-    /// Accepts `stdio`, `sse`, `streamable_http`, `streamable-http`, and `http`
-    /// in any ASCII case.
+    /// Accepts `stdio`, `sse`, `streamable_http`, `streamable-http`, `http`,
+    /// `openapi`, `open_api`, and `playwright` in any ASCII case.
     ///
     /// # Errors
     ///
@@ -78,8 +86,11 @@ impl McpClientType {
             "stdio" => Ok(Self::Stdio),
             "sse" => Ok(Self::Sse),
             "streamable_http" | "http" => Ok(Self::StreamableHttp),
+            "openapi" | "open_api" => Ok(Self::OpenApi),
+            "playwright" => Ok(Self::Playwright),
             _ => Err(Error::validation(format!(
-                "unsupported MCP client type `{value}`; expected stdio, sse, or streamable-http"
+                "unsupported MCP client type `{value}`; expected stdio, sse, streamable-http, \
+                 openapi, or playwright"
             ))),
         }
     }
@@ -427,16 +438,34 @@ pub trait McpClient: Send + Sync + 'static {
 /// Builds a client for `config` without connecting.
 ///
 /// Python parity: `ToolMgr._create_client` plus the client registry
-/// (`"stdio"`, `"sse"`, `"streamable-http"`). The returned client connects on
-/// its first operation.
+/// (`"stdio"`, `"sse"`, `"streamable-http"`, `"openapi"`, `"playwright"`). The
+/// returned client connects on its first operation. The Playwright transport is
+/// deferred: it needs a browser runtime, so it is rejected here.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Validation`] when `config` cannot address its transport (a
-/// stdio config without a command, or an HTTP config without an absolute
-/// http/https URL).
+/// stdio config without a command, an HTTP config without an absolute
+/// http/https URL, or an `OpenAPI` config without a spec source), and
+/// [`Error::Unsupported`] for the deferred Playwright transport.
 pub fn connect_mcp_server(config: &McpServerConfig) -> Result<Arc<dyn McpClient>> {
-    let client = RmcpClient::new(config)?;
+    let client: Arc<dyn McpClient> = match config.client_type {
+        McpClientType::OpenApi => Arc::new(super::openapi::OpenApiClient::new(config)?),
+        McpClientType::Playwright => {
+            tracing::debug!(
+                server_name = %config.server_name,
+                server_id = %config.server_id,
+                client_type = config.client_type.as_str(),
+                "playwright MCP transport is deferred"
+            );
+            return Err(Error::unsupported(
+                "playwright MCP transport requires a browser runtime",
+            ));
+        }
+        McpClientType::Stdio | McpClientType::Sse | McpClientType::StreamableHttp => {
+            Arc::new(RmcpClient::new(config)?)
+        }
+    };
     tracing::debug!(
         server_name = %config.server_name,
         server_id = %config.server_id,
@@ -444,7 +473,7 @@ pub fn connect_mcp_server(config: &McpServerConfig) -> Result<Arc<dyn McpClient>
         auth_headers = ?config.redacted_headers(),
         "created MCP client"
     );
-    Ok(Arc::new(client))
+    Ok(client)
 }
 
 /// The number of total connect attempts (first try included).
@@ -476,6 +505,13 @@ fn is_retryable(error: &Error) -> bool {
     matches!(error, Error::Transport(_))
 }
 
+/// The error a transport this client does not speak reports.
+fn unsupported_transport(client_type: McpClientType) -> Error {
+    Error::unsupported(format!(
+        "`{}` is not an rmcp transport; build it through `connect_mcp_server`",
+        client_type.as_str()
+    ))
+}
 /// Maps a `rmcp` service error onto the shared error type.
 fn map_service_error(error: ServiceError) -> Error {
     match error {
@@ -511,7 +547,10 @@ impl RmcpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for an unusable transport configuration.
+    /// Returns [`Error::Validation`] for an unusable transport configuration and
+    /// [`Error::Unsupported`] for the transports this client does not speak
+    /// (`openapi`, `playwright`); [`connect_mcp_server`] routes those elsewhere,
+    /// so the unsupported arms are defensive only.
     pub fn new(config: &McpServerConfig) -> Result<Self> {
         match config.client_type {
             McpClientType::Stdio => {
@@ -523,6 +562,9 @@ impl RmcpClient {
             }
             McpClientType::Sse | McpClientType::StreamableHttp => {
                 super::http::validate_endpoint(&config.server_path)?;
+            }
+            McpClientType::OpenApi | McpClientType::Playwright => {
+                return Err(unsupported_transport(config.client_type));
             }
         }
         Ok(Self {
@@ -574,6 +616,9 @@ impl RmcpClient {
                     .await
                     .map_err(|error| failure(error.to_string()))?;
                 Ok((session, None))
+            }
+            McpClientType::OpenApi | McpClientType::Playwright => {
+                Err(unsupported_transport(self.config.client_type))
             }
         }
     }
