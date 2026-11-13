@@ -1,10 +1,19 @@
-//! The deferred `DeepSeek` Harness (DSH) provider: card, configuration data and model mapping.
+//! The `DeepSeek` Harness (DSH) provider: card, configuration data, model mapping and the
+//! subprocess harness.
 //!
-//! Ports the data half of Python `openjiuwen.harness_providers.dsh` (v0.1.20):
-//! [`DshHarnessConfig`] mirrors `DshHarnessConfig` in `config.py` and [`model_config`] mirrors the
-//! provider's `model_config` classmethod. The harness itself is not ported — the adapter needs the
-//! `deepseek-harness-sdk` runtime, so [`HarnessProvider::create`] validates the mapping and then
-//! reports [`HarnessError::UnsupportedCapability`] with the SDK requirement.
+//! Ports Python `openjiuwen.harness_providers.dsh` (v0.1.20): [`DshHarnessConfig`] mirrors
+//! `DshHarnessConfig` in `config.py`, [`model_config`] mirrors the provider's `model_config`
+//! classmethod, and [`DshDriver`] is the subprocess harness the provider's `create` returns.
+//!
+//! # Structure
+//!
+//! - this module — the configuration data, the system-prompt enum, the card, the provider and the
+//!   model mapping;
+//! - `wire` — the process invocation (argv, environment, `DSH_HOME` resolution);
+//! - `frames` — the accumulator that projects DSH session events onto harness observations and
+//!   builds the terminal turn result;
+//! - `harness` — [`DshDriver`], the JSON-RPC transport that spawns the `dsh` runtime and drives one
+//!   session.
 //!
 //! # Python parity
 //!
@@ -20,12 +29,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::security::SecretString;
 use openjiuwen_harness_protocol::{
-    HarnessCapability, HarnessCard, HarnessError, HarnessProtocol, HarnessProvider, HarnessResult,
-    HostCapability, JsonObject, ModelChoice, ModelConfigProvider,
+    EventBufferConfig, EventOverflowPolicy, HarnessCapability, HarnessCard, HarnessError,
+    HarnessProtocol, HarnessProvider, HarnessResult, HostCapability, JsonObject, ModelChoice,
+    ModelConfigProvider,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +45,20 @@ use crate::decode::{
     optional_u64, reject_unknown_keys,
 };
 use crate::skills::{parse_skills_value, SkillConflict, SkillSource};
+use crate::vendor_cli::{resolve_binary, BinarySpec, VendorHarness};
 
 use super::vendor;
+
+mod frames;
+mod harness;
+mod wire;
+
+pub use harness::DshDriver;
+
+// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
+// assert it; this provider no longer produces that message, so keep the constant referenced in
+// non-test builds (removing it is the vendor module's call, not this provider's).
+const _: &str = crate::providers::vendor::DSH_SDK_REQUIRED;
 
 /// Registry name of the DSH provider.
 pub const PROVIDER_NAME: &str = "dsh";
@@ -351,7 +374,7 @@ impl fmt::Debug for DshHarnessConfig {
     }
 }
 
-/// Returns the deferred DSH provider stub.
+/// Returns the DSH provider.
 #[must_use]
 pub fn provider() -> DshHarnessProvider {
     DshHarnessProvider::default()
@@ -359,14 +382,21 @@ pub fn provider() -> DshHarnessProvider {
 
 /// Returns the capability card of the DSH adapter.
 ///
-/// DSH only consumes MCP server configurations and runs endpoint models; it declares no session,
-/// checkpoint, steering or fork capability.
+/// The adapter keeps one reusable runtime session across turns, executes its own tools, consumes
+/// MCP server configurations and runs endpoint models. The pinned DSH protocol exposes no steering
+/// input, no abort of a running turn, no pause/resume and no portable checkpoint, so the card
+/// declares none of those: [`abort`](HarnessProtocol::abort),
+/// [`pause`](HarnessProtocol::pause) and
+/// [`export_checkpoint`](HarnessProtocol::export_checkpoint) report
+/// [`HarnessError::UnsupportedCapability`](openjiuwen_harness_protocol::HarnessError) instead of
+/// pretending to work.
 #[must_use]
 pub fn card() -> HarnessCard {
     vendor::vendor_card(
         CARD_NAME,
         IMPLEMENTATION_VERSION,
         [
+            HarnessCapability::PersistentSession,
             HarnessCapability::McpTools,
             HarnessCapability::EndpointModels,
         ],
@@ -412,7 +442,7 @@ pub fn model_config(
     Ok(object)
 }
 
-/// The deferred DSH provider: identity card plus validation-only `create`.
+/// The DSH provider: identity card plus the subprocess `create` path.
 #[derive(Debug, Clone)]
 pub struct DshHarnessProvider {
     /// Card reported by [`HarnessProvider::card`].
@@ -420,7 +450,7 @@ pub struct DshHarnessProvider {
 }
 
 impl Default for DshHarnessProvider {
-    /// Builds the stub with the card of [`card`].
+    /// Builds the provider with the card of [`card`].
     fn default() -> Self {
         Self { card: card() }
     }
@@ -432,17 +462,41 @@ impl HarnessProvider for DshHarnessProvider {
         &self.card
     }
 
-    /// Validates `config` and then reports the missing `deepseek-harness-sdk` runtime.
+    /// Validates `config`, resolves the `dsh` executable and `DSH_HOME`, and returns an unstarted
+    /// harness.
+    ///
+    /// The returned [`VendorHarness`] wraps a [`DshDriver`], so it reports
+    /// [`HarnessState::Terminated`](openjiuwen_harness_protocol::HarnessState::Terminated) until
+    /// [`start`](HarnessProtocol::start) succeeds; it never spawns the runtime here.
     ///
     /// # Errors
     ///
-    /// Returns [`HarnessError::Validation`] when `config` is not a valid [`DshHarnessConfig`], and
-    /// [`HarnessError::UnsupportedCapability`] carrying `vendor::DSH_SDK_REQUIRED` otherwise.
+    /// Returns [`HarnessError::Validation`] when `config` is not a valid [`DshHarnessConfig`] (a
+    /// bad `patches` entry included), and [`HarnessError::Protocol`] naming `dsh` when the
+    /// executable cannot be resolved or naming `DSH_HOME` when neither `dsh_home` nor the
+    /// environment supplies the mandatory home directory. A missing runtime or home is an operator
+    /// configuration problem, never an unimplemented capability.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
-        vendor::unsupported_create(
-            DshHarnessConfig::from_json(&config).map(|_| ()),
-            vendor::DSH_SDK_REQUIRED,
-        )
+        let config =
+            DshHarnessConfig::from_json(&config).map_err(vendor::config_error_to_harness)?;
+        let binary = resolve_binary(&BinarySpec {
+            name: "dsh",
+            explicit: config.dsh_bin.as_deref(),
+            label: "DeepSeek Harness",
+            install_hint: "install the DeepSeek Harness runtime (npm install -g deepseek-harness)",
+        })?;
+        let dsh_home = wire::require_dsh_home(&config)?;
+        // A patch path is resolved against the project directory before anything is spawned, so an
+        // unusable path is a configuration error and not a failed start.
+        let patches_base = config.cwd.clone().or_else(|| config.runtime_cwd.clone());
+        let launch = wire::build_args(&config, patches_base.as_deref())
+            .map_err(vendor::config_error_to_harness)?;
+        let buffer = EventBufferConfig {
+            capacity: config.event_buffer_capacity,
+            overflow: EventOverflowPolicy::CoalesceOrBlock,
+        };
+        let driver = Arc::new(DshDriver::new(config, binary, dsh_home, launch));
+        Ok(Box::new(VendorHarness::new(card(), buffer, driver)))
     }
 }
 
@@ -541,17 +595,25 @@ mod tests {
     }
 
     #[test]
-    fn card_declares_only_mcp_tools_and_endpoint_models() {
+    fn card_declares_a_persistent_session_mcp_tools_and_endpoint_models() {
         let card = card();
         assert_eq!(card.name, "deepseek-harness");
         assert_eq!(card.implementation_version, "0.3.0");
         assert_eq!(
             card.capabilities,
             std::collections::BTreeSet::from([
+                HarnessCapability::PersistentSession,
                 HarnessCapability::McpTools,
                 HarnessCapability::EndpointModels,
             ])
         );
+        assert!(!card
+            .capabilities
+            .contains(&HarnessCapability::GracefulAbort));
+        assert!(!card.capabilities.contains(&HarnessCapability::ForceAbort));
+        assert!(!card.capabilities.contains(&HarnessCapability::Steer));
+        assert!(!card.capabilities.contains(&HarnessCapability::PauseResume));
+        assert!(!card.capabilities.contains(&HarnessCapability::Checkpoint));
         assert_eq!(
             card.optional_host_capabilities,
             std::collections::BTreeSet::from([HostCapability::McpServers])
@@ -690,13 +752,13 @@ mod tests {
     }
 
     #[test]
-    fn create_reports_the_missing_sdk() {
+    fn create_reports_the_missing_runtime() {
         let error = provider()
-            .create(object(json!({})))
+            .create(object(json!({"dsh_bin": "/nonexistent/dsh"})))
             .err()
-            .expect("the SDK is required");
-        assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-        assert!(error.message().contains("deepseek-harness-sdk"));
+            .expect("the runtime is required");
+        assert_eq!(error.kind(), HarnessErrorKind::Protocol);
+        assert!(error.message().contains("dsh"), "{}", error.message());
     }
 
     #[test]

@@ -206,6 +206,15 @@ impl TurnContext {
         self.emit_event(event).await;
     }
 
+    /// Publishes one item lifecycle event of `turn_id` under `item_id`.
+    ///
+    /// Vendor adapters whose items are not tool calls (steps, subagents, …) build the payload
+    /// themselves and pass the stable item id the vendor uses.
+    pub async fn item(&self, turn_id: &str, payload: ItemLifecycleEvent, item_id: &str) {
+        let event = self.envelope.next_for_item(payload, turn_id, item_id);
+        self.emit_event(event).await;
+    }
+
     /// Publishes the `Completed` item lifecycle of a tool call.
     ///
     /// The item data carries `tool_call_id` (when the vendor has one), `tool_name`, `result` and,
