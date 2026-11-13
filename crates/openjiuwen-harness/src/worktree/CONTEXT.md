@@ -30,7 +30,7 @@ No new dependencies, no `unsafe`, no `println!` (tracing only); errors are `open
 The registry document is written atomically (sibling `.tmp` + rename) and a missing file loads as empty while malformed JSON is `ErrorKind::Validation`.
 The tool never returns `Err` for expected failures: it returns a `ToolPayload` with `success = false`; only cancellation propagates.
 The tool consults `crate::permission` path guards for the target path on mutating actions and blocks only on `PermissionLevel::Deny` (`ask`/`allow` pass, no engine fails open).
-The tool is **not** mounted by `crate::tools::ToolRegistry`; registry wiring is a separate change.
+The tool is mounted by `crate::tools::ToolRegistry` as `BuiltinTool::Worktree`, the last of the extended tools, built from a `WorktreeManager` plus the registry language and permission engine.
 No repo-wide cross-process file lock and no operation serialisation: concurrent managers over one workspace are not coordinated.
 ## Deferred
 Python's `lock.py` cross-process `filelock` + per-repo in-process lock and timeout.

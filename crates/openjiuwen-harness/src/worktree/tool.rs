@@ -12,9 +12,11 @@
 //!   guards for the target path first and refuse on a `deny`; `ask` and `allow`
 //!   do not block the tool (the interrupt rail owns asking a human).
 //!
-//! The tool is **not** mounted by [`crate::tools::ToolRegistry`] yet: the registry
-//! wiring is a separate change. Build it with
-//! [`WorktreeTool::new`] and register it wherever the host wants it.
+//! The tool is mounted by [`crate::tools::ToolRegistry`] as
+//! [`BuiltinTool::Worktree`](crate::tools::BuiltinTool::Worktree), the last of the
+//! extended tools; the registry builds it from a [`WorktreeManager`] plus its
+//! language and permission engine, and a host outside the registry builds it with
+//! [`WorktreeTool::new`].
 #![allow(clippy::result_large_err)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

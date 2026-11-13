@@ -18,6 +18,8 @@
 //!    skill path that exists on disk.
 //! 3. `subagent` — when sub-agents are configured or the general-purpose agent
 //!    is enabled.
+//! 4. `goal` — when the mounted tools include `get_current_goal` or
+//!    `submit_goal_report`; the rail is rooted at the workspace goal store.
 //!
 //! Memory rails are never added here: they carry caller-supplied recall and
 //! write-back seams, so they belong to
@@ -38,6 +40,8 @@ use crate::permission::{PermissionHost, PermissionsSection};
 use crate::rails::{HarnessRail, SecurityRail, SkillsRail, SkillsRailConfig, SubagentRail};
 use crate::schema::{DeepAgentConfig, PromptMode, SubAgentConfig};
 use crate::skills::{SkillBudget, SkillLibrary};
+use crate::tools::goal::{GoalRail, GoalRailConfig, GoalStore};
+use crate::tools::BuiltinTool;
 use crate::workspace::Workspace;
 
 use super::builder::DeepAgentBuilder;
@@ -51,6 +55,9 @@ const SKILLS_RAIL_NAME: &str = "skills";
 
 /// Name of the default subagent rail.
 const SUBAGENT_RAIL_NAME: &str = "subagent";
+
+/// Name of the default goal rail.
+pub(crate) const GOAL_RAIL_NAME: &str = "goal";
 
 /// Workspace node holding the skill library.
 const SKILLS_WORKSPACE_NODE: &str = "skills";
@@ -103,8 +110,8 @@ impl fmt::Debug for DeepAgentParts {
 /// Assembles the configuration, default rails and tools of a `DeepAgent`.
 ///
 /// Rails are appended in the Python factory order (`security`, `skills`,
-/// `subagent`) and each default is skipped when `rails` already contains a rail
-/// with the same [`HarnessRail::name`]. The caller rails are appended after the
+/// `subagent`, `goal`) and each default is skipped when `rails` already contains a
+/// rail with the same [`HarnessRail::name`]. The caller rails are appended after the
 /// defaults in their original order, so they keep precedence.
 ///
 /// `model` is not embedded in the parts (the configuration carries only data);
@@ -165,6 +172,14 @@ pub fn resolve_deep_agent_parts(
         all_rails.push(Arc::new(SubagentRail::new()));
     }
 
+    if tools
+        .iter()
+        .any(|tool| is_goal_tool_name(&tool.card().name))
+        && !caller_names.contains(&GOAL_RAIL_NAME)
+    {
+        all_rails.push(default_goal_rail(&config.workspace, &config.language));
+    }
+
     all_rails.extend(rails);
     Ok(DeepAgentParts {
         config,
@@ -196,6 +211,26 @@ fn default_skills_rail(config: &DeepAgentConfig) -> SkillsRail {
         },
         language: Some(config.language.clone()),
     })
+}
+
+/// Whether `name` is the model-facing name of one of the two goal tools.
+///
+/// A tool set without a goal tool cannot read or report a goal, so exactly those two names
+/// gate the default goal rail.
+pub(crate) fn is_goal_tool_name(name: &str) -> bool {
+    [
+        BuiltinTool::GetCurrentGoal.name(),
+        BuiltinTool::SubmitGoalReport.name(),
+    ]
+    .contains(&name)
+}
+
+/// Builds the default goal rail over the workspace goal store.
+pub(crate) fn default_goal_rail(workspace: &Workspace, language: &str) -> Arc<dyn HarnessRail> {
+    Arc::new(GoalRail::new(
+        GoalStore::for_workspace(workspace),
+        GoalRailConfig::default().with_prompt_language(language.to_string()),
+    ))
 }
 
 /// Applies resolved [`DeepAgentParts`] onto an already built agent.
@@ -331,6 +366,7 @@ mod tests {
     use crate::permission::{PermissionLevel, PermissionsSection};
     use crate::rails::{HarnessRail, HarnessRailContext};
     use crate::schema::{DeepAgentConfig, PromptMode, SubAgentConfig};
+    use crate::tools::goal::{GetCurrentGoalTool, GoalStore};
     use crate::tools::tool_card;
     use crate::workspace::Workspace;
 
@@ -625,6 +661,39 @@ mod tests {
             .unwrap();
         assert_eq!(output.output, "denied");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_deep_agent_registers_one_goal_rail_for_a_goal_tool() {
+        let temp = TempWorkspace::new().unwrap();
+        let workspace = Workspace::for_language(temp.workspace(), "en");
+        let goal_tool = GetCurrentGoalTool::new(GoalStore::for_workspace(&workspace), "en");
+        let agent = create_deep_agent(
+            Arc::new(ScriptedModel::text("hi")),
+            None,
+            None,
+            vec![Arc::new(goal_tool)],
+            Vec::new(),
+            Some(workspace),
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            Some("en".to_string()),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let names = agent.rails().names();
+        assert_eq!(
+            names.iter().filter(|name| name.as_str() == "goal").count(),
+            1,
+            "the factory and the builder register the goal rail once: {names:?}"
+        );
     }
 
     #[tokio::test]

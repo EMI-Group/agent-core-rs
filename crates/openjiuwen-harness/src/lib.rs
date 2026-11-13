@@ -71,8 +71,8 @@ pub use permission::{
 };
 
 // --- tools -----------------------------------------------------------------
-/// Names of the thirty tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the ten
-/// extended ones), in registry order.
+/// Names of the thirty-two tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
+/// twelve extended ones), in registry order.
 pub use tools::extended_tool_names;
 pub use tools::{
     tool_names, AudioMetadata, AudioMetadataArgs, AudioMetadataTool, BuiltinTool, CronAction,
@@ -88,9 +88,17 @@ pub use tools::{
 
 // --- rails -----------------------------------------------------------------
 pub use rails::{
-    rail_priority, EvolutionRail, HarnessRail, HarnessRailAdapter, HarnessRailContext,
-    HarnessRailRegistry, MemoryRail, NoopEvolutionRail, SecurityRail, SkillsRail, SubagentRail,
-    TaskIterationInfo,
+    default_metrics_clock, evolution_adapter, rail_priority, EvolutionMetrics, EvolutionProposal,
+    EvolutionRail, EvolutionRailAdapter, EvolutionSnapshot, HarnessRail, HarnessRailAdapter,
+    HarnessRailContext, HarnessRailRegistry, IterationRecorder, MemoryRail, MetricsClock,
+    MetricsEvolutionRail, MetricsEvolutionRailConfig, NoopEvolutionRail, ProposalLog, SecurityRail,
+    SkillsRail, SubagentRail, TaskIterationInfo, EVOLUTION_SNAPSHOT_VERSION,
+};
+
+// --- lsp -------------------------------------------------------------------
+pub use lsp::{
+    ChannelTransport, LspClient, LspServerConfig, LspTool, LspToolConfig, LspTransport,
+    StdioTransport,
 };
 
 // --- prompts ---------------------------------------------------------------
@@ -124,6 +132,12 @@ pub use subagents::{
 
 // --- skills ----------------------------------------------------------------
 pub use skills::{Skill, SkillBudget, SkillLibrary, SkillResourceValidator, SkillRootMount};
+
+// --- spec ------------------------------------------------------------------
+pub use spec::{
+    resolve, DeepAgentSpec, PluginManifest, PluginRegistry, ResolvedSpec, SpecBuildOptions,
+    SpecEntry, SpecRegistry, SpecSource,
+};
 
 // --- task loop -------------------------------------------------------------
 pub use task_loop::{
@@ -162,6 +176,12 @@ pub use manifest::{
 
 // --- observability ---------------------------------------------------------
 pub use observability::{NoopTelemetry, Observability, TelemetrySink};
+
+// --- worktree --------------------------------------------------------------
+pub use worktree::{
+    slugify, GitRunner, ProcessGitRunner, WorktreeEvent, WorktreeInfo, WorktreeManager,
+    WorktreeRecord, WorktreeTool,
+};
 
 /// Returns the crate name.
 #[must_use]
