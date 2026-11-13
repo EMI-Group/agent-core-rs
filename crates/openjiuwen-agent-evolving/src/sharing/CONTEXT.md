@@ -9,7 +9,8 @@ The remote hub client is not ported; the backend seam is real and testable offli
 - `SharingMeta`, `SharedExperience`, `SharedSkillBundle`, `SkillPackageMeta`, `SkillSearchResult`, `QueryKeywords` — pure serde wire data.
 - `SharedSkillBundle::new` derives `bundle_id` as `bundle-{16 hex}` of an FNV-1a hash over the skill id and the sorted distinct record ids; `SharedExperience` carries the record payload plus its provenance.
 - `KeywordExtractor` — deterministic keyword and summary extraction (`extract`), with the shared `experience::stopwords` vocabulary.
-- `ShareStager` — `min_confidence`, `require_approval`, `max_experiences`; `build_bundle(records)` filters, dedupes, wraps and keywords; `publish`/`share` enforce the approval gate; `StagedBundle` is the pending result.
+- `ShareStager` — `min_confidence`, `require_approval`, `max_experiences`; `build_bundle(records, meta)` filters, dedupes, wraps and keywords; `publish`/`share` enforce the approval gate; `StagedBundle` is the pending result.
+- `SharingMeta::default()` uses `upload_trigger = "user_approval"` and `confidence = 0.7`; `SharedSkillBundle::new` requires a non-blank `skill_id` and derives `bundle_id` itself.
 - `SharingBackend` (async trait) — `publish`, `list`, `get`, `remove`, `search`; implementations `LocalFileSharingBackend` (one JSON file per bundle id) and `MemorySharingBackend`.
 - Both backends share one ranking rule, `score = 0.7 * keyword_ratio + 0.3 * intent_ratio`.
 
@@ -17,7 +18,8 @@ The remote hub client is not ported; the backend seam is real and testable offli
 - Deterministic: bundle ids are derived from content, never from `uuid4` or a clock, so re-publishing the same records yields the same id.
 - The stager never mutates or deletes input records; a rejected record stays in the local archive untouched.
 - `build_bundle` drops records that fail `ExperienceRecord::validate` or fall below `min_confidence`, and rejects a bundle with no surviving record; `max_experiences` `0` means unlimited.
-- Backends are async and return `Error::Io`; the in-memory backend guards its map with a `Mutex` that is never held across an `.await`.
+- Backends are async and return `Error::Io` (or `Error::External` for a poisoned lock); the in-memory backend guards its map with a `Mutex` that is never held across an `.await`.
+- The module has no inline `#[cfg(test)]` unit tests; its coverage lives in `crates/openjiuwen-agent-evolving/tests/sharing.rs`.
 
 ## Design Decisions
 - A content-derived `bundle_id` replaces Python's random one, which keeps tests, re-publishes and file names reproducible.

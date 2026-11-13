@@ -19,6 +19,12 @@ The LLM draft pipeline and the online orchestrator are not ported; extraction an
 - Ranking is a fixed linear blend of keyword overlap, text overlap and observed success rate; `ExperienceRecord::score` is `weight * confidence * (0.5 + success_rate)`.
 - Dedupe is content-token Jaccard at or above the archive threshold; a full archive evicts its lowest-scoring record.
 - Constructors validate: blank record ids, skill names and content are rejected with `Error::validation`.
+- Record ids are content-derived FNV-1a 64-bit hashes (`sig-`/`traj-`/`case-` plus 16 hex digits); `created_seq`/`updated_seq` are stamped only by `ExperienceArchive::add`.
+- Serde is asymmetric: `ExperienceRecord`, `ExperienceQuery`, `ExperienceMatch`, `ExperienceSection`, `AddOutcome`, `MergeSummary`, `ExperienceStats` and `ExperienceArchive` (private fields) serialize, but `ExperienceExtractor`, `LifecycleConfig`, `LifecycleReport` and `ExperienceLifecycle` do not derive `Serialize`/`Deserialize`.
+- Deserializing an `ExperienceArchive` restores its records verbatim without re-validating them; callers must run `ExperienceRecord::validate` if the payload is untrusted.
+
+## Known Issues
+- `ExperienceArchive::prune_below` documents that a non-finite threshold removes nothing, but a `NaN` threshold makes the `weight >= NaN` retain predicate false for every record and prunes the whole archive.
 
 ## Design Decisions
 - Sequence counters replace Python's wall-clock timestamp and free-form patch payload, so archives replay identically from a fixed input order.
