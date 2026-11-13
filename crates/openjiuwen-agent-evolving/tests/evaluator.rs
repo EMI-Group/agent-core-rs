@@ -3,9 +3,13 @@
 //!
 //! Covers the deterministic scoring surface: `ExactMatchMetric` normalization
 //! and label/prediction projections, metric aggregation (`Mean`/`First`,
-//! non-finite coercion), the deferred `LlmAsJudgeMetric`, the default
+//! non-finite coercion), the verdict-parsing `LlmAsJudgeMetric`, the default
 //! `Evaluator::batch_evaluate`, `EvaluationReport` math, `MapCaseRunner`, the
-//! `evaluate_cases` driver, and `AgentCaseRunner` over a fake `Agent`.
+//! `evaluate_cases` driver, model-less `DefaultEvaluator` scoring, and
+//! `AgentCaseRunner` over a fake `Agent`.
+//!
+//! The model-backed judge (`LlmJudge`/`LlmJudgeEvaluator`) is covered by the
+//! unit tests in `src/evaluator/judge.rs`; nothing here needs a model.
 //!
 //! Everything here is offline and deterministic: no network, no environment
 //! reads, no clock, and no dependence on execution order.
@@ -320,17 +324,41 @@ async fn non_finite_and_empty_metrics_do_not_error() {
     assert_eq!(empty.reason, "0 metric(s)");
 }
 
+/// A verdict-shaped prediction scores its normalised judge score; anything else
+/// falls back to exact match so recorded answers still score offline.
 #[test]
-fn llm_as_judge_is_deferred() {
+fn llm_as_judge_metric_scores_verdicts_and_falls_back_to_exact_match() {
     let metric = LlmAsJudgeMetric::new();
     assert_eq!(metric.name(), "llm_as_judge");
     assert!(metric.higher_is_better());
-    let error = metric
-        .compute(&text("4"), &text_map("answer", "4"))
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::Unsupported(message) if message.contains("LlmAsJudgeMetric")),
-        "unexpected error: {error}"
+
+    let label = text_map("answer", "4");
+    // A raw score on the default 0..10 rubric scale normalises to `0.0..=1.0`.
+    assert_eq!(
+        metric
+            .compute(&json!({"score": 8, "reasoning": "ok"}), &label)
+            .unwrap(),
+        MetricValue::Scalar(0.8)
+    );
+    // A verdict delivered as a JSON string works too.
+    assert_eq!(
+        metric
+            .compute(&text("{\"score\": 10, \"reasoning\": \"perfect\"}"), &label)
+            .unwrap(),
+        MetricValue::Scalar(1.0)
+    );
+    // Plain text is not verdict-shaped: exact match decides.
+    assert_eq!(
+        metric.compute(&text("4"), &label).unwrap(),
+        MetricValue::Scalar(1.0)
+    );
+    assert_eq!(
+        metric.compute(&text("5"), &label).unwrap(),
+        MetricValue::Scalar(0.0)
+    );
+    assert_eq!(
+        metric.compute(&Value::Null, &label).unwrap(),
+        MetricValue::Scalar(0.0)
     );
 }
 
@@ -641,7 +669,7 @@ async fn agent_runner_feeds_case_inputs_and_scores_cancellation() {
 }
 
 #[tokio::test]
-async fn default_evaluator_is_reachable_from_the_crate_root() {
+async fn default_evaluator_scores_with_exact_match_without_a_model() {
     // The crate root re-exports the primary evaluator types.
     let evaluator = openjiuwen_agent_evolving::DefaultEvaluator::new("accuracy");
     assert_eq!(evaluator.name(), "default");
@@ -650,14 +678,27 @@ async fn default_evaluator_is_reachable_from_the_crate_root() {
         openjiuwen_agent_evolving::CRATE_NAME,
         "openjiuwen-agent-evolving"
     );
+    // An unknown metric name degrades to the offline exact-match baseline.
+    assert_eq!(evaluator.fallback().name(), "exact_match");
 
-    let error = evaluator
-        .evaluate(&answer_case("case-1", "4"), &Value::Null)
-        .await
-        .unwrap_err();
+    let matching = answer_case("case-1", "4");
+    let evaluated = evaluator.evaluate(&matching, &text("4")).await.unwrap();
+    assert!(close(evaluated.score, 1.0), "score: {}", evaluated.score);
     assert!(
-        matches!(&error, Error::Unsupported(message)
-            if message.contains("DefaultEvaluator") && message.contains("docs/PARITY.md")),
-        "unexpected error: {error}"
+        evaluated.reason.contains("no judge model is configured")
+            && evaluated.reason.contains("exact_match"),
+        "reason: {}",
+        evaluated.reason
     );
+    let per_metric = evaluated.per_metric.expect("per-metric breakdown");
+    assert!(close(per_metric["exact_match"], 1.0));
+
+    let evaluated = evaluator.evaluate(&matching, &text("5")).await.unwrap();
+    assert!(close(evaluated.score, 0.0), "score: {}", evaluated.score);
+
+    // The explicit `exact_match` constructor answers the same way.
+    let exact = openjiuwen_agent_evolving::DefaultEvaluator::new("exact_match");
+    assert_eq!(exact.metric(), "exact_match");
+    let evaluated = exact.evaluate(&matching, &text("  4 ")).await.unwrap();
+    assert!(close(evaluated.score, 1.0), "score: {}", evaluated.score);
 }
