@@ -22,6 +22,9 @@ use tokio::task::JoinHandle;
 
 use super::{SubAgentConfig, SubAgentRegistry};
 
+pub mod clock;
+pub mod transcript;
+
 /// Default live-instance cap (Python `max_subagents`).
 const DEFAULT_MAX_SUBAGENTS: usize = 10;
 /// Default concurrent-turn cap (Python `max_concurrent_running`).
