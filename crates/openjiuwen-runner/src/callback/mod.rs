@@ -82,10 +82,10 @@ pub use decorator::{
 pub use event::{CallbackEvent, EventDomain, DEFAULT_SCOPE, SCOPE_PREFIX};
 pub use filters::{
     and, lenient, not, or, record_failure, record_success, run_filters, AuthFilter,
-    CircuitBreakerFilter, Clock, ClosureFilter, ConditionalFilter, EventFilter, EventFilterExt,
-    FilterChain, FilterDecision, FilterFeedback, FilterInput, FilterRunOutcome, KindFilter,
-    LenientFilter, LoggingFilter, ManualClock, NameFilter, NotFilter, OrFilter, ParamModifyFilter,
-    PredicateFilter, RateLimitFilter, SessionFilter, ValidationFilter,
+    CircuitBreakerFilter, Clock, ClosureFilter, ConditionalFilter, ContextModifier, EventFilter,
+    EventFilterExt, FilterChain, FilterDecision, FilterFeedback, FilterInput, FilterRunOutcome,
+    KindFilter, LenientFilter, LoggingFilter, ManualClock, NameFilter, NotFilter, OrFilter,
+    ParamModifyFilter, PredicateFilter, RateLimitFilter, SessionFilter, ValidationFilter,
 };
 pub use framework::{CallbackFramework, CallbackId, CallbackInfo, CallbackRegistration};
 pub use handler::{AsyncHandler, CallbackHandler, CallbackResult, SyncHandler};
