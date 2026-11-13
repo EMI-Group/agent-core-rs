@@ -68,6 +68,21 @@ pub fn register_gateway_provider(
 - `register_deferred` is `async` only for parity with the Python async setup path; it performs no I/O and is the Rust equivalent of importing the Python `providers` package (hosts call it explicitly; there is no import-time side effect).
 - Registration is not transactional: a set that fails part-way (duplicate or kernel error) leaves the factories registered before the failure in place.
 
+## Kernel Seam Facts (what a real transport must satisfy)
+
+- `SandboxProviderRegistry` is public, `Clone + Default + Send + Sync`, and constructed with `new()`; clones share the same `Arc<RwLock<BTreeMap<..>>>` maps, so a registration on one handle is visible on every clone.
+- Registration is per `(sandbox_type, operation)`: `register_fs` / `register_shell` / `register_code` each take `impl Into<String>` and return the kernel's `Error::SysOp` on a duplicate.
+- `create_fs` / `create_shell` / `create_code(&self, sandbox_type: &str, endpoint: &SandboxEndpoint, config: &SandboxGatewayConfig)` return `Result<Arc<dyn FsOperation>>` (resp. shell/code) and answer `Error::Unsupported("Sandbox type '<t>' does not support operation '<op>'")` when the slot is empty.
+- `sandbox_types()` enumerates only the filesystem map, so a shell/code-only registration is invisible to `registered_types`.
+- Factories are **synchronous** `Arc<dyn Fn(&SandboxEndpoint, &SandboxGatewayConfig) -> Result<Arc<dyn ...>> + Send + Sync>`; an async create/auth handshake must be deferred into the returned backend (e.g. a `OnceCell`), never awaited inside the factory.
+- `SandboxProviderRegistry` is a plain value; `openjiuwen_sysop::sandbox::provider::global()` is the process-global instance, and the kernel's dispatch path (`SysOperation` with mode `sandbox`) resolves **only** from `global()` — registering on a local registry never reaches a `SysOperation`.
+- The kernel builds the endpoint itself (`base_url` from `launcher_config.base_url`, `sandbox_id: None`, resolved `isolation_key`), so a provider cannot feed a discovered `sandbox_id` back into the seam; container identity must live in the provider, keyed by `isolation_key`.
+- Sysop has **no** launcher or lifecycle API: no create / pause / resume / delete requests, responses, or trait; `SandboxLauncherConfig.on_stop` (`OnStop::{Delete,Pause,Keep}`), `idle_ttl_seconds`, `gateway_url`, `extra_params`, and `SandboxGatewayConfig.{auth_headers,auth_query_params,timeout_seconds,isolation}` are pure configuration data that a provider must interpret itself.
+- The reusable wire envelope is `GatewayInvokeRequest { op_type, method, params, isolation_key }` / `GatewayResponse { code, message, data }` in the always-compiled `sandbox::config`; `sandbox::http::HttpSandboxGateway` sits behind sysop's opt-in `sandbox` feature, its `invoke` returns `Error::Unsupported`, and only `probe` performs a GET — it is a scaffold, not a transport.
+- No workspace crate enables `openjiuwen-sysop/sandbox` and `openjiuwen-core` does not forward that feature, so an HTTP provider in this crate must depend on `openjiuwen-sysop` directly to reuse anything from `sandbox::http`.
+- Consequence: a genuine remote provider is implementable entirely outside `openjiuwen-sysop` by implementing the public `FsOperation` (10 methods + defaulted `supports_conditional_write`), `ShellOperation` (4), and `CodeOperation` (2) `#[async_trait]` traits, returning `OpResult<T>` payloads (code `199007` via `sandbox_gateway_message` for gateway failures) rather than `Result` errors, and registering the factories on `global()` before any `SysOperation` is constructed.
+- `openjiuwen-harness` only ever builds `SysOperation::local(..)` and never touches the registry, so no harness code path exercises a remote provider today.
+
 ## Constraints
 
 - No new protocol implementation, no `reqwest` calls here; only factory registration.
