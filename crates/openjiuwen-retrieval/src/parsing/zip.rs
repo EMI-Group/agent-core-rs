@@ -40,6 +40,9 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::parsing::inflate::{crc32, inflate, DEFAULT_MAX_OUTPUT_BYTES};
 
+pub mod writer;
+pub use writer::ZipWriter;
+
 /// End-of-central-directory signature (`PK\x05\x06`).
 const EOCD_SIGNATURE: u32 = 0x0605_4B50;
 /// Central-directory file header signature (`PK\x01\x02`).
