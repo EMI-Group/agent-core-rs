@@ -4,7 +4,12 @@
 //! exposed to the model, plus their shared payload/path helpers and the registry.
 //! Upper layers only see [`ToolRegistry`], [`BuiltinTool`] and the tool seam traits.
 mod ask_user;
+pub mod cron;
 pub mod descriptions;
+pub mod discovery;
+pub mod goal;
+pub mod mcp_resources;
+pub mod media;
 mod memory;
 mod read;
 mod read_state;
@@ -14,6 +19,7 @@ mod support;
 #[cfg(test)]
 mod tests;
 mod todo;
+pub mod web;
 mod write;
 
 use std::path::{Path, PathBuf};

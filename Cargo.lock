@@ -2040,6 +2040,7 @@ dependencies = [
  "openjiuwen-workflow",
  "parking_lot",
  "regex",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
