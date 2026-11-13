@@ -81,11 +81,6 @@ mod wire;
 
 pub use harness::CodexDriver;
 
-// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
-// assert it; this provider no longer produces that message, so keep the constant referenced in
-// non-test builds (removing it is the vendor module's call, not this provider's).
-const _: &str = crate::providers::vendor::CODEX_SDK_REQUIRED;
-
 /// Registry name of the Codex provider.
 pub const PROVIDER_NAME: &str = "codex";
 

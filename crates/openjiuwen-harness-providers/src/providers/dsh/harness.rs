@@ -1,4 +1,4 @@
-//! The DeepSeek Harness (DSH) subprocess transport.
+//! The `DeepSeek` Harness (DSH) subprocess transport.
 //!
 //! [`DshDriver`] implements [`VendorDriver`] over the `dsh` runtime in its JSON-RPC 2.0 stdio
 //! mode: it spawns one child process per start/stop cycle, writes id-correlated requests, reads
@@ -134,7 +134,7 @@ pub(super) struct DriverState {
     pub(super) closing: bool,
 }
 
-/// The DeepSeek Harness subprocess driver.
+/// The `DeepSeek` Harness subprocess driver.
 ///
 /// One instance backs one [`VendorHarness`](crate::vendor_cli::VendorHarness) handle: the runtime
 /// is spawned by [`open`](VendorDriver::open), prompted by

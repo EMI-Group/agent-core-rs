@@ -9,7 +9,7 @@
 //!
 //! A notification is `{"method": "<name>", "params": {…}}`; a server-to-client request is the same
 //! message plus an `id`. The app-server spells its payload members in camelCase (`itemId`,
-//! `tokenUsage`, `willRetry`), while the vendored data types use snake_case; both spellings are
+//! `tokenUsage`, `willRetry`), while the vendored data types use `snake_case`; both spellings are
 //! accepted so a renamed field never drops an observation.
 
 use std::collections::BTreeMap;
@@ -151,11 +151,11 @@ impl CodexDriver {
             }
             "item/started" => {
                 self.item_started(&params, turn_id, session, accumulator)
-                    .await
+                    .await;
             }
             "item/completed" => {
                 self.item_completed(&params, turn_id, session, accumulator)
-                    .await
+                    .await;
             }
             "thread/tokenUsage/updated" => {
                 self.token_usage(&params, turn_id, session, accumulator)
@@ -592,7 +592,9 @@ impl CodexDriver {
             provider_data,
         )
         .await;
-        client.respond(id, answers_wire(response, &questions)).await
+        client
+            .respond(id, answers_wire(response.as_ref(), &questions))
+            .await
     }
 }
 
@@ -732,7 +734,7 @@ fn is_generic(error: &TurnError) -> bool {
     error
         .category
         .as_deref()
-        .map_or(true, |category| category == SDK_ERROR_CATEGORY)
+        .is_none_or(|category| category == SDK_ERROR_CATEGORY)
 }
 
 /// Prefers a specific `pending` failure over a generic `terminal` one, like Python's
@@ -756,8 +758,7 @@ fn classify_notification(params: &Frame) -> (TurnError, bool) {
     let message = error
         .and_then(|error| get_str(error, "message"))
         .filter(|message| !message.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| "Codex reported an error".to_owned());
+        .map_or_else(|| "Codex reported an error".to_owned(), str::to_owned);
     let message = with_additional_details(message, error);
     let info = error.and_then(|error| {
         error
@@ -845,7 +846,7 @@ fn classify_info(info: Option<&JsonValue>, http_status: Option<u64>) -> (String,
     };
     if let Some(status) = http_status {
         if let Some(mapped) = http_category(status) {
-            category = mapped.to_owned();
+            mapped.clone_into(&mut category);
         }
     }
     let code = if identifier.is_empty() {
@@ -970,7 +971,7 @@ fn first_choices(questions: &[JsonValue]) -> Vec<String> {
 }
 
 /// Renders a host user-input answer in the app-server's `answers` shape.
-fn answers_wire(response: Option<JsonValue>, questions: &[JsonValue]) -> JsonValue {
+fn answers_wire(response: Option<&JsonValue>, questions: &[JsonValue]) -> JsonValue {
     let ids: Vec<String> = questions
         .iter()
         .map(|question| {
@@ -992,7 +993,7 @@ fn answers_wire(response: Option<JsonValue>, questions: &[JsonValue]) -> JsonVal
         })
         .collect();
     let mut answers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    match &response {
+    match response {
         None => {}
         Some(JsonValue::Object(object)) => {
             let source = object
@@ -1164,7 +1165,7 @@ mod tests {
             json!({"id": "q1", "question": "Colour?"}),
         ];
         let answers = answers_wire(
-            Some(json!({"answers": {"q0": "Ada", "q1": ["red", "blue"]}})),
+            Some(&json!({"answers": {"q0": "Ada", "q1": ["red", "blue"]}})),
             &questions,
         );
         assert_eq!(
@@ -1175,7 +1176,7 @@ mod tests {
             }})
         );
         assert_eq!(
-            answers_wire(Some(json!("only")), &questions),
+            answers_wire(Some(&json!("only")), &questions),
             json!({"answers": {"q0": {"answers": ["only"]}}})
         );
         assert_eq!(answers_wire(None, &questions), json!({"answers": {}}));
@@ -1184,7 +1185,7 @@ mod tests {
     #[test]
     fn question_texts_are_matched_to_their_id() {
         let questions = vec![json!({"id": "q0", "question": "Name?"})];
-        let answers = answers_wire(Some(json!({"Name?": "Ada"})), &questions);
+        let answers = answers_wire(Some(&json!({"Name?": "Ada"})), &questions);
         assert_eq!(answers, json!({"answers": {"q0": {"answers": ["Ada"]}}}));
     }
 }

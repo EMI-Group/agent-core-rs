@@ -1,11 +1,3 @@
-#![cfg(feature = "vendor")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::too_many_lines,
-    clippy::items_after_statements,
-    clippy::needless_pass_by_value
-)]
 //! Offline, deterministic suite of the Claude Code subprocess adapter.
 //!
 //! Every case starts a real child process from [`support::FakeCli`], a POSIX shell script that
@@ -19,6 +11,14 @@
 //! argv, and the missing-result failure.
 //!
 //! Python counterpart: `tests/unit_tests/harness_providers/claudecode/`.
+#![cfg(feature = "vendor")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value
+)]
 mod support;
 
 use std::collections::BTreeSet;

@@ -55,11 +55,6 @@ mod wire;
 
 pub use harness::DshDriver;
 
-// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
-// assert it; this provider no longer produces that message, so keep the constant referenced in
-// non-test builds (removing it is the vendor module's call, not this provider's).
-const _: &str = crate::providers::vendor::DSH_SDK_REQUIRED;
-
 /// Registry name of the DSH provider.
 pub const PROVIDER_NAME: &str = "dsh";
 

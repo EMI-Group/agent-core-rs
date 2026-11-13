@@ -133,16 +133,17 @@ fn mcp_overrides(server: &McpServerConfig) -> Vec<String> {
             }
             overrides
         }
-        McpTransport::Http => match server.url.as_deref() {
-            Some(url) => vec![format!("mcp_servers.{key}.url={}", json_string(url))],
-            None => {
+        McpTransport::Http => {
+            if let Some(url) = server.url.as_deref() {
+                vec![format!("mcp_servers.{key}.url={}", json_string(url))]
+            } else {
                 tracing::warn!(
                     server = %server.name,
                     "the Codex app-server needs a url for an HTTP MCP server; skipping it"
                 );
                 Vec::new()
             }
-        },
+        }
         McpTransport::InProcess => {
             tracing::warn!(
                 server = %server.name,

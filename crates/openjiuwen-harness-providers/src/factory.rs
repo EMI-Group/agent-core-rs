@@ -85,22 +85,31 @@ const NATIVE_V2_REQUIREMENT: Option<&str> = None;
 /// External prerequisite reported for `native_v2` in a build without the feature.
 #[cfg(not(feature = "native-v2"))]
 const NATIVE_V2_REQUIREMENT: Option<&str> = Some(NATIVE_V2_REQUIRES);
-/// Card name of the deferred Claude Code provider.
+/// Card name of the Claude Code provider.
 const CLAUDE_CODE_CARD_NAME: &str = "claude-code";
-/// Card name of the deferred Codex provider.
+/// Card name of the Codex provider.
 const CODEX_CARD_NAME: &str = "codex";
-/// Card name of the deferred `DeepSeek` harness provider.
+/// Card name of the `DeepSeek` harness provider.
 const DSH_CARD_NAME: &str = "deepseek-harness";
-/// Implementation version declared for the Claude Code and Codex stubs.
+/// Implementation version declared for the Claude Code and Codex adapters.
 const VENDOR_VERSION: &str = "0.1.0";
-/// Implementation version declared for the DSH stub.
+/// Implementation version declared for the DSH adapter.
 const DSH_VERSION: &str = "0.3.0";
-/// External prerequisite of the deferred Claude Code provider.
-const CLAUDE_CODE_REQUIRES: &str = "claude CLI + Claude Agent SDK (NDJSON stdio)";
-/// External prerequisite of the deferred Codex provider.
-const CODEX_REQUIRES: &str = "codex app-server + openai-codex SDK (JSON-RPC stdio)";
-/// External prerequisite of the deferred DSH provider.
-const DSH_REQUIRES: &str = "deepseek-harness-sdk runtime subprocess";
+/// External prerequisite of the vendor providers when this build has them compiled out.
+#[cfg(not(feature = "vendor"))]
+const VENDOR_REQUIRES: &str = "rebuild with the `vendor` feature";
+/// External prerequisite reported for the vendor providers: none once the feature is compiled in.
+#[cfg(feature = "vendor")]
+const VENDOR_REQUIREMENT: Option<&str> = None;
+/// External prerequisite reported for the vendor providers in a build without the feature.
+#[cfg(not(feature = "vendor"))]
+const VENDOR_REQUIREMENT: Option<&str> = Some(VENDOR_REQUIRES);
+/// Whether this build compiles the vendor providers in.
+#[cfg(feature = "vendor")]
+const VENDOR_IMPLEMENTED: bool = true;
+/// Whether this build compiles the vendor providers in.
+#[cfg(not(feature = "vendor"))]
+const VENDOR_IMPLEMENTED: bool = false;
 
 /// Creates the provider registered under a name.
 ///
@@ -267,10 +276,11 @@ pub fn provider_model_config(
 ///
 /// A registered factory that fails to build its provider is skipped instead of failing the whole
 /// listing, so one broken adapter does not hide the rest of the registry. The declared descriptors
-/// are static metadata: a vendor entry reports `implemented: false` even with the `vendor` feature,
-/// because its `create` cannot build a harness, and feature flags never rewrite an entry — a build
-/// compiled without `native` still lists it here while [`resolve_provider`] reports the missing
-/// feature.
+/// are static metadata: the three vendor entries are `implemented` exactly when this build has the
+/// `vendor` feature compiled in (`create` really constructs their subprocess harnesses), and
+/// otherwise report the feature as their `requires` entry. Feature flags never rewrite the other
+/// declared names: a build compiled without `native` still lists it as implemented here while
+/// [`resolve_provider`] reports the missing feature.
 #[must_use]
 pub fn provider_descriptors() -> Vec<ProviderDescriptor> {
     let mut descriptors: Vec<ProviderDescriptor> = PROVIDER_NAMES
@@ -332,27 +342,27 @@ fn builtin_descriptor(name: &str) -> Option<ProviderDescriptor> {
             card_name: CLAUDE_CODE_CARD_NAME.to_owned(),
             implementation_version: VENDOR_VERSION.to_owned(),
             builtin: true,
-            implemented: false,
+            implemented: VENDOR_IMPLEMENTED,
             configures_models: true,
-            requires: Some(CLAUDE_CODE_REQUIRES.to_owned()),
+            requires: VENDOR_REQUIREMENT.map(str::to_owned),
         },
         provider_names::CODEX => ProviderDescriptor {
             name: name.to_owned(),
             card_name: CODEX_CARD_NAME.to_owned(),
             implementation_version: VENDOR_VERSION.to_owned(),
             builtin: true,
-            implemented: false,
+            implemented: VENDOR_IMPLEMENTED,
             configures_models: true,
-            requires: Some(CODEX_REQUIRES.to_owned()),
+            requires: VENDOR_REQUIREMENT.map(str::to_owned),
         },
         provider_names::DSH => ProviderDescriptor {
             name: name.to_owned(),
             card_name: DSH_CARD_NAME.to_owned(),
             implementation_version: DSH_VERSION.to_owned(),
             builtin: true,
-            implemented: false,
+            implemented: VENDOR_IMPLEMENTED,
             configures_models: true,
-            requires: Some(DSH_REQUIRES.to_owned()),
+            requires: VENDOR_REQUIREMENT.map(str::to_owned),
         },
         _ => return None,
     };

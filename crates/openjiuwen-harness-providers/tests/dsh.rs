@@ -1,12 +1,4 @@
-#![cfg(all(feature = "vendor", unix))]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::too_many_lines,
-    clippy::items_after_statements,
-    clippy::needless_pass_by_value
-)]
-//! End-to-end suite of the DeepSeek Harness (DSH) provider.
+//! End-to-end suite of the `DeepSeek` Harness (DSH) provider.
 //!
 //! Every case runs the real adapter over a real child process: [`FakeCli`] writes a POSIX shell
 //! script that speaks the DSH JSON-RPC stdio transport (it answers `initialize` and
@@ -19,6 +11,14 @@
 //! cursor or the adapter's chunk stream, and every await that could hang is bounded.
 //!
 //! Python counterpart: `tests/unit_tests/harness_providers/dsh/`.
+#![cfg(all(feature = "vendor", unix))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value
+)]
 mod support;
 
 use std::path::Path;
@@ -480,7 +480,7 @@ async fn a_turn_projects_outputs_and_the_tool_pair_through_the_io_adapter() {
     assert_eq!(chunks[1].payload["channel"], json!("answer"));
     assert_eq!(
         chunks[1].payload["output_id"],
-        json!(format!("dsh-output:1:1:0:answer"))
+        json!("dsh-output:1:1:0:answer")
     );
     assert_eq!(chunks[2].payload["content"], json!("lo"));
     assert_eq!(chunks[3].payload["content"], json!("Hello"));
@@ -633,12 +633,12 @@ async fn subagent_lifecycles_become_items_and_child_events_are_forwarded() {
     let home = tempfile::tempdir().expect("a temporary DSH home");
     let child = r#"{"type":"assistant/chunk","data":{"turn":1,"step":1,"chunk":{"type":"text-delta","index":0,"text":"child text"}}}"#;
     let events = [
-        format!("      notify 'subagent.started' '{{\"childSessionId\":\"child-1\"}}'"),
+        String::from("      notify 'subagent.started' '{\"childSessionId\":\"child-1\"}'"),
         format!(
             "      printf '{{\"jsonrpc\":\"2.0\",\"method\":\"session.event\",\
              \"params\":{{\"sessionId\":\"child-1\",\"event\":{child}}}}}\\n'"
         ),
-        format!("      notify 'subagent.finished' '{{\"childSessionId\":\"child-1\"}}'"),
+        String::from("      notify 'subagent.finished' '{\"childSessionId\":\"child-1\"}'"),
         delta(0, "root"),
         turn_end(r#"{"kind":"completed"}"#),
     ]

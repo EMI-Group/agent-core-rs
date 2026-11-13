@@ -7,9 +7,9 @@
 //! "not found".
 //!
 //! Feature gating is expressed here, not in the provider modules: without the `native` feature the
-//! native entry point is compiled out, without `vendor` the three vendor stubs stay unregistered,
-//! and without `native-v2` the agent-teams-hosted provider is absent. The module itself is always
-//! declared because the factory consults it in every feature combination.
+//! native entry point is compiled out, without `vendor` the three vendor providers stay
+//! unregistered, and without `native-v2` the agent-teams-hosted provider is absent. The module
+//! itself is always declared because the factory consults it in every feature combination.
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
@@ -91,7 +91,7 @@ fn native_provider() -> Result<Arc<dyn ProviderSpec>> {
     ))
 }
 
-/// The vendor stub for `name`, or the reason this build has it compiled out.
+/// The vendor provider registered as `name`, or the reason this build has it compiled out.
 #[cfg(feature = "vendor")]
 fn vendor_provider(name: &str) -> Result<Arc<dyn ProviderSpec>> {
     match name {
@@ -105,12 +105,12 @@ fn vendor_provider(name: &str) -> Result<Arc<dyn ProviderSpec>> {
     }
 }
 
-/// The vendor stub for `name`, or the reason this build has it compiled out.
+/// The vendor provider registered as `name`, or the reason this build has it compiled out.
 #[cfg(not(feature = "vendor"))]
 fn vendor_provider(name: &str) -> Result<Arc<dyn ProviderSpec>> {
     Err(Error::unsupported(format!(
         "vendor harness provider '{name}' is deferred; rebuild with the `vendor` feature to \
-         register the stub"
+         register it"
     )))
 }
 
@@ -119,6 +119,12 @@ mod tests {
     // Tests assert by panicking on failure, which is the intent of a test.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    // Only the "this build lacks the feature" tests inspect the error variant.
+    #[cfg(any(
+        not(feature = "native"),
+        not(feature = "native-v2"),
+        not(feature = "vendor")
+    ))]
     use openjiuwen_common::error::Error;
 
     use super::builtin_provider;

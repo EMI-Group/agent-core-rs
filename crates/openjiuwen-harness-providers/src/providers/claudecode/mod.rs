@@ -52,11 +52,6 @@ mod wire;
 
 pub use harness::ClaudeDriver;
 
-// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
-// assert it; this provider no longer produces that message, so keep the constant referenced in
-// non-test builds (removing it is the vendor module's call, not this provider's).
-const _: &str = crate::providers::vendor::CLAUDE_SDK_REQUIRED;
-
 /// Registry name of the Claude Code provider.
 pub const PROVIDER_NAME: &str = "claudecode";
 

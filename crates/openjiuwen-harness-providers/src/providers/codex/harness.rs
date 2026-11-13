@@ -234,7 +234,7 @@ impl CodexDriver {
     }
 
     /// Resolves the thread id to resume, applying the host's resume policy.
-    fn resume_thread_id(&self, context: &HarnessContext) -> HarnessResult<Option<String>> {
+    fn resume_thread_id(context: &HarnessContext) -> HarnessResult<Option<String>> {
         let checkpoint = context
             .checkpoint
             .as_ref()
@@ -354,7 +354,7 @@ impl VendorDriver for CodexDriver {
             })?;
         }
         let policy = PermissionPolicy::from_context(context);
-        let resume = self.resume_thread_id(context)?;
+        let resume = Self::resume_thread_id(context)?;
         let args = build_args(&self.config, context);
         let env = build_env(&self.config, context);
         let process = ChildProcess::spawn(ChildProcessConfig {

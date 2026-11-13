@@ -1,4 +1,4 @@
-//! Process invocation of the DeepSeek Harness transport: `DSH_HOME`, argv and environment.
+//! Process invocation of the `DeepSeek` Harness transport: `DSH_HOME`, argv and environment.
 //!
 //! The transport contract these helpers implement is documented on the
 //! [`harness`](super::harness) module; nothing here spawns a process or talks to the runtime.

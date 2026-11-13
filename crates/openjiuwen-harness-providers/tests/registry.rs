@@ -285,7 +285,7 @@ fn vendor_names_resolve_when_enabled() {
         ("codex", "codex"),
         ("dsh", "deepseek-harness"),
     ] {
-        let spec = resolve_provider(name).expect("the vendor feature registers the stub");
+        let spec = resolve_provider(name).expect("the vendor feature registers the provider");
         assert_eq!(spec.card().name, card_name, "for {name}");
     }
 }
@@ -469,8 +469,9 @@ fn builtin_descriptors_are_declared_in_python_order() {
 
 /// Every built-in descriptor reports the Card identity plus its external prerequisite.
 ///
-/// `native_v2` is implemented once the `native-v2` feature hosts it; the three vendor entries stay
-/// declared with their transport requirement, which is what `requires` documents.
+/// `native_v2` is implemented once the `native-v2` feature hosts it; the three vendor entries are
+/// implemented once the `vendor` feature compiles them in, and otherwise name that feature as the
+/// prerequisite — which is what `requires` documents.
 #[test]
 fn builtin_descriptors_name_their_prerequisite() {
     let descriptors = provider_descriptors();
@@ -492,40 +493,42 @@ fn builtin_descriptors_name_their_prerequisite() {
     assert_eq!(claudecode.card_name, "claude-code");
     assert_eq!(claudecode.implementation_version, "0.1.0");
     assert!(claudecode.builtin && claudecode.configures_models);
-    assert!(
-        claudecode
-            .requires
-            .as_deref()
-            .is_some_and(|text| text.contains("Claude Agent SDK")),
-        "unexpected requirement: {:?}",
-        claudecode.requires
-    );
     let codex = describe_provider("codex").expect("codex is declared");
     assert_eq!(codex.card_name, "codex");
     assert_eq!(codex.implementation_version, "0.1.0");
     assert!(codex.builtin && codex.configures_models);
-    assert!(
-        codex
-            .requires
-            .as_deref()
-            .is_some_and(|text| text.contains("openai-codex")),
-        "unexpected requirement: {:?}",
-        codex.requires
-    );
     let dsh = describe_provider("dsh").expect("dsh is declared");
     assert_eq!(dsh.card_name, "deepseek-harness");
     assert_eq!(dsh.implementation_version, "0.3.0");
     assert!(dsh.builtin && dsh.configures_models);
-    assert!(
-        dsh.requires
-            .as_deref()
-            .is_some_and(|text| text.contains("deepseek-harness-sdk")),
-        "unexpected requirement: {:?}",
-        dsh.requires
-    );
+    for (name, descriptor) in [
+        ("claudecode", &claudecode),
+        ("codex", &codex),
+        ("dsh", &dsh),
+    ] {
+        #[cfg(feature = "vendor")]
+        {
+            assert!(descriptor.implemented, "{name} builds a harness here");
+            assert_eq!(
+                descriptor.requires, None,
+                "{name} has no remaining prerequisite with the vendor feature"
+            );
+        }
+        #[cfg(not(feature = "vendor"))]
+        {
+            assert!(!descriptor.implemented, "{name} is compiled out");
+            assert_eq!(
+                descriptor.requires.as_deref(),
+                Some("rebuild with the `vendor` feature"),
+                "{name} names the feature that hosts it"
+            );
+        }
+    }
     // `describe_provider` reports the same static entry the listing does.
     assert_eq!(descriptor_named(&descriptors, "claudecode"), claudecode);
     assert_eq!(descriptor_named(&descriptors, "native_v2"), native_v2);
+    assert_eq!(descriptor_named(&descriptors, "codex"), codex);
+    assert_eq!(descriptor_named(&descriptors, "dsh"), dsh);
 }
 
 /// Returns the descriptor `name` from an existing listing.

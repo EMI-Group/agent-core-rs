@@ -1,4 +1,4 @@
-//! Session-event projection of the DeepSeek Harness transport.
+//! Session-event projection of the `DeepSeek` Harness transport.
 //!
 //! Every method here turns one decoded JSON-RPC notification into harness observations (outputs,
 //! tool calls, tool results, usage, step/subagent items, provider events) or into the turn's
@@ -109,7 +109,7 @@ impl DshAccumulator {
 
     /// Returns whether `session_id` is the root session (a missing id counts as root).
     pub(super) fn is_root(&self, session_id: Option<&str>) -> bool {
-        session_id.map_or(true, |session_id| session_id == self.root_session_id)
+        session_id.is_none_or(|session_id| session_id == self.root_session_id)
     }
 
     /// Maps one `session.event` of the root session, returning the terminal result on `turn/end`.
@@ -563,7 +563,7 @@ impl DshAccumulator {
             return false;
         }
         if channel == OutputChannel::Answer {
-            self.last_text_output = text.to_owned();
+            text.clone_into(&mut self.last_text_output);
         }
         true
     }

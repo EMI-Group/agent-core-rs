@@ -324,8 +324,14 @@ pub struct StdinWriter {
 
 impl std::fmt::Debug for StdinWriter {
     /// Formats the handle without its pipe.
+    ///
+    /// The pipe handle has no printable form (it is an OS handle, and printing it would expose the
+    /// child's descriptor), and the retained stderr lines are diagnostics rather than state, so both
+    /// are rendered as placeholders.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StdinWriter")
+            .field("stdin", &"<stdin>")
+            .field("stderr", &"<stderr>")
             .field("label", &self.label)
             .finish()
     }

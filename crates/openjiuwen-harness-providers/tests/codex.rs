@@ -1,12 +1,3 @@
-#![cfg(feature = "vendor")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::too_many_lines,
-    clippy::items_after_statements,
-    clippy::needless_pass_by_value,
-    clippy::similar_names
-)]
 //! Offline, deterministic suite of the Codex app-server adapter.
 //!
 //! Every case starts a real child process from [`support::FakeCli`], a POSIX shell script that
@@ -21,9 +12,19 @@
 //! interrupt path, the resumed thread, and a stream that ends without `turn/completed`.
 //!
 //! Python counterpart: `tests/unit_tests/harness_providers/codex/`.
+#![cfg(feature = "vendor")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::similar_names
+)]
 mod support;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,9 +80,10 @@ fn turn_arm(notifications: &[(&str, &str)]) -> String {
 "#,
     );
     for (method, params) in notifications {
-        arm.push_str(&format!(
-            "      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params}}}'\n"
-        ));
+        let _ = writeln!(
+            arm,
+            "      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params}}}'"
+        );
     }
     arm.push_str("      ;;\n");
     arm

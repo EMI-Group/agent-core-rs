@@ -1,29 +1,15 @@
-//! Shared helpers for the deferred vendor providers (`claudecode`, `codex`, `dsh`).
+//! Shared helpers for the vendor providers (`claudecode`, `codex`, `dsh`).
 //!
-//! The vendor providers are stubs: they keep the registration surface, cards and configuration
-//! data, but [`create`](openjiuwen_harness_protocol::HarnessProvider::create) always reports that
-//! the vendor SDK is missing. This module holds what all three share, so no provider module
-//! duplicates it: the SDK-required messages, the configuration-error translation, the
+//! The three vendor providers are real subprocess harnesses; this module holds only what they
+//! share, so no provider module duplicates it: the configuration-error translation, the
 //! `{"model": {…}}` / flat create fragments, and card construction.
 //!
-//! Nothing here spawns a process or talks to a vendor SDK — the helpers are pure data transforms.
+//! Nothing here spawns a process or talks to a vendor CLI — the helpers are pure data transforms.
 use openjiuwen_common::error::Error;
 use openjiuwen_harness_protocol::{
-    json_object_to_value, HarnessCapability, HarnessCard, HarnessError, HarnessProtocol,
-    HarnessResult, HostCapability, JsonObject, JsonValue, ModelChoice,
+    json_object_to_value, HarnessCapability, HarnessCard, HarnessError, HostCapability, JsonObject,
+    JsonValue, ModelChoice,
 };
-
-/// Message of a Claude Code `create` (Python `claude-agent-sdk` import failure).
-pub(crate) const CLAUDE_SDK_REQUIRED: &str =
-    "claude-agent-sdk is required for the Claude Code harness; install the optional SDK";
-
-/// Message of a Codex `create` (Python `openai-codex` import failure).
-pub(crate) const CODEX_SDK_REQUIRED: &str =
-    "openai-codex is required for the Codex harness; install the optional SDK";
-
-/// Message of a DSH `create` (Python `deepseek-harness-sdk` import failure).
-pub(crate) const DSH_SDK_REQUIRED: &str =
-    "deepseek-harness-sdk is required for the DSH adapter; install the optional SDK before start()";
 
 /// Translates a vendor configuration error into the harness SPI error.
 ///
@@ -37,21 +23,6 @@ pub(crate) fn config_error_to_harness(error: Error) -> HarnessError {
         Error::External(error) => HarnessError::validation(error.to_string()),
         other => HarnessError::validation(other.to_string()),
     }
-}
-
-/// Runs `config_validation` and then reports the deferred provider's SDK requirement.
-///
-/// # Errors
-///
-/// Returns the configuration error mapped through [`config_error_to_harness`] when validation
-/// fails, otherwise [`HarnessError::UnsupportedCapability`] carrying `message` — a vendor stub
-/// never constructs a harness.
-pub(crate) fn unsupported_create(
-    config_validation: openjiuwen_common::error::Result<()>,
-    message: &str,
-) -> HarnessResult<Box<dyn HarnessProtocol>> {
-    config_validation.map_err(config_error_to_harness)?;
-    Err(HarnessError::unsupported_capability(message))
 }
 
 /// Inserts `value` under `key` when it is present, leaving the key absent otherwise.
@@ -142,10 +113,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{
-        config_error_to_harness, model_fragment, nested_model_config, unsupported_create,
-        vendor_card, CLAUDE_SDK_REQUIRED,
-    };
+    use super::{config_error_to_harness, model_fragment, nested_model_config, vendor_card};
 
     /// Choice with a model, no effort and no endpoint.
     fn builtin_choice() -> ModelChoice {
@@ -287,26 +255,5 @@ mod tests {
         let error = config_error_to_harness(Error::config("bad workspace"));
         assert_eq!(error.kind(), HarnessErrorKind::Validation);
         assert_eq!(error.message(), "config: bad workspace");
-    }
-
-    #[test]
-    fn unsupported_create_reports_the_sdk_requirement() {
-        let error = unsupported_create(Ok(()), CLAUDE_SDK_REQUIRED)
-            .err()
-            .expect("a vendor stub never constructs a harness");
-        assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-        assert_eq!(error.message(), CLAUDE_SDK_REQUIRED);
-    }
-
-    #[test]
-    fn unsupported_create_surfaces_the_configuration_error_first() {
-        let error = unsupported_create(
-            Err(Error::validation("unknown Codex configuration fields: foo")),
-            CLAUDE_SDK_REQUIRED,
-        )
-        .err()
-        .expect("invalid configuration must win over the SDK requirement");
-        assert_eq!(error.kind(), HarnessErrorKind::Validation);
-        assert_eq!(error.message(), "unknown Codex configuration fields: foo");
     }
 }

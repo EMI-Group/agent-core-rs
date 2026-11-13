@@ -284,8 +284,13 @@ fn dsh_card_declares_a_persistent_session_mcp_tools_and_endpoint_models() {
     );
 }
 
+/// The vendor descriptors report the identity, the model hook and a real implementation.
+///
+/// This suite only compiles with the `vendor` feature, which is exactly the configuration in which
+/// the providers build harnesses: `requires` therefore documents no remaining prerequisite. The
+/// compiled-out arm of the contract is covered by `tests/registry.rs`, which also runs without it.
 #[test]
-fn descriptors_report_the_deferred_vendor_providers() {
+fn vendor_descriptors_report_implemented_with_the_feature() {
     for (name, card_name, version) in [
         (
             claudecode::PROVIDER_NAME,
@@ -308,9 +313,12 @@ fn descriptors_report_the_deferred_vendor_providers() {
         assert_eq!(descriptor.card_name, card_name);
         assert_eq!(descriptor.implementation_version, version);
         assert!(descriptor.builtin, "{name} stays a built-in name");
-        assert!(!descriptor.implemented, "{name} is deferred");
         assert!(descriptor.configures_models);
-        assert!(descriptor.requires.is_some(), "{name} needs an SDK");
+        assert!(descriptor.implemented, "{name} builds a harness here");
+        assert_eq!(
+            descriptor.requires, None,
+            "{name} has no remaining prerequisite with the vendor feature"
+        );
     }
 }
 
