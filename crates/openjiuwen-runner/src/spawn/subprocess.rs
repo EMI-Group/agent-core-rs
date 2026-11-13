@@ -18,10 +18,8 @@
 //! stream was dropped before a terminator is marked out of sync and refuses
 //! further exchanges with [`openjiuwen_common::error::Error::Validation`],
 //! because the next read would consume that abandoned exchange's frames. For the
-//! same reason a child implements no task cancellation
-//! ([`SpawnedAgent::cancel_task`] keeps its unsupported default): there is no
-//! task handle to address, so the way to stop one is
-//! [`SpawnedProcess::shutdown`] or [`SpawnedProcess::force_kill`].
+//! same reason a child implements no task cancellation (there is no task handle
+//! to address): stop one with `shutdown` or `force_kill`.
 //!
 //! **Timing** (`request_timeout_secs`, `shutdown_timeout_secs`,
 //! `health_check_*`) comes from [`SubprocessConfig`]; the matching [`SpawnSpec`]
@@ -220,8 +218,8 @@ impl SpawnedProcess {
         is_alive_impl(&self.state)
     }
 
-    /// The last observed health state: `true` for a fresh child, refreshed by
-    /// [`SpawnedProcess::health`] and the background task.
+    /// The last observed health state, refreshed by `health` and the background
+    /// task; `true` for a fresh child.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.state.healthy.load(Ordering::SeqCst)
@@ -238,10 +236,9 @@ impl SpawnedProcess {
     /// is out of sync.
     ///
     /// A probe that hits its deadline leaves the child's response frame unread,
-    /// which desynchronizes the handle exactly like an abandoned stream: every
-    /// later exchange on it — `health`, `send`, or `stream` — fails with
-    /// [`openjiuwen_common::error::Error::Validation`], so the handle must be
-    /// dropped and the child respawned.
+    /// which desynchronizes the handle like an abandoned stream: every later
+    /// exchange fails with [`openjiuwen_common::error::Error::Validation`], so the
+    /// handle must be dropped and the child respawned.
     pub async fn health(&self) -> Result<bool> {
         health_impl(&self.state).await
     }
@@ -331,16 +328,13 @@ impl SpawnedAgent for SpawnedProcess {
         SpawnBackend::Subprocess
     }
 
-    /// The last observed probe result, read from the same atomic the background
-    /// health task updates.
+    /// The same atomic the background health task updates.
     fn is_healthy(&self) -> bool {
         self.state.healthy.load(Ordering::SeqCst)
     }
 
-    /// Named here rather than inherited so the backend is pinned to
-    /// [`SpawnBackend::Subprocess`] and no field can drift from the handle's own
-    /// accessors; `last_error` stays `None` because the backend fabricates no
-    /// failure — a failed probe is reported by [`SpawnedProcess::health`].
+    /// Pinned to [`SpawnBackend::Subprocess`]; `last_error` stays `None` because a
+    /// failed probe is an `Err` from `health`, never a fabricated field.
     fn health_snapshot(&self) -> SpawnHealth {
         SpawnHealth {
             backend: SpawnBackend::Subprocess,
@@ -351,15 +345,8 @@ impl SpawnedAgent for SpawnedProcess {
         }
     }
 
-    /// Runs one health probe (`health_check` in, `health_check_response` out)
-    /// within the configured probe deadline.
-    ///
-    /// # Errors
-    ///
-    /// [`openjiuwen_common::error::Error::Timeout`] when the probe deadline
-    /// expires, [`openjiuwen_common::error::Error::Transport`] when the transport
-    /// fails, and [`openjiuwen_common::error::Error::Validation`] when the handle
-    /// is out of sync (see [`SpawnedProcess::health`]).
+    /// One probe; see [`SpawnedProcess::health`] for the deadline, desync and
+    /// error rules.
     async fn health(&self) -> Result<bool> {
         health_impl(&self.state).await
     }
