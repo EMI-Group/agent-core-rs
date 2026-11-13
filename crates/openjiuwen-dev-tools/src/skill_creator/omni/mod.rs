@@ -27,8 +27,9 @@
 //!   documents, and the drafting prompt.
 //!
 //! Stages 1–5 are implemented; Playwright browser automation, Pillow image
-//! decoding, the LLM image-relevance judge (Python stage 3), and binary image
-//! storage are deliberately not ported. Every stage is deterministic and
+//! decoding, and the LLM image-relevance judge (Python stage 3) are
+//! deliberately not ported, while kept images are persisted byte-for-byte into
+//! `references/`. Every stage is deterministic and
 //! bounded: caps come from [`pipeline::OmniConfig`], ordering is first-seen, and
 //! network access happens only through the injected [`fetch::Fetcher`].
 pub mod archive;
