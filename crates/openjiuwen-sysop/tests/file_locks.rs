@@ -40,6 +40,8 @@ const BOUND: Duration = Duration::from_secs(10);
 const HELPER_ENV: &str = "SYSOP_LOCK_HELPER";
 /// Environment variable selecting the helper's lock mode (`read` or `write`).
 const HELPER_MODE_ENV: &str = "SYSOP_LOCK_HELPER_MODE";
+/// Environment variable asking the helper to wait (bounded) instead of probing once.
+const HELPER_WAIT_ENV: &str = "SYSOP_LOCK_HELPER_WAIT";
 /// The helper test's name, used as the libtest `--exact` filter.
 const HELPER_TEST: &str = "lock_helper_process";
 /// Exit code of the helper when it took the lock.
@@ -89,12 +91,35 @@ fn lock_helper_process() {
         Ok("read") => LockMode::Read,
         _ => LockMode::Write,
     };
-    let manager = FileLockManager::with_root(&LocalWorkConfig::default(), root);
+    // `wait` mode uses a bounded blocking acquire: the caller dropped its guard before
+    // spawning us, so success proves the descriptor close released the lock. This is more
+    // robust than a single non-blocking probe under a loaded CI machine.
+    let waiting = std::env::var(HELPER_WAIT_ENV).is_ok_and(|value| value == "1");
+    let mut config = LocalWorkConfig::default();
+    if waiting {
+        config.lock_timeout_secs = 10;
+    }
+    let manager = FileLockManager::with_root(&config, root);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("the helper runtime builds");
-    let code = match runtime.block_on(manager.try_acquire(Path::new(target), mode)) {
+    let attempt = runtime.block_on(async {
+        let result = if waiting {
+            manager.acquire(Path::new(target), mode).await
+        } else {
+            manager.try_acquire(Path::new(target), mode).await
+        };
+        result.map_err(|error| match error {
+            LockError::TimedOut { .. } => LockError::Contended {
+                target: Path::new(target).to_path_buf(),
+                lock_path: manager.lock_path(Path::new(target)),
+                mode,
+            },
+            other => other,
+        })
+    });
+    let code = match attempt {
         Ok(guard) => {
             let active = guard.is_active();
             drop(guard);
@@ -116,14 +141,23 @@ fn lock_helper_process() {
 
 /// Runs the helper as a separate process and returns its exit code.
 fn run_helper(root: &Path, target: &Path, mode: LockMode) -> i32 {
+    run_helper_with(root, target, mode, false)
+}
+/// Runs the helper, optionally in bounded-wait mode instead of a single probe.
+fn run_helper_with(root: &Path, target: &Path, mode: LockMode, wait: bool) -> i32 {
     let executable = std::env::current_exe().expect("the test binary path");
     let spec = format!("{}\n{}", root.display(), target.display());
-    let output = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
         .args(["--exact", HELPER_TEST, "--test-threads", "1"])
         .env(HELPER_ENV, spec)
-        .env(HELPER_MODE_ENV, mode.label())
-        .output()
-        .expect("the helper process starts");
+        .env(HELPER_MODE_ENV, mode.label());
+    if wait {
+        command.env(HELPER_WAIT_ENV, "1");
+    } else {
+        command.env_remove(HELPER_WAIT_ENV);
+    }
+    let output = command.output().expect("the helper process starts");
     output.status.code().unwrap_or(-1)
 }
 
@@ -152,7 +186,7 @@ async fn a_second_process_observes_the_lock() {
     drop(held);
     let (root_for_helper, target_for_helper) = (root.clone(), target.clone());
     let acquired = tokio::task::spawn_blocking(move || {
-        run_helper(&root_for_helper, &target_for_helper, LockMode::Read)
+        run_helper_with(&root_for_helper, &target_for_helper, LockMode::Read, true)
     })
     .await
     .unwrap();
