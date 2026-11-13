@@ -78,11 +78,11 @@ impl AliyunReranker {
 - `reqwest` (async, rustls) is the only HTTP client here; no vendor SDK, and no blocking calls on async tasks.
 - Errors: `openjiuwen_common::error::{Error, Result}`; deferred or silent defaults are not acceptable.
 - Logging: `tracing` only, target `openjiuwen_extensions::vendor_specific`; the API key and document texts never appear above `debug`.
-- Size: `dashscope.rs` is intentionally ~1.1k lines because the transport and its wire/error matrix must live in this node's single write scope; move the `#[cfg(test)]` block into `dashscope/tests.rs` when a wider write scope allows it.
+- Size: `dashscope.rs` holds the transport and wire types; `dashscope/tests.rs` holds the wire/error test matrix, kept as one file because those cases share the mock-server and env-guard fixtures.
 
 ## Test Strategy
 
-- Unit tests beside the code: `dashscope.rs`'s `#[cfg(test)] mod tests` covers the request shape (method, path, bearer token, exact JSON body), index mapping/sorting/tie stability, `top_n` precedence and the `0`/oversized no-truncation cases, missing documents scoring `0.0`, the empty-input short circuit (zero requests), `401`/`403`/`429`/`400`/`500` mapping, malformed and resultless bodies, out-of-range indices, non-finite scores, `endpoint_url` normalization and rejection, `DASHSCOPE_API_KEY` resolution under a process-wide `static Mutex<()>` env guard that restores the variable, serde request/response shapes, and `error_detail` bounding.
+- Unit tests beside the code: `dashscope/tests.rs` walks to the parent with `use super::*;` and covers the request shape (method, path, bearer token, exact JSON body), index mapping/sorting/tie stability, `top_n` precedence and the `0`/oversized no-truncation cases, missing documents scoring `0.0`, the empty-input short circuit (zero requests), `401`/`403`/`429`/`400`/`500` mapping, malformed and resultless bodies, out-of-range indices, non-finite scores, `endpoint_url` normalization and rejection, `DASHSCOPE_API_KEY` resolution under a process-wide `static Mutex<()>` env guard that restores the variable, serde request/response shapes, and `error_detail` bounding.
 - `mod.rs`'s test module keeps the delegation tests (`new` forwards arguments, order, and errors verbatim, `config() == None`) plus the config defaults, `Debug` redaction, and snake_case serde tests, and proves `from_config` builds a working transport against a `wiremock` server.
 - All tests are offline: `wiremock` binds `127.0.0.1:0`, no credentials exist, and no test touches the DashScope service.
 - Python counterparts named in comments: `tests/unit_tests/core/retrieval/` (`DashscopeReranker`, `StandardReranker._parse_response`) and `tests/unit_tests/extensions/vendor_specific/` when present.
@@ -90,4 +90,5 @@ impl AliyunReranker {
 ## Routing Table
 
 - `./mod.rs` → `AliyunReranker`, `AliyunRerankerConfig`, the deprecation warning, delegation impl, and its tests
-- `./dashscope.rs` → the live `DashScope` transport: wire types, request building, response mapping, credential and endpoint resolution, error mapping, and its tests
+- `./dashscope.rs` → the live `DashScope` transport: wire types, request building, response mapping, credential and endpoint resolution, and error mapping
+- `./dashscope/tests.rs` → the transport test matrix (mock-server request/response, error mapping, credential and endpoint resolution)
