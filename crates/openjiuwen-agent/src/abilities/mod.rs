@@ -11,16 +11,22 @@
 //! `BeforeToolCall`/`AfterToolCall` rails around it.
 pub mod arguments;
 pub(crate) mod execute;
+pub mod mcp;
+pub mod sub_agent;
+pub mod workflow;
 
 pub use arguments::parse_tool_arguments;
 use indexmap::IndexMap;
+pub use mcp::{load_mcp_abilities, McpAbilityOptions, McpToolAbility};
 use openjiuwen_foundation::{openai_tools, BaseMessage, Tool, ToolCall, ToolCard};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+pub use sub_agent::SubAgentAbility;
 use tokio_util::sync::CancellationToken;
+pub use workflow::WorkflowAbility;
 
 /// Outcome of [`AbilityManager::add_tool`].
 ///
