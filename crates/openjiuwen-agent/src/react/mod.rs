@@ -52,6 +52,8 @@ pub(crate) mod hooks;
 pub mod model_step;
 pub(crate) mod prompt;
 pub(crate) mod resume;
+#[cfg(test)]
+mod wiring;
 
 pub use config::{MaxIterationsPolicy, ReActAgentConfig};
 
