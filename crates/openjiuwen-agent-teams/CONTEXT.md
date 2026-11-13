@@ -3,275 +3,158 @@
 ## Intent
 
 Leader/teammate multi-agent runtime: the Rust port of the Python package `openjiuwen.agent_teams` (v0.1.20, ~108k lines / 336 files).
-Scope is the **in-process core**: team specs and expert catalog, the leader/teammate runtime (organisation dispatch, task board, mailbox, member lifecycle, local workspace isolation), HITL forwarding, the harness-protocol adapter, the `team-member` skill CLI, and the `openjiuwen-team-mcp` MCP server.
-Distributed/process modes (ZeroMQ, PostgreSQL, Pulsar, external CLI members) exist only as documented trait seams returning `Error::Unsupported`.
+The crate owns team specs and the expert catalog, the leader/teammate runtime (dispatch, task board, mailbox, member lifecycle, workspace isolation), HITL forwarding, the harness-protocol adapter, the organisation layer, model-pool routing and KV-cache affinity, observability and the monitor status stream, cross-process attach, sqlite persistence, the `team-member` CLI (including its `serve` child-process server) and the `openjiuwen-team-mcp` MCP server.
+A member runs in-process, as an OS-process child speaking the JSON-lines member protocol, as an external CLI adapter, or over SSH; its workspace is a local directory or a git worktree.
+Transport stays in-process (`InProcessMessager`); persistence is in-memory or SQLite.
 Parity rule: serialized JSON names, defaults, status values, tool/command names and observable lifecycle behaviour follow Python; internals are idiomatic Rust.
 
 ## API Surface
 
-Crate root (`lib.rs`) re-exports the public surface flat, mirroring `agent_teams/__init__.py` plus the seams listed below.
+`src/lib.rs` re-exports the public surface flat at the crate root, grouped as follows (the full item lists are in that file and in each module's `CONTEXT.md`).
 
 ```rust
-// identity / addressing
-pub const DEFAULT_LEADER_MEMBER_NAME: &str = "team_leader";
-pub const HUMAN_AGENT_MEMBER_NAME: &str = "human_agent";
-pub const USER_PSEUDO_MEMBER_NAME: &str = "user";
-pub const RESERVED_MEMBER_NAMES: [&str; N];
-pub fn is_reserved_name(name: &str) -> bool;
-pub fn parse_mention(text: &str) -> Option<(&str, &str)>;   // "^@(\S+)\s+([\s\S]+)$"
-
-// spec → runtime
-#[async_trait] pub trait SpecBuild { async fn build(&self) -> Result<Arc<TeamAgent>>; async fn build_with(&self, deps: TeamBuildDeps) -> Result<Arc<TeamAgent>>; }
-pub struct TeamAgentSpec { /* Python blueprint.py: agents, leader, predefined_members, dispatch_mode, … */ }
-pub struct TeamAgent;            // impl openjiuwen_agent::Agent + openjiuwen_multiagent::Team
-pub struct TeamRuntimeManager;   // activate / live / interact / finalize_member / stop_team / snapshot
-pub struct TeamRuntimePool;
-
-// protocol
+// identity, defaults, addressing
+pub use constants::{is_reserved_name, parse_mention, BROADCAST_TARGET, DEFAULT_LANGUAGE, …};
+// `DEFAULT_*` names, HUMAN_AGENT_MEMBER_NAME, RESERVED_MEMBER_NAMES, MAX_MESSAGE_CONTENT_CHARS,
+// OPENJIUWEN_HOME_ENV, TEAM_JOIN_ENV, USER_PSEUDO_MEMBER_NAME
+pub use schema::*;  pub use storage::*;  pub use workspace::*;  pub use member::*;
+pub use taskboard::{…};    // TaskBoard, TaskBoardLimits, TaskMutation, TaskOpResult, ReviewTally, detect_cycle
+pub use messager::{…};     // Messager, InProcessMessager, EventSink, create_messager, peer/transport configs
+pub use experts::{…};      // ExpertCatalog/ExpertRef, package loading, template composition, process catalog slot
+pub use interaction::{…};  // InteractPayload, DeliverResult, InteractGate, inbox, approval bridge, routing grammar
+pub use runtime::{…};      // TeamAgent, TeamBackend, TeamBuildDeps, SpecBuild, runtime manager/pool,
+                           // member spawner, attach host, model allocator/router, org binding, metadata parsers
+pub use harness::{…};      // MemberHarnessFactory/Context, HarnessMemberRuntime, NativeMemberFactory,
+                           // ModelResolver/EnvModelResolver, NativeCheckpoint, mapping helpers
+pub use mcp::{…};          // TeamMcpServer, build_mcp_server, OPERATOR_INSTRUCTIONS, SERVER_NAME
+pub use skill::{…};        // TeamClient + store/socket clients, skill CLI, join descriptor, tool catalogues,
+                           // connect_live_client/connect_socket_client, outcome types
+// organisation, model routing, KV-cache affinity, observability
+pub use org::*;  pub use models::*;  pub use kv_cache::*;  pub use observability::*;
+// live status stream and attach: item-by-item, because a glob would re-export `monitor::stream`
+// (collides with `schema::stream`) and `attach::protocol` (collides with `member::protocol`)
+pub use monitor::{…};      // TeamMonitor, StatusStream, MonitorEmitter/Receiver, BackpressurePolicy, snapshot_events
+pub use attach::{…};       // AttachClient, AttachServer, AttachHandler, AttachOp, frames, errors, limits, version
 pub use openjiuwen_harness_protocol::HarnessState;   // re-export, never redefine
-pub struct HarnessMemberRuntime;                     // impl MemberRuntime over Arc<dyn HarnessProtocol>
-pub trait MemberHarnessFactory;                      // builds one Arc<dyn HarnessProtocol> per member
-pub struct NativeMemberFactory;                      // DeepAgentSpec → DeepAgent → NativeHarness
-
-// experts
-pub trait ExpertCatalog;  pub struct ExpertRef;  pub struct PackageLocation;
-pub fn set_process_expert_catalog(c: Arc<dyn ExpertCatalog>);  pub fn get_process_expert_catalog() -> Option<Arc<dyn ExpertCatalog>>;
-
-// CLI / MCP
-pub trait TeamClient;  pub struct TeamJoinDescriptor;  pub fn run_skill_cli(argv: Vec<String>) -> i32;
-pub fn connect_live_client(d: &TeamJoinDescriptor) -> Option<Arc<dyn TeamClient>>;  // in-process attach: global registry
-pub struct SkillCli;   pub enum CliCommand { Member(MemberCommand), Operator(OperatorCommand) }  // clap tree, publicly matchable
-pub fn run_skill_cli(argv: Vec<String>) -> i32;      // exit 0 success/--help, 1 refused or unhosted, 2 CLI-side, 130 cancelled
-pub struct TeamMcpServer;  pub fn build_mcp_server(client: Arc<dyn TeamClient>) -> TeamMcpServer;
 ```
 
-Binaries (mirroring the Python console script and MCP entry point): `team-member` → `run_skill_cli`;
-`openjiuwen-team-mcp` (`mcp` feature) → `mcp::run_mcp_server_from_env` over stdio.
+Module roles beyond the kernel seams, one line each:
 
-Modules are documented by their own `CONTEXT.md`; the list is in the Routing Table.
+- `org` → organisation chart, reporting lines, delegation router, org task pool, org mailbox, swarmflow, fork/compact.
+- `models` → `ModelPool` validation and lookup, `ModelRouter` strategies (`by_name`, `round_robin`, `least_busy`, `rule_based`) and per-member allocation.
+- `kv_cache` → member cache identity, fork lineage, the advisory env bag and release/cleanup hooks.
+- `observability` → the `ObservabilityHooks` seam and an in-memory span sink; the `otel` feature adds structured hooks over the same seam.
+- `monitor` → plain-text status stream for a live team (`TeamMonitor`, `StatusStream`, backpressure policy).
+- `attach` → the Unix-socket wire contract (`protocol`) plus `AttachClient` and `AttachServer`.
 
-## Cross-module seams (do not change without updating every dependent node)
+Binaries: `team-member` (`src/bin/team-member.rs` → `skill::run_skill_cli`, exit `0/1/2/130`) and `openjiuwen-team-mcp` (`src/bin/openjiuwen-team-mcp.rs`, `mcp` feature, stdio MCP server).
 
-Everything below is the contract child nodes code against. Types are `#[serde(rename_all = "snake_case", default)]`, tolerate unknown fields, and default collections to empty.
+## Cross-module seams (change only together with every dependent node)
 
-### `schema` → everyone
+Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate unknown fields and default collections to empty.
 
-```rust
-pub struct TeamAgentSpec {                      // Python blueprint.py
-    pub team_name: String,                      // "agent_team"
-    pub team_display_name: Option<String>, pub team_desc: Option<String>,
-    pub agents: BTreeMap<String, DeepAgentSpec>,// required; must contain "leader"
-    pub leader: LeaderSpec,
-    pub predefined_members: Vec<PredefinedMemberSpec>,
-    pub agent_group_name: Option<String>,
-    pub lifecycle: TeamLifecycle,               // temporary | persistent
-    pub conversation_mode: ConversationMode,    // team | group_chat
-    pub dispatch_mode: DispatchMode,            // autonomous | scheduled
-    pub teammate_mode: MemberMode,              // build_mode | plan_mode
-    pub spawn_mode: SpawnMode,                  // inprocess | process
-    pub bootstrap_mode: BootstrapMode,          // leader | framework
-    pub enable_member_messaging: bool,          // false
-    pub enable_task_verification: bool,         // false
-    pub max_subtask_depth: usize,               // 0
-    pub enable_hitt: bool,                      // false
-    pub language: Option<String>,               // cn default; cf|en
-    pub model_pool: Vec<ModelPoolEntry>, pub model_pool_strategy: ModelPoolStrategy, // round_robin
-    pub workspace: TeamWorkspaceSpec, pub transport: TransportSpec, pub storage: StorageSpec,
-    pub default_max_review_rounds: usize,       // 3
-    pub review_stall_timeout: u64,              // 2400 s
-    pub stale_claim_idle_timeout: u64,          // 600 s
-    pub stale_pending_idle_timeout: u64,        // 600 s
-    pub steer_batch_size: usize,                // 2
-    pub metadata: BTreeMap<String, Value>,
-}
-impl TeamAgentSpec {
-    pub fn validate(&self) -> Result<()>;              // leader present, reserved names, dispatch/teammate knobs, bootstrap rules
-    pub fn leader_member_name(&self) -> &str;          // leader.member_name, default "team_leader"
-    pub fn member_spec(&self, name: &str) -> Option<TeamMemberSpec>;  // predefined, else derived from agents[name]/agents["teammate"]
-    pub fn teammate_defaults(&self) -> Option<&DeepAgentSpec>;
-}
-
-pub struct DeepAgentSpec { /* subset of Python harness/schema/deep_agent_spec.py */ }
-pub enum PredefinedMemberSpec { Teammate { .. }, HumanAgent { .. }, PassiveHuman { .. }, BridgeAgent { .. }, ExternalCli { .. } } // #[serde(tag = "role_type")]
-pub struct TeamMemberSpec { pub base: MemberSpecBase, pub role_type: TeamRole, pub goal: Option<bool> }
-pub struct MemberSpecBase { pub member_name: String, pub display_name: String, pub desc: String, pub prompt: String, pub model_name: Option<String> }
-pub struct LeaderSpec { pub member_name: String /* "team_leader" */, pub display_name: String /* "Team Leader" */, pub desc: String, pub goal: Option<TeamGoalSpec> }
-pub struct TeamGoalSpec { pub strategy: GoalStrategy /* hybrid */, pub max_attempts: Option<u32> /* 10 */, pub token_budget: Option<u64> }
-pub struct TeamSpec { /* runtime mirror: team_name, display_name, conversation_mode, leader_member_name, language, dispatch_mode, enable_member_messaging, max_subtask_depth, teammate_mode, model_pool, model_pool_strategy, workspace, metadata */ }
-pub struct TeamRuntimeContext { /* role, member_name, display_name, desc, prompt, team_spec, workspace_root, member_model, language */ }
-pub struct TransportSpec { pub kind: String /* inprocess */, pub params: BTreeMap<String, Value> }
-pub struct StorageSpec  { pub kind: String /* memory */,    pub params: BTreeMap<String, Value> }
-pub struct TinyAgentSpec;  pub struct ModelPoolEntry;
-```
-
-`events` seam: `EventMessage { event_type: String, payload: Value, sender_id: String }`, `TeamTopic` (`Team|Task|Message`) with Python topic strings, and typed payload structs (`MessageEvent`, `BroadcastEvent`, `MemberStatusChangedEvent`, `TaskCreatedEvent`, `TaskVerifiedEvent`, `ToolApprovalResultEvent`, …) serialized into `payload`.
-
-`status` seam: `MemberStatus`, `ExecutionStatus`, `TaskStatus`, `is_valid_member_transition`, `retire_target`, `round_transitions(RoundOutcome) -> Vec<ExecutionStatus>`, `TASK_TRANSITIONS`.
-`task` seam: `TaskRecord`, `TaskSummary`, `TaskDetail`, `TaskGraphSpec`, `ReviewVote`, `TaskFilter`, `TaskPatch`.
-
-### `storage` → `taskboard`, `member`, `runtime`, `skill`, `mcp`
-
-```rust
-#[async_trait] pub trait TeamStore: Send + Sync {
-    async fn upsert_team(&self, rec: TeamInfoRecord) -> Result<()>;
-    async fn team(&self, team_name: &str) -> Result<Option<TeamInfoRecord>>;
-    async fn insert_member(&self, rec: MemberRecord) -> Result<()>;
-    async fn member(&self, team: &str, name: &str) -> Result<Option<MemberRecord>>;
-    async fn list_members(&self, team: &str) -> Result<Vec<MemberRecord>>;
-    async fn update_member(&self, team: &str, name: &str, patch: MemberPatch) -> Result<bool>;
-    async fn transition_member(&self, team: &str, name: &str, from: MemberStatus, to: MemberStatus) -> Result<bool>; // CAS
-    async fn insert_task(&self, rec: TaskRecord) -> Result<()>;
-    async fn task(&self, team: &str, task_id: &str) -> Result<Option<TaskRecord>>;
-    async fn list_tasks(&self, team: &str, filter: &TaskFilter) -> Result<Vec<TaskRecord>>;
-    async fn update_task(&self, team: &str, task_id: &str, patch: TaskPatch) -> Result<bool>;
-    async fn transition_task(&self, team: &str, task_id: &str, from: TaskStatus, to: TaskStatus) -> Result<bool>;
-    async fn add_dependency(&self, team: &str, task_id: &str, depends_on: &str) -> Result<()>;
-    async fn dependencies(&self, team: &str, task_id: &str) -> Result<Vec<String>>;
-    async fn dependents(&self, team: &str, task_id: &str) -> Result<Vec<String>>;
-    async fn insert_vote(&self, rec: ReviewVote) -> Result<()>;
-    async fn votes(&self, team: &str, task_id: &str, round: u32) -> Result<Vec<ReviewVote>>;
-    async fn insert_message(&self, rec: MessageRecord) -> Result<()>;
-    async fn unread_messages(&self, team: &str, member: &str) -> Result<Vec<MessageRecord>>;
-    async fn mark_read(&self, team: &str, member: &str, ids: &[String]) -> Result<()>;
-    async fn read_watermark(&self, team: &str, member: &str) -> Result<Option<u64>>;
-    async fn set_read_watermark(&self, team: &str, member: &str, ts: u64) -> Result<()>;
-}
-pub struct InMemoryTeamStore;    // `StorageSpec::in("memory")`; deterministic, no I/O
-pub fn open_store(spec: &StorageSpec) -> Result<Arc<dyn TeamStore>>;  // non-`memory` → Error::Unsupported
-```
-
-### `messager` → `runtime`, `member`
-
-```rust
-pub type EventSink = Arc<dyn Fn(EventMessage) + Send + Sync>;
-#[async_trait] pub trait Messager: Send + Sync {
-    fn name(&self) -> &str;                                          // "inprocess"
-    fn subscribe(&self, member: &str, topics: &[TeamTopic], sink: EventSink) -> Result<()>;
-    fn unsubscribe(&self, member: &str) -> Result<()>;
-    async fn publish(&self, topic: TeamTopic, event: EventMessage) -> Result<()>;
-    async fn send(&self, target: &str, event: EventMessage) -> Result<()>;
-    async fn subscribe_transport(&self, team_name: &str) -> Result<()>;
-}
-pub fn create_messager(cfg: &TransportSpec) -> Result<Arc<dyn Messager>>;   // inprocess only; pyzmq/hybrid → Unsupported
-```
-A sink failure is logged, never propagated; `sender_id == ""` is stamped with the sending member name.
-
-### `member` → `runtime`
-
-```rust
-pub trait MemberRuntime: Send + Sync {
-    fn session_id(&self) -> &str;
-    fn state(&self) -> HarnessState;
-    async fn start(&self, team_session: Option<Arc<dyn Session>>) -> Result<()>;
-    async fn stop(&self) -> Result<()>;
-    async fn send(&self, content: String, immediate: bool) -> Result<()>;
-    async fn abort(&self, immediate: bool) -> Result<()>;
-    async fn pause(&self) -> Result<()>;
-    async fn resume(&self, query: Option<String>) -> Result<()>;
-    fn subscribe(&self, observer: Arc<dyn MemberObserver>);
-}
-pub trait MemberObserver: Send + Sync { fn on_state(&self, s: HarnessState); fn on_round(&self, r: RoundOutcome); fn on_chunk(&self, chunk: Value); }
-pub struct TeamMember;            // status CAS + lifecycle; owns Arc<dyn MemberRuntime>
-pub struct InProcessSpawnHandle;  // owns the spawned task + cancellation token
-pub struct MemberActivityRegistry;
-```
-
-### `runtime` entry points consumed by CLI/MCP/umbrella
-
-```rust
-impl TeamAgent {
-    pub fn card(&self) -> &AgentCard;
-    pub async fn invoke(&self, inputs: Value, session: Option<Arc<dyn Session>>) -> Result<AgentOutput>;
-    pub fn stream(&self, inputs: Value, session: Option<Arc<dyn Session>>) -> BoxStream<'static, Result<AgentChunk>>;
-    pub async fn start(&self) -> Result<()>;   pub async fn stop(&self) -> Result<()>;
-    pub fn state(&self) -> HarnessState;
-    pub async fn interact(&self, payload: InteractPayload) -> DeliverResult;
-    pub async fn snapshot(&self) -> TeamSnapshot;      // members + tasks, sorted
-    pub fn backend(&self) -> Arc<TeamBackend>;         // org facade used by tools/CLI
-}
-pub struct TeamBuildDeps { pub harness_factory: Arc<dyn MemberHarnessFactory>, pub store: Arc<dyn TeamStore>,
-                           pub workspace: Arc<dyn WorkspaceProvider>, pub language: String }
-```
+- `storage` → everyone: `TeamStore` is `fn name()` plus 23 async methods over the team row, roster (with CAS `transition_member`), tasks (with `transition_task`), dependency edges, review votes, mailbox and the per-member read watermark; `InMemoryTeamStore` is the deterministic default, `SqliteTeamStore` (feature `sqlite`) the persistent one, and `open_store(&StorageSpec)` maps `memory`/`sqlite` while reporting `postgresql`/`mysql`/unknown kinds as `Error::Unsupported`.
+- `messager` → `runtime`, `member`: `Messager` (`name`, `subscribe`, `unsubscribe`, `publish`, `send`, `subscribe_transport`) over `EventSink = Arc<dyn Fn(EventMessage) + Send + Sync>`; `create_messager(&TransportSpec)` builds `InProcessMessager` for `inprocess` and rejects `pyzmq`/`hybrid`; a sink failure is logged and a blank `sender_id` is stamped with the sending member.
+- `member` → `runtime`: `MemberRuntime` (`session_id`, `state`, `start`, `stop`, `send`, `abort`, `pause`, `resume`, `subscribe`), `MemberObserver` (`on_state`/`on_round`/`on_chunk`), `TeamMember` (roster CAS plus a cached status projection), `MemberSpawner`/`MemberSpawnOptions` with the in-process, process, external-CLI and SSH spawners, and `InProcessSpawnHandle`.
+- `runtime` entry points used by CLI/MCP/attach/host: `TeamAgent::{card, invoke, stream, start, stop, state, interact, deliver, snapshot, backend, spawn_member, shutdown_member, auto_start_all, create_task, send_message, members, monitor_stream, signals, kv_cache, kv_env, org, attach_socket, create_org_task, delegate_org_task}`, `TeamRuntimeManager::{activate, live, live_state, interact, finalize_member, stop_team, remove, shutdown, snapshot, pool}`, and `TeamBuildDeps { harness_factory, store, workspace, language: Option<String>, observability_hooks, kv_cache, routing }`.
 
 ## Constraints
 
 - Only `crates/openjiuwen-agent-teams/**` is edited; root manifest, sibling crates and `docs/` are out of scope.
-- Dependency direction: this crate depends on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-core`/`openjiuwen-multiagent`/`openjiuwen-agent`/`openjiuwen-session`, `openjiuwen-common`, `openjiuwen-foundation`; nothing may depend on this crate. No cycles, no `openjiuwen-cli`/`openjiuwen` imports.
+- Dependency direction: this crate depends on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-core`/`openjiuwen-multiagent`/`openjiuwen-agent`/`openjiuwen-session`, `openjiuwen-common` and `openjiuwen-foundation`; nothing may depend on this crate, and there are no `openjiuwen-cli`/`openjiuwen` imports.
 - Async-first tokio; `#[async_trait]` for object-safe async seams; locks never held across `.await` (`parking_lot` for short sections, `tokio::sync` for awaitable coordination); cancellation via `tokio_util::sync::CancellationToken`.
-- Errors: `openjiuwen_common::error::{Error, Result}` only. User input never panics. Deferred capability → `Error::Unsupported` with the Python capability name.
-- Serde on every public data type (snake_case, unknown fields tolerated). No `JsonSchema` needed; Cards crossing the wire are `openjiuwen_agent::AgentCard`.
-- `tracing` only — no `println!`/`eprintln!` in library code; the CLI writes to stdout through its own writer.
-- No `unsafe`. No undocumented global mutable state: the process-global expert catalog and the process-global `TeamRegistry` (team_name → runtime manager) are the two documented singletons; tests construct local instances.
-- Files ≤1000 lines; split by responsibility; a legitimately long file carries a top-of-file note and is listed in this file's Test Strategy/Notes.
-- `--no-default-features` must build: `mcp` gates `rmcp`, `distributed` gates transport stubs.
+- Errors: `openjiuwen_common::error::{Error, Result}` only; user input never panics; `Error::validation` for user-supplied names and knobs, `Error::config` for missing build inputs, `Error::not_found` for unknown members/tasks, and `Error::Unsupported` naming the Python capability for anything deferred.
+- Serde on every public data type (snake_case, unknown fields tolerated); Cards crossing the wire are `openjiuwen_agent::AgentCard`.
+- `tracing` only: no `println!`/`eprintln!` in library code, and the only stdout writes are the CLI's rendered lines and the `team-member serve` frame stream (its diagnostics go to stderr).
+- No `unsafe`. No undocumented global mutable state: the process-global expert catalog and the process-global runtime registry (team name → runtime manager) are the two documented singletons; tests construct local instances.
+- Files around ≤1000 lines; split by responsibility; a legitimately long file carries a top-of-file note.
+- Every feature combination builds offline: default `mcp`, plus the opt-in `sqlite`, `otel`, `distributed` and `live-tests`; `--no-default-features` builds without `rmcp`/`sqlx`.
+- Tests are offline and deterministic: scripted harnesses or a loopback mock model, temp directories, in-process transport, real sockets/binaries only where a suite says so, bounded waits, no `#[ignore]`.
 
 ## Behaviour parity notes (wire-visible)
 
-- `MemberStatus` wire values: `unstarted, starting, ready, busy, paused, stopped, restarting, shutdown_requested, shut_down, dormant, error`.
+- `MemberStatus`: `unstarted, starting, ready, busy, paused, stopped, restarting, shutdown_requested, shut_down, dormant, error`.
 - `TaskStatus`: `pending, blocked, planning, in_progress, in_review, completed, cancelled`; terminal = `completed|cancelled`; claimable = `pending`.
 - `ExecutionStatus`: `idle, starting, running, cancel_requested, cancelling, cancelled, completing, completed, failed, timed_out`.
 - Topics: `session:<sid>:team:<team>:{team|task|message}` with `%`→`%25` and `:`→`%3A` escaping.
 - Addressing: `"*"` = broadcast, `targets=[…]` = multicast, `"leader"`/`"user"` are role placeholders resolved at delivery; `parse_mention` grammar `@name body`.
-- Member names match `^[a-z][a-z0-9_-]*$` and may not collide with reserved names (`user`, `team_leader`, `human_agent`).
-- Review gate: author completes → `in_review` when reviewers exist (autonomous: first verdict; scheduled: vote tally per round); otherwise `completed` and dependent edges unblock (`blocked` → `pending`).
+- Member names match `^[a-z][a-z0-9_-]*$` and may not collide with the reserved names (`user`, `team_leader`, `human_agent`).
+- Review gate: an author completing a task enters `in_review` when reviewers exist (autonomous: first verdict; scheduled: per-round vote tally); otherwise it is `completed` and dependent edges unblock (`blocked` → `pending`).
 - Broadcast read state is a single per-member watermark, never a row flag.
+- `team-member` exit codes: `0` success and `--help`, `1` refused/unhosted team or a failed served member start, `2` CLI-side error (unknown command/flag, missing argument, malformed or absent descriptor), `130` a cancelled operation.
+- `team-member serve` contract: one JSON object per line on stdin/stdout (`start`/`send`/`abort`/`pause`/`resume`/`stop` in, `ready`/`state`/`round`/`chunk`/`error` out); stdout carries protocol frames only and diagnostics go to stderr; a `start` answers `ready` then one `state`; an unparsable line is answered with `error` and the loop keeps serving; `stop` or EOF exits `0`; a runtime that cannot be built or started exits `1` after one `error` frame.
+- Attach protocol: one `{"v":1,"id":<n>,"op":"…","args":{…}}` request per connection answered by one `{"v":1,"id":<n>,"ok":…}` response; an op-level error travels in band and keeps the connection, a frame-level error is answered once and ends that connection; `MAX_FRAME_BYTES` (1 MiB) bounds one line; `stop_team` answers `{"stopping": true}`; `OPENJIUWEN_TEAM_SOCKET` is the read-side fallback when the metadata names no socket (the host never sets it).
+- `TeamAgentSpec::metadata` keys, all optional and tolerant (a malformed value logs and keeps the default, except `organization`, where a configured-but-broken chart fails the build):
+  - `spawn` → bare `MemberSpawnOptions` (`{"kind": "in_process"|"process"|"external_cli"|"ssh", …}`) or `{"options": …, "fork": …}`; selects the spawner.
+  - `fork` → `{"parent": "dev-1", "task": {…}|null, "tools": {…}}`, also read from `spawn.fork`; forks a member from `parent` and registers its KV lineage.
+  - `workspace` → `"worktree"` or `{"isolation": "worktree"}`; anything else stays local.
+  - `organization` → `{"spec": OrganizationSpec, "rules": DelegationRules}`; installs the `OrgBinding`.
+  - `kv_cache` → `{"enabled": bool, "max_entries": n}` (absent means enabled).
+  - `attach` → `"/path/team.sock"` or `{"socket"|"path": "…", "required": bool}`; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins.
 
 ## Deferred (documented, `Error::Unsupported` through seams)
 
-- Transports: `pyzmq`, `hybrid` (WebSocket), Pulsar — `Messager` seam + `create_messager` rejection.
-- Storage: `sqlite`, `postgresql`, `mysql` — `TeamStore` seam; Python's SQL schema is not ported.
-- Spawn: OS-process members (`spawn_mode="process"`), external CLI members (claude/codex), SSH transport, external leader.
-- Workspace: git worktree backend (`isolation="worktree"`), remote worktree backend, team-workspace artifact versioning/linking.
-- Organisation layer (cross-team org task pool, summary teams, org messaging), swarmflow, fork/compact, KV-cache affinity, OTel observability, reliability rail, group-chat policy, monitor/TUI.
-- Model router / IntelliRouter / builtin-model selection (round-robin and by-name allocator only).
-- Skill visibility library, `skill/rail_spec` rails, prompt packs (`prompts/{cn,en}` are not shipped; built-in English prompts only).
+- Transports: ZeroMQ/pyzmq, hybrid WebSocket publishing and Pulsar — `Messager` seam plus `create_messager` rejection.
+- Storage: PostgreSQL and MySQL `TeamStore` backends; distributed workspace transport (only the `RemoteDispatch` seam and its protocol types ship).
+- OTLP span export and the `opentelemetry` SDK: the `otel` feature is the in-memory/tracing seam, and the real exporter lives in `openjiuwen-extensions`.
+- Monitor TUI and DB-backed monitor readers: the text stream is the contract and presentation belongs to the CLI front-end.
+- Attach security: filesystem permissions only (a `0600` socket in an owner-only directory), no token, `SO_PEERCRED` check, TLS or named-pipe transport.
+- Vendor CLI harness translation: `claudecode`/`codex`/`dsh` stay `Unsupported` in `openjiuwen-harness-providers`; this crate ships the generic stdio child and a scriptable external-CLI adapter.
+- Cross-process organisation/team federation: shared-store resume, leader-turn queues, summary teams and the org transport handshake.
+- LLM-driven context compaction (fork/compact emits the deterministic template summary) and `IntelliRouter`/builtin-model selection (four router strategies and two pool strategies are the full surface).
 
 ## Routing Table
 
 - `./src/schema/` → spec/blueprint types, team runtime types, statuses/transitions, task records, event payloads, stream frames (`src/schema/CONTEXT.md`)
 - `./src/experts/` → `ExpertCatalog`, `ExpertRef`, agent-group packages, template→member composition (`src/experts/CONTEXT.md`)
 - `./src/storage/` → `TeamStore` trait, records/patches, in-memory store, `open_store` (`src/storage/CONTEXT.md`)
-- `./src/taskboard/` → task tree: dependency graph, claims, completion, reviews/votes, revisions, subtasks (`src/taskboard/CONTEXT.md`)
-- `./src/messager/` → `Messager` seam, in-process bus, transport factories (`src/messager/CONTEXT.md`)
-- `./src/workspace/` → member workspace allocation, local directory layout, worktree seam (`src/workspace/CONTEXT.md`)
-- `./src/member/` → `MemberRuntime`/`MemberObserver`, `TeamMember` status machine, in-process spawn handles (`src/member/CONTEXT.md`)
+- `./src/storage/sqlite/` → `SqliteTeamStore`: schema, row encoding, statements and its contract suites (`src/storage/sqlite/CONTEXT.md`)
+- `./src/taskboard/` → dependency graph, claims, completion, reviews/votes, revisions, subtasks (`src/taskboard/CONTEXT.md`)
+- `./src/messager/` → `Messager` seam, in-process bus, transport factories, distributed stubs (`src/messager/CONTEXT.md`)
+- `./src/workspace/` → allocation seam and layout, `local.rs` provider, `worktree.rs`/`worktree_git.rs` git backend, `worktree_remote.rs` remote protocol, `git.rs`, locks (`src/workspace/CONTEXT.md`)
+- `./src/member/` → `MemberRuntime`/`MemberObserver`, `TeamMember` status machine, spawn requests, `protocol.rs` frames, in-process/process/external-CLI/SSH spawners (`src/member/CONTEXT.md`)
 - `./src/interaction/` → HITL payloads, routing grammar, `InteractGate`, human inbox, tool-approval bridge (`src/interaction/CONTEXT.md`)
-- `./src/runtime/` → `TeamAgent` (leader/teammate loop), `TeamBackend`, dispatch decision, runtime manager/pool, model allocator, `Team` adapter (`src/runtime/CONTEXT.md`)
-- `./src/harness/` → harness-protocol adapter: `MemberHarnessFactory`, `HarnessMemberRuntime`, native factory, checkpoints (`src/harness/CONTEXT.md`)
-- `./src/skill/` → `team-member` clap CLI, join descriptor, `TeamClient` implementations, live-team attach via the runtime registry (`src/skill/CONTEXT.md`)
-- `./src/bin/` → the two binaries: `team-member` (skill CLI, exit `0/1/2/130`) and `openjiuwen-team-mcp` (stdio MCP server, `mcp` feature)
-- `./src/mcp/` → `openjiuwen-team-mcp` server: tool catalogue + dispatch, stdio serve (`src/mcp/CONTEXT.md`)
+- `./src/runtime/` → `TeamAgent` and the leader/teammate loop, `TeamBackend`, dispatch, build path, `spec_meta`, `attach_host`, manager/pool, model allocator/router (`src/runtime/CONTEXT.md`)
+- `./src/harness/` → harness-protocol adapter, native factory, model resolvers, checkpoints (`src/harness/CONTEXT.md`)
+- `./src/org/` → roles, delegation router, org task pool, org mailbox, swarmflow, fork/compact (`src/org/CONTEXT.md`)
+- `./src/models/` → `ModelPool`, `ModelRouter` strategies, allocation helpers (`src/models/CONTEXT.md`)
+- `./src/kv_cache/` → `TeamKvCacheAffinity`, cache identity, cleanup/eviction hooks (`src/kv_cache/CONTEXT.md`)
+- `./src/observability/` → span/hook types, `TeamObservability`, the `otel` feature (`src/observability/CONTEXT.md`)
+- `./src/monitor/` → `TeamMonitor`, `StatusStream`, event stamping and rendering (`src/monitor/CONTEXT.md`)
+- `./src/attach/` → `protocol.rs` frames/ops/errors, `client.rs`, `server.rs` (`src/attach/CONTEXT.md`)
+- `./src/skill/` → `team-member` CLI and join descriptor, `TeamClient` with `StoreTeamClient`/`SocketTeamClient`, `live.rs` resolution, `socket_client.rs`, `serve.rs` child-process server (`src/skill/CONTEXT.md`)
+- `./src/mcp/` → `openjiuwen-team-mcp`: tool catalogue, dispatch, stdio serve (`src/mcp/CONTEXT.md`)
+- `./src/bin/` → the two binaries: `team-member` (exit `0/1/2/130`) and `openjiuwen-team-mcp` (`mcp` feature)
 - `./src/constants.rs` → reserved names, defaults, mention parsing
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
 
 ### Sibling consumers (read-only from this node)
 
-- `../openjiuwen/` → umbrella crate: `pub use openjiuwen_agent_teams as agent_teams` and forwards the `live-tests` feature (`crates/openjiuwen/src/lib.rs`, `crates/openjiuwen/Cargo.toml`); never edited here.
-- `../openjiuwen-cli/` → the `openjiuwen` binary front-end (sibling crate, no dependency on this crate); this crate is where the `team-member` and `openjiuwen-team-mcp` binaries are built.
+- `../openjiuwen/` → umbrella crate: `pub use openjiuwen_agent_teams as agent_teams`, forwards the `live-tests` feature; never edited here.
+- `../openjiuwen-cli/` → the `openjiuwen` binary front-end (sibling crate, no dependency on this crate).
 
 ## Test Strategy
 
-- Unit tests live beside their module (`#[cfg(test)]` in each file), ~676 of them, and cover the internals of `schema`, `storage`, `taskboard`, `messager`, `workspace`, `member`, `interaction`, `runtime`, `harness`, `skill` and `mcp`.
-- Integration suites in `./tests/` drive the public API only and pin cross-module behaviour (187 tests): `spec_build.rs` (JSON parse/defaults/unknown fields, `validate`, `build_with`, activate admission), `team_run.rs` (full in-process run, single `team.completed` marker, open-task run, `interact` outcomes, snapshot/stop), `member_and_mail.rs` (spawn, factory failure, shutdown matrix, workspace isolation, direct/broadcast/multicast mail, leader-only tasks), `task_flow.rs` (dependency graph, cycles, claims, review gate, votes, subtasks), `hitl.rs` (mention grammar, targets, gate, approval bridge), `protocol_adapter.rs` (command forwarding, observer order, mapping tables, checkpoint round-trip), `cli.rs` (full clap tree, output lines, exit codes 0/1/2), `mcp.rs` (tool tables per scope, exact `call_tool` text), `expert_catalog.rs` (agent-group packages, template composition), and `bins.rs` (the two binaries' process contract through `CARGO_BIN_EXE_*`: help, missing descriptor, unhosted team, MCP stderr diagnostic).
-- Fakes live in `./tests/support/` (scripted harness factory, recording workspace provider, in-memory store, bounded `wait_until`) and in `openjiuwen-test-support` as a dev-dependency. Everything offline and deterministic: no network, no `#[ignore]`, no sleeps beyond short bounded waits.
-- Definition of done (all four green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`.
+- Unit tests live beside their modules (`#[cfg(test)]`): 1351 in total, concentrated in `runtime` (217), `member` (196), `skill` (136), `org` (133), `schema` (114), `attach` (84), `workspace` (68), `taskboard` (52), `monitor` (46), `storage` (45), `models` (44), `interaction` (42), `kv_cache` (38), `observability` (34), `harness` (30), `messager` (26), `mcp` (23) and `experts` (21), plus a couple in `constants.rs`.
+- Doctests: 38 listed by `cargo test -p openjiuwen-agent-teams --doc -- --list`, plus two `no_run` examples that compile but are not run (13 `text` blocks and one `ignore` block are not doctests).
+- Integration suites in `./tests/` drive the public API only: 219 tests over 15 binaries — `spec_build` (12), `team_run` (9), `member_and_mail` (14), `task_flow` (32), `hitl` (33), `protocol_adapter` (13), `cli` (39), `mcp` (21), `expert_catalog` (12), `bins` (6), `full_team_sqlite` (4), `member_process_kind` (5), `attach_e2e` (6), `org_flow` (9) and `workspace_isolation` (4).
+- `full_team_sqlite` compiles only with `--features sqlite`; `attach_e2e` is `#![cfg(unix)]`; `bins`/`member_process_kind` launch the real binaries through `CARGO_BIN_EXE_*`; `workspace_isolation` needs `git` on `PATH`.
+- Fakes live in `./tests/support/` plus `openjiuwen-test-support` as a dev-dependency; nothing in the suite needs the network.
+- Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite` and `--features otel` configurations, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 
 ## Notes for Agents
 
-- Python `TeamAgent` is one class for both roles. Keep that: `TeamAgent` carries `TeamRole`; the leader owns dispatch, teammates poll the board.
-- Python `spec.build()` mutates the spec (fills `language`); the Rust `build_with` takes `&self` and does not mutate — documented deviation.
+- Python `TeamAgent` is one class for both roles. Keep that: `TeamAgent` carries a `TeamRole`; the leader owns dispatch, teammates poll the board.
+- Python `spec.build()` mutates the spec (fills `language`); the Rust `build_with` takes `&self`, does not mutate, and `TeamBuildDeps::language` is `Option<String>` resolved ahead of the spec.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it, never define a second enum.
-- Module-level `//!` docs resolve intra-doc links in the *parent* module's scope, not the file's own `use` list, so a module doc needs a fully-qualified target (`[`X`](crate::schema::X)`) for anything the parent does not import; item-level `///` docs resolve in the item's module, where an imported name can be linked bare.
-- `cargo doc -p openjiuwen-agent-teams --no-deps` is warning-free; keep it that way (no `#[allow(rustdoc::…)]`, link private items as plain code spans rather than widening visibility).
-- The Python `_Bus` (in-process messager), `TeamDatabase` (sqlite) and `asyncio.Task` spawn handle map to `messager::InProcessMessager`, `storage::InMemoryTeamStore` and `member::InProcessSpawnHandle`.
-- `openjiuwen_multiagent` is used only for the `Team`/`AgentTeamSession` seam so `Runner::run_agent_team` can drive a `TeamAgent`; its message bus is not used (Python `agent_teams` has its own envelope).
-- Prefer `Error::validation` for user-supplied names/dispatch knobs, `Error::config` for missing build dependencies (model, factory), `Error::not_found` for unknown members/tasks.
-- Cross-node deviations from Python, each owned and explained by its child node: `SpecBuild` is `#[async_trait]` and `build_with` takes `&self` without mutating the spec (`./src/runtime/`); the worktree name suffix is a FNV-1a digest instead of `sha256(..)[:10]` and member state lives at `<base>/<team>/sessions/<sid>/members/<member>` (`./src/workspace/`); the multiagent `AgentTeamSession` is ignored by the adapter, `Team::add_agent` writes its row on the current runtime, and one run at a time per team (`./src/runtime/`); `HarnessMemberRuntime::send` drops transport-level `SendReceipt` (`./src/member/` Known gaps); `TaskStatus` transitions are narrower than Python's (no `in_progress→pending`, `planning→pending`) (`./src/taskboard/`).
-- Live attach is in-process only: `connect_live_client` reads the process-global runtime registry, so the CLI/MCP server can act on a team this process hosts; a team this process does not host is exit `1` (`Error::config`/CLI `1`), and cross-process attach via a shared store or distributed transport is deferred.
-- The `openjiuwen` umbrella re-exports this crate as `openjiuwen::agent_teams` (and forwards the `live-tests` feature); the `openjiuwen` CLI is a sibling binary crate that does not depend on this crate, and the two binaries this crate ships (`team-member`, `openjiuwen-team-mcp`) are built from `./src/bin/`.
-- The `live-tests` feature is declared in `Cargo.toml` but no test or module in this crate reads it: real-provider runs are not gated here, so nothing in the crate needs the network.
-- Models reach a member only through `MemberHarnessFactory::create(&DeepAgentSpec, &MemberHarnessContext)`: the model name comes from `DeepAgentSpec::model` (else the resolver's default), and credentials/provider come from the factory's `ModelResolver` (`NativeMemberFactory::from_env` → `EnvModelResolver` reads `MODEL_PROVIDER`/`MODEL_NAME`/`API_KEY`/`API_BASE`).
-- `NativeMemberFactory` writes the effective model identity onto the `DeepAgentConfig` it builds as well as onto the builder model: `model_name`/`model_provider` take the spec's pinned `ModelRef` values, else the resolved model's own name/provider (blanks skipped).
-  `DeepAgentBuilder` copies that identity into the inner `ReActAgentConfig`, and the agent loop fills a blank request name from it — leaving it unset makes every provider request and `list_models` run with an empty `model_name` (`./src/harness/`).
-- `TeamAgentSpec::model_pool` allocation is recorded on `MemberRecord::model_ref` only; it is never passed into the harness factory, so a pool entry currently selects no endpoint.
+- The runtime reads six optional `TeamAgentSpec::metadata` keys (`spawn`, `fork`, `workspace`, `organization`, `kv_cache`, `attach`); their shapes, degradation rules and wiring points are tabulated in `src/runtime/CONTEXT.md` §"Metadata-driven wiring".
+- `TeamBuildDeps` carries only injection hooks (`with_observability_hook`, `with_kv_cache`, `with_routing`); `monitor_stream` is the monitor knob, and organisation/attach come from metadata.
+- Workspace lifecycle: `build_with` allocates the leader's workspace and `spawn_member` one per teammate, both retained on the handle; `shutdown_member` releases that member's workspace and `stop()` releases everything still retained, each workspace exactly once.
+- `team-member serve` lives in `src/skill/serve.rs` over the frames in `src/member/protocol.rs`; `StdioMemberRuntime` launches it with the identity in `OPENJIUWEN_TEAM_NAME`/`OPENJIUWEN_MEMBER_NAME`/`OPENJIUWEN_SESSION_ID`/`OPENJIUWEN_MEMBER_WORKSPACE`, and `serve_with_context` drives the same loop over any pipe pair.
+- Attach wiring: `metadata["attach"]` makes `start()` bind `AttachHost`, which serves `BackendAttachHandler` (backend roster/mail/board/snapshot plus `stop_team`) over `AttachServer`; `SocketTeamClient` is the dialing side, and `src/skill/live.rs` resolves the in-process registry first, then the descriptor path, then `OPENJIUWEN_TEAM_SOCKET`.
+- Models reach a member only through `MemberHarnessFactory::create(&DeepAgentSpec, &MemberHarnessContext)`: the name comes from `DeepAgentSpec::model` (else the resolver default), credentials/provider from the factory's `ModelResolver` (`NativeMemberFactory::from_env` → `EnvModelResolver` reads `MODEL_PROVIDER`/`MODEL_NAME`/`API_KEY`/`API_BASE`), and `NativeMemberFactory` also writes that identity onto the `DeepAgentConfig` so provider requests carry a non-empty `model_name`.
+- `TeamAgentSpec::model_pool` allocation is recorded on `MemberRecord::model_ref` and passed to the harness factory through the routed `DeepAgentSpec`, so a pool entry selects the member's endpoint.
+- Cross-node deviations from Python, each owned by its child node: `SpecBuild` is `#[async_trait]` and `build_with` takes `&self` without mutating the spec; the worktree name suffix is a FNV-1a digest instead of `sha256(..)[:10]` and member state lives at `<base>/<team>/sessions/<sid>/…`; `Team::add_agent` writes its row on the current runtime and a team runs one at a time; `HarnessMemberRuntime::send` drops the transport-level `SendReceipt`; `TaskStatus` transitions are narrower than Python's (no `in_progress→pending`, `planning→pending`).
+- Module-level `//!` docs resolve intra-doc links in the *parent* module's scope, so a module doc needs a fully-qualified target (`[`X`](crate::schema::X)`) for anything the parent does not import; item-level `///` docs resolve in the item's module. Keep `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free (no `#[allow(rustdoc::…)]`, link private items as plain code spans).
 - Offline runs need either an injected factory (the test pattern) or `NativeMemberFactory::new(resolver)` with a resolver returning a scripted `openjiuwen_foundation::llm::Model`; `TeamAgentSpec::build()` over `TeamBuildDeps::default()` fails with `ErrorKind::Config` when no provider/model is configured.
+- The `live-tests` feature is declared in `Cargo.toml` and read by no test or module in this crate: nothing here needs the network.
