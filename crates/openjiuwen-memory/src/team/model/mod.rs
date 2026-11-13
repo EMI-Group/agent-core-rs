@@ -33,12 +33,12 @@
 //!
 //! # Layout
 //!
-//! - [`scope`] — `TeamMemoryScope` and the visibility/read rules.
-//! - [`kind`] — `TeamMemoryKind` and `TeamVisibility`.
-//! - [`record`] — `TeamMemoryRecord` and id generation.
-//! - [`input`] — `NewTeamMemory` and `TeamMemoryUpdate`.
-//! - [`filter`] — `TeamMemoryFilter`.
-//! - [`results`] — `TeamMemoryStats` and `TeamSearchHit`.
+//! - `scope` — [`TeamMemoryScope`] and the visibility/read rules.
+//! - `kind` — [`TeamMemoryKind`] and [`TeamVisibility`].
+//! - `record` — [`TeamMemoryRecord`] and id generation.
+//! - `input` — [`NewTeamMemory`] and [`TeamMemoryUpdate`].
+//! - `filter` — [`TeamMemoryFilter`].
+//! - `results` — [`TeamMemoryStats`] and [`TeamSearchHit`].
 //! - `validate` — the shared validation and normalization helpers.
 mod filter;
 mod input;
