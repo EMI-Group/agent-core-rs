@@ -26,8 +26,12 @@ pub mod vendors;
 pub use api::{ApiModelBackend, ApiModelBackendConfig, ModerationRequest, ModerationTransport};
 pub use http::{HttpAuth, HttpModerationConfig, HttpModerationTransport};
 pub use llm::{LlmPromptInjectionBackend, LlmPromptInjectionBackendConfig};
-pub use local::{LocalModelBackend, LocalModelBackendConfig, ModelInfo};
+pub use local::{LocalModelBackend, LocalModelBackendConfig, ModelInfo, SUPPORTED_DEVICES};
 pub use rule_based::{RuleBasedBackendConfig, RuleBasedPromptInjectionBackend};
+pub use vendors::{
+    AliyunGreenAuth, AliyunGreenBackend, AliyunGreenConfig, AzureContentSafetyBackend,
+    AzureContentSafetyConfig, OpenAiModerationBackend, OpenAiModerationConfig,
+};
 
 /// The assessment a backend reports when it finds no risk.
 ///

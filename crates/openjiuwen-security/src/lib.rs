@@ -112,10 +112,12 @@ pub mod result;
 pub mod rules;
 
 pub use backends::{
-    ApiModelBackend, ApiModelBackendConfig, LlmPromptInjectionBackend,
-    LlmPromptInjectionBackendConfig, LocalModelBackend, LocalModelBackendConfig, ModelInfo,
-    ModerationRequest, ModerationTransport, RuleBasedBackendConfig,
-    RuleBasedPromptInjectionBackend,
+    AliyunGreenAuth, AliyunGreenBackend, AliyunGreenConfig, ApiModelBackend, ApiModelBackendConfig,
+    AzureContentSafetyBackend, AzureContentSafetyConfig, HttpAuth, HttpModerationConfig,
+    HttpModerationTransport, LlmPromptInjectionBackend, LlmPromptInjectionBackendConfig,
+    LocalModelBackend, LocalModelBackendConfig, ModelInfo, ModerationRequest, ModerationTransport,
+    OpenAiModerationBackend, OpenAiModerationConfig, RuleBasedBackendConfig,
+    RuleBasedPromptInjectionBackend, SUPPORTED_DEVICES,
 };
 pub use config::{FailurePolicy, ScanTargets, SecurityConfig, SecurityPolicy};
 pub use context::{
