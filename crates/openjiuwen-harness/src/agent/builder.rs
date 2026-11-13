@@ -40,6 +40,7 @@ use crate::task_loop::LoopQueues;
 use crate::tools::{ToolRegistry, UserAsker};
 use crate::workspace::Workspace;
 
+use super::factory::{default_goal_rail, is_goal_tool_name, GOAL_RAIL_NAME};
 use super::prompt_rail::{PromptRail, PromptState};
 use super::{subagent_factory, DeepAgent, Driver};
 
@@ -178,6 +179,10 @@ impl DeepAgentBuilder {
 
     /// Builds the fully wired [`DeepAgent`].
     ///
+    /// The default rails are the [`PromptRail`], the memory and subagent rails of the supplied
+    /// seams, and the goal rail ([`crate::tools::goal::GoalRail`]) when the mounted tool cards
+    /// include a goal tool; a caller rail of the same name replaces a default one.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::config`] when the merged configuration is invalid, and
@@ -255,6 +260,7 @@ impl DeepAgentBuilder {
         let prompt = build_prompt_state(&config, &cards);
         let queues = LoopQueues::default();
 
+        let caller_names: Vec<&str> = extra_rails.iter().map(|rail| rail.name()).collect();
         let rails = HarnessRailRegistry::new();
         rails.register(Arc::new(PromptRail::new(prompt.clone(), queues.clone())));
         if let Some((recall, write_back)) = memory {
@@ -266,6 +272,11 @@ impl DeepAgentBuilder {
         }
         if mounts_subagents {
             rails.register(Arc::new(SubagentRail::new()));
+        }
+        if cards.iter().any(|card| is_goal_tool_name(&card.name))
+            && !caller_names.contains(&GOAL_RAIL_NAME)
+        {
+            rails.register(default_goal_rail(&workspace, &language));
         }
         for rail in extra_rails {
             rails.register(rail);
@@ -505,11 +516,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use openjiuwen_agent::AgentCard;
-    use openjiuwen_test_support::ScriptedModel;
+    use openjiuwen_test_support::{ScriptedModel, TempWorkspace};
     use serde_json::json;
 
     use super::{build_prompt_builder, DeepAgentBuilder};
     use crate::schema::{AgentMode, DeepAgentConfig};
+    use crate::tools::goal::{GetCurrentGoalTool, GoalStore};
     use crate::tools::tool_card;
     use crate::workspace::Workspace;
 
@@ -576,5 +588,41 @@ mod tests {
             .err()
             .expect("invalid configuration must fail");
         assert!(error.to_string().contains("max_iterations_hard_limit"));
+    }
+
+    #[tokio::test]
+    async fn build_registers_the_goal_rail_when_a_goal_tool_is_mounted() {
+        let temp = TempWorkspace::new().unwrap();
+        let workspace = Workspace::for_language(temp.workspace(), "en");
+        let goal_tool = GetCurrentGoalTool::new(GoalStore::for_workspace(&workspace), "en");
+        let agent = DeepAgentBuilder::new(card())
+            .config(DeepAgentConfig::default().with_workspace(workspace))
+            .model(std::sync::Arc::new(ScriptedModel::text("hi")))
+            .tool(std::sync::Arc::new(goal_tool))
+            .build()
+            .unwrap();
+
+        assert!(
+            agent.rails().names().iter().any(|name| name == "goal"),
+            "the goal rail joins the default rails when a goal tool is mounted: {:?}",
+            agent.rails().names()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_skips_the_goal_rail_without_goal_tools() {
+        let temp = TempWorkspace::new().unwrap();
+        let workspace = Workspace::for_language(temp.workspace(), "en");
+        let agent = DeepAgentBuilder::new(card())
+            .config(DeepAgentConfig::default().with_workspace(workspace))
+            .model(std::sync::Arc::new(ScriptedModel::text("hi")))
+            .build()
+            .unwrap();
+
+        assert!(
+            !agent.rails().names().iter().any(|name| name == "goal"),
+            "no goal tool is mounted by default: {:?}",
+            agent.rails().names()
+        );
     }
 }

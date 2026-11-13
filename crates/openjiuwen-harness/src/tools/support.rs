@@ -310,6 +310,15 @@ impl ToolEnv {
         &self.language
     }
 
+    /// The permission engine consulted before a path is touched, when one is wired.
+    ///
+    /// Tools that mutate state outside the filesystem backends (such as `worktree`) forward the
+    /// engine instead of consulting [`Self::deny_reason`] themselves.
+    #[must_use]
+    pub fn permission(&self) -> Option<&Arc<PermissionEngine>> {
+        self.permission.as_ref()
+    }
+
     /// Whether the description language is English.
     #[must_use]
     pub fn is_english(&self) -> bool {

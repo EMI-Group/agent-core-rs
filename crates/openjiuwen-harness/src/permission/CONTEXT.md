@@ -32,6 +32,7 @@ Every public item is also re-exported flat from this module (`crate::permission:
 - `check_permission` is synchronous and non-blocking: no filesystem/network IO, compiled policy behind `parking_lot::RwLock`, shared as `Arc<PermissionEngine>`; locks are never held across `.await`.
 - Config types are serde snake_case, tolerate unknown fields, and derive `JsonSchema` (no `serde_json::Value` fields) because `PermissionsSection` is embedded by `crate::schema::DeepAgentConfig`; `tools` accepts both `"bash": "ask"` and legacy `"bash": {"*": "ask"}` and serializes as the plain level string.
 - No dependency on `crate::schema` or any other harness module — only kernel crates (`openjiuwen-common`, `openjiuwen-foundation`, `openjiuwen-agent`).
+- No on-disk permission YAML load or save exists in this module or the crate: `builtin_rules.yaml` is `include_str!`-embedded, sections arrive from `PermissionsSection::default()` (CLI) or provider JSON, and `PermissionHost::permission_yaml_path` has no consumer.
 - No `unsafe`, no `panic`/`unwrap`/`expect` outside `#[cfg(test)]`, `tracing` only (no stdout).
 - Files ≤1000 lines of implementation; `model.rs` and `paths.rs` exceed that only because of their inline test modules (called out in a top-of-file size note).
 
@@ -52,7 +53,7 @@ Every public item is also re-exported flat from this module (`crate::permission:
 - `external_directory` legacy section (superseded by `file_guard` + `trusted_dirs`).
 - Literal-shell allow shortcut (`literal_shell.py`, `parse_literal_shell`).
 - `ask_presentation.py` suggestion chips/categories beyond category/title/summary and the always-allow hint.
-- YAML write-back of the `permissions:` block (`write_permissions_section_to_agent_config_yaml`) — belongs to the CLI/config layer.
+- YAML write-back into an agent config document (`write_permissions_section_to_agent_config_yaml`); the CLI persists its merged section to `<home>/permissions.yaml` through `cli::allow_rules` instead.
 - `permission_checks_active` predicate seam (`set_permission_checks_active`).
 - `skill_authorization/` (a separate security axis, not this module).
 

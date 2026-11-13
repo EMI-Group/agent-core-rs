@@ -27,6 +27,7 @@
 
 pub mod agent;
 pub mod cli;
+pub mod lsp;
 pub mod manifest;
 pub mod observability;
 pub mod permission;
@@ -35,10 +36,12 @@ pub mod protocol;
 pub mod rails;
 pub mod schema;
 pub mod skills;
+pub mod spec;
 pub mod subagents;
 pub mod task_loop;
 pub mod tools;
 pub mod workspace;
+pub mod worktree;
 
 // --- agent -----------------------------------------------------------------
 pub use agent::{
@@ -68,13 +71,40 @@ pub use permission::{
 };
 
 // --- tools -----------------------------------------------------------------
-pub use tools::{tool_names, BuiltinTool, MemoryToolBackend, ToolRegistry, UserAsker};
+/// Names of the thirty-two tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
+/// twelve extended ones), in registry order.
+pub use tools::extended_tool_names;
+/// The goal rail, its tunables, and the `ctx.extra` key under which it queues its events.
+///
+/// [`GoalRail`] is a [`HarnessRail`] registered like the rails in [`rails`], but it is reachable
+/// only as `tools::goal::GoalRail`: [`rails`] must not depend on [`tools`], so the goal rail is
+/// exported from the module that owns it instead.
+pub use tools::goal::{GoalRail, GoalRailConfig, GOAL_EVENT_EXTRA_KEY};
+pub use tools::{
+    tool_names, AudioMetadata, AudioMetadataArgs, AudioMetadataTool, BuiltinTool, CronAction,
+    CronArgs, CronJob, CronSchedule, CronScheduler, CronTool, FakeMcpResourceProvider,
+    FakeSearchBackend, FetchRequest, FetchResponse, FetchWebpageArgs, FetchWebpageTool,
+    GetCurrentGoalArgs, GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord,
+    GoalStatus, GoalStore, HttpFetcher, ImageMetadata, ImageMetadataArgs, ImageMetadataTool,
+    ListMcpResourcesTool, McpResource, McpResourceContent, McpResourceProvider, MediaKind,
+    MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool, ReqwestFetcher, SearchBackend,
+    SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool, TokenUsage, ToolIndex, ToolRegistry,
+    ToolSearchArgs, ToolSearchHit, ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
+};
 
 // --- rails -----------------------------------------------------------------
 pub use rails::{
-    rail_priority, EvolutionRail, HarnessRail, HarnessRailAdapter, HarnessRailContext,
-    HarnessRailRegistry, MemoryRail, NoopEvolutionRail, SecurityRail, SkillsRail, SubagentRail,
-    TaskIterationInfo,
+    default_metrics_clock, evolution_adapter, rail_priority, EvolutionMetrics, EvolutionProposal,
+    EvolutionRail, EvolutionRailAdapter, EvolutionSnapshot, HarnessRail, HarnessRailAdapter,
+    HarnessRailContext, HarnessRailRegistry, IterationRecorder, MemoryRail, MetricsClock,
+    MetricsEvolutionRail, MetricsEvolutionRailConfig, NoopEvolutionRail, ProposalLog, SecurityRail,
+    SkillsRail, SubagentRail, TaskIterationInfo, EVOLUTION_SNAPSHOT_VERSION,
+};
+
+// --- lsp -------------------------------------------------------------------
+pub use lsp::{
+    ChannelTransport, LspClient, LspServerConfig, LspTool, LspToolConfig, LspTransport,
+    StdioTransport,
 };
 
 // --- prompts ---------------------------------------------------------------
@@ -87,13 +117,33 @@ pub use prompts::{
 };
 
 // --- subagents -------------------------------------------------------------
+/// Retention bound of the persisted sub-agent bucket for `max_subagents` live instances.
+pub use subagents::max_persisted_records;
+/// Formats epoch milliseconds as an RFC 3339 UTC timestamp (the runtime's stamp format).
+pub use subagents::rfc3339_from_ms;
+/// Reason stamped on an instance closed by the LRU eviction policy.
+pub use subagents::EVICTION_REASON;
+/// Key of the persisted sub-agent bucket inside the session state.
+pub use subagents::SUBAGENTS_KEY;
 pub use subagents::{
-    subagent_tools, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentRegistry,
-    SubAgentRuntime, SubAgentSpawnRequest, SubAgentSpec, SubagentStatus, TaskTool,
+    load_bucket_file, save_bucket_file, select_lru_candidate, subagent_tools,
+    subagent_tools_with_transcript, Clock, LoadReport, LruCandidate, ManualClock,
+    PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport, SpawnBudget, SubAgentFactory,
+    SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry, SubAgentRuntime,
+    SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentMetadata, SubagentStatus,
+    SubagentTranscriptTool, SystemClock, TaskTool, TranscriptBuffer, TranscriptChannel,
+    TranscriptEntry, TranscriptKind, TranscriptSubscription, TranscriptSummary,
+    DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
 
 // --- skills ----------------------------------------------------------------
 pub use skills::{Skill, SkillBudget, SkillLibrary, SkillResourceValidator, SkillRootMount};
+
+// --- spec ------------------------------------------------------------------
+pub use spec::{
+    resolve, DeepAgentSpec, PluginManifest, PluginRegistry, ResolvedSpec, SpecBuildOptions,
+    SpecEntry, SpecRegistry, SpecSource,
+};
 
 // --- task loop -------------------------------------------------------------
 pub use task_loop::{
@@ -132,6 +182,12 @@ pub use manifest::{
 
 // --- observability ---------------------------------------------------------
 pub use observability::{NoopTelemetry, Observability, TelemetrySink};
+
+// --- worktree --------------------------------------------------------------
+pub use worktree::{
+    slugify, GitRunner, ProcessGitRunner, WorktreeEvent, WorktreeInfo, WorktreeManager,
+    WorktreeRecord, WorktreeTool,
+};
 
 /// Returns the crate name.
 #[must_use]

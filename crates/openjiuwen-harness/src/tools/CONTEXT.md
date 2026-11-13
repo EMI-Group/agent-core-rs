@@ -4,15 +4,21 @@
 
 The model-facing coding tool set of the `DeepAgent`, implemented on `openjiuwen_sysop` and the foundation `Tool`/`ToolCard` contract, with Python-compatible tool names, JSON schemas, payload shapes and message text.
 Ports `openjiuwen/harness/tools/` (`shell/`, `filesystem.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`) and the English tool descriptions from `openjiuwen/harness/prompts/tools/`.
-Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and the two seam traits (`UserAsker`, `MemoryToolBackend`).
+The language-server navigation (`lsp`) and git-worktree (`worktree`) tools are owned by the sibling `crate::lsp` and `crate::worktree` modules and are mounted, configured and described here as extended tools.
+Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool`, the `ToolIndex` and the seam traits (`UserAsker`, `MemoryToolBackend`, `HttpFetcher`, `SearchBackend`, `McpResourceProvider`).
 
 ## API Surface
 
-### Registry — `mod.rs`
+### Registry — `mod.rs` + `registry.rs`
 
-- `BuiltinTool` enum: `Bash`, `ReadFile`, `WriteFile`, `EditFile`, `Glob`, `ListFiles`, `Grep`, `TodoCreate`, `TodoList`, `TodoGet`, `TodoModify`, `AskUser`, `MemorySearch`, `MemoryGet`, `WriteMemory`, `ReadMemory`, `EditMemory`, `CodingMemoryRead`, `CodingMemoryWrite`, `CodingMemoryEdit`; `ALL`, `name()`, `from_name()`, `parallel_safe()`.
-- `tool_names() -> &'static [&'static str]` — the model-facing names in registry order.
-- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `user_asker()`, `memory_backend()`, `todo_dir()`, `tools()`.
+- `BuiltinTool` enum: the core twenty `Bash`, `ReadFile`, `WriteFile`, `EditFile`, `Glob`, `ListFiles`, `Grep`, `TodoCreate`, `TodoList`, `TodoGet`, `TodoModify`, `AskUser`, `MemorySearch`, `MemoryGet`, `WriteMemory`, `ReadMemory`, `EditMemory`, `CodingMemoryRead`, `CodingMemoryWrite`, `CodingMemoryEdit`, then the twelve extended `FetchWebpage`, `WebSearch`, `ImageMetadata`, `AudioMetadata`, `Cron`, `ListMcpResources`, `ReadMcpResource`, `ToolSearch`, `GetCurrentGoal`, `SubmitGoalReport`, `Lsp`, `Worktree`; `DEFAULT: [Self; 20]`, `EXTENDED: [Self; 32]`, `ALL: [Self; 32]` (`= EXTENDED`), `name()`, `from_name()`, `parallel_safe()`.
+- `tool_names() -> &'static [&'static str]` — the core twenty names in registry order (what `ToolRegistry::new` mounts); `extended_tool_names() -> &'static [&'static str]` — all thirty-two names in `EXTENDED` order.
+- `parallel_safe()` is false for `WriteFile`, `EditFile`, `Cron`, `SubmitGoalReport` and `Worktree` (they mutate shared on-disk state) and true for every other variant; each tool's card reports the same flag.
+- `ToolRegistry` — `new(Workspace)` (builds a local `SysOperation` rooted at the workspace and mounts `BuiltinTool::DEFAULT`), `with_sys_operation(Arc<SysOperation>)`, `with_fs_operation`, `with_shell_operation`, `with_permissions(Arc<PermissionEngine>)`, `with_user_asker(Arc<dyn UserAsker>)`, `with_memory(Arc<dyn MemoryToolBackend>)`, `with_http_fetcher(Arc<dyn HttpFetcher>)`, `with_search_backend(Arc<dyn SearchBackend>)`, `with_mcp_resources(Arc<dyn McpResourceProvider>)`, `with_cron_scheduler(Arc<CronScheduler>)`, `with_goal_store(Arc<GoalStore>)`, `with_lsp_config(impl Into<Option<LspToolConfig>>)` (a bare `LspToolConfig` or an `Option`), `with_worktree_manager(Arc<WorktreeManager>)`, `with_worktree_root(impl Into<Option<PathBuf>>)`, `with_language(impl Into<String>)`, `with_todo_dir(impl Into<PathBuf>)`, `with_tools(impl IntoIterator<Item = BuiltinTool>)`, `with_deferred_tools(impl IntoIterator<Item = BuiltinTool>)`, `build() -> Vec<Arc<dyn Tool>>`, `cards(language: &str) -> Vec<ToolCard>`, `card(BuiltinTool, language: &str) -> ToolCard`; discovery API `discover(query, limit) -> Vec<ToolSearchHit>`, `reveal(names) -> Vec<ToolCard>`, `deferred_cards(language)`, `deferred_tools()`; accessors `env()`, `read_state()`, `sys_operation()`, `fs_operation()`, `shell_operation()`, `user_asker()`, `memory_backend()`, `http_fetcher()`, `search_backend()`, `mcp_provider()`, `lsp_config()`, `worktree_manager()`, `worktree_root()`, `todo_dir()`, `tools()`.
+- Defaults: the `fetch_webpage` fetcher is a `ReqwestFetcher` so the tool works out of the box; `web_search` has no default backend (it reports a typed failure until `with_search_backend` is used); the cron scheduler and goal store default to their workspace-backed instances, created once per `build()` call; MCP resources have no default provider.
+- `lsp` is always mounted when selected: with no `with_lsp_config` it is built from `LspToolConfig::default()` and every call answers `success=false` with the LSP module's "no LSP server configured" message, naming the missing `server` setting instead of the tool disappearing; a configured server descriptor is used as given (a command that cannot be spawned is the same kind of typed payload). The registry fills the config workspace root from the workspace when unset and always renders the built tool in the registry language; `cards(language)` always uses the requested language.
+- `worktree` defaults to a `WorktreeManager` rooted at `with_worktree_root` or the workspace root and forwards the registry's `PermissionEngine`; nothing is checked at construction time, so a non-repository workspace reports the manager's typed git failure as a `success=false` payload.
+- Deferred tools are held by `with_deferred_tools` but NOT mounted by `build()` and NOT listed by `cards()`: the model finds them through the `tool_search` tool (or `discover`) and the host unions `reveal(names)` into the next model call's tool list. The mounted set always wins, so a deferred tool can never shadow an active one.
 - `build()` yields one `Arc<dyn Tool>` per selected variant in `self.tools` order; the four todo tools share one `Arc<TodoStore>` created lazily once per call (`todo_dir` when set, else `TodoStore::for_workspace`), and the filesystem tools share the registry's `ReadStateRegistry`.
 - `cards(language)` maps `self.tools` through `card(tool, language)`, which returns the owning module's real `card_for`, never a placeholder.
 - Card schemas are Python-shaped: `schemars` output with `$schema`/`title`/`$defs` stripped, every `$ref` inlined (`todo` and `ask_user` post-process theirs), and `required` narrowed to Python's list; no card contains a dangling reference.
@@ -26,7 +32,7 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `truncate_chars(text, max_chars) -> Truncated { text, truncated, omitted_chars }` — `0` means unlimited, never splits a UTF-8 character, appends `TRUNCATION_MARKER`.
 - `schema_for::<T: JsonSchema>() -> Value` — object JSON Schema with `$schema`/`title`/`definitions` stripped so it matches the Python `{"type","properties","required"}` shape.
 - `tool_card(name, description, input_params, parallel_safe) -> ToolCard` — id is a fresh hex uuid, `exposure = Direct`, `execution = Server`, `idempotent = false`.
-- `ToolEnv` — the workspace plus the optional permission gate and language: `new(Workspace)`, `with_permission`, `with_language`, `workspace()`, `language()`, `is_english()`, `deny_reason(tool, args) -> Option<String>` (only a `deny` decision blocks; `ask` is the interrupt rail's job), `resolve_path(tool, raw, args) -> Result<PathBuf, ToolPayload>`, `resolve_dir(...)`.
+- `ToolEnv` — the workspace plus the optional permission gate and language: `new(Workspace)`, `with_permission`, `with_language`, `workspace()`, `language()`, `permission() -> Option<&Arc<PermissionEngine>>`, `is_english()`, `deny_reason(tool, args) -> Option<String>` (only a `deny` decision blocks; `ask` is the interrupt rail's job), `resolve_path(tool, raw, args) -> Result<PathBuf, ToolPayload>`, `resolve_dir(...)`.
 - `ModelArgs` — serde-deserialization of `invoke` inputs with Python-friendly errors: `parse::<T>(value) -> Result<T, ToolPayload>` where a non-object value yields `tool arguments must be an object`.
 
 ### Read-before-write state — `read_state.rs`
@@ -78,6 +84,39 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `MemoryTool { kind: MemoryToolKind, backend: Option<Arc<dyn MemoryToolBackend>> }` renders eight cards: `memory_search`, `memory_get`, `write_memory`, `read_memory`, `edit_memory` (scope `Memory`) and `coding_memory_read`, `coding_memory_write`, `coding_memory_edit` (scope `CodingMemory`).
 - No backend configured → `success=false` with `memory tool backend is not configured`.
 
+### Web — `web/`
+
+- `HttpFetcher` trait (`async fn fetch(&self, FetchRequest) -> Result<FetchResponse>`), `FetchRequest { url, timeout, max_bytes, headers }`, `FetchResponse { status, final_url, headers, body }` with `header()`/`content_type()`; `ReqwestFetcher` (redirect cap 10, byte-capped streaming read, no gzip/deflate, Chrome UA) is the default.
+- `FetchWebpageTool` (`fetch_webpage`) inputs `url` (required), `max_chars`, `max_bytes`, `timeout_seconds`, `prompt`, `caption`; consults the permission net guard before the request; detects the charset from `Content-Type` then `<meta charset>`; renders HTML through `html::extract`, passes JSON/text through; payload `{url, final_url, status, content_type, charset, content, truncated, title?, prompt?, caption?}`.
+- `SearchBackend` trait (`search(&self, query, max_results)`), `SearchResult { title, url, snippet }`, `HttpSearchBackend` (configurable endpoint, injectable fetcher), `FakeSearchBackend` (documented test double with canned results, failure injection and call recording), `WebSearchTool` (`web_search`) with `{success, results:[{title,url,snippet}]}`.
+- `web/html.rs` — `extract(&str) -> ExtractedHtml { title, text }`, `normalize_url(base, href)`, `decode_entities`, `collapse_whitespace`; `web/decode.rs` — `detect_charset`, `charset_from_content_type`, `sniff_meta_charset`, `decode_body` (UTF-8/ASCII, Latin-1/CP1252, UTF-16, BOM precedence, lossy fallback).
+
+### Media — `media/`
+
+- `ImageMetadataTool` (`image_metadata`) and `AudioMetadataTool` (`audio_metadata`), input `{image_path}` / `{audio_path}` (aliases `path`, `file_path`, `image_path_or_url` / `audio_path_or_url`), resolved through `ToolEnv::resolve_path` and read with `tokio::fs::read`.
+- Pure header parsing in `parse.rs` (bounds-checked `Cursor`, endian readers, `fourcc`, `Failure`, `MediaKind`) feeding `image/{png,jpeg,gif,webp,bmp}.rs` and `audio/{wav,flac,mp3,ogg}.rs`; `parse_image_header(&[u8])` / `parse_audio_header(&[u8]) -> ParseResult<…>` are public.
+- Payload `{kind, format, byte_size, …}`: PNG width/height/bit depth/color type/alpha/interlace/frames, JPEG dimensions/components/precision/progressive/EXIF orientation, GIF version/frames/animated/alpha, WebP variant/alpha/animated, BMP bit count/compression/top-down; WAV sample rate/channels/bits/format tag/duration, FLAC sample rate/channels/bits/total samples/duration, MP3 version/layer/bitrate/sample rate/channels/duration, OGG codec/sample rate/channels/duration.
+
+### Cron — `cron/`
+
+- `CronSchedule::parse(&str)` (5 fields `m h dom mon dow` with `*`, `*/n`, `a`, `a-b`, `a-b/n`, lists, `SUN..SAT`, `@hourly/@daily/@midnight/@weekly/@monthly/@yearly`) and `next_after(DateTime<Utc>) -> Option<DateTime<Utc>>` (strictly after, bounded horizon, Vixie OR-semantics for the two day fields).
+- `CronScheduler::new(dir)`, `for_workspace(&Workspace)` (`<cron node>/jobs.json`), `create`, `create_with_description`, `list`, `cancel`, `due(now)` (returns the fired jobs and advances/persists their `next_run_at`); `CronJob { id, cron, next_run_at, created_at, enabled, prompt, description }`.
+- `CronTool` (`cron`) with `action` = `create|list|cancel` (plus `cron`, `prompt`, `description`, `job_id`), payloads `{job, message}` / `{jobs}` / `{job_id, message}`, and `invoke_at(inputs, now)` as the injected-clock entry point.
+
+### MCP resources — `mcp_resources.rs`
+
+- `McpResourceProvider` trait (`list_resources`, `read_resource`), `McpResource { uri, name, mime_type, description }`, `McpResourceContent { uri, mime_type, text, blob_base64, byte_size }`, `FakeMcpResourceProvider` (documented test double).
+- `ListMcpResourcesTool` (`list_mcp_resources`) and `ReadMcpResourceTool` (`read_mcp_resource`, requires `uri`); payloads wrap the Python bare list/object in `{resources: [...]}` / `{resource: {...}}`; no provider wired yields a typed `success=false` reason.
+
+### Discovery — `discovery.rs`
+
+- `ToolIndex::from_cards(&[ToolCard])` with an in-crate BM25 scorer (`k1 = 1.2`, `b = 0.75`), `search(query, limit) -> Vec<ToolSearchHit { name, score, description }>` sorted by descending score then name.
+- `ToolSearchTool` (`tool_search`) inputs `{query, limit}` (default 5, clamped 1..=20) and returns `{query, results, count}`.
+
+### Goal — `goal/`
+
+- `GoalStore`, `GoalRecord`, `GoalStatus`, `GoalAssessmentStatus`, `GoalAssessment`, `TokenUsage` (see `goal/CONTEXT.md`), `GetCurrentGoalTool` (`get_current_goal`) and `SubmitGoalReportTool` (`submit_goal_report`), plus `GoalRail`/`GoalRailConfig`/`GOAL_EVENT_EXTRA_KEY`.
+
 ### Descriptions — `descriptions.rs`
 
 - `description(name, language) -> &'static str` and `SUPPORTED_LANGUAGES`; English text is verbatim from the Python `prompts/tools/` package, Chinese text is a faithful translation, unknown language falls back to `cn` (Python behavior).
@@ -90,10 +129,11 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - Model-supplied paths always go through `ToolEnv::resolve_path` → `crate::workspace::Workspace::resolve`; absolute paths inside the workspace are accepted, anything outside is refused. No raw `Path::new(model_input)`.
 - Mutations go through `FsOperation` (atomic rename, compare-and-swap); reads of resolved paths may use `tokio::fs`.
 - No panics, no `unwrap`/`expect` outside tests, no `unsafe`; `openjiuwen_common::error::{Error, Result}` only.
-- No dependency on `crate::prompts`, `crate::subagents`, `crate::agent`, `crate::rails`, `crate::task_loop`; upper layers depend on this module, never the reverse.
+- No dependency on `crate::prompts`, `crate::subagents`, `crate::agent`, `crate::rails`, `crate::task_loop`; upper layers depend on this module, never the reverse. One documented exception: `goal::GoalRail` implements `crate::rails::HarnessRail` and builds `crate::prompts::PromptSection` values, because it is owned by this node; it must only use those modules' public APIs.
 - `tracing` only, no stdout/stderr writes.
 - Files ≤1000 lines; shared helpers live in `support.rs`, never duplicated per tool.
-- Process state: the read-state registry and todo store are per-`ToolRegistry` instances (no process globals) so tests are isolated; the todo file location is the only shared on-disk state.
+- Process state: the read-state registry, todo store, cron scheduler, goal store and discovery index are per-`ToolRegistry` instances (no process globals) so tests are isolated; the todo file, cron job file and goal file are the only shared on-disk state.
+- Every new tool was added with `BuiltinTool::DEFAULT` untouched: `ToolRegistry::new` still mounts exactly the core twenty, so a host opts into the extended surface with `with_tools(BuiltinTool::EXTENDED)` or per tool.
 
 ## Design decisions
 
@@ -104,9 +144,17 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - **Deviation — bash truncation**: Python persists oversized output to a temp file and shows a preview; here `max_output_chars` truncates in place with `TRUNCATION_MARKER` and reports `truncated` in `data`.
 - **Deviation — bash exit codes**: a non-zero exit is reported as `success=false`; Python's `interpret_exit_code` neutrality for `grep`/`diff`/`test`/`find` is not ported.
 - **Deviation — todo path**: `<todo node>/<session_id>/todo.json` (the workspace `todo` node, which is the Python `TaskPlanningRail` wiring), overridable through `ToolRegistry::with_todo_dir`; the session id falls back to `default` instead of raising `Session ID is required`.
-- **Deviation — descriptions**: each tool carries the Python English description text verbatim (Chinese translated) inside this module; `crate::prompts` may re-export them but never owns them.
+- **Deviation — web**: no JS rendering, no Jina/vendor reader fallback, no paid search SDKs (Jina/Bocha/Serper/Perplexity env-key clients) and no LLM quality/assessment/budget pass; fetch and search both sit behind async seams with a `ReqwestFetcher` default and a documented `FakeSearchBackend` test double.
+- **Deviation — media**: metadata only, pure header parsing with no decoding crates; no OCR, transcription or visual/audio question answering (those need a model), and no URL inputs — a `*_path_or_url` value is resolved as a workspace path.
+- **Deviation — cron**: 5-field expressions plus shorthands instead of Python's 7-field Quartz grammar; only `create`/`list`/`cancel` actions (`get_job`, `update_job`, `toggle_job`, `preview_job`, `schedule.at`/`schedule.every`, run history are deferred); no background daemon — the host polls `due(now)`.
+- **Deviation — MCP resources**: the foundation `McpClient` exposes tools only, so the tools work through the narrow `McpResourceProvider` seam; no live-client adapter ships today and Python's `server_id` argument is tolerated but ignored.
+- **Deviation — discovery**: in-crate BM25 (`k1 = 1.2`) with an exact-name boost folded into the score instead of Python's separate boolean sort key; `tool_call` (relaying a call to a discovered tool) is not ported because `reveal` hands the card to the host instead.
+- **Deviation — goal**: no `GoalManager`/`GoalReportSink`; the tools write the store directly and the loop-side role lives in `goal::GoalRail`, which queues `goal.updated` events under `harness.goal_events` for the host to drain (rails have no event sink).
+- **Deviation — descriptions**: each tool carries the Python English description text verbatim (Chinese translated) in `descriptions.rs`; the table covers the core twenty plus the twelve extended names, and `description()` still returns `""` for an unknown name.
+- **Deviation — lsp/worktree mounting**: Python mounts `lsp_tool/` and `worktree/` from the same `tools/` package; here both live in the sibling `crate::lsp` and `crate::worktree` modules with their own `Tool` implementations, and `registry.rs` only constructs them (config, manager, language, permission engine) and renders their cards. Neither tool is mounted by `BuiltinTool::DEFAULT`; a host opts in with `with_tools(BuiltinTool::EXTENDED)` or by naming the variant.
 - **Deviation — edit_file fidelity**: LF/CRLF round-trip, quote-style and read-state rules are ported; `html.unescape`, the `_DESANITIZATIONS` table, `.ipynb` protection and operation-history files are not.
-- Never resolved here (owned elsewhere): skill/subagent/web/LSP/MCP tools, `task`/`subagent_*`, tool discovery, mode switching, cron, goal, compression recall, worktree and multimodal tools.
+- Still owned elsewhere: skill/subagent tools, `task`/`subagent_*`, mode switching, compression recall, the `enter_worktree`/`exit_worktree` tool pair and its rails integration (the single action-dispatching `worktree` tool is mounted here), browser/CUA/mobile GUI tools and the model-backed OCR/transcription/QA tools.
+- Deferred within the ported modules: `tool_call` (relay a call to a discovered tool), the `cron` update/toggle/preview/run actions, MCP resource subscriptions and an adapter over a live `McpClient`.
 
 ## Notes for Agents
 
@@ -115,6 +163,9 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `ask_user` reports `ask_user is not available: no user interaction handler is configured` until an asker is wired; the eight memory tools report `memory tool backend is not configured` until a backend is wired.
 - The todo store defaults to `<workspace>/todo/<session>/todo.json`; the session id comes from `ToolContext::session_id` and falls back to `default`, so a session-less caller shares one list.
 - `grep` reports `success=true` with empty output on no matches (exit-code 1 lives in `data`), which is what makes it render `No matches found.`.
+- The extended tools are opt-in: `ToolRegistry::new(..).with_tools(BuiltinTool::EXTENDED)` mounts all thirty-two; wire `with_search_backend`, `with_mcp_resources`, `with_http_fetcher`, `with_goal_store`/`with_cron_scheduler`, `with_lsp_config` and `with_worktree_manager`/`with_worktree_root` only when a live seam is wanted.
+- `lsp` needs an `LspToolConfig` with a `LspServerConfig` (or an injected transport through `crate::lsp::LspTool::with_transport`) before it can answer; `worktree` needs a git repository at the configured root.
+- `goal::GoalRail` is the one module here that implements a `crate::rails` trait; `DeepAgentBuilder::build` registers it automatically when a mounted tool card is `get_current_goal` or `submit_goal_report`, and a host drains `GOAL_EVENT_EXTRA_KEY` (`harness.goal_events`) after the task-iteration hooks, because the `DeepAgent` loop has no drain seam of its own.
 
 ## Deferred Python behavior
 
@@ -128,7 +179,8 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 
 ## Routing Table
 
-- `./mod.rs` → `ToolRegistry` (builder, `build`, `cards`, `card`), `BuiltinTool`, `tool_names`, flat re-exports of every tool module, module declarations
+- `./mod.rs` → `BuiltinTool` and its `DEFAULT`/`EXTENDED`/`ALL` tables, `tool_names`/`extended_tool_names`, flat re-exports of every tool module, module declarations and the `pub use registry::ToolRegistry`
+- `./registry.rs` → `ToolRegistry` (builder and configuration setters, `build`, `cards`, `card`, discovery/deferred API, accessors) and the `BuildCaches`/`memory_kind` arm helpers
 - `./support.rs` → `ToolPayload`, `render_fields`, truncation, `schema_for`, `tool_card`, `ToolEnv` (path resolution + permission gate), arg parsing
 - `./read_state.rs` → read-before-write registry, fingerprints, range coverage, per-path locks
 - `./descriptions.rs` → model-facing description text (en/cn) and language fallback
@@ -138,14 +190,23 @@ Upper layers (agent, rails, protocol) only see `ToolRegistry`, `BuiltinTool` and
 - `./search/` → `glob`, `list_files` and `grep` tools, one per file, plus the in-process grep scanner (`search/CONTEXT.md`)
 - `./todo/` → todo store, card-schema inlining, shared validation and the four todo tools, one per file (`todo/CONTEXT.md`)
 - `./ask_user.rs` → `UserAsker` seam and `AskUserTool`
+- `./web/` → `fetch_webpage`, `web_search`, `HttpFetcher`/`SearchBackend` seams, HTML→text extraction, charset detection (`web/CONTEXT.md`)
+- `./media/` → `image_metadata`, `audio_metadata`, pure header parsers for PNG/JPEG/GIF/WebP/BMP and WAV/FLAC/MP3/OGG (`media/CONTEXT.md`)
+- `./cron/` → cron expression parser, next-occurrence computation, persisted job list, the `cron` tool (`cron/CONTEXT.md`)
+- `./goal/` → goal record/store, `get_current_goal`, `submit_goal_report`, `GoalRail` (`goal/CONTEXT.md`)
+- `./discovery.rs` → BM25 `ToolIndex` and the `tool_search` tool used by the registry's deferred-tool mechanism
+- `./mcp_resources.rs` → `McpResourceProvider` seam, `list_mcp_resources`, `read_mcp_resource`, the fake provider
 - `./memory/` → memory backend seam, tool kinds and the eight memory tools (`memory/CONTEXT.md`)
-- `./tests.rs` → cross-module parity suite: name order, card schemas/languages, `required` lists, `parallel_safe`, end-to-end registry calls over a temp workspace, `render_for_llm` strings
+- `./tests.rs` → cross-module parity suite: name order, card schemas/languages, `required` lists, `parallel_safe`, end-to-end registry calls over a temp workspace, `render_for_llm` strings, the `lsp`/`worktree` cards and registry wiring
 
 ## Test Strategy
 
 - Unit tests live beside each module: `support` (truncation, render_fields, schema normalization, path confinement, deny gate), `read_state` (coverage merges, partial/stale gates), `shell` (clamping, rendering, timeout, background, blank command), `read` (line numbering, offset/limit, 256 KiB limit, empty file), `write` (read-before-write, create/update, edit uniqueness, `replace_all`, identical strings, CAS conflict), `search` (glob cap 100, brace patterns, list hidden filter, grep modes/context/head_limit/VCS skip), `todo` (create→list→get→modify round-trip, first item in_progress, validation messages, session fallback), `ask_user` (no asker), `memory` (no backend, payload shapes for each of the eight tools).
 - `tests.rs` drives one `build()` per temp workspace so the filesystem tools share read state: `read_file`→`edit_file`, `write_file` create, `glob`/`list_files`/`grep` discovery, a `todo_create`→`todo_list` round-trip read back through a second registry over the same workspace, `bash echo`, the missing-asker and missing-memory-backend failures, and the exact `render_for_llm` strings.
 - `tests.rs` also asserts the exact model-facing names, per-tool `required` lists, `parallel_safe` flags and `input_params` shape.
-- All tests are offline and deterministic: `tempfile` workspaces, fake `UserAsker`/`MemoryToolBackend` implementations, no network, no reliance on `rg`/`git` binaries.
-- Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
-- Current counts: 1088 unit tests plus 80 integration and 8 doc tests crate-wide, all four gates clean; every file in this subtree is under the 1000-line baseline.
+- Extended coverage in `tests.rs`: all thirty-two cards and their `required` lists, bilingual descriptions for every card, `DEFAULT` vs `EXTENDED` mounting, deferred-tool hide/discover/reveal, and end-to-end calls for `fetch_webpage` (injected fake fetcher), `web_search` (`FakeSearchBackend`), `image_metadata`/`audio_metadata` (inline header bytes), `cron` create/list/cancel, the goal tools, the MCP resource tools and `tool_search`.
+- `lsp`/`worktree` coverage in `tests.rs`: card name/uuid/schema/`required`/`parallel_safe`, `extended_tool_names()` ↔ `BuiltinTool::EXTENDED` (all thirty-two, `from_name` round-trip), the not-configured `lsp` payload naming the missing server, a configured LSP server descriptor reached by the built tool (an impossible command proves the config was used), `LspTool::with_transport` driven by an in-process fake JSON-RPC server over `tokio::io::duplex` (no language-server binary), the `worktree` tool over a scripted `GitRunner` manager (`list` payload), the default workspace-rooted manager's typed git failure, and the permission engine forwarded into `worktree create` (a `deny` becomes a `success=false` payload).
+- Module suites: `web` (HTML extraction, charset, fetch over a loopback `TcpListener`, redirects, truncation, timeouts, net-guard denial, search parsing), `media` (per-format happy path/truncated/unknown-magic, path confinement), `cron` (grammar, next-occurrence, persistence, tool actions), `goal` (schema round-trip, store, tools, rail heartbeat/events), `discovery`, `mcp_resources`.
+- All tests are offline and deterministic: `tempfile` workspaces, fake `UserAsker`/`MemoryToolBackend`/`HttpFetcher`/`SearchBackend`/`McpResourceProvider`/`GitRunner` implementations, an in-process fake language server over a duplex stream, loopback sockets only, injected clocks, no network, no reliance on `rg`/`git` binaries or a language-server binary.
+- Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean, `cargo doc -p openjiuwen-harness --no-deps` warning-free.
+- Current counts: 1863 unit tests plus 84 integration and 13 doc tests crate-wide, all gates clean; `mod.rs` (variant tables, re-exports, `registry_tests`) is 450 lines and `registry.rs` 722, so every file in this subtree is under the 1000-line baseline.

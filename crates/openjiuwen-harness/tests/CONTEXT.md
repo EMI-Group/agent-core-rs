@@ -7,12 +7,12 @@ Unit tests live beside their modules; these cover cross-module behavior.
 
 ## API Surface
 
-Test files (one concern each, 80 tests total):
+Test files (one concern each, 84 tests total):
 - `deep_agent_loop.rs` (6) — no-tool answer, real `FunctionTool` round, built-in `bash` permission denial, max-iteration truncation, follow-up queue drain, idempotent abort.
 - `workspace_safety.rs` (9) — cn/en schema seeding and markers, traversal/absolute/drive/UNC rejection, top-level-only `get_node_path`, idempotent rebuild, `is_safe_relative_path` truth table, unsafe node paths.
 - `permissions.rs` (14) — allow/ask/deny precedence and `strictest` fold, file-guard fold, session-scoped approvals via the rail, rail `skip_tool` denial, `PermissionConfirmResponse::parse` shapes.
 - `state_persistence.rs` (7) — `DeepAgentState` round-trip, exact `deepagent` key set, plan-mode/follow-up survival, default state, repeated-save null-key preservation, `todo.json` location and item keys.
-- `subagents_skills.rs` (15) — built-in presets, fake factory spawn/wait/close/capacity, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
+- `subagents_skills.rs` (19) — built-in presets, fake factory spawn/wait/close/capacity, quota refusal/free and per-parent/depth limits, activity lifecycle and LRU eviction with transcript digests, subagent tool payloads, skill discovery/budget/disabled state, `SkillRootMount`.
 - `protocol.rs` (8) — `NativeHarness` lifecycle, capability gating, single-consumer cursors, checkpoint export, provider `create` from JSON, capability card.
 - `cli.rs` (21) — clap grammar/flags/formats, headless `run_with_model` in all three output formats, scripted REPL transcript, permission answer mapping.
 
@@ -393,7 +393,7 @@ pub async fn run(cli: Cli) -> Result<()>                 // :233
 ```
 
 `Repl::new(agent: Arc<DeepAgent>, options: CliOptions)` (`repl.rs:161`), `Repl::with_io(agent, options, io: CliIo)` (`:177`, test path), `Repl::with_io_and_signals(...)` (`:171`), `async run(&mut self) -> Result<()>` (`:211`).
-`CliIo::new(reader: Box<dyn LineReader>, writer: Box<dyn Writer>)` (`io.rs:70`); `LineReader`/`Writer` are `#[async_trait]` with `read_line`/`write`/`flush` (`:26/:37`), so tests inject `ScriptedReader`/`SharedWriter` doubles (pattern in `src/cli/tests.rs:39-95`).
+`CliIo::new(reader: Box<dyn LineReader>, writer: Box<dyn Writer>)` (`io.rs:70`); `LineReader`/`Writer` are `#[async_trait]` with `read_line`/`write`/`flush` (`:26/:37`), so tests inject `ScriptedReader`/`SharedWriter` doubles (pattern in `src/cli/tests/mod.rs:39-95`).
 `async run_with_model(&CliOptions, &RunArgs, &CliIo, Arc<dyn Model>) -> Result<RunOutcome>` (`run.rs:210`) and `build_agent(model: Arc<dyn Model>, &CliOptions, &CliIo) -> Result<Arc<DeepAgent>>` (`:133`) are the headless seams; `run_cli` reads real env/home and builds a network model, so do not use it in tests.
 `CliOptions` has no `Default`; construct `CliOptions::resolve_with(&Cli, &dyn EnvSource, Option<&Settings>, cwd)` (`config.rs:293`) or fill its public fields.
 Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — approve `""|y|yes|ok|approve|allow|allow_once|true|1`, always `a|always|allow_always`, reject `n|no|deny|reject`, anything else is `Feedback`.
@@ -402,6 +402,6 @@ Permission prompt (`permissions.rs:56-66`): answers are trimmed/lowercased — a
 ### 11. Commands and known state
 
 - `cargo fmt -p openjiuwen-harness`; `cargo test -p openjiuwen-harness`; `cargo test -p openjiuwen-harness --no-default-features`; `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`.
-- The seven `*.rs` files above are the complete `tests/` tree; all seven compile and pass (`cargo test -p openjiuwen-harness`: 1088 unit + 80 integration + 8 doc tests).
+- The seven `*.rs` files above are the complete `tests/` tree; all seven compile and pass (`cargo test -p openjiuwen-harness`: 1915 unit + 84 integration + 13 doc tests).
 - Non-public APIs tests must not reach for: `SubAgentRuntime`'s `test_support` module, `discover_skills`, `Workspace::root`/`get_node` (absent), CLI child modules and `Repl::build`, `DeepLoopEvent` fields (serde-only), `DeepAgent` private fields, protocol `inner`/`cursor`/`events`/`bridge`/`turn`.
 - No panics were found on the public surfaces above; `PermissionLevel` has no `Ord`, `HarnessError` is `#[non_exhaustive]` and not comparable, and `ScriptedModel` is `Clone` but not `Debug`/`Serialize`.

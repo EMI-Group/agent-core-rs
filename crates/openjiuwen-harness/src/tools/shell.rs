@@ -15,8 +15,8 @@
 //! - `get_call_timeout`, the destructive-command warning, `sudo` rewriting, the
 //!   `OPENJIUWEN_BASH_STRICT` injection scan, the `.agent_history` rm tracking and the
 //!   `PowerShellTool` variant are deferred.
-//! - The streaming `stream()` override is not implemented yet, so callers get the
-//!   trait-default single-result stream.
+//! - The streaming `stream()` override is absent, so callers get the trait-default
+//!   single-result stream.
 use std::path::Path;
 use std::sync::Arc;
 

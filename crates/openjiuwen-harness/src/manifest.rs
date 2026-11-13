@@ -260,9 +260,9 @@ impl Catalog {
 ///
 /// Every built-in element lives under the `core.` namespace (parallel to a
 /// platform's `swarm.` namespace), so a spec `type` unambiguously names its
-/// owning layer. The list is a snapshot of `manifest/builtin_elements.py` and
-/// covers only the elements this crate ports: deferred areas (`lsp`, `worktree`,
-/// `heartbeat`, web and multimodal tools) are intentionally absent.
+/// owning layer. The list is a partial snapshot of `manifest/builtin_elements.py`:
+/// the `lsp`, `worktree`, `goal`, `heartbeat`, progressive-discovery, web,
+/// media, cron and MCP-resource surfaces have no descriptor here.
 #[must_use]
 pub fn builtin_elements() -> Vec<HarnessElementDescriptor> {
     vec![

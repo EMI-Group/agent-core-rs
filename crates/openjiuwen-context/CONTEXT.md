@@ -36,6 +36,9 @@ let recovered: RecoveryOutcome = engine
 - `CompressionRecallConfig` — `enabled`, `chunk_size_tokens` (3 000), `chunk_overlap_tokens` (300).
 - `DEFAULT_CONTEXT_TOKENS` — 200 000, used when `max_context_tokens` is `None`.
 - `ModelContext` trait — `context_id`, `session_id`, `messages`, `set_messages`, `add_message`, `pop_messages`, `clear_messages`, `token_counter`, `statistics`, `revision`.
+- `ConversationContext` has no inherent history accessor: `messages`/`set_messages`/`add_message`/`pop_messages`/`clear_messages`/`statistics`/`revision` are `ModelContext` trait methods (re-exported at crate root), so a caller must import `ModelContext` to read, replace, or clear stored history.
+- `ContextEngine` exposes no history reader and no pool enumeration: a caller reaches a context through `get_context(session_id, context_id)` (or `create_context`, which is idempotent and ignores options for an existing pair), and `remove_context` only drops the pool entry without touching session state.
+- `ConversationContext::save_state`/`load_state` are public inherent methods, so a `ContextState` round-trip also replaces stored messages and the revision from outside.
 - `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `recall_store()`, `session_memory_store()`, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state` (history + processor checkpoints), `prepare`; the constructor is engine-only.
 - `PreparedContext` — `messages` (system first, then selected context, plus the reload hint when injected), `tools`, `stats: ContextStats`, `token_count`, `overflow`, `window_size`, `events`.
 - `ContextStats` — total/per-role message counts and token counts, `total_dialogues`, `compressions`, `tokens_before_compression`, `tokens_after_compression`.
@@ -105,6 +108,7 @@ let recovered: RecoveryOutcome = engine
 - A `TruncationConfig::max_tokens` below the current size acts regardless of the trigger threshold; the threshold only gates the case where no processor budget is set.
 - `TruncationConfig::keep_system = false` drops the oldest system messages first, which is the only way that field is not inert.
 - The context pool key is `(session_id, context_id)` with dots in `context_id` normalized to `_`, matching Python's pool identity; the context keeps its original id.
+- There is no `ContextWindow`, `Compressor`, `OffloadProcessor`, or `TokenAccountant` type and no free `compress(&mut Vec<BaseMessage>)` function: the raw-history compaction seam is `ContextPipeline::run(&mut Vec<BaseMessage>, &ProcessorContext)` (or one processor's `process`), and `ContextEngine::compress` works only on an `Arc<ConversationContext>`.
 - The processor extension surface is exactly: a config struct (`serde(default)`, snake_case), a `ProcessorConfig` variant (internally tagged `{"type": ...}`), an arm in `ContextPipeline::from_configs_with`, a re-export in `lib.rs`, and a `ContextEventKind` reuse or variant when it reports a change; `default_processors` lists only the two defaulted processors.
 - `ProcessorContext` carries no session handle, so a processor persists only through `offload`/`recall`/`session_memory`/`scope` and its own `ProcessorState`, which the pipeline saves and loads around the session checkpoint.
 - Context state persistence is a serde `ContextState { messages, revision, processors }` written under session key `context.<context_id>`; the engine wraps a map of context id → state under `context`.

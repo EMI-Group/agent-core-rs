@@ -1,17 +1,24 @@
-//! Model-facing description text of the twenty built-in tools, in English and Chinese.
+//! Model-facing description text of the built-in tools, in English and Chinese.
 //!
+//! The table covers the core twenty tools (the shell, filesystem, todo, `ask_user` and memory
+//! tools) plus the extended tool set (web, media metadata, cron, MCP resources, tool discovery,
+//! goal tracking, LSP navigation and git worktrees).
 //! Ports the bilingual description constants of `openjiuwen/harness/prompts/tools/`
-//! (`filesystem.py`, `bash.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`).
-//! The text is prompt material seen by the model, so it is kept verbatim from the Python SDK,
-//! including blank lines; tools look it up through [`description`] by name and language.
+//! (`filesystem.py`, `bash.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`,
+//! `web_tools.py`, `vision.py`, `audio.py`, `cron.py`, `mcp.py`, `tool_search.py`, `goal.py`,
+//! `lsp_tool/`, `worktree/`).
+//! The text is prompt material seen by the model, so it is kept verbatim from the Python SDK
+//! wherever the ported tool has the same arguments, including blank lines; tools look it up
+//! through [`description`] by name and language.
 
 /// The languages with a description table ("en", "cn").
 pub const SUPPORTED_LANGUAGES: [&str; 2] = ["en", "cn"];
 
 /// The description table: `(tool name, English description, Chinese description)`.
 ///
-/// Rows are in registry order and hold the text verbatim from the Python SDK, so the table is
-/// intentionally long; use [`description`] to look rows up instead of indexing it directly.
+/// Rows are in registry order (the core tools first, then the extended tool set) and hold the
+/// text verbatim from the Python SDK, so the table is intentionally long; use [`description`] to
+/// look rows up instead of indexing it directly.
 static DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         "bash",
@@ -431,6 +438,204 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "Perform an exact string replacement inside a coding memory file (old_text → new_text).",
         "在 coding_memory/ 下的记忆文件中做精确字符串替换（old_text → new_text）。",
     ),
+    (
+        "fetch_webpage",
+        concat!(
+            "Fetch webpage text content from a URL and return status, title, and plain text. ",
+            "Read relevant sources only as needed, usually after search discovers their URLs. ",
+            "Do not reason only from snippets or guess article URLs; stop when evidence is sufficient. ",
+            "Set max_chars=0 to disable clipping and use a larger timeout_seconds for slow pages. ",
+            "Best fit: documentation, blog posts, news, API references, and similar general web content. ",
+            "Content status is distinct from HTTP status: challenges, authentication and empty shells are not evidence. ",
+            "Preserve source links and field associations; never fill missing fields with adjacent numbers or present stale observations as live data. ",
+            "Git repository URLs (GitHub/GitLab/Gitee/Gitcode/Bitbucket, etc.) are usually a poor fit - ",
+            "the webpage only shows a rendered file tree, while reading source, history, or searching across ",
+            "files is far easier after a local `git clone` via the shell tool (bash or powershell).",
+        ),
+        concat!(
+            "按需要读取原始来源，返回状态码、标题和正文文本。",
+            "通常先通过搜索发现相关 URL，不要只依赖摘要或猜测文章 URL；证据足够即可停止，不必抓取多个页面。",
+            "可设置 max_chars=0 关闭截断，也可以调大 timeout_seconds 处理慢站点。",
+            "适用场景：文档、博客、新闻、API 参考等普通网页。",
+            "Content status 与 HTTP 状态不同；验证码、WAF、登录限制或动态空壳不是有效证据。",
+            "保留来源链接与表格字段；缺失值不得用相邻数字补全，也不能把过期行情说成实时行情。",
+            "代码仓地址（GitHub/GitLab/Gitee/Gitcode/Bitbucket 等）一般不适合用本工具——",
+            "网页只能看到渲染后的目录页;要读源码、看历史、跨文件搜索，",
+            "更顺手的方式是用 shell 工具(bash 或 powershell)执行 `git clone` 拉到本地。",
+        ),
+    ),
+    (
+        "web_search",
+        concat!(
+            "Search the web and return relevance-filtered discovery results: titles, URLs, and snippets. ",
+            "Results are leads to verify, not facts — fetch the sources that matter with fetch_webpage and stop as soon as the evidence is sufficient.\n",
+            "\n",
+            "Use it for latest, current, or otherwise fast-moving information. Put the entity and the intent in query and add dates when useful, since a date keyword does not verify that a source is fresh. ",
+            "max_results caps the number of results (1-20), timeout_seconds bounds the request (5-60), and provider may only name an engine that is enabled; auto lets the backend pick and fall back among the configured sources. ",
+            "Do not guess article URLs or fill missing values; refine the query at most once instead of repeating a similar search.",
+        ),
+        concat!(
+            "联网搜索，返回经过相关性筛选的候选结果：标题、URL 与摘要。",
+            "结果是待核验的线索而非事实——需要时用 fetch_webpage 抓取关键来源，证据足够即停止。\n",
+            "\n",
+            "适合最新、当前或变化较快的信息。query 中保留实体与意图，必要时补充日期，但日期关键词不能替代来源时效核验。",
+            "max_results 限制结果数（1-20），timeout_seconds 限制请求超时（5-60），provider 只能填写已启用的引擎；auto 表示由后端在已配置来源中选择并回退。",
+            "不要猜测文章 URL 或补全缺失数字；查询不理想时最多改写一次，不要重复相近的搜索。",
+        ),
+    ),
+    (
+        "image_metadata",
+        concat!(
+            "Read the basic metadata of an image without sending it to a model: container format, pixel dimensions, and the frame count for animated formats. ",
+            "Pass image_path_or_url — a path inside the workspace (PNG, JPEG, GIF, WebP, BMP).\n",
+            "\n",
+            "Use it to check an image's size, orientation, or whether it is animated before reading or processing it; use read_file when you actually need the pixels or their text. ",
+            "Only the header is parsed, so the call is cheap, and an unsupported or corrupt file returns success=false with the reason rather than partial facts.",
+        ),
+        concat!(
+            "在不把图片交给模型的前提下读取图片的基础元数据：容器格式、像素尺寸，以及动图的帧数。",
+            "通过 image_path_or_url 传入工作区内的图片路径（PNG、JPEG、GIF、WebP、BMP）。\n",
+            "\n",
+            "可在读取或处理图片前用它确认尺寸、方向以及是否为动图；需要像素内容或图中的文字时请改用 read_file。",
+            "本工具只解析文件头，调用开销很小；格式不支持或文件损坏时返回 success=false 并说明原因，而不是给出不完整的信息。",
+        ),
+    ),
+    (
+        "audio_metadata",
+        concat!(
+            "Inspect the basic metadata of an audio file from its header: duration, format, sample rate, and channels where the container carries them. ",
+            "Pass audio_path_or_url — a path inside the workspace (WAV, FLAC, MP3, OGG). ",
+            "This tool cannot transcribe speech, identify songs, or answer questions about spoken content.\n",
+            "\n",
+            "Use it to check how long a recording is or whether it is usable before doing anything else; an unsupported or corrupt file returns success=false with the reason. ",
+            "Call it once per file — the header does not change between calls.",
+        ),
+        concat!(
+            "从文件头读取音频的基础元数据：时长、格式，以及容器中记录的采样率与声道数。",
+            "通过 audio_path_or_url 传入工作区内的音频路径（WAV、FLAC、MP3、OGG）。",
+            "本工具不能转写语音、不能识别歌曲，也不能回答关于语音内容的问题。\n",
+            "\n",
+            "可在做其他处理前先确认录音时长或文件是否可用；格式不支持或文件损坏时返回 success=false 并说明原因。",
+            "同一文件只需调用一次——文件头在多次调用之间不会变化。",
+        ),
+    ),
+    (
+        "cron",
+        concat!(
+            "Create, list, and cancel cron jobs for the current workspace. ",
+            "action selects the operation: create schedules a job from a cron expression, list shows the persisted jobs, and cancel removes one by id. ",
+            "The expression is 5-field cron — minute hour day-of-month month day-of-week — and supports *, */n steps, ranges, lists, and the @hourly/@daily/@weekly/@monthly shorthands; prefer listing jobs before creating one to avoid duplicates.\n",
+            "\n",
+            "For requests like \"in 2 minutes\", \"tomorrow at 9am\", or \"next Monday\", convert the time yourself from the current date/time in the system prompt instead of calling a shell tool for the arithmetic, and confirm the result in the user's own timezone wording.\n",
+            "\n",
+            "Jobs are persisted under the workspace and fired by the host, which polls the due jobs; creating one does not start a background daemon. ",
+            "Standard cron semantics apply: */X triggers when the field value is divisible by X, so */40 in the minute field fires at minute 0 and 40, not every 40 minutes — when an interval does not divide its field evenly, say so and let the user confirm before creating the job.",
+        ),
+        concat!(
+            "为当前工作区创建、列出和取消 cron 任务。",
+            "action 选择操作：create 按 cron 表达式创建任务，list 列出已持久化的任务，cancel 按 id 删除任务。",
+            "表达式为 5 段式 cron——分 时 日 月 周——支持 *、*/n 步进、区间、列表以及 @hourly/@daily/@weekly/@monthly 简写；创建前建议先 list，避免重复创建。\n",
+            "\n",
+            "处理“2分钟后”“明天上午9点”“下周一”这类时间时，优先根据系统提示中的当前日期与时间自行换算，不要为简单的时间推算先调用 shell 工具，并按用户原本的时区表述确认结果。\n",
+            "\n",
+            "任务保存在工作区中，由宿主机轮询到期任务后触发；创建任务不会启动后台守护进程。",
+            "遵循标准 cron 语义：*/X 表示“字段值能被 X 整除时触发”，因此分钟位 */40 实际在第 0 分和第 40 分触发，并非每 40 分钟——当间隔不能整除对应字段时，请说明该限制并让用户确认后再创建。",
+        ),
+    ),
+    (
+        "list_mcp_resources",
+        concat!(
+            "List the resources exposed by the configured MCP servers, with each resource's URI, name, MIME type, and description.\n",
+            "\n",
+            "Use it to discover what reference material a server publishes before reading anything; resources are addressed by the URI returned here. ",
+            "The list is the source of truth for what is currently available — do not reuse a URI remembered from an earlier turn.",
+        ),
+        concat!(
+            "列出已配置 MCP 服务器提供的资源，包含每个资源的 URI、名称、MIME 类型与描述。\n",
+            "\n",
+            "可在读取任何内容之前先用它了解服务器对外发布了哪些参考资料；资源通过这里返回的 URI 定位。",
+            "该列表是判断当前可用资源的唯一依据——不要复用历史轮次中记住的 URI。",
+        ),
+    ),
+    (
+        "read_mcp_resource",
+        concat!(
+            "Read the content of a specific resource from a configured MCP server. ",
+            "Pass uri exactly as list_mcp_resources returned it; the payload carries the resource content together with its MIME type.\n",
+            "\n",
+            "Call list_mcp_resources first when you do not know the URI, and read only the resources you need — a large resource consumes context.",
+        ),
+        concat!(
+            "读取已配置 MCP 服务器上某个资源的内容。",
+            "uri 必须与 list_mcp_resources 返回的值完全一致；返回内容同时携带该资源的 MIME 类型。\n",
+            "\n",
+            "不知道 URI 时先调用 list_mcp_resources；只读取真正需要的资源——大资源会占用上下文。",
+        ),
+    ),
+    (
+        "tool_search",
+        concat!(
+            "Search registered and available deferred tools based on the user's intent. ",
+            "Call this tool when no direct tool clearly supports the required capability or when you are unsure which tool to use. ",
+            "Search using the user's intent and required capability; do not guess tool names. ",
+            "The search uses BM25 to match tool names, descriptions, and parameter information. ",
+            "The results contain each matched tool's name, description, and complete parameters schema.\n",
+            "\n",
+            "Search-result tools are not added to the top-level tools list; execute a result on the next turn by calling the exact returned name with schema-compatible arguments. ",
+            "Only currently registered and available deferred tools are returned: the current registry is the only source of truth, so historical messages, successful results, or names in another tool/subagent description cannot restore a removed or changed tool. ",
+            "A previous search result may be reused while its tool is unchanged; if its description or schema changed, search again.\n",
+            "\n",
+            "Do not repeat the same or a similar search for the same user intent; if the results are not suitable, do not guess a tool name.",
+        ),
+        concat!(
+            "根据用户意图搜索已注册且可用的 deferred 工具。",
+            "当 direct 工具不能明确支持用户所需能力，或者你不确定应该使用哪个工具时，调用本工具。",
+            "请使用用户意图和所需能力描述进行搜索，不要猜测工具名称。",
+            "搜索使用 BM25 匹配工具名称、描述和参数信息。",
+            "返回结果包含匹配工具的名称、描述和完整 parameters schema。\n",
+            "\n",
+            "搜索结果不会加入顶层 tools；要执行搜索结果，必须下一轮使用返回的准确工具名称与符合 schema 的参数调用。",
+            "只返回当前仍注册且可用的 deferred 工具：当前注册表是判断当前能力的唯一依据，历史消息、历史成功结果，或其它工具/子代理描述中的名称不能恢复当前已删除或已修改的工具。",
+            "工具未变化时，可以继续复用之前的搜索结果；如果工具描述或 schema 发生变化，应重新搜索。\n",
+            "\n",
+            "对于同一用户意图，不要重复调用相同或相近的搜索；如果返回结果不适用，不要猜测工具名称。",
+        ),
+    ),
+    (
+        "get_current_goal",
+        "Query the current session's persistent goal. Call this when you are unsure what the goal is, or when the user refers to \"the goal / continue the goal / that task\". Returns objective, status, attempt_count, and the last assessment.",
+        "查询当前会话的持续目标（goal）。当你不确定当前 goal 任务是什么、或用户提到「目标 / 继续目标 / 那个任务」时调用。返回 objective、status、attempt_count 与上一次评估（last_assessment）。",
+    ),
+    (
+        "submit_goal_report",
+        concat!(
+            "Only call this tool when the current user message contains a <goal_task> tag (i.e. this is a Goal execution round); never call it on a normal turn without <goal_task>. ",
+            "Submit a structured result for the current goal attempt. ",
+            "This is the final tool action for the current goal attempt; after the tool call succeeds, do not call any other tools. ",
+            "Use continue when progress has been made but the objective can still be advanced; ",
+            "use complete only with auditable completion evidence; ",
+            "use blocked only when user input, permissions, dependencies, external services, or environment state prevent any meaningful progress.",
+        ),
+        concat!(
+            "仅当本次用户消息中包含 <goal_task> 标签（即处于 Goal 执行轮）时才调用本工具；",
+            "普通对话轮（无 <goal_task>）绝不要调用本工具。",
+            "本工具用于提交当前 goal 尝试的结构化结果。",
+            "这是本次 goal 尝试的最终工具动作；工具调用成功后不要再调用其他工具，",
+            "已有进展但目标仍可继续推进时使用 continue；",
+            "只有具备可审计完成证据时才使用 complete；",
+            "只有缺少用户输入、权限、依赖、外部服务或环境状态且无法继续任何有意义推进时才使用 blocked。",
+        ),
+    ),
+    (
+        "lsp",
+        "LSP (Language Server Protocol) code navigation: hover, definition, references, completion, document symbols and workspace symbols. Positions are one-based line and column. Returns short, typed text results.",
+        "LSP（语言服务器协议）代码导航工具：hover、definition、references、completion、symbols（文档符号）和 workspace_symbols。行号和列号从 1 开始，返回简短的结构化文本结果。",
+    ),
+    (
+        "worktree",
+        "Create and manage git worktrees for this repository. Worktrees live under `.worktrees/<name>` inside the project; never use `..` or paths outside it. Actions: `create` (name, optional branch/base), `list`, `remove` (name, optional force), `lock` (name, optional reason), `unlock` (name), `prune`, `status` (name).",
+        "在当前仓库中创建和管理 git worktree。worktree 位于项目内的 `.worktrees/<name>`，禁止使用 `..` 或项目之外的路径。操作：`create`（name，可选 branch/base）、`list`、`remove`（name，可选 force）、`lock`（name，可选 reason）、`unlock`（name）、`prune`、`status`（name）。",
+    ),
 ];
 
 /// Returns the description of `name` in `language`, or `""` for an unknown tool name.
@@ -451,8 +656,8 @@ pub fn description(name: &str, language: &str) -> &'static str {
 mod tests {
     use super::{description, DESCRIPTIONS, SUPPORTED_LANGUAGES};
 
-    /// The twenty model-facing tool names, in registry order.
-    const TOOL_NAMES: [&str; 20] = [
+    /// The thirty-two model-facing tool names: the core registry order, then the extended set.
+    const TOOL_NAMES: [&str; 32] = [
         "bash",
         "read_file",
         "write_file",
@@ -473,6 +678,18 @@ mod tests {
         "coding_memory_read",
         "coding_memory_write",
         "coding_memory_edit",
+        "fetch_webpage",
+        "web_search",
+        "image_metadata",
+        "audio_metadata",
+        "cron",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "tool_search",
+        "get_current_goal",
+        "submit_goal_report",
+        "lsp",
+        "worktree",
     ];
 
     #[test]
@@ -523,9 +740,21 @@ mod tests {
     }
 
     #[test]
-    fn table_holds_exactly_the_twenty_tools_in_registry_order() {
+    fn table_holds_exactly_the_extended_tools_in_registry_order() {
         let names: Vec<&str> = DESCRIPTIONS.iter().map(|(name, ..)| *name).collect();
         assert_eq!(names, TOOL_NAMES);
+    }
+
+    #[test]
+    fn tool_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for name in TOOL_NAMES {
+            assert!(
+                seen.insert(name),
+                "duplicate tool name in the table: {name}"
+            );
+        }
+        assert_eq!(seen.len(), TOOL_NAMES.len());
     }
 
     #[test]
@@ -558,6 +787,50 @@ mod tests {
         assert!(description("todo_modify", "en")
             .trim_start()
             .starts_with("Modify todo items for the current session, including:"));
+        assert!(
+            description("fetch_webpage", "en").starts_with("Fetch webpage text content from a URL")
+        );
+        assert!(description("fetch_webpage", "cn").starts_with("按需要读取原始来源"));
+        assert!(description("web_search", "en").starts_with("Search the web and return"));
+        assert!(description("web_search", "cn").starts_with("联网搜索，返回"));
+        assert!(
+            description("image_metadata", "en").starts_with("Read the basic metadata of an image")
+        );
+        assert!(description("image_metadata", "cn").starts_with("在不把图片交给模型的前提下"));
+        assert!(description("audio_metadata", "en")
+            .starts_with("Inspect the basic metadata of an audio file"));
+        assert!(description("audio_metadata", "cn").starts_with("从文件头读取音频的基础元数据"));
+        assert!(description("cron", "en").starts_with("Create, list, and cancel cron jobs"));
+        assert!(description("cron", "cn").starts_with("为当前工作区创建、列出和取消 cron 任务"));
+        assert!(description("list_mcp_resources", "en").starts_with("List the resources exposed"));
+        assert!(
+            description("list_mcp_resources", "cn").starts_with("列出已配置 MCP 服务器提供的资源")
+        );
+        assert!(description("read_mcp_resource", "en")
+            .starts_with("Read the content of a specific resource"));
+        assert!(description("read_mcp_resource", "cn")
+            .starts_with("读取已配置 MCP 服务器上某个资源的内容"));
+        assert!(description("tool_search", "en")
+            .starts_with("Search registered and available deferred tools"));
+        assert!(description("tool_search", "cn")
+            .starts_with("根据用户意图搜索已注册且可用的 deferred 工具"));
+        assert!(description("get_current_goal", "en")
+            .starts_with("Query the current session's persistent goal"));
+        assert!(description("get_current_goal", "cn").starts_with("查询当前会话的持续目标"));
+        assert!(description("submit_goal_report", "en")
+            .trim_start()
+            .starts_with(
+                "Only call this tool when the current user message contains a <goal_task> tag"
+            ));
+        assert!(description("submit_goal_report", "cn")
+            .trim_start()
+            .starts_with("仅当本次用户消息中包含 <goal_task> 标签"));
+        assert!(
+            description("lsp", "en").starts_with("LSP (Language Server Protocol) code navigation")
+        );
+        assert!(description("lsp", "cn").starts_with("LSP（语言服务器协议）代码导航工具"));
+        assert!(description("worktree", "en").starts_with("Create and manage git worktrees"));
+        assert!(description("worktree", "cn").starts_with("在当前仓库中创建和管理 git worktree"));
     }
 
     #[test]
