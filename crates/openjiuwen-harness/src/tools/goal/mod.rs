@@ -13,6 +13,23 @@
 //! - [`GetCurrentGoalTool`] and [`SubmitGoalReportTool`] — `new(store, language)` (plus
 //!   `unavailable(language)` when no store is wired) and `card_for(language)`; model-facing
 //!   names `get_current_goal` and `submit_goal_report`.
+//! - [`GoalRail`] and [`GoalRailConfig`] — the loop-side counterpart: before every outer task
+//!   iteration it publishes the goal reminder prompt section while the goal is active, nudges
+//!   the model to verify progress every `heartbeat_interval` iterations, and appends a
+//!   `goal.updated` event under [`GOAL_EVENT_EXTRA_KEY`] once the goal settles.
+//!
+//! # Goal rail
+//!
+//! The rail is built with `GoalRail::new(Arc<GoalStore>, GoalRailConfig)` and registered by the
+//! host on its `HarnessRailRegistry`. It publishes the prompt section named `goal` (title
+//! `Current Goal`) and queues its interaction events in `ctx.extra` under
+//! [`GOAL_EVENT_EXTRA_KEY`] (`harness.goal_events`), because rails have no direct event sink;
+//! the agent or task loop drains that JSON array and forwards each entry to the interaction
+//! stream. A corrupt goal file is logged and skipped, never fatal.
+//!
+//! A `crate::rails::goal` re-export is pending, so `crate::tools::goal::GoalRail` is the
+//! canonical path today. This module is the one place in `crate::tools` that touches
+//! `crate::rails`; the rail moves beside the other built-in rails once that node owns it.
 //!
 //! # Deviation from Python
 //!
@@ -28,6 +45,7 @@
 //! Two smaller differences: the persisted record is one `goal.json` instead of session state
 //! (see [`GoalStore::for_workspace`]), and an unknown persisted status degrades to `active`
 //! instead of clearing the goal (see [`GoalRecord::from_dict`]).
+mod rail;
 mod record;
 mod schema;
 mod store;
@@ -35,6 +53,7 @@ mod store;
 mod tests;
 mod tools;
 
+pub use rail::{GoalRail, GoalRailConfig, GOAL_EVENT_EXTRA_KEY};
 pub use record::GoalRecord;
 pub use schema::{
     now_iso, parse_timestamp, GoalAssessment, GoalAssessmentStatus, GoalStatus, TokenUsage,
