@@ -172,6 +172,7 @@ Operations (all `10 s` bounded, stderr captured, `GIT_TERMINAL_PROMPT=0`, empty 
 
 ## Locking
 `<common-dir>/openjiuwen-worktree.lock` (Python `<repo_root>/.git/openjiuwen-worktree.lock`), held around every critical section of one repository (`create`, `remove`, `lock`, `unlock`) so two members cannot race on shared `.git` state.
+The file lives inside `.git`, where a leading dot would be meaningless, so the name has none; Python only uses `.openjiuwen-worktree.lock` beside a repository that has no `.git` directory, a case this port does not reach.
 - Exclusivity is `create_new` file creation, which the filesystem arbitrates atomically across tasks and processes; the file records `pid=<n>`.
 - A loser polls every `poll` (25 ms) until `wait` (10 s) expires, then fails with `Error::Timeout` — never lock-free.
 - A file older than `stale_after` (60 s) is treated as abandoned: it is removed with `warn!` and the acquisition retries; an unreadable modification time is left alone (fail closed).
