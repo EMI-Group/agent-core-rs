@@ -30,6 +30,7 @@ pub mod filter;
 pub mod html;
 pub mod pipeline;
 pub mod render;
+pub mod sha256;
 
 pub use archive::{detect, ArchiveEntry, ArchiveFormat, ArchiveUnpacker};
 pub use fetch::{FetchedResource, Fetcher, HttpFetcher, ScriptedFetcher};
@@ -39,3 +40,4 @@ pub use filter::{
 };
 pub use html::{resolve_url, Heading, HtmlDocument, Image, Link};
 pub use pipeline::{DownloadedResource, OmniConfig, OmniCreation, OmniOutcome, ScrapedPage};
+pub use sha256::{digest, hex_digest};
