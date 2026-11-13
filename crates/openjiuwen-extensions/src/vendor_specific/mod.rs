@@ -2,15 +2,21 @@
 //!
 //! Ports the Python `openjiuwen/extensions/vendor_specific/aliyun_reranker.py`
 //! shim (v0.1.20), whose entire content is `AliyunReranker = DashscopeReranker`
-//! plus an import-time deprecation warning. The reranking implementations
-//! themselves live in the kernel (`openjiuwen_core::retrieval::reranker`), so
-//! this module keeps only the backwards-compatible alias shape:
-//! [`AliyunReranker`] adapts an already-configured [`Reranker`] and forwards
-//! every call unchanged.
+//! plus an import-time deprecation warning, so [`AliyunReranker`] keeps two
+//! construction paths:
 //!
-//! The `DashScope` HTTP transport is deferred: [`AliyunReranker::from_config`]
-//! always answers [`ErrorKind::Unsupported`]. Wrap a configured kernel reranker
-//! with [`AliyunReranker::new`] instead.
+//! - [`AliyunReranker::from_config`] builds the live `DashScope` HTTP transport
+//!   (the behavior Python inherits from `DashscopeReranker`): a `POST` to
+//!   `{api_base}/services/rerank/text-rerank/text-rerank` carrying the model,
+//!   the query, the document texts, and `top_n`, authenticated with a bearer
+//!   token. See the `dashscope` module for the wire contract.
+//! - [`AliyunReranker::new`] adapts an already-configured kernel [`Reranker`]
+//!   (for example `openjiuwen_core::retrieval::ScoreReranker`) and forwards
+//!   every call unchanged.
+//!
+//! The credential comes from [`AliyunRerankerConfig::api_key`], falling back to
+//! the `DASHSCOPE_API_KEY` environment variable; a missing key is a validation
+//! error naming both sources.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -25,12 +31,29 @@
 //! # }
 //! ```
 //!
-//! [`ErrorKind::Unsupported`]: openjiuwen_common::error::ErrorKind::Unsupported
+//! ```
+//! use openjiuwen_common::security::SecretString;
+//! use openjiuwen_extensions::vendor_specific::{AliyunReranker, AliyunRerankerConfig};
+//!
+//! # async fn example() -> openjiuwen_common::error::Result<()> {
+//! // Building the transport makes no network call; only `rerank` does.
+//! let config = AliyunRerankerConfig {
+//!     api_key: Some(SecretString::new("sk-demo")),
+//!     ..AliyunRerankerConfig::default()
+//! };
+//! let reranker = AliyunReranker::from_config(config).await?;
+//! assert!(reranker.config().is_some());
+//! # Ok(())
+//! # }
+//! ```
+
+mod dashscope;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::{Error, Result};
+use dashscope::DashScopeReranker;
+use openjiuwen_common::error::Result;
 use openjiuwen_common::security::SecretString;
 use openjiuwen_core::retrieval::{Reranker, SearchResult};
 use serde::{Deserialize, Serialize};
@@ -39,9 +62,6 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_API_BASE: &str = "https://dashscope.aliyuncs.com";
 /// `DashScope` reranker model used when `model_name` is not configured.
 const DEFAULT_MODEL_NAME: &str = "qwen3-reranker-0.6b";
-/// Deferred-transport message, identical to the one documented in `CONTEXT.md`.
-const HTTP_TRANSPORT_DEFERRED: &str =
-    "AliyunReranker HTTP transport is deferred; wrap a configured reranker with AliyunReranker::new";
 
 /// Configuration of a `DashScope`-compatible reranker.
 ///
@@ -76,60 +96,78 @@ impl Default for AliyunRerankerConfig {
 /// reranker.
 ///
 /// Python aliases `AliyunReranker` directly to `DashscopeReranker` and logs a
-/// deprecation warning at import time. Rust cannot alias a concrete type whose
-/// transport is not ported, so this adapter wraps any injected [`Reranker`] and
-/// delegates to it without changing arguments, ordering, `top_n` semantics, or
-/// errors. Construction logs the deprecation warning once, matching Python's
-/// import-time warning without logging on every call.
+/// deprecation warning at import time. Rust keeps that shape with two
+/// constructors: [`AliyunReranker::from_config`] builds the live `DashScope`
+/// HTTP transport, while [`AliyunReranker::new`] wraps any injected [`Reranker`]
+/// and delegates to it without changing arguments, ordering, `top_n` semantics,
+/// or errors. Every constructor logs the deprecation warning once, matching
+/// Python's import-time warning without logging on every call.
 #[derive(Clone)]
 pub struct AliyunReranker {
     inner: Arc<dyn Reranker>,
     config: Option<AliyunRerankerConfig>,
 }
 
+/// Emits the deprecation warning Python logs at import time.
+fn warn_deprecated() {
+    tracing::warn!(
+        target: "openjiuwen_extensions::vendor_specific",
+        "AliyunReranker is deprecated, please use a configured DashScope-compatible \
+         reranker from openjiuwen_core::retrieval::reranker instead"
+    );
+}
+
 impl AliyunReranker {
-    /// Wraps an already-configured reranker (the seam hosts use today).
+    /// Wraps an already-configured reranker.
     ///
     /// Emits the deprecation warning Python logs at import time, targeted at
     /// `openjiuwen_extensions::vendor_specific`.
     #[must_use]
     pub fn new(inner: Arc<dyn Reranker>) -> Self {
-        tracing::warn!(
-            target: "openjiuwen_extensions::vendor_specific",
-            "AliyunReranker is deprecated, please use a configured DashScope-compatible \
-             reranker from openjiuwen_core::retrieval::reranker instead"
-        );
+        warn_deprecated();
         Self {
             inner,
             config: None,
         }
     }
 
-    /// Builds the `DashScope` HTTP reranker.
+    /// Builds the live `DashScope` HTTP reranker from `config`.
     ///
-    /// The HTTP transport is not ported: this constructor exists for Python API
-    /// parity and always fails. Wrap a configured kernel reranker with
-    /// [`AliyunReranker::new`] instead.
+    /// Construction validates the configuration and creates the pooled HTTP
+    /// client; no network call happens until [`Reranker::rerank`] is called.
+    /// The credential is read from [`AliyunRerankerConfig::api_key`], falling
+    /// back to the `DASHSCOPE_API_KEY` environment variable.
+    ///
+    /// The instance behaves like Python's `DashscopeReranker` (see the
+    /// `dashscope` module): empty `documents` short-circuit without a request,
+    /// the effective limit is the call's `top_n` then the configured
+    /// [`AliyunRerankerConfig::top_n`] then the document count, `Some(0)` and an
+    /// oversized limit both mean "no truncation", and the response is mapped
+    /// back onto the input results by index, sorted by descending score with
+    /// input order kept for ties.
     ///
     /// # Errors
     ///
-    /// Always returns [`openjiuwen_common::error::ErrorKind::Unsupported`] with
-    /// the deferred-transport message naming [`AliyunReranker::new`].
-    #[allow(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        clippy::needless_pass_by_value
-    )]
-    // `async` and the by-value config are fixed by the Python factory signature
-    // (`await AliyunReranker.from_config(config)`); a future transport will both
-    // await the connection and consume the configuration.
+    /// [`openjiuwen_common::error::ErrorKind::Validation`] when no credential is
+    /// configured or `api_base` is empty, unparseable, or not `http`/`https`;
+    /// [`openjiuwen_common::error::ErrorKind::Transport`] when the HTTP client
+    /// cannot be built.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    // Python's factory is `async` and the signature stays; building the transport
+    // needs no `.await` because the client pools connections lazily.
     pub async fn from_config(config: AliyunRerankerConfig) -> Result<Self> {
+        warn_deprecated();
+        let transport = DashScopeReranker::new(config.clone())?;
         tracing::debug!(
+            target: "openjiuwen_extensions::vendor_specific",
             model = %config.model_name,
-            api_base = %config.api_base,
-            "DashScope reranker construction requested while the HTTP transport is deferred"
+            endpoint = %transport.endpoint(),
+            "constructed the DashScope rerank HTTP transport"
         );
-        Err(Error::Unsupported(HTTP_TRANSPORT_DEFERRED.to_owned()))
+        Ok(Self {
+            inner: Arc::new(transport),
+            config: Some(config),
+        })
     }
 
     /// The configuration this reranker was built from, if any.
@@ -146,9 +184,11 @@ impl AliyunReranker {
 impl Reranker for AliyunReranker {
     /// Delegates to the wrapped reranker unchanged.
     ///
-    /// The returned order, the per-call [`top_n`](Reranker::rerank) semantics,
-    /// and every error come from the inner implementation, exactly like the
-    /// Python alias that inherits `DashscopeReranker`'s behavior.
+    /// An instance built by [`AliyunReranker::new`] returns the inner
+    /// implementation's order, [`top_n`](Reranker::rerank) semantics, and every
+    /// error, exactly like the Python alias that inherits `DashscopeReranker`'s
+    /// behavior. An instance built by [`AliyunReranker::from_config`] delegates
+    /// to the `DashScope` transport, whose documented semantics apply.
     async fn rerank(
         &self,
         query: &str,
@@ -165,8 +205,11 @@ mod tests {
     use std::sync::Mutex;
 
     use openjiuwen_common::constants::REDACTED;
-    use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_common::error::{Error, ErrorKind};
     use openjiuwen_core::retrieval::ScoreReranker;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
@@ -284,17 +327,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_defers_the_http_transport() {
-        let error = AliyunReranker::from_config(AliyunRerankerConfig::default())
+    async fn from_config_builds_a_live_http_transport() {
+        // ports `AliyunReranker = DashscopeReranker`, whose `rerank` posts to the
+        // service and maps `output.results` back onto the documents.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/rerank/text-rerank/text-rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output": { "results": [{ "index": 1, "relevance_score": 0.8 }] }
+            })))
+            .mount(&server)
+            .await;
+        let config = AliyunRerankerConfig {
+            api_key: Some(SecretString::new("sk-test-key")),
+            api_base: server.uri(),
+            ..AliyunRerankerConfig::default()
+        };
+
+        let reranker = AliyunReranker::from_config(config.clone())
+            .await
+            .expect("the transport builds");
+
+        assert_eq!(reranker.config(), Some(&config));
+        let results = reranker
+            .rerank("query", vec![hit("a", 0.0), hit("b", 0.0)], None)
+            .await
+            .expect("the rerank succeeds");
+        let ids: Vec<&str> = results.iter().map(|result| result.id.as_str()).collect();
+        assert_eq!(ids, ["b", "a"]);
+        // The request carried the configured model and the bearer token.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], DEFAULT_MODEL_NAME);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer sk-test-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_an_invalid_api_base() {
+        let config = AliyunRerankerConfig {
+            api_key: Some(SecretString::new("sk-test-key")),
+            api_base: String::new(),
+            ..AliyunRerankerConfig::default()
+        };
+        let error = AliyunReranker::from_config(config)
             .await
             .err()
-            .expect("the HTTP transport is deferred");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert_eq!(
-            error.message(),
-            "AliyunReranker HTTP transport is deferred; wrap a configured reranker with \
-             AliyunReranker::new"
-        );
+            .expect("an empty api_base is rejected");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert!(error.message().contains("api_base"), "{}", error);
     }
 
     #[test]

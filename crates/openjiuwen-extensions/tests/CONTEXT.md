@@ -16,6 +16,8 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 | `otel.rs` | `#![cfg(feature = "otel")]` | `CaptureExporter` span names/attributes/statuses through the session `Tracer`/`TraceSink` and `OtelAgentHandler` |
 | `a2a_client.rs` | `#![cfg(feature = "a2a")]` | `A2aClient` against a `wiremock` peer; folded `AgentResult` plus the received JSON-RPC envelope |
 | `a2a_server.rs` | `#![cfg(feature = "a2a")]` | `A2aServer::router()` driven by `Router::oneshot`; card route, send/get/cancel, SSE frame order |
+| `sandbox_providers.rs` | none | the three real remote sandbox providers (`aio` gateway envelope, `jiuwenbox` REST, `yuanrong` ADX) against loopback `wiremock` gateways: registration, wire payloads, auth injection, error mapping, streams |
+| `vendor_reranker.rs` | none | the live DashScope rerank transport behind `AliyunReranker::from_config`: request shape, score/order mapping, `top_n` precedence, error mapping, `new` delegation |
 
 ## Constraints and Test Idioms
 
@@ -26,7 +28,10 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 - Async style: plain `#[tokio::test]` (multi-thread-capable workspace tokio) and `#[test]` for pure functions; the crate takes no `test-util` feature, so `#[tokio::test(start_paused = true)]` and `tokio::time::pause` are unavailable.
 - Bounding is done through the API under test (e.g. `request_json("math", json!(21), Some(Duration::from_secs(5)))`) or short real `tokio::time::timeout` calls in the in-src unit tests — no test harness timeout.
 - `tempfile` is a dev-dependency of the crate but currently used only by in-src unit tests (`src/checkpointer/mod.rs` uses `tempfile::tempdir()`, `src/store/mod.rs` uses `tempfile::TempDir::new()`); no file-boundary test in this directory uses a temp dir yet.
-- HTTP peers: `wiremock::MockServer::start()` with `server.uri()` for the client side; `server.router().oneshot(...)` via `tower::ServiceExt` for the server side; `http_body_util::BodyExt::collect()` decodes bodies. No suite binds a real socket here.
+- HTTP peers: `wiremock::MockServer::start()` with `server.uri()` for the client side; `server.router().oneshot(...)` via `tower::ServiceExt` for the server side; `http_body_util::BodyExt::collect()` decodes bodies.
+- The sandbox and DashScope suites bind an ephemeral loopback socket (`MockServer::start()` on `127.0.0.1:0`); the A2A suites never bind one.
+- Provider suites never touch `sandbox::provider::global()`: each test builds a local `SandboxProviderRegistry` and gives every endpoint a unique `isolation_key` (or a pinned sandbox/environment id via `launcher_config.extra_params`), so the process-global container caches cannot leak between tests.
+- `sandbox_providers.rs` is intentionally one large file: it is a single test binary covering three providers × three operation families, and splitting it would need out-of-scope `tests/sandbox_providers/` module files.
 - OTel assertions always call `handle.force_flush()` before reading the in-memory `CaptureExporter`; the last re-recorded attribute value wins, hence the reversed `attribute()` helper.
 - Everything is offline and deterministic; no `live-tests` gated file exists in this directory.
 
@@ -34,4 +39,6 @@ Every behavior test names its Python counterpart in a comment above it (e.g. `//
 
 - No `sqlite`-gated test at the crate boundary: the SQLite checkpointer/store backends are exercised only by `src/checkpointer/mod.rs` and `src/store/mod.rs` unit tests.
 - No test pairs `A2aClient` with `A2aServer` over a real loopback socket here; the only real-socket path is `src/a2a/e2e_tests.rs`.
-- `context_evolver::MemoryVectorStore` and `sandbox` provider registration have no direct crate-boundary suite beyond `adapters.rs`.
+- `context_evolver::MemoryVectorStore` has no direct crate-boundary suite beyond `adapters.rs`.
+- The sandbox suites cover success and failure wire paths but never a live container, so container lifecycle against a real JiuwenBox/ADX deployment stays an operator-side check.
+- `JIUWENBOX_API_TOKEN` resolution is only covered in-src (mutating the process environment from a parallel test binary would be racy); the crate-boundary suite supplies the bearer through `auth_headers` instead.
