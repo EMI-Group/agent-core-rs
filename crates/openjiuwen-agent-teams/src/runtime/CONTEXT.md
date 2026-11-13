@@ -508,8 +508,8 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   fatal while `required: true` fails the start; `stop` and the manager's `stop_team` remove the file and
   later calls fail.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1296 lib
-tests plus 187 integration tests), `cargo test -p openjiuwen-agent-teams --no-default-features`,
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1322 lib
+tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
 --all-targets -- -D warnings` and `cargo doc -p openjiuwen-agent-teams --no-deps` all green offline.
 
