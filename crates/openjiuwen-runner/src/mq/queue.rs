@@ -11,7 +11,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use openjiuwen_common::error::Result;
+use async_trait::async_trait;
+use openjiuwen_common::error::{Error, Result};
 use serde_json::Value;
 
 use crate::config::{MessageQueueConfig, MessageQueueKind};
@@ -117,6 +118,151 @@ pub trait MessageQueue: Send + Sync {
     fn has_subscriber(&self, topic: &str) -> bool;
 }
 
+/// The typed refusal of a transport this build does not compile.
+///
+/// The wording names the configured transport (`pulsar` / `zeromq`) and points at
+/// the backend that does work (`in_memory`); [`super::DeferredMessageQueue`] and
+/// [`create_message_queue`] share it so a host sees one message for one cause.
+fn deferred_transport(kind: MessageQueueKind) -> Error {
+    unsupported(
+        &format!("{} message queue", kind.as_str()),
+        "use `in_memory`",
+    )
+}
+
+/// The typed stand-in for a queue transport this build does not compile.
+///
+/// [`crate::Runner::with_config`] cannot fail, yet a configuration may select a
+/// transport this build cannot build ([`MessageQueueKind::Pulsar`],
+/// [`MessageQueueKind::ZeroMq`]). Rather than silently serving an in-memory queue
+/// under another backend's name, the runner installs this placeholder: it carries
+/// the configured kind and answers
+/// [`openjiuwen_common::error::Error::Unsupported`] — naming the missing
+/// transport and pointing at `in_memory` — from **every** operation.
+///
+/// That matters for a host that never calls [`crate::Runner::start`] (pooled team
+/// runs deliberately do not): it still gets the typed failure from
+/// [`crate::Runner::message_queue`] instead of a working queue of the wrong kind.
+///
+/// [`MessageQueueKind::InMemory`] is never deferred by the runner
+/// ([`create_message_queue`] builds the real backend); constructing this
+/// placeholder for it is allowed and still refuses every operation.
+pub struct DeferredMessageQueue {
+    /// The configured transport this placeholder stands in for; reported by
+    /// [`kind`](Self::kind) and `Debug`, and named in every error.
+    kind: MessageQueueKind,
+}
+
+impl std::fmt::Debug for DeferredMessageQueue {
+    /// Prints the configured transport under its wire name (`pulsar` /
+    /// `zeromq`), the same word the errors use; the placeholder holds no other
+    /// state.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredMessageQueue")
+            .field("kind", &self.kind.as_str())
+            .finish()
+    }
+}
+
+impl DeferredMessageQueue {
+    /// Builds the placeholder for `kind`.
+    #[must_use]
+    pub fn new(kind: MessageQueueKind) -> Arc<Self> {
+        Arc::new(Self { kind })
+    }
+
+    /// The configured transport this queue stands in for.
+    ///
+    /// Never [`MessageQueueKind::InMemory`] when the runner built it; the error
+    /// every operation returns names the same transport.
+    #[must_use]
+    pub fn kind(&self) -> MessageQueueKind {
+        self.kind
+    }
+
+    /// The error every operation of this placeholder returns.
+    fn error(&self) -> Error {
+        deferred_transport(self.kind)
+    }
+}
+
+#[async_trait]
+impl MessageQueue for DeferredMessageQueue {
+    /// Always `Error::Unsupported`: the transport is not compiled into this
+    /// build.
+    async fn start(&self) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `Error::Unsupported`; there is nothing to stop.
+    async fn stop(&self) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `false`: a deferred queue never starts.
+    fn is_started(&self) -> bool {
+        false
+    }
+
+    /// Always `Error::Unsupported`.
+    async fn subscribe(&self, _topic: &str) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `Error::Unsupported`.
+    async fn unsubscribe(&self, _topic: &str) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `Error::Unsupported`.
+    async fn add_handler(&self, _topic: &str, _handler: Arc<dyn MessageHandler>) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `Error::Unsupported`.
+    async fn publish(&self, _topic: &str, _message: QueueMessage) -> Result<()> {
+        Err(self.error())
+    }
+
+    /// Always `Error::Unsupported`.
+    async fn request(
+        &self,
+        _topic: &str,
+        _message: QueueMessage,
+        _timeout: Option<Duration>,
+    ) -> Result<Value> {
+        Err(self.error())
+    }
+
+    /// Always empty: a deferred queue owns no topics.
+    fn topics(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Always `false`: a deferred queue has no handlers.
+    fn has_subscriber(&self, _topic: &str) -> bool {
+        false
+    }
+}
+
+/// Builds the backend `config` selects, **without failing**.
+///
+/// [`MessageQueueKind::InMemory`] yields an unstarted
+/// [`InMemoryMessageQueue`] (the caller starts it, as Python's `Runner` does);
+/// `pulsar` and `zeromq` yield the typed [`DeferredMessageQueue`] placeholder,
+/// whose every operation is `Error::Unsupported`.
+///
+/// This is the infallible counterpart of [`create_message_queue`], used by
+/// [`crate::Runner::with_config`] so the runner never reports an in-memory queue
+/// for a configuration that names another transport.
+#[must_use]
+pub fn build_message_queue(config: &MessageQueueConfig) -> Arc<dyn MessageQueue> {
+    match config.kind {
+        MessageQueueKind::InMemory => InMemoryMessageQueue::new(config.clone()),
+        kind => DeferredMessageQueue::new(kind),
+    }
+}
+
 /// Builds the queue backend `config` selects.
 ///
 /// [`MessageQueueKind::InMemory`] yields an unstarted
@@ -134,10 +280,9 @@ pub trait MessageQueue: Send + Sync {
 pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn MessageQueue>> {
     match config.kind {
         MessageQueueKind::InMemory => Ok(InMemoryMessageQueue::new(config.clone())),
-        kind => {
-            let feature = format!("{} message queue", kind.as_str());
-            Err(unsupported(&feature, "use `in_memory`"))
-        }
+        // A host asking for a broker gets the typed refusal, not the placeholder
+        // `Runner::with_config` falls back to (it cannot fail).
+        kind => Err(deferred_transport(kind)),
     }
 }
 
@@ -172,6 +317,69 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains(kind.as_str()), "names the backend: {text}");
             assert!(text.contains("in_memory"), "points at the port: {text}");
+        }
+    }
+
+    #[test]
+    fn build_message_queue_never_misrepresents_the_configured_kind() {
+        let in_memory = build_message_queue(&MessageQueueConfig::default());
+        assert!(!in_memory.is_started(), "the runner starts its queue");
+        assert!(in_memory.topics().is_empty());
+
+        for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+            let config = MessageQueueConfig {
+                kind,
+                ..MessageQueueConfig::default()
+            };
+            let queue = build_message_queue(&config);
+            assert!(!queue.is_started());
+            assert!(queue.topics().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_deferred_queue_refuses_every_operation() {
+        for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+            let queue = DeferredMessageQueue::new(kind);
+            assert_eq!(queue.kind(), kind);
+            assert!(!queue.is_started());
+            assert!(queue.topics().is_empty());
+            assert!(!queue.has_subscriber("inbox"));
+            assert!(
+                format!("{queue:?}").contains(kind.as_str()),
+                "debug names it"
+            );
+
+            // Every fallible operation is the same typed refusal.
+            let failures = [
+                queue.start().await,
+                queue.stop().await,
+                queue.subscribe("inbox").await,
+                queue.add_handler("inbox", Arc::new(NoopHandler)).await,
+                queue.publish("inbox", QueueMessage::new(Value::Null)).await,
+                queue
+                    .request("inbox", QueueMessage::new(Value::Null), None)
+                    .await
+                    .map(|_| ()),
+                queue.unsubscribe("inbox").await,
+            ];
+            for result in failures {
+                let error = result.expect_err("deferred transport");
+                assert_eq!(error.kind(), ErrorKind::Unsupported);
+                let text = error.to_string();
+                assert!(text.contains(kind.as_str()), "names the backend: {text}");
+                assert!(text.contains("in_memory"), "points at the port: {text}");
+            }
+        }
+    }
+
+    /// A handler that is never reached by a deferred queue.
+    struct NoopHandler;
+
+    #[async_trait]
+    impl MessageHandler for NoopHandler {
+        async fn handle(&self, _message: QueueMessage) -> Result<Value> {
+            Ok(Value::Null)
         }
     }
 }

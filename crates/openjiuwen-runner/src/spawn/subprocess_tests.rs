@@ -91,6 +91,29 @@ fn timeout_seconds_are_clamped() {
 }
 
 #[test]
+fn the_shutdown_deadline_is_a_clamped_accessor_not_dead_config() {
+    assert_eq!(
+        SubprocessConfig::default().shutdown_timeout(),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        SubprocessConfig::new("agent")
+            .with_shutdown_timeout(Duration::from_millis(250))
+            .shutdown_timeout(),
+        Duration::from_millis(250),
+        "the builder reaches the accessor the supervisor reads"
+    );
+    let mut config = SubprocessConfig::new("agent");
+    config.shutdown_timeout_secs = -1.0;
+    assert_eq!(config.shutdown_timeout(), Duration::ZERO);
+    config.shutdown_timeout_secs = MAX_TIMEOUT_SECS * 4.0;
+    assert_eq!(
+        config.shutdown_timeout(),
+        Duration::from_secs_f64(MAX_TIMEOUT_SECS)
+    );
+}
+
+#[test]
 fn merged_env_lets_the_spec_win() {
     let config = SubprocessConfig::new("agent")
         .with_env("SHARED", "config")
@@ -240,6 +263,11 @@ fn child_config() -> SubprocessConfig {
         .with_request_timeout(BOUND)
 }
 
+/// [`child_config`] whose child runs in `mode` (`FAKE_CHILD_MODE`).
+fn child_config_in(mode: &str) -> SubprocessConfig {
+    child_config().with_env("FAKE_CHILD_MODE", mode)
+}
+
 /// Writes one protocol frame as a line and flushes it.
 fn emit(out: &mut impl std::io::Write, kind: SpawnMessageKind, payload: Value) {
     let frame = SpawnMessage::new(kind, payload);
@@ -253,10 +281,14 @@ fn emit(out: &mut impl std::io::Write, kind: SpawnMessageKind, payload: Value) {
 ///
 /// It answers an invocation with an `output` frame, a `health_check` with a
 /// healthy `health_check_response`, and a `shutdown` with `shutdown_ack`.
+/// `FAKE_CHILD_MODE=silent_input` ignores invocations (so a caller deadline must
+/// expire) and `FAKE_CHILD_MODE=silent_shutdown` ignores a shutdown and never
+/// exits (so the parent must enforce its deadline and kill it).
 #[test]
 #[ignore = "re-executed as the hermetic protocol child by the backend tests"]
 fn fake_child() {
     use std::io::{BufRead, Write as _};
+    let mode = std::env::var("FAKE_CHILD_MODE").unwrap_or_default();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     // libtest prints `running 1 test` and then `test ... ` without a trailing
@@ -272,8 +304,10 @@ fn fake_child() {
         };
         match frame.kind {
             SpawnMessageKind::Input => {
-                if frame.payload.get("spawn_spec").is_some() {
-                    continue; // the bootstrap frame carries no work
+                // The bootstrap frame carries no work, and `silent_input` never
+                // answers anything.
+                if frame.payload.get("spawn_spec").is_some() || mode == "silent_input" {
+                    continue;
                 }
                 emit(
                     &mut out,
@@ -287,6 +321,12 @@ fn fake_child() {
                 json!({"healthy": true}),
             ),
             SpawnMessageKind::Shutdown => {
+                if mode == "silent_shutdown" {
+                    // Never acknowledge and never exit: only a kill ends this.
+                    loop {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
                 emit(&mut out, SpawnMessageKind::ShutdownAck, Value::Null);
                 break;
             }
@@ -385,5 +425,108 @@ async fn a_spawned_child_reports_its_backend_and_health_through_the_seam() {
             .await
             .expect("shutdown must not hang")
             .expect("the fake child acknowledges the shutdown")
+    );
+}
+
+#[tokio::test]
+async fn a_caller_request_deadline_bounds_one_exchange_and_none_uses_the_configuration() {
+    // `None` keeps the configured `request_timeout_secs`, so a cooperative child
+    // answers exactly as it does for `send`.
+    let echo: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(child_config()).spawn(SpawnSpec::class_agent("tests.spawn", "Fake")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+    let output = tokio::time::timeout(
+        BOUND,
+        echo.send_with_timeout(json!({"query": "ping"}), None),
+    )
+    .await
+    .expect("send must not hang")
+    .expect("the fake child answers within the configured deadline");
+    assert_eq!(output.output, "pong");
+    tokio::time::timeout(BOUND, echo.shutdown(Duration::from_secs(5)))
+        .await
+        .expect("shutdown must not hang")
+        .expect("the fake child acknowledges the shutdown");
+
+    // A silent child: the caller deadline (50 ms) expires even though the
+    // configured one is 10 s, and the abandoned exchange desynchronizes the
+    // handle.
+    let silent: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(child_config_in("silent_input"))
+            .spawn(SpawnSpec::class_agent("tests.spawn", "Fake")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+    let error = tokio::time::timeout(
+        BOUND,
+        silent.send_with_timeout(json!({"query": "ping"}), Some(Duration::from_millis(50))),
+    )
+    .await
+    .expect("the caller deadline bounds the exchange")
+    .expect_err("a silent child never replies");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(error.to_string().contains("subprocess request"), "{error}");
+
+    let desynchronized = silent
+        .send_with_timeout(json!({"query": "ping"}), None)
+        .await
+        .expect_err("the abandoned exchange desynchronized the handle");
+    assert_eq!(desynchronized.kind(), ErrorKind::Validation);
+    assert!(
+        tokio::time::timeout(BOUND, silent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("a desynchronized handle still shuts down")
+    );
+}
+
+#[tokio::test]
+async fn a_zero_shutdown_timeout_uses_the_configured_deadline_and_a_non_zero_one_wins() {
+    // A child that never acknowledges a shutdown is killed after the *configured*
+    // deadline when the caller passes `Duration::ZERO`.
+    let configured = Duration::from_millis(200);
+    let silent = SubprocessSpawner::new(
+        child_config_in("silent_shutdown").with_shutdown_timeout(configured),
+    )
+    .spawn_process(SpawnSpec::class_agent("tests.spawn", "Fake"))
+    .await
+    .expect("the fake child launches");
+    let started = std::time::Instant::now();
+    let graceful = tokio::time::timeout(BOUND, silent.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown must not hang")
+        .expect("killing a silent child is not an error");
+    let elapsed = started.elapsed();
+    assert!(
+        !graceful,
+        "a child that never acknowledges has to be killed"
+    );
+    assert!(
+        elapsed >= configured,
+        "the configured shutdown deadline ({configured:?}) was honoured: {elapsed:?}"
+    );
+
+    // A non-zero caller deadline wins over a long configured one.
+    let silent =
+        SubprocessSpawner::new(child_config_in("silent_shutdown").with_shutdown_timeout(BOUND))
+            .spawn_process(SpawnSpec::class_agent("tests.spawn", "Fake"))
+            .await
+            .expect("the fake child launches");
+    let started = std::time::Instant::now();
+    let graceful = tokio::time::timeout(BOUND, silent.shutdown(Duration::from_millis(100)))
+        .await
+        .expect("shutdown must not hang")
+        .expect("killing a silent child is not an error");
+    assert!(!graceful);
+    assert!(
+        started.elapsed() < BOUND,
+        "the caller deadline won over the configuration: {:?}",
+        started.elapsed()
     );
 }

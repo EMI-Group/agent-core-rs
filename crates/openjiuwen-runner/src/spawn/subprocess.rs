@@ -28,7 +28,12 @@
 //! **Timing** (`request_timeout_secs`, `shutdown_timeout_secs`,
 //! `health_check_*`) comes from [`SubprocessConfig`]; the matching [`SpawnSpec`]
 //! fields travel to the child in the bootstrap payload, where the child's own
-//! runtime may honour them.
+//! runtime may honour them. A caller can bound one exchange with
+//! [`SpawnedProcess::send_with_timeout`] /
+//! [`SpawnedProcess::stream_with_timeout`] (`None` keeps the configured request
+//! deadline), and [`SpawnedProcess::shutdown`] treats a zero caller timeout as
+//! "the configured `shutdown_timeout_secs`", so the configuration is never
+//! silently ignored.
 //!
 //! **No child outlives its handle.** Dropping the last reference kills and reaps
 //! the process, and the stderr drain and health tasks are aborted with it;
@@ -304,7 +309,23 @@ impl SpawnedProcess {
     /// [`openjiuwen_common::error::Error::Validation`] when the handle is out of
     /// sync or the child's output payload is malformed.
     pub async fn send(&self, inputs: Value) -> Result<AgentOutput> {
-        send_impl(&self.state, inputs).await
+        send_impl(&self.state, inputs, None).await
+    }
+
+    /// Sends one invocation bounded by `timeout`; `None` keeps the configured
+    /// `request_timeout_secs`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`SpawnedProcess::send`] — a caller deadline that expires is
+    /// [`openjiuwen_common::error::Error::Timeout`] and also marks the handle out
+    /// of sync.
+    pub async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        send_impl(&self.state, inputs, timeout).await
     }
 
     /// Sends one invocation and yields its [`AgentChunk`] frames.
@@ -315,10 +336,24 @@ impl SpawnedProcess {
     /// stream before a terminator abandons the exchange and marks the handle out
     /// of sync.
     pub fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
-        stream_impl(Arc::clone(&self.state), inputs)
+        stream_impl(Arc::clone(&self.state), inputs, None)
+    }
+
+    /// Streams one invocation bounded by `timeout`; `None` keeps the configured
+    /// `request_timeout_secs`.
+    pub fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        stream_impl(Arc::clone(&self.state), inputs, timeout)
     }
 
     /// Asks the child to exit and waits up to `timeout` for it.
+    ///
+    /// `timeout` of [`Duration::ZERO`] means "the configured
+    /// [`SubprocessConfig::with_shutdown_timeout`]"; a non-zero caller timeout
+    /// wins over the configuration.
     ///
     /// Returns `true` when it exited after the `shutdown`/`shutdown_ack`
     /// exchange (or was already gone) and `false` when it had to be killed.
@@ -403,11 +438,31 @@ impl SpawnedAgent for SpawnedProcess {
     }
 
     async fn send(&self, inputs: Value) -> Result<AgentOutput> {
-        send_impl(&self.state, inputs).await
+        send_impl(&self.state, inputs, None).await
+    }
+
+    /// Bounds this one exchange by `timeout`; `None` keeps the configured
+    /// `request_timeout_secs`. A timed-out exchange desynchronizes the handle.
+    async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        send_impl(&self.state, inputs, timeout).await
     }
 
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
-        stream_impl(Arc::clone(&self.state), inputs)
+        stream_impl(Arc::clone(&self.state), inputs, None)
+    }
+
+    /// Bounds this one stream by `timeout`; `None` keeps the configured
+    /// `request_timeout_secs`.
+    fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        stream_impl(Arc::clone(&self.state), inputs, timeout)
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<bool> {
@@ -464,6 +519,11 @@ impl ProcessState {
     /// The request deadline from the configuration.
     fn request_timeout(&self) -> Duration {
         self.config.request_timeout()
+    }
+
+    /// The graceful-shutdown deadline from the configuration.
+    fn shutdown_timeout(&self) -> Duration {
+        self.config.shutdown_timeout()
     }
 
     /// The health-probe deadline from the configuration.
@@ -583,9 +643,16 @@ enum StreamStep {
 }
 
 /// Sends one invocation and awaits its terminal output.
-async fn send_impl(state: &ProcessState, inputs: Value) -> Result<AgentOutput> {
+///
+/// `timeout` bounds this exchange; `None` falls back to the configured
+/// `request_timeout_secs`.
+async fn send_impl(
+    state: &ProcessState,
+    inputs: Value,
+    timeout: Option<Duration>,
+) -> Result<AgentOutput> {
     let mut guard = state.acquire().await?;
-    let timeout = state.request_timeout();
+    let timeout = timeout.unwrap_or_else(|| state.request_timeout());
     match tokio::time::timeout(timeout, send_exchange(state, inputs)).await {
         Ok(Ok(output)) => {
             guard.finish();
@@ -632,10 +699,17 @@ async fn send_exchange(state: &ProcessState, inputs: Value) -> Result<AgentOutpu
 }
 
 /// Streams one invocation's frames.
-fn stream_impl(state: Arc<ProcessState>, inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
+///
+/// `timeout` bounds this exchange; `None` falls back to the configured
+/// `request_timeout_secs`.
+fn stream_impl(
+    state: Arc<ProcessState>,
+    inputs: Value,
+    timeout: Option<Duration>,
+) -> BoxStream<'static, Result<AgentChunk>> {
     let stream: BoxStream<'static, Result<AgentChunk>> = Box::pin(async_stream::try_stream! {
         let mut guard = state.acquire().await?;
-        let timeout = state.request_timeout();
+        let timeout = timeout.unwrap_or_else(|| state.request_timeout());
         let deadline = Instant::now() + timeout;
         if let Err(error) = write_frame(&state, &invoke_frame(&inputs)).await {
             guard.finish();
@@ -739,7 +813,16 @@ async fn health_impl(state: &ProcessState) -> Result<bool> {
 }
 
 /// Shuts the child down gracefully, escalating to a kill.
+///
+/// A zero `timeout` means "the configured
+/// [`SubprocessConfig::with_shutdown_timeout`]"; a non-zero caller deadline wins
+/// over it.
 async fn shutdown_impl(state: &ProcessState, timeout: Duration) -> Result<bool> {
+    let timeout = if timeout.is_zero() {
+        state.shutdown_timeout()
+    } else {
+        timeout
+    };
     state.stop_health_task().await;
     if !is_alive_impl(state) {
         state.record_health(false);

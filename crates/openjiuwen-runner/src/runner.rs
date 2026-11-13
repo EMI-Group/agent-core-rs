@@ -35,7 +35,7 @@ use crate::config::RunnerConfig;
 use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
-use crate::mq::{self, InMemoryMessageQueue, MessageQueue};
+use crate::mq::{self, MessageQueue};
 use crate::pool::{ActiveTeamInfo, PoolKey, PoolRequest, PoolRun, TeamPool};
 use crate::resources::ResourceMgr;
 use crate::run::{
@@ -155,15 +155,24 @@ impl Runner {
     /// Builds an isolated runner from `config`.
     ///
     /// The queue is created from `config.message_queue` in the stopped state;
-    /// the checkpointer is not built until [`Runner::start`]. The monitor, the
+    /// a configuration naming a deferred transport (`pulsar` / `zeromq`) yields
+    /// the typed [`crate::mq::DeferredMessageQueue`] placeholder instead of an
+    /// in-memory queue, so [`Runner::message_queue`] never misreports the
+    /// backend (its operations are `Error::Unsupported`).
+    ///
+    /// The checkpointer is not built until [`Runner::start`]. The monitor, the
     /// human-in-the-loop hub, and the team pool are built here (from
     /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
     /// before [`Runner::start`]. No spawn registry is installed: the
     /// [`UnsupportedSpawner`] default routes every spawn until a host installs a
     /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
+    ///
+    /// `config.distributed_mode` is accepted and preserved, but a distributed
+    /// runner cannot start: [`Runner::start`] refuses it until a distributed
+    /// transport lands.
     #[must_use]
     pub fn with_config(config: RunnerConfig) -> Arc<Self> {
-        let queue: Arc<dyn MessageQueue> = InMemoryMessageQueue::new(config.message_queue.clone());
+        let queue: Arc<dyn MessageQueue> = mq::build_message_queue(&config.message_queue);
         let monitor = Arc::new(RunMonitor::new());
         // The hub mirrors its transitions into the same monitor the runs report
         // into, so a host renders one consistent view of both seams.
@@ -266,6 +275,12 @@ impl Runner {
     /// Before [`Runner::start`] this is the configured backend in the stopped
     /// state (operations fail with `Error::Config`); after `start` it is the
     /// started queue; after `stop` it is that queue in the stopped state.
+    ///
+    /// When the configuration names a deferred transport (`pulsar` / `zeromq`)
+    /// this is [`crate::mq::DeferredMessageQueue`] — a placeholder that reports
+    /// the configured kind and answers `Error::Unsupported` naming the missing
+    /// transport from every operation. The backend is **never** silently
+    /// downgraded to the in-memory queue.
     #[must_use]
     pub fn message_queue(&self) -> Arc<dyn MessageQueue> {
         Arc::clone(&self.queue.read())
@@ -335,10 +350,14 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns the backend's error when `create_message_queue` rejects the
-    /// configured kind (`Error::Unsupported` for the deferred broker backends)
-    /// or the checkpointer cannot be built (`Error::Validation` /
-    /// `Error::Unsupported`). The runner stays stopped on any error.
+    /// `Error::Unsupported` when the live configuration selects
+    /// `distributed_mode` — the distributed transports are deferred, so a
+    /// distributed runner refuses to start rather than running in-process under a
+    /// distributed name (see [`RunnerConfig::distributed_mode`]) — or when
+    /// `create_message_queue` rejects the configured kind (`Error::Unsupported`
+    /// for the deferred broker backends) or the checkpointer cannot be built
+    /// (`Error::Validation` / `Error::Unsupported`). The runner stays stopped on
+    /// any error.
     pub async fn start(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.is_started() {
@@ -346,7 +365,29 @@ impl Runner {
             return Ok(());
         }
         let config = self.config();
-        let queue = mq::create_message_queue(&config.message_queue).await?;
+        if config.distributed_mode {
+            tracing::warn!(
+                target: LOG_TARGET,
+                runner_id = %self.runner_id,
+                "refusing to start a distributed runner; the transports are deferred"
+            );
+            return Err(error::unsupported(
+                "distributed runner mode (`drunner`)",
+                "the distributed transports are deferred (Pulsar/ZeroMQ reply-topic \
+                 routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach); run \
+                 in-process or enable distributed execution once a transport lands",
+            ));
+        }
+        let queue = match mq::create_message_queue(&config.message_queue).await {
+            Ok(queue) => queue,
+            Err(error) => {
+                // A deferred transport is a hard error here, but the placeholder
+                // still replaces the slot so `message_queue()` keeps reporting
+                // the configured kind after a `set_config`.
+                *self.queue.write() = mq::build_message_queue(&config.message_queue);
+                return Err(error);
+            }
+        };
         queue.start().await?;
         let checkpointer = match config.checkpointer.as_ref() {
             Some(checkpointer_config) => {

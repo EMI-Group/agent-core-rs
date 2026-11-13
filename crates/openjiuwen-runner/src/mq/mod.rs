@@ -11,6 +11,10 @@
 //! [`create_message_queue`] builds [`InMemoryMessageQueue`] for
 //! [`MessageQueueKind::InMemory`] and answers `Error::Unsupported` for the
 //! deferred `pulsar` / `zeromq` backends that `openjiuwen-extensions` will own.
+//! [`build_message_queue`] is the infallible counterpart: a deferred transport
+//! yields [`DeferredMessageQueue`], a typed placeholder whose every operation is
+//! that same `Error::Unsupported`, so a runner can never serve an in-memory queue
+//! under another backend's name.
 //!
 //! # Example
 //!
@@ -47,4 +51,4 @@ pub mod queue;
 pub use crate::config::{MessageQueueConfig, MessageQueueKind};
 pub use memory::InMemoryMessageQueue;
 pub use message::{MessageHandler, QueueMessage, SUCCESS};
-pub use queue::{create_message_queue, MessageQueue};
+pub use queue::{build_message_queue, create_message_queue, DeferredMessageQueue, MessageQueue};

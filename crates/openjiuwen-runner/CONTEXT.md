@@ -85,7 +85,7 @@ Free combinator functions stay under `openjiuwen_runner::callback::{decorator, f
 Security binding: `bind_guardrails`, `GuardrailHandler`, `scan_stage_for`, `event_for_stage`.
 
 ### `src/mq/` — the message queue
-`QueueMessage`, `MessageHandler`, `MessageQueue` trait, `InMemoryMessageQueue`, `create_message_queue`, `MessageQueueKind`.
+`QueueMessage`, `MessageHandler`, `MessageQueue` trait, `InMemoryMessageQueue`, `DeferredMessageQueue`, `create_message_queue`, `build_message_queue`, `MessageQueueKind`.
 
 ### `src/run/` — execution APIs
 `RunOptions` (session, timeout, cancellation, envs, metadata, `team_session`), `AgentRef`, `WorkflowRef`, `TeamRef`, `RunServices` (registries, callbacks, config, checkpointer, guardrails, optional `monitor`/`hitl`), session resolution, per-run cancellation/timeout (`run_with_limits`, `next_stream_step`), teardown, and tracing spans.
@@ -195,6 +195,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - Callback events the runner itself fires: `AgentInvokeInput`/`AgentInvokeOutput`, `AgentStreamInput`/`AgentStreamOutput`, `WorkflowInvokeInput`/`WorkflowInvokeOutput`, `WorkflowError`, `WorkflowStreamInput`/`WorkflowStreamOutput`, and `AgentSessionCreated` when it creates a session. LLM/tool events are fired by whoever owns the model/tool call.
 - Never hold a `parking_lot` guard across `.await`; registries and callback registries guard only synchronous lookups.
 - A runner's `runner_id` is fixed at construction: `set_config` keeps the instance id (logging a mismatch) so `runner_id()` can return `&str`.
-- `message_queue()` always returns a queue: before `start` it is the configured backend in the stopped state (operations fail with `Error::Config`), not `None`.
+- `message_queue()` always returns a queue: before `start` it is the configured backend in the stopped state (operations fail with `Error::Config`), not `None`; a configuration naming a deferred transport (`pulsar` / `zeromq`) yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport.
+- `start()` refuses `distributed_mode` and deferred queue transports with `Error::Unsupported` and leaves the runner stopped.
 - `set_guardrails` unregisters the previous binding first, so calling it twice replaces rather than double-scans.
 - `RunBinding::run_id` and `RunStatusGuard` stay `pub(crate)` and carry `#[allow(dead_code)]` for that reason; do not widen them to silence lints.

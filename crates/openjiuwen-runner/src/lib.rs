@@ -118,7 +118,8 @@ pub use monitor::{
 };
 // --- message queue ---
 pub use mq::{
-    create_message_queue, InMemoryMessageQueue, MessageHandler, MessageQueue, QueueMessage, SUCCESS,
+    build_message_queue, create_message_queue, DeferredMessageQueue, InMemoryMessageQueue,
+    MessageHandler, MessageQueue, QueueMessage, SUCCESS,
 };
 // --- team runtime pool ---
 pub use pool::{

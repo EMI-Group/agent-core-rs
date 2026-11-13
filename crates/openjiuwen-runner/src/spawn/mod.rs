@@ -338,9 +338,10 @@ impl SpawnSpec {
 /// child down. Implementations own the process; nothing in this crate does.
 ///
 /// Only the transport methods are required. [`Self::backend`],
-/// [`Self::is_healthy`], [`Self::health_snapshot`], [`Self::health`] and
-/// [`Self::cancel_task`] carry defaults so a minimal handle — and every backend
-/// that predates them — stays object-safe and compiles unchanged.
+/// [`Self::is_healthy`], [`Self::health_snapshot`], [`Self::health`],
+/// [`Self::cancel_task`], [`Self::send_with_timeout`] and
+/// [`Self::stream_with_timeout`] carry defaults so a minimal handle — and every
+/// backend that predates them — stays object-safe and compiles unchanged.
 #[async_trait]
 pub trait SpawnedAgent: Send + Sync {
     /// The handle's stable id (not necessarily the OS process id).
@@ -358,6 +359,40 @@ pub trait SpawnedAgent: Send + Sync {
     async fn send(&self, inputs: Value) -> Result<AgentOutput>;
     /// Sends one invocation and yields [`AgentChunk`] frames as they arrive.
     fn stream(&self, inputs: Value) -> BoxStream<'static, Result<AgentChunk>>;
+    /// Sends one invocation, asking the backend to bound it by `timeout`.
+    ///
+    /// The deadline is a hint, not part of the wire: a backend that cannot bound
+    /// a single request ignores it and calls [`Self::send`], and `None` means
+    /// "the backend's own default". [`SpawnedProcess`] (the configured
+    /// `request_timeout_secs`) and [`RemoteAgent`] (the configured
+    /// `timeout_secs`) honour it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::send`] returns, plus
+    /// [`openjiuwen_common::error::Error::Timeout`] from a backend that honours
+    /// the deadline.
+    ///
+    /// [`SpawnedProcess`]: crate::spawn::SpawnedProcess
+    /// [`RemoteAgent`]: crate::spawn::RemoteAgent
+    async fn send_with_timeout(
+        &self,
+        inputs: Value,
+        _timeout: Option<Duration>,
+    ) -> Result<AgentOutput> {
+        self.send(inputs).await
+    }
+    /// Streams one invocation, asking the backend to bound it by `timeout`.
+    ///
+    /// The same advisory rule as [`Self::send_with_timeout`]: the default ignores
+    /// the hint and returns [`Self::stream`].
+    fn stream_with_timeout(
+        &self,
+        inputs: Value,
+        _timeout: Option<Duration>,
+    ) -> BoxStream<'static, Result<AgentChunk>> {
+        self.stream(inputs)
+    }
     /// Asks the child to exit gracefully.
     ///
     /// Returns `true` when it exited within `timeout` and `false` when it had to

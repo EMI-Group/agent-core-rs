@@ -13,9 +13,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_runner::mq::{
-    create_message_queue, InMemoryMessageQueue, MessageHandler, MessageQueue, MessageQueueConfig,
-    MessageQueueKind, QueueMessage,
+    build_message_queue, create_message_queue, DeferredMessageQueue, InMemoryMessageQueue,
+    MessageHandler, MessageQueue, MessageQueueConfig, MessageQueueKind, QueueMessage,
 };
+use openjiuwen_runner::{Runner, RunnerConfig};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
@@ -382,4 +383,127 @@ async fn create_message_queue_rejects_the_deferred_backends() {
         assert!(text.contains(kind.as_str()), "names the backend: {text}");
         assert!(text.contains("in_memory"), "points at the port: {text}");
     }
+}
+
+// ------------------------------------------- deferred transports (typed) --
+
+#[test]
+fn build_message_queue_never_reports_a_deferred_kind_as_in_memory() {
+    let in_memory = build_message_queue(&MessageQueueConfig::default());
+    assert!(!in_memory.is_started(), "the runner starts its queue");
+    assert!(in_memory.topics().is_empty());
+
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let config = MessageQueueConfig {
+            kind,
+            ..MessageQueueConfig::default()
+        };
+        let queue = build_message_queue(&config);
+        assert!(!queue.is_started());
+        assert!(queue.topics().is_empty());
+        assert!(!queue.has_subscriber("inbox"));
+    }
+}
+
+#[test]
+fn the_deferred_queue_reports_the_kind_it_stands_in_for() {
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let queue = DeferredMessageQueue::new(kind);
+        assert_eq!(queue.kind(), kind);
+        assert!(format!("{queue:?}").contains(kind.as_str()));
+    }
+}
+
+/// `Runner::with_config` is infallible, but a configuration naming a deferred
+/// transport must not be served by an in-memory queue behind the host's back.
+#[tokio::test]
+async fn a_runner_configured_for_a_deferred_transport_never_serves_in_memory() {
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let config = RunnerConfig::default().with_message_queue(MessageQueueConfig {
+            kind,
+            url: Some("pulsar://broker:6650".to_owned()),
+            ..MessageQueueConfig::default()
+        });
+        let runner = Runner::with_config(config);
+        let queue = runner.message_queue();
+        assert!(!queue.is_started());
+        assert!(queue.topics().is_empty());
+        assert!(!queue.has_subscriber("inbox"));
+
+        let failures = [
+            queue.start().await,
+            queue.stop().await,
+            queue.subscribe("inbox").await,
+            queue.add_handler("inbox", Arc::new(EchoHandler)).await,
+            queue.publish("inbox", QueueMessage::new(json!(1))).await,
+            queue
+                .request("inbox", QueueMessage::new(json!(1)), None)
+                .await
+                .map(|_| ()),
+            queue.unsubscribe("inbox").await,
+        ];
+        for failure in failures {
+            let error = failure.expect_err("deferred transport");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            let text = error.to_string();
+            assert!(text.contains(kind.as_str()), "names the transport: {text}");
+            assert!(text.contains("in_memory"), "points at the port: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_deferred_transport_makes_start_unsupported() {
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let runner = Runner::with_config(RunnerConfig::default().with_message_queue(
+            MessageQueueConfig {
+                kind,
+                ..MessageQueueConfig::default()
+            },
+        ));
+        let error = runner.start().await.expect_err("deferred transport");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let text = error.to_string();
+        assert!(text.contains(kind.as_str()), "names the transport: {text}");
+        assert!(text.contains("in_memory"), "points at the port: {text}");
+        assert!(!runner.is_started(), "the runner stays stopped");
+
+        // The slot still stands for the configured transport, not for a stopped
+        // in-memory queue (which would answer `Error::Config`).
+        let error = runner
+            .message_queue()
+            .publish("inbox", QueueMessage::new(json!(1)))
+            .await
+            .expect_err("deferred transport");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+}
+
+#[tokio::test]
+async fn a_default_runner_still_serves_the_in_memory_queue() {
+    let runner = Runner::new();
+    let queue = runner.message_queue();
+    queue.start().await.expect("start");
+
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    queue
+        .add_handler("events", Arc::new(RecordingHandler { seen: seen_tx }))
+        .await
+        .expect("publish handler");
+    queue
+        .publish("events", QueueMessage::new(json!({"event": "ping"})))
+        .await
+        .expect("publish");
+    assert_eq!(seen_rx.recv().await, Some(json!({"event": "ping"})));
+
+    queue
+        .add_handler("echo", Arc::new(EchoHandler))
+        .await
+        .expect("echo handler");
+    let reply = queue
+        .request("echo", QueueMessage::new(json!("ping")), None)
+        .await
+        .expect("request");
+    assert_eq!(reply, json!("ping"));
+    queue.stop().await.expect("stop");
 }
