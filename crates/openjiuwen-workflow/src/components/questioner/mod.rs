@@ -32,19 +32,23 @@
 //!   instead of Python's `repr`; strings, numbers, booleans and `null` render exactly
 //!   like `str()`.
 
-use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::{BaseMessage, Model, ModelRequestConfig};
+use openjiuwen_foundation::{Model, ModelRequestConfig};
 
 use crate::ability::ComponentAbility;
 use crate::component::{Component, ComponentCard};
 use crate::context::ComponentContext;
+
+mod config;
+mod prompts;
+
+pub use config::{FieldInfo, QuestionerConfig};
+use prompts::{extraction_messages, format_continue_ask, format_template};
 
 /// The session component-lane key holding the questioner state.
 const QUESTIONER_STATE_KEY: &str = "questioner_state";
@@ -127,263 +131,6 @@ pub fn execution_process_error(error_msg: impl fmt::Display) -> Error {
         COMPONENT_QUESTIONER_EXECUTION_PROCESS_ERROR,
         format!("component questioner_execution process error, reason: {error_msg}"),
     )
-}
-
-/// Chinese extraction system prompt (Python `QUESTIONER_SYSTEM_TEMPLATE_ZH`).
-const QUESTIONER_SYSTEM_TEMPLATE_ZH: &str = r"你是一个信息收集助手，你需要根据指定的参数收集用户的信息，然后提交到系统。
-请注意：不要使用任何工具、不用理会问题的具体含义，并保证你的输出仅有 JSON 格式的结果数据。
-请严格遵循如下规则：
-  1. 让我们一步一步思考。
-  2. 用户输入中没有提及的参数提取为 null，并直接向询问用户没有明确提供的参数。
-  3. 通过用户提供的对话历史以及当前输入中提取 {{required_name}}，不要追问任何其他信息。
-  4. 参数收集完成后，将收集到的信息通过 JSON 的方式展示给用户。
-
-## Specified Parameters
-{{required_params_list}}
-
-## Constraints
-{{extra_info}}
-
-## Examples
-{{example}}
-";
-
-/// Chinese extraction user prompt (Python `QUESTIONER_USER_TEMPLATE_ZH`).
-const QUESTIONER_USER_TEMPLATE_ZH: &str = r"对话历史
-{{dialogue_history}}
-
-请充分考虑以上对话历史及用户输入，正确提取最符合约束要求的 JSON 格式参数。
-";
-
-/// English extraction system prompt (Python `QUESTIONER_SYSTEM_TEMPLATE_EN`).
-const QUESTIONER_SYSTEM_TEMPLATE_EN: &str = r"You are an information collection assistant. You need to collect user information based on the specified parameters and submit it to the system.
-Please note: Do not use any tools, do not consider the specific meaning of the questions, and ensure your output contains only JSON-formatted result data.
-Strictly follow these rules:
-  1. Let's think step by step.
-  2. Parameters not mentioned in user input should be extracted as null, and directly ask the user for parameters not explicitly provided.
-  3. Extract {{required_name}} from the conversation history and current user input. Do not ask for any other information.
-  4. After parameter collection is complete, display the collected information in JSON format.
-
-## Specified Parameters
-{{required_params_list}}
-
-## Constraints
-{{extra_info}}
-
-## Examples
-{{example}}
-";
-
-/// English extraction user prompt (Python `QUESTIONER_USER_TEMPLATE_EN`).
-const QUESTIONER_USER_TEMPLATE_EN: &str = r"Conversation History
-{{dialogue_history}}
-
-Please fully consider the above conversation history and user input, and correctly extract the JSON-formatted parameters that best meet the constraints.
-";
-
-/// One field the component collects from the conversation.
-///
-/// The wire shape matches Python's `FieldInfo` pydantic model: `field_type` is
-/// serialized as `"type"`, `default_value` defaults to `""`, and `field_type` to
-/// `"string"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-pub struct FieldInfo {
-    /// The key the extracted value is stored under.
-    pub field_name: String,
-    /// Human-readable description used by the extraction prompt.
-    pub description: String,
-    /// The JSON type the value is converted to (`string`, `integer`, `number`, `boolean`).
-    #[serde(rename = "type")]
-    pub field_type: String,
-    /// Chinese name used by the continue-ask question; falls back to `description`.
-    pub cn_field_name: String,
-    /// Whether the round keeps asking until this field is extracted.
-    pub required: bool,
-    /// Value filled in when the model does not extract the field.
-    pub default_value: Value,
-}
-
-impl Default for FieldInfo {
-    fn default() -> Self {
-        Self {
-            field_name: String::new(),
-            description: String::new(),
-            field_type: "string".to_owned(),
-            cn_field_name: String::new(),
-            required: false,
-            default_value: Value::String(String::new()),
-        }
-    }
-}
-
-/// Configuration of a [`QuestionerComponent`].
-///
-/// Field names and defaults match Python's `QuestionerConfig` dataclass. The struct is
-/// [`Default`], `snake_case` on the wire, tolerant of unknown fields, and every setter
-/// consumes and returns `self`. The model is injected at runtime and is therefore not
-/// serialized.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-pub struct QuestionerConfig {
-    /// The model used for field extraction; `None` leaves only `question_content` mode.
-    #[serde(skip)]
-    pub model: Option<Arc<dyn Model>>,
-    /// Logical model id carried for configuration parity (Python's `Runner` lookup).
-    pub model_id: Option<String>,
-    /// The answer shape; only `"reply_directly"` is supported.
-    pub response_type: String,
-    /// Question template rendered from the node inputs (`{{name}}` placeholders).
-    pub question_content: String,
-    /// Whether key fields are extracted from the conversation with the model.
-    pub extract_fields_from_response: bool,
-    /// The fields the component collects.
-    pub field_names: Vec<FieldInfo>,
-    /// How many answers one round accepts before it fails.
-    pub max_response: u32,
-    /// Whether chat history is injected; deferred (see the module docs).
-    pub with_chat_history: bool,
-    /// How many history rounds Python would inject; deferred (see the module docs).
-    pub chat_history_max_rounds: u32,
-    /// Extra instructions rendered into the prompt's `## Constraints` section.
-    pub extra_prompt_for_fields_extraction: String,
-    /// Sample JSON rendered into the prompt's `## Examples` section.
-    pub example_content: String,
-    /// Prompt and question language: `"en"` selects English, anything else Chinese.
-    pub accept_language: String,
-}
-
-impl Default for QuestionerConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            model_id: None,
-            response_type: RESPONSE_TYPE_REPLY_DIRECTLY.to_owned(),
-            question_content: String::new(),
-            extract_fields_from_response: true,
-            field_names: Vec::new(),
-            max_response: 3,
-            with_chat_history: false,
-            chat_history_max_rounds: 5,
-            extra_prompt_for_fields_extraction: String::new(),
-            example_content: String::new(),
-            accept_language: "zh".to_owned(),
-        }
-    }
-}
-
-impl fmt::Debug for QuestionerConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QuestionerConfig")
-            .field("model", &self.model.as_deref().map(Model::model_name))
-            .field("model_id", &self.model_id)
-            .field("response_type", &self.response_type)
-            .field("question_content", &self.question_content)
-            .field(
-                "extract_fields_from_response",
-                &self.extract_fields_from_response,
-            )
-            .field("field_names", &self.field_names)
-            .field("max_response", &self.max_response)
-            .field("with_chat_history", &self.with_chat_history)
-            .field("chat_history_max_rounds", &self.chat_history_max_rounds)
-            .field(
-                "extra_prompt_for_fields_extraction",
-                &self.extra_prompt_for_fields_extraction,
-            )
-            .field("example_content", &self.example_content)
-            .field("accept_language", &self.accept_language)
-            .finish()
-    }
-}
-
-impl QuestionerConfig {
-    /// Sets the extraction model.
-    #[must_use]
-    pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
-        self.model = Some(model);
-        self
-    }
-
-    /// Sets the logical model id.
-    #[must_use]
-    pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
-        self.model_id = Some(model_id.into());
-        self
-    }
-
-    /// Sets the answer shape.
-    #[must_use]
-    pub fn with_response_type(mut self, response_type: impl Into<String>) -> Self {
-        self.response_type = response_type.into();
-        self
-    }
-
-    /// Sets the question template.
-    #[must_use]
-    pub fn with_question_content(mut self, question_content: impl Into<String>) -> Self {
-        self.question_content = question_content.into();
-        self
-    }
-
-    /// Enables (or disables) field extraction from the conversation.
-    #[must_use]
-    pub fn with_extract_fields_from_response(mut self, extract: bool) -> Self {
-        self.extract_fields_from_response = extract;
-        self
-    }
-
-    /// Replaces the collected fields.
-    #[must_use]
-    pub fn with_field_names(mut self, field_names: Vec<FieldInfo>) -> Self {
-        self.field_names = field_names;
-        self
-    }
-
-    /// Sets how many answers one round accepts.
-    #[must_use]
-    pub fn with_max_response(mut self, max_response: u32) -> Self {
-        self.max_response = max_response;
-        self
-    }
-
-    /// Enables (or disables) chat-history injection; deferred (see the module docs).
-    #[must_use]
-    pub fn with_chat_history(mut self, with_chat_history: bool) -> Self {
-        self.with_chat_history = with_chat_history;
-        self
-    }
-
-    /// Sets how many history rounds would be injected; deferred (see the module docs).
-    #[must_use]
-    pub fn with_chat_history_max_rounds(mut self, rounds: u32) -> Self {
-        self.chat_history_max_rounds = rounds;
-        self
-    }
-
-    /// Sets the extra extraction constraints.
-    #[must_use]
-    pub fn with_extra_prompt_for_fields_extraction(
-        mut self,
-        extra_prompt: impl Into<String>,
-    ) -> Self {
-        self.extra_prompt_for_fields_extraction = extra_prompt.into();
-        self
-    }
-
-    /// Sets the extraction example.
-    #[must_use]
-    pub fn with_example_content(mut self, example_content: impl Into<String>) -> Self {
-        self.example_content = example_content.into();
-        self
-    }
-
-    /// Sets the prompt and question language (`"en"` or `"zh"`).
-    #[must_use]
-    pub fn with_accept_language(mut self, accept_language: impl Into<String>) -> Self {
-        self.accept_language = accept_language.into();
-        self
-    }
 }
 
 /// The built-in `questioner` component.
@@ -569,7 +316,7 @@ impl QuestionerComponent {
             .model
             .as_ref()
             .ok_or_else(|| input_invalid("questioner field extraction requires a model"))?;
-        let messages = self.build_extraction_messages(query);
+        let messages = extraction_messages(&self.config, query);
         let response = model
             .invoke(&messages, &ModelRequestConfig::default())
             .await
@@ -581,56 +328,6 @@ impl QuestionerComponent {
             .map(|message| message.text().into_owned())
             .unwrap_or_default();
         self.parse_extraction(&text)
-    }
-
-    /// Builds the extraction conversation from the Python prompt templates.
-    fn build_extraction_messages(&self, query: &Value) -> Vec<BaseMessage> {
-        let english = self.config.accept_language == "en";
-        let mut params = Vec::new();
-        let mut required = Vec::new();
-        for field in &self.config.field_names {
-            params.push(format!("{}: {}", field.field_name, field.description));
-            if field.required {
-                required.push(if field.cn_field_name.is_empty() {
-                    field.description.clone()
-                } else {
-                    field.cn_field_name.clone()
-                });
-            }
-        }
-        let required_name = if english {
-            format!(
-                "{} ({} required field(s))",
-                required.join(", "),
-                required.len()
-            )
-        } else {
-            format!("{}{}个必要信息", required.join("、"), required.len())
-        };
-        let dialogue_history = if english {
-            format!("user: {}", python_str(query))
-        } else {
-            format!("user：{}", python_str(query))
-        };
-        let values = BTreeMap::from([
-            ("required_name".to_owned(), required_name),
-            ("required_params_list".to_owned(), params.join("\n")),
-            (
-                "extra_info".to_owned(),
-                self.config.extra_prompt_for_fields_extraction.clone(),
-            ),
-            ("example".to_owned(), self.config.example_content.clone()),
-            ("dialogue_history".to_owned(), dialogue_history),
-        ]);
-        let (system, user) = if english {
-            (QUESTIONER_SYSTEM_TEMPLATE_EN, QUESTIONER_USER_TEMPLATE_EN)
-        } else {
-            (QUESTIONER_SYSTEM_TEMPLATE_ZH, QUESTIONER_USER_TEMPLATE_ZH)
-        };
-        vec![
-            BaseMessage::system(render_prompt(system, &values)),
-            BaseMessage::user(render_prompt(user, &values)),
-        ]
     }
 
     /// Parses a model answer into the configured, type-converted fields.
@@ -907,65 +604,6 @@ fn user_fields(inputs: &Value) -> Map<String, Value> {
     let mut fields = inputs.as_object().cloned().unwrap_or_default();
     fields.remove("query");
     fields
-}
-
-/// Formats the batch question template (Python `QuestionerUtils.format_template`).
-///
-/// Every `{{key}}` becomes `str(value)`; an unresolved placeholder becomes `None`.
-fn format_template(template: &str, fields: &Map<String, Value>) -> String {
-    substitute(template, |key| {
-        Some(python_str(fields.get(key).unwrap_or(&Value::Null)))
-    })
-}
-
-/// Renders a named placeholder template, leaving unknown placeholders verbatim.
-fn render_prompt(template: &str, values: &BTreeMap<String, String>) -> String {
-    substitute(template, |key| values.get(key).cloned())
-}
-
-/// Replaces `{{key}}` placeholders with `lookup`'s answer.
-fn substitute(template: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        if let Some(value) = lookup(&after[..end]) {
-            out.push_str(&value);
-        } else {
-            out.push_str("{{");
-            out.push_str(&after[..end]);
-            out.push_str("}}");
-        }
-        rest = &after[end + 2..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The continue-ask question for the still-missing fields
-/// (Python `format_continue_ask_question`).
-fn format_continue_ask(fields: &[&FieldInfo], accept_language: &str) -> String {
-    let names: Vec<&str> = fields
-        .iter()
-        .map(|field| {
-            if field.cn_field_name.is_empty() {
-                field.description.as_str()
-            } else {
-                field.cn_field_name.as_str()
-            }
-        })
-        .collect();
-    let names = names.join(", ");
-    if accept_language == "en" {
-        format!("Please provide information related to: {names}")
-    } else {
-        format!("请您提供{names}相关的信息")
-    }
 }
 
 /// Renders one value like Python's `str()`.
