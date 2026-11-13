@@ -6,8 +6,10 @@
 //! 1. **Once per team** — [`team_checkpoint_store`] resolves the store the whole team shares and the
 //!    build path writes it into [`TeamBuildDeps::checkpoints`](super::deps::TeamBuildDeps::checkpoints)
 //!    before the spawner is built. The injected store always wins; an enabled policy with no
-//!    injection gets one process-wide in-memory store, and the file backend has no team-wide root
-//!    (each member's own directory is resolved at member-build time).
+//!    injection mints one fresh in-memory store per built team, shared by the leader and every
+//!    teammate, so a re-spawned member of the same team restores its checkpoint while a new team
+//!    build starts empty (injecting a store is the seam for a wider scope), and the file backend has
+//!    no team-wide root (each member's own directory is resolved at member-build time).
 //! 2. **Once per member** — [`member_checkpoint_store`] resolves that member's store: the shared one
 //!    when the build path supplied it, else its own file root (an explicit directory, or
 //!    `<workspace root>/`[`CHECKPOINT_DIR`]), and ultimately a private in-memory store for a member
