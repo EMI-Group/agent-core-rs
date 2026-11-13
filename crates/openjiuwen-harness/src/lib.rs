@@ -27,6 +27,7 @@
 
 pub mod agent;
 pub mod cli;
+pub mod lsp;
 pub mod manifest;
 pub mod observability;
 pub mod permission;
@@ -34,11 +35,13 @@ pub mod prompts;
 pub mod protocol;
 pub mod rails;
 pub mod schema;
+pub mod spec;
 pub mod skills;
 pub mod subagents;
 pub mod task_loop;
 pub mod tools;
 pub mod workspace;
+pub mod worktree;
 
 // --- agent -----------------------------------------------------------------
 pub use agent::{
