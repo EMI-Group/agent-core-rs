@@ -1,5 +1,9 @@
 //! The adapter from a member's harness protocol to the team's member-runtime seam.
 //!
+//! Length note: this file is deliberately long because it pairs the adapter with its unit tests
+//! (roughly half the lines are `#[cfg(test)]`); the runtime-side pieces it depends on live in
+//! `checkpoint`, `checkpoint_store` and `mapping`.
+//!
 //! Python parity source: `openjiuwen/agent_teams/harness/protocol_adapter.py` and
 //! `openjiuwen/agent_teams/harness/native_harness.py` (`send`/`abort`/`pause`/`resume` surface and
 //! the `on_state`/`on_round` subscription). Python adapts `NativeHarness` *down* to the
@@ -15,14 +19,26 @@
 //! runtime), when the cursor is exhausted, on a cursor error (logged), or when the harness reports
 //! [`HarnessState::Terminated`]. The cursor itself is the cycle-long single-consumer view, so a
 //! finished turn does not end the pump.
-use super::mapping::{chunk_from_event, round_from_event, state_from_event};
+//!
+//! ## Checkpointing
+//!
+//! A runtime built with a [`MemberCheckpointStore`] always hands its harness a
+//! [`MemberCheckpointSink`], and — when its [`MemberCheckpointPolicy`] is enabled — restores the
+//! record stored for its `(session_id, card_id)` identity and captures new ones at the configured
+//! boundaries (finished turns, state changes, stop). Capture failures are logged and never fail a
+//! command or end the pump: a checkpoint is a convenience, not a correctness requirement.
+use super::checkpoint::NativeCheckpoint;
+use super::checkpoint_store::{
+    MemberCheckpointPolicy, MemberCheckpointRecord, MemberCheckpointSink, MemberCheckpointStore,
+};
+use super::mapping::{chunk_from_event, is_terminal_event, round_from_event, state_from_event};
 use crate::member::{MemberObserver, MemberRuntime};
 use crate::schema::MemberMode;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_harness_protocol::{
-    AbortMode, DeliveryMode, HarnessContext, HarnessError, HarnessEvent, HarnessInput,
-    HarnessProtocol, HarnessState,
+    json_object_to_value, AbortMode, DeliveryMode, HarnessContext, HarnessError, HarnessEvent,
+    HarnessInput, HarnessProtocol, HarnessState,
 };
 use openjiuwen_session::Session;
 use parking_lot::{Mutex, RwLock};
@@ -52,6 +68,11 @@ pub struct MemberHarnessContext {
     pub language: String,
     /// Tool/prompt set the member runs with (build or plan).
     pub mode: MemberMode,
+    /// Identifier of the agent card the member was built from.
+    ///
+    /// Empty when the team build path supplies none. A changed card invalidates a restored
+    /// checkpoint, so this value is part of the member's checkpoint identity.
+    pub card_id: String,
 }
 impl MemberHarnessContext {
     /// Builds the context from the six runtime identity values.
@@ -71,7 +92,23 @@ impl MemberHarnessContext {
             workspace_root: workspace_root.into(),
             language: language.into(),
             mode,
+            card_id: String::new(),
         }
+    }
+    /// Pins the identifier of the agent card the member was built from.
+    #[must_use]
+    pub fn with_card_id(mut self, card_id: impl Into<String>) -> Self {
+        self.card_id = card_id.into();
+        self
+    }
+    /// Returns the documented per-member session id `"<host_session_id>:<member_name>"`.
+    ///
+    /// The team session id is shared by every member, so a member's own harness session id is
+    /// derived by appending the member name. The runtime wiring passes this derived id as
+    /// `MemberHarnessContext::session_id` and the team session as the harness `host_session_id`.
+    #[must_use]
+    pub fn member_session_id(host_session_id: &str, member_name: &str) -> String {
+        format!("{host_session_id}:{member_name}")
     }
 }
 /// Builds one member's harness from its cold spec and runtime context.
@@ -109,6 +146,16 @@ pub struct HarnessMemberRuntime {
     observers: Arc<RwLock<Vec<Arc<dyn MemberObserver>>>>,
     /// The single background pump, when a cycle is running.
     pump: Mutex<Option<PumpHandle>>,
+    /// Identifier of the agent card this member runs; part of its checkpoint identity.
+    card_id: String,
+    /// Destination of captured checkpoints; `None` disables all persistence.
+    checkpoint_store: Option<Arc<dyn MemberCheckpointStore>>,
+    /// Which boundaries capture a checkpoint and how a stored one is consumed.
+    checkpoint_policy: MemberCheckpointPolicy,
+    /// Working directory recorded in every payload and handed to the harness.
+    cwd: Option<String>,
+    /// Newest captured payload, shared with the pump's capture handle.
+    latest_checkpoint: Arc<Mutex<Option<NativeCheckpoint>>>,
 }
 impl HarnessMemberRuntime {
     /// Wraps `harness` as the member runtime of `session_id`.
@@ -119,12 +166,135 @@ impl HarnessMemberRuntime {
             session_id: session_id.into(),
             observers: Arc::new(RwLock::new(Vec::new())),
             pump: Mutex::new(None),
+            card_id: String::new(),
+            checkpoint_store: None,
+            checkpoint_policy: MemberCheckpointPolicy::default(),
+            cwd: None,
+            latest_checkpoint: Arc::new(Mutex::new(None)),
         }
+    }
+    /// Pins the identifier of the agent card this member runs.
+    #[must_use]
+    pub fn with_card_id(mut self, card_id: impl Into<String>) -> Self {
+        self.card_id = card_id.into();
+        self
+    }
+    /// Persists captured checkpoints into `store`.
+    #[must_use]
+    pub fn with_checkpoint_store(mut self, store: Arc<dyn MemberCheckpointStore>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+    /// Chooses which boundaries capture a checkpoint and how a stored one is consumed.
+    #[must_use]
+    pub fn with_checkpoint_policy(mut self, policy: MemberCheckpointPolicy) -> Self {
+        self.checkpoint_policy = policy;
+        self
+    }
+    /// Pins the working directory handed to the harness and recorded in every payload.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
     }
     /// Returns the protocol handle, for callers that need provider-specific controls.
     #[must_use]
     pub fn harness(&self) -> &Arc<dyn HarnessProtocol> {
         &self.harness
+    }
+    /// Returns the agent-card identity this member checkpoints under.
+    #[must_use]
+    pub fn card_id(&self) -> &str {
+        &self.card_id
+    }
+    /// Returns the checkpoint store, when one is configured.
+    #[must_use]
+    pub fn checkpoint_store(&self) -> Option<&Arc<dyn MemberCheckpointStore>> {
+        self.checkpoint_store.as_ref()
+    }
+    /// Returns the checkpoint policy (defaults to capture on turn and stop, resume if available).
+    #[must_use]
+    pub fn checkpoint_policy(&self) -> &MemberCheckpointPolicy {
+        &self.checkpoint_policy
+    }
+    /// Returns the pinned working directory, when one is set.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    /// Returns the newest checkpoint captured for this member, if any.
+    ///
+    /// The accessor is `async` on purpose: a provider that cannot expose its checkpoint in memory
+    /// would have to read it back from storage, so callers already `.await` this seam.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // the async shape is the seam
+    pub async fn latest_checkpoint(&self) -> Option<NativeCheckpoint> {
+        self.latest_checkpoint.lock().clone()
+    }
+    /// Captures one checkpoint now, forced, reporting export and save failures.
+    ///
+    /// Returns `Ok(None)` when no store is configured or the policy is not enabled: in that
+    /// configuration no checkpoint work happens at all, which is the default for a runtime built
+    /// without a store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's error when the export fails, and the store's error when the record
+    /// cannot be persisted.
+    pub async fn capture_checkpoint(&self) -> Result<Option<NativeCheckpoint>> {
+        match self.capture_handle() {
+            Some(capture) => capture.capture(None).await,
+            None => Ok(None),
+        }
+    }
+    /// Builds the owned capture handle, when checkpointing is configured and enabled.
+    fn capture_handle(&self) -> Option<CheckpointCapture> {
+        let store = self.checkpoint_store.as_ref()?;
+        if !self.checkpoint_policy.is_enabled() {
+            return None;
+        }
+        Some(CheckpointCapture {
+            harness: Arc::clone(&self.harness),
+            store: Arc::clone(store),
+            session_id: self.session_id.clone(),
+            card_id: self.card_id.clone(),
+            cwd: self.cwd.clone(),
+            latest: Arc::clone(&self.latest_checkpoint),
+        })
+    }
+    /// Merges the stored checkpoint into `context` when it is compatible with this member.
+    ///
+    /// Every failure is logged and leaves `context` cold: restoring is opportunistic, never a
+    /// precondition for starting.
+    async fn restore_into(&self, mut context: HarnessContext) -> HarnessContext {
+        let Some(store) = &self.checkpoint_store else {
+            return context;
+        };
+        match store.load(&self.session_id, &self.card_id).await {
+            Ok(Some(record)) => {
+                if let Err(error) = record
+                    .checkpoint
+                    .validate_compatible(&self.session_id, &self.card_id)
+                {
+                    warn!(
+                        error = %error,
+                        member = %self.session_id,
+                        "stored member checkpoint does not belong to this member; starting cold"
+                    );
+                    return context;
+                }
+                if let Some(envelope) = record.protocol {
+                    context = context.with_checkpoint(envelope);
+                }
+                *self.latest_checkpoint.lock() = Some(record.checkpoint);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                error = %error,
+                member = %self.session_id,
+                "stored member checkpoint cannot be read; starting cold"
+            ),
+        }
+        context
     }
     /// Publishes the harness's current state to every observer, in registration order.
     fn publish_state(&self) {
@@ -135,7 +305,16 @@ impl HarnessMemberRuntime {
         }
     }
     /// Opens the observation pump for the cycle `start` just opened.
-    fn start_pump(&self) {
+    ///
+    /// `capture` is `Some` only when checkpointing is configured and enabled; the two flags pick
+    /// which observation boundaries capture. Captures run after the observers were notified and
+    /// never fail the pump.
+    fn start_pump(
+        &self,
+        capture: Option<CheckpointCapture>,
+        capture_on_turn: bool,
+        capture_on_state: bool,
+    ) {
         let mut cursor = self.harness.events();
         let observers = Arc::clone(&self.observers);
         let harness = Arc::clone(&self.harness);
@@ -149,6 +328,13 @@ impl HarnessMemberRuntime {
                     next = cursor.next_event() => match next {
                         Ok(Some(event)) => {
                             dispatch_event(&observers, &event);
+                            if let Some(capture) = &capture {
+                                if capture_on_turn && is_terminal_event(&event) {
+                                    capture.capture_best_effort(event.turn_id.as_deref()).await;
+                                } else if capture_on_state && state_from_event(&event).is_some() {
+                                    capture.capture_best_effort(None).await;
+                                }
+                            }
                             if harness.state() == HarnessState::Terminated {
                                 break;
                             }
@@ -198,6 +384,16 @@ impl MemberRuntime for HarnessMemberRuntime {
     /// team's session. The member's system prompt and workspace are part of the constructed agent,
     /// not of the start context, so `system_prompt` is empty here.
     ///
+    /// Checkpoints: a pinned [`cwd`](Self::with_cwd) is forwarded, and when a
+    /// [`checkpoint_store`](Self::with_checkpoint_store) is configured the harness *always* gets a
+    /// [`MemberCheckpointSink`] writing back into it plus the policy's resume policy. The stored
+    /// record for this member's `(session_id, card_id)` is restored only when the
+    /// [`policy`](Self::with_checkpoint_policy) is enabled: a compatible record contributes its
+    /// provider envelope (a payload-only record has nothing to resume from, so the harness starts
+    /// cold) and seeds [`latest_checkpoint`](Self::latest_checkpoint), while a mismatched,
+    /// unreadable or absent record degrades to a cold start — `start` never fails because of
+    /// checkpoint loading.
+    ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an empty session id and
@@ -213,24 +409,55 @@ impl MemberRuntime for HarnessMemberRuntime {
             || self.session_id.clone(),
             |session| session.id().to_owned(),
         );
-        let context = HarnessContext::new(
+        let mut context = HarnessContext::new(
             self.session_id.clone(),
             self.session_id.clone(),
             host_session_id,
             String::new(),
         );
+        if let Some(cwd) = &self.cwd {
+            context = context.with_cwd(cwd.clone());
+        }
+        if let Some(store) = &self.checkpoint_store {
+            let sink = MemberCheckpointSink::new(
+                Arc::clone(store),
+                self.session_id.clone(),
+                self.card_id.clone(),
+            );
+            let sink = match &self.cwd {
+                Some(cwd) => sink.with_cwd(cwd.clone()),
+                None => sink,
+            };
+            context = context
+                .with_checkpoint_sink(Arc::new(sink))
+                .with_resume_policy(self.checkpoint_policy.resume_policy());
+            if self.checkpoint_policy.is_enabled() {
+                context = self.restore_into(context).await;
+            }
+        }
+        let capture = self.capture_handle();
+        let capture_on_turn = self.checkpoint_policy.captures_on_turn();
+        let capture_on_state = self.checkpoint_policy.captures_on_state();
         self.harness.start(context).await.map_err(harness_error)?;
         self.publish_state();
-        self.start_pump();
+        self.start_pump(capture, capture_on_turn, capture_on_state);
         Ok(())
     }
-    /// Cancels the pump, then stops the harness cycle.
+    /// Captures a final checkpoint, cancels the pump, then stops the harness cycle.
+    ///
+    /// The final capture happens before the pump is cancelled and before the harness is stopped, so
+    /// it records the pre-stop state with no turn id; a failure is logged and never returned.
     ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::External`] when the provider cannot close
     /// its cycle cleanly.
     async fn stop(&self) -> Result<()> {
+        if self.checkpoint_policy.captures_on_stop() {
+            if let Some(capture) = self.capture_handle() {
+                capture.capture_best_effort(None).await;
+            }
+        }
         self.shutdown_pump().await;
         let result = self.harness.stop().await.map_err(harness_error);
         self.publish_state();
@@ -298,6 +525,78 @@ impl MemberRuntime for HarnessMemberRuntime {
 /// protocol has no timeout variant, so there is no timeout special case.
 fn harness_error(error: HarnessError) -> Error {
     Error::External(Box::new(error))
+}
+/// Owned capture state, shared by the pump, [`HarnessMemberRuntime::stop`] and the public capture
+/// method.
+///
+/// The runtime itself is not held behind an `Arc`, so the spawned pump cannot borrow it: this
+/// handle carries the owned clones one capture needs (the protocol handle, the store, the member
+/// identity and the payload cache).
+struct CheckpointCapture {
+    /// Protocol handle the provider envelope is exported from.
+    harness: Arc<dyn HarnessProtocol>,
+    /// Destination of every captured record.
+    store: Arc<dyn MemberCheckpointStore>,
+    /// Member session identity records are stored under.
+    session_id: String,
+    /// Agent-card identity records are stored under.
+    card_id: String,
+    /// Working directory recorded in every payload, when pinned.
+    cwd: Option<String>,
+    /// Newest payload, shared with [`HarnessMemberRuntime::latest_checkpoint`].
+    latest: Arc<Mutex<Option<NativeCheckpoint>>>,
+}
+impl CheckpointCapture {
+    /// Exports the provider envelope and persists one record.
+    ///
+    /// A `None` export still persists a payload-only record (empty outputs), which is a legitimate
+    /// snapshot of a harness that does not expose its own checkpoints.
+    async fn capture(&self, turn_id: Option<&str>) -> Result<Option<NativeCheckpoint>> {
+        let envelope = self
+            .harness
+            .export_checkpoint()
+            .await
+            .map_err(harness_error)?;
+        let outputs = envelope.as_ref().map_or_else(
+            || serde_json::json!({}),
+            |checkpoint| json_object_to_value(&checkpoint.data),
+        );
+        let mut payload = NativeCheckpoint::new(self.session_id.clone(), self.card_id.clone())
+            .with_state(self.harness.state())
+            .with_outputs(outputs);
+        if let Some(cwd) = &self.cwd {
+            payload = payload.with_cwd(cwd.clone());
+        }
+        if let Some(turn_id) = turn_id {
+            payload = payload.with_turn_id(turn_id.to_owned());
+        }
+        let mut record = MemberCheckpointRecord::new(payload.clone());
+        if let Some(envelope) = envelope {
+            record = record.with_protocol(envelope);
+        }
+        let revision = self.store.save(record).await?;
+        debug!(
+            revision = %revision,
+            member = %self.session_id,
+            card = %self.card_id,
+            "member checkpoint captured"
+        );
+        *self.latest.lock() = Some(payload.clone());
+        Ok(Some(payload))
+    }
+    /// [`capture`](Self::capture) with every failure logged and ignored.
+    ///
+    /// This is what the pump and `stop` use: an export or storage failure must never fail a member
+    /// command or end the observation pump.
+    async fn capture_best_effort(&self, turn_id: Option<&str>) {
+        if let Err(error) = self.capture(turn_id).await {
+            warn!(
+                error = %error,
+                member = %self.session_id,
+                "member checkpoint capture failed"
+            );
+        }
+    }
 }
 /// Forwards every team-relevant projection of one observation, in event order.
 fn dispatch_event(observers: &RwLock<Vec<Arc<dyn MemberObserver>>>, event: &HarnessEvent) {
@@ -372,11 +671,16 @@ enum Call {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::harness::checkpoint::NativeCheckpoint;
+    use crate::harness::checkpoint_store::{
+        InMemoryMemberCheckpointStore, MemberCheckpointPolicy, MemberCheckpointRecord,
+    };
     use crate::schema::RoundOutcome;
     use openjiuwen_harness_protocol::{
-        EventBufferConfig, HarnessCard, HarnessError, HarnessEventCursor, HarnessResult,
-        HarnessState, OutputChannel, OutputEvent, OutputKind, OutputOperation, SendReceipt,
-        StateChangedEvent, TurnEventKind, TurnLifecycleEvent, VecEventCursor,
+        EventBufferConfig, HarnessCard, HarnessCheckpoint, HarnessError, HarnessEventCursor,
+        HarnessResult, HarnessState, JsonObject, OutputChannel, OutputEvent, OutputKind,
+        OutputOperation, ResumePolicy, SendReceipt, StateChangedEvent, TurnEventKind,
+        TurnLifecycleEvent, VecEventCursor,
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -400,6 +704,13 @@ mod tests {
         closed: Arc<AtomicBool>,
         /// When set, `send` fails with a protocol error.
         fail_send: AtomicBool,
+        /// Contexts received by `start`, in order (`HarnessContext` is not `Debug`, so this is a
+        /// list rather than an assertable value).
+        contexts: Mutex<Vec<HarnessContext>>,
+        /// Envelope returned by `export_checkpoint`.
+        checkpoint: Mutex<Option<HarnessCheckpoint>>,
+        /// When set, `export_checkpoint` fails.
+        export_fails: AtomicBool,
     }
     impl FakeHarness {
         /// Builds the fake and the sender that scripts its observation stream.
@@ -414,12 +725,31 @@ mod tests {
                 delivered: Arc::new(AtomicUsize::new(0)),
                 closed: Arc::new(AtomicBool::new(false)),
                 fail_send: AtomicBool::new(false),
+                contexts: Mutex::new(Vec::new()),
+                checkpoint: Mutex::new(None),
+                export_fails: AtomicBool::new(false),
             });
             (fake, sender)
         }
         /// Returns the recorded commands.
         fn calls(&self) -> Vec<Call> {
             self.calls.lock().clone()
+        }
+        /// Returns the contexts `start` received, in order.
+        fn contexts(&self) -> Vec<HarnessContext> {
+            self.contexts.lock().clone()
+        }
+        /// Returns the context the most recent `start` received.
+        fn last_context(&self) -> Option<HarnessContext> {
+            self.contexts.lock().last().cloned()
+        }
+        /// Scripts the envelope `export_checkpoint` returns.
+        fn set_checkpoint(&self, checkpoint: Option<HarnessCheckpoint>) {
+            *self.checkpoint.lock() = checkpoint;
+        }
+        /// Makes `export_checkpoint` fail.
+        fn set_export_fails(&self, fails: bool) {
+            self.export_fails.store(fails, Ordering::SeqCst);
         }
     }
     /// Channel-backed cursor that records delivery and close.
@@ -462,8 +792,9 @@ mod tests {
         }
         async fn start(&self, context: HarnessContext) -> HarnessResult<()> {
             self.calls.lock().push(Call::Start {
-                host_session_id: context.host_session_id,
+                host_session_id: context.host_session_id.clone(),
             });
+            self.contexts.lock().push(context);
             *self.state.lock() = HarnessState::Idle;
             Ok(())
         }
@@ -517,10 +848,11 @@ mod tests {
             *self.state.lock() = HarnessState::Running;
             Ok(())
         }
-        async fn export_checkpoint(
-            &self,
-        ) -> HarnessResult<Option<openjiuwen_harness_protocol::HarnessCheckpoint>> {
-            Ok(None)
+        async fn export_checkpoint(&self) -> HarnessResult<Option<HarnessCheckpoint>> {
+            if self.export_fails.load(Ordering::SeqCst) {
+                return Err(HarnessError::protocol("checkpoint export unavailable"));
+            }
+            Ok(self.checkpoint.lock().clone())
         }
     }
     /// Observer that records callbacks as `"kind:value"` strings.
@@ -779,5 +1111,274 @@ mod tests {
             error.kind(),
             openjiuwen_common::error::ErrorKind::Validation
         );
+    }
+    /// Session every checkpoint-enabled runtime in these tests runs under.
+    const MEMBER_SESSION: &str = "team:dev-1";
+    /// Agent-card identity every checkpoint-enabled runtime in these tests uses.
+    const MEMBER_CARD: &str = "card-1";
+    /// Builds an empty in-memory store, kept concrete so tests can inspect it.
+    fn memory_store() -> Arc<InMemoryMemberCheckpointStore> {
+        Arc::new(InMemoryMemberCheckpointStore::new())
+    }
+    /// Coerces the concrete store into the trait handle a runtime takes.
+    fn shared(store: &Arc<InMemoryMemberCheckpointStore>) -> Arc<dyn MemberCheckpointStore> {
+        let concrete: Arc<InMemoryMemberCheckpointStore> = Arc::clone(store);
+        concrete
+    }
+    /// Builds a runtime over `fake` with a store, a card id and `policy`.
+    fn checkpoint_runtime(
+        fake: &Arc<FakeHarness>,
+        store: Arc<dyn MemberCheckpointStore>,
+        policy: MemberCheckpointPolicy,
+    ) -> (HarnessMemberRuntime, Arc<RecordingObserver>) {
+        let concrete: Arc<FakeHarness> = Arc::clone(fake);
+        let harness: Arc<dyn HarnessProtocol> = concrete;
+        let runtime = HarnessMemberRuntime::new(harness, MEMBER_SESSION)
+            .with_card_id(MEMBER_CARD)
+            .with_checkpoint_store(store)
+            .with_checkpoint_policy(policy);
+        let observer = Arc::new(RecordingObserver::default());
+        runtime.subscribe(Arc::clone(&observer) as Arc<dyn MemberObserver>);
+        (runtime, observer)
+    }
+    /// Builds the provider envelope the fake exports, carrying one answer part.
+    fn envelope(session_id: &str) -> HarnessCheckpoint {
+        let data: JsonObject = [("answer_parts".to_owned(), json!(["hi"]))]
+            .into_iter()
+            .collect();
+        HarnessCheckpoint {
+            provider: "fake".to_owned(),
+            schema_version: "1".to_owned(),
+            agent_id: session_id.to_owned(),
+            host_session_id: session_id.to_owned(),
+            checkpoint_id: "cp-1".to_owned(),
+            sequence: 1,
+            data,
+            provider_session_id: None,
+            revision: None,
+        }
+    }
+    #[tokio::test]
+    async fn start_attaches_a_sink_only_when_a_store_is_configured() {
+        let (plain_fake, _plain_sender) = FakeHarness::new();
+        let (plain, _plain_observer) = runtime(&plain_fake);
+        plain.start(None).await.unwrap();
+        let plain_context = plain_fake.last_context().expect("start context");
+        assert!(plain_context.checkpoint_sink.is_none());
+        assert_eq!(plain_context.resume_policy, ResumePolicy::New);
+        plain.stop().await.unwrap();
+
+        let store = memory_store();
+        let (stored_fake, _stored_sender) = FakeHarness::new();
+        let (stored, _stored_observer) = checkpoint_runtime(
+            &stored_fake,
+            shared(&store),
+            MemberCheckpointPolicy::default(),
+        );
+        stored.start(None).await.unwrap();
+        let stored_context = stored_fake.last_context().expect("start context");
+        assert!(stored_context.checkpoint_sink.is_some());
+        assert_eq!(
+            stored_context.resume_policy,
+            ResumePolicy::ResumeIfAvailable
+        );
+        stored.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn start_restores_the_stored_envelope_and_policy() {
+        let store = memory_store();
+        let envelope = envelope(MEMBER_SESSION);
+        let payload = NativeCheckpoint::new(MEMBER_SESSION, MEMBER_CARD);
+        store
+            .save(MemberCheckpointRecord::new(payload.clone()).with_protocol(envelope.clone()))
+            .await
+            .unwrap();
+
+        let (fake, _sender) = FakeHarness::new();
+        let (runtime, _observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::default());
+        runtime.start(None).await.unwrap();
+
+        assert_eq!(fake.contexts().len(), 1);
+        let context = fake.last_context().expect("start context");
+        assert_eq!(context.checkpoint, Some(envelope.clone()));
+        assert_eq!(context.resume_policy, ResumePolicy::ResumeIfAvailable);
+        assert_eq!(context.host_session_id, MEMBER_SESSION);
+        assert_eq!(runtime.latest_checkpoint().await, Some(payload));
+        runtime.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn start_starts_cold_on_a_session_or_card_mismatch() {
+        let store = memory_store();
+        // Stored under the right key, but the payload belongs to another session.
+        store
+            .save(
+                MemberCheckpointRecord::new(NativeCheckpoint::new("other:dev-1", MEMBER_CARD))
+                    .with_protocol(envelope("other:dev-1")),
+            )
+            .await
+            .unwrap();
+        let (fake, _sender) = FakeHarness::new();
+        let (runtime, _observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::default());
+        runtime.start(None).await.unwrap();
+        let context = fake.last_context().expect("start context");
+        assert!(context.checkpoint.is_none());
+        assert_eq!(runtime.state(), HarnessState::Idle);
+        assert_eq!(runtime.latest_checkpoint().await, None);
+        runtime.stop().await.unwrap();
+
+        // Same intent for a card change: the record is found but not compatible.
+        store
+            .save(
+                MemberCheckpointRecord::new(NativeCheckpoint::new(MEMBER_SESSION, "card-2"))
+                    .with_protocol(envelope(MEMBER_SESSION)),
+            )
+            .await
+            .unwrap();
+        let (card_fake, _card_sender) = FakeHarness::new();
+        let (card_runtime, _card_observer) = checkpoint_runtime(
+            &card_fake,
+            shared(&store),
+            MemberCheckpointPolicy::default(),
+        );
+        card_runtime.start(None).await.unwrap();
+        let card_context = card_fake.last_context().expect("start context");
+        assert!(card_context.checkpoint.is_none());
+        assert_eq!(card_runtime.state(), HarnessState::Idle);
+        card_runtime.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_turn_boundary_writes_a_checkpoint_that_a_second_runtime_restores() {
+        let store = memory_store();
+        let envelope = envelope(MEMBER_SESSION);
+        let (fake, sender) = FakeHarness::new();
+        fake.set_checkpoint(Some(envelope.clone()));
+        let (runtime, _observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::default());
+        runtime.start(None).await.unwrap();
+        sender.send(turn_event(TurnEventKind::Finished)).unwrap();
+        wait_until(|| !store.is_empty()).await;
+
+        let record = store.get(MEMBER_SESSION, MEMBER_CARD).expect("record");
+        assert_eq!(record.checkpoint.session_id, MEMBER_SESSION);
+        assert_eq!(record.checkpoint.card_id, MEMBER_CARD);
+        assert_eq!(record.checkpoint.state, HarnessState::Idle);
+        assert_eq!(record.checkpoint.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(record.checkpoint.outputs, json!({"answer_parts": ["hi"]}));
+        assert_eq!(record.protocol, Some(envelope.clone()));
+        runtime.stop().await.unwrap();
+
+        // A fresh harness over the same store restores the persisted envelope.
+        let (second_fake, _second_sender) = FakeHarness::new();
+        let (second, _second_observer) = checkpoint_runtime(
+            &second_fake,
+            shared(&store),
+            MemberCheckpointPolicy::default(),
+        );
+        second.start(None).await.unwrap();
+        let context = second_fake.last_context().expect("start context");
+        assert_eq!(context.checkpoint, Some(envelope));
+        second.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn stop_writes_a_final_checkpoint() {
+        let store = memory_store();
+        let (fake, _sender) = FakeHarness::new();
+        fake.set_checkpoint(Some(envelope(MEMBER_SESSION)));
+        let (runtime, _observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::default());
+        runtime.start(None).await.unwrap();
+        runtime.stop().await.unwrap();
+
+        assert_eq!(store.len(), 1);
+        let record = store.get(MEMBER_SESSION, MEMBER_CARD).expect("record");
+        assert_eq!(record.checkpoint.state, HarnessState::Idle);
+        assert_eq!(record.checkpoint.turn_id, None);
+        assert_eq!(record.protocol, Some(envelope(MEMBER_SESSION)));
+    }
+    #[tokio::test]
+    async fn a_disabled_policy_writes_nothing() {
+        let store = memory_store();
+        let (fake, sender) = FakeHarness::new();
+        fake.set_checkpoint(Some(envelope(MEMBER_SESSION)));
+        let (runtime, observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::disabled());
+        runtime.start(None).await.unwrap();
+        // The store is still wired into the harness context; a disabled policy only stops this
+        // runtime from capturing or restoring, so the sink never receives anything.
+        assert!(fake
+            .last_context()
+            .expect("start context")
+            .checkpoint_sink
+            .is_some());
+        sender.send(turn_event(TurnEventKind::Finished)).unwrap();
+        wait_until(|| observer.calls().iter().any(|call| call == "round:finished")).await;
+        runtime.stop().await.unwrap();
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(runtime.latest_checkpoint().await, None);
+        assert!(runtime.capture_checkpoint().await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn an_export_error_does_not_break_the_pump() {
+        let store = memory_store();
+        let (fake, sender) = FakeHarness::new();
+        fake.set_checkpoint(Some(envelope(MEMBER_SESSION)));
+        fake.set_export_fails(true);
+        let (runtime, observer) =
+            checkpoint_runtime(&fake, shared(&store), MemberCheckpointPolicy::default());
+        runtime.start(None).await.unwrap();
+        sender.send(turn_event(TurnEventKind::Finished)).unwrap();
+        sender
+            .send(state_event(HarnessState::Idle, HarnessState::Running))
+            .unwrap();
+        wait_until(|| observer.calls().iter().any(|call| call == "state:running")).await;
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(runtime.latest_checkpoint().await, None);
+        runtime.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn member_session_id_and_card_id() {
+        assert_eq!(
+            MemberHarnessContext::member_session_id("team:1", "dev-1"),
+            "team:1:dev-1"
+        );
+        let context = MemberHarnessContext::new(
+            "team",
+            "dev-1",
+            "team:1:dev-1",
+            "/work",
+            "en",
+            MemberMode::BuildMode,
+        );
+        assert_eq!(context.card_id, "");
+        let pinned = context.clone().with_card_id("card-1");
+        assert_eq!(pinned.card_id, "card-1");
+        assert_eq!(pinned.team_name, context.team_name);
+        assert_eq!(pinned.member_name, context.member_name);
+        assert_eq!(pinned.session_id, context.session_id);
+        assert_eq!(pinned.workspace_root, context.workspace_root);
+        assert_eq!(pinned.language, context.language);
+        assert_eq!(pinned.mode, context.mode);
+
+        let (fake, _sender) = FakeHarness::new();
+        let concrete: Arc<FakeHarness> = Arc::clone(&fake);
+        let harness: Arc<dyn HarnessProtocol> = concrete;
+        let plain = HarnessMemberRuntime::new(harness, MEMBER_SESSION);
+        assert_eq!(plain.card_id(), "");
+        assert!(plain.checkpoint_store().is_none());
+        assert_eq!(
+            plain.checkpoint_policy(),
+            &MemberCheckpointPolicy::default()
+        );
+        assert_eq!(plain.cwd(), None);
+        let pinned_runtime = plain.with_card_id("card-1").with_cwd("/work/dev-1");
+        assert_eq!(pinned_runtime.card_id(), "card-1");
+        assert_eq!(pinned_runtime.cwd(), Some("/work/dev-1"));
+        assert!(pinned_runtime.checkpoint_store().is_none());
+        assert!(pinned_runtime.latest_checkpoint().await.is_none());
+        assert!(pinned_runtime.capture_checkpoint().await.unwrap().is_none());
     }
 }
