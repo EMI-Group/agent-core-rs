@@ -3,18 +3,27 @@
 //! A turn paused on an interrupt persists its pending requests; resuming matches
 //! the caller's [`InteractiveInput`] answers against them with
 //! [`match_answers`](crate::interrupt::match_answers) (tool-call id first, then
-//! interrupt id) and turns each answer into a tool result: an approved call is
-//! re-executed, a rejected call yields the rejection-feedback tool message, and
-//! an ask-user answer becomes the tool content.
-use crate::abilities::{AbilityManager, ToolCallResult, ToolExecutionOptions};
+//! interrupt id) and turns each answer into a tool result:
+//!
+//! - a client tool (`client_tool` kind, or a name the
+//!   [`ClientToolRegistry`] knows) hands the answer to its registered handler and
+//!   renders the handler's value, or the handler's error as a failed result;
+//! - an approved server tool is re-executed with the run's resilience budget;
+//! - a rejected call yields the rejection-feedback tool message;
+//! - an ask-user answer becomes the tool content.
+use crate::abilities::execute::execute_calls_with;
+use crate::abilities::{ToolCallResult, ToolExecutionOptions};
 use crate::interrupt::{
-    answer_text, match_answers, parse_approval, reject_feedback, InterruptRequest,
+    answer_text, match_answers, parse_approval, reject_feedback, InterruptKind, InterruptRequest,
     InterruptionState,
 };
+use crate::policy::{ClientToolRegistry, ToolResiliencePolicy};
+use indexmap::IndexMap;
 use openjiuwen_common::error::Result;
-use openjiuwen_foundation::ToolCall;
+use openjiuwen_foundation::{Tool, ToolCall};
 use openjiuwen_session::InteractiveInput;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Iteration a resumed run restarts from after replaying the interrupted calls.
 ///
@@ -27,8 +36,12 @@ pub(crate) const RESUME_START_ITERATION: usize = 1;
 ///
 /// Each entry of [`InterruptionState::requests`] is matched to an answer:
 ///
+/// - a client tool (kind [`InterruptKind::ClientTool`], or a name registered in
+///   `client_tools`) is completed through the handler: a value becomes a
+///   successful result whose text is the value's string (a `Value::String`) or
+///   its JSON rendering, and a handler error becomes a failed result;
 /// - an approval (`parse_approval` is `Some(true)`) re-executes exactly that
-///   call through `abilities`;
+///   call through `execute_calls_with` using `tools` and `resilience`;
 /// - a rejection (`Some(false)`) becomes a failed result carrying
 ///   [`reject_feedback`] as its text;
 /// - any other answer (an ask-user reply) becomes a successful result whose
@@ -40,14 +53,16 @@ pub(crate) const RESUME_START_ITERATION: usize = 1;
 /// # Errors
 ///
 /// The signature keeps a `Result` so later rounds can surface matching or
-/// execution errors; the current replay turns every tool outcome into a
-/// [`ToolCallResult`].
+/// execution errors; the current replay turns every tool and handler outcome
+/// into a [`ToolCallResult`].
 #[allow(dead_code)] // used by the loop's resume path
 pub(crate) async fn replay_interrupted(
     state: &InterruptionState,
     interactive: &InteractiveInput,
-    abilities: &AbilityManager,
+    tools: &IndexMap<String, Arc<dyn Tool>>,
     options: &ToolExecutionOptions,
+    resilience: &ToolResiliencePolicy,
+    client_tools: &Arc<ClientToolRegistry>,
 ) -> Result<(Vec<ToolCallResult>, Vec<InterruptRequest>)> {
     let pending = state
         .requests
@@ -74,11 +89,23 @@ pub(crate) async fn replay_interrupted(
             unanswered.push(request.clone());
             continue;
         };
+        if request.kind == InterruptKind::ClientTool
+            || client_tools.is_client_tool(&request.tool_name)
+        {
+            match client_tools.invoke(&call, answer).await {
+                Ok(value) => {
+                    let text = text_of(&value);
+                    results.push(ToolCallResult::success(call, value, text));
+                }
+                Err(error) => results.push(ToolCallResult::failure(call, error.to_string())),
+            }
+            continue;
+        }
         match parse_approval(answer) {
             Some(true) => {
-                let executed = abilities
-                    .execute(std::slice::from_ref(&call), options)
-                    .await;
+                let executed =
+                    execute_calls_with(tools, std::slice::from_ref(&call), options, resilience)
+                        .await;
                 if let Some(result) = executed.into_iter().next() {
                     results.push(result);
                 } else {
@@ -103,11 +130,24 @@ pub(crate) async fn replay_interrupted(
     Ok((results, unanswered))
 }
 
+/// The model-visible text of a client tool's value.
+///
+/// A string value is taken verbatim so a client returning `"ok"` does not make
+/// the model read `"\"ok\""`; every other value is rendered as JSON.
+fn text_of(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interrupt::{InterruptKind, InterruptRequest};
+    use crate::policy::ClientToolHandler;
     use async_trait::async_trait;
+    use openjiuwen_common::error::Error;
     use openjiuwen_foundation::{Tool, ToolCard, ToolContext};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -128,15 +168,14 @@ mod tests {
         }
     }
 
-    fn abilities() -> AbilityManager {
-        let mut manager = AbilityManager::new("agent");
+    fn tools() -> IndexMap<String, Arc<dyn Tool>> {
         let tool: Arc<dyn Tool> = Arc::new(EchoTool {
             card: ToolCard::new("shell", "runs a shell command", json!({"type": "object"}))
                 .with_id("shell-1"),
         });
-        let added = manager.add_tool(tool);
-        assert!(added.added);
-        manager
+        let mut tools = IndexMap::new();
+        tools.insert("shell".to_owned(), tool);
+        tools
     }
 
     fn request(call_id: &str, tool_name: &str, arguments: &str) -> InterruptRequest {
@@ -171,6 +210,23 @@ mod tests {
         }
     }
 
+    /// Replays `state` against an empty client-tool registry.
+    async fn replay(
+        state: &InterruptionState,
+        interactive: &InteractiveInput,
+    ) -> (Vec<ToolCallResult>, Vec<InterruptRequest>) {
+        replay_interrupted(
+            state,
+            interactive,
+            &tools(),
+            &ToolExecutionOptions::default(),
+            &ToolResiliencePolicy::default(),
+            &Arc::new(ClientToolRegistry::new()),
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn approved_call_re_executes_the_mounted_tool() {
         let state = state(vec![(
@@ -178,14 +234,7 @@ mod tests {
             request("call-1", "shell", r#"{"command":"ls"}"#),
         )]);
         let interactive = interactive_with(vec![("call-1", json!({"approved": true}))]);
-        let (results, unanswered) = replay_interrupted(
-            &state,
-            &interactive,
-            &abilities(),
-            &ToolExecutionOptions::default(),
-        )
-        .await
-        .unwrap();
+        let (results, unanswered) = replay(&state, &interactive).await;
         assert_eq!(unanswered, Vec::<InterruptRequest>::new());
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
@@ -206,14 +255,7 @@ mod tests {
             "call-1",
             json!({"approved": false, "feedback": "nope"}),
         )]);
-        let (results, unanswered) = replay_interrupted(
-            &state,
-            &interactive,
-            &abilities(),
-            &ToolExecutionOptions::default(),
-        )
-        .await
-        .unwrap();
+        let (results, unanswered) = replay(&state, &interactive).await;
         assert_eq!(unanswered, Vec::<InterruptRequest>::new());
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
@@ -231,14 +273,7 @@ mod tests {
             },
         )]);
         let interactive = interactive_with(vec![("call-1", json!("Paris"))]);
-        let (results, unanswered) = replay_interrupted(
-            &state,
-            &interactive,
-            &abilities(),
-            &ToolExecutionOptions::default(),
-        )
-        .await
-        .unwrap();
+        let (results, unanswered) = replay(&state, &interactive).await;
         assert_eq!(unanswered, Vec::<InterruptRequest>::new());
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
@@ -253,14 +288,7 @@ mod tests {
             ("call-2", request("call-2", "shell", "{}")),
         ]);
         let interactive = interactive_with(vec![("call-1", json!({"approved": true}))]);
-        let (results, unanswered) = replay_interrupted(
-            &state,
-            &interactive,
-            &abilities(),
-            &ToolExecutionOptions::default(),
-        )
-        .await
-        .unwrap();
+        let (results, unanswered) = replay(&state, &interactive).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].call.id.as_deref(), Some("call-1"));
         assert_eq!(unanswered.len(), 1);
@@ -276,16 +304,86 @@ mod tests {
             interrupt_answers: BTreeMap::from([(interrupt_id, json!("yes"))]),
             ..InteractiveInput::default()
         };
-        let (results, unanswered) = replay_interrupted(
-            &state,
-            &interactive,
-            &abilities(),
-            &ToolExecutionOptions::default(),
-        )
-        .await
-        .unwrap();
+        let (results, unanswered) = replay(&state, &interactive).await;
         assert_eq!(unanswered, Vec::<InterruptRequest>::new());
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
+    }
+
+    /// Completes a client call with the answer, or fails when `fail` is set.
+    struct ClientHandler {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ClientToolHandler for ClientHandler {
+        async fn invoke(&self, _call: &ToolCall, answer: &Value) -> Result<Value> {
+            if self.fail {
+                Err(Error::tool("client boom"))
+            } else {
+                Ok(answer.clone())
+            }
+        }
+    }
+
+    fn client_registry(fail: bool) -> Arc<ClientToolRegistry> {
+        let registry = ClientToolRegistry::new();
+        registry.register("run_on_client", Arc::new(ClientHandler { fail }));
+        Arc::new(registry)
+    }
+
+    async fn replay_client(
+        state: &InterruptionState,
+        interactive: &InteractiveInput,
+        registry: &Arc<ClientToolRegistry>,
+    ) -> (Vec<ToolCallResult>, Vec<InterruptRequest>) {
+        replay_interrupted(
+            state,
+            interactive,
+            &tools(),
+            &ToolExecutionOptions::default(),
+            &ToolResiliencePolicy::default(),
+            registry,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_tool_answer_is_completed_by_its_handler() {
+        let state = state(vec![(
+            "call-1",
+            InterruptRequest {
+                kind: InterruptKind::ClientTool,
+                ..request("call-1", "run_on_client", "{}")
+            },
+        )]);
+        let interactive = interactive_with(vec![("call-1", json!({"stdout": "ok"}))]);
+        let (results, unanswered) =
+            replay_client(&state, &interactive, &client_registry(false)).await;
+        assert_eq!(unanswered, Vec::<InterruptRequest>::new());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].output, Some(json!({"stdout": "ok"})));
+        assert_eq!(results[0].text, r#"{"stdout":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_failing_client_handler_yields_a_failed_result() {
+        let state = state(vec![(
+            "call-1",
+            InterruptRequest {
+                kind: InterruptKind::ClientTool,
+                ..request("call-1", "run_on_client", "{}")
+            },
+        )]);
+        let interactive = interactive_with(vec![("call-1", json!("ok"))]);
+        let (results, _) = replay_client(&state, &interactive, &client_registry(true)).await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("client boom")));
     }
 }

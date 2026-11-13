@@ -4,18 +4,19 @@
 //! The loop drives the whole turn from [`run`]:
 //!
 //! - snapshot the agent into an owned [`AgentRuntime`] (config, model, request
-//!   config, rails, context engine, tools) so a streaming invocation can move it
-//!   into a spawned task;
+//!   config, rails, context engine, tools, policy seams) so a streaming
+//!   invocation can move it into a spawned task;
 //! - load any persisted [`InterruptionState`](crate::interrupt::InterruptionState)
 //!   and replay the interrupted tool calls, or seed a fresh turn with the user
 //!   query;
-//! - for each iteration in `start..=limit`, rebuild the system prompt, prepare
-//!   the window with `ContextEngine::prepare`, fire `BeforeModelCall`, call the
-//!   model through [`call_model_streaming`](crate::react::model_step::call_model_streaming),
+//! - for each iteration in `start..=limit`, drain the steering backlog, rebuild
+//!   the system prompt, prepare the window with `ContextEngine::prepare`, emit a
+//!   `context.usage` frame, fire `BeforeModelCall`, call the model through
+//!   [`call_model_streaming`](crate::react::model_step::call_model_streaming),
 //!   and fire `AfterModelCall`;
 //! - execute the model's tool calls in model order through
-//!   [`execute_calls`](crate::abilities::execute::execute_calls), firing
-//!   `BeforeToolCall`/`AfterToolCall` around each call and appending the
+//!   [`execute_calls_with`](crate::abilities::execute::execute_calls_with),
+//!   firing `BeforeToolCall`/`AfterToolCall` around each call and appending the
 //!   resulting tool messages with `ContextEngine::observe`;
 //! - fire `AfterReactIteration` after each iteration;
 //! - honour rail control flags: `force_finish` returns immediately, `retry`
@@ -23,21 +24,29 @@
 //!   substitutes the tool result without executing it, and `interrupts` pause the
 //!   run once every call of the turn has been asked, so one turn surfaces all of
 //!   its pending requests together and executes no tool;
+//! - pause a call the connected client must run as a `client_tool` interrupt
+//!   instead of executing it locally;
 //! - persist contexts with `ContextEngine::save_contexts` and interruption state
 //!   under `__react_agent_interruption__`;
 //! - terminate with `termination_reason` `max_iterations` or `token_budget`.
-use crate::abilities::execute::execute_calls;
-use crate::abilities::{AbilityManager, ToolCallResult, ToolExecutionOptions};
+use crate::abilities::execute::execute_calls_with;
+use crate::abilities::{ToolCallResult, ToolExecutionOptions};
+use crate::callbacks::CallbackFramework;
 use crate::input::AgentInput;
 use crate::interrupt::{
-    match_answers, InterruptRequest, InterruptionState, AUTO_CONFIRM_STATE_KEY,
+    match_answers, InterruptKind, InterruptRequest, InterruptionState, AUTO_CONFIRM_STATE_KEY,
 };
 use crate::output::{AgentChunk, AgentOutput, Observation, INTERACTION};
+use crate::policy::{
+    ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
+    ToolResiliencePolicy,
+};
 use crate::rails::{RailContext, RailEvent, RailRegistry};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
 use crate::react::prompt::build_system;
-use crate::react::resume;
+use crate::react::{exposure, frames, hooks, resume};
 use crate::react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
+use crate::steering::SteeringQueue;
 use indexmap::IndexMap;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_context::{ContextEngine, PrepareOptions};
@@ -90,19 +99,34 @@ pub(crate) struct AgentRuntime {
     pub(crate) engine: Arc<ContextEngine>,
     /// Mounted tools keyed by name, in model-visible order.
     pub(crate) tools: IndexMap<String, Arc<dyn Tool>>,
-    /// Owned copy of the agent's ability manager, used by interrupt replay.
-    pub(crate) abilities: AbilityManager,
-    /// `OpenAI` tool schemas of the mounted tools.
-    pub(crate) tool_info: Vec<Value>,
-    /// Cards of the mounted tools, in model-visible order.
+    /// Cards of every mounted tool, in model-visible order.
     pub(crate) tool_cards: Vec<ToolCard>,
+    /// Model-facing schemas after the exposure policy and MCP allowlist.
+    pub(crate) visible_tool_info: Vec<Value>,
+    /// Model-facing cards after the exposure policy and MCP allowlist.
+    pub(crate) visible_cards: Vec<ToolCard>,
+    /// Lifecycle callbacks observing this run.
+    pub(crate) callbacks: Arc<CallbackFramework>,
+    /// Steering backlog drained between iterations.
+    pub(crate) steering: SteeringQueue,
+    /// Policy deciding which tools the model may see.
+    pub(crate) exposure: ToolExposurePolicy,
+    /// Per-server MCP tool allowlist.
+    pub(crate) mcp_allowlist: McpToolAllowlist,
+    /// Handlers for tool calls the connected client executes.
+    pub(crate) client_tools: Arc<ClientToolRegistry>,
+    /// Per-tool resilience budget applied to execution.
+    pub(crate) resilience: ToolResiliencePolicy,
+    /// Check run before a final model request, when installed.
+    pub(crate) final_check: Option<Arc<dyn FinalRequestCheck>>,
 }
 
 impl AgentRuntime {
     /// Copies the agent's runtime state into an owned value.
     ///
     /// Every lock is taken and released synchronously, so the returned value is
-    /// independent of later agent mutations.
+    /// independent of later agent mutations. The model-facing tool projection
+    /// (`visible_tool_info`/`visible_cards`) is computed here, once per run.
     ///
     /// # Errors
     ///
@@ -123,15 +147,13 @@ impl AgentRuntime {
             }
             (tools, cards, abilities.tool_info())
         };
-        let mut abilities = AbilityManager::new(agent.card.id.clone());
-        for tool in tools.values() {
-            let _ = abilities.add_tool(Arc::clone(tool));
-        }
+        let exposure = agent.tool_exposure_policy();
+        let mcp_allowlist = agent.mcp_tool_allowlist();
         let mut request_config = agent.request_config.read().clone().unwrap_or_default();
         if request_config.model_name.is_empty() {
             request_config.model_name.clone_from(&config.model_name);
         }
-        Ok(Self {
+        let mut runtime = Self {
             card_id: agent.card.id.clone(),
             card_name: agent.card.name.clone(),
             config,
@@ -140,10 +162,26 @@ impl AgentRuntime {
             rails,
             engine,
             tools,
-            abilities,
-            tool_info,
             tool_cards,
-        })
+            visible_tool_info: Vec::new(),
+            visible_cards: Vec::new(),
+            callbacks: agent.callbacks(),
+            steering: agent.steering(),
+            exposure,
+            mcp_allowlist,
+            client_tools: agent.client_tools(),
+            resilience: agent.tool_resilience(),
+            final_check: agent.final_request_check(),
+        };
+        let (visible_tool_info, visible_cards) = exposure::visible_tools(
+            &tool_info,
+            &runtime.tool_cards,
+            &runtime.exposure,
+            &runtime.mcp_allowlist,
+        );
+        runtime.visible_tool_info = visible_tool_info;
+        runtime.visible_cards = visible_cards;
+        Ok(runtime)
     }
 }
 
@@ -237,6 +275,8 @@ pub(crate) async fn run_with(
             tracing::warn!(%error, "failed to write the answer frame to the session");
         }
     }
+    // The invocation-end callback observes both successful and failed runs.
+    hooks::invoke_end(runtime, &session, &output).await;
     if let Some(span) = span {
         match &result {
             Ok(output) => span.finish(output.to_value()),
@@ -351,8 +391,15 @@ async fn resume_or_seed(
         serde_json::to_value(&matched.answers)?,
     );
 
-    let (results, unanswered) =
-        resume::replay_interrupted(&state, &interactive, &runtime.abilities, tool_options).await?;
+    let (results, unanswered) = resume::replay_interrupted(
+        &state,
+        &interactive,
+        &runtime.tools,
+        tool_options,
+        &runtime.resilience,
+        &runtime.client_tools,
+    )
+    .await?;
     let mut observations = Vec::with_capacity(results.len());
     for result in results {
         runtime.engine.observe(context, result.message()).await?;
@@ -436,8 +483,13 @@ async fn run_inner(
     let mut total_usage = Usage::default();
     let mut empty_notice_sent = false;
 
+    hooks::invoke_start(runtime, session, &original_query, limit).await;
+
     for iteration in start..=limit {
         used = iteration;
+        // Steering pushed before the run lands in the first request; one pushed
+        // mid-run lands in the next iteration's window.
+        hooks::drain_steering(runtime, &context).await?;
         let system = build_system(config, input);
         let prepared = runtime
             .engine
@@ -445,16 +497,17 @@ async fn run_inner(
                 &context,
                 &PrepareOptions {
                     system_messages: vec![system],
-                    tools: runtime.tool_info.clone(),
+                    tools: runtime.visible_tool_info.clone(),
                     ..PrepareOptions::default()
                 },
             )
             .await?;
+        frames::context_usage(publisher, session, iteration, &prepared).await;
 
         reset_ctx(ctx, RailEvent::BeforeModelCall);
         ctx.iteration = iteration;
         ctx.messages.clone_from(&prepared.messages);
-        ctx.tools.clone_from(&runtime.tool_cards);
+        ctx.tools.clone_from(&runtime.visible_cards);
         runtime.rails.fire(ctx).await?;
         if let Some(output) = ctx.take_force_finish() {
             return Ok(with_progress(output, used, &observations));
@@ -466,11 +519,31 @@ async fn run_inner(
             .take()
             .unwrap_or_else(|| Arc::clone(&runtime.model));
         let request = request_for(runtime, &prepared.tools);
+        hooks::step_start(
+            runtime,
+            session,
+            iteration,
+            &messages,
+            &runtime.visible_cards,
+        )
+        .await;
 
         // At most two attempts: one retry a rail asks for after an exception.
         let mut attempt = 0;
         let reply = loop {
             attempt += 1;
+            if !Arc::ptr_eq(&model, &runtime.model) {
+                // A rail swapped the model for this call; the primary model
+                // emits no route frame.
+                frames::llm_route(
+                    publisher,
+                    session,
+                    &request,
+                    "backup",
+                    Some("model_override"),
+                )
+                .await;
+            }
             let mut sink = DeltaSink::new(publisher, Some(session));
             match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
                 Ok(reply) => break reply,
@@ -513,10 +586,37 @@ async fn run_inner(
             .await?;
         let raw = reply.message.text().into_owned();
         let calls = reply.message.tool_calls.clone();
+        hooks::step_end(runtime, session, iteration, &reply, calls.len()).await;
 
         if calls.is_empty() {
             if model_continue {
                 continue;
+            }
+            match hooks::check_final_request(
+                runtime,
+                iteration,
+                &raw,
+                &messages,
+                &runtime.visible_cards,
+            )
+            .await?
+            {
+                hooks::FinalCheckOutcome::Allow => {}
+                hooks::FinalCheckOutcome::Finish(output) => {
+                    return Ok(with_progress(*output, used, &observations));
+                }
+                hooks::FinalCheckOutcome::Reject { reason, inject } => {
+                    if iteration < limit {
+                        let notice = inject.unwrap_or(reason);
+                        runtime
+                            .engine
+                            .observe(&context, BaseMessage::user(notice))
+                            .await?;
+                        continue;
+                    }
+                    // At the limit a rejection falls through to the regular
+                    // termination of this round.
+                }
             }
             if raw.trim().is_empty() {
                 if !empty_notice_sent && iteration < limit {
@@ -568,8 +668,21 @@ async fn run_inner(
                 continue;
             }
             if let Some(text) = ctx.take_skip_tool() {
+                hooks::tool_call_start(runtime, session, iteration, call).await;
                 let output = Value::String(text.clone());
                 results[index] = Some(ToolCallResult::success(call.clone(), output, text));
+                continue;
+            }
+            if exposure::is_client_tool(&runtime.client_tools, &runtime.tool_cards, &call.name) {
+                // The connected client runs this tool: pause the turn instead
+                // of executing it locally. A rail-recorded request or a
+                // `skip_tool` wins because both are handled above.
+                interrupted.push(InterruptRequest::for_tool_call(
+                    InterruptKind::ClientTool,
+                    runtime.card_id.clone(),
+                    "Please run this tool and return its result",
+                    call,
+                ));
                 continue;
             }
             queued.push((index, call.clone()));
@@ -594,7 +707,16 @@ async fn run_inner(
                 .iter()
                 .map(|(_, call)| call.clone())
                 .collect::<Vec<_>>();
-            let executed = execute_calls(&runtime.tools, &calls_to_run, &tool_options).await;
+            for call in &calls_to_run {
+                hooks::tool_call_start(runtime, session, iteration, call).await;
+            }
+            let executed = execute_calls_with(
+                &runtime.tools,
+                &calls_to_run,
+                &tool_options,
+                &runtime.resilience,
+            )
+            .await;
             for ((index, _), result) in queued.into_iter().zip(executed) {
                 results[index] = Some(result);
             }
@@ -617,6 +739,7 @@ async fn run_inner(
                 result.text = text;
                 result.success = true;
             }
+            hooks::tool_call_end(runtime, session, iteration, &result).await;
             runtime.engine.observe(&context, result.message()).await?;
             observations.push(Observation {
                 content: result.text,
@@ -774,9 +897,16 @@ mod tests {
             rails: Arc::new(RailRegistry::new()),
             engine: Arc::new(ContextEngine::new(ContextConfig::default())),
             tools: IndexMap::new(),
-            abilities: AbilityManager::new("agent"),
-            tool_info: Vec::new(),
             tool_cards: Vec::new(),
+            visible_tool_info: Vec::new(),
+            visible_cards: Vec::new(),
+            callbacks: Arc::new(crate::callbacks::CallbackFramework::new()),
+            steering: crate::steering::SteeringQueue::new(),
+            exposure: crate::policy::ToolExposurePolicy::allow_all(),
+            mcp_allowlist: crate::policy::McpToolAllowlist::new(),
+            client_tools: Arc::new(crate::policy::ClientToolRegistry::new()),
+            resilience: crate::policy::ToolResiliencePolicy::new(),
+            final_check: None,
         };
         assert_eq!(request_for(&runtime, &[]).model_name, "gpt-4o");
     }

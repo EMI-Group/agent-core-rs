@@ -29,11 +29,26 @@
 //!    `skip_tool`; an interrupt pauses the loop into an output carrying state
 //!    frames and interrupt ids that a later invocation resumes.
 //!
+//! The loop also drives the agent's side seams, all of which are no-ops in
+//! their defaults: `hooks` drains steering messages at the top of every
+//! iteration, fires the six lifecycle callbacks (logging their errors instead
+//! of failing the run), and runs the optional final-request check; a client
+//! tool call pauses the turn as a `client_tool` interrupt instead of executing
+//! locally; and `frames` publishes a `context.usage` frame after each
+//! preparation plus an `llm_route` frame when a rail swapped the model.
+//! `exposure` owns the model-facing projection computed once per run: tools
+//! the exposure policy or MCP allowlist denies never reach the model, while
+//! execution still sees the full tool map.
+//!
 //! [`Agent::stream`] runs the same loop in a spawned task and yields
-//! [`AgentChunk`] frames: model deltas, one usage frame per call, the
-//! `__interaction__` frames of a pause, and one final `answer` frame.
+//! [`AgentChunk`] frames: model deltas, one usage frame per call, context and
+//! route frames, the `__interaction__` frames of a pause, and one final `answer`
+//! frame.
 pub(crate) mod agent_loop;
 pub mod config;
+pub(crate) mod exposure;
+pub(crate) mod frames;
+pub(crate) mod hooks;
 pub mod model_step;
 pub(crate) mod prompt;
 pub(crate) mod resume;
