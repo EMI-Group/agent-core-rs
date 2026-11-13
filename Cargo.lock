@@ -2187,11 +2187,13 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "openjiuwen-common",
  "openjiuwen-core",
  "openjiuwen-harness",
  "openjiuwen-test-support",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -2201,6 +2203,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "which",
 ]
 
 [[package]]
