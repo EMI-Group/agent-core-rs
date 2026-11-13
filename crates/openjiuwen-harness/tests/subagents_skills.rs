@@ -8,6 +8,9 @@
 //! Everything is offline and deterministic: the fake factory returns immediately, the
 //! filesystem fixtures live in per-test `tempfile::TempDir` roots, and the only waits are
 //! short deadlines that a completed turn satisfies at once.
+//!
+//! Size note: this suite is long by design — it is the single integration file for both the
+//! sub-agent runtime (quota, LRU, transcripts, persistence) and the skill library.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};

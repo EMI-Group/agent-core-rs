@@ -4,6 +4,9 @@
 //! together: the model-facing name order, the card shapes, the parallel-safety flags, the
 //! deferred-tool discovery API, and end-to-end calls through one `build()` (so the filesystem
 //! tools share their read state and the extended tools share their seams).
+//!
+//! Size note: this file is long by design — it is one parity suite over all 32 tools rather
+//! than per-module behaviour tests, which stay beside each tool module.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
