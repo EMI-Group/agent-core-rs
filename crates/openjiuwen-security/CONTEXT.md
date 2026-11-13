@@ -7,7 +7,7 @@ Ports the Python package `openjiuwen/core/security/guardrail/` (v0.1.20) and ext
 The crate is self-contained (layer 2): it owns the models, the guardrail abstraction, the ordered pipeline, the parsers, the rule engine, and the moderation backends; it never imports `openjiuwen-runner`, so any caller (agent, workflow, tool, CLI, harness) can run a scan in-process.
 Detection runs locally (regex rules, PII patterns, parser-graded replies) or remotely: a generic JSON-over-HTTP moderation transport plus first-party OpenAI, Azure Content Safety, and Aliyun Green adapters speak those wire formats over `openjiuwen_common::http::HttpClient`.
 No vendor SDK and no local inference runtime are linked: the three vendor adapters are plain HTTP clients, and `LocalModelBackend` keeps the Python configuration/introspection shape while `analyze` returns `Error::Unsupported`.
-`openjiuwen-foundation` is a dependency only for the judge-facing `llm::Model`/`ChatResponse`/`ModelRequestConfig` and `prompt::BaseMessage` types.
+`openjiuwen-foundation` supplies `prompt::BaseMessage` for the context/pipeline constructors and, for the judge, `llm::Model`/`ChatResponse`/`ModelRequestConfig`.
 
 ## Security Model
 
@@ -20,7 +20,7 @@ a detection returns a `GuardrailResult`; **only `CRITICAL` aborts the caller** (
 | unsafe `LOW`/`MEDIUM`/`HIGH` | `GuardrailError` raised, swallowed by the framework | finding recorded with `blocking = false`, `SecurityDecision::Allow`, `outcome.risk_level` = highest finding level |
 | unsafe at/above `policy.block_level` (default `CRITICAL`) | `AbortError` propagates, call aborted | finding `blocking = true`, `SecurityDecision::Block`, remaining guardrails skipped; `GuardrailOutcome::enforce()` yields `Error::Security` |
 | guardrail/backend/parser failure | propagated to the framework, logged, swallowed → execution continues (fail-open) | evaluation error recorded; `FailurePolicy::FailOpen` (default, parity) leaves the decision unchanged; `FailurePolicy::FailClosed` turns it into a blocking finding (`risk_type = "guardrail_error"`, level `CRITICAL`) |
-| guardrail constructed without a backend | `ValueError("No backend configured for ...")` | `Err(Error::Security("No backend configured for <name>. Use ..."))` from `check` |
+| guardrail constructed without a backend | `ValueError("No backend configured for ...")` at call time | not representable: `BackendGuardrail::new` requires an `Arc<dyn GuardrailBackend>`, so the mistake is a compile error |
 
 Rules:
 - A backend failure here includes an unusable HTTP reply, a transport error, and an invalid judge verdict; all are recorded as evaluation errors and handled by the failure policy.
@@ -50,7 +50,7 @@ finding:    Finding { guardrail, risk_level, risk_type, message, blocking, detai
             GuardrailViolation { risk_level, risk_type, message, event, details } + From<GuardrailViolation> for openjiuwen_common::error::Error
 guardrail:  #[async_trait] trait Guardrail { name(), priority() = 100, stages() = &[], handles(stage), check(&GuardrailContext) -> Result<GuardrailResult> }
             #[async_trait] trait GuardrailBackend { name(), analyze(&GuardrailContext) -> Result<RiskAssessment> }
-            BackendGuardrail (backend adapter implementing Guardrail; with_priority/with_stages/backend; no backend => Error::Security)
+            BackendGuardrail (adapts a backend into a Guardrail under an independent name; with_priority/with_stages/backend; always owns an Arc<dyn GuardrailBackend>)
 pipeline:   GuardrailPipeline { add(&mut self, impl Guardrail + 'static)/add_arc(&mut self, Arc<dyn Guardrail>)/extend(IntoIterator<Item = Arc<dyn Guardrail>>)/guardrails()/policy(), builders new()/with_policy(SecurityPolicy)/Default } running guardrails by descending priority, registration order as tiebreak
             run(&GuardrailContext) -> GuardrailOutcome (infallible); scan_text(ScanStage, impl Into<String>) / scan_user_input(impl Into<String>) / scan_prompt(&[BaseMessage]) / scan_model_output(impl Into<String>) / scan_tool_input(impl Into<String>, &Value) / scan_tool_output(impl Into<String>, &Value) -> GuardrailOutcome
 config:     SecurityConfig { enabled, policy, targets, prompt_injection, sensitive_data, content_rules, tool_arguments } with default()/protected()/pipeline() -> Result<GuardrailPipeline>
@@ -76,7 +76,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 
 ## Constraints
 
-- Async-first on tokio; `Guardrail`/`GuardrailBackend` are `#[async_trait]` and object-safe (`Arc<dyn Guardrail>`); the built-in detectors are CPU-only, while `HttpModerationTransport`, `ApiModelBackend::http`, the LLM judge, and the vendor adapters perform real I/O through the shared HTTP client.
+- Async-first on tokio; `Guardrail`/`GuardrailBackend` are `#[async_trait]` and object-safe (`Arc<dyn Guardrail>`); the regex/PII/content-rule detectors are CPU-only, while any detector wired to a remote backend (`HttpModerationTransport`, `ApiModelBackend::http`, the LLM judge, a vendor adapter) performs real I/O through the shared HTTP client.
 - Errors: `openjiuwen_common::error::{Error, Result}` only; no parallel error enum. `Error::security` marks blocking/guardrail failures, `Error::validation` bad config or invalid regex, `Error::transport`/`Error::timeout` remote wire failures, `Error::llm` an unusable judge reply, `Error::unsupported` deferred adapters. No `unwrap`/`expect` outside module-level test cfgs and `#[allow(clippy::expect_used)]` static regexes.
 - No `unsafe`, no globals: a pipeline is an owned value; there is no process-global registry (Python's `Runner.callback_framework` registration is the runner's concern, wired outside this crate).
 - Logging through `tracing` only (targets `openjiuwen_security::<module>`, vendor adapters `openjiuwen_security::backends::vendors::<name>`); no `stdout`. Guardrail content and credentials are never logged; log names, stages, levels, statuses, lengths.
@@ -110,7 +110,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - `tests/tool_arguments.rs` — denied/allowed tool names, shell-injection patterns in arguments, nested JSON argument traversal, sensitive-data redaction inside arguments, stage binding (tool input only).
 - `tests/config.rs` — every default preserved (Python `PromptInjectionGuardrailConfig`/`RuleBasedBackendConfig` fields and values), `SecurityConfig::default()` scans nothing, `protected()` enables the default set, `pipeline()` validation errors, full serde round-trip.
 - `tests/helpers.rs` — `scan_prompt`/`scan_user_input`/`scan_model_output`/`scan_tool_input`/`scan_tool_output` context shapes (stages, events, metadata `tool_name`/`message_count`), all-message scanning (a secret in an earlier turn is still found), `enforce()` on blocked vs finding-only outcomes, `RedactedOutcome`/`Debug` containing no original secrets, and `modified_data()` merge order.
-- `tests/adapters.rs` — 21 tests over loopback `wiremock` servers, driven through `GuardrailPipeline` + `BackendGuardrail`: for each vendor adapter and for `ApiModelBackend`+`HttpModerationTransport` a benign, blocking, sub-threshold (lowered `block_level`), transport-failure (fail-open and fail-closed), stage-binding, and no-content-leak case.
+- `tests/adapters.rs` — 21 tests over loopback `wiremock` servers, driven through `GuardrailPipeline` + `BackendGuardrail`: each vendor adapter gets benign, blocking, sub-threshold (lowered `block_level`), transport-failure (fail-open and fail-closed), stage-binding, and no-content-leak cases; the generic `ApiModelBackend` + `HttpModerationTransport` path gets the recorded wire request, a lowered-`block_level` block, and the failure-policy pair.
 - Module-level `#[cfg(test)]` suites cover the backends' wire requests, retries, status/JSON mapping, judge verdicts, signature vectors, config serde, and redacting `Debug` (see `src/backends/CONTEXT.md`).
 - Behavior-port tests cite the Python test they mirror in a comment (`// ports tests/unit_tests/core/security/guardrail/test_guardrail_base.py`).
 - Gates: `cargo fmt -p openjiuwen-security`, `cargo test -p openjiuwen-security`, `cargo clippy -p openjiuwen-security --all-targets -- -D warnings` all clean offline.
