@@ -3,11 +3,13 @@
 //! [`AliyunGreenBackend`] speaks the Aliyun Green `TextModeration` RPC
 //! (`green-20220302`) over the crate-shared [`crate::backends::http`] helpers:
 //! it posts `{"Service": ..., "ServiceParameters": "{\"content\": ...}"}` and
-//! maps `Data.Labels` and the per-label `Confidence` scores onto a
-//! [`crate::RiskAssessment`]. A label present means risk, the first label is
-//! `risk_type`, and the vendor's `RiskWords`, `Reason`, and the scanned text
-//! never appear in `details`, logs, or errors; empty text is safe without a
-//! request. Requests use either a gateway `Bearer` token or the native
+//! maps the label union of `Data.Labels` and `Data.Result[].Label` plus the
+//! per-label `Confidence` scores onto a [`crate::RiskAssessment`]. The label
+//! list is the union of both sources (the RPC can omit `Labels` while
+//! returning the per-label detail list), any label or a positive `Confidence`
+//! means risk, the first label is `risk_type`, and the vendor's `RiskWords`,
+//! `Reason`, and the scanned text never appear in `details`, logs, or errors;
+//! empty text is safe without a request. Requests use either a gateway `Bearer` token or the native
 //! `ACS3-HMAC-SHA256` signature over six headers, so the public endpoint
 //! accepts them without an SDK.
 #![allow(clippy::module_name_repetitions)]
@@ -138,7 +140,8 @@ pub struct AliyunGreenConfig {
     /// Retries after the first attempt (`2` by default).
     pub max_retries: u32,
     /// Fallback risk type kept for parity with the other vendor configs; the
-    /// vendor's first label is used whenever a label is present.
+    /// vendor's first label is used whenever a label is present, and a positive
+    /// confidence reported without any label falls back to this value.
     pub risk_type: String,
 }
 
@@ -276,13 +279,18 @@ impl AliyunGreenBackend {
     /// Grades one `TextModeration` reply.
     ///
     /// A non-`200` (or missing, or non-integer) `Code` is a transport failure.
-    /// Missing, blank, or `nonLabel`-only `Data.Labels` is a safe assessment.
-    /// Otherwise the highest `Result[].Confidence` (`0..=100`) picks the
-    /// severity (`>= 90` [`RiskLevel::Critical`], `>= 75` [`RiskLevel::High`],
-    /// `>= 50` [`RiskLevel::Medium`], else [`RiskLevel::Low`]; no score reports
-    /// [`RiskLevel::High`]), the first label is `risk_type`, and the rounded
-    /// confidence (`0..=1`) is reported. `details` carries the provider,
-    /// service, region, trimmed labels, confidence, and the request id.
+    /// The labels are the trimmed, de-duplicated union of the comma-separated
+    /// `Data.Labels` (first) and the `Data.Result[].Label` fields (`nonLabel`
+    /// dropped from both), because the RPC may omit `Labels` and report only
+    /// the per-label detail list. The reply is safe only when that union is
+    /// empty and no `Result` entry reports a positive `Confidence`; otherwise
+    /// the highest `Result[].Confidence` (`0..=100`) picks the severity (`>= 90`
+    /// [`RiskLevel::Critical`], `>= 75` [`RiskLevel::High`], `>= 50`
+    /// [`RiskLevel::Medium`], else [`RiskLevel::Low`]; labels without a usable
+    /// score report [`RiskLevel::High`]). The first union label is `risk_type`,
+    /// falling back to `config.risk_type` when only a confidence was reported,
+    /// and the rounded confidence (`0..=1`) is recorded. `details` carries the
+    /// provider, service, region, union labels, confidence, and the request id.
     ///
     /// # Errors
     ///
@@ -293,22 +301,24 @@ impl AliyunGreenBackend {
             return Err(code_error(response));
         }
         let data = response.get("Data");
-        let labels = data
-            .and_then(|data| data.get("Labels"))
-            .and_then(Value::as_str)
-            .map(parse_labels)
-            .unwrap_or_default();
-        let Some(risk_type) = labels.first().cloned() else {
-            return Ok(safe_assessment());
-        };
-        let max_confidence = data
+        let results = data
             .and_then(|data| data.get("Result"))
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let labels = response_labels(data, results);
+        let max_confidence = results
+            .iter()
             .filter_map(|entry| entry.get("Confidence").and_then(Value::as_f64))
             .filter(|confidence| confidence.is_finite())
             .reduce(f64::max);
+        if labels.is_empty() && !max_confidence.is_some_and(|max| max > 0.0) {
+            return Ok(safe_assessment());
+        }
+        let risk_type = labels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.config.risk_type.clone());
         let (risk_level, confidence) = max_confidence.map_or((RiskLevel::High, 1.0), |max| {
             (level_for_confidence(max), round_confidence(max / 100.0))
         });
@@ -478,6 +488,29 @@ fn parse_labels(raw: &str) -> Vec<String> {
         .filter(|label| !label.is_empty() && !label.eq_ignore_ascii_case(NON_LABEL))
         .map(str::to_owned)
         .collect()
+}
+
+/// Unions the `Data.Labels` list with the `Data.Result[].Label` fields.
+///
+/// The RPC may report only the per-label detail list, so both sources count:
+/// `Labels` entries come first, then the `Result`-only labels, trimmed, blanks
+/// and `nonLabel` dropped, duplicates removed in first-seen order.
+fn response_labels(data: Option<&Value>, results: &[Value]) -> Vec<String> {
+    let mut labels = data
+        .and_then(|data| data.get("Labels"))
+        .and_then(Value::as_str)
+        .map(parse_labels)
+        .unwrap_or_default();
+    for label in results
+        .iter()
+        .filter_map(|entry| entry.get("Label").and_then(Value::as_str))
+        .flat_map(parse_labels)
+    {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
 }
 
 /// Maps one vendor confidence (`0..=100`) onto a severity band.
@@ -1082,6 +1115,100 @@ mod tests {
         let details = assessment.details.expect("details");
         assert_eq!(details["confidence"].as_f64(), Some(1.0));
         assert!(details.get("request_id").is_none());
+    }
+
+    #[test]
+    fn parse_response_result_labels_are_authoritative() {
+        // The RPC may omit `Labels` and report only the per-label detail list.
+        let reply = json!({"Code": 200, "RequestId": "req-result-only", "Data": {"Result": [
+            {"Label": "political_content", "Confidence": 99, "RiskWords": "secret-risk-word",
+             "Reason": "vendor reason that must stay private"}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Critical);
+        assert_eq!(assessment.risk_type.as_deref(), Some("political_content"));
+        assert!((assessment.confidence - 0.99).abs() < f64::EPSILON);
+        let details = assessment.details.expect("details");
+        assert_eq!(details["labels"], json!(["political_content"]));
+        assert_eq!(details["request_id"], json!("req-result-only"));
+        let serialized = details.to_string();
+        assert!(!serialized.contains("secret-risk-word"), "{serialized}");
+        assert!(!serialized.contains("vendor reason"), "{serialized}");
+        assert!(!serialized.contains("RiskWords"), "{serialized}");
+        assert!(!serialized.contains("Reason"), "{serialized}");
+
+        // Regression: an empty `Labels` plus a scored `Result` entry is risky.
+        let reply = json!({"Code": 200, "Data": {"Labels": "", "Result": [
+            {"Label": "profanity", "Confidence": 60.0}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Medium);
+        assert_eq!(assessment.risk_type.as_deref(), Some("profanity"));
+        assert!((assessment.confidence - 0.6).abs() < f64::EPSILON);
+        assert_eq!(
+            assessment.details.expect("details")["labels"],
+            json!(["profanity"])
+        );
+
+        // The union keeps `Labels` first and drops duplicates.
+        let reply = json!({"Code": 200, "Data": {"Labels": "abuse", "Result": [
+            {"Label": "abuse", "Confidence": 80.0}, {"Label": "profanity", "Confidence": 80.0}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_type.as_deref(), Some("abuse"));
+        let details = assessment.details.expect("details");
+        assert_eq!(details["labels"], json!(["abuse", "profanity"]));
+        assert_eq!(details["labels"].as_array().map(Vec::len), Some(2));
+
+        // `nonLabel` never masks a real `Result` label.
+        let reply = json!({"Code": 200, "Data": {"Labels": "nonLabel", "Result": [
+            {"Label": " abuse ", "Confidence": 88.0}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_type.as_deref(), Some("abuse"));
+        assert_eq!(
+            assessment.details.expect("details")["labels"],
+            json!(["abuse"])
+        );
+
+        // Blank and `nonLabel` `Result` labels are dropped; an unscored or
+        // zero-scored `Result` entry is not risk on its own.
+        let reply = json!({"Code": 200, "Data": {"Result": [
+            {"Label": " ", "Confidence": 0.0}, {"Label": "nonLabel"}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(!assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Safe);
+        assert!(assessment.details.is_none());
+    }
+
+    #[test]
+    fn parse_response_scored_result_without_labels_uses_config_risk_type() {
+        let reply = json!({"Code": 200, "Data": {"Labels": "nonLabel", "Result": [
+            {"Label": "", "Confidence": 72.5}
+        ]}});
+        let assessment = offline_backend().parse_response(&reply).unwrap();
+        assert!(assessment.has_risk);
+        assert_eq!(assessment.risk_level, RiskLevel::Medium);
+        assert_eq!(assessment.risk_type.as_deref(), Some(DEFAULT_RISK_TYPE));
+        assert!((assessment.confidence - 0.725).abs() < f64::EPSILON);
+        let details = assessment.details.expect("details");
+        assert_eq!(details["labels"], json!([]));
+
+        let backend = AliyunGreenBackend::new(AliyunGreenConfig {
+            risk_type: "aliyun_green_fallback".to_owned(),
+            ..AliyunGreenConfig::default()
+        })
+        .unwrap();
+        let assessment = backend.parse_response(&reply).unwrap();
+        assert_eq!(
+            assessment.risk_type.as_deref(),
+            Some("aliyun_green_fallback")
+        );
     }
 
     #[test]
