@@ -249,7 +249,6 @@ impl ModelMgr {
     /// Python parity: `ResourceMgr.release` empties the model manager too, and
     /// [`ResourceMgr::release`](super::ResourceMgr::release) is the caller once
     /// the manager is wired into it; until then the method is unused in-crate.
-    #[allow(dead_code)]
     pub(crate) fn reset(&self) -> usize {
         self.models.reset()
     }

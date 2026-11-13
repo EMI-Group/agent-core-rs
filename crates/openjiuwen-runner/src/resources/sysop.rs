@@ -284,10 +284,6 @@ impl SysOperationMgr {
     /// Used by [`ResourceMgr::release`](super::ResourceMgr::release), which
     /// Python's `Runner::stop` calls to return the process to a pristine
     /// registry state.
-    #[allow(
-        dead_code,
-        reason = "mirrors the other registries' reset seam; ResourceMgr::release is wired outside this file"
-    )]
     pub(crate) fn reset(&self) -> usize {
         let mut isolation = self.isolation.lock();
         let removed = self.registry.reset();
