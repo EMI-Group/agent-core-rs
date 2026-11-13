@@ -35,8 +35,9 @@
 //! The scanner never panics and never loops: a stray `<` is literal text, an attribute with
 //! an unterminated quote consumes to the end of the input, a tag without `>` ends at the end
 //! of the input, and raw-text bodies (`script`, `style`, …) without their closing tag are
-//! dropped up to the end of the input. An element without its closing tag contributes no
-//! entry to its collection, while its text still appears in [`HtmlDocument::text`].
+//! dropped up to the end of the input. A heading, title, or code block without its closing tag
+//! contributes no entry (its text still appears in [`HtmlDocument::text`]), while an anchor
+//! without a closing tag is kept with empty text.
 //!
 //! Relative references are not resolved here; callers resolve them with [`resolve_url`].
 
