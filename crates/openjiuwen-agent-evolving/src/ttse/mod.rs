@@ -27,6 +27,12 @@ mod success;
 pub use bank::{AddOutcome, TipBank, TipBankStats};
 pub use classify::{ClassificationRule, TipClassifier};
 pub use config::TtseConfig;
+pub use consult::{consult, render_tips};
+pub use dream::Dreamer;
+pub use engine::TtseEngine;
+pub use induce::TipInducer;
 pub use models::{
     tip_id_for, ConsultResult, DreamReport, SuccessAssessment, TipCategory, TipEvidence, TipRecord,
 };
+pub use parse::{TipParser, DEFAULT_MAX_RULE_CHARS};
+pub use success::SuccessDetector;
