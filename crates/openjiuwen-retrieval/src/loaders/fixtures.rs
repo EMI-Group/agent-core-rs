@@ -23,6 +23,8 @@
 //! # }
 //! ```
 
+use std::fmt::Write as _;
+
 use openjiuwen_common::error::Result;
 
 use crate::parsing::ZipWriter;
@@ -92,10 +94,11 @@ pub fn plain_stream(content: &str) -> String {
 pub fn docx_document(paragraphs: &[&str]) -> Result<Vec<u8>> {
     let mut body = String::new();
     for paragraph in paragraphs {
-        body.push_str(&format!(
+        let _ = write!(
+            body,
             "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
             escape_xml(paragraph)
-        ));
+        );
     }
     let document = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -124,26 +127,30 @@ pub fn xlsx_workbook(sheets: &[(&str, &[&str])]) -> Result<Vec<u8>> {
 
     for (position, (name, rows)) in sheets.iter().enumerate() {
         let number = position + 1;
-        sheet_entries.push_str(&format!(
+        let _ = write!(
+            sheet_entries,
             "<sheet name=\"{}\" sheetId=\"{number}\" r:id=\"rId{number}\"/>",
             escape_attribute(name)
-        ));
-        relationship_entries.push_str(&format!(
+        );
+        let _ = write!(
+            relationship_entries,
             "<Relationship Id=\"rId{number}\" Type=\"worksheet\" \
              Target=\"worksheets/sheet{number}.xml\"/>"
-        ));
-
+        );
         let mut sheet_data = String::new();
         for (row_position, row) in rows.iter().enumerate() {
             let row_number = row_position + 1;
-            sheet_data.push_str(&format!("<row r=\"{row_number}\">"));
+            let _ = write!(sheet_data, "<row r=\"{row_number}\">");
             for (column_position, cell) in row.split(',').map(str::trim).enumerate() {
                 if cell.is_empty() {
                     continue;
                 }
                 let reference = format!("{}{row_number}", column_name(column_position));
                 let index = shared_string_index(&mut shared_strings, cell);
-                sheet_data.push_str(&format!("<c r=\"{reference}\" t=\"s\"><v>{index}</v></c>"));
+                let _ = write!(
+                    sheet_data,
+                    "<c r=\"{reference}\" t=\"s\"><v>{index}</v></c>"
+                );
             }
             sheet_data.push_str("</row>");
         }
@@ -169,7 +176,7 @@ pub fn xlsx_workbook(sheets: &[(&str, &[&str])]) -> Result<Vec<u8>> {
     );
     let mut shared = String::new();
     for value in &shared_strings {
-        shared.push_str(&format!("<si><t>{}</t></si>", escape_xml(value)));
+        let _ = write!(shared, "<si><t>{}</t></si>", escape_xml(value));
     }
     let shared_strings = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -207,13 +214,15 @@ pub fn pptx_slides(slides: &[(&str, &[&str])]) -> Result<Vec<u8>> {
 
     for (position, (title, paragraphs)) in slides.iter().enumerate() {
         let number = position + 1;
-        slide_ids.push_str(&format!(
+        let _ = write!(
+            slide_ids,
             "<p:sldId id=\"{}\" r:id=\"rId{number}\"/>",
             255 + number
-        ));
-        relationship_entries.push_str(&format!(
+        );
+        let _ = write!(
+            relationship_entries,
             "<Relationship Id=\"rId{number}\" Type=\"slide\" Target=\"slides/slide{number}.xml\"/>"
-        ));
+        );
         parts.push((
             format!("ppt/slides/slide{number}.xml"),
             slide_part(title, paragraphs),
@@ -255,7 +264,7 @@ pub fn pptx_slides(slides: &[(&str, &[&str])]) -> Result<Vec<u8>> {
 pub fn odt_document(paragraphs: &[&str]) -> Result<Vec<u8>> {
     let mut body = String::new();
     for paragraph in paragraphs {
-        body.push_str(&format!("<text:p>{}</text:p>", escape_xml(paragraph)));
+        let _ = write!(body, "<text:p>{}</text:p>", escape_xml(paragraph));
     }
     let content = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -276,15 +285,17 @@ fn slide_part(title: &str, paragraphs: &[&str]) -> String {
     if !paragraphs.is_empty() {
         let mut body = String::new();
         for paragraph in paragraphs {
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 "<a:p><a:r><a:t>{}</a:t></a:r></a:p>",
                 escape_xml(paragraph)
-            ));
+            );
         }
-        shapes.push_str(&format!(
+        let _ = write!(
+            shapes,
             "<p:sp><p:nvSpPr><p:nvPr><p:ph idx=\"1\"/></p:nvPr></p:nvSpPr><p:txBody>\
              <a:bodyPr/>{body}</p:txBody></p:sp>"
-        ));
+        );
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -295,12 +306,11 @@ fn slide_part(title: &str, paragraphs: &[&str]) -> String {
 
 /// Returns the shared-string index of `value`, appending it on first use.
 fn shared_string_index(shared: &mut Vec<String>, value: &str) -> usize {
-    match shared.iter().position(|existing| existing == value) {
-        Some(index) => index,
-        None => {
-            shared.push(value.to_owned());
-            shared.len() - 1
-        }
+    if let Some(index) = shared.iter().position(|existing| existing == value) {
+        index
+    } else {
+        shared.push(value.to_owned());
+        shared.len() - 1
     }
 }
 
@@ -400,7 +410,10 @@ mod tests {
 
     #[test]
     fn xlsx_fixture_supports_more_than_twenty_six_columns() {
-        let header: String = (0..28).map(|column| format!("C{column},")).collect();
+        let mut header = String::new();
+        for column in 0..28 {
+            let _ = write!(header, "C{column},");
+        }
         let header = header.trim_end_matches(',');
         let worksheet = XlsxParser::new()
             .parse_bytes(&xlsx_workbook(&[("Wide", &[header])]).unwrap())

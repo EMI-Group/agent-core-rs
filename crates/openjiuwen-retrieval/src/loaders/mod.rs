@@ -110,7 +110,7 @@ impl DocumentBytes {
 
     /// Returns the lowercase extension of [`DocumentBytes::name`], with its dot.
     ///
-    /// The rule is [`file_extension`]: case-insensitive, last suffix only, and an
+    /// The rule is `file_extension`: case-insensitive, last suffix only, and an
     /// empty string when the name has no extension.
     #[must_use]
     pub fn extension(&self) -> String {
@@ -195,7 +195,7 @@ pub trait DocumentLoader: Send + Sync {
     async fn load_bytes(
         &self,
         source: &DocumentBytes,
-        options: &LoadOptions,
+        _options: &LoadOptions,
     ) -> Result<Vec<Document>> {
         let loader = std::any::type_name::<Self>()
             .rsplit("::")
