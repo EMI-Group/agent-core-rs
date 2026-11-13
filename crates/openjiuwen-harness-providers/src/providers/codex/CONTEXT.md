@@ -81,9 +81,9 @@ Deliberately absent: `ForceAbort` and `PauseResume` (the app-server has no pause
 
 ## Test Strategy
 
-- `crates/openjiuwen-harness-providers/tests/codex.rs` (`#![cfg(feature = "vendor")]`, 11 tests) drives a real `tests/support::FakeCli` shell script over pipes: creation (fake binary unstarted, missing binary `Protocol`, invalid mapping `Validation`), a full turn through `HarnessIOAdapter` (answer delta, shell call/result, final text, lifecycle, thread id as session id), argv/`-c` rendering, approval round trip (accept/decline), steering, interruption, resumed thread, and a stream ending without `turn/completed`; every await is bounded by a 10 s `WAIT`.
+- `crates/openjiuwen-harness-providers/tests/codex.rs` (`#![cfg(all(unix, feature = "vendor"))]`, 11 tests) drives a real `tests/support::FakeCli` shell script over pipes: creation (fake binary unstarted, missing binary `Protocol`, invalid mapping `Validation`), a full turn through `HarnessIOAdapter` (answer delta, shell call/result, final text, lifecycle, thread id as session id), argv/`-c` rendering, approval round trip (accept/decline), steering, interruption, resumed thread, and a stream ending without `turn/completed`; every await is bounded by a 10 s `WAIT`.
 - Module unit tests: 13 in `mod.rs` (identity, card, defaults, strict decoding and error wording, model fragment, create errors, `Debug` redaction), 7 in `frames.rs` (tool names/args/results, error classification, answer wire shape), 9 in `wire.rs` (argv groups, endpoint table, user-input flag, MCP overrides, env layering, thread params, bypass).
-- The suite needs no `codex` binary, no SDK and no network; it is not `#![cfg(unix)]` (see the crate's Known Issues).
+- The suite needs no `codex` binary, no SDK and no network; it is gated on `unix` because the `FakeCli` fixture writes a POSIX shell script.
 
 ## Known Issues
 
