@@ -5,6 +5,10 @@
 //! tests therefore pin the wire contract instead — the kernel gateway envelope, the
 //! `params` names of the Python provider signatures, and the mapping of `data` back
 //! into the kernel result structs — against a loopback `wiremock` server.
+//!
+//! This root suite covers the envelope, authentication, invoke path, error
+//! mapping, conditional-write flag, and registration; the per-operation wire
+//! contracts live in `tests/fs.rs`, `tests/shell.rs`, and `tests/code.rs`.
 // A test module owns its panics: a failed `unwrap`/`expect` is an assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
