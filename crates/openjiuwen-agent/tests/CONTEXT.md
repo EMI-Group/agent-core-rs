@@ -15,6 +15,18 @@ Suites (run with `cargo test -p openjiuwen-agent`):
 - `llm_agent.rs` (7) → config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, interrupt pass-through.
 - `workflow_agent.rs` (5) → single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, no-workflow error.
 
+## Model fakes (`ScriptedModel`)
+
+- `openjiuwen_test_support::ScriptedModel` is the only model fake in the crate (unit tests included); no suite uses `MockLlmServer`, `TempWorkspace`, `TempHomeGuard`, or `EnvGuard` — isolation comes from in-process sessions and temp dirs created inside a test.
+- Construction, in rough frequency across `src/` + `tests/`: `ScriptedModel::builder().….build()` (61), `ScriptedModel::text("…")` (17), `ScriptedModel::new([ScriptedTurn::…])` (3).
+- Builder calls used: `.completion(MockCompletion::…)` (34), `.respond_text("…")` (54, the answer served when the script runs out), `.stream_text("…")` (6), `.fail(ScriptedError::llm("boom"))` (2), `.model_name("…")` (only `src/rails/model_backup.rs`).
+- `MockCompletion` variants used: `tool_call(name, json!({…}))` (29), `tool_calls(vec![MockToolCall::new(name, args), …])` (2, ids pinned with `.with_id("call_a")`), `text("a").with_usage(Usage::new(3, 4))` (1), `reasoning("think", "answer")` (2).
+- Failure turns: `ScriptedTurn::fail("boom")` and `ScriptedTurn::fail_with(ScriptedError::llm("boom"))` (3, always through `ScriptedModel::new`), or the builder's `.fail(...)`.
+- Inspection: `call_count()` (19), `calls()` (17 — index `calls[1].messages` or filter by `Role::Tool`), `last_call()` (6 — `.expect("one model call")` then `.messages` / `.request.tools`); each element is `openjiuwen_test_support::ModelCall { mode, messages, request }`.
+- No crate file calls `remaining()`; nothing asserts on `mode`/`CallMode` either.
+- `ScriptedModel` is `Clone` but not `Debug`, and the agent takes `Arc<dyn Model>`, so every suite has a `fn shared(model: &ScriptedModel) -> Arc<dyn Model> { Arc::new(model.clone()) }` (16 sites: `tests/react_agent.rs:24`, `tests/interrupt.rs:33`, `tests/rails.rs:44`, `tests/workflow_agent.rs:92`, `tests/streaming.rs:25`, plus per-module copies); it keeps the original handle for the call-history assertions.
+- `tests/llm_agent.rs` casts inline instead: `agent.react().set_model(Arc::new(model.clone()) as Arc<dyn Model>)`.
+
 ## Constraints
 
 - Every test is offline and deterministic; no wall-clock assertions beyond short timeouts and no external services.
