@@ -25,14 +25,15 @@
 //! 2. it unwraps the [`GatewayResponse`] tolerantly (`code` defaults to `0`,
 //!    `message` to `""`, `data` is optional) and returns `data` (`null` when
 //!    absent) on success, or a [`RemoteError::Status`] carrying
-//!    `aio gateway code <code>: <message>` otherwise — which the wrappers
-//!    render as code `199007` through
-//!    [`sandbox_gateway_message`](openjiuwen_core::sys_operation::status::sandbox_gateway_message);
-//!    because no HTTP status is involved in an envelope rejection, the reason
-//!    is rendered verbatim (`reason(error)`) instead of the transport's
-//!    `HTTP 0: …` form, while genuine transport failures keep the transport
-//!    rendering (including `HTTP 404`);
+//!    `aio gateway code <code>: <message>` otherwise;
 //! 3. it maps `data` into the kernel result structs.
+//!
+//! Every failure caused by the gateway or the transport — a `code != 0`
+//! envelope rejection, a non-2xx answer, a timeout, or an undecodable body —
+//! becomes the kernel's sandbox gateway status (code `199007`) with
+//! [`sandbox_gateway_message`](openjiuwen_core::sys_operation::status::sandbox_gateway_message),
+//! for filesystem, shell, and code operations alike. Operation-specific codes
+//! are reserved for parameter validation and execution outcomes.
 //!
 //! The `params` field names mirror the Python provider signatures exactly
 //! (`timeout`, not `timeout_secs`; `line_range` as a `[start, end]` array;
@@ -67,12 +68,19 @@
 //! # Notes on the mapping
 //!
 //! - Shell completion is success even for a non-zero exit code (Python
-//!   parity); only a timeout becomes a failure (`199004`), and a `124` exit
-//!   code — `timeout(1)`'s status — is the timeout signal.
+//!   parity); only a timeout becomes a failure (`199004`,
+//!   `execution timeout after <n> seconds` with the output as `data`), and a
+//!   `124` exit code — `timeout(1)`'s status — is the timeout signal. A blank
+//!   command is `199004` `command can not be empty`.
 //! - Code completion follows the same rule (`199005`), detecting a timeout
-//!   from exit code `124` or a `stderr` containing "timed out".
+//!   from exit code `124` or a `stderr` containing "timed out"; a blank
+//!   snippet is `199005` `code can not be empty`.
+//! - Gateway and transport failures are always `199007` (see above), so they
+//!   never take the operation-specific code of the call.
 //! - `write_file` rejects `expected_content_sha256` and `create_if_absent`
-//!   because a remote transport has no compare-and-swap.
+//!   because a remote transport has no compare-and-swap;
+//!   `supports_conditional_write` reports the gateway configuration's flag
+//!   as-is.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,7 +102,7 @@ use openjiuwen_core::sys_operation::fs::types::{
 use openjiuwen_core::sys_operation::operation::{
     CodeOperation, FsOperation, OpStream, ShellOperation,
 };
-use openjiuwen_core::sys_operation::result::{code_failure, fs_failure, shell_failure, OpResult};
+use openjiuwen_core::sys_operation::result::{fs_failure, shell_failure, OpResult};
 use openjiuwen_core::sys_operation::sandbox::config::{
     GatewayInvokeRequest, GatewayResponse, SandboxEndpoint, SandboxGatewayConfig,
 };
@@ -102,14 +110,16 @@ use openjiuwen_core::sys_operation::shell::types::{
     ShellArgvParams, ShellBackgroundOutput, ShellChunk, ShellExecParams, ShellOutput, ShellType,
     StreamKind,
 };
-use openjiuwen_core::sys_operation::status::{sandbox_gateway_message, SysOpStatus};
+use openjiuwen_core::sys_operation::status::SysOpStatus;
 
 use super::local_io::{read_host_file, write_host_file, HostIoError};
 use super::semantics::{
     byte_chunks, file_extension, filter_file_types, normalize_line_selection, posix_quote,
     sort_items, text_lines,
 };
-use super::transport::{base64_decode, base64_encode, hex_decode, RemoteError, SandboxHttp};
+use super::transport::{
+    base64_decode, base64_encode, gateway_failure, hex_decode, RemoteError, SandboxHttp,
+};
 use crate::sys_operation::SandboxProviderSet;
 
 #[cfg(test)]
@@ -173,6 +183,8 @@ pub(crate) struct AioClient {
     invoke_path: String,
     /// Resolved isolation key sent with every request (`null` when absent).
     isolation_key: Option<String>,
+    /// `SandboxGatewayConfig::supports_conditional_write` as resolved at construction.
+    supports_conditional_write: bool,
 }
 
 impl AioClient {
@@ -188,6 +200,7 @@ impl AioClient {
         Ok(Self {
             invoke_path: invoke_path(config),
             isolation_key: endpoint.isolation_key.clone(),
+            supports_conditional_write: config.supports_conditional_write,
             http,
         })
     }
@@ -310,6 +323,10 @@ impl AioFs {
 
 #[async_trait]
 impl FsOperation for AioFs {
+    fn supports_conditional_write(&self) -> bool {
+        self.client.supports_conditional_write
+    }
+
     async fn read_file(&self, params: ReadFileParams) -> OpResult<ReadFileData> {
         if let Err(reason) =
             normalize_line_selection(params.mode, params.head, params.tail, params.line_range)
@@ -318,7 +335,7 @@ impl FsOperation for AioFs {
         }
         match self.read_remote(&params).await {
             Ok(data) => OpResult::success(data),
-            Err(error) => call_failure("read_file", &error),
+            Err(error) => gateway_failure("read_file", &error),
         }
     }
 
@@ -389,7 +406,7 @@ impl FsOperation for AioFs {
         });
         let data = match self.client.invoke("fs", "write_file", payload).await {
             Ok(data) => data,
-            Err(error) => return call_failure("write_file", &error),
+            Err(error) => return gateway_failure("write_file", &error),
         };
         OpResult::success(WriteFileData {
             path: text_field(&data, "path").unwrap_or_else(|| params.path.clone()),
@@ -412,7 +429,7 @@ impl FsOperation for AioFs {
                     )
                 }
                 Ok(false) => {}
-                Err(error) => return call_failure("upload_file", &error),
+                Err(error) => return gateway_failure("upload_file", &error),
             }
         }
         let size = len_u64(bytes.len());
@@ -422,7 +439,7 @@ impl FsOperation for AioFs {
                 target_path: params.target_path,
                 size,
             }),
-            Err(error) => call_failure("upload_file", &error),
+            Err(error) => gateway_failure("upload_file", &error),
         }
     }
 
@@ -468,7 +485,7 @@ impl FsOperation for AioFs {
     async fn download_file(&self, params: DownloadFileParams) -> OpResult<DownloadFileData> {
         let bytes = match self.read_remote_bytes(&params.source_path).await {
             Ok(bytes) => bytes,
-            Err(error) => return call_failure("download_file", &error),
+            Err(error) => return gateway_failure("download_file", &error),
         };
         let size = len_u64(bytes.len());
         match write_host_file(
@@ -542,7 +559,7 @@ impl FsOperation for AioFs {
         });
         let entries = match self.entries("list_files", payload).await {
             Ok(entries) => entries,
-            Err(error) => return call_failure("list_files", &error),
+            Err(error) => return gateway_failure("list_files", &error),
         };
         let files: Vec<FileSystemItem> = entries
             .into_iter()
@@ -569,7 +586,7 @@ impl FsOperation for AioFs {
         });
         let entries = match self.entries("list_directories", payload).await {
             Ok(entries) => entries,
-            Err(error) => return call_failure("list_directories", &error),
+            Err(error) => return gateway_failure("list_directories", &error),
         };
         let mut items: Vec<FileSystemItem> = entries
             .into_iter()
@@ -598,7 +615,7 @@ impl FsOperation for AioFs {
         });
         let mut items = match self.entries("search_files", payload).await {
             Ok(entries) => entries,
-            Err(error) => return call_failure("search_files", &error),
+            Err(error) => return gateway_failure("search_files", &error),
         };
         sort_items(&mut items, SortBy::Name, false);
         OpResult::success(SearchFilesData {
@@ -640,7 +657,7 @@ impl AioShell {
         });
         let data = match self.client.invoke("shell", "execute_cmd", payload).await {
             Ok(data) => data,
-            Err(error) => return shell_failure(operation, &reason(&error)),
+            Err(error) => return gateway_failure(operation, &error),
         };
         let output = shell_output(command, cwd, &data);
         if output.timed_out {
@@ -713,7 +730,7 @@ impl ShellOperation for AioShell {
             .await
         {
             Ok(data) => data,
-            Err(error) => return shell_failure("execute_cmd_background", &reason(&error)),
+            Err(error) => return gateway_failure("execute_cmd_background", &error),
         };
         OpResult::success(ShellBackgroundOutput {
             command: text_field(&data, "command").unwrap_or_else(|| params.command.clone()),
@@ -780,7 +797,7 @@ impl CodeOperation for AioCode {
         });
         let data = match self.client.invoke("code", "execute_code", payload).await {
             Ok(data) => data,
-            Err(error) => return code_failure("execute_code", &reason(&error)),
+            Err(error) => return gateway_failure("execute_code", &error),
         };
         let output = code_output(&params.code, language, &data);
         if output.timed_out {
@@ -1108,30 +1125,6 @@ fn code_chunks(output: &CodeOutput) -> Vec<OpResult<CodeChunk>> {
     items
 }
 
-/// The failure reason of a gateway call.
-///
-/// An envelope rejection travels as [`RemoteError::Status`] with status `0`
-/// because no HTTP status is involved, and [`RemoteError::message`] would
-/// report it as `HTTP 0: ...`; that prefix is dropped so the reason reads
-/// exactly like the gateway's own message. Every other failure keeps the
-/// transport rendering (including `HTTP 404` and connection errors).
-fn reason(error: &RemoteError) -> String {
-    match error {
-        RemoteError::Status { status: 0, message } => message.clone(),
-        other => other.message(),
-    }
-}
-/// Renders a failed gateway call as the kernel's sandbox gateway status.
-///
-/// This is [`super::transport::gateway_failure`] with the envelope rejection
-/// recognised as such (see [`reason`]); the wrappers therefore answer `199007`
-/// with `sandbox gateway error, operation: <op>, reason: <reason>`.
-fn call_failure<T>(operation: &str, error: &RemoteError) -> OpResult<T> {
-    OpResult::failure(
-        SysOpStatus::SandboxGatewayError,
-        sandbox_gateway_message(operation, &reason(error)),
-    )
-}
 /// Whether a probe failure means the remote path is absent.
 ///
 /// The envelope signals a missing path as `code != 0` rather than as HTTP

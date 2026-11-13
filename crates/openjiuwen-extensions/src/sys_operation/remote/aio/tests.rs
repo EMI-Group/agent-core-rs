@@ -264,10 +264,10 @@ async fn a_gateway_rejection_names_the_calling_operation() {
         .execute_cmd_background(ShellExecParams::new("sleep 1"))
         .await;
 
-    assert_eq!(result.code, 199_004);
+    assert_eq!(result.code, 199_007);
     assert_eq!(
         result.message,
-        "shell operation execution error, execution: execute_cmd_background, \
+        "sandbox gateway error, operation: execute_cmd_background, \
          reason: aio gateway code -1: methods unavailable"
     );
     assert!(result.data.is_none());
@@ -1306,7 +1306,7 @@ async fn a_failing_shell_stream_emits_one_terminal_error_item() {
         collect(shell_arc(&server).execute_cmd_stream(ShellExecParams::new("echo a"))).await;
 
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].code, 199_004, "shell operations report 199004");
+    assert_eq!(items[0].code, 199_007, "gateway failures report 199007");
     assert!(
         items[0].message.contains("aio gateway code -1: nope"),
         "{}",
@@ -1409,7 +1409,7 @@ async fn code_output_maps_the_payload_and_falls_back_to_the_request() {
 }
 
 #[tokio::test]
-async fn a_code_gateway_failure_maps_to_199005() {
+async fn a_code_gateway_failure_maps_to_199007() {
     let server = MockServer::start().await;
     respond(&server, json!({"code": -1, "message": "no interpreter"})).await;
 
@@ -1417,10 +1417,13 @@ async fn a_code_gateway_failure_maps_to_199005() {
         .execute_code(CodeExecParams::new("print(1)"))
         .await;
 
-    assert_eq!(result.code, 199_005);
-    assert!(result
-        .message
-        .contains("aio gateway code -1: no interpreter"));
+    assert_eq!(result.code, 199_007);
+    assert_eq!(
+        result.message,
+        "sandbox gateway error, operation: execute_code, \
+         reason: aio gateway code -1: no interpreter"
+    );
+    assert!(result.data.is_none());
 }
 
 #[tokio::test]
@@ -1512,7 +1515,7 @@ async fn a_failing_code_stream_emits_one_terminal_error_item() {
         collect(code_arc(&server).execute_code_stream(CodeExecParams::new("pass"))).await;
 
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].code, 199_005);
+    assert_eq!(items[0].code, 199_007);
     let chunk = items[0].data.as_ref().unwrap();
     assert_eq!(chunk.chunk_index, 0);
     assert_eq!(chunk.exit_code, Some(-1));
@@ -1629,6 +1632,47 @@ async fn a_failing_read_stream_emits_one_terminal_error_item() {
     assert!(chunk.is_last_chunk);
     assert_eq!(chunk.chunk_size, 0);
     assert_eq!(chunk.chunk_index, 0);
+}
+
+// ─── conditional writes ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_conditional_write_flag_comes_from_the_gateway_configuration() {
+    let server = MockServer::start().await;
+    let config = SandboxGatewayConfig {
+        supports_conditional_write: true,
+        ..SandboxGatewayConfig::default()
+    };
+    let fs = AioFs {
+        client: Arc::new(AioClient::new(&endpoint(&server), &config).unwrap()),
+    };
+    assert!(fs.supports_conditional_write());
+
+    let plain = AioFs {
+        client: Arc::new(AioClient::new(&endpoint(&server), &gateway_config()).unwrap()),
+    };
+    assert!(!plain.supports_conditional_write());
+}
+
+#[tokio::test]
+async fn the_provider_set_forwards_the_conditional_write_flag() {
+    let config = SandboxGatewayConfig {
+        supports_conditional_write: true,
+        ..SandboxGatewayConfig::default()
+    };
+    let endpoint = SandboxEndpoint {
+        base_url: "http://127.0.0.1:1".to_string(),
+        ..SandboxEndpoint::default()
+    };
+    let factory = provider_set().fs.expect("a filesystem factory");
+    assert!(factory(&endpoint, &config)
+        .unwrap()
+        .supports_conditional_write());
+
+    let factory = provider_set().fs.expect("a filesystem factory");
+    assert!(!factory(&endpoint, &gateway_config())
+        .unwrap()
+        .supports_conditional_write());
 }
 
 // ─── registration ───────────────────────────────────────────────────────────

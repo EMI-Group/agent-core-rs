@@ -23,9 +23,7 @@ use openjiuwen_core::sys_operation::operation::{
     CodeOperation, FsOperation, OpStream, ShellOperation,
 };
 use openjiuwen_core::sys_operation::result::OpResult;
-use openjiuwen_core::sys_operation::shell::types::{
-    ShellArgvParams, ShellExecParams, StreamKind,
-};
+use openjiuwen_core::sys_operation::shell::types::{ShellArgvParams, ShellExecParams, StreamKind};
 
 use super::*;
 
@@ -139,10 +137,7 @@ impl SandboxBackend for FakeBackend {
         Ok(self.search_entries.lock().await.clone())
     }
 
-    async fn execute(
-        &self,
-        request: &ExecRequest,
-    ) -> std::result::Result<ExecResult, RemoteError> {
+    async fn execute(&self, request: &ExecRequest) -> std::result::Result<ExecResult, RemoteError> {
         self.requests.lock().await.push(request.clone());
         let mut scripted = self.executions.lock().await;
         if scripted.is_empty() {
@@ -153,10 +148,7 @@ impl SandboxBackend for FakeBackend {
     }
 }
 
-fn fs_backend(
-    backend: &Arc<FakeBackend>,
-    config: &SandboxGatewayConfig,
-) -> RemoteFs<FakeBackend> {
+fn fs_backend(backend: &Arc<FakeBackend>, config: &SandboxGatewayConfig) -> RemoteFs<FakeBackend> {
     RemoteFs::new(Arc::clone(backend), config)
 }
 
@@ -237,9 +229,9 @@ async fn read_validation_errors_use_the_fs_status() {
         .read_file(ReadFileParams::bytes("/work/a.bin").with_head(1))
         .await;
     assert_eq!(bytes_head.code, 199_003);
-    assert!(bytes_head.message.contains(
-        "Parameters 'head', 'tail', and 'line_range' are only supported in text mode"
-    ));
+    assert!(bytes_head
+        .message
+        .contains("Parameters 'head', 'tail', and 'line_range' are only supported in text mode"));
 
     let both = fs
         .read_file(
