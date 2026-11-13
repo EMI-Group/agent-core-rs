@@ -129,6 +129,10 @@ impl EnvPolicy {
 /// Configuration of the local (`OperationMode::Local`) backend.
 ///
 /// The first four fields are Python's `LocalWorkConfig` verbatim; the rest extend it.
+/// The independent booleans (`restrict_to_sandbox`, `cross_process_locks`,
+/// `line_buffered`, `pty_streaming`) are configuration switches for unrelated concerns,
+/// not a state machine, so grouping them into enums would obscure the JSON shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct LocalWorkConfig {
