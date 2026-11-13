@@ -633,6 +633,7 @@ impl LocalCodingMemory {
     ///
     /// Callers hold the state guard when they already own a document snapshot; taking
     /// the guard again here would deadlock the non-reentrant async mutex.
+    #[allow(clippy::unused_async_trait_impl)] // inherent method; the lint misfires on the cfg split
     async fn rebuild_index_from(&self, facts: &[CodingFact]) -> Result<usize> {
         #[cfg(feature = "sqlite")]
         {
@@ -834,7 +835,7 @@ mod tests {
         assert!(store.lock_path().exists());
         let text = std::fs::read_to_string(store.memory_path()).unwrap();
         assert!(text.contains("# Memory"), "{text}");
-        assert!(store.list().await.unwrap().is_empty());
+        assert_eq!(store.list().await.unwrap(), Vec::<CodingFact>::new());
         assert_eq!(store.reload_count(), 0);
         #[cfg(feature = "sqlite")]
         assert_eq!(store.indexed_count().await.unwrap(), 0);
@@ -865,7 +866,7 @@ mod tests {
         assert!(store.delete("build").await.unwrap());
         assert!(!store.delete("build").await.unwrap());
         assert!(store.read("build").await.unwrap().is_none());
-        assert!(store.list().await.unwrap().is_empty());
+        assert_eq!(store.list().await.unwrap(), Vec::<CodingFact>::new());
     }
 
     #[tokio::test]
@@ -912,11 +913,13 @@ mod tests {
         let hits = store.search("release", &keyword_options()).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].score > 0.0 && hits[0].score <= 1.0);
-        assert!(store
-            .search("absent-term", &keyword_options())
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .search("absent-term", &keyword_options())
+                .await
+                .unwrap(),
+            Vec::<RecallHit>::new()
+        );
     }
 
     #[tokio::test]
@@ -940,7 +943,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(hits.is_empty());
+        assert_eq!(hits, Vec::<RecallHit>::new());
     }
 
     #[tokio::test]
@@ -996,11 +999,14 @@ mod tests {
         assert_eq!(read.content, "edited outside the store");
         #[cfg(feature = "sqlite")]
         assert_eq!(store.indexed_count().await.unwrap(), 2);
-        assert!(!store
-            .search("edited", &keyword_options())
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .search("edited", &keyword_options())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
 
         // A write after the external edit must keep the external fact.
         let _ = store.write(fact("test", "cargo test")).await.unwrap();
