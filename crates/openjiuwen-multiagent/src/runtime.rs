@@ -10,6 +10,36 @@
 //! a [`Weak`] reference back to it, so the two never form an `Arc` cycle and a
 //! dropped runtime makes in-flight deliveries fail with
 //! `Error::session("team runtime dropped")`.
+//!
+//! # Team events
+//!
+//! Each runtime owns one [`TeamEventBus`] ([`TeamRuntime::events`]) and emits
+//! synchronously, after the corresponding state change succeeded:
+//!
+//! - [`TeamEvent::member_joined`] for every [`TeamRuntime::register_agent`]
+//!   (with a `replaced` detail when the id was already registered) and for a
+//!   [`TeamRuntime::pin_agent`] that creates an entry;
+//! - [`TeamEvent::member_left`] when [`TeamRuntime::unregister_agent`] removes a
+//!   member (an unknown id emits nothing);
+//! - [`TeamEvent::message_sent`] after a successful [`TeamRuntime::send`] or
+//!   [`TeamRuntime::publish`], carrying the envelope's message id and the topic
+//!   or session id when known;
+//! - [`TeamEvent::message_received`] (the pub/sub form carries the topic id)
+//!   before an inbound member is invoked, matching Python's
+//!   `AGENT_P2P_RECEIVED`/`AGENT_PUBSUB_RECEIVED` triggers that run before
+//!   `Runner.run_agent`;
+//! - [`TeamEvent::error`] when an outbound or inbound dispatch fails, with an
+//!   `operation` detail of `send`, `publish`, `p2p_dispatch`, or
+//!   `pubsub_dispatch`.
+//!
+//! # Resource manager and transport seams
+//!
+//! A runtime can consult a [`TeamResourceMgr`] (typically owned by a runner) for
+//! members the team never registered locally, and it can route outbound
+//! deliveries through a [`TeamTransport`] instead of the built-in in-process
+//! bus. The local member registry always wins over the resource manager.
+//! Inbound dispatch stays bus-driven for the in-process transport; a backend
+//! such as the Redis transport supplies its own inbound workers.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
@@ -25,8 +55,14 @@ use serde_json::Value;
 
 use crate::envelope::MessageEnvelope;
 use crate::error::TeamError;
+use crate::events::{TeamEvent, TeamEventBus};
 use crate::member::{AgentProvider, TeamAgent};
+use crate::member_checkpoint::MemberCheckpointer;
 use crate::message_bus::{MessageBus, MessageBusConfig, MessageHandler};
+use crate::resources::TeamResourceMgr;
+use crate::transport::{InProcessTransport, TeamTransport};
+
+mod seams;
 
 /// Team id used when the configured one is absent or empty.
 const DEFAULT_TEAM_ID: &str = "default";
@@ -131,6 +167,10 @@ pub struct TeamRuntime {
     config: RuntimeConfig,
     bus: Arc<MessageBus>,
     state: Arc<RuntimeState>,
+    events: Arc<TeamEventBus>,
+    transport: RwLock<Arc<dyn TeamTransport>>,
+    resource_mgr: RwLock<Option<Arc<dyn TeamResourceMgr>>>,
+    member_checkpointer: RwLock<Option<Arc<MemberCheckpointer>>>,
 }
 
 impl std::fmt::Debug for TeamRuntime {
@@ -138,6 +178,11 @@ impl std::fmt::Debug for TeamRuntime {
         f.debug_struct("TeamRuntime")
             .field("team_id", &self.config.team_id)
             .field("agents", &self.agent_ids())
+            .field("has_resource_mgr", &self.resource_mgr.read().is_some())
+            .field(
+                "has_member_checkpointer",
+                &self.member_checkpointer.read().is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -148,9 +193,32 @@ impl TeamRuntime {
     /// The bus holds a [`Weak`] back-reference, so the returned `Arc` is the
     /// only owner of the runtime. Construction uses [`Arc::new_cyclic`] so the
     /// weak reference exists before the value does.
+    ///
+    /// The runtime starts with its own [`TeamEventBus`], an in-process transport
+    /// over the bus it just built, and no resource manager or member
+    /// checkpointer.
     #[must_use]
     pub fn new(config: RuntimeConfig) -> Arc<Self> {
+        Self::build(config, None)
+    }
+
+    /// Builds a runtime that also consults `resource_mgr` for members, tools,
+    /// models, and team sessions it does not own.
+    ///
+    /// Registration forwards to the manager as well, matching Python's
+    /// `Runner.resource_mgr.add_agent` call inside `register_agent`.
+    #[must_use]
+    pub fn new_with_resource_mgr(
+        config: RuntimeConfig,
+        resource_mgr: Arc<dyn TeamResourceMgr>,
+    ) -> Arc<Self> {
+        Self::build(config, Some(resource_mgr))
+    }
+
+    /// Builds the runtime and its bus; `resource_mgr` is optional.
+    fn build(config: RuntimeConfig, resource_mgr: Option<Arc<dyn TeamResourceMgr>>) -> Arc<Self> {
         let state = Arc::new(RuntimeState::new(&config));
+        let events = TeamEventBus::new();
         // Python parity: the runtime stamps its team id onto the bus config, so
         // topic names isolate teams even without an explicit bus override.
         let mut bus_config = config.message_bus.clone().unwrap_or_default();
@@ -160,12 +228,28 @@ impl TeamRuntime {
             let handler = Arc::new(RuntimeHandler {
                 runtime: weak.clone(),
             });
+            let bus = Arc::new(MessageBus::new(bus_config, handler));
+            let transport: Arc<dyn TeamTransport> = InProcessTransport::from_bus(Arc::clone(&bus));
             Self {
                 config,
-                bus: Arc::new(MessageBus::new(bus_config, handler)),
+                bus,
                 state,
+                events,
+                transport: RwLock::new(transport),
+                resource_mgr: RwLock::new(resource_mgr),
+                member_checkpointer: RwLock::new(None),
             }
         })
+    }
+
+    /// Returns the team event bus this runtime emits on.
+    ///
+    /// The bus is process-local and shared as an `Arc`; it is not part of
+    /// [`RuntimeConfig`] because it is neither serializable nor shareable across
+    /// processes.
+    #[must_use]
+    pub fn events(&self) -> Arc<TeamEventBus> {
+        Arc::clone(&self.events)
     }
 
     /// Returns the team id embedded in transport topic names.
@@ -223,26 +307,50 @@ impl TeamRuntime {
     /// Registers `card` with its provider, replacing an existing registration.
     ///
     /// A replacement clears the pinned instance: the new provider is the source
-    /// of truth again.
+    /// of truth again. Registration is also forwarded to the configured
+    /// [`TeamResourceMgr`], where a duplicate is logged at `debug` and the
+    /// existing entry is reused (Python parity), so a `false` result never
+    /// fails the local registration.
+    ///
+    /// Emits [`TeamEvent::member_joined`], with a `replaced` detail when the
+    /// agent id was already registered.
     pub fn register_agent(&self, card: AgentCard, provider: AgentProvider) {
-        let mut registry = self.state.agents.write();
         let agent_id = card.id.clone();
-        if !registry.entries.contains_key(&agent_id) {
-            registry.order.push(agent_id.clone());
+        let replaced = {
+            let mut registry = self.state.agents.write();
+            let replaced = registry.entries.contains_key(&agent_id);
+            if !replaced {
+                registry.order.push(agent_id.clone());
+            }
+            registry.entries.insert(
+                agent_id.clone(),
+                RegisteredAgent {
+                    card: card.clone(),
+                    provider: Arc::clone(&provider),
+                    pinned: None,
+                },
+            );
+            replaced
+        };
+        if let Some(mgr) = self.resource_mgr() {
+            if !mgr.register_agent(card, provider) {
+                tracing::debug!(agent_id, "agent already in the resource manager; reusing");
+            }
         }
-        registry.entries.insert(
-            agent_id,
-            RegisteredAgent {
-                card,
-                provider,
-                pinned: None,
-            },
-        );
+        let mut event = TeamEvent::member_joined(self.team_id(), agent_id);
+        if replaced {
+            event = event.with_detail("replaced", Value::Bool(true));
+        }
+        self.events.emit(event);
     }
 
     /// Removes `agent_id` and all its subscriptions, returning its card.
     ///
-    /// An unknown agent is a no-op returning `None`.
+    /// An unknown agent is a no-op returning `None`. The resource manager is
+    /// deliberately left untouched, because an agent may be shared by several
+    /// teams (Python parity).
+    ///
+    /// Emits [`TeamEvent::member_left`] only when a member was removed.
     #[must_use]
     pub fn unregister_agent(&self, agent_id: &str) -> Option<AgentCard> {
         let card = {
@@ -254,6 +362,8 @@ impl TeamRuntime {
         for topic in self.bus.agent_topics(agent_id) {
             self.bus.remove_subscription(agent_id, &topic);
         }
+        self.events
+            .emit(TeamEvent::member_left(self.team_id(), agent_id));
         Some(card)
     }
 
@@ -261,7 +371,8 @@ impl TeamRuntime {
     /// the provider again.
     ///
     /// An unknown `agent_id` gets a placeholder card named after it, so a
-    /// strategy can pin an agent it wired before registering it.
+    /// strategy can pin an agent it wired before registering it; that path
+    /// emits [`TeamEvent::member_joined`] because it creates a registry entry.
     pub fn pin_agent(&self, agent_id: &str, agent: TeamAgent) {
         let mut registry = self.state.agents.write();
         if let Some(entry) = registry.entries.get_mut(agent_id) {
@@ -278,6 +389,9 @@ impl TeamRuntime {
                 pinned: Some(agent),
             },
         );
+        drop(registry);
+        self.events
+            .emit(TeamEvent::member_joined(self.team_id(), agent_id));
     }
 
     /// Binds `session` so deliveries carrying its id run in its child sessions.
@@ -311,32 +425,23 @@ impl TeamRuntime {
     }
 
     /// Returns the bus this runtime dispatches through.
+    ///
+    /// Outbound deliveries route through [`TeamRuntime::transport`], which
+    /// wraps this bus by default. Subscriptions and session cleanup stay on the
+    /// bus, because the in-process transport is bus-driven in both directions.
     #[must_use]
     pub fn message_bus(&self) -> Arc<MessageBus> {
         Arc::clone(&self.bus)
     }
 
-    /// Starts the bus. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Reserved for future transports; the in-process bus never fails.
-    pub async fn start(&self) -> Result<()> {
-        self.bus.start().await
-    }
-
-    /// Stops the bus and joins every topic worker. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Reserved for future transports; the in-process bus never fails.
-    pub async fn stop(&self) -> Result<()> {
-        self.bus.stop().await
-    }
-
     /// Sends `message` point-to-point and waits for the reply.
     ///
     /// The deadline is `timeout` when supplied, else [`TeamRuntime::p2p_timeout`].
+    /// The delivery routes through [`TeamRuntime::transport`].
+    ///
+    /// Emits [`TeamEvent::message_sent`] with the envelope's message id on
+    /// success, and [`TeamEvent::error`] (detail `operation = "send"`) when the
+    /// transport fails; the error is returned unchanged.
     ///
     /// # Errors
     ///
@@ -366,14 +471,31 @@ impl TeamRuntime {
         if let Some(session_id) = session_id {
             envelope = envelope.with_session(session_id);
         }
+        let message_id = envelope.message_id.clone();
         let deadline = Some(timeout.unwrap_or_else(|| self.p2p_timeout()));
-        self.bus.send(envelope, deadline).await
+        let result = self.transport().send(envelope, deadline).await;
+        match result {
+            Ok(value) => {
+                self.emit_message_sent(sender, recipient, &message_id, session_id, None);
+                Ok(value)
+            }
+            Err(error) => {
+                self.emit_dispatch_error(recipient, &error, "send");
+                Err(error)
+            }
+        }
     }
 
     /// Publishes `message` on `topic_id` and waits for the fan-out.
     ///
     /// The topic does not need a registered subscriber: an empty subscriber set
-    /// is a no-op, matching Python.
+    /// is a no-op, matching Python. The delivery routes through
+    /// [`TeamRuntime::transport`].
+    ///
+    /// Emits [`TeamEvent::message_sent`] with the envelope's message id and the
+    /// topic on success, and [`TeamEvent::error`] (detail
+    /// `operation = "publish"`) when the transport fails; the error is returned
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -394,7 +516,18 @@ impl TeamRuntime {
         if let Some(session_id) = session_id {
             envelope = envelope.with_session(session_id);
         }
-        self.bus.publish(envelope).await
+        let message_id = envelope.message_id.clone();
+        let result = self.transport().publish(envelope).await;
+        match result {
+            Ok(()) => {
+                self.emit_message_sent(sender, topic_id, &message_id, session_id, Some(topic_id));
+                Ok(())
+            }
+            Err(error) => {
+                self.emit_dispatch_error(topic_id, &error, "publish");
+                Err(error)
+            }
+        }
     }
 
     /// Subscribes `agent_id` to `topic` (an exact topic or a `*`/`?` pattern).
@@ -444,30 +577,123 @@ impl TeamRuntime {
     /// Resolves `agent_id`, binds it, and runs one invocation.
     ///
     /// A pinned instance wins over the provider; the bind hook runs on the
-    /// resolved member before the invocation.
+    /// resolved member before the invocation. A member the local registry does
+    /// not hold is resolved through [`TeamRuntime::resolve_agent_provider`], so
+    /// a runner-backed resource manager can supply members.
+    ///
+    /// With a [`MemberCheckpointer`] installed ([`TeamRuntime::set_member_checkpointer`])
+    /// and a session, the member's own state is restored before the invocation
+    /// and saved after a successful one — the Rust counterpart of Python's
+    /// `pre_agent_execute` restore and `post_agent_execute` save over the
+    /// `AgentStorage` keyed by the child session's agent id. A failed member is
+    /// not saved.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] when `agent_id` is not registered, and the member's
-    /// error unchanged when the invocation fails.
+    /// [`Error::NotFound`] when neither the local registry nor the resource
+    /// manager knows `agent_id`; a checkpoint restore or save failure is
+    /// propagated unchanged (Python's `pre_agent_execute` raises); a member
+    /// error is propagated unchanged and never saved.
     pub async fn invoke_agent(
         &self,
         agent_id: &str,
         inputs: Value,
         session: Option<Arc<dyn Session>>,
     ) -> Result<AgentOutput> {
-        let (pinned, provider) = {
-            let registry = self.state.agents.read();
-            let entry = registry.entries.get(agent_id).ok_or_else(|| {
-                Error::not_found(format!("Agent '{agent_id}' not registered in runtime"))
-            })?;
-            (entry.pinned.clone(), Arc::clone(&entry.provider))
-        };
+        let (pinned, provider) = self.resolve_member(agent_id)?;
         let member = pinned.unwrap_or_else(|| provider());
         if let Some(runtime) = self.state.self_ref.get().and_then(Weak::upgrade) {
             member.bind(&runtime, agent_id);
         }
-        member.agent().invoke(inputs, session).await
+        let checkpointer = self.member_checkpointer();
+        if let (Some(checkpointer), Some(member_session)) =
+            (checkpointer.as_ref(), session.as_deref())
+        {
+            let restored = checkpointer.restore(member_session).await?;
+            tracing::debug!(agent_id, restored, "restored team member state");
+        }
+        let output = member.agent().invoke(inputs, session.clone()).await;
+        match output {
+            Ok(output) => {
+                if let (Some(checkpointer), Some(member_session)) =
+                    (checkpointer.as_ref(), session.as_deref())
+                {
+                    if let Some(checkpoint_id) = checkpointer.save(member_session).await? {
+                        tracing::debug!(
+                            agent_id,
+                            checkpoint_id = %checkpoint_id,
+                            "saved team member state"
+                        );
+                    }
+                }
+                Ok(output)
+            }
+            // A failed member is not checkpointed: its state may be partial.
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resolves the member pinned instance and provider for `agent_id`.
+    ///
+    /// The local registry wins; otherwise the provider (and, for tracing, the
+    /// card) comes from the resource manager. Returns [`Error::NotFound`] with
+    /// the Python message when neither resolves.
+    fn resolve_member(&self, agent_id: &str) -> Result<(Option<TeamAgent>, AgentProvider)> {
+        let local = {
+            let registry = self.state.agents.read();
+            registry
+                .entries
+                .get(agent_id)
+                .map(|entry| (entry.pinned.clone(), Arc::clone(&entry.provider)))
+        };
+        if let Some(member) = local {
+            return Ok(member);
+        }
+        let provider = self.resolve_agent_provider(agent_id).ok_or_else(|| {
+            Error::not_found(format!("Agent '{agent_id}' not registered in runtime"))
+        })?;
+        match self.resolve_agent_card(agent_id) {
+            Some(card) => {
+                tracing::debug!(
+                    agent_id,
+                    card_id = %card.id,
+                    "resolved team member from the resource manager"
+                );
+            }
+            None => {
+                tracing::debug!(
+                    agent_id,
+                    "resource manager supplied a member provider without a card"
+                );
+            }
+        }
+        Ok((None, provider))
+    }
+
+    /// Emits one outbound [`TeamEvent::message_sent`].
+    fn emit_message_sent(
+        &self,
+        sender: &str,
+        recipient: &str,
+        message_id: &str,
+        session_id: Option<&str>,
+        topic_id: Option<&str>,
+    ) {
+        let mut event = TeamEvent::message_sent(self.team_id(), sender, recipient, message_id);
+        if let Some(topic_id) = topic_id {
+            event = event.with_topic(topic_id);
+        }
+        if let Some(session_id) = session_id {
+            event = event.with_session(session_id);
+        }
+        self.events.emit(event);
+    }
+
+    /// Emits one [`TeamEvent::error`] for a failed dispatch.
+    fn emit_dispatch_error(&self, subject: impl Into<String>, error: &Error, operation: &str) {
+        let event = TeamEvent::error(self.team_id(), subject, error.to_string())
+            .with_detail("operation", Value::String(operation.to_owned()));
+        self.events.emit(event);
     }
 
     /// Builds the child session a delivery to `agent_id` runs in.
@@ -489,11 +715,22 @@ impl TeamRuntime {
     }
 
     /// Handles one point-to-point delivery from the bus.
+    ///
+    /// Emits [`TeamEvent::message_received`] before the member is invoked,
+    /// mirroring Python's `AGENT_P2P_RECEIVED` trigger that runs before
+    /// `Runner.run_agent`.
     async fn dispatch_p2p(&self, envelope: &MessageEnvelope) -> Result<Value> {
         let recipient = envelope
             .recipient
             .clone()
             .ok_or_else(|| Error::validation("recipient is required"))?;
+        let sender = envelope.sender.clone().unwrap_or_default();
+        let mut received =
+            TeamEvent::message_received(self.team_id(), &sender, &recipient, &envelope.message_id);
+        if let Some(session_id) = &envelope.session_id {
+            received = received.with_session(session_id.clone());
+        }
+        self.events.emit(received);
         if !self.has_agent(&recipient) {
             return Err(Error::not_found(format!(
                 "Recipient '{recipient}' not registered in runtime"
@@ -503,12 +740,28 @@ impl TeamRuntime {
         let output = self
             .invoke_agent(&recipient, envelope.message.clone(), session)
             .await?;
-        let sender = envelope.sender.clone().unwrap_or_default();
         ensure_non_empty(output.to_value(), &sender, &recipient)
     }
 
     /// Handles one pub/sub delivery from the bus; the output is discarded.
+    ///
+    /// Emits [`TeamEvent::pubsub_received`] before the subscriber is invoked,
+    /// mirroring Python's `AGENT_PUBSUB_RECEIVED` trigger that runs before
+    /// `Runner.run_agent`.
     async fn dispatch_pubsub(&self, envelope: &MessageEnvelope, subscriber: &str) -> Result<()> {
+        let sender = envelope.sender.clone().unwrap_or_default();
+        let topic = envelope.topic_id.clone().unwrap_or_default();
+        let mut received = TeamEvent::pubsub_received(
+            self.team_id(),
+            &sender,
+            subscriber,
+            &topic,
+            &envelope.message_id,
+        );
+        if let Some(session_id) = &envelope.session_id {
+            received = received.with_session(session_id.clone());
+        }
+        self.events.emit(received);
         if !self.has_agent(subscriber) {
             return Err(Error::not_found(format!(
                 "Recipient '{subscriber}' not registered in runtime"
@@ -560,12 +813,21 @@ struct RuntimeHandler {
 impl MessageHandler for RuntimeHandler {
     async fn handle_p2p(&self, envelope: &MessageEnvelope) -> Result<Value> {
         let runtime = self.runtime.upgrade().ok_or_else(runtime_dropped)?;
-        runtime.dispatch_p2p(envelope).await
+        let result = runtime.dispatch_p2p(envelope).await;
+        if let Err(error) = &result {
+            let recipient = envelope.recipient.clone().unwrap_or_default();
+            runtime.emit_dispatch_error(recipient, error, "p2p_dispatch");
+        }
+        result
     }
 
     async fn handle_pubsub(&self, envelope: &MessageEnvelope, subscriber: &str) -> Result<()> {
         let runtime = self.runtime.upgrade().ok_or_else(runtime_dropped)?;
-        runtime.dispatch_pubsub(envelope, subscriber).await
+        let result = runtime.dispatch_pubsub(envelope, subscriber).await;
+        if let Err(error) = &result {
+            runtime.emit_dispatch_error(subscriber, error, "pubsub_dispatch");
+        }
+        result
     }
 }
 

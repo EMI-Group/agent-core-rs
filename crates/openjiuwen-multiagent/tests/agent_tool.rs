@@ -251,3 +251,24 @@ async fn cancelled_context_is_reported() {
     let error = tool.invoke(json!({}), &ctx).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
 }
+
+#[tokio::test]
+async fn cancelled_context_emits_no_task_events() {
+    use openjiuwen_multiagent::events::{TeamEvent, TeamEventFilter};
+
+    let (runtime, _seen) = runtime_with_member("worker");
+    let recorded: Arc<Mutex<Vec<TeamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    runtime.events().subscribe(
+        TeamEventFilter::new(),
+        Arc::new(move |event: &TeamEvent| sink.lock().push(event.clone())),
+    );
+
+    let card = agent_card("worker");
+    let tool = AgentTool::new(&card, Arc::downgrade(&runtime));
+    let ctx = ToolContext::new();
+    ctx.cancellation.cancel();
+    let error = tool.invoke(json!({}), &ctx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(recorded.lock().is_empty());
+}
