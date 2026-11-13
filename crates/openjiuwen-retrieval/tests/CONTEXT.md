@@ -16,6 +16,7 @@ All tests are offline and deterministic.
 - `graph.rs` → rule extraction pattern families, dedupe/cap, CJK entities, provenance metadata, `TripleMemory`/`TripleBeam`, graph-store traversal and queries.
 - `multimodal.rs` → `MultimodalDocument`/`ContentPart` JSON, data-URI round trips, `content()` shapes, `add_file`, `ImageLoader` metadata/errors, Markdown table round trip, row/column documents and table chunks.
 - `parsing_zip.rs` → the ZIP container reader against archives assembled byte by byte (stored/deflated entries, CRC and size failures, unsupported method/encryption/ZIP64, `read_text`, `open`).
+- `parsing_documents.rs` → DOCX/XLSX/PDF parsers against byte-built stored ZIP fixtures and `zlib_stored` PDF streams (blocks/headings/tables/title, sheets and row/column documents, content-stream operators, `FlateDecode`, unsupported variants, `parse_path`).
 
 ## Constraints
 
@@ -35,3 +36,4 @@ All tests are offline and deterministic.
 - `./graph.rs` → triple extraction and graph store
 - `./multimodal.rs` → multimodal documents, image loading, table conversion
 - `./parsing_zip.rs` → ZIP container reader (`openjiuwen_retrieval::parsing::ZipArchive`)
+- `./parsing_documents.rs` → DOCX/XLSX/PDF document parsers

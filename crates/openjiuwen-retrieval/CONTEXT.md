@@ -5,7 +5,8 @@
 Documents, chunking, embeddings, vector stores, rerankers, and knowledge base for the Rust rewrite.
 Maps to the Python package `openjiuwen.core.retrieval` (public surface in `openjiuwen/core/retrieval/__init__.py`), with the document/result/config models from `retrieval/common/` and the foundation store ABCs (`Document`, `Embedding`, `Reranker`, `VectorStore`).
 Scope is the offline-capable core: text/JSON/Markdown/CSV/HTML/URL loading, character/recursive/token chunking, an OpenAI-compatible embedding client plus a deterministic fake, an in-memory vector store with optional JSON persistence, score/LLM reranking seams, a knowledge base that runs load → chunk → embed → store → retrieve → rerank, and (Rust additions) deterministic rule-based triple extraction plus an in-memory graph store.
-External vector databases (Milvus, Chroma, PGVector, Elasticsearch), PDF/DOCX/XLSX parsing, LLM-backed triple extraction, multimodal documents, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+External vector databases (Milvus, Chroma, PGVector, Elasticsearch), LLM-backed triple extraction, query rewriting, sparse/BM25 and agentic retrievers are deferred behind traits or return `Error::Unsupported` (see `docs/PARITY.md`).
+PDF/DOCX/XLSX text is now parsed in-crate by `parsing::{PdfParser, DocxParser, XlsxParser}`; the file loaders still report those extensions as `Unsupported` until they are wired to the parsers.
 
 ## API Surface
 
@@ -233,5 +234,6 @@ Pattern families emit `is_a`, `has`, `contains`, `includes`, `uses`, `with`, `cr
 - `./src/graph/` → `Triple`/`TripleMemory`/`TripleBeam`, rule-based triple extraction, in-memory graph store (`graph/CONTEXT.md`)
 - `./src/reranker/` → `Reranker` trait, score default, `LlmScorer` seam (`reranker/CONTEXT.md`)
 - `./src/knowledge_base/` → `SimpleKnowledgeBase` pipeline, statistics, multi-KB retrieval (`knowledge_base/CONTEXT.md`)
+- `./src/parsing/` → in-crate DEFLATE/ZIP containers, tolerant XML, and the DOCX/XLSX/PDF readers (`parsing/CONTEXT.md`)
 - `./tests/` → cross-module integration tests (`tests/CONTEXT.md`)
 - `./Cargo.toml` → crate manifest and dependencies
