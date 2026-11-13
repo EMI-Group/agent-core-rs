@@ -63,13 +63,14 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Loopback services bind `127.0.0.1:0` and read the address back; every scenario shuts its server down (`ServerHandle::shutdown` + `join`).
 - A scenario that needs a sibling API change is `#[ignore = "<reason>"]`d with the gap recorded under **Known Gaps**, never fixed by editing the sibling crate.
 - `openjiuwen-e2e` is not in the workspace `default-members`: use `cargo test -p openjiuwen-e2e` (and `--features a2a`).
+- `openjiuwen-agent-teams` is taken with its default features only (`crates/openjiuwen-e2e/Cargo.toml:20`); the umbrella's `sqlite` feature forwards to extensions/symphony but not to agent-teams (`crates/openjiuwen/Cargo.toml:42`), so a SQLite team store needs a crate feature forwarding `openjiuwen-agent-teams/sqlite`.
 
 ## Routing Table
 
 - `./tests/kernel_flow.rs` → model → tool → session → workflow → runner flows (kernel crates)
 - `./tests/deep_agent.rs` → DeepAgent task loop, workspace tools, permissions, interrupt/resume
 - `./tests/provider_native.rs` → provider-neutral harness SPI: factory, native harness lifecycle, IO adapter
-- `./tests/team_flow.rs` → agent teams: spec build, leader/teammate runtime, task board
+- `./tests/team_flow.rs` → agent teams: spec build, leader/teammate runtime, task board (umbrella `openjiuwen::agent_teams` paths only, scripted `MemberHarnessFactory` + `InMemoryTeamStore`)
 - `./tests/a2a_roundtrip.rs` → A2A client/server round trip (feature `a2a`)
 - `./tests/symphony_plan.rs` → symphony capability registry, planning, graph execution, artifact reload
 - `./tests/self_improvement.rs` → RSI orchestrator and agent-evolving trainer with fake runners
