@@ -14,15 +14,19 @@
 //! [`fact`](self)); [`CodingFact::from_record`] identifies coding records by their
 //! `coding_fact` marker and metadata `name`.
 //!
-//! # Deviations from the Python lite stack
+//! # Two paths
 //!
-//! - There is no Markdown file source of truth and no SQLite FTS5/`sqlite_vec` index:
-//!   facts are engine records and keyword recall comes from the engine's BM25 path.
-//! - There are no filesystem watchers, no cross-process rebuild lock, and no
-//!   embedding cache: [`CodingMemory::render_index`] returns a string and the caller
-//!   decides where to write it.
-//! - The instance is an explicit `Arc<CodingMemory>` over an injected engine, not a
-//!   process-global singleton.
+//! - [`CodingMemory`] is the engine-backed path: facts are ordinary engine records, and
+//!   [`CodingMemory::render_index`]/[`CodingMemory::citation`] return strings, so the
+//!   caller decides where to materialize `MEMORY.md`.
+//! - [`local`] adds the local, file-backed path: [`LocalCodingMemory`](local::LocalCodingMemory)
+//!   owns a Markdown source of truth ([`markdown`]), a derived SQLite FTS5 index
+//!   (`fts`, feature `sqlite`), a cross-process advisory lock ([`lock`]), and a
+//!   debounced filesystem watcher ([`watch`]).
+//!
+//! Both paths are explicit instances (`Arc<CodingMemory>`, cloned `LocalCodingMemory`
+//! handles) over injected state, never process-global singletons. The remainder of the
+//! Python lite stack that is not ported is listed in this module's `CONTEXT.md`.
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
