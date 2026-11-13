@@ -22,7 +22,18 @@
 //! marker) instead of swallowing it. The run fails at that node, so the graph engine
 //! stores the *pre-superstep* boundary and `resume` re-runs the interrupted superstep
 //! with the seeded answers.
+//!
+//! **Error recovery** ports Python's `_run_error_recovery` / `_post_invoke`
+//! (`openjiuwen/core/graph/vertex.py`): once the graph's retries are exhausted, a failed
+//! `Invoke`/`Collect` node whose `ExceptionConfig` carries `default_outputs` and a
+//! non-`interrupt` `handle_type` is treated as recovered. The defaults go through the
+//! node's `outputs_schema` and are written to state under the node id, so downstream
+//! `${node.field}` references resolve, exactly like Python. Deviation: Python only
+//! recovers through a registered `component_error_recovery` callback and re-raises
+//! `Stream`/`Transform` failures; this port applies the declared policy inline and,
+//! matching Python, never recovers a streaming failure.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,6 +43,7 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::json as json_utils;
 use openjiuwen_graph::{GraphContext, GraphState, Node, NodeOutcome};
 use openjiuwen_session::tracer::SpanHandle;
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 
 use crate::ability::ComponentAbility;
@@ -57,6 +69,9 @@ pub(crate) struct RunScope {
     pub(crate) writer: Arc<FrameWriter>,
     /// Nesting level of this run (`0` for a top-level run).
     pub(crate) depth: usize,
+    /// Consecutive failed attempts per node id, so error recovery waits for the
+    /// graph's retries to be exhausted.
+    failures: Mutex<HashMap<String, u32>>,
 }
 
 impl RunScope {
@@ -71,7 +86,21 @@ impl RunScope {
             interactions,
             writer,
             depth,
+            failures: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Records one failed attempt of `id` and returns its consecutive failure count.
+    fn record_failure(&self, id: &str) -> u32 {
+        let mut failures = self.failures.lock();
+        let attempts = failures.entry(id.to_owned()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        *attempts
+    }
+
+    /// Forgets `id`'s failed attempts, called once it produces a value.
+    fn clear_failures(&self, id: &str) {
+        self.failures.lock().remove(id);
     }
 }
 
@@ -207,6 +236,26 @@ impl ComponentNode {
         }
         Ok(Value::Array(collected))
     }
+
+    /// The value substituted when a failed invocation is recoverable, if it is.
+    ///
+    /// Mirrors Python's `_run_error_recovery`: only `Invoke` and `Collect` failures are
+    /// recoverable (a stream's frames cannot be replaced by a fixed value), and only when
+    /// the node's `ExceptionConfig` declares `default_outputs` under a policy other than
+    /// `"interrupt"`. An `"interrupt"` policy — Python's default — always propagates.
+    fn recovered_output(&self) -> Option<&Value> {
+        if !matches!(
+            self.rt.ability,
+            ComponentAbility::Invoke | ComponentAbility::Collect
+        ) {
+            return None;
+        }
+        let config = self.rt.node.exception_config.as_ref()?;
+        if config.handle_type == "interrupt" {
+            return None;
+        }
+        config.default_outputs.as_ref()
+    }
 }
 
 impl std::fmt::Debug for ComponentNode {
@@ -246,6 +295,7 @@ impl Node for ComponentNode {
 
         match self.dispatch(&source, inputs, &context, scope).await {
             Ok(Dispatch::Route(targets)) => {
+                scope.clear_failures(&self.rt.id);
                 if let Some(span) = &span {
                     // A branch produces no output; the span still closes.
                     span.finish(Value::Null);
@@ -253,6 +303,7 @@ impl Node for ComponentNode {
                 Ok(NodeOutcome::Route { targets })
             }
             Ok(Dispatch::Output(raw)) => {
+                scope.clear_failures(&self.rt.id);
                 let output = project_output(
                     self.rt.node.outputs_schema.as_ref(),
                     &source,
@@ -275,6 +326,45 @@ impl Node for ComponentNode {
                     // halting) makes the graph save the *pre-superstep* boundary, so
                     // `resume` re-runs this superstep with the seeded answers.
                     return Err(failure);
+                }
+                // Python recovers only once every retry is exhausted, so the failed
+                // attempts are counted here; the graph owns the retry loop itself.
+                let attempts = scope.record_failure(&self.rt.id);
+                if attempts > self.rt.node.max_retries {
+                    if let Some(defaults) = self.recovered_output() {
+                        // Python's `_run_error_recovery` calls `_post_invoke` with the
+                        // handler's value, so the defaults go through `outputs_schema` too.
+                        let output = project_output(
+                            self.rt.node.outputs_schema.as_ref(),
+                            &source,
+                            &self.rt.id,
+                            defaults,
+                        );
+                        if let Some(span) = &span {
+                            span.set_metadata(
+                                "error_recovery",
+                                serde_json::json!({
+                                    "handle_type": self
+                                        .rt
+                                        .node
+                                        .exception_config
+                                        .as_ref()
+                                        .map(|config| config.handle_type.as_str())
+                                        .unwrap_or_default(),
+                                    "error": failure.to_string(),
+                                }),
+                            );
+                            span.finish(output.clone());
+                        }
+                        tracing::warn!(
+                            component = %self.rt.id,
+                            error = %failure,
+                            "recovered a failed component with its configured default outputs"
+                        );
+                        scope.clear_failures(&self.rt.id);
+                        state.set(self.rt.id.clone(), output);
+                        return Ok(NodeOutcome::Continue);
+                    }
                 }
                 let failure = error::component_execution_error(
                     self.rt.component.component_type(),
