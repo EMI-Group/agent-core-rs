@@ -2,7 +2,7 @@
 
 ## Intent
 
-Shared subprocess plumbing plus the generic harness shell for the vendor CLI harnesses (`claudecode`, `codex`, `dsh`) and the future `native_v2`.
+Shared subprocess plumbing plus the generic harness shell for the vendor CLI harnesses (`claudecode`, `codex`, `dsh`) and the in-process `native_v2`.
 Every adapter needs the same mechanics: resolve the CLI binary, spawn it, speak newline-delimited JSON over stdin/stdout, retain a bounded stderr tail, publish harness SPI events through a single-consumer cursor, derive a stable provider session id and translate host permissions.
 Adapters on the JSON-RPC wire (the Codex app-server, the DeepSeek Harness runtime) additionally need id-correlated request/response traffic with notifications and server-to-client requests, which `rpc` supplies over the same child process.
 An adapter then implements one trait (`VendorDriver`) and is wrapped by `VendorHarness`, which supplies the whole `HarnessProtocol`: lifecycle, turn queue and supervisor, event sequence, capability gating, abort/pause/resume and teardown.
@@ -12,7 +12,7 @@ It is plumbing and protocol scaffolding only — no harness behavior and no vend
 
 - `binary` — `BinarySpec { name, explicit, label, install_hint }`, `resolve_binary(&BinarySpec) -> HarnessResult<PathBuf>`, `is_available(&BinarySpec) -> bool`; explicit paths are validated (exists, regular file, execute bit on Unix) and a missing binary reports the label, the name, the install hint and the `PATH`/`cli_path` fix as `HarnessError::Protocol`.
 - `jsonl` — `parse_line`, `parse_line_labelled`, `encode_line`, `get_str`, `get_object`, `get_array`, `get_bool`, `get_u64`, `get_f64`, `string_list`, `snippet`.
-- `child` — `ChildProcessConfig { program, args, cwd, env, inherit_env, label, max_line_bytes }`, `ChildProcess::{spawn, write_json, write_line, read_json, stderr_tail, close_stdin, kill, wait, pid}`; `DEFAULT_MAX_LINE_BYTES`, `STDERR_TAIL_LINES`, `STDERR_TAIL_CHARS`, `EXIT_TIMEOUT`.
+- `child` — `ChildProcessConfig { program, args, cwd, env, inherit_env, label, max_line_bytes }`, `ChildProcess::{spawn, write_json, write_line, writer, read_json, stderr_tail, close_stdin, kill, wait, pid}`, `StdinWriter` (a cloneable, per-line-flushing handle onto the same pipe so a control message can be written while another task is parked on a read) and the `LineWriter` trait the JSON-RPC client holds; `DEFAULT_MAX_LINE_BYTES` (32 MiB), `STDERR_TAIL_LINES` (40), `STDERR_TAIL_CHARS` (8000), `EXIT_TIMEOUT` (5 s).
 - `rpc` — JSON-RPC 2.0 over NDJSON: `RpcTransport { write_line, read_json, stderr_tail }` (implemented for `ChildProcess`) and `JsonRpcClient` (`spawn(transport, label)`, `request`, `request_with_timeout`, `notify`, `next_incoming`, `respond`, `respond_error`, `close`, `is_closed`, `label`, `stderr_tail`), plus `request_id_value(u64)`.
   Wire rules: a request is `{"id": <u64>, "method": <str>, "params": <value>}`, a notification omits `id`, a response is `{"id": …, "result": …}` or `{"id": …, "error": {"code": …, "message": …}}`, and a server-to-client request carries both `id` and `method` (delivered by `next_incoming`, answered with the same id echoed verbatim).
 - `events` — `EventBus::{new, emit, events, turn_events, close, is_closed, len, is_empty}`, `EnvelopeBuilder::{new, set_provider_session_id, next, next_for_turn, next_for_item}`, `DEFAULT_CAPACITY`.
