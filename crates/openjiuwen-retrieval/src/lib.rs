@@ -4,10 +4,18 @@
 //! Maps to the Python package `openjiuwen.core.retrieval` in the openJiuwen
 //! reference implementation. The crate is split into independent layers:
 //! [`common`] (shared data model, configs, metadata filters), [`chunking`],
-//! [`loaders`] (text/Markdown/JSON/CSV/HTML/URL sources, PDF/DOCX/XLSX readers,
-//! images, plus auto dispatch),
+//! [`loaders`] (text/Markdown/JSON/CSV/HTML/URL sources, PDF/DOCX/XLSX/PPTX/ODT
+//! readers, images, plus auto dispatch),
 //! [`embedding`], [`vector_store`], [`reranker`], and [`knowledge_base`], the
 //! pipeline that composes them.
+//!
+//! Every loader also accepts in-memory bytes: [`DocumentBytes`] pairs a display
+//! file name with the bytes to parse, [`LoadOptions`] overrides the document id
+//! and title, and [`DocumentLoader::load_bytes`] runs the same parse as the
+//! path-based [`DocumentLoader::load`].
+//! The `loaders::fixtures` module exposes the public document builders that turn
+//! paragraphs, rows, or slides into exactly those bytes, so binary ingestion can
+//! be exercised with no office suite and no temporary files.
 //!
 //! Retrieval channels: [`sparse`] adds the additive [`SparseVector`]
 //! representation and a self-contained BM25 lexical index ([`Bm25Index`],
@@ -35,9 +43,12 @@
 //! ([`to_data_uri`], [`parse_data_uri`]).
 //!
 //! [`parsing`] is a pure-Rust document layer: a DEFLATE/ZIP reader
-//! ([`inflate()`], [`zlib_decompress`], [`ZipArchive`]) and the DOCX, XLSX, and
-//! PDF readers ([`DocxParser`], [`XlsxParser`], [`PdfParser`]) plus the tolerant
-//! XML reader they share ([`XmlDocument`]). It reports typed
+//! ([`inflate()`], [`zlib_decompress`], [`ZipArchive`]), a stored-entry ZIP
+//! writer ([`ZipWriter`]) that builds archives without a compression crate, and
+//! the DOCX, XLSX, PPTX, ODT, and PDF readers ([`DocxParser`], [`XlsxParser`],
+//! [`PptxParser`], [`OdtParser`], [`PdfParser`]) plus the tolerant XML reader
+//! they share ([`XmlDocument`]).
+//! It reports typed
 //! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) for
 //! encrypted PDFs and compressed object streams instead of degrading silently;
 //! image-only PDFs have no OCR, so they parse to empty text with
@@ -91,8 +102,9 @@ pub use chunking::{
 };
 // Document loaders and the extension-based dispatch registry.
 pub use loaders::{
-    extract_title, html_to_text, AutoLoader, CsvLoader, DocumentLoader, HtmlLoader, JsonLoader,
-    LoaderRegistry, MarkdownLoader, TextLoader, UrlLoader,
+    extract_title, html_to_text, AutoLoader, CsvLoader, DocumentBytes, DocumentLoader, HtmlLoader,
+    JsonLoader, LoadOptions, LoaderRegistry, MarkdownLoader, OdtLoader, PptxLoader, TextLoader,
+    UrlLoader,
 };
 // Embedding models: OpenAI-compatible client and the deterministic hash fake.
 pub use embedding::{validate_query, validate_texts, Embedding, HashEmbedding, OpenAiEmbedding};
@@ -126,11 +138,12 @@ pub use multimodal::{
     parse_data_uri, to_data_uri, ContentPart, ImageCaptioner, ImageLoader, Modality,
     MultimodalDocument, OfflineCaptioner, TableData,
 };
-// Pure-Rust containers (DEFLATE/ZIP, XML) and the DOCX/XLSX/PDF readers.
+// Pure-Rust containers (DEFLATE/ZIP, XML) and the office/PDF readers.
 pub use parsing::{
     adler32, crc32, inflate, parse_xml, zlib_decompress, DocxBlock, DocxDocument, DocxParser,
-    PdfDocument, PdfParser, XlsxParser, XlsxSheet, XlsxWorkbook, XmlDocument, XmlElement,
-    ZipArchive, ZipEntry, DEFAULT_MAX_OUTPUT_BYTES,
+    OdtDocument, OdtParser, PdfDocument, PdfParser, PptxDocument, PptxParser, PptxSlide,
+    XlsxParser, XlsxSheet, XlsxWorkbook, XmlDocument, XmlElement, ZipArchive, ZipEntry, ZipWriter,
+    DEFAULT_MAX_OUTPUT_BYTES,
 };
 // Rerankers: score ordering plus the LLM-scorer seam.
 pub use reranker::{LlmReranker, LlmScorer, Reranker, ScoreReranker};
