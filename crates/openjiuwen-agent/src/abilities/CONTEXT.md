@@ -12,7 +12,13 @@ Python's workflow, sub-agent, and MCP ability paths are ported as ordinary `open
 
 - `AbilityManager` (`new(owner_id)`, `add_tool`, `remove_tool`, `get`, `cards`, `tool_info`, `revision`, `reorder`, `len`, `is_empty`, `execute`).
 - `AddAbilityResult { name, added, reason }` (`added_tool | refreshed_tool | duplicate_tool`).
-- `ToolExecutionOptions` and `ToolCallResult { call, output, text, success, error }` with `ToolCallResult::message()`.
+- `ToolExecutionOptions` and `ToolCallResult { call, output, text, success, error, parts }` with `ToolCallResult::message()` and `ToolCallResult::with_parts`.
+- `ToolCallResult::message()` builds a `tool` message with `tool_call_id`/`name` preserved; its content is `MessageContent::Parts` (the text first, then the parts) only when `parts` is non-empty, and the plain text string otherwise.
+### `parts.rs` — multimodal tool results
+- `extract_parts(&Value) -> Vec<ContentPart>` recognises `{"content_parts": [...]}`, `{"content": [...]}`, a bare array, and foundation-content shapes (`{"type":"parts","parts":[...]}`, `{"type":"text","text":...}`); an OpenAI-style `{"type":"image", ...}` is rewritten to `image_url`.
+- Elements convert through `openjiuwen_foundation::ContentPart`; scalars, `null`, plain strings, unknown tags, and payload-less parts are skipped, never reported as errors; order is preserved.
+- `part_summary(&ContentPart)` renders a short placeholder (`[image: image/png]`, `[audio: audio/wav]`, `[file: report.pdf]`, a text part's own text, `[<type tag>]` otherwise).
+- `render_with_parts(text, parts)` is the fallback for providers that cannot receive parts: the text followed by each non-text summary on its own line.
 
 ### `arguments.rs` — argument repair
 
@@ -23,6 +29,7 @@ Python's workflow, sub-agent, and MCP ability paths are ported as ordinary `open
 - Execution policy: model order, contiguous `parallel_safe` batches run concurrently (`futures::future::join_all`, capped by `MAX_PARALLEL_BATCH`), non-parallel-safe tools act as barriers.
 - Per-call `tokio::time::timeout` from `ToolExecutionOptions::timeout`; cancellation via `CancellationToken`.
 - Failures, timeouts, malformed arguments, and unknown tools become error results, never `Err`.
+- A successful call keeps `render_for_llm`'s text as `text` and fills `parts` from the raw output through `parts::extract_parts`; failures keep empty parts.
 
 ### `sub_agent.rs` — `SubAgentAbility`
 
