@@ -64,12 +64,13 @@ The subtree, one module per concern:
 - State lives behind `Arc<RwLock<..>>`/`Arc<Mutex<..>>` and no guard is ever held across `.await`.
 - Errors: `Error::Validation` (algorithm names, malformed nodes/replies, blank content), `Error::Unsupported` (deferred backend); no panics.
 - Logging is `tracing` only; memory and trajectory contents never leave a frame above `debug`, and the retrieve fallback logs the error kind only.
-- Files ≤ ~1000 lines (the OTel handler suites in the sibling tree are the documented exception).
+- Files ≤ ~1000 lines; `prompt/mod.rs` (dispatch + shared parsers), `completion.rs` (HTTP adapter) and `service/llm.rs` run slightly over because each carries a dense inline test matrix — split them only when a new phase or family is added.
 
 ## Test Strategy
 
 - Unit tests beside each module: `normalize_algo_name` (full table), `Algo::family`, the vector store, record validation/identity/feedback, the store backends (memory and JSON file), prompt parsing per family, ranking, and both services.
 - `Service` tests use `ScriptedCompletion` + `InMemoryMemoryStore`, so every flow runs offline and deterministically; the factory tests cover each `MemoryBackend` arm.
+- The crate-boundary suite `tests/context_evolver.rs` runs the deterministic file-store round trips (ordering, `top_k`, the on-disk `{"memories": [...]}` shape) and the LLM path over a `wiremock` chat-completions mock, including malformed/fenced/hallucinated replies.
 - Python counterparts named in comments: `tests/unit_tests/extensions/context_evolver/` (`test_retrieve_flow.py`, `test_summary_flow.py`, `test_file_connector.py`), `service/task_memory_service.py`, `retrieve/task/*/run.py`, `summary/task/*/update.py`.
 
 ## Routing Table
