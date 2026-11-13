@@ -44,7 +44,7 @@ pub use xlsx::{
     WORKBOOK_RELS_PART,
 };
 pub use xml::{local_name, parse as parse_xml, XmlDocument, XmlElement, MAX_DEPTH};
-pub use zip::{ZipArchive, ZipEntry};
+pub use zip::{ZipArchive, ZipEntry, ZipWriter};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
