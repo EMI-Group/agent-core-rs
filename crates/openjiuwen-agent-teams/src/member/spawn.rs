@@ -20,7 +20,7 @@
 //! spawner for a failed spawn. The registry never drops a live handle on the floor; see
 //! [`SpawnRegistry::cancel_all`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,7 +33,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::runtime::MemberRuntime;
-use super::spawn_config::MemberSpawnOptions;
+use super::spawn_config::{MemberSpawnOptions, StdioCommand};
+
+/// Environment variable carrying the owning team name to a spawned member process.
+pub const TEAM_NAME_ENV: &str = "OPENJIUWEN_TEAM_NAME";
+/// Environment variable carrying the member's own name to a spawned member process.
+pub const MEMBER_NAME_ENV: &str = "OPENJIUWEN_MEMBER_NAME";
+/// Environment variable carrying the session id to a spawned member process.
+pub const SESSION_ID_ENV: &str = "OPENJIUWEN_SESSION_ID";
+/// Environment variable carrying the member's workspace root to a spawned member process.
+pub const MEMBER_WORKSPACE_ENV: &str = "OPENJIUWEN_MEMBER_WORKSPACE";
 
 /// Everything a spawner needs to bring one member up.
 ///
@@ -82,6 +91,37 @@ impl MemberSpawnRequest {
     pub fn with_options(mut self, options: MemberSpawnOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Returns the identity environment a child-process spawner exports to the member.
+    ///
+    /// A spawned member process cannot inherit the request, and the JSON-lines member protocol
+    /// carries only the session id in its `start` frame, so the team name, member name, session id
+    /// and workspace root cross the process boundary as environment variables. Empty values are
+    /// omitted so an unset field never blanks a variable the child already has.
+    #[must_use]
+    pub fn identity_env(&self) -> BTreeMap<String, String> {
+        let workspace = self.workspace_root.to_string_lossy().into_owned();
+        [
+            (TEAM_NAME_ENV, self.team_name.as_str()),
+            (MEMBER_NAME_ENV, self.member_name.as_str()),
+            (SESSION_ID_ENV, self.session_id.as_str()),
+            (MEMBER_WORKSPACE_ENV, workspace.as_str()),
+        ]
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+    }
+
+    /// Applies [`Self::identity_env`] to `command` without overriding an explicitly configured value.
+    ///
+    /// A spec that pre-sets one of these variables is an intentional override and wins over the
+    /// request-derived value; every other variable is inherited from the parent environment.
+    pub fn apply_identity_env(&self, command: &mut StdioCommand) {
+        for (key, value) in self.identity_env() {
+            command.env.entry(key).or_insert(value);
+        }
     }
 }
 
@@ -450,6 +490,39 @@ mod tests {
         assert_eq!(decoded, request);
         let default: MemberSpawnRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(default, MemberSpawnRequest::default());
+    }
+
+    #[test]
+    fn identity_env_carries_the_request_facts() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws");
+        let env = request.identity_env();
+        assert_eq!(env.get(TEAM_NAME_ENV).map(String::as_str), Some("alpha"));
+        assert_eq!(env.get(MEMBER_NAME_ENV).map(String::as_str), Some("dev-1"));
+        assert_eq!(env.get(SESSION_ID_ENV).map(String::as_str), Some("sess-1"));
+        assert_eq!(
+            env.get(MEMBER_WORKSPACE_ENV).map(String::as_str),
+            Some("/tmp/ws")
+        );
+    }
+
+    #[test]
+    fn identity_env_omits_empty_values_and_respects_explicit_overrides() {
+        let request = MemberSpawnRequest::new("", "", "", "");
+        assert!(request.identity_env().is_empty());
+
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws");
+        let mut command = StdioCommand::new("team-member")
+            .with_arg("serve")
+            .with_env(MEMBER_NAME_ENV, "explicit");
+        request.apply_identity_env(&mut command);
+        assert_eq!(
+            command.env().get(MEMBER_NAME_ENV).map(String::as_str),
+            Some("explicit")
+        );
+        assert_eq!(
+            command.env().get(TEAM_NAME_ENV).map(String::as_str),
+            Some("alpha")
+        );
     }
 
     #[test]
