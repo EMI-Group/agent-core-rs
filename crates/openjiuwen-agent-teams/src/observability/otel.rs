@@ -42,6 +42,17 @@ use super::hooks::{
     TaskTransitionEvent, TurnMetrics,
 };
 use super::span::TeamSpan;
+use crate::schema::RoundOutcome;
+
+/// Returns the Python wire string of a round outcome (`RoundOutcome` has no `as_str` in `schema`).
+const fn round_outcome_str(outcome: RoundOutcome) -> &'static str {
+    match outcome {
+        RoundOutcome::Started => "started",
+        RoundOutcome::Finished => "finished",
+        RoundOutcome::Aborted => "aborted",
+        RoundOutcome::Failed => "failed",
+    }
+}
 
 /// One recorded span, flattened for an in-memory sink or a downstream exporter.
 ///
@@ -215,7 +226,7 @@ impl ObservabilityHooks for OtelHooks {
             team = %event.team_name,
             member = %event.member_name,
             round = event.round,
-            outcome = ?event.outcome,
+            outcome = round_outcome_str(event.outcome),
             "otel round.started"
         );
         self.sink.record(span, "round.started");
@@ -228,7 +239,7 @@ impl ObservabilityHooks for OtelHooks {
             team = %event.team_name,
             member = %event.member_name,
             round = event.round,
-            outcome = ?event.outcome,
+            outcome = round_outcome_str(event.outcome),
             "otel round.finished"
         );
         self.sink.record(span, "round.finished");
@@ -488,6 +499,19 @@ mod tests {
         };
         let value = serde_json::to_value(&child).unwrap();
         assert_eq!(value["parent_span_id"], json!("parent"));
+    }
+
+    #[test]
+    fn round_outcome_str_matches_the_python_wire_values() {
+        for (outcome, wire) in [
+            (RoundOutcome::Started, "started"),
+            (RoundOutcome::Finished, "finished"),
+            (RoundOutcome::Aborted, "aborted"),
+            (RoundOutcome::Failed, "failed"),
+        ] {
+            assert_eq!(round_outcome_str(outcome), wire);
+            assert_eq!(json!(wire), serde_json::to_value(outcome).unwrap());
+        }
     }
 
     #[test]
