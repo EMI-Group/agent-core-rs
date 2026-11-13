@@ -1,10 +1,12 @@
 //! Candidate generation, optimizer seam, deterministic grid baseline, best-so-far
 //! tracking, and the LLM retry policy.
 //!
-//! This module ports the portable parts of Python `openjiuwen.agent_evolving.optimizer`
-//! (the optimizer seam and its candidate records) and keeps the ML prompt optimisers
-//! out of scope: [`GridSearchOptimizer`] provides a deterministic baseline that never
-//! calls a model, so the trainer can run offline.
+//! This module ports the portable parts of Python `openjiuwen.agent_evolving.optimizer`:
+//! [`GridSearchOptimizer`] provides a deterministic baseline that never calls a
+//! model, and the `research` submodule provides real textual-gradient
+//! optimizers (instruction, tool, memory, skill, Metis context and TTSE tips)
+//! that run offline and switch to model-driven proposals when a `Model` is
+//! injected.
 //!
 //! Checkpoint persistence lives in `checkpoint` and is re-exported here.
 //!
@@ -32,11 +34,20 @@
 //! ```
 
 mod checkpoint;
+mod research;
 
 pub use checkpoint::{
     CheckpointBest, CheckpointManager, CheckpointSnapshot, CheckpointStep, CheckpointStore,
     DefaultCheckpointManager, EvolveCheckpoint, FileCheckpointStore, MemoryCheckpointStore,
     RestoredState,
+};
+pub use research::{
+    parse_tagged, InstructionOptimizer, InstructionStrategy, MemoryOptimizer, MemoryStrategy,
+    MetisOptimizer, MetisStrategy, OperatorKind, OperatorState, ProposalRecord,
+    SkillExperienceOptimizer, SkillExperienceStrategy, TextualGradientOptimizer, TextualParameter,
+    TextualStrategy, ToolOptimizer, ToolStrategy, TtseOptimizer, TtseStrategy, CANDIDATE_META_KEY,
+    DEFAULT_CLUSTER_THRESHOLD, DEFAULT_MAX_PROPOSALS, DEFAULT_SECTION_BUDGET, DEFAULT_TIP_CAPACITY,
+    IMPROVED_TAG, MAX_GRADIENT_CHARS, PARAMETER_SEPARATOR,
 };
 
 use std::collections::BTreeMap;
