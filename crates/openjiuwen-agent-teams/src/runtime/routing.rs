@@ -55,7 +55,7 @@ impl std::fmt::Debug for TeamModelRouter {
         f.debug_struct("TeamModelRouter")
             .field("strategy", &self.allocator.strategy())
             .field("pool_len", &self.pool.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 impl TeamModelRouter {
@@ -147,7 +147,7 @@ impl TeamModelRouter {
             |name| RequestHint::for_role(role).with_model_name(name),
         );
         match self.router.decide(&hint) {
-            Ok(decision) => Ok(self.selection_from(decision)),
+            Ok(decision) => Ok(Self::selection_from(decision)),
             Err(error) => {
                 debug!(%error, "model router refused; falling back to the allocator");
                 let allocation = self.allocator.allocate(requested)?;
@@ -159,7 +159,7 @@ impl TeamModelRouter {
         }
     }
     /// Returns the "nothing routed" selection used when a team declares no pool at all.
-    fn unrouted_selection(&self) -> ModelSelection {
+    fn unrouted_selection() -> ModelSelection {
         ModelSelection {
             allocation: TeamModelAllocation {
                 model_name: String::new(),
@@ -187,7 +187,7 @@ impl TeamModelRouter {
         if self.pool.is_empty() && requested.is_none() {
             // No pool and no pinned name: the member keeps whatever the factory resolves
             // (environment / resolver default), exactly as before the router existed.
-            return Ok((spec.clone(), self.unrouted_selection()));
+            return Ok((spec.clone(), Self::unrouted_selection()));
         }
         let selection = self.select(requested, role)?;
         let Some(entry) = selection.entry.as_ref() else {
@@ -209,7 +209,7 @@ impl TeamModelRouter {
     }
 
     /// Mirrors a router decision into the persisted allocation shape.
-    fn selection_from(&self, decision: RouterDecision) -> ModelSelection {
+    fn selection_from(decision: RouterDecision) -> ModelSelection {
         ModelSelection {
             allocation: TeamModelAllocation {
                 model_name: decision.entry.model_name.clone(),
