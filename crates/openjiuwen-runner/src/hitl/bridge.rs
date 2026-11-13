@@ -84,7 +84,7 @@ impl ActiveRunSpec {
     /// Clones the run's cancellation token so the hub and the run path share
     /// cancellation; the run id, labels, session id, and detail are copied.
     #[must_use]
-    #[allow(dead_code)] // the execution paths adopt this constructor next
+    #[allow(dead_code)] // called by the agent, workflow, and team paths and the team pool; the only dead item is `RunBinding::run_id`
     pub(crate) fn for_execution(
         run_id: &str,
         label: &str,
@@ -173,7 +173,7 @@ impl RunHandle {
 ///
 /// A binding for an absent hub is inert: it carries a run id but registers
 /// nothing, so a caller can use it unconditionally.
-#[allow(dead_code)] // the execution paths adopt this binding next
+#[allow(dead_code)] // held by every run path and the team pool; the only item unreferenced outside this module's tests is `RunBinding::run_id`
 pub(crate) struct RunBinding {
     /// The hub the run is registered on; `None` makes the binding inert.
     hub: Option<Arc<InteractionHub>>,
@@ -183,7 +183,7 @@ pub(crate) struct RunBinding {
     active: AtomicBool,
 }
 
-#[allow(dead_code)] // the execution paths adopt this binding next
+#[allow(dead_code)] // `unregister` runs from every run path, the pool, and `Drop`; the only item unreferenced outside this module's tests is `RunBinding::run_id`
 impl RunBinding {
     /// Returns the run id this binding is for.
     pub(crate) fn run_id(&self) -> &str {
@@ -225,7 +225,7 @@ impl Drop for RunBinding {
 /// A `None` hub yields an inert binding whose run id is `spec.run_id` (cloned) or
 /// a fresh UUID v4. A session-attach failure is logged and does not undo the
 /// registration: the run stays observable, just without an interaction watcher.
-#[allow(dead_code)] // the execution paths adopt this bridge next
+#[allow(dead_code)] // called by the agent, workflow, and team paths and the team pool; the only dead item is `RunBinding::run_id`
 pub(crate) fn bind_run(
     hub: Option<&Arc<InteractionHub>>,
     spec: ActiveRunSpec,
