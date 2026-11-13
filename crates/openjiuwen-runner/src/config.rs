@@ -227,9 +227,12 @@ fn positive_duration(secs: f64) -> Option<std::time::Duration> {
 ///
 /// Python's `MessageQueueType` has `pulsar` and `fake`; the in-process backend
 /// is spelled `in_memory` here (Rust naming) and is the only implemented one.
-/// `Pulsar` and `ZeroMq` are the documented seams a future backend implements;
+/// `Pulsar` and `ZeroMq` are the documented seams a future backend implements:
 /// [`crate::create_message_queue`] returns
-/// [`openjiuwen_common::error::Error::Unsupported`] for both.
+/// [`openjiuwen_common::error::Error::Unsupported`] for both, and
+/// [`crate::mq::build_message_queue`] yields a typed
+/// [`DeferredMessageQueue`](crate::mq::DeferredMessageQueue) placeholder rather
+/// than an in-memory queue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageQueueKind {
@@ -256,6 +259,14 @@ impl MessageQueueKind {
 }
 
 /// Settings for the message queue the runner owns.
+///
+/// The runner builds the backend from this tree in [`crate::Runner::with_config`]:
+/// [`MessageQueueKind::InMemory`] yields the in-process queue, and any deferred
+/// kind (`pulsar` / `zeromq`) yields the typed
+/// [`DeferredMessageQueue`](crate::mq::DeferredMessageQueue) placeholder whose
+/// every operation is `Error::Unsupported` — the configured kind is never
+/// silently served by the in-memory queue. [`crate::Runner::start`] returns that
+/// same typed error for a deferred kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct MessageQueueConfig {
@@ -321,7 +332,11 @@ impl MessageQueueConfig {
 ///
 /// Distributed execution is **deferred** in this port: the struct preserves
 /// Python's field names and defaults so configuration round-trips, but
-/// [`crate::Runner`] never starts a broker. See `docs/PARITY.md`.
+/// [`crate::Runner`] never starts a broker — [`crate::Runner::start`] refuses a
+/// [`RunnerConfig::distributed_mode`] runner with `Error::Unsupported` naming the
+/// missing `drunner/` transports (Pulsar/ZeroMQ reply-topic routing,
+/// `RemoteProtocol::Mq`/`A2a`, cross-process attach). The values are persisted
+/// and inspected by hosts; nothing in-process reads them. See `docs/PARITY.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DistributedConfig {
@@ -354,8 +369,15 @@ impl Default for DistributedConfig {
 pub struct RunnerConfig {
     /// Identifier of the runner instance; `global` for the process singleton.
     pub runner_id: String,
-    /// Whether distributed execution was configured (deferred; see
-    /// [`DistributedConfig`]).
+    /// Whether distributed execution was configured (Python `distributed_mode`).
+    ///
+    /// Persisted and inspected by hosts, but **execution is refused**: this build
+    /// ships no distributed transport (`drunner/` — Pulsar/ZeroMQ reply-topic
+    /// routing, `RemoteProtocol::Mq`/`A2a`, cross-process attach), so
+    /// [`crate::Runner::start`] returns `Error::Unsupported` naming it.
+    /// [`crate::Runner::with_config`] still accepts the tree (a host can build,
+    /// serialize, and inspect it) and every in-process path — runs, callbacks,
+    /// registries, the team pool — is unaffected by the flag.
     pub distributed_mode: bool,
     /// Distributed settings (kept for parity and future use).
     pub distributed: DistributedConfig,
@@ -427,7 +449,11 @@ impl RunnerConfig {
         self
     }
 
-    /// Enables the (deferred) distributed mode; configuration only.
+    /// Enables distributed mode: configuration only.
+    ///
+    /// The flag round-trips and is visible to hosts, but [`crate::Runner::start`]
+    /// refuses a distributed runner (`Error::Unsupported`) until a distributed
+    /// transport lands; see [`RunnerConfig::distributed_mode`].
     #[must_use]
     pub fn with_distributed_mode(mut self, enabled: bool) -> Self {
         self.distributed_mode = enabled;

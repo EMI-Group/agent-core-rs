@@ -5,6 +5,7 @@
 A generic, runner-owned topic queue: publish/subscribe plus request/reply, with per-topic FIFO delivery, idempotent start/stop, and explicit error propagation.
 Ports Python `openjiuwen/core/runner/message_queue_base.py` (`QueueMessage`, `MessageQueueBase`, `SubscriptionBase`, `AsyncMessageHandler`) and the behavioural core of `message_queue_inmemory.py` / `dunner/dmessage_queue/message_queue_fake.py`, without the distributed wire (`DmqRequestMessage`/`DmqResponseMessage`, reply topics).
 The `MessageQueue` trait is the seam a broker backend implements: `openjiuwen-extensions` will supply Pulsar/ZeroMQ; `create_message_queue` answers `Error::Unsupported` for both today.
+`build_message_queue` is its infallible twin: a deferred kind yields `DeferredMessageQueue`, a typed placeholder that refuses every operation with that same `Error::Unsupported`, so the runner never serves an in-memory queue under another backend's name.
 
 ## API Surface
 
@@ -43,10 +44,19 @@ impl InMemoryMessageQueue {
     pub fn with_capacity(capacity: usize) -> Arc<Self>;
     pub fn deliveries(&self) -> u64;                       // counter for tests/observability
 }
-pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn MessageQueue>>;
+pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn MessageQueue>>;  // in_memory only; Error::Unsupported otherwise
+pub fn build_message_queue(config: &MessageQueueConfig) -> Arc<dyn MessageQueue>;                 // infallible: deferred kind → DeferredMessageQueue
 
-// mod.rs re-exports: QueueMessage, MessageHandler, MessageQueue, InMemoryMessageQueue, create_message_queue,
-//                    MessageQueueKind, MessageQueueConfig (re-exported from config)
+#[derive(Debug)] pub struct DeferredMessageQueue { .. }   // typed stand-in for pulsar/zeromq
+impl DeferredMessageQueue {
+    pub fn new(kind: MessageQueueKind) -> Arc<Self>;
+    pub fn kind(&self) -> MessageQueueKind;                // the configured transport
+}
+// impl MessageQueue for DeferredMessageQueue: is_started() == false, topics() == [], has_subscriber() == false,
+// and start/stop/subscribe/unsubscribe/add_handler/publish/request all return Error::Unsupported.
+
+// mod.rs re-exports: QueueMessage, MessageHandler, MessageQueue, InMemoryMessageQueue, DeferredMessageQueue,
+//                    create_message_queue, build_message_queue, MessageQueueKind, MessageQueueConfig (from config)
 ```
 
 ## Semantics (the contract)
@@ -57,7 +67,8 @@ pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn
 - **`publish` returns once the delivery is enqueued**, not once it is handled; a full queue awaits capacity (backpressure). Handling errors on the publish path are logged at `warn` (a publisher cannot observe them).
 - **`request` waits for the handler's `Result<Value>`**: a handler `Err` is returned to the caller unchanged; a caller timeout is `Error::Timeout("message queue request on '<topic>' timed out after <ms>ms")` and the handler keeps running. `timeout = None` falls back to `MessageQueueConfig::request_timeout()`; both `None` means wait forever.
 - **Lifecycle**: `publish`/`request`/`subscribe`/`add_handler` before `start` fail with `Error::Config("message queue is not started")`. `start` after `stop` re-enables the queue but does not resurrect old topics (topics are emptied by `stop`). `stop` unsubscribes every topic (closing channels and joining workers) and is idempotent.
-- **Backends**: `create_message_queue` builds `InMemoryMessageQueue` for `MessageQueueKind::InMemory` and returns `Error::Unsupported` naming the deferred backend otherwise; `MessageQueueConfig::url` is carried untouched for that future implementation.
+- **Backends**: `create_message_queue` builds `InMemoryMessageQueue` for `MessageQueueKind::InMemory` and returns `Error::Unsupported` naming the deferred backend otherwise (`"<kind> message queue is not supported: use `in_memory`"`); `MessageQueueConfig::url` is carried untouched for that future implementation.
+- **A deferred kind is never misrepresented**: `build_message_queue` (used by `Runner::with_config`, which cannot fail) yields `DeferredMessageQueue` for `pulsar`/`zeromq`. Its `kind()` and `Debug` report the configured transport, `is_started()` is `false`, `topics()` is empty, and every fallible operation returns the same typed `Error::Unsupported` naming the transport — so `Runner::message_queue()` fails loudly before `start`, and `Runner::start` returns that same error. There is no silent downgrade to in-memory.
 
 ## Constraints
 
@@ -73,11 +84,12 @@ pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn
 - `publish` to a subscribed topic with no handler returns before enqueueing, so it consumes no capacity in the bounded channel (same logged-no-op contract).
 - `deliveries()` counts the deliveries a worker actually started (handler present), including ones whose handler returned `Err`; requests rejected before enqueueing are not counted.
 - A handler that calls `request` on its own topic deadlocks (the worker awaits that handler); this is the price of strict per-topic FIFO and is not worked around.
+- `DeferredMessageQueue` is a placeholder, not a backend: even `stop` returns `Error::Unsupported` (a host that wants a working queue uses `in_memory`). `Runner::start` also installs it in the queue slot when the configured kind is deferred, so `message_queue()` keeps reporting the configured transport after a `set_config`.
 
 ## Routing Table
 
 - `./src/mq/message.rs` → `QueueMessage`, `MessageHandler`, `SUCCESS`
-- `./src/mq/queue.rs` → `MessageQueue` trait, `create_message_queue`
+- `./src/mq/queue.rs` → `MessageQueue` trait, `create_message_queue`, `build_message_queue`, `DeferredMessageQueue`
 - `./src/mq/memory.rs` → `InMemoryMessageQueue` and its topic workers
 - `./src/mq/mod.rs` → re-exports
 - `../tests/message_queue.rs` → behavior suite (sibling — read-only, escalate writes to the crate root)
