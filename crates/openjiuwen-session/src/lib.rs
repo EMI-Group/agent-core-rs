@@ -65,11 +65,13 @@ pub mod constants;
 pub mod interaction;
 pub mod otel;
 pub mod session;
+pub mod session_controller;
 pub mod sessions;
 pub mod state;
 pub mod stream;
 pub mod trace_hook;
 pub mod tracer;
+pub mod vcs;
 
 #[cfg(feature = "sqlite")]
 pub use checkpoint::SqliteCheckpointer;
@@ -118,9 +120,6 @@ pub use sessions::{RouterSession, SubWorkflowSession};
 pub use trace_hook::SwappableTraceSink;
 
 // Disk-backed product sessions (`session_controller`) and local VCS history.
-pub mod session_controller;
-pub mod vcs;
-
 pub use session_controller::{
     DiskSessionStore, Scope, SessionController, SessionMeta, SessionRecord, SessionScope,
     SessionScopeKey, Subject,
@@ -129,3 +128,6 @@ pub use vcs::{
     diff_snapshots, diff_values, ChangeKind, JsonChange, SessionHistory, Version, VersionId,
     VersionMeta,
 };
+
+// Remote checkpointing over Redis.
+pub use checkpoint::{RedisCheckpointer, RedisOptions};
