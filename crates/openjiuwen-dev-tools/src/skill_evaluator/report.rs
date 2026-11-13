@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::judge::VerdictSource;
+
 use super::assertion::AssertionOutcome;
 use super::case::CaseStatus;
 
@@ -173,6 +175,20 @@ pub struct FinalScore {
     pub recommendation: String,
 }
 
+/// Where the design and safety scores of a judge-driven run came from.
+///
+/// A deterministic run carries no record at all; a judge-driven run records one
+/// [`VerdictSource`] per judged stage so a degraded (fallback) judgement is
+/// visible in the persisted report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct JudgeRecord {
+    /// The source of the design judgement.
+    pub design_source: VerdictSource,
+    /// The source of the safety judgement.
+    pub safety_source: VerdictSource,
+}
+
 /// Every report produced by one evaluation run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -185,6 +201,58 @@ pub struct EvaluationReport {
     pub safety: SafetyReport,
     /// The weighted final verdict.
     pub final_score: FinalScore,
+    /// Judge provenance; `None` for the deterministic pipeline and omitted from
+    /// the serialized report when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeRecord>,
+}
+
+/// Derives the per-case status from its assertion outcomes.
+///
+/// All assertions passing is [`CaseStatus::Passed`], none passing is
+/// [`CaseStatus::Failed`], and anything in between is [`CaseStatus::Partial`].
+pub(crate) fn status_from(assertions: &[AssertionOutcome]) -> CaseStatus {
+    let passed = assertions.iter().filter(|outcome| outcome.passed).count();
+    if passed == assertions.len() {
+        CaseStatus::Passed
+    } else if passed == 0 {
+        CaseStatus::Failed
+    } else {
+        CaseStatus::Partial
+    }
+}
+
+/// Aggregates per-case results into the shared functional summary.
+///
+/// The pass rate is `(passed + 0.5 * partial) / total`; an empty result list
+/// yields `0.0`. Both the deterministic evaluator and the evaluation harness use
+/// this function so their summaries cannot drift apart.
+pub(crate) fn summarize(results: &[CaseResult]) -> CaseSummary {
+    let total = results.len();
+    let passed = results
+        .iter()
+        .filter(|result| result.status == CaseStatus::Passed)
+        .count();
+    let partial = results
+        .iter()
+        .filter(|result| result.status == CaseStatus::Partial)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| result.status == CaseStatus::Failed)
+        .count();
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        (passed as f64 + 0.5 * partial as f64) / total as f64
+    };
+    CaseSummary {
+        total,
+        passed,
+        partial,
+        failed,
+        pass_rate,
+    }
 }
 
 impl EvaluationReport {
@@ -306,5 +374,79 @@ mod tests {
         assert_eq!(report.skill_name, "demo");
         assert!((report.design_score - 100.0).abs() < 1e-9);
         assert!(report.dimensions.is_empty());
+    }
+
+    fn outcome(passed: bool) -> AssertionOutcome {
+        AssertionOutcome {
+            text: "contains:x".to_string(),
+            passed,
+            evidence: String::new(),
+        }
+    }
+
+    #[test]
+    fn status_from_covers_all_and_none_and_mixed() {
+        assert_eq!(
+            status_from(&[outcome(true), outcome(true)]),
+            CaseStatus::Passed
+        );
+        assert_eq!(status_from(&[outcome(false)]), CaseStatus::Failed);
+        assert_eq!(
+            status_from(&[outcome(true), outcome(false)]),
+            CaseStatus::Partial
+        );
+        assert_eq!(status_from(&[]), CaseStatus::Passed);
+    }
+
+    #[test]
+    fn summarize_credits_partial_cases_with_half_a_pass() {
+        let results = [
+            CaseResult {
+                id: "a".to_string(),
+                status: CaseStatus::Passed,
+                ..CaseResult::default()
+            },
+            CaseResult {
+                id: "b".to_string(),
+                status: CaseStatus::Partial,
+                ..CaseResult::default()
+            },
+            CaseResult {
+                id: "c".to_string(),
+                status: CaseStatus::Failed,
+                ..CaseResult::default()
+            },
+        ];
+        let summary = summarize(&results);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.partial, 1);
+        assert_eq!(summary.failed, 1);
+        assert!((summary.pass_rate - 0.5).abs() < 1e-9);
+
+        let empty = summarize(&[]);
+        assert_eq!(empty.total, 0);
+        assert!((empty.pass_rate - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn judge_record_is_omitted_when_absent() {
+        let report = EvaluationReport::default();
+        let json = report.to_json().expect("to_json");
+        assert!(json.get("judge").is_none(), "{json}");
+
+        let judged = EvaluationReport {
+            judge: Some(JudgeRecord {
+                design_source: VerdictSource::Model,
+                safety_source: VerdictSource::Deterministic,
+            }),
+            ..EvaluationReport::default()
+        };
+        let json = judged.to_json().expect("to_json");
+        assert_eq!(json["judge"]["design_source"], "model");
+        assert_eq!(json["judge"]["safety_source"], "deterministic");
+
+        let back: EvaluationReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, judged);
     }
 }
