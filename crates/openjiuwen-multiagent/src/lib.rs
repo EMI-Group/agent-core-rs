@@ -24,6 +24,14 @@ mod strategy;
 mod subscription;
 mod team;
 
+pub mod ability;
+pub mod autosubscribe;
+pub mod events;
+pub mod member_checkpoint;
+pub mod pyrepr;
+pub mod resources;
+pub mod transport;
+
 pub use agent_tool::AgentTool;
 pub use card::{EventDrivenTeamCard, TeamCard};
 pub use config::TeamConfig;
