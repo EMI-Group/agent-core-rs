@@ -108,7 +108,7 @@ Wire names are `snake_case` (`health_check_response`), not Python's upper-case `
 `frame_bytes(&SpawnMessage) -> Result<Vec<u8>>` — `to_line()` as bytes.
 The cap is enforced through `fill_buf`/`consume`, so only consumed bytes are accumulated and a runaway line fails instead of allocating.
 
-### Subprocess backend — `subprocess.rs`
+### Subprocess backend — `subprocess.rs` + `subprocess_io.rs`
 
 ```rust
 pub struct SubprocessConfig {                              // serde snake_case, default
@@ -143,6 +143,8 @@ The handle's `Debug` output shows that label beside its id, pid, liveness, and h
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
 Configured timeouts are clamped to `[0, 86_400]` seconds, so `Instant + Duration` cannot overflow and nonsense configuration means "no deadline".
 `SubprocessConfig` env wins over the inherited environment and `SpawnSpec::envs` wins over `SubprocessConfig` env.
+The handle, its state, and the launch/bootstrap path are in `subprocess.rs`; the exchange and supervision layer is the private `subprocess_io` child module declared there — the request guard and its desync rule, `send`/`stream`/`health`/`shutdown`/`force_kill`, the frame I/O, the health loop, the stderr drain, and the kill escalation.
+That child module's helpers are `pub(super)` where `SpawnedProcess` calls them, so the public surface is unchanged.
 
 ### External-command backend — `external.rs`
 
@@ -214,7 +216,7 @@ Routing precedence in `route`: `spec.backend` when set (registered spawner, else
 `spawn_with` resolves exactly the named backend and answers with `DeferredSpawner::for_backend` when it is not registered.
 The registry holds one `parking_lot::RwLock` over `{spawners: BTreeMap<SpawnBackend, Arc<dyn AgentSpawner>>, default: Option<SpawnBackend>}`; the spawner `Arc` is cloned out before any `.await`, so no guard is held across one.
 
-### Remote backend — `remote.rs`
+### Remote backend — `remote.rs` + `remote_io.rs`
 
 ```rust
 pub const DEFAULT_INVOKE_PATH: &str = "agents/{agent_id}/invoke";
@@ -258,6 +260,8 @@ Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_heal
 
 URL layout: the endpoint is `{base_url}/{path}` with `{agent_id}` substituted into the path; extra slashes are collapsed outside the scheme and a missing or extra slash between base and path is tolerated, so `("http://host:8080/", "/agents/{agent_id}/invoke")` and `("http://host:8080", "agents/{agent_id}/invoke")` build the same URL.
 A path that contains `{agent_id}` requires a non-empty agent id (`Validation`), and an empty `base_url` is `Validation`.
+The configuration, the URL layout, `RemoteProtocol`, `RemoteClient`, the `RemoteAgent` lifecycle (`ensure_started`/`http_client`/`start`/`stop`), and `RemoteSpawner` are in `remote.rs`; client construction, request execution (`invoke`/`stream`/`cancel_task`), status mapping, and the NDJSON stream parser are in the private `remote_io` child module declared there.
+That child module's helpers are `pub(super)` where `RemoteAgent` calls them, so the public surface is unchanged.
 
 ### Monitored decorator — `monitored.rs`
 
@@ -341,7 +345,8 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/mod.rs` → `SpawnAgentKind`, `SpawnSpec`, `SpawnedAgent`, `AgentSpawner`, `UnsupportedSpawner`, module re-exports, seam docs
 - `./src/spawn/protocol.rs` → `SpawnMessage`, `SpawnMessageKind`, NDJSON line serialization
 - `./src/spawn/frames.rs` → bounded line framing, `read_frame`, `parse_frame_line`, `frame_bytes`, `DEFAULT_MAX_FRAME_BYTES`
-- `./src/spawn/subprocess.rs` → `SubprocessSpawner`, `SpawnedProcess`, request guard/desync, health task, stderr drain, kill-on-drop, wire helpers
+- `./src/spawn/subprocess.rs` → `SubprocessSpawner`, `SpawnedProcess`, `ProcessState` (handle, state, construction/bootstrap, kill-on-drop), `bootstrap_frame`, `merged_env`, and the `SubprocessConfig` re-export
+- `./src/spawn/subprocess_io.rs` → the exchange and supervision layer of that backend: request guard/desync, send/stream/health/shutdown/force-kill, frame I/O, health loop, stderr drain, kill escalation
 - `./src/spawn/subprocess_config.rs` → `SubprocessConfig` (serde config, builders, clamped deadlines), private to the module and re-exported as `spawn::subprocess::SubprocessConfig`
 - `./src/spawn/external.rs` → `ExternalCommandSpawner` (command resolution on a search path / `PATH`, executable checks, delegation to the subprocess backend)
 - `./src/spawn/in_process.rs` → `InProcessHandler`, `InProcessFactory`, `InProcessSpawner`, `InProcessAgent` (host-bound agent, no child)
@@ -349,7 +354,8 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/monitored.rs` → `MonitoredSpawnedAgent` (lifecycle into `RunMonitor` as `RunKind::Spawn`: admission, health observation, dead-child terminal rule, shutdown/kill/drop) and its unit tests
 - `./src/spawn/mod_tests.rs` → inline unit tests of `mod.rs` (loaded via `#[path]`): wire names, `SpawnHealth`, `SpawnSpec::backend`, the defaulted accessors
 - `./src/spawn/subprocess_tests.rs` → inline unit tests of `subprocess.rs` (loaded via `#[path]`)
-- `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, `RemoteAgent`, `create_remote_client`, `RemoteSpawner`, URL building, stream parsing, status mapping
+- `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, the `RemoteAgent` lifecycle, `create_remote_client`, `RemoteSpawner`, URL building, spawn-time validation
+- `./src/spawn/remote_io.rs` → the HTTP transport of that backend: client construction, request body, invoke/stream/cancel execution, status mapping, NDJSON stream parsing
 - `./src/spawn/remote_tests.rs` → inline unit tests of `remote.rs` (loaded via `#[path]`)
 
 ## Notes for Agents
