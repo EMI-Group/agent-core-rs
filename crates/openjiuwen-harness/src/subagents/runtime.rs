@@ -33,6 +33,7 @@ use super::{SubAgentConfig, SubAgentRegistry};
 pub mod clock;
 mod evict;
 mod instance;
+pub mod persistence;
 pub mod quota;
 pub mod transcript;
 mod turn;
