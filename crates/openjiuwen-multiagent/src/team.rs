@@ -14,7 +14,21 @@
 //! The trait is also the seam the runner drives: it calls
 //! [`Team::invoke`]/[`Team::stream`] with the run's team session and binds that
 //! session on [`Team::runtime`].
+//!
+//! # Auto-subscription
+//!
+//! Membership wires the bus automatically: with the default
+//! [`AutoSubscriptionMode::Merge`], every added member subscribes to the patterns
+//! [`crate::autosubscribe::derive_with_overrides`] derives from the *current*
+//! team card — the `topic` broadcast (`topic`, `topic.*`, `topic.<member name>`),
+//! `subscribe:` tags, and any installed overrides — and [`Team::start`] applies
+//! the whole plan once. A card without a topic, a `subscribe:` tag, or an
+//! override derives an empty plan, so legacy teams keep exactly their manual
+//! wiring; [`BaseTeam::with_auto_subscriptions`] switches to
+//! [`AutoSubscriptionMode::Replace`] (which also drops stale patterns) or
+//! [`AutoSubscriptionMode::Disabled`] (which never touches the registry).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +41,7 @@ use openjiuwen_session::AgentTeamSession;
 use parking_lot::RwLock;
 use serde_json::Value;
 
+use crate::autosubscribe::{self, AutoSubscriptionMode, AutoSubscriptionPlan};
 use crate::card::TeamCard;
 use crate::config::TeamConfig;
 use crate::member::AgentProvider;
@@ -163,6 +178,9 @@ pub trait Team: Send + Sync {
 
     /// Starts the team's transport. Idempotent.
     ///
+    /// A [`BaseTeam`] also applies its card-driven subscription plan once, so a
+    /// member registered before the first start gets its planned subscriptions.
+    ///
     /// # Errors
     ///
     /// Propagates a transport start failure.
@@ -236,6 +254,8 @@ pub struct BaseTeam {
     strategy: Arc<dyn TeamStrategy>,
     team_id: String,
     started: AtomicBool,
+    auto_subscriptions: RwLock<AutoSubscriptionMode>,
+    subscription_overrides: RwLock<BTreeMap<String, Vec<String>>>,
 }
 
 impl std::fmt::Debug for BaseTeam {
@@ -244,6 +264,7 @@ impl std::fmt::Debug for BaseTeam {
             .field("team_id", &self.team_id)
             .field("kind", &self.strategy.kind())
             .field("agents", &self.list_agents())
+            .field("auto_subscriptions", &self.auto_subscriptions())
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +303,84 @@ impl BaseTeam {
         Arc::clone(&self.strategy)
     }
 
+    /// Switches card-driven auto-subscription to `mode` (builder form).
+    #[must_use]
+    pub fn with_auto_subscriptions(self, mode: AutoSubscriptionMode) -> Self {
+        self.set_auto_subscriptions(mode);
+        self
+    }
+
+    /// Returns the card-driven auto-subscription mode.
+    ///
+    /// The default is [`AutoSubscriptionMode::Merge`].
+    #[must_use]
+    pub fn auto_subscriptions(&self) -> AutoSubscriptionMode {
+        *self.auto_subscriptions.read()
+    }
+
+    /// Changes the mode without touching the subscriptions already registered.
+    pub fn set_auto_subscriptions(&self, mode: AutoSubscriptionMode) {
+        *self.auto_subscriptions.write() = mode;
+    }
+
+    /// Installs explicit per-agent subscription overrides (builder form).
+    ///
+    /// An override replaces the derived pattern set of the named agent id
+    /// verbatim (sorted and de-duplicated), and ids that are not members are kept,
+    /// matching [`crate::autosubscribe::derive_with_overrides`].
+    #[must_use]
+    pub fn with_subscription_overrides(self, overrides: BTreeMap<String, Vec<String>>) -> Self {
+        *self.subscription_overrides.write() = overrides;
+        self
+    }
+
+    /// Returns the installed subscription overrides.
+    #[must_use]
+    pub fn subscription_overrides(&self) -> BTreeMap<String, Vec<String>> {
+        self.subscription_overrides.read().clone()
+    }
+
+    /// Returns the subscription plan of the current card.
+    ///
+    /// The plan is derived from the member list captured at call time plus the
+    /// card's `topic` and `subscribe:` tags, with the installed overrides applied
+    /// last; every pattern list is sorted and de-duplicated, so iteration order and
+    /// change counts are deterministic. A card without a topic, a `subscribe:` tag,
+    /// or an override derives an empty plan.
+    #[must_use]
+    pub fn subscription_plan(&self) -> AutoSubscriptionPlan {
+        autosubscribe::derive_with_overrides(&self.card(), &self.subscription_overrides())
+    }
+
+    /// Applies the whole plan to the runtime and returns the number of changes.
+    ///
+    /// [`AutoSubscriptionMode::Merge`] counts only the patterns that were not
+    /// subscribed before, [`AutoSubscriptionMode::Replace`] also removes stale
+    /// patterns (and counts them), and [`AutoSubscriptionMode::Disabled`] returns
+    /// `0` and leaves the registry untouched.
+    #[must_use]
+    pub fn apply_subscriptions(&self) -> usize {
+        let plan = self.subscription_plan();
+        let mode = self.auto_subscriptions();
+        autosubscribe::apply(&self.runtime, &plan, mode)
+    }
+
+    /// Applies the planned patterns of `agent_id` and returns the number of
+    /// changes.
+    ///
+    /// The planned patterns are the ones [`subscription_plan`](Self::subscription_plan)
+    /// holds for that agent, applied with the same ordering and counting rules as
+    /// [`apply_subscriptions`](Self::apply_subscriptions). An agent absent from the
+    /// plan derives nothing, so it gains nothing in
+    /// [`AutoSubscriptionMode::Merge`] and loses its current subscriptions in
+    /// [`AutoSubscriptionMode::Replace`].
+    #[must_use]
+    pub fn apply_member_subscriptions(&self, agent_id: &str) -> usize {
+        let plan = self.subscription_plan();
+        let mode = self.auto_subscriptions();
+        autosubscribe::apply_agent(&self.runtime, &plan, agent_id, mode)
+    }
+
     /// Shared constructor: captures the team id and resolves the runtime.
     fn build(
         card: TeamCard,
@@ -300,6 +399,8 @@ impl BaseTeam {
             strategy,
             team_id,
             started: AtomicBool::new(false),
+            auto_subscriptions: RwLock::new(AutoSubscriptionMode::default()),
+            subscription_overrides: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -342,6 +443,9 @@ impl BaseTeam {
                 agent_id = %card.id,
                 "agent is already a member; ignoring the duplicate"
             );
+            // Applying is idempotent, so the duplicate path only reconciles the
+            // member's patterns (a repeated card may now derive more of them).
+            let _ = self.apply_member_subscriptions(&card.id);
             return Ok(());
         }
         if self.agent_count() >= self.config.max_agents {
@@ -352,9 +456,28 @@ impl BaseTeam {
         }
         self.runtime.register_agent(card.clone(), provider);
         self.card.write().agent_cards.push(card.clone());
+        let _ = self.apply_member_subscriptions(&card.id);
         self.strategy
             .on_member_added(&self.strategy_context(), card, options);
         Ok(())
+    }
+
+    /// Drops the planned subscriptions of `agent_id`.
+    ///
+    /// Only the patterns the plan holds for that agent are removed, so unrelated
+    /// manual subscriptions of other members stay. A
+    /// [`AutoSubscriptionMode::Disabled`] team never wired the plan, so this is a
+    /// no-op for it.
+    fn remove_member_subscriptions(&self, agent_id: &str) {
+        if self.auto_subscriptions() == AutoSubscriptionMode::Disabled {
+            return;
+        }
+        let plan = self.subscription_plan();
+        let patterns: &[String] = plan.get(agent_id).unwrap_or_default();
+        let bus = self.runtime.message_bus();
+        for pattern in patterns {
+            bus.remove_subscription(agent_id, pattern);
+        }
     }
 }
 
@@ -411,6 +534,7 @@ impl Team for BaseTeam {
         let Some(agent_id) = self.resolve_agent_id(agent) else {
             return Ok(());
         };
+        self.remove_member_subscriptions(&agent_id);
         if self.runtime.unregister_agent(&agent_id).is_none() {
             return Ok(());
         }
@@ -497,6 +621,14 @@ impl Team for BaseTeam {
         if let Err(error) = self.runtime.start().await {
             self.started.store(false, Ordering::SeqCst);
             return Err(error);
+        }
+        let changes = self.apply_subscriptions();
+        if changes > 0 {
+            tracing::debug!(
+                team = %self.team_id,
+                changes,
+                "applied card-driven subscriptions on start"
+            );
         }
         Ok(())
     }
