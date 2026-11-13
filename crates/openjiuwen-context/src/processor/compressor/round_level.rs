@@ -39,7 +39,8 @@ use crate::processor::compressor::{
     iter_summary_merge_ranges, rollback_recall_archive, split_recall_markers, summarize,
     summarize_offline, MemoryBlockKind, ROUND_LEVEL_MEMORY_BLOCK, SUMMARY_JOIN_SEPARATOR,
 };
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::impl_processor_state;
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::{count_message, count_messages};
 
 /// Characters per token the character budgets assume.
@@ -153,6 +154,8 @@ pub struct RoundLevelCompressor {
     pub config: RoundLevelCompressorConfig,
     /// Model used when the request does not supply one.
     pub model: Option<Arc<dyn Model>>,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl std::fmt::Debug for RoundLevelCompressor {
@@ -160,7 +163,7 @@ impl std::fmt::Debug for RoundLevelCompressor {
         f.debug_struct("RoundLevelCompressor")
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -210,7 +213,11 @@ impl RoundLevelCompressor {
     /// Creates a compressor with `config` and an optional fallback `model`.
     #[must_use]
     pub fn new(config: RoundLevelCompressorConfig, model: Option<Arc<dyn Model>>) -> Self {
-        Self { config, model }
+        Self {
+            config,
+            model,
+            state: ProcessorState::default(),
+        }
     }
 
     /// The configured block marker.
@@ -363,6 +370,8 @@ impl RoundLevelCompressor {
     }
 
     /// Phase 1: one block per completed round in the compressible prefix.
+    ///
+    /// Returns how many blocks it created.
     async fn phase_one(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -370,7 +379,7 @@ impl RoundLevelCompressor {
         cx: &ProcessorContext<'_>,
         changed: &mut Vec<usize>,
         summaries: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let compress_end = messages
             .len()
             .saturating_sub(self.config.keep_recent_messages);
@@ -378,23 +387,30 @@ impl RoundLevelCompressor {
             .into_iter()
             .filter(|round| round.end <= compress_end)
             .collect();
+        let mut blocks = 0usize;
         for span in rounds.into_iter().rev() {
-            self.compress_span(
-                messages,
-                origin,
-                cx,
-                span,
-                self.config.first_pass_target_tokens,
-                changed,
-                summaries,
-            )
-            .await?;
+            if self
+                .compress_span(
+                    messages,
+                    origin,
+                    cx,
+                    span,
+                    self.config.first_pass_target_tokens,
+                    changed,
+                    summaries,
+                )
+                .await?
+            {
+                blocks += 1;
+            }
         }
-        Ok(())
+        Ok(blocks)
     }
 
     /// Phase 2: merge contiguous blocks until the history fits or no run can be
     /// merged profitably.
+    ///
+    /// Returns how many runs it merged.
     fn phase_two(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -402,7 +418,8 @@ impl RoundLevelCompressor {
         cx: &ProcessorContext<'_>,
         changed: &mut Vec<usize>,
         summaries: &mut Vec<String>,
-    ) {
+    ) -> usize {
+        let mut merged_runs = 0usize;
         while count_messages(cx.counter, messages) > self.config.target_total_tokens {
             let runs = iter_summary_merge_ranges(messages, self.marker(), 2);
             if runs.is_empty() {
@@ -448,11 +465,13 @@ impl RoundLevelCompressor {
                 origin.splice(run, std::iter::once(block_origin));
                 summaries.push(merged_body);
                 merged_any = true;
+                merged_runs += 1;
             }
             if !merged_any {
                 break;
             }
         }
+        merged_runs
     }
 
     /// Phase 3: compress the completed rounds the keep window protected,
@@ -467,9 +486,9 @@ impl RoundLevelCompressor {
         cx: &ProcessorContext<'_>,
         changed: &mut Vec<usize>,
         summaries: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if count_messages(cx.counter, messages) <= self.config.target_total_tokens {
-            return Ok(());
+            return Ok(0);
         }
         let tail_start = messages
             .iter()
@@ -478,7 +497,7 @@ impl RoundLevelCompressor {
         let tail = &messages[tail_start..];
         let rounds = group_completed_rounds(tail);
         if rounds.len() <= 1 {
-            return Ok(());
+            return Ok(0);
         }
         let aggressive: Vec<Range<usize>> = rounds[..rounds.len() - 1]
             .iter()
@@ -489,19 +508,24 @@ impl RoundLevelCompressor {
             })
             .map(|round| tail_start + round.start..tail_start + round.end)
             .collect();
+        let mut blocks = 0usize;
         for span in aggressive.into_iter().rev() {
-            self.compress_span(
-                messages,
-                origin,
-                cx,
-                span,
-                self.config.second_pass_target_tokens,
-                changed,
-                summaries,
-            )
-            .await?;
+            if self
+                .compress_span(
+                    messages,
+                    origin,
+                    cx,
+                    span,
+                    self.config.second_pass_target_tokens,
+                    changed,
+                    summaries,
+                )
+                .await?
+            {
+                blocks += 1;
+            }
         }
-        Ok(())
+        Ok(blocks)
     }
 
     /// Phase 4: collapse the compressible prefix into one truncated block.
@@ -610,6 +634,8 @@ impl ContextProcessor for RoundLevelCompressor {
         "round_level"
     }
 
+    impl_processor_state!(RoundLevelCompressor);
+
     async fn process(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -624,13 +650,16 @@ impl ContextProcessor for RoundLevelCompressor {
         let mut changed: Vec<usize> = Vec::new();
         let mut summaries: Vec<String> = Vec::new();
 
-        self.phase_one(messages, &mut origin, cx, &mut changed, &mut summaries)
+        let mut blocks = self
+            .phase_one(messages, &mut origin, cx, &mut changed, &mut summaries)
             .await?;
-        self.phase_two(messages, &mut origin, cx, &mut changed, &mut summaries);
-        self.phase_three(messages, &mut origin, cx, &mut changed, &mut summaries)
+        let merged_runs = self.phase_two(messages, &mut origin, cx, &mut changed, &mut summaries);
+        blocks += self
+            .phase_three(messages, &mut origin, cx, &mut changed, &mut summaries)
             .await?;
 
         // Phase 4: hard truncation of whatever still does not fit.
+        let mut truncated = false;
         if count_messages(cx.counter, messages) > self.config.target_total_tokens {
             if cx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -640,6 +669,7 @@ impl ContextProcessor for RoundLevelCompressor {
                 .await
             {
                 summaries.push(body);
+                truncated = true;
             }
         }
 
@@ -650,6 +680,15 @@ impl ContextProcessor for RoundLevelCompressor {
         changed.sort_unstable();
         changed.dedup();
         let tokens_after = count_messages(cx.counter, messages);
+        self.state.bump("compressions");
+        self.state.add("blocks", blocks as u64);
+        self.state.add("merges", merged_runs as u64);
+        if truncated {
+            self.state.bump("truncations");
+        }
+        self.state
+            .record_tokens("last_tokens_before", tokens_before);
+        self.state.record_tokens("last_tokens_after", tokens_after);
         Ok(Some(ContextEvent {
             processor: self.name().to_owned(),
             kind: ContextEventKind::Summarized,

@@ -45,7 +45,8 @@ use crate::events::{ContextEvent, ContextEventKind};
 use crate::processor::compressor::{
     archive_replaced_messages, rollback_recall_archive, summarize, summarize_offline,
 };
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::impl_processor_state;
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::session_memory::{reinject_session_memory, SessionMemoryStore, RECENT_MESSAGES_NOTICE};
 use crate::tokens::count_messages;
 
@@ -266,6 +267,8 @@ pub struct FullCompactProcessor {
     pub model: Option<Arc<dyn Model>>,
     /// Session-memory notes preferred over a model summary.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl std::fmt::Debug for FullCompactProcessor {
@@ -274,7 +277,7 @@ impl std::fmt::Debug for FullCompactProcessor {
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -291,6 +294,7 @@ impl FullCompactProcessor {
             config,
             model,
             session_memory,
+            state: ProcessorState::default(),
         }
     }
 
@@ -439,6 +443,8 @@ impl ContextProcessor for FullCompactProcessor {
         "full_compact"
     }
 
+    impl_processor_state!(FullCompactProcessor);
+
     async fn process(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -461,11 +467,14 @@ impl ContextProcessor for FullCompactProcessor {
         }
 
         // Session memory first; a model summary only when it cannot apply.
-        let (mut candidate, summary) =
-            match self.session_memory_candidate(cx, &prefix, &active).await? {
-                Some(value) => value,
-                None => self.summary_candidate(cx, &prefix, &active).await,
-            };
+        let (mut candidate, summary, from_session_memory) = if let Some((candidate, notes)) =
+            self.session_memory_candidate(cx, &prefix, &active).await?
+        {
+            (candidate, notes, true)
+        } else {
+            let (candidate, summary) = self.summary_candidate(cx, &prefix, &active).await;
+            (candidate, summary, false)
+        };
         // Both paths put the summary user message right after the boundary, so
         // the recall marker of the replaced `active` history lands at its end.
         let marker = archive_replaced_messages(cx, &active).await;
@@ -497,6 +506,13 @@ impl ContextProcessor for FullCompactProcessor {
             return Ok(None);
         }
         *messages = candidate;
+        self.state.bump("compactions");
+        if from_session_memory {
+            self.state.bump("session_memory_compactions");
+        }
+        self.state
+            .record_tokens("last_tokens_before", tokens_before);
+        self.state.record_tokens("last_tokens_after", tokens_after);
         Ok(Some(ContextEvent {
             processor: self.name().to_owned(),
             kind: ContextEventKind::Summarized,

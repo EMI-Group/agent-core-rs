@@ -34,7 +34,8 @@ use crate::processor::compressor::{
     archive_replaced_messages, group_completed_rounds, rollback_recall_archive, summarize,
     summarize_offline, MemoryBlockKind,
 };
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::impl_processor_state;
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::{count_message, count_messages};
 
 /// Characters per token used to size the offline summary fallback.
@@ -126,6 +127,8 @@ pub struct DialogueCompressor {
     pub config: DialogueCompressorConfig,
     /// Model used when the request does not supply one.
     pub model: Option<Arc<dyn Model>>,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl std::fmt::Debug for DialogueCompressor {
@@ -133,7 +136,7 @@ impl std::fmt::Debug for DialogueCompressor {
         f.debug_struct("DialogueCompressor")
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -141,7 +144,11 @@ impl DialogueCompressor {
     /// Creates a compressor with `config` and an optional fallback `model`.
     #[must_use]
     pub fn new(config: DialogueCompressorConfig, model: Option<Arc<dyn Model>>) -> Self {
-        Self { config, model }
+        Self {
+            config,
+            model,
+            state: ProcessorState::default(),
+        }
     }
 
     /// Whether the thresholds ask for a pass.
@@ -204,6 +211,8 @@ impl ContextProcessor for DialogueCompressor {
         "dialogue"
     }
 
+    impl_processor_state!(DialogueCompressor);
+
     async fn process(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -236,6 +245,7 @@ impl ContextProcessor for DialogueCompressor {
         // Newest first: replacing a span never shifts the indices of the older
         // spans still to be processed.
         let mut changed: Vec<usize> = Vec::new();
+        let mut applied = 0u64;
         let mut last_block: Option<String> = None;
         for span in targets.into_iter().rev() {
             let span_messages = messages[span.clone()].to_vec();
@@ -271,6 +281,7 @@ impl ContextProcessor for DialogueCompressor {
             }
             messages.splice(span.clone(), std::iter::once(replacement.clone()));
             changed.extend(span);
+            applied += 1;
             last_block = Some(replacement.text().into_owned());
         }
 
@@ -280,6 +291,11 @@ impl ContextProcessor for DialogueCompressor {
         changed.sort_unstable();
         changed.dedup();
         let tokens_after = count_messages(cx.counter, messages);
+        self.state.add("compressions", applied);
+        self.state.add("rounds_dropped", changed.len() as u64);
+        self.state
+            .record_tokens("last_tokens_before", tokens_before);
+        self.state.record_tokens("last_tokens_after", tokens_after);
         Ok(Some(ContextEvent {
             processor: self.name().to_owned(),
             kind: ContextEventKind::Summarized,

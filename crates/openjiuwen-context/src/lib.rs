@@ -91,7 +91,7 @@ pub use processor::{
     DialogueCompressor, DialogueCompressorConfig, FullCompactProcessor, FullCompactProcessorConfig,
     MemoryBlockKind, MessageOffloader, MessageOffloaderConfig, MessageSummaryOffloader,
     MessageSummaryOffloaderConfig, MicroCompactProcessor, MicroCompactProcessorConfig,
-    PipelineDeps, ProcessorConfig, ProcessorContext, RoundLevelCompressor,
+    PipelineDeps, ProcessorConfig, ProcessorContext, ProcessorState, RoundLevelCompressor,
     RoundLevelCompressorConfig, SummarizationConfig, SummarizationProcessor,
     ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, ToolResultConfig,
     ToolResultProcessor, ToolResultWindowProcessor, ToolResultWindowProcessorConfig,

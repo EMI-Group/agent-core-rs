@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
 use crate::processor::compressor::compact::ends_on_completed_api_round;
+use crate::processor::impl_processor_state;
 use crate::processor::offloader::resolve_tool_name;
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::count_messages;
 
 /// Replacement text of a cleared tool result.
@@ -88,13 +89,18 @@ impl MicroCompactProcessorConfig {
 pub struct MicroCompactProcessor {
     /// Processor configuration.
     pub config: MicroCompactProcessorConfig,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl MicroCompactProcessor {
     /// Creates a processor with `config`.
     #[must_use]
     pub fn new(config: MicroCompactProcessorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            state: ProcessorState::default(),
+        }
     }
 
     /// Whether this processor may clear results of `name`.
@@ -105,8 +111,8 @@ impl MicroCompactProcessor {
             .any(|allowed| allowed == name)
     }
 
-    /// Indices of the results to clear, grouped by tool name.
-    fn collect_clearable(&self, messages: &[BaseMessage], manual: bool) -> Vec<usize> {
+    /// Indices of the results to clear and how many tool groups fired.
+    fn collect_clearable(&self, messages: &[BaseMessage], manual: bool) -> (Vec<usize>, usize) {
         let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
         for (index, message) in messages.iter().enumerate() {
             if message.role != Role::Tool {
@@ -132,15 +138,17 @@ impl MicroCompactProcessor {
                 .saturating_add(self.config.trigger_threshold)
         };
         let mut clearable: Vec<usize> = Vec::new();
+        let mut fired = 0usize;
         for indices in groups.values() {
             if indices.len() <= threshold {
                 continue;
             }
+            fired += 1;
             let keep = self.config.keep_recent_per_tool.min(indices.len());
             clearable.extend(indices[..indices.len() - keep].iter().copied());
         }
         clearable.sort_unstable();
-        clearable
+        (clearable, fired)
     }
 }
 
@@ -149,6 +157,8 @@ impl ContextProcessor for MicroCompactProcessor {
     fn name(&self) -> &'static str {
         "micro_compact"
     }
+
+    impl_processor_state!(MicroCompactProcessor);
 
     async fn process(
         &self,
@@ -172,7 +182,7 @@ impl MicroCompactProcessor {
         messages: &mut [BaseMessage],
         cx: &ProcessorContext<'_>,
     ) -> Option<ContextEvent> {
-        let clearable = self.collect_clearable(messages, cx.manual);
+        let (clearable, groups) = self.collect_clearable(messages, cx.manual);
         if clearable.is_empty() {
             return None;
         }
@@ -183,6 +193,8 @@ impl MicroCompactProcessor {
             messages[*index] = cleared;
         }
         let tokens_after = count_messages(cx.counter, messages);
+        self.state.add("cleared", clearable.len() as u64);
+        self.state.add("groups", groups as u64);
         Some(ContextEvent {
             processor: self.name().to_owned(),
             kind: ContextEventKind::ToolResultTrimmed,

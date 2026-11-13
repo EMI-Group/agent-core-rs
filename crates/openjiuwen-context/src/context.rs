@@ -112,6 +112,13 @@ pub struct ContextState {
     pub messages: Vec<BaseMessage>,
     /// The revision the messages were saved at.
     pub revision: u64,
+    /// Process-level checkpoint state, keyed by processor name.
+    ///
+    /// Filled from [`ContextPipeline::save_state`] and restored through
+    /// [`ContextPipeline::load_state`], so a processor's cross-run counters
+    /// survive the process that wrote them. Empty when no processor keeps
+    /// counters, and when the state was written before processors had any.
+    pub processors: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Whether a message carries no payload at all.
@@ -322,15 +329,17 @@ impl ConversationContext {
         self.pipeline.run(messages, &cx).await
     }
 
-    /// Serializes the history for persistence.
+    /// Serializes the history and the processor checkpoints for persistence.
     pub async fn save_state(&self) -> ContextState {
         ContextState {
             messages: self.messages().await,
             revision: self.revision(),
+            processors: self.pipeline.save_state(),
         }
     }
 
-    /// Replaces the history with `state`.
+    /// Replaces the history with `state` and restores the processor counters it
+    /// carries.
     ///
     /// The revision stored in `state` becomes the context's revision, so a
     /// restored context continues the sequence the saved one used.
@@ -340,9 +349,15 @@ impl ConversationContext {
     /// Currently infallible; the signature keeps the door open for
     /// implementations that persist eagerly.
     pub async fn load_state(&self, state: ContextState) -> Result<()> {
-        *self.messages.write().await = state.messages;
-        self.revision.store(state.revision, Ordering::SeqCst);
+        let ContextState {
+            messages,
+            revision,
+            processors,
+        } = state;
+        *self.messages.write().await = messages;
+        self.revision.store(revision, Ordering::SeqCst);
         self.invalidate_stats().await;
+        self.pipeline.load_state(&processors);
         Ok(())
     }
 

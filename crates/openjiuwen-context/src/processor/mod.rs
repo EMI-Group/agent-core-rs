@@ -19,6 +19,7 @@
 //! })]);
 //! assert_eq!(pipeline.processors().len(), 1);
 //! ```
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,6 +41,7 @@ pub mod offloader;
 pub mod summarize;
 pub mod summary_offloader;
 pub mod tool_result;
+pub mod tool_result_window;
 pub mod truncate;
 
 pub use self::compressor::{
@@ -54,8 +56,8 @@ pub use self::compressor::{
 };
 pub use self::offloader::{
     wildcard_match, MessageOffloadRole, MessageOffloader, MessageOffloaderConfig,
-    ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, ToolResultWindowProcessor,
-    ToolResultWindowProcessorConfig, OMIT_STRING, WINDOWED_OUTPUT_TAG, WINDOW_MANAGED_METADATA_KEY,
+    ToolResultBudgetProcessor, ToolResultBudgetProcessorConfig, OMIT_STRING, WINDOWED_OUTPUT_TAG,
+    WINDOW_MANAGED_METADATA_KEY,
 };
 pub use self::summarize::{SummarizationConfig, SummarizationProcessor, CONTEXT_SUMMARY_PREFIX};
 pub use self::summary_offloader::{
@@ -65,7 +67,157 @@ pub use self::summary_offloader::{
 pub use self::tool_result::{
     ToolResultConfig, ToolResultProcessor, PERSISTED_OUTPUT_TAG, TRUNCATED_MARKER,
 };
+pub use self::tool_result_window::{ToolResultWindowProcessor, ToolResultWindowProcessorConfig};
 pub use self::truncate::{TruncationConfig, TruncationProcessor};
+
+/// Implements the checkpoint hooks of a processor whose cross-run counters live
+/// in its `state` field.
+///
+/// Both hooks are just the [`ProcessorState`] snapshot and restore, so every
+/// stateful processor spells them the same way.
+macro_rules! impl_processor_state {
+    ($processor:ty) => {
+        fn save_state(&self) -> serde_json::Value {
+            self.state.snapshot()
+        }
+
+        fn load_state(&self, state: &serde_json::Value) {
+            self.state.restore(state);
+        }
+    };
+}
+pub(crate) use impl_processor_state;
+
+/// A small, thread-safe JSON bag a processor keeps its cross-run counters in.
+///
+/// The bag is the persisted side of [`ContextProcessor::save_state`]: a
+/// processor counts what it did while it ran, and [`ContextPipeline::save_state`]
+/// writes the snapshot into the session checkpoint through
+/// [`ContextState`](crate::ContextState), so the counters survive a restart.
+/// Counters are observability only — they never influence a transform, and a
+/// processor that changed nothing does not advance them.
+///
+/// Values are read back through the typed accessors; a corrupt or foreign entry
+/// restored with [`ProcessorState::restore`] is ignored rather than trusted.
+///
+/// ```
+/// use openjiuwen_context::ProcessorState;
+///
+/// let state = ProcessorState::default();
+/// assert_eq!(state.snapshot(), serde_json::Value::Null);
+/// state.bump("compressions");
+/// state.set_u64("blocks", 4);
+/// assert_eq!(state.counter("compressions"), 1);
+/// assert_eq!(state.counter("blocks"), 4);
+/// assert_eq!(state.counter("missing"), 0);
+/// ```
+#[derive(Debug, Default)]
+pub struct ProcessorState {
+    /// The counters; `Value::Null` until the first write.
+    inner: std::sync::Mutex<serde_json::Value>,
+}
+
+impl ProcessorState {
+    /// Creates an empty state bag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A snapshot of the counters, [`serde_json::Value::Null`] when nothing was
+    /// written yet.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        lock_state(&self.inner).clone()
+    }
+
+    /// Replaces the counters with a snapshot taken by [`ProcessorState::snapshot`].
+    ///
+    /// A `Null` or non-object value is ignored, so corrupt or foreign entries
+    /// leave the current counters intact.
+    pub fn restore(&self, state: &serde_json::Value) {
+        if !state.is_object() {
+            return;
+        }
+        *lock_state(&self.inner) = state.clone();
+    }
+
+    /// Increments the integer counter `key`, creating it when absent.
+    pub fn bump(&self, key: &str) {
+        self.add(key, 1);
+    }
+
+    /// The value of `key`, `0` when it is absent or not a non-negative integer.
+    #[must_use]
+    pub fn counter(&self, key: &str) -> u64 {
+        lock_state(&self.inner)
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// Sets the integer counter `key` to `value`.
+    pub fn set_u64(&self, key: &str, value: u64) {
+        with_object(&self.inner, |object| {
+            object.insert(key.to_owned(), serde_json::Value::from(value));
+        });
+    }
+
+    /// Records a token count under `key`.
+    ///
+    /// Counts are u64 counters too, so a size that does not fit saturates
+    /// instead of wrapping.
+    pub fn record_tokens(&self, key: &str, value: usize) {
+        self.set_u64(key, u64::try_from(value).unwrap_or(u64::MAX));
+    }
+
+    /// Adds `delta` to the integer counter `key`, creating it when absent.
+    pub(crate) fn add(&self, key: &str, delta: u64) {
+        with_object(&self.inner, |object| {
+            let current = object
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            object.insert(
+                key.to_owned(),
+                serde_json::Value::from(current.saturating_add(delta)),
+            );
+        });
+    }
+}
+
+impl Clone for ProcessorState {
+    /// Clones the snapshot, so the copy and the original advance independently.
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(self.snapshot()),
+        }
+    }
+}
+
+/// Locks the bag, recovering from a poisoned mutex.
+fn lock_state(
+    state: &std::sync::Mutex<serde_json::Value>,
+) -> std::sync::MutexGuard<'_, serde_json::Value> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Applies `f` to the object of the bag, which is created when it is not an
+/// object yet.
+fn with_object(
+    state: &std::sync::Mutex<serde_json::Value>,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let mut guard = lock_state(state);
+    if !guard.is_object() {
+        *guard = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(object) = guard.as_object_mut() {
+        f(object);
+    }
+}
 
 /// One transform applied to a conversation history.
 #[async_trait]
@@ -87,11 +239,18 @@ pub trait ContextProcessor: Send + Sync {
     ) -> Result<Option<ContextEvent>>;
 
     /// Serializes any state the processor keeps across runs.
+    ///
+    /// The default is [`serde_json::Value::Null`], which
+    /// [`ContextPipeline::save_state`] omits from the checkpoint. A stateful
+    /// processor returns its [`ProcessorState`] snapshot instead.
     fn save_state(&self) -> serde_json::Value {
         serde_json::Value::Null
     }
 
     /// Restores state previously returned by [`ContextProcessor::save_state`].
+    ///
+    /// The default ignores the state; a stateful processor hands it to
+    /// [`ProcessorState::restore`].
     fn load_state(&self, _state: &serde_json::Value) {}
 }
 
@@ -362,6 +521,70 @@ impl ContextPipeline {
     #[must_use]
     pub fn processors(&self) -> &[Arc<dyn ContextProcessor>] {
         &self.processors
+    }
+
+    /// Serializes the checkpoint state of every processor that keeps any.
+    ///
+    /// Entries are keyed by [`ContextProcessor::name`] in pipeline order; a
+    /// second processor with the same name becomes `"<name>#2"`, a third
+    /// `"<name>#3"`. Processors that report [`serde_json::Value::Null`] are
+    /// omitted, so the map only holds real checkpoints.
+    #[must_use]
+    pub fn save_state(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut state = BTreeMap::new();
+        for (processor, key) in self.state_keys() {
+            let value = processor.save_state();
+            if !value.is_null() {
+                state.insert(key, value);
+            }
+        }
+        state
+    }
+
+    /// Restores the processor checkpoints a [`ContextPipeline::save_state`] map
+    /// carries.
+    ///
+    /// Every entry is handed to the processor its key names, using the same key
+    /// scheme [`ContextPipeline::save_state`] used. A key that matches no
+    /// processor is ignored and logged at debug level, so a checkpoint written
+    /// by a different pipeline configuration still loads.
+    pub fn load_state(&self, state: &BTreeMap<String, serde_json::Value>) {
+        let keys = self.state_keys();
+        for (processor, key) in &keys {
+            if let Some(value) = state.get(key) {
+                processor.load_state(value);
+            }
+        }
+        for key in state.keys() {
+            if !keys.iter().any(|(_, known)| known == key) {
+                tracing::debug!(
+                    processor = %key,
+                    "ignored checkpoint state for an unknown processor"
+                );
+            }
+        }
+    }
+
+    /// `(processor, checkpoint key)` pairs in pipeline order.
+    ///
+    /// The counter is positional, so save and load always agree on a key even
+    /// when a processor in between keeps no state.
+    fn state_keys(&self) -> Vec<(&Arc<dyn ContextProcessor>, String)> {
+        let mut seen: HashMap<&'static str, usize> = HashMap::new();
+        self.processors
+            .iter()
+            .map(|processor| {
+                let name = processor.name();
+                let count = seen.entry(name).or_insert(0);
+                *count += 1;
+                let key = if *count == 1 {
+                    name.to_owned()
+                } else {
+                    format!("{name}#{count}")
+                };
+                (processor, key)
+            })
+            .collect()
     }
 
     /// Runs every processor in order and returns the events they produced.

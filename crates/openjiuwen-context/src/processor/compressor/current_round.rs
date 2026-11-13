@@ -11,7 +11,7 @@
 //!    tail holds at least
 //!    [`CurrentRoundCompressorConfig::min_selected_tokens_for_compression`]
 //!    tokens, it is summarised into one
-//!    [`CURRENT_ROUND_MEMORY_BLOCK`](crate::processor::compressor::CURRENT_ROUND_MEMORY_BLOCK)
+//!    [`CURRENT_ROUND_MEMORY_BLOCK`]
 //!    user message. The span is clamped back to the last completed API round, so
 //!    a tool-call/tool-result exchange is never split, and the replacement must
 //!    be smaller than the span.
@@ -40,7 +40,8 @@ use crate::processor::compressor::{
     iter_summary_merge_ranges, rollback_recall_archive, split_recall_markers, summarize,
     summarize_offline, MemoryBlockKind, CURRENT_ROUND_MEMORY_BLOCK, SUMMARY_JOIN_SEPARATOR,
 };
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::impl_processor_state;
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::{count_message, count_messages};
 
 /// Characters per token used to size the offline summary fallback.
@@ -122,6 +123,8 @@ pub struct CurrentRoundCompressor {
     pub config: CurrentRoundCompressorConfig,
     /// Model used when the request does not supply one.
     pub model: Option<Arc<dyn Model>>,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl std::fmt::Debug for CurrentRoundCompressor {
@@ -129,7 +132,7 @@ impl std::fmt::Debug for CurrentRoundCompressor {
         f.debug_struct("CurrentRoundCompressor")
             .field("config", &self.config)
             .field("has_model", &self.model.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -137,7 +140,11 @@ impl CurrentRoundCompressor {
     /// Creates a compressor with `config` and an optional fallback `model`.
     #[must_use]
     pub fn new(config: CurrentRoundCompressorConfig, model: Option<Arc<dyn Model>>) -> Self {
-        Self { config, model }
+        Self {
+            config,
+            model,
+            state: ProcessorState::default(),
+        }
     }
 
     /// Whether the thresholds ask for a pass.
@@ -241,6 +248,8 @@ impl ContextProcessor for CurrentRoundCompressor {
         "current_round"
     }
 
+    impl_processor_state!(CurrentRoundCompressor);
+
     async fn process(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -274,6 +283,7 @@ impl ContextProcessor for CurrentRoundCompressor {
         let mut changed: Vec<usize> = Vec::new();
         let mut summaries: Vec<String> = Vec::new();
         let mut stage_one: Option<Range<usize>> = None;
+        let mut merged = false;
 
         if let Some(span) = self.span(messages, boundary) {
             let span_messages = messages[span.clone()].to_vec();
@@ -314,8 +324,9 @@ impl ContextProcessor for CurrentRoundCompressor {
             }
         }
 
-        if let Some(merged) = self.merge_blocks(messages, cx, &mut changed, stage_one.as_ref()) {
-            summaries.push(merged);
+        if let Some(body) = self.merge_blocks(messages, cx, &mut changed, stage_one.as_ref()) {
+            summaries.push(body);
+            merged = true;
         }
 
         if changed.is_empty() {
@@ -324,6 +335,15 @@ impl ContextProcessor for CurrentRoundCompressor {
         changed.sort_unstable();
         changed.dedup();
         let tokens_after = count_messages(cx.counter, messages);
+        if stage_one.is_some() {
+            self.state.bump("compressions");
+        }
+        if merged {
+            self.state.bump("merges");
+        }
+        self.state
+            .record_tokens("last_tokens_before", tokens_before);
+        self.state.record_tokens("last_tokens_after", tokens_after);
         Ok(Some(ContextEvent {
             processor: self.name().to_owned(),
             kind: ContextEventKind::Summarized,

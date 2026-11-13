@@ -27,12 +27,13 @@ use serde::{Deserialize, Serialize};
 use crate::events::ContextEvent;
 use crate::offload::OffloadStore;
 use crate::processor::compressor::TRUNCATED_MARKER;
+use crate::processor::impl_processor_state;
 use crate::processor::offloader::{
     is_already_offloaded, is_protected_tool_message, offloaded_event, persist_offload,
     role_allowed, MessageOffloadRole,
 };
 use crate::processor::summarize;
-use crate::processor::{ContextProcessor, ProcessorContext};
+use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::{count_message, count_messages};
 
 /// Tag that opens the block recording what was offloaded.
@@ -80,6 +81,8 @@ pub struct MessageSummaryOffloader {
     pub model: Option<Arc<dyn Model>>,
     /// Where offloaded originals are written.
     pub store: Arc<dyn OffloadStore>,
+    /// Cross-run counters, persisted through the context checkpoint.
+    pub state: ProcessorState,
 }
 
 impl std::fmt::Debug for MessageSummaryOffloader {
@@ -107,6 +110,7 @@ impl MessageSummaryOffloader {
             config,
             model,
             store,
+            state: ProcessorState::default(),
         }
     }
 
@@ -174,6 +178,8 @@ impl ContextProcessor for MessageSummaryOffloader {
         "message_summary_offloader"
     }
 
+    impl_processor_state!(MessageSummaryOffloader);
+
     async fn process(
         &self,
         messages: &mut Vec<BaseMessage>,
@@ -212,6 +218,11 @@ impl ContextProcessor for MessageSummaryOffloader {
             last_handle = Some(handle);
         }
         let tokens_after = count_messages(cx.counter, messages);
+        self.state.add("offloaded", changed.len() as u64);
+        self.state.add("summaries", changed.len() as u64);
+        self.state
+            .record_tokens("last_tokens_before", tokens_before);
+        self.state.record_tokens("last_tokens_after", tokens_after);
         Ok(Some(offloaded_event(
             self.name(),
             &mut changed,
