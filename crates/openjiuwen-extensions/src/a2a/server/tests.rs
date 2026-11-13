@@ -19,14 +19,15 @@ use tower::ServiceExt;
 #[allow(unused_imports)]
 mod public_paths {
     use crate::a2a::server::{
-        A2aExecutionContext, A2aExecutor, A2aServer, A2aServerAdapter, A2aServerConfig, EventSink,
-        InMemoryTaskStore, ServerHandle, TaskStore, DEFAULT_CARD_PATH, DEFAULT_HOST, DEFAULT_PORT,
-        DEFAULT_PROTOCOL_VERSION, DEFAULT_RPC_PATH,
+        A2aExecutionContext, A2aExecutor, A2aServer, A2aServerAdapter, A2aServerConfig,
+        A2aTransport, EventSink, InMemoryTaskStore, ServerHandle, TaskStore, DEFAULT_CARD_PATH,
+        DEFAULT_HOST, DEFAULT_PORT, DEFAULT_PROTOCOL_VERSION, DEFAULT_REST_PATH,
+        DEFAULT_REST_PREFIX, DEFAULT_RPC_PATH,
     };
 }
 
 /// An executor that publishes an open artifact and a terminal one.
-struct EchoExecutor;
+pub(super) struct EchoExecutor;
 
 #[async_trait::async_trait]
 impl A2aExecutor for EchoExecutor {
@@ -51,7 +52,7 @@ impl A2aExecutor for EchoExecutor {
 }
 
 /// An executor that fails.
-struct FailingExecutor;
+pub(super) struct FailingExecutor;
 
 #[async_trait::async_trait]
 impl A2aExecutor for FailingExecutor {
@@ -60,7 +61,7 @@ impl A2aExecutor for FailingExecutor {
     }
 }
 
-fn card() -> types::AgentCard {
+pub(super) fn card() -> types::AgentCard {
     types::AgentCard {
         name: String::from("test-agent"),
         description: String::from("does things"),
@@ -78,7 +79,7 @@ fn server(executor: Arc<dyn A2aExecutor>) -> A2aServer {
 }
 
 /// A stored task in `state`, for cancel/resubscribe tests.
-fn stored_task(id: &str, state: TaskState) -> Task {
+pub(super) fn stored_task(id: &str, state: TaskState) -> Task {
     Task {
         id: String::from(id),
         context_id: String::from("ctx-1"),
