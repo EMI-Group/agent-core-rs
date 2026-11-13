@@ -5,11 +5,18 @@
 //! request on a session id and receives the artifact it could parse, or a
 //! clarifying question.
 //!
-//! Python runs a multi-stage pipeline here (intention detection, clarifier,
-//! designer, DSL generator and reflector, cycle checker, Mermaid rendering);
-//! this port performs **one** model round trip and treats any unparseable answer
-//! as [`BuildOutput::Response`]. Time comes from [`now_millis`], and the only
-//! random value is the fallback DSL agent id.
+//! Two entry points share the session machinery:
+//!
+//! - [`AgentBuilder::build_agent`] / [`AgentBuilder::build_agent_at`] keep the
+//!   single-round-trip behavior: one model answer that is either a fenced JSON
+//!   artifact or a plain-text clarification.
+//! - [`AgentBuilder::build_with_pipeline`] runs the staged pipeline —
+//!   clarification, then the workflow designer/generator/reflector chain or the
+//!   LLM-agent generation plus deterministic repair — and falls back to the
+//!   deterministic stage implementations whenever a model answer is unusable.
+//!
+//! Time comes from [`now_millis`], and the only random values are the DSL agent
+//! ids.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,9 +29,14 @@ use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::BaseMessage;
 use serde::{Deserialize, Serialize};
 
+use super::clarifier::{Clarification, Clarifier};
+use super::designer::WorkflowDesigner;
+use super::dl_generator::DlGenerator;
+use super::dl_reflector::DlReflector;
 use super::dsl::LlmAgentDsl;
 use super::history::{DialogueMessage, HistoryManager, DEFAULT_MAX_HISTORY_SIZE};
 use super::outcome::{map_state_to_status, BuildOutput, BuildResult, BuildState, BuildStatus};
+use super::spec::LlmAgentSpec;
 use super::workflow_dsl::WorkflowDsl;
 use crate::util::extract_json_fence;
 
@@ -69,6 +81,19 @@ using these keys:
 The graph needs at least one node and every edge endpoint must be a node.
 Do not add other keys and do not wrap the document in prose.
 When the request is ambiguous, answer in plain text with one clarifying question."#;
+
+/// The clarification question used when the clarifier names no detail at all.
+const DEFAULT_CLARIFICATION_QUESTION: &str =
+    "Please describe what the agent should accomplish and what output it should produce.";
+
+/// How many whitespace-separated words of a request become the agent name.
+const MAX_NAME_WORDS: usize = 6;
+
+/// How many characters of a CJK-only request become the agent name.
+const MAX_NAME_CHARS: usize = 24;
+
+/// How many characters of a request become the agent description.
+const MAX_DESCRIPTION_CHARS: usize = 160;
 
 /// Which artifact the builder is asked to produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -268,6 +293,112 @@ impl AgentBuilder {
         })
     }
 
+    /// Builds the requested artifact through the staged pipeline.
+    ///
+    /// Stage 1 always runs [`Clarifier`]; when the request is incomplete the
+    /// session stops with a clarifying response. A ready request then runs the
+    /// workflow stages ([`WorkflowDesigner`] -> [`DlGenerator`] -> [`DlReflector`])
+    /// or the LLM-agent stage, falling back deterministically whenever a model
+    /// answer is unusable. Only a blank query is an error; use this variant when
+    /// a full artifact is wanted, and [`Self::build_agent_at`] for the legacy
+    /// single round trip.
+    ///
+    /// Sessions behave exactly like [`Self::build_agent_at`]: a blank query is
+    /// rejected before any session exists, the session is created on first use,
+    /// its `agent_type` is set, the user turn is appended, and the state becomes
+    /// [`BuildState::Processing`]. The clarifier receives the turns retained
+    /// *before* this request, so the query is not duplicated.
+    ///
+    /// A not-ready clarification becomes [`BuildOutput::Response`] holding the
+    /// question, or else the summary, or else
+    /// `DEFAULT_CLARIFICATION_QUESTION`, with state
+    /// [`BuildState::Clarifying`]. A ready workflow request designs, generates,
+    /// and reflects a document; an unusable reflection falls back to the
+    /// deterministic generation of the same design. A ready LLM-agent request
+    /// makes one model call, repairs the parsed document deterministically, and
+    /// falls back to `deterministic_agent_dsl` when the answer is unparseable
+    /// or the call fails. Both successes complete the session.
+    ///
+    /// The assistant text (the JSON document, or the clarification) is appended
+    /// to the session history and the final state is stored, so
+    /// [`Self::status`] reports two more retained turns per call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for a blank query, which is the only error
+    /// a caller can trigger; a failing model answer never propagates. Stage
+    /// output that cannot be represented (serialization) or a structurally
+    /// impossible design would surface as [`Error::Validation`] as well.
+    pub async fn build_with_pipeline(
+        &mut self,
+        query: &str,
+        session_id: &str,
+        agent_type: AgentType,
+        timestamp_ms: i64,
+    ) -> Result<BuildResult> {
+        if query.trim().is_empty() {
+            return Err(Error::validation("query must not be blank"));
+        }
+
+        // The borrow of the session ends here so no async stage holds it.
+        let prior = {
+            let session = self
+                .sessions
+                .entry(session_id.to_owned())
+                .or_insert_with(|| SessionState {
+                    history: HistoryManager::new(DEFAULT_MAX_HISTORY_SIZE),
+                    state: BuildState::Initial,
+                    agent_type,
+                });
+            session.agent_type = agent_type;
+            session.state = BuildState::Processing;
+            let prior = session.history.clone();
+            session.history.add_user_message(query);
+            prior
+        };
+
+        let model = Arc::clone(&self.model);
+        let clarification = Clarifier::with_model(Arc::clone(&model))
+            .clarify(query, &prior)
+            .await?;
+
+        let (output, state) = if clarification.ready {
+            match agent_type {
+                AgentType::Workflow => {
+                    let workflow = workflow_pipeline(&model, query).await?;
+                    (BuildOutput::Workflow(workflow), BuildState::Completed)
+                }
+                AgentType::LlmAgent => {
+                    let mut history = prior.clone();
+                    history.add_user_message(query);
+                    let dsl = llm_agent_pipeline(&model, query, &history, timestamp_ms).await?;
+                    (BuildOutput::Dsl(dsl), BuildState::Completed)
+                }
+            }
+        } else {
+            let text = clarification_text(clarification);
+            (BuildOutput::Response(text), BuildState::Clarifying)
+        };
+
+        let assistant_text = match &output {
+            BuildOutput::Dsl(dsl) => dsl.to_json_string()?,
+            BuildOutput::Workflow(workflow) => workflow.to_json_string()?,
+            BuildOutput::Response(text) => text.clone(),
+        };
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.history.add_assistant_message(assistant_text);
+            session.state = state;
+        }
+
+        Ok(BuildResult {
+            status: map_state_to_status(state, agent_type),
+            session_id: session_id.to_owned(),
+            agent_type,
+            output,
+        })
+    }
+
     /// Returns the retained dialogue of a session, oldest first.
     ///
     /// `k` limits the answer to the newest `k` turns ([`HistoryManager`] treats
@@ -388,6 +519,198 @@ fn parse_artifact(text: &str, agent_type: AgentType, timestamp_ms: i64) -> Optio
             }
         },
     }
+}
+
+/// The text a not-ready clarification is answered with.
+///
+/// The clarifier's question wins, then its detected-signal summary, then the
+/// generic [`DEFAULT_CLARIFICATION_QUESTION`].
+fn clarification_text(clarification: Clarification) -> String {
+    if !clarification.question.is_empty() {
+        clarification.question
+    } else if !clarification.summary.is_empty() {
+        clarification.summary
+    } else {
+        DEFAULT_CLARIFICATION_QUESTION.to_string()
+    }
+}
+
+/// Designs, generates, and reflects one workflow.
+///
+/// The reflector repairs the generated document with its deterministic rules; a
+/// failing reflection falls back to the generator's deterministic document for
+/// the same design rather than failing the request.
+async fn workflow_pipeline(model: &Arc<dyn Model>, query: &str) -> Result<WorkflowDsl> {
+    let design = WorkflowDesigner::with_model(Arc::clone(model))
+        .design(query)
+        .await?;
+    let generator = DlGenerator::with_model(Arc::clone(model));
+    let candidate = generator.generate_with_model(&design).await?;
+
+    match DlReflector::with_model(Arc::clone(model)).reflect(&candidate) {
+        Ok(reflection) => Ok(reflection.repaired),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "workflow reflection failed; using the deterministic document"
+            );
+            generator.generate(&design)
+        }
+    }
+}
+
+/// Asks the model for one LLM-agent document and repairs it deterministically.
+///
+/// A failed call, a choice-less answer, or an unparseable answer is logged and
+/// replaced by [`deterministic_agent_dsl`], so this entry point never reports a
+/// model problem as an error.
+async fn llm_agent_pipeline(
+    model: &Arc<dyn Model>,
+    query: &str,
+    history: &HistoryManager,
+    timestamp_ms: i64,
+) -> Result<LlmAgentDsl> {
+    let messages = conversation(history, AgentType::LlmAgent);
+    let request = ModelRequestConfig::new(model.model_name());
+    let response = match model.invoke(&messages, &request).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "LLM-agent model call failed; using the deterministic document"
+            );
+            return Ok(deterministic_agent_dsl(query, timestamp_ms));
+        }
+    };
+    let Some(choice) = response.choices.into_iter().next() else {
+        tracing::debug!("LLM-agent model returned no choices; using the deterministic document");
+        return Ok(deterministic_agent_dsl(query, timestamp_ms));
+    };
+
+    let text = choice.message.text().into_owned();
+    let parsed = extract_json_fence(&text)
+        .ok_or_else(|| Error::validation("model answer contained no JSON code fence"))
+        .and_then(LlmAgentDsl::from_value);
+    match parsed {
+        Ok(dsl) => Ok(repair_llm_dsl(dsl, query, timestamp_ms)),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "LLM-agent answer is not a DSL document; using the deterministic document"
+            );
+            Ok(deterministic_agent_dsl(query, timestamp_ms))
+        }
+    }
+}
+
+/// Fills the blanks of a parsed LLM-agent document.
+///
+/// Identity, text fields, and timestamps are each repaired only when blank or
+/// zero, so a complete model answer is returned untouched apart from a missing
+/// `agent_id`.
+fn repair_llm_dsl(mut dsl: LlmAgentDsl, query: &str, timestamp_ms: i64) -> LlmAgentDsl {
+    if dsl.agent_id.trim().is_empty() {
+        dsl.agent_id = uuid::Uuid::new_v4().to_string();
+    }
+    if dsl.agent_type.trim().is_empty() {
+        dsl.agent_type = "react".to_string();
+    }
+    if dsl.name.trim().is_empty() {
+        dsl.name = derived_agent_name(query);
+    }
+    if dsl.description.trim().is_empty() {
+        dsl.description = describe_query(query).unwrap_or_else(|| dsl.name.clone());
+    }
+    if dsl.configs.system_prompt.trim().is_empty() {
+        dsl.configs.system_prompt = default_system_prompt(query);
+    }
+    if dsl.create_time == 0 {
+        dsl.create_time = timestamp_ms;
+    }
+    if dsl.update_time == 0 {
+        dsl.update_time = timestamp_ms;
+    }
+    dsl
+}
+
+/// Builds a complete LLM-agent document from the request alone.
+///
+/// The name, description, and system prompt are derived from `query`; the agent
+/// id is a fresh `UUIDv4` and the clock is the supplied `timestamp_ms`, so two
+/// calls with the same query and timestamp differ only in the id.
+fn deterministic_agent_dsl(query: &str, timestamp_ms: i64) -> LlmAgentDsl {
+    let name = derived_agent_name(query);
+    let description = describe_query(query).unwrap_or_else(|| name.clone());
+    LlmAgentSpec::new(name, description, default_system_prompt(query))
+        .to_dsl(uuid::Uuid::new_v4().to_string(), timestamp_ms)
+}
+
+/// The fallback system prompt for a request that supplied none.
+fn default_system_prompt(query: &str) -> String {
+    format!("You are an assistant built for the following request: {query}")
+}
+
+/// A display name derived from the request: its first few words, or its first
+/// few characters when it is written without spaces in a CJK script.
+fn derived_agent_name(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return "Agent".to_string();
+    }
+
+    let candidate = if is_cjk_only(trimmed) {
+        trimmed.chars().take(MAX_NAME_CHARS).collect::<String>()
+    } else {
+        trimmed
+            .split_whitespace()
+            .take(MAX_NAME_WORDS)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        "Agent".to_string()
+    } else {
+        candidate.to_string()
+    }
+}
+
+/// The trimmed request, truncated to [`MAX_DESCRIPTION_CHARS`].
+///
+/// `None` when nothing usable remains, so callers can fall back to the name.
+fn describe_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let description: String = trimmed.chars().take(MAX_DESCRIPTION_CHARS).collect();
+    let description = description.trim();
+    (!description.is_empty()).then(|| description.to_string())
+}
+
+/// Whether `text` is written in a CJK script without ASCII letters or digits.
+fn is_cjk_only(text: &str) -> bool {
+    let mut has_cjk = false;
+    for character in text.chars() {
+        if is_cjk(character) {
+            has_cjk = true;
+        } else if character.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    has_cjk
+}
+
+/// Whether `character` belongs to a CJK block (Han, Kana, or Hangul).
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
 }
 
 #[cfg(test)]
@@ -724,5 +1047,294 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("sessions: 0"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
+
+    /// The request every pipeline test in this module submits.
+    const QUERY: &str = "Create a workflow that summarizes the document and returns a summary.";
+
+    /// A clarification answer declaring the request complete.
+    const CLARIFY_READY: &str = r#"```json
+{"ready": true, "question": "", "summary": "goal, output"}
+```"#;
+
+    /// A clarification answer asking for the expected output.
+    const CLARIFY_NEEDED: &str = r#"```json
+{"ready": false, "question": "What should the agent produce?", "summary": "goal"}
+```"#;
+
+    /// A model answer holding a complete workflow design.
+    const DESIGN_FENCE: &str = r#"```json
+{"name": "demo", "description": "demo design",
+ "nodes": [{"id": "start", "type": "start", "title": "Start"},
+           {"id": "llm_1", "type": "llm", "title": "Draft", "description": "draft it"},
+           {"id": "end", "type": "end", "title": "End"}],
+ "edges": [{"source": "start", "target": "llm_1"}, {"source": "llm_1", "target": "end"}]}
+```"#;
+
+    /// A model answer holding a valid workflow document.
+    const GENERATED_FENCE: &str = r#"```json
+{"name": "generated", "description": "generated workflow",
+ "nodes": [{"id": "start", "type": "start", "title": "Start"},
+           {"id": "llm_1", "type": "llm", "title": "Draft"},
+           {"id": "end", "type": "end", "title": "End"}],
+ "edges": [{"source": "start", "target": "llm_1"}, {"source": "llm_1", "target": "end"}]}
+```"#;
+
+    /// Coerces a scripted model into the trait object the builder takes.
+    fn dynamic(model: &Arc<ScriptedModel>) -> Arc<dyn Model> {
+        let cloned: Arc<ScriptedModel> = Arc::clone(model);
+        cloned
+    }
+
+    /// The workflow document of a successful build result.
+    fn workflow_of(result: &BuildResult) -> &WorkflowDsl {
+        match &result.output {
+            BuildOutput::Workflow(workflow) => workflow,
+            other => panic!("expected workflow, got {other:?}"),
+        }
+    }
+
+    /// The DSL document of a successful build result.
+    fn dsl_of(result: &BuildResult) -> &LlmAgentDsl {
+        match &result.output {
+            BuildOutput::Dsl(dsl) => dsl,
+            other => panic!("expected DSL, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_pipeline_runs_clarifier_designer_and_generator() {
+        let model = Arc::new(ScriptedModel::new([
+            ScriptedTurn::text(CLARIFY_READY),
+            ScriptedTurn::text(DESIGN_FENCE),
+            ScriptedTurn::text(GENERATED_FENCE),
+        ]));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_with_pipeline(QUERY, "w1", AgentType::Workflow, 1_700_000_000_000)
+            .await
+            .expect("the pipeline succeeds");
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.agent_type, AgentType::Workflow);
+        let workflow = workflow_of(&result);
+        workflow.validate().expect("the workflow is valid");
+        assert_eq!(workflow.name, "generated");
+        assert_eq!(
+            workflow
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["start", "llm_1", "end"]
+        );
+
+        assert_eq!(model.call_count(), 3);
+        let calls = model.calls();
+        assert_eq!(calls[0].last_user_text().as_deref(), Some(QUERY));
+        assert!(calls[1]
+            .last_user_text()
+            .is_some_and(|text| text.contains("summary")));
+        assert!(calls[2]
+            .last_user_text()
+            .is_some_and(|text| text.contains("demo design")));
+
+        let status = builder.status("w1").expect("the session exists");
+        assert_eq!(status.state, BuildState::Completed);
+        assert_eq!(status.resource_count, 2);
+
+        let history = builder.history("w1", None);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].role, "assistant");
+        let persisted =
+            WorkflowDsl::from_json_str(&history[1].content).expect("the document round-trips");
+        assert_eq!(&persisted, workflow);
+    }
+
+    #[tokio::test]
+    async fn workflow_pipeline_falls_back_to_the_deterministic_stages() {
+        let model = Arc::new(ScriptedModel::new([]));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_with_pipeline(QUERY, "w1", AgentType::Workflow, 1_700_000_000_000)
+            .await
+            .expect("the deterministic stages succeed");
+
+        assert_eq!(result.status, "completed");
+        let workflow = workflow_of(&result);
+        workflow.validate().expect("the workflow is valid");
+        assert_eq!(
+            workflow.nodes.first().map(|node| node.id.as_str()),
+            Some("start")
+        );
+        assert_eq!(
+            workflow.nodes.last().map(|node| node.id.as_str()),
+            Some("end")
+        );
+        assert!(workflow.nodes.iter().any(|node| node.id == "llm_1"));
+        assert_eq!(
+            builder.status("w1").expect("the session exists").state,
+            BuildState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_stops_with_the_clarification_question() {
+        let model = Arc::new(ScriptedModel::text(CLARIFY_NEEDED));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_with_pipeline("do something", "s1", AgentType::LlmAgent, 1)
+            .await
+            .expect("the pipeline succeeds");
+
+        assert_eq!(result.status, "clarifying");
+        match &result.output {
+            BuildOutput::Response(text) => assert_eq!(text, "What should the agent produce?"),
+            other => panic!("expected a response, got {other:?}"),
+        }
+        assert_eq!(
+            builder.status("s1").expect("the session exists").state,
+            BuildState::Clarifying
+        );
+        assert_eq!(model.call_count(), 1);
+
+        let history = builder.history("s1", None);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "do something");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, "What should the agent produce?");
+    }
+
+    #[tokio::test]
+    async fn llm_agent_pipeline_repairs_an_unparseable_answer() {
+        let model = Arc::new(ScriptedModel::new([
+            ScriptedTurn::text(CLARIFY_READY),
+            ScriptedTurn::text("I cannot help with that."),
+        ]));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_with_pipeline(QUERY, "s1", AgentType::LlmAgent, 1_700_000_000_000)
+            .await
+            .expect("the pipeline succeeds");
+
+        assert_eq!(result.status, "completed");
+        let dsl = dsl_of(&result);
+        assert_ne!(dsl.agent_id.trim(), "");
+        assert_ne!(dsl.name.trim(), "");
+        assert_ne!(dsl.configs.system_prompt.trim(), "");
+        assert_eq!(dsl.create_time, 1_700_000_000_000);
+        assert_eq!(dsl.update_time, 1_700_000_000_000);
+
+        let history = builder.history("s1", None);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].role, "assistant");
+        let persisted =
+            LlmAgentDsl::from_json_str(&history[1].content).expect("the document round-trips");
+        assert_eq!(&persisted, dsl);
+        assert_eq!(model.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn llm_agent_pipeline_absorbs_a_model_failure() {
+        let model = Arc::new(ScriptedModel::new([
+            ScriptedTurn::text(CLARIFY_READY),
+            ScriptedTurn::fail("boom"),
+        ]));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_with_pipeline(QUERY, "s1", AgentType::LlmAgent, 1_700_000_000_000)
+            .await
+            .expect("the model failure is absorbed");
+
+        assert_eq!(result.status, "completed");
+        let dsl = dsl_of(&result);
+        assert_ne!(dsl.agent_id.trim(), "");
+        assert_eq!(dsl.create_time, 1_700_000_000_000);
+        assert_eq!(model.call_count(), 2);
+        assert_eq!(
+            builder.status("s1").expect("the session exists").state,
+            BuildState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_query_is_rejected_before_any_session_or_model_call() {
+        let model = Arc::new(ScriptedModel::new([]));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        for query in ["", "   ", "\n\t"] {
+            let error = builder
+                .build_with_pipeline(query, "s1", AgentType::LlmAgent, 1)
+                .await
+                .expect_err("a blank query is invalid");
+            assert_eq!(error.kind(), ErrorKind::Validation);
+            assert!(error.to_string().contains("query must not be blank"));
+        }
+
+        assert_eq!(model.call_count(), 0);
+        assert!(builder.status("s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn deterministic_fallback_is_reproducible() {
+        let first_model = Arc::new(ScriptedModel::new([]));
+        let mut first = AgentBuilder::new(dynamic(&first_model));
+        let second_model = Arc::new(ScriptedModel::new([]));
+        let mut second = AgentBuilder::new(dynamic(&second_model));
+
+        let first_result = first
+            .build_with_pipeline(QUERY, "s1", AgentType::LlmAgent, 1_700_000_000_000)
+            .await
+            .expect("first pipeline succeeds");
+        let second_result = second
+            .build_with_pipeline(QUERY, "s2", AgentType::LlmAgent, 1_700_000_000_000)
+            .await
+            .expect("second pipeline succeeds");
+
+        let first_dsl = dsl_of(&first_result);
+        let second_dsl = dsl_of(&second_result);
+        assert_eq!(first_dsl.name, second_dsl.name);
+        assert_eq!(first_dsl.description, second_dsl.description);
+        assert_eq!(
+            first_dsl.configs.system_prompt,
+            second_dsl.configs.system_prompt
+        );
+        assert_eq!(first_dsl.create_time, second_dsl.create_time);
+        assert_eq!(first_dsl.update_time, second_dsl.update_time);
+    }
+
+    #[tokio::test]
+    async fn legacy_build_agent_at_keeps_its_single_round_trip() {
+        let model = Arc::new(ScriptedModel::text("I cannot help with that."));
+        let mut builder = AgentBuilder::new(dynamic(&model));
+
+        let result = builder
+            .build_agent_at("build me an agent", "s1", AgentType::LlmAgent, 1)
+            .await
+            .expect("build succeeds");
+
+        assert_eq!(result.status, "clarifying");
+        match &result.output {
+            BuildOutput::Response(text) => assert_eq!(text, "I cannot help with that."),
+            other => panic!("expected a response, got {other:?}"),
+        }
+        assert_eq!(model.call_count(), 1);
+        assert_eq!(
+            builder.status("s1").expect("the session exists").state,
+            BuildState::Clarifying
+        );
     }
 }
