@@ -296,6 +296,8 @@ The reranker (when attached) runs after retrieval and before `top_k` truncation;
 - Offline graph path: `InMemoryGraphStore::new()` + `RuleTripleExtractor::default()`; `GraphRetriever::new(chunks_retriever, Arc::new(store))`.
 - The in-crate OpenAI client, `HashEmbedding`, and the URL loader use `openjiuwen_common::http`; the crate has no `openjiuwen-foundation` dependency.
 - Keep `docs/PARITY.md` and `crates/CONTEXT.md` in sync through the parent agent — this crate's deferred list no longer includes BM25, query rewriting, agentic retrievers, graph extraction, multimodal documents, or PDF/DOCX/XLSX parsing.
+- `lib.rs` re-exports `AutoLoader`/`CsvLoader`/`HtmlLoader`/`JsonLoader`/`MarkdownLoader`/`TextLoader`/`UrlLoader` but **not** `DocxLoader`/`XlsxLoader`/`PdfLoader`, which are reachable only as `loaders::{DocxLoader, XlsxLoader, PdfLoader}` (or `loaders::docx` etc.); the `parsing::{DocxParser, XlsxParser, PdfParser}` counterparts *are* at the crate root.
+- The DOCX/XLSX/ZIP byte builders used by unit tests live in the private `loaders::fixtures` module (`pub(crate)`, `src/loaders/mod.rs:149`) and in `tests/loaders.rs`; external crates (e.g. `openjiuwen-e2e`) must rebuild stored-ZIP bytes themselves, using the public `parsing::crc32`/`parsing::inflate` helpers — no ZIP writer is exported.
 
 ## Routing Table
 
