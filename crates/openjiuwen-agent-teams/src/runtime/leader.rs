@@ -76,9 +76,12 @@ enum RunExit {
 /// Runs one team request to completion and returns the leader's answer.
 ///
 /// `session` is accepted for API parity with [`openjiuwen_agent::Agent::invoke`] but unused beyond a
-/// debug log: the harness owns the session (`HarnessMemberRuntime::start` already ran with the
-/// team's session before this loop starts), so a caller-supplied session is never forwarded into a
-/// live cycle. A second `start` of the same runtime would reject it anyway.
+/// debug log.
+/// The harness owns the session: every member runs under its derived `"<team session>:<member>"`
+/// id, which `HarnessMemberRuntime::start(None)` already ran with before this loop starts, so that
+/// id is also the harness `HarnessContext::host_session_id`.
+/// A caller-supplied session is therefore never forwarded into a live cycle, and a second `start`
+/// of the same runtime would reject it anyway.
 ///
 /// # Errors
 ///
