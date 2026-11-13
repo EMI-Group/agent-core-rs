@@ -314,8 +314,8 @@ impl FtsIndex {
 - `local.rs`: 13 tests — open creates document/state dir, write/read/edit/delete round trip, typed errors for missing facts and blank input, keyword search across name/body/description/tag, blank-query/semantic rejection, summary index shape, cross-instance visibility, external edit reload, reindex, document round trip through the store, concurrent writers serialized, watcher reload (`#[cfg(unix)]`), `Send + Sync` handle; the `sqlite` assertions are `#[cfg(feature = "sqlite")]`.
 - `tests/lite.rs`: 10 integration tests over the engine-backed `CodingMemory` — write/read/edit/delete/list ordering/search kinds, upsert-by-name, scope isolation, index grouping and cap including the title, citation.
 - Offline and deterministic: `tempfile` directories, real filesystem writes, no credentials, no network; watcher awaits are bounded (≲5 s `BOUND` in `watch.rs`, 50 ms polling capped at 100 iterations in `local.rs`).
-- Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline --lib lite`, the same with `--features sqlite`, and `cargo clippy -p openjiuwen-memory --offline --all-targets -- -D warnings` with and without the feature.
-- Known failure in the current tree (pre-existing, unrelated to the docs): `local::tests::external_markdown_edits_are_reloaded_and_reindexed` asserts two `edited` hits while search yields one, so `--lib lite` reports 72 passed / 1 failed without the `sqlite` feature and 88 passed / 1 failed with it.
+- Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline --lib lite`, the same with `--features sqlite`, `cargo clippy -p openjiuwen-memory --offline --all-targets -- -D warnings` with and without the feature, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
+- Module-level (`//!`) doc links in this directory must be absolute (`crate::lite::<module>::<Item>`): `//!` docs resolve in the parent module's scope, so a bare item link does not resolve.
 
 ## Deferred (Python `core.memory.lite` features not ported)
 
