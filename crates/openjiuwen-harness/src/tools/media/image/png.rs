@@ -2,7 +2,7 @@
 //! `tRNS`/`acTL` chunks that reveal palette transparency and animation.
 //!
 //! Only the header is read: the chunk list is walked for those two hints and parsing stops at
-//! `IEND`, the first truncated chunk, or [`MAX_CHUNKS`] chunks, so no image data is decoded.
+//! `IEND`, the first truncated chunk, or `MAX_CHUNKS` chunks, so no image data is decoded.
 
 use serde::Serialize;
 

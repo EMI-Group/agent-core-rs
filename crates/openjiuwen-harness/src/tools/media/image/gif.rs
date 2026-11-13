@@ -2,7 +2,7 @@
 //! image descriptors (frames) and detects the transparency flag of a graphic control extension.
 //!
 //! The walk stops at the trailer (`0x3B`), at the first truncated block, or when the block
-//! budget ([`MAX_BLOCKS`]) runs out; LZW data is skipped, never decoded.
+//! budget (`MAX_BLOCKS`) runs out; LZW data is skipped, never decoded.
 
 use serde::Serialize;
 

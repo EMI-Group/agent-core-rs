@@ -256,7 +256,7 @@ impl SubmitGoalReportTool {
             "submit_goal_report",
             description("submit_goal_report", language),
             input_params,
-            true,
+            false,
         )
     }
 
@@ -411,7 +411,8 @@ mod tests {
 
         let card = SubmitGoalReportTool::card_for("en");
         assert_eq!(card.name, "submit_goal_report");
-        assert!(card.parallel_safe);
+        // The card mutates the persisted goal record, so it never runs in parallel.
+        assert!(!card.parallel_safe);
         assert_eq!(
             card.input_params["properties"]["status"]["enum"],
             json!(["continue", "complete", "blocked"])

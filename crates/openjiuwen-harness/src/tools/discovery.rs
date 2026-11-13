@@ -18,7 +18,7 @@
 //!
 //! The name is not given a separate term weight, because Python does not weight it either.
 //! What Python does instead is rank `_contains_exact_tool_name` hits first, regardless of
-//! BM25 score; here that match adds [`EXACT_NAME_BOOST`] to the score so the documented
+//! BM25 score; here that match adds `EXACT_NAME_BOOST` to the score so the documented
 //! "score descending, then name ascending" order still holds and stays deterministic.
 //! Documents with a zero score and no exact-name match are dropped (Python behaviour).
 //!
@@ -28,7 +28,7 @@
 //! # Model-facing contract
 //!
 //! `tool_search` takes `{ "query": <string>, "limit": <integer, optional> }`, where `limit`
-//! defaults to [`DEFAULT_LIMIT`] and is clamped to `1..=MAX_LIMIT` (`0` therefore means
+//! defaults to `DEFAULT_LIMIT` and is clamped to `1..=MAX_LIMIT` (`0` therefore means
 //! "one"). The payload is the usual six-key envelope whose `data` is
 //! `{ "query": <string>, "results": [{ "name", "score", "description" }], "count": <n> }`.
 //!
@@ -79,7 +79,7 @@ const MAX_LIMIT: usize = 20;
 pub struct ToolSearchHit {
     /// The model-facing tool name.
     pub name: String,
-    /// BM25 score, plus [`EXACT_NAME_BOOST`] when the query names the tool verbatim.
+    /// BM25 score, plus `EXACT_NAME_BOOST` when the query names the tool verbatim.
     pub score: f64,
     /// The tool's model-facing description.
     pub description: String,

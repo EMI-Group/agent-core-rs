@@ -95,7 +95,7 @@ struct Header {
 /// # Errors
 ///
 /// Returns a [`Failure`] when the stream (after any `ID3v2` tag) is empty or contains no valid MPEG
-/// frame header within the first [`MAX_SEARCH_BYTES`] bytes.
+/// frame header within the first `MAX_SEARCH_BYTES` bytes.
 pub fn parse(bytes: &[u8]) -> ParseResult<Mp3Info> {
     let body = strip_id3v2(bytes);
     let id3v2_bytes = bytes.len().saturating_sub(body.len());

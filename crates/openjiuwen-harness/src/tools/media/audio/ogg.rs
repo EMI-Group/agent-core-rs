@@ -2,7 +2,7 @@
 //! (`OpusHead`), giving codec, sample rate and channel count.
 //!
 //! Duration is best effort: it comes from the granule position of the last page found in the
-//! final [`TAIL_BYTES`] bytes of the file, divided by the sample rate. No packet is decoded.
+//! final `TAIL_BYTES` bytes of the file, divided by the sample rate. No packet is decoded.
 
 use serde::Serialize;
 

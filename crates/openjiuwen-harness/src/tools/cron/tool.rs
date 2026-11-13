@@ -159,7 +159,7 @@ impl CronTool {
             TOOL_NAME,
             descriptions::description(TOOL_NAME, language),
             input_params,
-            true,
+            false,
         )
     }
 
@@ -521,7 +521,8 @@ mod tests {
     fn card_carries_the_action_surface() {
         let card = CronTool::card_for("en");
         assert_eq!(card.name, "cron");
-        assert!(card.parallel_safe);
+        // The card mutates the persisted job list, so it never runs in parallel.
+        assert!(!card.parallel_safe);
         let properties = card.input_params["properties"].as_object().unwrap();
         assert_eq!(
             properties["action"]["enum"],

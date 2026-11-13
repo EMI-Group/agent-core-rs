@@ -2,7 +2,7 @@
 //! tag carried by `APP1`.
 //!
 //! The walk stops at the first `SOS` (scan) marker, at `EOI`, when the segment budget
-//! ([`MAX_SEGMENTS`]) runs out, or when a segment is truncated, so only header bytes are read
+//! (`MAX_SEGMENTS`) runs out, or when a segment is truncated, so only header bytes are read
 //! and the entropy-coded scan data is never touched.
 
 use serde::Serialize;
