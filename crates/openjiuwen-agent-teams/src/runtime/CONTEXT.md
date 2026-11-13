@@ -7,7 +7,7 @@ path from a `TeamAgentSpec`, the leader's run loop, the organisation facade over
 the pool and process-global runtime manager used by the CLI/MCP, and the model-pool router.
 Python parity sources: `openjiuwen/agent_teams/agent/team_agent.py`, `agent/agent_configurator.py`,
 `runtime/{manager,dispatch,pool,gate}.py`, `models/allocator.py`.
-This node also owns the six **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity and attach hosting.
+This node also owns the seven **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity, attach hosting and per-member checkpoints.
 Model routing, observability signals and the monitor stream are wired at build time as well (they are not metadata keys).
 
 The module owns *policy and orchestration*: who runs, what a run means, when a team is done, how an
@@ -30,6 +30,7 @@ pub struct TeamBuildDeps {
     pub observability_hooks: Vec<Arc<dyn ObservabilityHooks>>,   // empty = no-ops
     pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,       // None = built from metadata
     pub routing: Option<Arc<TeamModelRouter>>,            // None = built from model_pool
+    pub checkpoints: Option<Arc<dyn MemberCheckpointStore>>,   // None = resolved from metadata
     pub store_injected: bool,                             // set by `with_store`, cleared by `default()`
 }
 impl TeamBuildDeps {
@@ -42,25 +43,38 @@ impl TeamBuildDeps {
     pub fn with_observability_hook(self, Arc<dyn ObservabilityHooks>) -> Self;  // pushes
     pub fn with_kv_cache(self, Arc<TeamKvCacheAffinity>) -> Self;
     pub fn with_routing(self, Arc<TeamModelRouter>) -> Self;
+    pub fn with_checkpoint_store(self, Arc<dyn MemberCheckpointStore>) -> Self;
+    pub fn has_injected_checkpoints(&self) -> bool;        // `checkpoints.is_some()`
     pub fn resolved_language(&self) -> &'static str;       // unknown/None -> "cn"
 }
 // Default: NativeMemberFactory::from_env(), InMemoryTeamStore, LocalWorkspaceProvider rooted at
-// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing.
+// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing/checkpoints.
 
 // spec_meta.rs — the metadata parsers (all tolerant; an absent key keeps the default)
 pub const SPAWN_METADATA_KEY: &str = "spawn";        pub const FORK_METADATA_KEY: &str = "fork";
 pub const WORKSPACE_METADATA_KEY: &str = "workspace"; pub const ORGANIZATION_METADATA_KEY: &str = "organization";
 pub const KV_CACHE_METADATA_KEY: &str = "kv_cache";   pub const ATTACH_METADATA_KEY: &str = "attach";
+pub const CHECKPOINT_METADATA_KEY: &str = "checkpoint";
 pub const ATTACH_SOCKET_ENV: &str = "OPENJIUWEN_TEAM_SOCKET";
 pub struct ForkDirective { pub parent: String, pub task: Option<ForkTaskOverride>, pub tools: ForkToolPolicy }
 pub struct OrganizationBlock { pub spec: OrganizationSpec, pub rules: DelegationRules }
 pub struct AttachConfig { pub socket: PathBuf, pub required: bool }
+pub struct CheckpointConfig { pub policy: MemberCheckpointPolicy, pub store: CheckpointStoreConfig }
+pub enum CheckpointStoreConfig { Memory, File { dir: Option<PathBuf> } }   // Default = Memory
 pub fn spawn_options(&TeamAgentSpec) -> MemberSpawnOptions;              // bare or {"options":..}
 pub fn fork_directive(&TeamAgentSpec) -> Option<ForkDirective>;          // spawn.fork, else fork
 pub fn isolation_mode(&TeamAgentSpec) -> IsolationMode;                  // "worktree" | {"isolation":..}
 pub fn organization_block(&TeamAgentSpec) -> Result<Option<OrganizationBlock>>;  // Validation on a bad chart
 pub fn kv_cache_config(&TeamAgentSpec) -> KvCacheConfig;                 // enabled=true by default
 pub fn attach_config(&TeamAgentSpec) -> Option<AttachConfig>;            // metadata, else env socket
+pub fn checkpoint_config(&TeamAgentSpec) -> CheckpointConfig;            // bare policy or {"policy","store","dir"}
+// checkpoints.rs — per-member checkpoint identity and store resolution (`pub(crate)`)
+pub const CHECKPOINT_DIR: &str = ".openjiuwen/checkpoints";
+pub(crate) fn member_card_id(&DeepAgentSpec, member_name: &str) -> String;         // card id, else member name
+pub(crate) fn team_checkpoint_store(&CheckpointConfig, Option<&Arc<dyn MemberCheckpointStore>>) -> Option<Arc<dyn MemberCheckpointStore>>;
+pub(crate) fn member_checkpoint_store(&CheckpointConfig, Option<&Arc<dyn MemberCheckpointStore>>, &Path) -> Option<Arc<dyn MemberCheckpointStore>>;
+pub(crate) fn wire_runtime(HarnessMemberRuntime, card_id: &str, &CheckpointConfig,
+                           Option<&Arc<dyn MemberCheckpointStore>>, &Path) -> HarnessMemberRuntime;
 
 // routing.rs — model pool → one endpoint per member (`Arc`-shared, not `Clone`)
 pub struct ModelSelection { pub allocation: TeamModelAllocation, pub entry: Option<ModelPoolEntry> }
@@ -359,8 +373,11 @@ config therefore just logs.
    (`params` keys `path`/`url`/`database`; `:memory:`, `mode=memory` and `sqlite:` URLs are left alone),
    logging and continuing on failure — so the first write cannot fail on a missing directory.
 4. Wiring inputs: `TeamModelRouter::for_spec` (or the injected router for a direct spawner), the
-   `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the four
-   metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`).
+   `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the five
+   metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`, `checkpoint_config`).
+   `checkpoint_config` is resolved into the team store before the spawner is built
+   (`team_checkpoint_store`: the injected store wins, `memory` mints one `InMemoryMemberCheckpointStore`,
+   `file` pins none) and written back into `deps.checkpoints`, so the leader and every teammate share it.
 5. `TaskBoard::new(store, team_name, TaskBoardLimits::new().with_default_max_review_rounds(..)
    .with_max_subtask_depth(..))`, then `TeamBackend::new(..).with_signals(signals)`.
 6. `organization_block(spec)?` → `OrgBinding::build(block, store, Some(org_task_sink(backend)))` →
@@ -368,8 +385,11 @@ config therefore just logs.
 7. `TeamMemberSpawner::with_parts(spec, deps, session_id, options, fork, router)`.
 8. Team row upsert, then the leader row (`TeamRole::Leader`), then the leader's effective spec through
    `routing.effective_spec_for(leader, ..)` (memoizes the leader's allocation).
-9. Workspace allocation (`WorkspaceRequest` with `isolation`, retained keyed by the leader's name), `factory.create(effective, context)` →
-   `HarnessMemberRuntime::new(harness, session_id)` → `TeamMember::attach_runtime`.
+9. Workspace allocation (`WorkspaceRequest` with `isolation`, retained keyed by the leader's name); the
+   leader's identity is derived from it (`member_card_id(effective, leader)` and
+   `member_session_id(session_id, leader)`), the factory receives that context with `.with_card_id(..)`, and
+   `wire_runtime(HarnessMemberRuntime::new(harness, member_session), ..)` attaches the policy, the store and
+   `cwd = workspace root` before `TeamMember::attach_runtime`.
 10. `kv_cache.register_member(leader_key, model)` — the root allocation.
 11. `leader_member.observe(MemberStreamObserver::new(activity, weak leader, Leader, signals, chunk_sinks))`.
 12. `insert_teammate_rows` — one `Unstarted` row per roster teammate (`predefined_members` ∪ `agents` keys
@@ -383,8 +403,9 @@ config therefore just logs.
 2. Each delivery is handed to `deliver` without touching the leader runtime: `HumanAgent` → inbox push +
    persisted message row + `message` event; `Operator`/`GroupChat`/`GodView` → gate + leader mailbox;
    `ExternalTeam` → `DeliverResult::unsupported`.
-3. `start()` (idempotent): messager start, leader `MemberRuntime::start(None)`, attach bind (see policy),
-   `signals.team_started`.
+3. `start()` (idempotent): messager start, leader `MemberRuntime::start(None)` — which restores the stored
+   checkpoint envelope for the leader's `(derived session, card id)` when one exists — attach bind (see
+   policy), `signals.team_started`. A teammate's `spawn_member` start does the same restore before its pump.
 4. The leader query is sent with `immediate = false` (a follow-up turn).
 5. Loop on `tokio::select!`: member chunks, bus events, caller cancellation, and a settle tick.
    - teammate/leader chunks are forwarded tagged with `TeamOutputSchema{source_member, role, chunk}`;
@@ -572,8 +593,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `host_session_id == "<team session>:<member>"`; `{"enabled": false}` attaches no sink, restores nothing and
   captures nothing; an explicit `dir` receives one `checkpoint.json` per member.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1338 lib
-tests in the default build, 1357 with `--features sqlite`, plus 219 integration tests over 15 binaries),
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1411 lib
+tests in the default build, 1430 with `--features sqlite`, 1439 with `--all-features`, plus 219 integration
+tests over 15 binaries),
 `cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
 --all-targets -- -D warnings` and `cargo doc -p openjiuwen-agent-teams --no-deps` all green offline.
@@ -594,8 +616,8 @@ tests in the default build, 1357 with `--features sqlite`, plus 219 integration 
   `Error::validation("only the leader can create tasks")`.
 - The team roster is materialized as rows at build time (`unstarted` teammates); Python creates rows lazily
   on bootstrap. This makes `snapshot()` answer before the first spawn.
-- `metadata` is the only place a host tunes the runtime; `TeamBuildDeps` only injects hooks, a KV registry and
-  (for direct spawner construction) a router. Adding a new knob means a parser in `spec_meta.rs` plus a field
+- `metadata` is the only place a host tunes the runtime; `TeamBuildDeps` only injects hooks, a KV registry, a
+  checkpoint store and (for direct spawner construction) a router. Adding a new knob means a parser in `spec_meta.rs` plus a field
   on `TeamAgentInner`, never a new constructor argument.
 - Formatting/typing invariant: a member's `DeepAgentSpec.model` and its `MemberRecord::model_ref` come from the
   same `ModelSelection`, so a pool entry selects a real endpoint instead of only labelling the row.
@@ -653,6 +675,13 @@ tests in the default build, 1357 with `--features sqlite`, plus 219 integration 
   per-tool spans. The monitor stream has no TUI/consumer here.
 - The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
   swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
+- Checkpointing has no team-level resume policy, no retention/pruning or TTL, and no leader restart: only
+  `TeamAgentSpec::metadata["checkpoint"]` + `TeamBuildDeps::with_checkpoint_store` decide, and a retired
+  member row cannot be revived in place (`TeamBackend::remove_member` + `spawn_member` is the restart path).
+- Known cross-node issue: `crates/openjiuwen-agent-teams/tests/member_and_mail.rs`
+  (`the_roster_accessors_agree_and_are_sorted`, lines ~689 and ~702) still asserts that a runtime session
+  equals the team session; the leader and every teammate now run under `"<team session>:<member>"`, so the
+  assertion belongs to the crate-root node and needs `format!("{}:{}", agent.session_id(), agent.member_name())`.
 - Attach hosting serves one request/response op per connection with no subscriptions, authentication,
   streaming or non-Unix transport; a CLI or MCP process reaches a hosted team through that socket, and only
   a shared-store or brokered attach remains deferred.
