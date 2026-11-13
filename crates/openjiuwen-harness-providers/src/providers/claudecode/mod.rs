@@ -1,11 +1,16 @@
-//! The deferred Claude Code provider: card, configuration data and model mapping.
+//! The Claude Code provider: card, configuration data, model mapping and the CLI harness.
 //!
-//! Ports the data half of Python `openjiuwen.harness_providers.claudecode` (v0.1.20):
-//! [`ClaudeCodeHarnessConfig`] mirrors `ClaudeCodeHarnessConfig` in `config.py`,
-//! [`ClaudeModelConfig`] mirrors `ClaudeModelConfig`, and [`model_config`] mirrors the provider's
-//! `model_config` classmethod. The harness itself is not ported — the adapter needs the Claude
-//! Agent SDK and the `claude` CLI, so [`HarnessProvider::create`] validates the mapping and then
-//! reports `HarnessError::UnsupportedCapability` with the SDK requirement.
+//! Ports Python `openjiuwen.harness_providers.claudecode` (v0.1.20): [`ClaudeCodeHarnessConfig`]
+//! mirrors `ClaudeCodeHarnessConfig` in `config.py`, [`ClaudeModelConfig`] mirrors
+//! `ClaudeModelConfig`, [`model_config`] mirrors the provider's `model_config` classmethod, and
+//! [`ClaudeDriver`] is the subprocess harness the provider's `create` returns.
+//!
+//! # Structure
+//!
+//! - this module — the configuration data, the permission/system-prompt enums, the card, the
+//!   provider and the model mapping;
+//! - `harness` — [`ClaudeDriver`], the transport that spawns the `claude` CLI, speaks its
+//!   stream-json protocol and maps its frames onto the harness SPI.
 //!
 //! # Python parity
 //!
@@ -21,12 +26,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::security::SecretString;
 use openjiuwen_harness_protocol::{
-    HarnessCapability, HarnessCard, HarnessProtocol, HarnessProvider, HarnessResult,
-    HostCapability, JsonObject, JsonValue, ModelChoice, ModelConfigProvider,
+    EventBufferConfig, EventOverflowPolicy, HarnessCapability, HarnessCard, HarnessProtocol,
+    HarnessProvider, HarnessResult, HostCapability, JsonObject, JsonValue, ModelChoice,
+    ModelConfigProvider,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,8 +42,20 @@ use crate::decode::{
     optional_string_map, optional_u32, optional_u64, reject_unknown_keys,
 };
 use crate::skills::{parse_skills_value, SkillConflict, SkillSource};
+use crate::vendor_cli::{resolve_binary, BinarySpec, VendorHarness};
 
 use super::vendor;
+
+mod frames;
+mod harness;
+mod wire;
+
+pub use harness::ClaudeDriver;
+
+// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
+// assert it; this provider no longer produces that message, so keep the constant referenced in
+// non-test builds (removing it is the vendor module's call, not this provider's).
+const _: &str = crate::providers::vendor::CLAUDE_SDK_REQUIRED;
 
 /// Registry name of the Claude Code provider.
 pub const PROVIDER_NAME: &str = "claudecode";
@@ -419,7 +438,7 @@ impl fmt::Debug for ClaudeCodeHarnessConfig {
     }
 }
 
-/// Returns the deferred Claude Code provider stub.
+/// Returns the Claude Code provider.
 #[must_use]
 pub fn provider() -> ClaudeCodeHarnessProvider {
     ClaudeCodeHarnessProvider::default()
@@ -427,7 +446,9 @@ pub fn provider() -> ClaudeCodeHarnessProvider {
 
 /// Returns the capability card of the Claude Code adapter.
 ///
-/// The card describes what the eventual adapter exploits; this build never creates it.
+/// The card declares what the subprocess adapter exploits: steering, graceful abort, persistent
+/// sessions, checkpoints, MCP tools, model selection/discovery over endpoint models and the
+/// authentication fallback to `fallback_model`.
 #[must_use]
 pub fn card() -> HarnessCard {
     vendor::vendor_card(
@@ -471,7 +492,7 @@ pub fn model_config(
     Ok(vendor::nested_model_config(choice, fallback, false))
 }
 
-/// The deferred Claude Code provider: identity card plus validation-only `create`.
+/// The Claude Code provider: identity card plus the subprocess `create` path.
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeHarnessProvider {
     /// Card reported by [`HarnessProvider::card`].
@@ -479,7 +500,7 @@ pub struct ClaudeCodeHarnessProvider {
 }
 
 impl Default for ClaudeCodeHarnessProvider {
-    /// Builds the stub with the card of [`card`].
+    /// Builds the provider with the card of [`card`].
     fn default() -> Self {
         Self { card: card() }
     }
@@ -491,18 +512,33 @@ impl HarnessProvider for ClaudeCodeHarnessProvider {
         &self.card
     }
 
-    /// Validates `config` and then reports the missing Claude Agent SDK.
+    /// Validates `config`, resolves the `claude` executable and returns an unstarted harness.
+    ///
+    /// The returned [`VendorHarness`] wraps a [`ClaudeDriver`], so it reports
+    /// [`HarnessState::Terminated`](openjiuwen_harness_protocol::HarnessState::Terminated) until
+    /// [`start`](HarnessProtocol::start) succeeds; it never spawns the CLI here.
     ///
     /// # Errors
     ///
     /// Returns `HarnessError::Validation` when `config` is not a valid
-    /// [`ClaudeCodeHarnessConfig`], and `HarnessError::UnsupportedCapability` carrying
-    /// `vendor::CLAUDE_SDK_REQUIRED` otherwise.
+    /// [`ClaudeCodeHarnessConfig`], and `HarnessError::Protocol` naming `claude` and the
+    /// `cli_path` fix when the executable cannot be resolved. A missing CLI is an operator
+    /// configuration problem, never an unimplemented capability.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
-        vendor::unsupported_create(
-            ClaudeCodeHarnessConfig::from_json(&config).map(|_| ()),
-            vendor::CLAUDE_SDK_REQUIRED,
-        )
+        let config =
+            ClaudeCodeHarnessConfig::from_json(&config).map_err(vendor::config_error_to_harness)?;
+        let binary = resolve_binary(&BinarySpec {
+            name: "claude",
+            explicit: config.cli_path.as_deref(),
+            label: "Claude Code",
+            install_hint: "install Claude Code (https://claude.com/claude-code)",
+        })?;
+        let buffer = EventBufferConfig {
+            capacity: config.event_buffer_capacity,
+            overflow: EventOverflowPolicy::CoalesceOrBlock,
+        };
+        let driver = Arc::new(ClaudeDriver::new(config, binary));
+        Ok(Box::new(VendorHarness::new(card(), buffer, driver)))
     }
 }
 
@@ -773,13 +809,22 @@ mod tests {
     }
 
     #[test]
-    fn create_reports_the_missing_sdk() {
+    fn create_reports_a_missing_binary_as_a_protocol_error() {
         let error = provider()
-            .create(object(json!({})))
+            .create(object(json!({"cli_path": "/nonexistent/claude"})))
             .err()
-            .expect("the SDK is required");
-        assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-        assert!(error.message().contains("claude-agent-sdk"));
+            .expect("the explicit path does not exist");
+        assert_eq!(error.kind(), HarnessErrorKind::Protocol);
+        assert!(
+            error.message().contains("claude"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("not executable"),
+            "unexpected message: {}",
+            error.message()
+        );
     }
 
     #[test]
