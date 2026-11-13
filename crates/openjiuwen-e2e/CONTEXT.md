@@ -68,7 +68,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 | `team_flow.rs` (3) | `TeamAgentSpec` → `build_with` a scripted `MemberHarnessFactory`; roster and member cards | `openjiuwen-agent-teams` (`TeamAgentSpec`, `SpecBuild`, `TeamBuildDeps`) |
 | `team_flow.rs` | Leader/teammate dispatch; exactly one `team.completed` marker, member frames tagged | `openjiuwen-agent-teams` runtime + stream tagging |
 | `team_flow.rs` | Task board create → claim → complete settles the board | `openjiuwen-agent-teams` `TaskBoard` |
-| `team_backend.rs` (4, 5 with `sqlite`) | Event bus subscription records `member_status_changed`, mailbox and task publications in order | `TeamBackend::messager`, `Messager::subscribe`, `TeamTopic`, `EventMessage` |
+| `team_backend.rs` (4, 5 with `sqlite`) | Event bus subscription records `member_status_changed`, mailbox and task publications in order, plus the settled run's single `team_completed` publication | `TeamBackend::messager`, `Messager::subscribe`, `TeamTopic`, `EventMessage` |
 | `team_backend.rs` | Mailbox send / `unread` / `mark_read` and the task board read back through the backend | `TeamBackend::send_message`, `TaskBoard` |
 | `team_backend.rs` | Per-member checkpoint payload round-trips through `HarnessCheckpoint` → `NativeCheckpoint` and validates its session/card | `export_checkpoint`, `NativeCheckpoint::validate_compatible` |
 | `team_backend.rs` | SQLite team store (`StorageSpec { kind: "sqlite" }`) persists board rows and mail across store instances | `open_store`, `SqliteTeamStore` (feature `sqlite`) |
@@ -167,7 +167,7 @@ Deterministic, surprising-but-correct outcomes the scenarios assert; do not "fix
 - Retrieval: chunk and DOCX/PDF document ids are uuid4, so they are read back from the producer; XLSX ids are deterministic (`people_s0_r2`). `SimpleKnowledgeBase::parse_files` parses but does not ingest.
 - `TeamAgentSpec::default()` does not validate; `agents["leader"]` must exist, and member rows start `Unstarted` until `spawn_member`.
 - `TaskBoard::create_task` publishes both `task_created` and an initial `task_status_changed`; `spawn_member` steers a "member ready" notice to the leader after the caller's query.
-- Team completion is published only as the result-stream marker `team.completed`; the event bus carries member/mail/task publications but no `TeamCompleted` event.
+- A settled run publishes both halves of completion: the `team.completed` result-stream marker (the last frame, exactly one) and one `EventPayload::TeamCompleted` bus event on `TeamTopic::Team` with `reason: Some("settled")`, published between the pre-run publications and any task the caller creates afterwards.
 - `build_with` consumes `TeamBuildDeps.store` and ignores `TeamAgentSpec::storage`; a SQLite store must be injected through the deps.
 - `PlanExecution::steps` is a `BTreeMap`, so its keys read back lexicographically — assert plan ordering on `OrchestrationPlan::steps`/`stages()`, not on the map.
 - A2A: the server auto-completes any sink left open, so `INPUT_REQUIRED` is the only durable non-terminal state reachable through a real `SendMessage` and is what `CancelTask` acts on; `message/stream` is always routed regardless of the card's `capabilities.streaming`.
