@@ -53,6 +53,9 @@ mod rows;
 mod schema;
 mod statements;
 
+#[cfg(test)]
+mod tests;
+
 /// Storage kind of this backend; the `StorageSpec` value [`open_store`](super::open_store) dispatches
 /// on.
 pub const SQLITE_STORAGE_KIND: &str = "sqlite";

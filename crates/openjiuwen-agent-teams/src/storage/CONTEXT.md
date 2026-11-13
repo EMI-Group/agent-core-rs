@@ -2,7 +2,7 @@
 
 ## Intent
 
-The persistence seam of the crate: one object-safe `TeamStore` trait over the team, roster, task board, dependency-edge, review-vote and mailbox tables, plus the deterministic in-process backend every test and every single-process runtime uses and the persistent SQLite backend behind the `sqlite` feature.
+The persistence seam of the crate: one object-safe `TeamStore` trait over the team, roster, task board, dependency-edge, review-vote and mailbox tables, with two backends behind it — the deterministic in-process `InMemoryTeamStore` and the feature-gated persistent `SqliteTeamStore`.
 Python parity source: `openjiuwen/agent_teams/tools/database/` (SQLAlchemy DAOs `team_dao`, `member_dao`, `task_dao`, `message_dao` and the SQLite `TeamDatabase` they run on) and the `team_backend` persistence calls that drive them.
 This node is a *state* seam, not a policy seam: it validates row keys and status transitions, and answers queries in a fixed order.
 Dependency unblocking, review gating, dispatch, member spawning and message routing belong to the sibling nodes (`../taskboard/`, `../member/`, `../runtime/`), which code against this trait.
@@ -66,7 +66,7 @@ impl MessageRecord {
 }
 
 #[async_trait] pub trait TeamStore: Send + Sync {
-    fn name(&self) -> &'static str;                                   // "memory"
+    fn name(&self) -> &'static str;                                   // "memory" | "sqlite"
     async fn upsert_team(&self, rec: TeamInfoRecord) -> Result<()>;
     async fn team(&self, team: &str) -> Result<Option<TeamInfoRecord>>;
     async fn insert_member(&self, rec: MemberRecord) -> Result<()>;
@@ -100,6 +100,11 @@ pub struct SqliteTeamStore;                      // feature `sqlite`; lazy pool 
 impl SqliteTeamStore { pub async fn open(path) -> Result<Self>; pub async fn in_memory() -> Result<Self>; }
 ```
 
+`pub use sqlite::SqliteTeamStore` re-exports the backend from this module when the `sqlite` feature is on; without the feature the item does not exist and `open_store` reports the missing feature.
+`StorageSpec::params` keys for the SQLite backend, in precedence order: `path`, `url`, `database`; each must be a string, and the accepted forms are `data/team.db` (filesystem path, relative to the working directory), `sqlite://data/team.db` (the same relative path as a `sqlx` URL), `sqlite:///abs/team.db` (an absolute path as a URL) and `:memory:` (or any value containing it — a private in-memory database).
+`open_store` is synchronous and therefore only *records* the SQLite target: the pool is a `tokio::sync::OnceCell` connected by the store's first trait call, so a bad path or a broken database surfaces there, not at construction; `SqliteTeamStore::open` / `in_memory` connect eagerly when construction errors must surface immediately.
+Without `path`/`url`/`database` the SQLite spec is `Error::config`; a non-string value or an empty target is `Error::validation`.
+
 Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilter`, `ReviewVote`, `Verdict`, `TaskRevision` come from `../schema/task.rs` and `MemberStatus`, `ExecutionStatus`, `TaskStatus`, `TeamRole`, `MemberMode`, `DispatchMode` from `../schema/status.rs` and `../schema/team.rs`.
 
 ## Constraints
@@ -108,9 +113,10 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - `openjiuwen_common::error::{Error, Result}` only; no panic on user input; no `unwrap`/`expect` outside `#[cfg(test)]`.
 - No `unsafe`. No process-global store: `open_store` returns an independent instance per call, and the crate shares one by holding the `Arc`.
 - Async-first tokio with `#[async_trait]`; `InMemoryTeamStore` holds a `parking_lot::RwLock` for the duration of one map operation only and never awaits while holding it.
-- `tracing` only; this module currently logs nothing (there is no recoverable anomaly a caller cannot see from a `Result`).
+- The SQLite backend is gated by the `sqlite` feature: `--no-default-features` still builds, and nothing in `sqlite/` may be referenced without that gate.
+- `tracing` only; this module currently logs nothing (there is no recoverable anomaly a caller cannot see from a `Result`); the SQLite backend logs one `debug!` when a pool opens.
 - Every public item carries a doc comment (workspace `missing_docs`), and every fallible method documents its errors (clippy `missing_errors_doc`).
-- Files ≤1000 lines; the test suite lives in `store_tests.rs` rather than inline so the implementation stays readable.
+- Files ≤1000 lines; the in-memory suite lives in `store_tests.rs` and the SQLite suite in `sqlite/tests/` rather than inline, so the implementations stay readable.
 
 ## Behaviour (wire-visible and caller-visible)
 
@@ -126,7 +132,22 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - Mailbox: a direct row is unread while `is_read == false` and `to_member_name == member`; a broadcast is unread while its `timestamp` is strictly greater than the member's watermark and the member is not its sender. No watermark means every broadcast is unread.
 - `mark_read` flags direct rows only, for the addressed member; broadcast ids are skipped silently (read state for broadcasts is the watermark). Advancing a broadcast read state is `set_read_watermark`, which never regresses.
 - `message_count` is the unread count (`unread_messages(..).len()` without materializing rows) — the mailbox-depth signal for the runtime's idle sweep.
-- `open_store`: `"memory"` (or an empty/whitespace kind) → fresh `InMemoryTeamStore`; `"sqlite"` → a lazily connected `SqliteTeamStore` built from `params` (`path`, else `url`, else `database`; `:memory:` selects the private in-memory database; a `sqlite:` value is a `sqlx` URL validated eagerly; no parameter is `Error::config`), or, with the feature off, `Error::unsupported("storage backend 'sqlite' requires the 'sqlite' feature; enable 'openjiuwen-agent-teams/sqlite'")`; `"postgresql" | "mysql"` → `Error::unsupported("storage backend '<kind>' is not implemented; the <kind> driver is not available offline")`; any other kind → `Error::unsupported("unknown storage backend '<kind>'; use 'memory'")`.
+- `open_store`: `"memory"` (or an empty/whitespace kind) → fresh `InMemoryTeamStore`; `"sqlite"` → a lazily connected `SqliteTeamStore` built from `params` (see the API Surface above), or, with the feature off, `Error::unsupported("storage backend 'sqlite' requires the 'sqlite' feature; enable 'openjiuwen-agent-teams/sqlite'")`; `"postgresql" | "mysql"` → `Error::unsupported("storage backend '<kind>' is not implemented; the <kind> driver is not available offline")`; any other kind → `Error::unsupported("unknown storage backend '<kind>'; use 'memory'")`.
+
+### SQLite backend behaviour
+
+- Schema: seven tables (`team_info`, `team_member`, `team_task`, `team_task_dependency`, `team_review_vote`, `team_message`, `team_read_watermark`) plus seven indexes, all `CREATE ... IF NOT EXISTS`, so the whole DDL is idempotent and re-applied on every connect; `PRAGMA user_version` is `1` (a `0` database is stamped, a version above `1` is rejected with `Error::unsupported` naming "newer than this build").
+- No foreign keys are declared on purpose: the trait allows a member, task, dependency or message row to exist before its team row.
+- File databases open with `create_if_missing`, WAL, `synchronous=NORMAL`, a 5 s busy timeout and `foreign_keys=ON`, in a pool of at most four connections; the in-memory construction pins its pool to a single connection because `:memory:` is private to the connection that created it.
+- Every read-modify-write path (`upsert_team`, `insert_member`, `insert_task`, `update_member`, `update_task`) runs in a `BEGIN IMMEDIATE` transaction, so the read and the write cannot interleave with another writer.
+- `transition_member` / `transition_task` are one conditional statement — `UPDATE ... SET status = ?, updated_at = MAX(?, updated_at + 1) WHERE ... AND status = ?` — and report `rows_affected == 1`; no transaction and no lease is involved.
+- Claiming a task from the board is exactly `transition_task(team, task_id, Pending, InProgress)`: two concurrent callers get `true` and `false` respectively and the stored status is `InProgress`, which is what the two-writer race test pins.
+- `desc` is stored in a `description` column (SQL keyword); enum columns hold their serde wire strings; `reviewers` and `change_notes` are JSON arrays; SQLite has no unsigned integers, so every counter and stamp binds through `rows::to_i64` and reads back through saturating getters.
+
+### Limitation: no lease/expiry column
+
+`TaskRecord`/`TaskPatch` expose no lease or expiry column, so the store cannot model stale-claim expiry; the only lease clock available to a sweeper is `assignee` plus `updated_at`, and staleness policy (`stale_claim_idle_timeout`) belongs to the task board, not the store.
+Member lifecycle has no separate lease either: `MemberRecord::status` plus `updated_at` is all the store keeps, and deciding when a `busy` member has stalled is the runtime's job.
 
 ## Routing Table
 
@@ -134,20 +155,17 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - `./records.rs` → `TeamInfoRecord`, `MemberRecord`, `MemberPatch`, `MessageRecord`, `PLAIN_MESSAGE_PROTOCOL` (+ wire-shape tests)
 - `./memory.rs` → `InMemoryTeamStore`, the unread predicate
 - `./stamps.rs` → `refresh`, `stamp`, `require_key`, shared by both backends
-- `./sqlite/` → `SqliteTeamStore` (feature `sqlite`): pool/connect, DDL + migrations, row codecs (`./sqlite/CONTEXT.md`)
-- `./store_tests.rs` → the store suite on the `dyn TeamStore` seam (`#[cfg(test)]`)
+- `./sqlite/` → the SQLite backend (`./sqlite/CONTEXT.md`): `SqliteTeamStore`, connect/pool, schema DDL, statements, row codecs
+- `./store_tests.rs` → the in-memory suite on the `dyn TeamStore` seam (`#[cfg(test)]`)
+- `./sqlite/tests/` → the SQLite suite (`#[cfg(test)]`): backend parity, reopen persistence, races, migrations, `open_store` dispatch
 
 ## Test Strategy
 
-`cargo test -p openjiuwen-agent-teams --lib` covers 27 storage tests beside the code; all run offline and deterministically, with no sleeps (caller-supplied stamps, or assertions that a stamp strictly grew).
+`cargo test -p openjiuwen-agent-teams --lib` covers 45 storage tests beside the code (27 in-memory, 18 SQLite); all run offline and deterministically, with no sleeps (caller-supplied stamps, or assertions that a stamp strictly grew).
 
 - `records.rs`: serde wire names and defaults for all four records (including `"autonomous"`, `"build_mode"`, `"unstarted"`, `"idle"`, `protocol: "plain"`, `clear_model: false`), unknown-field tolerance and full-default decoding, `MemberPatch` merge/clear/no-op/`is_empty`, message constructors.
-- `store_tests.rs`: team upsert (created preservation, replacement, store stamping), empty-key validation for every row kind, member CAS (first `unstarted -> starting` true, replay false, illegal `ready -> dormant` false, stale `from` false, unknown member false), member patch merge/clear/stamp, member listing order, task CAS + `updated_at` refresh + terminal status, `update_task` revision bump and change notes (content / title+content / identical content / note-only / explicit revision / `clear_assignee`), `list_tasks` filters (status, assignee, parent, limit) and ordering, dependency idempotence + sorting + team scoping + self-dependency rejection, per-round vote isolation with reviewer replacement, mailbox ordering, `mark_read` semantics, watermark coverage/regression, `message_count`, keyed message replacement, keyed member replacement, `open_store` selection and unsupported-backend messages, per-call store independence.
-
-`SqliteTeamStore` has no dedicated suite yet: this phase ships the backend and the `open_store` feature-off/feature-on dispatch is covered by `open_store_selects_memory_and_rejects_deferred_backends`; the sqlite suite (rows, stamps, CAS, filters, mailbox) is the next phase.
-
-Definition of done for this node: `rustfmt --check` clean on the four files, `cargo test -p openjiuwen-agent-teams --lib` and `--no-default-features --lib` green, no clippy diagnostic pointing at `src/storage/`.
-Crate-wide diagnostics (clippy `missing_docs`, crate-root doctests) belong to the crate root node; the sibling modules are implemented and re-exported from `../lib.rs`.
+- `store_tests.rs` (27 tests, the in-memory suite): team upsert (created preservation, replacement, store stamping), empty-key validation for every row kind, member CAS (first `unstarted -> starting` true, replay false, illegal `ready -> dormant` false, stale `from` false, unknown member false), member patch merge/clear/stamp, member listing order, task CAS + `updated_at` refresh + terminal status, `update_task` revision bump and change notes (content / title+content / identical content / note-only / explicit revision / `clear_assignee`), `list_tasks` filters (status, assignee, parent, limit) and ordering, dependency idempotence + sorting + team scoping + self-dependency rejection, per-round vote isolation with reviewer replacement, mailbox ordering, `mark_read` semantics, watermark coverage/regression, `message_count`, keyed message replacement, keyed member replacement, `open_store` selection and unsupported-backend messages, per-call store independence.
+- `sqlite/tests/` (18 tests, feature `sqlite`): `contract.rs` holds the backend-independent sequence (team rows and stamps, roster patches and CAS, the task board with every filter and revision rule, dependency edges, votes, mailbox and watermark) and `parity.rs` runs it over both `InMemoryTeamStore` and `SqliteTeamStore`, so a divergence fails the suite; `persistence.rs` writes one of every row kind to `dir/team.db`, closes and reopens, and asserts every row, ordering and watermark; `races.rs` runs two spawned writers against one file database for `transition_task(pending → in_progress)` and `transition_member(unstarted → starting)` and asserts exactly one `true`; `migration.rs` covers idempotent DDL on reopen, the `user_version = 99` rejection and parent-directory creation; `open_store.rs` covers the `memory`/`sqlite` dispatch, `path`/`url`/`database` and their precedence, the malformed-parameter errors, the deferred backends, laziness (no file until the first call) and independent `:memory:` stores.
 
 ## Notes for Agents
 
@@ -161,3 +179,6 @@ Crate-wide diagnostics (clippy `missing_docs`, crate-root doctests) belong to th
 - `update_task` distinguishes an explicit `revision` (author-controlled, no change note) from an implicit bump (title/content edit, note appended). Keep that split: the task board renders `change_notes` as history.
 - Backends stay behind `open_store`: `memory` and `sqlite` are real, `postgresql`/`mysql` return `Error::Unsupported` with the Python capability name, and the trait is the only thing a new backend has to implement.
 - `SqliteTeamStore` is lazily connected (the `open_store` seam is synchronous), links no foreign keys, and stamps rows through `./stamps.rs`, so its observable answers match `InMemoryTeamStore`.
+- `open_store` cannot await, so the SQLite pool is a `tokio::sync::OnceCell`: a connect error is reported by the first trait call, and `SqliteTeamStore::open` / `in_memory` exist for callers that want it at construction.
+- `desc` is persisted as `description`; SQLite has no unsigned integers, so bind stamps and counters through `rows::to_i64` and read them back with the saturating getters.
+- Keep `./memory.rs` and `./sqlite/` in lockstep: `memory.rs` is the behavioural spec, and a change to an observable answer in either must land in both plus `sqlite/tests/contract.rs`.
