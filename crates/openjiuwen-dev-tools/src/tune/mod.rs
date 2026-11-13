@@ -19,7 +19,9 @@
 //!   (alternating both), [`PromptSearchOptimizer`] (one breadth-first sweep),
 //!   and [`Trainer`] (train/validation with early stop) share
 //!   [`OptimizerConfig`] and the tuning constants ([`DEFAULT_ITERATION_NUM`],
-//!   [`MAX_PARALLEL_NUM`], …).
+//!   [`MAX_PARALLEL_NUM`], …). A [`Trainer`] can also report its evaluation as
+//!   an [`EvaluationSummary`], which adds the per-case tool usage to the mean
+//!   score and results.
 //!
 //! A case may declare tools, and the tool layer makes them runnable and
 //! observable: [`ToolStub`] is a named in-process fixture, [`ToolStubs`] the table
@@ -74,8 +76,8 @@ pub use evaluator::{
 };
 pub use loader::CaseLoader;
 pub use optimizer::{
-    format_prompt, optimize_prompt, placeholders, render_examples, ExampleOptimizer,
-    InstructionOptimizer, JointOptimizer, OptimizationResult, OptimizerConfig,
+    format_prompt, optimize_prompt, placeholders, render_examples, EvaluationSummary,
+    ExampleOptimizer, InstructionOptimizer, JointOptimizer, OptimizationResult, OptimizerConfig,
     PromptSearchOptimizer, Trainer,
 };
 pub use optimizer::{
