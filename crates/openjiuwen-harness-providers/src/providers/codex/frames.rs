@@ -11,6 +11,13 @@
 //! message plus an `id`. The app-server spells its payload members in camelCase (`itemId`,
 //! `tokenUsage`, `willRetry`), while the vendored data types use `snake_case`; both spellings are
 //! accepted so a renamed field never drops an observation.
+//!
+//! # Why this module is long
+//!
+//! This module is deliberately larger than the crate's usual file-size target: it is the single
+//! exhaustive Codex app-server notification/server-request projection table (a one-to-one mirror of
+//! Python's `mapping.py`), so splitting it would scatter one protocol table across several files.
+//! The mapping reference lives in `src/providers/codex/CONTEXT.md`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

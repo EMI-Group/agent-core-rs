@@ -14,8 +14,8 @@ openjiuwen-harness.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-agent.workspace = true
 openjiuwen-session.workspace = true
-# Only the `native-v2` provider reaches into the team runtime; the default build never compiles it.
-openjiuwen-agent-teams = { workspace = true, default-features = false, optional = true }
+# Pulled in only by the `native-v2` feature; its `mcp` default feature comes along.
+openjiuwen-agent-teams = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

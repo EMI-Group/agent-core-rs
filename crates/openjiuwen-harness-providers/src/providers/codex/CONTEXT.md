@@ -85,6 +85,10 @@ Deliberately absent: `ForceAbort` and `PauseResume` (the app-server has no pause
 - Module unit tests: 13 in `mod.rs` (identity, card, defaults, strict decoding and error wording, model fragment, create errors, `Debug` redaction), 7 in `frames.rs` (tool names/args/results, error classification, answer wire shape), 9 in `wire.rs` (argv groups, endpoint table, user-input flag, MCP overrides, env layering, thread params, bypass).
 - The suite needs no `codex` binary, no SDK and no network; it is not `#![cfg(unix)]` (see the crate's Known Issues).
 
+## Known Issues
+
+- `./frames.rs` is legitimately larger than the crate's ~1000-line target: it is the single exhaustive app-server notification/server-request projection table (a one-to-one mirror of Python's `mapping.py`), so it is kept in one file instead of splitting one protocol table across several.
+
 ## Routing Table
 
 - `./mod.rs` → constants, `CodexApprovalMode`/`CodexSystemPromptMode`, `CodexModelConfig`, `CodexHarnessConfig` (+ `from_json`/`validate`/`Debug`), `card()`, `model_config()`, `CodexHarnessProvider` and its `create`
