@@ -36,7 +36,7 @@ use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
 use crate::mq::{self, MessageQueue};
-use crate::pool::{ActiveTeamInfo, PoolKey, PoolRequest, PoolRun, TeamPool};
+use crate::pool::{ActiveTeamInfo, PoolKey, PoolLease, PoolRequest, PoolRun, TeamPool};
 use crate::resources::ResourceMgr;
 use crate::run::{
     invoke_agent, invoke_team, invoke_workflow, stream_agent, stream_team, stream_workflow,
@@ -596,6 +596,76 @@ impl Runner {
     ) -> Result<PoolRun> {
         let request = PoolRequest::new(team.into(), inputs).with_options(options);
         self.team_pool().start(self.services(), request).await
+    }
+
+    /// Starts a pooled team run only when a concurrency permit is free right now.
+    ///
+    /// The refuse-instead-of-queue counterpart of
+    /// [`Runner::start_agent_team`]: it admits through
+    /// [`crate::pool::TeamPool::try_start`], so a full pool is an `Error::Config`
+    /// naming the capacity and **no** pool entry is created — a host that would
+    /// rather reject a request than let it wait can say so. A run already live
+    /// under the same `(team name, session id)` is still the busy error
+    /// ([`crate::pool::PoolError::Busy`]).
+    ///
+    /// Kept `async` so the facade's team controls share one shape: the admission
+    /// itself never waits for a permit, so nothing is queued.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Validation` when the key already has a live run, `Error::Config`
+    /// when no permit is available, when the pool was closed, or when the call is
+    /// made outside a tokio runtime.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // deliberate: see the doc comment
+    pub async fn try_start_agent_team(
+        &self,
+        team: impl Into<TeamRef>,
+        inputs: Value,
+        options: RunOptions,
+    ) -> Result<PoolRun> {
+        let request = PoolRequest::new(team.into(), inputs).with_options(options);
+        self.team_pool().try_start(self.services(), request)
+    }
+
+    /// Starts a pooled team run and takes its first lease, or joins a live one.
+    ///
+    /// Admission goes through [`crate::pool::TeamPool::acquire`], so a host that
+    /// may already have a run under `(team name, session id)` either creates it or
+    /// receives a refcounted [`PoolLease`] on the run that exists — the in-process
+    /// form of the cross-process attach Python defers. Because a join attaches to
+    /// an existing run, **the joining request's inputs and options are ignored**:
+    /// the run keeps the inputs, session, and options of the request that created
+    /// it (the pool's documented contract). Release the lease with
+    /// [`PoolLease::release`] (or by dropping it) when the joining host is done.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Config` when the pool was closed or the call is made outside a
+    /// tokio runtime, and `Error::Cancelled` when a run was cancelled while queued
+    /// for a permit.
+    pub async fn acquire_agent_team(
+        &self,
+        team: impl Into<TeamRef>,
+        inputs: Value,
+        options: RunOptions,
+    ) -> Result<PoolLease> {
+        let request = PoolRequest::new(team.into(), inputs).with_options(options);
+        self.team_pool().acquire(self.services(), request).await
+    }
+
+    /// Drains the buffered human-in-the-loop payloads of the pooled run addressed
+    /// by `(team_name, session_id)`.
+    ///
+    /// A pooled run never suspends on an inbound payload: it buffers it (and
+    /// publishes it as a [`crate::pool::PoolFrame::Payload`]) so the host can
+    /// replay it. This is the drain for a host that delivered through
+    /// [`Runner::interact_agent_team`] but does not hold the [`PoolRun`]; the
+    /// drain is destructive, and an unknown or already-finalised key yields an
+    /// empty vector rather than an error.
+    #[must_use]
+    pub fn take_team_payloads(&self, team_name: &str, session_id: &str) -> Vec<InteractPayload> {
+        self.team_pool()
+            .take_payloads(&PoolKey::new(team_name, session_id))
     }
 
     /// Lists the pooled team runs that are not finished, ordered by

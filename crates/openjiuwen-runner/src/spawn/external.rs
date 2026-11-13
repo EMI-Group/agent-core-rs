@@ -19,10 +19,11 @@
 //! Search path: [`ExternalCommandSpawner::with_search_path`] replaces the
 //! inherited `PATH` entirely (the hermetic form, for tests and sandboxes); unset,
 //! the process `PATH` is used, split with the platform's own separator rules.
-use crate::spawn::subprocess::SubprocessSpawner;
+use crate::spawn::subprocess::{describe_settings, SubprocessSpawner};
 use crate::spawn::{AgentSpawner, SpawnBackend, SpawnSpec, SpawnedAgent, SubprocessConfig};
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +205,20 @@ impl ExternalCommandSpawner {
 impl AgentSpawner for ExternalCommandSpawner {
     fn backend(&self) -> SpawnBackend {
         SpawnBackend::ExternalCommand
+    }
+
+    /// The command, the search path, and the subprocess summary it inherits
+    /// (`launch`) — the environment is reported by name only, never by value.
+    fn describe(&self) -> Value {
+        json!({
+            "backend": SpawnBackend::ExternalCommand.as_str(),
+            "command": self.command,
+            "search_path": self
+                .search_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            "launch": Value::Object(describe_settings(&self.config)),
+        })
     }
 
     /// Resolves the command, then spawns it through the subprocess backend
@@ -436,5 +451,41 @@ mod tests {
             ExternalCommandSpawner::default(),
             ExternalCommandSpawner::new("")
         );
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    #[test]
+    fn describe_reports_the_command_search_path_and_launch_settings() {
+        let spawner = ExternalCommandSpawner::new("vendor-cli")
+            .with_search_path("/opt/vendor/bin")
+            .with_args(vec!["--protocol".to_owned(), "ndjson".to_owned()])
+            .with_env("VENDOR_TOKEN", "super-secret-value")
+            .with_request_timeout(Duration::from_secs(12))
+            .with_health_check(Duration::from_secs(2), Duration::from_millis(500), 7);
+        let described = spawner.describe();
+        assert_eq!(described["backend"], json!("external_command"));
+        assert_eq!(described["command"], json!("vendor-cli"));
+        assert_eq!(described["search_path"], json!("/opt/vendor/bin"));
+        // The program is resolved at spawn time, so the summary reports it empty.
+        assert_eq!(described["launch"]["program"], json!(""));
+        assert_eq!(described["launch"]["args"], json!(["--protocol", "ndjson"]));
+        assert_eq!(described["launch"]["env_names"], json!(["VENDOR_TOKEN"]));
+        assert_eq!(described["launch"]["request_timeout_secs"], json!(12.0));
+        assert_eq!(described["launch"]["health_check_timeout_secs"], json!(0.5));
+        assert_eq!(described["launch"]["max_health_failures"], json!(7));
+        let rendered = described.to_string();
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "no environment value leaks: {rendered}"
+        );
+
+        // An unset search path is JSON null, never an empty string.
+        let plain = ExternalCommandSpawner::default().describe();
+        assert_eq!(plain["search_path"], Value::Null);
+        assert_eq!(plain["launch"]["cwd"], Value::Null);
     }
 }

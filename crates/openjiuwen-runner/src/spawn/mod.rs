@@ -509,6 +509,22 @@ pub trait AgentSpawner: Send + Sync {
     fn backend(&self) -> SpawnBackend {
         SpawnBackend::Unknown
     }
+
+    /// A JSON-safe, secret-free summary of the backend's configuration.
+    ///
+    /// For logging and diagnostics on a host that only holds
+    /// `Arc<dyn AgentSpawner>`: the object names the [`AgentSpawner::backend`] and
+    /// whatever the backend was configured with, but never a credential — an
+    /// environment *name* rather than its value, a header *name* rather than its
+    /// value — and never a full configured secret.
+    ///
+    /// Defaults to [`serde_json::Value::Null`], which is the honest answer for a
+    /// backend that exposes no configuration (and for [`UnsupportedSpawner`]); the
+    /// shape of a backend that does have configuration is documented on its own
+    /// `describe` implementation.
+    fn describe(&self) -> Value {
+        Value::Null
+    }
 }
 
 /// The built-in [`AgentSpawner`]: spawns nothing and reports the seam.
@@ -522,6 +538,12 @@ impl AgentSpawner for UnsupportedSpawner {
             "subprocess agent spawning",
             "install an AgentSpawner with Runner::set_spawner",
         ))
+    }
+
+    /// Always [`serde_json::Value::Null`]: the default spawner has no
+    /// configuration to summarise.
+    fn describe(&self) -> Value {
+        Value::Null
     }
 }
 

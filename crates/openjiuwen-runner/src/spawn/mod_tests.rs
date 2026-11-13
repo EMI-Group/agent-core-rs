@@ -357,3 +357,33 @@ async fn a_minimal_handle_reports_the_probe_and_cancel_seams() {
 fn the_unsupported_spawner_names_no_backend() {
     assert_eq!(UnsupportedSpawner.backend(), SpawnBackend::Unknown);
 }
+#[test]
+fn the_default_and_the_built_in_default_describe_nothing() {
+    assert_eq!(UnsupportedSpawner.describe(), Value::Null);
+    assert_eq!(
+        UnsupportedSpawner.backend(),
+        SpawnBackend::Unknown,
+        "the default spawner names no backend"
+    );
+}
+#[test]
+fn a_deferred_spawner_describes_its_backend_and_reason() {
+    let described = DeferredSpawner::for_backend(SpawnBackend::RemoteMq).describe();
+    assert_eq!(described["backend"], json!("remote_mq"));
+    assert_eq!(described["deferred"], json!(true));
+    let reason = described["reason"].as_str().expect("a reason string");
+    let hint = described["hint"].as_str().expect("a hint string");
+    assert!(reason.contains("Pulsar"), "{reason}");
+    assert!(hint.contains("reply-topic"), "{hint}");
+
+    // Calling it through the object-safe seam gives the same summary.
+    let spawner: Arc<dyn AgentSpawner> = Arc::new(DeferredSpawner::new(
+        SpawnBackend::RemoteA2a,
+        "a2a spawn transport",
+        "use the A2A spawner",
+    ));
+    let dynamic = spawner.describe();
+    assert_eq!(dynamic["backend"], json!("remote_a2a"));
+    assert_eq!(dynamic["reason"], json!("a2a spawn transport"));
+    assert_eq!(dynamic["hint"], json!("use the A2A spawner"));
+}

@@ -32,6 +32,7 @@ Suites (one file per area):
 - `team_pool_leases.rs` — lease refcounting, joining two acquisitions onto one entry, `PoolLease` keep-alive, and the reaper's idle/idle-eviction rules.
 - `team_pool_lifecycle.rs` — admission beyond capacity (queueing until a permit frees), `pause`/`resume`, `stop`/`stop_all`, and the closed-pool rejection.
 - `team_pool_hitl.rs` — a pooled run's inbound payload delivery, the payload buffer and its frame, the drain, and unbinding on finalisation.
+- `runner_team_attach.rs` — the facade's attach primitives over the pool: `try_start_agent_team` refusing at capacity while `start_agent_team` queues, `acquire_agent_team` joining one live entry with two leases (the joining request's inputs ignored), and `take_team_payloads` draining a delivered HITL payload / answering an unknown key with an empty vec.
 - `api_surface.rs` — compile-time pinning of the crate-root surface: every re-export (dispatch core, chains, filters, handler combinators, monitor, HITL, pool, spawn backends, resource sub-managers), trait-object coercion (`AgentRef`/`WorkflowRef`/`TeamRef`/`MessageHandler`/`CallbackHandler`/`AgentSpawner`/`RemoteClient`/`McpConnector`), `Send + Sync` and serde checks, the deliberate module-only scoping of the free combinators, `RunOptions` builder reachability, `CallbackEvent::ALL` length/round-trip, and JSON round-trips (`SpawnMessage`'s `f64` timestamp compared with the documented tolerance, never exact equality).
 
 ## Constraints

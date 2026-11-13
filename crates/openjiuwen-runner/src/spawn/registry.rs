@@ -37,6 +37,7 @@ use crate::spawn::{AgentSpawner, SpawnBackend, SpawnSpec, SpawnedAgent, Subproce
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use parking_lot::RwLock;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -122,6 +123,18 @@ impl DeferredSpawner {
 impl AgentSpawner for DeferredSpawner {
     fn backend(&self) -> SpawnBackend {
         self.backend
+    }
+
+    /// The backend this spawner stands in for plus the deferral wording, so a
+    /// diagnostic dump explains *why* a spawn cannot happen. A deferred backend
+    /// has no configuration, hence no transport settings.
+    fn describe(&self) -> Value {
+        json!({
+            "backend": self.backend.as_str(),
+            "deferred": true,
+            "reason": self.reason,
+            "hint": self.hint,
+        })
     }
 
     async fn spawn(&self, _spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {

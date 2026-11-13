@@ -530,3 +530,55 @@ async fn a_zero_shutdown_timeout_uses_the_configured_deadline_and_a_non_zero_one
         started.elapsed()
     );
 }
+
+#[test]
+fn describe_reports_the_launch_settings_and_no_environment_values() {
+    let spawner = SubprocessSpawner::new(
+        SubprocessConfig::new("/usr/local/bin/agent")
+            .with_args(["--serve", "--port", "0"])
+            .with_cwd("/tmp/agent")
+            .with_env("AGENT_TOKEN", "super-secret-value")
+            .with_request_timeout(Duration::from_secs(12))
+            .with_shutdown_timeout(Duration::from_secs(4))
+            .with_health_check(Duration::from_secs(2), Duration::from_millis(500), 7)
+            .with_max_frame_bytes(4096),
+    );
+    let described: Value = spawner.describe();
+    assert_eq!(described["backend"], json!("subprocess"));
+    assert_eq!(described["program"], json!("/usr/local/bin/agent"));
+    assert_eq!(described["args"], json!(["--serve", "--port", "0"]));
+    assert_eq!(described["cwd"], json!("/tmp/agent"));
+    assert_eq!(
+        described["env_names"],
+        json!(["AGENT_TOKEN"]),
+        "the environment is reported by name only"
+    );
+    assert_eq!(described["request_timeout_secs"], json!(12.0));
+    assert_eq!(described["shutdown_timeout_secs"], json!(4.0));
+    assert_eq!(described["health_check_interval_secs"], json!(2.0));
+    assert_eq!(described["health_check_timeout_secs"], json!(0.5));
+    assert_eq!(described["max_health_failures"], json!(7));
+    assert_eq!(described["max_frame_bytes"], json!(4096));
+    let rendered = described.to_string();
+    assert!(
+        !rendered.contains("super-secret-value"),
+        "no environment value leaks: {rendered}"
+    );
+
+    // An unset working directory and an empty environment are JSON null/[].
+    let plain: Value = SubprocessSpawner::default().describe();
+    assert_eq!(plain["backend"], json!("subprocess"));
+    assert_eq!(plain["program"], json!(""));
+    assert_eq!(plain["args"], json!([]));
+    assert_eq!(plain["cwd"], Value::Null);
+    assert_eq!(plain["env_names"], json!([]));
+}
+
+#[test]
+fn a_wrapper_backend_describes_its_own_label() {
+    let spawner = SubprocessSpawner::with_backend(
+        SubprocessConfig::new("agent"),
+        SpawnBackend::ExternalCommand,
+    );
+    assert_eq!(spawner.describe()["backend"], json!("external_command"));
+}

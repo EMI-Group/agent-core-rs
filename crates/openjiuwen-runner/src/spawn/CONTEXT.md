@@ -67,9 +67,19 @@ impl SpawnSpec { pub fn class_agent(module, class) -> Self; pub fn team_agent(pa
 #[async_trait] pub trait AgentSpawner: Send + Sync {
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
     fn backend(&self) -> SpawnBackend;                     // Unknown
+    fn describe(&self) -> Value;                           // Value::Null; JSON-safe, secret-free summary
 }
 pub struct UnsupportedSpawner;                             // every spawn -> Error::Unsupported(<message naming Runner::set_spawner>)
+                                                            // describe() -> Value::Null
 ```
+
+`describe()` is the configuration introspection a host holding only `Arc<dyn AgentSpawner>` (from `Runner::spawner()` or `SpawnerRegistry::get`) can rely on: it is object-safe, defaulted to `Value::Null`, and JSON-safe for logging/diagnostics.
+Its per-backend shapes are `{"backend": "subprocess", "program", "args", "cwd", "env_names", "request_timeout_secs", "shutdown_timeout_secs", "health_check_interval_secs", "health_check_timeout_secs", "max_health_failures", "max_frame_bytes"}`,
+`{"backend": "external_command", "command", "search_path", "launch": <subprocess summary>}`,
+`{"backend": "in_process", "hosted": true}` (a marker: a factory has no configuration),
+`{"backend": "remote_http", "base_url", "timeout_secs", "header_names"}`, and
+`{"backend": <deferred backend>, "deferred": true, "reason", "hint"}` for a `DeferredSpawner`.
+No secret is ever reported: the environment and the HTTP headers appear as **names only** (`env_names`, `header_names`), so a configured `Authorization: Bearer <token>` or `API_KEY=<value>` never reaches the summary.
 
 `SpawnSpec::backend` is a routing hint for `SpawnerRegistry`, not a wire change: it is additive metadata a Python child ignores (unknown fields are tolerated) and it never alters the frames.
 A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`cancel_task` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
@@ -123,6 +133,7 @@ pub struct SpawnedProcess;                                  // id, backend, pid,
 ```
 
 `SubprocessSpawner::spawn_process` returns the concrete `Arc<SpawnedProcess>` so hosts can call `health`/`pid`; the `AgentSpawner::spawn` impl coerces it to `Arc<dyn SpawnedAgent>`.
+`describe()` reports the launch settings through the `describe_settings` helper the external backend reuses: `program`, `args`, `cwd`, `env_names`, and the configured deadlines/caps, with the spawner's own `backend` label.
 `SubprocessSpawner::new(config)` labels its children `SpawnBackend::Subprocess`, while `SubprocessSpawner::with_backend(config, backend)` is the wrapper form: a backend that is this protocol plus a step of its own labels its children with its own name, and both `Spawner::backend()` (the spawner's own `backend` field) and every child's handle report that label.
 `SpawnedProcess` implements `SpawnedAgent` directly, so both paths expose the same behaviour, including the trait's health accessors: `backend()` is the spawner's label (not always `subprocess`), `is_healthy()` reads the same atomic the background task updates, `health()` runs one probe, and `health_snapshot()` carries the same label and leaves `last_error` empty (a failed probe is an `Err` from `health`, not a fabricated snapshot field).
 The handle's `Debug` output shows that label beside its id, pid, liveness, and health.
@@ -148,6 +159,7 @@ impl ExternalCommandSpawner {
 
 `resolve` is the whole backend: an empty (or whitespace-only) command is `Error::Config` naming `ExternalCommandSpawner::command`; a command containing a path separator or an absolute path must be an existing regular file and, on unix, carry an executable bit, else `Error::NotFound` naming the command and the reason; a bare name is looked up in `with_search_path` (used instead of `PATH`, unsplit, for hermetic hosts) or in `PATH` split with `std::env::split_paths`, and the first candidate passing the same checks wins.
 A bare name that matches nothing is `Error::NotFound` naming the command and how many directories were searched (or that none is configured).
+`describe()` reports `command`, `search_path` (`null` when unset) and the inherited subprocess summary under `launch`, so a host sees the configuration this backend adds on top of the protocol.
 `spawn` resolves, clones the config with `program` set to the resolved path, and delegates to `SubprocessSpawner::with_backend(config, SpawnBackend::ExternalCommand).spawn(spec)`: process handling, framing, timeouts and the health task are the subprocess backend's, and the label makes it the external-command backend — so `Spawner::backend()`, the child's `backend()`/`health_snapshot()`, and a runner's monitor detail all report `external_command`.
 
 ### In-process backend — `in_process.rs`
@@ -169,6 +181,7 @@ Each spawn wraps its handler in a fresh `InProcessAgent` with the id `in-process
 `is_alive` is this handle's alive flag *and* `handler.is_alive()`, `pid()` is always `None`, `backend()` is `InProcess`, `is_healthy()`/`health()` report liveness (there is no probe in-process), and `send`/`stream` delegate to the handler.
 `shutdown` calls `handler.shutdown()` then marks the handle dead and returns `Ok(true)`; `force_kill` does the same because an in-process handler is stopped, not signalled — there is no OS process — and both are idempotent because the handler's `shutdown` must be.
 A factory `Err` propagates from `spawn` and launches nothing.
+`describe()` is the marker `{"backend": "in_process", "hosted": true}`: a factory (or one shared handler) is not a transport configuration.
 
 ### Registry — `registry.rs`
 
@@ -194,6 +207,7 @@ impl SpawnerRegistry {
 
 `DeferredSpawner::for_backend` is the wording table: `RemoteMq` → `"Pulsar/ZeroMQ spawn transport"` with a hint naming drunner reply-topic routing; `RemoteA2a` → `"a2a spawn transport"` with a hint naming `openjiuwen-extensions`' `a2a` feature; an implemented-but-unregistered backend → `"no <name> spawner registered"` with a hint naming the matching `register_*` method; anything else → ``"spawn backend `<name>`"``.
 Every `spawn` on one is `Error::Unsupported` (`error::unsupported(reason, hint)`).
+`DeferredSpawner::describe()` reports the deferred backend with its `reason` and `hint` and `"deferred": true`, so a diagnostic dump says why a spawn cannot happen; `SpawnerRegistry` is not an `AgentSpawner` and has no `describe` of its own (its registered spawners each do).
 
 Routing precedence in `route`: `spec.backend` when set (registered spawner, else the matching `DeferredSpawner` — never a fallback to another backend) → the explicit default → the sole registered spawner → `(Unknown, DeferredSpawner)` with reason `"no default spawn backend"` (empty) or `"ambiguous spawn backend"` (more than one), whose hint names `set_default` and `SpawnSpec::backend`.
 `route` also reports the resolved key, so a spawner registered under a key but reporting `Unknown` still labels its spawn with that key; `spawner_for` is `route(spec).1` with the same precedence.
@@ -239,6 +253,7 @@ Through the seam it reports `backend() == RemoteHttp`, `pid() == None`, `is_heal
 `send_with_timeout`/`stream_with_timeout` forward the deadline to `RemoteClient::invoke`/`RemoteClient::stream`, so a bounded invocation is real on this backend while `send`/`stream` keep the configured `timeout_secs`.
 `RemoteAgent::new` stays lazy (the `reqwest` client is built on first `invoke`/`stream` or by `start`, so a directly constructed handle reports itself not alive until then), but `RemoteSpawner::spawn` calls `RemoteClient::start` before returning: a spawned remote child is started, so `is_alive()`/`is_healthy()`/`health()` are `true` immediately with no request sent (Python's `remote_agent.py` starts the child too), and a client that cannot be built fails the spawn.
 `RemoteSpawner::backend()` is `RemoteHttp`.
+`RemoteSpawner::describe()` reports `base_url`, `timeout_secs` (`null` when unset), and `header_names` — the header names only, so an `Authorization` bearer token never reaches the summary.
 `RemoteSpawner::spawn` derives the agent id from `agent_class`, then `agent_module`, then a non-empty `init_kwargs["agent_id"]` (`Validation` when none is usable), copies `SpawnSpec::session_id` into the config, and validates the endpoint at spawn time rather than at first invoke: an empty `base_url` and a non-empty one that is still not an absolute URL both fail there (`Validation`), as does a client that cannot be built (an invalid configured header).
 
 URL layout: the endpoint is `{base_url}/{path}` with `{agent_id}` substituted into the path; extra slashes are collapsed outside the scheme and a missing or extra slash between base and path is tolerated, so `("http://host:8080/", "/agents/{agent_id}/invoke")` and `("http://host:8080", "agents/{agent_id}/invoke")` build the same URL.

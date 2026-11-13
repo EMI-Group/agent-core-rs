@@ -25,7 +25,7 @@ use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::Result;
 use openjiuwen_common::utils::id::uuid_v4;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -116,6 +116,16 @@ impl fmt::Debug for InProcessSpawner {
 impl AgentSpawner for InProcessSpawner {
     fn backend(&self) -> SpawnBackend {
         SpawnBackend::InProcess
+    }
+
+    /// A marker, not a configuration: an in-process spawner holds a factory (or
+    /// one already-built handler) and has no program, endpoint, or deadline to
+    /// report.
+    fn describe(&self) -> Value {
+        json!({
+            "backend": SpawnBackend::InProcess.as_str(),
+            "hosted": true,
+        })
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
@@ -475,5 +485,20 @@ mod tests {
         }
 
         assert!(SilentHandler.is_alive());
+    }
+
+    #[test]
+    fn describe_is_a_marker_because_a_factory_has_no_configuration() {
+        let handler = RecordingHandler::new();
+        let spawner = InProcessSpawner::from_handler(as_handler(&handler));
+        assert_eq!(
+            spawner.describe(),
+            json!({"backend": "in_process", "hosted": true}),
+            "an in-process spawner reports its identity, not a transport"
+        );
+        let factory = InProcessSpawner::new(Arc::new(|_spec: &SpawnSpec| {
+            Err(Error::validation("no handler"))
+        }));
+        assert_eq!(factory.describe()["backend"], json!("in_process"));
     }
 }

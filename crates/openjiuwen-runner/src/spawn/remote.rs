@@ -46,7 +46,7 @@ use openjiuwen_common::error::{Error, Result};
 use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -878,6 +878,17 @@ impl AgentSpawner for RemoteSpawner {
         SpawnBackend::RemoteHttp
     }
 
+    /// The origin, the default deadline, and the header *names* — never a header
+    /// value, because that is where an `Authorization` bearer token lives.
+    fn describe(&self) -> Value {
+        json!({
+            "backend": SpawnBackend::RemoteHttp.as_str(),
+            "base_url": self.base_url,
+            "timeout_secs": self.timeout.map(|timeout| timeout.as_secs_f64()),
+            "header_names": self.headers.keys().collect::<Vec<_>>(),
+        })
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let agent_id = remote_agent_id(&spec)?;
         let mut config = self.config_for(&agent_id);
@@ -1045,3 +1056,39 @@ fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    #[test]
+    fn describe_reports_the_origin_and_header_names_only() {
+        let spawner = RemoteSpawner::new("http://127.0.0.1:8080")
+            .with_timeout(Duration::from_secs(15))
+            .with_header("Authorization", "Bearer super-secret-value")
+            .with_header("X-Tenant", "acme");
+        let described = spawner.describe();
+        assert_eq!(described["backend"], json!("remote_http"));
+        assert_eq!(described["base_url"], json!("http://127.0.0.1:8080"));
+        assert_eq!(described["timeout_secs"], json!(15.0));
+        assert_eq!(
+            described["header_names"],
+            json!(["Authorization", "X-Tenant"]),
+            "headers are reported by name only"
+        );
+        let rendered = described.to_string();
+        assert!(
+            !rendered.contains("super-secret-value") && !rendered.contains("Bearer"),
+            "no header value leaks: {rendered}"
+        );
+        assert!(
+            !rendered.contains("acme"),
+            "no header value leaks: {rendered}"
+        );
+
+        // An unset deadline is JSON null; an empty header set is [].
+        let plain = RemoteSpawner::new("http://127.0.0.1:8080").describe();
+        assert_eq!(plain["timeout_secs"], Value::Null);
+        assert_eq!(plain["header_names"], json!([]));
+    }
+}

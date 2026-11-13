@@ -59,7 +59,7 @@ use futures::stream::BoxStream;
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_v4;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::process::Stdio;
@@ -228,10 +228,65 @@ impl AgentSpawner for SubprocessSpawner {
         self.backend
     }
 
+    /// The launch line, the deadlines, and the environment *names* — never an
+    /// environment value, because a child's environment routinely carries a
+    /// credential.
+    fn describe(&self) -> Value {
+        let mut summary = describe_settings(&self.config);
+        summary.insert("backend".to_owned(), json!(self.backend.as_str()));
+        Value::Object(summary)
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let process = self.spawn_process(spec).await?;
         Ok(process)
     }
+}
+
+/// The launch settings of `config` as a JSON object, for
+/// [`AgentSpawner::describe`](crate::spawn::AgentSpawner::describe).
+///
+/// Shared with the wrapper backends so a backend that reuses this protocol
+/// reports the settings it inherits: the program, its arguments, the working
+/// directory, the environment **names** (never their values), and the configured
+/// deadlines and caps.
+pub(super) fn describe_settings(config: &SubprocessConfig) -> Map<String, Value> {
+    let mut summary = Map::new();
+    summary.insert("program".to_owned(), json!(config.program));
+    summary.insert("args".to_owned(), json!(config.args));
+    summary.insert(
+        "cwd".to_owned(),
+        config
+            .cwd
+            .as_ref()
+            .map_or(Value::Null, |cwd| json!(cwd.to_string_lossy().into_owned())),
+    );
+    summary.insert(
+        "env_names".to_owned(),
+        json!(config.env.keys().cloned().collect::<Vec<_>>()),
+    );
+    summary.insert(
+        "request_timeout_secs".to_owned(),
+        json!(config.request_timeout_secs),
+    );
+    summary.insert(
+        "shutdown_timeout_secs".to_owned(),
+        json!(config.shutdown_timeout_secs),
+    );
+    summary.insert(
+        "health_check_interval_secs".to_owned(),
+        json!(config.health_check_interval_secs),
+    );
+    summary.insert(
+        "health_check_timeout_secs".to_owned(),
+        json!(config.health_check_timeout_secs),
+    );
+    summary.insert(
+        "max_health_failures".to_owned(),
+        json!(config.max_health_failures),
+    );
+    summary.insert("max_frame_bytes".to_owned(), json!(config.max_frame_bytes));
+    summary
 }
 
 /// A live child process speaking the NDJSON protocol.
