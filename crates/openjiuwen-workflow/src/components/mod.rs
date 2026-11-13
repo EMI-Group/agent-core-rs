@@ -28,11 +28,13 @@ pub use http_request::{
     HttpResponseFormat, HttpResponseHandlingConfig, HttpResponseMode, HttpRetryConfig,
 };
 pub use intent_detection::{IntentDetectionCompConfig, IntentDetectionComponent, IntentRouter};
-pub use llm::{LlmCompConfig, LlmComponent, LlmResponseFormat};
+pub use llm::{LLMCompConfig, LLMComponent, LlmCompConfig, LlmComponent, LlmResponseFormat};
 pub use loop_::{LoopComponent, LoopConfig, LoopType};
 pub use memory::{MemoryRecall, MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent};
 pub use questioner::{FieldInfo, QuestionerComponent, QuestionerConfig};
-pub use react_agent::{AgentRunner, ModelReActRunner, ReActAgentComponent, ReActAgentConfig};
+pub use react_agent::{
+    AgentRunner, ModelReActRunner, ReActAgentCompConfig, ReActAgentComponent, ReActAgentConfig,
+};
 pub use retrieval::KnowledgeRetrievalComponent;
 pub use start::StartComponent;
 pub use sub_workflow::{SubWorkflowComponent, SUB_WORKFLOW_COMPONENT};

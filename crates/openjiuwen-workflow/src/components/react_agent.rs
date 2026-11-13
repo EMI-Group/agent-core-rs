@@ -280,6 +280,13 @@ impl ReActAgentConfig {
     }
 }
 
+/// Mirrors the Python class name `ReActAgentCompConfig` (`react_config.py`).
+///
+/// A plain alias, not a distinct type: [`ReActAgentConfig`] is the canonical Rust name
+/// and both spellings name the same struct.
+#[allow(clippy::upper_case_acronyms)]
+pub type ReActAgentCompConfig = ReActAgentConfig;
+
 /// The built-in `react_agent` component.
 ///
 /// `invoke` forwards the resolved inputs to its [`AgentRunner`] and normalizes
