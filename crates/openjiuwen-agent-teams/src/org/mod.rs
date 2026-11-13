@@ -41,8 +41,14 @@ pub mod roles;
 pub mod swarmflow;
 pub mod task_pool;
 
-// Flat re-exports of every submodule are added once their public items land (`pub use roles::*;`
-// …), so a host can reach the whole layer as `openjiuwen_agent_teams::org::OrgChart`.
+// Flat re-exports so a host reaches the whole layer as
+// `openjiuwen_agent_teams::org::OrgChart`, mirroring the other modules of the crate.
+pub use delegation::*;
+pub use fork_compact::*;
+pub use mailbox::*;
+pub use roles::*;
+pub use swarmflow::*;
+pub use task_pool::*;
 
 /// Maximum length of an organisation id in characters.
 pub const MAX_ORG_ID_LEN: usize = 96;
