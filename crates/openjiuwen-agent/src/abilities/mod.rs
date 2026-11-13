@@ -11,6 +11,8 @@
 //! `BeforeToolCall`/`AfterToolCall` rails around it.
 pub mod arguments;
 pub(crate) mod execute;
+pub mod sub_agent;
+pub mod workflow;
 
 pub use arguments::parse_tool_arguments;
 use indexmap::IndexMap;
@@ -20,7 +22,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+pub use sub_agent::SubAgentAbility;
 use tokio_util::sync::CancellationToken;
+pub use workflow::WorkflowAbility;
 
 /// Outcome of [`AbilityManager::add_tool`].
 ///
