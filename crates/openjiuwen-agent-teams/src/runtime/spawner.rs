@@ -15,15 +15,15 @@
 //! * `in_process` (default) — the harness factory builds the brain here, exactly as before;
 //! * `process` / `external_cli` / `ssh` — the request is forwarded to the matching member spawner
 //!   (`ProcessMemberSpawner`, `ExternalCliMemberSpawner`, `SshMemberSpawner`), which owns the child
-//!   process and reaps it on [`MemberSpawner::despawn`].
+//!   process and reaps it on [`MemberSpawner::despawn`](crate::member::MemberSpawner::despawn).
 //!
-//! The mode comes from the blueprint: `metadata["spawn"]` (see [`super::spec_meta`]) with
+//! The mode comes from the blueprint: `metadata["spawn"]` (see [`super::spec_meta`](crate::runtime::spec_meta)) with
 //! `spawn_mode: process` as the fallback. Child spawners live for the spawner's lifetime, so a
 //! re-spawn of the same member reuses and replaces its child.
 //!
 //! # Model identity and forks
 //!
-//! Before the factory is called, the member's [`DeepAgentSpec`] is run through the team's
+//! Before the factory is called, the member's [`DeepAgentSpec`](crate::schema::DeepAgentSpec) is run through the team's
 //! [`TeamModelRouter`]: a pool entry rewrites `spec.model` to that endpoint, so the pool selects a
 //! real model instead of only being recorded on the roster row. A fork directive
 //! (`metadata["spawn"]["fork"]` / `metadata["fork"]`) replaces the blueprint with
@@ -276,9 +276,12 @@ impl TeamMemberSpawner {
         let requested = self
             .member_spec(member_name)
             .and_then(|member| member.base.model_name);
-        let (effective, selection) =
-            self.routing
-                .effective_spec(&base, requested.as_deref(), TeamRole::Teammate)?;
+        let (effective, selection) = self.routing.effective_spec_for(
+            member_name,
+            &base,
+            requested.as_deref(),
+            TeamRole::Teammate,
+        )?;
         debug!(
             team = self.team_name(),
             member = member_name,

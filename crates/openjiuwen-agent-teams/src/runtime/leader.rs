@@ -272,18 +272,22 @@ fn answer_text(payload: &Value) -> Option<&str> {
 }
 
 /// Sends one batched steering message to the leader, logging (never failing) a rejection.
+///
+/// A rejected batch is restored so the next tick retries it: the ids it carries must stay
+/// unacknowledged until a flush succeeds.
 async fn flush(agent: &TeamAgent, batch: &mut Vec<String>) -> bool {
     if batch.is_empty() {
         return true;
     }
     let joined = batch.join("\n");
     batch.clear();
-    if let Err(error) = agent.runtime().send(joined, false).await {
+    if let Err(error) = agent.runtime().send(joined.clone(), false).await {
         debug!(
             team = agent.team_name(),
             error = %error,
             "leader runtime did not accept a steering batch"
         );
+        batch.push(joined);
         return false;
     }
     true
@@ -292,8 +296,9 @@ async fn flush(agent: &TeamAgent, batch: &mut Vec<String>) -> bool {
 /// Drains the organisation mailbox for this team into the current steering batch.
 ///
 /// One line per unread message; the ids are remembered so they can be acknowledged only after the
-/// leader accepted the batch that carried them. A team without an organisation is a no-op, and a
-/// store failure is logged rather than ending the run.
+/// leader accepted the batch that carried them. An id is queued at most once, because a batch the
+/// leader rejected is retried on the next tick while its messages stay unread. A team without an
+/// organisation is a no-op, and a store failure is logged rather than ending the run.
 async fn drain_org_mail(agent: &TeamAgent, batch: &mut Vec<String>, acks: &mut Vec<String>) {
     let Some(org) = agent.org() else {
         return;
@@ -306,7 +311,9 @@ async fn drain_org_mail(agent: &TeamAgent, batch: &mut Vec<String>, acks: &mut V
                     message.from_team,
                     message.preview(160)
                 ));
-                acks.push(message.message_id);
+                if !acks.contains(&message.message_id) {
+                    acks.push(message.message_id);
+                }
             }
         }
         Err(error) => debug!(

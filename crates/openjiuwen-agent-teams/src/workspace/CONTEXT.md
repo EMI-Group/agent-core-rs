@@ -241,6 +241,7 @@ Branch: `worktree_branch(name)` = `worktree-<name>` with `/` flattened to `+`.
 
 ## Test Strategy
 Unit tests live beside the code (`#[cfg(test)]` inline) and in the sibling `*_tests.rs` suites, all offline and deterministic; filesystem and repository tests use `tempfile::TempDir` and never touch the network.
+The git-backed suites spawn the real `git` binary (resolved through `which`) and are not `#[cfg(unix)]`- or feature-gated, so a host without `git` fails `test_repo::git_ok`'s "git is available" assertion instead of skipping.
 - `layout.rs`: exact path equality for team/session/workspace/member/worktrees, sanitization accept/reject matrix, Unicode-per-scalar replacement, 96-char truncation, hostile input never escaping `base`.
 - `worktree.rs`: the documented name example, case/space/unicode slugging and fallbacks, 14/16 truncation with digest-distinguished long names, branch flattening, digest determinism/shape, `UnsupportedWorktreeBackend` failing closed with the Python capability name.
 - `local.rs`: enabled spec creates the workspace plus `members/<member>`; disabled spec creates nothing; `member_spec.root_path` creates `<workspace>/src/x` and rejects `/abs` and `../escape`; a worktree outside a repository is `Config`; an injected `UnsupportedWorktreeBackend` keeps worktrees off; a fake backend records one `create` (name starts `agent-`, path under `<session>/worktrees/`) and surfaces on the `MemberWorkspace`; a failing backend propagates; release retains a shared workspace and calls `remove` for a worktree.

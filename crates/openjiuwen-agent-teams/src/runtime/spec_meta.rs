@@ -1,7 +1,7 @@
 //! Spec-metadata configuration the runtime reads at build time.
 //!
-//! Everything the host tunes without touching the typed [`TeamAgentSpec`] surface lives under
-//! [`TeamAgentSpec::metadata`]: spawn mode, workspace isolation, the organisation layer, KV-cache
+//! Everything the host tunes without touching the typed [`TeamAgentSpec`](crate::schema::TeamAgentSpec) surface lives under
+//! [`TeamAgentSpec::metadata`](crate::schema::TeamAgentSpec::metadata): spawn mode, workspace isolation, the organisation layer, KV-cache
 //! affinity and attach hosting. Parsing is deliberately tolerant — a value that does not decode is
 //! logged and ignored (the in-process default stays in force), because a runtime must not fail just
 //! because an optional knob is malformed. The organisation block is the exception: an explicitly
@@ -11,7 +11,7 @@
 //!
 //! | key | value | effect |
 //! | --- | --- | --- |
-//! | `spawn` | [`MemberSpawnOptions`] (`{"kind":"process", …}`) or `{"options": …, "fork": …}` | which spawner materialises a member |
+//! | `spawn` | [`MemberSpawnOptions`](crate::member::MemberSpawnOptions) (`{"kind":"process", …}`) or `{"options": …, "fork": …}` | which spawner materialises a member |
 //! | `fork` | [`ForkDirective`] | parent member + task override for a forked member |
 //! | `workspace` | `{"isolation":"worktree"}` or `"worktree"` | workspace backend |
 //! | `organization` | `{"spec": OrganizationSpec, "rules": DelegationRules}` | organisation layer |
@@ -260,7 +260,7 @@ pub fn attach_config(spec: &TeamAgentSpec) -> Option<AttachConfig> {
             _ => {}
         }
     }
-    if socket.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if socket.as_deref().is_none_or(|path| path.trim().is_empty()) {
         socket = std::env::var(ATTACH_SOCKET_ENV)
             .ok()
             .filter(|path| !path.trim().is_empty());

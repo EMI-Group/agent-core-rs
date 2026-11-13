@@ -751,9 +751,11 @@ impl TeamAgent {
             )));
         }
         member.attach_runtime(runtime);
-        self.register_kv_affinity(name);
         let previous = member.status();
         member.start(None).await?;
+        // Register the KV identity only after the start succeeded: a failed start would otherwise
+        // leave a live affinity entry for a member that never ran.
+        self.register_kv_affinity(name);
         self.inner.signals.member_spawned(name, member.role());
         self.publish_member_status(name, previous, member.status())
             .await;
@@ -1019,7 +1021,7 @@ impl TeamAgent {
         let model = self
             .inner
             .routing
-            .model_ref(None, self.role_of(member_name))
+            .model_ref_for(member_name, None, self.role_of(member_name))
             .unwrap_or_default();
         let forked = self.inner.spawner.forked_member(member_name);
         let identity = match forked {
