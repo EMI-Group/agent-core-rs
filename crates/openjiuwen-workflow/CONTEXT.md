@@ -8,7 +8,8 @@ A workflow is a directed graph of components with one start and one end; the bui
 Data flow is textual: a component's `inputs_schema` is a JSON template whose pure `"${node.field}"` strings resolve against workflow state before the component runs; references never fail (a missing path resolves to `null`).
 Components declare capabilities (`invoke`, `stream`, `collect`, `transform`) that determine legal edges and how the engine drives them.
 Fourteen built-ins cover control flow, the leaf components (LLM, tool, retrieval, memory), HTTP requests, human-in-the-loop questioning, intent detection, ReAct, and nested workflows.
-Workflows render locally, and deterministically, as Mermaid text or SVG.
+`execute_single_component` runs one component outside any graph, mirroring Python's `_workflow.py` helper.
+Workflows render locally, and deterministically, as Mermaid text or SVG; PNG selection is a typed `Error::Unsupported` because Python rasterizes it through the external mermaid.ink service.
 
 ## API Surface
 
@@ -35,7 +36,7 @@ impl Workflow {
     pub fn build(&self) -> Result<CompiledWorkflow>;                       // validate + compile
     pub fn to_mermaid(&self) -> Result<String>;
     pub fn to_svg(&self) -> Result<String>;                                // build + render
-    pub fn draw(&self, format: DrawFormat) -> Result<String>;              // Mermaid text or SVG
+    pub fn draw(&self, format: DrawFormat) -> Result<String>;              // Mermaid text or SVG; Png is Error::Unsupported
     pub async fn invoke(&self, inputs: Value, session: Arc<dyn Session>) -> Result<WorkflowOutput>;
     pub async fn invoke_with(&self, inputs: Value, session: Arc<dyn Session>, options: WorkflowRunOptions) -> Result<WorkflowOutput>;
     pub async fn resume(&self, interactive: InteractiveInput, session: Arc<dyn Session>) -> Result<WorkflowOutput>;
@@ -72,7 +73,8 @@ impl CompiledWorkflow {
 #[derive(Clone)] pub struct WorkflowRunOptions {
     pub cancellation: CancellationToken,        // default: never cancelled
     pub timeout: Option<Duration>,              // None → SessionConfig::execute_timeout_ms → none
-    pub interactive: Option<InteractiveInput>,  // seeded HITL answers
+    pub interactive: Option<InteractiveInput>,  // newly supplied HITL answers
+    pub answers: BTreeMap<String, Vec<Value>>,  // per-id FIFO answers replayed before `interactive` (nested runs); `with_answers(..)`, empty by default
     pub resume: bool,                           // continue from a stored graph snapshot
     pub stream_modes: Option<Vec<StreamMode>>,  // which frame modes `stream` yields (None → all)
     pub max_supersteps: Option<usize>,          // None → graph default
@@ -84,6 +86,24 @@ impl CompiledWorkflow {
 A node with `wait_for_all = false` and at least two distinct inbound sources compiles to dynamic "star" edges instead (first-arrival fan-in; see Design Decisions).
 `NodeOptions { timeout_ms, max_retries }` carries the per-component limits.
 
+### Single-component execution (`src/single.rs`)
+
+```rust
+pub struct SingleComponentOptions { pub inputs_schema: Option<Value>, pub outputs_schema: Option<Value>, pub interactive: Option<InteractiveInput> }
+impl SingleComponentOptions {
+    pub fn new();                                                    // all defaults
+    pub fn with_inputs_schema(self, Value) -> Self;
+    pub fn with_outputs_schema(self, Value) -> Self;
+    pub fn with_interactive(self, InteractiveInput) -> Self;
+}
+pub async fn execute_single_component(component_id: &str, component: Arc<dyn Component>, inputs: Value, session: Arc<dyn Session>) -> Result<WorkflowOutput>;
+pub async fn execute_single_component_with(component_id: &str, component: Arc<dyn Component>, inputs: Value, session: Arc<dyn Session>, options: SingleComponentOptions) -> Result<WorkflowOutput>;
+```
+
+- Ports Python `_workflow.py::execute_single_component`: `inputs_schema` resolves against the call's inputs, `invoke` runs once against a `ComponentContext` whose component *and* workflow id are `component_id` (Python builds `WorkflowSession(workflow_id=component_id)`), and `outputs_schema` projects the result through the engine's own projection (`${output.field}` and `${<component_id>.field}` both work).
+- An unseeded `interact` returns `WorkflowExecutionState::InputRequired` with the same `{"type","index","payload"}` interaction wires an interrupted run reports; a seeded `interactive` answer completes the call instead.
+- Deviations: no graph node, superstep, or barrier participation and no checkpointer snapshot (Python runs a one-vertex Pregel graph whose hooks fire), so a resume has nothing to restore; only the batch `invoke` ability is dispatched; outputs are returned rather than committed to session state under the component id; a non-interrupt failure is returned unwrapped instead of `[100054]`; Python's optional `context` (`ModelContext`) argument has no counterpart because `ComponentContext::history` already reads the session `__messages__` lane.
+
 ### Outputs and chunks (`src/output.rs`)
 
 ```rust
@@ -91,10 +111,12 @@ pub struct WorkflowOutput { pub result: Value, pub state: WorkflowExecutionState
 pub enum WorkflowExecutionState { Completed, InputRequired, Error }   // wire "COMPLETED" | "INPUT_REQUIRED" | "ERROR"
 pub type WorkflowChunk = StreamItem;                                    // mode + "type" + index + payload
 pub struct OutputFrame { /* type, index, payload */ }                   // Python OutputSchema projection
+pub enum WorkflowChunkType { Interaction, Output, Error }               // wire "interaction" | "output" | "error"
 pub const END_NODE_STREAM: &str = "end node stream";
 pub const WORKFLOW_FINAL: &str = "workflow_final";
 ```
 
+- `WorkflowChunkType` ports Python `base.py`'s coarse chunk category (`as_str()`/`Display`); the frame itself keeps the finer `type`/`index`/`payload` shape.
 - `invoke`: `result` is the end component's output value; when the end is streaming (or the run was interrupted) `result` is the JSON array of collected chunk wires (`{"type","index","payload"}`), matching Python's chunk-list result.
 - `stream`: yields frames in production order, then one `workflow_final` output frame carrying the end outputs (omitted when they are null), then ends; an interrupted run ends quietly after its interaction frames; any other failure yields exactly one `Err`.
 - Frames a component emits with `ctx.write_stream` / `ctx.write_custom_stream` are forwarded verbatim (mode `output` / `custom`); end-node streaming frames use type `end node stream`; HITL frames use `__interaction__`.
@@ -132,10 +154,10 @@ Built-ins (all offline-testable):
 | `BranchComponent` + `BranchRouter` | `components/branch.rs` | `route` evaluates ordered `Branch`es (condition DSL) to target ids; `invoke` returns `{}` |
 | `LoopComponent` | `components/loop_.rs` | bounded loop over an inner component list: number / array / condition, capped by `loop_number_max_limit` (1000), returns `{"loop_results": […]}` |
 | `HttpRequestComponent` | `components/http_request/` | Python `HttpComponentConfig` tree → `openjiuwen_common::http::HttpClient`; returns `{statusCode, headers, body, url, ok}`, 4xx/5xx as data |
-| `QuestionerComponent` | `components/questioner/` | HITL `start`/`user_interact`/`end` state machine persisted under `questioner_state`; returns `{user_response, question, <fields>}` |
+| `QuestionerComponent` | `components/questioner/` | HITL `start`/`user_interact`/`end` state machine persisted under `questioner_state`; optional chat history (`with_chat_history`, default off, `chat_history_max_rounds` default 5) read/written in the `__messages__` lane; returns `{user_response, question, <fields>}` |
 | `IntentDetectionComponent` + `IntentRouter` | `components/intent_detection.rs` (+`intent_detection/`) | model or keyword classification → `{classification_id, category_name, reason}`; `IntentRouter` picks successors |
 | `ReActAgentComponent` + `AgentRunner` | `components/react_agent.rs` | delegates to an injected runner and normalizes to `{output, result_type}` (`answer`/`error`/`interrupt`) |
-| `SubWorkflowComponent` | `components/sub_workflow.rs` | runs a compiled child workflow in a child session; abilities `[Invoke, Stream]` |
+| `SubWorkflowComponent` | `components/sub_workflow.rs` | runs a compiled child workflow in a child session and forwards resume answers into it (recorded under `sub_workflow_answers`); abilities `[Invoke, Stream]` |
 | `KnowledgeRetrievalComponent` | `components/retrieval.rs` | `SimpleKnowledgeBase::retrieve_with_config` → `{"query", "documents": [{text, score, metadata}]}` |
 | `MemoryRetrievalComponent`, `MemoryWriteComponent` | `components/memory.rs` | operate over the local `MemoryRecall` / `MemoryRecord` trait seams (adapters land in `openjiuwen-memory`) |
 
@@ -189,7 +211,7 @@ The store is the session global lane `__messages__` (a JSON array of `{"role","c
 ### Rendering (`src/render.rs`)
 
 ```rust
-pub enum DrawFormat { Mermaid, Svg }            // wire "mermaid" | "svg"
+pub enum DrawFormat { Mermaid, Svg, Png }       // wire "mermaid" | "svg" | "png"; default Mermaid
 pub enum LayoutDirection { LeftRight, TopDown }
 pub struct SvgOptions { pub title: Option<String>, pub direction: LayoutDirection, pub end_nodes: Vec<String> }
 pub fn to_svg(spec: &WorkflowSpec, card: &WorkflowCard, title: Option<&str>) -> String;
@@ -198,6 +220,7 @@ pub fn error_svg(message: &str) -> String;
 ```
 
 Layered BFS layout over the sorted spec maps, rounded start/end boxes, arrow markers, dashed stream edges, XML-escaped labels, and an optional `<title>`; output is byte-identical for the same spec (no clocks, no unordered iteration).
+`Workflow::draw` renders `Mermaid` text and `Svg` here; `Png` returns a typed `Error::Unsupported` whose message names the external mermaid.ink service and points at `DrawFormat::Svg` (no local rasterizer, and the rejection never degrades into another format's output).
 
 ### Reference resolution (`src/reference.rs`)
 
@@ -240,6 +263,7 @@ pub struct ExceptionConfig { pub handle_type: String /* "interrupt" */, pub defa
 pub struct NodeSpec { pub io_configs: Option<CompIoConfig>, pub stream_io_configs: Option<CompIoConfig>, pub abilities: Vec<ComponentAbility>, pub max_retries: u32, pub timeout: f64, pub exception_config: Option<ExceptionConfig>, pub name: Option<String> }
 pub struct WorkflowSpec { pub edges: BTreeMap<String, Vec<String>>, pub stream_edges: BTreeMap<String, Vec<String>>, pub comp_configs: BTreeMap<String, NodeSpec>, pub stream_source_groups: BTreeMap<String, Vec<Vec<String>>>, pub start_nodes: Vec<String> }
 pub struct WorkflowConfig { pub card: WorkflowCard, pub spec: WorkflowSpec, pub workflow_max_nesting_depth: u32 /* default 5 */ }
+pub fn generate_workflow_key(workflow_id: &str, workflow_version: &str) -> String;   // Python base.py: "{id}_{version}", bare concatenation
 ```
 
 Field names, defaults, and card keys match Python (`id`, `name`, `description`, `version`, `input_params`; `timeout` in seconds, negative = none). Every type is serde snake_case, tolerates unknown fields, and round-trips through JSON.
@@ -272,7 +296,9 @@ Component-local codes live beside the component: `intent_detection/error.rs` own
 - **Conversation history is session-backed.** `enable_history` reads and writes `__messages__` through `MessageHistory`/`SessionMessageHistory`, so history-enabled nodes on one session share it (Python keeps it per `ModelContext`).
 - **`response_format` rewrites the prompt, not the request.** Markdown and JSON replace the *last user message* with the verbatim Python instruction templates and shape the answer locally; no provider-side `response_format` parameter is sent.
 - **Sub-workflows get a child session, not a nested graph.** `SubWorkflowComponent` runs a `CompiledWorkflow` against a fresh `WorkflowSession` parented to the caller, so child node ids never collide with parent ids; `depth + 1` flows through `WorkflowRunOptions::depth` and the child's `workflow_max_nesting_depth` rejects deeper nesting with `[100100]`.
+- **Nested resume replays answers instead of re-running blind.** The child is replayed from a fresh session (its own snapshot is not resumed), so the sub-workflow node reads the answers already forwarded from the parent session lane `sub_workflow_answers` (`NESTED_ANSWERS_KEY`), folds Python's dotted `"<sub node id>.<child id>"` ids onto the bare child id, appends the answers still queued in the parent run (`ComponentContext::queued_answers`), records the merged map back, and passes it as `WorkflowRunOptions::answers`; the child run therefore consumes the same answers in the same order on every replay.
 - **Rendering is local.** `draw(DrawFormat::Svg)`/`to_svg` produce SVG in-process (Python calls the mermaid.ink service), so the same spec always renders the same bytes.
+- **PNG is a typed rejection, not a fallback.** `DrawFormat` keeps Python's third format so a caller selecting it gets an `Error::Unsupported` naming mermaid.ink and pointing at `DrawFormat::Svg`; silently returning SVG or Mermaid text would misreport the requested format.
 - **`WorkflowInput`/`session` handling is explicit.** `invoke` merges the workflow inputs into the session global lane (Python `commit_user_inputs`) and seeds graph state with them, so root refs (`${query}`) and node refs (`${start.query}`) both resolve.
 
 ## Routing Table
@@ -290,6 +316,7 @@ Component-local codes live beside the component: `intent_detection/error.rs` own
 - `./src/registry.rs` → `ComponentRegistry` and the five builtin factories
 - `./src/output.rs` → `WorkflowOutput`, `WorkflowExecutionState`, chunk/frame helpers
 - `./src/render.rs` → offline SVG renderer (`to_svg`, `render_svg`, `error_svg`, `SvgOptions`, `DrawFormat`, `LayoutDirection`)
+- `./src/single.rs` → `execute_single_component`/`execute_single_component_with`, `SingleComponentOptions` (one component outside a graph)
 - `./src/components/` → built-in components (`components/CONTEXT.md`)
 - `./src/engine/` → `CompiledWorkflow`, compile/validation, run/stream, node adapter (`engine/CONTEXT.md`)
 - `./src/workflow.rs` → `Workflow` builder, `ComponentOptions`, `build`/`to_mermaid`/`to_svg`/`draw` and the `invoke`/`resume`/`stream` entry points
@@ -315,12 +342,14 @@ Integration tests in `./tests/` (all offline, using `openjiuwen_test_support::Sc
 - `retrieval_component.rs` — `SimpleKnowledgeBase` + `HashEmbedding` + `InMemoryVectorStore` query.
 - `loop_component.rs` — number/array/condition loops, bound errors.
 - `http_component.rs` — request encoding, response projection, 4xx/5xx as data, retries and `102000` transport failures.
-- `questioner_component.rs` — `start → questioner → end` over a checkpointed session, `INPUT_REQUIRED` plus `resume` per question.
+- `questioner_component.rs` — `start → questioner → end` over a checkpointed session, `INPUT_REQUIRED` plus `resume` per question, and the opt-in chat history (prior turns in `dialogue_history`, rounds trimming, trailing-turn rule, user/assistant recording, structured content).
 - `intent_detection.rs` — model path via `ScriptedModel`, offline keyword path, `IntentRouter` successor selection.
 - `react_agent.rs` — inputs reach the runner unchanged, `{output, result_type}` normalization, error/interrupt data, `on_max_iterations` policies.
-- `sub_workflow.rs` — child output passthrough, isolated child state lanes, nesting limit, forwarded frames, stream cache, relayed HITL.
+- `sub_workflow.rs` — child output passthrough, isolated child state lanes, nesting limit, forwarded frames, stream cache, relayed HITL, and nested resume (bare and dotted interaction ids answering the child, the recorded `sub_workflow_answers` lane, replay across two resumes).
 - `exception_recovery.rs` — `default_outputs` recovery after retries, `outputs_schema` projection, `interrupt`/stream failures still propagate.
-- `draw.rs` — `draw` formats, deterministic SVG, XML escaping, rounded start/end, empty/single/disconnected specs.
+- `draw.rs` — `draw` formats, deterministic SVG, XML escaping, rounded start/end, empty/single/disconnected specs, the `Png` wire name and its typed `Unsupported` (naming mermaid.ink and pointing at `Svg`, with no SVG/Mermaid text leaking), and Mermaid/SVG unaffected by a rejected PNG call.
+- `single_component.rs` — `execute_single_component(_with)`: input/output template resolution, passthrough without schemas, `INPUT_REQUIRED` plus a seeded answer, error propagation, `generate_workflow_key`, `WorkflowChunkType` wire values.
+- `public_api.rs` — crate-root/module-path parity for the re-exported surface, Python-shaped `HttpComponentConfig` round-trip through the root types, alias usability, and the wire strings of the HTTP enums, component status codes and `on_max_iterations` policy constants.
 - `session_state.rs` — component state namespacing, `dump_state`, trace spans emitted, cancellation.
 - `checkpoint_resume.rs` — failing node resumes from the graph store without re-running completed nodes; interruption returns `INPUT_REQUIRED` and resumes with seeded answers.
 - `card_spec.rs` — `WorkflowCard`/`WorkflowSpec` JSON round-trip, unknown fields tolerated, `to_mermaid` output.
@@ -331,7 +360,7 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 ## Notes for Agents
 
 - Use `openjiuwen_graph::{GraphBuilder, ExecutionOptions, Router, RouterContext, Node, NodeOutcome, NodeOptions, GraphState, CheckpointerStore}`; do not add new graph APIs.
-- Every module is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context` (+`history`), `output`, `interrupt`, `registry`, `render`, `components/`, `engine/`, and `workflow`.
+- Every module is implemented: `ability`, `card`, `error`, `reference`, `condition`, `component`, `context` (+`history`), `output`, `interrupt`, `registry`, `render`, `single`, `components/`, `engine/`, and `workflow`.
 - Component families that grew beyond one file live in directories: `components/llm/` (`mod.rs`, `format.rs`, `messages.rs`), `components/http_request/` (`mod.rs`, `config.rs`), `components/questioner/` (`mod.rs`, `config.rs`, `prompts.rs`), and `components/intent_detection/` (`error.rs`, `tests.rs`) beside `components/intent_detection.rs`.
 - Local error codes live beside their component (`components/intent_detection/error.rs`, the questioner's `coded` helpers) instead of growing `src/error.rs`.
 - `src/workflow.rs` exposes `Workflow` (builder + `build`/`invoke`/`invoke_with`/`resume`/`stream`/`stream_with`/`to_mermaid`/`to_svg`/`draw`) and `ComponentOptions`; both are re-exported from the crate root.
@@ -340,8 +369,9 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - The loop component lives in `src/components/loop_.rs` because `loop` is a Rust keyword; it is re-exported as `LoopComponent`.
 - `src/condition.rs` is ~1100 lines on purpose: the lexer, parser, evaluator, `Condition`, `Branch`, `BranchRouter` and their inline tests form one cohesive grammar unit and lose coherence if split (split only when a second expression family appears).
 - `src/engine/definition.rs` (~1000 lines) likewise keeps the builder's recorded definition, ability selection, and `WorkflowSpec` projection together so the builder and validator share one source of truth.
-- The crate root re-exports the primary public surface (`Component`, `ComponentContext`, the built-in components, the engine types, the error helpers), but not every public item.
-- Module-path-only items (reachable as `openjiuwen_workflow::<module>::…` but not at the crate root): `card::{MAX_COMPONENT_ID_LEN, INVALID_ID_CHARS_REASON}`; all `components::http_request::config` types except `HttpComponentConfig`/`HttpRequestParamConfig` (the other 14: `HttpAdvancedOptionsConfig`, `HttpAuthConfig`, `HttpAuthIn`, `HttpAuthType`, `HttpBackoffType`, `HttpContentType`, `HttpHeadersConfig`, `HttpRateLimitConfig`, `HttpRateLimitUnit`, `HttpRequestBodyConfig`, `HttpResponseFormat`, `HttpResponseHandlingConfig`, `HttpResponseMode`, `HttpRetryConfig`); the questioner's seven `COMPONENT_QUESTIONER_*` codes and seven error builders; the intent detector's 13 `COMPONENT_INTENT_DETECTION_*` codes and 13 `intent_detection_*` error builders; `components::react_agent::{ON_MAX_ITERATIONS_ERROR, ON_MAX_ITERATIONS_FINAL_ANSWER, ON_MAX_ITERATIONS_RETURN_OBSERVATIONS}`; `output::{CUSTOM_FRAME_TYPE, TRACE_FRAME_TYPE, FrameCollector, frame_to_wire}`; and `engine::validate::validate`.
+- The crate root mirrors Python's `openjiuwen/core/workflow/__init__.py`: every built-in component, the whole `Http*` configuration tree, the component status codes (`COMPONENT_QUESTIONER_*`, `COMPONENT_INTENT_DETECTION_*`), the `on_max_iterations` policy constants, `card::{MAX_COMPONENT_ID_LEN, INVALID_ID_CHARS_REASON, generate_workflow_key}`, `output::{CUSTOM_FRAME_TYPE, TRACE_FRAME_TYPE, FrameCollector, frame_to_wire, WorkflowChunkType}`, `single::*`, and the Python-name aliases `LLMComponent`/`LLMCompConfig` (`components::llm`) and `ReActAgentCompConfig` (`components::react_agent`).
+- Module-path-only items (reachable as `openjiuwen_workflow::<module>::…` but not at the crate root): the component error *builder functions* — `components::questioner::{input_param_error, config_error, input_invalid, state_init_failed, runtime_error, invoke_call_failed, execution_process_error}` and the 13 `components::intent_detection::intent_detection_*` builders (their status codes are at the root); `components::sub_workflow::NESTED_ANSWERS_KEY`; and `engine::validate::validate`.
+- `src/single.rs` reuses the engine's `pub(crate)` helpers rather than duplicating them: `engine::run::interaction_wires` for the interrupted result and `engine::node::project_output` for `outputs_schema`, so a single-component call and a workflow run agree on both shapes.
 - `Component::route` is consulted before the selected ability and wins outright: a component returning `Some(targets)` produces no value and writes no state (`NodeOutcome::Route`). `IntentDetectionComponent` therefore does not implement `route`; a caller wires an `IntentRouter` through `add_conditional_connection` so the classification is still written to state.
 - `AgentRunner` is this crate's seam to the agent runtimes: `openjiuwen-agent`/`openjiuwen-harness` adapt to it in their own crates, and this crate never depends on them.
 - HTTP goes through `openjiuwen_common::http::HttpClient`; the crate manifest therefore depends on `base64` and `bytes` (both workspace deps).
@@ -350,18 +380,24 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
 - `openjiuwen-retrieval` is a normal dependency; `openjiuwen-memory` is not one, although it is fully implemented — the memory components reach it through the local `MemoryRecall`/`MemoryRecord` trait seams, so callers inject adapters instead of this crate depending on the memory engine.
 
-- `ComponentContext::interact` keys an interaction by the question object's `"id"` field when present, otherwise by the component id; a resume answer may be node-addressed (`InteractiveInput::update`) or interrupt-addressed (`InteractiveInput::answer`), and interrupt answers are consumed first.
+- `ComponentContext::interact` keys an interaction by the question object's `"id"` field when present, otherwise by the component id; a resume answer may be node-addressed (`InteractiveInput::update`) or interrupt-addressed (`InteractiveInput::answer`), and for one id an interrupt-addressed answer in the same seeding call wins over the node-addressed one.
 - `Workflow::resume` requires the session to carry a checkpointer (the interrupted superstep is replayed from the stored graph snapshot); `openjiuwen_test_support::workflow_session_with_checkpointer` is the fixture for that.
 - Consumers without a direct dependency on this crate (for example `openjiuwen-e2e`) reach every public item through the umbrella as `openjiuwen::core::workflow::…`; no feature flag gates workflow types.
 
 ## Known Issues and Deferred Work
 
-- Deferred semantics: the Python streaming actor network (live interleaving of concurrent producers), PNG rendering (Python's `output_format="png"` needs mermaid.ink) plus `WORKFLOW_DRAWABLE` gating, per-run `async` graph mutation, and sub-workflow HITL resume (the parent re-runs the child from scratch; child seeded answers are not forwarded).
-- Fan-in reached only through declared conditional edges stays CNF: alternative branch targets that merge into one node wait for every predecessor, so wire each alternative path to its own successor or declare `wait_for_all = false` on the join (which validation rejects for `Collect`/`Transform`).
+- Live streaming-actor interleaving is not implemented: `openjiuwen-graph` owns supersteps and channels and runs one superstep's nodes sequentially, so producer frames are buffered and composed in template order instead of interleaving in real time (observable text and order still match Python for finite streams).
+- Python's loop coordination components (`LoopGroup`, `LoopBreakComponent`, `LoopSetVariableComponent`, `AdvancedLoopComponent`) are not ported; this crate's `LoopComponent` bounds its body by number/array/condition and returns a `loop_results` wrapper.
+- Python's condition classes (`FuncCondition`, `ArrayCondition`, `NumberCondition`, `AlwaysTrue`) map onto `Condition`'s expression DSL plus `BranchRouter`; a closure condition has no serializable equivalent because branches are registry/serde configs.
+- Mutually exclusive branch predecessors are not merged into one OR group (that needs graph-level barrier groups), so a join reached only through declared conditional edges stays CNF and waits for every predecessor; workaround: a dedicated successor per alternative, or `wait_for_all = false` on the join (which validation rejects for `Collect`/`Transform`).
+- `Workflow::draw(DrawFormat::Png)` is a typed `Error::Unsupported` because Python posts the chart to the external mermaid.ink service and no offline rasterizer reproduces it; Python's `WORKFLOW_DRAWABLE` environment gate is not modelled, so rendering is always available.
+- Interaction ids are the bare component id, where Python uses the node's possibly dotted path; nested answer forwarding accepts both spellings.
+- Python's per-component config objects are replaced by injected collaborators: `ToolComponentConfig`, `KnowledgeRetrievalCompConfig`/`ComponentKBConfig` and `MemoryRetrievalCompConfig`/`MemoryWriteCompConfig` have no Rust counterpart (the components take the tool/KB/memory seam directly), and `WorkflowCard::tool_info()` has no counterpart because workflow-as-tool registration belongs to the runner/agent layers.
+- A workflow is immutable during a run, so Python's per-run graph mutation is not supported.
 - `outputs_schema` resolves against workflow state plus the node's own id and an `output` key (`${<id>.field}` / `${output.field}`); there is no `self` shorthand, and a bare `${field}` resolves to `null`.
 - A loop missing its bound parameter reports `[101040]` at invoke time rather than Python's build-time `[101030]` (the builder-time check lives in the registry config parser).
 - `ComponentOptions::streaming()` declares `[Invoke, Stream]` (plus `Transform` when a stream input schema is set), so it cannot be used on a component that implements only `Stream`, and a streaming end is not a valid `add_stream_connection` target unless it declares `Transform`.
 - Unknown-component ids and capability mismatches are reported as one compile error rather than Python's split between build-time and run-start checks.
 - Recovery is inline in `ComponentNode::run` rather than Python's `component_error_recovery` callback framework; the observable contract (defaults written under the node id, run continues) is the same.
 - `enable_history` history is per session (`__messages__`), not per `ModelContext`: two history-enabled nodes on one session see each other's turns, and only plain text survives a round trip.
-- Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, memory components return `memories`/record results instead of Python's fragment/summary split, HTTP multipart/digest/AWS auth are `Unsupported` with several parsed-but-unenforced options, the questioner injects its model directly and has no chat-history window, intent detection adds an offline keyword path, ReAct returns a plain answer/observations value instead of Python's rich result dict and maps interrupts to data, and a sub-workflow's stream cache merges mixed types last-wins instead of raising `TypeError`.
+- Deviations from Python documented in `src/components/CONTEXT.md`: batch end templates stringify with JSON text instead of `str()`, branch routers support a Rust-only default target, loops return a `loop_results` wrapper, the retrieval component returns `documents` instead of Python's `results`/`context`, memory components return `memories`/record results instead of Python's fragment/summary split, HTTP multipart/digest/AWS auth are `Unsupported` with several parsed-but-unenforced options, the questioner injects its model directly and keeps chat history in the session `__messages__` lane rather than a `ModelContext` window, intent detection adds an offline keyword path, ReAct returns a plain answer/observations value instead of Python's rich result dict and maps interrupts to data, and a sub-workflow's stream cache merges mixed types last-wins instead of raising `TypeError`.
