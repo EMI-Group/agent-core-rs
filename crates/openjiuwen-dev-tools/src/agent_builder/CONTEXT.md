@@ -113,7 +113,8 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 - Time is a parameter everywhere except `now_millis`, and randomness is used only for a missing/generated `agent_id`, so tests never depend on the wall clock or generated ids.
 - No `unsafe`, no `unwrap`/`expect`/`panic!` in library code, no printing; diagnostics go through `tracing::debug`.
 - Async-first: model-assisted entry points are `async fn` and compose inside an existing tokio runtime; no blocking calls, no environment reads, no `block_on`.
-- Files stay under the ~1000-line baseline except where an exhaustive per-rule/per-alias test module makes them longer (`designer.rs`, `dl_reflector.rs`, `builder.rs`); those test modules are deliberate and should not be split out without a routing decision.
+- Files stay under the ~1000-line baseline: `designer.rs` (810), `builder.rs` (720), and `dl_reflector.rs` (607) keep their implementation only, with the test modules in `designer/tests.rs`, `builder/tests.rs`, `builder/pipeline_tests.rs`, and `dl_reflector/tests.rs` loaded through `#[cfg(test)] mod …;`.
+- A moved test module keeps its path (`builder::pipeline_tests` stays `builder::pipeline_tests`), so test bodies move verbatim and only the crate's existing `tests/` suites observe the public API.
 
 ## Design Decisions
 
@@ -138,7 +139,8 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 
 ## Test Strategy
 
-- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, `builder`, `outcome`, `clarifier`, `cycle_checker`, `designer`, `dl_generator`, `dl_reflector`, and `mermaid` each own a `#[cfg(test)] mod tests`; `builder.rs` additionally has `mod pipeline_tests`.
+- Unit tests live beside the code: `dsl`, `workflow_dsl`, `spec`, `bridge`, `history`, `outcome`, `clarifier`, `cycle_checker`, `dl_generator`, and `mermaid` each own an inline `#[cfg(test)] mod tests`, while `designer`, `dl_reflector`, and `builder` declare `#[cfg(test)] mod tests;` resolving to the sibling `designer/tests.rs`, `dl_reflector/tests.rs`, and `builder/tests.rs`; `builder` additionally declares `#[cfg(test)] mod pipeline_tests;` resolving to `builder/pipeline_tests.rs`.
+- A test module in a sibling file opens with `use super::*;`, so it reaches the parent module's private items exactly as the inline module did.
 - `cycle_checker`: acyclic chain, diamond, self-loop, three-node cycle, cycle behind an isolated root, dangling-edge tolerance, empty document, determinism.
 - `clarifier`: blank validation with zero calls, ready/missing-signal questions, history-carried signals, model JSON path with message-order assertions, garbage/error fallbacks, serde round-trip.
 - `designer`: offline single/multi-step synthesis, the 4-step cap, branch detection, CJK input, name slugging, blank validation with zero calls, model path with aliases, invalid/garbage/error fallbacks, `DesignNodeKind` alias matrix, `to_workflow_dsl` mapping, all `validate` rejections.
@@ -163,6 +165,10 @@ Success records `Completed`; the fallback records `Clarifying`; either way the a
 - `./dl_reflector.rs` → `DlReflector`, rule-based repair with issue reporting, optional model revision
 - `./cycle_checker.rs` → deterministic `find_cycle`/`has_cycle` over the workflow graph
 - `./mermaid.rs` → `render_mermaid`/`render_design` Mermaid `flowchart TD` output
+- `./designer/tests.rs` → `designer`'s `mod tests`: offline synthesis, model path and aliases, validation, design→DSL conversion
+- `./builder/tests.rs` → `builder`'s `mod tests`: legacy single-round-trip builds, result vocabulary, deterministic LLM-agent repair
+- `./builder/pipeline_tests.rs` → `builder`'s `mod pipeline_tests`: `build_with_pipeline` stages, model-call counts, fallbacks
+- `./dl_reflector/tests.rs` → `dl_reflector`'s `mod tests`: every repair rule, `passed` semantics, model-revision accept/reject paths
 - `./mod.rs` → module tree, crate-level re-exports, and the pipeline overview
 - `../util.rs` → shared `extract_json_fence` and text helpers (sibling, read-only — escalate writes to the parent)
 - `../../openjiuwen-agent/` → `AgentCard`, `LlmAgentConfig`, `LlmAgent`, `ReActAgent` consumed by the bridge (sibling crate, read-only — escalate writes to the parent)
