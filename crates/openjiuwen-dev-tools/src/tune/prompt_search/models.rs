@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(blank.case_id, "");
         assert_eq!(blank.output, "");
         assert!(blank.ok());
-        assert_eq!(CaseResult::new("c3", "x").with_hidden(true).hidden, true);
+        assert!(CaseResult::new("c3", "x").with_hidden(true).hidden);
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
         let breakdown = RewardBreakdown::default();
         assert!(!breakdown.is_gated());
         assert_eq!(breakdown.score, 0.0);
-        assert!(breakdown.notes.is_empty());
+        assert_eq!(breakdown.notes.len(), 0);
 
         let gated = RewardBreakdown {
             gated: true,

@@ -124,7 +124,7 @@ mod tests {
         let drift = BTreeMap::from([("w".to_owned(), 0.8)]);
         let breakdowns = reward.evaluate(&[best.clone(), worst], &task, &drift);
         assert!(breakdowns[0].score > breakdowns[1].score);
-        assert!(breakdowns[0].notes.is_empty());
+        assert_eq!(breakdowns[0].notes.len(), 0);
         assert!(breakdowns[1].score < 1e-12);
 
         let mut record = IterationRecord::new(1);
@@ -154,7 +154,7 @@ mod tests {
         memory
             .store(PromptRecord::new("r", "p", 1.0, "objective"))
             .unwrap();
-        assert!(memory.pending(0.0).is_empty());
+        assert_eq!(memory.pending(0.0).len(), 0);
 
         assert_eq!(clamp01(2.0), 1.0);
         assert_eq!(min_max_normalize(&[1.0, 2.0]), vec![0.0, 1.0]);
@@ -187,7 +187,7 @@ mod tests {
 
         let workspace = openjiuwen_test_support::TempWorkspace::new().unwrap();
         let memory = JsonlPromptMemory::new(workspace.path("memory")).unwrap();
-        assert!(memory.records().is_empty());
+        assert_eq!(memory.records().len(), 0);
 
         let error = ConvergenceDetector::new(0.0, 3, None).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);

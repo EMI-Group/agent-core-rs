@@ -332,7 +332,7 @@ mod tests {
                 "write".to_owned(),
             ])
         );
-        assert!(token_set("   ").is_empty());
+        assert_eq!(token_set("   ").len(), 0);
         assert_eq!(jaccard(&tokens, &tokens), 1.0);
         assert_eq!(jaccard(&tokens, &BTreeSet::new()), 0.0);
         let other = token_set("write a poem");
@@ -343,10 +343,10 @@ mod tests {
     fn null_memory_answers_empty() {
         let memory = NullPromptMemory::new();
         memory.store(PromptRecord::new("r", "p", 1.0, "o")).unwrap();
-        assert!(memory.records().is_empty());
-        assert!(memory.search_similar(&task("objective"), 3).is_empty());
+        assert_eq!(memory.records().len(), 0);
+        assert_eq!(memory.search_similar(&task("objective"), 3).len(), 0);
         assert!(memory.best_for_objective("objective").is_none());
-        assert!(memory.pending(0.0).is_empty());
+        assert_eq!(memory.pending(0.0).len(), 0);
         assert!(!memory.mark_applied("r").unwrap());
     }
 
@@ -356,7 +356,7 @@ mod tests {
         let directory = workspace.path("memory");
 
         let memory = JsonlPromptMemory::new(&directory).unwrap();
-        assert!(memory.records().is_empty());
+        assert_eq!(memory.records().len(), 0);
         assert_eq!(memory.skipped_lines(), 0);
         assert!(memory.path().ends_with("records.jsonl"));
 
@@ -420,7 +420,7 @@ mod tests {
         let top_one = memory.search_similar(&query, 1);
         assert_eq!(top_one.len(), 1);
         assert_eq!(top_one[0].record_id, "exact");
-        assert!(memory.search_similar(&query, 0).is_empty());
+        assert_eq!(memory.search_similar(&query, 0).len(), 0);
     }
 
     #[test]
