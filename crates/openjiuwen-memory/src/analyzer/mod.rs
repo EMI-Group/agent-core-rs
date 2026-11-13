@@ -11,6 +11,10 @@
 //!   signals) and [`LlmClassifier`] (model-backed, rules as fallback);
 //! - [`MemoryAnalyzer`] — config, extractor, classifier factory, and
 //!   [`MemoryAnalyzer::consolidate`], which turns facts into a [`ConsolidationPlan`].
+//! - [`StagedAnalyzer`] — the staged pipeline (plan → extract → reason → proactive →
+//!   conflict) built from [`ExtractionStage`]s, with [`StageConfig`] selecting
+//!   deterministic or model-backed stages and [`ScopeAnalyzerOverrides`] carrying the
+//!   per-scope model, embedding, kind, and threshold overrides.
 //!
 //! # Rule inventory
 //!
@@ -70,6 +74,7 @@ mod orchestrator;
 mod parse;
 mod prompt;
 mod rule;
+mod stage;
 
 pub use config::{
     AnalyzerConfig, ClassifierKind, ExtractorKind, DIRECTIVE_IMPORTANCE, IDENTITY_IMPORTANCE,
@@ -86,3 +91,13 @@ pub use prompt::{
     EXTRACTION_JSON_SCHEMA, EXTRACTION_SYSTEM_PROMPT, MEMORY_KINDS,
 };
 pub use rule::RuleExtractor;
+pub use stage::{
+    parse_plan_response, parse_proactive_response, parse_reasoning_response, ConflictStage,
+    ExtractStage, ExtractionPlan, ExtractionStage, FactReasoning, FactVerdict, LlmPlanStage,
+    LlmProactiveStage, LlmReasoningStage, PlanIntent, PlanOperation, ProactiveConfig,
+    ProactiveDecision, ProactiveSignal, ReasoningBasis, RulePlanStage, RuleProactiveStage,
+    RuleReasoningStage, ScopeAnalyzerOverrides, StageConfig, StageInput, StageKind, StageOutput,
+    StagedAnalyzer, StagedResult, DEFAULT_REASONING_KEY, PLAN_JSON_SCHEMA, PLAN_SYSTEM_PROMPT, PROACTIVE_JSON_SCHEMA,
+    PROACTIVE_SYSTEM_PROMPT, REASONING_JSON_SCHEMA, REASONING_SYSTEM_PROMPT,
+    SUMMARY_TOKEN_THRESHOLD,
+};
