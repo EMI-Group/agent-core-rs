@@ -66,6 +66,7 @@ mod base;
 mod evaluator;
 mod loader;
 mod optimizer;
+mod prompt_search;
 mod tool;
 
 pub use base::{Case, EvaluatedCase};
@@ -84,6 +85,15 @@ pub use optimizer::{
     DEFAULT_EARLY_STOP_SCORE, DEFAULT_EXAMPLE_NUM, DEFAULT_ITERATION_NUM, DEFAULT_PARALLEL_NUM,
     MAX_EXAMPLE_NUM, MAX_ITERATION_NUM, MAX_PARALLEL_NUM, MIN_EXAMPLE_NUM, MIN_ITERATION_NUM,
     MIN_PARALLEL_NUM,
+};
+pub use prompt_search::{
+    candidate_id, clamp01, default_weights, min_max_normalize, population_variance, CaseResult,
+    CompletenessReward, CompositeReward, ConvergenceDetector, ConvergenceState, CorrectnessReward,
+    CostReward, CustomReward, DriftJudge, Evaluation, Execution, HistoryCompressor, HistoryEntry,
+    IterationRecord, JsonlPromptMemory, LatencyReward, LexicalDriftJudge, ModelDriftJudge,
+    NullDriftJudge, NullPromptMemory, OptimizationHistory, PromptCandidate, PromptMemory,
+    PromptRecord, PromptTaskCase, PromptTaskSpec, RewardBreakdown, RewardComponent,
+    StructuredValidationReward, TokenUsageReward, OVERFIT_MARGIN, OVERFIT_PENALTY,
 };
 pub use tool::{RunOutcome, ToolCallRecord, ToolHandler, ToolStub, ToolStubs, ToolTrace};
 
