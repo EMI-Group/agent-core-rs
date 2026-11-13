@@ -11,14 +11,16 @@ Everything is offline and deterministic by default: no environment reads, no wal
 - `Case` — `inputs`, `label`, `tools`, `case_id` (Python field names); `new` (validating), `with_tools`, `with_case_id`, `validate` (which also rejects a blank or duplicated declared tool name under `Case.tools`), plus the read-only accessors `tools`/`tool_names`/`has_tools` and the Python `PromptTaskCase.from_text(text, expected)` constructor building `{"query": …}` / `{"output": …}`.
 - `EvaluatedCase` — `case`, `answer`, `score`, `reason`; `new` (score bounds), `validate`, accessors `inputs`/`label`/`tools`/`case_id`, `From<Case>` producing score `0.0` and empty answer/reason.
 - `CaseLoader` — `new`, `size`, `is_empty`, `cases`, `into_cases`, `get`, `iter`, `shuffle` (seeded xorshift64* Fisher-Yates), `split` (floor of `ratio * size`), iteration, JSON round-trip through `{"cases":[...]}`.
-- Evaluator seam (`evaluator/`):
-  - `PromptRunner` — `async fn run(&self, prompt, case) -> Result<BTreeMap<String, Value>>`.
+- Evaluator seam (`evaluator/`, details in `evaluator/CONTEXT.md`):
+  - `PromptRunner` — `async fn run(&self, prompt, case) -> Result<BTreeMap<String, Value>>` plus the provided `run_traced` returning a `RunOutcome` (default: `run` with an empty `ToolTrace`).
   - `ModelPromptRunner` — system message = candidate prompt, user message = `render_case_inputs(case)`; a fenced or whole-answer JSON object becomes the answer map, plain text becomes `{"output": text}`.
-  - `ScriptedPromptRunner` — canned answers keyed by case id, optional fallback, recorded `PromptCall`s, `Error::not_found` for an unscripted case without a fallback.
-  - `CaseScorer` — `fn score(&self, case, answer) -> (f64, String)`; `LabelScorer` is the deterministic default (see scoring bands below).
-  - `CaseEvaluator` — `async fn evaluate(&self, prompt, case) -> Result<EvaluatedCase>` plus a provided `score_cases` returning the mean and the per-case results (`0.0`/empty for no cases).
-  - `RunnerEvaluator` — any `PromptRunner` plus any `CaseScorer` (default `LabelScorer`).
-  - `ModelEvaluator` — the model preset: `ModelPromptRunner` + `LabelScorer`, `new(Arc<dyn Model>)`, `with_scorer`.
+    `with_stubs(ToolStubs)` and `with_max_tool_rounds(usize)` (default `DEFAULT_MAX_TOOL_ROUNDS = 8`) make `run_traced` declare `Case::tools()`, execute the model's tool calls in order against the stubs, record every call, and feed each outcome back as a `Role::Tool` message.
+  - `ScriptedPromptRunner` — canned answers keyed by case id, optional fallback, recorded `PromptCall`s, `Error::not_found` for an unscripted case without a fallback; runs no tools.
+  - `CaseScorer` — `fn score(&self, case, answer) -> (f64, String)` plus the provided `score_with_trace` (default ignores the trace); `LabelScorer` is the deterministic default (see scoring bands below).
+  - `ToolUsageScorer` — multiplies an inner `LabelScorer` (or any `Box<dyn CaseScorer>`) by the fraction of the required tools the trace used: `new(required)`, `from_case(&Case)`, `with_inner`, `required()`, `missing(&ToolTrace)`.
+  - `CaseEvaluator` — `async fn evaluate(&self, prompt, case) -> Result<EvaluatedCase>`, the provided `evaluate_traced` yielding `(EvaluatedCase, ToolTrace)`, the provided `score_cases` (mean plus per-case results), and the provided `score_cases_traced` (mean plus per-case pairs); `tool_usage(&[(EvaluatedCase, ToolTrace)])` aggregates per-tool call counts.
+  - `RunnerEvaluator` — any `PromptRunner` plus any `CaseScorer` (default `LabelScorer`); evaluates through `run_traced` + `score_with_trace`.
+  - `ModelEvaluator` — the model preset: `ModelPromptRunner` + `LabelScorer`, `new(Arc<dyn Model>)`, `with_stubs(model, stubs)`, `with_scorer`.
   - `DeterministicEvaluator` — offline default, `new(seed_prompt)`, `seed()`, `seed_placeholders()`, `score_parts(candidate, case) -> DeterministicScore` (total plus the four dimensions) and the `CaseEvaluator` impl.
   - `render_case_inputs(case)` — `[key]: value` per input, strings bare and other JSON compact.
 - Search (`optimizer.rs` facade and `optimizer/`):
@@ -29,6 +31,7 @@ Everything is offline and deterministic by default: no environment reads, no wal
   - `JointOptimizer::optimize(prompt, cases)` — alternating instruction and example ascent.
   - `PromptSearchOptimizer::optimize(prompt, cases)` — one breadth-first sweep over the whole pool.
   - `Trainer::train(prompt, train, val)` — train/validation loop with early stop; `Trainer::evaluate(prompt, cases)` returns the mean and per-case results.
+  - `Trainer::evaluate_traced(prompt, cases)` — `EvaluationSummary` (`mean_score`, `results`, `tool_usage`) with the same mean/results as `evaluate` plus per-tool call counts aggregated from the evaluator's traced seam; `is_empty()` reports no results and `tool_names()` lists the called tools sorted.
   - `optimize_prompt(prompt, cases)` — default `InstructionOptimizer`.
   - `placeholders(prompt)` — the `{{name}}` names of a prompt.
 - Tool layer (`tool.rs`): `ToolHandler` (synchronous `Fn(&Value) -> Result<Value>` shared through an `Arc`), `ToolStub` (named in-process fixture with `new`/`constant`/`name`/`call`), `ToolStubs` (a `BTreeMap` lookup with `insert`/`with_stub`/`get`/`contains`/`names`/`len`/`is_empty` and `call`, unknown names reported as `Error::not_found`), `ToolCallRecord` (`name`/`arguments`/`result`/`error` plus `success`/`failure`/`is_error`), `ToolTrace` (ordered records with `names`/`used`/`used_all`/`count`/`coverage`/`missing`/`usage`, serialized as a bare JSON array), and `RunOutcome` (`answer` plus `trace`, `new`/`with_trace`/`into_answer`).
@@ -65,7 +68,8 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - Serialization: `Debug, Clone, PartialEq, Serialize, Deserialize` on public data types, `schemars::JsonSchema` on `Case`/`EvaluatedCase`, `rename_all = "snake_case"`, unknown fields ignored.
 - Python JSON field names round-trip exactly: `inputs`, `label`, `tools`, `case_id`, `case`, `answer`, `score`, `reason`, `best_prompt`, `iterations`.
 - Deserialization is permissive (missing `case_id` gets a fresh simple v4 UUID, missing `score` is `0.0`, missing `CaseLoader.cases` is empty, missing config fields default to the constants); only `new`/`validate` enforce the Python `pydantic` constraints.
-- Errors come from `openjiuwen_common::error` only: `Error::validation` for bad input, `Error::not_found` for an unscripted case, `Error::llm` for provider failures; nothing in this module returns `Error::Unsupported`.
+- Errors come from `openjiuwen_common::error` only: `Error::validation` for bad input (a blank tool or required-tool name, a duplicated declaration, a zero `max_tool_rounds`), `Error::not_found` for an unscripted case or an unregistered tool, `Error::llm` for provider failures; nothing in this module returns `Error::Unsupported`.
+- `Case`/`EvaluatedCase` keep Python's JSON field names; `EvaluatedCase` gains no fields, so the tool trace travels only through the traced methods and `EvaluationSummary`.
 - No `unsafe`, no panics on user input or on a poisoned call-recording lock, no printing; tests may use `unwrap`/`expect`.
 - Async-first: optimizer entry points are `async` because they may call a model; the deterministic path never awaits anything external.
 - Files ≤1000 lines, one responsibility per file; shared candidate-generation helpers live in `optimizer/suggestion.rs`, never duplicated per optimizer.
@@ -83,6 +87,11 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - Python's `random.shuffle`/`random.sample` and `random.choice` strategy coin flip are replaced by seeded or deterministic selection so a run is reproducible; shuffling lives in `loader.rs` (xorshift64*).
 - Scores are clamped into `0.0..=1.0` and float comparisons use a `1e-12` tolerance, so a custom scorer returning a wild value cannot panic `EvaluatedCase::new`.
 - `placeholders` and the `ensure_placeholders` repair mirror Python's `PromptAssembler` input keys and its "append the missing `{{name}}` lines" repair, without pulling in the prompt assembler.
+- Tool-aware evaluation is additive: the trace is a return value (`run_traced`, `evaluate_traced`, `score_cases_traced`, `EvaluationSummary`), so `EvaluatedCase` keeps the Python wire shape and an untraced `PromptRunner`/`CaseScorer`/`CaseEvaluator` implementor keeps compiling.
+- Tool failures are data, not control flow: an unknown tool, a failing stub, and malformed call arguments are recorded in the `ToolTrace` and fed back to the model as the tool result, and the loop stays bounded by `max_tool_rounds`; only model/transport errors propagate.
+- `ToolStubs` is injected by the caller and never built from configuration, so tests pass deterministic fixtures and nothing reads the environment.
+- The rewrite prompt describes the case set's declared tools (`tools_description`/`tools_block` in `optimizer/suggestion.rs`) rather than offering them as a request `tools` array, matching Python's `str(tools)`; the `<tools_description>` block is omitted when no case declares tools, so tool-free prompts stay byte-identical.
+- `ToolUsageScorer` scales the inner score instead of vetoing it, and the case's own declarations stay advisory: the required list is explicit (or `from_case`), so a case can declare a tool the run is not scored on.
 
 ## Test Strategy
 
@@ -90,13 +99,13 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `base.rs` covers constructor validation, score bounds (`0.0`/`1.0` accepted; `-0.1`, `1.1`, `NaN`, infinities rejected), Python-field JSON round-trips, UUID defaulting, unknown-field tolerance, schema exposure, `From<Case>` accessors, and the tool accessors (`tools`/`tool_names` order and dedupe, `has_tools`, `from_text` shape and blank-text rejection, `validate` rejecting a blank or duplicated tool name).
 - `tool.rs` covers stub construction and dispatch (blank-name validation, `constant` ignoring arguments, handler errors propagating, `Debug` showing the name), the table (`insert`/replacement/`get`/`contains`/sorted `names`/`with_stub` chaining, unknown-name `NotFound` listing the registered names), call records (`success`/`failure`/`is_error`, snake_case JSON round-trip, unknown-field and missing-`error` tolerance), the trace (order, duplicates, `used`/`used_all`/`count`, `coverage` bands, `missing` order and dedupe, `usage` counts, transparent serde), and `RunOutcome` (`new`/`with_trace`/`into_answer`, JSON defaults).
 - `loader.rs` covers size/emptiness/get/iteration/split (including ratios `0.0`, `1.0`, `NaN`, out of range), shuffle determinism and permutation preservation, and JSON round-trip plus defaulting.
-- `evaluator/tests.rs` covers every `LabelScorer` band and the Jaccard mapping, missing and single-entry answers, the `ModelPromptRunner` conversation and JSON parsing, provider-error propagation, scripted-runner replay and unknown cases, `RunnerEvaluator` mean scoring and custom scorers, `ModelEvaluator`, and the deterministic dimensions (placeholder loss, coverage, structure, degenerate length/repetition, case dependence, repeatability).
-- `optimizer/instruction.rs` covers improvement over the seed, repeat-run equality, validation, early stop at the seed and after one round, iteration/beam caps, placeholder preservation, the model-rewrite path with placeholder repair, fallback on unparsable/failed/empty answers, an injected evaluator, beam ranking, and `Debug`.
+- `evaluator/tests.rs` covers every `LabelScorer` band and the Jaccard mapping, missing and single-entry answers, the `ModelPromptRunner` conversation and JSON parsing, provider-error propagation, scripted-runner replay and unknown cases, `RunnerEvaluator` mean scoring and custom scorers, `ModelEvaluator`, the deterministic dimensions (placeholder loss, coverage, structure, degenerate length/repetition, case dependence, repeatability), and the tool-aware paths (declarations reaching `ModelCall::request`, the multi-round loop and trace order, parallel calls, unknown tools and failing stubs fed back, the zero-budget rejection, the looping-model bound, `ToolUsageScorer` bands/reasons, and traced parity of both evaluator presets).
+- `optimizer/instruction.rs` covers improvement over the seed, repeat-run equality, validation, early stop at the seed and after one round, iteration/beam caps, placeholder preservation, the model-rewrite path with placeholder repair, fallback on unparsable/failed/empty answers, an injected evaluator, beam ranking, the `<tools_description>` block reaching the rewrite prompt, and `Debug`.
 - `optimizer/example.rs` covers the Python example format, `num_examples == 0`, the case-count cap, score monotonicity, determinism, validation (including `MAX_EXAMPLE_NUM + 1`), early stop, model index lists and the order they impose, fallback on bad lists/failures, greedy completion of a short list, and an injected evaluator.
 - `optimizer/joint.rs` checks it is never worse than either coordinate alone, both coordinates contribute, `num_examples == 0`, determinism, early stop, iteration cap, validation, placeholder preservation, the model path, and a shared injected evaluator.
-- `optimizer/search.rs` covers the single sweep, dedupe/determinism, placeholder/seed contract, validation, a model rewrite winning, an unusable model answer, the seed winning, and `Debug`.
-- `optimizer/trainer.rs` covers baseline early stop, validation-score monotonicity, the epoch cap, the empty-validation fallback, empty-train validation, invalid config, `evaluate`, determinism, placeholder preservation, the model path, an injected evaluator, and the deterministic default.
-- `optimizer/suggestion.rs` covers placeholder parsing (including nested malformed braces), the repair, mutation ordering and idempotence, dedupe, input validation, the tie-break helpers, ordered batch scoring, model-rewrite extraction and degradation, worst-case selection, and the `key:value | …` rendering.
+- `optimizer/search.rs` covers the single sweep, dedupe/determinism, placeholder/seed contract, validation, a model rewrite winning, an unusable model answer, the seed winning, the tools block reaching the rewrite prompt, and `Debug`.
+- `optimizer/trainer.rs` covers baseline early stop, validation-score monotonicity, the epoch cap, the empty-validation fallback, empty-train validation, invalid config, `evaluate`, determinism, placeholder preservation, the model path, an injected evaluator, the deterministic default, and `evaluate_traced` (tool-usage counts, parity with `evaluate`, the empty case set, the tool-free path, an injected traced evaluator, and the `EvaluationSummary` JSON round-trip).
+- `optimizer/suggestion.rs` covers placeholder parsing (including nested malformed braces), the repair, mutation ordering and idempotence, dedupe, input validation, the tie-break helpers, ordered batch scoring, model-rewrite extraction and degradation, worst-case selection, the `key:value | …` rendering, and the tools block (`tools_description` parity JSON and its `None` fallback, cross-case dedupe, absence for tool-free case sets, and the pinned no-tools rewrite message).
 
 ## Deferred
 
@@ -110,10 +119,11 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `./base.rs` → `Case`, `EvaluatedCase`, validation, JSON round-trips
 - `./loader.rs` → `CaseLoader`, seeded PRNG, shuffle, split, iteration
 - `./tool.rs` → `ToolStub`/`ToolStubs`, `ToolCallRecord`/`ToolTrace`, `RunOutcome`, tool handlers
-- `./evaluator/` → the evaluator seam (`evaluator/mod.rs` re-exports the four submodules)
-- `./evaluator/runner.rs` → `PromptRunner`, `ModelPromptRunner`, `ScriptedPromptRunner`, case rendering, answer-map parsing
-- `./evaluator/scorer.rs` → `CaseScorer`, `LabelScorer`, band comparison, tokenization
-- `./evaluator/seam.rs` → `CaseEvaluator`, `RunnerEvaluator`, `ModelEvaluator`, score clamping
+- `./evaluator/` → the evaluator seam with its traced/untraced contract (`evaluator/CONTEXT.md`)
+- `./evaluator/CONTEXT.md` → evaluator intent, traced API surface, tool-execution constraints, design decisions
+- `./evaluator/runner.rs` → `PromptRunner`, `ModelPromptRunner` tool loop, `render_case_inputs`, `ScriptedPromptRunner`, `DEFAULT_MAX_TOOL_ROUNDS`
+- `./evaluator/scorer.rs` → `CaseScorer`, `LabelScorer`, `ToolUsageScorer`, band comparison, tokenization
+- `./evaluator/seam.rs` → `CaseEvaluator` (traced and untraced), `RunnerEvaluator`, `ModelEvaluator`, `tool_usage`, score clamping
 - `./evaluator/deterministic.rs` → `DeterministicEvaluator`, `DeterministicScore`, weights and dimensions
 - `./evaluator/tests.rs` → the evaluator test suite
 - `./optimizer.rs` → facade: tuning constants, `OptimizationResult`, `mod` declarations, re-exports, `optimize_prompt`
@@ -123,7 +133,7 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `./optimizer/example.rs` → `ExampleOptimizer`, `render_examples`, `format_prompt`
 - `./optimizer/joint.rs` → `JointOptimizer` alternating ascent
 - `./optimizer/search.rs` → `PromptSearchOptimizer` single sweep
-- `./optimizer/trainer.rs` → `Trainer` train/validation loop
+- `./optimizer/trainer.rs` → `Trainer` train/validation loop and `EvaluationSummary` traced reporting
 - `./mod.rs` → module docs, private submodules, public re-exports
 - `../judge/` → rubric-driven model judging (sibling — read-only here, not a dependency of `tune`)
 - `../../util.rs` → `extract_tag`, `extract_list_fence`, `extract_json_fence` (outside this node — read-only, escalate writes to the crate root)
