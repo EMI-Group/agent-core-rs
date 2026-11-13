@@ -18,7 +18,9 @@
 //! kernel [`openjiuwen_agent::AgentRail`] slot of the inner `ReActAgent`.
 //!
 //! Built-in rails live in dedicated modules: `security`, `memory`, `skills`,
-//! `subagent`, and `evolution` (the [`EvolutionRail`] seam and its adapter).
+//! `subagent`, and `evolution` (the [`EvolutionRail`] seam, its adapter, and the
+//! harness-side [`MetricsEvolutionRail`] with its metrics, proposal log and run
+//! snapshot).
 mod context;
 mod evolution;
 mod memory;
@@ -32,7 +34,11 @@ pub use context::{
     TaskIterationPhase, MEMORY_CONTEXT_EXTRA_KEY, MEMORY_QUERY_EXTRA_KEY,
     PROMPT_SECTIONS_EXTRA_KEY,
 };
-pub use evolution::{evolution_adapter, EvolutionRail, EvolutionRailAdapter, NoopEvolutionRail};
+pub use evolution::{
+    default_metrics_clock, evolution_adapter, EvolutionMetrics, EvolutionProposal, EvolutionRail,
+    EvolutionRailAdapter, EvolutionSnapshot, IterationRecorder, MetricsClock, MetricsEvolutionRail,
+    MetricsEvolutionRailConfig, NoopEvolutionRail, ProposalLog, EVOLUTION_SNAPSHOT_VERSION,
+};
 pub use memory::{
     LongTermMemoryAdapter, MemoryRail, MemoryRailConfig, MemoryRecall, MemoryWriteBack,
     RecalledMemory, TurnRecord, DEFAULT_MEMORY_SOURCE,

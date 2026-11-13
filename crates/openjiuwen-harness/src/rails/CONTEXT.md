@@ -2,10 +2,12 @@
 
 ## Intent
 
-The harness hook layer: one rail trait covering the nine kernel lifecycle events plus the four outer task-loop events, a priority-ordered copy-on-write registry, and the built-in rails (security, memory, skills, subagent, evolution seam).
+The harness hook layer: one rail trait covering the nine kernel lifecycle events plus the four outer task-loop events, a priority-ordered copy-on-write registry, and the built-in rails (security, memory, skills, subagent, evolution).
 Ports `openjiuwen/harness/rails/` and the hook model of `openjiuwen/core/single_agent/rail/base.py` (`AgentRail`).
+The evolution area is both a seam for the layer-6 orchestrators and a complete harness-side body (`MetricsEvolutionRail`) that records metrics, proposals and a run snapshot on its own.
 Rails never call the model and never execute tools: they mutate the context handed to them and return control signals.
 The agent owns the firing points; this module owns the contract.
+Deferred: the LLM-driven evolution bodies (RSI search, `agent_evolving` trainers) stay in their own crates and are not reimplemented here.
 
 ## API Surface
 
@@ -44,7 +46,17 @@ Built-in rails:
 - `SkillsRail` (priority `SKILLS` = 95): owns a `crate::skills::SkillLibrary` plus `SkillsRailConfig { budget: SkillBudget, language: Option<String> }`. `before_model_call` refreshes the discovery/selection cache when the invocation marked it stale, then publishes `prompts::skills_section(&selected)`. `after_invoke` marks the cache stale so the next invocation re-discovers; `library_mut()` also re-stales. A discovery error is logged and keeps the previous selection, so `refresh()` never fails today. Accessors `skills()`, `library()`, `library_mut()`, `budget()`, `config()`, `refresh()` (explicit async refresh).
 - `SubagentRail` (priority `SUBAGENT` = 95): publishes `prompts::subagent_section()` on `before_model_call` and exposes an optional `Arc<dyn SubAgentSpawner>`.
 - Subagent seam: `spawn(SubAgentSpawner::spawn(SpawnRequest)) -> Result<SubAgentHandle>`, `wait(id, Option<Duration>) -> Result<SubAgentStatus>`, `list() -> Result<Vec<SubAgentStatus>>`, `send_input(id, String) -> Result<()>`, `close(id) -> Result<()>`; data types `SpawnRequest { prompt, preset, agent_id, parent_task_id }`, `SubAgentHandle { id, preset }`, `SubAgentStatus { id, state, output, error }`, `SubAgentState { Running, Completed, Failed, Closed }`. The runtime lives in `crate::subagents`; this module only defines the seam.
-- `EvolutionRail` (priority `EVOLUTION` = 60) + `NoopEvolutionRail`: `on_before_invoke` / `on_after_task_iteration` plus `name()`/`priority()`. `EvolutionRailAdapter` (built by `evolution_adapter`) implements `HarnessRail` and is the only entry into the registry; it logs and swallows hook errors, so an evolution failure never aborts a run. No dependency on `openjiuwen-agent-evolving`.
+- `EvolutionRail` (priority `EVOLUTION` = 60) + `NoopEvolutionRail`: synchronous metadata hooks `on_before_invoke`, `on_after_model_call`, `on_after_tool_call`, `on_after_task_iteration`, `on_after_invoke` plus `name()`/`priority()`. Every hook is a no-op `Ok(())` default, so an upper-layer implementation overrides only what it needs and the layer-6 orchestrators keep compiling.
+- Evolution hook context: `on_before_invoke` sees the run identity (`base.agent_id`, `base.session`) and an empty `base.extra`; `on_after_model_call` sees `base.response` (message with tool calls, `usage`, `finish_reason`) and `base.iteration`; `on_after_tool_call` sees `base.tool_call` and/or `base.tool_result` (either may be absent, so read defensively); `on_after_task_iteration` sees `ctx.task` (`TaskIterationInfo`) — `base.event` is *not* a reliable phase discriminator there; `on_after_invoke` sees the terminal `base.output` (`termination_reason`/`finish_reason`) and the whole run's `extra`.
+- `EvolutionRailAdapter` (built by `evolution_adapter`) implements `HarnessRail`, forwards exactly those five hooks, and logs and swallows every hook `Err` — an evolution failure never aborts a run; the other eight harness hooks stay no-ops.
+- `MetricsEvolutionRail` (`name()` = `"metrics-evolution"`, priority `EVOLUTION`): the harness-side body that needs no upper layer — mints a fresh `run_id` and clears both buffers on `on_before_invoke`, counts model calls/usage/finish reason, counts tool calls by name and failures, closes one `EvolutionMetrics` row per task iteration, and writes the snapshot on `on_after_invoke`.
+- `MetricsEvolutionRailConfig { metrics_capacity: 256, proposal_capacity: 64, snapshot_path: None, proposal_path: None }` with `with_*` setters; `0` capacity means unbounded, a missing path means "in memory only".
+- `EvolutionMetrics` (serde + `JsonSchema` + `Default`): `iteration`, `elapsed_ms`, `model_calls`, `tool_calls`, `failed_tool_calls`, `tool_calls_by_name: BTreeMap<String, u64>`, optional `input_tokens`/`output_tokens`/`total_tokens` (left `None` unless a reported sum is `> 0`, via `with_usage`), `stop_reason`; helper `record_tool_call(name, failed)`.
+- `IterationRecorder`: bounded ring buffer (`capacity == 0` unbounded, oldest evicted first) over `EvolutionMetrics` with `push`, `list`, `clear`, `capacity`, `len`, `is_empty`, `now_ms`, and `totals()` (folded counters, merged per-tool map, summed tokens, last non-`None` stop reason, `iteration` = folded row count).
+- `MetricsClock = Arc<dyn Fn() -> u64 + Send + Sync>` with `default_metrics_clock()` (monotonic milliseconds since the first reading) and `IterationRecorder::with_clock` / `MetricsEvolutionRail::with_clock` for deterministic tests.
+- `ProposalLog` (bounded, oldest first) + `EvolutionProposal { id, kind, summary, created_at_ms }`: `new(capacity)`, `with_path`, `path`, `push`, `entries`, `clear`, `save`, `load`. `save` is atomic (`<path>.tmp` + rename) and returns `Error::config` without a configured path; `load` returns `Error::validation` on a malformed document and an empty log when the file is absent. The document is `{"version": 1, "proposals": [...]}`; a bare array is accepted too. `MetricsEvolutionRail::push_proposal` stamps an unstamped (`created_at_ms == 0`) proposal with the rail clock.
+- `EvolutionSnapshot` (`EVOLUTION_SNAPSHOT_VERSION` = 1; serde + `JsonSchema`): `version`, `run_id`, `agent_id`, `session_id`, `started_at_ms`, `finished_at_ms`, `duration_ms`, `iteration_count`, `model_calls`, `tool_calls`, `failed_tool_calls`, `stop_reason`, `iterations`, `proposals`; `save(&Path)` / `load(&Path)` use the same atomic writer, tolerate unknown fields, and default a missing `version` to 1.
+- The rail's fallible surface stays public — `snapshot()` (in memory, and complete even mid-run because unflushed counters are folded in) and `write_snapshot()` — while the hooks only `tracing::warn!` a failure and swallow it.
 
 ## Constraints
 
@@ -53,7 +65,9 @@ Built-in rails:
 - Never log prompt text, tool arguments/outputs, memory content, or secrets: log guardrail/pipeline names, counts and risk types only.
 - Only this module imports `openjiuwen_security` / `openjiuwen_memory` kernel APIs, and it must not import `crate::tools`, `crate::agent`, or `crate::subagents`.
 - No panics on user input, no `unsafe`, `tracing` only (no stdout), files ≤1000 lines, every public item documented.
-- Per-invocation state lives in `ctx.extra` or in the context, never in rail fields (rails are shared across invocations).
+- Per-invocation state lives in `ctx.extra` or in the context, never in rail fields (rails are shared across invocations); `MetricsEvolutionRail` is the documented exception — it keeps its counters in a `parking_lot::Mutex` because an invocation is its unit of work.
+- The evolution module imports no evolution crate, reads time only through `MetricsClock`, and writes files only through the `evolution/store.rs` atomic writer (`<path>.tmp` + rename); no new crates.io dependencies.
+- Evolution failures are isolated: IO and serialization errors from `MetricsEvolutionRail` are `tracing::warn!`-ed and swallowed, and the rail never logs proposal summaries or prompt text.
 
 ## Design decisions
 
@@ -61,6 +75,8 @@ Built-in rails:
 - Python's `_skip_tool`/`tool_result` convention and "model-event reject → `request_force_finish`" become: `skip_tool` for tool inputs, `Error::security` for prompt/user/model-output and tool-output blocks. Documented deviation: an aborting error is unambiguous in Rust and already means "abort the run".
 - Live services arrive as seam traits (`MemoryRecall`, `MemoryWriteBack`, `SubAgentSpawner`, `EvolutionRail`) instead of builder-wired objects, so this module stays free of runtime dependencies and upper layers keep the wiring.
 - The prompt-section channel is a JSON contract in `ctx.extra`, not a rail-owned builder handle: the agent renders sections when it assembles the prompt, and rails stay pure context mutators.
+- The evolution trait is deliberately additive: the three `on_after_*` hooks arrived with no-op defaults so the layer-6 orchestrators (`openjiuwen-agent-evolving`, `openjiuwen-rsi`) keep compiling unchanged and decide which firing points they want.
+- Metrics are sampled at the harness instead of being reconstructed by the orchestrator: the rail sees `AfterModelCall`/`AfterToolCall`/`AfterTaskIteration`, which no upper layer observes directly, and the persisted snapshot is the artefact they consume.
 
 ## Routing Table
 
@@ -71,7 +87,13 @@ Built-in rails:
 - `./memory.rs` → `MemoryRail`, `MemoryRecall`/`MemoryWriteBack` seams, `LongTermMemoryAdapter`
 - `./skills.rs` → `SkillsRail` (discovery cache, budget, skills prompt section)
 - `./subagent.rs` → `SubagentRail` + `SubAgentSpawner` seam and request/status data
-- `./evolution.rs` → `EvolutionRail`, `NoopEvolutionRail`, `EvolutionRailAdapter` (failure-isolating bridge)
+- `./evolution/` → the self-evolution rail seam and its harness-side bodies
+- `./evolution/mod.rs` → `EvolutionRail` (five hooks), `NoopEvolutionRail`, `EvolutionRailAdapter`/`evolution_adapter`, module re-exports
+- `./evolution/metrics.rs` → `EvolutionMetrics`, `IterationRecorder`, `MetricsClock`, `default_metrics_clock`
+- `./evolution/proposal.rs` → `EvolutionProposal`, `ProposalLog` (bounded, atomic save/load)
+- `./evolution/snapshot.rs` → `EvolutionSnapshot` (+ `EVOLUTION_SNAPSHOT_VERSION`), save/load
+- `./evolution/rail.rs` → `MetricsEvolutionRail`, `MetricsEvolutionRailConfig`, run state and hook bodies
+- `./evolution/store.rs` → shared atomic JSON writer/reader (`<path>.tmp` + rename)
 
 ## Test Strategy
 
@@ -83,6 +105,11 @@ Built-in rails:
 - `memory.rs`: fake recaller/writer — injection position and `<memory-context>` wrapper, no memories → no message, recall/write-back errors swallowed, turn content handed to the writer, `LongTermMemoryAdapter` round-trip over an in-memory facade.
 - `skills.rs`: temp roots with `SKILL.md` — refresh selects and publishes the section, budget/disabled filtering, stale-once-per-invocation refresh, missing roots degrade to an empty selection.
 - `subagent.rs`: section publication, spawner accessor, a fake spawner exercises the whole seam.
-- `evolution.rs`: adapter forwards `before_invoke`/`after_task_iteration`, swallows failures, `NoopEvolutionRail` name/priority.
+- `evolution/mod.rs`: adapter forwards all five hooks exactly once, swallows an `Err` from every hook, leaves the other harness hooks as no-ops, and `NoopEvolutionRail` mutates nothing (`name`/`priority` asserted).
+- `evolution/metrics.rs`: usage stays `None` unless reported, per-tool/failure counting, bounded eviction order, unbounded `capacity == 0`, `clear`, injectable clock, folded totals incl. an empty recorder.
+- `evolution/proposal.rs`: uuid + stamping, insertion order, cap eviction, atomic save/load round-trip, bare-array documents, missing file → empty, save without path → `Error::config`, malformed JSON → `Error::validation`.
+- `evolution/snapshot.rs`: version default, save/load round-trip, unknown-field tolerance, missing file → `Error::config`, malformed → `Error::validation`, unwritable destination → `Error::config`.
+- `evolution/rail.rs`: one metrics row per iteration (counts, failures, per-tool map, tokens, stop reason), counter reset between iterations, unflushed counters still in the totals, proposal stamping/ordering/cap and a clean buffer per run, snapshot round-trip through a temp file, fresh `run_id` per run, proposal-log persistence, a failing write swallowed by the hook but visible on `write_snapshot()`, no path → no write.
+- `evolution/store.rs`: round-trip, missing file, malformed document, unwritable destination, temporary-path suffix.
 - Parity references: `tests/unit_tests/harness/test_deep_agent_rail_event_routing.py`, `rails/test_typed_interrupts.py`, `rails/test_base_security_rail.py`, `rails/evolution/test_evolution_rail.py`, `test_skill_rail.py`, `rails/test_memory_rail.py`.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings` clean.
