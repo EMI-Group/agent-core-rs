@@ -43,8 +43,12 @@ pub mod truncate;
 pub use self::compressor::{
     find_last_completed_round_end, group_completed_rounds, is_memory_block,
     iter_summary_merge_ranges, summarize, summarize_offline, CurrentRoundCompressor,
-    CurrentRoundCompressorConfig, DialogueCompressor, DialogueCompressorConfig, MemoryBlockKind,
-    CURRENT_ROUND_MEMORY_BLOCK, DIALOGUE_MEMORY_BLOCK, ROUND_LEVEL_MEMORY_BLOCK,
+    CurrentRoundCompressorConfig, DialogueCompressor, DialogueCompressorConfig,
+    FullCompactProcessor, FullCompactProcessorConfig, MemoryBlockKind, MicroCompactProcessor,
+    MicroCompactProcessorConfig, RoundLevelCompressor, RoundLevelCompressorConfig,
+    CURRENT_ROUND_MEMORY_BLOCK, DIALOGUE_MEMORY_BLOCK, FULL_COMPACT_BOUNDARY,
+    FULL_COMPACT_BOUNDARY_TEXT, FULL_COMPACT_SUMMARY_INTRO, MICRO_COMPACT_CLEARED_MARKER,
+    ROUND_LEVEL_MEMORY_BLOCK, TRUNCATED_FULL_CONTEXT_SCOPE,
 };
 pub use self::offloader::{
     wildcard_match, MessageOffloadRole, MessageOffloader, MessageOffloaderConfig,
@@ -196,6 +200,26 @@ impl ContextPipeline {
                         model.clone(),
                     )));
                 }
+                ProcessorConfig::RoundLevel(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(RoundLevelCompressor::new(
+                        config.clone(),
+                        model.clone(),
+                    )));
+                }
+                ProcessorConfig::FullCompact(config) => {
+                    // The integration round wires the session-memory store; here
+                    // the processor always has the model-summary path available.
+                    processors.push(Arc::new(FullCompactProcessor::new(
+                        config.clone(),
+                        model.clone(),
+                        None,
+                    )));
+                }
+                ProcessorConfig::MicroCompact(config) => {
+                    config.validate()?;
+                    processors.push(Arc::new(MicroCompactProcessor::new(config.clone())));
+                }
                 ProcessorConfig::MessageOffloader(config) => {
                     config.validate()?;
                     processors.push(Arc::new(MessageOffloader::new(
@@ -289,6 +313,12 @@ pub enum ProcessorConfig {
     DialogueCompressor(DialogueCompressorConfig),
     /// Compress the earlier part of the current round into a memory block.
     CurrentRoundCompressor(CurrentRoundCompressorConfig),
+    /// Compress a history down to a total token target with the fallback ladder.
+    RoundLevel(RoundLevelCompressorConfig),
+    /// Replace an exhausted conversation with one boundary and summary.
+    FullCompact(FullCompactProcessorConfig),
+    /// Clear the text of stale tool results, keeping the newest ones per tool.
+    MicroCompact(MicroCompactProcessorConfig),
     /// Offload large messages once the history outgrows the thresholds.
     MessageOffloader(MessageOffloaderConfig),
     /// Enforce a per-round token budget on tool results.

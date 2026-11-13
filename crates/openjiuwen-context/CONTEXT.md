@@ -103,14 +103,22 @@ let recovered: RecoveryOutcome = engine
 - `./src/processor/tool_result.rs` → `ToolResultProcessor` + config (per-result truncation and offload)
 - `./src/processor/offloader.rs` → `MessageOffloader`, `ToolResultBudgetProcessor`, `ToolResultWindowProcessor`, shared offloader helpers (protection patterns, placeholder, marker/event builders)
 - `./src/processor/summary_offloader.rs` → `MessageSummaryOffloader` + config, offline head/tail summary
+- `./src/processor/compressor/mod.rs` → shared compressor helpers (memory-block envelope, completed-round grouping, merge ranges, offline/LLM summarisation)
+- `./src/processor/compressor/dialogue.rs` → `DialogueCompressor` (whole-dialogue compaction)
+- `./src/processor/compressor/current_round.rs` → `CurrentRoundCompressor` (in-flight round compaction)
+- `./src/processor/compressor/round_level.rs` → `RoundLevelCompressor` (per-round blocks, recursive merge, aggressive pass, hard truncation)
+- `./src/processor/compressor/compact.rs` → `FullCompactProcessor` (boundary detection, kept tail, session-memory or LLM full compaction)
+- `./src/processor/compressor/micro_compact.rs` → `MicroCompactProcessor` (deterministic per-tool tool-result clearing)
 - `./tests/engine.rs` → engine end-to-end suite (prepare/observe/compress/recovery/persistence)
 - `./tests/processors.rs` → pipeline ordering, truncation, tool-result offload, summarisation, event serde
 - `./tests/offloaders.rs` → the four offloader processors, placeholder/flag/marker formats, store contents, `ProcessorConfig` tags, pipeline wiring
 - `./tests/offload.rs` → marker wire format, key isolation across all three stores, rehydration round-trips
+- `./tests/compressors_round_level.rs` → round-level ladder: blocks per round, pair safety, merge, aggressive pass, hard truncation, events
+- `./tests/compressors_compact.rs` → full-compact boundary/kept-tail/session-memory paths and micro-compact clearing, `ProcessorConfig` tags
 
 ## Test Strategy
 
-- Unit tests live beside each module (114 tests); integration suites live in `crates/openjiuwen-context/tests/` (131 tests); doc tests cover the crate-level example paths (8).
+- Unit tests live beside each module (123 tests); integration suites live in `crates/openjiuwen-context/tests/` (216 tests); doc tests cover the crate-level example paths (9).
 - Deterministic offline tests use `ApproxTokenCounter::with_chars_per_token(1)` (via `TokenCounterKind::Characters`) and `openjiuwen_test_support::ScriptedModel` as the `Model`; sessions are real `openjiuwen_session::AgentSession` instances.
 - Covered behaviors: window assembly with round/message budgets, leading-tool stripping, per-role stats, overflow detection, every processor, summary replacement with system/recent preservation, tool-pair preservation, offload/rehydrate round-trip, session isolation, `noop`/`compressed`/`busy`, overflow recovery refusal after streamed chunks, config serde round-trip, cancellation, `save_contexts`/`load_contexts` round-trip, corrupt-state tolerance, and for the offloaders: trim/placeholder wire formats, keep boundaries, protection patterns, the per-round budget order, the global tool window, managed-flag idempotence, and the offline summary fallback.
 - `cargo test -p openjiuwen-context --offline` must pass; `cargo clippy -p openjiuwen-context --all-targets --offline -- -D warnings` and `cargo fmt -p openjiuwen-context -- --check` must be clean.
@@ -120,7 +128,7 @@ let recovered: RecoveryOutcome = engine
 - Tokenizer registry/selector/artifact manager, native `tokenizer.json` loading, download logic, and model-specific BPE parity (`Tiktoken` uses `cl100k_base` with the documented heuristic fallback).
 - Usage/KV-cache telemetry (`ContextUsageAnalyzer`, `SessionKVCacheAggregator`, `context.usage` snapshots) beyond `ContextStats` and compression before/after counts.
 - Provider-specific context policies, `ContextWindowChange`/KV-cache eviction detection, OpenRouter context-window cache, and `model_revision`/`position` diffing.
-- The Python compressor family not represented here: `RoundLevelCompressor`, `FullCompactProcessor`, `MicroCompactProcessor`; their essential behaviors are covered by the Rust truncation, tool-result, summarisation, and compressor processors.
+- Python's adaptive strategy selection inside the compressor family (model-chosen passes, task extraction, JSON-schema memory blocks): the Rust compressors run a fixed deterministic ladder with an optional single summary call.
 - Python's adaptive summarisation pipeline inside `MessageSummaryOffloader` (task extraction, JSON-schema output, `offload_data_explanation`, `enable_precise_step`, strategy selection): the Rust processor makes one summary call with a fixed system prompt and falls back to a deterministic head/tail summary.
 - `processor/forked/` registry monkey-patching, session-memory agent, `[SESSION_MEMORY_BOUNDARY]` reinjection, skill/tool reinjection, and compression observability hooks beyond `ContextEvent`/`tracing`.
 - Compression-recall chunking, `enable_reload` filesystem rehydration prompt injection, and per-processor `save_state`/`load_state` checkpointing (the trait hooks exist but the engine does not persist processor state).

@@ -17,8 +17,11 @@
 //! - [`summarize_offline`] and [`summarize`] — the deterministic fallback and
 //!   the (optional) model-backed summary. Neither ever fails, so the pipeline
 //!   keeps working offline.
+pub mod compact;
 pub mod current_round;
 pub mod dialogue;
+pub mod micro_compact;
+pub mod round_level;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -28,8 +31,18 @@ use std::sync::Arc;
 use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::prompt::{BaseMessage, Role};
 
+pub use self::compact::{
+    FullCompactProcessor, FullCompactProcessorConfig, FULL_COMPACT_BOUNDARY,
+    FULL_COMPACT_BOUNDARY_TEXT, FULL_COMPACT_SUMMARY_INTRO,
+};
 pub use self::current_round::{CurrentRoundCompressor, CurrentRoundCompressorConfig};
 pub use self::dialogue::{DialogueCompressor, DialogueCompressorConfig};
+pub use self::micro_compact::{
+    MicroCompactProcessor, MicroCompactProcessorConfig, MICRO_COMPACT_CLEARED_MARKER,
+};
+pub use self::round_level::{
+    RoundLevelCompressor, RoundLevelCompressorConfig, TRUNCATED_FULL_CONTEXT_SCOPE,
+};
 
 /// Marker that opens a historical dialogue memory block.
 pub const DIALOGUE_MEMORY_BLOCK: &str = "[DIALOGUE_MEMORY_BLOCK]";
