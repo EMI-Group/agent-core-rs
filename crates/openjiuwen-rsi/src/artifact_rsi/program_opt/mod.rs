@@ -3,7 +3,7 @@
 //! Python parity: `openjiuwen.rsi.artifact_rsi.program_opt` (v0.1.20). The Rust
 //! port keeps the portable half — the configuration record and the flat tree with
 //! its selection rule — and leaves everything that needs a model client, a
-//! sandbox, git or subprocesses to the caller (`deferred::runtime`,
+//! sandbox, git or subprocesses to the caller (`crate::runtime`,
 //! `deferred::agentdescent`).
 //!
 //! - [`config`] — [`ProgramOptConfig`], [`ReplyFormat`] and the worker bounds.

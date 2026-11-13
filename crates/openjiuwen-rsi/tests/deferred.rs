@@ -1,13 +1,15 @@
-//! Offline integration suite for the deferred (`Error::Unsupported`) surfaces of
-//! `openjiuwen-rsi`.
+//! Offline integration suite for the surfaces of `openjiuwen-rsi` that remain
+//! deferred (`Error::Unsupported`).
 //!
-//! Ports the gap-detection contract of the crate `CONTEXT.md` `## Deferred Scope`
-//! table: every Python surface listed there (agentdescent, subprocess/runtime
-//! infrastructure, benchmark evaluators, paper and member optimisation) is an
-//! API-shaped stub in the Rust port, and each stub must fail loudly with
-//! `ErrorKind::Unsupported` instead of returning a silent placeholder. Python
-//! implements these surfaces, so there is no Python test to mirror; the tests
-//! here pin the *Rust* contract:
+//! The implemented runtime, evaluator, and optimiser surfaces moved out of this
+//! suite: the command/git/CI/Python/subprocess layers live in
+//! `openjiuwen_rsi::runtime`, the case records and benchmark runtimes in
+//! `openjiuwen_rsi::harness_rsi::evaluator`, member optimisation in
+//! `openjiuwen_rsi::harness_rsi::member_optimizer`, and paper optimisation in
+//! `openjiuwen_rsi::artifact_rsi::paper_opt`; `tests/crate_surface.rs` pins their
+//! flat re-exports. What is left is the crate `CONTEXT.md` `## Deferred Scope`
+//! residue, and each stub must fail loudly with `ErrorKind::Unsupported` instead
+//! of returning a silent placeholder:
 //!
 //! - the documented constructor always fails, so a caller cannot build one of
 //!   these types by accident and mistake it for a working implementation;
@@ -23,9 +25,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 
 use openjiuwen_rsi::{
-    CiGate, ErrorKind, EvolutionEngine, EvolutionPolicy, GitBackend, LlmJudgeEvaluator,
-    MemberOptimizer, PaperOptimizer, Result, RuntimeExtensionLoader, SubprocessEvaluator,
-    SweBenchEvaluator, TerminalBenchEvaluator,
+    ErrorKind, EvolutionEngine, EvolutionPolicy, LlmJudgeEvaluator, Result, RuntimeExtensionLoader,
 };
 use serde_json::{json, Value};
 
@@ -88,69 +88,28 @@ fn evolution_engine_is_deferred() {
     );
 }
 
-/// CONTEXT.md `## Deferred Scope` row: `program_opt` runtime/provisioning and
-/// `auto_harness.infra.{worktree_manager,ci_gate_runner,runtime_extension_loader,
-/// git_operations}` — all of which need subprocess, pip, or git-host execution.
+/// CONTEXT.md `## Deferred Scope` row:
+/// `auto_harness.infra.runtime_extension_loader` — synthetic `sys.modules`
+/// hot-loading has no Rust analogue.
 #[test]
-fn runtime_surfaces_are_deferred() {
-    assert_surface_pair(
-        SubprocessEvaluator::new(),
-        SubprocessEvaluator::evaluate(json!({"program": "print(1)", "timeout": 60})),
-        "subprocess program evaluator",
-    );
+fn runtime_extension_loader_is_deferred() {
     assert_surface_pair(
         RuntimeExtensionLoader::new(),
         RuntimeExtensionLoader::load(json!({"module": "openjiuwen.runtime_ext"})),
         "runtime extension loader",
     );
-    assert_surface_pair(
-        CiGate::new(),
-        CiGate::run(json!({"commands": ["ruff check", "pytest"]})),
-        "CI gate runner",
-    );
-    assert_surface_pair(
-        GitBackend::new(),
-        GitBackend::apply(json!({"branch": "rsi/session-1", "patch": "diff --git"})),
-        "git backend",
-    );
 }
 
-/// CONTEXT.md `## Deferred Scope` row: `harness_rsi.evaluator.{swebench_runtime,
-/// terminal_bench_runtime,judger}` — benchmark runtimes and judge-model
-/// plumbing, all needing external toolchains or a live model.
+/// CONTEXT.md `## Deferred Scope` row: `harness_rsi.evaluator.judger` —
+/// judge-model plumbing and prompt construction need the harness layer. The
+/// benchmark runtimes are implemented and are covered by
+/// `tests/evaluator_benchmarks.rs`.
 #[test]
-fn evaluator_surfaces_are_deferred() {
-    assert_surface_pair(
-        SweBenchEvaluator::new(),
-        SweBenchEvaluator::evaluate(json!({"instance_id": "django__django-11099"})),
-        "SWE-bench evaluator",
-    );
-    assert_surface_pair(
-        TerminalBenchEvaluator::new(),
-        TerminalBenchEvaluator::evaluate(json!({"task_id": "hello-world"})),
-        "terminal-bench evaluator",
-    );
+fn llm_judge_evaluator_is_deferred() {
     assert_surface_pair(
         LlmJudgeEvaluator::new(),
         LlmJudgeEvaluator::evaluate(json!({"rubric": "passes the tests", "answer": "ok"})),
         "LLM judge evaluator",
-    );
-}
-
-/// CONTEXT.md `## Deferred Scope` rows: `artifact_rsi.paper_opt.auto_research`
-/// and `harness_rsi.{evaluation_result_analyzer,member_optimizer}` — agent-driven
-/// pipelines with no portable core.
-#[test]
-fn optimiser_surfaces_are_deferred() {
-    assert_surface_pair(
-        PaperOptimizer::new(),
-        PaperOptimizer::optimize(json!({"paper_dir": "/tmp/paper", "topic": "rsi"})),
-        "paper optimiser",
-    );
-    assert_surface_pair(
-        MemberOptimizer::new(),
-        MemberOptimizer::optimize(json!({"member": "teammate-1", "failures": ["timeout"]})),
-        "member optimiser",
     );
 }
 
@@ -214,7 +173,7 @@ fn evolution_policy_rejects_unknown_names() {
 }
 
 /// The reason attached to a deferred error is per-surface, so a caller can tell
-/// the ten deferred families apart from the message alone.
+/// the three remaining deferred families apart from the message alone.
 #[test]
 fn deferred_reasons_are_surface_specific() {
     let surfaces = [
@@ -223,40 +182,12 @@ fn deferred_reasons_are_surface_specific() {
             "agentdescent evolution engine",
         ),
         (
-            assert_deferred(SubprocessEvaluator::new(), "subprocess program evaluator"),
-            "subprocess program evaluator",
-        ),
-        (
             assert_deferred(RuntimeExtensionLoader::new(), "runtime extension loader"),
             "runtime extension loader",
         ),
         (
-            assert_deferred(CiGate::new(), "CI gate runner"),
-            "CI gate runner",
-        ),
-        (
-            assert_deferred(GitBackend::new(), "git backend"),
-            "git backend",
-        ),
-        (
-            assert_deferred(SweBenchEvaluator::new(), "SWE-bench evaluator"),
-            "SWE-bench evaluator",
-        ),
-        (
-            assert_deferred(TerminalBenchEvaluator::new(), "terminal-bench evaluator"),
-            "terminal-bench evaluator",
-        ),
-        (
             assert_deferred(LlmJudgeEvaluator::new(), "LLM judge evaluator"),
             "LLM judge evaluator",
-        ),
-        (
-            assert_deferred(PaperOptimizer::new(), "paper optimiser"),
-            "paper optimiser",
-        ),
-        (
-            assert_deferred(MemberOptimizer::new(), "member optimiser"),
-            "member optimiser",
         ),
     ];
 
@@ -267,8 +198,8 @@ fn deferred_reasons_are_surface_specific() {
             "`{surface}` must not reuse another surface's reason"
         );
     }
-    assert_eq!(reasons.len(), 10, "all ten deferred surfaces are covered");
+    assert_eq!(reasons.len(), 3, "all three deferred surfaces are covered");
 
-    let rejected: Result<Value> = PaperOptimizer::optimize(Value::Null);
-    assert_deferred(rejected, "paper optimiser");
+    let rejected: Result<Value> = RuntimeExtensionLoader::load(Value::Null);
+    assert_deferred(rejected, "runtime extension loader");
 }

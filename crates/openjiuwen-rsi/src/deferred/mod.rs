@@ -1,21 +1,35 @@
-//! API-shaped stubs for the Python surfaces deferred to a future milestone.
+//! API-shaped stubs for the Python surfaces that stay out of scope.
 //!
-//! Python's `openjiuwen.rsi` package spans ~97k lines across 313 files; part of
-//! it needs an ML runtime, a vendor harness SDK, subprocess/git execution, or
-//! distributed evolution, none of which the offline, deterministic Rust port
-//! ships. Rather than dropping those areas silently, every one of them keeps its
-//! public shape here so a caller can write against the eventual API and detect
-//! the gap programmatically by matching
-//! [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported).
+//! Python's `openjiuwen.rsi` package spans ~97k lines across 313 files. Most of
+//! it is ported: subprocess/git/CI execution and program evaluation live in
+//! [`crate::runtime`], run usage accounting in [`crate::ledger`], case records,
+//! judge scoring, the benchmark runtimes and metrics in
+//! [`crate::harness_rsi::evaluator`], member optimisation in
+//! [`crate::harness_rsi::member_optimizer`], the promotion loops in
+//! [`crate::harness_rsi::single_harness`], and paper optimisation in
+//! [`crate::artifact_rsi::paper_opt`].
 //!
-//! Every entry point returns [`Error::Unsupported`]
-//! built by `not_implemented`, whose message reads
-//! `<surface> is not implemented in the Rust port: <reason>` and names the
-//! crate `CONTEXT.md` `## Deferred Scope` table. The documented constructors
-//! always fail, so a caller cannot build one of these types by accident and
-//! mistake it for a working implementation; the operations are associated
-//! functions (`EvolutionEngine::evolve`, `GitBackend::apply`, …) so the error is
-//! reachable without a value.
+//! Three surfaces still need something the offline, deterministic Rust port
+//! cannot ship. Rather than dropping them silently, each keeps its public shape
+//! here so a caller can write against the eventual API and detect the gap
+//! programmatically by matching
+//! [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported):
+//!
+//! - [`agentdescent::EvolutionEngine`] — the `agentdescent==0.4.6`
+//!   evolve/ledger/aggregator internals carry distributed, deep-RL training
+//!   machinery with no maintained Rust equivalent.
+//! - [`evaluators::LlmJudgeEvaluator`] — a guarded judge model and its prompt
+//!   construction belong to the harness layer, not to this crate.
+//! - [`runtime::RuntimeExtensionLoader`] — Python's `sys.modules` hot-loading
+//!   has no Rust analogue.
+//!
+//! Every entry point returns [`Error::Unsupported`] built by
+//! `not_implemented`, whose message reads
+//! `<surface> is not implemented in the Rust port: <reason>`. The documented
+//! constructors always fail, so a caller cannot build one of these types by
+//! accident and mistake it for a working implementation; the operations are
+//! associated functions (`EvolutionEngine::evolve`, …) so the error is reachable
+//! without a value.
 //!
 //! The one implemented type is [`EvolutionPolicy`], which is ordinary data: it
 //! parses, formats, and round-trips through serde like any other public type.
@@ -24,15 +38,11 @@ use openjiuwen_common::error::Error;
 
 pub mod agentdescent;
 pub mod evaluators;
-pub mod member_optimizer;
-pub mod paper_opt;
 pub mod runtime;
 
 pub use agentdescent::{EvolutionEngine, EvolutionPolicy};
-pub use evaluators::{LlmJudgeEvaluator, SweBenchEvaluator, TerminalBenchEvaluator};
-pub use member_optimizer::MemberOptimizer;
-pub use paper_opt::PaperOptimizer;
-pub use runtime::{CiGate, GitBackend, RuntimeExtensionLoader, SubprocessEvaluator};
+pub use evaluators::LlmJudgeEvaluator;
+pub use runtime::RuntimeExtensionLoader;
 
 /// Builds the explicit [`Error::Unsupported`] every deferred entry point
 /// returns.
@@ -88,48 +98,21 @@ mod tests {
     }
 
     #[test]
-    fn runtime_surfaces_are_deferred() {
-        assert!(SubprocessEvaluator::new().is_err());
-        assert_deferred(
-            SubprocessEvaluator::evaluate(json!({"program": "print(1)"})),
-            "subprocess program evaluator",
-        );
+    fn runtime_extension_loader_is_deferred() {
         assert!(RuntimeExtensionLoader::new().is_err());
         assert_deferred(
             RuntimeExtensionLoader::load(Value::Null),
             "runtime extension loader",
         );
-        assert!(CiGate::new().is_err());
-        assert_deferred(CiGate::run(Value::Null), "CI gate runner");
-        assert!(GitBackend::new().is_err());
-        assert_deferred(GitBackend::apply(Value::Null), "git backend");
     }
 
     #[test]
-    fn evaluator_surfaces_are_deferred() {
-        assert!(SweBenchEvaluator::new().is_err());
-        assert_deferred(
-            SweBenchEvaluator::evaluate(Value::Null),
-            "SWE-bench evaluator",
-        );
-        assert!(TerminalBenchEvaluator::new().is_err());
-        assert_deferred(
-            TerminalBenchEvaluator::evaluate(Value::Null),
-            "terminal-bench evaluator",
-        );
+    fn llm_judge_evaluator_is_deferred() {
         assert!(LlmJudgeEvaluator::new().is_err());
         assert_deferred(
             LlmJudgeEvaluator::evaluate(Value::Null),
             "LLM judge evaluator",
         );
-    }
-
-    #[test]
-    fn optimiser_surfaces_are_deferred() {
-        assert!(PaperOptimizer::new().is_err());
-        assert_deferred(PaperOptimizer::optimize(Value::Null), "paper optimiser");
-        assert!(MemberOptimizer::new().is_err());
-        assert_deferred(MemberOptimizer::optimize(Value::Null), "member optimiser");
     }
 
     #[test]
