@@ -4,6 +4,8 @@
 
 Provider-neutral model invocation: the `Model` trait, the two transports (OpenAI-compatible chat completions, Anthropic Messages), the serializable configs, and the provider registry/factory.
 Ports `openjiuwen/core/foundation/llm/` (`model.py`, `schema/config.py`, `model_clients/*`).
+Four side surfaces sit beside the chat clients: `reasoning/` (provider/model thinking profiles and wire encoders), `routing/` (IntelliRouter model groups, route compilation, ordered failover), `oauth/` (`OpenAI` account device authorization and token storage), and `dashscope/` (`DashScope` image, speech and video generation over HTTP).
+They are independent of each other; `reasoning` is the only one the request builders call, and `routing` is the only one that builds models.
 
 ## API Surface
 
@@ -27,11 +29,38 @@ Ports `openjiuwen/core/foundation/llm/` (`model.py`, `schema/config.py`, `model_
 - `ModelProviderRegistry` (`new`, `register`, `get`, `resolve`, `names`, `global`), `register_model_provider`, `register_builtin_providers`.
 - `init_model(ModelClientConfig, ModelRequestConfig) -> Result<Arc<dyn Model>>`, `init_model_with(provider, model_name) -> Result<Arc<dyn Model>>`.
 
+`reasoning`:
+- `ReasoningMode { Auto (default) | Enabled | Disabled }`, `ReasoningConfig { mode, effort: Option<String>, budget_tokens: Option<u32> }` with builders, predicates (`is_no_intent`, `is_disabled`, `has_disabled_effort`, `effective_effort`) and `from_value(&Value) -> Result<Option<Self>>`.
+- `ReasoningCapability { options, recommended }`, `CapabilitySpec` (const-constructible table entry), `ReasoningProtocol { ChatCompletions | Responses | AnthropicMessages }`, `ReasoningProfile { provider, model_patterns, capability, anthropic_capability, wire, anthropic_wire, protocol }`, `ReasoningPlan { sdk_params, extra_body, warnings }`.
+- `provider_key_for(provider, api_base)`, `matches_pattern(pattern, model)`, `find_reasoning_profile(provider, model)`, `reasoning_capability(provider, model)`, `reasoning_capability_for(protocol, provider, model)`, `standard_reasoning_capability(protocol)`.
+- `resolve_reasoning_plan(provider, api_base, model, &ReasoningConfig)`, `resolve_reasoning_plan_for(protocol, …)`, `apply_reasoning_plan(&mut Value, &ReasoningPlan)`, `apply_reasoning_plan_with(&mut Value, &ReasoningPlan, override_existing)`; tables `REASONING_PROFILES` and `MODEL_REASONING_FALLBACKS`.
+
+`routing`:
+- `ModelSelection { kind: SelectionKind (Model | ModelGroup), id }`, `ModelSelectionWire` (the JSON selection the compiler accepts), `CompiledModelSelection { model_client_config, model_request_config, selected_type, selected_id }`.
+- `ResolvedModel`, `ResolvedRoute { route_id, model, enabled, request_overrides, tpm, rpm, timeout, priority, tag }`, `ResolvedModelGroup`, `ResolvedRoutingConfig { strategy, num_retries, strategy_kwargs, timeout_seconds }`, `RoutingStrategy { OrderedFailover | TagFiltered | Custom(String) }`.
+- `compile_model_selection(&ModelSelectionWire)`, `compile_route`, `merge_request_defaults`, `resolve_model_group_routes`, `is_retryable_failure`, `RoutingModel` (`from_group`, `with_models`, `routes`, `route_ids`, `route_count`, `routing_config`, `impl Model`).
+
+`oauth`:
+- `OAuthToken { access_token: SecretString, refresh_token, id_token, expires_at, token_type, scope }` with builders, `is_expired(skew)`, redacting `Debug`.
+- `TokenStore` (`load`/`save`/`clear`), `InMemoryTokenStore`, `FileTokenStore` (`new`, `with_base_url`, `path`, `base_url`, `default_path`).
+- `DeviceCode { user_code, device_auth_id, interval, expires_in }`, `OpenAiOAuthClient` (`new`, `with_http_client`, `with_base_url`, `with_client_id`, `request_device_code`, `poll_device_token`, `poll_device_token_with_deadline`, `exchange_code`, `refresh`, `access_token`).
+- Constants `DEFAULT_ISSUER`, `DEFAULT_CLIENT_ID`, `DEVICE_CALLBACK_PATH`, `PROVIDER_KEY`, `AUTH_MODE`, `DEFAULT_BASE_URL`, `AUTH_FILE_ENV`, `REFRESH_SKEW`.
+
+`dashscope`:
+- `DashScopeConfig { api_base, api_key: SecretString, timeout, poll_interval, task_timeout }` with builders, `from_env`, `from_client_config`, redacting `Debug`.
+- `ImageRequest` / `ImageGenerationResponse`, `SpeechRequest` / `AudioGenerationResponse`, `VideoRequest` / `VideoGenerationResponse`, `VideoTask`, `VideoTaskStatus`.
+- Pure wire helpers `build_image_body`, `build_speech_body`, `build_video_body`, `parse_image_response`, `parse_speech_response`, `parse_video_task`, `parse_video_response`, `last_user_text`, `task_path`, plus the three path constants.
+- `DashScopeMediaClient` (`new`, `with_http_client`, `config`, `generate_image`, `generate_speech`, `generate_video`).
+
 ## Constraints
 
 - Only `openjiuwen_common::http::HttpClient` performs I/O; no direct `reqwest` calls.
 - `api_key` is a `SecretString`: never logged, never formatted; provider errors redact the body (`security::redact_str`) and truncate it to ~1000 chars.
 - All bodies are built by pure functions (`build_chat_completion_body`, `build_messages_body`) and parsed by pure functions, so tests can assert exact JSON without a server.
+- `reasoning` is pure data plus pure functions: a `const`/`static` table, a hand-rolled `*`/`?` glob matcher, no I/O, no clock, no global mutable state, no new crate.
+- `oauth` and `dashscope` also perform every request through `HttpClient`; no module calls `reqwest` directly, and no module adds a dependency.
+- `routing` builds per-route models with `init_model` and never mutates a caller's configs: overrides are merged into owned copies (route `request_defaults` < group `request_config` < route `request_overrides`).
+- Secrets (`api_key` of `ModelClientConfig` and `DashScopeConfig`, every OAuth token field) are `SecretString`s with redacting `Debug`; provider/vendor error bodies are redacted via `security::redact_str` and truncated before they reach an error message or a log.
 - `provider` strings are case- and separator-insensitive: `normalize_provider_name` lowercases, strips `-`/`_`/spaces and maps vendor aliases.
 - Streaming never panics on malformed events: undecodable SSE data is logged and skipped; a terminal `error` event becomes `Err(Error::Llm)`.
 
@@ -54,6 +83,13 @@ Ports `openjiuwen/core/foundation/llm/` (`model.py`, `schema/config.py`, `model_
 - **Error bodies are redacted in full**: `security::redact_str` replaces any non-empty body with `<REDACTED>`, so provider error prose never reaches logs; tests assert on status, error kind, and URL instead.
 - **Async factory**: `init_model`/`init_model_with` stay `async` per `docs/ARCHITECTURE.md` §2.2 even though built-in providers construct synchronously, so provider creation can become async without a signature break.
 - **Client request semantics**: `invoke`/`stream` use the `ModelRequestConfig` passed by the caller, never the constructor's; `model_name()` reports the constructor's request. A caller must therefore always pass a non-empty `model_name`.
+- **Reasoning is opt-in and body-invisible otherwise**: `build_chat_completion_body` reads `request.extra["reasoning"]` as a `ReasoningConfig`; with no such key the produced body is byte-identical to the pre-reasoning behaviour, and a caller's own `extra` keys are still merged last and win over the plan.
+- **Reasoning `extra_body` merges at the body top level**, unlike Python (whose OpenAI SDK nests `extra_body` and folds it in before the request); the body this crate builds is the wire body, so the nesting would be wrong.
+- **Reasoning never guesses beyond the profile**: an intent the family's capability cannot express drops only the unsupported `effort`, keeps the explicit mode/budget encoding, and records one warning; a family with no selectable control yields an empty plan plus one warning.
+- **Routing is additive to the Python schema**: `priority` and `tag` on a route are Rust extensions for rule/priority routing; with no priority anywhere the route list order is preserved, so a ported configuration routes exactly as in Python.
+- **Routing failover is bounded and selective**: the attempt budget is `min(num_retries + 1, candidates)`, only transport/timeout/`Llm`/`External` failures fall over, and a stream fails over only before its first chunk.
+- **DashScope reuses the shared error taxonomy** rather than a vendor error enum: non-2xx is `Error::Llm`, `401`/`403` become `Error::Config`, `408`/`504` and an exhausted task budget become `Error::Timeout`, and vendor `code`/`message` are surfaced truncated.
+- **OAuth state lives in the auth file, not in memory**: `OpenAiOAuthClient` reads and writes a `TokenStore` per call, so two processes observe the rotated refresh token; writes are atomic (`temp` + `rename`, `0600` on unix) with read-merge-write of the `providers.OpenAIAccount` entry.
 
 ## OpenAI-compatible wire contract
 
@@ -122,7 +158,8 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 `factory.rs`:
 - `pub async fn init_model(client: ModelClientConfig, request: ModelRequestConfig) -> Result<Arc<dyn Model>>`, `pub async fn init_model_with(provider: impl Into<String>, model_name: impl Into<String>) -> Result<Arc<dyn Model>>`.
 
-`mod.rs` re-exports (in addition to the module list): `AssistantTurn`, `ChatResponse`, `Choice`, `FinishReason`, `Model`, `ModelExt`, `ModelClientConfig`, `ModelRequestConfig`, `StreamAccumulator`, `StreamChunk`, `ProviderFlavor`, `ProviderProfile`, `ANTHROPIC_VERSION`, `normalize_provider_name`, `provider_profile`, `ModelProvider`, `ModelProviderRegistry`, `register_builtin_providers`, `register_model_provider`, `SseDecoder`, `SseEvent`, `init_model`, `init_model_with`, `OpenAiCompatibleClient`, `AnthropicClient`.
+`mod.rs` re-exports (in addition to the module list): `AssistantTurn`, `ChatResponse`, `Choice`, `FinishReason`, `Model`, `ModelExt`, `ModelClientConfig`, `ModelRequestConfig`, `StreamAccumulator`, `StreamChunk`, `ProviderFlavor`, `ProviderProfile`, `ANTHROPIC_VERSION`, `normalize_provider_name`, `provider_profile`, `ModelProvider`, `ModelProviderRegistry`, `register_builtin_providers`, `register_model_provider`, `SseDecoder`, `SseEvent`, `init_model`, `init_model_with`, `OpenAiCompatibleClient`, `AnthropicClient`, plus `ReasoningConfig`/`ReasoningMode`/`ReasoningPlan`/`ReasoningCapability`/`ReasoningProfile`/`ReasoningProtocol`/`resolve_reasoning_plan`/`apply_reasoning_plan`/`apply_reasoning_plan_with`/`find_reasoning_profile`, `compile_model_selection`/`CompiledModelSelection`/`ModelSelection`/`ResolvedModel`/`ResolvedRoute`/`ResolvedModelGroup`/`ResolvedRoutingConfig`/`RoutingStrategy`/`RoutingModel`, `OpenAiOAuthClient`/`OAuthToken`/`DeviceCode`/`TokenStore`/`FileTokenStore`/`InMemoryTokenStore`, and `DashScopeMediaClient`/`DashScopeConfig`/`ImageRequest`/`ImageGenerationResponse`/`SpeechRequest`/`AudioGenerationResponse`/`VideoRequest`/`VideoGenerationResponse`.
+The full per-module signatures, wire contracts and gaps live in the child `CONTEXT.md` files linked from the routing table below.
 
 ## Test Strategy
 
@@ -131,6 +168,12 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 - Streaming timeout budgets are tested against a loopback stalling server, never a real provider.
 - No test touches the network or a real credential; `MODEL_PROVIDER`/`API_KEY`/`API_BASE` mutations are serialized by a module mutex and restored.
 - `cargo test -p openjiuwen-foundation llm` covers the whole module in both feature sets; the module has no feature-gated code.
+- `reasoning` is covered by table-driven tests (`./reasoning/tests.rs`, `./reasoning/plan_tests.rs`): glob matching, provider/alias/host-hint precedence, fallback on the full id and its last `/` segment, and the exact JSON of every encoder in enabled/disabled/effort/budget shapes, plus capability rejection and apply merge/no-overwrite rules.
+- `openai/request.rs` additionally asserts that a body with no `reasoning` intent carries no reasoning keys at all and stays byte-identical.
+- `oauth` tests drive every endpoint through `wiremock` (device code, `403`→`404`→`200` polling, exchange, refresh with and without rotation) and exercise `FileTokenStore` round trips, envelope merging, unix `0600`, atomic-write leftovers and `default_path` env precedence with `tempfile`.
+- `dashscope` tests assert exact image/speech/video request JSON and headers, parse both URL and inline-base64 responses, and cover async task polling `PENDING`→`RUNNING`→`SUCCEEDED`, `FAILED`, and a bounded task timeout (millisecond-scale poll budgets, so the suite stays fast).
+- `routing` tests cover schema round trips, merge precedence/deep merge/stripped keys, every compile error, priority ordering, and wiremock end-to-end failover: `500`→`200` (one request per server), `401` not retried, `num_retries = 0`, tag pinning, and stream failover only before the first chunk.
+- OAuth and DashScope env mutations are serialized by a module mutex and restored, so the suite stays deterministic under `--test-threads` defaults.
 
 ## Known Gaps
 
@@ -138,7 +181,10 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 - There is no `response_format`/`ResponseFormat` type, field, or helper and no history/`enable_history` flag anywhere in the crate: structured output and every vendor knob go through `ModelRequestConfig::extra`, which `build_chat_completion_body` merges last at the top level.
 - There is no `BoxModel`/`type Model = …` alias; `Arc<dyn Model>` is the convention (`init_model`, `init_model_with`, `ModelProvider::create`) and `impl Model for Arc<dyn Model>` makes it callable directly.
 - `Model` exposes only `provider()`, `model_name()`, `invoke()` and `stream()`: there is no `name()`, `config()`, or cancellation method on the trait.
-- Reasoning-profile resolution, IntelliRouter routing, OpenAI account/OAuth transport, and DashScope media generation are not ported (see `docs/PARITY.md`).
+- Reasoning: `build_chat_completion_body` passes `api_base = None`, so api-base host hints are only reachable through the public `resolve_reasoning_plan`/`provider_key_for`; the Anthropic client does not apply reasoning plans (that wiring is owned by `./anthropic/`), and the `Responses` protocol is encoded but has no transport.
+- Routing: TPM/RPM are recorded but not enforced (no rate limiter), there is no cross-request circuit breaker or tag-based cost/latency scoring, a group `timeout_seconds` is recorded but not enforced, `Custom` strategies are rejected by the compiler and treated as ordered failover by `RoutingModel`, and the Python `extra_body` flattening/health-probe options are not ported.
+- OAuth: no `Responses` transport for OAuth-backed calls, no `/models` catalog or cache, no `login|status|logout` CLI and no `AuthStatus` type, no cross-process file lock (atomic writes, last writer wins), `token_type` is not carried over on refresh, and a refresh response without an expiry keeps the previous `expires_at`.
+- DashScope: no streaming media, no result-URL byte download, no `X-DashScope-WorkSpace` scoping, no voice/language allow-lists, no local-file/`oss://` inputs, and no per-call `**kwargs` escape hatch.
 - OpenAI-compatible: Python drops one of `temperature`/`top_p` for `openai.com` bases; this module sends both when the caller sets both.
 - Anthropic: no `cache_control` breakpoints, no mid-conversation `system` turns, and thinking blocks are ignored in non-streaming responses.
 - A provider that keeps sending framing-only stream events can hold a stream open indefinitely when `stream_idle_timeout` is `None`.
@@ -154,3 +200,7 @@ Every item below is public unless marked `pub(crate)`; these are the names and s
 - `./sse.rs` → incremental SSE decoder shared by both clients
 - `./openai/` → OpenAI-compatible client (`request.rs`, `response.rs`, `stream.rs`)
 - `./anthropic/` → Anthropic Messages client (`request.rs`, `response.rs`, `stream.rs`)
+- `./reasoning/` → `ReasoningConfig`, profile tables, plan resolution and wire encoders, body application (`reasoning/CONTEXT.md`)
+- `./routing/` → IntelliRouter selection/route schema, route compiler, `RoutingModel` ordered failover (`routing/CONTEXT.md`)
+- `./oauth/` → `OpenAI` account device authorization, `OAuthToken`/`TokenStore` and the auth file (`oauth/CONTEXT.md`)
+- `./dashscope/` → `DashScope` image/speech/video client, pure body builders and response parsers (`dashscope/CONTEXT.md`)
