@@ -16,6 +16,17 @@
 //! - `repl` — the interactive REPL and its slash commands
 //! - `permissions` — approval prompts and the permission host
 //! - `session_store` — append-only session records under the home directory
+//! - `allow_rules` — permanent allow-rule persistence to `permissions.yaml`
+//! - `compact` — the `/compact` context-compaction slash command
+//! - `history` — persistent REPL input history with a retained-entry cap
+//! - `instruction` — project instruction files injected into the prompt
+//! - `mcp_config` — `mcp.json` discovery and merge
+//! - `onboarding` — the first-run onboarding wizard
+//! - `paths` — every CLI-owned file path and environment switch
+//! - `shell` — the `!cmd` shell-passthrough command
+//! - `skill_command` — `/<skill>` slash-command dispatch
+//! - `style` — ANSI styling helpers and colour gating
+//! - `usage` — token and cost accounting for `/cost`
 //! - `tests` — offline unit and integration suite
 //!
 //! Dispatch is a pure function of the parsed command line plus one injected
@@ -29,6 +40,20 @@ mod render;
 mod repl;
 mod run;
 mod session_store;
+
+// Public CLI submodules: each owns one user-facing concern and is documented
+// in its own file.
+pub mod allow_rules;
+pub mod compact;
+pub mod history;
+pub mod instruction;
+pub mod mcp_config;
+pub mod onboarding;
+pub mod paths;
+pub mod shell;
+pub mod skill_command;
+pub mod style;
+pub mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -88,6 +113,13 @@ pub struct Cli {
     /// Stream reasoning chunks and extra diagnostics.
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
+
+    /// Disable ANSI colour in terminal output.
+    ///
+    /// Colour is off automatically when the output is not a terminal or when
+    /// `NO_COLOR` is set; this flag forces it off unconditionally.
+    #[arg(long = "no-color", global = true)]
+    pub no_color: bool,
 
     /// Optional subcommand; without one the mode is chosen from the terminal.
     #[command(subcommand)]
