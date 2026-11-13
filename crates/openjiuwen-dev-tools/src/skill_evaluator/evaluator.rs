@@ -19,7 +19,9 @@ use crate::skill_creator::SkillDefinition;
 
 use super::assertion::Assertion;
 use super::case::{CaseStatus, EvalCase};
-use super::report::{CaseResult, CaseSummary, EvaluationReport, FunctionalReport};
+use super::report::{
+    status_from, summarize, CaseResult, EvaluationReport, FunctionalReport,
+};
 use super::runner::{CaseRunner, ScriptedCaseRunner};
 use super::scoring::{aggregate, scan_safety, score_design, SafetyRule};
 
@@ -162,47 +164,15 @@ impl SkillEvaluator {
                 let assertion = Assertion::parse(expectation)?;
                 assertions.push(assertion.check(&output)?);
             }
-            let passed = assertions.iter().filter(|outcome| outcome.passed).count();
-            let status = if passed == assertions.len() {
-                CaseStatus::Passed
-            } else if passed == 0 {
-                CaseStatus::Failed
-            } else {
-                CaseStatus::Partial
-            };
             results.push(CaseResult {
                 id: case.id.clone(),
                 name: case.name.clone(),
-                status,
+                status: status_from(&assertions),
                 assertions,
             });
         }
 
-        let total = cases.len();
-        let passed = results
-            .iter()
-            .filter(|result| result.status == CaseStatus::Passed)
-            .count();
-        let partial = results
-            .iter()
-            .filter(|result| result.status == CaseStatus::Partial)
-            .count();
-        let failed = results
-            .iter()
-            .filter(|result| result.status == CaseStatus::Failed)
-            .count();
-        let pass_rate = if total == 0 {
-            0.0
-        } else {
-            (passed as f64 + 0.5 * partial as f64) / total as f64
-        };
-        let summary = CaseSummary {
-            total,
-            passed,
-            partial,
-            failed,
-            pass_rate,
-        };
+        let summary = summarize(&results);
         let recommendations = results
             .iter()
             .filter(|result| matches!(result.status, CaseStatus::Failed | CaseStatus::Partial))
@@ -236,6 +206,7 @@ impl SkillEvaluator {
             functional,
             safety,
             final_score,
+            judge: None,
         })
     }
 }

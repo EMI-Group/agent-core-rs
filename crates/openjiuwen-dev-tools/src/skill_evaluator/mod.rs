@@ -36,7 +36,9 @@
 //! [`SkillDefinition`]: crate::skill_creator::SkillDefinition
 pub mod assertion;
 pub mod case;
+pub mod eval;
 pub mod evaluator;
+pub mod judge_scoring;
 pub mod report;
 pub mod runner;
 pub mod scoring;
@@ -46,7 +48,8 @@ pub use case::{CaseStatus, EvalCase};
 pub use evaluator::{EvaluatorConfig, SkillEvaluator};
 pub use report::{
     grade_for, CaseResult, CaseSummary, DesignReport, EvaluationReport, EvaluatorScore,
-    EvaluatorScores, FinalScore, FunctionalReport, SafetyFinding, SafetyReport, ScoreDimension,
+    EvaluatorScores, FinalScore, FunctionalReport, JudgeRecord, SafetyFinding, SafetyReport,
+    ScoreDimension,
 };
 pub use runner::{CaseRunner, ModelCaseRunner, ScriptedCaseRunner};
 pub use scoring::{aggregate, scan_safety, score_design, SafetyRule};
