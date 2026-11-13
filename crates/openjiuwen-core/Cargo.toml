@@ -27,6 +27,9 @@ serde_json.workspace = true
 
 [features]
 default = []
+# Forwards `openjiuwen-session/otel`: `session::install_trace_sink` then really installs the sink
+# instead of being the documented no-op.
+otel = ["openjiuwen-session/otel"]
 
 [lints]
 workspace = true

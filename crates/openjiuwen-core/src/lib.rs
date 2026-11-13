@@ -18,8 +18,18 @@
 //! | `openjiuwen.core.security` | [`security`] → `openjiuwen_security` |
 //! | `openjiuwen.core.single_agent` | [`single_agent`] → `openjiuwen_agent` |
 //! | `openjiuwen.core.application` | [`application`] → the application agents in `openjiuwen_agent` |
+//! | `openjiuwen.core.controller` | [`controller`] → `openjiuwen_agent::controller` |
+//! | `openjiuwen.core.kv_cache` | [`kv_cache`] → `openjiuwen_agent::kv_cache` |
+//! | `openjiuwen.core.operator` | [`operator`] → `openjiuwen_agent::operator` |
 //! | `openjiuwen.core.multi_agent` | [`multi_agent`] → `openjiuwen_multiagent` |
 //! | `openjiuwen.core.runner` | [`runner`] → `openjiuwen_runner` |
+//!
+//! `controller`, `kv_cache`, and `operator` are Python top-level packages hosted by
+//! `openjiuwen-agent`'s modules of the same name; this umbrella re-exports those
+//! modules wholesale, so nested paths such as `controller::schema::Task`,
+//! `kv_cache::runtime`, and `operator::base` stay reachable. Because
+//! [`single_agent`] is a blanket glob of the same crate, those items are also
+//! exposed there as an alternative spelling.
 //!
 //! # Usage
 //!
@@ -84,4 +94,38 @@ pub mod application {
         LlmAgentConfig as LLMAgentConfig, ModelConfig, ModelInfo, WorkflowAgent,
         WorkflowAgentConfig,
     };
+}
+
+/// The Python `openjiuwen.core.controller` package: events, intents, tasks,
+/// executors, and the turn loop that routes them.
+///
+/// This is a module glob of `openjiuwen_agent::controller` (the controller stack
+/// is hosted by `openjiuwen-agent`), so nested paths such as
+/// [`schema`](controller::schema) and [`executors`](controller::executors) remain
+/// reachable alongside the flattened
+/// [`ControllerAgent`](controller::ControllerAgent),
+/// [`Task`](controller::Task), and [`TaskScheduler`](controller::TaskScheduler)
+/// re-exports.
+pub mod controller {
+    pub use openjiuwen_agent::controller::*;
+}
+
+/// The Python `openjiuwen.core.kv_cache` package: cache identity/runtime types,
+/// the affinity hook, and lineage metadata.
+///
+/// This is a module glob of `openjiuwen_agent::kv_cache`, so nested paths such as
+/// [`runtime`](kv_cache::runtime) and [`types`](kv_cache::types) are reachable
+/// alongside the flattened re-exports.
+pub mod kv_cache {
+    pub use openjiuwen_agent::kv_cache::*;
+}
+
+/// The Python `openjiuwen.core.operator` package: tunable parameter handles for
+/// LLM, tool, memory, skill, and context-evolution call paths.
+///
+/// This is a module glob of `openjiuwen_agent::operator`, so nested paths such as
+/// [`base`](operator::base) are reachable alongside the flattened operator
+/// re-exports.
+pub mod operator {
+    pub use openjiuwen_agent::operator::*;
 }
