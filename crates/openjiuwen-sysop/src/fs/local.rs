@@ -15,15 +15,24 @@
 //! download destination), which Python never sandbox-checks; those paths are only
 //! tilde-expanded and canonicalized.
 //!
-//! # In-process locks
+//! # Locks
 //!
-//! `LocalFsOperation::locks` maps a resolved path to a [`tokio::sync::RwLock`]. Readers
-//! take the shared lock, writers the exclusive one, and a transfer locks both paths in a
-//! deterministic order (sorted by path, `Write` winning over `Read`) so two transfers can
-//! never deadlock. These are **in-process** locks: Python's `ReadWriteLockManager` uses
-//! on-disk SQLite locks shared between processes, which is not ported because a single
-//! process owns a workspace here. A read with `only_read = true` takes no lock at all
-//! (Python `skip_lock`).
+//! Locking happens in two layers, both taken in the same canonical order (sorted by the
+//! resolved path) so a transfer that locks two paths can never deadlock:
+//!
+//! 1. `LocalFsOperation::locks` maps a resolved path to a [`tokio::sync::RwLock`]. Readers
+//!    take the shared lock, writers the exclusive one; this serialises tasks inside one
+//!    process and is the cheap fast path.
+//! 2. [`crate::fs::lock::FileLockManager`] takes an advisory `flock` on a sidecar lock file
+//!    per resolved path, so other *processes* sharing the workspace exclude each other too —
+//!    what Python's SQLite-backed `ReadWriteLockManager` provides. A transfer locks both
+//!    endpoints (`Write` winning over `Read` when the same path is requested twice).
+//!
+//! The `flock` is taken after the in-process guard for the same path, in the same order, and
+//! both are released when the returned guard is dropped. A read with `only_read = true` takes
+//! no lock at all (Python `skip_lock`), and
+//! [`LocalWorkConfig::cross_process_locks`] `= false` leaves only the in-process layer, with
+//! no lock files created.
 //!
 //! # Blocking work
 //!
@@ -69,6 +78,7 @@ use async_trait::async_trait;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::config::LocalWorkConfig;
+use crate::fs::lock::{FileLockGuard, FileLockManager};
 use crate::fs::types::{
     CopyData, CopyParams, DeleteData, DeleteParams, DownloadFileData, DownloadFileParams, FileStat,
     ListDirsParams, ListFilesData, ListFilesParams, MkdirData, MkdirParams, MoveData, MoveParams,
@@ -84,13 +94,15 @@ use crate::workspace::PathPolicy;
 /// The local filesystem backend (Python `local/fs_operation.py`).
 ///
 /// Built by [`LocalFsOperation::new`] or through [`crate::fs::local_fs`]; it owns the
-/// resolved [`PathPolicy`], the configuration it was built from, and the per-path lock
-/// map. Cheap to share: wrap it in an `Arc` and clone that.
+/// resolved [`PathPolicy`], the configuration it was built from, the per-path in-process
+/// lock map, and the cross-process lock manager. Cheap to share: wrap it in an `Arc` and
+/// clone that.
 #[derive(Debug)]
 pub struct LocalFsOperation {
     policy: PathPolicy,
     config: LocalWorkConfig,
     locks: Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>,
+    file_locks: FileLockManager,
 }
 
 impl LocalFsOperation {
@@ -104,10 +116,12 @@ impl LocalFsOperation {
     pub fn new(config: LocalWorkConfig) -> openjiuwen_common::error::Result<Self> {
         config.validate()?;
         let policy = PathPolicy::new(&config);
+        let file_locks = FileLockManager::new(&config);
         Ok(Self {
             policy,
             config,
             locks: Mutex::new(HashMap::new()),
+            file_locks,
         })
     }
 
@@ -125,7 +139,7 @@ impl LocalFsOperation {
 
     // ----- locking -------------------------------------------------------------------
 
-    /// Returns the lock guarding `path`, creating it on first use.
+    /// Returns the in-process lock guarding `path`, creating it on first use.
     ///
     /// A poisoned mutex is recovered rather than panicking: the map itself is never left in
     /// an inconsistent state, so the worst case is a stale per-path lock.
@@ -134,27 +148,62 @@ impl LocalFsOperation {
         Arc::clone(locks.entry(path.to_path_buf()).or_default())
     }
 
-    /// Takes the shared lock for `path` (Python's default read lock).
-    pub(crate) async fn read_guard(&self, path: &Path) -> OwnedRwLockReadGuard<()> {
-        let lock = self.lock_for(path);
-        lock.read_owned().await
+    /// Takes the shared lock for `path` (Python's default read lock), both layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for an `OpResult` code `199003` when the cross-process lock times
+    /// out or its sidecar file cannot be opened; the in-process lock is released again.
+    pub(crate) async fn read_guard(&self, path: &Path) -> Result<PathGuard, String> {
+        self.guard(path, LockMode::Read).await
     }
 
-    /// Takes the exclusive lock for `path`.
-    pub(crate) async fn write_guard(&self, path: &Path) -> OwnedRwLockWriteGuard<()> {
-        let lock = self.lock_for(path);
-        lock.write_owned().await
+    /// Takes the exclusive lock for `path`, both layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for an `OpResult` code `199003` when the cross-process lock times
+    /// out or its sidecar file cannot be opened; the in-process lock is released again.
+    pub(crate) async fn write_guard(&self, path: &Path) -> Result<PathGuard, String> {
+        self.guard(path, LockMode::Write).await
     }
 
-    /// Takes several locks in a deadlock-free order.
+    /// Takes both lock layers for one path, in-process first.
+    ///
+    /// The in-process guard is acquired before the `flock` so a same-process waiter is
+    /// queued cheaply on the tokio lock; if the `flock` then fails, dropping the local guard
+    /// releases the in-process lock again.
+    async fn guard(&self, path: &Path, mode: LockMode) -> Result<PathGuard, String> {
+        let lock = self.lock_for(path);
+        let local = match mode {
+            LockMode::Read => LocalGuard::Read(lock.read_owned().await),
+            LockMode::Write => LocalGuard::Write(lock.write_owned().await),
+        };
+        let file = self
+            .file_locks
+            .acquire(path, mode)
+            .await
+            .map_err(|error| error.reason())?;
+        Ok(PathGuard { local, file })
+    }
+
+    /// Takes several locks in a deadlock-free order, in both layers.
     ///
     /// Requests are sorted by path and deduplicated, keeping the stronger mode when the same
     /// path is requested twice (a transfer whose source and destination coincide). The
-    /// returned guards must be kept alive for the duration of the operation.
+    /// returned guards must be kept alive for the duration of the operation. Acquisition
+    /// walks the merged list once — in-process guard, then `flock`, per path — so every
+    /// process takes the cross-process locks in the same order; if one acquisition fails, the
+    /// earlier guards are released in reverse order before the error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for an `OpResult` code `199003` when a cross-process lock times out
+    /// or its sidecar file cannot be opened. No lock is leaked in that case.
     pub(crate) async fn acquire_ordered(
         &self,
         mut requests: Vec<(PathBuf, LockMode)>,
-    ) -> Vec<PathGuard> {
+    ) -> Result<Vec<PathGuard>, String> {
         requests.sort_by(|left, right| left.0.cmp(&right.0));
         let mut merged: Vec<(PathBuf, LockMode)> = Vec::with_capacity(requests.len());
         for (path, mode) in requests {
@@ -169,13 +218,18 @@ impl LocalFsOperation {
         }
         let mut guards = Vec::with_capacity(merged.len());
         for (path, mode) in merged {
-            let lock = self.lock_for(&path);
-            guards.push(match mode {
-                LockMode::Read => PathGuard::Read(lock.read_owned().await),
-                LockMode::Write => PathGuard::Write(lock.write_owned().await),
-            });
+            match self.guard(&path, mode).await {
+                Ok(guard) => guards.push(guard),
+                Err(reason) => {
+                    // Release what was already taken, in reverse acquisition order.
+                    while let Some(guard) = guards.pop() {
+                        drop(guard);
+                    }
+                    return Err(reason);
+                }
+            }
         }
-        guards
+        Ok(guards)
     }
 }
 
@@ -267,18 +321,23 @@ impl FsExtOperation for LocalFsOperation {
     }
 }
 
-/// How a path is locked for one operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LockMode {
-    /// Shared access, used by readers.
-    Read,
-    /// Exclusive access, used by writers.
-    Write,
+pub(crate) use crate::fs::lock::LockMode;
+
+/// An acquired per-path lock: the in-process guard plus the cross-process `flock`.
+///
+/// Held for as long as the value lives; dropping it releases both layers (the `flock` is
+/// released by closing the guard's file descriptor).
+#[allow(dead_code)] // RAII holder: the fields exist only to keep the locks held
+pub(crate) struct PathGuard {
+    /// The in-process `tokio::sync::RwLock` guard.
+    local: LocalGuard,
+    /// The cross-process advisory lock (inactive when cross-process locking is off).
+    file: FileLockGuard,
 }
 
-/// An acquired per-path lock, held for as long as the value lives.
+/// Which in-process lock a [`PathGuard`] holds.
 #[allow(dead_code)] // RAII holder: the guards exist only to keep the locks held
-pub(crate) enum PathGuard {
+enum LocalGuard {
     /// A shared guard.
     Read(OwnedRwLockReadGuard<()>),
     /// An exclusive guard.

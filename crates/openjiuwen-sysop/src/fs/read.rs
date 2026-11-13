@@ -226,9 +226,14 @@ async fn load_for_read(
 
 /// Reads `path`, holding the shared lock unless `only_read` skips it.
 ///
+/// `only_read` (Python `skip_lock`) takes neither the in-process lock nor the
+/// cross-process `flock`; everything else goes through
+/// [`LocalFsOperation::read_guard`](crate::fs::local::LocalFsOperation), which takes both.
+///
 /// # Errors
 ///
-/// Returns the I/O error message when the file cannot be read.
+/// Returns the reason when the cross-process lock times out, or the I/O error message when
+/// the file cannot be read.
 async fn read_bytes_locked(
     op: &LocalFsOperation,
     path: &Path,
@@ -239,7 +244,7 @@ async fn read_bytes_locked(
             .await
             .map_err(|error| error.to_string());
     }
-    let guard = op.read_guard(path).await;
+    let guard = op.read_guard(path).await?;
     let result = tokio::fs::read(path).await;
     drop(guard);
     result.map_err(|error| error.to_string())

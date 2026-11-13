@@ -22,7 +22,14 @@ checklist; this file records only what is specific to this subtree.
   `pub(crate)` entry points behind the four transfer trait methods; `prepare_upload`,
   `prepare_download`, `transfer`, `transfer_stream`, `copy_file`, `copy_chunks` are private.
 - `local::{read_guard, write_guard, acquire_ordered}` are `pub(crate)` so the sibling modules
-  can take locks; `local::{LockMode, PathGuard, len_u64}` are the shared lock/byte helpers.
+  can take locks; each returns `Result<PathGuard, String>` (the `String` is the 199003 reason) and
+  takes both lock layers. `local::{LockMode, PathGuard, len_u64}` are the shared lock/byte
+  helpers; `LockMode` is re-exported from `lock.rs`, which owns the single definition.
+- `lock::{FileLockManager, FileLockGuard, LockMode, LockError, lock_path_for,
+  default_lock_root, LOCK_DIR_NAME, POLL_INTERVAL}` — the cross-process advisory `flock` layer
+  (Unix; a no-op guard elsewhere). `FileLockManager` is cheaply cloneable and exposes
+  `new`/`with_root`/`with_timeout`, `is_enabled`, `timeout`, `lock_path`, `try_acquire` and
+  `acquire`.
 - `list::{list_files, list_directories, file_system_item}` — directory listing with recursion,
   depth, suffix filter and sorting; `file_system_item` is the single `FileSystemItem` constructor
   shared with search.
@@ -41,17 +48,21 @@ checklist; this file records only what is specific to this subtree.
 - `local.rs` is the facade and the only place the lock map lives: the trait impls there are
   one-line delegations (`read::read_file(self, params).await`, `transfer::upload_file_stream(self,
   params)`, …), so behavior changes belong in the sibling module, never in the delegation.
-- The sibling modules never touch the lock map directly: they call
+- The sibling modules never touch the lock maps directly: they call
   `LocalFsOperation::{read_guard, write_guard, acquire_ordered}`, which keep the ordering,
-  poisoning-recovery, and mode-merge rules in one place.
+  poisoning-recovery, mode-merge, and two-layer acquisition rules in one place.
 - Failures are `OpResult` values (`fs_failure(execution, reason)`, code 199003; code 199011 with
   message `file version conflict` for a rejected conditional write). Nothing panics.
 - Blocking work stays off the async task: `walkdir` walks run in `spawn_blocking`; file I/O is
-  `tokio::fs`; only cheap `set_permissions`/metadata calls on already-resolved paths are sync.
-- Locks are per-resolved-path `tokio::sync::RwLock`s in a `std::sync::Mutex<HashMap<..>>`; the std
-  guard is never held across an `await`, and a poisoned mutex is recovered, never unwrapped.
-  Readers take the shared lock (skipped when `only_read`), writers the exclusive one, and transfers
-  lock both paths sorted by path (`Write` wins) so transfers cannot deadlock.
+  `tokio::fs`; the `flock` syscall runs in `spawn_blocking`; only cheap
+  `set_permissions`/metadata calls on already-resolved paths are sync.
+- Locking is two-layered *and ordered*. Layer 1 is a per-resolved-path `tokio::sync::RwLock` in a
+  `std::sync::Mutex<HashMap<..>>` (the std guard is never held across an `await`, and a poisoned
+  mutex is recovered, never unwrapped). Layer 2 is the advisory `flock` from `lock.rs`, taken
+  after layer 1 for the same path. Readers take the shared mode (both layers skipped when
+  `only_read`), writers the exclusive one, and transfers lock both paths sorted by path (`Write`
+  wins) so transfers cannot deadlock in either layer. `cross_process_locks = false` leaves only
+  layer 1, with no lock files created.
 - Module docs explain the local backend; public items carry `# Errors`; clippy `all` + `pedantic`
   runs with `-D warnings`.
 
@@ -83,35 +94,58 @@ checklist; this file records only what is specific to this subtree.
   `\u{85}`, `\u{2028}`, `\u{2029}`); `\n`, `\r\n` and lone `\r` are handled.
 - `line_range: Some(0, 0)` counts as "not specified" (only non-zero values participate in
   validation), so it cannot conflict with `head`/`tail`.
-- Lock-map entries are never evicted; memory grows with the number of distinct resolved paths a
-  process touches. Locks are in-process only (Python uses cross-process SQLite locks).
+- Lock-map entries and lock files are never evicted; memory grows with the number of distinct
+  resolved paths a process touches, and the `openjiuwen-sysop-locks` temp directory keeps one
+  empty `.lock` file per path ever locked (Python's `ReadWriteLockManager` runs a cleanup task;
+  this port leaves reclamation to the OS temp cleaner).
+- Cross-process locks only defend against other processes that also use these helpers; a program
+  writing the file directly does not take the `flock`.
+- The `flock` sidecar is per resolved path, so two hard links to one inode lock different files
+  (Python's SQLite lock manager has the same limitation).
+- `ext::{stat, exists, mkdir, delete, copy, move_path}` never took a lock (they predate the lock
+  map and have no `LocalFsOperation` handle), and they still do not; only `read_file`,
+  `write_file`, and the four transfer methods lock.
+- Non-Unix platforms (and `cross_process_locks = false`) yield an inactive guard immediately, so
+  only the in-process layer applies.
 - Directory copies skip symlinks found inside the tree (logged at `debug`) so a link cannot pull
   content from outside the sandbox.
 
 ## Test Strategy
 
-- 45 module-level unit tests live beside the code they exercise, all offline and deterministic
+- 53 module-level unit tests live beside the code they exercise, all offline and deterministic
   (`tempfile` workspaces, no network, no host locale):
   `slice.rs` (validation order, line splitting, selection, chunk math, write-content composition),
   `read.rs` (read text/bytes/slicing/max-size/binary policy/traversal denial/symlink escape, text
-  and byte stream shapes, the empty-file and tail terminal-chunk cases), `write.rs` (newline
+  and byte stream shapes, the empty-file and tail-terminal-chunk cases), `write.rs` (newline
   defaults, append semantics, flag-combination rejection, stale-digest and `create_if_absent`
   conflicts with a byte-identical file), `transfer.rs` (upload/download paths, parent creation,
-  overwrite refusal, permissions, empty-source and multi-chunk stream shapes), `list.rs`,
-  `search.rs` and `ext.rs` cover their own modules.
+  overwrite refusal, permissions, empty-source and multi-chunk stream shapes), `lock.rs`
+  (digest naming, config -> enablement/timeout mapping, shared/exclusive compatibility through
+  separate descriptors, timeout reason text, disabled manager creating nothing, guard `Send` +
+  release on drop), `list.rs`, `search.rs` and `ext.rs` cover their own modules.
 - `local.rs` keeps only the delegation tests (`list_files`/`search_files`/ext ops) and the
   constructor tests, plus `#[cfg(test)] pub(crate) mod test_util` with the fixtures the sibling test
   modules import (`backend`, `restricted`, `canonical`, `read_back`).
+- `tests/file_locks.rs` proves the cross-process layer with 10 tests: same-process contention and
+  `try_acquire`, genuine second-process contention (the test binary re-execs itself as a helper via
+  `SYSOP_LOCK_HELPER` and exits 3 while the parent holds the lock, 0 after the drop), the optional
+  util-linux `flock -n` probe (skipped when absent), the two 199003 timeout mappings
+  (`read_file`/`write_file` with the `execution` slot), reversed upload/download deadlock freedom
+  (plain and streaming, under a 10 s bound), and the `cross_process_locks` switch creating or not
+  creating the sidecar.
 - Gates: `cargo fmt -p openjiuwen-sysop`, `cargo test -p openjiuwen-sysop --offline`,
   `cargo clippy -p openjiuwen-sysop --all-targets --offline -- -D warnings`,
   `cargo test -p openjiuwen-sysop --features sandbox --offline`,
   `cargo clippy -p openjiuwen-sysop --all-targets --features sandbox --offline -- -D warnings`.
+  Current counts: 245 unit tests without the feature / 253 with it (1 `#[ignore]`d live sandbox
+  probe), 109 integration tests without the feature / 123 with it, 29 doc tests.
 
 ## Routing Table
 
-- `./mod.rs` → `local_fs` factory, module declarations (public types/list/search/ext/slice, crate-private read/write/transfer)
+- `./mod.rs` → `local_fs` factory, module declarations (public types/list/search/ext/slice/lock, crate-private read/write/transfer)
 - `./types.rs` → frozen parameter/data types (`ReadFileParams`, `WriteFileParams`, `FileSystemItem`, ext types)
-- `./local.rs` → `LocalFsOperation` facade, `new`/`policy`/`config`, per-path lock map (`read_guard`, `write_guard`, `acquire_ordered`, `LockMode`, `PathGuard`), `len_u64`, delegating trait impls, shared `test_util` fixtures
+- `./local.rs` → `LocalFsOperation` facade, `new`/`policy`/`config`, two-layer lock helpers (`read_guard`, `write_guard`, `acquire_ordered`, `PathGuard`, re-exported `LockMode`), `len_u64`, delegating trait impls, shared `test_util` fixtures
+- `./lock.rs` → cross-process advisory `flock`: `FileLockManager`, `FileLockGuard`, `LockMode`, `LockError`, `lock_path_for`, `default_lock_root`, polling and timeout, non-Unix no-op fallback
 - `./read.rs` → `read_file`, `read_file_stream`, `prepare_read_stream`, `load_for_read`, `read_bytes_locked`, read stream plan types
 - `./write.rs` → `write_file`, `validate_write`, `write_locked`, conditional compare-and-swap, permission application
 - `./transfer.rs` → `upload_file`/`download_file` (+ streams), `prepare_upload`/`prepare_download`, ordered-lock copy engine, chunk streaming, host-path expansion
