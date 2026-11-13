@@ -16,7 +16,7 @@
 //!
 //! Rendering values contain every top-level key of the input object plus the whole
 //! input under `"inputs"`. Only the `{{name}}` delimiters of
-//! [`PromptTemplate`] are placeholders; single-brace `{name}` stays literal.
+//! `PromptTemplate` are placeholders; single-brace `{name}` stays literal.
 //!
 //! # Response formatting
 //!
@@ -45,16 +45,40 @@
 //! embedded in a prompt is serialized compactly, whereas Python's `json.dumps`
 //! inserts spaces after `:` and `,`; the value only ever appears inside a prompt.
 //!
+//! # Conversation history
+//!
+//! `enable_history` ports Python's `_insert_history_to_system_and_user_prompt`,
+//! `_write_user_message_to_context` and `_write_assistant_message_to_context`, driven by
+//! `_get_model_input`:
+//!
+//! - the built prompt is split into its leading system messages and the rest, and the
+//!   recorded history is spliced between them, so the current user prompt stays last;
+//! - the format instruction is applied afterwards, rewriting that last user message and
+//!   never a history entry;
+//! - after a successful model call the sent user text and the raw assistant reply are
+//!   appended as one turn, which a later call on the same session reads back.
+//!
+//! With `enable_history` off nothing is read from or written to the history store, so the
+//! conversation stays byte-identical to a history-less component.
+//!
+//! Deviations from Python:
+//!
+//! - Python's `ModelContext` message list is reproduced by the session-backed
+//!   [`crate::MessageHistory`] on the session global lane `__messages__`, so history is
+//!   shared by every history-enabled LLM node running on the same session.
+//! - The recorded user message is the conversation text actually sent (post
+//!   `format_prompt`, so a markdown/JSON run records the instruction), and the assistant
+//!   entry stores the raw reply rather than the shaped output object.
+//! - The user and assistant entries are appended after a successful model call (Python
+//!   writes the user message before calling the model), so a failed call records nothing.
+//! - A streamed run records the accumulated text once at the end, not per delta.
+//!
 //! # Deferred behavior
 //!
-//! - `enable_history` is carried for builder/spec parity but history insertion is
-//!   deferred: there is no history source on [`ComponentContext`] yet, and
-//!   inventing one would change the observable conversation.
 //! - Stream frames are content deltas: each frame carries the
 //!   [`StreamChunk::Delta`](openjiuwen_foundation::StreamChunk::Delta) text, not the
 //!   accumulated answer.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -64,9 +88,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_foundation::{
-    BaseMessage, ChatResponse, Model, ModelRequestConfig, PromptTemplate, TemplateContent,
-};
+use openjiuwen_foundation::{BaseMessage, ChatResponse, Model, ModelRequestConfig};
 
 use crate::ability::ComponentAbility;
 use crate::component::{Component, ComponentCard};
@@ -74,6 +96,7 @@ use crate::context::ComponentContext;
 use crate::error::llm_invoke_call_failed;
 
 mod format;
+mod messages;
 
 /// The requested shape of the model answer.
 ///
@@ -137,7 +160,8 @@ pub struct LlmCompConfig {
     pub json_instruction: Option<String>,
     /// Python `output_config`; its first key names the output field.
     pub output_config: Option<Value>,
-    /// Whether history is inserted before the call; deferred (see module docs).
+    /// Whether history is inserted before the call and the turn recorded after it;
+    /// see the module docs.
     pub enable_history: bool,
 }
 
@@ -234,7 +258,7 @@ impl LlmCompConfig {
         self
     }
 
-    /// Enables (or disables) history insertion; deferred (see module docs).
+    /// Enables (or disables) history insertion and turn recording; see the module docs.
     #[must_use]
     pub fn with_enable_history(mut self, enable_history: bool) -> Self {
         self.enable_history = enable_history;
@@ -298,71 +322,11 @@ impl LlmComponent {
             .unwrap_or_else(|| "result".to_owned())
     }
 
-    /// Builds the conversation for `inputs`.
-    ///
-    /// See the module docs for the template precedence rules.
-    fn build_messages(&self, inputs: &Value) -> Vec<BaseMessage> {
-        let values = render_values(inputs);
-        match (
-            self.config.system_prompt_template.as_deref(),
-            self.config.user_prompt_template.as_deref(),
-        ) {
-            (Some(system), None) => vec![
-                BaseMessage::system(render_text(system, &values)),
-                BaseMessage::user(""),
-            ],
-            (None, Some(user)) => vec![BaseMessage::user(render_text(user, &values))],
-            (Some(system), Some(user)) => vec![
-                BaseMessage::system(render_text(system, &values)),
-                BaseMessage::user(render_text(user, &values)),
-            ],
-            (None, None) => {
-                if self.config.template_content.is_empty() {
-                    vec![BaseMessage::user("")]
-                } else {
-                    PromptTemplate::from_messages(self.config.template_content.clone())
-                        .format(&values)
-                        .to_messages()
-                }
-            }
-        }
-    }
-
     /// The wire frame carrying one answer fragment.
     pub(super) fn frame(output_key: &str, text: &str) -> Value {
         let mut output = serde_json::Map::new();
         output.insert(output_key.to_owned(), Value::String(text.to_owned()));
         Value::Object(output)
-    }
-}
-
-/// The rendering values of `inputs`: its top-level entries plus `"inputs"`.
-fn render_values(inputs: &Value) -> BTreeMap<String, Value> {
-    let mut values = BTreeMap::new();
-    if let Value::Object(object) = inputs {
-        values.extend(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-    }
-    values.insert("inputs".to_owned(), inputs.clone());
-    values
-}
-
-/// Renders `{{name}}` placeholders in one template string.
-///
-/// An unresolvable placeholder is kept verbatim by [`PromptTemplate`], matching
-/// Python's partial rendering.
-fn render_text(template: &str, values: &BTreeMap<String, Value>) -> String {
-    match PromptTemplate::new(template).format(values).content {
-        TemplateContent::Text(text) => text,
-        // `PromptTemplate::new` always builds text content; join defensively so a
-        // future change cannot panic here.
-        TemplateContent::Messages(messages) => messages
-            .iter()
-            .map(|message| message.text().into_owned())
-            .collect::<String>(),
     }
 }
 
@@ -383,14 +347,8 @@ impl Component for LlmComponent {
         "llm"
     }
 
-    async fn invoke(&self, inputs: Value, _ctx: &ComponentContext) -> Result<Value> {
-        let messages = format::format_prompt(
-            self.build_messages(&inputs),
-            self.config.response_format,
-            self.config.markdown_instruction.as_deref(),
-            self.config.json_instruction.as_deref(),
-            self.config.output_config.as_ref(),
-        );
+    async fn invoke(&self, inputs: Value, ctx: &ComponentContext) -> Result<Value> {
+        let messages = self.assemble_messages(&inputs, ctx).await;
         let response: ChatResponse = self
             .model
             .invoke(&messages, &self.config.request)
@@ -400,6 +358,9 @@ impl Component for LlmComponent {
             .message()
             .map(|message| message.text().into_owned())
             .unwrap_or_default();
+        // Python records the turn before `_create_output`, so a shaping failure still
+        // leaves it in the history.
+        self.record_turn(&messages, &text, ctx).await;
         format::shape_output(
             &text,
             self.config.response_format,
@@ -410,15 +371,10 @@ impl Component for LlmComponent {
     fn stream(
         self: Arc<Self>,
         inputs: Value,
-        _ctx: Arc<ComponentContext>,
+        ctx: Arc<ComponentContext>,
     ) -> BoxStream<'static, Result<Value>> {
-        let messages = format::format_prompt(
-            self.build_messages(&inputs),
-            self.config.response_format,
-            self.config.markdown_instruction.as_deref(),
-            self.config.json_instruction.as_deref(),
-            self.config.output_config.as_ref(),
-        );
+        let this = Arc::clone(&self);
+        let ctx = Arc::clone(&ctx);
         let request = self.config.request.clone();
         let response_format = self.config.response_format;
         let output_config = self.config.output_config.clone();
@@ -426,15 +382,16 @@ impl Component for LlmComponent {
         // Python's `_invoke_for_json_format`: a JSON answer cannot be shaped per
         // delta, so the stream is one non-streaming call yielding one frame.
         if response_format == LlmResponseFormat::Json {
-            let model = Arc::clone(&self.model);
             return Box::pin(async_stream::stream! {
-                match model.invoke(&messages, &request).await {
+                let messages = this.assemble_messages(&inputs, &ctx).await;
+                match this.model.invoke(&messages, &request).await {
                     Err(error) => yield Err(llm_invoke_call_failed(&format!("{error}"))),
                     Ok(response) => {
                         let text = response
                             .message()
                             .map(|message| message.text().into_owned())
                             .unwrap_or_default();
+                        this.record_turn(&messages, &text, &ctx).await;
                         match format::shape_output(&text, response_format, output_config.as_ref()) {
                             Ok(value) => yield Ok(value),
                             Err(error) => yield Err(error),
@@ -452,8 +409,12 @@ impl Component for LlmComponent {
             ))));
         }
 
-        let mut source = self.model.stream(messages, request);
         Box::pin(async_stream::stream! {
+            let messages = this.assemble_messages(&inputs, &ctx).await;
+            let mut source = this.model.stream(messages.clone(), request);
+            // Python's `_stream_with_chunks` records the whole answer once the stream
+            // ends, so the accumulator is the raw delta text.
+            let mut accumulated = String::new();
             while let Some(item) = source.next().await {
                 match item {
                     Err(error) => {
@@ -465,6 +426,7 @@ impl Component for LlmComponent {
                     Ok(chunk) => {
                         if let Some(text) = chunk.content() {
                             if !text.is_empty() {
+                                accumulated.push_str(text);
                                 match format::shape_output(
                                     text,
                                     response_format,
@@ -481,6 +443,7 @@ impl Component for LlmComponent {
                     }
                 }
             }
+            this.record_turn(&messages, &accumulated, &ctx).await;
         })
     }
 }
