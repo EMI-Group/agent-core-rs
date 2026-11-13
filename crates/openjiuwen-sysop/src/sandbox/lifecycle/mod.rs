@@ -615,7 +615,7 @@ impl SandboxLifecycle {
     }
 }
 
-/// The process-global lifecycle, over [`LauncherRegistry::global`].
+/// The process-global lifecycle, over [`crate::sandbox::launcher::global`].
 ///
 /// Python parity: `SandboxGateway.get_instance()` — one store per process. A local
 /// [`SandboxLifecycle`] should be used in tests and for isolation.
