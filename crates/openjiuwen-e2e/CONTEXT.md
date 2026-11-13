@@ -21,7 +21,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-35 tests across 8 binaries: 34 pass with `--features a2a` (30 with default features, since `a2a_roundtrip` is gated), 1 documented `#[ignore]`.
+40 tests across 9 binaries: 39 pass with `--features a2a` (35 with default features, since `a2a_roundtrip` is gated), 1 documented `#[ignore]`.
 
 | Binary | Scenario | Crates / seams exercised |
 |---|---|---|
@@ -54,6 +54,10 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 | `cli_binary.rs` (5 + 1 ignored) | `run_with_model` one-shot: `text`, `json`, `stream-json` output contracts | `openjiuwen-harness` `cli` (`run_with_model`, `CliIo`, `OutputFormat`) |
 | `cli_binary.rs` | Pre-run validation (option resolution, blank prompt) rejects before any model call | `CliOptions::resolve_with`, `Cli::dispatch` |
 | `cli_binary.rs` | Process-boundary `--version`/`--help` — `#[ignore]`d, see Known Gaps | `openjiuwen-cli` binary, resolved at runtime |
+| `runner_subprocess.rs` (4 + 1 inert child) | `Runner::set_spawner` + `spawn_agent` launches this test binary as the NDJSON child; one `send` round-trips an `AgentOutput` | `openjiuwen-runner` `spawn` (`SubprocessSpawner`, `SpawnSpec`, `SpawnMessage`) |
+| `runner_subprocess.rs` | The `AgentSpawner` seam returns a working `Arc<dyn SpawnedAgent>`; two sends on one child answer their own payloads | `AgentSpawner::spawn`, `SpawnedAgent::send` |
+| `runner_subprocess.rs` | Explicit `health()` reports healthy, `shutdown(BOUND)` acknowledges and reaps the child | `SpawnedProcess` (`health`, `is_healthy`, `shutdown`, `is_alive`) |
+| `runner_subprocess.rs` | An `error` frame surfaces `ErrorKind::Transport`; non-frame JSON surfaces `ErrorKind::Validation` — neither hangs | `SubprocessConfig::with_request_timeout`, frame parsing |
 
 ## Constraints
 
@@ -77,6 +81,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - `./tests/symphony_plan.rs` → symphony capability registry, planning, graph execution, artifact reload
 - `./tests/self_improvement.rs` → RSI orchestrator and agent-evolving trainer with fake runners
 - `./tests/cli_binary.rs` → harness CLI layer (one-shot output formats, pre-run validation, process boundary)
+- `./tests/runner_subprocess.rs` → runner subprocess spawn seam: self-executing NDJSON child, request/reply, health, graceful shutdown, typed transport/validation errors
 - `./tests/support/mod.rs` → cross-scenario deadline and stream helpers (`BOUND`, `within`, `collect_bounded`)
 - `./Cargo.toml` → manifest, test-only dependency set, `a2a`/`otel` features
 
@@ -88,6 +93,10 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Gates: `cargo fmt -p openjiuwen-e2e -- --check`, `cargo test -p openjiuwen-e2e`, `cargo test -p openjiuwen-e2e --features a2a`, `cargo clippy -p openjiuwen-e2e --all-targets [--features a2a] --no-deps -- -D warnings`. The whole suite runs in well under a second of test time and is stable across repeated runs.
 
 ## Design Decisions
+
+- `runner_subprocess.rs` re-executes **its own test binary** as the fake agent child instead of shipping a second binary: `std::env::current_exe()` plus the libtest filter `fake_agent_child --exact --test-threads=1 --nocapture`.
+- The child entry point is a normal `#[test]` that returns immediately unless `E2E_FAKE_AGENT_CHILD` is set (the parent sets it), so it is never `#[ignore]`d and the default suite runs it as a silent pass; `--nocapture` is mandatory or libtest swallows the protocol frames.
+- `E2E_FAKE_AGENT_MODE` selects `echo`/`error_frame`/`bad_frame`; the background health task is disabled (`with_health_check(Duration::ZERO, …)`) so no probe races an exchange.
 
 - Shared helpers are limited to the timing/stream contract; fixtures live in `openjiuwen-test-support` (models, workspaces, sessions, checkpoints) so library and scenario suites use the same fakes.
 - Dependencies live under `[dependencies]` rather than `[dev-dependencies]`: the `a2a`/`otel` features must enable features of the same crates, and a feature may not reliably forward to a dev-dependency.
