@@ -490,7 +490,16 @@ Unit tests beside each file, the `./wiring_tests/` suites for the metadata-drive
 of 2 s polling every 5 ms, no `#[ignore]`).
 
 - `deps.rs`: defaults are wired (native factory name, in-memory store, temp-rooted workspace), builders
-  override one field each, `resolved_language` honours `Language::resolve`.
+  override one field each, `resolved_language` honours `Language::resolve`, and `store_injected` is false
+  by default / true after `with_store` (it survives the other overrides).
+- `build.rs`: store resolution — a memory spec reuses the dependency store, an injected store wins over a
+  `postgresql` spec (as `Arc::ptr_eq`, proving `open_store` was skipped), a `sqlite` spec
+  (`#[cfg(feature = "sqlite")]`) opens its own backend and creates the nested parent directory, and
+  `postgresql`/`mysql`/`oracle` surface `ErrorKind::Unsupported` naming the backend or kind.
+- `health.rs`: `alive` needs an attached runtime whose phase is not `Terminated` on a row that is not
+  `Unstarted`; `from_roster` sorts by name and copies the leader; missing/unknown fields and the
+  snake_case wire shape (`team_name`, `started`, `leader`, `members`; `name`, `role`, `status`,
+  `execution`, `alive`).
 - `allocator.rs`: round-robin cycles in pool order and persists its cursor; `by_name` picks the named
   entry and falls back to the first; empty pool + `Some(name)` echoes the name with `index = 0`; empty pool
   + `None` is `Error::config`; `state_dict` round-trip.
@@ -512,8 +521,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `auto_start_all`, `create_task` leader-only, workspace isolation per member, attach bind policy, and the
   workspace lifecycle (`stop`/`shutdown_member` release exactly once, a failed release is logged).
 - `leader.rs` / `./tests/`: invoke with an immediate fake answer and an empty board → exactly one
-  `team.completed` marker last and the leader answer in `AgentOutput.output`; an open task keeps the stream
-  open until the board settles; cancellation ends the run.
+  `team.completed` marker last, exactly one `team_completed` bus event carrying the team name and
+  `reason: "settled"`, and the leader answer in `AgentOutput.output`; an open task keeps the stream
+  open until the board settles; cancellation ends the run and publishes no completion event.
 - `manager.rs`: activate → live, session-mismatch rejection for a temporary team, `interact` unknown
   (`not_active`) and after `stop_team` (`gate_closed`/`not_active`), `finalize_member`, `shutdown`,
   `stop_team` tearing the attach socket down.
@@ -547,8 +557,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   fatal while `required: true` fails the start; `stop` and the manager's `stop_team` remove the file and
   later calls fail.
 
-Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1322 lib
-tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p openjiuwen-agent-teams --no-default-features`,
+Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1338 lib
+tests in the default build, 1357 with `--features sqlite`, plus 219 integration tests over 15 binaries),
+`cargo test -p openjiuwen-agent-teams --no-default-features`,
 `cargo test -p openjiuwen-agent-teams --features sqlite`, `cargo clippy -p openjiuwen-agent-teams
 --all-targets -- -D warnings` and `cargo doc -p openjiuwen-agent-teams --no-deps` all green offline.
 
@@ -602,7 +613,12 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   exercises a real process member writes its own `sh` script or asserts the missing-program `Error::Config`;
   attach hosting is `#[cfg(unix)]` (`AttachServer::bind`/`serve` return `Unsupported` elsewhere) and the
   worktree backend needs a real `git` binary plus a repository.
-- `team_agent/test_support.rs` (`pub(crate)`, `#[cfg(test)]`) is the shared offline kit: `blueprint`,
+- `TeamHealth`/`MemberHealth` are exported from `runtime` (`runtime::mod` re-export) but **not** from the crate root: `src/lib.rs` enumerates the runtime items by name and belongs to another node, so a crate-root import needs that file updated elsewhere. `openjiuwen_agent_teams::runtime::{TeamHealth, MemberHealth}` works today.
+- `alive` is deliberately narrower than "has a harness": `build_with` already attaches the leader's harness, so an `Unstarted` row would otherwise read as alive. The predicate is `status != Unstarted && runtime attached && runtime state != Terminated`.
+- `deps.store_injected` is the only store-resolution switch: `with_store` sets it, `default()`/`new()` clear it. Adding a second way to supply a store would silently diverge from `resolve_store`.
+- `crates/openjiuwen-e2e/tests/team_backend.rs` still asserts that completion is stream-only (`all(|event| event.event_type != "team_completed")`); a settled run now also publishes `team_completed` on `TeamTopic::Team`, so that assertion belongs to the e2e owner and must be inverted there — this crate cannot edit it.
+- `src/schema/CONTEXT.md` (schema node) still says the leader loop emits no completion bus event; that node owns the correction.
+- A settled run publishes the bus event after the stream marker is sent, so a caller that reads the bus alone sees completion strictly after the frame; a publish failure is logged and never fails the run. `blueprint`,
   `deps`, `built`, `ScriptedFactory` (`failing_for`/`hanging_for`/`calls`/`harness`), `ScriptedHarness`
   (`calls`/`sends`, answers `done: <member>` by default), `RecordingWorkspaceProvider` (`requests`, `releases`/`released_names`, `fail_releases`).
 - `team_agent/` is split by concern (`mod.rs` handle, `lifecycle.rs`, `members.rs` plus the small
