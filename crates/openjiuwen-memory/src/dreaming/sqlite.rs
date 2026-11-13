@@ -84,8 +84,14 @@ INSERT INTO dream_jobs (
 ) ON CONFLICT(id) DO NOTHING";
 
 /// The single-statement claim: pick the head, move it to `running`, and return it.
-const CLAIM_JOB: &str = "
-UPDATE dream_jobs
+///
+/// Built from [`COLUMNS`] so the claimed row decodes through the same [`row_to_job`]
+/// helper as every other read. The subquery selects the head, the outer
+/// `state = 'pending'` predicate re-checks the row under the write lock, and the whole
+/// thing is one statement, so concurrent callers cannot both win.
+fn claim_query() -> String {
+    format!(
+        "UPDATE dream_jobs
    SET state = 'running', attempts = attempts + 1, started_at = ?1, updated_at = ?1
  WHERE id = (
         SELECT id FROM dream_jobs
@@ -95,9 +101,9 @@ UPDATE dream_jobs
          LIMIT 1
        )
    AND state = 'pending'
-RETURNING id, user_id, scope_id, session_id, agent_id, kind, state, trigger, priority, \
-          attempts, max_attempts, created_at, updated_at, started_at, finished_at, \
-          last_error, metrics_json, payload_json, metadata_json";
+RETURNING {COLUMNS}"
+    )
+}
 
 /// A [`DreamRepository`] backed by a `SQLite` database.
 ///
@@ -199,7 +205,7 @@ impl DreamRepository for SqliteDreamRepository {
     }
 
     async fn claim_next(&self, now: DateTime<Utc>) -> Result<Option<DreamJob>> {
-        let row = sqlx::query(CLAIM_JOB)
+        let row = sqlx::query(&claim_query())
             .bind(format_time(now))
             .fetch_optional(&self.pool)
             .await
