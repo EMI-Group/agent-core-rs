@@ -46,12 +46,16 @@ mod model;
 mod outcome;
 mod planner;
 mod repository;
+mod retention;
+mod salience;
 pub use config::*;
 pub use lease::*;
 pub use model::*;
 pub use outcome::*;
 pub use planner::*;
 pub use repository::*;
+pub use retention::*;
+pub use salience::*;
 
 #[cfg(feature = "sqlite")]
 mod sqlite;
