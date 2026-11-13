@@ -19,6 +19,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use openjiuwen_agent::AgentCard;
 use openjiuwen_common::error::{ErrorKind, Result};
+use openjiuwen_multiagent::autosubscribe::AutoSubscriptionMode;
 use openjiuwen_multiagent::{
     AgentProvider, BaseTeam, MemberOptions, StrategyContext, Team, TeamAgent, TeamCard, TeamConfig,
     TeamStrategy,
@@ -276,6 +277,24 @@ async fn strategy_free_team_is_unsupported() {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     assert_eq!(error.message(), "team has no strategy");
     assert!(frames.next().await.is_none());
+}
+
+#[tokio::test]
+async fn auto_subscriptions_default_to_merge_and_derive_nothing() {
+    let team = echo_team("team");
+    assert_eq!(team.auto_subscriptions(), AutoSubscriptionMode::Merge);
+    assert!(team.subscription_overrides().is_empty());
+    assert!(team.subscription_plan().is_empty());
+
+    team.add_agent(agent_card("a"), echoing_provider("a"))
+        .unwrap();
+    assert!(team.subscription_plan().is_empty());
+    assert_eq!(team.apply_subscriptions(), 0);
+    team.start().await.unwrap();
+    assert_eq!(
+        team.runtime().message_bus().agent_topics("a"),
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test]

@@ -4,8 +4,9 @@
 //! The suite registers [`common::FakeAgent`] members on a [`TeamRuntime`] and
 //! drives the tool directly: the model-facing card shape, the child session one
 //! dispatch builds (parent-scoped and invocation-scoped ids), the runtime's
-//! dispatch, and the mapping of a dropped runtime and of a failing member onto
-//! tool errors. Nothing touches the network.
+//! dispatch, the mapping of a dropped runtime and of a failing member onto
+//! tool errors, and the Python `str()` rendering of a result. Nothing touches
+//! the network.
 
 mod common;
 
@@ -250,4 +251,81 @@ async fn cancelled_context_is_reported() {
     ctx.cancellation.cancel();
     let error = tool.invoke(json!({}), &ctx).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
+}
+
+#[tokio::test]
+async fn cancelled_context_emits_no_task_events() {
+    use openjiuwen_multiagent::events::{TeamEvent, TeamEventFilter};
+
+    let (runtime, _seen) = runtime_with_member("worker");
+    let recorded: Arc<Mutex<Vec<TeamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    runtime.events().subscribe(
+        TeamEventFilter::new(),
+        Arc::new(move |event: &TeamEvent| sink.lock().push(event.clone())),
+    );
+
+    let card = agent_card("worker");
+    let tool = AgentTool::new(&card, Arc::downgrade(&runtime));
+    let ctx = ToolContext::new();
+    ctx.cancellation.cancel();
+    let error = tool.invoke(json!({}), &ctx).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(recorded.lock().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Result rendering (Python `str(result)`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn render_keeps_a_bare_string_bare() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new());
+    let tool = AgentTool::new(&agent_card("worker"), Arc::downgrade(&runtime));
+
+    assert_eq!(tool.render_for_llm(&json!("plain text")), "plain text");
+    assert_eq!(tool.render_for_llm(&json!("")), "");
+}
+
+#[tokio::test]
+async fn render_unwraps_a_string_content_object() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new());
+    let tool = AgentTool::new(&agent_card("worker"), Arc::downgrade(&runtime));
+
+    assert_eq!(
+        tool.render_for_llm(&json!({"content": "the answer", "trace": 7})),
+        "the answer",
+        "the foundation rule keeps only the string content"
+    );
+}
+
+#[tokio::test]
+async fn render_uses_python_repr_for_containers() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new());
+    let tool = AgentTool::new(&agent_card("worker"), Arc::downgrade(&runtime));
+
+    assert_eq!(
+        tool.render_for_llm(&json!({"a": 1, "ok": true, "missing": null})),
+        "{'a': 1, 'ok': True, 'missing': None}",
+        "booleans and null follow Python's spelling"
+    );
+    assert_eq!(
+        tool.render_for_llm(&json!([1, true, null, "x"])),
+        "[1, True, None, 'x']"
+    );
+    assert_eq!(tool.render_for_llm(&json!(true)), "True");
+    assert_eq!(tool.render_for_llm(&json!(7)), "7");
+    assert_eq!(
+        tool.render_for_llm(&json!({"content": {"nested": true}})),
+        "{'content': {'nested': True}}",
+        "a non-string content stays part of the rendered object"
+    );
+}
+
+#[tokio::test]
+async fn render_keeps_the_empty_text_for_a_null_result() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new());
+    let tool = AgentTool::new(&agent_card("worker"), Arc::downgrade(&runtime));
+
+    assert_eq!(tool.render_for_llm(&Value::Null), "");
 }

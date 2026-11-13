@@ -9,6 +9,27 @@
 //!
 //! The tool holds a [`Weak`] reference back to the runtime: an agent tool that
 //! outlives its team fails the call instead of keeping the team alive.
+//!
+//! # Task events
+//!
+//! Every successful dispatch through the runtime emits
+//! [`TeamEvent::task_assigned`] before the member is invoked and
+//! [`TeamEvent::task_completed`] after it answers. Both carry the child session
+//! id and a `call_id` detail with the derived tool-call/conversation id. A
+//! failed dispatch emits [`TeamEvent::error`] with an `operation` detail of
+//! `agent_tool` instead of the completion event. A dropped runtime emits
+//! nothing.
+//!
+//! # Result rendering
+//!
+//! Python renders a member result into the model's tool message with `str()`
+//! (`P2PAbilityManager`, `p2p_ability_manager.py`), so
+//! [`render_for_llm`](Tool::render_for_llm) reproduces Python's rendering
+//! instead of the foundation's compact-JSON default: a bare string stays bare, an
+//! object with a string `content` unwraps to that string (the foundation rule),
+//! a `null` result keeps the empty text, and every other value renders through
+//! [`render_python_value`], so `{"a": 1, "ok": true}` reads as
+//! `{'a': 1, 'ok': True}`.
 
 use std::sync::{Arc, Weak};
 
@@ -20,6 +41,8 @@ use openjiuwen_session::{AgentSession, AgentSessionOptions, Session};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::events::TeamEvent;
+use crate::pyrepr::render_python_value;
 use crate::runtime::TeamRuntime;
 
 /// Metadata key carrying the model's tool-call id for this invocation.
@@ -124,6 +147,10 @@ impl AgentTool {
     }
 
     /// Runs the member once, honouring the call deadline.
+    ///
+    /// Emits the task lifecycle events: `task_assigned` before the dispatch,
+    /// then `task_completed` on success or an `agent_tool` error event on
+    /// failure.
     async fn dispatch(
         &self,
         inputs: Value,
@@ -134,9 +161,52 @@ impl AgentTool {
             .runtime
             .upgrade()
             .ok_or_else(|| Error::tool("Agent execution error: team runtime dropped".to_owned()))?;
+        let events = runtime.events();
+        let team_id = runtime.team_id().to_owned();
         let session = self.child_session(ctx.session_id.as_deref(), tool_call_id);
-        // The permit is held until the invocation finishes, so the cap counts
-        // in-flight sub-agents rather than queued tool calls.
+        let child_id = session.id().to_owned();
+        events.emit(Self::task_event(
+            TeamEvent::task_assigned(&team_id, &self.agent_id, &self.card.name),
+            &child_id,
+        ));
+        let result = self.run(runtime, inputs, session, ctx).await;
+        match &result {
+            Ok(_) => {
+                events.emit(Self::task_event(
+                    TeamEvent::task_completed(&team_id, &self.agent_id, &self.card.name),
+                    &child_id,
+                ));
+            }
+            Err(error) => {
+                events.emit(
+                    TeamEvent::error(&team_id, &self.agent_id, error.to_string())
+                        .with_session(&child_id)
+                        .with_detail("call_id", Value::String(child_id.clone()))
+                        .with_detail("operation", Value::String("agent_tool".to_owned())),
+                );
+            }
+        }
+        result
+    }
+
+    /// Stamps the child session id and the derived call id onto `event`.
+    fn task_event(event: TeamEvent, child_id: &str) -> TeamEvent {
+        event
+            .with_session(child_id)
+            .with_detail("call_id", Value::String(child_id.to_owned()))
+    }
+
+    /// Invokes the member in `session`, bounded by the limiter and the deadline.
+    ///
+    /// The permit is held until the invocation finishes, so the cap counts
+    /// in-flight sub-agents rather than queued tool calls.
+    async fn run(
+        &self,
+        runtime: Arc<TeamRuntime>,
+        inputs: Value,
+        session: Arc<dyn Session>,
+        ctx: &ToolContext,
+    ) -> Result<Value> {
         let _permit = self.acquire_permit().await?;
         let pending = runtime.invoke_agent(&self.agent_id, inputs, Some(session));
         let output = match ctx.timeout {
@@ -172,5 +242,25 @@ impl Tool for AgentTool {
             .and_then(Value::as_str)
             .unwrap_or(ctx.invocation_id.as_str());
         self.dispatch(inputs, tool_call_id, ctx).await
+    }
+
+    /// Renders a member result the way Python's `str(result)` did.
+    ///
+    /// A bare string stays bare, an object with a string `content` unwraps to
+    /// that string, and a `null` result keeps the foundation's empty text. Every
+    /// other value renders through [`render_python_value`], so booleans and null
+    /// inside a container read as `True`/`None` rather than JSON's `true`/`null`,
+    /// matching what a Python model prompt carried. See the module docs for the
+    /// Python origin of this rule.
+    fn render_for_llm(&self, output: &Value) -> String {
+        match output {
+            Value::Null => String::new(),
+            Value::String(text) => text.clone(),
+            Value::Object(map) => match map.get("content") {
+                Some(Value::String(text)) => text.clone(),
+                _ => render_python_value(output),
+            },
+            other => render_python_value(other),
+        }
     }
 }

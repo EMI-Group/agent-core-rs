@@ -80,7 +80,8 @@ pub const CONTEXT_HISTORY_STATE_KEY: &str = "__handoff_ctx_history__";
 - **`ContainerAgent::invoke` always returns `Ok(AgentOutput::answer("{}"))`**; results reach consumers only through frames written to the team stream, matching the Python design where the container is a control shuttle, not a result carrier.
 - **Tool injection happens at most once per endpoint**: the `tools_injected` flag is set before the tool host is probed, so a host-less member is probed once and a rejected mount is only logged (Python parity).
 - **Signal extraction is observations-first**: `AgentOutput.answer(..)` carries no top-level signal key, so the order is result object, then `observations` (newest first), then the session `context` tool messages.
-- **Session signal extraction is JSON-only** (no Python `ast.literal_eval` fallback); a non-JSON tool message is ignored.
+- **Session signal extraction is JSON-first with a Python-literal fallback**: both the session `context` tool messages and the observation content go through `crate::pyrepr::literal_or_json`, so a payload that was routed through `str()` (`{'__handoff_to__': 'b'}`) still routes; text that is neither JSON nor a Python literal is ignored.
+- **Every hop is observable on the team event bus**: the container emits `handoff_started` (per dispatched hop, `detail.hop` 1-based, `peer_id` = the member about to run), the coordinator's winning completion emits `handoff_completed` (`detail.handoffs`, `detail.interrupted = true` when the hop forwarded an interrupt), and a failed hop emits `error` with `detail.operation = "handoff"`. Emission goes through `runtime.events()` and never affects the chain's result; a dropped runtime emits nothing (the endpoint cannot upgrade its `Weak`).
 - **Restore tolerates partial snapshots**: a missing/invalid coordinator snapshot starts a fresh coordinator, and a malformed history array is logged and treated as empty; on resume, entries whose output has `result_type == "interrupt"` are dropped because the interrupted hop is replayed.
 - **Context mirroring is best effort**: before a hop the team history is copied into the child session's `context.default_context_id.messages`; after the hop the cleaned child messages (no `tool` role, no assistant `tool_calls`) are deduped against the team history and appended. State errors are logged, never fatal.
 - **The stream strategy writes no frames itself**: `stream` delegates to `crate::session::team_stream` and the containers produce every frame (`{"type":"message","payload":..}`), so `invoke` and `stream` share one code path.
@@ -92,17 +93,18 @@ pub const CONTEXT_HISTORY_STATE_KEY: &str = "__handoff_ctx_history__";
 - `./mod.rs` → module docs (flow + re-entrancy), the six state/signal keys, module declarations, the re-exports, `HandoffStrategy` (setup/wiring/drive/invoke/stream) and `handoff_team`.
 - `./config.rs` → `HandoffConfig`, `HandoffRoute`, `HandoffSnapshot`, `TerminationCondition`, `HandoffTeamConfig` and their serde defaults.
 - `./request.rs` → `HandoffRequest` (wire form), `HandoffHistoryEntry`.
-- `./signal.rs` → `HandoffSignal` and the three extractors (result, observations, session).
+- `./signal.rs` → `HandoffSignal` and the three extractors (result, observations, session); JSON first, then `crate::pyrepr::literal_or_json`.
 - `./tool.rs` → `HandoffTool`, the `transfer_to_<id>` tool a model calls to hand off.
 - `./interrupt.rs` → `TeamInterruptSignal`, `extract_interrupt_signal`, `flush_team_session`.
 - `./orchestrator.rs` → `HandoffOrchestrator` (route graph, hop cap, termination, rendezvous) and `HandoffRegistry`.
-- `./container.rs` → `ContainerAgent`, the per-hop endpoint: tool injection, input shaping, target invocation, context mirroring, stream writes, interrupt forwarding, next-hop publish.
+- `./container.rs` → `ContainerAgent`, the per-hop endpoint: tool injection, input shaping, target invocation, context mirroring, stream writes, interrupt forwarding, next-hop publish, `handoff_started`/`handoff_completed`/`error` events.
 - `./container_tests.rs` → `ContainerAgent` unit tests (12), declared from `container.rs` as `mod tests`.
 
 ## Test Strategy
 
 - `container_tests.rs` (12 tests, local fakes from `handoff::support`): missing session ⇒ External `session_id is empty`; no coordinator ⇒ External `coordinator not found`; a successful hop returns `"{}"`, writes a `message` frame and lets `coordinator.wait(None)` yield the target output; an observation-driven handoff advances `current_agent_id`, an unknown/blocked target completes the chain; an interrupt output completes the coordinator and persists `COORDINATOR_STATE_KEY`/`HISTORY_STATE_KEY`; a failing target reports the error and still returns `Ok`; tool injection mounts `transfer_to_<target>` exactly once on a stable `ReActAgent` and skips a host-less member; history shaping for object/string/empty history.
 - `mod.rs` (9 tests) end to end through `handoff_team` + `BaseTeam::add_agent` + `Team::invoke`/`Team::stream`: single hop, two-hop chain via a spawned publish, blocked route, `max_handoffs = 0`, streamed frames, `message_timeout` timeout rewrite, and a skipped unregistered provider.
+- `tests/handoff_events.rs` (crate integration suite) covers the observable chain: one `handoff_started` per dispatched hop with `detail.hop`, `handoff_completed` with `detail.handoffs` and `interrupted: true` on an interrupt forward, the `handoff` `error` event for a failing member, and silence when the runtime was dropped.
 - A fake agent emits a handoff signal by returning an `Observation` whose `content` is the JSON signal (`{"__handoff_to__": ..}`), not through `AgentOutput::answer`.
 - Run the crate tests offline: `cargo test -p openjiuwen-multiagent --offline`; the handoff unit tests are `cargo test -p openjiuwen-multiagent --lib --offline handoff`.
 
@@ -110,7 +112,7 @@ pub const CONTEXT_HISTORY_STATE_KEY: &str = "__handoff_ctx_history__";
 
 - Session identity travels on the bus envelope (the child session's `parent_id()`), not inside `HandoffRequest` as in Python's object-carrying dataclass.
 - Signal extraction reads `AgentOutput.observations` before the session context; Python relies on the context engine's tool messages alone.
-- Python's `ast.literal_eval` repr fallback is not ported: session signals are JSON only.
+- Python's `ast.literal_eval` fallback is ported as a literal *parser* (`crate::pyrepr`), not an evaluator: names, calls, operators and comments are rejected, strings always render single-quoted, and floats render without exponent padding (`1e-5`, not `1e-05`).
 - `setup` skips a member whose provider or card vanished between registration and wiring (logged at `warn`), where Python would raise on attribute access.
 - `max_handoffs`/termination are enforced by the shared `HandoffOrchestrator`, so a blocked hop completes with the current result instead of returning Python's error string.
 - The endpoint provider returns a fresh `TeamAgent` per resolution but the same `ContainerAgent` prototype clone, so `tools_injected` is shared across resolutions.

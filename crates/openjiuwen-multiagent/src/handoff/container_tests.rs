@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::events::{TeamEvent, TeamEventFilter, TeamEventKind};
 use crate::handoff::support::{agent_card, fake_provider, FakeAgent};
 use crate::handoff::{HandoffConfig, HandoffRoute, COORDINATOR_STATE_KEY};
 use crate::runtime::RuntimeConfig;
@@ -443,4 +444,67 @@ async fn the_context_history_is_mirrored_from_and_to_the_hop() {
         vec!["hello", "hi there", "again"],
         "tool turns are dropped and repeats are not appended twice"
     );
+}
+
+#[tokio::test]
+async fn a_hop_reports_started_and_completed_on_the_event_bus() {
+    let fixture = Fixture::new(&["a"], "hop-events", &HandoffConfig::default());
+    let container = fixture.container("a", &[], fake_provider(FakeAgent::echo("a")));
+    let child = fixture.child();
+    let seen: Arc<Mutex<Vec<TeamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    fixture.runtime.events().subscribe(
+        TeamEventFilter::new(),
+        Arc::new(move |event: &TeamEvent| sink.lock().push(event.clone())),
+    );
+
+    container
+        .invoke(request(json!({"query": "hi"}), vec![]), Some(child))
+        .await
+        .unwrap();
+
+    let events = seen.lock().clone();
+    let kinds: Vec<TeamEventKind> = events.iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TeamEventKind::HandoffStarted,
+            TeamEventKind::HandoffCompleted
+        ]
+    );
+    let started = &events[0];
+    assert_eq!(started.agent_id.as_deref(), Some("a"));
+    assert_eq!(started.peer_id.as_deref(), Some("a"));
+    assert_eq!(started.session_id.as_deref(), Some("hop-events"));
+    assert_eq!(started.team_id, "container-tests");
+    assert_eq!(started.detail["hop"], 1);
+
+    let completed = &events[1];
+    assert_eq!(completed.agent_id.as_deref(), Some("a"));
+    assert_eq!(completed.session_id.as_deref(), Some("hop-events"));
+    assert_eq!(completed.detail["handoffs"], 0);
+    assert!(completed.detail.get("interrupted").is_none());
+}
+
+#[tokio::test]
+async fn a_hop_on_a_dropped_runtime_reports_nothing() {
+    let registry: Arc<HandoffRegistry> = Arc::new(HandoffRegistry::new());
+    let container = ContainerAgent::new(
+        agent_card("a"),
+        fake_provider(FakeAgent::echo("a")),
+        Vec::new(),
+        "team-card".to_owned(),
+        "__handoff_ep_team-card_a".to_owned(),
+        Weak::new(),
+        registry,
+    );
+
+    // Reporting is best effort: a dangling runtime must never panic a hop.
+    container.emit(None, TeamEvent::handoff_started("team", "a", "a"));
+
+    // A live runtime still receives the event through the hop handle.
+    let runtime = TeamRuntime::new(RuntimeConfig::new());
+    let events = runtime.events();
+    container.emit(Some(&runtime), TeamEvent::handoff_started("team", "a", "b"));
+    assert_eq!(events.history_of(TeamEventKind::HandoffStarted).len(), 1);
 }

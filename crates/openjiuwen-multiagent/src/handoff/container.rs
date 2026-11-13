@@ -29,6 +29,26 @@
 //!
 //! A failing target never raises: the coordinator is resolved with the target's
 //! error and the container still returns `{}` (Python parity).
+//!
+//! ## Events
+//!
+//! The container owns the hop-level notifications of a chain, all emitted on
+//! the runtime's event bus while the chain runs:
+//!
+//! - `handoff_started` right before the target is invoked, with the previous
+//!   member as the subject (the target itself for the first hop), the target as
+//!   the peer, the team session as the session, and the 1-based hop index under
+//!   the `hop` detail;
+//! - `handoff_completed` when a hop actually resolves the chain, with the
+//!   resolving member in both agent slots, the approved-transfer count under the
+//!   `handoffs` detail, and `interrupted: true` when the hop forwarded a team
+//!   interrupt;
+//! - `error` when the target invocation fails, with the failure message and an
+//!   `operation` detail of `handoff` (the chain is then resolved with that error,
+//!   as before).
+//!
+//! A container whose runtime is gone emits nothing: reporting is best effort and
+//! never fails a hop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -51,6 +71,7 @@ use super::{
 };
 
 use crate::error::TeamError;
+use crate::events::TeamEvent;
 use crate::member::{AgentProvider, TeamAgent};
 use crate::runtime::TeamRuntime;
 
@@ -149,6 +170,82 @@ impl ContainerAgent {
     #[must_use]
     pub fn allowed_targets(&self) -> &[String] {
         &self.allowed_targets
+    }
+
+    /// Emits `event` on the runtime's event bus.
+    ///
+    /// `runtime` is the hop runtime once it is resolved; without it the
+    /// container's own weak handle is upgraded. A dropped runtime emits nothing,
+    /// because event reporting must never fail a hop.
+    fn emit(&self, runtime: Option<&Arc<TeamRuntime>>, event: TeamEvent) {
+        let bus = runtime
+            .map(|runtime| runtime.events())
+            .or_else(|| self.runtime.upgrade().map(|runtime| runtime.events()));
+        if let Some(bus) = bus {
+            bus.emit(event);
+        }
+    }
+
+    /// Emits the `handoff_started` event of the hop that is about to run.
+    ///
+    /// The subject is the member recorded last in the hop history — the one that
+    /// handed control over; the first hop has no predecessor, so it names the
+    /// target itself. The hop index is 1-based and counts the accumulated
+    /// history, so it survives a resumed chain.
+    fn emit_hop_started(&self, hop: &HopContext, history: &[HandoffHistoryEntry]) {
+        let source = history
+            .last()
+            .map_or_else(|| self.target_card.id.clone(), |entry| entry.agent.clone());
+        let index = u64::try_from(history.len().saturating_add(1)).unwrap_or(u64::MAX);
+        let event =
+            TeamEvent::handoff_started(hop.runtime.team_id(), source, self.target_card.id.as_str())
+                .with_session(hop.session_id.as_str())
+                .with_detail("hop", Value::from(index));
+        self.emit(Some(&hop.runtime), event);
+    }
+
+    /// Emits the `handoff_completed` event of a resolved chain.
+    ///
+    /// The agent slots hold the coordinator's current member (the one that
+    /// produced the terminal result) and the `handoffs` detail counts the
+    /// approved transfers of the chain. An interrupted chain is marked with
+    /// `interrupted: true`.
+    fn emit_completion(&self, hop: &HopContext, interrupted: bool) {
+        let last_agent = hop.coordinator.current_agent_id();
+        let handoffs = u64::try_from(hop.coordinator.handoff_count()).unwrap_or(u64::MAX);
+        let mut event =
+            TeamEvent::handoff_completed(hop.runtime.team_id(), last_agent.clone(), last_agent)
+                .with_session(hop.session_id.as_str())
+                .with_detail("handoffs", Value::from(handoffs));
+        if interrupted {
+            event = event.with_detail("interrupted", Value::Bool(true));
+        }
+        self.emit(Some(&hop.runtime), event);
+    }
+
+    /// Emits the `error` event of a hop whose member invocation failed.
+    ///
+    /// The `handoff` operation detail tells this failure apart from other team
+    /// errors; the chain is resolved with the same error afterwards.
+    fn emit_hop_error(&self, hop: &HopContext, error: &Error) {
+        let event = TeamEvent::error(
+            hop.runtime.team_id(),
+            self.target_card.id.as_str(),
+            error.to_string(),
+        )
+        .with_session(hop.session_id.as_str())
+        .with_detail("operation", Value::String("handoff".to_owned()));
+        self.emit(Some(&hop.runtime), event);
+    }
+
+    /// Resolves the chain with `result` and reports the completion.
+    ///
+    /// The event is emitted only when this call resolved the chain, so a late
+    /// completion of an already-resolved chain stays silent.
+    async fn complete_chain(&self, hop: &HopContext, result: Value, interrupted: bool) {
+        if hop.coordinator.complete(result).await {
+            self.emit_completion(hop, interrupted);
+        }
     }
 
     /// Mounts the `transfer_to_<id>` tools of the allowed targets on `handle`.
@@ -383,11 +480,12 @@ impl ContainerAgent {
     /// completes the chain with the interrupt result.
     async fn forward_interrupt(
         &self,
-        coordinator: &HandoffOrchestrator,
-        team_session: &Arc<AgentTeamSession>,
+        hop: &HopContext,
         history: &[HandoffHistoryEntry],
         result: Value,
     ) {
+        let coordinator = &hop.coordinator;
+        let team_session = &hop.team_session;
         if let Err(error) = coordinator.save_to_session(team_session).await {
             tracing::warn!(
                 team = %self.team_card_id,
@@ -417,7 +515,7 @@ impl ContainerAgent {
             );
         }
         flush_team_session(Some(team_session)).await;
-        coordinator.complete(result).await;
+        self.complete_chain(hop, result, true).await;
     }
 
     /// Publishes the next hop from a spawned task.
@@ -515,6 +613,7 @@ impl ContainerAgent {
 
         self.inject_context_history(&hop.team_session, session.as_ref())
             .await;
+        self.emit_hop_started(hop, &history);
         let output = match handle.agent().invoke(agent_input, session.clone()).await {
             Ok(output) => output,
             Err(error) => {
@@ -526,6 +625,7 @@ impl ContainerAgent {
                     %error,
                     "handoff target invocation failed"
                 );
+                self.emit_hop_error(hop, &error);
                 hop.coordinator.error(error).await;
                 return Ok(AgentOutput::answer(EMPTY_ANSWER));
             }
@@ -547,8 +647,7 @@ impl ContainerAgent {
                 session_id = %hop.session_id,
                 "handoff hop interrupted; persisting the chain state"
             );
-            self.forward_interrupt(&hop.coordinator, &hop.team_session, &history, result)
-                .await;
+            self.forward_interrupt(hop, &history, result).await;
             return Ok(AgentOutput::answer(EMPTY_ANSWER));
         }
         self.dispatch_result(
@@ -586,7 +685,7 @@ impl ContainerAgent {
                 session_id = %hop.session_id,
                 "handoff chain completed without a handoff signal"
             );
-            hop.coordinator.complete(result).await;
+            self.complete_chain(hop, result, false).await;
             return Ok(AgentOutput::answer(EMPTY_ANSWER));
         };
         let target = signal.target.clone();
@@ -602,7 +701,7 @@ impl ContainerAgent {
                 %target,
                 "handoff blocked; completing with the current result"
             );
-            hop.coordinator.complete(result).await;
+            self.complete_chain(hop, result, false).await;
             return Ok(AgentOutput::answer(EMPTY_ANSWER));
         }
         let next_input = signal

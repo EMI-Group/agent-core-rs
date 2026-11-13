@@ -37,7 +37,14 @@ Everything is offline and deterministic: members are in-process closures, sessio
 - `./agent_tool.rs` → `AgentTool` card shape, dispatch, failures, concurrency limiter.
 - `./handoff.rs` → handoff strategy: route graph, coordinator semantics, save/restore, signal locators, `HandoffTool`, request wire form, end-to-end chains, streaming, resume.
 - `./hierarchical.rs` → hierarchical strategies: msgbus supervision (readiness, single hop, deadline, one-frame stream), agents-as-tools wiring and pinning (`RecordingToolHost` mounts, mounted-tool dispatch, root stream shaping, error frame), and the `SupervisorAgent` factory (validation, card, end-to-end dispatch, model-visible tool cards, parallel budget).
-- `./api_surface.rs` → compile-time pinning of every crate-root re-export and trait-object coercion, including the hierarchical configs, strategies, team builders, and supervisor factory, their serde round-trip and `schemars` property names, and the two strategy `kind()` strings.
+- `./api_surface.rs` → compile-time pinning of every crate-root re-export and trait-object coercion, including the hierarchical configs, strategies, team builders, and supervisor factory, their serde round-trip and `schemars` property names, the two strategy `kind()` strings, and (`new_*_are_re_exported_at_the_root`) the extended subsystems published at the root: events, autosubscribe, pyrepr, resources, member checkpoints, transports, and the P2P ability manager — plus its Python-parity `hierarchical::P2PAbilityManager` path.
+- `./events.rs` → typed team-event bus: wire names and Python parity constants, filtered delivery, unsubscribe, bounded history, serde/schema contracts, concurrent emission.
+- `./autosubscribe.rs` → card-driven subscription derivation (broadcast, directed tags, overrides) and the three reconciliation modes against the runtime registry.
+- `./pyrepr.rs` → `parse_python_literal`/`literal_or_json` parsing and `render_python_value` rendering, including the depth cap.
+- `./member_checkpoint.rs` → member-scoped keys/ids and per-member save/restore over one shared `MemoryCheckpointer`.
+- `./resources.rs` → `LocalResourceMgr` inherent surface and `TeamResourceMgr` trait-object defaults, duplicates, listings, revision and `clear`.
+- `./transport.rs` → `TeamTransport` backends: in-process delegation, the loopback Redis backend, key scheme, subscribers, deadlines, and the `Unsupported` Pulsar path.
+- `./ability.rs` → `P2PAbilityManager` batch dispatch: P2P vs local routing, input-order results, per-call failures, parallel cap.
 
 ## Test Strategy
 

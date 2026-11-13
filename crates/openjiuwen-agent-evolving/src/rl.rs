@@ -1,360 +1,62 @@
-//! RL records and API-shaped stubs for the Python RL stack.
+//! RL configuration, batching, rollout bookkeeping, and the pluggable trainer loop.
 //!
 //! Python `openjiuwen.agent_evolving.agent_rl` splits into two layers:
 //!
 //! - pure configuration and record models (`RlConfig`, `RlTask`, `Rollout`,
-//!   `RolloutMessage`, `RolloutWithReward`, `RewardRegistry`), which have no ML
-//!   dependency and are ported here as faithful `serde` shapes;
-//! - the training/rollout engines (`OfflineRlOptimizer`, `OnlineRlOptimizer`),
-//!   which need `torch`/`verl`/`ray`, Redis and a vLLM gateway, and are therefore
-//!   deferred (see [`crate::deferred`] and `docs/PARITY.md`).
+//!   `RolloutMessage`, `RolloutWithReward`, `RewardRegistry`) plus the offline
+//!   machinery that does not need a GPU — sample packing, reward
+//!   normalisation, rollout logs, checkpoints, and the training loop over
+//!   [`Policy`]/[`RolloutEngine`] seams;
+//! - the GPU training/rollout engines (`OfflineRlOptimizer`'s PPO/verl/ray
+//!   stack and `OnlineRlOptimizer`'s Redis/vLLM gateway), which remain deferred
+//!   (see [`crate::deferred`] and `docs/PARITY.md`).
 //!
-//! The stub methods keep their Python signatures so callers, tests, and the RL
-//! service router can be written against the final API; every one of them returns
-//! [`openjiuwen_common::error::Error::Unsupported`] naming the operation, never a
-//! panic. `RewardRegistry` is real: it is a pure name → reward map with
-//! insert/replace semantics.
+//! The deferred methods keep their Python signatures and return
+//! [`openjiuwen_common::error::Error::Unsupported`] naming the operation, never
+//! a panic. The orchestration itself is real: [`RlTrainer`] drives pluggable
+//! policies and rollout engines offline and deterministically, and
+//! [`crate::rl::OfflineRlOptimizer::train_with`] wires it to the same configuration the
+//! deferred `train` entry point uses.
 // Stub entry points keep their Python `async` shape although they never await.
 #![allow(clippy::unused_async_trait_impl)]
-use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use openjiuwen_common::error::{Error, Result};
 
-/// The full RL configuration: training, rollout, runtime, and persistence.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RlConfig {
-    /// Training-loop configuration.
-    pub training: RlTrainingConfig,
-    /// Rollout/actor configuration.
-    pub rollout: RlRolloutConfig,
-    /// Generation-time runtime configuration.
-    pub runtime: RlRuntimeConfig,
-    /// Rollout persistence configuration.
-    pub persistence: RlPersistenceConfig,
-}
+mod batch;
+mod checkpoint;
+mod config;
+mod policy;
+mod rollout;
+mod task;
+mod trainer;
 
-/// Training-loop configuration (Python `RlTrainingConfig`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RlTrainingConfig {
-    /// Path of the training dataset.
-    pub train_data_path: Option<String>,
-    /// Path of the validation dataset.
-    pub val_data_path: Option<String>,
-    /// Training data files, when the dataset is split over several files.
-    pub train_files: Vec<String>,
-    /// Validation data files, when the dataset is split over several files.
-    pub val_files: Vec<String>,
-    /// Path of the policy model to train.
-    pub model_path: Option<String>,
-    /// Directory the trainer writes checkpoints to.
-    pub save_path: Option<String>,
-    /// Advantage estimator name (`grpo` in Python).
-    pub algorithm_adv_estimator: String,
-    /// Number of training epochs.
-    pub epoch_num: usize,
-    /// Save a checkpoint every `save_freq` steps.
-    pub save_freq: usize,
-    /// Run the validation split every `test_freq` steps.
-    pub test_freq: usize,
-    /// Training batch size.
-    pub train_batch_size: usize,
-    /// Number of concurrent rollout workers.
-    pub rollout_concurrency: usize,
-    /// Micro-batch size per GPU.
-    pub micro_batch_size_per_gpu: usize,
-    /// Maximum prompt length in tokens.
-    pub max_prompt_length: usize,
-    /// Maximum response length in tokens.
-    pub max_response_length: usize,
-    /// Whether to evaluate the validation split before training starts.
-    pub val_before_train: bool,
-}
+pub use batch::{token_estimate, BatchPacker, RlBatch, RlSample, MESSAGE_TOKEN_OVERHEAD};
+pub use checkpoint::{RlCheckpoint, CHECKPOINT_VERSION};
+pub use config::{
+    RlConfig, RlPersistenceConfig, RlRolloutConfig, RlRuntimeConfig, RlTrainingConfig,
+};
+pub use policy::{
+    DeterministicPolicy, FakeRolloutEngine, Policy, RewardFn, RlUpdate, RolloutEngine,
+};
+pub use rollout::{
+    RewardGroupStats, RewardNormalisation, RewardNormaliser, RewardStats, RolloutLog,
+};
+pub use task::{RewardRegistry, RlTask, Rollout, RolloutMessage, RolloutWithReward};
+pub use trainer::{RlEpochReport, RlStopReason, RlTrainReport, RlTrainer, RlTrainerConfig};
 
-fn default_algorithm_adv_estimator() -> String {
-    "grpo".to_owned()
-}
-
-const fn default_one() -> usize {
-    1
-}
-
-const fn default_prompt_length() -> usize {
-    1024
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-impl Default for RlTrainingConfig {
-    fn default() -> Self {
-        Self {
-            train_data_path: None,
-            val_data_path: None,
-            train_files: Vec::new(),
-            val_files: Vec::new(),
-            model_path: None,
-            save_path: None,
-            algorithm_adv_estimator: default_algorithm_adv_estimator(),
-            epoch_num: default_one(),
-            save_freq: default_one(),
-            test_freq: default_one(),
-            train_batch_size: default_one(),
-            rollout_concurrency: default_one(),
-            micro_batch_size_per_gpu: default_one(),
-            max_prompt_length: default_prompt_length(),
-            max_response_length: default_prompt_length(),
-            val_before_train: default_true(),
-        }
-    }
-}
-
-/// Rollout/actor configuration (Python `RlRolloutConfig`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RlRolloutConfig {
-    /// Learning rate of the actor optimizer.
-    pub actor_optimizer_lr: f64,
-    /// Whether the actor uses a KL penalty against the reference policy.
-    pub actor_use_kl_loss: bool,
-    /// KL-penalty coefficient.
-    pub actor_kl_loss_coef: f64,
-    /// Entropy-bonus coefficient.
-    pub actor_entropy_coef: f64,
-    /// Lower clipping ratio of the policy ratio.
-    pub actor_clip_ratio_low: f64,
-    /// Upper clipping ratio of the policy ratio.
-    pub actor_clip_ratio_high: f64,
-    /// Number of sampled responses per prompt.
-    pub rollout_n: usize,
-}
-
-const fn default_actor_optimizer_lr() -> f64 {
-    1e-6
-}
-
-const fn default_actor_kl_loss_coef() -> f64 {
-    0.001
-}
-
-const fn default_actor_entropy_coef() -> f64 {
-    0.001
-}
-
-const fn default_actor_clip_ratio_low() -> f64 {
-    0.2
-}
-
-const fn default_actor_clip_ratio_high() -> f64 {
-    0.28
-}
-
-impl Default for RlRolloutConfig {
-    fn default() -> Self {
-        Self {
-            actor_optimizer_lr: default_actor_optimizer_lr(),
-            actor_use_kl_loss: default_true(),
-            actor_kl_loss_coef: default_actor_kl_loss_coef(),
-            actor_entropy_coef: default_actor_entropy_coef(),
-            actor_clip_ratio_low: default_actor_clip_ratio_low(),
-            actor_clip_ratio_high: default_actor_clip_ratio_high(),
-            rollout_n: default_one(),
-        }
-    }
-}
-
-/// Generation-time runtime configuration (Python `RlRuntimeConfig`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RlRuntimeConfig {
-    /// System prompt prepended to every rollout prompt.
-    pub system_prompt: String,
-    /// Sampling temperature.
-    pub temperature: f64,
-    /// Nucleus-sampling probability mass.
-    pub top_p: f64,
-    /// Maximum number of generated tokens per turn.
-    pub max_new_tokens: usize,
-    /// Presence penalty applied to generated tokens.
-    pub presence_penalty: f64,
-    /// Frequency penalty applied to generated tokens.
-    pub frequency_penalty: f64,
-}
-
-const fn default_temperature() -> f64 {
-    1.0
-}
-
-const fn default_top_p() -> f64 {
-    1.0
-}
-
-impl Default for RlRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            system_prompt: String::new(),
-            temperature: default_temperature(),
-            top_p: default_top_p(),
-            max_new_tokens: default_prompt_length(),
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-        }
-    }
-}
-
-/// Rollout persistence configuration (Python `RlPersistenceConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RlPersistenceConfig {
-    /// Whether rollout persistence is enabled.
-    pub enabled: bool,
-    /// Directory rollouts are written to.
-    pub save_path: Option<String>,
-    /// Flush interval in steps; `0` flushes every step.
-    pub flush_interval: u64,
-    /// Whether the raw rollouts are persisted.
-    pub save_rollouts: bool,
-    /// Whether the per-step summaries are persisted.
-    pub save_step_summaries: bool,
-}
-
-/// One task handed to the RL environment (Python `RlTask`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RlTask {
-    /// Identifier of the task.
-    pub task_id: String,
-    /// Identifier of the task this one was derived from, if any.
-    pub origin_task_id: Option<String>,
-    /// The task sample (prompt, metadata) as JSON.
-    pub task_sample: Value,
-    /// Round number the task belongs to.
-    pub round_num: u64,
-}
-
-/// One model turn of a rollout (Python `Rollout`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Rollout {
-    /// Turn index inside the rollout.
-    pub turn_id: u64,
-    /// Prompt fed to the model, as JSON.
-    pub input_prompt: Value,
-    /// Raw model response, as JSON.
-    pub output_response: Value,
-    /// LLM configuration used for the turn, as JSON.
-    pub llm_config: Value,
-    /// Token ids of the prompt.
-    pub input_prompt_ids: Vec<u32>,
-    /// Token ids of the response.
-    pub output_response_ids: Vec<u32>,
-}
-
-/// A finished rollout with its reward, as published to the trainer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RolloutMessage {
-    /// Identifier of the task the rollout belongs to.
-    pub task_id: String,
-    /// Identifier of the task this one was derived from, if any.
-    pub origin_task_id: Option<String>,
-    /// Identifier of the rollout.
-    pub rollout_id: String,
-    /// ISO-8601 start time, when the producer recorded one.
-    pub start_time: Option<String>,
-    /// ISO-8601 end time, when the producer recorded one.
-    pub end_time: Option<String>,
-    /// Rollout metadata, as JSON.
-    pub rollout_info: Value,
-    /// Per-turn rewards.
-    pub reward_list: Vec<f64>,
-    /// Aggregated reward of the rollout.
-    pub global_reward: f64,
-    /// Number of turns in the rollout.
-    pub turn_count: u64,
-    /// Round number the rollout belongs to.
-    pub round_num: u64,
-}
-
-/// A reward-annotated turn used as a training sample (Python `RolloutWithReward`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RolloutWithReward {
-    /// Turn index inside the rollout.
-    pub turn_id: u64,
-    /// Identifier of the task the turn belongs to.
-    pub task_id: String,
-    /// Identifier of the rollout the turn belongs to.
-    pub rollout_id: String,
-    /// Token ids of the prompt.
-    pub input_prompt_ids: Vec<u32>,
-    /// Token ids of the response.
-    pub output_response_ids: Vec<u32>,
-    /// Reward assigned to the turn.
-    pub reward: f64,
-    /// Number of turns in the rollout.
-    pub n_turns: u64,
-    /// Loss mask over the response tokens (`1` = train, `0` = ignore).
-    pub loss_mask: Vec<u8>,
-}
-
-/// A name → reward-payload registry, mirroring Python's `RewardRegistry`.
+/// The offline (batch) RL optimizer.
 ///
-/// Registration is a plain map insert: registering a new name returns `true`,
-/// registering an existing name replaces the payload and returns `false`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RewardRegistry {
-    /// Reward payloads keyed by reward name.
-    pub rewards: BTreeMap<String, Value>,
-}
-
-impl RewardRegistry {
-    /// Creates an empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers `reward` under `name`.
-    ///
-    /// Returns `true` when the name was newly inserted and `false` when an
-    /// existing payload was replaced.
-    pub fn register(&mut self, name: impl Into<String>, reward: Value) -> bool {
-        self.rewards.insert(name.into(), reward).is_none()
-    }
-
-    /// Returns the payload registered under `name`.
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<&Value> {
-        self.rewards.get(name)
-    }
-
-    /// Lists the registered reward names in sorted order.
-    #[must_use]
-    pub fn list(&self) -> Vec<&str> {
-        self.rewards.keys().map(String::as_str).collect()
-    }
-
-    /// Number of registered rewards.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.rewards.len()
-    }
-
-    /// Whether no reward is registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rewards.is_empty()
-    }
-}
-
-/// The offline (batch) RL optimizer, stubbed.
-///
-/// Python drives this through `verl` + `ray` with a local PPO trainer. That stack
-/// is Python-only and deferred; the type keeps the constructor, the configuration
-/// accessor, and the reward registry so callers can be written today.
+/// Python drives this through `verl` + `ray` with a local PPO trainer. That
+/// stack is Python-only and deferred; the type keeps the constructor, the
+/// configuration accessor, and the reward registry so callers can be written
+/// today, and exposes the portable orchestration through
+/// [`Self::train_with`].
 #[derive(Debug, Clone)]
 pub struct OfflineRlOptimizer {
     config: RlConfig,
@@ -382,7 +84,8 @@ impl OfflineRlOptimizer {
     /// # Errors
     ///
     /// Always returns [`Error::Unsupported`]: the distributed training stack is
-    /// deferred (see `docs/PARITY.md`).
+    /// deferred (see `docs/PARITY.md`). Use [`Self::train_with`] for the
+    /// portable loop.
     pub async fn train(&mut self) -> Result<()> {
         Err(Error::unsupported(
             "OfflineRlOptimizer::train is deferred: the Python PPO/verl/ray training stack is \
@@ -401,6 +104,33 @@ impl OfflineRlOptimizer {
             "OfflineRlOptimizer::start_training is deferred: the Python PPO/verl/ray training \
              stack is not ported; see docs/PARITY.md",
         ))
+    }
+
+    /// Runs the portable offline loop over a pluggable policy and rollout engine.
+    ///
+    /// The epoch count, rollout count, checkpoint frequency, and checkpoint
+    /// directory come from [`RlConfig`]: `training.epoch_num`,
+    /// `rollout.rollout_n`, `training.save_freq`, and `training.save_path`.
+    /// Unlike [`Self::train`], this method needs no GPU stack and is fully
+    /// offline and deterministic.
+    pub async fn train_with(
+        &mut self,
+        policy: Arc<dyn Policy>,
+        engine: &dyn RolloutEngine,
+        tasks: &[RlTask],
+        cancel: &CancellationToken,
+    ) -> Result<RlTrainReport> {
+        let config = RlTrainerConfig {
+            run_id: None,
+            epochs: self.config.training.epoch_num,
+            rollout_samples: self.config.rollout.rollout_n,
+            early_stop_reward: RlTrainerConfig::default().early_stop_reward,
+            checkpoint_dir: self.config.training.save_path.as_ref().map(PathBuf::from),
+            checkpoint_every: self.config.training.save_freq.max(1),
+        };
+        RlTrainer::new(config)
+            .train(policy, engine, tasks, cancel)
+            .await
     }
 
     /// Registers a reward payload under `name`; see [`RewardRegistry::register`].
@@ -634,6 +364,7 @@ mod tests {
             reward: 0.25,
             n_turns: 1,
             loss_mask: vec![1, 1],
+            group_id: None,
         };
         let decoded: RolloutWithReward =
             serde_json::from_value(serde_json::to_value(&sample).expect("serialize"))

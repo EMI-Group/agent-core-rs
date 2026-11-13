@@ -305,3 +305,26 @@ async fn publish_delivers_to_subscribers() {
     seen.sort();
     assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
 }
+
+#[tokio::test]
+async fn default_seams_are_wired_to_the_bus() {
+    use openjiuwen_multiagent::events::{TeamEvent, TeamEventFilter};
+    use openjiuwen_multiagent::transport::TransportKind;
+
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("wired"));
+    assert_eq!(runtime.events().history().len(), 0);
+    assert_eq!(runtime.transport().kind(), TransportKind::InProcess);
+    assert_eq!(runtime.transport().team_id(), "wired");
+    assert!(runtime.resource_mgr().is_none());
+    assert!(runtime.member_checkpointer().is_none());
+
+    let seen: Arc<Mutex<Vec<TeamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    runtime.events().subscribe(
+        TeamEventFilter::new(),
+        Arc::new(move |event: &TeamEvent| sink.lock().push(event.clone())),
+    );
+    runtime.register_agent(agent_card("worker"), echoing_provider("worker"));
+    assert_eq!(seen.lock().len(), 1);
+    assert_eq!(runtime.events().history().len(), 1);
+}

@@ -1,6 +1,6 @@
 //! Evaluation seams, reports, and the deterministic evaluation driver.
 //!
-//! Ports the offline part of Python `openjiuwen.agent_evolving.evaluator`:
+//! Ports Python `openjiuwen.agent_evolving.evaluator`:
 //!
 //! - [`Evaluator`] — turns a `(case, prediction)` pair into an
 //!   [`EvaluatedCase`]; the provided [`batch_evaluate`](Evaluator::batch_evaluate)
@@ -11,6 +11,18 @@
 //! - [`evaluate_cases`] — the end-to-end driver: run, score, and report.
 //!
 //! Metrics and their aggregation live in `metrics`.
+//!
+//! # Two scoring paths
+//!
+//! - **Live model judge** — [`LlmJudge`] sends
+//!   [`build_judge_messages`] to a [`Model`](openjiuwen_core::foundation::llm::Model)
+//!   and parses the reply into a [`JudgeVerdict`]; [`LlmJudgeEvaluator`] and
+//!   [`crate::evaluator::DefaultEvaluator`] wrap that with a
+//!   deterministic fallback metric. Only this path performs I/O, and every
+//!   fallback is stated in the evaluated case's reason.
+//! - **Deterministic metrics** — [`ExactMatchMetric`] and
+//!   [`LlmAsJudgeMetric`] score a prediction that is already present, so a
+//!   recorded verdict replays offline.
 //!
 //! # Determinism
 //!
@@ -62,6 +74,7 @@
 //! }
 //! ```
 
+mod judge;
 mod metrics;
 mod runner;
 
@@ -74,6 +87,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub use judge::{
+    build_judge_messages, JudgeCriterion, JudgeRubric, JudgeVerdict, LlmJudge, LlmJudgeEvaluator,
+};
 pub use metrics::{
     Aggregate, DefaultEvaluator, ExactMatchMetric, LlmAsJudgeMetric, Metric, MetricEvaluator,
     MetricValue,
@@ -102,8 +118,9 @@ pub trait Evaluator: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error when scoring cannot proceed (for example the deferred
-    /// model judge) or when the produced score is invalid.
+    /// Returns an error when scoring cannot proceed (for example an unreachable
+    /// judge model with no usable fallback) or when the produced score is
+    /// invalid.
     async fn evaluate(&self, case: &Case, prediction: &Value) -> Result<EvaluatedCase>;
 
     /// Evaluates `cases` and `predictions` pairwise with bounded concurrency.
