@@ -175,7 +175,10 @@
 //! [`TraceSpan`]: openjiuwen_core::session::tracer::TraceSpan
 
 pub mod config;
+pub mod env;
+pub mod grafana;
 pub mod handle;
+pub mod langfuse;
 pub mod redaction;
 pub mod semconv;
 pub mod span_names;
@@ -186,6 +189,8 @@ mod agent_handler;
 mod attrs;
 #[cfg(feature = "otel")]
 mod llm_attrs;
+#[cfg(feature = "otel")]
+pub mod otlp;
 #[cfg(feature = "otel")]
 pub mod provider;
 #[cfg(feature = "otel")]
