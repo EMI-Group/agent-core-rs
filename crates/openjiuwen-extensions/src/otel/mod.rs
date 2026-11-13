@@ -171,11 +171,130 @@
 //! # }
 //! ```
 //!
+//! # OTLP export
+//!
+//! [`ExporterType::Otlp`] ships finished spans to a collector over OTLP/HTTP
+//! with JSON payloads. That is the only transport this crate speaks: gRPC with
+//! protobuf framing needs `opentelemetry-otlp`, `prost`, and `tonic`, which the
+//! offline build cannot reach, so [`OtlpProtocol::Grpc`] — the configuration
+//! default — answers
+//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) instead
+//! of being downgraded silently. Select the supported transport with
+//! [`OtlpProtocol::Http`] or `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`.
+//!
+//! Every setting resolves in one order: the value on the configuration, then
+//! the `OPENJIUWEN_OTEL_*` variable, then the standard `OTEL_*` variable, then
+//! the built-in default ([`DEFAULT_OTLP_HTTP_ENDPOINT`],
+//! `http/json`, no extra headers). The rules live in [`mod@env`].
+//! `export_timeout_ms` bounds one HTTP request, `schedule_delay_millis` and
+//! `max_export_batch_size` shape the batch processor, and a failed export is
+//! logged at `warn` and dropped rather than propagated to the caller.
+//!
+//! Shutdown keeps the tail of the stream: [`TracerHandle::shutdown`] flushes the
+//! batch processor and then stops the provider within `export_timeout_ms`, and
+//! [`TracerHandle::shutdown_with_timeout`] takes an explicit budget; both are
+//! idempotent and both are no-ops for an inactive handle.
+//!
+//! The doctest below builds a handle towards a local collector and never
+//! exports a span, so it needs no running collector.
+//!
+//! ```
+//! # #[cfg(feature = "otel")]
+//! # {
+//! use std::time::Duration;
+//!
+//! use openjiuwen_extensions::otel::{
+//!     init_otel_tracer, ExporterType, OtelTracerConfig, OtlpProtocol,
+//! };
+//!
+//! let config = OtelTracerConfig {
+//!     protocol: OtlpProtocol::Http,
+//!     exporter_endpoint: Some("http://localhost:4318".to_owned()),
+//!     export_timeout_ms: 1_000,
+//!     ..OtelTracerConfig::default()
+//! }
+//! .with_exporter_type(ExporterType::Otlp);
+//! let handle = init_otel_tracer(config).expect("OTLP/HTTP initializes offline");
+//! assert!(handle.is_active());
+//! assert!(handle.capture().is_none(), "OTLP exposes no capture API");
+//!
+//! // No span was created, so the shutdown performs no HTTP request.
+//! handle.shutdown_with_timeout(Duration::from_millis(250));
+//! assert!(!handle.is_active());
+//! # }
+//! ```
+//!
+//! # Integrations
+//!
+//! [`ExporterType::Otlp`] with [`OtlpProtocol::Http`] is the transport the
+//! presets below share: finished spans leave the process as OTLP/HTTP JSON
+//! batches.
+//!
+//! - `grafana` — [`GrafanaCloudConfig`] turns a Grafana Cloud stack into the
+//!   gateway preset (`https://otlp-gateway-<zone>.grafana.net/otlp`) plus the
+//!   Basic `authorization` header built from the stack instance id and an
+//!   access-policy token. `GrafanaAgentConfig` keeps the self-hosted Grafana
+//!   Agent/Alloy push API-shaped and answers
+//!   [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported): the
+//!   collector service has to exist and run outside this process.
+//! - `langfuse` — [`LangfuseConfig`] addresses the OTLP endpoint
+//!   `{host}/api/public/otel` with the project keys as Basic credentials, and
+//!   [`LangfuseClient`] posts batched trace/span/generation events to
+//!   `POST {host}/api/public/ingestion` through [`IngestionBatch`].
+//!
+//! Neither preset contacts its backend at configuration time: requests happen
+//! when a span batch is exported, or when [`LangfuseClient`] is asked to
+//! ingest.
+//!
+//! ```
+//! use openjiuwen_extensions::otel::{
+//!     GrafanaAgentConfig, GrafanaCloudConfig, LangfuseConfig,
+//! };
+//!
+//! let grafana = GrafanaCloudConfig::new("123", "glc_token", "prod-us-east-0")
+//!     .with_service_name("checkout");
+//! assert_eq!(
+//!     grafana.endpoint(),
+//!     "https://otlp-gateway-prod-us-east-0.grafana.net/otlp",
+//! );
+//! assert!(grafana.authorization().starts_with("Basic "));
+//! let otel = grafana.otel_config()?;
+//! assert_eq!(
+//!     otel.exporter_endpoint.as_deref(),
+//!     Some(grafana.endpoint().as_str()),
+//! );
+//! assert_eq!(otel.headers["authorization"], grafana.authorization());
+//!
+//! let langfuse = LangfuseConfig::new("pk-lf-public", "sk-lf-secret")
+//!     .with_host("https://langfuse.internal");
+//! assert_eq!(
+//!     langfuse.endpoint(),
+//!     "https://langfuse.internal/api/public/otel",
+//! );
+//! assert_eq!(
+//!     langfuse.ingestion_url(),
+//!     "https://langfuse.internal/api/public/ingestion",
+//! );
+//! assert!(langfuse.otel_config()?.headers["authorization"].starts_with("Basic "));
+//!
+//! // The self-hosted Grafana Agent/Alloy push needs an external collector.
+//! let error = GrafanaAgentConfig::new("http://localhost:4318")
+//!     .otel_config()
+//!     .expect_err("a collector has to run outside the process");
+//! assert!(error.to_string().contains("collector"));
+//! # Ok::<(), openjiuwen_common::error::Error>(())
+//! ```
+//!
 //! [`TraceSink`]: openjiuwen_core::session::tracer::TraceSink
 //! [`TraceSpan`]: openjiuwen_core::session::tracer::TraceSpan
+//! [`TracerHandle::shutdown`]: self::handle::TracerHandle::shutdown
+//! [`TracerHandle::shutdown_with_timeout`]: self::handle::TracerHandle::shutdown_with_timeout
 
 pub mod config;
+pub mod env;
+pub mod grafana;
 pub mod handle;
+pub mod langfuse;
 pub mod redaction;
 pub mod semconv;
 pub mod span_names;
@@ -187,6 +306,8 @@ mod attrs;
 #[cfg(feature = "otel")]
 mod llm_attrs;
 #[cfg(feature = "otel")]
+pub mod otlp;
+#[cfg(feature = "otel")]
 pub mod provider;
 #[cfg(feature = "otel")]
 pub mod sink;
@@ -196,7 +317,13 @@ pub mod span_manager;
 mod workflow_handler;
 
 pub use config::{global_instrument_enabled, ExporterType, OtelTracerConfig, OtlpProtocol};
+pub use env::DEFAULT_OTLP_HTTP_ENDPOINT;
+pub use grafana::{GrafanaAgentConfig, GrafanaCloudConfig};
 pub use handle::{init_otel_tracer, TracerHandle};
+pub use langfuse::{
+    GenerationBody, IngestionBatch, IngestionEvent, IngestionEventType, IngestionSummary,
+    LangfuseClient, LangfuseConfig, SpanBody, TraceBody,
+};
 pub use redaction::{hash_value, truncate, RedactionField, Redactor};
 pub use span_names::{
     chat_span_name, chat_span_name_for_model, embeddings_span_name, is_llm_component,
@@ -208,6 +335,8 @@ pub use span_names::{
 pub use agent_handler::OtelAgentHandler;
 #[cfg(feature = "otel")]
 pub use handle::init_otel_tracer_with_exporter;
+#[cfg(feature = "otel")]
+pub use otlp::OtlpHttpExporter;
 #[cfg(feature = "otel")]
 pub use provider::{tracing_layer, CaptureExporter};
 #[cfg(feature = "otel")]

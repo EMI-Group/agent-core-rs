@@ -9,23 +9,22 @@
 //!
 //! Documented deviations from the Python module:
 //!
-//! - OTLP export is deferred: [`super::handle::init_otel_tracer`] rejects
-//!   [`ExporterType::Otlp`] with `Error::Unsupported`, so no OTLP exporter is
-//!   built here. Hosts that own an exporter inject it through
-//!   [`super::handle::init_otel_tracer_with_exporter`].
+//! - The OTLP exporter is not built here: [`super::handle::init_otel_tracer`]
+//!   resolves the transport and endpoint, then hands an `OtlpHttpExporter` to
+//!   `build_provider` like any other exporter. Hosts that own an exporter
+//!   inject it through [`super::handle::init_otel_tracer_with_exporter`].
 //! - The console exporter writes one `tracing` line per span at `debug`
 //!   instead of Python's `ConsoleSpanExporter` stdout dump (libraries never
 //!   write to stdout).
-//! - `export_timeout_ms` is not applied: `BatchConfigBuilder`'s
+//! - `export_timeout_ms` sizes one OTLP HTTP request (see
+//!   [`super::handle`]), not the batch processor: `BatchConfigBuilder`'s
 //!   `with_max_export_timeout` is gated behind the
 //!   `experimental_trace_batch_span_processor_with_async_runtime` feature of
-//!   `opentelemetry_sdk` 0.31, which this crate does not enable. The SDK
-//!   default (or `OTEL_BSP_EXPORT_TIMEOUT`) applies.
+//!   `opentelemetry_sdk` 0.31, which this crate does not enable, so the batch
+//!   processor keeps the SDK default (or `OTEL_BSP_EXPORT_TIMEOUT`).
 //! - `max_attr_length` is not a provider knob: 0.31's `SpanLimits` has no
 //!   attribute-value-length field, so the cap is enforced by
 //!   [`super::redaction::truncate`] when attributes are recorded.
-//!
-//! [`ExporterType::Otlp`]: super::config::ExporterType::Otlp
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -326,9 +325,11 @@ fn span_limits(config: &OtelTracerConfig) -> SpanLimits {
 
 /// Builds the batch processor configuration.
 ///
-/// `export_timeout_ms` is deliberately absent: the SDK builder method for it
-/// is feature-gated (see the module docs), so a host that needs the timeout
-/// sets `OTEL_BSP_EXPORT_TIMEOUT`.
+/// `export_timeout_ms` is deliberately absent: the SDK builder method for the
+/// batch export timeout is feature-gated (see the module docs), so the batch
+/// processor keeps the SDK default and a host that needs to change it sets
+/// `OTEL_BSP_EXPORT_TIMEOUT`. The OTLP HTTP request timeout uses
+/// `export_timeout_ms` instead, in [`super::handle`].
 fn batch_config(config: &OtelTracerConfig) -> BatchConfig {
     BatchConfigBuilder::default()
         .with_scheduled_delay(Duration::from_millis(config.schedule_delay_millis))

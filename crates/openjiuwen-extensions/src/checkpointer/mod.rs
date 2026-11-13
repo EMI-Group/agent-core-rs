@@ -5,10 +5,13 @@
 //! (`openjiuwen_core::session::checkpoint`), while this module re-exports that
 //! surface and dispatches [`build_checkpointer`] to the kernel factory.
 //!
-//! The Redis backend lives in the `redis` submodule behind the `redis`
-//! feature. It is API-shaped but deferred: every operation returns
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`], and pickled payloads
-//! are a deliberate non-goal (see `docs/PARITY.md`).
+//! The Redis backend lives in the `redis` submodule behind the `redis` feature.
+//! It is a live single-node implementation over this crate's in-tree `RESP`
+//! client; TLS (`rediss://`) and cluster slot routing remain deferred and report
+//! [`openjiuwen_common::error::ErrorKind::Unsupported`] with a reason. The kernel
+//! `CheckpointerKind` has no Redis variant, so [`build_checkpointer`] cannot
+//! select it: construct one with `checkpointer::redis::RedisCheckpointer::new`
+//! (lazy connect) or `connect`/`create` (eager connect).
 //!
 //! ```
 //! use openjiuwen_extensions::checkpointer::{build_checkpointer, CheckpointerConfig,
@@ -42,8 +45,9 @@ pub mod redis;
 ///
 /// Delegates to [`openjiuwen_core::session::checkpoint::create_checkpointer`]:
 /// `InMemory`, `File`, and (with the `sqlite` feature) `Sqlite` are built by the
-/// kernel; this module adds no backend of its own outside the deferred Redis
-/// surface in `redis`.
+/// kernel; the Redis backend in `redis` is reached through
+/// `RedisCheckpointer::connect`/`create` because `CheckpointerKind` has no Redis
+/// variant.
 ///
 /// # Errors
 ///

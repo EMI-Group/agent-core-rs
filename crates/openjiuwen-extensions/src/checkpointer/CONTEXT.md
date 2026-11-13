@@ -1,9 +1,11 @@
-# checkpointer/ — checkpointer factory and deferred Redis backend
+# checkpointer/ — kernel checkpointer factory and the live single-node Redis backend
 
 ## Intent
 
-Python's `extensions/checkpointer/redis/` registers a Redis provider with the core `CheckpointerFactory`; the local memory/file/sqlite backends live in the kernel.
-Rust keeps that split: this module dispatches on the kernel's `CheckpointerConfig` to the kernel backends, and owns only the Redis surface, which is deferred (`Error::Unsupported`) while keeping the Python constructor names.
+Python's `extensions/checkpointer/redis/` registers a Redis provider with the core `CheckpointerFactory`; the memory/file/sqlite backends live in the kernel.
+Rust keeps that split: this module dispatches on the kernel's `CheckpointerConfig` to the kernel backends, and owns the Redis backend.
+The Redis backend is a live single-node implementation over the crate's in-tree RESP client (`crate::redis`), because the workspace vendors no Redis driver and builds offline.
+The kernel `CheckpointerKind` has no Redis variant, so `build_checkpointer` cannot return a Redis backend; construct one with `RedisCheckpointer::new` (lazy connect) or `connect`/`create` (eager connect plus `PING`).
 Pick this node for any "checkpoint backend selection" or "Redis checkpointer" request.
 
 ## API Surface
@@ -16,9 +18,8 @@ pub use openjiuwen_core::session::checkpoint::{
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::session::checkpoint::SqliteCheckpointer;
 
-/// Builds the checkpointer `config.kind` selects.
-/// `InMemory`/`File`/`Sqlite` delegate to `openjiuwen_core::session::checkpoint::create_checkpointer`.
-/// `Redis` (only reachable from `RedisCheckpointerConfig`, not `CheckpointerKind`) returns `Error::Unsupported`.
+/// Builds the checkpointer `config.kind` selects (`InMemory`/`File`/`Sqlite`),
+/// delegating to `openjiuwen_core::session::checkpoint::create_checkpointer`.
 pub async fn build_checkpointer(config: &CheckpointerConfig) -> Result<Arc<dyn Checkpointer>>;
 
 /// `redis` feature only.
@@ -28,7 +29,7 @@ pub mod redis {
                                        pub connection_args: BTreeMap<String, Value> }
     pub struct RedisCheckpointerConfig { pub connection: RedisConnectionConfig,
                                          pub ttl: Option<RedisTTLConfig> }
-    pub struct RedisCheckpointer { .. }
+    pub struct RedisCheckpointer { /* config + lazy `OnceCell<Client>` */ }
     impl RedisTTLConfig {
         pub fn new(default_ttl_minutes: Option<f64>, refresh_on_read: bool) -> Self;
     }
@@ -46,41 +47,66 @@ pub mod redis {
         pub fn with_ttl(self, ttl: Option<RedisTTLConfig>) -> Self;
     }
     impl RedisCheckpointer {
-        /// Validates the URL scheme (`redis://`, `rediss://`, `redis+cluster://`, `rediss+cluster://`).
+        /// Validates the URL scheme and returns a handle that connects on first use.
         pub fn new(config: RedisCheckpointerConfig) -> Result<Self>;
-        /// Python's provider entry point: always `Error::Unsupported` today.
+        /// Python's provider entry point: connects eagerly, verifies `PING`, returns a live checkpointer.
         pub async fn connect(config: RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>>;
-        pub fn config(&self) -> &RedisCheckpointerConfig;
+        /// Alias of `connect`.
+        pub async fn create(config: &RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>>;
+        pub const fn config(&self) -> &RedisCheckpointerConfig;
     }
-    #[async_trait] impl Checkpointer for RedisCheckpointer { /* every method -> Error::Unsupported */ }
-    pub async fn create(config: &RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>>; // alias of connect
+    #[async_trait] impl Checkpointer for RedisCheckpointer { /* live single-node implementation */ }
 }
 ```
 
+## Storage Layout
+
+- Payload key `openjiuwen:checkpoint:{session_id}:{checkpoint_id}` holds the `Checkpoint` as compact JSON.
+- Index key `openjiuwen:checkpoint-index:{session_id}` is a sorted set of that session's checkpoint ids, scored by save time in epoch milliseconds.
+- `save` writes `SET payload` + `ZADD index` (plus `EXPIRE` on both when a default TTL is set) in one pipelined batch.
+- `delete` writes `DEL payload` + `ZREM index` in one pipelined batch; deleting a missing checkpoint is a no-op.
+- `release` pages `SCAN MATCH openjiuwen:checkpoint:{session_id}:* COUNT 500`, deletes payloads in chunks of 500, then deletes the index key.
+- The release pattern ends in `:` and escapes glob metacharacters (`*?[]\`) in the session id, so `session-1` never matches `session-10`.
+- `list` reads `ZRANGE index 0 -1`, `MGET`s the payloads in chunks of 500, drops index members whose payload vanished (and `ZREM`s them), and returns summaries newest first by `(created_at, checkpoint_id)` descending.
+- `latest` stays the trait default (sort `list`, then `load` the first), so it agrees with the backend ordering.
+- `session_exists` is `ZCARD index > 0`; an unknown session answers `false`, a missing payload answers `Ok(None)`, and an empty session lists no checkpoints — none of those are errors.
+- Ids are minted and validated exactly like the kernel memory backend: `validate_session_id`/`validate_checkpoint_id` first, empty `checkpoint_id` -> `uuid_hex()`, empty `created_at` -> `now_rfc3339()`.
+- TTL seconds are `ceil(minutes * 60)` with a floor of one second; `refresh_on_read` re-arms both the payload and index expiry after a successful read and ignores a failed refresh (a read never fails because of it).
+- Undecodable payloads are `Error::Session` naming the session and checkpoint ids, never the payload bytes.
+
 ## Ported Behavior
 
-- `RedisConnectionConfig` validation matches Python: a URL is required (Rust has no `redis_client`, so a URL is the only connection method) and must start with one of the four accepted schemes; `cluster_mode` is inferred from the `+cluster` scheme when unset; `connection_args` are carried untouched.
-- `connection_url()` mirrors Python `get_connection_url`: the `+cluster` marker is stripped because a real cluster client would take the plain `redis://`/`rediss://` URL.
+- `RedisConnectionConfig` validation matches Python: a URL is required (the Rust client is built from a URL, there is no pre-configured `redis_client`) and must start with one of the four accepted schemes; `cluster_mode` is inferred from the `+cluster` scheme when unset; `connection_args` are carried untouched.
+- `connection_url()` mirrors Python `get_connection_url`: the `+cluster` marker is stripped because the client takes the plain `redis://`/`rediss://` URL and records cluster mode separately.
 - `RedisTTLConfig::default_ttl_minutes` serializes as `default_ttl` to keep Python's field name; `refresh_on_read` defaults to `false` and unknown JSON fields are ignored.
-- `RedisTTLConfig::default_ttl_minutes` and `refresh_on_read` are serialized/preserved; the deferred backend names them in its `Unsupported` message so operators know what was requested.
 - `RedisCheckpointerConfig` round-trips through JSON with Python's field names (`connection`, `ttl`, `default_ttl`, `refresh_on_read`).
-- The Redis backend is **not** implemented: pickle-encoded blobs are a deliberate non-goal (`docs/PARITY.md` intentional deviations), and key layout (`{session_id}:agent:{agent_id}:agent_state_blobs`) is documented only.
-- Every `Checkpointer` method on `RedisCheckpointer` returns `Error::Unsupported("redis checkpointer backend is deferred; use the in-memory, file, or sqlite backend")`; `session_exists` also returns that error rather than `false`, so callers cannot mistake deferral for an empty session.
+- `RedisCheckpointer` has a hand-written redacting `Debug` (it prints cluster mode, TTL, and connection state; never the URL or `connection_args`, which may carry credentials) and is not `Clone` because the client is a single shared `OnceCell`.
+- `RedisCheckpointer::connect`/`create` fail fast: they validate the config, open the connection (applying `connection_args` `username`/`password`/`db`/`timeout` and cluster mode), and require a `PING` reply.
+- Python's `async` signatures are kept as real async bodies; the former `clippy::unused_async` allows are gone.
 
 ## Constraints
 
-- This module never re-implements kernel backends; it delegates to `create_checkpointer`.
-- No Redis client dependency: the `redis` feature adds no crate, only the API surface (the backend would need `redis` when implemented).
-- Errors: `Error::Validation` for a bad URL/config, `Error::Unsupported` for the backend itself.
+- This module never re-implements kernel backends; `build_checkpointer` delegates to `create_checkpointer`.
+- No Redis driver dependency: the `redis` feature adds no crate, only the in-crate client and this backend.
+- Only `src/checkpointer/redis.rs` and the module docs change here; `src/redis/**` is consumed as-is.
+- Errors: `Error::Validation` for bad ids/URLs, `Error::Session` for encode/decode failures, `Error::Transport`/`Timeout` from the client, `Error::Unsupported` for TLS and cluster redirection.
+- No payload or credential is logged; refresh failures log at `debug` with the session id only.
 - All public items documented; files ≤ ~1000 lines.
 
 ## Test Strategy
 
 - Unit tests beside `mod.rs`: `CheckpointerKind::InMemory` builds a working checkpointer and a save/load round-trip succeeds; `File` without a path is `ErrorKind::Validation`; the sqlite branch is asserted only under `--features sqlite`.
-- `redis` tests: URL scheme validation (all four accepted, `http://` rejected), `cluster_mode` inference, JSON round-trip of `RedisCheckpointerConfig`, and `connect`/every trait method returning `ErrorKind::Unsupported`.
-- Python counterparts named in comments: `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer_provider.py`, `test_redis_checkpointer.py`.
+- `redis` config tests (no server): all four schemes accepted, missing/`http://` rejected, cluster inference and explicit override, `connection_url` marker stripping, `connection_args` carried through, Python-field JSON round-trip, `new` URL validation, glob escaping, TTL second rounding, redacting `Debug`.
+- `redis` live tests against `crate::redis::testsupport::FakeRedis`: full-field save/load round-trip, explicit ids, invalid-id validation, missing checkpoint/session results, newest-first `list` plus `latest`, `delete` vs `release` (including the `session-1`/`session-10` prefix case), stale-index cleanup, undecodable payloads, TTL on save, TTL refresh on read and its absence without `refresh_on_read`, `connect`/`create`, TLS rejection, cluster `MOVED` rejection, unreachable port, and `connection_args` credentials.
+- Python counterparts named in comments: `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py`, `test_redis_checkpointer_provider.py`.
+
+## Remaining Deferrals
+
+- `rediss://`/`rediss+cluster://` return `Error::Unsupported` naming TLS: the workspace vendors no TLS stack.
+- Cluster slot routing and `MOVED`/`ASK` following return `Error::Unsupported`; a cluster URL connects to one node with cluster mode recorded.
+- Python's pickle payload format and `{session_id}:agent:{agent_id}:agent_state_blobs` key layout are intentionally replaced by the JSON payload plus sorted-set index described above.
 
 ## Routing Table
 
-- `./mod.rs` → `build_checkpointer`, kernel re-exports, tests
-- `./redis.rs` → `redis` feature surface (`RedisConnectionConfig`, `RedisTTLConfig`, `RedisCheckpointerConfig`, `RedisCheckpointer`)
+- `./mod.rs` → kernel re-exports, `build_checkpointer`, module-level docs, backend-selection tests
+- `./redis.rs` → `redis` feature backend: configuration types, live single-node `Checkpointer`, key layout helpers, tests

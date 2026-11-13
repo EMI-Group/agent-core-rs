@@ -32,6 +32,9 @@ pub mod vendor_specific;
 #[cfg(feature = "a2a")]
 pub mod a2a;
 
+#[cfg(feature = "redis")]
+pub mod redis;
+
 /// Returns the crate name.
 #[must_use]
 pub fn crate_name() -> &'static str {

@@ -1,36 +1,117 @@
-//! Redis checkpointer surface (deferred).
+//! Redis checkpointer (single-node, live backend).
 //!
-//! Ports the configuration and provider shape of
-//! `openjiuwen/extensions/checkpointer/redis/` (v0.1.20) without a Redis client:
-//! Python's `RedisCheckpointerProvider` registers the `redis` checkpointer kind
-//! and `RedisCheckpointer` stores JSON blobs under
-//! `{session_id}:agent:{agent_id}:agent_state_blobs` (key layout documented
-//! only).
+//! Ports `openjiuwen/extensions/checkpointer/redis/` (v0.1.20): Python's
+//! `RedisCheckpointerProvider` registers the `redis` checkpointer kind, and
+//! `RedisCheckpointer` persists session checkpoints. Rust cannot depend on a
+//! Redis driver (the workspace builds offline and vendors none), so the backend
+//! speaks `RESP` through this crate's in-tree client
+//! ([`crate::redis::Client`]).
 //!
-//! The backend itself is deliberately not implemented — pickled payloads are a
-//! non-goal (`docs/PARITY.md`) — so [`RedisCheckpointer::connect`] and every
-//! [`Checkpointer`] method return
-//! [`openjiuwen_common::error::ErrorKind::Unsupported`] naming the supported
-//! alternatives. Configuration types still validate exactly as Python does, so
-//! callers fail on a bad URL before they hit the deferral.
+//! Key layout (one key per checkpoint plus one index per session):
 //!
-//! Every operation keeps Python's `async` signature while its body is
-//! synchronous, and clippy reports part of the family as `unused_async` and
-//! part as `unused_async_trait_impl`, so both lints are allowed here.
-#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-
+//! - `openjiuwen:checkpoint:{session_id}:{checkpoint_id}` — the payload,
+//!   holding the [`crate::checkpointer::Checkpoint`] as JSON.
+//! - `openjiuwen:checkpoint-index:{session_id}` — a sorted set of that
+//!   session's checkpoint ids, each scored with its save time in epoch
+//!   milliseconds.
+//!
+//! [`crate::checkpointer::Checkpointer::list`] reads the index, fetches the
+//! payloads, drops index members whose payload disappeared, and returns the
+//! summaries newest first by `(created_at, checkpoint_id)` descending;
+//! `latest` therefore picks the newest checkpoint of a session.
+//!
+//! When `ttl.default_ttl_minutes` is configured, `save` sets an expiry on both
+//! the payload and the index, and `ttl.refresh_on_read` re-arms both expiries
+//! after a successful `load`.
+//!
+//! # Entry points
+//!
+//! The kernel's `CheckpointerKind` has no Redis variant, so
+//! [`crate::checkpointer::build_checkpointer`] cannot select this backend:
+//! construct it with [`RedisCheckpointer::new`] (lazy connect) or
+//! [`RedisCheckpointer::connect`] / [`RedisCheckpointer::create`] (eager connect,
+//! which also verifies the server answers `PING`).
+//!
+//! # Deferred
+//!
+//! `rediss://` needs a TLS stack the workspace does not vendor, and cluster
+//! slot routing is not implemented; both return
+//! [`openjiuwen_common::error::ErrorKind::Unsupported`] with a reason instead of
+//! silently degrading.
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::utils::id::{now_rfc3339, uuid_hex};
+use openjiuwen_core::session::checkpoint::{validate_checkpoint_id, validate_session_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use super::{Checkpoint, CheckpointMeta, Checkpointer};
+use crate::redis::{command, Client, ConnectionOptions, Reply};
 
-/// The message every deferred operation returns.
-const DEFERRED: &str = "redis checkpointer backend is deferred; use the in-memory, file, \
-                        or sqlite backend";
+/// Prefix of a checkpoint payload key (`openjiuwen:checkpoint:{session}:{id}`).
+const PAYLOAD_PREFIX: &str = "openjiuwen:checkpoint:";
+/// Prefix of a session's checkpoint index (`openjiuwen:checkpoint-index:{session}`).
+const INDEX_PREFIX: &str = "openjiuwen:checkpoint-index:";
+/// Page size used by the `SCAN` loop in [`Checkpointer::release`].
+const SCAN_COUNT: u32 = 500;
+/// Maximum number of keys per `MGET`/`DEL`/`ZREM` round trip.
+const BATCH_KEYS: usize = 500;
+
+/// Builds a checkpoint payload key.
+fn payload_key(session_id: &str, checkpoint_id: &str) -> String {
+    format!("{PAYLOAD_PREFIX}{session_id}:{checkpoint_id}")
+}
+
+/// Builds a session's checkpoint index key.
+fn index_key(session_id: &str) -> String {
+    format!("{INDEX_PREFIX}{session_id}")
+}
+
+/// Escapes `SCAN MATCH` glob metacharacters so a session id matches literally.
+///
+/// Ids cannot contain `/`, `\`, a NUL byte, or `..`, but they may contain `*`,
+/// `?`, `[` and `]`, which would otherwise widen the release pattern.
+fn escape_glob(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+/// The current time in epoch milliseconds, used as the index sort score.
+fn now_epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
+}
+
+/// Converts a TTL in minutes into whole seconds, rounding up and never below 1.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ttl_seconds(minutes: f64) -> u64 {
+    if !minutes.is_finite() || minutes <= 0.0 {
+        return 1;
+    }
+    // A positive, finite product saturates instead of wrapping in the cast.
+    (minutes * 60.0).ceil().max(1.0) as u64
+}
+
+/// Decodes a stored checkpoint, naming the ids but never the payload.
+fn decode_checkpoint(session_id: &str, checkpoint_id: &str, payload: &[u8]) -> Result<Checkpoint> {
+    serde_json::from_slice(payload).map_err(|error| {
+        Error::session(format!(
+            "failed to decode checkpoint '{checkpoint_id}' of session '{session_id}': {error}"
+        ))
+    })
+}
 
 /// TTL configuration for data stored by the Redis checkpointer.
 ///
@@ -59,9 +140,9 @@ impl RedisTTLConfig {
 
 /// Redis connection configuration (Python `RedisConnectionConfig`).
 ///
-/// Python additionally accepts a pre-configured `redis_client`; Rust has no
-/// Redis client dependency, so a `url` is required. Accepted schemes are
-/// `redis://`, `rediss://`, `redis+cluster://`, and `rediss+cluster://`.
+/// Python additionally accepts a pre-configured `redis_client`; Rust's client is
+/// built from a URL, so a `url` is required. Accepted schemes are `redis://`,
+/// `rediss://`, `redis+cluster://`, and `rediss+cluster://`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedisConnectionConfig {
@@ -178,27 +259,46 @@ impl RedisCheckpointerConfig {
     }
 }
 
-/// A Redis-backed checkpointer that is API-compatible but deferred.
+/// A single-node Redis-backed [`Checkpointer`].
 ///
-/// Construction validates the connection configuration; every storage
-/// operation then returns [`openjiuwen_common::error::ErrorKind::Unsupported`].
-/// `session_exists` errors rather than returning `false`, so callers cannot
-/// mistake deferral for an empty session.
-#[derive(Debug, Clone)]
+/// [`RedisCheckpointer::new`] validates the configuration without touching the
+/// network; the connection is opened by the first storage operation and reused
+/// afterwards. [`RedisCheckpointer::connect`] connects eagerly instead, so an
+/// unreachable or misconfigured server fails at construction time.
 pub struct RedisCheckpointer {
     config: RedisCheckpointerConfig,
+    client: OnceCell<Client>,
+}
+
+/// A redacting `Debug`: neither `connection_args` (which may carry a password)
+/// nor the URL (which may embed credentials) is printed.
+impl fmt::Debug for RedisCheckpointer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedisCheckpointer")
+            .field("cluster_mode", &self.config.connection.is_cluster_mode())
+            .field("ttl", &self.config.ttl)
+            .field("connected", &self.client.initialized())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedisCheckpointer {
-    /// Creates a Redis checkpointer handle after validating `config`.
+    /// Creates a checkpointer handle after validating `config`.
+    ///
+    /// No connection is opened; the first storage operation connects lazily.
     ///
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] when the
-    /// connection URL is missing or uses an unsupported scheme.
+    /// connection URL is missing or uses a scheme outside the four accepted
+    /// ones.
     pub fn new(config: RedisCheckpointerConfig) -> Result<Self> {
         config.connection.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            client: OnceCell::new(),
+        })
     }
 
     /// Returns the configuration this handle was built from.
@@ -209,235 +309,288 @@ impl RedisCheckpointer {
 
     /// Python's provider entry point (`CheckpointerFactory.register("redis")`).
     ///
+    /// Connects eagerly and verifies the server answers `PING`, so a bad
+    /// endpoint, credentials, or TLS/cluster request fails here rather than on
+    /// the first checkpoint operation. The kernel `CheckpointerKind` has no
+    /// Redis variant, so this (and [`RedisCheckpointer::create`]) is how a
+    /// Redis checkpointer is obtained.
+    ///
     /// # Errors
     ///
-    /// Always returns [`openjiuwen_common::error::ErrorKind::Unsupported`]: the
-    /// backend is deferred.
-    pub async fn connect(_config: RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
-        Err(deferred())
+    /// Returns [`openjiuwen_common::error::ErrorKind::Validation`] for an
+    /// invalid configuration, `Unsupported` for `rediss://` (no TLS stack) or a
+    /// cluster `MOVED`/`ASK` redirection, and `Transport`/`Timeout` when the
+    /// server cannot be reached.
+    pub async fn connect(config: RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
+        let checkpointer = Self::new(config)?;
+        checkpointer.client().await?.ping().await?;
+        Ok(Arc::new(checkpointer))
     }
 
     /// Alias of [`RedisCheckpointer::connect`].
     ///
     /// # Errors
     ///
-    /// Always returns [`openjiuwen_common::error::ErrorKind::Unsupported`]: the
-    /// backend is deferred.
-    pub async fn create(_config: &RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
-        Err(deferred())
+    /// Same as [`RedisCheckpointer::connect`].
+    pub async fn create(config: &RedisCheckpointerConfig) -> Result<Arc<dyn Checkpointer>> {
+        Self::connect(config.clone()).await
     }
-}
 
-/// The deferral error shared by every Redis operation.
-fn deferred() -> Error {
-    Error::unsupported(DEFERRED)
+    /// Returns the shared client, connecting on first use.
+    async fn client(&self) -> Result<&Client> {
+        self.client
+            .get_or_try_init(|| async {
+                let url = self.config.connection.connection_url().ok_or_else(|| {
+                    Error::validation("a redis `url` is required in RedisConnectionConfig")
+                })?;
+                let options = ConnectionOptions::from_url(&url)?
+                    .with_connection_args(&self.config.connection.connection_args)?
+                    .with_cluster_mode(self.config.connection.is_cluster_mode());
+                Client::connect(options).await
+            })
+            .await
+    }
+
+    /// The configured default TTL in whole seconds, when one is set.
+    fn default_ttl_seconds(&self) -> Option<u64> {
+        self.config
+            .ttl
+            .as_ref()?
+            .default_ttl_minutes
+            .map(ttl_seconds)
+    }
+
+    /// Whether a successful read must re-arm the expiries.
+    fn refresh_on_read(&self) -> bool {
+        self.default_ttl_seconds().is_some()
+            && self
+                .config
+                .ttl
+                .as_ref()
+                .is_some_and(|ttl| ttl.refresh_on_read)
+    }
+
+    /// Re-arms the payload and index expiries after a read.
+    ///
+    /// A refresh failure never turns a successful read into an error; transport
+    /// failures on the read itself are still propagated by the caller.
+    async fn refresh_ttl(&self, session_id: &str, key: &str) {
+        let Some(seconds) = self.default_ttl_seconds() else {
+            return;
+        };
+        let seconds = seconds.to_string();
+        let index_key = index_key(session_id);
+        let batch = [
+            command(&[b"EXPIRE".as_slice(), key.as_bytes(), seconds.as_bytes()]),
+            command(&[
+                b"EXPIRE".as_slice(),
+                index_key.as_bytes(),
+                seconds.as_bytes(),
+            ]),
+        ];
+        match self.client().await {
+            Ok(client) => {
+                if let Err(error) = client.pipeline(&batch).await {
+                    tracing::debug!(
+                        %error,
+                        session_id,
+                        "redis checkpointer could not refresh the checkpoint ttl"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                %error,
+                session_id,
+                "redis checkpointer could not refresh the checkpoint ttl"
+            ),
+        }
+    }
+
+    /// Drops stale members from a session's checkpoint index.
+    async fn remove_from_index(&self, index_key: &str, checkpoint_ids: &[String]) -> Result<()> {
+        let client = self.client().await?;
+        for chunk in checkpoint_ids.chunks(BATCH_KEYS) {
+            let mut args: Vec<&[u8]> = Vec::with_capacity(chunk.len() + 2);
+            args.push(b"ZREM");
+            args.push(index_key.as_bytes());
+            args.extend(chunk.iter().map(String::as_bytes));
+            client.command(&args).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl Checkpointer for RedisCheckpointer {
-    async fn save(&self, _checkpoint: Checkpoint) -> Result<String> {
-        Err(deferred())
+    async fn save(&self, mut checkpoint: Checkpoint) -> Result<String> {
+        validate_session_id(&checkpoint.session_id)?;
+        if checkpoint.checkpoint_id.is_empty() {
+            checkpoint.checkpoint_id = uuid_hex();
+        } else {
+            validate_checkpoint_id(&checkpoint.checkpoint_id)?;
+        }
+        if checkpoint.created_at.is_empty() {
+            checkpoint.created_at = now_rfc3339();
+        }
+        let checkpoint_id = checkpoint.checkpoint_id.clone();
+        let key = payload_key(&checkpoint.session_id, &checkpoint_id);
+        let index_key = index_key(&checkpoint.session_id);
+        let payload = serde_json::to_vec(&checkpoint).map_err(|error| {
+            Error::session(format!(
+                "failed to encode checkpoint '{checkpoint_id}' of session '{}': {error}",
+                checkpoint.session_id
+            ))
+        })?;
+        let score = now_epoch_millis().to_string();
+        let mut batch = vec![
+            command(&[b"SET".as_slice(), key.as_bytes(), payload.as_slice()]),
+            command(&[
+                b"ZADD".as_slice(),
+                index_key.as_bytes(),
+                score.as_bytes(),
+                checkpoint_id.as_bytes(),
+            ]),
+        ];
+        if let Some(seconds) = self.default_ttl_seconds() {
+            let seconds = seconds.to_string();
+            batch.push(command(&[
+                b"EXPIRE".as_slice(),
+                key.as_bytes(),
+                seconds.as_bytes(),
+            ]));
+            batch.push(command(&[
+                b"EXPIRE".as_slice(),
+                index_key.as_bytes(),
+                seconds.as_bytes(),
+            ]));
+        }
+        self.client().await?.pipeline(&batch).await?;
+        Ok(checkpoint_id)
     }
 
-    async fn load(&self, _session_id: &str, _checkpoint_id: &str) -> Result<Option<Checkpoint>> {
-        Err(deferred())
+    async fn load(&self, session_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>> {
+        validate_session_id(session_id)?;
+        validate_checkpoint_id(checkpoint_id)?;
+        let key = payload_key(session_id, checkpoint_id);
+        let reply = self.client().await?.command_str(&["GET", &key]).await?;
+        let Some(payload) = reply.as_opt_bytes()? else {
+            return Ok(None);
+        };
+        let checkpoint = decode_checkpoint(session_id, checkpoint_id, payload)?;
+        if self.refresh_on_read() {
+            self.refresh_ttl(session_id, &key).await;
+        }
+        Ok(Some(checkpoint))
     }
 
-    async fn list(&self, _session_id: &str) -> Result<Vec<CheckpointMeta>> {
-        Err(deferred())
+    async fn list(&self, session_id: &str) -> Result<Vec<CheckpointMeta>> {
+        validate_session_id(session_id)?;
+        let index_key = index_key(session_id);
+        let client = self.client().await?;
+        let reply = client
+            .command_str(&["ZRANGE", &index_key, "0", "-1"])
+            .await?;
+        let ids: Vec<String> = reply
+            .as_array()?
+            .iter()
+            .map(Reply::as_string_owned)
+            .collect::<Result<_>>()?;
+
+        let mut checkpoints: Vec<Checkpoint> = Vec::with_capacity(ids.len());
+        let mut stale: Vec<String> = Vec::new();
+        for chunk in ids.chunks(BATCH_KEYS) {
+            let keys: Vec<String> = chunk.iter().map(|id| payload_key(session_id, id)).collect();
+            let mut args: Vec<&[u8]> = Vec::with_capacity(keys.len() + 1);
+            args.push(b"MGET");
+            args.extend(keys.iter().map(String::as_bytes));
+            let reply = client.command(&args).await?;
+            let values = reply.as_array()?;
+            if values.len() != chunk.len() {
+                return Err(Error::transport(
+                    "redis MGET returned an unexpected number of replies",
+                ));
+            }
+            for (checkpoint_id, value) in chunk.iter().zip(values.iter()) {
+                match value.as_opt_bytes()? {
+                    Some(payload) => {
+                        checkpoints.push(decode_checkpoint(session_id, checkpoint_id, payload)?);
+                    }
+                    None => stale.push(checkpoint_id.clone()),
+                }
+            }
+        }
+        if !stale.is_empty() {
+            self.remove_from_index(&index_key, &stale).await?;
+        }
+        checkpoints.sort_by(|left, right| {
+            (&right.created_at, &right.checkpoint_id).cmp(&(&left.created_at, &left.checkpoint_id))
+        });
+        Ok(checkpoints.iter().map(CheckpointMeta::from).collect())
     }
 
-    async fn delete(&self, _session_id: &str, _checkpoint_id: &str) -> Result<()> {
-        Err(deferred())
+    async fn delete(&self, session_id: &str, checkpoint_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        validate_checkpoint_id(checkpoint_id)?;
+        let key = payload_key(session_id, checkpoint_id);
+        let index_key = index_key(session_id);
+        let batch = [
+            command(&[b"DEL".as_slice(), key.as_bytes()]),
+            command(&[
+                b"ZREM".as_slice(),
+                index_key.as_bytes(),
+                checkpoint_id.as_bytes(),
+            ]),
+        ];
+        self.client().await?.pipeline(&batch).await?;
+        Ok(())
     }
 
-    async fn release(&self, _session_id: &str) -> Result<()> {
-        Err(deferred())
+    async fn release(&self, session_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        let index_key = index_key(session_id);
+        let pattern = format!("{PAYLOAD_PREFIX}{}:*", escape_glob(session_id));
+        let count = SCAN_COUNT.to_string();
+        let client = self.client().await?;
+        let mut cursor = "0".to_owned();
+        loop {
+            let reply = client
+                .command_str(&["SCAN", &cursor, "MATCH", &pattern, "COUNT", &count])
+                .await?;
+            let items = reply.as_array()?;
+            let [next_cursor, keys] = items else {
+                return Err(Error::transport("redis SCAN returned a malformed reply"));
+            };
+            cursor = next_cursor.as_string_owned()?;
+            let payloads: Vec<Vec<u8>> = keys
+                .as_array()?
+                .iter()
+                .map(|key| key.as_bytes().map(ToOwned::to_owned))
+                .collect::<Result<_>>()?;
+            for chunk in payloads.chunks(BATCH_KEYS) {
+                let mut args: Vec<&[u8]> = Vec::with_capacity(chunk.len() + 1);
+                args.push(b"DEL");
+                args.extend(chunk.iter().map(Vec::as_slice));
+                client.command(&args).await?;
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        client.command_str(&["DEL", &index_key]).await?;
+        Ok(())
     }
 
-    async fn session_exists(&self, _session_id: &str) -> Result<bool> {
-        Err(deferred())
+    async fn session_exists(&self, session_id: &str) -> Result<bool> {
+        validate_session_id(session_id)?;
+        let index_key = index_key(session_id);
+        let reply = self
+            .client()
+            .await?
+            .command_str(&["ZCARD", &index_key])
+            .await?;
+        Ok(reply.as_integer()? > 0)
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use crate::checkpointer::CheckpointNamespace;
-    use openjiuwen_common::error::ErrorKind;
-    use serde_json::json;
-
-    // port of tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py and
-    // test_redis_checkpointer_provider.py (configuration/validation cases)
-
-    fn valid_config() -> RedisCheckpointerConfig {
-        RedisCheckpointerConfig::new(RedisConnectionConfig::new("redis://127.0.0.1:6379"))
-    }
-
-    #[test]
-    fn accepts_every_python_scheme() {
-        for url in [
-            "redis://localhost:6379",
-            "rediss://localhost:6379",
-            "redis+cluster://localhost:7000",
-            "rediss+cluster://localhost:7000",
-        ] {
-            let config = RedisConnectionConfig::new(url);
-            assert!(config.validate().is_ok(), "{url} must be accepted");
-        }
-    }
-
-    #[test]
-    fn rejects_missing_or_foreign_urls() {
-        let missing = RedisConnectionConfig::default();
-        let error = missing.validate().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert!(error.to_string().contains("url"), "unexpected: {error}");
-
-        let foreign = RedisConnectionConfig::new("http://localhost:6379");
-        let error = foreign.validate().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        assert!(
-            error.to_string().contains("invalid Redis URL format"),
-            "unexpected: {error}"
-        );
-    }
-
-    #[test]
-    fn cluster_mode_is_inferred_from_the_scheme_when_unset() {
-        assert!(!RedisConnectionConfig::new("redis://localhost:6379").is_cluster_mode());
-        assert!(!RedisConnectionConfig::new("rediss://localhost:6379").is_cluster_mode());
-        assert!(RedisConnectionConfig::new("redis+cluster://localhost:7000").is_cluster_mode());
-        assert!(RedisConnectionConfig::new("rediss+cluster://localhost:7000").is_cluster_mode());
-    }
-
-    #[test]
-    fn explicit_cluster_mode_overrides_the_scheme() {
-        let mut config = RedisConnectionConfig::new("redis://localhost:6379");
-        config.cluster_mode = Some(true);
-        assert!(config.is_cluster_mode());
-
-        let mut config = RedisConnectionConfig::new("redis+cluster://localhost:7000");
-        config.cluster_mode = Some(false);
-        assert!(!config.is_cluster_mode());
-    }
-
-    #[test]
-    fn connection_url_strips_the_cluster_marker() {
-        assert_eq!(
-            RedisConnectionConfig::new("redis+cluster://localhost:7000").connection_url(),
-            Some("redis://localhost:7000".to_string())
-        );
-        assert_eq!(
-            RedisConnectionConfig::new("rediss+cluster://localhost:7000").connection_url(),
-            Some("rediss://localhost:7000".to_string())
-        );
-        assert_eq!(
-            RedisConnectionConfig::new("redis://localhost:6379").connection_url(),
-            Some("redis://localhost:6379".to_string())
-        );
-        assert_eq!(RedisConnectionConfig::default().connection_url(), None);
-    }
-
-    #[test]
-    fn connection_args_are_carried_through() {
-        let config: RedisConnectionConfig = serde_json::from_value(json!({
-            "url": "redis://localhost:6379",
-            "connection_args": {"db": 1, "timeout": 5}
-        }))
-        .unwrap();
-        assert_eq!(config.connection_args["db"], json!(1));
-        assert_eq!(config.connection_args["timeout"], json!(5));
-        assert!(!config.is_cluster_mode());
-    }
-
-    #[test]
-    fn checkpointer_config_round_trips_with_python_field_names() {
-        let value = json!({
-            "connection": {"url": "redis://localhost:6379", "cluster_mode": true},
-            "ttl": {"default_ttl": 5.0, "refresh_on_read": true}
-        });
-        let config: RedisCheckpointerConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            config.connection.url.as_deref(),
-            Some("redis://localhost:6379")
-        );
-        assert!(config.connection.is_cluster_mode());
-        let ttl = config.ttl.as_ref().unwrap();
-        assert_eq!(ttl.default_ttl_minutes, Some(5.0));
-        assert!(ttl.refresh_on_read);
-
-        let encoded = serde_json::to_value(&config).unwrap();
-        assert_eq!(
-            encoded["connection"]["url"],
-            json!("redis://localhost:6379")
-        );
-        assert_eq!(encoded["ttl"]["default_ttl"], json!(5.0));
-        assert_eq!(encoded["ttl"]["refresh_on_read"], json!(true));
-    }
-
-    #[test]
-    fn new_validates_the_connection_url() {
-        let error = RedisCheckpointer::new(RedisCheckpointerConfig::new(
-            RedisConnectionConfig::new("noscheme"),
-        ))
-        .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Validation);
-
-        let checkpointer = RedisCheckpointer::new(valid_config()).unwrap();
-        assert_eq!(
-            checkpointer.config().connection.url.as_deref(),
-            Some("redis://127.0.0.1:6379")
-        );
-    }
-
-    #[tokio::test]
-    async fn connect_and_create_are_unsupported() {
-        let error = RedisCheckpointer::connect(valid_config())
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(
-            error.to_string().contains("deferred"),
-            "unexpected: {error}"
-        );
-
-        let error = RedisCheckpointer::create(&valid_config())
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-    }
-
-    #[tokio::test]
-    async fn every_checkpointer_method_is_unsupported() {
-        let checkpointer = RedisCheckpointer::new(valid_config()).unwrap();
-        let checkpoint = Checkpoint::new("session-1", CheckpointNamespace::Agent, "agent-1");
-
-        let error = checkpointer.save(checkpoint).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(
-            error.to_string().contains("deferred"),
-            "unexpected: {error}"
-        );
-
-        let error = checkpointer.load("session-1", "cp-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-
-        let error = checkpointer.list("session-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-
-        let error = checkpointer.latest("session-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-
-        let error = checkpointer.delete("session-1", "cp-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-
-        let error = checkpointer.release("session-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-
-        // Deferral must never masquerade as an empty session.
-        let error = checkpointer.session_exists("session-1").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-    }
-}
+mod tests;
