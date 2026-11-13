@@ -254,7 +254,7 @@ signals and forwarded chunks, so every member (not only the leader) feeds the sa
 
 ## Metadata-driven wiring
 
-Six optional keys under `TeamAgentSpec::metadata` select the wiring; `spec_meta.rs` parses them and every
+Seven optional keys under `TeamAgentSpec::metadata` tune the runtime; `spec_meta.rs` parses them and every
 parser except `organization` degrades to its default with a `warn!` on a malformed value.
 
 | key | accepted shapes | effect |
@@ -266,10 +266,18 @@ parser except `organization` degrades to its default with a `warn!` on a malform
 | `kv_cache` | `{"enabled": bool, "max_entries": n}`; absent ⇒ `enabled: true` | builds the `TeamKvCacheAffinity` used for register → env → release |
 | `attach` | `"/path/team.sock"` or `{"socket"\|"path": "…", "required": bool}`; blank ⇒ unset; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins | `start()` binds an `AttachHost` that serves `AttachOp`s over a Unix socket |
 
+| `checkpoint` | `CheckpointConfig`: `enabled`, `resume`, `policy` and `store` (`"memory"` or `{"store": "file", "dir": "…"}`); absent ⇒ enabled, in-memory, resume-if-available | the store, policy and card id every member runtime is wired with (`./checkpoints.rs`); the build path resolves the team-shared store once, and `file` roots each member under its own workspace unless `dir` is named |
 Per-kind launch shapes (`process`, `external_cli`, `ssh`) live in `src/member/CONTEXT.md`; the org chart
 shapes (`OrganizationSpec`, `DelegationRules`, `OrgTaskSpec`) live in `src/org/CONTEXT.md`.
 `TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`.
 It has no monitor/org/attach builder — those come from the metadata; `monitor_stream` is the monitor knob.
+
+### Checkpoint wiring
+
+`metadata["checkpoint"]` is parsed by `checkpoint_config`; `build_with` resolves the team-shared store once (`checkpoints::team_checkpoint_store`: an injected store wins, `memory` mints one `InMemoryMemberCheckpointStore`, `file` pins none) and every member runtime goes through `checkpoints::wire_runtime` with the card id, the policy, `cwd = workspace root` and that store.
+Identity is `(member session id, card id)`: the member session is `"<team session>:<member>"` — both the runtime session and the harness `host_session_id`, because `start(None)` makes the derived id the host session — and the card id is the effective spec's card id, else the member name.
+`start` restores a compatible record's provider envelope (a payload-only, mismatched or unreadable record starts cold), a finished turn and `stop` capture one record for the identity, and a disabled policy neither resolves a store nor attaches a sink.
+A retired (shut-down) roster row cannot be re-spawned — `MemberStatus` has no `shut_down → unstarted` edge — so a member restart is a fresh row (`TeamBackend::remove_member` + `TeamAgent::spawn_member`).
 
 ### Model routing
 
@@ -460,7 +468,8 @@ a new session instead of being rebuilt.
 - `./org_bind.rs` → `OrgBinding` (chart, delegation router, org task pool, org mailbox, `org_task` events)
 - `./attach_host.rs` → `AttachHost` / `BackendAttachHandler` (Unix-socket attach server, `AttachHost::start(&AttachConfig, handler)`)
 - `./wiring_tests.rs` → wiring test root (`Wiring` harness, `with_metadata`, `wait_until`, `take_monitor`, `monitor_kinds`)
-- `./wiring_tests/` → the seven wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach)
+- `./wiring_tests/` → the eight wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach, checkpoints)
+- `./checkpoints.rs` → per-member checkpoint identity and store resolution (`member_card_id`, `team_checkpoint_store`, `member_checkpoint_store`, `wire_runtime`, `CHECKPOINT_DIR`)
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
@@ -529,7 +538,7 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `stop_team` tearing the attach socket down.
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
-`./wiring_tests/` (56 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
+`./wiring_tests/` (67 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
 `ScriptedFactory` + `RecordingWorkspaceProvider` and returns the agent, the factory and the workspace):
 
 - `spawn_modes.rs` (9): the default blueprint stays in-process; `metadata["spawn"]` selects
@@ -556,6 +565,12 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `BackendAttachHandler`; `stop_team` acknowledges and cancels the run token; an unbindable socket is not
   fatal while `required: true` fails the start; `stop` and the manager's `stop_team` remove the file and
   later calls fail.
+- `checkpoints.rs` (11): the default build pins one `"memory"` team store while a `file` config pins none;
+  the leader and a spawned teammate restore under `(derived member session, card id)` with the blueprint card
+  id and fall back to the member name for a card-less blueprint; a finished turn and a `stop` each reach the
+  store once; a restarted member `start`s with the stored provider envelope, `ResumeIfAvailable` and
+  `host_session_id == "<team session>:<member>"`; `{"enabled": false}` attaches no sink, restores nothing and
+  captures nothing; an explicit `dir` receives one `checkpoint.json` per member.
 
 Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1338 lib
 tests in the default build, 1357 with `--features sqlite`, plus 219 integration tests over 15 binaries),
