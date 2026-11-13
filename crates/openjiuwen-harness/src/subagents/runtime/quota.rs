@@ -37,8 +37,10 @@ pub struct SubAgentQuota {
     pub max_depth: Option<usize>,
     /// Evict the least-recently-used idle instance when the live cap is hit.
     ///
-    /// Python parity: enabled by default (`SubagentRuntimeConfig.enable_lru_eviction`). The
-    /// runtime exposes the policy inputs but the eviction pass itself is a later step.
+    /// Python parity: enabled by default (`SubagentRuntimeConfig.enable_lru_eviction`). When
+    /// enabled, a spawn that finds the live cap reached closes the LRU evictable instance
+    /// first (see [`crate::subagents::EVICTION_REASON`]); when disabled, the spawn is refused
+    /// with the legacy `subagent capacity exceeded` error.
     pub enable_lru_eviction: bool,
     /// Ring-buffer cap of one subagent transcript.
     pub transcript_capacity: usize,
@@ -233,12 +235,19 @@ pub fn select_lru_candidate(candidates: &[LruCandidate]) -> Option<&LruCandidate
     candidates
         .iter()
         .filter(|candidate| candidate.activity.is_evictable())
-        .min_by(|left, right| {
-            activity_rank(left.activity)
-                .cmp(&activity_rank(right.activity))
-                .then_with(|| left.last_activity_ms.cmp(&right.last_activity_ms))
-                .then_with(|| left.subagent_id.cmp(&right.subagent_id))
-        })
+        .min_by(|left, right| compare_lru(left, right))
+}
+
+/// Orders two candidates by LRU preference: `Idle` before `Queued`, then the oldest
+/// `last_activity_ms`, then the smallest `subagent_id`.
+///
+/// [`select_lru_candidate`] takes the first candidate under this order and the runtime sorts
+/// its candidate list with it, so the picked instance and the reported order always agree.
+pub(super) fn compare_lru(left: &LruCandidate, right: &LruCandidate) -> std::cmp::Ordering {
+    activity_rank(left.activity)
+        .cmp(&activity_rank(right.activity))
+        .then_with(|| left.last_activity_ms.cmp(&right.last_activity_ms))
+        .then_with(|| left.subagent_id.cmp(&right.subagent_id))
 }
 
 /// Eviction preference: `Idle` first, then `Queued`; non-evictable phases sort last.

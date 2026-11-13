@@ -408,7 +408,15 @@ async fn cancel_all_closes_live_instances_and_describe_list_separates_them() {
     assert_eq!(list["subagents"].as_array().map(Vec::len), Some(0));
     assert_eq!(list["live_subagents"].as_array().map(Vec::len), Some(0));
     assert_eq!(list["closed_subagents"].as_array().map(Vec::len), Some(2));
-    assert_eq!(list["summary"], json!({"live_count": 0, "closed_count": 2}));
+    assert_eq!(
+        list["summary"],
+        json!({
+            "live_count": 0,
+            "closed_count": 2,
+            "evicted_count": 0,
+            "eviction": {"enabled": true, "candidates": 0},
+        })
+    );
 }
 
 #[tokio::test]
@@ -459,4 +467,5 @@ fn status_wire_strings_and_finality() {
     assert!(outcome.is_final());
 }
 
+mod eviction;
 mod quota;

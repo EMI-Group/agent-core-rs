@@ -6,14 +6,14 @@
 use super::*;
 use crate::subagents::{ManualClock, SubAgentQuota, SubagentActivity};
 
-fn config_error(error: &Error) -> &str {
+pub(super) fn config_error(error: &Error) -> &str {
     match error {
         Error::Config(message) => message,
         other => panic!("expected a config error, got {other:?}"),
     }
 }
 
-fn split_request(parent: &str) -> SubAgentSpawnRequest {
+pub(super) fn split_request(parent: &str) -> SubAgentSpawnRequest {
     let mut request = SubAgentSpawnRequest::new("worker", "nested");
     request.parent_subagent_id = Some(parent.to_owned());
     request

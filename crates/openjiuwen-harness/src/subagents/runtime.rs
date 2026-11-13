@@ -31,10 +31,13 @@ use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
 pub mod clock;
+mod evict;
 mod instance;
 pub mod quota;
 pub mod transcript;
 mod turn;
+
+pub use self::evict::EVICTION_REASON;
 
 /// Default per-turn timeout (Python `TURN_TIMEOUT_S_DEFAULT`).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(2400);
@@ -638,6 +641,9 @@ impl SubAgentRuntime {
     /// Every row carries the metadata fields (including `activity`, `depth`,
     /// `parent_subagent_id`, `last_used_at` and `closed_reason`); `capacity` reports the live
     /// usage, the cumulative spawn ledger and the running-turn count against their limits.
+    /// `summary` reports `live_count`, `closed_count`, `evicted_count` (closed instances whose
+    /// `closed_reason` is `"evicted"`) and `eviction`, the policy in force:
+    /// `{"enabled": <bool>, "candidates": <evictable live instances>}`.
     #[must_use]
     pub fn describe_list(&self) -> Value {
         let state = self.shared.state.lock();
@@ -646,6 +652,16 @@ impl SubAgentRuntime {
         let running = instances
             .iter()
             .filter(|instance| instance.activity == SubagentActivity::Running)
+            .count();
+        let evicted_count = instances
+            .iter()
+            .filter(|instance| {
+                !instance.is_live() && instance.closed_reason.as_deref() == Some(EVICTION_REASON)
+            })
+            .count();
+        let candidates = instances
+            .iter()
+            .filter(|instance| instance.is_live() && instance.activity.is_evictable())
             .count();
         let (mut live, mut closed) = (Vec::new(), Vec::new());
         for instance in instances {
@@ -670,7 +686,15 @@ impl SubAgentRuntime {
             "subagents": live,
             "live_subagents": live_alias,
             "closed_subagents": closed,
-            "summary": {"live_count": live_count, "closed_count": closed_count},
+            "summary": {
+                "live_count": live_count,
+                "closed_count": closed_count,
+                "evicted_count": evicted_count,
+                "eviction": {
+                    "enabled": self.quota.enable_lru_eviction,
+                    "candidates": candidates,
+                },
+            },
         })
     }
 
@@ -708,8 +732,11 @@ impl SubAgentRuntime {
 
     /// Reserves the id and one capacity slot by inserting a `Queued` instance.
     ///
-    /// The cumulative, per-parent and depth limits come from [`SubAgentQuota`]; the live cap
-    /// keeps its legacy error message.
+    /// When the live cap is reached with [`SubAgentQuota::enable_lru_eviction`] set, the
+    /// least-recently-used evictable instance is closed first (Python
+    /// `SubagentControl._acquire_slot`); the requesting parent is never recycled. The
+    /// cumulative, per-parent and depth limits come from [`SubAgentQuota`], and the live cap
+    /// keeps its legacy error message when nothing can be evicted.
     #[allow(clippy::too_many_lines)]
     fn reserve(&self, id: &SubAgentId, request: &SubAgentSpawnRequest) -> Result<u64> {
         let now_ms = self.clock.now_ms();
@@ -722,8 +749,8 @@ impl SubAgentRuntime {
                     )));
                 }
             }
-            let live = state.instances.values().filter(|i| i.is_live()).count();
-            let (depth, parent_live) = if let Some(parent) = request.parent_subagent_id.as_deref() {
+            let parent = request.parent_subagent_id.as_deref();
+            let depth = if let Some(parent) = parent {
                 let Some(parent_instance) = state
                     .instances
                     .get(parent)
@@ -733,33 +760,24 @@ impl SubAgentRuntime {
                         "subagent parent not found: {parent}"
                     )));
                 };
-                let depth = parent_instance.depth.saturating_add(1);
-                let parent_live = state
+                parent_instance.depth.saturating_add(1)
+            } else {
+                1
+            };
+            let evicted = evict::make_room(&mut state, &self.quota, now_ms, parent);
+            let budget = SpawnBudget {
+                live: evict::live_count(&state),
+                spawned: state.spawned,
+                parent_live: state
                     .instances
                     .values()
                     .filter(|instance| {
-                        instance.is_live() && instance.parent_subagent_id.as_deref() == Some(parent)
+                        instance.is_live() && instance.parent_subagent_id.as_deref() == parent
                     })
-                    .count();
-                (depth, parent_live)
-            } else {
-                let parent_live = state
-                    .instances
-                    .values()
-                    .filter(|instance| instance.is_live() && instance.parent_subagent_id.is_none())
-                    .count();
-                (1, parent_live)
-            };
-            let budget = SpawnBudget {
-                live,
-                spawned: state.spawned,
-                parent_live,
+                    .count(),
                 depth,
             };
-            let parent_label = request
-                .parent_subagent_id
-                .as_deref()
-                .unwrap_or(self.shared.parent_session_id.as_str());
+            let parent_label = parent.unwrap_or(self.shared.parent_session_id.as_str());
             if let Err(error) = self.quota.check_spawn(&budget, parent_label) {
                 tracing::debug!(
                     target: "openjiuwen_harness::subagents",
@@ -771,6 +789,11 @@ impl SubAgentRuntime {
                     %error,
                     "subagent spawn refused by quota"
                 );
+                if evicted > 0 {
+                    // The early return skips the post-reservation notify; waking here keeps a
+                    // `wait` registered on an evicted id from blocking on a stale snapshot.
+                    self.shared.notify.notify_waiters();
+                }
                 return Err(error);
             }
             state.spawned = state.spawned.saturating_add(1);
