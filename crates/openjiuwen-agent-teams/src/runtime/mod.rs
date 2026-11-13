@@ -19,6 +19,7 @@
 //! | [`org_bind`] | [`OrgBinding`]: chart, delegation router, org task pool and mailbox |
 //! | [`attach_host`] | [`AttachHost`] / [`BackendAttachHandler`]: Unix-socket attach hosting |
 //! | [`dispatch`] | [`decide_run_action`]: whether a run creates, attaches, resumes or is rejected |
+//! | [`health`] | [`TeamHealth`] / [`MemberHealth`]: the member-liveness projection of a team |
 //! | [`initial_input`] | [`parse_initial_input`]: caller request → leader query + deliveries |
 //! | [`backend`] | [`TeamBackend`]: members, mail, events, task board and snapshot facade |
 //! | [`build`] | the blueprint → runtime build path (`SpecBuild::build` / `build_with`) |
@@ -43,6 +44,8 @@ pub mod build;
 pub mod deps;
 /// Run admission: create, attach, resume or reject.
 pub mod dispatch;
+/// The member-liveness projection of a running team.
+pub mod health;
 /// Caller request parsing into a leader query and pre-routed deliveries.
 pub mod initial_input;
 /// The leader's coordination loop.
@@ -76,6 +79,7 @@ pub use attach_host::{AttachHost, BackendAttachHandler};
 pub use backend::TeamBackend;
 pub use deps::TeamBuildDeps;
 pub use dispatch::{decide_run_action, LiveTeamState, RunAction, RunActionKind};
+pub use health::{MemberHealth, TeamHealth};
 pub use initial_input::{parse_initial_input, InitialInput};
 pub use leader::SETTLE_POLL_INTERVAL;
 pub use manager::{

@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use super::attach_host::AttachHost;
 use super::backend::TeamBackend;
 use super::deps::TeamBuildDeps;
+use super::health::TeamHealth;
 use super::observability_bind::TeamSignals;
 use super::routing::TeamModelRouter;
 use super::spawner::TeamMemberSpawner;
@@ -283,6 +284,17 @@ impl TeamAgent {
     #[must_use]
     pub fn is_started(&self) -> bool {
         self.inner.started.load(Ordering::SeqCst)
+    }
+    /// Returns the member-liveness projection of the team, with the run flag filled in.
+    ///
+    /// The roster projection comes from [`Self::backend`] (`TeamHealth::health`); `started` comes
+    /// from this handle, because the backend does not track the run lifecycle. Purely a read of
+    /// already-cached state: no store access, no probe, no `.await`.
+    #[must_use]
+    pub fn health(&self) -> TeamHealth {
+        let mut health = self.backend().health();
+        health.started = self.is_started();
+        health
     }
 
     /// Returns the organisation facade of the team.

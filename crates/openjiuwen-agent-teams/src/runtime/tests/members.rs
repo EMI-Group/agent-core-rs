@@ -182,3 +182,106 @@ async fn create_task_persists_the_row_and_publishes_the_created_event() {
         "board events are stamped with the team"
     );
 }
+
+/// The whole roster is projected before the first start: every row is `unstarted` and only the
+/// leader owns a (build-time) runtime.
+#[tokio::test]
+async fn health_before_a_start_reports_the_unstarted_roster() {
+    let (team, _factory, _workspace) = crate::runtime::team_agent::test_support::built(&blueprint(
+        "alpha",
+        "boss",
+        &["dev-1", "dev-2"],
+    ))
+    .await;
+    let health = team.health();
+    assert_eq!(health.team_name, "alpha");
+    assert!(!health.started, "the team has not started");
+    let names: Vec<&str> = health
+        .members
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["boss", "dev-1", "dev-2"], "sorted, leader included");
+    assert!(
+        health
+            .members
+            .iter()
+            .all(|entry| entry.status == MemberStatus::Unstarted),
+        "{:?}",
+        health.members
+    );
+    // The build path materializes the leader's harness before the first start, so the leader
+    // already owns an idle runtime while every teammate row is still a bare row.
+    let alive: Vec<&str> = health
+        .members
+        .iter()
+        .filter(|entry| entry.alive)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(alive, ["boss"], "{:?}", health.members);
+    let leader = health.leader.expect("the leader row is in the roster");
+    assert_eq!(leader.name, "boss");
+    assert_eq!(leader.status, MemberStatus::Unstarted);
+    assert!(leader.alive, "the leader harness exists before the start");
+}
+/// A start makes the leader (and only the leader) alive.
+#[tokio::test]
+async fn health_marks_the_leader_alive_after_a_start() {
+    let (team, _factory, _workspace) =
+        crate::runtime::team_agent::test_support::built(&blueprint("alpha", "boss", &["dev-1"]))
+            .await;
+    team.start().await.unwrap();
+    let health = team.health();
+    assert!(health.started);
+    let leader = health.leader.expect("the leader row is in the roster");
+    assert_eq!(leader.name, "boss");
+    assert_eq!(leader.status, MemberStatus::Ready);
+    assert!(leader.alive, "the leader runtime is attached and idle");
+    let teammate = health
+        .members
+        .iter()
+        .find(|entry| entry.name == "dev-1")
+        .expect("the teammate row exists");
+    assert_eq!(teammate.status, MemberStatus::Unstarted);
+    assert!(!teammate.alive, "an unspawned teammate owns no runtime");
+}
+/// Spawning a teammate makes it alive; shutting it down makes it dead again.
+#[tokio::test]
+async fn health_follows_a_teammate_spawn_and_shutdown() {
+    let (team, _factory, _workspace) =
+        crate::runtime::team_agent::test_support::built(&blueprint("alpha", "boss", &["dev-1"]))
+            .await;
+    team.start().await.unwrap();
+    team.spawn_member("dev-1").await.unwrap();
+    let spawned = team
+        .health()
+        .members
+        .into_iter()
+        .find(|entry| entry.name == "dev-1")
+        .expect("the teammate row exists");
+    assert_eq!(spawned.status, MemberStatus::Ready);
+    assert!(spawned.alive, "a spawned member owns a live runtime");
+    team.shutdown_member("dev-1", MemberLifetime::Shutdown, true)
+        .await
+        .unwrap();
+    let shut_down = team
+        .health()
+        .members
+        .into_iter()
+        .find(|entry| entry.name == "dev-1")
+        .expect("the row stays in the roster");
+    assert_eq!(shut_down.status, MemberStatus::ShutDown);
+    assert!(!shut_down.alive, "a terminated runtime is not alive");
+    assert!(
+        team.health().leader.expect("the leader row").alive,
+        "the leader is untouched by a teammate shutdown"
+    );
+    team.stop().await.unwrap();
+    let stopped = team.health();
+    assert!(!stopped.started);
+    assert!(
+        stopped.members.iter().all(|entry| !entry.alive),
+        "a stopped team has no live runtime: {:?}",
+        stopped.members
+    );
+}
