@@ -22,6 +22,10 @@
 //! [`create_supervisor`], which returns the `(card, provider)` pair the team
 //! registers like any other member, or with [`hierarchical_tools_team`], whose
 //! root agent is supplied as a card and registered by the caller.
+//!
+//! The supervisor's ability routing ([`P2PAbilityManager`]) is re-exported here
+//! as well as from the crate root, because Python keeps it at
+//! `openjiuwen/core/multi_agent/teams/hierarchical_msgbus/p2p_ability_manager.py`.
 
 mod msgbus;
 mod supervisor;
@@ -30,3 +34,9 @@ mod tools;
 pub use msgbus::{hierarchical_msgbus_team, HierarchicalMsgbusConfig, HierarchicalMsgbusStrategy};
 pub use supervisor::{create_supervisor, SupervisorAgent, SupervisorConfig};
 pub use tools::{hierarchical_tools_team, HierarchicalToolsConfig, HierarchicalToolsStrategy};
+
+// Python parity: `P2PAbilityManager` lives in
+// `openjiuwen/core/multi_agent/teams/hierarchical_msgbus/p2p_ability_manager.py`,
+// so it is reachable both as `crate::P2PAbilityManager` and under this module
+// path.
+pub use crate::ability::{AbilityCall, AbilityResult, AbilityRoute, P2PAbilityManager};

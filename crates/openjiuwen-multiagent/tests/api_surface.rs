@@ -565,3 +565,307 @@ async fn bus_and_subscription_registry_are_reachable() {
     bus.stop().await.unwrap();
     assert!(!bus.is_started());
 }
+
+// --- extended subsystems (published from the crate root) ---
+
+use openjiuwen_multiagent::{
+    apply, apply_agent, build_transport, derive, derive_from_event_card, derive_with_overrides,
+    derived_for_member, literal_or_json, member_checkpoint_id, member_checkpoint_key,
+    parse_python_literal, render_python_value, AbilityCall, AbilityExecutor, AbilityResult,
+    AbilityRoute, AutoSubscriptionMode, AutoSubscriptionPlan, InProcessTransport, LocalResourceMgr,
+    MemberCheckpointer, P2PAbilityManager, RedisTransport, RedisTransportConfig, TeamEvent,
+    TeamEventBus, TeamEventFilter, TeamEventKind, TeamEventListener, TeamResourceMgr,
+    TeamTransport, TransportConfig, TransportKind, AGENT_P2P_RECEIVED_EVENT,
+    AGENT_PUBSUB_RECEIVED_EVENT, MAX_LITERAL_DEPTH, MEMBER_CHECKPOINT_NAMESPACE,
+    SUBSCRIBE_TAG_PREFIX, TEAM_EVENT_SCOPE,
+};
+use openjiuwen_session::{Checkpointer, MemoryCheckpointer};
+
+/// An [`AbilityExecutor`] that exists to prove the trait is object-safe.
+struct PinExecutor;
+
+#[async_trait]
+impl AbilityExecutor for PinExecutor {
+    async fn execute(
+        &self,
+        call: &AbilityCall,
+        _session: Option<Arc<dyn Session>>,
+    ) -> Result<Value> {
+        Ok(json!({ "call_id": call.call_id }))
+    }
+}
+
+#[test]
+fn new_event_and_autosubscribe_surface_is_re_exported_at_the_root() {
+    // --- events ---
+    let _: fn() -> Arc<TeamEventBus> = TeamEventBus::new;
+    let _: fn(usize) -> Arc<TeamEventBus> = TeamEventBus::with_capacity;
+    let _: fn() -> TeamEventFilter = TeamEventFilter::new;
+    let _: fn() -> TeamEventFilter = TeamEventFilter::all;
+    assert_eq!(TEAM_EVENT_SCOPE, "agent_team");
+    assert_eq!(AGENT_P2P_RECEIVED_EVENT, "_framework:agent_p2p_received");
+    assert_eq!(
+        AGENT_PUBSUB_RECEIVED_EVENT,
+        "_framework:agent_pubsub_received"
+    );
+    assert_eq!(TeamEventKind::ALL.len(), 9);
+    assert_eq!(TeamEventKind::MemberJoined.as_str(), "member_joined");
+    assert_eq!(
+        TeamEventKind::MemberJoined.event_name(),
+        "agent_team:member_joined"
+    );
+    assert_eq!(
+        TeamEventKind::MessageReceived.python_event_name(),
+        Some(AGENT_P2P_RECEIVED_EVENT)
+    );
+    assert_eq!(TeamEventKind::MessageSent.python_event_name(), None);
+
+    let bus = TeamEventBus::new();
+    let listener: TeamEventListener = Arc::new(|_event: &TeamEvent| {});
+    let subscription = bus.subscribe(TeamEventFilter::all(), Arc::clone(&listener));
+    let emitted = bus.emit(TeamEvent::new(TeamEventKind::MemberJoined, "team"));
+    assert_eq!(emitted.sequence, 1);
+    assert_eq!(bus.last_sequence(), 1);
+    assert_eq!(bus.subscriber_count(), 1);
+    assert!(bus.unsubscribe(subscription));
+    assert_eq!(bus.subscriber_count(), 0);
+
+    // --- autosubscribe ---
+    let _: fn(&TeamCard) -> AutoSubscriptionPlan = derive;
+    let _: fn(&TeamCard, &BTreeMap<String, Vec<String>>) -> AutoSubscriptionPlan =
+        derive_with_overrides;
+    let _: fn(&EventDrivenTeamCard) -> AutoSubscriptionPlan = derive_from_event_card;
+    let _: fn(&Arc<TeamRuntime>, &AutoSubscriptionPlan, AutoSubscriptionMode) -> usize = apply;
+    let _: fn(&Arc<TeamRuntime>, &AutoSubscriptionPlan, &str, AutoSubscriptionMode) -> usize =
+        apply_agent;
+    let _: fn(&TeamCard, &str) -> Vec<String> = derived_for_member;
+    assert_eq!(SUBSCRIBE_TAG_PREFIX, "subscribe:");
+    assert_eq!(AutoSubscriptionMode::default(), AutoSubscriptionMode::Merge);
+
+    let card = TeamCard::new("crew")
+        .with_id("crew")
+        .with_topic("news")
+        .with_agent_cards(vec![AgentCard::new("member").with_id("member")]);
+    let plan: AutoSubscriptionPlan = derive(&card);
+    assert!(!plan.is_empty());
+    assert!(derived_for_member(&card, "member").contains(&"news.member".to_owned()));
+    let event_card = EventDrivenTeamCard {
+        card: card.clone(),
+        subscriptions: BTreeMap::from([("member".to_owned(), vec!["override.*".to_owned()])]),
+    };
+    assert_eq!(
+        derive_from_event_card(&event_card).get("member"),
+        Some(["override.*".to_owned()].as_slice())
+    );
+
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("api-surface"));
+    // `Disabled` never touches the bus, so the count is the documented zero.
+    assert_eq!(apply(&runtime, &plan, AutoSubscriptionMode::Disabled), 0);
+    assert_eq!(
+        apply_agent(&runtime, &plan, "", AutoSubscriptionMode::Merge),
+        0
+    );
+}
+
+#[test]
+fn new_pyrepr_resource_and_checkpoint_surface_is_re_exported_at_the_root() {
+    // --- pyrepr ---
+    let _: fn(&str) -> Option<Value> = parse_python_literal;
+    let _: fn(&str) -> Option<Value> = literal_or_json;
+    let _: fn(&Value) -> String = render_python_value;
+    assert_eq!(MAX_LITERAL_DEPTH, 64);
+    assert_eq!(
+        parse_python_literal("{'handoff': 'member'}"),
+        Some(json!({"handoff": "member"}))
+    );
+    assert_eq!(literal_or_json("[1, 2]"), Some(json!([1, 2])));
+    assert_eq!(
+        render_python_value(&json!({"a": Value::Null})),
+        "{'a': None}"
+    );
+
+    // --- resources ---
+    let _: fn() -> Arc<LocalResourceMgr> = LocalResourceMgr::new;
+    let resources: Arc<dyn TeamResourceMgr> = LocalResourceMgr::new();
+    assert!(resources.agent_card("missing").is_none());
+
+    // --- member_checkpoint ---
+    let _: fn(Arc<dyn Checkpointer>) -> MemberCheckpointer = MemberCheckpointer::new;
+    let _: fn(&str, &str) -> String = member_checkpoint_key;
+    let _: fn(&str, &str, u64) -> String = member_checkpoint_id;
+    assert_eq!(MEMBER_CHECKPOINT_NAMESPACE.as_str(), "agent");
+    assert_eq!(
+        member_checkpoint_key("team-1", "member"),
+        "team-1:agent:member"
+    );
+    assert_eq!(
+        member_checkpoint_id("team-1", "member", 7),
+        "team-1:agent:member:000007"
+    );
+    let members = MemberCheckpointer::new(Arc::new(MemoryCheckpointer::new()));
+    let _: Arc<dyn Checkpointer> = members.checkpointer();
+}
+
+#[test]
+#[allow(clippy::type_complexity)]
+fn new_transport_surface_is_re_exported_at_the_root() {
+    // --- transport ---
+    let _: fn() -> TransportConfig = TransportConfig::new;
+    let _: fn(TransportConfig, TransportKind) -> TransportConfig = TransportConfig::with_kind;
+    let _: fn(TransportConfig, String) -> TransportConfig = TransportConfig::with_key_prefix;
+    let _: fn(TransportConfig, RedisTransportConfig) -> TransportConfig =
+        TransportConfig::with_redis;
+    let _: fn() -> RedisTransportConfig = RedisTransportConfig::new;
+    let _: fn(
+        &TransportConfig,
+        &str,
+        MessageBusConfig,
+        Arc<dyn MessageHandler>,
+    ) -> Result<Arc<dyn TeamTransport>> = build_transport;
+    assert_eq!(TransportKind::default(), TransportKind::InProcess);
+    assert_eq!(TransportKind::InProcess.as_str(), "in_process");
+    assert_eq!(TransportKind::Redis.as_str(), "redis");
+    assert_eq!(TransportKind::Pulsar.as_str(), "pulsar");
+
+    let in_process = InProcessTransport::new(
+        "api-surface",
+        MessageBusConfig::new(),
+        Arc::new(NoopHandler),
+    );
+    assert_eq!(in_process.bus().team_id(), "api-surface");
+    let redis = RedisTransport::new(
+        RedisTransportConfig::new()
+            .with_addr("127.0.0.1:6379")
+            .with_db(1),
+        "api-surface",
+        "openjiuwen:team",
+        Arc::new(NoopHandler),
+    );
+    assert_eq!(redis.config().addr, "127.0.0.1:6379");
+    assert_eq!(redis.key_prefix(), "openjiuwen:team");
+    assert!(!redis.is_started());
+
+    let transport: Arc<dyn TeamTransport> = build_transport(
+        &TransportConfig::new(),
+        "api-surface",
+        MessageBusConfig::new(),
+        Arc::new(NoopHandler),
+    )
+    .unwrap();
+    assert_eq!(transport.kind(), TransportKind::InProcess);
+    assert_eq!(transport.team_id(), "api-surface");
+    assert_eq!(transport.subscribers("news"), Vec::<String>::new());
+
+    // The deferred backend fails loudly instead of degrading to another one.
+    let unsupported = build_transport(
+        &TransportConfig::new().with_kind(TransportKind::Pulsar),
+        "api-surface",
+        MessageBusConfig::new(),
+        Arc::new(NoopHandler),
+    )
+    .unwrap_err();
+    assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
+}
+
+#[test]
+fn new_ability_surface_is_re_exported_at_the_root() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("api-surface"));
+
+    // --- ability ---
+    let call = AbilityCall::new("member", json!({"query": "hi"})).with_call_id("call-1");
+    assert_eq!(call.call_id, "call-1");
+    assert_eq!(call.name, "member");
+    assert_eq!(call.arguments, json!({"query": "hi"}));
+
+    let executor: Arc<dyn AbilityExecutor> = Arc::new(PinExecutor);
+    let manager: Arc<P2PAbilityManager> = P2PAbilityManager::new(Arc::clone(&runtime), "boss");
+    assert_eq!(manager.supervisor_id(), "boss");
+    assert_eq!(manager.runtime().team_id(), "api-surface");
+    let manager = manager.with_max_parallel(2).with_executor(executor);
+    assert_eq!(manager.max_parallel(), 2);
+    manager.register_agent_tool(&AgentCard::new("member").with_id("member"));
+    assert!(manager.is_agent_tool("member"));
+    assert_eq!(manager.agent_tool_ids(), vec!["member".to_owned()]);
+    assert_eq!(
+        manager.agent_card("member").map(|card| card.id),
+        Some("member".to_owned())
+    );
+    let _ = P2PAbilityManager::execute;
+
+    // Python keeps the manager under the hierarchical_msgbus module path, so the
+    // crate exposes it there too — the same type, not a second one.
+    let mirror: Arc<openjiuwen_multiagent::hierarchical::P2PAbilityManager> =
+        openjiuwen_multiagent::hierarchical::P2PAbilityManager::new(Arc::clone(&runtime), "boss");
+    assert_eq!(mirror.max_parallel(), 10);
+    let _: Option<openjiuwen_multiagent::hierarchical::AbilityResult> = None;
+    let _: openjiuwen_multiagent::hierarchical::AbilityCall =
+        AbilityCall::new("member", Value::Null);
+    let _ = openjiuwen_multiagent::hierarchical::AbilityRoute::P2p;
+}
+
+#[test]
+fn new_subsystem_data_types_round_trip_through_json() {
+    round_trip(&TransportConfig::new());
+    round_trip(
+        &TransportConfig::new().with_redis(
+            RedisTransportConfig::new()
+                .with_addr("127.0.0.1:6379")
+                .with_username("default")
+                .with_db(2)
+                .with_poll_interval_ms(5),
+        ),
+    );
+    round_trip(&AbilityResult {
+        call_id: "call-1".to_owned(),
+        name: "member".to_owned(),
+        route: AbilityRoute::Local,
+        output: json!({"answer": "hi"}),
+        error: None,
+    });
+    round_trip(
+        &TeamEvent::new(TeamEventKind::TaskAssigned, "crew")
+            .with_session("session-1")
+            .with_agent("member"),
+    );
+    round_trip(&AutoSubscriptionPlan::new());
+
+    // Wire names stay snake_case.
+    assert_eq!(
+        serde_json::to_value(TransportKind::InProcess).unwrap(),
+        json!("in_process")
+    );
+    assert_eq!(
+        serde_json::to_value(AbilityRoute::Error).unwrap(),
+        json!("error")
+    );
+    assert_eq!(
+        serde_json::to_value(TeamEventKind::HandoffStarted).unwrap(),
+        json!("handoff_started")
+    );
+    assert_eq!(
+        serde_json::to_value(AutoSubscriptionMode::Disabled).unwrap(),
+        json!("disabled")
+    );
+
+    // Schemas keep the documented property names.
+    let transport =
+        serde_json::to_value(schemars::schema_for!(TransportConfig)).expect("schema serializes");
+    assert_eq!(
+        schema_properties(&transport),
+        ["key_prefix", "kind", "redis"]
+    );
+    let event = serde_json::to_value(schemars::schema_for!(TeamEvent)).expect("schema serializes");
+    assert!(event.is_object(), "the event exposes one object schema");
+    let result =
+        serde_json::to_value(schemars::schema_for!(AbilityResult)).expect("schema serializes");
+    assert_eq!(
+        schema_properties(&result),
+        ["call_id", "error", "name", "output", "route"]
+    );
+
+    // The two new subsystem types that carry no wire shape are still Send+Sync.
+    assert_send_sync::<TeamEventBus>();
+    assert_send_sync::<P2PAbilityManager>();
+    assert_send_sync::<LocalResourceMgr>();
+    assert_send_sync::<MemberCheckpointer>();
+}
