@@ -171,7 +171,7 @@ impl PoolShutdown {
 }
 
 impl Clone for PoolShutdown {
-    /// Clones the failure through [`rebuild`], because [`Error`] is not
+    /// Clones the failure through `rebuild`, because [`Error`] is not
     /// `Clone`.
     fn clone(&self) -> Self {
         Self {

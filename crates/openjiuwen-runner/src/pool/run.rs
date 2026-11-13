@@ -50,7 +50,7 @@ const STOPPED_REASON: &str = "stopped";
 /// cancellation token).
 ///
 /// **Session precedence.** [`PoolRequest::key`] derives the entry's session id
-/// through [`resolve_session_id`](crate::run::resolve_session_id):
+/// through `crate::run::resolve_session_id`:
 /// `inputs["conversation_id"]` first, then this request's
 /// [`PoolRequest::session_id`], then [`RunOptions::session_id`], then
 /// `RunnerConfig::default_session_id`. The derived id always wins, and it is
@@ -123,7 +123,7 @@ impl PoolRequest {
     ///
     /// The team name comes from [`PoolKey::for_team`] (an id reference verbatim,
     /// a live team's card id); the session id comes from
-    /// [`resolve_session_id`](crate::run::resolve_session_id).
+    /// `crate::run::resolve_session_id`.
     #[must_use]
     pub fn key(&self, config: &RunnerConfig) -> PoolKey {
         let session_id = resolve_session_id(&self.inputs, &self.options_for_key(), config);
@@ -463,7 +463,7 @@ impl StreamDrive {
 impl TeamPool {
     /// Starts a new run, waiting for a concurrency permit when the pool is full.
     ///
-    /// The entry is created in [`RunPhase::Queued`](crate::monitor::RunPhase::Queued)
+    /// The entry is created in [`RunPhase::Queued`]
     /// and registered on the monitor and the hub before the wait, so a queued run
     /// is observable. A run whose entry token is tripped while queued is
     /// finalised as cancelled and never starts.
@@ -514,7 +514,7 @@ impl TeamPool {
     /// Stops the run pooled under `key`.
     ///
     /// Cancels the entry, finalises it as
-    /// [`RunPhase::Cancelled`](crate::monitor::RunPhase::Cancelled), removes it
+    /// [`RunPhase::Cancelled`], removes it
     /// from the pool, and awaits the worker for at most
     /// `TeamPoolConfig::stop_timeout` (aborting it on expiry). An unknown key is
     /// `Ok(false)`, not an error, so a host can call it unconditionally.
