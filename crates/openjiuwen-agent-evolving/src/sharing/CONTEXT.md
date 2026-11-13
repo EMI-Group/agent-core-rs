@@ -18,7 +18,8 @@ The remote hub client is not ported; the backend seam is real and testable offli
 - Deterministic: bundle ids are derived from content, never from `uuid4` or a clock, so re-publishing the same records yields the same id.
 - The stager never mutates or deletes input records; a rejected record stays in the local archive untouched.
 - `build_bundle` drops records that fail `ExperienceRecord::validate` or fall below `min_confidence`, and rejects a bundle with no surviving record; `max_experiences` `0` means unlimited.
-- Backends are async and return `Error::Io`; the in-memory backend guards its map with a `Mutex` that is never held across an `.await`.
+- Backends are async and return `Error::Io` (or `Error::External` for a poisoned lock); the in-memory backend guards its map with a `Mutex` that is never held across an `.await`.
+- The module has no inline `#[cfg(test)]` unit tests; its coverage lives in `crates/openjiuwen-agent-evolving/tests/sharing.rs`.
 
 ## Design Decisions
 - A content-derived `bundle_id` replaces Python's random one, which keeps tests, re-publishes and file names reproducible.
