@@ -276,9 +276,12 @@ impl TeamMemberSpawner {
         let requested = self
             .member_spec(member_name)
             .and_then(|member| member.base.model_name);
-        let (effective, selection) =
-            self.routing
-                .effective_spec(&base, requested.as_deref(), TeamRole::Teammate)?;
+        let (effective, selection) = self.routing.effective_spec_for(
+            member_name,
+            &base,
+            requested.as_deref(),
+            TeamRole::Teammate,
+        )?;
         debug!(
             team = self.team_name(),
             member = member_name,

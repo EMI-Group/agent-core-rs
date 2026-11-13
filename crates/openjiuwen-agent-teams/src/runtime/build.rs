@@ -155,8 +155,12 @@ impl SpecBuild for TeamAgentSpec {
         let leader_record = leader_record(self, &leader_name, &leader_spec, &routing);
         store.insert_member(leader_record.clone()).await?;
         let leader_member = Arc::new(TeamMember::new(store.clone(), leader_record.clone()));
-        let (leader_effective, leader_selection) =
-            routing.effective_spec(&leader_spec, leader_spec.model_name(), TeamRole::Leader)?;
+        let (leader_effective, leader_selection) = routing.effective_spec_for(
+            &leader_name,
+            &leader_spec,
+            leader_spec.model_name(),
+            TeamRole::Leader,
+        )?;
         let workspace = deps
             .workspace
             .allocate(&WorkspaceRequest {
@@ -291,7 +295,7 @@ fn leader_record(
         desc: blueprint.leader.desc_or_default().to_owned(),
         prompt: leader_spec.system_prompt.clone().unwrap_or_default(),
         mode: blueprint.teammate_mode,
-        model_ref: routing.model_ref(leader_spec.model_name(), TeamRole::Leader),
+        model_ref: routing.model_ref_for(leader_name, leader_spec.model_name(), TeamRole::Leader),
         ..MemberRecord::new(&blueprint.team_name, leader_name, TeamRole::Leader)
     }
 }
@@ -311,7 +315,8 @@ pub(super) fn teammate_record(
         .map_or(TeamRole::Teammate, |spec| spec.role_type);
     let mut record = MemberRecord::new(spawner.team_name(), name, role);
     record.mode = spawner.spec().teammate_mode;
-    record.model_ref = routing.model_ref(requested_model(member_spec.as_ref(), blueprint), role);
+    record.model_ref =
+        routing.model_ref_for(name, requested_model(member_spec.as_ref(), blueprint), role);
     if let Some(spec) = &member_spec {
         record.display_name.clone_from(&spec.base.display_name);
         record.desc.clone_from(&spec.base.desc);

@@ -16,7 +16,7 @@ use openjiuwen_harness_protocol::HarnessProtocol;
 
 use crate::harness::{MemberHarnessContext, MemberHarnessFactory};
 use crate::member::{MemberSpawnRequest, MemberSpawner};
-use crate::runtime::routing::TeamModelRouter;
+use crate::runtime::routing::{ModelSelection, TeamModelRouter};
 use crate::runtime::spawner::TeamMemberSpawner;
 use crate::runtime::team_agent::{SpecBuild, TeamAgent};
 use crate::schema::{
@@ -58,13 +58,19 @@ impl RecordingFactory {
         })
     }
 
-    /// Returns the spec `member` was built with.
-    fn spec(&self, member: &str) -> Option<DeepAgentSpec> {
+    /// Returns every spec `member` was built with, in build order.
+    fn specs(&self, member: &str) -> Vec<DeepAgentSpec> {
         self.calls
             .lock()
             .iter()
-            .find(|(_, ctx)| ctx.member_name == member)
+            .filter(|(_, ctx)| ctx.member_name == member)
             .map(|(spec, _)| spec.clone())
+            .collect()
+    }
+
+    /// Returns the spec `member` was built with.
+    fn spec(&self, member: &str) -> Option<DeepAgentSpec> {
+        self.specs(member).into_iter().next()
     }
 }
 
@@ -127,26 +133,28 @@ async fn a_pool_entry_rewrites_the_member_spec_and_the_roster_row() {
         .spec("dev-1")
         .and_then(|spec| spec.model)
         .expect("the teammate model");
-    // `TeamModelRouter::select` previews the round-robin decision through `ModelRouter::decide`,
-    // which does not advance the cursor, so every member of a round-robin pool resolves to the
-    // first entry (documented deviation; reported to the crate owner).
-    assert_eq!(teammate.model_name.as_deref(), Some("m0"));
-    assert_eq!(teammate.provider.as_deref(), Some("openai"));
+    // The allocator hands out one entry per member: the leader took `m0`, so the first teammate in
+    // roster order rotates onto `m1`.
+    assert_eq!(teammate.model_name.as_deref(), Some("m1"));
+    assert_eq!(teammate.provider.as_deref(), Some("anthropic"));
 
-    assert_eq!(
-        agent
-            .backend()
-            .member("boss")
-            .map(|row| row.record().model_ref),
-        Some(Some("m0".to_owned()))
-    );
-    assert_eq!(
-        agent
-            .backend()
-            .member("dev-1")
-            .map(|row| row.record().model_ref),
-        Some(Some("m0".to_owned()))
-    );
+    // The roster row and the harness spec come from the same allocation, for every member.
+    for (member, expected) in [("boss", "m0"), ("dev-1", "m1")] {
+        assert_eq!(
+            model_name(&factory, member).as_deref(),
+            Some(expected),
+            "the harness spec of {member}"
+        );
+        assert_eq!(
+            agent
+                .backend()
+                .member(member)
+                .and_then(|row| row.record().model_ref.clone())
+                .as_deref(),
+            Some(expected),
+            "the roster row of {member} disagrees with its harness"
+        );
+    }
 }
 
 #[tokio::test]
@@ -241,27 +249,138 @@ fn select_honours_the_requested_name_under_by_name() {
 }
 
 #[test]
-fn select_previews_the_round_robin_entry_without_advancing_the_cursor() {
+fn select_rotates_the_round_robin_entry_on_every_call() {
     let router = TeamModelRouter::new(&entries(), ModelPoolStrategy::RoundRobin).expect("router");
-    let indices: Vec<usize> = (0..3)
+    let selections: Vec<_> = (0..3)
         .map(|_| {
             router
                 .select(None, TeamRole::Teammate)
                 .expect("a pooled selection")
-                .allocation
-                .index
         })
         .collect();
-    assert_eq!(
-        indices,
-        vec![0, 0, 0],
-        "select previews through decide, which never advances the round-robin cursor"
-    );
-    // Round-robin ignores a requested name by contract: the strategy rotates instead.
+    let indices: Vec<usize> = selections.iter().map(|sel| sel.allocation.index).collect();
+    assert_eq!(indices, vec![0, 1, 0], "round-robin rotates per allocation");
+    let names: Vec<&str> = selections.iter().map(ModelSelection::model_name).collect();
+    assert_eq!(names, vec!["m0", "m1", "m0"]);
+    // Round-robin ignores a requested name by contract: the rotation decides, here `m1`.
     let requested = router
-        .select(Some("m1"), TeamRole::Teammate)
+        .select(Some("m0"), TeamRole::Teammate)
         .expect("a pooled selection");
-    assert_eq!(requested.model_name(), "m0");
+    assert_eq!(requested.allocation.index, 1);
+    assert_eq!(requested.model_name(), "m1");
+    // By-name honours the same request (the strategy difference is documented on the allocator).
+    let by_name = TeamModelRouter::new(&entries(), ModelPoolStrategy::ByModelName).expect("router");
+    assert_eq!(
+        by_name
+            .select(Some("m1"), TeamRole::Teammate)
+            .expect("a pooled selection")
+            .model_name(),
+        "m1"
+    );
+}
+
+#[test]
+fn select_for_allocates_one_endpoint_per_member() {
+    let router = TeamModelRouter::new(&entries(), ModelPoolStrategy::RoundRobin).expect("router");
+    let first = router
+        .select_for("dev-1", None, TeamRole::Teammate)
+        .expect("a pooled selection");
+    let second = router
+        .select_for("dev-1", None, TeamRole::Teammate)
+        .expect("the memoized selection");
+    assert_eq!(first, second, "a member is allocated exactly once");
+    assert_eq!(first.model_name(), "m0");
+
+    let other = router
+        .select_for("dev-2", None, TeamRole::Teammate)
+        .expect("the next member");
+    assert_eq!(
+        other.model_name(),
+        "m1",
+        "the cursor moved on to the next member"
+    );
+
+    // An empty pool without a requested name is the unrouted selection, cached like any other.
+    let empty = TeamModelRouter::empty();
+    let unrouted = empty
+        .select_for("boss", None, TeamRole::Leader)
+        .expect("the unrouted selection");
+    assert_eq!(unrouted.allocation.model_name, "");
+    assert_eq!(
+        empty
+            .select_for("boss", None, TeamRole::Leader)
+            .expect("the memoized selection"),
+        unrouted
+    );
+}
+
+#[tokio::test]
+async fn each_member_keeps_its_endpoint_across_respawns() {
+    let (agent, factory, _inner) = build_recording(&pooled(ModelPoolStrategy::RoundRobin)).await;
+    agent
+        .spawn_member("dev-1")
+        .await
+        .expect("dev-1 did not spawn");
+    agent
+        .spawn_member("dev-2")
+        .await
+        .expect("dev-2 did not spawn");
+
+    // Two entries over three members: the documented rotation, in roster order (the leader first,
+    // then the teammates sorted by name).
+    for (member, expected) in [("boss", "m0"), ("dev-1", "m1"), ("dev-2", "m0")] {
+        assert_eq!(
+            model_name(&factory, member).as_deref(),
+            Some(expected),
+            "the harness spec of {member}"
+        );
+        assert_eq!(
+            agent
+                .backend()
+                .member(member)
+                .and_then(|row| row.record().model_ref.clone())
+                .as_deref(),
+            Some(expected),
+            "the roster row of {member} disagrees with its harness"
+        );
+    }
+
+    let first = factory.spec("dev-1").expect("dev-1's first harness");
+    // Materialize dev-1's harness a second time through the same spawner: the memo must hand back
+    // the endpoint the member was allocated at build time, not the next round-robin slot.
+    agent
+        .spawner()
+        .spawn(MemberSpawnRequest::new(
+            agent.team_name(),
+            "dev-1",
+            agent.session_id(),
+            std::env::temp_dir(),
+        ))
+        .await
+        .expect("dev-1 did not respawn");
+
+    let specs = factory.specs("dev-1");
+    assert_eq!(specs.len(), 2, "one harness per spawn: {specs:?}");
+    assert_eq!(
+        specs[0], specs[1],
+        "a respawn rebuilt the member for a different model"
+    );
+    assert_eq!(specs[1], first);
+    assert_eq!(
+        specs[1]
+            .model
+            .as_ref()
+            .and_then(|model| model.model_name.as_deref()),
+        Some("m1")
+    );
+    assert_eq!(
+        agent
+            .backend()
+            .member("dev-1")
+            .and_then(|row| row.record().model_ref)
+            .as_deref(),
+        Some("m1")
+    );
 }
 
 #[test]
@@ -282,7 +401,7 @@ fn effective_spec_on_an_empty_pool_echoes_the_requested_name() {
     let (effective, selection) = router
         .effective_spec(&spec, None, TeamRole::Leader)
         .expect("the unrouted selection");
-    assert!(selection.allocation.model_name.is_empty());
+    assert_eq!(selection.allocation.model_name, "");
     assert_eq!(effective.model, spec.model);
 }
 
