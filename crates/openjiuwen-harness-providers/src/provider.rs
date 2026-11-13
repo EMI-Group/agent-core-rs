@@ -32,7 +32,7 @@ use serde::Serialize;
 pub mod provider_names {
     /// In-process native openJiuwen harness (`openjiuwen-harness`).
     pub const NATIVE: &str = "native";
-    /// Native v2 harness hosted by `openjiuwen-agent-teams`; not wired into this build.
+    /// Native v2 harness hosted by `openjiuwen-agent-teams`; needs the `native-v2` feature.
     pub const NATIVE_V2: &str = "native_v2";
     /// Claude Code harness; deferred vendor stub.
     pub const CLAUDE_CODE: &str = "claudecode";
@@ -53,8 +53,9 @@ const BUILTIN_PROVIDER_NAMES: [&str; 5] = [
 
 /// Returns whether `name` is one of the provider names this crate declares.
 ///
-/// Declared is not the same as usable: `native_v2` and the vendor names are known but not
-/// implemented in this build, so resolution reports them as unsupported.
+/// Declared is not the same as usable: a name whose feature is compiled out (`native-v2` for the
+/// agent-teams provider, `vendor` for the three vendor stubs) is known but cannot be resolved, so
+/// resolution reports the missing feature.
 #[must_use]
 pub fn is_builtin_provider(name: &str) -> bool {
     BUILTIN_PROVIDER_NAMES.contains(&name)

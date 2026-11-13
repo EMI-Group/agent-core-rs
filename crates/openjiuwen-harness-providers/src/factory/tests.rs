@@ -307,9 +307,14 @@ fn builtin_descriptors_are_always_listed() {
     );
     for descriptor in &descriptors[..PROVIDER_NAMES.len()] {
         assert!(descriptor.builtin, "{} is declared", descriptor.name);
+        // A declared provider names an external requirement when it cannot be constructed: because
+        // it is deferred, or because the build-time feature that hosts it is compiled out
+        // (`native_v2` is the only feature-gated declared provider).
         assert!(
-            descriptor.requires.is_none() || !descriptor.implemented,
-            "{}: only a deferred provider names a requirement",
+            descriptor.requires.is_none()
+                || !descriptor.implemented
+                || descriptor.name == provider_names::NATIVE_V2,
+            "{}: only a deferred or feature-gated provider names a requirement",
             descriptor.name
         );
     }
@@ -331,8 +336,11 @@ fn describe_provider_answers_declared_names_statically() {
     assert_eq!(native_v2.card_name, "native_v2");
     assert_eq!(native_v2.implementation_version, "0.2.0");
     assert!(native_v2.builtin);
-    assert!(!native_v2.implemented);
+    assert!(native_v2.implemented);
     assert!(!native_v2.configures_models);
+    #[cfg(feature = "native-v2")]
+    assert_eq!(native_v2.requires, None);
+    #[cfg(not(feature = "native-v2"))]
     assert_eq!(
         native_v2.requires.as_deref(),
         Some("openjiuwen-agent-teams")
