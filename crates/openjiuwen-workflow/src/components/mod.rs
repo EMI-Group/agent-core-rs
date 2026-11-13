@@ -12,7 +12,11 @@ pub mod intent_detection;
 pub mod llm;
 pub mod loop_;
 pub mod memory;
+<<<<<<< HEAD
 pub mod questioner;
+=======
+pub mod react_agent;
+>>>>>>> f771f1e96139fdf2d362c8d372f930f0822f4779
 pub mod retrieval;
 pub mod start;
 pub mod sub_workflow;
@@ -31,6 +35,7 @@ pub use llm::{LlmCompConfig, LlmComponent, LlmResponseFormat};
 pub use loop_::{LoopComponent, LoopConfig, LoopType};
 pub use memory::{MemoryRecall, MemoryRecord, MemoryRetrievalComponent, MemoryWriteComponent};
 pub use questioner::{FieldInfo, QuestionerComponent, QuestionerConfig};
+pub use react_agent::{AgentRunner, ModelReActRunner, ReActAgentComponent, ReActAgentConfig};
 pub use retrieval::KnowledgeRetrievalComponent;
 pub use start::StartComponent;
 pub use sub_workflow::{SubWorkflowComponent, SUB_WORKFLOW_COMPONENT};
