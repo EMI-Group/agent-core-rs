@@ -9,7 +9,8 @@ The remote hub client is not ported; the backend seam is real and testable offli
 - `SharingMeta`, `SharedExperience`, `SharedSkillBundle`, `SkillPackageMeta`, `SkillSearchResult`, `QueryKeywords` — pure serde wire data.
 - `SharedSkillBundle::new` derives `bundle_id` as `bundle-{16 hex}` of an FNV-1a hash over the skill id and the sorted distinct record ids; `SharedExperience` carries the record payload plus its provenance.
 - `KeywordExtractor` — deterministic keyword and summary extraction (`extract`), with the shared `experience::stopwords` vocabulary.
-- `ShareStager` — `min_confidence`, `require_approval`, `max_experiences`; `build_bundle(records)` filters, dedupes, wraps and keywords; `publish`/`share` enforce the approval gate; `StagedBundle` is the pending result.
+- `ShareStager` — `min_confidence`, `require_approval`, `max_experiences`; `build_bundle(records, meta)` filters, dedupes, wraps and keywords; `publish`/`share` enforce the approval gate; `StagedBundle` is the pending result.
+- `SharingMeta::default()` uses `upload_trigger = "user_approval"` and `confidence = 0.7`; `SharedSkillBundle::new` requires a non-blank `skill_id` and derives `bundle_id` itself.
 - `SharingBackend` (async trait) — `publish`, `list`, `get`, `remove`, `search`; implementations `LocalFileSharingBackend` (one JSON file per bundle id) and `MemorySharingBackend`.
 - Both backends share one ranking rule, `score = 0.7 * keyword_ratio + 0.3 * intent_ratio`.
 
