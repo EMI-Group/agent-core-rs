@@ -401,7 +401,7 @@ fn recorded_answers(recorded: &Map<String, Value>) -> BTreeMap<String, Vec<Value
                     .or_default()
                     .extend(values.iter().cloned());
             }
-            Value::Null => continue,
+            Value::Null => {}
             other => {
                 answers.entry(id.clone()).or_default().push(other.clone());
             }
