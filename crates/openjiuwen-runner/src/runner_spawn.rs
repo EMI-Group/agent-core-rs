@@ -14,8 +14,16 @@
 //!
 //! Both entry points wrap a successful child in
 //! [`MonitoredSpawnedAgent::track`], so [`Runner::active_spawns`] (and
-//! [`Runner::monitor`]) report it as a [`RunKind::Spawn`] run from admission to
-//! shutdown, kill, or drop. A failed spawn creates no monitor entry.
+//! [`Runner::monitor`]) report it as a [`RunKind::Spawn`] run from admission until
+//! the run is reported finished — a health probe that finds the child gone, a
+//! `shutdown`, a `force_kill`, or a drop of the handle. A failed spawn creates no
+//! monitor entry.
+//!
+//! A [`SpawnSpec::backend`] hint is a registry address. With a
+//! [`SpawnerRegistry`] installed it selects the backend (see
+//! [`SpawnerRegistry::route`]); with only a single spawner it can only confirm
+//! that spawner, so a hint naming a different backend is
+//! [`openjiuwen_common::error::Error::Config`] instead of a silent misroute.
 
 use crate::monitor::{RunKind, RunStatus};
 use crate::runner::Runner;
@@ -93,10 +101,14 @@ impl Runner {
     /// Asks the installed spawner — or the registry a spec routes to — to launch
     /// the agent described by `spec`.
     ///
-    /// With a registry installed the spec goes through
-    /// [`SpawnerRegistry::spawner_for`], so its `backend` hint, the registry's
-    /// default, and the sole-spawner rule apply; without one it goes to the single
-    /// installed spawner. The default [`crate::spawn::UnsupportedSpawner`] answers
+    /// With a registry installed the spec goes through [`SpawnerRegistry::route`],
+    /// so its `backend` hint, the registry's default, and the sole-spawner rule
+    /// apply, and the run is labelled with the *resolved* backend key. Without a
+    /// registry the spec goes to the single installed spawner, and a
+    /// [`SpawnSpec::backend`] hint must agree with that spawner: a contradiction is
+    /// [`openjiuwen_common::error::Error::Config`], and an installed spawner that
+    /// reports [`SpawnBackend::Unknown`] cannot contradict the hint, so the hint
+    /// labels the run. The default [`crate::spawn::UnsupportedSpawner`] answers
     /// [`openjiuwen_common::error::Error::Unsupported`] naming the seam.
     ///
     /// A successful child is admitted into [`Runner::monitor`] as a
@@ -105,18 +117,19 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns the resolved spawner's error (by default
+    /// [`openjiuwen_common::error::Error::Config`] when a `spec.backend` hint
+    /// contradicts the single installed spawner (install a [`SpawnerRegistry`]
+    /// with [`Runner::set_spawner_registry`] or address one with
+    /// [`Runner::spawn_agent_with`]), plus the resolved spawner's error (by default
     /// `Error::Unsupported`, or the registry's deferred-backend wording).
     pub async fn spawn_agent(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         let session_id = spec.session_id.clone();
-        let (spawner, backend) = if let Some(registry) = self.spawner_registry() {
-            let spawner = registry.spawner_for(&spec);
-            let backend = spawner.backend();
-            (spawner, backend)
+        let (backend, spawner) = if let Some(registry) = self.spawner_registry() {
+            registry.route(&spec)
         } else {
             let spawner = self.spawner();
-            let backend = spawner.backend();
-            (spawner, backend)
+            let backend = single_spawn_backend(&spec, &spawner)?;
+            (backend, spawner)
         };
         let child = spawner.spawn(spec).await?;
         Ok(self.observed_spawn(child, backend, session_id.as_deref()))
@@ -153,8 +166,14 @@ impl Runner {
         Ok(self.observed_spawn(child, backend, session_id.as_deref()))
     }
 
-    /// The live spawned children: [`RunKind::Spawn`] runs this runner admitted and
-    /// has not seen shut down, killed, or dropped.
+    /// The spawned children this runner has not reported finished: every
+    /// [`RunKind::Spawn`] run admitted here whose end has not been observed.
+    ///
+    /// "Finished" is an observation, not a live check: a run leaves this list when
+    /// a `health` probe finds the child gone, when it is shut down or killed, or
+    /// when its handle is dropped. A child that dies without any of those still
+    /// appears here until something probes it — this method does not poll the
+    /// backends, so an idle dead child is listed until the host asks.
     ///
     /// A convenience over [`RunMonitor::list_active`](crate::monitor::RunMonitor::list_active)
     /// filtered to [`RunKind::Spawn`]; finished spawns stay readable through
@@ -190,6 +209,33 @@ impl Runner {
             detail,
         ))
     }
+}
+
+/// The backend a spec resolves to when only a single spawner is installed.
+///
+/// One spawner can only serve its own backend, so a [`SpawnSpec::backend`] hint is
+/// honoured only when it agrees with [`AgentSpawner::backend`]; a contradiction is
+/// [`Error::Config`] naming both sides rather than a silent misroute. An installed
+/// spawner that reports [`SpawnBackend::Unknown`] names no backend, so it cannot
+/// contradict the hint — the hint is kept and labels the run.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the hint names a backend the installed spawner does not
+/// launch; the message names both backends and both remedies.
+fn single_spawn_backend(spec: &SpawnSpec, spawner: &Arc<dyn AgentSpawner>) -> Result<SpawnBackend> {
+    let installed = spawner.backend();
+    let Some(requested) = spec.backend else {
+        return Ok(installed);
+    };
+    if installed == SpawnBackend::Unknown || installed == requested {
+        return Ok(requested);
+    }
+    Err(Error::config(format!(
+        "spawn spec requests backend '{requested}' but the installed single spawner launches \
+         '{installed}'; install a `SpawnerRegistry` with `Runner::set_spawner_registry` to host \
+         several backends, or address a registry backend with `Runner::spawn_agent_with`"
+    )))
 }
 
 #[cfg(test)]

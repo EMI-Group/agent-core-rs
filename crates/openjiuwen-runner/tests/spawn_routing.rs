@@ -18,12 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{stream::BoxStream, StreamExt};
 use openjiuwen_agent::output::{AgentChunk, AgentOutput};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_runner::{
-    AgentSpawner, InProcessHandler, InProcessSpawner, RunKind, Runner, SpawnBackend, SpawnSpec,
-    SpawnedAgent, SpawnerRegistry,
+    AgentSpawner, InProcessHandler, InProcessSpawner, RunKind, RunPhase, Runner, SpawnBackend,
+    SpawnSpec, SpawnedAgent, SpawnerRegistry,
 };
 use serde_json::{json, Value};
 
@@ -122,6 +122,126 @@ struct FailingSpawner;
 impl AgentSpawner for FailingSpawner {
     async fn spawn(&self, _spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
         Err(Error::transport("launch failed"))
+    }
+}
+
+/// A spawner that never reports its backend, so a registry key is the only label.
+struct UnlabelledSpawner {
+    /// Id prefix of the children it hands out.
+    id_prefix: &'static str,
+}
+
+#[async_trait]
+#[allow(clippy::unused_async_trait_impl)]
+impl AgentSpawner for UnlabelledSpawner {
+    async fn spawn(&self, _spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
+        Ok(Arc::new(FakeChild {
+            id: format!("{}-0", self.id_prefix),
+            backend: SpawnBackend::Unknown,
+        }))
+    }
+}
+
+/// A spawner handing out children whose liveness and failures the test drives.
+struct ScriptedSpawner {
+    /// Backend this spawner names.
+    backend: SpawnBackend,
+    /// Liveness flag every child reports and the test flips.
+    alive: Arc<AtomicBool>,
+    /// Whether `send`/`stream` answer with a transport error.
+    fails: bool,
+    /// How many children it handed out, so their ids are unique.
+    spawned: Arc<AtomicUsize>,
+}
+
+impl ScriptedSpawner {
+    /// A spawner naming `backend`, sharing `alive`, failing calls when `fails`.
+    fn new(backend: SpawnBackend, alive: Arc<AtomicBool>, fails: bool) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            alive,
+            fails,
+            spawned: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+#[async_trait]
+impl AgentSpawner for ScriptedSpawner {
+    async fn spawn(&self, _spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>> {
+        let call = self.spawned.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(ScriptedChild {
+            id: format!("scripted-{call}"),
+            backend: self.backend,
+            alive: Arc::clone(&self.alive),
+            fails: self.fails,
+        }))
+    }
+
+    fn backend(&self) -> SpawnBackend {
+        self.backend
+    }
+}
+
+/// A child handle whose liveness, probe and failures the test controls.
+struct ScriptedChild {
+    /// Stable handle id, unique per spawn.
+    id: String,
+    /// Backend the handle reports.
+    backend: SpawnBackend,
+    /// Liveness the handle reports; the test flips it.
+    alive: Arc<AtomicBool>,
+    /// Whether `send`/`stream` answer with a transport error.
+    fails: bool,
+}
+
+#[async_trait]
+impl SpawnedAgent for ScriptedChild {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    async fn send(&self, _inputs: Value) -> Result<AgentOutput> {
+        if self.fails {
+            Err(Error::transport("the child did not answer"))
+        } else {
+            Ok(AgentOutput::answer("scripted"))
+        }
+    }
+
+    fn stream(&self, _inputs: Value) -> BoxStream<'static, Result<AgentChunk>> {
+        if self.fails {
+            let frame: Result<AgentChunk> = Err(Error::transport("the child did not answer"));
+            Box::pin(futures::stream::iter([frame]))
+        } else {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    async fn shutdown(&self, _timeout: Duration) -> Result<bool> {
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn force_kill(&self) -> Result<()> {
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn backend(&self) -> SpawnBackend {
+        self.backend
+    }
+
+    async fn health(&self) -> Result<bool> {
+        Ok(self.alive.load(Ordering::SeqCst))
     }
 }
 
@@ -288,6 +408,271 @@ async fn a_runner_without_a_registry_never_consults_one() {
         0,
         "the other runner's registry was never asked to spawn"
     );
+}
+
+#[tokio::test]
+async fn a_contradicting_spec_backend_is_a_config_error() {
+    let single = FakeSpawner::new(SpawnBackend::RemoteHttp, "http");
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(Arc::clone(&single)));
+
+    let error = runner
+        .spawn_agent(SpawnSpec::default().with_backend(SpawnBackend::Subprocess))
+        .await
+        .err()
+        .expect("the single spawner cannot serve a subprocess hint");
+    assert_eq!(error.kind(), ErrorKind::Config);
+    let message = error.to_string();
+    assert!(
+        message.contains("subprocess"),
+        "the request is named: {message}"
+    );
+    assert!(
+        message.contains("remote_http"),
+        "the installation is named: {message}"
+    );
+    assert!(
+        message.contains("Runner::set_spawner_registry"),
+        "the registry remedy is named: {message}"
+    );
+    assert!(
+        message.contains("Runner::spawn_agent_with"),
+        "the addressed remedy is named: {message}"
+    );
+    assert_eq!(single.calls(), 0, "nothing was launched");
+    assert!(
+        runner.active_spawns().is_empty(),
+        "a refused spec admits no run"
+    );
+}
+
+#[tokio::test]
+async fn a_matching_spec_backend_spawns_through_the_single_spawner() {
+    let single = FakeSpawner::new(SpawnBackend::RemoteHttp, "http");
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(Arc::clone(&single)));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default().with_backend(SpawnBackend::RemoteHttp))
+        .await
+        .expect("the hint agrees with the installed spawner");
+    assert_eq!(single.calls(), 1);
+    assert_eq!(child.id(), "http-0");
+    assert_eq!(
+        runner.active_spawns()[0].detail["backend"],
+        json!("remote_http"),
+        "the run is labelled with the agreed backend"
+    );
+}
+
+#[tokio::test]
+async fn an_unlabelled_single_spawner_keeps_the_spec_hint() {
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(Arc::new(UnlabelledSpawner {
+        id_prefix: "unlabelled",
+    })));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default().with_backend(SpawnBackend::InProcess))
+        .await
+        .expect("an unlabelled spawner cannot contradict the hint");
+    assert_eq!(child.id(), "unlabelled-0");
+    assert_eq!(
+        child.backend(),
+        SpawnBackend::Unknown,
+        "the handle itself names no backend"
+    );
+    assert_eq!(
+        runner.active_spawns()[0].detail["backend"],
+        json!("in_process"),
+        "the hint labels the run"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_registered_unlabelled_spawner_is_labelled_with_its_key() {
+    let runner = Runner::new();
+    let registry = Arc::new(SpawnerRegistry::new());
+    registry.register(
+        SpawnBackend::RemoteHttp,
+        as_spawner(Arc::new(UnlabelledSpawner {
+            id_prefix: "unlabelled",
+        })),
+    );
+    runner.set_spawner_registry(registry);
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the sole registered spawner answers");
+    assert_eq!(
+        child.backend(),
+        SpawnBackend::Unknown,
+        "the spawner's self-report is silent"
+    );
+    assert_eq!(
+        runner.active_spawns()[0].detail["backend"],
+        json!("remote_http"),
+        "the registry key labels the run, not the silent self-report"
+    );
+}
+
+// --- liveness ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_probe_of_a_dead_child_finishes_the_spawn() {
+    let alive = Arc::new(AtomicBool::new(true));
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(ScriptedSpawner::new(
+        SpawnBackend::InProcess,
+        Arc::clone(&alive),
+        false,
+    )));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the scripted spawner answers");
+    let run_id = child.id().to_owned();
+
+    assert!(child.health().await.unwrap(), "a live probe reports health");
+    assert_eq!(
+        runner.monitor().snapshot(&run_id).unwrap().phase,
+        RunPhase::Running,
+        "a live probe only observes"
+    );
+
+    alive.store(false, Ordering::SeqCst);
+    assert!(
+        !child.health().await.unwrap(),
+        "the probe result is returned unchanged"
+    );
+    let status = runner.monitor().snapshot(&run_id).unwrap();
+    assert_eq!(status.phase, RunPhase::Failed);
+    assert_eq!(status.error.as_deref(), Some("spawned child exited"));
+    assert_eq!(
+        status.detail,
+        json!({"reason": "child_exited", "backend": "in_process"})
+    );
+    assert!(
+        runner.active_spawns().is_empty(),
+        "a dead child is no longer active"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_call_to_a_live_child_leaves_the_spawn_active() {
+    let alive = Arc::new(AtomicBool::new(true));
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(ScriptedSpawner::new(
+        SpawnBackend::InProcess,
+        Arc::clone(&alive),
+        true,
+    )));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the scripted spawner answers");
+    let error = child
+        .send(json!({"query": "hi"}))
+        .await
+        .expect_err("the scripted child fails the call");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert_eq!(
+        runner.active_spawns().len(),
+        1,
+        "a failure against a live child is not terminal"
+    );
+    assert_eq!(
+        runner.monitor().snapshot(child.id()).unwrap().phase,
+        RunPhase::Running
+    );
+}
+
+#[tokio::test]
+async fn a_failed_call_to_a_dead_child_finishes_the_spawn() {
+    let alive = Arc::new(AtomicBool::new(true));
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(ScriptedSpawner::new(
+        SpawnBackend::InProcess,
+        Arc::clone(&alive),
+        true,
+    )));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the scripted spawner answers");
+    let run_id = child.id().to_owned();
+
+    alive.store(false, Ordering::SeqCst);
+    let error = child
+        .send(json!({"query": "hi"}))
+        .await
+        .expect_err("the scripted child fails the call");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let status = runner.monitor().snapshot(&run_id).unwrap();
+    assert_eq!(status.phase, RunPhase::Failed);
+    assert_eq!(status.error.as_deref(), Some("spawned child exited"));
+    assert!(
+        runner.active_spawns().is_empty(),
+        "the exited child left the active list"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_error_from_a_dead_child_finishes_the_spawn() {
+    let alive = Arc::new(AtomicBool::new(true));
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(ScriptedSpawner::new(
+        SpawnBackend::InProcess,
+        Arc::clone(&alive),
+        true,
+    )));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the scripted spawner answers");
+    let run_id = child.id().to_owned();
+
+    alive.store(false, Ordering::SeqCst);
+    let mut frames = child.stream(json!({}));
+    let frame = StreamExt::next(&mut frames)
+        .await
+        .expect("the scripted child yields one error frame");
+    assert!(frame.is_err());
+    drop(frames);
+    let status = runner.monitor().snapshot(&run_id).unwrap();
+    assert_eq!(status.phase, RunPhase::Failed);
+    assert!(
+        runner.active_spawns().is_empty(),
+        "an exited child leaves the active list"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_error_from_a_live_child_leaves_the_spawn_active() {
+    let alive = Arc::new(AtomicBool::new(true));
+    let runner = Runner::new();
+    runner.set_spawner(as_spawner(ScriptedSpawner::new(
+        SpawnBackend::InProcess,
+        Arc::clone(&alive),
+        true,
+    )));
+
+    let child = runner
+        .spawn_agent(SpawnSpec::default())
+        .await
+        .expect("the scripted spawner answers");
+    let mut frames = child.stream(json!({}));
+    assert!(StreamExt::next(&mut frames)
+        .await
+        .expect("one frame")
+        .is_err());
+    drop(frames);
+    assert_eq!(runner.active_spawns().len(), 1);
 }
 
 // --- observability ----------------------------------------------------------

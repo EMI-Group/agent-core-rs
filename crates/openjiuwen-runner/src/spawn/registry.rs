@@ -17,6 +17,11 @@
 //!    [`openjiuwen_common::error::Error::Unsupported`] with the hint that fixes
 //!    it.
 //!
+//! [`SpawnerRegistry::route`] answers that rule with the resolved backend key
+//! beside the spawner, so a host can label a spawn with the route it took rather
+//! than with a spawner's self-report; [`SpawnerRegistry::spawner_for`] is the
+//! spawner-only wrapper over it.
+//!
 //! [`SpawnerRegistry::with_deferred`] pre-registers the deferred backends
 //! ([`crate::spawn::SpawnBackend::RemoteMq`],
 //! [`crate::spawn::SpawnBackend::RemoteA2a`]) so a spec that asks for them is
@@ -274,30 +279,38 @@ impl SpawnerRegistry {
         self.state.read().default
     }
 
-    /// The spawner a [`SpawnSpec`] routes to.
+    /// Resolves `spec` to the backend key it routes to and that backend's spawner.
     ///
-    /// Never `None`: an unroutable spec gets a [`DeferredSpawner`] that names the
-    /// problem, so the failure happens at spawn time with the right wording.
+    /// The key is the *resolved route* rather than the spawner's self-report:
+    /// [`SpawnSpec::backend`] when the caller named one, the explicit default, or
+    /// the sole registered backend. A custom spawner registered under a key and
+    /// reporting [`SpawnBackend::Unknown`] therefore still labels the spawn with
+    /// the key it was registered under.
+    ///
+    /// Never fails: an unroutable spec gets
+    /// ([`SpawnBackend::Unknown`], a [`DeferredSpawner`]) that names the problem,
+    /// so the failure happens at spawn time with the right wording.
     #[must_use]
-    pub fn spawner_for(&self, spec: &SpawnSpec) -> Arc<dyn AgentSpawner> {
+    pub fn route(&self, spec: &SpawnSpec) -> (SpawnBackend, Arc<dyn AgentSpawner>) {
         let state = self.state.read();
         if let Some(backend) = spec.backend {
-            return state.spawners.get(&backend).map_or_else(
+            let spawner = state.spawners.get(&backend).map_or_else(
                 || Arc::new(DeferredSpawner::for_backend(backend)) as Arc<dyn AgentSpawner>,
                 Arc::clone,
             );
+            return (backend, spawner);
         }
         if let Some(backend) = state.default {
             if let Some(spawner) = state.spawners.get(&backend) {
-                return Arc::clone(spawner);
+                return (backend, Arc::clone(spawner));
             }
         }
         if state.spawners.len() == 1 {
-            if let Some(spawner) = state.spawners.values().next() {
-                return Arc::clone(spawner);
+            if let Some((backend, spawner)) = state.spawners.iter().next() {
+                return (*backend, Arc::clone(spawner));
             }
         }
-        match state.spawners.len() {
+        let spawner: Arc<dyn AgentSpawner> = match state.spawners.len() {
             0 | 1 => Arc::new(DeferredSpawner::new(
                 SpawnBackend::Unknown,
                 "no default spawn backend",
@@ -309,7 +322,19 @@ impl SpawnerRegistry {
                 "ambiguous spawn backend",
                 "call `SpawnerRegistry::set_default` or set `SpawnSpec::backend` to pick one",
             )),
-        }
+        };
+        (SpawnBackend::Unknown, spawner)
+    }
+
+    /// The spawner a [`SpawnSpec`] routes to.
+    ///
+    /// Never `None`: an unroutable spec gets a [`DeferredSpawner`] that names the
+    /// problem, so the failure happens at spawn time with the right wording. A
+    /// caller that also needs the resolved backend key (to label the spawn) should
+    /// use [`Self::route`].
+    #[must_use]
+    pub fn spawner_for(&self, spec: &SpawnSpec) -> Arc<dyn AgentSpawner> {
+        self.route(spec).1
     }
 
     /// Spawns `spec` through the backend it routes to.
@@ -536,6 +561,56 @@ mod tests {
         assert_eq!(
             registry.spawner_for(&SpawnSpec::default()).backend(),
             SpawnBackend::Unknown
+        );
+    }
+
+    #[test]
+    fn route_reports_the_resolved_backend_key_beside_the_spawner() {
+        let registry = SpawnerRegistry::new();
+        registry.register_in_process(in_process());
+        registry.register_remote(RemoteSpawner::new("http://127.0.0.1:9"));
+
+        // The spec's own hint wins, and its key is reported even when the
+        // spawner is a deferred stand-in.
+        let (backend, spawner) =
+            registry.route(&SpawnSpec::default().with_backend(SpawnBackend::RemoteHttp));
+        assert_eq!(backend, SpawnBackend::RemoteHttp);
+        assert_eq!(spawner.backend(), SpawnBackend::RemoteHttp);
+
+        let (backend, _) =
+            registry.route(&SpawnSpec::default().with_backend(SpawnBackend::ExternalCommand));
+        assert_eq!(backend, SpawnBackend::ExternalCommand);
+
+        // The explicit default beats the sole-spawner rule.
+        registry.set_default(SpawnBackend::RemoteHttp).unwrap();
+        assert_eq!(
+            registry.route(&SpawnSpec::default()).0,
+            SpawnBackend::RemoteHttp
+        );
+
+        // The sole registered spawner reports its own key.
+        registry.unregister(SpawnBackend::RemoteHttp);
+        assert_eq!(
+            registry.route(&SpawnSpec::default()).0,
+            SpawnBackend::InProcess
+        );
+
+        // Nothing routable is `Unknown` beside the deferred wording.
+        let empty = SpawnerRegistry::new();
+        let (backend, spawner) = empty.route(&SpawnSpec::default());
+        assert_eq!(backend, SpawnBackend::Unknown);
+        assert_eq!(spawner.backend(), SpawnBackend::Unknown);
+    }
+
+    #[test]
+    fn an_ambiguous_route_is_unknown() {
+        let registry = SpawnerRegistry::new();
+        registry.register_in_process(in_process());
+        registry.register_remote(RemoteSpawner::new("http://127.0.0.1:9"));
+        assert_eq!(
+            registry.route(&SpawnSpec::default()).0,
+            SpawnBackend::Unknown,
+            "two spawners and no default route nowhere"
         );
     }
 

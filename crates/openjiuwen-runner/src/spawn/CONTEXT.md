@@ -179,7 +179,8 @@ impl SpawnerRegistry {
     pub fn len() -> usize; pub fn is_empty() -> bool; pub fn backends() -> Vec<SpawnBackend>;  // sorted
     pub fn set_default(backend) -> Result<()>;             // Validation when it is not registered
     pub fn default_backend() -> Option<SpawnBackend>;
-    pub fn spawner_for(&SpawnSpec) -> Arc<dyn AgentSpawner>;   // never None
+    pub fn spawner_for(&SpawnSpec) -> Arc<dyn AgentSpawner>;   // route(spec).1, never None
+    pub fn route(&SpawnSpec) -> (SpawnBackend, Arc<dyn AgentSpawner>);  // resolved key + spawner
     pub async fn spawn(SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
     pub async fn spawn_with(SpawnBackend, SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;
 }
@@ -188,7 +189,8 @@ impl SpawnerRegistry {
 `DeferredSpawner::for_backend` is the wording table: `RemoteMq` → `"Pulsar/ZeroMQ spawn transport"` with a hint naming drunner reply-topic routing; `RemoteA2a` → `"a2a spawn transport"` with a hint naming `openjiuwen-extensions`' `a2a` feature; an implemented-but-unregistered backend → `"no <name> spawner registered"` with a hint naming the matching `register_*` method; anything else → ``"spawn backend `<name>`"``.
 Every `spawn` on one is `Error::Unsupported` (`error::unsupported(reason, hint)`).
 
-Routing precedence in `spawner_for`: `spec.backend` when set (registered spawner, else the matching `DeferredSpawner` — never a fallback to another backend) → the explicit default → the sole registered spawner → a `DeferredSpawner` with reason `"no default spawn backend"` (empty) or `"ambiguous spawn backend"` (more than one), whose hint names `set_default` and `SpawnSpec::backend`.
+Routing precedence in `route`: `spec.backend` when set (registered spawner, else the matching `DeferredSpawner` — never a fallback to another backend) → the explicit default → the sole registered spawner → `(Unknown, DeferredSpawner)` with reason `"no default spawn backend"` (empty) or `"ambiguous spawn backend"` (more than one), whose hint names `set_default` and `SpawnSpec::backend`.
+`route` also reports the resolved key, so a spawner registered under a key but reporting `Unknown` still labels its spawn with that key; `spawner_for` is `route(spec).1` with the same precedence.
 `spawn_with` resolves exactly the named backend and answers with `DeferredSpawner::for_backend` when it is not registered.
 The registry holds one `parking_lot::RwLock` over `{spawners: BTreeMap<SpawnBackend, Arc<dyn AgentSpawner>>, default: Option<SpawnBackend>}`; the spawner `Arc` is cloned out before any `.await`, so no guard is held across one.
 
@@ -283,8 +285,10 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **Cancellation is per-backend, never simulated.** The NDJSON protocol has no request correlation id, so a subprocess handle keeps the `Unsupported` default for `cancel_task` and stops its child with `shutdown`/`force_kill`; only the HTTP client, which owns a real `cancel_path`, forwards it.
 - **A deferred backend is a registered answer.** `SpawnerRegistry::with_deferred` stores `DeferredSpawner`s for `RemoteMq`/`RemoteA2a`, so routing is uniform: the missing transport is named in the `Unsupported` message (`Pulsar`/`a2a`) instead of surfacing as "nothing registered".
 - **Routing never falls back silently.** A `SpawnSpec::backend` that is not registered is a deferred failure naming that backend, `spawn_with` resolves exactly what it was asked for, and only an *unspecified* backend reaches the default / sole-spawner / ambiguity rules.
+- **A hint a runner cannot honour is a configuration error.** With only a single spawner installed, a `SpawnSpec::backend` that contradicts the spawner's own `backend()` is `Error::Config` naming both sides and both remedies (`Runner::set_spawner_registry`, `Runner::spawn_agent_with`); an unlabelled `Unknown` spawner cannot contradict the hint and keeps it as the run's label.
 - **Observation is a decorator, not a backend.** `MonitoredSpawnedAgent` wraps whatever handle a backend returned, so every backend — including a host's own `AgentSpawner` — reports the same `RunKind::Spawn` lifecycle without knowing the monitor exists; `is_healthy` stays a pure read and only `health` records, which keeps the poll path free of monitor churn.
-- **Runner routing is registry-first and last-install-wins.** A `Runner` holds one spawner and an optional registry beside it: a registry routes `spawn_agent` (its `spawner_for` precedence), `spawn_agent_with` requires the registry and refuses to fall back, and `set_spawner` clears the registry while `set_spawner_registry` leaves the single spawner installed for `spawn_backend`/`spawn_agent`-without-registry reporting.
+- **A dead child is terminal.** After a `health` probe, and after a `send`/`stream` that returned an error, a child reporting `is_alive() == false` finishes the run as failed with `{"reason": "child_exited", "backend": …}` (latched once), while the same failure against a live child only observes — so `Runner::active_spawns` stops listing an exited child once something probes or calls it, and never mistakes a desync for an exit.
+- **Runner routing is registry-first and last-install-wins.** A `Runner` holds one spawner and an optional registry beside it: a registry routes `spawn_agent` through its `route` (resolved key + spawner), `spawn_agent_with` requires the registry and refuses to fall back, and `set_spawner` clears the registry while `set_spawner_registry` leaves the single spawner installed for `spawn_backend`/`spawn_agent`-without-registry reporting.
 - **An external command is a resolved path, not a shell.** `ExternalCommandSpawner` refuses an empty command, a missing file, a directory, and (on unix) a file without an executable bit, then hands the absolute path to the subprocess backend; `PATH` is only a lookup, never an execution vehicle.
 - **An in-process agent is stopped, not signalled.** `shutdown` and `force_kill` both call the handler's own `shutdown`, `pid()` is `None`, and liveness is the handle's flag *and* the handler's, so a stopped handler cannot be reported alive.
 - **Backends are state-free spawners.** `SubprocessSpawner`, `ExternalCommandSpawner`, `InProcessSpawner` and `RemoteSpawner` hold configuration only; every `spawn` builds an independent child, client, or handle.
@@ -306,7 +310,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - `./src/spawn/external.rs` → `ExternalCommandSpawner` (command resolution on a search path / `PATH`, executable checks, delegation to the subprocess backend)
 - `./src/spawn/in_process.rs` → `InProcessHandler`, `InProcessFactory`, `InProcessSpawner`, `InProcessAgent` (host-bound agent, no child)
 - `./src/spawn/registry.rs` → `SpawnerRegistry` (multi-backend routing), `DeferredSpawner` (the wording table for undeferrable/undeferred backends)
-- `./src/spawn/monitored.rs` → `MonitoredSpawnedAgent` (lifecycle into `RunMonitor` as `RunKind::Spawn`: admission, health observation, shutdown/kill/drop) and its unit tests
+- `./src/spawn/monitored.rs` → `MonitoredSpawnedAgent` (lifecycle into `RunMonitor` as `RunKind::Spawn`: admission, health observation, dead-child terminal rule, shutdown/kill/drop) and its unit tests
 - `./src/spawn/mod_tests.rs` → inline unit tests of `mod.rs` (loaded via `#[path]`): wire names, `SpawnHealth`, `SpawnSpec::backend`, the defaulted accessors
 - `./src/spawn/subprocess_tests.rs` → inline unit tests of `subprocess.rs` (loaded via `#[path]`)
 - `./src/spawn/remote.rs` → `RemoteAgentConfig`, `RemoteProtocol`, `RemoteClient`, `RemoteAgent`, `create_remote_client`, `RemoteSpawner`, URL building, stream parsing, status mapping
@@ -315,7 +319,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 ## Notes for Agents
 
 - Install a backend with `Runner::set_spawner`, or several with `Runner::set_spawner_registry`; `UnsupportedSpawner` stays the default, so an unconfigured runner fails a spawn with `Error::Unsupported`.
-- Every successful `Runner::spawn_agent`/`Runner::spawn_agent_with` is wrapped in `MonitoredSpawnedAgent::track`, so `Runner::active_spawns` lists the live ones and a failed spawn creates no monitor entry.
+- Every successful `Runner::spawn_agent`/`Runner::spawn_agent_with` is wrapped in `MonitoredSpawnedAgent::track`, so `Runner::active_spawns` lists the spawns not yet reported finished (a probe seeing a dead child, `shutdown`, `force_kill`, or `Drop`) and a failed spawn creates no monitor entry.
 - This module's own `pub use` group is the source of truth for names; `src/lib.rs` re-exports them flat (`SpawnBackend`, `SpawnHealth`, `SpawnerRegistry`, `DeferredSpawner`, the four backends, and `MonitoredSpawnedAgent`).
 - Integration suites: `tests/spawn_subprocess.rs` re-executes the test binary as the fake child (`FAKE_CHILD_MODE` selects echo/stream/crash/silent/malformed/oversized/health-failure/shutdown modes), and `tests/spawn_remote.rs` drives a loopback `wiremock` server.
 - The crate-level `## Deferred Python Behavior` and `tests/CONTEXT.md` still describe the pre-backend deferral and are reconciled by the parent node.
