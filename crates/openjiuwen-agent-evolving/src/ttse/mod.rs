@@ -14,3 +14,13 @@
 //!
 //! LLM-driven merging and embedding-backed retrieval are optional seams; the
 //! default paths are deterministic.
+mod bank;
+mod classify;
+mod config;
+mod models;
+pub use bank::{AddOutcome, TipBank, TipBankStats};
+pub use classify::{ClassificationRule, TipClassifier};
+pub use config::TtseConfig;
+pub use models::{
+    tip_id_for, ConsultResult, DreamReport, SuccessAssessment, TipCategory, TipEvidence, TipRecord,
+};
