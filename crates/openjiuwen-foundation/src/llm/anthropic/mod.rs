@@ -13,7 +13,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use request::{build_messages_body, normalize_api_base};
+pub use request::{build_messages_body, build_messages_body_with_provider, normalize_api_base};
 pub use response::{parse_anthropic_usage, parse_messages_response};
 pub use stream::AnthropicStreamState;
 
@@ -189,7 +189,13 @@ impl Model for AnthropicClient {
         messages: &[BaseMessage],
         request: &ModelRequestConfig,
     ) -> Result<ChatResponse> {
-        let body = build_messages_body(messages, request, false)?;
+        let body = build_messages_body_with_provider(
+            messages,
+            request,
+            false,
+            self.client.provider.as_str(),
+            self.client.api_base.as_deref(),
+        )?;
         let http_request = self.build_http_request(&body)?;
         let response = self.http.execute(http_request).await?;
 
@@ -215,8 +221,14 @@ impl Model for AnthropicClient {
         messages: Vec<BaseMessage>,
         request: ModelRequestConfig,
     ) -> BoxStream<'static, Result<StreamChunk>> {
-        let prepared = build_messages_body(&messages, &request, true)
-            .and_then(|body| self.build_http_request(&body));
+        let prepared = build_messages_body_with_provider(
+            &messages,
+            &request,
+            true,
+            self.client.provider.as_str(),
+            self.client.api_base.as_deref(),
+        )
+        .and_then(|body| self.build_http_request(&body));
         let http_request = match prepared {
             Ok(http_request) => http_request,
             Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),

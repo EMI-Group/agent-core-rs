@@ -20,12 +20,21 @@ use crate::prompt::{BaseMessage, Usage};
 
 const MODEL: &str = "claude-sonnet-4";
 
+/// A model with an explicit Anthropic budget-only reasoning profile.
+const REASONING_MODEL: &str = "claude-sonnet-4-5-20250929";
+
 /// Builds a client pointed at the mock server with a fixed test key.
 fn build_client(server: &MockServer, request: ModelRequestConfig) -> AnthropicClient {
     let config = ModelClientConfig::new("anthropic")
         .with_api_key("test-key")
         .with_api_base(server.uri());
     AnthropicClient::new(config, request).expect("the test client builds")
+}
+
+/// A [`REASONING_MODEL`] request asking for medium reasoning.
+fn reasoning_request() -> ModelRequestConfig {
+    ModelRequestConfig::new(REASONING_MODEL)
+        .with_extra(json!({"reasoning": {"mode": "enabled", "effort": "medium"}}))
 }
 
 /// A canned Messages response with text, a tool call, and cache-aware usage.
@@ -288,6 +297,79 @@ async fn malformed_success_bodies_are_llm_errors() {
     assert!(error
         .to_string()
         .contains("decoding the Anthropic response"));
+}
+
+#[tokio::test]
+async fn invoke_sends_the_resolved_reasoning_plan() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_json(json!({
+            "model": REASONING_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }],
+            "max_tokens": 32768,
+            "stream": false,
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(canned_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let request = reasoning_request();
+    let response = client
+        .invoke(&[BaseMessage::user("hello")], &request)
+        .await
+        .expect("the response parses");
+    assert_eq!(response.id, "msg_1");
+}
+
+#[tokio::test]
+async fn stream_sends_the_resolved_reasoning_plan() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_json(json!({
+            "model": REASONING_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }],
+            "max_tokens": 32768,
+            "stream": true,
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(canned_event_stream()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = build_client(&server, ModelRequestConfig::new(MODEL));
+    let mut stream = client.stream(vec![BaseMessage::user("hello")], reasoning_request());
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("every chunk decodes");
+        if let Some(content) = chunk.content() {
+            text.push_str(content);
+        }
+    }
+    assert_eq!(text, "hello world");
 }
 
 #[tokio::test]

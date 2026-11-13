@@ -15,7 +15,11 @@
 //! - assistant `tool_calls` become `tool_use` blocks with a parsed JSON `input`;
 //! - consecutive `tool` turns become one `user` message of `tool_result` blocks;
 //! - `OpenAI` `image_url` parts become Anthropic `image` blocks (base64 or URL);
-//! - `OpenAI` function schemas become `{name, description, input_schema}` tools.
+//! - `OpenAI` function schemas become `{name, description, input_schema}` tools;
+//! - a provider-neutral reasoning intent in `extra["reasoning"]` is resolved for
+//!   the Anthropic Messages protocol and merged as top-level body fields
+//!   (`thinking`, `output_config`), unless the caller already set a legacy
+//!   vendor control such as `extra["thinking"]`.
 //!
 //! The converter is a pure function so tests assert the exact body without a
 //! server. It never panics on caller input: an unrepresentable message is an
@@ -25,6 +29,9 @@ use openjiuwen_common::error::{Error, Result};
 use serde_json::{Map, Value};
 
 use crate::llm::config::ModelRequestConfig;
+use crate::llm::reasoning::{
+    apply_reasoning_plan, resolve_reasoning_plan_for, ReasoningConfig, ReasoningProtocol,
+};
 use crate::prompt::BaseMessage;
 
 use super::cache::{
@@ -32,6 +39,7 @@ use super::cache::{
     last_input_is_transient, CacheControl,
 };
 use super::convert::{convert_messages, convert_tool_choice, convert_tools, ConvertedMessages};
+use super::DEFAULT_PROVIDER;
 
 /// `max_tokens` used when the request does not set one.
 const DEFAULT_MAX_TOKENS: u32 = 32768;
@@ -69,7 +77,23 @@ pub fn normalize_api_base(api_base: &str) -> String {
     trimmed.trim_end_matches('/').to_owned()
 }
 
-/// Builds the Anthropic Messages request body.
+/// Builds the Anthropic Messages request body for the `anthropic` provider.
+///
+/// Thin wrapper over [`build_messages_body_with_provider`] with no API-base host
+/// hint; call sites that know their provider use that function directly.
+///
+/// # Errors
+///
+/// See [`build_messages_body_with_provider`].
+pub fn build_messages_body(
+    messages: &[BaseMessage],
+    request: &ModelRequestConfig,
+    stream: bool,
+) -> Result<Value> {
+    build_messages_body_with_provider(messages, request, stream, DEFAULT_PROVIDER, None)
+}
+
+/// Builds the Anthropic Messages request body, resolving provider hints.
 ///
 /// `stream` is written verbatim to the body's `stream` field; the caller decides
 /// between the buffered and streaming endpoint behavior.
@@ -79,15 +103,35 @@ pub fn normalize_api_base(api_base: &str) -> String {
 /// true` omits every anchor, and `cache_control_ttl: "1h"` writes the long
 /// ephemeral lifetime on each marker (the default marker has no `ttl` key).
 ///
+/// `provider` and `api_base` are the client's resolved provider name and
+/// endpoint; together they select the reasoning profile for a provider-neutral
+/// reasoning intent in `request.extra["reasoning"]` (see [`crate::llm::reasoning`]).
+/// A resolved plan is merged as top-level body fields — `sdk_params` first, then
+/// `extra_body` — because the Messages API takes `thinking`, `output_config` and
+/// friends at the top level. `request.extra` is merged after that, so a caller's
+/// own keys still win, and the consumed control keys (`reasoning` plus the two
+/// cache knobs) are never forwarded.
+///
+/// A caller's explicit legacy reasoning control — any of `reasoning_effort`,
+/// `thinking`, `enable_thinking`, `thinking_budget`, `thinking_strategy`,
+/// `chat_template_kwargs`, at the top level of `extra` or inside its
+/// `extra_body` object — takes precedence over the plain intent: no plan is
+/// resolved or applied, so the two encodings can never be mixed.
+///
 /// # Errors
 ///
 /// Returns [`Error::Validation`] when the model name is empty, when a tool call
-/// has no id, when a tool result has no `tool_call_id`, or when a content part
-/// cannot be represented by the Messages API (for example a non-HTTP image URL).
-pub fn build_messages_body(
+/// has no id, when a tool result has no `tool_call_id`, when a content part
+/// cannot be represented by the Messages API (for example a non-HTTP image URL),
+/// or when `request.extra["reasoning"]` is present but is not a reasoning intent
+/// (`null`, a boolean, a mode/effort string, or an object with `mode`, `effort`
+/// and/or `budget_tokens`).
+pub fn build_messages_body_with_provider(
     messages: &[BaseMessage],
     request: &ModelRequestConfig,
     stream: bool,
+    provider: &str,
+    api_base: Option<&str>,
 ) -> Result<Value> {
     if request.model_name.trim().is_empty() {
         return Err(Error::validation(
@@ -143,12 +187,52 @@ pub fn build_messages_body(
         body.insert("tool_choice".to_owned(), tool_choice);
     }
 
+    if let Some(intent) = reasoning_intent(request)? {
+        if has_legacy_reasoning_controls(&request.extra) {
+            tracing::debug!(
+                target: "openjiuwen_foundation::llm::reasoning",
+                model = request.model_name.as_str(),
+                "legacy reasoning controls were supplied; \
+                 the provider-neutral reasoning intent is ignored"
+            );
+        } else {
+            let plan = resolve_reasoning_plan_for(
+                ReasoningProtocol::AnthropicMessages,
+                provider,
+                api_base,
+                &request.model_name,
+                &intent,
+            );
+            for warning in &plan.warnings {
+                tracing::debug!(
+                    target: "openjiuwen_foundation::llm::reasoning",
+                    model = request.model_name.as_str(),
+                    "reasoning config resolution: {warning}"
+                );
+            }
+            if !plan.is_empty() {
+                tracing::trace!(
+                    target: "openjiuwen_foundation::llm::reasoning",
+                    model = request.model_name.as_str(),
+                    sdk_params = ?plan.sdk_param_names(),
+                    extra_body = ?plan.extra_body_names(),
+                    "applied the Anthropic reasoning plan"
+                );
+            }
+            let mut resolved = Value::Object(std::mem::take(&mut body));
+            apply_reasoning_plan(&mut resolved, &plan);
+            if let Value::Object(object) = resolved {
+                body = object;
+            }
+        }
+    }
+
     // The caller's `extra` map wins over every derived field, as documented by
-    // `ModelRequestConfig::extra`; the cache-control knobs are client-side and
-    // are not forwarded to the API.
+    // `ModelRequestConfig::extra`; the cache-control knobs and the reasoning
+    // intent are client-side and are not forwarded to the API.
     if let Some(extra) = request.extra.as_object() {
         for (key, value) in extra {
-            if is_control_key(key) {
+            if is_control_key(key) || key == REASONING_KEY {
                 continue;
             }
             body.insert(key.clone(), value.clone());
@@ -156,6 +240,61 @@ pub fn build_messages_body(
     }
 
     Ok(Value::Object(body))
+}
+
+/// Key of the provider-neutral reasoning intent inside [`ModelRequestConfig::extra`].
+const REASONING_KEY: &str = "reasoning";
+
+/// Explicit vendor reasoning controls that replace the neutral intent.
+const LEGACY_REASONING_KEYS: [&str; 6] = [
+    "reasoning_effort",
+    "thinking",
+    "enable_thinking",
+    "thinking_budget",
+    "thinking_strategy",
+    "chat_template_kwargs",
+];
+
+/// Reads the reasoning intent out of a request's `extra` map.
+///
+/// A missing key and `null` both mean "no intent". Any other value must be an
+/// intent (a boolean, a mode/effort string, or an object with `mode`, `effort`
+/// and/or `budget_tokens`); anything else is [`Error::Validation`] rather than a
+/// silently dropped request.
+fn reasoning_intent(request: &ModelRequestConfig) -> Result<Option<ReasoningConfig>> {
+    match request.extra.get(REASONING_KEY) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match ReasoningConfig::from_value(value)? {
+            Some(intent) => Ok(Some(intent)),
+            None => Err(Error::validation(format!(
+                "invalid `reasoning` value: expected null, a boolean, a mode or effort string, \
+                 or an object with `mode`, `effort` and/or `budget_tokens`; got `{value}`"
+            ))),
+        },
+    }
+}
+
+/// Whether the caller supplied an explicit vendor reasoning control.
+///
+/// The keys are recognized at the top level of `extra` and inside a nested
+/// `extra_body` object, matching how an OpenAI-SDK caller expresses vendor
+/// extensions.
+fn has_legacy_reasoning_controls(extra: &Value) -> bool {
+    let Some(object) = extra.as_object() else {
+        return false;
+    };
+    let top_level = LEGACY_REASONING_KEYS
+        .iter()
+        .any(|key| object.contains_key(*key));
+    let nested = object
+        .get("extra_body")
+        .and_then(Value::as_object)
+        .is_some_and(|nested| {
+            LEGACY_REASONING_KEYS
+                .iter()
+                .any(|key| nested.contains_key(*key))
+        });
+    top_level || nested
 }
 
 /// Resolves `max_tokens`, using the documented default and per-family caps.
@@ -176,5 +315,7 @@ fn max_tokens_for(model: &str, requested: Option<u32>) -> u32 {
 }
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod reasoning_tests;
 #[cfg(test)]
 mod tests;

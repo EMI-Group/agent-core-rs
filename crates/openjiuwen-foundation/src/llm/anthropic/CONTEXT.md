@@ -8,7 +8,8 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 ## API Surface
 
 - `AnthropicClient` — `new(ModelClientConfig, ModelRequestConfig)`, `with_http_client`, `client_config`, `request_config`, `base_url`, `impl Model` (`invoke`, `stream`, `provider`, `model_name`).
-- `build_messages_body(&[BaseMessage], &ModelRequestConfig, stream) -> Result<Value>` — pure request projection.
+- `build_messages_body(&[BaseMessage], &ModelRequestConfig, stream) -> Result<Value>` — pure request projection for the `anthropic` provider.
+- `build_messages_body_with_provider(&[BaseMessage], &ModelRequestConfig, stream, provider, api_base: Option<&str>) -> Result<Value>` — the same projection with the client's provider name and endpoint, which select the reasoning profile.
 - `normalize_api_base(&str) -> String` — strips a pasted `/v1/messages` or `/v1` suffix.
 - `parse_messages_response`, `parse_anthropic_usage`, `AnthropicStreamState` — response and stream conversion.
 
@@ -18,7 +19,19 @@ Ports `openjiuwen/core/foundation/llm/model_clients/anthropic_model_client.py`.
 A single system turn yields a one-element array; a request with no (or only empty) system turn omits `system` entirely.
 Turns are never joined into one string, never `<system>`-prefixed, and never dropped; non-text parts on a system turn have no destination and are skipped.
 Assistant `tool_calls` become `tool_use` blocks with a parsed JSON `input` (`{"_raw_arguments": …}` for unparseable text), consecutive `tool` turns merge into one `user` message of `tool_result` blocks (flushed before every assistant/user/system turn), images become base64 or URL `image` blocks, and OpenAI function schemas become `{name, description, input_schema}`.
-`request.extra` is merged last and wins, except the two cache-control knobs, which are consumed and never forwarded.
+`request.extra` is merged last and wins, except the reasoning intent and the two cache-control knobs, which are consumed and never forwarded.
+
+## Reasoning Plan (`request.rs`)
+
+A provider-neutral intent in `request.extra["reasoning"]` (`{mode, effort, budget_tokens}`, also `true`/`false` or a mode/effort string) is parsed with `ReasoningConfig::from_value` and resolved with `resolve_reasoning_plan_for(ReasoningProtocol::AnthropicMessages, provider, api_base, model, &intent)`.
+`provider`/`api_base` are the client's resolved values (`AnthropicClient::invoke`/`stream` pass `client_config.provider` and `client_config.api_base`), so a generic provider name defers to an API-base host hint (a DashScope-hosted Claude resolves the DashScope Anthropic wire).
+`plan.sdk_params` are merged first, then `plan.extra_body`, both at the body top level because the Messages API takes `thinking`, `output_config`, `reasoning_effort` there; `apply_reasoning_plan` keeps a caller key that is already present.
+`request.extra` is merged afterwards, so a caller's own keys still win, and `reasoning` is never forwarded.
+Examples: `{"mode":"enabled","effort":"medium"}` on `claude-sonnet-4-5*` → `thinking: {"type":"enabled","budget_tokens":8192}` (the `anthropic_manual` effort map); `{"mode":"disabled"}` → `thinking: {"type":"disabled"}`; an unlisted model with `{"mode":"enabled","budget_tokens":2048}` → `thinking: {"type":"enabled","budget_tokens":2048}`; `{"mode":"enabled","effort":"high"}` on an unlisted model → `thinking: {"type":"adaptive"}` plus `output_config: {"effort":"high"}`.
+
+Legacy precedence: when `extra` already carries any of `reasoning_effort`, `thinking`, `enable_thinking`, `thinking_budget`, `thinking_strategy`, `chat_template_kwargs` — at the top level or inside a nested `extra_body` object — no plan is resolved or applied, so the caller's explicit vendor control is the only encoding sent (a `tracing::debug!` records the skip).
+A present `reasoning` key that is not an intent (`null` means "no intent"; a number, an array, or an object with foreign keys like `{"thinking": …}`) is `Error::Validation`, never a panic and never a silently dropped key.
+Without a `reasoning` key the produced body is unchanged, and `build_messages_body` is exactly `build_messages_body_with_provider(…, "anthropic", None)`.
 
 ## Cache Breakpoints (`cache.rs`)
 
@@ -44,24 +57,28 @@ Inline turns carry plain text as their `content`; neighbours are read from the p
 - All HTTP goes through `openjiuwen_common::http::HttpClient`; headers are `x-api-key` (never `authorization`) and `anthropic-version`.
 - `max_tokens` is required: `request.max_tokens` else 32768, capped at 8192 for `claude-3-5*`/`claude-3.5*` and 4096 for `claude-3-opus|sonnet|haiku`.
 - Errors are `openjiuwen_common::error::{Error, Result}`: 401/403 → `Config`, 408/504 → `Timeout`, other non-2xx → `Llm` with a redacted body; an unrepresentable message is `Validation`.
-- The projection is pure: no I/O, no panics on caller input, no provider-specific extra fields beyond `request.extra`.
+- The projection is pure: no I/O, no panics on caller input, and no provider-specific extra fields beyond `request.extra` and the resolved reasoning plan.
 - Files stay ≤1000 lines; the projection lives in `convert.rs`, the anchors in `cache.rs`, the body assembly in `request.rs`.
 
 ## Routing Table
 
 - `./mod.rs` → client, `Model` impl, streaming loop, module wiring
-- `./request.rs` → body assembly, `max_tokens` caps, `normalize_api_base`
+- `./request.rs` → body assembly, reasoning-plan wiring and legacy-control precedence, `max_tokens` caps, `normalize_api_base`
 - `./convert.rs` → message projection, mid-conversation system partition, tools/tool_choice, images
 - `./cache.rs` → cache-control marker, the three anchors, transient-tail detection, `extra` knobs
 - `./response.rs` → non-streaming response parsing (`content` blocks → `BaseMessage`, `stop_reason`, usage)
 - `./stream.rs` → SSE event state machine (`content_block_*`, `message_*`, tool-input buffering)
 - `./request/tests.rs` → body projection tests
 - `./request/cache_tests.rs` → cache-anchor tests
+- `./request/reasoning_tests.rs` → reasoning-plan wiring tests (`thinking`/`output_config` shapes, legacy precedence, validation)
 - `./tests.rs` → wiremock client tests (headers, body, error mapping, streaming)
 
 ## Test Strategy
 
-`request/tests.rs` and `request/cache_tests.rs` assert exact JSON for every projection and anchor: single/multiple system turns, marker placement on tool_use/tool_result/image/plain-text anchors, the transient-tail skip, `disable_cache_control`, `cache_control_ttl`, and inline-vs-hoisted system placement; `cache.rs` unit-tests the marker/walk-back primitives; `tests.rs` asserts the wire body, headers, retry/auth error mapping, and streamed assembly against wiremock. No test needs a network or a credential.
+`request/tests.rs` and `request/cache_tests.rs` assert exact JSON for every projection and anchor: single/multiple system turns, marker placement on tool_use/tool_result/image/plain-text anchors, the transient-tail skip, `disable_cache_control`, `cache_control_ttl`, and inline-vs-hoisted system placement.
+`request/reasoning_tests.rs` asserts the reasoning body shapes for a profiled model (`claude-sonnet-4-5*`), an unlisted model, and a host-hint-routed vendor, plus every legacy control key, the nested `extra_body` form, the consumed keys, and the validation errors for malformed intents.
+`cache.rs` unit-tests the marker/walk-back primitives; `tests.rs` asserts the wire body, headers, retry/auth error mapping, streamed assembly, and that `invoke`/`stream` send the resolved reasoning plan against wiremock.
+No test needs a network or a credential.
 
 ## Known Gaps
 
