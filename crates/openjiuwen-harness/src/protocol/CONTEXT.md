@@ -67,6 +67,8 @@ Usage: accumulated `llm_usage` frames (`None` when the model reported nothing). 
 Checkpoints are emitted best-effort (`SessionActivated` after start, `TurnCompleted` after each turn, `StateChanged` on pause) through `HarnessContext::checkpoint_sink` with monotonic `sequence` and the last successful `storage_revision` as the compare-and-set expectation; a `CheckpointConflict` is logged, never fatal, and does not replace the latest local checkpoint.
 `start` applies a resumed checkpoint before publishing `SessionActivated`, so that checkpoint already reports the restored state, and it raises the checkpoint writer to at least the resumed checkpoint's `sequence` so the sequence never restarts at 1 on the same host session (event sequencing still resets per cycle).
 `export_checkpoint` returns the latest locally built checkpoint (`None` before the first one).
+`stop` publishes no checkpoint; the only reasons emitted are `SessionActivated`, `TurnCompleted` and `StateChanged`.
+Each checkpoint's `revision` is the previous successful storage revision (the compare-and-set expectation), not the revision the pending write produces.
 
 ## Model control
 
@@ -90,6 +92,12 @@ Unknown keys → `Validation("unknown native harness configuration fields: <sort
 - `HarnessInput.content` is a JSON string used verbatim; a JSON object contributes its `query` string; anything else is stringified (`content_text`).
 - One observation cursor at a time: take `harness.events()` once and read `next_event()` until `None`; a second cursor reports `State`.
 - Answer text arrives as `HarnessEventPayload::Output` deltas (`channel == OutputChannel::Answer`, `content` a `String`, `operation == Delta`) and the turn ends with a `TurnLifecycle` payload whose `kind` is in `TERMINAL_TURN_EVENT_KINDS` and whose `result` is the `TurnResult`.
+
+## Host service usage
+
+- `start` consumes only `protocol_version`, `host_capabilities`, `agent_name`, `agent_id`, `host_session_id`, `system_prompt`, `resume_policy`/`checkpoint`, `checkpoint_sink` and `mcp_servers` from `HarnessContext`.
+- `interactions`, `hooks`, `tools`, `telemetry`, `cwd`, `env` and `metadata` are ignored: `ToolApproval`/`UserInput`/`Telemetry` are advertised as optional host capabilities but never called.
+- A permission `ask` surfaces as a kernel interrupt (`PermissionInterruptRail`) and reaches the host only through the turn's `TurnResult` (`stop_reason: "interrupt"`, `provider_data.pending_interrupt_ids`); the `__interaction__` frame maps to no event and no `HarnessInteractionRequest` is ever issued.
 
 ## Constraints
 
