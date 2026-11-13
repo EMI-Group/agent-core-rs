@@ -2,10 +2,10 @@
 
 ## Intent
 
-Shared subprocess plumbing for the vendor CLI harnesses (`claudecode`, `codex`, `dsh`).
+Shared subprocess plumbing plus the generic harness shell for the vendor CLI harnesses (`claudecode`, `codex`, `dsh`) and the future `native_v2`.
 Every adapter needs the same mechanics: resolve the CLI binary, spawn it, speak newline-delimited JSON over stdin/stdout, retain a bounded stderr tail, publish harness SPI events through a single-consumer cursor, derive a stable provider session id and translate host permissions.
-This module owns those pieces so the three follow-up adapters only contribute their own wire-message mapping.
-It is plumbing only — no harness behavior and no vendor SDK.
+An adapter then implements one trait (`VendorDriver`) and is wrapped by `VendorHarness`, which supplies the whole `HarnessProtocol`: lifecycle, turn queue and supervisor, event sequence, capability gating, abort/pause/resume and teardown.
+It is plumbing and protocol scaffolding only — no harness behavior and no vendor SDK.
 
 ## API Surface
 
@@ -15,6 +15,9 @@ It is plumbing only — no harness behavior and no vendor SDK.
 - `events` — `EventBus::{new, emit, events, turn_events, close, is_closed, len, is_empty}`, `EnvelopeBuilder::{new, set_provider_session_id, next, next_for_turn, next_for_item}`, `DEFAULT_CAPACITY`.
 - `permissions` — `PermissionPolicy { user_input, tool_approval, dynamic_tools, native_tools }` with `from_context` / `interactive`, `ApprovalDecision::{Allow, Deny}`, `ask_tool_approval`, `ask_user_input`.
 - `session` — `derive_session_id`, `resolve_resume_id`, `checkpoint_str`.
+- `driver` — the adapter seam: `TurnRequest { turn_id, message_id, content, metadata }` (`new`, `text`), `TurnContext` (`new(bus, envelope)`, `emit`, `emit_correlated`, `emit_event`, `output`, `tool_started`, `tool_completed`, `usage`, `provider_event`, `diagnostic`), `#[async_trait] VendorDriver { label, open, close, run_turn, steer, interrupt, pause, resume, export_checkpoint }` (the last five have capability default bodies returning `HarnessError::UnsupportedCapability("the {label} harness does not support …")`; `export_checkpoint` defaults to `Ok(None)`), the result constructors `completed_turn`, `interrupted_turn`, `failed_turn`, `turn_error`, and `TOOL_CALL_ITEM_TYPE` (`"tool_call"`), `PROVIDER_SCHEMA_VERSION` (`"1"`).
+  `tool_started`/`tool_completed` publish `ItemLifecycleEvent { item_type: "tool_call", data { tool_call_id, name|tool_name, arguments, result, rendered_result } }`, which is exactly what `io_adapter` projects into tool items.
+- `harness` — `VendorHarness::new(card, EventBufferConfig, Arc<dyn VendorDriver>)` + `label()`, a complete `HarnessProtocol` implementation: `card`, `state`, `provider_session_id`, `event_buffer_config`, `start`, `stop`, `events`, `turn_events`, `send`, `abort`, `pause`, `resume`, `export_checkpoint`.
 - Crate-root flat re-exports mirror every item above under `openjiuwen_harness_providers::vendor_cli`.
 
 ## Constraints
@@ -28,6 +31,13 @@ It is plumbing only — no harness behavior and no vendor SDK.
 - `parse_line` has no provider label in its signature, so it uses the neutral label `harness`; adapters call `parse_line_labelled` when the message must name the vendor.
 - `derive_session_id` is `sha256` over the compact JSON seed `[host_session_id, agent_name]` formatted as `8-4-4-4-12` (Python uses a UUID5 over `NAMESPACE_URL`).
 - Auto-approval: an undeclared capability or a missing handler allows the tool call / returns `None` for user input instead of blocking a turn.
+- `VendorHarness` holds one `start`/`stop` cycle per handle and serializes the two on a `tokio::sync::Mutex`; `start` requires `Terminated`, validates the host with `card.validate_host`, calls `driver.open` and only then publishes exactly one `StateChanged(Terminated→Idle)`. `stop` is idempotent, bounds `driver.close` at 10 s (`CLOSE_TIMEOUT`, timeout → `State("the {label} harness did not stop cleanly")` while teardown continues), bounds the supervisor join at 5 s (`SUPERVISOR_TIMEOUT`) before aborting it, and returns the close error after the full teardown.
+- Exactly one supervisor task per harness (spawned on demand, stored on the handle) pops the pending turns and runs them strictly one at a time; `send` only enqueues and returns the receipt, minting `turn-<uuid>`/`message-<uuid>`.
+- Per-turn event sequence: `StateChanged(Idle→Running)`, `TurnLifecycle(Started)` with `correlation_id = message_id`, the driver's own observations, one terminal `TurnLifecycle` whose kind matches the result status (`Completed→Finished`, `Interrupted→Aborted`, `Failed→Failed`), then `StateChanged(Running→Idle)`.
+- A driver *error* from `run_turn` becomes a `Failed` terminal event carrying `turn_error(error.message(), code_from_kind, "protocol", false)`; a driver *result* keeps its own normalized `TurnError`. Either way the harness stays usable for the next turn.
+- Capability gating happens before the driver is consulted: `Steer`, `GracefulAbort`, `ForceAbort`, `PauseResume` and `Checkpoint` are all checked on the card. An abort with no active turn drains the queue as `Started`+`Aborted(HarnessStop)` pairs and ignores the requested mode; `DeliveryMode::Auto` is reported as `FollowUp` because the supervisor never starts a turn synchronously.
+- The provider session id is sticky: the id of the first successful `start` is reported forever, and a later cycle reporting a different id is `HarnessError::State`. `resume` settles in `Running` while a turn is active and in `Idle` otherwise; `Pausing`/`Resuming` are never resting states.
+- All protocol state lives behind one `std::sync::Mutex` and no guard is held across an `.await`. A driver that publishes during `open` emits before the `Terminated→Idle` event, so that event is only the first one for a quiet driver.
 
 ## Routing Table
 
@@ -37,3 +47,5 @@ It is plumbing only — no harness behavior and no vendor SDK.
 - `./events.rs` → the observation bus, its single-consumer cursor/turn filter, and the envelope builder
 - `./permissions.rs` → host permission policy and the approval/user-input translation
 - `./session.rs` → deterministic session ids, resume-policy resolution, checkpoint field access
+- `./driver.rs` → the `VendorDriver` seam an adapter implements, `TurnRequest`/`TurnContext` observation helpers, and the `completed_turn`/`interrupted_turn`/`failed_turn`/`turn_error` constructors
+- `./harness.rs` → `VendorHarness`: the generic `HarnessProtocol` shell, its lifecycle locks, turn queue and single supervisor task

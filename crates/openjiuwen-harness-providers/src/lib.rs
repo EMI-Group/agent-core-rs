@@ -40,8 +40,8 @@
 //!   stubs) and its resolution helper.
 //! - [`skills`] — portable skill-bundle normalization and installation.
 //! - [`vendor_cli`] — shared plumbing for the vendor CLI harnesses: binary resolution, the NDJSON
-//!   child transport, the observation event bus, session-id derivation and host permission
-//!   translation.
+//!   child transport, the observation event bus, session-id derivation, host permission
+//!   translation, and the generic supervisor shell ([`VendorHarness`]) over a [`VendorDriver`].
 //!
 //! The crate-internal `decode` module holds the strict JSON mapping helpers (unknown-key
 //! rejection, typed option decoding) shared by the factory and the provider configuration
@@ -84,8 +84,10 @@ pub use skills::{
     install_skills, normalize_skills, skill_scan_dir, SkillConflict, SkillMode, SkillSource,
 };
 pub use vendor_cli::{
-    ask_tool_approval, ask_user_input, checkpoint_str, derive_session_id, encode_line, get_array,
-    get_bool, get_f64, get_object, get_str, get_u64, is_available, parse_line, parse_line_labelled,
-    resolve_binary, resolve_resume_id, snippet, string_list, ApprovalDecision, BinarySpec,
-    ChildProcess, ChildProcessConfig, EnvelopeBuilder, EventBus, PermissionPolicy,
+    ask_tool_approval, ask_user_input, checkpoint_str, completed_turn, derive_session_id,
+    encode_line, failed_turn, get_array, get_bool, get_f64, get_object, get_str, get_u64,
+    interrupted_turn, is_available, parse_line, parse_line_labelled, resolve_binary,
+    resolve_resume_id, snippet, string_list, turn_error, ApprovalDecision, BinarySpec,
+    ChildProcess, ChildProcessConfig, EnvelopeBuilder, EventBus, PermissionPolicy, TurnContext,
+    TurnRequest, VendorDriver, VendorHarness,
 };

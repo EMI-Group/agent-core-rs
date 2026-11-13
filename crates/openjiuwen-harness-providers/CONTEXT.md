@@ -43,6 +43,8 @@ Shared vendor CLI transport (module `vendor_cli`, foundation for the three CLI a
 - `events` — `EventBus` (`new`, `emit`, `events`, `turn_events`, `close`, `is_closed`, `len`, `is_empty`), `EnvelopeBuilder` (`new`, `set_provider_session_id`, `next`, `next_for_turn`, `next_for_item`).
 - `permissions` — `PermissionPolicy` (`from_context`, `interactive`), `ApprovalDecision`, `ask_tool_approval`, `ask_user_input`.
 - `session` — `derive_session_id`, `resolve_resume_id`, `checkpoint_str`.
+- `driver` — the adapter seam `#[async_trait] VendorDriver { label, open, close, run_turn, steer, interrupt, pause, resume, export_checkpoint }` (unsupported commands have default bodies returning `HarnessError::UnsupportedCapability`), `TurnRequest`, `TurnContext` (`output`, `tool_started`, `tool_completed`, `usage`, `provider_event`, `diagnostic`, `emit`), the result constructors `completed_turn`/`interrupted_turn`/`failed_turn`/`turn_error`, `TOOL_CALL_ITEM_TYPE`, `PROVIDER_SCHEMA_VERSION`.
+- `harness` — `VendorHarness::new(HarnessCard, EventBufferConfig, Arc<dyn VendorDriver>)`, the complete `HarnessProtocol` shell: lifecycle, turn queue + single supervisor task, per-turn event sequence, capability gating, abort/pause/resume, bounded teardown.
 
 ## Constraints
 
@@ -78,7 +80,7 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `./src/factory.rs` → process-global registry, resolution order, `create_harness`, `provider_model_config`, `provider_descriptors`, `build_harness_context`, `HarnessContextOptions`; unit tests in `./src/factory/tests.rs`
 - `./src/providers/` → built-in provider table (`mod.rs`), `native.rs`, vendor stubs (`claudecode.rs`, `codex.rs`, `dsh.rs`) behind `vendor`, shared vendor helpers in `vendor.rs`
 - `./src/io_adapter/` → `HarnessIOAdapter`, `HarnessIOAdapterConfig`, `EventObserver`, `ProviderInteractionHandler` (`mod.rs`), event→chunk projection (`projection.rs`), interaction routing and the pending map (`interactions.rs`), host-answer parsing (`answers.rs`)
-- `./src/vendor_cli/` → shared vendor CLI subprocess transport: binary resolution, NDJSON helpers, the child process, the observation bus, host permission translation, session-id derivation
+- `./src/vendor_cli/` → shared vendor CLI transport and harness shell: binary resolution, NDJSON helpers, the child process, the observation bus, host permission translation, session-id derivation, the `VendorDriver` seam and `VendorHarness`
 - `./src/skills.rs` → `SkillSource`, conflict policies, portable skill-bundle install
 - `./src/decode.rs` → strict JSON mapping helpers shared by factory + vendor configs (unknown-key rejection, typed option decoding)
 - `./src/error.rs` → `HarnessError` → `openjiuwen_common::error::Error` translation
@@ -112,6 +114,10 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `mcp_tool_naming_preamble` emits only the `<mcp-tools>` block; Python's trailing explanatory sentence is not appended (documented deviation from `mcp_naming.py`).
 - `harness_input_text` joins an array when every element carries a string `text` field; Python additionally requires each block's `type` to equal `"text"`.
 - Vendor `from_json` type errors use the shared `decode` wording (`{key} must be …`); Python's `TypeError` text is kept for the cross-field rules and every unknown-key message keeps the Python prefix.
+- `VendorHarness` collapses `DeliveryMode::Auto` to `FollowUp` (the supervisor serializes turns, so an accepted input never starts synchronously) and reports an abort with no active turn by draining the queue as `Started`+`Aborted(HarnessStop)` pairs, ignoring the requested mode because no turn is left to interrupt.
+- `VendorHarness::resume` settles in `Running` while a turn is still active and in `Idle` otherwise; `Pausing`/`Resuming` are transient states only. The provider session id is sticky: a later cycle reporting a different id is `HarnessError::State` instead of a silent identity switch.
+- A `VendorDriver` error from `run_turn` becomes a `Failed` terminal event with category `"protocol"`; a driver-*returned* failure keeps its own `TurnError` category. `VendorHarness` never overrides a normalized result.
+- `VendorHarness::stop` returns the `driver.close` error but still completes teardown (drain, `Terminated`, bus close, supervisor join); a close timeout is reported as `State("the {label} harness did not stop cleanly")` after the same full teardown.
 
 ## Deferred Integrations
 
@@ -131,17 +137,19 @@ Capability cards: `claudecode`/`codex` declare steer, graceful abort, persistent
 - `tests/vendor.rs` (`#![cfg(feature = "vendor")]`) — vendor cards/capabilities, config `from_json` strictness and defaults, `model_config` fragments and rejections, `create` returns `Error::Unsupported` with the SDK-required message, serde round-trip snapshots.
 - `tests/skills.rs` — normalize modes/errors, skip/replace/append conflict policies, `enabled_skills` selection, traversal rejection, non-regular-file rejection.
 - `tests/vendor_cli.rs` (`#![cfg(unix)]`) — the real subprocess path over `tests/support::FakeCli`: NDJSON round trip and transcript, ordered replies, EOF as `Ok(None)`, stderr tail, broken-pipe message, malformed and over-long output lines, `kill` reaping, arguments/cwd, cleared environment.
+- `tests/vendor_supervisor.rs` — `VendorHarness` over an in-test `FakeDriver` (`Answer`/`Fail`/`Error`/`Hang` modes): host validation, the single `Terminated→Idle` transition, the per-turn event sequence, serialized queued turns, steering and abort reaching the driver, capability gating on a bare card, pause/resume, checkpoint delegation, the single-consumer event lease, driver errors as `Failed`, and idempotent `stop` draining the queue.
 - `tests/support/mod.rs` — `FakeCli::{script, replies, path, lines, env}`, a temp-directory POSIX shell script with a stdin transcript; included per test binary with `mod support;`.
 - Unit tests beside modules for pure helpers (`input`, `json`, `mcp_naming`, `decode`, `error`, plus factory and projection/answer unit tests).
 - All tests are offline and deterministic: no network, no sleeps beyond bounded timeouts, temporary directories for filesystem work, Python behavior tests named after their counterpart in `tests/unit_tests/harness_providers/`.
 - Registry-mutating tests share a per-binary `Mutex` guard (`registry_guard()`) because the registry is process-global; without it, positional `available_providers()` assertions race with a concurrent `unregister_harness_provider`.
-- Current suites: lib 166 unit tests, `tests/io_adapter.rs` 20, `tests/native.rs` 9, `tests/registry.rs` 23 (18 without `native`), `tests/skills.rs` 26, `tests/vendor.rs` 36, `tests/vendor_cli.rs` 11.
+- Current suites: lib 176 unit tests, `tests/io_adapter.rs` 20, `tests/native.rs` 9, `tests/registry.rs` 23 (18 without `native`), `tests/skills.rs` 26, `tests/vendor.rs` 36, `tests/vendor_cli.rs` 11, `tests/vendor_supervisor.rs` 14.
 - Definition of done: `cargo fmt -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers`, `cargo test -p openjiuwen-harness-providers --features vendor`, `cargo test -p openjiuwen-harness-providers --no-default-features`, `cargo clippy -p openjiuwen-harness-providers --all-targets --features vendor -- -D warnings` all clean.
 
 ## Notes for Agents
 
 - The Python reference is read-only; consult it through `subagent_investigator` only.
-- Do not add vendor SDK crates or spawn external CLIs: the vendor surface is data + explicit `Unsupported` errors.
+- Do not add vendor SDK crates or spawn external CLIs: the vendor surface is data + explicit `Unsupported` errors. A vendor adapter implements `VendorDriver` and is wrapped by `VendorHarness`; it must never implement `HarnessProtocol` itself.
+- `VendorHarness` is the only place that publishes lifecycle events: an adapter publishes observations through its `TurnContext` and returns the `TurnResult`, nothing else.
 - `HarnessCard` is not serde-optional: build cards with `HarnessCard::new(name, version)` and fill `capabilities`, `optional_host_capabilities`, `fork_modes`.
 - A harness created through `create_harness` cannot be handed an injected `Model`: the native provider builds its client lazily inside `start` (`openjiuwen-harness/src/agent/builder.rs:446`), so offline scripted-model tests construct `NativeHarness::new(agent, options)` over a `DeepAgentBuilder::model(Arc<dyn Model>)` and use the registry only for identity/create/descriptor assertions.
 - Registry reachability: the umbrella exposes it ungated as `openjiuwen::harness_providers` (`crates/openjiuwen/src/lib.rs:67`); `openjiuwen-core` has no harness-provider symbols.
