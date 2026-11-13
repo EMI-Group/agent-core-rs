@@ -77,7 +77,10 @@ pub use clarifier::{Clarification, Clarifier};
 pub use cycle_checker::{find_cycle, has_cycle};
 pub use designer::{DesignEdge, DesignNode, DesignNodeKind, WorkflowDesign, WorkflowDesigner};
 pub use dl_generator::DlGenerator;
-pub use dl_reflector::{DlReflector, Reflection, ReflectionIssue, ReflectionIssueKind};
+pub use dl_reflector::{
+    DlReflector, DlValidation, Reflection, ReflectionIssue, ReflectionIssueKind,
+    DEFAULT_MAX_RETRIES,
+};
 pub use dl_transformer::{
     DlCondition, DlDocument, DlNode, DlNodeType, DlParameters, DlTransformer, DlVariable,
     PlatformEdge, PlatformNode, PlatformWorkflow, PluginResource,
