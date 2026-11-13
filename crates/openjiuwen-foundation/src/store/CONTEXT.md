@@ -26,7 +26,7 @@ Vector (`vector`):
 - `FieldSchema { name, dtype, is_primary, auto_id, max_length, dim, description, default_value }`.
 - `CollectionSchema { fields, description, enable_dynamic_field }` with `new`, `primary_key`, `vector_field`, `default_vector_field`, `vector_fields`, `validate`.
 - `VectorQuery { query_vector, vector_field: Option<String>, top_k (default 5), filters }`, `VectorSearchResult { score, fields }`, `DEFAULT_TOP_K`.
-- `Metric` (`Cosine` default, `Dot`, `Euclidean`) with normalized `score` in `[0,1]`, higher is better: cosine `(cos+1)/2`, dot `(tanh(dot)+1)/2`, euclidean `1/(1+distance)`; mismatched/empty vectors score `0.0` (empty vs empty `1.0`), never `NaN`.
+- `Metric` (`Cosine` default, `Dot`, `Euclidean`) with normalized `score` in `[0,1]`, higher is better: cosine `(cos+1)/2`, dot `(tanh(dot)+1)/2`, euclidean `1/(1+distance)`; mismatched/empty vectors score `0.0` (empty vs empty `1.0`), a zero vector scores `0.5` against a non-zero one (orthogonal by convention), never `NaN`.
 - `VectorStore` async trait: `create_collection(collection, CollectionSchema)`, `delete_collection`, `collection_exists`, `get_schema`, `add_docs(collection, Vec<Map<String, Value>>) -> usize` (insert-only), `search(collection, &VectorQuery)`, `delete_docs_by_ids`, `delete_docs_by_filters`, `list_collection_names`.
 - Backends: `InMemoryVectorStore` (+ synchronous `search_with_metric`), `LocalFileVectorStore::new(root)` (+ `search_with_metric`); both share `vector::memory::VectorIndex`.
 
@@ -51,6 +51,7 @@ Filter (`filter`):
 - Local backends live under a caller-provided root path and never touch paths outside it; collection/bucket/key names are validated as safe single segments where they become paths.
 - `sqlite` code is `#[cfg(feature = "sqlite")]`; default builds and `--no-default-features` must not require `sqlx`.
 - No blocking std I/O on async paths: backends use `tokio::fs`; in-memory state is guarded by `parking_lot::Mutex`, file backends by a `tokio::sync::Mutex` writer lock.
+- The `KvStore` seam carries a TTL only on `exclusive_set` (`set` stores without expiry and clears any existing one) and has no `flush`, `close`, or `len`; a remote backend owns its connection object and maps transport failures to `Error::external`.
 - Files stay ≤1000 lines; every public item is documented; no `unsafe`; no `unwrap`/`expect` outside tests.
 
 ## Design Decisions
