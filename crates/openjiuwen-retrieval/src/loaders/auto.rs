@@ -7,6 +7,12 @@
 //! `AutoFileParser.parse` (`doc_id`, `title`, `file_path`, `file_ext`). Every
 //! format without a registered loader (for example `.xls` or `.zip`) is rejected
 //! instead of returning an empty list.
+//!
+//! The in-memory byte path is available both as [`AutoLoader::load_bytes`]/
+//! [`AutoLoader::load_document_bytes`] and through
+//! [`DocumentLoader::load_bytes`], so trait-object callers
+//! (`Arc<dyn DocumentLoader>`) get the same dispatch instead of the trait's
+//! [`Error::Unsupported`] default.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -346,6 +352,17 @@ impl DocumentLoader for AutoLoader {
     async fn load(&self, source: &str) -> Result<Vec<Document>> {
         // The inherent method (not this trait method) does the dispatch.
         AutoLoader::load(self, source).await
+    }
+
+    async fn load_bytes(
+        &self,
+        source: &DocumentBytes,
+        options: &LoadOptions,
+    ) -> Result<Vec<Document>> {
+        // Delegates to the inherent byte dispatch (the trait method and the
+        // inherent method differ only in argument shape; inherent wins for
+        // method-call syntax).
+        AutoLoader::load_document_bytes(self, source, options).await
     }
 }
 
@@ -720,6 +737,51 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn trait_object_load_bytes_reaches_the_inherent_dispatch() {
+        // `Arc<dyn DocumentLoader>` must not fall through to the trait's
+        // `Error::Unsupported` default: the override delegates to the inherent
+        // byte dispatch, so the text is loaded and provenance is stamped.
+        let loader: Arc<dyn DocumentLoader> = Arc::new(AutoLoader::new());
+        let source = DocumentBytes::new("notes.txt", b"body".to_vec());
+        let documents = loader
+            .load_bytes(&source, &LoadOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "body");
+        assert_eq!(
+            documents[0].metadata.get("file_ext"),
+            Some(&Value::String(".txt".to_owned()))
+        );
+        assert_eq!(
+            documents[0].metadata.get("doc_id"),
+            Some(&Value::String(documents[0].id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_load_bytes_uses_the_same_dispatch() {
+        /// Loads bytes through a generic bound, as a downstream caller would.
+        async fn load_via_trait<L: DocumentLoader + ?Sized>(
+            loader: &L,
+            source: &DocumentBytes,
+        ) -> Result<Vec<Document>> {
+            loader.load_bytes(source, &LoadOptions::new()).await
+        }
+
+        let loader = AutoLoader::new();
+        let source = DocumentBytes::new("notes.txt", b"body".to_vec());
+        let documents = load_via_trait(&loader, &source).await.unwrap();
+        assert_eq!(documents[0].text, "body");
+
+        let unsupported = DocumentBytes::new("archive.xyz", b"unknown".to_vec());
+        let error = load_via_trait(&loader, &unsupported).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Unsupported format: .xyz"));
     }
 
     #[tokio::test]
