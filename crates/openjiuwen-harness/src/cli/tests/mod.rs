@@ -18,6 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod commands;
+mod features;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
