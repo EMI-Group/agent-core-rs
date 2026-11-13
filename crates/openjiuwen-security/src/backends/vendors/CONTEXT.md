@@ -102,7 +102,7 @@ Confidence is the maximum `Data.Result[].Confidence` (`0..=100`) banded at `90`/
 - `./mod.rs` → module list and the six re-exports
 - `./openai.rs` → OpenAI moderation config/backend, score-band mapping, wire + loopback tests behind the module docs
 - `./azure.rs` → Azure Content Safety config/backend, URL composition, severity mapping, wire + loopback tests
-- `./aliyun.rs` → Aliyun Green config/auth/backend, RPC body, ACS3 signing, label/confidence mapping, wire + loopback tests
+- `./aliyun/` → Aliyun Green adapter as a directory module (`src/backends/vendors/aliyun/CONTEXT.md`): `mod.rs` (config/auth/backend, RPC body, label/confidence mapping), `signing.rs` (ACS3-HMAC-SHA256), `tests.rs` (wire + loopback tests)
 
 ## Test Strategy
 

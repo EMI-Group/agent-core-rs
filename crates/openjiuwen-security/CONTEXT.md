@@ -81,7 +81,7 @@ Python name mapping: `GuardrailResult.pass_` → `GuardrailResult::pass`, `Guard
 - No `unsafe`, no globals: a pipeline is an owned value; there is no process-global registry (Python's `Runner.callback_framework` registration is the runner's concern, wired outside this crate).
 - Logging through `tracing` only (targets `openjiuwen_security::<module>`, vendor adapters `openjiuwen_security::backends::vendors::<name>`); no `stdout`. Guardrail content and credentials are never logged; log names, stages, levels, statuses, lengths.
 - Every credential is a `SecretString`; configs round-trip through JSON but `Debug` shows presence/kind only.
-- Files target ≤1000 lines; `src/backends/vendors/aliyun.rs` (~1130 lines) is the current exception, holding the RPC wire mapping, the ACS3 signing helpers, and their unit tests in one module.
+- Files target ≤1000 lines; the Aliyun adapter is a directory module (`vendors/aliyun/{mod,signing,tests}.rs`) so the wire mapping, the ACS3 signing helpers, and their tests stay separately reviewable.
 - Default features are empty and every test runs offline: loopback `wiremock` servers, no live network, no credentials.
 
 ## Routing Table
