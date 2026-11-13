@@ -8,9 +8,22 @@
 //! induction and dreaming (`ttse/induction.py`, `ttse/dream.py`).
 //!
 //! - [`TtseConfig`] — Python-shaped, serde-persisted tunables.
-//! - [`TipBank`] — record store with dedupe, clustering and pruning.
-//! - [`TtseEngine`] — offline pipeline over signals/trajectories that induces and
+//! - [`TipBank`] — record store with dedupe, clustering and pruning; [`TipBankStats`]
+//!   is its aggregate summary.
+//! - [`TipCategory`] / [`TipRecord`] — the tip schema, with [`TipClassifier`]
+//!   assigning the category and [`tip_id_for`] deriving the content-addressed id.
+//! - [`SuccessDetector`] — decides whether a run counts as a successful experience.
+//! - [`TipParser`] — turns a model answer into tip records ([`DEFAULT_MAX_RULE_CHARS`]
+//!   bounds each rule).
+//! - [`TipInducer`] — proposes tips from failed trajectories and evolution signals,
+//!   offline or through an injected model.
+//! - [`Dreamer`] — merges near-duplicate tips and prunes stale ones.
+//! - [`TtseEngine`] — the pipeline over signals/trajectories that induces and
 //!   ranks tips, then renders them for prompt injection.
+//! - [`consult`] / [`render_tips`] — selects and renders the tips injected into a
+//!   prompt, producing a [`ConsultResult`]; [`DreamReport`] and
+//!   [`SuccessAssessment`] are the pass results, and [`TipEvidence`] the
+//!   trajectory evidence a tip was induced from.
 //!
 //! LLM-driven merging and embedding-backed retrieval are optional seams; the
 //! default paths are deterministic.
