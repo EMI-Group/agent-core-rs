@@ -10,10 +10,10 @@
 //! The port is landing in phases. [`config`] holds the behaviour knobs,
 //! [`schema`] the data model, [`executors`] the task-executor seam, [`intent`]
 //! recognition and planning, and [`base`] the controller loop itself. A later
-//! phase adds `legacy` (the string-routed controller that predates the event
-//! queue).
+//! [`legacy`] holds the string-routed controller that predates the event queue.
 pub mod base;
 pub mod config;
 pub mod executors;
 pub mod intent;
+pub mod legacy;
 pub mod schema;
