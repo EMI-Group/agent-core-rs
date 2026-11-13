@@ -19,7 +19,6 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use openjiuwen_common::error::{Error, Result};
-use openjiuwen_common::utils::id::unix_millis;
 
 use crate::schema::{
     is_valid_member_transition, MemberStatus, ReviewVote, TaskFilter, TaskPatch, TaskRecord,
@@ -27,36 +26,11 @@ use crate::schema::{
 };
 
 use super::records::{MemberPatch, MemberRecord, MessageRecord, TeamInfoRecord};
+use super::stamps::{refresh, require_key, stamp};
 use super::{TeamStore, MEMORY_STORAGE_KIND};
 
 /// Key used by every row map and by the watermark map: `(team_name, row_id)`.
 type RowKey = (String, String);
-
-/// One monotonically increasing write stamp.
-///
-/// A real backend stamps `now()`; the in-process backend must also keep ordering stable when two
-/// writes land inside the same millisecond, so it returns `max(now, previous + 1)`.
-fn refresh(previous: u64) -> u64 {
-    let now = u64::try_from(unix_millis()).unwrap_or(0);
-    now.max(previous.saturating_add(1))
-}
-
-/// Returns the caller-supplied stamp when it is set, else a fresh write stamp after `previous`.
-fn stamp(supplied: u64, previous: u64) -> u64 {
-    if supplied == 0 {
-        refresh(previous)
-    } else {
-        supplied
-    }
-}
-
-/// Rejects an empty row key.
-fn require_key(value: &str, label: &str) -> Result<()> {
-    if value.is_empty() {
-        return Err(Error::validation(format!("{label} must not be empty")));
-    }
-    Ok(())
-}
 
 /// Returns `true` when `message` is still waiting in `member`'s mailbox.
 ///

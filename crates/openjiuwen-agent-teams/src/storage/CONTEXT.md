@@ -2,7 +2,7 @@
 
 ## Intent
 
-The persistence seam of the crate: one object-safe `TeamStore` trait over the team, roster, task board, dependency-edge, review-vote and mailbox tables, plus the deterministic in-process backend every test and every single-process runtime uses.
+The persistence seam of the crate: one object-safe `TeamStore` trait over the team, roster, task board, dependency-edge, review-vote and mailbox tables, plus the deterministic in-process backend every test and every single-process runtime uses and the persistent SQLite backend behind the `sqlite` feature.
 Python parity source: `openjiuwen/agent_teams/tools/database/` (SQLAlchemy DAOs `team_dao`, `member_dao`, `task_dao`, `message_dao` and the SQLite `TeamDatabase` they run on) and the `team_backend` persistence calls that drive them.
 This node is a *state* seam, not a policy seam: it validates row keys and status transitions, and answers queries in a fixed order.
 Dependency unblocking, review gating, dispatch, member spawning and message routing belong to the sibling nodes (`../taskboard/`, `../member/`, `../runtime/`), which code against this trait.
@@ -94,6 +94,10 @@ impl MessageRecord {
 
 pub struct InMemoryTeamStore;                    // ::new(), Default, Arc<dyn TeamStore>
 pub fn open_store(spec: &StorageSpec) -> Result<Arc<dyn TeamStore>>;
+
+pub const SQLITE_STORAGE_KIND: &str = "sqlite";  // feature `sqlite`
+pub struct SqliteTeamStore;                      // feature `sqlite`; lazy pool over a file or `:memory:`
+impl SqliteTeamStore { pub async fn open(path) -> Result<Self>; pub async fn in_memory() -> Result<Self>; }
 ```
 
 Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilter`, `ReviewVote`, `Verdict`, `TaskRevision` come from `../schema/task.rs` and `MemberStatus`, `ExecutionStatus`, `TaskStatus`, `TeamRole`, `MemberMode`, `DispatchMode` from `../schema/status.rs` and `../schema/team.rs`.
@@ -122,13 +126,15 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 - Mailbox: a direct row is unread while `is_read == false` and `to_member_name == member`; a broadcast is unread while its `timestamp` is strictly greater than the member's watermark and the member is not its sender. No watermark means every broadcast is unread.
 - `mark_read` flags direct rows only, for the addressed member; broadcast ids are skipped silently (read state for broadcasts is the watermark). Advancing a broadcast read state is `set_read_watermark`, which never regresses.
 - `message_count` is the unread count (`unread_messages(..).len()` without materializing rows) — the mailbox-depth signal for the runtime's idle sweep.
-- `open_store`: `"memory"` (or an empty/whitespace kind) → fresh `InMemoryTeamStore`; `"sqlite" | "postgresql" | "mysql"` → `Error::unsupported("storage backend '<kind>' is not implemented; use 'memory'")`; any other kind → `Error::unsupported("unknown storage backend '<kind>'; use 'memory'")`. `StorageSpec::params` is accepted and ignored.
+- `open_store`: `"memory"` (or an empty/whitespace kind) → fresh `InMemoryTeamStore`; `"sqlite"` → a lazily connected `SqliteTeamStore` built from `params` (`path`, else `url`, else `database`; `:memory:` selects the private in-memory database; a `sqlite:` value is a `sqlx` URL validated eagerly; no parameter is `Error::config`), or, with the feature off, `Error::unsupported("storage backend 'sqlite' requires the 'sqlite' feature; enable 'openjiuwen-agent-teams/sqlite'")`; `"postgresql" | "mysql"` → `Error::unsupported("storage backend '<kind>' is not implemented; the <kind> driver is not available offline")`; any other kind → `Error::unsupported("unknown storage backend '<kind>'; use 'memory'")`.
 
 ## Routing Table
 
 - `./mod.rs` → `TeamStore` trait, `MEMORY_STORAGE_KIND`, `open_store`, flat re-exports
 - `./records.rs` → `TeamInfoRecord`, `MemberRecord`, `MemberPatch`, `MessageRecord`, `PLAIN_MESSAGE_PROTOCOL` (+ wire-shape tests)
-- `./memory.rs` → `InMemoryTeamStore`, stamping helpers, the unread predicate
+- `./memory.rs` → `InMemoryTeamStore`, the unread predicate
+- `./stamps.rs` → `refresh`, `stamp`, `require_key`, shared by both backends
+- `./sqlite/` → `SqliteTeamStore` (feature `sqlite`): pool/connect, DDL + migrations, row codecs (`./sqlite/CONTEXT.md`)
 - `./store_tests.rs` → the store suite on the `dyn TeamStore` seam (`#[cfg(test)]`)
 
 ## Test Strategy
@@ -137,6 +143,8 @@ Task/status types are *not* redefined here: `TaskRecord`, `TaskPatch`, `TaskFilt
 
 - `records.rs`: serde wire names and defaults for all four records (including `"autonomous"`, `"build_mode"`, `"unstarted"`, `"idle"`, `protocol: "plain"`, `clear_model: false`), unknown-field tolerance and full-default decoding, `MemberPatch` merge/clear/no-op/`is_empty`, message constructors.
 - `store_tests.rs`: team upsert (created preservation, replacement, store stamping), empty-key validation for every row kind, member CAS (first `unstarted -> starting` true, replay false, illegal `ready -> dormant` false, stale `from` false, unknown member false), member patch merge/clear/stamp, member listing order, task CAS + `updated_at` refresh + terminal status, `update_task` revision bump and change notes (content / title+content / identical content / note-only / explicit revision / `clear_assignee`), `list_tasks` filters (status, assignee, parent, limit) and ordering, dependency idempotence + sorting + team scoping + self-dependency rejection, per-round vote isolation with reviewer replacement, mailbox ordering, `mark_read` semantics, watermark coverage/regression, `message_count`, keyed message replacement, keyed member replacement, `open_store` selection and unsupported-backend messages, per-call store independence.
+
+`SqliteTeamStore` has no dedicated suite yet: this phase ships the backend and the `open_store` feature-off/feature-on dispatch is covered by `open_store_selects_memory_and_rejects_deferred_backends`; the sqlite suite (rows, stamps, CAS, filters, mailbox) is the next phase.
 
 Definition of done for this node: `rustfmt --check` clean on the four files, `cargo test -p openjiuwen-agent-teams --lib` and `--no-default-features --lib` green, no clippy diagnostic pointing at `src/storage/`.
 Crate-wide diagnostics (clippy `missing_docs`, crate-root doctests) belong to the crate root node; the sibling modules are implemented and re-exported from `../lib.rs`.
@@ -151,4 +159,5 @@ Crate-wide diagnostics (clippy `missing_docs`, crate-root doctests) belong to th
 - Broadcast read state is a single per-member watermark, never a row flag. `mark_read` on a broadcast id is a silent no-op; use `set_read_watermark` (Python's `mark_message_read` does both in one call — this port splits them).
 - `MemberPatch::apply` is the single place patch precedence lives (`clear_model`/`clear_worktree` beat the setters); `update_member` only adds the stamp.
 - `update_task` distinguishes an explicit `revision` (author-controlled, no change note) from an implicit bump (title/content edit, note appended). Keep that split: the task board renders `change_notes` as history.
-- Deferred backends stay behind `open_store`: `sqlite`/`postgresql`/`mysql` return `Error::Unsupported` with the Python capability name, and the trait is the only thing a new backend has to implement.
+- Backends stay behind `open_store`: `memory` and `sqlite` are real, `postgresql`/`mysql` return `Error::Unsupported` with the Python capability name, and the trait is the only thing a new backend has to implement.
+- `SqliteTeamStore` is lazily connected (the `open_store` seam is synchronous), links no foreign keys, and stamps rows through `./stamps.rs`, so its observable answers match `InMemoryTeamStore`.
