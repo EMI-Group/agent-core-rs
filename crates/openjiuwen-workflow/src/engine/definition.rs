@@ -33,7 +33,9 @@ use serde_json::Value;
 use openjiuwen_graph::Router;
 
 use crate::ability::ComponentAbility;
-use crate::card::{CompIoConfig, NodeSpec, WorkflowCard, WorkflowConfig, WorkflowSpec};
+use crate::card::{
+    CompIoConfig, ExceptionConfig, NodeSpec, WorkflowCard, WorkflowConfig, WorkflowSpec,
+};
 use crate::component::Component;
 
 /// The per-component configuration the builder records.
@@ -55,13 +57,21 @@ pub struct NodeConfig {
     pub stream_outputs_schema: Option<Value>,
     /// Declared abilities; `None` (or empty) means "infer from topology".
     pub abilities: Option<Vec<ComponentAbility>>,
-    /// Accepted for compatibility; graph channels are CNF barriers, so a fan-in always
-    /// waits for every predecessor and `false` is rejected for collect/transform nodes.
+    /// Whether a fan-in waits for every predecessor (Python's `wait_for_all`).
+    ///
+    /// `Some(true)` or `None` keeps the all-predecessors CNF barrier every edge compiles
+    /// to. `Some(false)` on a node with at least two distinct regular/stream/barrier
+    /// predecessors compiles Python's first-arrival fan-in instead: the node fires per
+    /// arrival and a key whose producer has not run yet resolves to `null`. A node with a
+    /// single inbound source is unaffected (one source is one barrier). `Collect` and
+    /// `Transform` nodes must keep it `true`; `false` is rejected with `[100011]`.
     pub wait_for_all: Option<bool>,
     /// How many times a failing invocation is retried.
     pub max_retries: u32,
     /// The per-node timeout in milliseconds; `None` means no timeout.
     pub timeout_ms: Option<u64>,
+    /// What to do when the node fails after every retry; see [`crate::card::ExceptionConfig`].
+    pub exception_config: Option<ExceptionConfig>,
     /// An optional display name.
     pub name: Option<String>,
 }
@@ -466,7 +476,7 @@ impl WorkflowDefinition {
             timeout: node
                 .timeout_ms
                 .map_or(-1.0, |ms| Duration::from_millis(ms).as_secs_f64()),
-            exception_config: None,
+            exception_config: node.exception_config.clone(),
             name: node.name.clone(),
         }
     }
@@ -937,6 +947,32 @@ mod tests {
     }
 
     #[test]
+    fn spec_emits_the_node_exception_config() {
+        let mut definition = spec_definition();
+        let config = ExceptionConfig {
+            handle_type: "defaultOutputs".to_string(),
+            default_outputs: Some(json!({"result": "recovered"})),
+            metadata: BTreeMap::new(),
+        };
+        definition
+            .components
+            .get_mut("llm")
+            .unwrap()
+            .node
+            .exception_config = Some(config.clone());
+
+        let spec = definition.spec();
+        assert_eq!(
+            spec.comp_configs.get("llm").unwrap().exception_config,
+            Some(config)
+        );
+        assert_eq!(
+            spec.comp_configs.get("start").unwrap().exception_config,
+            None
+        );
+    }
+
+    #[test]
     fn spec_without_start_has_no_start_nodes() {
         let definition = WorkflowDefinition::new(card());
         assert!(definition.spec().start_nodes.is_empty());
@@ -977,12 +1013,18 @@ mod tests {
             wait_for_all: Some(true),
             max_retries: 3,
             timeout_ms: Some(2500),
+            exception_config: Some(ExceptionConfig {
+                handle_type: "defaultOutputs".to_string(),
+                default_outputs: Some(json!({"result": "recovered"})),
+                metadata: BTreeMap::new(),
+            }),
             name: Some("Node".to_string()),
         };
         let wire = serde_json::to_value(&node).unwrap();
         assert_eq!(wire["timeout_ms"], json!(2500));
         assert_eq!(wire["abilities"], json!(["stream", "collect"]));
         assert_eq!(wire["wait_for_all"], json!(true));
+        assert_eq!(wire["exception_config"]["handle_type"], "defaultOutputs");
         let parsed: NodeConfig = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, node);
 
