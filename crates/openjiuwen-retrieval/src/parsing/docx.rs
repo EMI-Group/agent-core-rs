@@ -13,7 +13,7 @@
 //!   (the reference leaves `Subtitle` as plain text; the Rust port treats it as a
 //!   second-level heading), `Heading1…Heading9` → `#`×(level+1) (`Heading1` → `## `);
 //! - a table becomes a Markdown table rendered by
-//!   [`TableData`](crate::multimodal::TableData), with every cell's paragraphs
+//!   [`TableData`], with every cell's paragraphs
 //!   joined by newlines and pipes escaped.
 //!
 //! The document text joins the rendered blocks with `\n` and drops empty blocks.

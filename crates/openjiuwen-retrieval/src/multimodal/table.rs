@@ -2,8 +2,8 @@
 //!
 //! Port of the row/column document scheme of the Python `ExcelParser`
 //! (`indexing/processor/parser/excel_parser.py`) without the `openpyxl`
-//! dependency: callers bring a [`TableData`] value (from `CSV`, a future `XLSX`
-//! reader, or a Markdown table) and this module converts it into the same row
+//! dependency: callers bring a [`TableData`] value (from the `XLSX` reader, `CSV`
+//! data, or a Markdown table) and this module converts it into the same row
 //! documents, column documents, and text chunks the reference implementation
 //! emits. Python converts `DOCX` tables to Markdown text with its own renderer;
 //! [`TableData::to_markdown`] is the Rust equivalent.

@@ -4,7 +4,8 @@
 //! Maps to the Python package `openjiuwen.core.retrieval` in the openJiuwen
 //! reference implementation. The crate is split into independent layers:
 //! [`common`] (shared data model, configs, metadata filters), [`chunking`],
-//! [`loaders`] (text/Markdown/JSON/CSV/HTML/URL sources plus auto dispatch),
+//! [`loaders`] (text/Markdown/JSON/CSV/HTML/URL sources, PDF/DOCX/XLSX readers,
+//! images, plus auto dispatch),
 //! [`embedding`], [`vector_store`], [`reranker`], and [`knowledge_base`], the
 //! pipeline that composes them.
 //!

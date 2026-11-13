@@ -20,9 +20,10 @@
 //! and the image loader reports `NotFound`/`Unsupported` errors instead of
 //! silently returning an empty document list.
 //!
-//! Loader registration is not wired here: [`ImageLoader`] implements
-//! [`DocumentLoader`](crate::loaders::DocumentLoader) and is registered with
-//! `LoaderRegistry`/`AutoLoader` by a later round.
+//! [`ImageLoader`] implements [`DocumentLoader`](crate::loaders::DocumentLoader)
+//! and `LoaderRegistry::with_defaults()` registers it for [`IMAGE_EXTENSIONS`],
+//! so [`AutoLoader`](crate::loaders::AutoLoader) dispatches image files by
+//! extension like any other source.
 
 pub mod caption;
 pub mod document;

@@ -1,4 +1,4 @@
-//! Unified retriever interface, the four retriever implementations, and rank
+//! Unified retriever interface, the five retriever implementations, and rank
 //! fusion.
 //!
 //! Port of the Python `openjiuwen/core/retrieval/retriever/` package and
