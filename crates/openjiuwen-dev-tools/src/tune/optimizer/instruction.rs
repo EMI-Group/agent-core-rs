@@ -180,6 +180,7 @@ impl InstructionOptimizer {
             best_prompt,
             score: best_score,
             iterations,
+            ..OptimizationResult::default()
         })
     }
 }
