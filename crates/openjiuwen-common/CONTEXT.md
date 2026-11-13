@@ -109,6 +109,8 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 - Id formats differ by purpose: `utils::id::uuid_hex()` (32 lowercase hex, Python card/event ids) vs `uuid_v4()` (hyphenated, task/trace ids).
 - `HttpClientConfig.headers` are sanitized: `authorization`, `host`, `content-length`, `transfer-encoding`, and `connection` are dropped; pass credentials through `HttpRequest::bearer` or per-request headers.
 - Timeouts and cancellation surface as `ErrorKind::Timeout` / `ErrorKind::Cancelled`; non-2xx responses are returned normally — call `error_for_status()` when a failure must become an error.
+- `Error` itself is not `Serialize`/`Deserialize` (it wraps `dyn Error` and is `#[derive(Debug, thiserror::Error)]` only); serialize `ErrorKind` and `Error::message()` instead.
+- Header builder names clash by design: `HttpClientConfig::with_headers` *replaces* the default header map, while `HttpRequest::with_headers` *extends* it (`header()` inserts one).
 
 ## Routing Table
 
