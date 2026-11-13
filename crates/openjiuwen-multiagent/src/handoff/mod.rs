@@ -34,6 +34,24 @@
 //! worker cannot drain while it awaits the handler. Every follow-up hop is
 //! therefore published from a spawned task, and a failed publish is logged
 //! rather than raised (the chain then ends through its deadline).
+//!
+//! ## Events
+//!
+//! Every chain reports on the team event bus (`TeamRuntime::events`):
+//!
+//! - `TeamEvent::handoff_started` once per dispatched hop, emitted by the hop's
+//!   [`ContainerAgent`] right before it invokes its member, with the previous
+//!   member as the subject (the member itself for the first hop), the running
+//!   member as the peer, the team session as the session, and the 1-based hop
+//!   index under the `hop` detail;
+//! - `TeamEvent::handoff_completed` when a hop resolves the chain, with the
+//!   resolving member in both agent slots, the approved-transfer count under the
+//!   `handoffs` detail, and `interrupted: true` when the hop forwarded a team
+//!   interrupt;
+//! - `TeamEvent::error` when a member invocation fails, with an `operation`
+//!   detail of `handoff`; the chain is then resolved with that error, as before.
+//!
+//! A chain whose runtime was dropped emits nothing.
 
 /// Signal key carrying the id of the agent to hand off to.
 pub const HANDOFF_TARGET_KEY: &str = "__handoff_to__";

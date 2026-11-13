@@ -19,6 +19,17 @@
 //! failed dispatch emits [`TeamEvent::error`] with an `operation` detail of
 //! `agent_tool` instead of the completion event. A dropped runtime emits
 //! nothing.
+//!
+//! # Result rendering
+//!
+//! Python renders a member result into the model's tool message with `str()`
+//! (`P2PAbilityManager`, `p2p_ability_manager.py`), so
+//! [`render_for_llm`](Tool::render_for_llm) reproduces Python's rendering
+//! instead of the foundation's compact-JSON default: a bare string stays bare, an
+//! object with a string `content` unwraps to that string (the foundation rule),
+//! a `null` result keeps the empty text, and every other value renders through
+//! [`render_python_value`], so `{"a": 1, "ok": true}` reads as
+//! `{'a': 1, 'ok': True}`.
 
 use std::sync::{Arc, Weak};
 
@@ -31,6 +42,7 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
 use crate::events::TeamEvent;
+use crate::pyrepr::render_python_value;
 use crate::runtime::TeamRuntime;
 
 /// Metadata key carrying the model's tool-call id for this invocation.
@@ -230,5 +242,25 @@ impl Tool for AgentTool {
             .and_then(Value::as_str)
             .unwrap_or(ctx.invocation_id.as_str());
         self.dispatch(inputs, tool_call_id, ctx).await
+    }
+
+    /// Renders a member result the way Python's `str(result)` did.
+    ///
+    /// A bare string stays bare, an object with a string `content` unwraps to
+    /// that string, and a `null` result keeps the foundation's empty text. Every
+    /// other value renders through [`render_python_value`], so booleans and null
+    /// inside a container read as `True`/`None` rather than JSON's `true`/`null`,
+    /// matching what a Python model prompt carried. See the module docs for the
+    /// Python origin of this rule.
+    fn render_for_llm(&self, output: &Value) -> String {
+        match output {
+            Value::Null => String::new(),
+            Value::String(text) => text.clone(),
+            Value::Object(map) => match map.get("content") {
+                Some(Value::String(text)) => text.clone(),
+                _ => render_python_value(output),
+            },
+            other => render_python_value(other),
+        }
     }
 }

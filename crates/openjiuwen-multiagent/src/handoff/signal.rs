@@ -15,9 +15,10 @@
 //! - [`extract_handoff_signal_from_session`] falls back to the session context's
 //!   `tool` messages, newest first.
 //!
-//! Python's session scan has an `ast.literal_eval` fallback for Python-repr
-//! tool output; Rust speaks JSON only and intentionally does not port that
-//! fallback (see `docs/PARITY.md`).
+//! Python's scan tries `json.loads` first and falls back to `ast.literal_eval`,
+//! so a Python-repr tool payload (`"{'__handoff_to__': 'b'}"`) is recovered too;
+//! both locators use [`crate::pyrepr::literal_or_json`], which keeps that order
+//! and skips content that neither grammar accepts.
 
 use std::sync::Arc;
 
@@ -91,13 +92,16 @@ pub fn extract_handoff_signal(result: &Value) -> Option<HandoffSignal> {
 /// Extracts a handoff directive from recorded tool observations.
 ///
 /// Observations are appended in call order, so they are scanned newest first:
-/// the most recent handoff wins when an agent called `transfer_to_*` twice.
+/// the most recent handoff wins when an agent called `transfer_to_*` twice. Each
+/// content is read as JSON first and as a Python literal second (Python's
+/// `json.loads` → `ast.literal_eval` order), and content that neither grammar
+/// accepts is skipped.
 #[must_use]
 pub fn extract_handoff_signal_from_observations(
     observations: &[Observation],
 ) -> Option<HandoffSignal> {
     observations.iter().rev().find_map(|observation| {
-        let parsed: Value = serde_json::from_str(&observation.content).ok()?;
+        let parsed = crate::pyrepr::literal_or_json(&observation.content)?;
         extract_handoff_signal(&parsed)
     })
 }
@@ -107,11 +111,11 @@ pub fn extract_handoff_signal_from_observations(
 ///
 /// The result-level extraction runs first. When it finds nothing,
 /// `session.get_state("context")["default_context_id"]["messages"]` is scanned
-/// newest first: every `tool` message whose string `content` parses as JSON is
-/// inspected for a directive payload, which recovers a handoff that a follow-up
-/// model answer overwrote. Non-`tool` roles and unparseable content are skipped.
-/// Only JSON is accepted; Python's `ast.literal_eval` fallback is intentionally
-/// not ported.
+/// newest first: every `tool` message whose string `content` parses as JSON or,
+/// failing that, as a Python literal is inspected for a directive payload, which
+/// recovers a handoff that a follow-up model answer overwrote. The two grammars
+/// are tried in Python's `json.loads` → `ast.literal_eval` order; non-`tool`
+/// roles and content that neither grammar accepts are skipped.
 pub async fn extract_handoff_signal_from_session(
     result: &Value,
     session: &Arc<dyn Session>,
@@ -129,7 +133,7 @@ pub async fn extract_handoff_signal_from_session(
             return None;
         }
         let text = message.get("content").and_then(Value::as_str)?;
-        let parsed: Value = serde_json::from_str(text).ok()?;
+        let parsed = crate::pyrepr::literal_or_json(text)?;
         signal_from_payload(&parsed)
     })
 }
@@ -263,6 +267,68 @@ mod tests {
         assert!(extract_handoff_signal_from_observations(&[]).is_none());
     }
 
+    #[test]
+    fn observations_accept_python_repr_payloads() {
+        let observations = vec![Observation {
+            content:
+                "{'__handoff_to__': 'b', '__handoff_reason__': 'py', 'flag': True, 'note': None}"
+                    .to_owned(),
+            ..Observation::default()
+        }];
+        let signal = extract_handoff_signal_from_observations(&observations).unwrap();
+        assert_eq!(signal.target, "b");
+        assert_eq!(signal.reason.as_deref(), Some("py"));
+
+        // Garbage is still skipped, and an older directive is still found.
+        let mixed = vec![
+            Observation {
+                content: "{'__handoff_to__': 'older'}".to_owned(),
+                ..Observation::default()
+            },
+            Observation {
+                content: "{'unterminated".to_owned(),
+                ..Observation::default()
+            },
+        ];
+        assert_eq!(
+            extract_handoff_signal_from_observations(&mixed)
+                .unwrap()
+                .target,
+            "older"
+        );
+    }
+
+    #[test]
+    fn json_payloads_keep_their_json_reading() {
+        // `true`/`null` are JSON-only spellings, so a recovered signal proves the
+        // JSON pass runs first.
+        let observations = vec![Observation {
+            content: json!({
+                HANDOFF_TARGET_KEY: "b",
+                HANDOFF_REASON_KEY: "json",
+                "flag": true,
+                "note": null
+            })
+            .to_string(),
+            ..Observation::default()
+        }];
+        let signal = extract_handoff_signal_from_observations(&observations).unwrap();
+        assert_eq!(signal.target, "b");
+        assert_eq!(signal.reason.as_deref(), Some("json"));
+
+        // A payload both grammars accept keeps the JSON reading.
+        let shared = vec![Observation {
+            content: "{\"__handoff_to__\": \"both\"}".to_owned(),
+            ..Observation::default()
+        }];
+        assert_eq!(
+            extract_handoff_signal_from_observations(&shared)
+                .unwrap()
+                .target,
+            "both"
+        );
+    }
+
     #[tokio::test]
     async fn session_extraction_reads_tool_messages() {
         let session: Arc<dyn Session> = Arc::new(AgentSession::new("s-1"));
@@ -289,6 +355,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(signal.target, "from_result");
+    }
+
+    #[tokio::test]
+    async fn session_scans_python_repr_tool_messages() {
+        let session: Arc<dyn Session> = Arc::new(AgentSession::new("s-3"));
+        session
+            .update_state(json!({"context": {"default_context_id": {"messages": [
+                {"role": "tool", "content": "{\"__handoff_to__\": \"json\"}"},
+                {"role": "tool", "content": "{'__handoff_to__': 'py', '__handoff_reason__': 'single', 'ok': True, 'note': None}"}
+            ]}}}))
+            .await
+            .unwrap();
+
+        let signal = extract_handoff_signal_from_session(&json!({"output": "plain"}), &session)
+            .await
+            .unwrap();
+        assert_eq!(signal.target, "py", "the newest tool message wins");
+        assert_eq!(signal.reason.as_deref(), Some("single"));
+    }
+
+    #[tokio::test]
+    async fn session_skips_unparseable_content_and_keeps_scanning() {
+        let session: Arc<dyn Session> = Arc::new(AgentSession::new("s-4"));
+        session
+            .update_state(json!({"context": {"default_context_id": {"messages": [
+                {"role": "tool", "content": "{'__handoff_to__': 'older', '__handoff_reason__': 'py'}"},
+                {"role": "tool", "content": "{'unterminated"},
+                {"role": "tool", "content": "not a literal either"}
+            ]}}}))
+            .await
+            .unwrap();
+
+        let signal = extract_handoff_signal_from_session(&json!({}), &session)
+            .await
+            .unwrap();
+        assert_eq!(signal.target, "older");
+        assert_eq!(signal.reason.as_deref(), Some("py"));
     }
 
     #[tokio::test]
