@@ -48,6 +48,23 @@ impl TeamMemory {
     pub fn in_memory() -> Self {
         Self::new(Arc::new(InMemoryTeamMemoryStore::new()))
     }
+    /// Opens a SQLite-backed team memory at `path` (feature `sqlite`).
+    ///
+    /// The parent directory is created when needed and the schema is applied, so the path
+    /// may point at a directory that does not exist yet; reopening the same path keeps the
+    /// committed records.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's construction error: [`Error::Memory`] when the parent
+    /// directory cannot be created and [`Error::External`] when the database cannot be
+    /// opened or the schema cannot be applied.
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Ok(Self::new(Arc::new(
+            crate::team::sqlite::SqliteTeamMemoryStore::open(path).await?,
+        )))
+    }
     /// Sets the importance used when an input does not carry one.
     ///
     /// The value is clamped into `0.0..=1.0`; a non-finite value keeps
