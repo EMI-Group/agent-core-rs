@@ -102,7 +102,6 @@ Panics are isolated with `FutureExt::catch_unwind` and recorded as `Failed`; `jo
 ## Notes for Agents
 
 - Import errors from `openjiuwen_common::error::{Error, Result}`; `use openjiuwen_common::error::ResultExt;` enables `.context("...")` on any `E: Into<Error>` result.
-- `lib.rs` does not re-export `Error`/`Result` at the crate root, and there is no `Internal`/`Serialization` variant or numeric `code()` — `serde_json`/`url` parse failures map to `Validation` and generic causes go to `External`.
 - `src` never logs with `println!`; use `openjiuwen_common::logging::{info, warn, error, debug, trace}` re-exported from `tracing`, and pick a target from `logging::targets`.
 - Tokio task-locals are not inherited by `tokio::spawn`; propagate a `LogScope` with `Arc<LogScope>::instrument(fut)` (or `with_scope`) around the spawned future.
 - `LogEvent::redacted(Some(fields))` replaces `DEFAULT_SENSITIVE_FIELDS`; pass `None` for the Python default list.
