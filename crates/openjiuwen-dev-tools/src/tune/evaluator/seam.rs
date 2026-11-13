@@ -1,5 +1,11 @@
 //! The evaluator seam: compose a runner and a scorer into `EvaluatedCase`s.
+//!
+//! Every evaluation has a traced form: [`CaseEvaluator::evaluate_traced`] also
+//! returns the [`ToolTrace`] behind the answer, and
+//! [`CaseEvaluator::score_cases_traced`] keeps the per-case traces.
+//! [`tool_usage`] aggregates those traces into per-tool call counts.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -8,6 +14,7 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::llm::Model;
 
 use crate::tune::base::{Case, EvaluatedCase};
+use crate::tune::tool::{ToolStubs, ToolTrace};
 
 use super::runner::ModelPromptRunner;
 use super::scorer::LabelScorer;
@@ -23,6 +30,23 @@ pub trait CaseEvaluator: Send + Sync {
     /// Propagates the runner's error and any score that cannot be represented
     /// as an [`EvaluatedCase`].
     async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase>;
+
+    /// Evaluates `prompt` on `case` and reports the tool calls behind the
+    /// answer.
+    ///
+    /// The default evaluates normally and reports an empty trace; an evaluator
+    /// over a tool-aware runner overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`evaluate`](Self::evaluate) returns.
+    async fn evaluate_traced(
+        &self,
+        prompt: &str,
+        case: &Case,
+    ) -> Result<(EvaluatedCase, ToolTrace)> {
+        Ok((self.evaluate(prompt, case).await?, ToolTrace::default()))
+    }
 
     /// Evaluates `prompt` on every case and returns the mean score plus the
     /// per-case results.
@@ -43,6 +67,45 @@ pub trait CaseEvaluator: Send + Sync {
         let total: f64 = evaluated.iter().map(|case| case.score).sum();
         Ok((total / evaluated.len() as f64, evaluated))
     }
+
+    /// Like [`score_cases`](Self::score_cases) but keeps each case's tool trace.
+    ///
+    /// An empty `cases` slice yields `(0.0, vec![])`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`evaluate_traced`](Self::evaluate_traced) failure.
+    async fn score_cases_traced(
+        &self,
+        prompt: &str,
+        cases: &[Case],
+    ) -> Result<(f64, Vec<(EvaluatedCase, ToolTrace)>)> {
+        if cases.is_empty() {
+            return Ok((0.0, Vec::new()));
+        }
+        let mut evaluated = Vec::with_capacity(cases.len());
+        for case in cases {
+            evaluated.push(self.evaluate_traced(prompt, case).await?);
+        }
+        let total: f64 = evaluated.iter().map(|(case, _)| case.score).sum();
+        Ok((total / evaluated.len() as f64, evaluated))
+    }
+}
+
+/// Merges the tool-usage counts of every traced result.
+///
+/// Each trace's [`usage`](ToolTrace::usage) counts by tool name and the counts
+/// are summed, so the result answers "how often did the agent call each tool
+/// over this run".
+#[must_use]
+pub fn tool_usage(results: &[(EvaluatedCase, ToolTrace)]) -> BTreeMap<String, usize> {
+    let mut usage = BTreeMap::new();
+    for (_, trace) in results {
+        for (name, count) in trace.usage() {
+            *usage.entry(name).or_insert(0) += count;
+        }
+    }
+    usage
 }
 
 /// A [`CaseEvaluator`] composing any [`PromptRunner`] with any [`CaseScorer`].
@@ -96,9 +159,23 @@ impl fmt::Debug for RunnerEvaluator {
 #[async_trait]
 impl CaseEvaluator for RunnerEvaluator {
     async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase> {
-        let answer = self.runner.run(prompt, case).await?;
-        let (score, reason) = self.scorer.score(case, &answer);
-        EvaluatedCase::new(case.clone(), answer, sanitize_score(score), reason)
+        self.evaluate_traced(prompt, case)
+            .await
+            .map(|(evaluated, _)| evaluated)
+    }
+
+    async fn evaluate_traced(
+        &self,
+        prompt: &str,
+        case: &Case,
+    ) -> Result<(EvaluatedCase, ToolTrace)> {
+        let outcome = self.runner.run_traced(prompt, case).await?;
+        let (score, reason) = self
+            .scorer
+            .score_with_trace(case, &outcome.answer, &outcome.trace);
+        let evaluated =
+            EvaluatedCase::new(case.clone(), outcome.answer, sanitize_score(score), reason)?;
+        Ok((evaluated, outcome.trace))
     }
 }
 
@@ -130,6 +207,15 @@ impl ModelEvaluator {
         }
     }
 
+    /// Creates an evaluator over `model` that executes the case's tools through
+    /// `stubs`.
+    #[must_use]
+    pub fn with_stubs(model: Arc<dyn Model>, stubs: ToolStubs) -> Self {
+        Self {
+            inner: RunnerEvaluator::new(Arc::new(ModelPromptRunner::new(model).with_stubs(stubs))),
+        }
+    }
+
     /// Replaces the scorer.
     #[must_use]
     pub fn with_scorer(mut self, scorer: Arc<dyn CaseScorer>) -> Self {
@@ -157,5 +243,13 @@ impl fmt::Debug for ModelEvaluator {
 impl CaseEvaluator for ModelEvaluator {
     async fn evaluate(&self, prompt: &str, case: &Case) -> Result<EvaluatedCase> {
         self.inner.evaluate(prompt, case).await
+    }
+
+    async fn evaluate_traced(
+        &self,
+        prompt: &str,
+        case: &Case,
+    ) -> Result<(EvaluatedCase, ToolTrace)> {
+        self.inner.evaluate_traced(prompt, case).await
     }
 }

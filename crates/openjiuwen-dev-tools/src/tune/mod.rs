@@ -68,9 +68,9 @@ mod tool;
 
 pub use base::{Case, EvaluatedCase};
 pub use evaluator::{
-    render_case_inputs, CaseEvaluator, CaseScorer, DeterministicEvaluator, DeterministicScore,
-    LabelScorer, ModelEvaluator, ModelPromptRunner, PromptCall, PromptRunner, RunnerEvaluator,
-    ScriptedPromptRunner,
+    render_case_inputs, tool_usage, CaseEvaluator, CaseScorer, DeterministicEvaluator,
+    DeterministicScore, LabelScorer, ModelEvaluator, ModelPromptRunner, PromptCall, PromptRunner,
+    RunnerEvaluator, ScriptedPromptRunner, ToolUsageScorer, DEFAULT_MAX_TOOL_ROUNDS,
 };
 pub use loader::CaseLoader;
 pub use optimizer::{
