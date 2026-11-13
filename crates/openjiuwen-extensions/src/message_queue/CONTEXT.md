@@ -53,10 +53,14 @@ pub mod pulsar {
     impl PulsarMessageQueue {
         pub fn new(config: PulsarConfig) -> Result<Self>;                       // validates max_workers > 0
     }
-    // Module-level functions (Python's provider entry points).
-    pub async fn connect(config: PulsarConfig) -> Result<Arc<dyn MessageQueue>>; // Error::Unsupported
+    /// The one deferral text: names `pulsar`, the protobuf-framed
+    /// `pulsar-client` protocol + missing `prost`/`tonic` codegen, the absent
+    /// broker, and the in-process alternative.
+    pub const PULSAR_DEFERRED_REASON: &str;
+    // Module-level functions (Python's provider entry points): validate, then defer.
+    pub async fn connect(config: PulsarConfig) -> Result<Arc<dyn MessageQueue>>; // Error::Unsupported(PULSAR_DEFERRED_REASON)
     pub async fn start_with_retry(config: PulsarConfig, max_retries: u32, retry_delay: Duration)
-        -> Result<Arc<dyn MessageQueue>>;                                        // Error::Unsupported
+        -> Result<Arc<dyn MessageQueue>>;                                        // Error::Unsupported(PULSAR_DEFERRED_REASON)
 }
 ```
 
@@ -66,12 +70,12 @@ pub mod pulsar {
 - The bridge keeps the kernel request/reply contract: `publish_json` returns once enqueued, `request_json` returns the handler's JSON response, handler errors propagate unchanged, and timeouts surface as `Error::Timeout` from the kernel.
 - `topic_stream` installs a handler that forwards each delivery into a bounded `mpsc` channel (backpressure by capacity) and yields it as a `BoxStream`; a `QueueMessage` with `error_code != SUCCESS` becomes `Error::Transport(error_msg)` on the stream.
 - Pulsar surface preserves Python names/constants: `PulsarConfig{url, max_workers}`, `MAX_PRODUCERS = 10_000`, `DEFAULT_SUBSCRIPTION_NAME = "default"`, `DEFAULT_MAX_RETRIES = 3`, `DEFAULT_RETRY_DELAY_SECS = 1.0`, `WireVersion` (`V1` default) and `KeyEncoding` (`Literal` default).
-- Deferral message: `Error::Unsupported` naming `pulsar` and the in-process alternative; no silent fallback to the in-memory queue (Python's `fallback_to_fake` is documented, not ported).
+- Deferral message: `Error::Unsupported(PULSAR_DEFERRED_REASON)` naming `pulsar`, the missing transport (protobuf-framed `pulsar-client` protocol on `pulsar://` 6650 / `pulsar+ssl://` 6651 plus an HTTP admin API, no `prost`/`tonic` codegen offline, no test broker) and the in-process alternative (`openjiuwen_runner::mq::InMemoryMessageQueue`, i.e. `create_queue(&QueueConfig::in_memory())`); no silent fallback to the in-memory queue (Python's `fallback_to_fake` is documented, not ported), no retry/sleep, and `PulsarMessageQueue` is an introspection handle with no `start`/`send`/`subscribe`.
 
 ## Constraints
 
 - The in-memory queue is always the kernel implementation — this crate adds no transport.
-- No broker client dependency; the `pulsar` feature is API-only.
+- No broker client dependency; the `pulsar` feature is API-only — `pulsar.rs` compiles no transport, and `PULSAR_DEFERRED_REASON` is the single deferral text for both its entry points (the `create_queue` factory in `mod.rs` keeps its own shorter `PULSAR_DEFERRED`).
 - The bridge never holds a lock across `.await`; topics are created via `add_handler`/`subscribe`.
 - `topic_stream` keeps its synchronous signature: it spawns the `add_handler` registration on the current tokio runtime and the stream yields a registration failure as its first (and only) item, so it must be called inside a runtime.
 - Errors: `Error::Config`/`Error::Validation` (config), `Error::Unsupported` (deferred backend), otherwise the kernel's error unchanged.
@@ -80,7 +84,7 @@ pub mod pulsar {
 ## Test Strategy
 
 - Unit tests beside `mod.rs`/`bridge.rs`: `QueueConfig::in_memory` builds a started queue, publish/request round-trips JSON, handler errors propagate, `topic_stream` yields published payloads in order and maps error codes, `pulsar` config → `ErrorKind::Unsupported`.
-- `pulsar` tests: `PulsarConfig` validation, `connect`/`start_with_retry` returning `Unsupported`, wire enums defaulting to V1/Literal.
+- `pulsar` tests: `PulsarConfig` defaults/serde round-trip and unknown-field tolerance, `connect`/`start_with_retry` returning `ErrorKind::Unsupported` with exactly `PULSAR_DEFERRED_REASON` (substrings: `pulsar`, `in-process`, `protobuf`, `pulsar-client`/`broker`, `InMemoryMessageQueue`, `QueueConfig::in_memory()`, ports 6650/6651, `admin API`, `prost`), and config validation winning over the deferral (`max_workers = 0` → `ErrorKind::Validation`); the Pulsar wire enums (`WireVersion` V1 / `KeyEncoding` Literal defaults) are covered by `mod.rs` tests.
 - Python counterparts named in comments: `tests/unit_tests/extensions/message_queue/test_start_with_retry.py`, `test_wire_formats.py`, `test_unsubscribe_all.py`.
 
 ## Routing Table
