@@ -750,6 +750,9 @@ pub fn standard_reasoning_capability(protocol: ReasoningProtocol) -> ReasoningCa
     ReasoningCapability::standard(protocol)
 }
 #[cfg(test)]
+#[path = "profiles_parity_tests.rs"]
+mod parity_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
