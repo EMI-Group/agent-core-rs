@@ -40,7 +40,13 @@ pub mod client;
 pub mod store;
 
 #[cfg(test)]
+mod refresh_tests;
+#[cfg(test)]
+mod support;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod token_tests;
 
 pub use client::{OpenAiOAuthClient, DEFAULT_CLIENT_ID, DEFAULT_ISSUER, DEVICE_CALLBACK_PATH};
 pub use store::{

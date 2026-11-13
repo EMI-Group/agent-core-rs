@@ -1,4 +1,4 @@
-//! Tests for the `OpenAI` account OAuth transport and its credential store.
+//! Transport tests for the `OpenAI` account OAuth client and its credential store.
 //!
 //! Every HTTP test talks to a [`MockServer`] on loopback and every file test uses
 //! a [`tempfile`] directory, so the suite needs no network, no credential, and
@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{TimeDelta, Utc};
 use openjiuwen_common::config::env;
 use openjiuwen_common::error::ErrorKind;
-use openjiuwen_common::security::{SecretString, REDACTED};
+use openjiuwen_common::security::REDACTED;
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, body_string, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -22,31 +22,10 @@ use super::store::{
     DeviceCode, FileTokenStore, InMemoryTokenStore, OAuthToken, TokenStore, AUTH_FILE_ENV,
     AUTH_MODE, DEFAULT_BASE_URL, REFRESH_SKEW,
 };
-
-/// Client id every test configures: a literal proves the configured value wins
-/// over the built-in default.
-const CLIENT_ID: &str = "test-client-id";
+use super::support::{expiry_in, jwt, oauth_client, secret, CLIENT_ID};
 
 /// The redirect URI the device flow reports to the token endpoint.
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
-
-/// Builds a client pointed at the mock server's root.
-fn oauth_client(server: &MockServer) -> OpenAiOAuthClient {
-    OpenAiOAuthClient::new()
-        .expect("the test client builds")
-        .with_base_url(server.uri())
-        .with_client_id(CLIENT_ID)
-}
-
-/// Returns an expiry `seconds` from now, truncated to whole seconds.
-fn expiry_in(seconds: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(Utc::now().timestamp() + seconds, 0).expect("an in-range timestamp")
-}
-
-/// Reads a secret option back as plain text.
-fn secret(value: Option<&SecretString>) -> Option<&str> {
-    value.map(SecretString::expose_secret)
-}
 
 /// Encodes a form body the same way the client does, for exact assertions.
 fn form(fields: &[(&str, &str)]) -> String {
@@ -85,6 +64,32 @@ async fn request_device_code_posts_the_client_id_and_parses_the_response() {
     assert_eq!(device.device_auth_id, "device-1");
     assert_eq!(device.interval, 3);
     assert_eq!(device.expires_in, 600);
+}
+
+#[tokio::test]
+async fn request_device_code_raises_a_short_advertised_interval_to_three() {
+    // ports `max(3, interval)` from request_openai_account_device_code.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/deviceauth/usercode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "user_code": "ABCD-EFGH",
+            "device_auth_id": "device-1",
+            "interval": 1,
+            "expires_in": 600
+        })))
+        .mount(&server)
+        .await;
+
+    let device = oauth_client(&server)
+        .request_device_code()
+        .await
+        .expect("the device code");
+
+    assert_eq!(
+        device.interval, 3,
+        "the endpoint is never polled faster than every three seconds"
+    );
 }
 
 #[tokio::test]
@@ -323,6 +328,17 @@ async fn refresh_rotates_the_refresh_token() {
         Some("rotated-refresh")
     );
     assert!(refreshed.expires_at.expect("expiry") > Utc::now());
+
+    // The grant form carries exactly three parameters: no `scope`, no
+    // `redirect_uri` (Python parity: refresh_openai_account_oauth).
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the recorded requests");
+    let body = String::from_utf8_lossy(&requests.first().expect("the refresh request").body);
+    assert!(!body.contains("scope="), "body: {body}");
+    assert!(!body.contains("redirect_uri="), "body: {body}");
+    assert_eq!(body.matches('=').count(), 3, "body: {body}");
 }
 
 #[tokio::test]
@@ -502,6 +518,65 @@ async fn access_token_without_a_refresh_token_reports_relogin() {
         error.to_string().contains("refresh token"),
         "message: {error}"
     );
+}
+
+#[tokio::test]
+async fn access_token_never_refreshes_a_token_without_a_resolvable_expiry() {
+    let server = MockServer::start().await;
+    let store = InMemoryTokenStore::new();
+    // A token whose expiry nothing can resolve: no recorded `expires_at`, and an
+    // access token that is not a JWT.
+    store
+        .save(&OAuthToken::new("opaque-access").with_refresh_token("old-refresh"))
+        .await
+        .expect("the stored token");
+
+    let token = oauth_client(&server)
+        .access_token(&store, false)
+        .await
+        .expect("the usable token");
+
+    assert_eq!(token.access_token.expose_secret(), "opaque-access");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the recorded requests")
+            .is_empty(),
+        "an unresolvable expiry never triggers a refresh"
+    );
+}
+
+#[tokio::test]
+async fn access_token_refreshes_a_token_whose_jwt_claim_has_passed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("refresh_token=old-refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "fresh-access",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let expired_claim = Utc::now().timestamp() - 60;
+    let store = InMemoryTokenStore::new();
+    store
+        .save(
+            &OAuthToken::new(jwt(json!({ "exp": expired_claim })))
+                .with_refresh_token("old-refresh"),
+        )
+        .await
+        .expect("the stored token");
+
+    let token = oauth_client(&server)
+        .access_token(&store, false)
+        .await
+        .expect("the refreshed token");
+
+    assert_eq!(token.access_token.expose_secret(), "fresh-access");
 }
 
 // --- file-backed store ------------------------------------------------------
@@ -716,158 +791,5 @@ fn default_path_follows_the_environment() {
     assert!(
         error.to_string().contains(AUTH_FILE_ENV),
         "the message names the override: {error}"
-    );
-}
-
-// --- token serialization ----------------------------------------------------
-
-#[test]
-fn token_deserializes_expires_in_into_an_expiry() {
-    let token: OAuthToken = serde_json::from_value(json!({
-        "access_token": "access-1",
-        "refresh_token": "refresh-1",
-        "id_token": "id-1",
-        "token_type": "Bearer",
-        "scope": "openid",
-        "expires_in": 3600,
-        "unknown_field": { "ignored": true }
-    }))
-    .expect("the token payload");
-
-    assert_eq!(token.access_token.expose_secret(), "access-1");
-    assert_eq!(secret(token.refresh_token.as_ref()), Some("refresh-1"));
-    assert_eq!(secret(token.id_token.as_ref()), Some("id-1"));
-    assert_eq!(token.scope.as_deref(), Some("openid"));
-    let remaining = token
-        .expires_at
-        .expect("the payload carries a lifetime")
-        .signed_duration_since(Utc::now());
-    assert!(remaining > TimeDelta::try_seconds(3_500).expect("a duration"));
-    assert!(remaining <= TimeDelta::try_seconds(3_600).expect("a duration"));
-    assert!(!token.is_expired(REFRESH_SKEW));
-}
-
-#[test]
-fn token_accepts_epoch_and_rfc3339_expiries() {
-    let epoch: OAuthToken =
-        serde_json::from_value(json!({ "access_token": "a", "expires_at": 1_900_000_000 }))
-            .expect("an epoch expiry");
-    assert_eq!(epoch.expires_at, DateTime::from_timestamp(1_900_000_000, 0));
-
-    let rfc3339: OAuthToken = serde_json::from_value(
-        json!({ "access_token": "a", "expires_at": "2030-01-01T00:00:00Z" }),
-    )
-    .expect("an RFC 3339 expiry");
-    assert_eq!(
-        rfc3339.expires_at,
-        DateTime::from_timestamp(1_893_456_000, 0)
-    );
-
-    let stringy: OAuthToken =
-        serde_json::from_value(json!({ "access_token": "a", "expires_in": "1800" }))
-            .expect("a numeric string lifetime");
-    let remaining = stringy
-        .expires_at
-        .expect("the lifetime is honoured")
-        .signed_duration_since(Utc::now());
-    assert!(remaining > TimeDelta::try_seconds(1_700).expect("a duration"));
-}
-
-#[test]
-fn token_serializes_the_canonical_fields() {
-    let token = OAuthToken::new("access-1")
-        .with_refresh_token("refresh-1")
-        .with_scope("openid")
-        .with_expires_at(DateTime::from_timestamp(1_900_000_000, 0).expect("a timestamp"));
-
-    let value = serde_json::to_value(&token).expect("the serialized token");
-    assert_eq!(
-        value,
-        json!({
-            "access_token": "access-1",
-            "refresh_token": "refresh-1",
-            "expires_at": 1_900_000_000,
-            "token_type": "Bearer",
-            "scope": "openid"
-        })
-    );
-
-    let minimal = serde_json::to_value(OAuthToken::new("access-2")).expect("the serialized token");
-    assert_eq!(
-        minimal,
-        json!({ "access_token": "access-2", "token_type": "Bearer" })
-    );
-}
-
-#[test]
-fn token_round_trips_through_json() {
-    let original = OAuthToken::new("access-1")
-        .with_refresh_token("refresh-1")
-        .with_id_token("id-1")
-        .with_expires_at(expiry_in(3600));
-
-    let restored: OAuthToken =
-        serde_json::from_value(serde_json::to_value(&original).expect("the serialized token"))
-            .expect("the deserialized token");
-
-    assert_eq!(restored.access_token, original.access_token);
-    assert_eq!(restored.refresh_token, original.refresh_token);
-    assert_eq!(restored.id_token, original.id_token);
-    assert_eq!(restored.expires_at, original.expires_at);
-    assert_eq!(restored.token_type, original.token_type);
-    assert_eq!(restored.scope, original.scope);
-}
-
-#[test]
-fn token_without_an_expiry_is_never_expired() {
-    let token = OAuthToken::new("access-1");
-    assert!(token.expires_at.is_none());
-    assert!(!token.is_expired(Duration::ZERO));
-    assert!(!token.is_expired(Duration::from_secs(86_400)));
-
-    let expired = OAuthToken::new("access-1").with_expires_at(expiry_in(-10));
-    assert!(expired.is_expired(Duration::ZERO));
-
-    let within_skew = OAuthToken::new("access-1").with_expires_at(expiry_in(60));
-    assert!(within_skew.is_expired(REFRESH_SKEW));
-    assert!(!within_skew.is_expired(Duration::from_secs(10)));
-}
-
-#[test]
-fn token_debug_redacts_every_secret() {
-    let token = OAuthToken::new("super-secret-access")
-        .with_refresh_token("super-secret-refresh")
-        .with_id_token("super-secret-id");
-
-    let rendered = format!("{token:?}");
-    assert!(rendered.contains("OAuthToken"), "rendered: {rendered}");
-    assert!(rendered.contains(REDACTED), "rendered: {rendered}");
-    assert!(!rendered.contains("super-secret"), "rendered: {rendered}");
-    assert!(
-        !format!("{:?}", token.refresh_token).contains("super-secret-refresh"),
-        "a nested option is redacted too"
-    );
-}
-
-#[test]
-fn device_code_is_tolerant_of_missing_and_string_fields() {
-    let minimal: DeviceCode =
-        serde_json::from_value(json!({ "user_code": "ABCD", "device_auth_id": "device-1" }))
-            .expect("the minimal device code");
-    assert_eq!(minimal.interval, 5);
-    assert_eq!(minimal.expires_in, 0);
-
-    let stringy: DeviceCode = serde_json::from_value(json!({
-        "user_code": "ABCD",
-        "device_auth_id": "device-1",
-        "interval": "10",
-        "expires_in": "600"
-    }))
-    .expect("the tolerant device code");
-    assert_eq!(
-        stringy,
-        DeviceCode::new("ABCD", "device-1")
-            .with_interval(10)
-            .with_expires_in(600)
     );
 }
