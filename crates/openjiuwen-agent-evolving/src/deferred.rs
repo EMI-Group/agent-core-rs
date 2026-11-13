@@ -1,11 +1,13 @@
 //! The machine-readable counterpart of the crate's "Deferred Scope" table.
 //!
-//! Python `openjiuwen.agent_evolving` is a large area whose trainer, evaluator and
-//! optimizer packages (plus the online-RL service) depend on a Python ML stack
-//! (`torch`, `transformers`, `verl`, `ray`, Redis, vLLM). This crate ports the
-//! portable, offline core and turns every deferred path into an explicit
-//! [`openjiuwen_common::error::Error::Unsupported`] carrying the same list the
-//! documentation and tests use:
+//! Almost the whole Python `openjiuwen.agent_evolving` area is ported as offline,
+//! deterministic Rust. What remains deferred is the part that genuinely needs a
+//! Python ML stack (`torch`, `transformers`, `verl`, `ray`), a distributed service
+//! (Redis, vLLM), a vendor HTTP service with authentication, or a remote hub.
+//!
+//! This module names those areas and builds the explicit
+//! [`openjiuwen_common::error::Error::Unsupported`] each deferred path returns,
+//! carrying the same list the documentation and tests use:
 //!
 //! ```
 //! use openjiuwen_agent_evolving::deferred::{deferred_features, unsupported};
@@ -15,8 +17,8 @@
 //!     .iter()
 //!     .any(|feature| feature.area.contains("RL trainer")));
 //! assert_eq!(
-//!     unsupported("reward").to_string(),
-//!     "unsupported: reward is deferred; see docs/PARITY.md"
+//!     unsupported("OfflineRlOptimizer::train").to_string(),
+//!     "unsupported: OfflineRlOptimizer::train is deferred; see docs/PARITY.md"
 //! );
 //! ```
 use serde::{Deserialize, Serialize};
@@ -87,32 +89,28 @@ pub const DEFERRED_FEATURES: &[DeferredFeature] = &[
         reason: "needs Redis task queues, vLLM/verl executors and gateway integration",
     },
     DeferredFeature {
-        area: "LLM-as-judge / default model evaluator",
-        reason: "requires a live model and is non-deterministic",
-    },
-    DeferredFeature {
-        area: "prompt/textual-gradient optimizers",
-        reason: "research code tied to Python LLM flows",
-    },
-    DeferredFeature {
-        area: "evaluator_pipeline",
-        reason: "external Docker + git harness protocol",
-    },
-    DeferredFeature {
-        area: "reward, attribution, experience, sharing, signal, trajectory and ttse subsystems",
-        reason: "large, near-leaf subsystems with vendor/browser dependencies",
-    },
-    DeferredFeature {
-        area: "evolution prompt/tool asset packages",
-        reason: "LLM-flow prompt text and the evolution toolset are not ported",
-    },
-    DeferredFeature {
         area: "agent_rl proxy/judge/verification gateway",
         reason: "vendor HTTP services and authentication",
     },
     DeferredFeature {
         area: "RL YAML configuration ecosystem",
         reason: "Python training-stack configuration (verl/ray configs)",
+    },
+    DeferredFeature {
+        area: "vendor reward checks (browser/PIL/evidence agent)",
+        reason: "container browser sessions, image analysis and the evidence agent model flow",
+    },
+    DeferredFeature {
+        area: "remote sharing hub client",
+        reason: "remote hub transport and authentication; local-file and memory backends are ported",
+    },
+    DeferredFeature {
+        area: "LLM experience draft pipeline",
+        reason: "live model drafting and the online orchestrator; deterministic extraction is ported",
+    },
+    DeferredFeature {
+        area: "TTSE embedding retrieval and LLM dreaming",
+        reason: "embedding provider, vector index and model merge passes; deterministic bank/consult are ported",
     },
     DeferredFeature {
         area: "full Python agent_evolving unit suite",
@@ -128,8 +126,8 @@ pub fn deferred_features() -> &'static [DeferredFeature] {
 
 /// Builds the error a deferred code path returns.
 ///
-/// `area` names the missing capability (for example `"reward"` or
-/// `"OfflineRlOptimizer::train"`); the message always points at `docs/PARITY.md`.
+/// `area` names the missing capability (for example `"OfflineRlOptimizer::train"`);
+/// the message always points at `docs/PARITY.md`.
 pub fn unsupported(area: &str) -> Error {
     Error::unsupported(format!("{area} is deferred; see docs/PARITY.md"))
 }
@@ -141,12 +139,28 @@ mod tests {
     #[test]
     fn table_covers_every_documented_area() {
         let areas: Vec<&str> = deferred_features().iter().map(|f| f.area).collect();
-        assert_eq!(areas.len(), 10);
+        assert_eq!(areas.len(), 9);
         assert!(areas.contains(&"RL trainer (PPO/verl/ray)"));
         assert!(areas.contains(&"online RL service state machine"));
-        assert!(areas.contains(&"evaluator_pipeline"));
+        assert!(areas.contains(&"remote sharing hub client"));
         assert!(areas.contains(&"RL YAML configuration ecosystem"));
         assert!(areas.contains(&"full Python agent_evolving unit suite"));
+    }
+
+    #[test]
+    fn implemented_subsystems_are_no_longer_deferred() {
+        let areas: Vec<&str> = deferred_features().iter().map(|f| f.area).collect();
+        for legacy in [
+            "LLM-as-judge / default model evaluator",
+            "prompt/textual-gradient optimizers",
+            "evaluator_pipeline",
+            "reward, attribution, experience, sharing, signal, trajectory and ttse subsystems",
+        ] {
+            assert!(
+                !areas.contains(&legacy),
+                "{legacy} is implemented and must not be listed as deferred"
+            );
+        }
     }
 
     #[test]
@@ -159,12 +173,15 @@ mod tests {
 
     #[test]
     fn unsupported_names_the_area_and_the_doc_pointer() {
-        let error = unsupported("reward");
+        let error = unsupported("OfflineRlOptimizer::train");
         assert_eq!(
             error.kind(),
             openjiuwen_common::error::ErrorKind::Unsupported
         );
-        assert_eq!(error.message(), "reward is deferred; see docs/PARITY.md");
+        assert_eq!(
+            error.message(),
+            "OfflineRlOptimizer::train is deferred; see docs/PARITY.md"
+        );
     }
 
     #[test]
@@ -177,11 +194,11 @@ mod tests {
     #[test]
     fn deserialization_resolves_the_canonical_entry() {
         let decoded: DeferredFeature = serde_json::from_str(
-            r#"{"area":"evaluator_pipeline","reason":"ignored","unknown_field":true}"#,
+            r#"{"area":"remote sharing hub client","reason":"ignored","unknown_field":true}"#,
         )
         .expect("deserialize");
-        assert_eq!(decoded.area, "evaluator_pipeline");
-        assert_eq!(decoded.reason, "external Docker + git harness protocol");
+        assert_eq!(decoded.area, "remote sharing hub client");
+        assert!(decoded.reason.contains("local-file and memory backends"));
     }
 
     #[test]
