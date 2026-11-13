@@ -187,7 +187,8 @@ The mutation bank is an ordered, marker-identified list (step-by-step reasoning,
 - `./optimizer/instruction.rs` → `InstructionOptimizer` beam search
 - `./optimizer/example.rs` → `ExampleOptimizer`, `render_examples`, `format_prompt`
 - `./optimizer/joint.rs` → `JointOptimizer` alternating ascent
-- `./optimizer/search/` → `PromptSearchOptimizer`'s bounded multi-round loop (no directory `CONTEXT.md`; see the per-file entries below)
+- `./optimizer/search/` → `PromptSearchOptimizer`'s bounded multi-round loop (`optimizer/search/CONTEXT.md`)
+- `./optimizer/search/CONTEXT.md` → loop intent, round mechanics, adaptations, test strategy
 - `./optimizer/search/mod.rs` → the loop: builders, `run_id`, `optimize`/`optimize_task`, prepare/round/scoring/stopping/persistence
 - `./optimizer/search/execute.rs` → per-candidate and batched execution, drift scores, warm start, policy context, observations/metrics/metadata
 - `./optimizer/search/tests.rs` → the prompt-search loop test suite
