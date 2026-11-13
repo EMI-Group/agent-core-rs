@@ -29,10 +29,19 @@
 //! I/O; only the drift judge keeps an asynchronous seam because it may call a
 //! model.
 //!
-//! Not ported (see the crate `CONTEXT.md`): the policy, environment, optimizer
-//! loop, run log, and service modules; Python's LLM-backed history buckets,
-//! embedding-backed memory, and LLM correctness judge. A model answer never
-//! fails a run: an unusable answer degrades to a documented deterministic value.
+//! This node supplies the vocabulary — models, rewards, convergence, drift,
+//! memory, and history — that the bounded optimization loop in
+//! `crate::tune::optimizer::search` drives.
+//! Still unported from Python (see the crate `CONTEXT.md`): `policy.py` (LLM
+//! multi-candidate generation), `environment.py` (LLM/callable environments),
+//! `run_log.py` (the JSONL run logger), and `service.py`, because candidate
+//! generation here is the deterministic mutation bank plus one model rewrite per
+//! round, candidates execute through the caller's `CaseEvaluator`, and there is
+//! no run-log sink.
+//! Python's LLM-backed history buckets, embedding-backed memory, and LLM
+//! correctness judge are likewise replaced by deterministic equivalents, and a
+//! model answer never fails a run: an unusable answer degrades to a documented
+//! deterministic value.
 //!
 //! # Example
 //!
