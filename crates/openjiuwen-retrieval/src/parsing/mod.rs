@@ -31,6 +31,7 @@
 
 pub mod docx;
 pub mod inflate;
+pub mod odt;
 pub mod pdf;
 pub mod xlsx;
 pub mod xml;
@@ -38,6 +39,7 @@ pub mod zip;
 
 pub use docx::{DocxBlock, DocxDocument, DocxParser, CORE_PROPERTIES_PART, DOCUMENT_PART};
 pub use inflate::{adler32, crc32, inflate, zlib_decompress, DEFAULT_MAX_OUTPUT_BYTES};
+pub use odt::{OdtDocument, OdtParser};
 pub use pdf::{PdfDocument, PdfParser, KERNING_SPACE_THRESHOLD};
 pub use xlsx::{
     SheetRef, XlsxParser, XlsxSheet, XlsxWorkbook, SHARED_STRINGS_PART, WORKBOOK_PART,
