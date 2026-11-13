@@ -32,6 +32,8 @@ reqwest = { workspace = true, optional = true }
 default = []
 sandbox = ["dep:reqwest"]
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
