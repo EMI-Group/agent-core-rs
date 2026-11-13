@@ -2215,9 +2215,11 @@ dependencies = [
  "openjiuwen-multiagent",
  "openjiuwen-security",
  "openjiuwen-session",
+ "openjiuwen-sysop",
  "openjiuwen-test-support",
  "openjiuwen-workflow",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2226,6 +2228,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
