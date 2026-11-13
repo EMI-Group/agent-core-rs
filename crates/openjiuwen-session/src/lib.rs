@@ -24,7 +24,13 @@
 //!   [`sessions::AgentTeamSession`]) and their construction factories
 //!   ([`sessions::create_workflow_session`],
 //!   [`sessions::create_agent_session`],
-//!   [`sessions::create_agent_team_session`]).
+//!   [`sessions::create_agent_team_session`]), plus the two wrapper sessions
+//!   ([`sessions::SubWorkflowSession`], [`sessions::RouterSession`]).
+//! - [`trace_hook`] — [`trace_hook::SwappableTraceSink`], the swappable sink a
+//!   session owns so [`session::Session::install_trace_sink`] can reroute
+//!   tracing after construction.
+//! - [`otel`] — the feature-gated [`otel::install_trace_sink`] helper (a
+//!   documented no-op unless the `otel` feature is on).
 //! - [`checkpoint`] — the [`checkpoint::Checkpointer`] contract, the
 //!   [`checkpoint::Checkpoint`] model, and the memory, file, and feature-gated
 //!   SQLite backends.
@@ -57,10 +63,12 @@ pub mod checkpoint;
 pub mod config;
 pub mod constants;
 pub mod interaction;
+pub mod otel;
 pub mod session;
 pub mod sessions;
 pub mod state;
 pub mod stream;
+pub mod trace_hook;
 pub mod tracer;
 
 #[cfg(feature = "sqlite")]
@@ -102,3 +110,9 @@ pub use tracer::{
     InvokeType, MemoryTraceSink, NoopTraceSink, SpanHandle, SpanStatus, StreamTraceSink,
     TraceFrame, TraceFrameType, TracePosition, TraceSink, TraceSpan, TraceSpanKind, Tracer,
 };
+
+// Wrapper sessions and the trace-sink hook (added with the `SubWorkflowSession`,
+// `RouterSession`, and per-session trace-sink work).
+pub use otel::install_trace_sink;
+pub use sessions::{RouterSession, SubWorkflowSession};
+pub use trace_hook::SwappableTraceSink;

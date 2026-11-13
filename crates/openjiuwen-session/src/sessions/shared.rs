@@ -26,6 +26,7 @@ use crate::interaction::{InteractionBroker, InteractionRequest, InteractionRespo
 use crate::session::{Session, SessionMetadata, SessionSnapshot, SessionType};
 use crate::state::{ensure_object, StateStore};
 use crate::stream::{StreamEvent, StreamHub, StreamItem, StreamWriterManager};
+use crate::trace_hook::SwappableTraceSink;
 use crate::tracer::{StreamTraceSink, TraceSink, Tracer};
 
 /// Everything a concrete session hands to [`SessionInner::new`].
@@ -61,7 +62,10 @@ pub(crate) struct SessionInner {
     pub(crate) config: Arc<RwLock<SessionConfig>>,
     pub(crate) state: Arc<dyn StateStore>,
     pub(crate) writers: Arc<StreamWriterManager>,
-    pub(crate) trace_sink: Arc<dyn TraceSink>,
+    /// The stable sink handle handed out by [`Session::trace`]; the tracer
+    /// holds the same wrapper, so [`SessionInner::install_trace_sink`] reroutes
+    /// every span without changing any reference already handed out.
+    pub(crate) trace_sink: Arc<SwappableTraceSink>,
     pub(crate) tracer: Tracer,
     pub(crate) interactions: Arc<InteractionBroker>,
     pub(crate) checkpointer: Option<Arc<dyn Checkpointer>>,
@@ -97,12 +101,12 @@ impl SessionInner {
             let hub = StreamHub::with_capacity(stream_capacity.unwrap_or(DEFAULT_STREAM_CAPACITY));
             StreamWriterManager::new(hub)
         });
-        let trace_sink =
-            sink.unwrap_or_else(|| Arc::new(StreamTraceSink::new(Arc::clone(&writers))));
+        let sink = sink.unwrap_or_else(|| Arc::new(StreamTraceSink::new(Arc::clone(&writers))));
+        let trace_sink = Arc::new(SwappableTraceSink::new(sink));
         let tracer = Tracer::with_sink(
             id.clone(),
             trace_id.unwrap_or_default(),
-            Arc::clone(&trace_sink),
+            Arc::clone(&trace_sink) as Arc<dyn TraceSink>,
         );
         let trace_id = tracer.trace_id().to_string();
         Arc::new(Self {
@@ -123,6 +127,15 @@ impl SessionInner {
             parent,
             metadata,
         })
+    }
+
+    /// Replaces the sink behind the stable `trace_sink` handle.
+    ///
+    /// The tracer keeps a handle to the same [`SwappableTraceSink`], so spans
+    /// started after this call route to `sink` and [`Session::trace`] reports
+    /// the new sink's position.
+    pub(crate) fn install_trace_sink(&self, sink: Arc<dyn TraceSink>) {
+        self.trace_sink.install(sink);
     }
 
     /// Derives the public metadata block from the inner fields.

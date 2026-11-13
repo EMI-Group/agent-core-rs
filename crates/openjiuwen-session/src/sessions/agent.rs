@@ -366,6 +366,11 @@ impl Session for AgentSession {
         self.inner.trace_sink.as_ref()
     }
 
+    fn install_trace_sink(&self, sink: Arc<dyn TraceSink>) -> Result<()> {
+        self.inner.install_trace_sink(sink);
+        Ok(())
+    }
+
     fn metadata(&self) -> SessionMetadata {
         self.inner.metadata()
     }
