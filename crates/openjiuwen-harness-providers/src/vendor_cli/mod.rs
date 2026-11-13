@@ -39,7 +39,7 @@ pub mod session;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub use binary::{is_available, resolve_binary, BinarySpec};
-pub use child::{ChildProcess, ChildProcessConfig};
+pub use child::{ChildProcess, ChildProcessConfig, LineWriter, StdinWriter};
 pub use driver::{
     completed_turn, failed_turn, interrupted_turn, turn_error, TurnContext, TurnRequest,
     VendorDriver, PROVIDER_SCHEMA_VERSION, TOOL_CALL_ITEM_TYPE,

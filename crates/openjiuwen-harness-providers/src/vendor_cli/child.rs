@@ -18,9 +18,11 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use openjiuwen_harness_protocol::{HarnessError, HarnessResult, JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use super::jsonl::{encode_line, snippet};
@@ -63,8 +65,9 @@ pub struct ChildProcessConfig<'a> {
 pub struct ChildProcess {
     /// The child handle; `kill_on_drop` guarantees it is reaped when the struct is dropped.
     child: Child,
-    /// stdin of the child; [`None`] once it has been closed or the pipe broke.
-    stdin: Option<ChildStdin>,
+    /// stdin of the child, shared with every [`StdinWriter`] the transport handed out; [`None`]
+    /// once it has been closed or the pipe broke.
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     /// Line-buffered stdout of the child.
     stdout: BufReader<ChildStdout>,
     /// Retained stderr lines, shared with the drain task.
@@ -124,7 +127,7 @@ impl ChildProcess {
         let stderr_task = tokio::spawn(drain_stderr(stderr, Arc::clone(&tail)));
         Ok(Self {
             child,
-            stdin,
+            stdin: Arc::new(AsyncMutex::new(stdin)),
             stdout: BufReader::new(stdout),
             stderr: tail,
             stderr_task: Some(stderr_task),
@@ -155,24 +158,19 @@ impl ChildProcess {
     /// `the {label} CLI exited before the message was written`, plus the stderr tail, when stdin
     /// was already closed or the write failed.
     pub async fn write_line(&mut self, line: &str) -> HarnessResult<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(self.exited_error());
-        };
-        let mut payload = String::with_capacity(line.len() + 1);
-        payload.push_str(line);
-        payload.push('\n');
-        let written = async {
-            stdin.write_all(payload.as_bytes()).await?;
-            stdin.flush().await
-        }
-        .await;
-        match written {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.stdin = None;
-                tracing::debug!(%error, label = %self.label, "failed to write to a vendor CLI");
-                Err(self.exited_error())
-            }
+        write_stdin(&self.stdin, &self.label, &self.stderr, line).await
+    }
+
+    /// Returns a cloneable writer onto the child's stdin.
+    ///
+    /// The handle lets a caller write one line while another task is blocked reading stdout — the
+    /// codex app-server needs that for `turn/steer` and `turn/interrupt` during an idle turn.
+    #[must_use]
+    pub fn writer(&self) -> StdinWriter {
+        StdinWriter {
+            stdin: Arc::clone(&self.stdin),
+            stderr: Arc::clone(&self.stderr),
+            label: self.label.clone(),
         }
     }
 
@@ -235,7 +233,7 @@ impl ChildProcess {
 
     /// Closes stdin, which signals `EOF` to a CLI that reads until end of file.
     pub async fn close_stdin(&mut self) {
-        if let Some(mut stdin) = self.stdin.take() {
+        if let Some(mut stdin) = self.stdin.lock().await.take() {
             // Flushing before the drop surfaces a broken pipe here instead of losing it silently.
             if let Err(error) = stdin.flush().await {
                 tracing::debug!(%error, label = %self.label, "failed to flush vendor CLI stdin");
@@ -249,7 +247,7 @@ impl ChildProcess {
             tracing::debug!(%error, label = %self.label, program = %self.program.display(), "failed to kill a vendor CLI");
         }
         let code = self.wait_bounded().await;
-        self.stdin = None;
+        self.stdin.lock().await.take();
         code
     }
 
@@ -298,13 +296,6 @@ impl ChildProcess {
     }
 
     /// Builds the "the CLI exited before the message was written" error, with the stderr tail.
-    fn exited_error(&self) -> HarnessError {
-        self.with_tail(format!(
-            "the {} CLI exited before the message was written",
-            self.label
-        ))
-    }
-
     /// Appends the retained stderr tail to `message` when the child produced any output.
     fn with_tail(&self, message: String) -> HarnessError {
         let tail = self.stderr_tail();
@@ -313,6 +304,99 @@ impl ChildProcess {
         } else {
             HarnessError::protocol(format!("{message}\n{tail}"))
         }
+    }
+}
+
+/// A cloneable writer onto one child's stdin.
+///
+/// Every clone writes through the same pipe under one mutex, so a harness can answer the peer or
+/// send a control request while its turn loop is parked on a read. Writes are flushed per line, so
+/// the peer sees each message as soon as it is sent.
+#[derive(Clone)]
+pub struct StdinWriter {
+    /// The shared stdin pipe; [`None`] once it has been closed or the pipe broke.
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
+    /// Retained stderr lines, appended to a write failure.
+    stderr: Arc<Mutex<StderrTail>>,
+    /// Label used in error messages.
+    label: String,
+}
+
+impl std::fmt::Debug for StdinWriter {
+    /// Formats the handle without its pipe.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdinWriter")
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl StdinWriter {
+    /// Writes `line` followed by a newline and flushes stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ChildProcess::write_line`].
+    pub async fn write_line(&self, line: &str) -> HarnessResult<()> {
+        write_stdin(&self.stdin, &self.label, &self.stderr, line).await
+    }
+}
+
+/// A line sink that stays writable while a read is pending on the same peer.
+#[async_trait]
+pub trait LineWriter: Send + Sync {
+    /// Writes `line` as one newline-terminated message and flushes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport's own error when the peer is gone.
+    async fn write_line(&self, line: &str) -> HarnessResult<()>;
+}
+
+#[async_trait]
+impl LineWriter for StdinWriter {
+    async fn write_line(&self, line: &str) -> HarnessResult<()> {
+        write_stdin(&self.stdin, &self.label, &self.stderr, line).await
+    }
+}
+
+/// Writes one flushed line onto `stdin`, reporting a closed pipe like the owning process does.
+async fn write_stdin(
+    stdin: &AsyncMutex<Option<ChildStdin>>,
+    label: &str,
+    stderr: &Mutex<StderrTail>,
+    line: &str,
+) -> HarnessResult<()> {
+    let mut payload = String::with_capacity(line.len() + 1);
+    payload.push_str(line);
+    payload.push('\n');
+    let mut guard = stdin.lock().await;
+    let Some(pipe) = guard.as_mut() else {
+        return Err(exited_error(label, stderr));
+    };
+    let written = async {
+        pipe.write_all(payload.as_bytes()).await?;
+        pipe.flush().await
+    }
+    .await;
+    match written {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            *guard = None;
+            tracing::debug!(%error, label = %label, "failed to write to a vendor CLI");
+            Err(exited_error(label, stderr))
+        }
+    }
+}
+
+/// Builds the "the peer exited before the message was written" error plus the stderr tail.
+fn exited_error(label: &str, stderr: &Mutex<StderrTail>) -> HarnessError {
+    let message = format!("the {label} CLI exited before the message was written");
+    let tail = lock(stderr).rendered().trim().to_owned();
+    if tail.is_empty() {
+        HarnessError::protocol(message)
+    } else {
+        HarnessError::protocol(format!("{message}\n{tail}"))
     }
 }
 

@@ -1,11 +1,44 @@
-//! The deferred Codex provider: card, configuration data and model mapping.
+//! The Codex provider: card, configuration data, model mapping and the app-server harness.
 //!
-//! Ports the data half of Python `openjiuwen.harness_providers.codex` (v0.1.20):
-//! [`CodexHarnessConfig`] mirrors `CodexHarnessConfig` in `config.py`, [`CodexModelConfig`]
-//! mirrors `CodexModelConfig`, and [`model_config`] mirrors the provider's `model_config`
-//! classmethod. The harness itself is not ported — the adapter needs the `codex` app-server and the
-//! `openai-codex` SDK, so [`HarnessProvider::create`] validates the mapping and then reports
-//! `HarnessError::UnsupportedCapability` with the SDK requirement.
+//! Ports Python `openjiuwen.harness_providers.codex` (v0.1.20): [`CodexHarnessConfig`] mirrors
+//! `CodexHarnessConfig` in `config.py`, [`CodexModelConfig`] mirrors `CodexModelConfig`,
+//! [`model_config`] mirrors the provider's `model_config` classmethod, and [`CodexDriver`] is the
+//! subprocess harness the provider's `create` returns.
+//!
+//! # Structure
+//!
+//! - this module — the configuration data, the approval/system-prompt enums, the card, the
+//!   provider and the model mapping;
+//! - `harness` — [`CodexDriver`], the transport that spawns `codex app-server`, performs the
+//!   JSON-RPC handshake, opens or resumes the thread and runs the turn loop;
+//! - `wire` — the argv (configuration overrides, MCP servers), the process environment and the
+//!   thread options;
+//! - `frames` — the projection of app-server notifications and server requests onto the harness
+//!   SPI.
+//!
+//! # Transport contract
+//!
+//! The harness speaks newline-delimited JSON-RPC 2.0 to `codex app-server --listen stdio://` over
+//! the shared [`JsonRpcClient`](crate::vendor_cli::JsonRpcClient):
+//!
+//! - the executable is `codex_bin` when set, otherwise the `codex` on `PATH`; a missing binary is
+//!   a typed `Protocol` error naming `codex`, never an unimplemented capability;
+//! - one `-c key=value` override per configuration entry: the external endpoint's
+//!   `model_provider` / `model_providers.<key>.{name,base_url,env_key}` group, the
+//!   `features.default_mode_request_user_input` flag when the host declared user input, and one
+//!   `mcp_servers.<key>.{command,args,url}` group per host MCP server;
+//! - `initialize` + `initialized`, then `thread/start` (or `thread/resume` with a checkpoint's
+//!   `thread_id`) carrying the model, the developer instructions, the approval policy and sandbox
+//!   mode, and the thread configuration;
+//! - `turn/start` per turn, then notifications until `turn/completed`: message and reasoning
+//!   deltas, tool items (`shell`, `dynamicToolCall`, `apply_patch`, `<server>.<tool>`), usage
+//!   updates, errors and every other notification as a `codex` provider event;
+//! - the app-server's server-to-client requests are answered through the host's tool-approval and
+//!   user-input policies; dynamic host tools stay unsupported;
+//! - `turn/steer` steers, `turn/interrupt` aborts, and the thread id is the provider session id
+//!   carried by every checkpoint as `{"thread_id": …, "resumed": …}`.
+//!
+//! The full contract is documented on the [`harness`] module.
 //!
 //! # Python parity
 //!
@@ -22,12 +55,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::security::SecretString;
 use openjiuwen_harness_protocol::{
-    json_object_from_value, HarnessCapability, HarnessCard, HarnessProtocol, HarnessProvider,
-    HarnessResult, HostCapability, JsonObject, JsonValue, ModelChoice, ModelConfigProvider,
+    json_object_from_value, EventBufferConfig, EventOverflowPolicy, HarnessCapability, HarnessCard,
+    HarnessProtocol, HarnessProvider, HarnessResult, HostCapability, JsonObject, JsonValue,
+    ModelChoice, ModelConfigProvider,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +71,20 @@ use crate::decode::{
     optional_string_map, optional_u32, optional_u64, reject_unknown_keys,
 };
 use crate::skills::{parse_skills_value, SkillConflict, SkillSource};
+use crate::vendor_cli::{resolve_binary, BinarySpec, VendorHarness};
 
 use super::vendor;
+
+mod frames;
+mod harness;
+mod wire;
+
+pub use harness::CodexDriver;
+
+// The shared `vendor` module still owns the Python "SDK required" text and its own unit tests
+// assert it; this provider no longer produces that message, so keep the constant referenced in
+// non-test builds (removing it is the vendor module's call, not this provider's).
+const _: &str = crate::providers::vendor::CODEX_SDK_REQUIRED;
 
 /// Registry name of the Codex provider.
 pub const PROVIDER_NAME: &str = "codex";
@@ -435,7 +482,7 @@ impl fmt::Debug for CodexHarnessConfig {
     }
 }
 
-/// Returns the deferred Codex provider stub.
+/// Returns the Codex provider.
 #[must_use]
 pub fn provider() -> CodexHarnessProvider {
     CodexHarnessProvider::default()
@@ -443,7 +490,11 @@ pub fn provider() -> CodexHarnessProvider {
 
 /// Returns the capability card of the Codex adapter.
 ///
-/// The card describes what the eventual adapter exploits; this build never creates it.
+/// The card declares only what the app-server transport really provides through the generic
+/// harness shell: steering, graceful abort (Codex has no harder stop than `turn/interrupt`),
+/// persistent threads, checkpoints, MCP tools, endpoint models and the authentication fallback to
+/// `fallback_model`. Model control (selection and discovery) and pausing stay deferred: the shell
+/// exposes no `HarnessModelControl` seam.
 #[must_use]
 pub fn card() -> HarnessCard {
     vendor::vendor_card(
@@ -455,9 +506,6 @@ pub fn card() -> HarnessCard {
             HarnessCapability::PersistentSession,
             HarnessCapability::Checkpoint,
             HarnessCapability::McpTools,
-            HarnessCapability::NativeTools,
-            HarnessCapability::ModelSelection,
-            HarnessCapability::ModelDiscovery,
             HarnessCapability::EndpointModels,
             HarnessCapability::AuthFallback,
         ],
@@ -490,7 +538,7 @@ pub fn model_config(
     Ok(vendor::nested_model_config(choice, fallback, true))
 }
 
-/// The deferred Codex provider: identity card plus validation-only `create`.
+/// The Codex provider: identity card plus the app-server harness creation.
 #[derive(Debug, Clone)]
 pub struct CodexHarnessProvider {
     /// Card reported by [`HarnessProvider::card`].
@@ -498,7 +546,7 @@ pub struct CodexHarnessProvider {
 }
 
 impl Default for CodexHarnessProvider {
-    /// Builds the stub with the card of [`card`].
+    /// Builds the provider with the card of [`card`].
     fn default() -> Self {
         Self { card: card() }
     }
@@ -510,18 +558,32 @@ impl HarnessProvider for CodexHarnessProvider {
         &self.card
     }
 
-    /// Validates `config` and then reports the missing `openai-codex` SDK.
+    /// Validates `config`, resolves the `codex` executable and returns an unstarted harness.
+    ///
+    /// The returned [`VendorHarness`] wraps a [`CodexDriver`], so it reports
+    /// [`HarnessState::Terminated`](openjiuwen_harness_protocol::HarnessState::Terminated) until
+    /// [`start`](HarnessProtocol::start) succeeds; it never spawns the app-server here.
     ///
     /// # Errors
     ///
-    /// Returns `HarnessError::Validation` when `config` is not a valid [`CodexHarnessConfig`],
-    /// and `HarnessError::UnsupportedCapability` carrying `vendor::CODEX_SDK_REQUIRED`
-    /// otherwise.
+    /// Returns `HarnessError::Validation` when `config` is not a valid [`CodexHarnessConfig`], and
+    /// `HarnessError::Protocol` naming `codex` and the fix when the executable cannot be resolved.
+    /// A missing CLI is an operator configuration problem, never an unimplemented capability.
     fn create(&self, config: JsonObject) -> HarnessResult<Box<dyn HarnessProtocol>> {
-        vendor::unsupported_create(
-            CodexHarnessConfig::from_json(&config).map(|_| ()),
-            vendor::CODEX_SDK_REQUIRED,
-        )
+        let config =
+            CodexHarnessConfig::from_json(&config).map_err(vendor::config_error_to_harness)?;
+        let binary = resolve_binary(&BinarySpec {
+            name: "codex",
+            explicit: config.codex_bin.as_deref(),
+            label: "Codex",
+            install_hint: "install the Codex CLI (npm install -g @openai/codex)",
+        })?;
+        let buffer = EventBufferConfig {
+            capacity: config.event_buffer_capacity,
+            overflow: EventOverflowPolicy::CoalesceOrBlock,
+        };
+        let driver = Arc::new(CodexDriver::new(config, binary));
+        Ok(Box::new(VendorHarness::new(card(), buffer, driver)))
     }
 }
 
@@ -680,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn card_adds_native_tools_to_the_claude_capabilities() {
+    fn card_declares_only_what_the_app_server_transport_provides() {
         let card = card();
         assert_eq!(card.name, "codex");
         for capability in [
@@ -689,13 +751,22 @@ mod tests {
             HarnessCapability::PersistentSession,
             HarnessCapability::Checkpoint,
             HarnessCapability::McpTools,
-            HarnessCapability::NativeTools,
-            HarnessCapability::ModelSelection,
-            HarnessCapability::ModelDiscovery,
             HarnessCapability::EndpointModels,
             HarnessCapability::AuthFallback,
         ] {
             assert!(card.supports(capability), "{capability:?} must be declared");
+        }
+        for deferred in [
+            HarnessCapability::NativeTools,
+            HarnessCapability::ForceAbort,
+            HarnessCapability::PauseResume,
+            HarnessCapability::ModelSelection,
+            HarnessCapability::ModelDiscovery,
+        ] {
+            assert!(
+                !card.supports(deferred),
+                "{deferred:?} is not provided by the transport"
+            );
         }
         assert!(card.required_host_capabilities.is_empty());
         assert_eq!(provider().card(), &card);
@@ -819,13 +890,25 @@ mod tests {
     }
 
     #[test]
-    fn create_reports_the_missing_sdk() {
+    fn create_rejects_an_invalid_mapping() {
         let error = provider()
-            .create(object(json!({})))
+            .create(object(json!({"unknown_key": true})))
             .err()
-            .expect("the SDK is required");
-        assert_eq!(error.kind(), HarnessErrorKind::UnsupportedCapability);
-        assert!(error.message().contains("openai-codex"));
+            .expect("an unknown key is invalid");
+        assert_eq!(error.kind(), HarnessErrorKind::Validation);
+        assert!(error
+            .message()
+            .contains("unknown Codex configuration fields"));
+    }
+
+    #[test]
+    fn create_reports_a_missing_binary() {
+        let error = provider()
+            .create(object(json!({"codex_bin": "/nonexistent/codex"})))
+            .err()
+            .expect("the CLI is missing");
+        assert_eq!(error.kind(), HarnessErrorKind::Protocol);
+        assert!(error.message().contains("codex"));
     }
 
     #[test]
