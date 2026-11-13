@@ -40,7 +40,7 @@ pub use components::{
     ToolComponent,
 };
 pub use condition::{Branch, BranchRouter, Condition};
-pub use context::ComponentContext;
+pub use context::{ComponentContext, MessageHistory, SessionMessageHistory, MESSAGES_STATE_KEY};
 pub use engine::{
     CompiledWorkflow, ConditionalSource, Edge, EdgeKind, Entry, NodeConfig, WorkflowDefinition,
     WorkflowRunOptions,

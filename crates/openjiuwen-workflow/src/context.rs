@@ -9,6 +9,15 @@
 //! State reads accept both plain session paths (`"start.query"`) and whole-string
 //! references (`"${start.query}"`); reads never fail on a missing path, they return
 //! `Ok(None)`.
+//!
+//! [`crate::ComponentContext::history`] exposes the conversation seam
+//! ([`crate::context::history::MessageHistory`]): it ports Python's
+//! `ModelContext.get_messages()` / `add_messages()` as a session-backed store over the
+//! `__messages__` global lane, and [`crate::ComponentContext::with_history`] swaps in an
+//! embedder-provided store. See the [`crate::context::history`] module for the
+//! deviations (text-only, session-backed, non-failing).
+
+pub mod history;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,6 +35,8 @@ use crate::interrupt::{interrupt_error, InteractionState, WorkflowInteraction};
 use crate::output::{self, FrameWriter};
 use crate::reference;
 
+pub use history::{MessageHistory, SessionMessageHistory, MESSAGES_STATE_KEY};
+
 /// Trace frame type used for workflow trace payloads.
 const TRACE_ITEM_TYPE: &str = "tracer_workflow";
 
@@ -42,6 +53,7 @@ pub struct ComponentContext {
     metadata: BTreeMap<String, Value>,
     depth: usize,
     frame_index: Arc<AtomicU64>,
+    history: Option<Arc<dyn MessageHistory>>,
 }
 
 impl fmt::Debug for ComponentContext {
@@ -54,6 +66,10 @@ impl fmt::Debug for ComponentContext {
             .field("metadata", &self.metadata)
             .field("depth", &self.depth)
             .field("frame_index", &self.frame_index.load(Ordering::Relaxed))
+            .field(
+                "history",
+                &self.history.as_ref().map_or("session", |_| "custom"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -81,6 +97,7 @@ impl ComponentContext {
             metadata: BTreeMap::new(),
             depth: 0,
             frame_index: Arc::new(AtomicU64::new(0)),
+            history: None,
         }
     }
 
@@ -166,6 +183,28 @@ impl ComponentContext {
     #[must_use]
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// The conversation history this component reads and appends to.
+    ///
+    /// This is the seam that stands in for Python's `ModelContext`
+    /// (`get_messages()` / `add_messages()`): without an override it is a
+    /// [`SessionMessageHistory`] over this context's session, so every component in one
+    /// run shares the `__messages__` global lane. The handle is rebuilt per call on
+    /// purpose — it only clones the session `Arc`, and there is no cached mutable state.
+    #[must_use]
+    pub fn history(&self) -> Arc<dyn MessageHistory> {
+        self.history
+            .clone()
+            .unwrap_or_else(|| Arc::new(SessionMessageHistory::new(Arc::clone(&self.session))))
+    }
+
+    /// Override the history store (tests / embedders that keep history outside the
+    /// session).
+    #[must_use]
+    pub fn with_history(mut self, history: Arc<dyn MessageHistory>) -> Self {
+        self.history = Some(history);
+        self
     }
 
     /// Reads the workflow's global state lane.
@@ -399,6 +438,7 @@ mod tests {
     use std::sync::Arc;
 
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_foundation::{BaseMessage, Role};
     use openjiuwen_session::stream::{StreamItem, StreamMode};
     use openjiuwen_session::{InteractiveInput, Session, WorkflowSession};
     use parking_lot::Mutex;
@@ -719,5 +759,58 @@ mod tests {
         let ctx = context();
         let error = ctx.write_stream(Value::Null).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+
+    /// A history store that keeps messages in memory, for the override test.
+    #[derive(Default)]
+    struct FakeHistory {
+        messages: Mutex<Vec<BaseMessage>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHistory for FakeHistory {
+        async fn messages(&self) -> Vec<BaseMessage> {
+            self.messages.lock().clone()
+        }
+
+        async fn append(&self, messages: Vec<BaseMessage>) {
+            self.messages.lock().extend(messages);
+        }
+
+        async fn clear(&self) {
+            self.messages.lock().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn history_is_session_backed_by_default() {
+        let session = session();
+        let ctx = ComponentContext::new(Arc::clone(&session), "comp", "wf");
+
+        ctx.history().append(vec![BaseMessage::user("a")]).await;
+
+        assert_eq!(
+            session.get_state(MESSAGES_STATE_KEY).await.unwrap(),
+            Some(json!([{"role": "user", "content": "a"}]))
+        );
+        let messages = ctx.history().messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "a");
+    }
+
+    #[tokio::test]
+    async fn with_history_returns_the_override() {
+        let fake: Arc<dyn MessageHistory> = Arc::new(FakeHistory::default());
+        let ctx = ComponentContext::new(session(), "comp", "wf").with_history(Arc::clone(&fake));
+
+        ctx.history()
+            .append(vec![BaseMessage::assistant("b")])
+            .await;
+
+        assert!(Arc::ptr_eq(&ctx.history(), &fake));
+        let messages = fake.messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert_eq!(messages[0].text(), "b");
     }
 }
