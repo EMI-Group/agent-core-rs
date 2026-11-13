@@ -134,6 +134,7 @@ impl PromptSearchOptimizer {
             best_prompt: pool.get(best).cloned().unwrap_or_else(|| seed.clone()),
             score: scores.get(best).copied().unwrap_or(0.0),
             iterations: 1,
+            ..OptimizationResult::default()
         })
     }
 }
