@@ -36,6 +36,9 @@ let recovered: RecoveryOutcome = engine
 - `CompressionRecallConfig` — `enabled`, `chunk_size_tokens` (3 000), `chunk_overlap_tokens` (300).
 - `DEFAULT_CONTEXT_TOKENS` — 200 000, used when `max_context_tokens` is `None`.
 - `ModelContext` trait — `context_id`, `session_id`, `messages`, `set_messages`, `add_message`, `pop_messages`, `clear_messages`, `token_counter`, `statistics`, `revision`.
+- `ConversationContext` has no inherent history accessor: `messages`/`set_messages`/`add_message`/`pop_messages`/`clear_messages`/`statistics`/`revision` are `ModelContext` trait methods (re-exported at crate root), so a caller must import `ModelContext` to read, replace, or clear stored history.
+- `ContextEngine` exposes no history reader and no pool enumeration: a caller reaches a context through `get_context(session_id, context_id)` (or `create_context`, which is idempotent and ignores options for an existing pair), and `remove_context` only drops the pool entry without touching session state.
+- `ConversationContext::save_state`/`load_state` are public inherent methods, so a `ContextState` round-trip also replaces stored messages and the revision from outside.
 - `ConversationContext` — the built-in `ModelContext`: config/model/processors/offload-store accessors, `recall_store()`, `session_memory_store()`, `scope()`, `session()`, `cancel()`, `cancellation()`, `save_state`, `load_state` (history + processor checkpoints), `prepare`; the constructor is engine-only.
 - `PreparedContext` — `messages` (system first, then selected context, plus the reload hint when injected), `tools`, `stats: ContextStats`, `token_count`, `overflow`, `window_size`, `events`.
 - `ContextStats` — total/per-role message counts and token counts, `total_dialogues`, `compressions`, `tokens_before_compression`, `tokens_after_compression`.
