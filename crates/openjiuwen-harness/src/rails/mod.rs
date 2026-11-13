@@ -23,9 +23,13 @@
 //! snapshot).
 mod context;
 mod evolution;
+mod heartbeat;
+mod kv_cache;
 mod memory;
+mod personal_context;
 mod registry;
 mod security;
+mod sha256;
 mod skills;
 mod subagent;
 
