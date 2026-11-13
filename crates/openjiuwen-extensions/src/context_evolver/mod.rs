@@ -5,16 +5,20 @@
 //! mixes small, dependency-free pieces — memory schemas, algorithm names, JSON
 //! persistence shapes, a prompt table, and an in-memory cosine vector store —
 //! with pipelines driven by an LLM, an embedding model, and Milvus. Rust ports
-//! the former and models the latter behind [`TaskMemoryService`], so a host can
-//! inject any model or persistence backend; the bundled
-//! [`UnsupportedTaskMemoryService`] answers [`Error::Unsupported`] for every
-//! LLM-driven flow instead of pretending to run it.
+//! the former and models the latter behind [`TaskMemoryService`]: a host can
+//! inject any model or persistence backend, and
+//! [`create_task_memory_service`] builds either the offline
+//! [`DeterministicTaskMemoryService`] or the model-driven
+//! [`LlmTaskMemoryService`]. The bundled [`UnsupportedTaskMemoryService`]
+//! answers [`Error::Unsupported`] for a configuration that defers the flow,
+//! instead of pretending to run it.
 //!
 //! Python counterparts for the ported behavior:
 //! `tests/unit_tests/extensions/context_evolver/test_retrieve_flow.py`
 //! (`TestAlgorithmNormalization`) and `test_summary_flow.py`
 //! (`test_all_algorithm_normalizations`). The live retrieve/summarize flows are
-//! skipped in Python without an API key and are deferred here.
+//! skipped in Python without an API key and run here against an injected
+//! completion backend.
 //!
 //! # Example
 //!
@@ -33,8 +37,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod memory_store;
+pub mod prompt;
+pub mod record;
+pub mod service;
+pub mod store;
 
 pub use memory_store::{MemoryVectorStore, ScoredNode, VectorNode};
+pub use prompt::{
+    parse_retrieve, parse_summarize, parse_trajectories, render_memory_string, retrieve_prompt,
+    summarize_prompt, PromptPair, RetrievedHit, SummaryDraft, SummaryOperation, Trajectory,
+    TrajectoryFeedback,
+};
+pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
+pub use service::{
+    create_task_memory_service, DeterministicTaskMemoryService, HashingEmbedding,
+    LlmTaskMemoryService, MemoryBackend, MemoryEmbedding, TaskMemoryConfig,
+};
+pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 
 /// The memory algorithm selected for retrieval and summarization.
 ///
@@ -595,3 +614,8 @@ mod tests {
         assert_eq!(store.len().await, 0);
     }
 }
+
+pub mod completion;
+pub use completion::{
+    ChatCompletionConfig, MemoryCompletion, OpenAiChatCompletion, ScriptedCompletion,
+};
