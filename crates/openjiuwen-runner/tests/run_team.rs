@@ -344,6 +344,123 @@ async fn an_expired_deadline_times_out_the_team_invocation() {
     );
 }
 
+// ports tests/unit_tests/core/runner/test_team_runner.py (cancelled team stream)
+#[tokio::test]
+async fn a_cancelled_token_ends_the_team_stream_with_one_error() {
+    let token = CancellationToken::new();
+    token.cancel();
+    let (team, calls) = fixture("cancelled-team-stream");
+
+    let mut frames = stream_team(
+        common::services(),
+        TeamRef::of(Arc::clone(&team) as Arc<dyn Team>),
+        json!({"query": "hi", "conversation_id": "conv-cancelled-stream"}),
+        RunOptions::default().with_cancellation(token),
+    );
+
+    let first = frames.next().await.expect("a terminal frame");
+    let error = first.expect_err("a cancelled stream yields an error frame");
+    assert!(error.is_cancelled(), "unexpected: {error}");
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(error.to_string(), "cancelled");
+    assert!(
+        frames.next().await.is_none(),
+        "no frame follows the terminal error"
+    );
+    assert!(
+        calls.inputs().is_empty(),
+        "no member ran: the token was tripped before the strategy was polled"
+    );
+    assert!(
+        team.runtime()
+            .team_session("conv-cancelled-stream")
+            .is_none(),
+        "the lease is finished on the cancelled streaming path too"
+    );
+}
+
+// ports tests/unit_tests/core/runner/test_team_runner.py (team stream deadline)
+#[tokio::test]
+async fn an_expired_deadline_ends_the_team_stream_with_one_timeout_error() {
+    // The member sleeps far past the deadline, but the stream drops its future the
+    // moment the deadline fires, so nothing waits on the wall clock.
+    let team = delayed_team("deadline-team-stream", Duration::from_secs(60));
+
+    let mut frames = stream_team(
+        common::services(),
+        TeamRef::of(team as Arc<dyn Team>),
+        json!({"query": "hi", "conversation_id": "conv-deadline-stream"}),
+        RunOptions::default().with_timeout(Duration::from_millis(10)),
+    );
+
+    let first = frames.next().await.expect("a terminal frame");
+    let error = first.expect_err("an expired deadline yields an error frame");
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert_eq!(
+        error.to_string(),
+        "timeout: run_agent_team timed out after 10ms"
+    );
+    assert!(
+        frames.next().await.is_none(),
+        "no frame follows the terminal error"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_team_stream_is_mirrored_as_cancelled() {
+    let monitor = Arc::new(RunMonitor::new());
+    let hub = Arc::new(InteractionHub::new());
+    let mut transitions = monitor.subscribe();
+    let services = common::services()
+        .with_monitor(Arc::clone(&monitor))
+        .with_hitl(Arc::clone(&hub));
+    let token = CancellationToken::new();
+    token.cancel();
+    let (team, _calls) = fixture("cancelled-stream-mirror");
+
+    let frames = stream_team(
+        services,
+        TeamRef::of(Arc::clone(&team) as Arc<dyn Team>),
+        json!({"query": "hi", "conversation_id": "conv-cancelled-stream-mirror"}),
+        RunOptions::default().with_cancellation(token),
+    )
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(frames.len(), 1, "one terminal error frame: {frames:?}");
+    assert!(
+        frames[0].as_ref().unwrap_err().is_cancelled(),
+        "unexpected: {:?}",
+        frames[0]
+    );
+
+    let published: Vec<_> = std::iter::from_fn(|| transitions.try_recv().ok()).collect();
+    assert_eq!(
+        published
+            .iter()
+            .map(|event| event.phase)
+            .collect::<Vec<_>>(),
+        vec![RunPhase::Queued, RunPhase::Running, RunPhase::Cancelled],
+        "a cancelled team stream finishes its mirror as cancelled, not failed"
+    );
+    let run_id = published
+        .first()
+        .expect("the run was admitted")
+        .run_id
+        .clone();
+    let status = monitor
+        .snapshot(&run_id)
+        .expect("the finished run is retained");
+    assert_eq!(status.kind, RunKind::Team);
+    assert_eq!(status.phase, RunPhase::Cancelled);
+    assert!(status.finished_at.is_some());
+    assert_eq!(monitor.list_active(), Vec::new(), "no run stays active");
+    assert!(
+        hub.is_empty(),
+        "the cancelled stream's hub binding was unregistered"
+    );
+}
+
 #[tokio::test]
 async fn a_cancelled_team_run_is_mirrored_as_cancelled() {
     let monitor = Arc::new(RunMonitor::new());

@@ -21,15 +21,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::stream::{BoxStream, StreamExt};
-use openjiuwen_common::error::Result;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_multiagent::SessionLease;
 use openjiuwen_session::Session;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    effective_deadline, resolve_team, run_with_limits, trace_failure, trace_finish, trace_start,
-    RunOptions, RunServices, RunSpan, TeamRef, Teardown, LOG_TARGET,
+    effective_deadline, next_stream_step, record_stream_outcome, resolve_team, run_with_limits,
+    trace_failure, trace_finish, trace_start, RunOptions, RunServices, RunSpan, StreamStep,
+    TeamRef, Teardown, LOG_TARGET,
 };
 
 /// Runs one agent-team invocation to completion.
@@ -159,6 +160,20 @@ pub async fn invoke_team(
 /// [`SessionLease`] is finished by the `Teardown` after the last frame or when
 /// the consumer drops the stream early.
 ///
+/// Between frames the stream is bounded by the run's cancellation token
+/// ([`RunOptions::cancellation`]) and its deadline: `options.timeout`, else the
+/// runner's [`RunnerConfig::default_run_timeout`](crate::config::RunnerConfig::default_run_timeout)
+/// when one is configured — the same rule [`invoke_team`] and the agent stream
+/// apply. A tripped token ends the stream with exactly one
+/// [`Error::Cancelled`](openjiuwen_common::error::Error::Cancelled) frame and an
+/// expired deadline with exactly one [`crate::error::run_timeout`] frame; in
+/// both cases the span, the trace event, the mirrored run, the [`SessionLease`],
+/// and the hub binding are finalised before that frame is yielded, and no frame
+/// follows it. A stream dropped mid-flight still runs the teardown.
+///
+/// The [`TeamPool`](crate::pool::TeamPool) races [`stream_team`] against its own
+/// per-run limits as well, so a pooled run can be cut short by either.
+///
 /// As with [`invoke_team`], no callback events are fired and a caller-provided
 /// team session is left bound by the caller.
 #[allow(clippy::needless_pass_by_value)]
@@ -217,35 +232,56 @@ pub fn stream_team(
         trace_start("team", &run_id, &card.id, session.id());
         let span = RunSpan::start(session.tracer(), "run_team_stream", inputs.clone());
         let teardown = team_teardown(lease);
+        // The same deadline rule as `invoke_team` and the agent stream: the run's
+        // own timeout, else the runner's `default_run_timeout` when configured.
+        let deadline = effective_deadline(&services, &options);
+        let deadline_at = deadline.map(|limit| (tokio::time::Instant::now() + limit, limit));
         let mut inner = team.stream(inputs, Some(Arc::clone(&session)));
+        let mut failure: Option<Error> = None;
 
-        while let Some(frame) = inner.next().await {
-            match frame {
-                Ok(value) => yield Ok(value),
-                Err(error) => {
-                    span.fail(&error);
-                    trace_failure(
-                        "team",
-                        &run_id,
-                        &card.id,
-                        session.id(),
-                        started.elapsed(),
-                        &error,
-                    );
-                    status.fail(&error, detail.clone());
-                    binding.unregister();
-                    teardown.finish().await;
-                    yield Err(error);
-                    return;
+        loop {
+            if options.cancellation.is_cancelled() {
+                failure = Some(Error::cancelled());
+                break;
+            }
+            match next_stream_step(&mut inner, &options.cancellation, deadline_at).await {
+                StreamStep::Cancelled => {
+                    failure = Some(Error::cancelled());
+                    break;
                 }
+                StreamStep::TimedOut => {
+                    if let Some((_, limit)) = deadline_at {
+                        failure = Some(crate::error::run_timeout("run_agent_team", limit));
+                    }
+                    break;
+                }
+                StreamStep::Frame(Some(Ok(value))) => yield Ok(value),
+                StreamStep::Frame(Some(Err(error))) => {
+                    failure = Some(error);
+                    break;
+                }
+                StreamStep::Frame(None) => break,
             }
         }
 
-        span.finish(Value::Null);
-        trace_finish("team", &run_id, &card.id, session.id(), started.elapsed());
-        status.ok(detail);
-        binding.unregister();
+        record_stream_outcome(
+            &span,
+            "team",
+            &run_id,
+            &card.id,
+            session.id(),
+            started,
+            failure.as_ref(),
+        );
         teardown.finish().await;
+        match &failure {
+            Some(error) => status.fail(error, detail),
+            None => status.ok(detail),
+        }
+        binding.unregister();
+        if let Some(error) = failure {
+            yield Err(error);
+        }
     }
     .boxed()
 }

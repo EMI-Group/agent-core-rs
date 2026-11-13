@@ -100,7 +100,7 @@ The crate root re-exports these items from `openjiuwen_runner::hitl` (added by t
 - The inbox is bounded (`INBOX_CAPACITY`); a full inbox is reported as `Closed`, never silently dropped.
 - Public data types are serde (`snake_case`, `default`, tolerant of unknown fields); `ActiveRunSpec` is not serde because it holds a `CancellationToken`.
 - Every public item and field is documented; workspace lints include `missing_docs`, `unreachable_pub`, `unsafe_code = deny`, clippy `all`+`pedantic`+`unwrap_used`+`expect_used`+`needless_pass_by_value`.
-- `bind_run`, `RunBinding`, and `ActiveRunSpec::for_execution` carry `#[allow(dead_code)]` because the execution paths adopt them next.
+- The agent, workflow, and team run paths and the team pool call `bind_run`, build specs with `ActiveRunSpec::for_execution`, and hold the returned `RunBinding`; the item-level `#[allow(dead_code)]` attributes stay only because `RunBinding::run_id` is unreferenced outside this module's tests.
 - Files stay around ≤ 600 lines: `mod.rs` (docs, re-exports, hub-wide constants, error wording, tests), `hub.rs` (registry, inbox, answering), `bridge.rs` (spec/info/handle/binding plus session watcher and cancellation delivery), `payload.rs`, `target.rs`.
 
 ## Routing Table

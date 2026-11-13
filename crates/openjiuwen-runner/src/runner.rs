@@ -482,7 +482,9 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` for an unregistered id, or the team's error.
+    /// Returns `Error::NotFound` for an unregistered id, `Error::Cancelled` when
+    /// the run's cancellation token fires, `Error::Timeout` when the run deadline
+    /// expires, or the team's error.
     pub async fn run_agent_team(
         &self,
         team: impl Into<TeamRef>,

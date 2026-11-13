@@ -160,8 +160,8 @@ pub struct RunOptions {
     /// Cancels the run when triggered.
     pub cancellation: CancellationToken,
     /// Per-run deadline; `None` falls back to
-    /// [`RunnerConfig::default_run_timeout`] for agents and means "no deadline"
-    /// for workflows (the engine owns its own deadline).
+    /// [`RunnerConfig::default_run_timeout`] for agents and teams, and means
+    /// "no deadline" for workflows (the engine owns its own deadline).
     pub timeout: Option<Duration>,
     /// Frame modes requested from a workflow stream.
     pub stream_modes: Option<Vec<StreamMode>>,
