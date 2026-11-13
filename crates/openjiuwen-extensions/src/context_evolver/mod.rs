@@ -33,10 +33,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod memory_store;
+pub mod prompt;
 pub mod record;
 pub mod store;
 
 pub use memory_store::{MemoryVectorStore, ScoredNode, VectorNode};
+pub use prompt::{
+    parse_retrieve, parse_summarize, parse_trajectories, render_memory_string, retrieve_prompt,
+    summarize_prompt, PromptPair, RetrievedHit, SummaryDraft, SummaryOperation, Trajectory,
+    TrajectoryFeedback,
+};
 pub use record::{generate_memory_id, MemoryDraft, MemoryRecord};
 pub use store::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryStore};
 
