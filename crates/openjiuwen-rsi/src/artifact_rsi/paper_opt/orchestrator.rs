@@ -483,9 +483,7 @@ impl PaperOptimizer {
             ..Program::default()
         };
         let root = ranking.add_node(None, root_program)?;
-        let mut winner = 0_usize;
-        let mut winner_score = f64::NEG_INFINITY;
-        for (position, (candidate, score)) in scored.iter().enumerate() {
+        for (candidate, score) in scored {
             let program = Program {
                 program_id: candidate.candidate_id.clone(),
                 parent_id: Some(self.state.frontier_node_id.clone().unwrap_or_default()),
@@ -498,12 +496,11 @@ impl PaperOptimizer {
             };
             let index = ranking.add_node(Some(root), program)?;
             ranking.record_score(index, Some(score.composite))?;
-            if score.composite > winner_score {
-                winner = position;
-                winner_score = score.composite;
-            }
         }
-        Ok(winner)
+        Ok(ranking
+            .best()
+            .filter(|node| node.index > 0)
+            .map_or(0, |node| node.index.saturating_sub(1)))
     }
     /// Copies derived counters onto the observable state.
     fn refresh_counts(&mut self) {
