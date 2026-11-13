@@ -349,6 +349,10 @@ Gates: `cargo fmt -p openjiuwen-workflow`, `cargo test -p openjiuwen-workflow`, 
 - `Session::config()` supplies `execute_timeout_ms`; `WorkflowRunOptions::timeout` overrides it.
 - `openjiuwen-retrieval` is a normal dependency; `openjiuwen-memory` is not one, although it is fully implemented — the memory components reach it through the local `MemoryRecall`/`MemoryRecord` trait seams, so callers inject adapters instead of this crate depending on the memory engine.
 
+- `ComponentContext::interact` keys an interaction by the question object's `"id"` field when present, otherwise by the component id; a resume answer may be node-addressed (`InteractiveInput::update`) or interrupt-addressed (`InteractiveInput::answer`), and interrupt answers are consumed first.
+- `Workflow::resume` requires the session to carry a checkpointer (the interrupted superstep is replayed from the stored graph snapshot); `openjiuwen_test_support::workflow_session_with_checkpointer` is the fixture for that.
+- Consumers without a direct dependency on this crate (for example `openjiuwen-e2e`) reach every public item through the umbrella as `openjiuwen::core::workflow::…`; no feature flag gates workflow types.
+
 ## Known Issues and Deferred Work
 
 - Deferred semantics: the Python streaming actor network (live interleaving of concurrent producers), PNG rendering (Python's `output_format="png"` needs mermaid.ink) plus `WORKFLOW_DRAWABLE` gating, per-run `async` graph mutation, and sub-workflow HITL resume (the parent re-runs the child from scratch; child seeded answers are not forwarded).

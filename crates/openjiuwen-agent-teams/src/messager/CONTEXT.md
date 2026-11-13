@@ -136,3 +136,8 @@ Definition of done for this node: `cargo fmt -p openjiuwen-agent-teams`, `cargo 
 - Python's `inprocess` passes the `EventMessage` object through untouched; because Rust stamps a copy, sinks must treat the received event as read-only.
 - The `hybrid` transport in Python is a publish-only WebSocket relay built only by `external/client.py`; `create_messager` always rejected it. Keep the validation error.
 - Deferred capabilities keep their Python names in the `Error::Unsupported` message so the parity table can match them.
+- There is no receiver, channel or cursor on this seam: observation is an [`EventSink`] callback (`Arc<dyn Fn(EventMessage) + Send + Sync>`), so a test records into `Arc<Mutex<Vec<EventMessage>>>` and reads that snapshot afterwards.
+  The leader's `mpsc::unbounded_channel` in `src/runtime/build.rs` is an internal detail of the team runtime, not part of the messager API.
+- Crate root re-exports `create_messager`, `EventSink`, `InProcessMessager`, `Messager`, `MessagerPeerConfig` and `MessagerTransportConfig`; `InProcessMessagerConfig` and `PyZmqMessagerConfig` are reachable only as `messager::*`.
+- Mailbox persistence lives in the store, not in the transport: `TeamStore::insert_message` / `unread_messages` / `mark_read` / `read_watermark` / `set_read_watermark` / `message_count` (no `list_messages`, no `append_message`).
+  `TeamBackend::send_message` persists the row first and then publishes `message` (direct/multicast, one row per target) or `broadcast` on `TeamTopic::Message`.

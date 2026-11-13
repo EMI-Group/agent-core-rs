@@ -191,6 +191,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - HITL: `deliver` needs a pool-registered run with an open inbox (otherwise `NoInbox`/`MissingTarget`); `answer` needs a run whose session was attached by the run path. Pause/resume are signals, not suspension.
 - Monitor: `update` refuses terminal phases (only `finish` ends a run); finished runs are retained up to `LIVE_RUN_LIMIT`, so `history`/`snapshot` still work after completion but not indefinitely.
 - Subprocess: a handle desynchronizes after an abandoned stream or a health probe that hits its deadline and is then single-use; `RemoteAgent::pid()` is always `None`; a remote `shutdown` is `stop()`.
+- The spawn backend is installed on the runner (`Runner::set_spawner(Arc<dyn AgentSpawner>)`, not per run): `RunOptions` has no spawner field, `ResourceMgr` takes no part, and `Runner::spawn_agent(spec)` only delegates to the installed spawner.
 - Callback events the runner itself fires: `AgentInvokeInput`/`AgentInvokeOutput`, `AgentStreamInput`/`AgentStreamOutput`, `WorkflowInvokeInput`/`WorkflowInvokeOutput`, `WorkflowError`, `WorkflowStreamInput`/`WorkflowStreamOutput`, and `AgentSessionCreated` when it creates a session. LLM/tool events are fired by whoever owns the model/tool call.
 - Never hold a `parking_lot` guard across `.await`; registries and callback registries guard only synchronous lookups.
 - A runner's `runner_id` is fixed at construction: `set_config` keeps the instance id (logging a mismatch) so `runner_id()` can return `&str`.

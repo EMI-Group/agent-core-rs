@@ -14,7 +14,9 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries):
   `kernel_flow`, `deep_agent`, `provider_native`, `team_flow`, `a2a_roundtrip`, `symphony_plan`, `self_improvement`, `cli_binary`.
 - Features: `default = []`; `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`); `otel` (declared for parity, no scenario).
-- Dependencies are declared under `[dependencies]` so the `a2a`/`otel` features can enable features on the same crates: the umbrella `openjiuwen` (module aliases `core`, `harness`, `harness_protocol`, `harness_providers`, `agent_teams`, `extensions`, `symphony`, `rsi`, `agent_evolving`), the concrete crates for their module spellings, `openjiuwen-test-support`, `tokio`, `tokio-util`, `futures`, `async-trait`, `anyhow`, `reqwest`, `serde_json`, `tempfile`.
+- Dependencies are declared under `[dependencies]` so the `a2a`/`otel` features can enable features on the same crates: the umbrella `openjiuwen` (module aliases `core`, `harness`, `harness_protocol`, `harness_providers`, `agent_teams`, `extensions`, `symphony`, `rsi`, `agent_evolving`), the concrete harness-layer crates `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-harness-providers`, `openjiuwen-agent-teams`, `openjiuwen-extensions`, `openjiuwen-symphony`, `openjiuwen-rsi`, `openjiuwen-agent-evolving`, plus `openjiuwen-test-support`, `tokio`, `tokio-util`, `futures`, `async-trait`, `anyhow`, `reqwest`, `serde_json`, `tempfile`.
+- No kernel crate (`openjiuwen-session`, `-workflow`, `-graph`, `-agent`, `-foundation`, `-runner`, `-common`) is a direct dependency: kernel types must be imported through the umbrella as `openjiuwen::core::<module>::…` (e.g. `openjiuwen::core::workflow::{Workflow, WorkflowCard, …}`, `openjiuwen::core::session::AgentSessionOptions`, `openjiuwen::core::runner::{Runner, RunOptions}`), which requires no feature.
+- Model/session fixtures come from `openjiuwen_test_support`, never from `tests/support/mod.rs`: `agent_session`, `agent_session_with`, `agent_session_with_checkpointer`, `workflow_session`, `workflow_session_with`, `workflow_session_with_checkpointer`, `memory_checkpointer`, `ScriptedModel`, `MockCompletion`, `MockLlmServer`, `ScriptedResponse`, `TEST_API_KEY`.
 - `a2a_roundtrip.rs` needs `#![allow(missing_docs)]` **before** its `#![cfg(feature = "a2a")]`: with the feature off the whole crate body (including its `//!` docs) is stripped, so a later `allow` is stripped too and the denied `missing_docs` lint fires on the empty crate root.
 
 ## Scenario Matrix
@@ -63,13 +65,14 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 - Loopback services bind `127.0.0.1:0` and read the address back; every scenario shuts its server down (`ServerHandle::shutdown` + `join`).
 - A scenario that needs a sibling API change is `#[ignore = "<reason>"]`d with the gap recorded under **Known Gaps**, never fixed by editing the sibling crate.
 - `openjiuwen-e2e` is not in the workspace `default-members`: use `cargo test -p openjiuwen-e2e` (and `--features a2a`).
+- `openjiuwen-agent-teams` is taken with its default features only (`crates/openjiuwen-e2e/Cargo.toml:20`); the umbrella's `sqlite` feature forwards to extensions/symphony but not to agent-teams (`crates/openjiuwen/Cargo.toml:42`), so a SQLite team store needs a crate feature forwarding `openjiuwen-agent-teams/sqlite`.
 
 ## Routing Table
 
 - `./tests/kernel_flow.rs` → model → tool → session → workflow → runner flows (kernel crates)
 - `./tests/deep_agent.rs` → DeepAgent task loop, workspace tools, permissions, interrupt/resume
 - `./tests/provider_native.rs` → provider-neutral harness SPI: factory, native harness lifecycle, IO adapter
-- `./tests/team_flow.rs` → agent teams: spec build, leader/teammate runtime, task board
+- `./tests/team_flow.rs` → agent teams: spec build, leader/teammate runtime, task board (umbrella `openjiuwen::agent_teams` paths only, scripted `MemberHarnessFactory` + `InMemoryTeamStore`)
 - `./tests/a2a_roundtrip.rs` → A2A client/server round trip (feature `a2a`)
 - `./tests/symphony_plan.rs` → symphony capability registry, planning, graph execution, artifact reload
 - `./tests/self_improvement.rs` → RSI orchestrator and agent-evolving trainer with fake runners
