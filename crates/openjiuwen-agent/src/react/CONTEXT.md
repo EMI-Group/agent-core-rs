@@ -47,6 +47,9 @@ Ports Python `core/single_agent/agents/react_agent.py` (`ReActAgent`, `ReActAgen
 - The loop never constructs tools or models itself: tools come from the snapshot, the model from `ReActAgent::model()`.
 - Rails are fired through `rails::RailRegistry`; every firing point resets the event-specific fields (`reset_ctx`) while `extra`/`session`/`agent_id`/`input`/`iteration` survive.
 - Model calls use `ContextEngine::prepare` for the window; assistant/tool messages are appended with `ContextEngine::observe`.
+- The engine is rebuilt by `ReActAgent::configure` from `ReActAgentConfig::context_engine_config`; no setter or constructor accepts a prebuilt `ContextEngine`, so a host customises the window/processor pipeline only through `ReActAgentConfig::configure_context_engine` before `configure`.
+- Only `create_context`/`prepare`/`observe`/`save_contexts` are called; `compress`, `recover_from_model_exception`, and `load_contexts` are never invoked, so compression is pipeline-driven inside `prepare`.
+- The engine is never handed a model (`create_context`, never `create_context_with` with `ContextOptions.model`), so a `ProcessorConfig::Summarization` in `context_engine_config` fails every run at context creation with `Error::Config` ("the summarization processor requires a model, but none is configured"); model-optional compressors run without one.
 - `stream` always runs the loop in a spawned task and mirrors frames into the session; `invoke` passes no publisher.
 - Files ≤1000 lines: loop orchestration (`agent_loop.rs`), model-call mechanics (`model_step.rs`), loop hooks (`hooks.rs`), frame emission (`frames.rs`), exposure projection (`exposure.rs`), pause persistence (`pause.rs`), and resume replay/seeding (`resume.rs`) stay in separate files.
 - Callback failures are advisory: every firing point logs with `tracing::warn!` and continues, so a broken observer never changes the run's outcome; nothing is built when `CallbackFramework::has_hooks` is false.

@@ -331,6 +331,7 @@ config therefore just logs.
 1. `spec.validate()` — reserved names, dispatch knob rules (the spec's own messages).
 2. `TeamSpec::from_spec(spec)` — the runtime mirror; language from `deps.language` else `spec.language`.
 3. `create_messager(&spec.transport)` — one in-process transport shared by the backend and every member.
+   The store is never opened here: the build path uses `deps.store` (default `InMemoryTeamStore`) and never reads `TeamAgentSpec::storage`, so SQLite team storage is selected by injecting `open_store(&spec.storage)?` through `TeamBuildDeps::with_store`.
 4. Wiring inputs: `TeamModelRouter::for_spec` (or the injected router for a direct spawner), the
    `TeamKvCacheAffinity` (injected, else `kv_cache_config`), `TeamSignals::new(team, hooks)`, and the four
    metadata parsers (`spawn_options`, `fork_directive`, `isolation_mode`, `attach_config`).
@@ -523,6 +524,8 @@ tests plus 215 integration tests, 219 with `--features sqlite`), `cargo test -p 
   the `src/member/` child-process spawners for `process`/`external_cli`/`ssh`; nothing in this module builds a
   DeepAgent directly.
 - `TeamSpec` (not `TeamAgentSpec`) is what the running team carries, mirroring Python's runtime mirror.
+- `TeamAgent` has no direct `store()` accessor: a test or host reaches the store through `TeamAgent::backend().store()` (`backend.rs:177`), reads mail through `TeamBackend::unread`/`mark_read` and the board through `TeamBackend::tasks()`/`list_tasks`.
+- `TeamBuildDeps.store` is an `Arc<dyn TeamStore>` field (`deps.rs:49`), set by `with_store`; the default is `InMemoryTeamStore` (`deps.rs:150`) and `--features sqlite` users inject `SqliteTeamStore` instead of a `StorageSpec`-like value.
 - A teammate runs the same loop but creates no tasks and never dispatches: `create_task` on a teammate is
   `Error::validation("only the leader can create tasks")`.
 - The team roster is materialized as rows at build time (`unstarted` teammates); Python creates rows lazily

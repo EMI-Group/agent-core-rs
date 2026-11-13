@@ -39,6 +39,10 @@ a2a = ["openjiuwen/a2a", "openjiuwen-extensions/a2a"]
 # Declared for parity with the umbrella; the OTel seam is covered by the
 # `openjiuwen-extensions` unit tests and has no cross-crate scenario here.
 otel = ["openjiuwen/otel", "openjiuwen-extensions/otel"]
+# The umbrella's `sqlite` feature forwards to extensions/symphony but not to
+# `openjiuwen-agent-teams`, so the team-store scenario (`tests/team_backend.rs`)
+# enables the agent-teams SQLite backend here.
+sqlite = ["openjiuwen-agent-teams/sqlite"]
 
 [lints]
 workspace = true
