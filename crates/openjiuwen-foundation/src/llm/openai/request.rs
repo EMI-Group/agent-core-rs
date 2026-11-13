@@ -13,6 +13,9 @@ use crate::prompt::BaseMessage;
 
 use super::super::config::ModelRequestConfig;
 use super::super::provider::normalize_provider_name;
+use super::super::reasoning::{
+    apply_reasoning_plan, resolve_reasoning_plan, ReasoningConfig, ReasoningPlan,
+};
 
 /// Suffix a caller may have left on `api_base` by pasting a full endpoint.
 const CHAT_COMPLETIONS_SUFFIX: &str = "/chat/completions";
@@ -164,6 +167,12 @@ pub fn convert_tool_choice(choice: &Value) -> Value {
 /// [`ModelRequestConfig::extra`] is merged last at the top level, so a caller can
 /// override or extend any computed key.
 ///
+/// A provider-neutral reasoning intent in `extra.reasoning` is resolved first (see
+/// [`crate::llm::reasoning`]) and applied before that final merge, so the caller's
+/// keys still win. The intent key itself is consumed by this layer; a legacy raw
+/// payload (an object with keys outside `mode`/`effort`/`budget_tokens`) keeps being
+/// forwarded verbatim. Without a `reasoning` key the body is unchanged.
+///
 /// # Errors
 ///
 /// Returns [`Error::Config`] when [`ModelRequestConfig::model_name`] is empty,
@@ -224,13 +233,69 @@ pub fn build_chat_completion_body(
         );
     }
 
+    let (reasoning, consumes_reasoning_key) = reasoning_intent(request)?;
+    if let Some(intent) = &reasoning {
+        let plan = resolve_reasoning_plan(provider, None, model_name, intent);
+        log_reasoning_plan(model_name, &plan);
+        let mut resolved = Value::Object(std::mem::take(&mut body));
+        apply_reasoning_plan(&mut resolved, &plan);
+        if let Value::Object(object) = resolved {
+            body = object;
+        }
+    }
+
     if let Some(extra) = request.extra.as_object() {
         for (key, value) in extra {
+            if consumes_reasoning_key && key == REASONING_KEY {
+                continue;
+            }
             body.insert(key.clone(), value.clone());
         }
     }
 
     Ok(Value::Object(body))
+}
+/// Key of the provider-neutral reasoning intent inside [`ModelRequestConfig::extra`].
+const REASONING_KEY: &str = "reasoning";
+/// Reads the reasoning intent out of a request's `extra` map.
+///
+/// Returns the parsed intent and whether the raw `reasoning` key must stay out of
+/// the request body. `null` and intent-shaped values are consumed by the reasoning
+/// layer; anything else (a legacy raw payload, a number) is forwarded verbatim, so
+/// pre-existing callers keep working unchanged.
+fn reasoning_intent(request: &ModelRequestConfig) -> Result<(Option<ReasoningConfig>, bool)> {
+    match request.extra.get(REASONING_KEY) {
+        None => Ok((None, false)),
+        Some(Value::Null) => Ok((None, true)),
+        Some(value) => {
+            let intent = ReasoningConfig::from_value(value)?;
+            let consumed = intent.is_some();
+            Ok((intent, consumed))
+        }
+    }
+}
+/// Emits the resolver's diagnostics for one request.
+///
+/// Warnings are reported even when the plan is empty (an empty plan with a warning
+/// means "your intent could not be expressed"); the applied parameter names are
+/// traced only when something is actually sent.
+fn log_reasoning_plan(model: &str, plan: &ReasoningPlan) {
+    for warning in &plan.warnings {
+        tracing::debug!(
+            target: "openjiuwen_foundation::llm::reasoning",
+            model,
+            "reasoning config resolution: {warning}"
+        );
+    }
+    if !plan.is_empty() {
+        tracing::trace!(
+            target: "openjiuwen_foundation::llm::reasoning",
+            model,
+            sdk_params = ?plan.sdk_param_names(),
+            extra_body = ?plan.extra_body_names(),
+            "applied reasoning plan"
+        );
+    }
 }
 
 /// Renders an `f32` sampling parameter as the decimal the caller wrote.
@@ -646,5 +711,118 @@ mod tests {
         assert_eq!(sampling_value(1.0), json!(1.0));
         assert_eq!(sampling_value(1.5), json!(1.5));
         assert_eq!(sampling_value(f32::NAN), Value::Null);
+    }
+
+    // --- reasoning intent wiring -------------------------------------------
+    /// Builds a body for a request whose `extra` carries a reasoning intent.
+    fn body_with_extra(provider: &str, model: &str, extra: Value) -> Value {
+        let request = ModelRequestConfig::new(model).with_extra(extra);
+        build_chat_completion_body(provider, &[BaseMessage::user("hi")], &request, false)
+            .expect("the body builds")
+    }
+    #[test]
+    fn bodies_without_a_reasoning_key_are_unchanged() {
+        let request = ModelRequestConfig::new("gpt-4o")
+            .with_temperature(0.7)
+            .with_max_tokens(64);
+        let plain = body(&[BaseMessage::user("hi")], &request);
+        assert_eq!(
+            plain,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+                "temperature": 0.7,
+                "max_tokens": 64,
+            })
+        );
+        assert!(!plain.as_object().unwrap().contains_key("reasoning"));
+        assert!(!plain.as_object().unwrap().contains_key("reasoning_effort"));
+        // An `extra` map without the reasoning key only adds its own keys.
+        let with_extra = request.with_extra(json!({"frequency_penalty": 0.5}));
+        let extended = body(&[BaseMessage::user("hi")], &with_extra);
+        assert_eq!(extended["frequency_penalty"], json!(0.5));
+        assert!(!extended
+            .as_object()
+            .unwrap()
+            .contains_key("reasoning_effort"));
+    }
+    #[test]
+    fn a_reasoning_intent_adds_wire_parameters_and_is_consumed() {
+        let body = body_with_extra(
+            "openai",
+            "gpt-5.1",
+            json!({"reasoning": {"mode": "enabled", "effort": "high"}}),
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        // The neutral intent is not forwarded to the provider.
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+    }
+    #[test]
+    fn a_reasoning_intent_does_not_clobber_other_extra_keys() {
+        let body = body_with_extra(
+            "openai",
+            "gpt-5.1",
+            json!({"reasoning": {"effort": "low"}, "frequency_penalty": 0.25}),
+        );
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert_eq!(body["frequency_penalty"], json!(0.25));
+        assert_eq!(body["model"], json!("gpt-5.1"));
+    }
+    #[test]
+    fn a_caller_extra_key_still_wins_over_a_resolved_parameter() {
+        let body = body_with_extra(
+            "openai",
+            "gpt-5.1",
+            json!({"reasoning": {"effort": "low"}, "reasoning_effort": "max"}),
+        );
+        assert_eq!(body["reasoning_effort"], json!("max"));
+    }
+    #[test]
+    fn a_null_reasoning_key_is_dropped() {
+        let body = body_with_extra("openai", "gpt-5.1", json!({"reasoning": null}));
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
+    }
+    #[test]
+    fn a_legacy_reasoning_payload_is_forwarded_verbatim() {
+        let legacy = json!({"enabled": true});
+        let body = body_with_extra("openai", "gpt-4o", json!({"reasoning": legacy.clone()}));
+        assert_eq!(body["reasoning"], legacy);
+    }
+    #[test]
+    fn an_invalid_reasoning_intent_is_a_validation_error() {
+        let request = ModelRequestConfig::new("gpt-5.1")
+            .with_extra(json!({"reasoning": {"mode": "sometimes"}}));
+        let error = build_chat_completion_body("openai", &[], &request, false)
+            .expect_err("an invalid mode must fail");
+        assert_eq!(
+            error.kind(),
+            openjiuwen_common::error::ErrorKind::Validation
+        );
+    }
+    #[test]
+    fn reasoning_is_encoded_for_the_configured_provider() {
+        // DashScope-style switch, chosen from the provider name.
+        let body = body_with_extra(
+            "qwen",
+            "qwen3.8-max",
+            json!({"reasoning": {"mode": "enabled", "effort": "xhigh"}}),
+        );
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
+        // DeepSeek puts `thinking` in the body too.
+        let body = body_with_extra(
+            "deepseek",
+            "deepseek-v4-pro",
+            json!({"reasoning": {"mode": "disabled"}}),
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    }
+    #[test]
+    fn an_unsupported_reasoning_intent_sends_nothing() {
+        let body = body_with_extra("openai", "gpt-5", json!({"reasoning": {"effort": "max"}}));
+        assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
+        assert!(!body.as_object().unwrap().contains_key("reasoning"));
     }
 }
