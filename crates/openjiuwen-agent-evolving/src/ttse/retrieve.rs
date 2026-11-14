@@ -367,15 +367,15 @@ mod tests {
             .clone()
     }
 
-    async fn indexed() -> EmbeddingIndex {
+    async fn indexed(bank: &TipBank) -> EmbeddingIndex {
         let embedding: Arc<dyn Embedding> = Arc::new(FixedEmbedding::new(&[
             (QUERY, [1.0, 0.0]),
             (X, [1.0, 0.0]),
             (Z, [0.0, 1.0]),
         ]));
         let mut index = EmbeddingIndex::new(embedding);
-        index.upsert(X, X).await.expect("upsert x");
-        index.upsert(Z, Z).await.expect("upsert z");
+        index.upsert(&id_of(bank, X), X).await.expect("upsert x");
+        index.upsert(&id_of(bank, Z), Z).await.expect("upsert z");
         index
     }
 
@@ -394,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn dump_mode_keeps_bank_order_and_ignores_query() {
         let bank = bank();
-        let index = indexed().await;
+        let index = indexed(&bank).await;
         let ranked = rank(&bank, Some(&index), QUERY, 2, RetrieveMode::Dump)
             .await
             .expect("rank");
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn the_mode_matrix_uses_the_expected_branch() {
         let bank = bank();
-        let index = indexed().await;
+        let index = indexed(&bank).await;
 
         let embedded = rank(&bank, Some(&index), QUERY, 2, RetrieveMode::Embed)
             .await
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn hybrid_fusion_prefers_a_tip_both_branches_return() {
         let bank = bank();
-        let index = indexed().await;
+        let index = indexed(&bank).await;
         let ranked = rank(&bank, Some(&index), QUERY, 2, RetrieveMode::Hybrid)
             .await
             .expect("hybrid");
@@ -475,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn consult_async_limits_and_renders() {
         let bank = bank();
-        let index = indexed().await;
+        let index = indexed(&bank).await;
         let config = TtseConfig {
             consult_top_k: 1,
             ..TtseConfig::default()

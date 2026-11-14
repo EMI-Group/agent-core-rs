@@ -641,4 +641,145 @@ mod tests {
             .expect_err("malformed store");
         assert!(matches!(error, Error::Validation(_)), "got {error:?}");
     }
+
+    // ---- embedding-backed retrieval ---------------------------------------
+
+    use openjiuwen_core::retrieval::embedding::{Embedding, HashEmbedding};
+
+    use crate::ttse::index::EmbeddingIndex;
+    use crate::ttse::retrieve::RetrieveMode;
+
+    fn rules() -> [&'static str; 3] {
+        [
+            "use rg instead of grep",
+            "run the tests offline",
+            "quote every path",
+        ]
+    }
+
+    fn with_tips(engine: &mut TtseEngine) {
+        for rule in rules() {
+            engine
+                .bank_mut()
+                .add(TipRecord::new(rule, TipCategory::Tool).expect("valid rule"));
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_consult_cold_fills_and_ranks() {
+        let mut engine = TtseEngine::new(TtseConfig::default())
+            .expect("valid config")
+            .with_embedding(Arc::new(HashEmbedding::new(64)));
+        with_tips(&mut engine);
+        assert_eq!(engine.embedding_index().expect("index").len(), 0);
+
+        assert_eq!(engine.sync_index().await.expect("cold fill"), 3);
+        assert_eq!(engine.sync_index().await.expect("idempotent"), 0);
+
+        let result = engine
+            .consult_async("use rg instead of grep")
+            .await
+            .expect("consult");
+        assert_eq!(result.tips[0].rule, "use rg instead of grep");
+        assert_eq!(engine.consult_count(), 1);
+        assert_eq!(engine.bank().tips()[0].hits, 1);
+
+        let embedded = engine
+            .consult_with("run the tests offline", RetrieveMode::Embed)
+            .await
+            .expect("consult by embedding");
+        assert!(!embedded.tips.is_empty());
+        assert_eq!(engine.consult_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn with_embedding_index_creates_then_validates_the_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let index_path = directory.path().join("nested").join("index.json");
+        let mut engine = TtseEngine::new(TtseConfig::default())
+            .expect("valid config")
+            .with_embedding_index(&index_path, Arc::new(HashEmbedding::new(64)))
+            .expect("a missing file creates an empty index");
+        assert!(engine.embedding_index().expect("index").is_empty());
+        assert_eq!(
+            engine.embedding_index().expect("index").path(),
+            Some(index_path.as_path())
+        );
+
+        with_tips(&mut engine);
+        engine.sync_index().await.expect("sync");
+        let bank_path = directory.path().join("bank.json");
+        engine.save_with_index(&bank_path).await.expect("save");
+        assert!(bank_path.exists());
+        assert!(
+            index_path.exists(),
+            "a bound index writes back to its own path"
+        );
+
+        let reloaded = TtseEngine::new(TtseConfig::default())
+            .expect("valid config")
+            .with_embedding_index(&index_path, Arc::new(HashEmbedding::new(64)))
+            .expect("matching embedder loads");
+        assert_eq!(reloaded.embedding_index().expect("index").len(), 3);
+
+        let mismatch = TtseEngine::new(TtseConfig::default())
+            .expect("valid config")
+            .with_embedding_index(&index_path, Arc::new(HashEmbedding::new(32)))
+            .expect_err("dimension mismatch");
+        assert!(matches!(mismatch, Error::Validation(_)), "got {mismatch:?}");
+    }
+
+    #[tokio::test]
+    async fn save_with_index_round_trips_both_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("bank.json");
+        let mut engine = TtseEngine::new(TtseConfig::default())
+            .expect("valid config")
+            .with_embedding(Arc::new(HashEmbedding::new(64)));
+        with_tips(&mut engine);
+        engine.sync_index().await.expect("sync");
+
+        engine.save_with_index(&path).await.expect("save");
+
+        assert!(path.exists());
+        let index_path = directory.path().join("bank.json.embedding.json");
+        let index = EmbeddingIndex::open(
+            &index_path,
+            Arc::new(HashEmbedding::new(64)) as Arc<dyn Embedding>,
+        )
+        .expect("the sibling index is readable");
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            TtseEngine::load(&path).await.expect("bank reload").bank(),
+            engine.bank()
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_async_without_a_model_matches_the_deterministic_dream() {
+        let duplicates = [
+            "always check the workspace path before running tests",
+            "always check the workspace path before running the tests",
+            "always check the workspace path before running all tests",
+        ];
+        let mut sync_engine = TtseEngine::new(TtseConfig::default()).expect("valid config");
+        let mut async_engine = TtseEngine::new(TtseConfig::default()).expect("valid config");
+        for engine in [&mut sync_engine, &mut async_engine] {
+            for rule in duplicates {
+                // Push directly: `TipBank::add` would dedupe these near-identical
+                // rules at the 0.88 add threshold before dreaming sees them.
+                engine
+                    .bank_mut()
+                    .tips
+                    .push(TipRecord::new(rule, TipCategory::Tool).expect("valid rule"));
+            }
+        }
+
+        let expected = sync_engine.dream();
+        let actual = async_engine.dream_async().await.expect("dream");
+
+        assert_eq!(actual, expected);
+        assert_eq!(async_engine.bank(), sync_engine.bank());
+        assert_eq!(actual.merged, 2);
+    }
 }

@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(verdict.merge_indices, vec![0, 1]);
         assert_eq!(verdict.keep_indices, vec![2]);
         assert_eq!(verdict.reason, "they are paraphrases");
-        assert!(verdict.thinking.contains("paraphrases"));
+        assert!(verdict.thinking.contains("the same thing"));
         assert!(verdict.canonical.starts_with("When running tests"));
     }
 
@@ -962,16 +962,333 @@ mod tests {
     #[test]
     fn capped_clusters_keep_the_best_scoring_rules() {
         let mut bank = TipBank::with_capacity(8);
-        for (rule, hits) in [("rule one", 0), ("rule two", 4), ("rule three", 2)] {
+        for (rule, hits, successes, failures) in [
+            ("rule one", 4, 0, 4),
+            ("rule two", 4, 4, 0),
+            ("rule three", 2, 1, 1),
+        ] {
             let tip = TipRecord::new(rule, TipCategory::Tool)
                 .expect("valid rule")
-                .with_observation(hits, hits, 0);
+                .with_observation(hits, successes, failures);
             bank.add(tip);
         }
         let ids: Vec<String> = bank.tips().iter().map(|tip| tip.tip_id.clone()).collect();
         let capped = capped_cluster(&bank, &ids, 2);
         assert_eq!(capped.len(), 2);
-        assert_eq!(capped[0], ids[1], "the best-observed rule wins");
+        assert_eq!(capped[0], ids[1], "the highest success rate wins");
         assert_eq!(capped[1], ids[2]);
+    }
+
+    // ---- model-backed passes (offline `ScriptedModel`) ---------------------
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use openjiuwen_common::error::Result as CrateResult;
+    use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
+    use openjiuwen_core::retrieval::embedding::Embedding;
+    use openjiuwen_test_support::ScriptedModel;
+
+    use crate::ttse::bank::TipBank;
+    use crate::ttse::config::TtseConfig;
+    use crate::ttse::index::EmbeddingIndex;
+    use crate::ttse::models::{TipCategory, TipRecord};
+
+    /// Two rules whose token sets overlap well above the 0.72 dream threshold.
+    const D1: &str = "always check the workspace path before running tests";
+    const D2: &str = "always check the workspace path before running the tests";
+    const D3: &str = "always check the workspace path before running all tests";
+    /// A rule sharing no token with the duplicates.
+    const UNRELATED: &str = "prefer rg over grep for speed";
+    /// The canonical rule the scripted merge answer folds the duplicates into.
+    const CANONICAL: &str = "When running tests: use cargo to run them offline";
+
+    fn dream_config() -> TtseConfig {
+        TtseConfig {
+            dream_prune_enabled: false,
+            dream_merge_threshold: 0.72,
+            dream_cluster_min_size: 2,
+            dream_ttl_ticks: 90,
+            ..TtseConfig::default()
+        }
+    }
+
+    fn bank_with(rules: &[(&str, TipCategory)]) -> TipBank {
+        let mut bank = TipBank::with_capacity(16);
+        bank.tick = 20;
+        for (rule, category) in rules {
+            bank.tips
+                .push(TipRecord::new(*rule, *category).expect("valid rule"));
+        }
+        bank
+    }
+
+    fn scripted(answer: &str) -> Arc<dyn Model> {
+        Arc::new(ScriptedModel::text(answer))
+    }
+
+    /// An embedder mapping every text to the same unit vector.
+    struct ConstantEmbedding;
+
+    #[async_trait]
+    impl Embedding for ConstantEmbedding {
+        fn model_name(&self) -> &str {
+            "constant"
+        }
+
+        fn dimension_hint(&self) -> Option<usize> {
+            Some(2)
+        }
+
+        async fn embed_query(&self, _text: &str) -> CrateResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> CrateResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merge_verdict_collapses_a_cluster_into_the_canonical_text() {
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&merge_answer()), ModelRequestConfig::default());
+        assert!(dreamer.has_model());
+        let mut bank = bank_with(&[
+            (D1, TipCategory::Tool),
+            (D2, TipCategory::Tool),
+            (D3, TipCategory::Tool),
+            (UNRELATED, TipCategory::Tool),
+        ]);
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!(report.examined, 4);
+        assert_eq!(report.merged, 1, "MERGE_INDICES folded two of the three");
+        assert_eq!(report.promoted, 1);
+        assert_eq!(bank.len(), 3);
+        let canonical = bank
+            .tips()
+            .iter()
+            .find(|tip| tip.rule == CANONICAL)
+            .expect("the canonical rule replaced the merged members");
+        assert_eq!(canonical.source, "dream");
+        assert!(bank.tips().iter().any(|tip| tip.rule == UNRELATED));
+    }
+
+    #[tokio::test]
+    async fn a_full_cluster_merge_absorbs_every_member() {
+        let answer = [
+            "THINKING:",
+            "all three say the same thing",
+            "REASON: paraphrases",
+            "VERDICT: MERGE",
+            &format!("CANONICAL: {CANONICAL}"),
+            "MERGE_INDICES:",
+            "KEEP_INDICES:",
+        ]
+        .join("\n");
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&answer), ModelRequestConfig::default());
+        let mut bank = bank_with(&[
+            (D1, TipCategory::Tool),
+            (D2, TipCategory::Tool),
+            (D3, TipCategory::Tool),
+        ]);
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!((report.merged, report.promoted), (2, 1));
+        assert_eq!(bank.len(), 1);
+        assert_eq!(bank.tips()[0].rule, CANONICAL);
+    }
+
+    #[tokio::test]
+    async fn keep_distinct_leaves_the_bank_untouched() {
+        let answer = [
+            "THINKING:",
+            "the conditions differ",
+            "REASON: different cases",
+            "VERDICT: KEEP_DISTINCT",
+            "CANONICAL:",
+        ]
+        .join("\n");
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&answer), ModelRequestConfig::default());
+        let mut bank = bank_with(&[(D1, TipCategory::Tool), (D2, TipCategory::Tool)]);
+        let before = bank.clone();
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!((report.merged, report.promoted, report.pruned), (0, 0, 0));
+        assert_eq!(bank, before);
+    }
+
+    #[tokio::test]
+    async fn malformed_model_output_keeps_the_tips() {
+        let mut dreamer = Dreamer::new(dream_config()).with_model(
+            scripted("I would merge those two"),
+            ModelRequestConfig::default(),
+        );
+        let mut bank = bank_with(&[(D1, TipCategory::Tool), (D2, TipCategory::Tool)]);
+        let before = bank.clone();
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream never errors on a bad answer");
+
+        assert_eq!(report.merged, 0);
+        assert_eq!(bank, before);
+    }
+
+    async fn index_of(bank: &TipBank) -> EmbeddingIndex {
+        let mut index = EmbeddingIndex::new(Arc::new(ConstantEmbedding));
+        for tip in bank.tips() {
+            index.upsert(&tip.tip_id, &tip.rule).await.expect("upsert");
+        }
+        index
+    }
+    #[tokio::test]
+    async fn cross_category_clusters_never_merge() {
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&merge_answer()), ModelRequestConfig::default());
+        let mut bank = bank_with(&[(D1, TipCategory::Tool), (D2, TipCategory::Pitfall)]);
+        let index = index_of(&bank).await;
+        let before = bank.clone();
+
+        let report = dreamer
+            .dream_with_model(&mut bank, Some(&index))
+            .await
+            .expect("dream");
+
+        assert_eq!(report.merged, 0);
+        assert_eq!(bank, before, "identical vectors never cross a category");
+    }
+
+    #[tokio::test]
+    async fn cosine_clustering_merges_rules_token_overlap_misses() {
+        let first = "use rg instead of grep";
+        let second = "prefer ripgrep over grep";
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&merge_answer()), ModelRequestConfig::default());
+        let mut bank = bank_with(&[(first, TipCategory::Tool), (second, TipCategory::Tool)]);
+        let index = index_of(&bank).await;
+
+        let report = dreamer
+            .dream_with_model(&mut bank, Some(&index))
+            .await
+            .expect("dream");
+
+        assert_eq!((report.merged, report.promoted), (1, 1));
+        assert_eq!(bank.len(), 1);
+        assert_eq!(bank.tips()[0].rule, CANONICAL);
+    }
+
+    #[tokio::test]
+    async fn purge_verdicts_remove_the_flagged_tip() {
+        let answer = [
+            "INDEX: 0 | VERDICT: PURGE | REASON: tip_malformed",
+            "INDEX: 1 | VERDICT: KEEP | REASON: ok",
+            "INDEX: 2 | VERDICT: KEEP | REASON: ok",
+        ]
+        .join("\n");
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&answer), ModelRequestConfig::default());
+        let first = "use rg instead of grep";
+        let mut bank = bank_with(&[
+            (first, TipCategory::Tool),
+            ("run the tests offline", TipCategory::Workflow),
+            ("quote every path", TipCategory::Pitfall),
+        ]);
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!(report.pruned, 1);
+        assert_eq!(bank.len(), 2);
+        assert!(bank.tips().iter().all(|tip| tip.rule != first));
+    }
+
+    #[tokio::test]
+    async fn the_deterministic_fallback_purges_a_generic_rule() {
+        let answer = [
+            "INDEX: 0 | VERDICT: KEEP | REASON: ok",
+            "INDEX: 1 | VERDICT: KEEP | REASON: ok",
+        ]
+        .join("\n");
+        let mut dreamer = Dreamer::new(dream_config())
+            .with_model(scripted(&answer), ModelRequestConfig::default());
+        let mut bank = bank_with(&[
+            ("check", TipCategory::Tool),
+            ("use rg instead of grep", TipCategory::Tool),
+        ]);
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!(report.pruned, 1, "the one-word rule is not actionable");
+        assert_eq!(bank.len(), 1);
+        assert_eq!(bank.tips()[0].rule, "use rg instead of grep");
+    }
+
+    #[tokio::test]
+    async fn the_no_model_path_equals_the_deterministic_dream() {
+        let mut plain = Dreamer::new(dream_config());
+        let mut model_free = Dreamer::new(dream_config());
+        let rules = [
+            (D1, TipCategory::Tool),
+            (D2, TipCategory::Tool),
+            (D3, TipCategory::Tool),
+            (UNRELATED, TipCategory::Tool),
+        ];
+        let mut left = bank_with(&rules);
+        let mut right = bank_with(&rules);
+
+        let expected = plain.dream(&mut left);
+        let actual = model_free
+            .dream_with_model(&mut right, None)
+            .await
+            .expect("dream");
+
+        assert_eq!(actual, expected);
+        assert_eq!(right, left);
+    }
+
+    #[tokio::test]
+    async fn the_merge_budget_caps_the_number_of_prompts() {
+        let model = ScriptedModel::text(&merge_answer());
+        let mut dreamer = Dreamer::new(dream_config()).with_max_llm_merges(0);
+        dreamer = dreamer.with_model(
+            Arc::new(model.clone()) as Arc<dyn Model>,
+            ModelRequestConfig::default(),
+        );
+        assert_eq!(dreamer.max_llm_merges(), 0);
+        let mut bank = bank_with(&[(D1, TipCategory::Tool), (D2, TipCategory::Tool)]);
+
+        let report = dreamer
+            .dream_with_model(&mut bank, None)
+            .await
+            .expect("dream");
+
+        assert_eq!(report.merged, 0);
+        assert_eq!(bank.len(), 2);
     }
 }
