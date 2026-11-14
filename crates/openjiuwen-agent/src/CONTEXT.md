@@ -2,7 +2,7 @@
 
 ## Intent
 
-Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop, abilities, rails, interrupts, the application agents (`LLMAgent`, `WorkflowAgent`), the tool policy layer, callbacks, steering, skills, the controller stack, KV-cache affinity, tunable operators, self-evolution, and YAML prompt packs.
+Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop, abilities, rails, interrupts, the application agents (`LLMAgent`, `WorkflowAgent`), the tool policy layer, callbacks, steering, skills, the controller stack, KV-cache affinity and provider actions, tunable operators, self-evolution, and YAML/prompt-directory packs.
 
 ## Module Layout
 
@@ -24,11 +24,11 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 | `steering/` | `SteeringMessage`, `SteeringQueue` |
 | `policy/` | tool exposure policy, MCP allowlist, client tools, resilience, `FinalRequestCheck` |
 | `skills/` | skill definitions, discovery, prompt injection |
-| `controller/` | controller stack routing events to agents/workflows |
-| `kv_cache/` | cache identity, runtime, metadata, model-call affinity hook |
-| `operator/` | tunable operators for LLM/tool/memory/context-evolve calls |
+| `controller/` | controller stack: turn loop, shared task store, background scheduler, pause/cancel, per-conversation queue, group routing, task-op reasoner |
+| `kv_cache/` | cache identity, prefix runtime, metadata, model-call affinity hook, provider prefetch/offload action runtime |
+| `operator/` | tunable operators, rich `ApplyResult`/`UpdateValue`, legacy `LLMCall`, experience staging |
 | `evolve/` | `ReActAgentEvolve` operator seam |
-| `prompt_pack/` | YAML prompt packs |
+| `prompt_pack/` | YAML prompt packs and Python prompt-directory loading |
 
 ## Constraints
 
@@ -46,6 +46,7 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 ## Routing Table
 
 - `./react/` → `ReActAgent`, config, loop, model step, hooks, frames, exposure, pause/resume (`react/CONTEXT.md`)
+- `./react/agent_loop/` → the invoke loop and its unit tests (`agent_loop/CONTEXT.md`)
 - `./abilities/` → ability manager and tool execution (`abilities/CONTEXT.md`)
 - `./rails/` → rail seam and built-in rails (`rails/CONTEXT.md`)
 - `./workflow_agent/` → `WorkflowAgent` (`workflow_agent/CONTEXT.md`)
@@ -53,8 +54,12 @@ Module tree of the `openjiuwen-agent` crate: the `Agent` seam, the `ReAct` loop,
 - `./steering/` → steering queue (`steering/CONTEXT.md`)
 - `./policy/` → tool policy, client tools, resilience, final request check (`policy/CONTEXT.md`)
 - `./skills/` → skill utilities and prompt injection
-- `./controller/` → controller stack (event → intent → task executor)
-- `./kv_cache/` → KV-cache affinity types and in-process runtime
-- `./operator/` → tunable operators
+- `./controller/` → controller stack: turn loop, task store, background scheduler, reasoner, queue, group (`controller/CONTEXT.md`)
+- `./controller/task_manager/` → shared task store (`task_manager/CONTEXT.md`)
+- `./controller/reasoner/` → task-op planning/application (`reasoner/CONTEXT.md`)
+- `./controller/executors/` → executors, registry, background scheduler (`executors/CONTEXT.md`)
+- `./kv_cache/` → KV-cache affinity, prefix runtime, action runtime (`kv_cache/CONTEXT.md`)
+- `./operator/` → tunable operators and staging (`operator/CONTEXT.md`)
+- `./operator/legacy/` → executing `LLMCall` wrapper (`operator/legacy/CONTEXT.md`)
 - `./evolve/` → `ReActAgentEvolve`
-- `./prompt_pack/` → YAML prompt packs
+- `./prompt_pack/` → YAML packs and prompt directories (`prompt_pack/CONTEXT.md`)
