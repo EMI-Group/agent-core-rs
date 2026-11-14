@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use openjiuwen_agent::RailEvent;
 use openjiuwen_common::error::ErrorKind;
-use openjiuwen_foundation::{BaseMessage, Model};
+use openjiuwen_foundation::{BaseMessage, Model, ToolCall};
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
 use tokio_util::sync::CancellationToken;
 
@@ -341,4 +341,56 @@ async fn consultation_skill_mounts_and_unmounts_through_the_library() {
     assert!(mount.unmount(&mut library));
     assert!(!mount.is_mounted());
     assert_eq!(library.roots, Vec::<std::path::PathBuf>::new());
+}
+
+/// Verifier routing is host-driven: the rail observes, the host verifies and consults.
+#[tokio::test]
+async fn host_driven_verification_records_steps_then_consults_within_the_budget() {
+    let proposer = ScriptedModel::text("- Fix src/main.rs\n- Run cargo test to verify");
+    let probe = proposer.clone();
+    let rail = MoaRail::new(
+        MoaConfig::new(vec![reference(proposer)])
+            .with_mode(MoaMode::VerifierRouted)
+            .with_max_reference_calls(Some(1)),
+    )
+    .unwrap();
+    let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeInvoke);
+    ctx.base.messages = vec![user("fix the failing build in src/main.rs")];
+    rail.before_invoke(&mut ctx).await.unwrap();
+
+    ctx.base.messages.push(
+        BaseMessage::assistant("I will inspect src/main.rs")
+            .with_tool_calls(vec![ToolCall::new("read_file")]),
+    );
+    ctx.base
+        .messages
+        .push(BaseMessage::tool("call-1", "fn main() { broken }"));
+    rail.after_react_iteration(&mut ctx).await.unwrap();
+
+    let steps = rail.recorded_steps();
+    assert_eq!(steps.len(), 1);
+    assert!(steps[0].starts_with("Action: read_file; response: I will inspect src/main.rs"));
+    assert_eq!(rail.snapshot().unwrap().completed_turns, 1);
+    assert_eq!(probe.call_count(), 0, "hooks never ask a model");
+
+    let score = rail.verify_progress(&steps).await.unwrap();
+    assert!((0.0..=1.0).contains(&score));
+    assert_eq!(rail.snapshot().unwrap().verifier_calls, 3);
+
+    let outcome = rail
+        .consult(&ctx.base.messages, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.success_count, 1);
+    assert_eq!(probe.call_count(), 1);
+    assert_eq!(rail.snapshot().unwrap().reference_calls, 1);
+
+    // The single permitted batch is spent, so the host's next consultation is refused.
+    let error = rail
+        .consult(&ctx.base.messages, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert_eq!(error.message(), "MoA reference-call budget exhausted");
+    assert_eq!(probe.call_count(), 1);
 }

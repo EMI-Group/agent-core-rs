@@ -17,7 +17,7 @@ Python entry points and persisted JSON keys are preserved where the reference pe
 - `consultation.rs` — bounded concurrent proposer fan-out over injected models with timeout, cancellation and partial-failure accounting.
 - `verifier.rs` — `ProgressVerifier` seam, offline `StructuralVerifier`, model-driven `LlmVerifier`, structural proposal ranking (`rank_proposals`).
 - `aggregate.rs` — `AggregationStrategy`, `Aggregator`: deterministic labelled concatenation by default, optional model synthesis.
-- `rail.rs` — `MoaRail`: harness rail that publishes the MoA system-prompt section, installs the per-invocation `MoaState`, publishes the snapshot/outcome diagnostics, and owns the explicit `consult` call, the last outcome and the bounded history.
+- `rail.rs` — `MoaRail`: harness rail that publishes the MoA system-prompt section, installs the per-invocation `MoaState`, publishes the snapshot/outcome diagnostics, records redacted progress steps, and owns the explicit `consult`/`verify_progress` calls, the last outcome and the bounded history.
 - `builtin_skills.rs` — embedded `consult-reference-models` skill descriptor and materialization helper.
 - `skill_mount.rs` — `ConsultationSkillMount`: validates and mounts the consultation skill root into a `crate::skills::SkillLibrary`.
 - `tests.rs` — offline integration-style suite for the whole module.
@@ -55,7 +55,10 @@ Verifier (`verifier.rs`): `ProgressVerifier` async trait, `StructuralVerifier`, 
 
 Aggregation (`aggregate.rs`): `AggregationStrategy { Labelled, Synthesis }`, `Aggregator::new`, `Aggregator::labelled`, `Aggregator::aggregate(config, problem, sources, cancel) -> Result<String>`.
 
-Rail (`rail.rs`): `MOA_RAIL_NAME`, `MOA_PROMPT_SECTION`, `MOA_STATE_EXTRA_KEY`, `MOA_OUTCOME_EXTRA_KEY`, `MoaRail::{new, config, prompt_section, last_outcome, snapshot, history, consult, save_history, load_history}`; implements `crate::rails::HarnessRail` with `name() = "moa"` and priority `rail_priority::MOA` by default.
+Rail (`rail.rs`): `MOA_RAIL_NAME`, `MOA_PROMPT_SECTION`, `MOA_STATE_EXTRA_KEY`, `MOA_OUTCOME_EXTRA_KEY`, `MoaRail::{new, with_language, config, prompt_section, last_outcome, snapshot, history, consult, record_step, recorded_steps, verify_progress, save_history, load_history}`; implements `crate::rails::HarnessRail` with `name() = "moa"` and priority `rail_priority::MOA` by default.
+`MoaRail::consult` refuses `MoaMode::JevRouted` and enforces `MoaConfig::max_reference_calls` while an invocation state is installed.
+`MoaRail::record_step` redacts and bounds one step, `MoaRail::recorded_steps` exposes the recorded steps, and `MoaRail::verify_progress` scores them while enforcing `VerifierConfig::max_verifier_calls`.
+`HarnessRail::after_react_iteration` only observes: it counts the completed turn and, in `verifier_routed` mode, records one redacted step built from the last assistant message and its tool observations.
 
 Skills (`builtin_skills.rs`, `skill_mount.rs`): `CONSULT_SKILL_NAME`, `CONSULT_SKILL_DESCRIPTION`, `CONSULT_SKILL_BODY`, `validate_builtin_skill_name`, `consult_skill`, `materialize_builtin_skill`; `ConsultationSkillMount::{new, embedded, from_dir, skill, mount, unmount, validate}`.
 
@@ -84,14 +87,16 @@ Every public item is re-exported from this module root; the crate root adds the 
 - `consultation.rs`: fan-out preserves configured order, partial failure is recorded and does not sink the batch, all-fail returns an error, per-proposer character caps are applied, pre-cancelled token returns `Error::Cancelled`, timeout is recorded as a failure.
 - `verifier.rs`: structural scores stay in 0..1, longer/structured proposals outrank thin ones, redaction applies before scoring, `LlmVerifier` parses a scripted score and rejects non-numeric output, progress scores detect stalled repetition, config selection picks structural vs LLM.
 - `aggregate.rs`: labelled output shape and source order, empty sources, synthesis required-model error, synthesis through `ScriptedModel`, cancellation.
-- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, consult stores outcome/history, `before_model_call` upserts, `after_invoke` retires the state, history file round-trip.
+- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, consult stores outcome/history, `before_model_call` upserts, `after_invoke` retires the state, history file round-trip, `jev_routed` refusal with no proposer call, reference-budget refusal with and without an installed state, `record_step` redaction/truncation/disabled behaviour, `verify_progress` budget refusal plus score/`verifier_calls` accounting, `after_react_iteration` turn counting and one redacted step in `verifier_routed` mode.
 - `skill_mount.rs`: embedded descriptor, explicit directory validation and error messages, mount/unmount ownership, materialization round-trip.
-- `tests.rs`: end-to-end offline scenarios (proposers -> verifier -> aggregator -> rail -> history, all-fail, cancellation, synthesis, redaction, config validation, snapshot/history JSON, skill materialization/mount/unmount).
+- `tests.rs`: end-to-end offline scenarios (proposers -> verifier -> aggregator -> rail -> history, all-fail, cancellation, synthesis, redaction, config validation, snapshot/history JSON, skill materialization/mount/unmount, host-driven verification -> consultation within the reference budget).
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline`, `--no-default-features`, `--all-features`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` warning-free.
 
 ## Deferred items (typed)
 
-- `jev_routed` decision-making (`decide_reference`) returns `Error::Unsupported` with reason `jev_routed requires an external System One client, which this port does not provide`; the config and state fields are present so callers can model it.
+- `jev_routed` consultation returns `Error::Unsupported` with reason `jev_routed requires an external System One client, which this port does not provide`; the config and state fields are present for parity, and the on-demand fan-out never runs in this mode.
+- Automatic verifier-routed consultation at each ReAct iteration is host-driven: `MoaRail::after_react_iteration` only observes turns and steps, and the host calls `MoaRail::verify_progress` and `MoaRail::consult`, because crate rails never call a model.
+- `max_reference_calls` and `max_verifier_calls` are enforced by `MoaRail::consult` and `MoaRail::verify_progress` respectively; the reference budget applies only while an invocation state is installed.
 - LLM-as-judge proposal quality, multimodal proposals, vendor proposer clients and OTLP telemetry are out of scope; models are always injected handles.
 - `consult_reference_models` tool registration and Python's ability-manager integration are not ported (the crate has no ability manager); `MoaRail::consult` is the replacement seam.
 - Dynamic plugin/`sys.modules` loading of skills is not ported; the builtin skill body is embedded with `include_str!` and materialized on request.

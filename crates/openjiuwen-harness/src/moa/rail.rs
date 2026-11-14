@@ -19,11 +19,18 @@
 //!   current outcome, so the outcome survives every `ReAct` iteration of the invocation.
 //! - [`HarnessRail::after_invoke`] retires the installed state: it marks the state closed,
 //!   closes the proposal store with `outer_end`, and clears the installed state.
+//! - [`HarnessRail::after_react_iteration`] is a pure observer: it counts the completed turn
+//!   and, in [`MoaMode::VerifierRouted`], records one redacted progress step built from the
+//!   conversation, exactly like Python's rail. It never verifies and never consults.
 //!
 //! The rail never calls a model: the hooks only read configuration and consultation state.
-//! [`MoaRail::consult`] is where the reference models are asked, and it always runs because
-//! the host asked for it, mirroring Python's ability-manager tool. The remaining hooks keep
-//! their defaults.
+//! [`MoaRail::consult`] is where the reference models are asked and
+//! [`MoaRail::verify_progress`] is where the verifier is asked; both run because the host
+//! asked for them, mirroring Python's ability-manager tool. Automatic verifier-driven
+//! consultation (Python's `after_react_iteration` → `prepare_reference` call) therefore
+//! stays host-driven here: the host observes the recorded steps through
+//! [`MoaRail::recorded_steps`], scores them with [`MoaRail::verify_progress`] and decides
+//! whether to call [`MoaRail::consult`]. The remaining hooks keep their defaults.
 //!
 //! # Failure policy
 //!
@@ -48,9 +55,10 @@ use crate::prompts::PromptSection;
 use crate::rails::{last_user_text, publish_prompt_section, HarnessRail, HarnessRailContext};
 
 use super::aggregate::{AggregationStrategy, Aggregator};
-use super::config::MoaConfig;
+use super::config::{MoaConfig, MoaMode};
 use super::consultation;
 use super::prompts;
+use super::redaction;
 use super::state::{
     ConsultationHistory, ConsultationOutcome, ConsultationRecord, MoaSnapshot, MoaState,
 };
@@ -79,6 +87,12 @@ pub const MOA_OUTCOME_EXTRA_KEY: &str = "harness.moa_outcome";
 
 /// Language a run uses until [`MoaRail::with_language`] replaces it.
 const DEFAULT_LANGUAGE: &str = "en";
+
+/// Character budget of one recorded progress step (Python's `[:8_000]`).
+const MAX_STEP_CHARS: usize = 8_000;
+
+/// Character budget of one observation inside a recorded step (Python's `[:1_000]`).
+const MAX_OBSERVATION_CHARS: usize = 1_000;
 
 /// Harness rail that publishes the `MoA` prompt section and owns the consultation state.
 ///
@@ -197,10 +211,20 @@ impl MoaRail {
     /// of asked reference models), stores the outcome as [`Self::last_outcome`] and appends
     /// one record to the bounded history.
     ///
+    /// The configured [`MoaConfig::max_reference_calls`] is enforced only while an invocation
+    /// state is installed: a stateless call outside an invocation has no per-invocation
+    /// budget to spend.
+    ///
     /// # Errors
     ///
     /// - [`Error::Config`] with `MoA consultation is disabled` when
     ///   [`MoaConfig::enabled`] is `false`.
+    /// - [`Error::Unsupported`] with `jev_routed requires an external System One client,
+    ///   which this port does not provide` when [`MoaConfig::mode`] is [`MoaMode::JevRouted`]:
+    ///   the router decision is not ported, so the on-demand path must not run in its place.
+    /// - [`Error::Config`] with `MoA reference-call budget exhausted` when an invocation state
+    ///   is installed and its `reference_calls` already reached
+    ///   [`MoaConfig::max_reference_calls`].
     /// - [`Error::Llm`] when every reference model fails, or when
     ///   [`AggregationStrategy::Synthesis`] is configured but the aggregator fails or answers
     ///   with nothing.
@@ -215,6 +239,23 @@ impl MoaRail {
     ) -> Result<ConsultationOutcome> {
         if !self.config.enabled {
             return Err(Error::config("MoA consultation is disabled"));
+        }
+        if self.config.mode == MoaMode::JevRouted {
+            return Err(Error::unsupported(
+                "jev_routed requires an external System One client, which this port does not provide",
+            ));
+        }
+        // The guard lives in the block, so no lock is held across the fan-out below.
+        {
+            let state = self.state.read();
+            let exhausted = state.as_ref().is_some_and(|state| {
+                self.config
+                    .max_reference_calls
+                    .is_some_and(|limit| state.reference_calls >= limit)
+            });
+            if exhausted {
+                return Err(Error::config("MoA reference-call budget exhausted"));
+            }
         }
         let problem = last_user_text(messages).unwrap_or_default();
         let batch = consultation::consult(&self.config, messages, cancel).await?;
@@ -285,6 +326,94 @@ impl MoaRail {
         Ok(())
     }
 
+    /// Records one progress step on the installed invocation state.
+    ///
+    /// The step is redacted with [`redaction::redact`] (secrets never reach the state) and
+    /// truncated to `8_000` characters, then appended to the state's `steps`, which is what
+    /// [`Self::verify_progress`] scores. Returns `true` when the step was recorded and
+    /// `false` — without panicking — when the rail is disabled or no invocation state is
+    /// installed.
+    #[must_use]
+    pub fn record_step(&self, step: impl Into<String>) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        let step = truncate_chars(&redaction::redact(&step.into()), MAX_STEP_CHARS);
+        // The guard lives in the statement, so it never spans a suspension point.
+        let mut state = self.state.write();
+        let Some(state) = state.as_mut() else {
+            return false;
+        };
+        state.steps.push(step);
+        true
+    }
+
+    /// The progress steps recorded on the installed invocation state, oldest first.
+    ///
+    /// Empty when no invocation state is installed. This is the host's view of what
+    /// [`HarnessRail::after_react_iteration`] and [`Self::record_step`] collected, so it can
+    /// be handed to [`Self::verify_progress`].
+    #[must_use]
+    pub fn recorded_steps(&self) -> Vec<String> {
+        self.state
+            .read()
+            .as_ref()
+            .map(|state| state.steps.clone())
+            .unwrap_or_default()
+    }
+
+    /// Scores `steps` with the configured verifier against the invocation problem.
+    ///
+    /// The problem text is the installed state's `problem`; the caller supplies the steps,
+    /// normally [`Self::recorded_steps`]. On success the installed state's `verifier_calls`
+    /// grows by [`VerifierConfig::n_evaluations`](super::config::VerifierConfig::n_evaluations)
+    /// and its `previous_score` becomes the returned score.
+    ///
+    /// This is the host-driven replacement for Python's rail-internal verification: the rail
+    /// never calls a model from a hook, so the host decides when to verify and, when the score
+    /// stalls, whether to call [`Self::consult`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Config`] with `MoA rail has no active invocation` when no invocation state
+    ///   is installed.
+    /// - [`Error::Config`] with `MoA verifier budget exhausted` when spending
+    ///   [`VerifierConfig::n_evaluations`](super::config::VerifierConfig::n_evaluations) more
+    ///   calls would exceed
+    ///   [`VerifierConfig::max_verifier_calls`](super::config::VerifierConfig::max_verifier_calls).
+    /// - The [`verifier::score_progress`] errors: [`Error::Config`] when the LLM selection has
+    ///   no verifier model, [`Error::Llm`] when the injected model fails or answers without a
+    ///   numeric score.
+    pub async fn verify_progress(&self, steps: &[String]) -> Result<f32> {
+        // Clone what the verification needs, then drop the guard before the model call.
+        let problem = {
+            let state = self.state.read();
+            let state = state
+                .as_ref()
+                .ok_or_else(|| Error::config("MoA rail has no active invocation"))?;
+            let over_budget = self
+                .config
+                .verifier
+                .max_verifier_calls
+                .is_some_and(|limit| {
+                    state.verifier_calls + self.config.verifier.n_evaluations > limit
+                });
+            if over_budget {
+                return Err(Error::config("MoA verifier budget exhausted"));
+            }
+            state.problem.clone()
+        };
+        let score = verifier::score_progress(&self.config, &problem, steps).await?;
+        {
+            let mut state = self.state.write();
+            if let Some(state) = state.as_mut() {
+                state.verifier_calls += self.config.verifier.n_evaluations;
+                state.previous_score = Some(score);
+            }
+        }
+        Ok(score)
+    }
+
     /// Installs a fresh invocation state for `problem` and returns its snapshot.
     fn install_state(&self, problem: impl Into<String>) -> MoaSnapshot {
         let state = MoaState::new(problem);
@@ -308,6 +437,46 @@ impl MoaRail {
                 .insert(MOA_OUTCOME_EXTRA_KEY.to_owned(), value);
         }
     }
+}
+
+/// Truncates `value` to at most `limit` characters, never splitting one in half.
+fn truncate_chars(value: &str, limit: usize) -> String {
+    match value.char_indices().nth(limit) {
+        Some((index, _)) => value[..index].to_owned(),
+        None => value.to_owned(),
+    }
+}
+
+/// Builds the progress step Python's `after_react_iteration` records, redacted and bounded.
+///
+/// The step pairs the last assistant message (its text plus its tool-call names) with the
+/// text of every later tool message, each observation truncated to `1_000` characters:
+/// `Action: <calls>; response: <answer>\nObservations: <observations>`. Returns `None` when
+/// the conversation carries no assistant message.
+fn verifier_step(messages: &[BaseMessage]) -> Option<String> {
+    let (index, assistant) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role.is_assistant())?;
+    let actions: Vec<&str> = assistant
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
+    let observations: Vec<String> = messages
+        .iter()
+        .skip(index + 1)
+        .filter(|message| message.role.is_tool())
+        .map(|message| truncate_chars(&message.text(), MAX_OBSERVATION_CHARS))
+        .collect();
+    let step = format!(
+        "Action: {}; response: {}\nObservations: {}",
+        actions.join(", "),
+        assistant.text(),
+        observations.join("\n")
+    );
+    Some(truncate_chars(&redaction::redact(&step), MAX_STEP_CHARS))
 }
 
 #[async_trait::async_trait]
@@ -359,6 +528,38 @@ impl HarnessRail for MoaRail {
         ctx.extra_mut().remove(MOA_STATE_EXTRA_KEY);
         Ok(())
     }
+
+    /// Observes one completed `ReAct` iteration without calling a model.
+    ///
+    /// The completed-turn counter grows whenever the rail is enabled and an invocation state
+    /// is installed. In [`MoaMode::VerifierRouted`] the iteration additionally records one
+    /// redacted progress step built by the internal `verifier_step` helper, matching Python's rail.
+    ///
+    /// Python's rail then verifies on its configured cadence and consults the references when
+    /// progress stalls. That automatic consultation stays **host-driven** in this port, because
+    /// crate rails never call a model: the host reads [`MoaRail::recorded_steps`], scores them
+    /// with [`MoaRail::verify_progress`] and calls [`MoaRail::consult`] when it decides the
+    /// proposals are worth asking for.
+    async fn after_react_iteration(&self, ctx: &mut HarnessRailContext) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        // Build the step before locking, so the guard covers synchronous statements only.
+        let step = if self.config.mode == MoaMode::VerifierRouted {
+            verifier_step(&ctx.base.messages)
+        } else {
+            None
+        };
+        let mut state = self.state.write();
+        let Some(state) = state.as_mut() else {
+            return Ok(());
+        };
+        state.completed_turns += 1;
+        if let Some(step) = step {
+            state.steps.push(step);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -369,13 +570,13 @@ mod tests {
 
     use openjiuwen_agent::RailEvent;
     use openjiuwen_common::error::ErrorKind;
-    use openjiuwen_foundation::Model;
+    use openjiuwen_foundation::{Model, ToolCall};
     use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
 
     use crate::rails::{prompt_sections, rail_priority};
 
     use super::*;
-    use crate::moa::config::{MoaMode, DEFAULT_HISTORY_LIMIT};
+    use crate::moa::config::{JevConfig, MoaMode, VerifierConfig, DEFAULT_HISTORY_LIMIT};
     use crate::moa::state::ConsultationOutcome;
 
     /// Wraps a scripted model as a reference handle.
@@ -584,5 +785,163 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn jev_routed_consult_is_unsupported_and_asks_no_model() {
+        let proposer = ScriptedModel::text("proposal");
+        let probe = proposer.clone();
+        let rail = MoaRail::new(
+            MoaConfig::new(vec![reference(proposer)])
+                .with_mode(MoaMode::JevRouted)
+                .with_jev(JevConfig::default()),
+        )
+        .unwrap();
+
+        let error = rail
+            .consult(&[BaseMessage::user("fix it")], &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "jev_routed requires an external System One client, which this port does not provide"
+        );
+        assert_eq!(probe.call_count(), 0);
+        assert!(rail.last_outcome().is_none());
+        assert_eq!(rail.history(), Vec::<ConsultationRecord>::new());
+    }
+
+    #[tokio::test]
+    async fn reference_call_budget_applies_only_while_a_state_is_installed() {
+        let proposer = ScriptedModel::text("proposal");
+        let probe = proposer.clone();
+        let rail = MoaRail::new(
+            MoaConfig::new(vec![reference(proposer)]).with_max_reference_calls(Some(0)),
+        )
+        .unwrap();
+        let mut ctx = context("fix the build");
+        rail.before_invoke(&mut ctx).await.unwrap();
+
+        let error = rail
+            .consult(&ctx.base.messages, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.message(), "MoA reference-call budget exhausted");
+        assert_eq!(probe.call_count(), 0);
+        assert_eq!(rail.snapshot().unwrap().reference_calls, 0);
+        assert!(rail.last_outcome().is_none());
+        assert_eq!(rail.history(), Vec::<ConsultationRecord>::new());
+
+        // Outside an invocation there is no per-invocation budget to spend.
+        rail.after_invoke(&mut ctx).await.unwrap();
+        let outcome = rail
+            .consult(&ctx.base.messages, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(probe.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn record_step_redacts_truncates_and_needs_an_installed_state() {
+        let rail = MoaRail::new(config()).unwrap();
+        assert!(!rail.record_step("api_key=sk-secret"));
+        assert_eq!(rail.recorded_steps(), Vec::<String>::new());
+
+        let mut ctx = context("fix the build");
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(rail.record_step("read the log with api_key=sk-secret"));
+        let long = "x".repeat(MAX_STEP_CHARS + 500);
+        assert!(rail.record_step(long));
+
+        let steps = rail.recorded_steps();
+        assert_eq!(steps.len(), 2);
+        assert!(!steps[0].contains("sk-secret"));
+        assert!(steps[0].contains("read the log with"));
+        assert_eq!(steps[1].chars().count(), MAX_STEP_CHARS);
+        assert_eq!(rail.snapshot().unwrap().completed_turns, 0);
+
+        let disabled = MoaRail::new(config().with_enabled(false)).unwrap();
+        assert!(!disabled.record_step("anything"));
+        assert_eq!(disabled.recorded_steps(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn verify_progress_needs_a_state_enforces_the_budget_and_records_the_score() {
+        let stateless = MoaRail::new(config()).unwrap();
+        let error = stateless
+            .verify_progress(&["read src/main.rs".to_owned()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.message(), "MoA rail has no active invocation");
+
+        let limited = MoaRail::new(
+            config().with_verifier(VerifierConfig::default().with_max_verifier_calls(Some(1))),
+        )
+        .unwrap();
+        let mut ctx = context("fix the failing build in src/main.rs");
+        limited.before_invoke(&mut ctx).await.unwrap();
+        let error = limited
+            .verify_progress(&["read src/main.rs".to_owned()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.message(), "MoA verifier budget exhausted");
+        assert_eq!(limited.snapshot().unwrap().verifier_calls, 0);
+
+        let rail = MoaRail::new(config()).unwrap();
+        let mut ctx = context("fix the failing build in src/main.rs");
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(rail.record_step("read src/main.rs and fix the failing build"));
+        let score = rail.verify_progress(&rail.recorded_steps()).await.unwrap();
+        assert!((0.0..=1.0).contains(&score));
+        let snapshot = rail.snapshot().unwrap();
+        assert_eq!(snapshot.verifier_calls, 3);
+        assert_eq!(snapshot.previous_score, Some(score));
+    }
+
+    #[tokio::test]
+    async fn after_react_iteration_counts_turns_and_records_one_redacted_step() {
+        /// Builds the conversation an iteration ends with.
+        fn iteration_messages() -> Vec<BaseMessage> {
+            vec![
+                BaseMessage::user("fix the build"),
+                BaseMessage::assistant("Running the tests").with_tool_calls(vec![
+                    ToolCall::new("bash").with_id("call-1"),
+                    ToolCall::new("read_file").with_id("call-2"),
+                ]),
+                BaseMessage::tool("call-1", "api_key=sk-secret tests passed"),
+            ]
+        }
+
+        let on_demand = MoaRail::new(config()).unwrap();
+        let mut ctx = context("fix the build");
+        on_demand.before_invoke(&mut ctx).await.unwrap();
+        ctx.base.messages = iteration_messages();
+        on_demand.after_react_iteration(&mut ctx).await.unwrap();
+        assert_eq!(on_demand.snapshot().unwrap().completed_turns, 1);
+        assert_eq!(on_demand.recorded_steps(), Vec::<String>::new());
+
+        let routed = MoaRail::new(config().with_mode(MoaMode::VerifierRouted)).unwrap();
+        let mut ctx = context("fix the build");
+        routed.before_invoke(&mut ctx).await.unwrap();
+        ctx.base.messages = iteration_messages();
+        routed.after_react_iteration(&mut ctx).await.unwrap();
+        assert_eq!(routed.snapshot().unwrap().completed_turns, 1);
+        let steps = routed.recorded_steps();
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].starts_with("Action: bash, read_file; response: Running the tests"));
+        assert!(steps[0].contains("Observations: "));
+        assert!(steps[0].contains("tests passed"));
+        assert!(!steps[0].contains("sk-secret"));
+
+        let disabled = MoaRail::new(config().with_enabled(false)).unwrap();
+        let mut ctx = context("fix the build");
+        disabled.after_react_iteration(&mut ctx).await.unwrap();
+        assert!(disabled.snapshot().is_none());
+        assert_eq!(disabled.recorded_steps(), Vec::<String>::new());
     }
 }
