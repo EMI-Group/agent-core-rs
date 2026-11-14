@@ -45,6 +45,8 @@ mod handle;
 mod handlers;
 mod hub;
 mod targets;
+#[cfg(all(test, feature = "notify"))]
+mod tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
