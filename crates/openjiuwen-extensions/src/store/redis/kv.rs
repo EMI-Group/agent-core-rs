@@ -4,15 +4,16 @@
 //! wraps `redis.asyncio`. The workspace vendors no `Redis` driver, so this
 //! backend speaks RESP through [`crate::redis`] instead: [`RedisStoreConfig`]
 //! keeps the Python configuration surface, [`RedisStore::new`] validates it
-//! synchronously, and a lazily opened [`tokio::sync::OnceCell`] client runs the
-//! commands. [`RedisStore::connect`] opens the connection eagerly and verifies
-//! it with `PING`, so a bad URL or an unreachable host fails before the caller
+//! synchronously, and the shared [`RedisConnection`] opens one client on first
+//! use. [`RedisStore::connect`] opens the connection eagerly and verifies it
+//! with `PING`, so a bad URL or an unreachable host fails before the caller
 //! stores anything.
 //!
 //! # Key and value encoding
 //!
 //! Keys are used verbatim; Python's `index_prefix`-style namespacing stays the
-//! caller's responsibility.
+//! caller's responsibility. (The document and vector backends next to this
+//! module do namespace their keys, because they own their whole key space.)
 //!
 //! RESP has no text/bytes distinction, but the kernel contract requires a
 //! [`KvValue`] to keep its variant across a round trip. Every value is therefore
@@ -48,8 +49,9 @@
 //! # Deferred
 //!
 //! `rediss://` (TLS) and real cluster slot routing stay deferred and are
-//! reported by [`crate::redis`] as [`Error::Unsupported`]. This is a key-value
-//! store only — there is no document or vector surface here.
+//! reported by [`crate::redis`] as [`Error::Unsupported`]. This module is a
+//! key-value store only; documents and vectors live in [`super::document`] and
+//! [`super::vector`].
 //!
 //! Python counterpart tests:
 //! `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py`
@@ -59,51 +61,22 @@
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_core::foundation::store::{KvPipeline, KvStore, KvValue};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::OnceCell;
 
-use crate::redis::{Client, ConnectionOptions, Reply};
+use super::{
+    expect_ok, is_ok_status, reply_count, unexpected, RedisConnection, RedisStoreConfig, CHUNK_SIZE,
+};
+use crate::redis::{Client, Reply};
 
-/// The accepted connection-scheme prefixes.
-///
-/// `rediss://` is listed separately because it does not start with `redis://`.
-const ACCEPTED_URL_SCHEMES: [&str; 4] = [
-    "redis://",
-    "rediss://",
-    "redis+cluster://",
-    "rediss+cluster://",
-];
 /// Kind tag stored in front of a [`KvValue::Text`] payload.
-const TEXT_TAG: u8 = 0x00;
+pub(crate) const TEXT_TAG: u8 = 0x00;
 /// Kind tag stored in front of a [`KvValue::Bytes`] payload.
-const BYTES_TAG: u8 = 0x01;
-/// Number of keys per `MGET`/`UNLINK` chunk (Python's `batch_size` default).
-const CHUNK_SIZE: usize = 500;
+pub(crate) const BYTES_TAG: u8 = 0x01;
 /// Upper bound on `SCAN` rounds, so a misbehaving server cannot loop forever.
 const MAX_SCAN_ROUNDS: usize = 10_000;
-
-/// Configuration for a [`RedisStore`].
-///
-/// Mirrors the Python constructor's inputs: a `url` or explicit
-/// `connection_args`, plus an optional forced `cluster_mode`. When
-/// `cluster_mode` is unset, [`RedisStore::new`] infers it from a `+cluster`
-/// URL scheme.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "snake_case")]
-pub struct RedisStoreConfig {
-    /// Connection URL; one of `redis://`, `rediss://`, `redis+cluster://`, or
-    /// `rediss+cluster://`.
-    pub url: Option<String>,
-    /// Whether to use a cluster client; inferred from the URL when `None`.
-    pub cluster_mode: Option<bool>,
-    /// Extra connection parameters, used when no `url` is supplied.
-    pub connection_args: BTreeMap<String, Value>,
-}
 
 /// A live `Redis` key-value store over the in-crate RESP client.
 ///
@@ -113,26 +86,16 @@ pub struct RedisStoreConfig {
 /// It is not `Clone` (a connection is shared, not duplicated); use [`RedisStore::connect`]
 /// to obtain the shared `Arc<dyn KvStore>`.
 pub struct RedisStore {
-    config: RedisStoreConfig,
-    client: OnceCell<Client>,
+    connection: RedisConnection,
 }
 
 impl fmt::Debug for RedisStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `connection_args` can carry a password, so only its key names are
         // rendered; the URL user-info is redacted for the same reason.
-        let connection_args: Vec<&str> = self
-            .config
-            .connection_args
-            .keys()
-            .map(String::as_str)
-            .collect();
         formatter
             .debug_struct("RedisStore")
-            .field("url", &self.config.url.as_deref().map(redact_url))
-            .field("cluster_mode", &self.config.cluster_mode)
-            .field("connection_args", &connection_args)
-            .field("connected", &self.client.get().is_some())
+            .field("connection", &self.connection)
             .finish()
     }
 }
@@ -145,11 +108,9 @@ impl RedisStore {
     /// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
     /// when neither a `url` nor a non-empty `connection_args` is present, or
     /// when the URL does not use an accepted scheme.
-    pub fn new(mut config: RedisStoreConfig) -> Result<Self> {
-        normalize(&mut config)?;
+    pub fn new(config: RedisStoreConfig) -> Result<Self> {
         Ok(Self {
-            config,
-            client: OnceCell::new(),
+            connection: RedisConnection::new(config)?,
         })
     }
 
@@ -175,7 +136,7 @@ impl RedisStore {
     /// The normalized configuration this store was built from.
     #[must_use]
     pub fn config(&self) -> &RedisStoreConfig {
-        &self.config
+        self.connection.config()
     }
 
     /// Opens the connection (if needed) and verifies it with `PING`.
@@ -184,22 +145,17 @@ impl RedisStore {
     ///
     /// Same as [`RedisStore::connect`] after validation.
     pub async fn ping(&self) -> Result<()> {
-        self.client().await?.ping().await
+        self.connection.ping().await
     }
 
     /// The lazily connected client, built from [`RedisStoreConfig`].
     async fn client(&self) -> Result<&Client> {
-        self.client
-            .get_or_try_init(|| async {
-                let options = connection_options(&self.config)?;
-                Client::connect(options).await
-            })
-            .await
+        self.connection.client().await
     }
 
     /// Sends one command through the shared client.
     async fn run(&self, args: &[&[u8]]) -> Result<Reply> {
-        self.client().await?.command(args).await
+        self.connection.run(args).await
     }
 
     /// Deletes `keys` with `UNLINK`, falling back to `DEL` when the server does
@@ -370,10 +326,13 @@ enum QueuedOp {
 
 /// A real batched [`KvPipeline`] over `Redis`.
 ///
+/// Obtained from [`KvStore::pipeline`]; it is public so a caller can name the
+/// type it gets back without importing a private item.
+///
 /// The kernel's `StorePipeline` issues one round trip per operation; this
 /// pipeline instead queues operations and sends them as a single
 /// [`Client::pipeline`] batch, which is the point of `Redis` pipelining.
-struct RedisPipeline<'a> {
+pub struct RedisPipeline<'a> {
     store: &'a RedisStore,
     ops: Vec<QueuedOp>,
 }
@@ -445,95 +404,6 @@ impl KvPipeline for RedisPipeline<'_> {
     }
 }
 
-/// Normalizes `config` in place, inferring `cluster_mode` and validating the URL.
-fn normalize(config: &mut RedisStoreConfig) -> Result<()> {
-    let url = config
-        .url
-        .take()
-        .map(|url| url.trim().to_string())
-        .filter(|url| !url.is_empty());
-    if let Some(url) = url.as_deref() {
-        validate_url(url)?;
-    }
-    if url.is_none() && config.connection_args.is_empty() {
-        return Err(Error::validation(
-            "redis store config requires a `url` or non-empty `connection_args`",
-        ));
-    }
-    if config.cluster_mode.is_none() {
-        config.cluster_mode = Some(url.as_deref().is_some_and(|url| url.contains("+cluster")));
-    }
-    config.url = url;
-    Ok(())
-}
-
-/// Rejects a URL whose scheme is not a Redis scheme.
-fn validate_url(url: &str) -> Result<()> {
-    if ACCEPTED_URL_SCHEMES
-        .iter()
-        .any(|scheme| url.starts_with(scheme))
-    {
-        Ok(())
-    } else {
-        Err(Error::validation(format!(
-            "redis url `{url}` must start with one of: redis://, rediss://, redis+cluster://, rediss+cluster://"
-        )))
-    }
-}
-
-/// Builds the client options from a normalized configuration.
-fn connection_options(config: &RedisStoreConfig) -> Result<ConnectionOptions> {
-    let mut options = match config.url.as_deref() {
-        Some(url) => ConnectionOptions::from_url(url)?,
-        None => ConnectionOptions::default(),
-    };
-    if let Some(host) = config.connection_args.get("host") {
-        options.host = host_from_arg(host)?;
-    }
-    if let Some(port) = config.connection_args.get("port") {
-        options.port = port_from_arg(port)?;
-    }
-    Ok(options
-        .with_connection_args(&config.connection_args)?
-        .with_cluster_mode(config.cluster_mode.unwrap_or(false)))
-}
-
-/// Reads the `host` connection argument.
-fn host_from_arg(value: &Value) -> Result<String> {
-    match value {
-        Value::String(host) if !host.trim().is_empty() => Ok(host.trim().to_string()),
-        Value::String(_) => Err(Error::validation(
-            "redis connection argument 'host' must not be empty",
-        )),
-        _ => Err(Error::validation(
-            "redis connection argument 'host' must be a string",
-        )),
-    }
-}
-
-/// Reads the `port` connection argument (an integer or a numeric string).
-fn port_from_arg(value: &Value) -> Result<u16> {
-    let port = match value {
-        Value::Number(number) => number.as_u64().and_then(|port| u16::try_from(port).ok()),
-        Value::String(text) => text.trim().parse::<u16>().ok(),
-        _ => None,
-    };
-    port.filter(|port| *port != 0).ok_or_else(|| {
-        Error::validation("redis connection argument 'port' must be an integer between 1 and 65535")
-    })
-}
-
-/// Redacts the user-info of a URL so `Debug` output never carries credentials.
-fn redact_url(url: &str) -> String {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    if scheme.is_empty() {
-        rest.to_string()
-    } else {
-        format!("{scheme}://{rest}")
-    }
-}
-
 /// Encodes a value as its kind tag followed by the raw payload.
 fn encode_value(value: &KvValue) -> Vec<u8> {
     let payload = value.as_bytes();
@@ -544,7 +414,7 @@ fn encode_value(value: &KvValue) -> Vec<u8> {
 }
 
 /// Decodes a stored payload back into the [`KvValue`] variant it was written as.
-fn decode_value(key: &str, payload: &[u8]) -> Result<KvValue> {
+pub(crate) fn decode_value(key: &str, payload: &[u8]) -> Result<KvValue> {
     let (tag, rest) = payload.split_first().ok_or_else(|| {
         Error::validation(format!(
             "redis key `{key}` holds an empty value; expected a kind tag followed by the payload"
@@ -566,7 +436,7 @@ fn decode_value(key: &str, payload: &[u8]) -> Result<KvValue> {
 }
 
 /// The `PX` argument for an expiry, rounding sub-millisecond values up to 1 ms.
-fn expiry_millis(expiry: Duration) -> u64 {
+pub(crate) fn expiry_millis(expiry: Duration) -> u64 {
     let millis = u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX);
     millis.max(1)
 }
@@ -576,7 +446,7 @@ fn expiry_millis(expiry: Duration) -> u64 {
 /// `SCAN MATCH` treats `*` and `?` as wildcards and `[...]` as a character
 /// class, with `\` as the escape character; a literal occurrence of any of them
 /// in the prefix must be escaped to avoid over-matching.
-fn escape_glob(prefix: &str) -> String {
+pub(crate) fn escape_glob(prefix: &str) -> String {
     let mut escaped = String::with_capacity(prefix.len());
     for character in prefix.chars() {
         if matches!(character, '*' | '?' | '[' | ']' | '\\') {
@@ -606,44 +476,8 @@ fn command_for(op: &QueuedOp) -> Vec<Vec<u8>> {
     }
 }
 
-/// Whether a status reply is `+OK`.
-fn is_ok_status(reply: &Reply) -> bool {
-    match reply {
-        Reply::Simple(text) => text.eq_ignore_ascii_case("OK"),
-        Reply::Bulk(bytes) => bytes.eq_ignore_ascii_case(b"OK"),
-        _ => false,
-    }
-}
-
-/// Requires `reply` to be the `+OK` status of `command`.
-fn expect_ok(reply: &Reply, command: &str) -> Result<()> {
-    if is_ok_status(reply) {
-        Ok(())
-    } else {
-        Err(unexpected(command, reply))
-    }
-}
-
-/// The transport error for an unexpected reply to `command`.
-fn unexpected(command: &str, reply: &Reply) -> Error {
-    Error::transport(format!(
-        "redis {command} returned an unexpected {} reply",
-        reply.kind_name()
-    ))
-}
-
-/// Interprets a delete reply as the number of live keys removed.
-fn reply_count(reply: &Reply) -> Result<usize> {
-    let count = reply.as_integer()?;
-    usize::try_from(count)
-        .map_err(|_| Error::transport(format!("redis returned a negative delete count: {count}")))
-}
-
 /// Whether `error` is the server rejecting `command` as unknown.
-fn is_unknown_command(error: &Error, command: &str) -> bool {
+pub(crate) fn is_unknown_command(error: &Error, command: &str) -> bool {
     let message = error.message().to_ascii_lowercase();
     message.contains("unknown command") && message.contains(&command.to_ascii_lowercase())
 }
-
-#[cfg(test)]
-mod tests;
