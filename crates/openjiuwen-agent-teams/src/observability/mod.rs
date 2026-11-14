@@ -53,24 +53,35 @@
 //! are also emitted as structured `tracing` events so a subscriber can consume them without an
 //! SDK. [`MemorySpanObserver`] follows the same split: it always emits one `tracing` event per
 //! observed team-memory operation, and only with `otel` does it also carry a sink
-//! (`MemorySpanObserver::with_sink`). Real OTLP export is not part of this crate (see below).
+//! (`MemorySpanObserver::with_sink`).
+//!
+//! The `otlp` feature adds a *second* team-memory bridge,
+//! [`OtlpMemoryObserver`], which forwards every
+//! event into the real `OTel` pipeline through `openjiuwen-extensions`'
+//! `OtelTraceSink` (the feature pulls that crate in as an optional dependency).
 //!
 //! # Deferrals
 //!
-//! - Real OTLP export, the `opentelemetry` SDK and exporter configuration are not ported here;
-//!   [`OTLP_EXPORT_AVAILABLE`] is always `false` and the `openjiuwen-extensions` crate (same
-//!   layer, not depend-able from this crate) owns the `OTel` integration of the workspace.
+//! - Real OTLP export is wired for the team-memory bridge only: with `otlp`,
+//!   [`OtlpMemoryObserver`] drives the `openjiuwen-extensions` exporter
+//!   (`OTLP/HTTP`, memory, console, …). Everything else in this crate — the member/round/task
+//!   spans, the hook fan-out and [`MemorySpanObserver`] — stays on the in-memory/`tracing` seam,
+//!   which is why [`OTLP_EXPORT_AVAILABLE`] describes the *baseline* build and remains `false`.
+//!   The memory bridge's spans form their own trace in the exporter, because the in-process
+//!   [`TeamSpan`] tree is plain data rather than an `OTel` span.
 //! - Python's `monitor_handler.py` (a `LoggingSpanProcessor` that renders spans as log lines),
 //!   `setup.py` (process-global tracer acquisition/release) and the tool/LLM span stack built by
 //!   `rail.py` are not ported; `rail.py`'s turn decoration maps onto
 //!   [`TurnMetrics`] plus the member/round/task spans above.
 //! - There is no process-global tracer or span registry: every [`TeamObservability`] value is
-//!   local to the team that owns it.
+//!   local to the team that owns it, and the extensions sink owns its private provider.
 
 pub mod hooks;
 pub mod memory;
 #[cfg(feature = "otel")]
 pub mod otel;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 pub mod span;
 
 pub use hooks::{
@@ -84,14 +95,21 @@ pub use memory::{
 };
 #[cfg(feature = "otel")]
 pub use otel::{OtelHooks, OtelSpanSink, SpanRecord};
+#[cfg(feature = "otlp")]
+pub use otlp::{otlp_memory_observer, OtlpMemoryObserver};
 pub use span::{
     SpanContext, TeamSpan, AT_MEMBER_NAME, AT_MEMBER_ROLE, AT_TASK_ID, AT_TEAM_ID, AT_TEAM_NAME,
     GEN_AI_CONVERSATION_ID, OJ_AGENT_MODE,
 };
 
-/// Whether real OTLP span export is wired in this build. Always `false`: the `otel`
-/// feature only enables structured `tracing` events plus an in-memory sink; the real
-/// SDK/exporter lives in `openjiuwen-extensions` (same layer, not depend-able here).
+/// Whether the baseline build of this crate exports spans over OTLP. Always `false` in every
+/// build.
+///
+/// It describes the crate-wide promise: without a feature the `otel` one only enables structured
+/// `tracing` events plus an in-memory sink, and the same seam carries the runtime's
+/// member/round/task spans. The opt-in `otlp` feature upgrades the team-memory bridge alone — it
+/// adds `OtlpMemoryObserver`, which drives the real `OTel` exporter owned by
+/// `openjiuwen-extensions` — so this constant stays `false` even when that bridge is compiled in.
 pub const OTLP_EXPORT_AVAILABLE: bool = false;
 
 #[cfg(test)]
@@ -107,6 +125,18 @@ mod tests {
     fn otlp_export_is_never_available() {
         let export_available = OTLP_EXPORT_AVAILABLE;
         assert!(!export_available, "the baseline build never exports OTLP");
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn the_otlp_feature_upgrades_only_the_memory_bridge() {
+        assert!(
+            !OTLP_EXPORT_AVAILABLE,
+            "the crate-wide promise is still no exporter"
+        );
+        let observer = otlp_memory_observer("s-1").expect("the memory provider builds");
+        assert!(observer.sink().is_recording());
+        assert_eq!(observer.session_id(), Some("s-1"));
     }
 
     #[cfg(not(feature = "otel"))]
