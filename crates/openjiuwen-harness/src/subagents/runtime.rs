@@ -12,7 +12,7 @@
 //! fan-out, nesting depth, LRU eviction) and every timestamp comes from an injected `Clock`,
 //! so a `ManualClock` makes the lifecycle fully deterministic in tests.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ pub mod transcript;
 mod transcript_api;
 mod turn;
 
-pub use self::evict::EVICTION_REASON;
+pub use self::evict::{SubagentEviction, EVICTION_REASON};
 pub use self::persist_api::LoadReport;
 
 /// Default per-turn timeout (Python `TURN_TIMEOUT_S_DEFAULT`).
@@ -254,6 +254,9 @@ struct RuntimeState {
     spawned: usize,
     /// Revision of the persisted bucket; every snapshot advances it.
     revision: u64,
+    /// Ids claimed by an in-flight two-phase eviction, so concurrent evictions of one instance
+    /// cannot both write a tombstone.
+    evicting: BTreeSet<SubAgentId>,
 }
 
 /// The sub-agent instances of one parent session; share it behind an `Arc`.
@@ -289,6 +292,7 @@ impl SubAgentRuntime {
                     next_seq: 0,
                     spawned: 0,
                     revision: 0,
+                    evicting: BTreeSet::new(),
                 }),
             }),
             quota,
@@ -382,7 +386,18 @@ impl SubAgentRuntime {
         }
         config.subagent_type = Some(request.subagent_type.clone());
         // The instance keeps the patched configuration, so a restored instance can be rebuilt.
-        let seq = self.reserve(&id, &request, config.clone())?;
+        // The capacity-pressure eviction inside `reserve` cannot await `BeforeEvict` (the slot
+        // must be freed synchronously), so it only captures the `Close` snapshots; they are
+        // awaited here, right after the state lock is released.
+        let mut closed_events = Vec::new();
+        let seq = match self.reserve(&id, &request, config.clone(), &mut closed_events) {
+            Ok(seq) => seq,
+            Err(error) => {
+                lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, closed_events).await;
+                return Err(error);
+            }
+        };
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, closed_events).await;
         let agent = match self.shared.factory.create(&config, &id).await {
             Ok(agent) => agent,
             Err(error) => {
@@ -790,6 +805,7 @@ impl SubAgentRuntime {
         id: &SubAgentId,
         request: &SubAgentSpawnRequest,
         config: SubAgentConfig,
+        closed_events: &mut Vec<SubagentLifecycleEvent>,
     ) -> Result<u64> {
         let now_ms = self.clock.now_ms();
         let seq = {
@@ -816,7 +832,9 @@ impl SubAgentRuntime {
             } else {
                 1
             };
-            let evicted = evict::make_room(&mut state, &self.quota, now_ms, parent);
+            let (evicted, evicted_events) =
+                evict::make_room(&mut state, &self.quota, now_ms, parent);
+            closed_events.extend(evicted_events);
             let budget = SpawnBudget {
                 live: evict::live_count(&state),
                 spawned: state.spawned,
@@ -850,6 +868,7 @@ impl SubAgentRuntime {
             }
             state.spawned = state.spawned.saturating_add(1);
             state.instances.remove(id);
+            state.evicting.remove(id);
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
             state.instances.insert(
@@ -866,6 +885,7 @@ impl SubAgentRuntime {
     fn rollback(&self, id: &str, seq: u64) {
         {
             let mut state = self.shared.state.lock();
+            state.evicting.remove(id);
             if state
                 .instances
                 .get(id)
