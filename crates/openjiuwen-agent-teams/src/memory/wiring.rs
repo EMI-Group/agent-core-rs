@@ -8,7 +8,7 @@
 //!   [`TeamMemoryHooks`] lifecycle seam over it, and the `TEAM_MEMORY.md` document path;
 //! - [`TeamMemoryWiring::toolkit`] hands each member its [`MemberMemoryToolkit`], cached per
 //!   member, and [`TeamMemoryWiring::tools`] projects that toolkit onto
-//!   [`Tool`](openjiuwen_foundation::tool::Tool) handles;
+//!   [`Tool`] handles;
 //! - the lifecycle methods forward to the engine with a fresh
 //!   [`CallOptions`] (see "Cancellation" below);
 //! - [`TeamMemoryWiring::export`] and [`TeamMemoryWiring::import`] move the whole team through
@@ -29,15 +29,15 @@
 //! # Disabled
 //!
 //! When [`MemoryConfig::enabled`] is `false` the wiring touches nothing: no hook runs, no turn is
-//! buffered, no session is installed, no toolkit write is accepted from this node, [`Self::flush`]
-//! answers an empty [`TeamMemoryFlush`], and [`Self::export`] answers `Ok(None)`. The facade and
+//! buffered, no session is installed, no toolkit write is accepted from this node, [`TeamMemoryWiring::flush`]
+//! answers an empty [`TeamMemoryFlush`], and [`TeamMemoryWiring::export`] answers `Ok(None)`. The facade and
 //! the hooks are still constructed, so a disabled wiring is a lawful value with no side effects.
 //!
 //! # Cancellation
 //!
 //! A runtime has no per-call memory cancellation token, so every lifecycle pass-through supplies
 //! [`CallOptions::new`] (never cancels, never times out). A caller that needs a deadline drives
-//! [`Self::hooks`] directly; the pass-throughs are the convenience path, not the only one.
+//! [`TeamMemoryWiring::hooks`] directly; the pass-throughs are the convenience path, not the only one.
 //!
 //! # Failure
 //!
@@ -334,7 +334,7 @@ impl TeamMemoryWiring {
             .map_err(|error| self.failed("on_member_leave", Some(member), error))
     }
 
-    /// Buffers one team turn for the next [`Self::flush`].
+    /// Buffers one team turn for the next [`TeamMemoryWiring::flush`].
     ///
     /// # Errors
     ///

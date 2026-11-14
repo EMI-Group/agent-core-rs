@@ -4,7 +4,7 @@
 //! advertises `team_memory_remember`, `team_memory_search`, `team_memory_forget` and
 //! `team_memory_stats` to a model. The engine keeps that toolkit in
 //! [`openjiuwen_memory::team::MemberMemoryToolkit`] — schemas plus a JSON dispatcher — and this
-//! module projects it onto the crate-wide [`Tool`](openjiuwen_foundation::tool::Tool) seam so a
+//! module projects it onto the crate-wide [`Tool`] seam so a
 //! member harness can mount the four tools like any other.
 //!
 //! [`TeamMemoryTool`] owns no logic of its own:
