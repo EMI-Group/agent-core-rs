@@ -92,9 +92,18 @@ An empty query is `Error::Validation`.
 
 - `update`: load the record (`NotFound` if absent), validate the patch, apply content/kind/importance/metadata merge/source, re-embed when content changed, `updated_at = now`, persist. `kind == Variable` is rejected.
 - `delete`: load, delete KV + embedding, return `true` when the record existed.
-- `clear(filter)`: list matching records (prefix scan), delete each record+embedding; returns the count. `filter.kinds` empty means every memory kind, so an unfiltered clear also removes `Variable` projections (their KV entries belong to the variable API and are removed by `delete_variable_everywhere`); variables/messages are otherwise cleared by the facade/store methods, not `clear`.
+- `clear(filter)`: list matching records (prefix scan), delete each record+embedding; returns the count. `filter.kinds` empty means every memory kind except `Variable` projections; variables/messages are otherwise cleared by the facade/store methods, not `clear`.
 - `list(filter)`: storage listing (timestamp desc), no scoring.
 - `stats(filter)`: count by kind (`BTreeMap<String, usize>` keyed by `MemoryType::as_str`), oldest/newest timestamp, and `total_tokens` from the engine token counter over record contents.
+
+## Variable Visibility
+
+- `MemoryType::Variable` is Python's separate variable namespace, not ordinary memory: `list`, `stats` (including `by_kind`), and `clear` exclude the variable projections whenever `filter.kinds` does not name the kind.
+- A `MemoryFilter` whose `kinds` explicitly contains `MemoryType::Variable` includes (and, for `clear`, deletes) them; an explicit kind list is the only way those three paths see a projection.
+- `search` keeps its own rule — `Variable` records are returned only when `SearchOptions::kinds` names the kind, because `searchable_kinds` validation rejects it as a configured kind.
+- `MemoryEngine::variable_records` always lists the scope's projections, and `write_variable`/`delete_variable_everywhere` keep owning both representations.
+- The narrowing lives in one place: `includes_record(filter, record)` (with `includes_variables(filter)`) in `mod.rs`, applied after the unchanged prefix-scan listing by `list`/`clear`/`stats`.
+- The rule is a behaviour rule, not an API change: no signature, key layout, or storage-layer behaviour changes, and `[Unknown]` keeps its existing meaning (no special casing in a filter; `get_user_mem_by_page` maps a `Unknown` kind argument to "every kind").
 
 ## Concurrency and Inputs
 
@@ -114,7 +123,7 @@ An empty query is `Error::Validation`.
 
 ## Routing Table
 
-- `./mod.rs` → `MemoryEngine`, `MemoryEngineBuilder`, re-exports (`VariableWrite`)
+- `./mod.rs` → `MemoryEngine`, `MemoryEngineBuilder`, re-exports (`VariableWrite`), the `includes_record`/`includes_variables` visibility helpers
 - `./write.rs` → add/add_many/update/delete/clear, dedupe integration, the shared `persist` helper
 - `./variables.rs` → `write_variable`, `delete_variable_everywhere`, `variable_records`, deterministic variable ids
 - `./search.rs` → candidate generation, search, access-touch
@@ -125,6 +134,7 @@ An empty query is `Error::Validation`.
 ## Test Strategy
 
 - Module tests: duplicate policy matrix, failed-index rollback, blank content, same-scope lock serialization is covered indirectly by concurrent add tests in `tests/crud.rs`.
-- `variables.rs` tests: KV entry plus one projection, session namespace, in-place rewrite (creation time preserved, `created == false`), forbidden names, invalid names, deleting both representations plus the vector, ascending/scope-isolated listing, `list`/`stats` inclusion, explicit-kind recall, no merge with ordinary records, cancellation, unreadable-row repair, id determinism, `VariableWrite` JSON, and SQLite persistence across a reopen (feature `sqlite`).
+- `variables.rs` tests: KV entry plus one projection, session namespace, in-place rewrite (creation time preserved, `created == false`), forbidden names, invalid names, deleting both representations plus the vector, ascending/scope-isolated listing, unfiltered `list`/`stats`/`clear` exclusion with explicit-kind inclusion, `clear` counts and KV survival, explicit-kind recall, no merge with ordinary records, cancellation, unreadable-row repair, id determinism, `VariableWrite` JSON, and SQLite persistence across a reopen (feature `sqlite`).
+- `mod.rs` tests: the `includes_record`/`includes_variables` predicate matrix (an unfiltered filter hides `Variable` and keeps every other kind, an explicit `Variable` kind includes it).
 - Integration tests: `tests/crud.rs` (write/read/update/delete/clear/stats), `tests/recall.rs` (pipeline, thresholds, budgets, keyword fallback), `tests/dedupe.rs`, `tests/scoping.rs`.
 - Deterministic: `HashEmbedding`, fixed `DateTime` values in assertions, `ScriptedModel` for extraction.
