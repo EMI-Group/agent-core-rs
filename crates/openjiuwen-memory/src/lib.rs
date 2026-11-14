@@ -23,8 +23,8 @@
 //!   subsystem constructors.
 //! - [`graph`] — entity/relation extraction, persistence, neighbor recall.
 //! - [`analyzer`] — rule/LLM fact extraction, conflict classification, consolidation
-//!   plans, and the [`analyzer::stage`] plan → extract → reasoning → proactive → conflict
-//!   pipeline with per-scope overrides.
+//!   plans, and the `StagedAnalyzer` pipeline (plan → extract → reasoning → proactive →
+//!   conflict) with its per-scope overrides.
 //! - [`external`] — memory-provider SPI, the engine provider, the registry, the REST/live
 //!   vendor transports, and the vendor `Unsupported` handles.
 //! - [`dreaming`] — the durable dream-job queue, the orchestrator with its caller-injected
