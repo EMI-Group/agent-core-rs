@@ -7,25 +7,30 @@
 //!
 //! # Layering
 //!
-//! `protocol` owns framing and the navigation wire types, `wire` owns the pull-diagnostics and
-//! call-hierarchy types plus their tolerant parsers, `uri` converts `file://` URIs,
-//! `transport` owns the [`LspTransport`] seam, `config` holds [`LspServerConfig`],
-//! `client` correlates requests, `render` formats results, and `tool` adapts all of it
-//! to the [`Tool`](openjiuwen_foundation::tool::Tool) trait.
+//! `protocol` owns framing and the navigation wire types, `wire` owns the push/pull diagnostics
+//! and call-hierarchy types plus their tolerant parsers, `uri` converts `file://` URIs,
+//! `transport` owns the [`LspTransport`] seam, `config` holds [`LspServerConfig`], `client`
+//! correlates requests, `diagnostics` buffers push diagnostics, `discovery` maps files to
+//! servers, `instance` supervises one server's lifecycle, `render` formats results, and `tool`
+//! adapts all of it to the [`Tool`](openjiuwen_foundation::tool::Tool) trait.
 //!
 //! # Offline testing
 //!
 //! No test needs a real language server: [`ChannelTransport`] runs an in-process fake server
-//! over [`tokio::io::duplex`], and the process transport is exercised with `/bin/cat` when it
-//! exists. See `tests/fake_server.rs`.
+//! over [`tokio::io::duplex`], the process transport is exercised with `/bin/cat` when it
+//! exists, discovery tests use temp directories, and crash recovery runs on an injected
+//! [`InstantTimer`]. See `tests/fake_server.rs`.
 //!
 //! # Deferred
 //!
 //! The `lsp` tool still reports `diagnostics`, `implementation` and call-hierarchy actions as
-//! deferred, and there is no diagnostics registry, per-extension server discovery or crash
-//! retry yet. The client and `wire` layer they need are in place.
+//! deferred until it owns a [`DiagnosticRegistry`] and a [`ServerSupervisor`]; the client,
+//! `wire`, diagnostics, discovery and supervision layers are in place.
 mod client;
 mod config;
+mod diagnostics;
+mod discovery;
+mod instance;
 pub mod protocol;
 pub mod render;
 mod tool;
@@ -39,6 +44,12 @@ mod tests;
 
 pub use client::LspClient;
 pub use config::LspServerConfig;
+pub use diagnostics::{DiagnosticRegistry, DiagnosticsChange, DiagnosticsConfig, DiagnosticsFile};
+pub use discovery::{builtin_server_configs, DiscoveryIndex, ResolvedServer, ServerKey};
+pub use instance::{
+    BackoffTimer, InstantTimer, RestartPolicy, ServerFactory, ServerState, ServerStatus,
+    ServerSupervisor, TokioTimer,
+};
 pub use protocol::{
     client_capabilities, parse_completion_items, parse_document_symbols, parse_hover,
     parse_locations, parse_workspace_symbols, CompletionItem, DocumentSymbol, FrameDecoder, Hover,
