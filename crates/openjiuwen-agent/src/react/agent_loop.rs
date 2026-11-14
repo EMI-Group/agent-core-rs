@@ -39,6 +39,7 @@ use crate::policy::{
     ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
     ToolResiliencePolicy,
 };
+use crate::rails::memory::MEMORY_VARIABLES_KEY;
 use crate::rails::{RailContext, RailEvent, RailRegistry};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
 use crate::react::pause::pause_output;
@@ -311,6 +312,18 @@ fn request_for(runtime: &AgentRuntime, tools: &[Value]) -> ModelRequestConfig {
     request.with_tools(tools.to_vec())
 }
 
+/// The render fields a `BeforeInvoke` rail published under the
+/// `MEMORY_VARIABLES_KEY` extra key, if any.
+///
+/// The loop hands them to the prompt renderer on every system-prompt build, so
+/// `{{sys_long_term_memory}}`/`{{sys_memory_variables}}` resolve in the first
+/// and in later iterations alike; `extra` survives `reset_ctx`.
+fn memory_render_fields(ctx: &RailContext) -> Option<&serde_json::Map<String, Value>> {
+    ctx.extra
+        .get(MEMORY_VARIABLES_KEY)
+        .and_then(Value::as_object)
+}
+
 /// Drives the iteration loop and turns its termination into an [`AgentOutput`].
 #[allow(clippy::too_many_lines)]
 async fn run_inner(
@@ -371,7 +384,7 @@ async fn run_inner(
         // Steering pushed before the run lands in the first request; one pushed
         // mid-run lands in the next iteration's window.
         hooks::drain_steering(runtime, &context).await?;
-        let system = build_system(config, input);
+        let system = build_system(config, input, memory_render_fields(ctx));
         let prepared = runtime
             .engine
             .prepare(
@@ -663,7 +676,7 @@ async fn run_inner(
         return Ok(output);
     }
 
-    let system = build_system(config, input);
+    let system = build_system(config, input, memory_render_fields(ctx));
     let prepared = runtime
         .engine
         .prepare(
@@ -1033,5 +1046,68 @@ mod tests {
         assert_eq!(resumed.result_type, ResultType::Answer);
         assert_eq!(resumed.output, "settled");
         assert_eq!(resumed.observations[0].content, "Paris");
+    }
+
+    /// A `BeforeInvoke` rail that publishes memory prompt variables the way
+    /// `MemoryRail` does.
+    struct MemoryVariablesRail;
+
+    #[async_trait::async_trait]
+    impl crate::rails::AgentRail for MemoryVariablesRail {
+        fn name(&self) -> &'static str {
+            "memory-variables"
+        }
+
+        async fn before_invoke(&self, ctx: &mut RailContext) -> Result<()> {
+            ctx.extra.insert(
+                MEMORY_VARIABLES_KEY.to_owned(),
+                serde_json::json!({
+                    "sys_memory_variables": "{\"name\":\"Alice\"}",
+                    "sys_long_term_memory": "[\"sticky\"]",
+                }),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_variables_reach_every_model_call() {
+        let model = ScriptedModel::builder()
+            .completion(MockCompletion::tool_call("echo", serde_json::json!({})))
+            .respond_text("done")
+            .build();
+        let agent = ReActAgent::new(AgentCard::new("react"));
+        agent.set_model(Arc::new(model.clone()));
+        agent.configure(ReActAgentConfig {
+            prompt_template: vec![BaseMessage::system(
+                "identity {{sys_long_term_memory}} vars {{sys_memory_variables}}",
+            )],
+            ..ReActAgentConfig::new()
+        });
+        agent.add_tool(Arc::new(Echo(ToolCard::new(
+            "echo",
+            "echoes its arguments",
+            serde_json::json!({"type": "object"}),
+        ))));
+        agent.register_rail(Arc::new(MemoryVariablesRail));
+
+        let output = agent
+            .invoke(Value::String("hi".to_owned()), None)
+            .await
+            .unwrap();
+        assert_eq!(output.result_type, ResultType::Answer);
+        let calls = model.calls();
+        assert_eq!(calls.len(), 2, "one tool turn plus one answer turn");
+        for call in calls {
+            let system = call
+                .messages
+                .iter()
+                .find(|message| message.role == Role::System)
+                .expect("every request carries the system prompt");
+            assert_eq!(
+                system.text(),
+                "identity [\"sticky\"] vars {\"name\":\"Alice\"}"
+            );
+        }
     }
 }

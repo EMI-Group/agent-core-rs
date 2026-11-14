@@ -1,8 +1,17 @@
-//! The long-term-memory rail: recall before the model call, write-back after
-//! the invocation.
+//! The long-term-memory rail: memory prompt variables on `BeforeInvoke`, recall
+//! before the model call, write-back after the invocation.
 //!
-//! Python parity: the memory callback of `openjiuwen/core/memory`.
+//! Python parity: the memory callback of `openjiuwen/core/memory` plus
+//! `_render_system_messages`.
 //!
+//! - `BeforeInvoke` publishes the `ctx.extra` key `MEMORY_VARIABLES_KEY` — a JSON
+//!   object of string→string values — when the invocation carries a non-empty
+//!   `user_id`. It holds up to two keys: `sys_memory_variables` (the user's
+//!   memory variables filtered to [`AgentMemoryConfig::mem_variables`], as a
+//!   JSON object) and `sys_long_term_memory` (the prompted recall, as a JSON
+//!   array whose fragment hits follow the `用户画像记忆：` label and whose
+//!   history-summary hits follow `摘要记忆：`). The loop renders these into the
+//!   system prompt.
 //! - `BeforeModelCall` recalls against [`LongTermMemory`] for
 //!   [`MemoryRail::scope`] using the last user message as the query, renders the
 //!   hits with
@@ -14,9 +23,13 @@
 //! - `AfterInvoke` stores the turn's user and assistant messages with
 //!   `add_messages`, honoring [`MemoryRail::agent_config`].
 //!
-//! Both directions are best-effort: a memory failure is logged with
-//! `tracing::warn!` and never aborts the run. Both are skipped when
-//! [`AgentMemoryConfig::enable_long_term_mem`] is disabled.
+//! The prompt-variable mechanism and the recall message coexist: the same
+//! invocation may both render `{{sys_long_term_memory}}` and receive a recall
+//! system message. Both directions are best-effort: a memory failure is logged
+//! with `tracing::warn!` and never aborts the run. Prompt variables are only
+//! fetched when the invocation has a `user_id`; recall and write-back are
+//! additionally skipped when [`AgentMemoryConfig::enable_long_term_mem`] is
+//! disabled.
 use super::{AgentRail, RailContext};
 use async_trait::async_trait;
 use openjiuwen_common::error::Result;
@@ -25,7 +38,9 @@ use openjiuwen_memory::{
     hits_to_system_message, AddOptions, AgentMemoryConfig, LongTermMemory, MemoryScope,
     SearchOptions,
 };
+use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 /// Default number of recall hits injected into the prompt.
 const DEFAULT_TOP_K: usize = 5;
@@ -34,6 +49,22 @@ const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_RECALL_TOKEN_BUDGET: usize = 512;
 /// `ctx.extra` key marking that this invocation already recalled.
 const RECALLED_KEY: &str = "openjiuwen.rails.memory.recalled";
+/// `ctx.extra` key carrying the render-ready memory prompt variables.
+pub(crate) const MEMORY_VARIABLES_KEY: &str = "memory_variables";
+/// Variable-map key holding the user's memory variables (JSON object).
+const SYS_MEMORY_VARIABLES_KEY: &str = "sys_memory_variables";
+/// Variable-map key holding the prompted recall (JSON array).
+const SYS_LONG_TERM_MEMORY_KEY: &str = "sys_long_term_memory";
+/// Label prefixed to the user-profile/semantic/episodic hits.
+const FRAGMENT_LABEL: &str = "用户画像记忆：";
+/// Label prefixed to the history-summary hits.
+const SUMMARY_LABEL: &str = "摘要记忆：";
+/// Number of fragment hits requested for the prompted recall.
+const FRAGMENT_TOP_K: usize = 10;
+/// Number of summary hits requested for the prompted recall.
+const SUMMARY_TOP_K: usize = 5;
+/// Similarity threshold both prompted searches use.
+const PROMPT_THRESHOLD: f32 = 0.3;
 /// Recalls long-term memory before a model call and writes the turn back after.
 pub struct MemoryRail {
     memory: Arc<LongTermMemory>,
@@ -92,6 +123,123 @@ impl MemoryRail {
     pub fn top_k(&self) -> usize {
         self.top_k
     }
+    /// Whether the prompted recall asks for user-profile/semantic/episodic hits.
+    fn fragment_memory_enabled(&self) -> bool {
+        self.agent_config.enable_user_profile
+            || self.agent_config.enable_semantic_memory
+            || self.agent_config.enable_episodic_memory
+    }
+    /// Scope the prompted lookups use: the invocation's user id over the rail's
+    /// scope id, mirroring Python's `user_id`/`scope_id` arguments.
+    fn prompted_scope(&self, user_id: &str) -> MemoryScope {
+        MemoryScope::new(user_id, self.scope.scope_id.clone())
+    }
+    /// Fetches the user's memory variables, filtered to the configured names.
+    ///
+    /// Returns `None` when nothing is stored or when the fetch fails (logged);
+    /// an all-filtered result is the JSON object `"{}"`.
+    async fn memory_variables(&self, user_id: &str) -> Option<String> {
+        let variables = match self
+            .memory
+            .get_variables(&self.prompted_scope(user_id), None)
+            .await
+        {
+            Ok(variables) => variables,
+            Err(error) => {
+                tracing::warn!(
+                    target: "openjiuwen_agent::rails::memory",
+                    error = %error,
+                    "memory variable fetch failed"
+                );
+                return None;
+            }
+        };
+        if variables.is_empty() {
+            return None;
+        }
+        let allowed: BTreeSet<&str> = self
+            .agent_config
+            .mem_variables
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let filtered: BTreeMap<String, String> = variables
+            .into_iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .collect();
+        Some(json_string(&filtered, "{}"))
+    }
+    /// Builds the prompted long-term-memory block: the fragment hits behind the
+    /// `用户画像记忆：` label, then the history-summary hits behind `摘要记忆：`.
+    ///
+    /// Returns the JSON array text, or `"[]"` when nothing is found or a search
+    /// fails (logged).
+    async fn long_term_memory(&self, user_id: &str, query: &str) -> String {
+        let scope_id = self.scope.scope_id.clone();
+        let mut contents: Vec<String> = Vec::new();
+        if self.fragment_memory_enabled() {
+            let hits = match self
+                .memory
+                .search_user_mem(query, FRAGMENT_TOP_K, user_id, &scope_id, PROMPT_THRESHOLD)
+                .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "openjiuwen_agent::rails::memory",
+                        error = %error,
+                        "memory variable search failed"
+                    );
+                    return "[]".to_owned();
+                }
+            };
+            if !hits.is_empty() {
+                contents.push(FRAGMENT_LABEL.to_owned());
+                contents.extend(hits.into_iter().map(|hit| hit.record.content));
+            }
+        }
+        if self.agent_config.enable_summary_memory {
+            let hits = match self
+                .memory
+                .search_user_history_summary(
+                    query,
+                    SUMMARY_TOP_K,
+                    user_id,
+                    &scope_id,
+                    PROMPT_THRESHOLD,
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "openjiuwen_agent::rails::memory",
+                        error = %error,
+                        "memory variable summary search failed"
+                    );
+                    return "[]".to_owned();
+                }
+            };
+            if !hits.is_empty() {
+                contents.push(SUMMARY_LABEL.to_owned());
+                contents.extend(hits.into_iter().map(|hit| hit.record.content));
+            }
+        }
+        json_string(&contents, "[]")
+    }
+}
+
+/// Serializes `value` to JSON text, falling back to `fallback` on the (practically
+/// unreachable) encoding error. Non-ASCII text is kept as UTF-8.
+fn json_string<T: Serialize>(value: &T, fallback: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "openjiuwen_agent::rails::memory",
+            error = %error,
+            "failed to encode memory variables"
+        );
+        fallback.to_owned()
+    })
 }
 /// Returns the text of the last user message, if any.
 fn last_user_text(messages: &[BaseMessage]) -> Option<String> {
@@ -105,6 +253,40 @@ fn last_user_text(messages: &[BaseMessage]) -> Option<String> {
 impl AgentRail for MemoryRail {
     fn name(&self) -> &str {
         &self.name
+    }
+    /// Publishes the render-ready memory prompt variables under the
+    /// `MEMORY_VARIABLES_KEY` extra key when the invocation has a `user_id`;
+    /// failures are logged and the run continues.
+    async fn before_invoke(&self, ctx: &mut RailContext) -> Result<()> {
+        let Some(user_id) = ctx
+            .input
+            .as_ref()
+            .and_then(|input| input.user_id.as_deref())
+            .filter(|user_id| !user_id.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let query = ctx
+            .input
+            .as_ref()
+            .and_then(crate::AgentInput::query_text)
+            .map(str::to_owned)
+            .or_else(|| last_user_text(&ctx.messages))
+            .unwrap_or_default();
+        let mut variables = serde_json::Map::new();
+        if !self.agent_config.mem_variables.is_empty() {
+            if let Some(value) = self.memory_variables(&user_id).await {
+                variables.insert(SYS_MEMORY_VARIABLES_KEY.to_owned(), Value::String(value));
+            }
+        }
+        if self.agent_config.enable_long_term_mem {
+            let value = self.long_term_memory(&user_id, &query).await;
+            variables.insert(SYS_LONG_TERM_MEMORY_KEY.to_owned(), Value::String(value));
+        }
+        ctx.extra
+            .insert(MEMORY_VARIABLES_KEY.to_owned(), Value::Object(variables));
+        Ok(())
     }
     /// Recalls for `self.scope` and inserts the rendered hits after the leading
     /// system prompt; failures are logged and the run continues.
@@ -372,5 +554,169 @@ mod tests {
         rail.after_invoke(&mut ctx).await.unwrap();
         let messages = store.get_recent_messages(&scope(), 10).await.unwrap();
         assert_eq!(messages.len(), 0);
+    }
+
+    fn input_with_user(query: &str, user_id: &str) -> AgentInput {
+        AgentInput::parse(&json!({"query": query, "user_id": user_id})).unwrap()
+    }
+
+    fn invoke_ctx(input: AgentInput) -> RailContext {
+        context(RailEvent::BeforeInvoke, Vec::new()).with_input(input)
+    }
+
+    fn published(ctx: &RailContext) -> serde_json::Map<String, Value> {
+        ctx.extra
+            .get(MEMORY_VARIABLES_KEY)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn published_string(ctx: &RailContext, key: &str) -> Option<String> {
+        published(ctx)
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn before_invoke_without_a_user_id_publishes_nothing() {
+        let store = memory();
+        store.set_variable(&scope(), "name", "Alice").await.unwrap();
+        let rail = rail(Arc::clone(&store));
+        let mut ctx = invoke_ctx(AgentInput::from_text("hi"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(!ctx.extra.contains_key(MEMORY_VARIABLES_KEY));
+
+        let mut ctx = invoke_ctx(input_with_user("hi", ""));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(!ctx.extra.contains_key(MEMORY_VARIABLES_KEY));
+    }
+
+    #[tokio::test]
+    async fn memory_variables_are_filtered_to_the_configured_names() {
+        let store = memory();
+        store.set_variable(&scope(), "name", "Alice").await.unwrap();
+        store.set_variable(&scope(), "city", "Paris").await.unwrap();
+        let rail = rail(Arc::clone(&store)).with_agent_config(AgentMemoryConfig {
+            mem_variables: vec!["name".to_owned()],
+            ..AgentMemoryConfig::default()
+        });
+        let mut ctx = invoke_ctx(input_with_user("hi", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert_eq!(
+            published_string(&ctx, SYS_MEMORY_VARIABLES_KEY).as_deref(),
+            Some("{\"name\":\"Alice\"}")
+        );
+        assert_eq!(
+            published_string(&ctx, SYS_LONG_TERM_MEMORY_KEY).as_deref(),
+            Some("[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_filtered_variables_publish_an_empty_object() {
+        let store = memory();
+        store.set_variable(&scope(), "name", "Alice").await.unwrap();
+        let rail = rail(Arc::clone(&store)).with_agent_config(AgentMemoryConfig {
+            mem_variables: vec!["absent".to_owned()],
+            ..AgentMemoryConfig::default()
+        });
+        let mut ctx = invoke_ctx(input_with_user("hi", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert_eq!(
+            published_string(&ctx, SYS_MEMORY_VARIABLES_KEY).as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_stored_variables_leave_the_variable_key_absent() {
+        let rail = rail(memory()).with_agent_config(AgentMemoryConfig {
+            mem_variables: vec!["name".to_owned()],
+            ..AgentMemoryConfig::default()
+        });
+        let mut ctx = invoke_ctx(input_with_user("hi", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(published_string(&ctx, SYS_MEMORY_VARIABLES_KEY).is_none());
+        assert!(ctx.extra.contains_key(MEMORY_VARIABLES_KEY));
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_is_an_empty_array_when_nothing_matches() {
+        let rail = rail(memory());
+        let mut ctx = invoke_ctx(input_with_user("anything", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert_eq!(
+            published_string(&ctx, SYS_LONG_TERM_MEMORY_KEY).as_deref(),
+            Some("[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn fragment_and_summary_hits_are_labelled_in_order() {
+        let store = memory();
+        store
+            .add(
+                &scope(),
+                NewMemory::semantic("the user's favourite editor is helix"),
+                &AddOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .add(
+                &scope(),
+                NewMemory::summary("session summary about the helix editor"),
+                &AddOptions::default(),
+            )
+            .await
+            .unwrap();
+        let rail = rail(Arc::clone(&store));
+        let mut ctx = invoke_ctx(input_with_user(
+            "favourite editor helix session summary",
+            "alice",
+        ));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        let raw = published_string(&ctx, SYS_LONG_TERM_MEMORY_KEY).unwrap();
+        // Non-ASCII labels are kept as UTF-8, not `\u` escapes.
+        assert!(raw.contains(FRAGMENT_LABEL), "unexpected encoding: {raw}");
+        assert!(raw.contains(SUMMARY_LABEL), "missing summary label: {raw}");
+        let entries: Vec<String> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(entries.first().map(String::as_str), Some(FRAGMENT_LABEL));
+        let summary_at = entries
+            .iter()
+            .position(|entry| entry == SUMMARY_LABEL)
+            .expect("the summary label is present");
+        assert!(summary_at > 0);
+        assert!(entries[1..summary_at]
+            .iter()
+            .any(|entry| entry.contains("helix editor")));
+        assert!(entries[summary_at + 1..]
+            .iter()
+            .any(|entry| entry.contains("session summary")));
+    }
+
+    #[tokio::test]
+    async fn search_failure_publishes_an_empty_array() {
+        let rail = MemoryRail::new(memory())
+            // An invalid scope id makes every lookup fail.
+            .with_scope(MemoryScope::new("alice", "bad/id"));
+        let mut ctx = invoke_ctx(input_with_user("hi", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert_eq!(
+            published_string(&ctx, SYS_LONG_TERM_MEMORY_KEY).as_deref(),
+            Some("[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_long_term_memory_omits_the_long_term_key() {
+        let store = memory();
+        let rail = disabled_rail(Arc::clone(&store));
+        let mut ctx = invoke_ctx(input_with_user("hi", "alice"));
+        rail.before_invoke(&mut ctx).await.unwrap();
+        assert!(published_string(&ctx, SYS_LONG_TERM_MEMORY_KEY).is_none());
+        assert_eq!(published(&ctx).len(), 0);
     }
 }
