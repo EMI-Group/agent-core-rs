@@ -23,6 +23,13 @@ pub const DEFAULT_THRESHOLD: f32 = 0.3;
 /// Largest `top_k` a tuned operator may request.
 pub const MAX_TOP_K: usize = 100;
 
+/// Default number of additional recall attempts after a failure.
+pub const DEFAULT_MAX_RETRIES: usize = 0;
+
+/// Largest `max_retries` a tuned operator may request (Python constraint
+/// `0..=5`).
+pub const MAX_RETRIES: usize = 5;
+
 /// Minimal recall seam the memory operator drives.
 ///
 /// [`LongTermMemory`] implements it; a test or a vendor memory backend can
@@ -88,6 +95,7 @@ pub struct MemoryCallOperator {
     threshold: f32,
     memory_scope_id: String,
     enabled: bool,
+    max_retries: usize,
     on_parameter_updated: Option<ParameterCallback>,
 }
 
@@ -101,6 +109,7 @@ impl MemoryCallOperator {
             threshold: DEFAULT_THRESHOLD,
             memory_scope_id: String::new(),
             enabled: true,
+            max_retries: DEFAULT_MAX_RETRIES,
             on_parameter_updated: None,
         }
     }
@@ -136,21 +145,46 @@ impl MemoryCallOperator {
         self.enabled
     }
 
+    /// Additional recall attempts after a failure (`0..=5`).
+    #[must_use]
+    pub const fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+
     /// Recalls `query` through `memory` with the tuned parameters.
     ///
     /// A disabled operator returns an empty result without touching the
-    /// backend.
+    /// backend. A failing backend is retried up to [`Self::max_retries`]
+    /// additional times; the last error is returned, never swallowed.
     ///
     /// # Errors
     ///
-    /// Returns the backend's error from [`MemoryRecall::recall_texts`].
+    /// Returns the backend's error from [`MemoryRecall::recall_texts`] once the
+    /// retry budget is exhausted.
     pub async fn recall(&self, memory: &dyn MemoryRecall, query: &str) -> Result<Vec<String>> {
         if !self.enabled {
             return Ok(Vec::new());
         }
-        memory
-            .recall_texts(&self.memory_scope_id, query, self.top_k, self.threshold)
-            .await
+        let mut attempt = 0;
+        loop {
+            match memory
+                .recall_texts(&self.memory_scope_id, query, self.top_k, self.threshold)
+                .await
+            {
+                Ok(hits) => return Ok(hits),
+                Err(error) if attempt < self.max_retries => {
+                    attempt += 1;
+                    tracing::warn!(
+                        target = "openjiuwen_agent::operator::memory_call",
+                        attempt,
+                        max_retries = self.max_retries,
+                        error = %error,
+                        "memory recall failed; retrying"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Parses and stores one field, returning its canonical JSON value.
@@ -183,6 +217,13 @@ impl MemoryCallOperator {
                 self.enabled = value;
                 Ok(Value::Bool(self.enabled))
             }
+            "max_retries" => {
+                let retries = serde_json::from_value::<usize>(value.clone()).map_err(|_| {
+                    Error::validation("tunable 'max_retries' expects a non-negative integer")
+                })?;
+                self.max_retries = retries.min(MAX_RETRIES);
+                Ok(json!(self.max_retries))
+            }
             other => Err(Error::validation(format!("unknown target '{other}'"))),
         }
     }
@@ -211,6 +252,10 @@ impl Operator for MemoryCallOperator {
                 .with_description("memory scope id; empty selects the default scope"),
             TunableSpec::new("enabled", TunableKind::Bool)
                 .with_description("whether memory recall runs"),
+            TunableSpec::new("max_retries", TunableKind::Number)
+                .with_description("additional recall attempts after a failure (0..=5)")
+                .with_path("max_retries")
+                .with_constraint(json!({"type": "int", "min": 0, "max": MAX_RETRIES})),
         ]
     }
 
@@ -220,6 +265,7 @@ impl Operator for MemoryCallOperator {
             "threshold": f64::from(self.threshold),
             "memory_scope_id": self.memory_scope_id,
             "enabled": self.enabled,
+            "max_retries": self.max_retries,
         })
     }
 
@@ -236,7 +282,13 @@ impl Operator for MemoryCallOperator {
         let object = state
             .as_object()
             .ok_or_else(|| Error::validation("operator state must be a JSON object"))?;
-        for target in ["top_k", "threshold", "memory_scope_id", "enabled"] {
+        for target in [
+            "top_k",
+            "threshold",
+            "memory_scope_id",
+            "enabled",
+            "max_retries",
+        ] {
             let Some(value) = object.get(target) else {
                 continue;
             };
@@ -263,7 +315,17 @@ mod tests {
     #[derive(Default)]
     struct FakeMemory {
         hits: Vec<String>,
+        failures: parking_lot::Mutex<usize>,
         calls: parking_lot::Mutex<Vec<(String, String, usize, f32)>>,
+    }
+
+    impl FakeMemory {
+        fn failing(times: usize) -> Self {
+            Self {
+                failures: parking_lot::Mutex::new(times),
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait]
@@ -278,6 +340,11 @@ mod tests {
             self.calls
                 .lock()
                 .push((scope_id.to_owned(), query.to_owned(), top_k, threshold));
+            let mut failures = self.failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(Error::memory("backend unavailable"));
+            }
             Ok(self.hits.clone())
         }
     }
@@ -300,12 +367,18 @@ mod tests {
         assert_eq!(operator.threshold(), DEFAULT_THRESHOLD);
         assert!(operator.enabled());
         assert_eq!(operator.memory_scope_id(), "");
-        let names: Vec<String> = operator
-            .get_tunables()
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect();
-        assert_eq!(names, ["top_k", "threshold", "memory_scope_id", "enabled"]);
+        assert_eq!(operator.max_retries(), DEFAULT_MAX_RETRIES);
+        let tunables = operator.get_tunables();
+        let names: Vec<&str> = tunables.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["top_k", "threshold", "memory_scope_id", "enabled", "max_retries"]
+        );
+        assert_eq!(tunables[4].kind, TunableKind::Number);
+        assert_eq!(
+            tunables[4].constraint,
+            Some(json!({"type": "int", "min": 0, "max": MAX_RETRIES}))
+        );
     }
 
     #[tokio::test]
@@ -348,12 +421,19 @@ mod tests {
         assert_eq!(operator.threshold(), 0.0);
         operator.set_parameter("threshold", json!(2.0)).unwrap();
         assert_eq!(operator.threshold(), 1.0);
+        operator.set_parameter("max_retries", json!(10_000)).unwrap();
+        assert_eq!(operator.max_retries(), MAX_RETRIES);
+        operator.set_parameter("max_retries", json!(-1)).unwrap();
+        assert_eq!(operator.max_retries(), MAX_RETRIES);
         let targets: Vec<String> = log
             .lock()
             .iter()
             .map(|(target, _)| target.clone())
             .collect();
-        assert_eq!(targets, ["top_k", "threshold", "threshold"]);
+        assert_eq!(
+            targets,
+            ["top_k", "threshold", "threshold", "max_retries"]
+        );
         assert!(!operator.set_parameter("unknown", json!(1)).unwrap().applied);
         assert!(
             !operator
@@ -374,7 +454,32 @@ mod tests {
         restored.load_state(state.clone()).unwrap();
         assert_eq!(restored.get_state(), state);
         assert!(!restored.enabled());
-        assert_eq!(log.lock().len(), 4);
+        assert_eq!(log.lock().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn recall_retries_up_to_the_budget_then_propagates() {
+        let mut operator = MemoryCallOperator::new("op");
+        operator.set_parameter("max_retries", json!(2)).unwrap();
+        let memory = FakeMemory {
+            hits: vec!["recalled".to_owned()],
+            failures: parking_lot::Mutex::new(2),
+            ..FakeMemory::default()
+        };
+        let hits = operator.recall(&memory, "q").await.unwrap();
+        assert_eq!(hits, ["recalled"]);
+        assert_eq!(memory.calls.lock().len(), 3);
+
+        let memory = FakeMemory::failing(5);
+        let error = operator.recall(&memory, "q").await.unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Memory);
+        assert_eq!(memory.calls.lock().len(), 3);
+
+        let mut no_retry = MemoryCallOperator::new("op");
+        no_retry.set_parameter("max_retries", json!(0)).unwrap();
+        let memory = FakeMemory::failing(1);
+        assert!(no_retry.recall(&memory, "q").await.is_err());
+        assert_eq!(memory.calls.lock().len(), 1);
     }
 
     #[tokio::test]
