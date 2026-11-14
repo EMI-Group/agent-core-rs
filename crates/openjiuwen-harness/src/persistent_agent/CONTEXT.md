@@ -22,11 +22,11 @@ Foundation (`util`, `identity`, `entry`):
 
 Execution journal (`log`):
 - `LogCapacity { max_entries, max_bytes, keep_segments }` (serde, validated; defaults `4096`, `4 MiB`, `4`).
-- `ExecutionLog::open(dir, identity, capacity, clock)` / `open_with_clock` / `for_workspace`, `identity`, `dir`, `capacity`, `next_seq`, `cursor`.
+- `ExecutionLog::open(dir, identity, capacity)` (uses `SystemClock`) / `open_with_clock(dir, identity, capacity, clock)` / `for_workspace(workspace, identity, capacity)` (both async; `<persistent_agent node | root/persistent_agent>/logs/<identity.directory_name()>`), plus `identity`, `dir`, `capacity`, and the async `next_seq`, `cursor` (they read the write mutex).
 - Writes: `append(EntryPayload) -> ExecutionEntry`, `append_many`, `rotate_now`.
 - Reads: `read() -> LogSnapshot`, `replay() -> Replay`, `digest() -> LogDigest`.
-- `LogSnapshot { identity, entries, skipped_invalid, duplicates_removed, conflicting_seqs, missing_ranges, retained_out, unusable }` with `is_usable`, `digest`, `replay`.
-- `LogDigest { entries, first_seq, last_seq, counts, tool_outcomes, input_tokens, output_tokens, unknown_usage, missing_ranges, skipped_invalid, duplicates_removed }` with `summary()`.
+- `LogSnapshot { identity, entries, skipped_invalid, duplicates_removed, conflicting_seqs, missing_ranges, retained_out, unusable }` with `is_usable`, `is_truncated`, `digest`, `replay` (`unusable` is `empty` / `no_usable_entry` / `None`).
+- `LogDigest { entries, first_seq, last_seq, counts, tool_outcomes, input_tokens, output_tokens, unknown_usage, missing_ranges, skipped_invalid, duplicates_removed }` with `summary()`; `tool_outcomes` is keyed by the snake-case status spelling (`succeeded`/`failed`/`unknown`) because `ToolStatus` is not `Ord`.
 - `Replay { cursor, entries, digest, truncated }`, `LogCursor { next_seq, last_seq, generation }`.
 - `LOG_ENCODING = "pa-jsonl/1"`, `LOG_ENTRY_FILE = "entries.jsonl"`, `LOG_META_FILE = "meta.json"`.
 
@@ -105,6 +105,10 @@ Rails (`rails`):
 ## Design Decisions
 
 - The execution journal is the durability boundary: a resumed session replays the JSONL instead of trusting an in-memory transcript, so a crash between appends loses at most the last partial line.
+- One `tokio::sync::Mutex` guards `next_seq`/`lines`/`bytes`/`generation`, and reads take the same mutex, so a rotation can never race an append or a read.
+- Rotation renames the active segment to the next free `entries.<generation>.jsonl` (skipping taken names instead of overwriting), rewrites `meta.json` atomically, then prunes the lowest generations beyond `keep_segments`; opening recomputes counters by scanning the segments and rewrites the metadata, so reopening is idempotent.
+- A read skips empty, unparseable and invalid lines (zero `seq` or a non-RFC 3339 timestamp) into `skipped_invalid`, collapses exact duplicates by `digest()`, drops a whole sequence group whose members disagree, and reports gaps from `1` before retention trimming.
+- `LogSnapshot::replay()` derives its cursor from the entries with `generation = 0` (a snapshot does not carry the segment counter); `ExecutionLog::cursor()` and `ExecutionLog::replay()` report the live values.
 - `ExecutionEntry` flattens an internally tagged `EntryPayload`, giving one self-describing JSON object per line (`{"seq":…,"occurred_at":…,"kind":"tool_intent",…}`).
 - Session records keep Python's persisted key names; capability flags, participation and continuation cursor are additive Rust fields, not renames.
 - Window assembly is synchronous and pure: entries → message groups → newest-first budget fit, with an extractive summary and a per-entry elision report; an LLM summariser is an injected `WindowSummarizer` seam.
