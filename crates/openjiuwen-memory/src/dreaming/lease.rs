@@ -260,13 +260,15 @@ mod chrono_millis {
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<ChronoDuration, D::Error> {
-        Ok(ChronoDuration::milliseconds(i64::deserialize(deserializer)?))
+        Ok(ChronoDuration::milliseconds(i64::deserialize(
+            deserializer,
+        )?))
     }
 }
 /// Serde support encoding a `std::time::Duration` as whole milliseconds.
 mod std_millis {
-    use std::time::Duration as StdDuration;
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration as StdDuration;
     /// Writes the duration as a `u64` millisecond count, saturating beyond `u64::MAX`.
     pub(super) fn serialize<S: Serializer>(
         value: &StdDuration,
