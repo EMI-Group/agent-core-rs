@@ -3,8 +3,9 @@
 //! [`MemoryEngine`] owns the engine state: the configuration, the persistence seam,
 //! the optional embedding model, the optional LLM (kept for message-history
 //! extraction wiring), the token counter, and the per-scope write locks.
-//! The write path lives in `write`, the read path in `search`, statistics in `stats`,
-//! the lock registry in `locks`, and the embedding helpers in `embedding`.
+//! The write path lives in `write`, the variable projection in `variables`, the read
+//! path in `search`, statistics in `stats`, the lock registry in `locks`, and the
+//! embedding helpers in `embedding`.
 //!
 //! Construction always goes through [`MemoryEngineBuilder`] (or the
 //! [`MemoryEngine::new`] shorthand), because one engine instance is shared as an
@@ -16,6 +17,7 @@ mod embedding;
 mod locks;
 mod search;
 mod stats;
+mod variables;
 mod write;
 
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use crate::config::MemoryEngineConfig;
 use crate::store::{MemoryStorage, MemoryStores, MessageStore};
 
 use locks::WriteLocks;
+pub use variables::VariableWrite;
 
 /// The write and recall orchestrator of long-term memory.
 ///

@@ -348,7 +348,12 @@ impl super::MemoryEngine {
     ///
     /// The record row is written first so a vector hit always resolves to a record. If
     /// indexing fails the row is removed again, so no half-indexed record remains.
-    async fn persist(&self, record: &MemoryRecord, embedding: Option<&[f32]>) -> Result<()> {
+    /// Shared with the variable projection (`super::variables`).
+    pub(super) async fn persist(
+        &self,
+        record: &MemoryRecord,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
         self.storage().put_record(record).await?;
         let Some(vector) = embedding else {
             return Ok(());
