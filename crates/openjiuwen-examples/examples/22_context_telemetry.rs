@@ -504,7 +504,8 @@ fn print_records(harness: &Harness) -> Result<()> {
     );
     ensure!(
         states.iter().any(|state| {
-            state.phase == CompressionStatePhase::ActiveCompress && state.processor == "summarization"
+            state.phase == CompressionStatePhase::ActiveCompress
+                && state.processor == "summarization"
         }),
         "the compression pass should record the summarization processor"
     );
