@@ -225,7 +225,7 @@ let recovered = engine
 
 ## Test Strategy
 
-- `cargo test -p openjiuwen-context --offline` is green: 242 unit tests in the library target, 526 tests across 27 integration binaries, and 16 doc tests.
+- `cargo test -p openjiuwen-context --offline` is green: 242 unit tests in the library target, 510 tests across 26 integration binaries, and 16 doc tests.
 - Integration suites: `engine`, `integration`, `processors`, `processor_state`, `offload`, `offloaders`, `recall`, `recall_integration`, `session_memory`, `reload`, `compressors_dialogue`, `compressors_current_round`, `compressors_round_level`, `compressors_compact`, `adaptive`, `reinjection`, `rule_compression`, `usage`, `telemetry`, `pipeline_telemetry`, `engine_usage`, `policy`, `tokenizers`, `tokenizers_native`, `tokenizers_tiktoken_model`, `tokenizers_artifacts`.
 - Deterministic offline tests use `ApproxTokenCounter::with_chars_per_token(1)` (via `TokenCounterKind::Characters`), `openjiuwen_test_support::ScriptedModel` as the `Model`, real `openjiuwen_session::AgentSession` instances, `tempfile` artefact caches and `wiremock` for the download/`OpenRouter` paths; there is no live network test.
 - Covered behaviors: window assembly with round/message budgets, leading-tool stripping, per-role stats, overflow detection, every processor, summary replacement with system/recent preservation, tool-pair preservation, offload/rehydrate round-trip, session isolation, `noop`/`compressed`/`busy`, overflow recovery refusal after streamed chunks, config serde round-trip, cancellation, `save_contexts`/`load_contexts` round-trip, corrupt-state tolerance, resolved-window precedence, window diffing.
