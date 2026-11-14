@@ -73,6 +73,12 @@ The two single-flight paths survive because each is one command — `SET … NX`
 Operationally that means one writable service process per Redis database, as Python's single scheduler ran.
 The fake `RESP2` server in `tests/fake_redis.rs` (`PING`, `ECHO`, `AUTH`, `SELECT`, `GET`, `SET NX`, `DEL`, `EXISTS`, set commands, `FLUSHDB`, `WRONGTYPE` and unknown-command errors) keeps the suite offline.
 
+## Feature Gates and Reachability
+Everything in this directory is compiled unconditionally — `axum` is a regular dependency, so `routes.rs` is always built — and only `redis_store` needs the crate feature `redis`, which is off by default.
+These types are reachable only at `openjiuwen_agent_evolving::online::…` (or `openjiuwen::agent_evolving::online::…`): the crate root re-exports `service`'s router/config types but no `online` type.
+No route answers `501`: a deferred capability surfaces either as `/health` `503` (the executor probe) or as a `failed` training-run record whose `failure_reason` names the missing stack.
+`commit_capture` stages its sample only under `rl:v1:task:{id}:pending:{cid}`; the training ledger is fed separately by `SampleLedger::save_once` (the gateway upload path), and nothing promotes a staged capture sample into the ledger.
+
 ## Determinism
 
 Timestamps come from the injected `Clock` (`FixedClock` by default); no code here calls `SystemTime`, `Instant` or `rand`.
