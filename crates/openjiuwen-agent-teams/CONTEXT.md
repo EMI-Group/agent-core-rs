@@ -36,6 +36,10 @@ pub use skill::{…};        // TeamClient + store/socket clients, skill CLI, jo
                            // connect_live_client/connect_socket_client, outcome types
 // organisation, model routing, KV-cache affinity, observability
 pub use org::*;  pub use models::*;  pub use kv_cache::*;  pub use observability::*;
+// team memory: the wiring handle, its metadata config, and the member tool surface
+pub use memory::{…};       // TeamMemoryWiring, MemoryConfig, MemoryStoreConfig, MemoryExtractorKind,
+                           // memory_config, MEMORY_METADATA_KEY, TEAM_MEMORY_FILE, TeamMemoryTool,
+                           // team_memory_tools, OtelSpanSink
 // live status stream and attach: item-by-item, because a glob would re-export `monitor::stream`
 // (collides with `schema::stream`) and `attach::protocol` (collides with `member::protocol`)
 pub use monitor::{…};      // TeamMonitor, StatusStream, MonitorEmitter/Receiver, BackpressurePolicy, snapshot_events
@@ -49,6 +53,7 @@ Module roles beyond the kernel seams, one line each:
 - `models` → `ModelPool` validation and lookup, `ModelRouter` strategies (`by_name`, `round_robin`, `least_busy`, `rule_based`) and per-member allocation.
 - `kv_cache` → member cache identity, fork lineage, the advisory env bag and release/cleanup hooks.
 - `observability` → the `ObservabilityHooks` seam and an in-memory span sink; the `otel` feature adds structured hooks over the same seam.
+- `memory` → `TeamMemoryWiring` (the `openjiuwen_memory::team` facade + lifecycle hooks + per-member toolkits + `TEAM_MEMORY.md` export/import), the tolerant `metadata["memory"]` config, the four member-memory tools as `Tool` handles, and the tracing/`otel` observer bridge.
 - `monitor` → plain-text status stream for a live team (`TeamMonitor`, `StatusStream`, backpressure policy).
 - `attach` → the Unix-socket wire contract (`protocol`) plus `AttachClient` and `AttachServer`.
 - `harness::checkpoint_store` → `MemberCheckpointPolicy`/`CheckpointResume` capture knobs, `MemberCheckpointRecord`, the `MemberCheckpointStore` seam (`InMemoryMemberCheckpointStore`, `FileMemberCheckpointStore`) and the `MemberCheckpointSink` adapter.
@@ -57,6 +62,9 @@ Module roles beyond the kernel seams, one line each:
 Checkpoint and health seams: `TeamBuildDeps::with_checkpoint_store` injects a store and `has_injected_checkpoints` reports it.
 `HarnessMemberRuntime` exposes `with_card_id`, `with_checkpoint_store`, `with_checkpoint_policy`, `with_cwd`, `latest_checkpoint` and `capture_checkpoint`.
 `MemberHarnessContext` carries `card_id` alongside `member_session_id(host, member)`.
+
+Team memory seams: `TeamBuildDeps::with_memory` injects a `TeamMemoryWiring` and `has_injected_memory` reports it; the build path resolves `metadata["memory"]` into one wiring per team and exposes it as `TeamAgent::memory()`.
+`MemberHarnessContext::with_memory_toolkit` carries a member's `MemberMemoryToolkit` and `memory_tools()` projects it onto the four `Tool` handles the native factory mounts; `skill::ServeContext::checkpoint_config` and `member::spawn::{CHECKPOINT_ENV, CHECKPOINT_DIR_ENV}` carry the child-process checkpoint contract.
 
 Binaries: `team-member` (`src/bin/team-member.rs` → `skill::run_skill_cli`, exit `0/1/2/130`) and `openjiuwen-team-mcp` (`src/bin/openjiuwen-team-mcp.rs`, `mcp` feature, stdio MCP server).
 
