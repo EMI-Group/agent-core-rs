@@ -610,8 +610,12 @@ mod tests {
         assert!(report.is_empty());
         assert_eq!(report.considered, 0);
         assert_eq!(report.skipped_running, 1);
+        assert_eq!(report.evicted, Vec::new());
+        // The running instance is not an eviction candidate at all, not merely "skipped late".
+        assert_eq!(runtime.eviction_candidates(), Vec::<SubAgentId>::new());
         assert_eq!(runtime.get_status(&id), SubagentStatus::Running);
         assert_eq!(count_entries(&runtime, &id, TranscriptKind::Evicted), 0);
+        assert_eq!(count_frames(&runtime, &id, ActivityKind::Evicted), 0);
         gate.notify_waiters();
     }
 
@@ -780,15 +784,35 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_handle_cancels_the_loop() {
-        let (runtime, _clock) = manual_runtime(Behavior::Echo);
-        let (_sender, receiver) = mpsc::channel::<()>(1);
+        let (runtime, clock) = manual_runtime(Behavior::Echo);
+        let id = spawn(&runtime, "held").await;
+        wait_completed(&runtime, &id).await;
+        // The instance is expired, so a tick delivered to a live driver would evict it.
+        clock.advance(60_000);
+
+        let (sender, receiver) = mpsc::channel::<()>(4);
         let ticks = tokio_stream::wrappers::ReceiverStream::new(receiver);
-        let handle =
-            runtime.start_eviction_scheduler_with_ticks(EvictionSchedulerConfig::default(), ticks);
+        let handle = runtime.start_eviction_scheduler_with_ticks(
+            EvictionSchedulerConfig::new(Duration::from_secs(60), 1_000),
+            ticks,
+        );
         assert!(handle.is_running());
         drop(handle);
-        // The token is cancelled synchronously; the runtime is left untouched.
-        assert_eq!(runtime.capacity().0, 0);
+
+        // Cancellation is synchronous, so a tick can never reach a sweep. Once the cancelled
+        // driver exits at its next `select!` boundary it drops the tick stream, which closes the
+        // channel; retrying until then keeps the assertion timing-independent.
+        timeout(BOUND, async {
+            while sender.send(()).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled driver task drops its tick stream");
+
+        assert_eq!(runtime.get_status(&id), SubagentStatus::Completed);
+        assert_eq!(count_entries(&runtime, &id, TranscriptKind::Evicted), 0);
+        assert_eq!(runtime.capacity().0, 1);
     }
 
     #[test]

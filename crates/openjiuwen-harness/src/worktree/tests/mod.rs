@@ -7,7 +7,9 @@
 //! and change-summary call order through the same runner.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -162,4 +164,60 @@ pub(crate) fn temp_root() -> (tempfile::TempDir, PathBuf) {
 /// Whether the real git binary is available (guards the single live test).
 pub(crate) fn real_git_available() -> bool {
     super::git_available()
+}
+
+/// A `tracing` subscriber that keeps every event's fields as one string, so a
+/// test can prove that a warning was emitted (and what it carried) without a
+/// process-global subscriber.
+#[derive(Default)]
+pub(crate) struct MessageRecorder {
+    messages: Mutex<Vec<String>>,
+}
+
+impl MessageRecorder {
+    /// Installs the recorder on the current thread until the guard is dropped.
+    pub(crate) fn install(self: &Arc<Self>) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(Arc::clone(self))
+    }
+
+    /// Every recorded event rendering, oldest first.
+    pub(crate) fn messages(&self) -> Vec<String> {
+        self.messages.lock().clone()
+    }
+}
+
+impl tracing::Subscriber for MessageRecorder {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.messages.lock().push(visitor.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Renders every field of one event as `name=value`.
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value:?}", field.name());
+    }
 }

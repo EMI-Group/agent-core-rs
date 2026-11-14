@@ -35,7 +35,7 @@ Affinity is an optional optimisation: when off, nothing is stored, no child cach
 - `openjiuwen_common::error::{Error, Result}` everywhere; `tracing` only; no stdout; no `unwrap`/`expect` outside tests; no panics on user input.
 - No lock is held across `.await`: every lifecycle method takes a short `parking_lot::Mutex` section before the provider call and another to record the result.
 - `src/rails` must not import `crate::tools`, `crate::agent` or `crate::subagents`; this module reads tool payloads as opaque JSON instead.
-- Digests come from `crate::rails::sha256::{sha256_hex, sha256_prefix}`; `sha2` is not a dependency of the crate and must not be added.
+- Digests come from `openjiuwen_sysop::util::sha256_hex` and `crate::rails::sha256::sha256_prefix`; no `sha2` dependency is declared by the harness and none may be added.
 - State is per `KvCacheSubagentLifecycle` instance; no module-level singletons or caches.
 - Unknown subagent ids and provider failures never surface as panics: direct calls return `Err`/`Ok(None)`, the rail logs and swallows them.
 

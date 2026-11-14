@@ -921,8 +921,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use openjiuwen_common::error::ErrorKind;
-
-    use crate::rails::sha256::sha256_hex;
+    use openjiuwen_sysop::util::sha256_hex;
 
     use super::*;
 
@@ -963,7 +962,7 @@ mod tests {
         ]);
         assert_eq!(
             identity,
-            sha256_hex(canonical_json(&record))[..IDENTITY_HEX_CHARS]
+            sha256_hex(canonical_json(&record).as_bytes())[..IDENTITY_HEX_CHARS]
         );
 
         for mutation in [

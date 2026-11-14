@@ -14,6 +14,7 @@
 // Python contract and intentionally repeat the module name.
 #![allow(clippy::module_name_repetitions)]
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use openjiuwen_common::error::{Error, Result};
@@ -440,15 +441,18 @@ impl ConsultationRecord {
 
 /// Bounded, oldest-first history of consultations.
 ///
-/// The retained count never exceeds [`Self::limit`]; pushing past it evicts the oldest
-/// record. Persisting is an explicit [`Self::save`] call against a caller-supplied path.
+/// The retained count never exceeds [`Self::limit`], and pushing past it evicts the oldest
+/// record through the front of the deque, so a full history accepts a new record in constant
+/// time. `limit == 0` disables the history: nothing is retained and [`Self::push`] discards
+/// the record instead of trimming a buffer it would never report. Persisting is an explicit
+/// [`Self::save`] call against a caller-supplied path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ConsultationHistory {
-    /// Maximum number of retained records; `0` retains nothing.
+    /// Maximum number of retained records; `0` disables the history.
     pub limit: usize,
     /// Retained records, oldest first.
-    pub records: Vec<ConsultationRecord>,
+    pub records: VecDeque<ConsultationRecord>,
 }
 
 impl Default for ConsultationHistory {
@@ -463,25 +467,40 @@ impl ConsultationHistory {
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
-            records: Vec::new(),
+            records: VecDeque::new(),
         }
     }
 
     /// Appends `record`, evicting the oldest records beyond [`Self::limit`].
+    ///
+    /// Eviction pops the oldest record, so a full history always stays at [`Self::len`] equal
+    /// to its limit. A disabled history (`limit == 0`) retains nothing: the record is dropped
+    /// and anything already retained is emptied, so the state never exceeds the declared limit.
     pub fn push(&mut self, record: ConsultationRecord) {
         if self.limit == 0 {
             self.records.clear();
             return;
         }
         while self.records.len() >= self.limit {
-            self.records.remove(0);
+            self.records.pop_front();
         }
-        self.records.push(record);
+        self.records.push_back(record);
+    }
+
+    /// Replaces the retained records with `records`, keeping the newest [`Self::limit`].
+    ///
+    /// Used to adopt a persisted history: the receiver's limit wins, so a smaller or disabled
+    /// limit is honoured instead of inheriting the limit stored in the file.
+    pub fn replace(&mut self, records: impl IntoIterator<Item = ConsultationRecord>) {
+        self.records.clear();
+        for record in records {
+            self.push(record);
+        }
     }
 
     /// The retained records, oldest first.
     #[must_use]
-    pub fn records(&self) -> &[ConsultationRecord] {
+    pub fn records(&self) -> &VecDeque<ConsultationRecord> {
         &self.records
     }
 
@@ -726,6 +745,99 @@ mod tests {
         let mut empty = ConsultationHistory::new(0);
         empty.push(ConsultationRecord::new("x", ConsultationOutcome::default()));
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_full_history_keeps_only_the_newest_records() {
+        let mut history = ConsultationHistory::new(3);
+        for index in 0..1_000 {
+            history.push(ConsultationRecord::new(
+                format!("problem {index}"),
+                ConsultationOutcome::default(),
+            ));
+            assert!(history.len() <= 3);
+        }
+        assert_eq!(history.len(), 3);
+        let problems: Vec<&str> = history
+            .records()
+            .iter()
+            .map(|record| record.problem.as_str())
+            .collect();
+        assert_eq!(problems, ["problem 997", "problem 998", "problem 999"]);
+    }
+
+    #[test]
+    fn a_zero_limit_history_is_disabled() {
+        let mut disabled = ConsultationHistory::new(0);
+        assert_eq!(disabled.limit, 0);
+        disabled.push(ConsultationRecord::new("a", ConsultationOutcome::default()));
+        disabled.push(ConsultationRecord::new("b", ConsultationOutcome::default()));
+        assert_eq!(disabled.len(), 0);
+        assert!(disabled.is_empty());
+        assert!(disabled.records().is_empty());
+
+        // Lowering the limit on a populated history drops what it had retained instead of
+        // leaving records behind a limit that says nothing is kept.
+        let mut lowered = ConsultationHistory::new(2);
+        for problem in ["a", "b"] {
+            lowered.push(ConsultationRecord::new(
+                problem,
+                ConsultationOutcome::default(),
+            ));
+        }
+        assert_eq!(lowered.len(), 2);
+        lowered.limit = 0;
+        lowered.push(ConsultationRecord::new("c", ConsultationOutcome::default()));
+        assert!(lowered.is_empty());
+    }
+
+    #[test]
+    fn replace_adopts_the_newest_records_within_the_local_limit() {
+        let mut history = ConsultationHistory::new(2);
+        history.push(ConsultationRecord::new(
+            "stale",
+            ConsultationOutcome::default(),
+        ));
+
+        history.replace([
+            ConsultationRecord::new("first", ConsultationOutcome::default()),
+            ConsultationRecord::new("second", ConsultationOutcome::default()),
+            ConsultationRecord::new("third", ConsultationOutcome::default()),
+        ]);
+        let problems: Vec<&str> = history
+            .records()
+            .iter()
+            .map(|record| record.problem.as_str())
+            .collect();
+        assert_eq!(problems, ["second", "third"]);
+
+        // The receiving instance's limit wins, so a disabled history adopts nothing.
+        let mut disabled = ConsultationHistory::new(0);
+        disabled.replace([ConsultationRecord::new(
+            "ignored",
+            ConsultationOutcome::default(),
+        )]);
+        assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn history_json_shape_is_a_limit_plus_a_record_array() {
+        let mut history = ConsultationHistory::new(2);
+        history.push(ConsultationRecord::new(
+            "problem",
+            ConsultationOutcome::default(),
+        ));
+
+        let value = serde_json::to_value(&history).unwrap();
+        let object = value.as_object().unwrap();
+        let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["limit", "records"]);
+        assert_eq!(object["limit"], serde_json::json!(2));
+        assert_eq!(object["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<ConsultationHistory>(value).unwrap(),
+            history
+        );
     }
 
     #[tokio::test]

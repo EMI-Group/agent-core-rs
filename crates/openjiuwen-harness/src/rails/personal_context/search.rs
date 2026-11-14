@@ -45,10 +45,14 @@
 //!   heading shown to the user.
 //!
 //! Nothing in this module panics on user input: page text, paths and queries
-//! are arbitrary strings and are handled as data.
+//! are arbitrary strings and are handled as data. The two regular expressions
+//! are compile-time constants, and a constant that stopped compiling is
+//! reported once as a typed [`Error::config`]; the public helpers then degrade
+//! to an empty token stream (which ranks nothing) instead of panicking.
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use openjiuwen_common::error::{Error, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -91,11 +95,13 @@ const TOKEN_PATTERN: &str = r"[a-z0-9_]+|[\u{3400}-\u{4dbf}\u{4e00}-\u{9fff}]+";
 /// Python's `_HEADING`: `#`, `##` or `###` followed by whitespace and text.
 const HEADING_PATTERN: &str = r"^(#{1,3})\s+(.+?)\s*$";
 
-/// Compiled [`TOKEN_PATTERN`], shared process-wide.
-static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+/// Compiled [`TOKEN_PATTERN`], shared process-wide; `None` means the constant
+/// stopped compiling.
+static TOKEN_RE: OnceLock<Option<Regex>> = OnceLock::new();
 
-/// Compiled [`HEADING_PATTERN`], shared process-wide.
-static HEADING_RE: OnceLock<Regex> = OnceLock::new();
+/// Compiled [`HEADING_PATTERN`], shared process-wide; `None` means the constant
+/// stopped compiling.
+static HEADING_RE: OnceLock<Option<Regex>> = OnceLock::new();
 
 /// A page handed to the search index.
 ///
@@ -187,9 +193,12 @@ impl SearchHit {
 /// ```
 #[must_use]
 pub fn tokenize(text: &str) -> Vec<String> {
+    let Ok(pattern) = token_regex() else {
+        return Vec::new();
+    };
     let folded = text.to_lowercase();
     let mut tokens = Vec::new();
-    for found in token_regex().find_iter(&folded) {
+    for found in pattern.find_iter(&folded) {
         let token = found.as_str();
         if token.is_ascii() {
             tokens.push(token.to_owned());
@@ -221,11 +230,14 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// ```
 #[must_use]
 pub fn page_heading_fields(relative: &str, text: &str) -> (String, String) {
+    let Ok(pattern) = heading_regex() else {
+        return (path_stem(relative).to_owned(), String::new());
+    };
     let mut title = String::new();
     let mut headings: Vec<String> = Vec::new();
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let Some((level, heading)) = heading_parts(line) else {
+        let Some((level, heading)) = heading_parts(pattern, line) else {
             continue;
         };
         if level == 1 {
@@ -370,27 +382,66 @@ struct DocumentStats {
 }
 
 /// Returns the compiled token pattern.
-fn token_regex() -> &'static Regex {
-    TOKEN_RE.get_or_init(|| {
-        // The pattern is a constant covered by unit tests, so a compilation
-        // failure can only mean the source itself is broken.
-        Regex::new(TOKEN_PATTERN)
-            .unwrap_or_else(|error| panic!("personal-context token pattern is invalid: {error}"))
-    })
+///
+/// # Errors
+///
+/// [`Error::config`] when [`TOKEN_PATTERN`] stops compiling: the constant is a
+/// compile-time invariant, so only a source edit can break it. The failure is
+/// logged once, when the pattern is first compiled.
+fn token_regex() -> Result<&'static Regex> {
+    resolve_pattern(TOKEN_PATTERN, &TOKEN_RE, "token")
 }
 
 /// Returns the compiled heading pattern.
-fn heading_regex() -> &'static Regex {
-    HEADING_RE.get_or_init(|| {
-        // Same invariant as `token_regex`: a constant, unit-tested pattern.
-        Regex::new(HEADING_PATTERN)
-            .unwrap_or_else(|error| panic!("personal-context heading pattern is invalid: {error}"))
-    })
+///
+/// # Errors
+///
+/// [`Error::config`] when [`HEADING_PATTERN`] stops compiling, mirroring
+/// [`token_regex`].
+fn heading_regex() -> Result<&'static Regex> {
+    resolve_pattern(HEADING_PATTERN, &HEADING_RE, "heading")
+}
+
+/// Resolves `pattern` from `cache` or reports a typed configuration error.
+///
+/// # Errors
+///
+/// [`Error::config`] when `pattern` does not compile; [`compile`] logs the
+/// underlying reason once.
+fn resolve_pattern(
+    pattern: &str,
+    cache: &'static OnceLock<Option<Regex>>,
+    label: &str,
+) -> Result<&'static Regex> {
+    cache
+        .get_or_init(|| compile(pattern, label))
+        .as_ref()
+        .ok_or_else(|| Error::config(format!("personal-context {label} pattern is invalid")))
+}
+
+/// Compiles `pattern`, logging and returning `None` when it is invalid.
+///
+/// The single logging site: [`TOKEN_RE`] and [`HEADING_RE`] call this from
+/// `OnceLock::get_or_init`, so a broken constant is reported once per process
+/// instead of once per token.
+fn compile(pattern: &str, label: &str) -> Option<Regex> {
+    match Regex::new(pattern) {
+        Ok(regex) => Some(regex),
+        Err(error) => {
+            tracing::error!(
+                pattern,
+                label,
+                error = %error,
+                "personal-context search pattern is invalid"
+            );
+            None
+        }
+    }
 }
 
 /// Splits one heading line into its hash level and cleaned heading text.
-fn heading_parts(line: &str) -> Option<(usize, &str)> {
-    let captures = heading_regex().captures(line)?;
+fn heading_parts<'line>(regex: &Regex, line: &'line str) -> Option<(usize, &'line str)> {
+    let captures = regex.captures(line)?;
     let level = captures.get(1)?.as_str().len();
     let heading = captures.get(2)?.as_str().trim_end_matches('#').trim();
     Some((level, heading))
@@ -568,6 +619,23 @@ mod tests {
     /// Maps hits to their paths for ordering assertions.
     fn paths(hits: &[SearchHit]) -> Vec<&str> {
         hits.iter().map(|hit| hit.path.as_str()).collect()
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_a_typed_error_instead_of_a_panic() {
+        static BAD: OnceLock<Option<Regex>> = OnceLock::new();
+
+        let error = resolve_pattern("(", &BAD, "test").unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::Config);
+        assert_eq!(
+            error.to_string(),
+            "config: personal-context test pattern is invalid"
+        );
+        // The cache remembers the failure, so the error is stable and cheap.
+        assert!(resolve_pattern("(", &BAD, "test").is_err());
+        // The production patterns do compile, so the helpers keep working.
+        assert_eq!(tokenize("Hello"), ["hello"]);
+        assert_eq!(page_heading_fields("a.md", "# Title").0, "Title");
     }
 
     #[test]

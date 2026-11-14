@@ -22,9 +22,14 @@
 //!
 //! Every firing increments that pair's sequence and queues a
 //! [`HeartbeatEvent`] in a bounded, oldest-evicted-first queue, so a host can
-//! observe the cadence without installing a callback. The queue and the
-//! per-pair bookkeeping live in this rail instance (never in process-global
-//! state) and are only read through short `parking_lot` critical sections.
+//! observe the cadence without installing a callback. The queue is bounded by
+//! [`HeartbeatRailConfig::event_capacity`]; a capacity of `0` disables that
+//! bound, so the host must drain the queue itself. The per-pair bookkeeping is
+//! bounded the same way by [`HeartbeatRailConfig::session_capacity`], which
+//! evicts the least-recently-seen `(agent_id, session_id)` pair once the bound
+//! is exceeded (a capacity of `0` keeps every pair). Both live in this rail
+//! instance (never in process-global state) and are only read through short
+//! `parking_lot` critical sections.
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -56,6 +61,9 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 60_000;
 
 /// Default capacity of the queued-event buffer.
 pub const DEFAULT_HEARTBEAT_EVENT_CAPACITY: usize = 64;
+
+/// Default capacity of the tracked `(agent_id, session_id)` pairs.
+pub const DEFAULT_HEARTBEAT_SESSION_CAPACITY: usize = 1024;
 
 /// The Chinese heartbeat system prompt, verbatim from the Python SDK.
 const HEARTBEAT_PROMPT_CN: &str = r"
@@ -149,8 +157,12 @@ pub struct HeartbeatRailConfig {
     pub interval_ms: u64,
     /// Prompt language; `"en"` selects the English text, anything else Chinese.
     pub language: String,
-    /// Capacity of the queued-event buffer; `0` keeps every event.
+    /// Capacity of the queued-event buffer; `0` disables the bound, so the
+    /// host must drain the queue itself.
     pub event_capacity: usize,
+    /// Capacity of the tracked `(agent_id, session_id)` pairs; the
+    /// least-recently-seen pair is evicted first, and `0` keeps every pair.
+    pub session_capacity: usize,
     /// Whether a run marked [`HEARTBEAT_RUN_KIND`] always fires.
     pub force_on_heartbeat_run: bool,
     /// Whether a firing publishes the heartbeat prompt section.
@@ -158,12 +170,14 @@ pub struct HeartbeatRailConfig {
 }
 
 impl Default for HeartbeatRailConfig {
-    /// A one-minute cadence, Chinese prompts, 64 kept events, both switches on.
+    /// A one-minute cadence, Chinese prompts, 64 kept events, 1024 tracked
+    /// pairs, both switches on.
     fn default() -> Self {
         Self {
             interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             language: "cn".to_string(),
             event_capacity: DEFAULT_HEARTBEAT_EVENT_CAPACITY,
+            session_capacity: DEFAULT_HEARTBEAT_SESSION_CAPACITY,
             force_on_heartbeat_run: true,
             publish_prompt_section: true,
         }
@@ -185,10 +199,19 @@ impl HeartbeatRailConfig {
         self
     }
 
-    /// Returns this config keeping at most `capacity` events (`0` unbounded).
+    /// Returns this config keeping at most `capacity` events (`0` unbounded,
+    /// so the host must drain).
     #[must_use]
     pub const fn with_event_capacity(mut self, capacity: usize) -> Self {
         self.event_capacity = capacity;
+        self
+    }
+
+    /// Returns this config tracking at most `capacity` pairs, evicting the
+    /// least-recently-seen first (`0` unbounded).
+    #[must_use]
+    pub const fn with_session_capacity(mut self, capacity: usize) -> Self {
+        self.session_capacity = capacity;
         self
     }
 
@@ -237,6 +260,10 @@ pub struct HeartbeatEvent {
 struct HeartbeatState {
     /// Timestamp the current cadence is measured from.
     baseline_ms: u64,
+    /// Timestamp of the last observation of this pair, used to pick the
+    /// eviction victim once [`HeartbeatRailConfig::session_capacity`] is
+    /// exceeded.
+    last_seen_ms: u64,
     /// Timestamp of the last firing, `None` before the first one.
     last_fired_ms: Option<u64>,
     /// Number of firings of this pair, `0` before the first one.
@@ -317,6 +344,10 @@ impl HeartbeatRail {
     /// baseline (except for a marked heartbeat run, which fires immediately) and
     /// returns `None`.
     ///
+    /// Either way the pair is marked as just seen, and the least-recently-seen
+    /// pairs are evicted once [`HeartbeatRailConfig::session_capacity`] is
+    /// exceeded.
+    ///
     /// Returns the queued event, or `None` when nothing fired.
     #[must_use]
     pub fn observe(
@@ -336,10 +367,12 @@ impl HeartbeatRail {
                 .get(&key)
                 .is_some_and(|current| self.periodic_due(now, current.baseline_ms));
             if !forced && !due {
-                state.entry(key).or_insert(HeartbeatState {
+                let entry = state.entry(key.clone()).or_insert(HeartbeatState {
                     baseline_ms: now,
                     ..HeartbeatState::default()
                 });
+                entry.last_seen_ms = now;
+                self.evict_idle_pairs(&mut state, &key);
                 return None;
             }
             let entry = state.entry(key.clone()).or_insert(HeartbeatState {
@@ -347,6 +380,7 @@ impl HeartbeatRail {
                 ..HeartbeatState::default()
             });
             entry.baseline_ms = now;
+            entry.last_seen_ms = now;
             entry.last_fired_ms = Some(now);
             entry.sequence = entry.sequence.saturating_add(1);
             let reason = if forced {
@@ -354,7 +388,9 @@ impl HeartbeatRail {
             } else {
                 HeartbeatReason::Scheduled
             };
-            (entry.sequence, reason)
+            let sequence = entry.sequence;
+            self.evict_idle_pairs(&mut state, &key);
+            (sequence, reason)
         };
 
         let event = HeartbeatEvent {
@@ -387,6 +423,39 @@ impl HeartbeatRail {
             events.drain(..excess);
         }
         events.push_back(event);
+    }
+
+    /// Evicts the least-recently-seen pairs while `state` exceeds
+    /// [`HeartbeatRailConfig::session_capacity`].
+    ///
+    /// `keep` — the pair being observed — is never evicted, so the observation
+    /// that pushed the map over its bound survives. Ties on `last_seen_ms` fall
+    /// back to the map's key order, which makes the choice deterministic. A
+    /// capacity of `0` keeps every pair.
+    fn evict_idle_pairs(
+        &self,
+        state: &mut BTreeMap<(String, String), HeartbeatState>,
+        keep: &(String, String),
+    ) {
+        if self.config.session_capacity == 0 {
+            return;
+        }
+        while state.len() > self.config.session_capacity {
+            let victim = state
+                .iter()
+                .filter(|(pair, _)| *pair != keep)
+                .min_by_key(|(_, session)| session.last_seen_ms)
+                .map(|(pair, _)| pair.clone());
+            let Some(victim) = victim else {
+                return;
+            };
+            state.remove(&victim);
+            tracing::debug!(
+                agent_id = %victim.0,
+                session_id = %victim.1,
+                "harness heartbeat: evicted the least-recently-seen session pair"
+            );
+        }
     }
 
     /// Snapshot of the queued events, oldest first.
@@ -621,7 +690,9 @@ mod tests {
     async fn the_marked_run_path_can_be_disabled() {
         let (clock, now) = manual_clock();
         now.store(1_000, Ordering::SeqCst);
-        let config = HeartbeatRailConfig::default().with_force_on_heartbeat_run(false);
+        let config = HeartbeatRailConfig::default()
+            .with_force_on_heartbeat_run(false)
+            .with_interval_ms(1_000);
         let rail = HeartbeatRail::new(config).with_clock(clock);
         let mut ctx = ctx_for(RailEvent::BeforeModelCall, "agent-a", "session-a");
         ctx.extra_mut()
@@ -629,9 +700,19 @@ mod tests {
 
         rail.before_model_call(&mut ctx).await.unwrap();
 
+        // The marked run only records the baseline of the pair ...
         assert!(prompt_sections(&ctx).is_empty());
         assert!(rail.events().is_empty());
         assert!(rail.last_fired_ms("agent-a", "session-a").is_none());
+
+        // ... while the periodic path still fires the same pair once due.
+        now.store(2_000, Ordering::SeqCst);
+        rail.before_model_call(&mut ctx).await.unwrap();
+        let events = rail.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, HeartbeatReason::Scheduled);
+        assert_eq!(events[0].fired_at_ms, 2_000);
+        assert_eq!(prompt_sections(&ctx).len(), 1);
     }
 
     #[test]
@@ -782,6 +863,8 @@ mod tests {
         assert_eq!(events[0].fired_at_ms, 3);
     }
 
+    /// The documented contract: `event_capacity == 0` disables the bound, so
+    /// the host must drain the queue itself.
     #[test]
     fn a_zero_capacity_queue_keeps_every_event() {
         let (clock, now) = manual_clock();
@@ -797,6 +880,79 @@ mod tests {
         let events = rail.events();
         let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
         assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_bounded_pair_map_evicts_the_least_recently_seen_pair() {
+        let (clock, now) = manual_clock();
+        now.store(1_000, Ordering::SeqCst);
+        let rail = HeartbeatRail::new(
+            HeartbeatRailConfig::default()
+                .with_interval_ms(1_000)
+                .with_session_capacity(2),
+        )
+        .with_clock(clock);
+
+        assert!(rail.observe("agent-a", "session-1", None).is_none());
+        assert!(rail.observe("agent-a", "session-2", None).is_none());
+
+        // Both pairs fire once; session-2 is seen one tick later.
+        now.store(3_000, Ordering::SeqCst);
+        assert_eq!(
+            rail.observe("agent-a", "session-1", None).unwrap().sequence,
+            1
+        );
+        now.store(3_100, Ordering::SeqCst);
+        assert_eq!(
+            rail.observe("agent-a", "session-2", None).unwrap().sequence,
+            1
+        );
+
+        // A third pair pushes the map past its bound: session-1 is the
+        // least-recently-seen pair, so it is the one dropped.
+        now.store(3_200, Ordering::SeqCst);
+        assert!(rail.observe("agent-a", "session-3", None).is_none());
+        assert!(format!("{rail:?}").contains("state: 2"), "{rail:?}");
+        assert_eq!(rail.last_fired_ms("agent-a", "session-1"), None);
+        assert_eq!(rail.last_fired_ms("agent-a", "session-2"), Some(3_100));
+        assert!(!rail.is_due("agent-a", "session-2"));
+
+        // The survivors keep their cadence and sequence.
+        now.store(4_300, Ordering::SeqCst);
+        let fired = rail.observe("agent-a", "session-2", None).unwrap();
+        assert_eq!(fired.sequence, 2);
+        assert_eq!(fired.fired_at_ms, 4_300);
+        assert_eq!(
+            rail.observe("agent-a", "session-3", None).unwrap().sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn a_zero_pair_capacity_keeps_every_pair() {
+        let (clock, now) = manual_clock();
+        now.store(1_000, Ordering::SeqCst);
+        let rail = HeartbeatRail::new(
+            HeartbeatRailConfig::default()
+                .with_interval_ms(1_000)
+                .with_session_capacity(0),
+        )
+        .with_clock(clock);
+
+        for session in ["session-1", "session-2", "session-3", "session-4"] {
+            now.store(now.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+            assert!(rail.observe("agent-a", session, None).is_none());
+        }
+        assert!(format!("{rail:?}").contains("state: 4"), "{rail:?}");
+
+        // The oldest pair survived and still carries its own baseline.
+        assert_eq!(rail.last_fired_ms("agent-a", "session-1"), None);
+        now.store(3_000, Ordering::SeqCst);
+        assert!(rail.is_due("agent-a", "session-1"));
+        assert_eq!(
+            rail.observe("agent-a", "session-1", None).unwrap().sequence,
+            1
+        );
     }
 
     #[tokio::test]
@@ -820,13 +976,22 @@ mod tests {
     async fn a_non_firing_model_call_publishes_nothing() {
         let (clock, now) = manual_clock();
         now.store(100, Ordering::SeqCst);
-        let rail = HeartbeatRail::new(HeartbeatRailConfig::default()).with_clock(clock);
+        let rail = HeartbeatRail::new(HeartbeatRailConfig::default().with_interval_ms(1_000))
+            .with_clock(clock);
         let mut ctx = ctx_for(RailEvent::BeforeModelCall, "agent-a", "session-a");
 
+        // The baseline-only observation is silent ...
         rail.before_model_call(&mut ctx).await.unwrap();
-
         assert!(prompt_sections(&ctx).is_empty());
         assert!(rail.events().is_empty());
+
+        // ... and the same hook publishes as soon as the cadence is due, so the
+        // silence above is a decision of the rail and not a missing body.
+        now.store(1_100, Ordering::SeqCst);
+        rail.before_model_call(&mut ctx).await.unwrap();
+        assert_eq!(prompt_sections(&ctx).len(), 1);
+        assert_eq!(rail.events().len(), 1);
+        assert_eq!(rail.events()[0].fired_at_ms, 1_100);
     }
 
     #[test]
@@ -892,6 +1057,8 @@ mod tests {
         assert_eq!(config.language, "cn");
         assert_eq!(config.event_capacity, DEFAULT_HEARTBEAT_EVENT_CAPACITY);
         assert_eq!(config.event_capacity, 64);
+        assert_eq!(config.session_capacity, DEFAULT_HEARTBEAT_SESSION_CAPACITY);
+        assert_eq!(config.session_capacity, 1024);
         assert!(config.force_on_heartbeat_run);
         assert!(config.publish_prompt_section);
 
@@ -899,6 +1066,7 @@ mod tests {
         assert_eq!(json["interval_ms"], json!(60_000));
         assert_eq!(json["language"], json!("cn"));
         assert_eq!(json["event_capacity"], json!(64));
+        assert_eq!(json["session_capacity"], json!(1024));
         assert_eq!(json["force_on_heartbeat_run"], json!(true));
         assert_eq!(json["publish_prompt_section"], json!(true));
 
@@ -911,6 +1079,7 @@ mod tests {
         assert_eq!(partial.language, "en");
         assert_eq!(partial.interval_ms, DEFAULT_HEARTBEAT_INTERVAL_MS);
         assert_eq!(partial.event_capacity, DEFAULT_HEARTBEAT_EVENT_CAPACITY);
+        assert_eq!(partial.session_capacity, DEFAULT_HEARTBEAT_SESSION_CAPACITY);
         assert!(partial.force_on_heartbeat_run);
         assert!(partial.publish_prompt_section);
     }
@@ -921,6 +1090,7 @@ mod tests {
             .with_interval_ms(250)
             .with_language("en")
             .with_event_capacity(0)
+            .with_session_capacity(5)
             .with_force_on_heartbeat_run(false)
             .with_publish_prompt_section(false);
         assert_eq!(
@@ -929,6 +1099,7 @@ mod tests {
                 interval_ms: 250,
                 language: "en".to_string(),
                 event_capacity: 0,
+                session_capacity: 5,
                 force_on_heartbeat_run: false,
                 publish_prompt_section: false,
             }

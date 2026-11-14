@@ -39,6 +39,7 @@ use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 use crate::permission::{paths::normalize_lexically, PermissionEngine};
 use crate::tools::{schema_for, tool_card, ToolPayload};
 
+use super::changes::WorktreeChangeSummary;
 use super::events::WorktreeEvent;
 use super::manager::{WorktreeCreateOptions, WorktreeManager};
 use super::models::WorktreeState;
@@ -407,13 +408,24 @@ impl EnterWorktreeTool {
 
         // A registry record without a live git worktree is stale state: the
         // `worktree` tool's `prune` action reconciles it, entering would hide it.
-        if self.listed_target(&target).await == Some(false)
-            && self.has_registry_record(&name, &target)
-        {
-            return ToolPayload::fail(format!(
-                "registered worktree `{name}` at `{}` is not live (git does not list it); run the `worktree` tool's `prune` action",
-                target.display()
-            ));
+        // A failed listing is not "not listed": while a record exists the state
+        // cannot be confirmed, so it refuses instead of guessing.
+        let listed = self.listed_target(&target).await;
+        let recorded = self.has_registry_record(&name, &target);
+        match listed {
+            Ok(false) if recorded => {
+                return ToolPayload::fail(format!(
+                    "registered worktree `{name}` at `{}` is not live (git does not list it); run the `worktree` tool's `prune` action",
+                    target.display()
+                ));
+            }
+            Err(error) if recorded => {
+                return ToolPayload::fail(format!(
+                    "Could not verify whether `{}` is a live worktree: {error}. Refusing to enter while a registry record may be stale; run the `worktree` tool's `status` action, or delete the record with `prune`.",
+                    target.display()
+                ));
+            }
+            _ => {}
         }
 
         let result = match self
@@ -472,10 +484,24 @@ impl EnterWorktreeTool {
         }))
     }
 
-    /// Whether git lists `target`, or `None` when the listing failed.
-    async fn listed_target(&self, target: &Path) -> Option<bool> {
-        let infos = self.manager.list().await.ok()?;
-        Some(infos.iter().any(|info| same_path(&info.path, target)))
+    /// Whether git lists `target`.
+    ///
+    /// `Err` means the listing itself failed, so "not listed" cannot be
+    /// concluded; the error is logged at `warn` here with the target and the git
+    /// failure instead of being dropped. The caller refuses whenever a registry
+    /// record could be stale, and otherwise leaves the decision to the manager.
+    async fn listed_target(&self, target: &Path) -> Result<bool> {
+        match self.manager.list().await {
+            Ok(infos) => Ok(infos.iter().any(|info| same_path(&info.path, target))),
+            Err(error) => {
+                tracing::warn!(
+                    path = %target.display(),
+                    error = %error,
+                    "cannot list worktrees; refusing to confirm the target state"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Whether an active registry record of `name` points at `target`.
@@ -624,25 +650,13 @@ impl ExitWorktreeTool {
             }));
         }
 
-        let Ok(summary) = self.manager.change_summary(&name).await else {
-            return ToolPayload::fail(format!(
-                "Could not verify worktree state at {}. Refusing to remove without explicit confirmation. Set discard_changes=True to proceed, or use action='keep' to preserve the worktree.",
-                session.worktree_path.display()
-            ));
+        let summary = match self
+            .inspect_before_remove(&session, &branch, args.discard_changes)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(payload) => return payload,
         };
-        if summary.is_dirty() && !args.discard_changes {
-            let mut parts: Vec<String> = Vec::new();
-            if summary.changed_files > 0 {
-                parts.push(format!("{} uncommitted files", summary.changed_files));
-            }
-            if summary.commits > 0 {
-                parts.push(format!("{} commits on {branch}", summary.commits));
-            }
-            return ToolPayload::fail(format!(
-                "Worktree has {}. Removing will discard this work permanently. Confirm with the user, then set discard_changes=True to proceed, or use action='keep' to preserve the work.",
-                parts.join(" and ")
-            ));
-        }
         if let Err(error) = self.manager.remove(&name, args.discard_changes).await {
             return ToolPayload::fail(format!("Failed to exit worktree: {error}"));
         }
@@ -658,6 +672,10 @@ impl ExitWorktreeTool {
             "Removed worktree '{name}' (branch {branch}). Returned to {}",
             original_cwd.display()
         );
+        // `null` when the state could not be verified: an unverified removal must
+        // not claim it discarded zero files.
+        let discarded_files = summary.as_ref().map(|summary| summary.changed_files);
+        let discarded_commits = summary.as_ref().map(|summary| summary.commits);
         ToolPayload::ok(json!({
             "action": "remove",
             "original_cwd": original_cwd,
@@ -665,9 +683,62 @@ impl ExitWorktreeTool {
             "worktree_branch": session.worktree_branch,
             "worktree_name": name,
             "message": message,
-            "discarded_files": summary.changed_files,
-            "discarded_commits": summary.commits,
+            "discarded_files": discarded_files,
+            "discarded_commits": discarded_commits,
         }))
+    }
+
+    /// Verifies the session's worktree before a `remove`.
+    ///
+    /// `Ok(Some(summary))` when the state was inspected; `Ok(None)` when
+    /// `discard_changes` is set and the inspection failed (the flag is the
+    /// confirmation, so the removal proceeds); `Err(payload)` when the state is
+    /// unverifiable without the flag, or dirty and unconfirmed.
+    async fn inspect_before_remove(
+        &self,
+        session: &WorktreeSessionState,
+        branch: &str,
+        discard_changes: bool,
+    ) -> std::result::Result<Option<WorktreeChangeSummary>, ToolPayload> {
+        let name = session.worktree_name.as_str();
+        let summary = match self.manager.change_summary(name).await {
+            Ok(summary) => summary,
+            Err(error) if discard_changes => {
+                tracing::warn!(
+                    worktree = %name,
+                    path = %session.worktree_path.display(),
+                    error = %error,
+                    "cannot verify worktree state; removing anyway because discard_changes is set"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    worktree = %name,
+                    path = %session.worktree_path.display(),
+                    error = %error,
+                    "cannot verify worktree state; refusing to remove"
+                );
+                return Err(ToolPayload::fail(format!(
+                    "Could not verify worktree state at {}: {error}. Refusing to remove without explicit confirmation. Set discard_changes=True to proceed, or use action='keep' to preserve the worktree.",
+                    session.worktree_path.display()
+                )));
+            }
+        };
+        if summary.is_dirty() && !discard_changes {
+            let mut parts: Vec<String> = Vec::new();
+            if summary.changed_files > 0 {
+                parts.push(format!("{} uncommitted files", summary.changed_files));
+            }
+            if summary.commits > 0 {
+                parts.push(format!("{} commits on {branch}", summary.commits));
+            }
+            return Err(ToolPayload::fail(format!(
+                "Worktree has {}. Removing will discard this work permanently. Confirm with the user, then set discard_changes=True to proceed, or use action='keep' to preserve the work.",
+                parts.join(" and ")
+            )));
+        }
+        Ok(Some(summary))
     }
 }
 

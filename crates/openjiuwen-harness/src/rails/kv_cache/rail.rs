@@ -915,8 +915,29 @@ mod tests {
             json!({"subagent_type": "verification_agent"}),
             json!({"success": true, "data": {"subagent_id": "sub-1", "sub_session_id": "sub-1"}}),
         );
-        assert!(rail.after_tool_call(&mut ctx).await.is_ok());
+        // The hook succeeds, but only after really asking the provider and
+        // recording nothing when that provider failed.
+        rail.after_tool_call(&mut ctx).await.unwrap();
+        assert_eq!(registry.calls(), vec!["prepare:cache-parent"]);
         assert!(rail.lifecycle().get("sub-1").is_none());
+
+        // The rail survives the failure: the next frame with a working
+        // provider prepares and tracks the child.
+        registry.set_fail(false);
+        let mut retry = tool_context(
+            "subagent_spawn",
+            json!({"subagent_type": "verification_agent"}),
+            json!({"success": true, "data": {"subagent_id": "sub-1", "sub_session_id": "sub-1"}}),
+        );
+        rail.after_tool_call(&mut retry).await.unwrap();
+        assert_eq!(
+            registry.calls(),
+            vec!["prepare:cache-parent", "prepare:cache-parent"]
+        );
+        assert_eq!(
+            rail.lifecycle().get("sub-1").unwrap().state,
+            KvCacheSubagentState::Active
+        );
     }
     #[tokio::test]
     async fn the_rail_is_inert_when_affinity_is_off() {
@@ -929,6 +950,19 @@ mod tests {
         );
         rail.after_tool_call(&mut ctx).await.unwrap();
         assert!(registry.calls().is_empty());
+        assert!(rail.lifecycle().sessions().is_empty());
+
+        // The same frame through an affinity-on rail does prepare, so the
+        // silence above comes from the switch and not from a payload the rail
+        // failed to recognise.
+        let enabled = self::rail(Arc::clone(&registry), true);
+        let mut probe = tool_context(
+            "subagent_spawn",
+            json!({"subagent_type": "verification_agent"}),
+            json!({"success": true, "data": {"subagent_id": "sub-1", "sub_session_id": "sub-1"}}),
+        );
+        enabled.after_tool_call(&mut probe).await.unwrap();
+        assert_eq!(registry.calls(), vec!["prepare:cache-parent"]);
         assert!(rail.lifecycle().sessions().is_empty());
     }
     #[test]

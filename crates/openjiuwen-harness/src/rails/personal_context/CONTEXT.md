@@ -23,7 +23,7 @@ Every remote or vendor path is behind a source-provider seam and returns a typed
 ## Constraints
 
 - Async-first only where IO is genuinely async (provider seam, rail hooks); filesystem work is short and synchronous, bounded by explicit byte caps.
-- No new crates: digests come from `crate::rails::sha256` (`sha256_hex`, `sha256_prefix`), and this subtree carries its own `<path>.tmp` + rename JSON writer (`atomic.rs`) because `rails::evolution::store` is private to that module.
+- No new crates: digests come from `openjiuwen_sysop::util::sha256_hex` with `crate::rails::sha256::sha256_prefix` for truncation, and this subtree carries its own `<path>.tmp` + rename JSON writer (`atomic.rs`) because `rails::evolution::store` is private to that module.
 - Errors are `openjiuwen_common::error::{Error, Result}`; vendor paths are `Error::unsupported`, malformed documents are `Error::validation`, unusable paths are `Error::config`/`Error::security`, a blank-status guard is the `StateInvalid` status.
 - No panics on user input, no `unwrap`/`expect` outside tests, `tracing` only (never stdout), secrets and file contents are never logged.
 - Path safety is mandatory: absolute paths, `.`/`..`, backslashes, empty segments, non-portable segments, symlink chains and root escapes are rejected before any read or write.
@@ -48,6 +48,7 @@ Every remote or vendor path is behind a source-provider seam and returns a typed
 
 - Python's per-source Markdown metadata becomes one `<root>/src_<32 hex>.json` per source: field names, `src_<32 hex>` id derivation and first/last-seen semantics are identical, so ids stay wire-compatible; JSON removes the fragile heading/field parser.
 - Timestamps are RFC3339 UTC strings derived from an injected `observed_at_ms`; nothing reads the wall clock implicitly.
+- The token and heading patterns are resolved through a `OnceLock<Option<Regex>>` cache, so a broken constant is a typed `Error::config` logged once, and `tokenize`/`page_heading_fields` degrade to an empty result instead of panicking.
 - The rail's capability replaces Python's `pcs_search` tool registration: `PersonalContextRail::search(query)` holds the same guards (state-invalid when agent use is off, state-invalid for a blank query) while a host decides how to mount a tool over it.
 - Link-book identity is `sha256_hex` over the canonical (alphabetically keyed) record JSON truncated to 32 hex, matching Python's `json.dumps(record, sort_keys=True)` so existing books stay readable.
 - `resolve_target` returns typed errors where Python returned an empty string for unsupported schemes: an unregistered scheme is a caller bug, not a silent empty target.

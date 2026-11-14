@@ -384,36 +384,74 @@ mod tests {
     use super::super::transcript::TranscriptKind;
     use super::*;
 
-    /// Hook that records the stages it was invoked for and can fail on one of them.
+    /// One recorded hook invocation: the stage the registry dispatched and the event payload.
+    type Call = (LifecycleStage, SubagentLifecycleEvent);
+
+    /// Shared invocation log of one recording hook.
+    type Seen = Arc<Mutex<Vec<Call>>>;
+
+    /// Shared cross-hook invocation log (`<hook>:<stage>`), used to prove registration order.
+    type Order = Arc<Mutex<Vec<String>>>;
+
+    /// One recorded callback call: stage, subagent id, and reason.
+    type CallRecord = (LifecycleStage, String, Option<String>);
+
+    /// A pass over `invoked` hooks where every hook succeeded.
+    fn clean(invoked: usize) -> LifecycleReport {
+        LifecycleReport {
+            invoked,
+            failures: Vec::new(),
+        }
+    }
+
+    /// The dispatched stages of `seen`, in invocation order.
+    fn stages(seen: &Seen) -> Vec<LifecycleStage> {
+        seen.lock().iter().map(|(stage, _)| *stage).collect()
+    }
+
+    /// Hook that records the dispatched stage plus the event payload and can fail on one stage.
     struct RecordingHook {
         name: &'static str,
-        seen: Arc<Mutex<Vec<LifecycleStage>>>,
+        seen: Seen,
+        order: Option<Order>,
         fail_on: Option<LifecycleStage>,
     }
 
     impl RecordingHook {
-        fn new(name: &'static str) -> (Self, Arc<Mutex<Vec<LifecycleStage>>>) {
-            let seen: Arc<Mutex<Vec<LifecycleStage>>> = Arc::new(Mutex::new(Vec::new()));
+        fn new(name: &'static str) -> (Self, Seen) {
+            Self::build(name, None)
+        }
+
+        fn failing(name: &'static str, stage: LifecycleStage) -> (Self, Seen) {
+            Self::build(name, Some(stage))
+        }
+
+        fn build(name: &'static str, fail_on: Option<LifecycleStage>) -> (Self, Seen) {
+            let seen: Seen = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     name,
                     seen: Arc::clone(&seen),
-                    fail_on: None,
+                    order: None,
+                    fail_on,
                 },
                 seen,
             )
         }
 
-        fn failing(name: &'static str, stage: LifecycleStage) -> Self {
-            Self {
-                name,
-                seen: Arc::new(Mutex::new(Vec::new())),
-                fail_on: Some(stage),
-            }
+        /// Also appends `<name>:<stage>` to the shared cross-hook `order` log.
+        fn with_order(mut self, order: Order) -> Self {
+            self.order = Some(order);
+            self
         }
 
-        fn record(&self, stage: LifecycleStage) -> Result<()> {
-            self.seen.lock().push(stage);
+        fn record(&self, stage: LifecycleStage, event: &SubagentLifecycleEvent) -> Result<()> {
+            self.seen.lock().push((stage, event.clone()));
+            if let Some(order) = &self.order {
+                order
+                    .lock()
+                    .push(format!("{}:{}", self.name, stage.as_str()));
+            }
             if self.fail_on == Some(stage) {
                 return Err(Error::Validation(format!(
                     "{} refused {stage:?}",
@@ -430,20 +468,20 @@ mod tests {
             self.name
         }
 
-        async fn on_spawn(&self, _event: &SubagentLifecycleEvent) -> Result<()> {
-            self.record(LifecycleStage::Spawn)
+        async fn on_spawn(&self, event: &SubagentLifecycleEvent) -> Result<()> {
+            self.record(LifecycleStage::Spawn, event)
         }
 
-        async fn on_ready(&self, _event: &SubagentLifecycleEvent) -> Result<()> {
-            self.record(LifecycleStage::Ready)
+        async fn on_ready(&self, event: &SubagentLifecycleEvent) -> Result<()> {
+            self.record(LifecycleStage::Ready, event)
         }
 
-        async fn on_before_evict(&self, _event: &SubagentLifecycleEvent) -> Result<()> {
-            self.record(LifecycleStage::BeforeEvict)
+        async fn on_before_evict(&self, event: &SubagentLifecycleEvent) -> Result<()> {
+            self.record(LifecycleStage::BeforeEvict, event)
         }
 
-        async fn on_close(&self, _event: &SubagentLifecycleEvent) -> Result<()> {
-            self.record(LifecycleStage::Close)
+        async fn on_close(&self, event: &SubagentLifecycleEvent) -> Result<()> {
+            self.record(LifecycleStage::Close, event)
         }
     }
 
@@ -461,6 +499,8 @@ mod tests {
     struct ReentrantHook {
         inner: LifecycleHooks,
         seen: Arc<Mutex<Vec<LifecycleStage>>>,
+        /// Report of the nested `Ready` pass, so the test can inspect its contents.
+        nested: Arc<Mutex<Option<LifecycleReport>>>,
     }
 
     #[async_trait::async_trait]
@@ -475,14 +515,14 @@ mod tests {
             let names = self.inner.names();
             assert_eq!(names.len(), self.inner.len());
             let nested = self.inner.run(LifecycleStage::Ready, event).await;
-            assert!(nested.is_ok());
+            // The nested pass invoked every registered hook for `Ready`, not just this one.
+            assert_eq!(nested.invoked, names.len());
+            *self.nested.lock() = Some(nested);
             Ok(())
         }
     }
 
-    /// One recorded callback call: stage, subagent id, and reason.
-    type CallRecord = (LifecycleStage, String, Option<String>);
-
+    /// The canonical event payload the tests dispatch.
     fn event(stage: LifecycleStage) -> SubagentLifecycleEvent {
         SubagentLifecycleEvent {
             subagent_id: "parent_sub_code_agent_0011aabb".to_owned(),
@@ -507,55 +547,89 @@ mod tests {
     #[tokio::test]
     async fn hooks_run_in_registration_order() {
         let hooks = LifecycleHooks::new();
+        let order: Order = Arc::new(Mutex::new(Vec::new()));
         let (first, first_seen) = RecordingHook::new("first");
         let (second, second_seen) = RecordingHook::new("second");
-        hooks.register(Arc::new(first));
-        hooks.register(Arc::new(second));
+        hooks.register(Arc::new(first.with_order(Arc::clone(&order))));
+        hooks.register(Arc::new(second.with_order(Arc::clone(&order))));
 
-        let report = hooks
-            .run(LifecycleStage::Spawn, &event(LifecycleStage::Spawn))
-            .await;
+        let spawn_event = event(LifecycleStage::Spawn);
+        let report = hooks.run(LifecycleStage::Spawn, &spawn_event).await;
 
-        assert!(report.is_ok());
-        assert_eq!(report.invoked, 2);
-        assert_eq!(report.failures.len(), 0);
-        assert_eq!(*first_seen.lock(), vec![LifecycleStage::Spawn]);
-        assert_eq!(*second_seen.lock(), vec![LifecycleStage::Spawn]);
+        assert_eq!(report, clean(2));
+        // The shared log proves the hooks were awaited in registration order, which the
+        // per-hook logs alone cannot show.
+        assert_eq!(
+            *order.lock(),
+            vec!["first:spawn".to_owned(), "second:spawn".to_owned()]
+        );
+        // Each hook received the dispatched stage and the very payload under test.
+        assert_eq!(
+            *first_seen.lock(),
+            vec![(LifecycleStage::Spawn, spawn_event.clone())]
+        );
+        assert_eq!(
+            *second_seen.lock(),
+            vec![(LifecycleStage::Spawn, spawn_event.clone())]
+        );
         assert_eq!(hooks.names(), vec!["first".to_owned(), "second".to_owned()]);
     }
 
     #[tokio::test]
     async fn a_failing_hook_is_reported_and_later_hooks_still_run() {
         let hooks = LifecycleHooks::new();
+        let order: Order = Arc::new(Mutex::new(Vec::new()));
         let (first, first_seen) = RecordingHook::new("first");
-        hooks.register(Arc::new(first));
-        let failing = RecordingHook::failing("broken", LifecycleStage::BeforeEvict);
-        hooks.register(Arc::new(failing));
+        hooks.register(Arc::new(first.with_order(Arc::clone(&order))));
+        let (failing, failing_seen) = RecordingHook::failing("broken", LifecycleStage::BeforeEvict);
+        hooks.register(Arc::new(failing.with_order(Arc::clone(&order))));
         let (last, last_seen) = RecordingHook::new("last");
-        hooks.register(Arc::new(last));
+        hooks.register(Arc::new(last.with_order(Arc::clone(&order))));
 
-        let report = hooks
-            .run(
-                LifecycleStage::BeforeEvict,
-                &event(LifecycleStage::BeforeEvict),
-            )
-            .await;
+        let evict_event = event(LifecycleStage::BeforeEvict);
+        let report = hooks.run(LifecycleStage::BeforeEvict, &evict_event).await;
 
         assert!(!report.is_ok());
         assert_eq!(report.invoked, 3);
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].hook, "broken");
-        assert_eq!(report.failures[0].stage, LifecycleStage::BeforeEvict);
-        assert!(report.failures[0].message.contains("refused"));
-        assert_eq!(*first_seen.lock(), vec![LifecycleStage::BeforeEvict]);
-        assert_eq!(*last_seen.lock(), vec![LifecycleStage::BeforeEvict]);
+        // The failure names the hook, the stage and the exact error the hook returned.
+        assert_eq!(
+            report.failures,
+            vec![LifecycleFailure {
+                hook: "broken".to_owned(),
+                stage: LifecycleStage::BeforeEvict,
+                message: "validation: broken refused BeforeEvict".to_owned(),
+            }]
+        );
+        // All three hooks were awaited, in registration order, even though the middle one failed.
+        assert_eq!(
+            *order.lock(),
+            vec![
+                "first:before_evict".to_owned(),
+                "broken:before_evict".to_owned(),
+                "last:before_evict".to_owned(),
+            ]
+        );
+        // The failing hook did observe the event before returning its error, and the hooks before
+        // and after it still received the same payload.
+        assert_eq!(
+            *failing_seen.lock(),
+            vec![(LifecycleStage::BeforeEvict, evict_event.clone())]
+        );
+        assert_eq!(
+            *first_seen.lock(),
+            vec![(LifecycleStage::BeforeEvict, evict_event.clone())]
+        );
+        assert_eq!(
+            *last_seen.lock(),
+            vec![(LifecycleStage::BeforeEvict, evict_event.clone())]
+        );
     }
 
     #[tokio::test]
     async fn registering_by_name_replaces_in_place_and_keeps_order() {
         let hooks = LifecycleHooks::new();
-        let (first, _first_seen) = RecordingHook::new("first");
-        let (second, _second_seen) = RecordingHook::new("second");
+        let (first, first_seen) = RecordingHook::new("first");
+        let (second, second_seen) = RecordingHook::new("second");
         hooks.register(Arc::new(first));
         hooks.register(Arc::new(second));
         let (replacement, replacement_seen) = RecordingHook::new("first");
@@ -564,18 +638,28 @@ mod tests {
         assert_eq!(hooks.len(), 2);
         assert_eq!(hooks.names(), vec!["first".to_owned(), "second".to_owned()]);
 
-        let report = hooks
-            .run(LifecycleStage::Close, &event(LifecycleStage::Close))
-            .await;
-        assert!(report.is_ok());
-        assert_eq!(report.invoked, 2);
-        assert_eq!(*replacement_seen.lock(), vec![LifecycleStage::Close]);
+        let close_event = event(LifecycleStage::Close);
+        let report = hooks.run(LifecycleStage::Close, &close_event).await;
+        assert_eq!(report, clean(2));
+        // The replacement ran in the evicted slot and the other hook kept its position.
+        assert_eq!(
+            *replacement_seen.lock(),
+            vec![(LifecycleStage::Close, close_event.clone())]
+        );
+        assert_eq!(
+            *second_seen.lock(),
+            vec![(LifecycleStage::Close, close_event.clone())]
+        );
+        assert!(
+            first_seen.lock().is_empty(),
+            "the replaced hook must not run again"
+        );
     }
 
     #[tokio::test]
     async fn with_hook_chains_and_exposes_names() {
-        let (first, _first_seen) = RecordingHook::new("first");
-        let (second, _second_seen) = RecordingHook::new("second");
+        let (first, first_seen) = RecordingHook::new("first");
+        let (second, second_seen) = RecordingHook::new("second");
         let hooks = LifecycleHooks::new()
             .with_hook(Arc::new(first))
             .with_hook(Arc::new(second));
@@ -584,15 +668,33 @@ mod tests {
         assert!(!hooks.is_empty());
         assert_eq!(hooks.names(), vec!["first".to_owned(), "second".to_owned()]);
 
+        let close_event = event(LifecycleStage::Close);
+        assert_eq!(
+            hooks.run(LifecycleStage::Close, &close_event).await,
+            clean(2)
+        );
+        assert_eq!(stages(&first_seen), vec![LifecycleStage::Close]);
+        assert_eq!(stages(&second_seen), vec![LifecycleStage::Close]);
+
         hooks.clear();
         assert!(hooks.is_empty());
         assert_eq!(hooks.len(), 0);
+        assert_eq!(hooks.names(), Vec::<String>::new());
+        // The cleared registry awaits nothing, so neither hook is invoked again.
+        assert_eq!(
+            hooks.run(LifecycleStage::Close, &close_event).await,
+            clean(0)
+        );
+        assert_eq!(stages(&first_seen), vec![LifecycleStage::Close]);
+        assert_eq!(stages(&second_seen), vec![LifecycleStage::Close]);
     }
 
     #[tokio::test]
     async fn defaulted_methods_are_no_ops_for_every_stage() {
         let hooks = LifecycleHooks::new();
         hooks.register(Arc::new(BareHook));
+        let (recorder, recorder_seen) = RecordingHook::new("recorder");
+        hooks.register(Arc::new(recorder));
 
         for stage in [
             LifecycleStage::Spawn,
@@ -600,14 +702,23 @@ mod tests {
             LifecycleStage::BeforeEvict,
             LifecycleStage::Close,
         ] {
-            let report = hooks.run(stage, &event(stage)).await;
-            assert!(report.is_ok());
-            assert_eq!(report.invoked, 1);
+            let payload = event(stage);
+            let report = hooks.run(stage, &payload).await;
+            // The bare hook contributes no failure; the recorder proves the pass really
+            // dispatched this stage with this payload.
+            assert_eq!(report, clean(2), "stage {}", stage.as_str());
+            assert_eq!(
+                *recorder_seen.lock(),
+                vec![(stage, payload)],
+                "stage {} reached the recorder",
+                stage.as_str()
+            );
+            recorder_seen.lock().clear();
         }
     }
 
     #[tokio::test]
-    async fn callback_hook_invokes_only_the_invoked_stage_and_forwards_the_event() {
+    async fn callback_hook_invokes_only_the_registered_stage_and_forwards_the_event() {
         let received: Arc<Mutex<Vec<CallRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
         let sink = Arc::clone(&received);
@@ -619,23 +730,49 @@ mod tests {
                 Ok(())
             })
         };
+        let refuse = |_: SubagentLifecycleEvent| -> BoxFuture<'static, Result<()>> {
+            Box::pin(async { Err(Error::Validation("release refused".to_owned())) })
+        };
         let hook = CallbackLifecycleHook::new("kv-cache")
-            .on(LifecycleStage::BeforeEvict, Arc::new(record));
+            .on(LifecycleStage::BeforeEvict, Arc::new(record))
+            .on(LifecycleStage::Ready, Arc::new(refuse));
 
         let hooks = LifecycleHooks::new().with_hook(Arc::new(hook));
+
+        // A stage without a callback is a no-op, not a failure.
         let spawn_report = hooks
             .run(LifecycleStage::Spawn, &event(LifecycleStage::Spawn))
             .await;
-        assert!(spawn_report.is_ok());
+        assert_eq!(spawn_report, clean(1));
         assert!(
             received.lock().is_empty(),
             "the spawn stage has no callback"
         );
 
+        // A callback that fails is reported against the hook name and the dispatched stage, and
+        // it never reaches the `BeforeEvict` recorder.
+        let ready_report = hooks
+            .run(LifecycleStage::Ready, &event(LifecycleStage::Ready))
+            .await;
+        assert_eq!(
+            ready_report,
+            LifecycleReport {
+                invoked: 1,
+                failures: vec![LifecycleFailure {
+                    hook: "kv-cache".to_owned(),
+                    stage: LifecycleStage::Ready,
+                    message: "validation: release refused".to_owned(),
+                }],
+            }
+        );
+        assert!(
+            received.lock().is_empty(),
+            "the ready callback is the failing one"
+        );
+
         let evict_event = event(LifecycleStage::BeforeEvict);
         let evict_report = hooks.run(LifecycleStage::BeforeEvict, &evict_event).await;
-        assert!(evict_report.is_ok());
-        assert_eq!(evict_report.invoked, 1);
+        assert_eq!(evict_report, clean(1));
 
         let calls = received.lock().clone();
         assert_eq!(calls.len(), 1);
@@ -650,25 +787,40 @@ mod tests {
         let (watcher, watcher_seen) = RecordingHook::new("watcher");
         hooks.register(Arc::new(watcher));
         let reentrant_seen: Arc<Mutex<Vec<LifecycleStage>>> = Arc::new(Mutex::new(Vec::new()));
+        let nested_report: Arc<Mutex<Option<LifecycleReport>>> = Arc::new(Mutex::new(None));
         hooks.register(Arc::new(ReentrantHook {
             inner: hooks.clone(),
             seen: Arc::clone(&reentrant_seen),
+            nested: Arc::clone(&nested_report),
         }));
 
+        let spawn_event = event(LifecycleStage::Spawn);
         let report = tokio::time::timeout(
             Duration::from_secs(5),
-            hooks.run(LifecycleStage::Spawn, &event(LifecycleStage::Spawn)),
+            hooks.run(LifecycleStage::Spawn, &spawn_event),
         )
         .await
         .expect("the reentrant hook must not deadlock");
 
-        assert!(report.is_ok());
-        assert_eq!(report.invoked, 2);
+        // The outer pass ran both hooks; the nested `Ready` pass did the same.
+        assert_eq!(report, clean(2));
         assert_eq!(*reentrant_seen.lock(), vec![LifecycleStage::Spawn]);
-        // The nested `Ready` pass reached the recording watcher as well.
+        let nested = nested_report
+            .lock()
+            .clone()
+            .expect("the nested pass finished");
+        assert_eq!(nested, clean(2));
+        // The nested pass reached the recording watcher at `Ready` and forwarded the same event.
         assert_eq!(
-            *watcher_seen.lock(),
+            stages(&watcher_seen),
             vec![LifecycleStage::Spawn, LifecycleStage::Ready]
+        );
+        assert!(
+            watcher_seen
+                .lock()
+                .iter()
+                .all(|(_, payload)| *payload == spawn_event),
+            "both passes forwarded the same payload"
         );
     }
 

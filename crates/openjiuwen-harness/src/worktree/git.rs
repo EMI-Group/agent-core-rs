@@ -611,12 +611,15 @@ pub async fn diff_stat(runner: &dyn GitRunner, cwd: &Path, base: Option<&str>) -
 /// Counts the commits in `range` (`<base>..HEAD`), or `None` when unknown.
 ///
 /// A git failure and an unparsable count both degrade to `None`, which callers
-/// read as "cannot determine" (fail-closed) rather than "zero".
+/// read as "cannot determine" (fail-closed) rather than "zero". The failure is
+/// logged at `warn` with the command and the git error (whose message carries
+/// the stderr), so a broken repository is visible in the log instead of looking
+/// like an empty commit range.
 ///
 /// # Errors
 ///
-/// Never returns `Err` today: the `Result` keeps the signature uniform with the
-/// other helpers and leaves room for a future strict variant.
+/// Never returns `Err`: a failure is logged and becomes `Ok(None)`, so the
+/// `Result` keeps the signature uniform with the other helpers.
 pub async fn rev_list_count(
     runner: &dyn GitRunner,
     cwd: &Path,
@@ -624,7 +627,16 @@ pub async fn rev_list_count(
 ) -> Result<Option<u64>> {
     match runner.run(&["rev-list", "--count", range], cwd).await {
         Ok(output) => Ok(output.stdout.trim().parse::<u64>().ok()),
-        Err(_) => Ok(None),
+        Err(error) => {
+            tracing::warn!(
+                command = "git rev-list --count",
+                range = %range,
+                cwd = %cwd.display(),
+                error = %error,
+                "cannot count commits; treating the count as unknown"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -632,16 +644,27 @@ pub async fn rev_list_count(
 ///
 /// `Some(true)` when `git rev-list --max-count=1 HEAD --not --remotes` printed a
 /// commit, `Some(false)` when it printed nothing, and `None` when the probe
-/// failed — the fail-closed value Python's cleanup uses to keep a worktree.
+/// failed — the fail-closed value Python's cleanup uses to keep a worktree. A
+/// failed probe is logged at `warn` with the command and the git error (whose
+/// message carries the stderr), so a broken repository cannot masquerade as one
+/// with no unpushed commits.
 ///
 /// # Errors
 ///
-/// Never returns `Err` today: probe failures degrade to `Ok(None)`.
+/// Never returns `Err`: probe failures are logged and degrade to `Ok(None)`.
 pub async fn has_unpushed_commits(runner: &dyn GitRunner, cwd: &Path) -> Result<Option<bool>> {
     let args = ["rev-list", "--max-count=1", "HEAD", "--not", "--remotes"];
     match runner.run(&args, cwd).await {
         Ok(output) => Ok(Some(!output.stdout.trim().is_empty())),
-        Err(_) => Ok(None),
+        Err(error) => {
+            tracing::warn!(
+                command = "git rev-list --max-count=1 HEAD --not --remotes",
+                cwd = %cwd.display(),
+                error = %error,
+                "cannot probe unpushed commits; treating the state as unknown"
+            );
+            Ok(None)
+        }
     }
 }
 

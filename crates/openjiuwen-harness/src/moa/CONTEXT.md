@@ -11,7 +11,7 @@ Python entry points and persisted JSON keys are preserved where the reference pe
 ## Module layout
 
 - `config.rs` — `MoaConfig`, `VerifierConfig`, `JevConfig`, `MoaMode`, `VerifierSelection`, validation helpers and Python-compatible error messages.
-- `state.rs` — `TurnKey`, `ProposalSource`, `ProposerFailure`, `ProposalAttempt`, `ProposalBatch`, `ProposalStore`, `MoaState`, `MoaSnapshot`, `ConsultationOutcome`, `ConsultationRecord`, `ConsultationHistory`.
+- `state.rs` — `TurnKey`, `ProposalSource`, `ProposerFailure`, `ProposalAttempt`, `ProposalBatch`, `ProposalStore`, `MoaState`, `MoaSnapshot`, `ConsultationOutcome`, `ConsultationRecord`, `ConsultationHistory` (bounded, `VecDeque`-backed).
 - `redaction.rs` — `redact`: shared credential/PII redaction for verifier and transcript inputs.
 - `prompts.rs` — `REFERENCE_SYSTEM_PROMPT`, `AGGREGATOR_SYSTEM_PROMPT`, reference-proposal rendering, transcript flattening, reference/aggregator/verifier message builders, `moa_section`.
 - `consultation.rs` — bounded concurrent proposer fan-out over injected models with timeout, cancellation and partial-failure accounting.
@@ -43,7 +43,7 @@ State (`state.rs`):
 - `MoaState { problem, baseline: Vec<BaseMessage>, proposals, active_key, completed_turns, steps, previous_score: Option<f32>, reference_calls, verifier_calls, consultation_rejection, closed, jev_calls, last_jev_decision, last_jev_reason, invoke_id }` with `new`, `accepts_result(epoch)`, `snapshot`.
 - `MoaSnapshot` serde struct with the diagnostics Python exposes (no reference text).
 - `ConsultationOutcome { proposals, success_count, failed_count, failures, ranking, aggregate, verifier_score }` serde, `is_empty`, `best`.
-- `ConsultationRecord { problem, outcome }`, `ConsultationHistory { limit, records }` bounded with `push`, `records`, `save(path)`, `load(path)`, `clear`.
+- `ConsultationRecord { problem, outcome }`, `ConsultationHistory { limit, records }` bounded with `push`, `replace`, `records`, `save(path)`, `load(path)`, `clear`; `records` is a `VecDeque` so eviction pops the oldest record instead of shifting the vector, and `limit == 0` disables the history (nothing retained, `push` discards).
 
 Redaction (`redaction.rs`): `redact(&str) -> String` removes JSON-shaped secret values, bearer tokens, `api_key`/`token`/`password` assignments and `sk-` keys.
 
@@ -57,12 +57,15 @@ Aggregation (`aggregate.rs`): `AggregationStrategy { Labelled, Synthesis }`, `Ag
 
 Rail (`rail.rs`): `MOA_RAIL_NAME`, `MOA_PROMPT_SECTION`, `MOA_STATE_EXTRA_KEY`, `MOA_OUTCOME_EXTRA_KEY`, `MoaRail::{new, with_language, config, prompt_section, last_outcome, snapshot, history, consult, record_step, recorded_steps, verify_progress, save_history, load_history}`; implements `crate::rails::HarnessRail` with `name() = "moa"` and priority `rail_priority::MOA` by default.
 `MoaRail::consult` refuses `MoaMode::JevRouted` and enforces `MoaConfig::max_reference_calls` while an invocation state is installed.
+The internal `publish_extra` helper inserts a serialized payload into the rail context and logs a `tracing::warn!` naming the key and payload when the JSON encoding fails, instead of discarding the failure.
+`MoaRail::load_history` adopts a persisted history through `ConsultationHistory::replace`, so the rail's own `history_limit` (including `0`) wins over the limit stored in the file.
 `MoaRail::record_step` redacts and bounds one step, `MoaRail::recorded_steps` exposes the recorded steps, and `MoaRail::verify_progress` scores them while enforcing `VerifierConfig::max_verifier_calls`.
 `HarnessRail::after_react_iteration` only observes: it counts the completed turn and, in `verifier_routed` mode, records one redacted step built from the last assistant message and its tool observations.
 
 Skills (`builtin_skills.rs`, `skill_mount.rs`): `CONSULT_SKILL_NAME`, `CONSULT_SKILL_DESCRIPTION`, `CONSULT_SKILL_BODY`, `validate_builtin_skill_name`, `consult_skill`, `materialize_builtin_skill`; `ConsultationSkillMount::{new, embedded, from_dir, skill, mount, unmount, validate}`.
 
 Every public item is re-exported from this module root; the crate root does not yet flatten these names.
+`ConsultationSkillMount::mount` verifies the recorded root still covers the configured directory (through `same_skill_root`, which borrows the library's path rules), keeps prior ownership when it re-adds a root that went missing, and returns `Error::Config` with `STALE_MOUNT` for a recorded mount that drifted away from the directory instead of leaving the skill silently undiscoverable.
 
 ## Constraints
 
@@ -80,15 +83,15 @@ Every public item is re-exported from this module root; the crate root does not 
 ## Test Strategy
 
 - Offline only: `openjiuwen_test_support::ScriptedModel`, hand-built `BaseMessage`s, `tempfile` directories, `tokio_util::sync::CancellationToken`; no network, no wall-clock ordering.
-- `config.rs`: defaults, builders, every validation message, serde of `MoaMode`/`VerifierConfig`/`JevConfig`, redacting `Debug`.
-- `state.rs`: store activate/invalidate/close, snapshot diagnostics, outcome best/is_empty, bounded history eviction and JSON round-trip.
+- `config.rs`: defaults checked against the ranges validation enforces, builders, every validation message, the accepted boundaries (`Some(0)` and `usize::MAX - 1` budgets, structural verification without a model), the filesystem check of `consultation_skill_dir` (a directory accepted once `SKILL.md` exists and rejected again after it is removed), serde of `MoaMode`/`VerifierConfig`/`JevConfig`, redacting `Debug`.
+- `state.rs`: store activate/invalidate/close, snapshot diagnostics, outcome best/is_empty, bounded history eviction over a 1,000-push run, the disabled (`limit == 0`) history, `replace` adopting only the newest records, and the `limit` + JSON-array persisted shape.
 - `redaction.rs`: JSON secrets, bearer tokens, assignments and `sk-` keys; unrelated text untouched.
 - `prompts.rs`: reference rendering wraps and escapes, limits bodies, transcript filtering/truncation, message builders, bilingual section.
 - `consultation.rs`: fan-out preserves configured order, partial failure is recorded and does not sink the batch, all-fail returns an error, per-proposer character caps are applied, pre-cancelled token returns `Error::Cancelled`, timeout is recorded as a failure.
 - `verifier.rs`: structural scores stay in 0..1, longer/structured proposals outrank thin ones, redaction applies before scoring, `LlmVerifier` parses a scripted score and rejects non-numeric output, progress scores detect stalled repetition, config selection picks structural vs LLM.
 - `aggregate.rs`: labelled output shape and source order, empty sources, synthesis required-model error, synthesis through `ScriptedModel`, cancellation.
-- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, consult stores outcome/history, `before_model_call` upserts, `after_invoke` retires the state, history file round-trip, `jev_routed` refusal with no proposer call, reference-budget refusal with and without an installed state, `record_step` redaction/truncation/disabled behaviour, `verify_progress` budget refusal plus score/`verifier_calls` accounting, `after_react_iteration` turn counting and one redacted step in `verifier_routed` mode.
-- `skill_mount.rs`: embedded descriptor, explicit directory validation and error messages, mount/unmount ownership, materialization round-trip.
+- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, `publish_extra` skipping (and logging) a payload whose `Serialize` fails while an encodable payload still lands, consult stores outcome/history, `before_model_call` upserts, `after_invoke` retires the state, history file round-trip, loading a file through a smaller or disabled rail `history_limit`, `jev_routed` refusal with no proposer call, reference-budget refusal with and without an installed state, `record_step` redaction/truncation/disabled behaviour, `verify_progress` budget refusal plus score/`verifier_calls` accounting, `after_react_iteration` turn counting and one redacted step in `verifier_routed` mode.
+- `skill_mount.rs`: embedded descriptor, explicit directory validation and error messages, mount/unmount ownership, re-adding a root that went missing while keeping its ownership, rejection of a recorded mount that drifted from the configured directory, `same_skill_root` path normalization, materialization round-trip.
 - `tests.rs`: end-to-end offline scenarios (proposers -> verifier -> aggregator -> rail -> history, all-fail, cancellation, synthesis, redaction, config validation, snapshot/history JSON, skill materialization/mount/unmount, host-driven verification -> consultation within the reference budget).
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline`, `--no-default-features`, `--all-features`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` warning-free.
 

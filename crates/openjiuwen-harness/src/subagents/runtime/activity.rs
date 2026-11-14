@@ -1256,6 +1256,10 @@ mod tests {
             silent(&frames);
         }
         assert!(stream.is_empty());
+        assert_eq!(stream.frames(), Vec::new());
+        assert_eq!(stream.recent(8), Vec::new());
+        assert_eq!(stream.after(0, 0), Vec::new());
+        assert_eq!(stream.summary(), ActivitySummary::default());
         assert_eq!((stream.next_seq(), stream.dropped()), (1, 0));
         assert!(!stream.is_terminal());
         assert!(subscription.try_recv().is_none());
