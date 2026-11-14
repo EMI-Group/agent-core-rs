@@ -47,10 +47,7 @@ pub struct CapabilityIo {
 }
 impl CapabilityIo {
     pub fn new(name: impl Into<String>, io_type: impl Into<String>) -> Self;
-    pub fn with_description(self, description: impl Into<String>) -> Self;
-    pub fn with_required(self, required: bool) -> Self;
-    pub fn with_default(self, value: Value) -> Self;
-    pub fn with_metadata(self, key: impl Into<String>, value: Value) -> Self;
+    // with_description / with_required / with_default / with_metadata
 }
 
 pub struct CapabilityDescriptor {
@@ -63,15 +60,8 @@ pub struct CapabilityDescriptor {
 }
 impl CapabilityDescriptor {
     pub fn new(capability_type: impl Into<String>, capability_id: impl Into<String>, name: impl Into<String>) -> Self;
-    pub fn with_description(self, description: impl Into<String>) -> Self;
-    pub fn with_source(self, source: impl Into<String>) -> Self;
-    pub fn with_available(self, available: bool) -> Self;
-    pub fn with_classification(self, classification: impl Into<String>) -> Self;
-    pub fn with_tags(self, tags: impl IntoIterator<Item = impl Into<String>>) -> Self;
-    pub fn with_inputs(self, inputs: Vec<CapabilityIo>) -> Self;
-    pub fn with_outputs(self, outputs: Vec<CapabilityIo>) -> Self;
-    pub fn with_semantic_content(self, text: impl Into<String>) -> Self;
-    pub fn with_metadata(self, key: impl Into<String>, value: Value) -> Self;
+    // with_description / with_source / with_available / with_classification / with_tags /
+    // with_inputs / with_outputs / with_semantic_content / with_metadata
     pub fn key(&self) -> CapabilityKey;
     pub fn qualified_id(&self) -> String;
     pub fn validate(&self) -> Result<()>;          // non-blank capability_id/capability_type/name
@@ -157,8 +147,7 @@ impl CapabilityRegistry {
     pub async fn reload(&self) -> Result<usize>;                     // replace the in-memory map from the store
     pub fn store(&self) -> Option<&Arc<dyn AssetStore>>;
     pub fn revision(&self) -> u64;                                  // monotonic catalog revision, SeqCst, starts at 0
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
+    pub fn len(&self) -> usize;   pub fn is_empty(&self) -> bool;
     pub async fn register(&self, descriptor: CapabilityDescriptor) -> Result<()>;  // validate + upsert + persist
     pub async fn register_all(&self, descriptors: Vec<CapabilityDescriptor>) -> Result<usize>;
     pub async fn get(&self, key: &CapabilityKey) -> Option<CapabilityDescriptor>;
@@ -294,169 +283,83 @@ The file backend writes `root/versions/<version>/graph.json` and `root/current.j
 
 ### `orchestration` (`src/orchestration/`)
 
-```rust
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
-pub enum PlanStatus { Ready, NeedsInput, NoPlan }
-pub struct PlanEdge { pub source: String, pub target: String }
-pub struct PlanStep {
-    pub step_id: String,             // qualified capability id
-    pub capability_type: String, pub name: String,
-    pub inputs: Vec<CapabilityIo>, pub outputs: Vec<CapabilityIo>,
-    pub missing_inputs: Vec<String>, pub filled_inputs: Vec<String>, pub score: f64,
-}
-pub struct OrchestrationPlan {
-    pub plan_id: String, pub query: String, pub language: String,   // "cn" | "en"
-    pub status: PlanStatus, pub title: String, pub message: Option<String>,
-    pub steps: Vec<PlanStep>, pub edges: Vec<PlanEdge>, pub score: f64,
-}
-impl OrchestrationPlan {
-    pub fn planned_graph(&self) -> Value;            // {"graph": {id, type:"planned_graph", directed:true, nodes, edges}}
-    pub fn to_value(&self) -> Value;                 // {"plan_id",...,"steps",...,"edges",...,"planned_graph"}
-    pub fn from_value(value: &Value) -> Result<Self>;
-    pub fn stages(&self) -> Result<Vec<Vec<String>>>; // Kahn layering; cycle -> Error::Validation
-    pub fn is_empty(&self) -> bool;
-}
+Relation candidates, bounded planning, plan execution over `openjiuwen-graph`, and the graph-mutation request contract, all deterministic and offline.
 
+```rust
+#[serde(rename_all = "snake_case")] pub enum PlanStatus { Ready, NeedsInput, NoPlan }
 #[serde(rename_all = "snake_case")] pub enum MatchStrategy { ExactIo, SemanticOverlap, TextualCoercion }
-impl MatchStrategy { pub fn rank(self) -> u8; pub fn as_str(self) -> &'static str; }   // "exact_io" | "semantic_overlap" | "textual_coercion"
-pub struct RelationCandidate {
-    pub source: String, pub target: String, pub relation: String /* CAN_FEED */,
-    pub confidence: f64, pub strategy: MatchStrategy,
-    pub matched_input: Option<String>, pub matched_output: Option<String>,
-}
-pub struct CandidateConfig { pub min_confidence: f64 /*0.7*/, pub min_token_overlap: f64 /*0.6*/, pub max_candidates_per_source: usize /*32*/ }
+#[serde(rename_all = "snake_case")] pub enum PlanMode { Fast, Beam }          // default Fast
+
+pub struct RelationCandidate { pub source: String, pub target: String, pub relation: String /* can_feed */,
+                               pub confidence: f64, pub strategy: MatchStrategy,
+                               pub matched_input: Option<String>, pub matched_output: Option<String> }
+pub struct CandidateConfig { pub min_confidence: f64 /*0.7*/, pub min_token_overlap: f64 /*0.6*/,
+                             pub max_candidates_per_source: usize /*32*/ }
 pub struct CandidateGenerator;
 impl CandidateGenerator {
     pub fn new(config: CandidateConfig) -> Self;
-    pub fn config(&self) -> &CandidateConfig;
     pub fn generate(&self, capabilities: &[CapabilityDescriptor]) -> Vec<RelationCandidate>;
     pub fn edges(&self, candidates: &[RelationCandidate]) -> Vec<CapabilityEdge>;
 }
-impl Default for CandidateConfig; impl Default for CandidateGenerator;
 
-#[serde(rename_all = "snake_case")] pub enum PlanMode { Fast, Beam }   // default Fast
-pub struct PlanConfig {
-    pub mode: PlanMode, pub top_k: usize /*3*/, pub max_depth: usize /*4*/,
-    pub min_edge_confidence: f64 /*0.7*/, pub max_expansions: usize /*128*/,
-    pub max_plans: usize /*256*/, pub dynamic_graph_enabled: bool /*false*/,
-}
-impl Default for PlanConfig;
-pub struct PlanRequest {
-    pub query: String, pub candidate_ids: Option<Vec<String>>, pub disabled_ids: Vec<String>,
-    pub provided_inputs: Vec<String>, pub language: String /*"cn"*/,
-    pub top_k: Option<usize>, pub max_depth: Option<usize>,
-}
-impl Default for PlanRequest; impl PlanRequest { pub fn new(query: impl Into<String>) -> Self; }
+pub struct PlanStep { pub step_id: String /* qualified id */, pub capability_type: String, pub name: String,
+                      pub inputs: Vec<CapabilityIo>, pub outputs: Vec<CapabilityIo>,
+                      pub missing_inputs: Vec<String>, pub filled_inputs: Vec<String>, pub score: f64 }
+pub struct OrchestrationPlan { pub plan_id: String, pub query: String, pub language: String /* "cn" | "en" */,
+                               pub status: PlanStatus, pub title: String, pub message: Option<String>,
+                               pub steps: Vec<PlanStep>, pub edges: Vec<PlanEdge>, pub score: f64 }
+impl OrchestrationPlan { pub fn planned_graph(&self) -> Value; pub fn to_value(&self) -> Value;
+                         pub fn from_value(value: &Value) -> Result<Self>;
+                         pub fn stages(&self) -> Result<Vec<Vec<String>>>; pub fn is_empty(&self) -> bool; }
 
-#[async_trait]
-pub trait SemanticScorer: Send + Sync {
+pub struct PlanConfig { pub mode: PlanMode, pub top_k: usize /*3*/, pub max_depth: usize /*4*/,
+                        pub min_edge_confidence: f64 /*0.7*/, pub max_expansions: usize /*128*/,
+                        pub max_plans: usize /*256*/, pub dynamic_graph_enabled: bool /*false*/ }
+pub struct PlanRequest { pub query: String, pub candidate_ids: Option<Vec<String>>, pub disabled_ids: Vec<String>,
+                         pub provided_inputs: Vec<String>, pub language: String /*"cn"*/,
+                         pub top_k: Option<usize>, pub max_depth: Option<usize> }
+#[async_trait] pub trait SemanticScorer: Send + Sync {
     async fn score(&self, query: &str, capabilities: &[CapabilityDescriptor]) -> Result<BTreeMap<String, f64>>;
 }
-pub struct LexicalSemanticScorer;    // deterministic default: query-term coverage in [0,1]
-pub struct Planner;
-impl Planner {
-    pub fn new(config: PlanConfig) -> Self;
-    pub fn with_scorer(config: PlanConfig, scorer: Arc<dyn SemanticScorer>) -> Self;
-    pub fn config(&self) -> &PlanConfig;
-    pub async fn plan(&self, request: &PlanRequest, graph: &CapabilityGraph, capabilities: &[CapabilityDescriptor]) -> Result<OrchestrationPlan>;
-}
-pub fn normalize_language(raw: &str) -> String;   // "zh"|"cn"|"zh_cn" -> "cn"; "en" -> "en"; other -> "cn"
-pub fn plan_title(query: &str, language: &str) -> String;   // "计划：{query}" / "Plan: {query}"
+pub struct LexicalSemanticScorer;                                             // deterministic default
+impl Planner { pub fn new(config: PlanConfig) -> Self;
+               pub fn with_scorer(config: PlanConfig, scorer: Arc<dyn SemanticScorer>) -> Self;
+               pub async fn plan(&self, request: &PlanRequest, graph: &CapabilityGraph,
+                                 capabilities: &[CapabilityDescriptor]) -> Result<OrchestrationPlan>; }
+pub fn normalize_language(raw: &str) -> String;                              // zh|cn|zh_cn -> "cn"; en -> "en"
+pub fn plan_title(query: &str, language: &str) -> String;                    // "计划：{query}" / "Plan: {query}"
 
 pub struct RunnerContext { pub step_id: String, pub session_id: Option<String>, pub cancellation: CancellationToken }
-#[async_trait]
-pub trait CapabilityRunner: Send + Sync {
+#[async_trait] pub trait CapabilityRunner: Send + Sync {
     async fn invoke(&self, capability: &CapabilityDescriptor, inputs: Value, context: &RunnerContext) -> Result<Value>;
 }
-pub struct UnsupportedRunner;          // invoke -> Error::Unsupported
-pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64> /*None*/, pub fail_fast: bool /*true*/ }
-pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool, pub output: Value, pub error: Option<String>, pub duration_ms: u64 }
-pub struct PlanExecution { pub plan_id: String, pub graph_id: String, pub steps: BTreeMap<String, StepOutcome>, pub outputs: BTreeMap<String, Value>, pub state: Value }
-impl PlanExecution { pub fn failed_steps(&self) -> Vec<&StepOutcome>; pub fn succeeded(&self) -> bool; }
-pub struct PlanExecutor;
+pub struct UnsupportedRunner;                                                // invoke -> Error::Unsupported
+pub struct ExecutorConfig { pub max_steps: usize /*32*/, pub node_timeout_ms: Option<u64>, pub fail_fast: bool /*true*/ }
+pub struct StepOutcome { pub step_id: String, pub capability_type: String, pub success: bool,
+                         pub output: Value, pub error: Option<String>, pub duration_ms: u64 }
+pub struct PlanExecution { pub plan_id: String, pub graph_id: String, pub steps: BTreeMap<String, StepOutcome>,
+                           pub outputs: BTreeMap<String, Value>, pub state: Value }
 impl PlanExecutor {
     pub fn new(runner: Arc<dyn CapabilityRunner>) -> Self;
-    pub fn with_config(config: ExecutorConfig, runner: Arc<dyn CapabilityRunner>) -> Self;
     pub fn compile(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor]) -> Result<CompiledGraph>;
     pub async fn execute(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
-    pub async fn execute_with_inputs(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], inputs: Value, session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;   // seeds state["inputs"]; `execute` delegates with Value::Null
+    pub async fn execute_with_inputs(&self, plan: &OrchestrationPlan, capabilities: &[CapabilityDescriptor], inputs: Value, session: Option<Arc<dyn Session>>) -> Result<PlanExecution>;
 }
-impl Default for ExecutorConfig;
-```
-
-**Candidate rules** (deterministic, sorted by strategy rank, then confidence desc, then source, then target):
-`ExactIo` — an output and an input share the normalized name *and* normalized type: confidence `1.0`.
-`SemanticOverlap` — token Jaccard of output text vs input text `>= min_token_overlap`: confidence `0.70 + 0.25 * overlap`.
-`TextualCoercion` — `DataTypeVocabulary::can_feed(output.type, input.type)` with at least one shared name token: confidence `0.75`.
-Candidates below `min_confidence` are dropped; each source keeps at most `max_candidates_per_source` (highest confidence first).
-
-**Plan scoring** (Python formula, deterministic substitute scorer):
-`score = 0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)`.
-`input_coverage` = distinct step inputs produced by an earlier step or listed in `provided_inputs`, divided by all distinct step inputs (`1.0` when there are none).
-`mean(semantic)` is the mean scorer value over the path's steps, falling back to Python's `SEED_BASELINE_SCORE` (`0.5`) when no step is scored; `mean(edge_confidence)` is the mean edge weight along the path, `1.0` when the path has no edges.
-A step input is *missing* when it is required (`required != Some(false)`) and neither an earlier step output (normalized name plus compatible type) nor a `provided_inputs` name supplies it; `missing_inputs`/`filled_inputs` hold sorted, deduped names.
-`candidate_ids`/`disabled_ids` prune expansion targets as well as the start set; `available` gates the start set only, so a withdrawn capability can still be a downstream step.
-`plan_id` is a fresh `uuid_hex()`, so determinism holds for every field except `plan_id` and the embedded graph id.
-Rank key: `(-score, missing_inputs, step_count, step_ids, edge_weights)`; non-finite scores are sanitized to `0.0`.
-Start set: capabilities with a positive scorer value (all when the query has no tokens), minus `disabled_ids`, intersected with `candidate_ids` when given, `available` only.
-Expansion follows graph edges with `weight >= min_edge_confidence`, never revisiting a step, bounded by `max_depth`, `max_expansions` and `max_plans`; `Fast` keeps one greedy best partial path per start, `Beam` keeps the best `top_k` partial paths per depth.
-`status` is `Ready` when the best plan's root steps have no missing inputs, `NeedsInput` when a plan exists but a root input is unfilled (listed in `message`), and `NoPlan` when no candidate plan exists.
-
-**Execution mapping:** each plan step becomes an `openjiuwen_graph` node whose id is the step id; plan edges become graph edges; entries are steps with no incoming edge and exits steps with no outgoing edge.
-A step's inputs start from `state["inputs"]` and are overlaid by predecessor step outputs whose normalized name matches an input name (a predecessor with exactly one output also fills a single unmatched input).
-Each node writes the top-level state key equal to its step id: `{"success", "output", "error", "duration_ms"}`.
-With `fail_fast` the first runner error aborts with `Error::Graph("step `<id>` failed: ...")`; otherwise every step runs and `failed_steps()` reports failures.
-`max_steps` is checked before compilation; the default session is `WorkflowSession::new(<uuid>)`; an empty plan executes to an empty `PlanExecution`.
-A `Cancelled` or `Unsupported` runner error keeps its own [`ErrorKind`] instead of becoming `Error::Graph`.
-
-**Mutation contract** (`src/orchestration/mutation.rs`):
-
-```rust
-pub const REQUEST_SCHEMA_VERSION: &str = "Symphony-skill-graph-mutation-request-v2";
-pub const JOURNAL_SCHEMA_VERSION: &str = "Symphony-skill-graph-mutation-requests-v1";
-pub const MAX_REQUEST_ID_CHARS: usize = 256;      pub const MAX_SOURCE_REVISION_CHARS: usize = 512;
-pub const MAX_CHANGED_IDS: usize = 1024;
-
-#[serde(rename_all = "snake_case")] pub enum MutationOperation { Add, Update, Delete }
-impl MutationOperation { pub fn as_str(self) -> &'static str; }   // "add" | "update" | "delete"
 
 pub struct MutationRequest { pub request_id: String, pub operation: MutationOperation,
                              pub source_revision: Option<String>, pub changed_skill_ids: Vec<String> }
-impl MutationRequest {
-    pub fn prepare(operation: MutationOperation, changed_skill_ids: &[String], request_id: &str,
-                   source_revision: Option<&str>) -> Result<Self>;   // trim, reject blank/dup/empty/oversized, sort
-    pub fn digest(&self) -> String;
-    pub fn declared_ids(&self) -> BTreeSet<&str>;
-}
-pub fn request_digest(request: &MutationRequest) -> String;   // sha256 hex over canonical JSON of Python's field set
-pub fn validate_mutation_against_inventory(request: &MutationRequest, changed: &[String],
-                                           inventory_ids: &[String]) -> Result<()>;
-
+pub fn request_digest(request: &MutationRequest) -> String;
+pub fn validate_mutation_against_inventory(request: &MutationRequest, changed: &[String], inventory_ids: &[String]) -> Result<()>;
 pub struct JournalRecord { pub digest: String, pub operation: MutationOperation, pub revision: String,
                            pub inserted_at: String, pub result: Option<Value> }
-impl JournalRecord {
-    pub fn new(operation: MutationOperation, revision: impl Into<String>, digest: impl Into<String>) -> Self;
-    pub fn with_inserted_at(self, inserted_at: impl Into<String>) -> Self;   // metadata override
-    pub fn with_result(self, result: Value) -> Self;
-}
-pub struct MutationJournal;
-impl MutationJournal {
-    pub fn new(path: impl Into<PathBuf>) -> Self;
-    pub async fn open(path: impl Into<PathBuf>) -> Result<Self>;   // absent = empty; malformed envelope = Error::Validation naming the file
-    pub fn path(&self) -> &Path;
-    pub fn len(&self) -> usize;   pub fn is_empty(&self) -> bool;   pub fn contains(&self, request_id: &str) -> bool;
-    pub fn request_ids(&self) -> impl Iterator<Item = &str>;
-    pub async fn lookup(&self, request_id: &str) -> Option<JournalRecord>;     // in-memory, cannot fail
-    pub async fn record(&mut self, request_id: impl Into<String>, record: JournalRecord) -> Result<()>;
-    pub async fn clear(&mut self) -> Result<()>;
-}
+pub struct MutationJournal;   // new/open/path/len/is_empty/contains/request_ids/lookup/record/clear
 ```
 
-`prepare` rejects a blank or oversized `request_id`, a blank or oversized `source_revision`, an empty batch (including a `delete` without ids), a blank id, and duplicate ids after trimming, always naming the offending field.
-The digest is order-independent by construction (ids are sorted/deduped) and sensitive to each declared field; it covers the declared id batch, not the descriptor payloads, so a replay is keyed on the batch identity.
-`validate_mutation_against_inventory` requires the applied change set to equal the declared batch (`Error::Validation` naming the missing/extra ids) — add and update batches are also checked against the catalog before anything is written.
-The journal is one JSON document (`{"schema_version", "records"}`) with records in a `BTreeMap` (sorted by request id) written through a temp sibling plus rename; a malformed record is warned about and skipped so one bad entry cannot cost the rest of the journal its idempotency.
-`inserted_at` is metadata only and never participates in a lookup; `result` is a Rust-only extension so a reopened runtime can answer a replay with the exact recorded result.
+Candidate rules: `ExactIo` (same normalized name and type, confidence `1.0`), `SemanticOverlap` (output/input token Jaccard `>= min_token_overlap`, confidence `0.70 + 0.25 * overlap`), `TextualCoercion` (`can_feed` plus a shared name token, confidence `0.75`); sorted by strategy rank, confidence, source, target; below `min_confidence` dropped; per-source cap.
+Plan score: `0.45*mean(semantic) + 0.25*mean(edge_confidence) + 0.20*input_coverage - 0.03*(steps - 1)`, ranked by `(-score, missing_inputs, step_count, step_ids, edge_weights)`; expansion is bounded by `max_depth`/`max_expansions`/`max_plans` (`Fast` greedy, `Beam` `top_k`), and `status` is `Ready`/`NeedsInput`/`NoPlan` from the best plan's root inputs.
+Execution maps each step to an `openjiuwen_graph` node writing `state[step_id] = {"success", "output", "error", "duration_ms"}`; `fail_fast` aborts with `Error::Graph`, while `Cancelled`/`Unsupported` keep their own `ErrorKind`.
+Mutations: `MutationRequest::prepare` trims/sorts/rejects, the digest is SHA-256 over canonical JSON of `{schema_version, request_id, operation, source_revision, changed_skill_ids}` (declared ids, not payloads), the inventory check requires the applied change set to equal the declared batch, and `MutationJournal` is a `BTreeMap`-ordered JSON document written through atomically (`inserted_at` is metadata; the malformed-envelope case names the file).
+See [`orchestration`](src/orchestration/CONTEXT.md) for the full rules, formulas, bounds and journal semantics.
 
 ### `evaluation` (`src/evaluation/`)
 
@@ -468,92 +371,53 @@ pub struct EvaluationInput { pub capability: CapabilityDescriptor, pub target: O
 pub struct MetricScore { pub metric: String, pub score: Option<f64>, pub passed: bool,
                          pub detail: Option<String>, pub status: MetricStatus }
 #[serde(rename_all = "snake_case")] pub enum MetricStatus { Pass, Fail, NotApplicable, Error, Observed }
-#[async_trait]
-pub trait Metric: Send + Sync {
-    fn name(&self) -> &str;
-    fn scope(&self) -> MetricScope;                                   // static | trace
-    fn cache_key(&self) -> Option<String>;
+#[async_trait] pub trait Metric: Send + Sync {
+    fn name(&self) -> &str; fn scope(&self) -> MetricScope; fn cache_key(&self) -> Option<String>;
     async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>;
 }
-pub struct CompletenessMetric;          pub struct SchemaValidityMetric;
-pub struct StructureConformanceMetric;  pub struct DescriptionQualityMetric;
-pub struct ClassificationConsistencyMetric;  pub struct LlmJudgedMetric;   // delegates to llm::LlmJudgeMetric
-pub struct SuccessRateMetric;           pub struct LatencyMetric;
-pub struct AccuracyMetric;              pub struct CapabilitySelectionMetric;
-pub struct CompositionEffectivenessMetric;
-
-pub struct CapabilityCall { name, success, duration_ms, event_time, arguments: Value }
-pub struct EvaluationCase { case_id, query, event_time: Option<String>, calls,
-                            expected_answer: Option<String>, actual_answer: Option<String>, metadata }
-pub struct EvaluationTrace { cases: Vec<EvaluationCase> }
-pub struct EvaluationWindow { start: Option<String>, end: Option<String> }   // start inclusive, end exclusive
-pub struct LatencyStatistics { avg_ms, p50_ms, p95_ms, max_ms, count, samples_ms }
-pub struct QualityResult { confidence: QualityConfidence, score: Option<f64>, aggregation, per_metric: BTreeMap<String, MetricScore> }
-
-pub fn percentile(values: &[f64], fraction: f64) -> f64;        // pos = (n-1) * f
-pub fn latency_statistics(samples_ms: &[f64]) -> LatencyStatistics;
+// static: CompletenessMetric, SchemaValidityMetric, StructureConformanceMetric,
+//         DescriptionQualityMetric, ClassificationConsistencyMetric, LlmJudgedMetric
+// trace:  SuccessRateMetric, LatencyMetric, AccuracyMetric, CapabilitySelectionMetric,
+//         CompositionEffectivenessMetric
+pub struct QualityResult { pub confidence: QualityConfidence, pub score: Option<f64>, pub aggregation: String,
+                           pub per_metric: BTreeMap<String, MetricScore> }
+pub fn percentile(values: &[f64], fraction: f64) -> f64;   pub fn latency_statistics(samples_ms: &[f64]) -> LatencyStatistics;
 pub fn select_cases(cases: &[EvaluationCase], window: Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
 pub fn aggregate_metric(scores: &[MetricScore]) -> MetricScore;
 
 impl EvaluationSuite {
-    pub fn new(metrics: Vec<Arc<dyn Metric>>) -> Self;
     pub fn default_suite() -> Self;                                  // completeness + schema validity
-    pub fn with_llm_judge(self) -> Self;                             // model-free judge, deterministic rubric
-    pub fn with_llm_judge_model(self, model: Arc<dyn CompletionModel>) -> Self;
-    pub fn metrics(&self) -> &[Arc<dyn Metric>];
+    pub fn with_llm_judge(self) -> Self;   pub fn with_llm_judge_model(self, model: Arc<dyn CompletionModel>) -> Self;
     pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;
     pub async fn evaluate_static(&self, input: &EvaluationInput) -> EvaluationReport;
     pub async fn evaluate_case(&self, input: &EvaluationInput) -> EvaluationReport;
     pub async fn evaluate_quality(&self, input: &EvaluationInput) -> QualityResult;
-    pub fn cache_signature(&self) -> Option<String>;                 // SHA-256, SYMPHONY_EVALUATION_PROTOCOL
-    pub fn aggregate(&self, reports: &[EvaluationReport]) -> EvaluationReport;
+    pub fn cache_signature(&self) -> Option<String>;   pub fn aggregate(&self, reports: &[EvaluationReport]) -> EvaluationReport;
 }
 pub const SYMPHONY_EVALUATION_PROTOCOL: &str = "symphony-evaluation-suite-v5";
 ```
 
 A metric either scores (`score: Some`) or reports a status without a score: latency is always `Observed`, a missing trace or case is `NotApplicable`, a metric failure is `Error` (also recorded in `EvaluationReport::errors`).
-Aggregation follows Python's precedence (`Error` > `Observed` > `NotApplicable`, and a mean `Pass` only when every scored sample passed); `QualityConfidence` maps sample counts 0 / 1 / 2–9 / ≥10 to none / low / normal / high, and `QualityResult.score` stays `None` with `aggregation = "per_metric"`.
-`evaluation::LlmJudgedMetric` is a thin delegating wrapper over [`llm::LlmJudgeMetric`](crate::llm::LlmJudgeMetric): it owns only the `"llm_judged"` name and the default rubric and forwards `with_model`/`with_rubric`/`with_fallback` plus `Metric::evaluate`, so there is one judge implementation and `with_llm_judge()` scores a card offline with the deterministic rubric instead of recording an error.
+`evaluation::LlmJudgedMetric` is a thin delegating wrapper over [`llm::LlmJudgeMetric`](crate::llm::LlmJudgeMetric), so one judge implementation serves both and `with_llm_judge()` scores offline.
 See [`evaluation`](src/evaluation/CONTEXT.md) for the per-metric rubrics, check lists and thresholds.
 
 ### `runtime` (`src/runtime/`)
 
+The composition root: state machine, graph publication, planning/invocation, lazy semantic sync, evolution, and the mutation path.
+
 ```rust
 #[serde(rename_all = "snake_case")] pub enum RuntimeState { Created, Running, Stopped }
-
-pub struct SymphonyConfig {
-    pub graph_artifact_root: Option<PathBuf>,   // None = in-memory artifacts
-    pub graph_scope_id: String,                 // default "default"
-    pub mutation_journal_path: Option<PathBuf>, // None = in-memory request ledger
-    pub plan: PlanConfig,
-    pub executor: ExecutorConfig,
-    pub candidates: CandidateConfig,
-}
-impl Default for SymphonyConfig;
-
-pub struct SymphonyRuntimeBuilder;
-impl SymphonyRuntimeBuilder {
-    pub fn new(config: SymphonyConfig) -> Self;
-    pub fn with_registry(self, registry: Arc<CapabilityRegistry>) -> Self;
-    pub fn with_asset_store(self, store: Arc<dyn AssetStore>) -> Self;
-    pub fn with_artifacts(self, artifacts: Arc<dyn GraphArtifactStore>) -> Self;
-    pub fn with_runner(self, runner: Arc<dyn CapabilityRunner>) -> Self;
-    pub fn with_planner(self, planner: Planner) -> Self;
-    pub fn with_semantic_index(self, index: Arc<SemanticIndex>) -> Self;
-    pub fn with_mutation_journal(self, journal: MutationJournal) -> Self;   // takes precedence over the config path
-    pub async fn open(self) -> Result<SymphonyRuntime>;
-}
-
+pub struct SymphonyConfig { pub graph_artifact_root: Option<PathBuf>, pub graph_scope_id: String,
+                            pub mutation_journal_path: Option<PathBuf>, pub plan: PlanConfig,
+                            pub executor: ExecutorConfig, pub candidates: CandidateConfig }
+pub struct SymphonyRuntimeBuilder;   // new/with_registry/with_asset_store/with_artifacts/with_runner/
+                                     // with_planner/with_semantic_index/with_mutation_journal/open
 pub struct SymphonyRuntime;
 impl SymphonyRuntime {
     pub async fn open(config: SymphonyConfig) -> Result<Self>;
     pub fn builder(config: SymphonyConfig) -> SymphonyRuntimeBuilder;
-    pub fn config(&self) -> &SymphonyConfig;
-    pub fn state(&self) -> RuntimeState;
-    pub fn registry(&self) -> &Arc<CapabilityRegistry>;
-    pub async fn start(&self) -> Result<()>;
-    pub async fn stop(&self) -> Result<()>;
-    pub async fn close(&self) -> Result<()>;
+    pub fn state(&self) -> RuntimeState;   pub fn registry(&self) -> &Arc<CapabilityRegistry>;
+    pub async fn start(&self) -> Result<()>;   pub async fn stop(&self) -> Result<()>;   pub async fn close(&self) -> Result<()>;
     pub async fn build(&self) -> Result<GraphRevision>;
     pub async fn graph(&self) -> CapabilityGraph;
     pub async fn graph_status(&self) -> Result<GraphArtifactStatus>;
@@ -561,51 +425,28 @@ impl SymphonyRuntime {
     pub async fn plan(&self, request: &PlanRequest) -> Result<OrchestrationPlan>;
     pub async fn invoke(&self, request: InvokeRequest) -> Result<InvokeResponse>;
     pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>>;
-    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>>;   // lazily synchronized; `top_k == 0` = unlimited
-    pub async fn reindex_semantics(&self) -> Result<usize>;          // force a full re-embed; returns the indexed count
+    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>>;
+    pub async fn reindex_semantics(&self) -> Result<usize>;
     pub async fn mutate(&self, request: MutationRequest, descriptors: Vec<CapabilityDescriptor>) -> Result<GraphMutationResult>;
-    pub async fn add_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;   // delegates to `mutate`
+    pub async fn add_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn update_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn remove_capabilities(&self, keys: &[CapabilityKey], request_id: &str) -> Result<GraphMutationResult>;
     pub async fn submit_evolution(&self, execution: &PlanExecution) -> Result<EvolutionResult>;
     pub fn capture_graph_snapshot(&self) -> BTreeMap<String, Value>;
 }
-
-pub struct InvokeRequest {
-    pub query: String, pub candidate_ids: Option<Vec<String>>, pub disabled_ids: Vec<String>,
-    pub execute: bool, pub inputs: Value, pub session: Option<Arc<dyn Session>>,
-}
-impl InvokeRequest { pub fn new(query: impl Into<String>) -> Self; pub fn execute(self) -> Self; pub fn with_inputs(self, inputs: Value) -> Self; pub fn with_session(self, session: Arc<dyn Session>) -> Self; }
-pub struct InvokeResponse { pub plan: OrchestrationPlan, pub execution: Option<PlanExecution>, pub graph_status: GraphArtifactStatus }
-
+pub struct InvokeRequest;   pub struct InvokeResponse { pub plan, pub execution: Option<PlanExecution>, pub graph_status }
 #[serde(rename_all = "snake_case")] pub enum MutationOperation { Add, Update, Delete }
-#[serde(rename_all = "snake_case")] pub enum MutationStatus { Published, Noop, Replayed }   // default Published
-pub struct GraphMutationResult {
-    pub operation: MutationOperation, pub request_id: String, pub changed: Vec<String>,
-    pub added_edges: usize, pub removed_edges: usize, pub revision: String, pub replayed: bool,
-    // additive, serde-defaulted bookkeeping
-    pub status: MutationStatus, pub digest: String,
-    pub source_revision: Option<String>, pub diagnostics: Vec<String>,
-}
+#[serde(rename_all = "snake_case")] pub enum MutationStatus { Published, Noop, Replayed }
+pub struct GraphMutationResult { operation, request_id, changed, added_edges, removed_edges, revision, replayed,
+                                 status, digest, source_revision, diagnostics }   // last four serde-defaulted
 pub struct EvolutionResult { pub accepted_edges: usize, pub rejected_edges: usize, pub revision: String }
 ```
 
-Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`; both `start` and `stop` are idempotent and `close` is `stop` plus artifact flush, and `start` also restarts a `Stopped` runtime.
-`start` builds and publishes the graph when no revision exists, flipping to `Running` only after the build succeeds; `build` re-derives the graph from the registry plus candidate edges and publishes a new revision.
-`add/update/remove_capabilities` delegate to `mutate` with a prepared request; the mutations mutate the registry, re-derive and publish the graph, and are idempotent per `request_id` (a replay returns the recorded result with `replayed = true` and `status = replayed`).
-The mutation path is ordered: request preparation → replay lookup (in-memory ledger, then the journal) → digest-conflict check → `Running` gate → active-state snapshot → `source_revision` compare-and-swap → apply (add/update validate the whole batch first) → change-set check → publish → record.
-`request_digest` is SHA-256 over canonical JSON of `{schema_version, request_id, operation, source_revision, changed_skill_ids}`, so it covers the declared id batch and not the descriptor payloads: the same batch under the same id replays, changed content under a new id does not.
-A replay whose digest differs from the recorded one is `Error::Validation` naming `request_id`; a declared `source_revision` that is not the current artifact revision is `Error::Validation` naming `source_revision`.
-The ledger is in memory by default; `SymphonyConfig::mutation_journal_path` or `SymphonyRuntimeBuilder::with_mutation_journal` makes it durable (see [`orchestration::mutation`](src/orchestration/mutation.rs)), so a runtime rebuilt over the same journal still answers replays.
-`invoke` and the three mutations require `Running` (`Error::Validation` naming `runtime.state` otherwise); planning, graph reads, search, build, evolution and the accessors work in every state.
-`invoke` plans, optionally executes when `execute` is set, and returns both; a `NoPlan` result with `execute` set returns `execution: None` rather than an error.
-A blank `request_id` is `Error::Validation`; `update` requires every key to exist (`Error::NotFound`, whole batch rejected) while `remove` skips absent keys.
-`graph()` is infallible: when the artifact read fails it logs a warning and answers with the catalog-derived, node-only graph.
-`submit_evolution` applies successful step transitions as an EMA on edge weights (`w' = (w + 1.0) / 2`), publishes only when a weight changed, and reports accepted/rejected edges.
-`capture_graph_snapshot` returns `{"current_version", "graph_id", "graph_scope_id"}` with `null` values when no revision exists.
-`SymphonyRuntimeBuilder::with_asset_store` hydrates the registry from the store, so a preconfigured asset store survives restarts.
-`semantic_search` clears and re-embeds the catalog only when `CapabilityRegistry::revision()` differs from the last synchronization; `reindex_semantics` force-re-embeds and returns the count; both serialize through one `tokio::sync::Mutex`.
-Without a semantic index both entry points return `Error::Unsupported`.
+Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`; `start`/`stop` are idempotent, `close` is `stop` plus artifact flush, and `start` restarts a stopped runtime.
+`start` publishes a graph when none exists; `build` re-derives it from the registry plus candidate edges.
+The mutation order is replay lookup → digest conflict → `Running` gate → change-set/CAS → apply → publish → record; a replay with a different digest or a stale `source_revision` is `Error::Validation` naming that field, and the ledger is in-memory unless a journal is configured.
+`submit_evolution` applies successful transitions as an EMA on edge weights (`w' = (w + 1.0) / 2`); `semantic_search` re-embeds only when `CapabilityRegistry::revision()` changed, and without a semantic index it is `Error::Unsupported`.
+See [`runtime`](src/runtime/CONTEXT.md) for the full surface and rules.
 
 ### `discovery` (`src/discovery/`)
 
@@ -624,34 +465,23 @@ See [`experience`](src/experience/CONTEXT.md) for the full surface and rules.
 
 Trace ingestion and normalization, structural distillation into versioned `ExperienceRecipe`s, content-addressed `SkillPack` packaging with a ten-check review (`structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`, `integrity`, `meta_naming`, `materials`, `permissions`, `license`), `SwarmFlow` script generation, package rendering, and an eager atomic flow store.
 Every model-written narrative and trace-derived free-text field is redacted before it enters a recipe or package.
-A recipe-derived package now carries the generated script (`swarmflow_script`) and the trigger conditions (`trigger_conditions`) in its materials, and renders them as the `swarmflow/run.py` artifact, so both participate in the package id.
 
 ```rust
-// src/flow/codegen.rs
-pub const SWARMFLOW_MODULE: &str = "swarmflow";   pub const ALLOWED_OPERATOR: &str = "agent";
-pub const SCRIPT_FILENAME: &str = "swarmflow/run.py";
-pub const SCRIPT_MATERIAL_KEY: &str = "swarmflow_script";   pub const TRIGGER_CONDITIONS_KEY: &str = "trigger_conditions";
-pub const DEFAULT_STEP_DESCRIPTION: &str = "协作成员能力";   pub const META_NAME_FALLBACK: &str = "skill-pack";
-pub const IDENTIFIER_PREFIX: &str = "combo-";   pub const IDENTIFIER_HASH_LENGTH: usize = 12;
-
+pub const SCRIPT_FILENAME: &str = "swarmflow/run.py";   pub const SCRIPT_MATERIAL_KEY: &str = "swarmflow_script";
 pub struct SwarmflowScript { pub identifier: String, pub source: String, pub meta: Value, pub task: String, pub steps: Vec<String> }
-pub fn swarmflow_identifier(materials: &Value, recipe_id: &str) -> String;   // "combo-<12 hex>" over the canonical materials hash
+pub fn swarmflow_identifier(materials: &Value, recipe_id: &str) -> String;   // "combo-<12 hex>"
 pub fn generate_swarmflow_script(recipe: &ExperienceRecipe) -> Result<SwarmflowScript>;
-pub fn python_string_literal(value: &str) -> String;               // CPython repr-style, UTF-8 preserved
-pub fn validate_generated_script(source: &str) -> Result<()>;      // line-oriented, names the first offending line
+pub fn python_string_literal(value: &str) -> String;   pub fn validate_generated_script(source: &str) -> Result<()>;
 
-// src/flow/render.rs
 pub struct RenderedArtifact { pub target: String, pub path: String, pub content: String }
 pub trait SkillAdapter: Send + Sync { fn target(&self) -> &str; fn render(&self, pack: &SkillPack) -> Result<RenderedArtifact>; }
-pub struct SkillPackAdapter;
-impl SkillPackAdapter { pub fn new() -> Self; pub fn validate_members(pack: &SkillPack) -> Result<()>; }
-pub fn render_package(pack: &SkillPack, target_kind: &str) -> Result<RenderedArtifact>;   // "" = "skill"; anything else is Unsupported
+pub struct SkillPackAdapter;   // new, validate_members
+pub fn render_package(pack: &SkillPack, target_kind: &str) -> Result<RenderedArtifact>;   // "" = "skill"; else Unsupported
 ```
 
-The generated script has Python's shape: docstring, `from swarmflow import agent`, `META = {"name", "phases"}`, `TASK`, `async def run(args):` with one `await agent(prompt, label=…, phase='step_N')` per capability in topological order, and `return step_N` (`None` for an empty combination).
-`validate_generated_script` is a documented line-oriented approximation of Python's AST whitelist (masked strings/comments, bracket and quote balance, the `META`/`TASK`/`run` markers, `agent(...)` only) plus the review gate's forbidden tokens; in-expression syntax errors are not detected.
-`SkillPackAdapter` checks member presence, uniqueness and a linear `can_feed` chain — the `active` + `verified` half of Python's contract is enforced at pack time because a pack does not retain the recipe status.
-See [`flow`](src/flow/CONTEXT.md) for the full surface and rules.
+A recipe-derived package carries `swarmflow_script` and `trigger_conditions` in its materials and renders them as `swarmflow/run.py`, so both participate in the package id; the generated script must pass the review's `code_safety` check.
+`validate_generated_script` is a documented line-oriented approximation of Python's AST whitelist; `SkillPackAdapter::validate_members` checks member presence, uniqueness and a linear `can_feed` chain (the `active` + `verified` half is enforced at pack time).
+See [`flow`](src/flow/CONTEXT.md) for the script shape, rendering rules and review checks.
 
 ### `redaction` (`src/redaction/`)
 
@@ -735,9 +565,9 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **A SkillPack is a frozen, reviewable artifact.** Only an `active` + `verified` linear chain can be packed; the package id hashes canonical materials; a static ten-check review decides the verdict without a model or network.
 - **Redaction happens where text enters an artifact**, not at render time — one sanitize call per path, so no double redaction and no leak through a copy; the review's `secrets` check re-runs the redactor as the last line of defence.
 - **Evaluation separates scored from scoreless verdicts.** `MetricScore::score` is optional and `status` is explicit, so latency stays an `Observed` measurement and a missing case a `NotApplicable` rather than a zero.
-- **Object storage is the third artifact backend, not a new abstraction.** `ObjectGraphArtifactStore` reuses the revision envelope and key layout of `FileGraphArtifactStore`, so in-memory, local, S3-compatible, GCS and Azure Blob stores are interchangeable.
-- **GCS and Azure Blob are Rust-only transports.** Python's `shared/storage.py` is a boto3 helper for `s3`/`obs` only and has no cloud-native transport at all; the crate adds the GCS JSON API and the Blob REST API over `openjiuwen_common::http`, with hand-rolled HMAC-SHA256 SharedKey signing and a hand-rolled XML scanner because no XML or `hmac` crate is available offline.
-- **File and artifact writes are atomic everywhere.** Flow stores, experience JSON documents, experience-index artifacts, and graph artifacts write a temp sibling and rename; an object store writes the revision before the pointer.
+- **Object storage is the third artifact backend, not a new abstraction**: `ObjectGraphArtifactStore` reuses the revision envelope and key layout of `FileGraphArtifactStore`, so memory, local, S3, GCS and Azure Blob stores are interchangeable.
+- **GCS and Azure Blob are Rust-only transports.** Python's `shared/storage.py` is a boto3 helper for `s3`/`obs` only; the crate adds the GCS JSON API and Blob REST over `openjiuwen_common::http`, hand-rolling HMAC-SHA256 and the XML scanner because neither crate exists offline.
+- **File and artifact writes are atomic everywhere**: flow stores, experience documents and indexes, and graph artifacts use a temp sibling plus rename; an object store writes the revision before the pointer.
 - **Timestamps never decide behavior.** `reviewed_at`, `created_at`, and `last_hit_at` are metadata; ordering always comes from sorted ids or content hashes.
 - **Semantic search uses embeddings** via `openjiuwen_retrieval::{Embedding, InMemoryVectorStore}` (with `HashEmbedding` for deterministic tests), additively over the shared `SearchHit` type.
 - **The semantic index is catalog-revision-driven.** `CapabilityRegistry::revision()` lets `semantic_search` re-embed only after a mutation; `reindex_semantics` covers changes the counter cannot see.
@@ -746,14 +576,14 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **The graph engine facade maps onto `openjiuwen-graph` for execution.** `CapabilityGraph`/`GraphArtifactStore` keep the JGF document semantics; `PlanExecutor` compiles a plan into a real `openjiuwen_graph::CompiledGraph`.
 - **Revisions are immutable and atomically published**, and object-store publications serialize through an async mutex; one store is the writer of its root or prefix.
 - **Evolution feedback is an EMA on observed edge weight**, reducing Python's append-only evidence and merged revisions to one observable weight update.
-- **The mutation digest covers the declared batch, not the payloads.** `request_digest` hashes `{schema_version, request_id, operation, source_revision, changed_skill_ids}` exactly as Python does, so replaying an id batch answers the recorded result even if the descriptor content changed under the same ids; a conflicting digest for a used id is rejected instead of silently answered.
-- **The mutation journal is opt-in and separate from the artifact store.** In-memory is the default so nothing changes for callers; a configured journal survives rebuilds, holds one record per `request_id` sorted by id, and writes through atomically. Python embeds the journal in the graph artifact store — a different storage choice with the same replay contract.
+- **The mutation digest covers the declared batch, not the payloads** (Python's field set exactly), so an id batch replays even if descriptor content changed; a conflicting digest for a used id is rejected, not answered.
+- **The mutation journal is opt-in and separate from the artifact store.** In-memory stays the default; a configured journal survives rebuilds and writes one id-sorted record per request through atomically, where Python embeds the journal in the graph artifact store.
 - **SwarmFlow generation is content-addressed and validator-gated.** The identifier is `combo-<sha256(materials)[:12]>`, the script enters the pack's materials so the package id moves with it, and the existing `code_safety` review check re-validates the generated source before a verdict.
 - **`FlowEngine::close` is a no-op**: every ingestion, recipe version, and package is written eagerly and atomically.
 - **A generated version bumps past pinned ids**, so an explicit `v2` never makes a later generated publish fail; an illegal version is a validation error on read as well as write.
 - **One judge implementation.** `evaluation::LlmJudgedMetric` is a thin delegating wrapper over `llm::LlmJudgeMetric`, so the prompt, the single repair retry and the deterministic rubric live in one place; `with_llm_judge()` therefore scores offline instead of recording a fail-soft error.
-- **Trace ingestion is deterministic, not statistical.** Python clusters traces with faiss k-means and distils patterns with a model; the port groups by skill set and token Jaccard, picks a centroid query deterministically, and merges similar patterns at a documented threshold — no RNG, no clock.
-- **The matcher cache is opt-in and signature-keyed.** Without `OntologyMatcher::with_cache` the code path is unchanged; with it, the key covers the candidate, both fingerprint digests and `matcher_signature()` (prompt/version constants, model identity, threshold), and cache failures degrade to a model call rather than stale matches.
+- **Trace ingestion is deterministic, not statistical.** Python uses faiss k-means plus model distillation; the port groups by skill set and token Jaccard, picks a centroid query deterministically, and merges at a documented threshold — no RNG, no clock.
+- **The matcher cache is opt-in and signature-keyed.** The key covers the candidate, both fingerprint digests and `matcher_signature()` (prompt/version constants, model identity, threshold); cache failures degrade to a model call, never to stale matches.
 - **Static evaluation remains the offline default.** The suite ships deterministic card and trace metrics, and every LLM-backed metric carries a static rubric as its fallback.
 
 ## Deferred Scope
@@ -805,16 +635,16 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/runtime.rs` — lifecycle idempotency, invoke, build revisions, mutation idempotency, `MutationStatus`/`digest`/`source_revision` shape, digest conflict, payload-vs-ids replay, request/payload mismatch, stale vs current `source_revision`, builder journal persistence across a rebuild, default in-memory behaviour, evolution EMA, lazy semantic re-embedding, stopped-runtime errors, snapshot.
 - `tests/mutation_journal.rs` — request preparation normalization and rejections, pinned digests (order independence, per-field sensitivity), change-set validation, journal round-trip/reopen, atomic layout, clear, and malformed documents.
 - `tests/discovery.rs` — immediate/recursive scans, front-matter diagnostics, content-hash stability, inventory fingerprint, catalog search/excerpts, disabled skills, symlinks, settings.
-- `tests/skill_prompt.rs` — visible-name ordering/filtering, pinned snapshot text (plain/category/empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated`/fingerprint bookkeeping, fingerprint stability, and added/removed/changed notices with the exact reminder wording, ordering, idempotence and serde persistence.
+- `tests/skill_prompt.rs` — visible-name ordering/filtering, pinned snapshot text (plain/category/empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated`/fingerprint bookkeeping, and added/removed/changed notices with exact reminder wording, idempotence and serde persistence.
 - `tests/experience.rs` — generated/explicit ids, dedupe merging, lexical and cosine ranking, skill filters, JSONL/SQLite persistence, id-counter continuity.
-- `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, and the IVF/unknown-algorithm errors.
-- `tests/experience_trace.rs` — section fixtures → exact `TraceRecord`s, idempotent re-parse, malformed-session tolerance, single-quoted payloads, clustering/centroid determinism, collector drop/auto-flush/merge/stats, end-to-end bank search, and the persisted index sink.
+- `tests/experience_index.rs` — add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, persist round-trip, reopen id continuity, IVF/unknown-algorithm errors.
+- `tests/experience_trace.rs` — section fixtures → exact `TraceRecord`s, idempotent re-parse, malformed-session tolerance, clustering/centroid determinism, collector drop/auto-flush/merge/stats, end-to-end bank search.
 - `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, the rendered `swarmflow/run.py` artifact, narrative fallback, and the ten-check review including `code_safety`/`secrets`/`artifact_paths`.
 - `tests/flow_codegen.rs` — the pinned two-step `SwarmFlow` script, the empty combination, identifier stability and content sensitivity, quote/newline/CJK escaping, validator accept plus first-bad-line rejects, member-validation failures, the unsupported render target, script participation in the package identity, and a full pack → review → install path carrying `run.py` (with a broken script failing `code_safety`).
 - `tests/redaction.rs` — every redaction entry point, idempotence, non-ASCII input, the JSON depth cap and key order, and a flow run whose model emits a key and a PEM block (recipe and pack materials must contain `<redacted>` and no secret).
 - `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
-- `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature/model invalidation, malformed cache, and degradation.
+- `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature invalidation, malformed cache, degradation.
 - `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, blank bucket, malformed `current.json`.
 - `tests/artifact_gcs.rs` / `tests/artifact_azure.rs` — full publish → read → status → versions round-trips against a stateful wiremock cloud emulator, plus auth-header assertions (bearer / `SharedKey` / SAS / anonymous), pagination, prefix sorting, 404 semantics and endpoint failure mapping.
 - `tests/deferred.rs` — the remaining `vLLM` stub and the `ivf*` algorithm deferral return `Error::Unsupported`, and `error::is_unsupported` recognizes them.
