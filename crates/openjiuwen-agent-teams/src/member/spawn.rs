@@ -173,7 +173,12 @@ impl MemberSpawnRequest {
         let mut env = BTreeMap::new();
         env.insert(
             CHECKPOINT_ENV.to_owned(),
-            if enabled { CHECKPOINT_ON } else { CHECKPOINT_OFF }.to_owned(),
+            if enabled {
+                CHECKPOINT_ON
+            } else {
+                CHECKPOINT_OFF
+            }
+            .to_owned(),
         );
         if let Some(dir) = checkpoint_dir(config, &self.workspace_root) {
             env.insert(

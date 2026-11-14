@@ -591,7 +591,10 @@ fn checkpoint_env_defaults_to_enabled_on_the_memory_store() {
     assert!(context.checkpoint_enabled);
     assert_eq!(context.checkpoint_dir, None);
     assert!(context.checkpoint_config().policy.is_enabled());
-    assert_eq!(context.checkpoint_config().store, CheckpointStoreConfig::Memory);
+    assert_eq!(
+        context.checkpoint_config().store,
+        CheckpointStoreConfig::Memory
+    );
 }
 
 #[test]
@@ -607,7 +610,10 @@ fn checkpoint_env_reads_the_directory_and_the_switch() {
 
     for value in ["off", "OFF", " false ", "False", "0"] {
         let disabled = ServeContext::from_env_map(|_| Some(value.to_owned()));
-        assert!(!disabled.checkpoint_enabled, "{value} disables checkpointing");
+        assert!(
+            !disabled.checkpoint_enabled,
+            "{value} disables checkpointing"
+        );
         assert!(!disabled.checkpoint_config().policy.is_enabled());
         assert_eq!(
             disabled.checkpoint_config().store,
@@ -639,7 +645,10 @@ fn checkpoint_config_uses_the_file_backend_when_a_directory_is_known() {
         }
     );
     // The identity the harness context carries is untouched by the checkpoint knobs.
-    assert_eq!(context.harness_context().workspace_root, PathBuf::from("/tmp/workspace"));
+    assert_eq!(
+        context.harness_context().workspace_root,
+        PathBuf::from("/tmp/workspace")
+    );
 }
 
 #[tokio::test]
@@ -655,8 +664,8 @@ async fn a_served_member_writes_its_checkpoint_under_the_configured_directory() 
 
     // The stop capture persists `<dir>/<session>/<member>/checkpoint.json`: the session comes from
     // the start handshake and the card id from the member name of the default spec.
-    let record_path = crate::harness::FileMemberCheckpointStore::new(directory.path())
-        .path_for("s1", "dev-1");
+    let record_path =
+        crate::harness::FileMemberCheckpointStore::new(directory.path()).path_for("s1", "dev-1");
     let bytes = tokio::fs::read(&record_path)
         .await
         .unwrap_or_else(|error| panic!("no checkpoint at {}: {error}", record_path.display()));
@@ -665,4 +674,3 @@ async fn a_served_member_writes_its_checkpoint_under_the_configured_directory() 
     assert_eq!(record["checkpoint"]["card_id"], json!("dev-1"));
     assert_eq!(record["checkpoint"]["cwd"], json!("/tmp/workspace"));
 }
-
