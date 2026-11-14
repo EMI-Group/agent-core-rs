@@ -595,7 +595,18 @@ Each stub documents the Python class it mirrors, and its data types stay ordinar
 
 ## Deferred Scope
 
-Only GPU/ML-dependent and vendor-transport areas remain; each keeps a typed `Error::Unsupported` entry point.
+GPU/ML-dependent and vendor-transport areas are typed deferrals; each keeps an `Error::Unsupported` entry point.
+The following pure-logic Python areas are not ported yet — the capability is absent rather than stubbed:
+
+- `observation/` — graph-evolution input contract, append-only evidence log, qualification/rebind and merged overlays (`runtime::submit_evolution` takes a `PlanExecution` and applies only an EMA).
+- `evaluation/{base,evaluators,suite}.py` — `StructureConformance`, `SuccessRate`, `Latency` (p50/p95), `Accuracy`, `Trace`, `CapabilitySelection`, `CompositionEffectiveness` and LLM-judged description/classification metrics, plus case/window selection and metric aggregation.
+- `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors, prompt snapshot, incremental notice state).
+- `flow/{privacy,codegen,render}.py` — credential/PII redaction, Swarmflow `run.py` generation (packs carry only `SKILL.md` and `dependencies.yaml`), single-skill `SkillAdapter` rendering, and the `code_safety`/`secrets`/`artifact_paths` review checks.
+- `orchestration/{mutations,mutation_service,artifacts}.py` — request digests, a persistent mutation journal, source-revision CAS and provider change-set validation (the runtime keeps an in-memory `request_id` ledger instead).
+- `experience/{trace,cluster,collector}.py` — session-trace parsing, query clustering and the collector/merge pipeline over the bank.
+- `orchestration/graph/matcher/cache.py` — persistent consensus-match cache; `shared/identity.sanitize_metadata` and endpoint hashing.
+- `shared/fingerprint/normalization.py` — IO-name vocabulary, alias merging and normalization audit records.
+- `retrieval/search/runtime/{lexical,selector,disclosure}.py` and `retrieval/build/io/*` — field-weighted lexical scoring, prebuilt-index loading and prompt disclosure rendering.
 
 | Python area | Why deferred |
 |---|---|
