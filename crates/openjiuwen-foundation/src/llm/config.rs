@@ -26,6 +26,16 @@
 //! held in [`SecretString`], so neither `Debug` nor any error message can print
 //! them.
 //!
+//! [`ModelRequestConfig`] also carries the client-side-only surface: a request
+//! [`purpose`](ModelRequestConfig::purpose) (`assistant`, `compaction`, or any
+//! caller-defined value) and caller-owned diagnostic
+//! [`metadata`](ModelRequestConfig::metadata). Both are routing and telemetry
+//! hints: no transport reads them and no protocol builder writes them to a
+//! request body. The legacy `extra` spellings (`request_purpose`, `purpose`,
+//! `metadata`, `context_operation_id`) are still accepted, resolved by
+//! [`effective_purpose`](ModelRequestConfig::effective_purpose) and stripped from
+//! the body by [`extra_without_internal_keys`](ModelRequestConfig::extra_without_internal_keys).
+//!
 //! ```
 //! use std::time::Duration;
 //! use openjiuwen_foundation::llm::config::{ModelClientConfig, ModelRequestConfig};
@@ -66,6 +76,36 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Providers served from a local machine, which need no API key.
 const KEYLESS_PROVIDERS: &[&str] = &["ollama", "lmstudio"];
+
+/// Well-known [`ModelRequestConfig::purpose`]: a user-facing assistant turn.
+///
+/// Owned only by the client for routing and telemetry; it is never written to a
+/// provider request body.
+pub const PURPOSE_ASSISTANT: &str = "assistant";
+
+/// Well-known [`ModelRequestConfig::purpose`]: a context-compaction call.
+///
+/// Owned only by the client for routing and telemetry; it is never written to a
+/// provider request body.
+pub const PURPOSE_COMPACTION: &str = "compaction";
+
+/// `extra` keys that are client-side bookkeeping and never reach a provider body.
+///
+/// Python's `internal_params` (`parser`, `output_parser`, `request_purpose`,
+/// `context_operation_id`) are stripped from the per-call kwargs before the
+/// request body is built; this crate strips the same purpose/operation keys from
+/// `extra` in every protocol builder, plus `purpose` and `metadata` (the field
+/// spellings).
+const INTERNAL_EXTRA_KEYS: &[&str] = &[
+    "request_purpose",
+    "purpose",
+    "metadata",
+    "context_operation_id",
+];
+
+/// Legacy `extra` keys [`ModelRequestConfig::effective_purpose`] accepts, in
+/// precedence order.
+const LEGACY_PURPOSE_KEYS: &[&str] = &["request_purpose", "purpose"];
 
 /// Returns `true` when `provider` cannot authenticate with an API key.
 fn is_keyless(provider: &str) -> bool {
@@ -525,6 +565,30 @@ pub struct ModelRequestConfig {
     /// consumed there, so it never reaches a provider body as a raw key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Value>,
+    /// Client-side request purpose: why this call is being made.
+    ///
+    /// Open-ended; the two well-known values are [`PURPOSE_ASSISTANT`] and
+    /// [`PURPOSE_COMPACTION`] (the only purposes the Python observability layer
+    /// recognises). It is a routing and telemetry hint owned by the caller, so it
+    /// is **never** written to a provider request body, is not interpreted by any
+    /// transport, and does not change the wire shape at all.
+    ///
+    /// Python passes the same hint as the internal `request_purpose` kwarg, which
+    /// `BaseModelClient` strips from the body. Older Rust call sites ride on
+    /// [`extra`](Self::extra) instead; [`effective_purpose`](Self::effective_purpose)
+    /// reads those legacy spellings and every builder strips them from the body,
+    /// so both styles keep working and neither leaks onto the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Internal, caller-owned diagnostic metadata.
+    ///
+    /// For values that describe the call rather than configure the provider —
+    /// `context_operation_id` (Python's internal kwarg), an evaluation run id, and
+    /// similar. It is never written to a provider request body and no transport
+    /// interprets it; a `metadata` key in [`extra`](Self::extra) is stripped for
+    /// the same reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
     /// Tool definitions in provider wire shape.
     pub tools: Option<Value>,
     /// Tool-selection policy in provider wire shape.
@@ -626,6 +690,115 @@ impl ModelRequestConfig {
         self
     }
 
+    /// Sets the client-side request purpose.
+    ///
+    /// The value is opaque and never reaches a provider body; see
+    /// [`purpose`](Self::purpose).
+    #[must_use]
+    pub fn with_purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.purpose = Some(purpose.into());
+        self
+    }
+
+    /// Marks the request as a user-facing assistant turn
+    /// ([`PURPOSE_ASSISTANT`]).
+    #[must_use]
+    pub fn with_purpose_assistant(self) -> Self {
+        self.with_purpose(PURPOSE_ASSISTANT)
+    }
+
+    /// Marks the request as a context-compaction call
+    /// ([`PURPOSE_COMPACTION`]).
+    #[must_use]
+    pub fn with_purpose_compaction(self) -> Self {
+        self.with_purpose(PURPOSE_COMPACTION)
+    }
+
+    /// Replaces the internal diagnostic metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Adds or replaces one internal diagnostic metadata entry.
+    #[must_use]
+    pub fn with_metadata_entry(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Records the `context_operation_id` diagnostic.
+    ///
+    /// Python carries the same value as an internal per-call kwarg; here it is
+    /// stored as `metadata["context_operation_id"]` and never reaches the wire.
+    #[must_use]
+    pub fn with_context_operation_id(self, context_operation_id: impl Into<String>) -> Self {
+        self.with_metadata_entry(
+            "context_operation_id",
+            Value::String(context_operation_id.into()),
+        )
+    }
+
+    /// Whether this request is a context-compaction call.
+    ///
+    /// Compares [`effective_purpose`](Self::effective_purpose) with
+    /// [`PURPOSE_COMPACTION`], so a legacy `extra` spelling counts too.
+    #[must_use]
+    pub fn is_compaction(&self) -> bool {
+        self.effective_purpose() == Some(PURPOSE_COMPACTION)
+    }
+
+    /// Resolves the request purpose, preferring the typed field over `extra`.
+    ///
+    /// Precedence, first non-blank wins:
+    ///
+    /// 1. [`purpose`](Self::purpose) — the field; a blank value is treated as
+    ///    unset;
+    /// 2. `extra["request_purpose"]` — Python's internal kwarg spelling;
+    /// 3. `extra["purpose"]` — the legacy field spelling.
+    ///
+    /// Only JSON strings count: a non-string legacy value (a number, an object)
+    /// is ignored rather than forwarded. `extra` may be any JSON value; a
+    /// non-object one carries no purpose.
+    #[must_use]
+    pub fn effective_purpose(&self) -> Option<&str> {
+        if let Some(purpose) = self
+            .purpose
+            .as_deref()
+            .map(str::trim)
+            .filter(|purpose| !purpose.is_empty())
+        {
+            return Some(purpose);
+        }
+        LEGACY_PURPOSE_KEYS
+            .iter()
+            .filter_map(|key| self.extra.get(key).and_then(Value::as_str))
+            .map(str::trim)
+            .find(|purpose| !purpose.is_empty())
+    }
+
+    /// Returns [`extra`](Self::extra) with the internal keys removed.
+    ///
+    /// The result is what every protocol builder merges into the request body, so
+    /// [`purpose`](Self::purpose), [`metadata`](Self::metadata) and the legacy
+    /// `request_purpose`/`purpose`/`metadata`/`context_operation_id` `extra` keys
+    /// can never leak onto the wire while every other key is still merged last,
+    /// exactly as before. Internal keys are only stripped from the top level of
+    /// `extra`; a non-object `extra` is returned unchanged (it is never merged into
+    /// a body anyway).
+    #[must_use]
+    pub fn extra_without_internal_keys(&self) -> Value {
+        let Some(object) = self.extra.as_object() else {
+            return self.extra.clone();
+        };
+        let mut filtered = object.clone();
+        for key in INTERNAL_EXTRA_KEYS {
+            filtered.remove(*key);
+        }
+        Value::Object(filtered)
+    }
+
     /// Builds a request from the environment, reading only `MODEL_NAME`.
     ///
     /// The model name is empty when the variable is unset; every provider client
@@ -641,3 +814,6 @@ impl ModelRequestConfig {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod purpose_tests;

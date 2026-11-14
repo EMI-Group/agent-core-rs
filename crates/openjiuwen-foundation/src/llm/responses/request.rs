@@ -159,6 +159,13 @@ pub fn convert_tools(tools: &[Value]) -> Vec<Value> {
 /// A one-level nested `extra.extra_body` object is flattened into the body root
 /// (outer keys win), and a chat-style `response_format` moves to `text.format`.
 ///
+/// [`ModelRequestConfig::purpose`] and [`ModelRequestConfig::metadata`] are
+/// client-side hints only and are never written to the body; the internal `extra`
+/// keys (`request_purpose`, `purpose`, `metadata`, `context_operation_id`) are
+/// stripped from the top level of `extra` before the merge (see
+/// [`ModelRequestConfig::extra_without_internal_keys`]), so the Responses API
+/// never sees them.
+///
 /// `stream` adds `"stream": true`; the non-streaming shape omits the field because
 /// the client always asks the endpoint to stream.
 ///
@@ -253,7 +260,8 @@ pub fn build_responses_body(
         body.insert(REASONING_KEY.to_owned(), raw);
     }
 
-    if let Some(extra) = request.extra.as_object() {
+    let extra = request.extra_without_internal_keys();
+    if let Some(extra) = extra.as_object() {
         for (key, value) in expand_extra_body(extra, consumes_reasoning) {
             body.insert(key, value);
         }
@@ -942,5 +950,57 @@ mod tests {
             "https://api.openai.com/v1"
         );
         assert_eq!(normalize_api_base(""), "");
+    }
+
+    #[test]
+    fn the_request_purpose_and_metadata_never_reach_the_body() {
+        let request = request()
+            .with_purpose_compaction()
+            .with_metadata_entry("run_id", json!("eval-7"))
+            .with_context_operation_id("op-1")
+            .with_extra(json!({
+                "parallel_tool_calls": true,
+                "request_purpose": "compaction",
+                "purpose": "compaction",
+                "metadata": {"run_id": "eval-7"},
+                "context_operation_id": "op-1",
+            }));
+        let body = build_body(&[BaseMessage::user("hello")], &request);
+        for key in [
+            "purpose",
+            "request_purpose",
+            "metadata",
+            "context_operation_id",
+        ] {
+            assert!(body.get(key).is_none(), "{key} is client-side only");
+        }
+        assert_eq!(
+            body["parallel_tool_calls"],
+            json!(true),
+            "unrelated extra keys still merge last"
+        );
+        assert_eq!(body["model"], json!("gpt-5"));
+    }
+
+    #[test]
+    fn a_legacy_extra_purpose_is_honoured_and_stripped() {
+        let request = request().with_extra(json!({"request_purpose": "compaction"}));
+        assert!(request.is_compaction());
+        assert!(build_body(&[BaseMessage::user("hello")], &request)
+            .get("request_purpose")
+            .is_none());
+    }
+
+    #[test]
+    fn a_non_object_extra_leaves_the_body_unchanged() {
+        let plain = build_body(&[BaseMessage::user("hello")], &request());
+        for extra in [Value::Null, json!("compaction"), json!([1, 2]), json!(7)] {
+            let request = request().with_extra(extra.clone());
+            assert_eq!(
+                build_body(&[BaseMessage::user("hello")], &request),
+                plain,
+                "extra {extra} is ignored"
+            );
+        }
     }
 }

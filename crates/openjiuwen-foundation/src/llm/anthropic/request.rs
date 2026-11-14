@@ -114,6 +114,12 @@ pub fn build_messages_body(
 /// own keys still win, and the consumed control keys (`reasoning` plus the two
 /// cache knobs) are never forwarded.
 ///
+/// [`ModelRequestConfig::purpose`] and [`ModelRequestConfig::metadata`] are
+/// client-side hints only: the Messages API has no field for them, so they are
+/// never written, and the internal `extra` keys (`request_purpose`, `purpose`,
+/// `metadata`, `context_operation_id`) are stripped before the merge (see
+/// [`ModelRequestConfig::extra_without_internal_keys`]).
+///
 /// A caller's explicit legacy reasoning control — any of `reasoning_effort`,
 /// `thinking`, `enable_thinking`, `thinking_budget`, `thinking_strategy`,
 /// `chat_template_kwargs`, at the top level of `extra` or inside its
@@ -257,9 +263,11 @@ pub fn build_messages_body_with_endpoint(
     }
 
     // The caller's `extra` map wins over every derived field, as documented by
-    // `ModelRequestConfig::extra`; the cache-control knobs and the reasoning
-    // intent are client-side and are not forwarded to the API.
-    if let Some(extra) = request.extra.as_object() {
+    // `ModelRequestConfig::extra`; the cache-control knobs, the reasoning intent,
+    // and the internal purpose/metadata keys are client-side and are not
+    // forwarded to the API.
+    let extra = request.extra_without_internal_keys();
+    if let Some(extra) = extra.as_object() {
         for (key, value) in extra {
             if is_control_key(key) || key == REASONING_KEY {
                 continue;

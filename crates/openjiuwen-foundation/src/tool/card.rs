@@ -17,14 +17,35 @@
 //! assert_eq!(card.exposure, ToolExposure::Direct);
 //! assert_eq!(card.tool_info().function.name, "calculator");
 //! ```
+//!
+//! # Wire shapes
+//!
+//! [`ToolInfo`] serializes to the nested `OpenAI` chat-completions tools shape
+//! `{"type": "function", "function": {"name", "description", "parameters"}}`,
+//! and that is what `ModelRequestConfig::tools` carries into every transport:
+//!
+//! - **`OpenAI` chat-completions** (`llm::openai`) sends the nested object
+//!   verbatim.
+//! - **`OpenAI` Responses** (`llm::responses`) flattens one level itself, so the
+//!   body receives `{"type": "function", "name", "description", "parameters"}`.
+//! - **Anthropic Messages** (`llm::anthropic`) maps it to
+//!   `{"name", "description", "input_schema"}`.
+//!
+//! Python's `ToolInfo` (`openjiuwen/core/foundation/tool/schema.py`) is flat:
+//! `{"type": "function", "name", "description", "parameters"}`. That flat shape
+//! is also the tool-card/program JSON contract here — [`ToolInfo::flat`] renders
+//! it, [`ToolInfo::from_flat`] parses it, and [`ToolInfo::from_wire`] accepts
+//! either shape by auto-detection, all without changing the serde
+//! representation (which stays nested for the crates that already depend on it).
 
 use std::collections::BTreeMap;
 
 use openjiuwen_common::card::Card;
+use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// When a callable tool is included in the model-visible tool list.
 ///
@@ -273,6 +294,18 @@ impl ToolCard {
             }
         })
     }
+
+    /// Builds the Python-flat `ToolInfo` object for this card.
+    ///
+    /// This is the tool-card/program-facing shape —
+    /// `{"type": "function", "name": ..., "description": ..., "parameters": ...}`
+    /// — and is exactly `self.tool_info().flat()`. It is deliberately distinct
+    /// from [`ToolCard::openai_tool`], which returns the nested wire shape that
+    /// `ModelRequestConfig::tools` and the provider clients expect.
+    #[must_use]
+    pub fn flat_tool_info(&self) -> Value {
+        self.tool_info().flat()
+    }
 }
 
 impl Card for ToolCard {
@@ -318,14 +351,33 @@ fn strip_generated_id_default(schema: &mut schemars::Schema) {
 
 /// The model-facing projection of a [`ToolCard`].
 ///
-/// Python parity: `ToolInfo` in `openjiuwen/core/foundation/tool/schema.py`,
-/// serialized in the `OpenAI` tools shape
-/// `{"type": "function", "function": {"name": ..., "description": ...,
-/// "parameters": ...}}`.
+/// Python parity: `ToolInfo` in `openjiuwen/core/foundation/tool/schema.py`.
+/// Python serializes it **flat**
+/// (`{"type": "function", "name": ..., "description": ..., "parameters": ...}`);
+/// Rust keeps the nested `OpenAI` chat-completions tools shape
+/// (`{"type": "function", "function": {"name": ..., "description": ...,
+/// "parameters": ...}}`) as its serde representation, because
+/// `openjiuwen-dev-tools`, `openjiuwen-agent-evolving` and the examples all
+/// consume the nested shape.
+///
+/// Which shape each protocol sends:
+///
+/// | Consumer | Shape |
+/// | --- | --- |
+/// | `ModelRequestConfig::tools` (`Vec<Value>`) | nested, as produced by [`ToolInfo::openai`] |
+/// | `OpenAI` chat-completions (`llm::openai`) | nested, sent verbatim |
+/// | `OpenAI` Responses (`llm::responses`) | flat `{type, name, description, parameters}`, flattened by the Responses builder |
+/// | Anthropic Messages (`llm::anthropic`) | `{name, description, input_schema}` |
+/// | Python program/tool-card JSON | flat, via [`ToolInfo::flat`] / [`ToolInfo::from_flat`] |
+///
+/// Conversions: [`ToolInfo::flat`] renders the Python shape,
+/// [`ToolInfo::from_flat`] parses it, [`ToolInfo::openai`] renders the canonical
+/// nested shape, [`ToolInfo::from_openai`] parses it, and
+/// [`ToolInfo::from_wire`] accepts either shape by auto-detection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", default)]
 pub struct ToolInfo {
-    /// The tool kind; always `"function"`.
+    /// The tool kind; `"function"` for every built-in tool.
     #[serde(rename = "type")]
     pub kind: String,
     /// The nested function description.
@@ -350,6 +402,224 @@ impl ToolInfo {
             kind: "function".to_owned(),
             function: ToolFunctionInfo::new(name, description, parameters),
         }
+    }
+
+    /// Renders Python's flat `ToolInfo` JSON.
+    ///
+    /// The result is `{"type": <kind>, "name": ..., "description": ...,
+    /// "parameters": ...}`. `parameters` is always a JSON object: when the
+    /// stored parameters are `null` or a non-object (a scalar, an array, a
+    /// boolean — shapes Python's `default_factory=dict` field can never hold),
+    /// `{}` is emitted instead, so the flat projection is always a valid
+    /// tool-info payload. The `type` field is copied verbatim.
+    #[must_use]
+    pub fn flat(&self) -> Value {
+        json!({
+            "type": self.kind,
+            "name": self.function.name,
+            "description": self.function.description,
+            "parameters": object_or_empty(&self.function.parameters),
+        })
+    }
+
+    /// Parses Python's flat `ToolInfo` JSON.
+    ///
+    /// Unknown fields are tolerated and dropped, a missing `type` (or a
+    /// non-string one) defaults to `"function"`, and a missing `name` /
+    /// `description` defaults to `""`. A missing or `null` `parameters` becomes
+    /// `{}`; any other non-object `parameters` is
+    /// [`Error::Validation`] naming the field, because the flat contract
+    /// declares it as a JSON Schema object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when the value is not a JSON object or
+    /// carries a non-object `parameters` field.
+    pub fn from_flat(value: Value) -> Result<Self> {
+        let object = expect_object(&value, "a flat tool info")?.clone();
+
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let name = string_field(&object, "name");
+        let description = string_field(&object, "description");
+        let parameters = match object.get("parameters") {
+            None | Some(Value::Null) => json!({}),
+            Some(value @ Value::Object(_)) => value.clone(),
+            Some(other) => {
+                return Err(Error::validation(format!(
+                    "flat tool info field `parameters` must be a JSON object, got {}",
+                    json_type_name(other)
+                )));
+            }
+        };
+
+        Ok(Self {
+            kind,
+            function: ToolFunctionInfo::new(name, description, parameters),
+        })
+    }
+
+    /// Renders the nested `OpenAI` chat-completions tools shape.
+    ///
+    /// This is the canonical serialization of [`ToolInfo`]: the result is
+    /// byte-for-byte equal to `serde_json::to_value(self)`, and it is built with
+    /// `json!` so it cannot fail. `ModelRequestConfig::tools` carries exactly
+    /// this shape — the `OpenAI` client sends it verbatim, the Responses builder
+    /// flattens it, and the Anthropic client maps it to
+    /// `{name, description, input_schema}`.
+    ///
+    /// Unlike [`ToolInfo::flat`], a non-object `parameters` value is copied
+    /// verbatim: this is a faithful serialization, not a normalization.
+    #[must_use]
+    pub fn openai(&self) -> Value {
+        json!({
+            "type": self.kind,
+            "function": {
+                "name": self.function.name,
+                "description": self.function.description,
+                "parameters": self.function.parameters,
+            }
+        })
+    }
+
+    /// Parses the nested `OpenAI` chat-completions tools shape.
+    ///
+    /// Deserialize-then-normalize: unknown fields are tolerated (the serde
+    /// container default applies), a missing `type` defaults to `"function"`,
+    /// and an empty `type` is rewritten to `"function"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when the value is not a JSON object, when
+    /// it has no `function` object (pointing the caller at
+    /// [`ToolInfo::from_flat`] / [`ToolInfo::from_wire`]), or when the nested
+    /// fields have the wrong JSON types.
+    pub fn from_openai(value: Value) -> Result<Self> {
+        let object = expect_object(&value, "a nested OpenAI tool info")?;
+        if !object.contains_key("function") {
+            return Err(Error::validation(
+                "nested OpenAI tool info has no `function` object: use ToolInfo::from_flat \
+                 for Python's flat shape, or ToolInfo::from_wire to accept either shape",
+            ));
+        }
+
+        let mut info: Self = serde_json::from_value(value).map_err(|error| {
+            Error::validation(format!("invalid nested OpenAI tool info: {error}"))
+        })?;
+        if info.kind.trim().is_empty() {
+            "function".clone_into(&mut info.kind);
+        }
+        Ok(info)
+    }
+
+    /// Parses either wire shape, auto-detecting which one the value uses.
+    ///
+    /// An object with a `function` key is parsed as the nested `OpenAI` shape
+    /// ([`ToolInfo::from_openai`]); every other object must carry a top-level
+    /// `name` and is parsed as Python's flat shape ([`ToolInfo::from_flat`]).
+    /// Unknown fields are tolerated in both shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when the value is not a JSON object, has
+    /// neither a `function` key nor a top-level `name` (so neither shape can be
+    /// assumed), or fails the checks of the detected shape.
+    pub fn from_wire(value: Value) -> Result<Self> {
+        let object = expect_object(&value, "a tool info")?;
+        if object.contains_key("function") {
+            return Self::from_openai(value);
+        }
+        if !object.contains_key("name") {
+            return Err(Error::validation(
+                "tool info is neither shape: expected a nested `function` object (OpenAI) \
+                 or a top-level `name` (Python flat)",
+            ));
+        }
+        Self::from_flat(value)
+    }
+}
+
+/// Renders `infos` as the Python-flat tool-info JSON array.
+///
+/// Mirrors [`crate::tool::schema::openai_tools`] for the flat shape: one
+/// [`ToolInfo::flat`] object per info, in slice order. An empty slice renders
+/// `[]`.
+#[must_use]
+pub fn flat_tools(infos: &[ToolInfo]) -> Value {
+    Value::Array(infos.iter().map(ToolInfo::flat).collect())
+}
+
+/// Parses a JSON array of tool infos in either wire shape.
+///
+/// Each element goes through [`ToolInfo::from_wire`], so nested `OpenAI` objects
+/// and Python-flat objects can be mixed in one array and unknown fields are
+/// ignored. This is the batch counterpart of [`flat_tools`].
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] when the value is not a JSON array, or when one
+/// element is not a valid tool info (the error names the element index).
+pub fn from_wire_tools(value: Value) -> Result<Vec<ToolInfo>> {
+    let Value::Array(items) = value else {
+        return Err(Error::validation(format!(
+            "tool infos must be a JSON array, got {}",
+            json_type_name(&value)
+        )));
+    };
+
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            ToolInfo::from_wire(item).map_err(|error| {
+                Error::validation(format!("tool info at index {index} is invalid: {error}"))
+            })
+        })
+        .collect()
+}
+
+/// Returns the parameters as an object, normalizing non-objects to `{}`.
+///
+/// Python's flat `parameters` field is `default_factory=dict`, so a non-object
+/// (including `null`) is rendered as an empty schema object.
+fn object_or_empty(parameters: &Value) -> Value {
+    match parameters {
+        Value::Object(_) => parameters.clone(),
+        _ => json!({}),
+    }
+}
+
+/// Borrows `value` as an object or reports [`Error::Validation`].
+fn expect_object<'a>(value: &'a Value, expected: &str) -> Result<&'a Map<String, Value>> {
+    value.as_object().ok_or_else(|| {
+        Error::validation(format!(
+            "{expected} must be a JSON object, got {}",
+            json_type_name(value)
+        ))
+    })
+}
+
+/// Reads an optional string field, defaulting to `""`.
+fn string_field(object: &Map<String, Value>, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Names a JSON value's type for error messages.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -725,3 +995,9 @@ mod tests {
         assert!(value["properties"].get("input_params").is_some());
     }
 }
+
+// The flat/nested wire-conversion tests live in their own file to keep this
+// module under the workspace file-size baseline.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod flat_tests;

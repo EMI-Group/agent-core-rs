@@ -168,6 +168,13 @@ pub fn convert_tool_choice(choice: &Value) -> Value {
 /// [`ModelRequestConfig::extra`] is merged last at the top level, so a caller can
 /// override or extend any computed key.
 ///
+/// [`ModelRequestConfig::purpose`] and [`ModelRequestConfig::metadata`] are
+/// client-side hints only and are never written to the body; the internal `extra`
+/// keys (`request_purpose`, `purpose`, `metadata`, `context_operation_id`) are
+/// stripped before that merge (see
+/// [`ModelRequestConfig::extra_without_internal_keys`]), so no provider ever sees
+/// them while every other key keeps its merge-last behavior.
+///
 /// A provider-neutral reasoning intent is resolved first (see
 /// [`crate::llm::reasoning`]) and applied before that final merge, so the caller's
 /// keys still win. The intent comes from [`ModelRequestConfig::reasoning`] when
@@ -286,7 +293,8 @@ pub fn build_chat_completion_body_with_endpoint(
         body.insert(REASONING_KEY.to_owned(), raw);
     }
 
-    if let Some(extra) = request.extra.as_object() {
+    let extra = request.extra_without_internal_keys();
+    if let Some(extra) = extra.as_object() {
         for (key, value) in extra {
             if consumes_reasoning_key && key == REASONING_KEY {
                 continue;
@@ -1059,5 +1067,57 @@ mod tests {
         );
         assert_eq!(body, named);
         assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn the_request_purpose_and_metadata_never_reach_the_body() {
+        let request = request()
+            .with_purpose_compaction()
+            .with_metadata_entry("run_id", json!("eval-7"))
+            .with_context_operation_id("op-1")
+            .with_extra(json!({
+                "top_k": 5,
+                "request_purpose": "compaction",
+                "purpose": "compaction",
+                "metadata": {"run_id": "eval-7"},
+                "context_operation_id": "op-1",
+            }));
+        let body = body(&[BaseMessage::user("hi")], &request);
+        for key in [
+            "purpose",
+            "request_purpose",
+            "metadata",
+            "context_operation_id",
+        ] {
+            assert!(body.get(key).is_none(), "{key} is client-side only");
+        }
+        assert_eq!(
+            body["top_k"],
+            json!(5),
+            "unrelated extra keys still merge last"
+        );
+        assert_eq!(body["model"], json!("gpt-4o"));
+    }
+
+    #[test]
+    fn a_legacy_extra_purpose_is_honoured_and_stripped() {
+        let request = request().with_extra(json!({"request_purpose": "compaction"}));
+        assert!(request.is_compaction());
+        assert!(body(&[BaseMessage::user("hi")], &request)
+            .get("request_purpose")
+            .is_none());
+    }
+
+    #[test]
+    fn a_non_object_extra_leaves_the_body_unchanged() {
+        let plain = body(&[BaseMessage::user("hi")], &request());
+        for extra in [Value::Null, json!("compaction"), json!([1, 2]), json!(7)] {
+            let request = request().with_extra(extra.clone());
+            assert_eq!(
+                body(&[BaseMessage::user("hi")], &request),
+                plain,
+                "extra {extra} is ignored"
+            );
+        }
     }
 }
