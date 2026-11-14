@@ -75,8 +75,8 @@ pub use permission::{
 };
 
 // --- tools -----------------------------------------------------------------
-/// Names of the thirty-three tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
-/// thirteen extended ones), in registry order.
+/// Names of the thirty-five tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
+/// fifteen extended ones), in registry order.
 pub use tools::extended_tool_names;
 /// The goal rail, its tunables, and the `ctx.extra` key under which it queues its events.
 ///
@@ -114,13 +114,13 @@ pub use rails::{
     KvCacheSubagent, KvCacheSubagentLifecycle, KvCacheSubagentSession, KvCacheSubagentState,
     LocalDirectoryConfig, LocalFilesProvider, MemoryRail, MetricsClock, MetricsEvolutionRail,
     MetricsEvolutionRailConfig, NoopEvolutionRail, PersonalContextRail, PersonalContextRailConfig,
-    PersonalContextStatus, PersonalContextStore, ProposalLog, RuntimeSessionLineage, SearchDocument,
-    SearchHit, SecurityRail, SkillsRail, SkillsRailConfig, SourceKind, SourceLink, SourceLinkBook,
-    SourceMetadata, SourceMetadataStore, SourceProvider, SourceProviderRegistry, SubagentRail,
-    TaskIterationInfo, UnsupportedKvCacheBackend, UnsupportedSourceProvider,
+    PersonalContextStatus, PersonalContextStore, ProposalLog, RuntimeSessionLineage,
+    SearchDocument, SearchHit, SecurityRail, SkillsRail, SkillsRailConfig, SourceKind, SourceLink,
+    SourceLinkBook, SourceMetadata, SourceMetadataStore, SourceProvider, SourceProviderRegistry,
+    SubagentRail, TaskIterationInfo, UnsupportedKvCacheBackend, UnsupportedSourceProvider,
     AFFINITY_PARENT_SESSION_ID_ENV, DEFAULT_HEARTBEAT_EVENT_CAPACITY,
-    DEFAULT_HEARTBEAT_INTERVAL_MS, EVOLUTION_SNAPSHOT_VERSION, HEARTBEAT_RUN_KIND, HEARTBEAT_SECTION,
-    HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY, STICKY_SUBAGENT_TYPE,
+    DEFAULT_HEARTBEAT_INTERVAL_MS, EVOLUTION_SNAPSHOT_VERSION, HEARTBEAT_RUN_KIND,
+    HEARTBEAT_SECTION, HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY, STICKY_SUBAGENT_TYPE,
 };
 
 // --- moa -------------------------------------------------------------------
@@ -128,16 +128,16 @@ pub use moa::{
     aggregation_messages, builtin_skill_content, consult, consult_problem, consult_skill,
     consultation_transcript, escape_xml, materialize_builtin_skill, moa_section, rank_proposals,
     rank_with_config, redact, reference_messages, render_reference_proposals, score_progress,
-    score_proposal, validate_builtin_skill_name, verifier_messages, AggregationStrategy, Aggregator,
-    Consultation, ConsultationHistory, ConsultationOutcome, ConsultationRecord,
+    score_proposal, validate_builtin_skill_name, verifier_messages, AggregationStrategy,
+    Aggregator, Consultation, ConsultationHistory, ConsultationOutcome, ConsultationRecord,
     ConsultationSkillMount, JevConfig, LlmVerifier, MoaConfig, MoaMode, MoaRail, MoaSnapshot,
     MoaState, ProgressVerifier, ProposalAttempt, ProposalBatch, ProposalSource, ProposalStore,
-    ProposerFailure, RankedProposal, StructuralVerifier, TurnKey, VerifierConfig, VerifierSelection,
-    AGGREGATOR_SYSTEM_PROMPT, CONSULT_SKILL_BODY, CONSULT_SKILL_DESCRIPTION, CONSULT_SKILL_FILE,
-    CONSULT_SKILL_NAME, CONSULT_TOOL_NAME, DEFAULT_HISTORY_LIMIT, DEFAULT_MAX_ADVICE_CHARS,
-    DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REFERENCE_CHARS, DEFAULT_REFERENCE_TIMEOUT_SECS,
-    MOA_OUTCOME_EXTRA_KEY, MOA_PROMPT_SECTION, MOA_PROMPT_SECTION_NAME, MOA_RAIL_NAME,
-    MOA_STATE_EXTRA_KEY, REFERENCE_SYSTEM_PROMPT,
+    ProposerFailure, RankedProposal, StructuralVerifier, TurnKey, VerifierConfig,
+    VerifierSelection, AGGREGATOR_SYSTEM_PROMPT, CONSULT_SKILL_BODY, CONSULT_SKILL_DESCRIPTION,
+    CONSULT_SKILL_FILE, CONSULT_SKILL_NAME, CONSULT_TOOL_NAME, DEFAULT_HISTORY_LIMIT,
+    DEFAULT_MAX_ADVICE_CHARS, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REFERENCE_CHARS,
+    DEFAULT_REFERENCE_TIMEOUT_SECS, MOA_OUTCOME_EXTRA_KEY, MOA_PROMPT_SECTION,
+    MOA_PROMPT_SECTION_NAME, MOA_RAIL_NAME, MOA_STATE_EXTRA_KEY, REFERENCE_SYSTEM_PROMPT,
 };
 
 // --- lsp -------------------------------------------------------------------
@@ -151,9 +151,9 @@ pub use lsp::{
     DiagnosticRegistry, DiagnosticRelatedInformation, DiagnosticReportKind, DiagnosticsChange,
     DiagnosticsConfig, DiagnosticsEvent, DiagnosticsFile, DiscoveryIndex, DocumentDiagnosticReport,
     DocumentSymbol, FrameDecoder, Hover, InstantTimer, Location, LspAction, LspArgs, LspClient,
-    LspError, LspServerConfig, LspTool, LspToolConfig, LspTransport, MessageReader, Position, Range,
-    ResolvedServer, RestartPolicy, ServerCapabilities, ServerFactory, ServerKey, ServerState,
-    ServerStatus, ServerSupervisor, StdioTransport, SymbolInformation, TokioTimer,
+    LspError, LspServerConfig, LspTool, LspToolConfig, LspTransport, MessageReader, Position,
+    Range, ResolvedServer, RestartPolicy, ServerCapabilities, ServerFactory, ServerKey,
+    ServerState, ServerStatus, ServerSupervisor, StdioTransport, SymbolInformation, TokioTimer,
     MAX_CONTENT_LENGTH,
 };
 
@@ -241,11 +241,12 @@ pub use observability::{NoopTelemetry, Observability, TelemetrySink};
 
 // --- worktree --------------------------------------------------------------
 pub use worktree::{
-    build_worktree_notice, change_summary, is_ephemeral_slug, is_lock_timeout, render_change_summary,
-    slugify, CleanupPolicy, CleanupReport, EnterWorktreeTool, ExitWorktreeTool, GitRunner,
-    MemoryWorktreeSessionStore, ProcessGitRunner, SparseConfig, SparseMode, WorktreeChangeSummary,
-    WorktreeCreateOptions, WorktreeEvent, WorktreeInfo, WorktreeLock, WorktreeLockConfig,
-    WorktreeManager, WorktreeRail, WorktreeRecord, WorktreeSessionState, WorktreeTool,
+    build_worktree_notice, change_summary, is_ephemeral_slug, is_lock_timeout,
+    render_change_summary, slugify, CleanupPolicy, CleanupReport, EnterWorktreeTool,
+    ExitWorktreeTool, GitRunner, MemoryWorktreeSessionStore, ProcessGitRunner, SparseConfig,
+    SparseMode, WorktreeChangeSummary, WorktreeCreateOptions, WorktreeEvent, WorktreeInfo,
+    WorktreeLock, WorktreeLockConfig, WorktreeManager, WorktreeRail, WorktreeRecord,
+    WorktreeSessionState, WorktreeTool,
 };
 // --- watcher ---------------------------------------------------------------
 pub use watcher::{
@@ -257,27 +258,28 @@ pub use watcher::{
 };
 // --- persistent_agent ------------------------------------------------------
 pub use persistent_agent::{
-    atomic_write, canonical_json, deterministic_model_call_id, digest_hex, hand_off, is_read_only_tool,
-    is_logical_path, is_valid_identifier, patch_stopped_calls, percent_encode_identifier, read_json,
-    resume, sha256_hex_str, valid_caption, write_json_atomic, AbortReason, Capacity, CheckpointKind,
-    Continuation, ContinuationCursor, Control, ControlSnapshot, DistributedHandoff, ElidedEntry,
-    ElisionReason, EmittedEvent, Emitter, EntryKind, EntryPayload, EventSink, EventType,
-    ExecutionEntry, ExecutionIdentity, ExecutionLink, ExecutionLinkSource, ExecutionLog,
-    ExecutionLogSource, ExecutionRecordRail, ExtractiveSummarizer, FileLinkStore, FileSessionStore,
-    FinalStatus, HandoffReceipt, HandoffTarget, HandoffTransfer, HandoffTransport, ImportedShareBundle,
-    InMemorySink, InterceptedCall, LinkRelation, LocalHandoff, LogCapacity, LogCursor, LogDigest,
-    LogMeta, LogPreview, LogSnapshot, ModelAdmission, ModelCallGate, ModelCallRail, ModelUsage,
-    PauseReason, ParticipationDecision, ParticipationState, PersistentEvent, PersistentSessionRecord,
-    RecordCheckpoint, RecordEnding, RecordRollover, RemoteHandoff, Replay, ResumePlan, RolloverTrigger,
-    RootLogSource, SessionBinding, SessionStateStore, ShareBundle, ShareFile, ShareMode,
-    SharedFileEntry, ToolRecordPolicy, ToolStatus, UnsupportedModelSummarizer, UsageStatus,
-    WaitingScene, WindowAssembler, WindowAssembly, WindowManager, WindowPlan, WindowPolicy,
-    WindowSummarizer, BUNDLE_FILE, CAPTION_MAX_CHARS, CONTINUATION_RULES, DETAIL_LIMIT,
-    ENTRY_SCHEMA_VERSION, FILE_PATH_MAX_CHARS, HANDOFF_TEXT_PREFIX, IDENTIFIER_MAX_CHARS,
-    LOG_ENCODING, LOG_ENTRY_FILE, LOG_META_FILE, MAX_SHARED_FILES, MODEL_CALL_ID_EXTRA_KEY,
-    PLACEHOLDER_TEXT, READ_ONLY_TOOLS, RECORD_INVALID_PREFIX, SESSION_KEY_PREFIX,
-    SESSION_RECORD_VERSION, SHARE_BUNDLE_SCHEMA_VERSION, SHARE_FILE_MAX_BYTES, SHARE_MODES,
-    SUMMARY_LIMIT,
+    atomic_write, canonical_json, deterministic_model_call_id, digest_hex, hand_off,
+    is_logical_path, is_read_only_tool, is_valid_identifier, patch_stopped_calls,
+    percent_encode_identifier, read_json, resume, sha256_hex_str, valid_caption, write_json_atomic,
+    AbortReason, Capacity, CheckpointKind, Continuation, ContinuationCursor, Control,
+    ControlSnapshot, DistributedHandoff, ElidedEntry, ElisionReason, EmittedEvent, Emitter,
+    EntryKind, EntryPayload, EventSink, EventType, ExecutionEntry, ExecutionIdentity,
+    ExecutionLink, ExecutionLinkSource, ExecutionLog, ExecutionLogSource, ExecutionRecordRail,
+    ExtractiveSummarizer, FileLinkStore, FileSessionStore, FinalStatus, HandoffReceipt,
+    HandoffTarget, HandoffTransfer, HandoffTransport, ImportedShareBundle, InMemorySink,
+    InterceptedCall, LinkRelation, LocalHandoff, LogCapacity, LogCursor, LogDigest, LogMeta,
+    LogPreview, LogSnapshot, ModelAdmission, ModelCallGate, ModelCallRail, ModelUsage,
+    ParticipationDecision, ParticipationState, PauseReason, PersistentEvent,
+    PersistentSessionRecord, RecordCheckpoint, RecordEnding, RecordRollover, RemoteHandoff, Replay,
+    ResumePlan, RolloverTrigger, RootLogSource, SessionBinding, SessionStateStore, ShareBundle,
+    ShareFile, ShareMode, SharedFileEntry, ToolRecordPolicy, ToolStatus,
+    UnsupportedModelSummarizer, UsageStatus, WaitingScene, WindowAssembler, WindowAssembly,
+    WindowManager, WindowPlan, WindowPolicy, WindowSummarizer, BUNDLE_FILE, CAPTION_MAX_CHARS,
+    CONTINUATION_RULES, DETAIL_LIMIT, ENTRY_SCHEMA_VERSION, FILE_PATH_MAX_CHARS,
+    HANDOFF_TEXT_PREFIX, IDENTIFIER_MAX_CHARS, LOG_ENCODING, LOG_ENTRY_FILE, LOG_META_FILE,
+    MAX_SHARED_FILES, MODEL_CALL_ID_EXTRA_KEY, PLACEHOLDER_TEXT, READ_ONLY_TOOLS,
+    RECORD_INVALID_PREFIX, SESSION_KEY_PREFIX, SESSION_RECORD_VERSION, SHARE_BUNDLE_SCHEMA_VERSION,
+    SHARE_FILE_MAX_BYTES, SHARE_MODES, SUMMARY_LIMIT,
 };
 
 /// Returns the crate name.

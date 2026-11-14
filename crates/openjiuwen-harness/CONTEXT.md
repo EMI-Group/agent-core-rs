@@ -135,10 +135,13 @@ Every public item is also re-exported flat from the crate root.
 - `./src/schema/` → config, state, task/todo, stop conditions, interaction, loop events, agent mode
 - `./src/workspace/` → `Workspace`, named directory nodes, default schema, `DirectoryBuilder`
 - `./src/permission/` → permission model, engine, file/shell/net guards, session decisions, HITL interrupt rail
-- `./src/tools/` → model-facing tools (`registry.rs`, core and extended sets), web fetch/search, media metadata, cron, MCP resources, goal, progressive discovery, descriptions, shared helpers
-- `./src/rails/` → rail trait/registry, security/memory/skills/subagent rails, evolution metrics/proposals/snapshot rail
+- `./src/tools/` → model-facing tools (`registry.rs`, core and extended sets), web fetch/search, media metadata, cron (classic + Quartz grammar, ten actions, run history), MCP resources and subscriptions, worktree enter/exit, goal, progressive discovery, descriptions, shared helpers
+- `./src/rails/` → rail trait/registry, security/memory/skills/subagent/evolution rails, heartbeat rail, KV-cache lifecycle rail, personal-context rail (`personal_context/` store/ingest/search)
+- `./src/moa/` → mixture-of-agents: config/validation, concurrent consultation, verifier/ranking, aggregation, state/history, `MoaRail`, embedded consult skill
+- `./src/persistent_agent/` → execution journal/replay, persisted session state, window assembly, continuation/resume, handoff, control/emitter/share-file seams, record rails
+- `./src/watcher/` → debounced workspace watcher (`notify`), change classification, bounded subscribers, reload hub and skills/instruction-file/MCP reloaders
 - `./src/prompts/` → system prompt builder, sections, tool descriptions, prompt report, sanitization
-- `./src/subagents/` → `SubAgentConfig`, registry, presets, quota/LRU/transcript/persistence runtime, task and subagent tools
+- `./src/subagents/` → `SubAgentConfig`, registry, presets, quota/LRU/transcript/activity/eviction/lifecycle runtime, task and subagent tools
 - `./src/skills/` → skill discovery/library state, mounting, `SKILL.md` validation
 - `./src/task_loop/` → loop coordinator, queues, event manager, task-loop controller/handler
 - `./src/agent/` → `DeepAgent`, builder, factory, goal-rail assembly, rail-event drain, subagent wiring, session state persistence, round execution
@@ -150,17 +153,20 @@ Every public item is also re-exported flat from the crate root.
 - `./src/manifest.rs` → harness element catalog (`@harness_element` equivalent)
 - `./src/observability.rs` → tracing spans/events and telemetry seam
 - `./src/lib.rs` → crate docs, module declarations, flat re-exports, feature flags
-- `./tests/` → offline integration suites (loop, workspace safety, permissions, state, subagents/transcripts, protocol, CLI) (`tests/CONTEXT.md`)
+- `./tests/` → offline integration suites (loop, workspace safety, permissions, state, subagents/transcripts, protocol, CLI, public surface, MoA, persistent-agent resume, goal rail events, watcher targets) (`tests/CONTEXT.md`)
 
 ## Offline recipe (DeepAgent + native harness)
 
 - Minimal agent: `DeepAgentBuilder::new(AgentCard::new(id)).config(DeepAgentConfig::default().with_language("en").with_workspace(Workspace::for_language(tmp.path(), "en"))).model(Arc::new(ScriptedModel::text("hi"))).build()` → `Result<Arc<DeepAgent>>`, then `agent.invoke(json!({"query": "hi"}), None).await` (`Agent` trait) for one turn; canonical example `./tests/deep_agent_loop.rs`.
 - One-call factory: `create_deep_agent(...)` at `./src/agent/factory.rs`; it always sets `enable_task_loop`/`restrict_to_work_dir` from its arguments and registers `security`, `skills`, `subagent` and (when a goal tool is mounted) `goal`.
-- Extended tools: `ToolRegistry::new(workspace).with_tools(BuiltinTool::EXTENDED)` for everything, or a chosen subset; `with_lsp_config(..)`/`with_worktree_root(..)` supply the two configured tools, and absent backends yield `success=false` payloads.
+- Extended tools: `ToolRegistry::new(workspace).with_tools(BuiltinTool::EXTENDED)` for everything, or a chosen subset; `with_lsp_config(..)`/`with_worktree_root(..)`/`with_mcp_subscriptions(..)`/`with_search_backend(..)` supply the configured tools, and absent backends yield `success=false` payloads.
 - Spec-driven agent: `SpecRegistry::discover(workspace, &[home])?.resolve("name")?` then `ResolvedSpec::build_agent(model, ...)`; templates live in `<workspace>/.openjiuwen/agents/*.{yaml,yml,json,md}`, plugins in `<workspace>/.openjiuwen/plugins/<name>/plugin.yaml`.
 - Native harness: `NativeHarness::new(Arc<DeepAgent>, NativeHarnessOptions::new())` then `start(HarnessContext::new(name, agent_id, host_session_id, prompt))`, `events()` (single consumer), `send(HarnessInput::text(..), DeliveryMode::Auto)`, `stop()`.
 - LSP offline: `LspTool::new(LspToolConfig::default()).with_transport(Box::new(ChannelTransport::new(buffer)))` plus an in-process fake server task; no language server binary required.
 - Worktree offline: `WorktreeManager::new(repo_root).with_runner(Arc::new(scripted_runner))` or a `tempfile` git repo when `git` is installed.
+- Watcher offline: `WorkspaceWatcher::for_workspace(&workspace).start()` (feature `notify`) with a temp workspace, then mutate `skills/`, `IDENTITY.md` or the MCP config and read `Subscription::recv`; without the feature `start()` is a typed `Unsupported`.
+- MoA offline: `MoaConfig` with two `ScriptedModel` proposers → `consult` → `rank_with_config` → `Aggregator`, all without a network.
+- Persistent agent offline: `ExecutionLog::open(dir)` + `resume(dir, capacity)` over a temp dir; `LocalHandoff`/`ShareFile` stay on disk.
 - No default path opens a network connection; web fetch/search, MCP resources and the LSP server are only reached when a tool is invoked with a configured backend.
 
 ## Test Strategy
@@ -172,5 +178,10 @@ Every public item is also re-exported flat from the crate root.
 - Tool tests assert exact names/JSON schemas/description tables and `success=false` error payloads; web/media/cron/goal/spec/worktree suites use injected fetchers, fixture bytes, scripted git output and frozen clocks.
 - Subagent tests cover quota refusals and frees, per-parent/depth limits, LRU eviction with transcript digests, and persistence round-trips.
 - CLI tests inject reader/writer/env/home/shell/model and assert slash commands, history round-trip, colour opt-out byte output, instruction precedence, MCP config errors, allow-rule YAML write-back, `!cmd`, skill slash and the onboarding paths.
-- LSP tests cover framing edge cases, transport lifecycles, timeout/cancel, and a fake in-process server.
+- LSP tests cover framing edge cases, transport lifecycles, timeout/cancel/retry, diagnostics push+pull, discovery, and a fake in-process server.
+- Cron tests cover both grammars, every action's happy and failure path, run-history rotation and cross-instance persistence with frozen clocks.
+- MoA tests use scripted proposers for fan-out, partial/all-fail, ranking, aggregation, rail activation and history round-trips.
+- Persistent-agent tests append/rotate/reopen a journal, resume after a simulated crash, assemble windows under tight budgets, and assert share-bundle/`Unsupported` behaviour.
+- Watcher tests (feature `notify`) drive OS notifications over a temp workspace: create/modify/remove delivery, burst coalescing, reload handlers, error storms and idempotent shutdown; the feature-off build asserts the typed `Unsupported` reason.
+- Rails tests cover heartbeat cadence with an injected clock, KV-cache affinity/release, personal-context path safety, ingestion and BM25F recall.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --no-default-features`, `cargo clippy -p openjiuwen-harness --all-targets -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` all clean and offline.

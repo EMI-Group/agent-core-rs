@@ -93,7 +93,7 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 ## Known Issues
 
 - The `lsp` card description is sourced from `src/tools/descriptions.rs` (the single source of truth, so no duplicate string lives here) and its current entry does not yet name implementation, call hierarchy or diagnostics; broadening it is a sibling edit in that table.
-- `lsp` has no CLI mounting: the CLI does not resolve a per-workspace server config yet (it opts into eleven extended tools but not `lsp`).
+- `lsp` has no CLI mounting: the CLI does not resolve a per-workspace server config yet (it mounts thirteen extended tools but not `lsp`).
 
 ## Remaining Deferrals
 

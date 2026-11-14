@@ -53,7 +53,7 @@ fn model(text: &str) -> Arc<dyn Model> {
     Arc::new(ScriptedModel::text(text))
 }
 
-/// The MoA configuration and rail resolve from the crate root and publish their section.
+/// The `MoA` configuration and rail resolve from the crate root and publish their section.
 #[tokio::test]
 async fn moa_config_and_rail_come_from_the_crate_root() -> Result<()> {
     let config = MoaConfig::new(vec![model("first proposal"), model("second proposal")]);
