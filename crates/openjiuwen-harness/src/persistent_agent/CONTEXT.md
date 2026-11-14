@@ -112,7 +112,12 @@ Re-exports:
 ## Design Decisions
 
 - The execution journal is the durability boundary: a resumed session replays the JSONL instead of trusting an in-memory transcript, so a crash between appends loses at most the last partial line.
-- One `tokio::sync::Mutex` guards `next_seq`/`lines`/`bytes`/`generation`, and reads take the same mutex, so a rotation can never race an append or a read.
+- One `parking_lot::Mutex` guards `next_seq`/`lines`/`bytes`/`generation` and is only held for the in-memory reads and mutations; a second `parking_lot` gate serializes the file operations, and both are only ever taken on the blocking pool, so no async task holds a lock across an `.await` and no disk IO runs on the async runtime.
+- Every journal file operation (open scan, append, rotate, read, replay, metadata write) runs through `tokio::task::spawn_blocking`; the operation gate serializes appends and rotations there, so concurrent appends still produce contiguous, unique sequence numbers.
+- `util::truncate_chars` treats `max_chars` as a hard budget: the ellipsis replaces the last kept character, so a truncated result is exactly `max_chars` characters, `0` yields an empty string and `1` yields `…` alone.
+- `ExecutionEntry::digest` falls back to a digest over `seq`, `kind` and `occurred_at` when serialization fails, so a failure can never collapse distinct entries onto `digest(null)`.
+- `LogPreview::preview` skips a line it cannot serialize (reporting it with `tracing::warn`) instead of emitting an empty line that would read back as a corrupt record.
+- A redacted tool payload that cannot be rendered becomes the literal `<unserializable>` marker, never an empty string.
 - Rotation renames the active segment to the next free `entries.<generation>.jsonl` (skipping taken names instead of overwriting), rewrites `meta.json` atomically, then prunes the lowest generations beyond `keep_segments`.
 - Opening recomputes the counters by scanning the segments and rewrites `meta.json`, so reopening is idempotent and a stale metadata generation never loses entries.
 - A read skips empty, unparseable, zero-`seq` and non-RFC-3339 lines into `skipped_invalid`, collapses exact duplicates by `digest()`, drops a whole sequence group whose members disagree, and reports gaps from `1` before retention trimming.
@@ -149,7 +154,7 @@ Re-exports:
 
 ## Test Strategy
 
-- Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
+- Inline unit tests per module: canonical JSON/digest/percent-encoding, entry serde round-trips and redaction, log append/rotation/replay/digest, hard-budget truncation at every boundary, digest and redaction serialization-failure fallbacks, log preview skipping unrenderable lines, 32 concurrent appends staying contiguous and replayable, session record round-trip with unknown fields, validation rules, window assembly under tight/loose budgets with elision reports, control flags, emitter sequencing and failure policy, share bundle round-trip and tamper rejection, handoff transfer, continuation links and resume.
 - Cross-module flows live in `src/persistent_agent/tests.rs` (an integration file under `crates/openjiuwen-harness/tests/` would also work but is outside this module's write scope): crash-and-reopen resume, in-process handoff, share-bundle round trip with tamper rejection, emitter-vs-journal sequence independence, and the exact `Unsupported` messages.
 - All tests use `tempfile::TempDir`, `ManualClock`, file-backed stores and no sleeps; nothing opens a socket or reads the wall clock.
 - Definition of done: `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo fmt -p openjiuwen-harness`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps`.
