@@ -11,13 +11,17 @@
 //!
 //! 1. `--version` prints the binary's name and version on **stdout** and exits
 //!    `0` (clap's `version` attribute, backed by the workspace version);
-//! 2. `--help` lists all three command groups (`run`, `chat`, `auto-harness`) on
-//!    **stdout**, exits `0`, and every subcommand's help is reachable;
+//! 2. `--help` lists every command group (`run`, `chat`, `auto-harness`, plus
+//!    the harness surfaces `lsp`, `cron`, `team`, `watch`) on **stdout**, exits
+//!    `0`, and every subcommand's help is reachable;
 //! 3. `auto-harness`'s help lists its five subcommands, and `run`/`experience`
 //!    list the flags and nested commands the port documents;
-//! 4. `--no-color` is accepted on both sides of a subcommand and is offered in
+//! 4. `lsp`, `cron`, `team` and `watch` document their actions, subcommands and
+//!    flags, and `run`/`chat` offer the binary's own `--worktree`/`--watch`
+//!    additions;
+//! 5. `--no-color` is accepted on both sides of a subcommand and is offered in
 //!    the help of the top-level grammar;
-//! 5. an unknown subcommand is a usage error: exit `2` (clap's documented code)
+//! 6. an unknown subcommand is a usage error: exit `2` (clap's documented code)
 //!    with the diagnostic on **stderr** and nothing on stdout.
 //!
 //! Every child is spawned through [`support::Sandbox`], so it runs in a temporary
@@ -50,8 +54,103 @@ fn help_lists_every_command_group() {
     let sandbox = Sandbox::new();
     let output = sandbox.run_blocking(&["--help"]);
     let text = assert_success(&output);
-    for row in ["run", "chat", "auto-harness"] {
+    for row in [
+        "run",
+        "chat",
+        "lsp",
+        "cron",
+        "team",
+        "watch",
+        "auto-harness",
+    ] {
         assert!(has_row(&text, row), "no `{row}` command in {text:?}");
+    }
+}
+
+#[test]
+fn lsp_help_lists_the_actions() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["lsp", "--help"]);
+    let text = assert_success(&output);
+    for action in [
+        "hover",
+        "definition",
+        "references",
+        "completion",
+        "symbols",
+        "workspace-symbols",
+        "diagnostics",
+        "implementation",
+        "prepare-call-hierarchy",
+        "incoming-calls",
+        "outgoing-calls",
+    ] {
+        assert!(
+            text.contains(action),
+            "expected the `{action}` action in {text:?}"
+        );
+    }
+}
+
+#[test]
+fn cron_help_lists_its_subcommands() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["cron", "--help"]);
+    let text = assert_success(&output);
+    for row in [
+        "list", "status", "get", "create", "toggle", "preview", "run", "runs", "cancel",
+    ] {
+        assert!(has_row(&text, row), "no `{row}` subcommand in {text:?}");
+    }
+}
+
+#[test]
+fn team_help_lists_its_subcommands() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["team", "--help"]);
+    let text = assert_success(&output);
+    for row in [
+        "members",
+        "member",
+        "inbox",
+        "send",
+        "broadcast",
+        "create-task",
+        "task",
+        "claim",
+        "complete",
+        "update",
+        "snapshot",
+        "stop",
+    ] {
+        assert!(has_row(&text, row), "no `{row}` subcommand in {text:?}");
+    }
+}
+
+#[test]
+fn watch_help_lists_its_flags() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_blocking(&["watch", "--help"]);
+    let text = assert_success(&output);
+    for flag in ["--json", "--list", "--debounce-ms", "--max-events"] {
+        assert!(text.contains(flag), "expected `{flag}` in {text:?}");
+    }
+}
+
+#[test]
+fn run_and_chat_help_show_the_binary_flags() {
+    let sandbox = Sandbox::new();
+    let run = assert_success(&sandbox.run_blocking(&["run", "--help"]));
+    assert!(
+        run.contains("--worktree"),
+        "expected `--worktree` on `run` in {run:?}"
+    );
+    let chat = assert_success(&sandbox.run_blocking(&["chat", "--help"]));
+    for flag in ["--watch", "--worktree"] {
+        assert!(
+            chat.contains(flag),
+            "expected `{flag}` on `chat` in {chat:?}"
+        );
     }
 }
 
