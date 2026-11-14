@@ -426,7 +426,7 @@ mod tests {
             "the injected wiring keeps the observer it was opened with"
         );
         wiring.on_member_join("dev-1").await.unwrap();
-        assert!(recorder.operations().is_empty());
+        assert_eq!(recorder.operations(), Vec::<String>::new());
     }
 
     #[test]

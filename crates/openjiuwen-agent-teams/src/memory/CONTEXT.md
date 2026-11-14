@@ -26,6 +26,7 @@ pub struct MemoryConfig {              // Clone, Serialize, Deserialize; Debug +
     pub import_on_build: bool,         // default true
     pub trace: bool,                   // default true — attach the team-memory observer
     pub otel_sink: Option<Arc<OtelSpanSink>>, // `#[serde(skip)]`, default None
+    pub observer: Option<Arc<dyn TeamMemoryObserver>>, // `#[serde(skip)]`, default None
     pub hooks: TeamMemoryHookConfig,   // TeamMemoryHookConfig::default()
 }
 impl Default for MemoryConfig;         // the fully working configuration
@@ -58,6 +59,9 @@ impl TeamMemoryWiring {
     pub async fn open_with_model(team_id: impl Into<String>, config: MemoryConfig,
                                  workspace_root: impl Into<PathBuf>,
                                  model: Arc<dyn Model>) -> Result<Arc<Self>>;
+    pub async fn open_with_observer(team_id: impl Into<String>, config: MemoryConfig,
+                                    workspace_root: impl Into<PathBuf>,
+                                    observer: Arc<dyn TeamMemoryObserver>) -> Result<Arc<Self>>;
     pub fn with_extractor(&self, extractor: Arc<dyn TeamMemoryExtractor>) -> Arc<Self>;
     pub fn team_id(&self) -> &str;
     pub fn memory(&self) -> &Arc<TeamMemory>;
@@ -119,6 +123,9 @@ Re-exported engine items are *not* re-exported here; callers reach them through
   engine defaults.
 - `otel_sink` is never read from metadata: it is `#[serde(skip)]` and `memory_config` always sets it
   to `None`, so a host that wants the in-memory sink assigns it on the parsed `MemoryConfig`.
+- `observer` is never read from metadata either: it is `#[serde(skip)]` and `memory_config` always
+  sets it to `None`, so a host that wants its own observer assigns it on the parsed `MemoryConfig`
+  or opens the wiring through `TeamMemoryWiring::open_with_observer`.
 
 ## Observability bridge
 
@@ -140,6 +147,16 @@ What one traced operation yields: one `memory.{operation}` child span of the obs
 `kind`, `error` when present), one `tracing` event at target `openjiuwen_agent_teams::memory`
 (`debug!` on success, `warn!` on failure), and — on the `otel` build — one `SpanRecord` in the
 configured sink.
+
+A caller-supplied observer (`MemoryConfig::observer`, or `TeamMemoryWiring::open_with_observer`)
+replaces that built-in bridge: `observer_for` clones the supplied `Arc` and the crate's
+`MemorySpanObserver` is not built at all, so a configured `otel_sink` stays unused (log line at
+target `openjiuwen_agent_teams::memory`).
+The precedence is `enabled` → `trace` → `observer` → built-in bridge, so an injected observer is
+**not** applied to a `trace: false` wiring: the explicit switch is the last word.
+There is deliberately no post-construction setter — `TeamMemory::with_observer` consumes the
+facade, so the observer can only be chosen while the facade is built.
+`with_extractor` carries whichever observer the wiring holds (injected or built-in) over unchanged.
 
 Disabled: `enabled: false` or `trace: false` attaches no observer at all, so no span, no event and
 no sink record is produced; the facade, hooks and document behave exactly as they otherwise would.
@@ -170,13 +187,15 @@ Caveats, stated because they are visible from this node:
 
 ## Routing Table
 
-- `./config.rs` → `MEMORY_METADATA_KEY`, `MemoryConfig` (with `trace` and the skipped `otel_sink`),
-  `MemoryStoreConfig`, `MemoryExtractorKind`, `validate()` and the tolerant `metadata["memory"]`
-  parser `memory_config`
-- `./trace.rs` → `observer_for` and `facade`: the one place the team-memory observer is built and
-  attached to the facade, plus the `OtelSpanSink` re-export and its uninhabited stand-in
+- `./config.rs` → `MEMORY_METADATA_KEY`, `MemoryConfig` (with `trace`, the skipped `otel_sink` and
+  the skipped caller-supplied `observer`), `MemoryStoreConfig`, `MemoryExtractorKind`, `validate()`
+  and the tolerant `metadata["memory"]` parser `memory_config`
+- `./trace.rs` → `observer_for` and `facade`: the one place the team-memory observer is chosen and
+  attached to the facade (`enabled` → `trace` → supplied observer → built-in bridge), plus the
+  `OtelSpanSink` re-export and its uninhabited stand-in
 - `./wiring.rs` → `TeamMemoryWiring` and `TEAM_MEMORY_FILE`: facade + hooks + per-member toolkit
-  cache + lifecycle pass-throughs + `TEAM_MEMORY.md` export/import + the observer handle
+  cache + lifecycle pass-throughs + `TEAM_MEMORY.md` export/import + the observer handle and its
+  `open_with_observer` constructor
 - `./tools.rs` → `TeamMemoryTool` and `team_memory_tools`: the four `MemberMemoryToolkit` tools as
   `openjiuwen_foundation::tool::Tool` handles
 
@@ -207,9 +226,11 @@ Caveats, stated because they are visible from this node:
 - `on_turn_message(from, to, content, at)` is the `TeamTurn` shorthand; `to: None` addresses the
   whole team.
 - The wiring installs no `TeamMemoryObserver` of its own beyond the trace bridge; a caller that
-  builds its own `TeamMemory` keeps the observer seam available.
-- `MemoryConfig` hand-writes `Debug` (the sink is rendered as `has_otel_sink: bool`, never dumped)
-  and `PartialEq` (sinks compare by `Arc::ptr_eq`), and carries
+  builds its own `TeamMemory` keeps the observer seam available, and a caller that wants its own
+  observer in a wiring supplies `MemoryConfig::observer` or uses `open_with_observer`.
+- `MemoryConfig` hand-writes `Debug` (the sink and the observer are rendered as
+  `has_otel_sink: bool` / `has_observer: bool`, never dumped) and `PartialEq` (both handles compare
+  by `Arc::ptr_eq`), and carries
   `#[allow(clippy::struct_excessive_bools)]` because its four switches are independent options.
 - The `otel` sink type is feature-shaped, not the field: `MemoryConfig::otel_sink` exists on every
   build, but without `otel` it is the uninhabited `trace::OtelSpanSink` and can only be `None`.
@@ -217,11 +238,15 @@ Caveats, stated because they are visible from this node:
   fixed `DateTime` values and `openjiuwen_test_support::ScriptedModel` for the LLM-extractor
   construction path.
 - The trace tests are offline and deterministic: the default build proves the observer is attached
-  (same `Arc` the facade holds) and that `trace: false` attaches none, and the `otel` build drives
-  `on_member_join` and asserts the sink holds one `memory.write` record per wiring, with one trace
-  per open (two opens of the same team mint two traces — no global registry).
+  (same `Arc` the facade holds), that `trace: false` attaches none, that a supplied observer wins
+  over the bridge (and is itself not attached to an untraced or disabled wiring), and that
+  `open_with_observer` replaces the bridge while still honouring `trace: false`; the `otel` build
+  drives `on_member_join` and asserts the sink holds one `memory.write` record per wiring, with one
+  trace per open (two opens of the same team mint two traces — no global registry).
 - `MEMORY_METADATA_KEY` is owned here; the runtime node reads it through `memory_config` only.
 - The runtime needs no new call to get the default tracing: it passes the parsed `MemoryConfig`
-  (from `memory_config`) straight into `TeamMemoryWiring::open`, whose sink slot is `None` unless
-  it assigns one; to collect span records it sets
-  `MemoryConfig { otel_sink: Some(Arc::new(OtelSpanSink::new(capacity))), .. }` before `open`.
+  (from `memory_config`) straight into `TeamMemoryWiring::open`, whose sink and observer slots are
+  `None` unless it assigns one; to collect span records it sets
+  `MemoryConfig { otel_sink: Some(Arc::new(OtelSpanSink::new(capacity))), .. }` before `open`, and
+  to route the operations into its own pipeline it sets `observer` (the runtime's
+  `TeamBuildDeps::with_memory_observer` does exactly that).

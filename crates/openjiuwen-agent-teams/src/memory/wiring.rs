@@ -859,7 +859,7 @@ mod tests {
         assert!(wiring.observer().is_none());
         assert!(wiring.memory().observer().is_none());
         wiring.on_member_join("dev-1").await.unwrap();
-        assert!(recorder.operations().is_empty());
+        assert_eq!(recorder.operations(), Vec::<String>::new());
         assert_eq!(stored(&wiring).await.len(), 1);
     }
 

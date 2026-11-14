@@ -328,7 +328,7 @@ mod tests {
         let (memory, observer) = facade("team-1", &config);
         assert!(observer.is_none());
         assert!(memory.observer().is_none());
-        assert!(recorder.operations().is_empty());
+        assert_eq!(recorder.operations(), Vec::<String>::new());
     }
 
     #[test]

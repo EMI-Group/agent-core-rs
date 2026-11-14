@@ -90,7 +90,8 @@ pub struct TeamBuildDeps {
     /// Team-memory observer the host wants on the resolved wiring (e.g. the OTLP bridge).
     ///
     /// [`TeamBuildDeps::with_memory_observer`] sets it; the build path copies it onto
-    /// [`MemoryConfig::observer`] of the metadata-resolved configuration before that wiring is
+    /// [`MemoryConfig::observer`](crate::memory::MemoryConfig::observer) of the metadata-resolved
+    /// configuration before that wiring is
     /// opened, so it replaces the crate's built-in `MemorySpanObserver` bridge. It is applied only
     /// on the metadata path: an injected [`TeamBuildDeps::memory`] is used verbatim and this
     /// observer is ignored (logged once at debug), because the facade of an existing wiring cannot

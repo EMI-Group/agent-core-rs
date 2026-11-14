@@ -490,7 +490,7 @@ async fn a_build_without_an_injected_observer_keeps_the_built_in_bridge() {
         "the built-in bridge is not the unused test observer"
     );
     built.agent.start().await.unwrap();
-    assert!(recorder.entries().is_empty());
+    assert_eq!(recorder.entries(), Vec::<String>::new());
     built.agent.stop().await.unwrap();
 }
 
@@ -544,5 +544,5 @@ async fn an_injected_wiring_ignores_the_injected_observer() {
         "the injected wiring keeps the observer it was opened with"
     );
     built.agent.start().await.unwrap();
-    assert!(recorder.entries().is_empty());
+    assert_eq!(recorder.entries(), Vec::<String>::new());
 }
