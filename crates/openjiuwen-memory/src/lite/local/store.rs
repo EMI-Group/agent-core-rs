@@ -184,7 +184,7 @@ impl LocalCodingMemory {
     ///
     /// Lock order is file lock before state guard; the watcher only takes the state
     /// guard, so the two can never deadlock.
-    async fn lock_for_write(&self) -> Result<(FileLock, MutexGuard<'_, LocalState>)> {
+    pub(super) async fn lock_for_write(&self) -> Result<(FileLock, MutexGuard<'_, LocalState>)> {
         let guard = FileLock::acquire(&self.inner.lock_path).await?;
         let state = self.inner.state.lock().await;
         Ok((guard, state))
@@ -217,7 +217,7 @@ impl LocalCodingMemory {
     ///
     /// In the per-fact file layout the document is projected instead: every fact file is
     /// written (stale ones removed) and both index documents are re-rendered.
-    async fn persist(&self, state: &mut LocalState) -> Result<()> {
+    pub(super) async fn persist(&self, state: &mut LocalState) -> Result<()> {
         if self.inner.fact_files {
             let _count = self.export_locked(state).await?;
             return Ok(());
@@ -266,7 +266,7 @@ impl LocalCodingMemory {
     }
 
     /// Resolves the fact type to store against the configured type list.
-    fn resolve_fact_type(&self, fact_type: CodingFactType) -> CodingFactType {
+    pub(super) fn resolve_fact_type(&self, fact_type: CodingFactType) -> CodingFactType {
         let configured = self
             .inner
             .config

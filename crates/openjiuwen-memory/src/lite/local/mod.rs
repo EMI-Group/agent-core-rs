@@ -102,6 +102,25 @@
 //! Nothing in this module panics on user input: invalid facts, bad scopes, and missing
 //! names are typed errors, and filesystem failures carry the failing path as context.
 //!
+//! Three further surfaces build on the same root without changing the source of truth:
+//!
+//! - Session logs live under `<root>/sessions/YYYY-MM-DD/<id>.jsonl`; they are append-only
+//!   and never copied into `MEMORY.md`. [`search_sessions`](crate::lite::local::LocalCodingMemory::search_sessions) scores them
+//!   keyword-first and, when an embedding model is configured, blends in their semantic
+//!   similarity (vectors are cached by content hash in the store's own cache, so an
+//!   unchanged line is never embedded twice). Without an embedding model hybrid recall
+//!   degrades to keyword and semantic recall is [`Error::Unsupported`], exactly like fact
+//!   recall.
+//! - Daily rollups live under `<root>/daily_memory/YYYY-MM-DD.md`. They are derived
+//!   documents over the day's facts and session lines: [`rollup_day`](crate::lite::local::LocalCodingMemory::rollup_day)
+//!   renders without writing, and [`write_daily_rollup`](crate::lite::local::LocalCodingMemory::write_daily_rollup) writes
+//!   atomically and reports whether the bytes changed.
+//! - [`write_mode`](crate::lite::local::LocalCodingMemory::write_mode) applies a
+//!   [`WriteMode`](crate::lite::write::WriteMode) (`create`, `append`, `merge`, `replace`,
+//!   `skip`) to a fact under a bounded retry policy. A `create` collision is a conflict that
+//!   is retried and finally reported as a typed memory error rather than silently
+//!   overwriting; a skip writes nothing at all.
+//!
 //! # Modules
 //!
 //! The store is split by responsibility; the public path is unchanged
@@ -121,16 +140,22 @@
 //!   representation.
 //! - `sync_mode` — the caller-driven sync surface: `sync_now`, the sync triggers, and the
 //!   opt-in background interval task.
+//! - `session_mode` — JSONL session recall under `sessions/`.
+//! - `daily_mode` — `daily_memory/` rollup rendering and writes.
+//! - `write_mode` — write modes plus the bounded conflict-retry driver.
 
 mod builder;
+mod daily_mode;
 mod embedding;
 mod facts_mode;
 mod layout;
 mod search;
+mod session_mode;
 mod state;
 mod store;
 mod sync_mode;
 mod watcher;
+mod write_mode;
 
 #[cfg(test)]
 mod tests;

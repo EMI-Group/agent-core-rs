@@ -167,25 +167,8 @@ pub fn render_rollup(
     facts: &[CodingFact],
     session_lines: &[DailySessionLine],
 ) -> String {
-    let mut day_facts: Vec<&CodingFact> = facts
-        .iter()
-        .filter(|fact| fact.updated_at.date_naive() == date)
-        .collect();
-    day_facts.sort_by(|left, right| {
-        type_rank(left.fact_type)
-            .cmp(&type_rank(right.fact_type))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-
-    let mut day_lines: Vec<&DailySessionLine> = session_lines
-        .iter()
-        .filter(|line| line.date == Some(date))
-        .collect();
-    day_lines.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.line.cmp(&right.line))
-    });
+    let day_facts = ordered_facts(date, facts);
+    let day_lines = ordered_lines(date, session_lines);
 
     let mut front_matter = FrontMatter::new();
     let _previous = front_matter.insert("id", rollup_id(date));
@@ -276,6 +259,63 @@ pub async fn write_rollup(root: &Path, date: NaiveDate, content: &str) -> Result
                 .with_context(format!("replacing the daily rollup {}", path.display()))
         })?;
     Ok((path, true))
+}
+
+/// The contributing facts of a rollup of `date`, in rendered order.
+///
+/// Only facts whose `updated_at` date is `date` are kept; the order is the fixed type order
+/// (user, feedback, project, reference) then name ascending.
+fn ordered_facts(date: NaiveDate, facts: &[CodingFact]) -> Vec<&CodingFact> {
+    let mut day_facts: Vec<&CodingFact> = facts
+        .iter()
+        .filter(|fact| fact.updated_at.date_naive() == date)
+        .collect();
+    day_facts.sort_by(|left, right| {
+        type_rank(left.fact_type)
+            .cmp(&type_rank(right.fact_type))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    day_facts
+}
+
+/// The contributing session lines of a rollup of `date`, in rendered order.
+///
+/// Only lines whose recorded date is `date` are kept; the order is `(path, line)` ascending.
+fn ordered_lines(date: NaiveDate, session_lines: &[DailySessionLine]) -> Vec<&DailySessionLine> {
+    let mut day_lines: Vec<&DailySessionLine> = session_lines
+        .iter()
+        .filter(|line| line.date == Some(date))
+        .collect();
+    day_lines.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    day_lines
+}
+
+/// The fact names and `<path>:<line>` session entries a rollup of `date` renders.
+///
+/// This is the selection and ordering [`render_rollup`] applies, exposed so a caller can
+/// report exactly what the rendered document contains without parsing it: the fact names in
+/// rendered order (fixed type order, then name ascending) and the session entries as
+/// `<path>:<line>`, ordered by `(path, line)` ascending. Neither list mentions a fact or line
+/// that the document leaves out.
+#[must_use]
+pub fn select_rollup_inputs(
+    date: NaiveDate,
+    facts: &[CodingFact],
+    session_lines: &[DailySessionLine],
+) -> (Vec<String>, Vec<String>) {
+    let names = ordered_facts(date, facts)
+        .iter()
+        .map(|fact| fact.name.clone())
+        .collect();
+    let sessions = ordered_lines(date, session_lines)
+        .iter()
+        .map(|line| format!("{}:{}", line.path, line.line))
+        .collect();
+    (names, sessions)
 }
 
 /// The sort rank of a fact type: the declaration order of [`CodingFactType::ALL`].
