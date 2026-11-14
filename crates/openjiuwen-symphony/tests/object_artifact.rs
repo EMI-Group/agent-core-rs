@@ -1,7 +1,8 @@
 //! Behaviour tests for the object-storage graph artifact backend: numbered immutable
-//! revisions, the `current` pointer, status reporting, reopen persistence, and the typed
-//! unsupported transport. The Google Cloud Storage transport is covered by
-//! `tests/artifact_gcs.rs`.
+//! revisions, the `current` pointer, status reporting, reopen persistence, and the
+//! transport-descriptor validation. The cloud transports build their own clients and are
+//! covered by `tests/artifact_gcs.rs` (Google Cloud Storage) and `tests/artifact_azure.rs`
+//! (Azure Blob Storage).
 //!
 //! Everything is offline and deterministic: the in-memory object store backs most cases, the
 //! local backend publishes into a `tempfile::TempDir`, and no assertion depends on the wall
@@ -17,7 +18,7 @@ use openjiuwen_foundation::store::{InMemoryObjectStore, LocalObjectStore, Object
 use openjiuwen_symphony::artifact::{
     GraphArtifactStatus, GraphArtifactStore, STATUS_MISSING, STATUS_READY,
 };
-use openjiuwen_symphony::error::{is_unsupported, ErrorKind};
+use openjiuwen_symphony::error::ErrorKind;
 use openjiuwen_symphony::graph::{CapabilityEdge, CapabilityGraph, CapabilityNode};
 use openjiuwen_symphony::object_artifact::{
     ArtifactTransport, ObjectGraphArtifactStore, DEFAULT_BUCKET,
@@ -319,18 +320,10 @@ async fn the_local_backend_tolerates_a_prefix_free_layout() {
 }
 
 #[tokio::test]
-async fn the_deferred_transport_is_a_typed_unsupported_error() {
-    // Google Cloud Storage is a real transport (see `tests/artifact_gcs.rs`); Azure Blob is
-    // still the one backend with no in-crate client.
-    let error = ObjectGraphArtifactStore::open(ArtifactTransport::AzureBlob, "bucket", "graph")
-        .expect_err("a deferred transport must not resolve to a backend");
-    assert!(is_unsupported(&error));
-    assert!(
-        error.message().contains("azure_blob"),
-        "the message must name the transport: {}",
-        error.message()
-    );
-
+async fn the_object_store_transport_carries_no_connection_details() {
+    // The three cloud transports build their own clients (see `tests/artifact_gcs.rs` and
+    // `tests/artifact_azure.rs`); a caller-owned store has nothing to reconstruct, so opening
+    // one is a validation error that points at the constructor.
     let error = ObjectGraphArtifactStore::open(ArtifactTransport::ObjectStore, "bucket", "graph")
         .expect_err("an unresolvable store must be rejected");
     assert_eq!(error.kind(), ErrorKind::Validation);
@@ -340,7 +333,6 @@ async fn the_deferred_transport_is_a_typed_unsupported_error() {
         error.message()
     );
 }
-
 #[tokio::test]
 async fn a_blank_bucket_is_a_validation_error_on_every_operation() {
     let objects = Arc::new(InMemoryObjectStore::new());

@@ -33,8 +33,8 @@
 //! - [`flow`] — flow distillation ([`flow::FlowEngine`]) and reusable `SkillPack` artifacts.
 //! - [`llm`] — LLM-guided stages (tree retrieval, ontology matching, semantic scoring,
 //!   fingerprint extraction, judging) with deterministic offline fallbacks.
-//! - [`object_artifact`] — S3/OBS and GCS graph artifact persistence over foundation's
-//!   object stores and the Google Cloud Storage JSON API.
+//! - [`object_artifact`] — S3/OBS, GCS and Azure Blob graph artifact persistence over
+//!   foundation's object stores and the Google Cloud Storage and Azure Blob REST APIs.
 //! - [`runtime`] — [`runtime::SymphonyRuntime`], the composition root: configuration,
 //!   lifecycle (`start`/`stop`/`close`), graph build, plan, invoke, mutations, and
 //!   evolution feedback.
