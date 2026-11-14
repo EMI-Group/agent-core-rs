@@ -24,7 +24,10 @@
 //! - `verifier` — the progress-verifier seam, structural and model-driven verification,
 //!   and proposal ranking
 //! - `aggregate` — labelled or model-synthesised aggregation of the proposals
-//! - `rail` — the harness rail that publishes [`moa_section`] and holds the last outcome
+//! - `rail` — [`MoaRail`], which publishes [`moa_section`] and the invocation
+//!   snapshot/outcome diagnostics into the rail context, holds the last
+//!   [`ConsultationOutcome`] and the bounded [`ConsultationHistory`], and exposes the explicit
+//!   [`MoaRail::consult`] call
 //! - `builtin_skills`/`skill_mount` — the embedded `consult-reference-models` skill
 //!   descriptor and its mounting into a [`crate::skills::SkillLibrary`]
 //!
@@ -48,19 +51,33 @@ pub mod verifier;
 #[cfg(test)]
 mod tests;
 
+pub use aggregate::{AggregationStrategy, Aggregator};
+pub use builtin_skills::{
+    builtin_skill_content, consult_skill, materialize_builtin_skill, validate_builtin_skill_name,
+    CONSULT_SKILL_BODY, CONSULT_SKILL_DESCRIPTION, CONSULT_SKILL_FILE, CONSULT_SKILL_NAME,
+};
 pub use config::{
     JevConfig, MoaConfig, MoaMode, VerifierConfig, VerifierSelection, DEFAULT_HISTORY_LIMIT,
     DEFAULT_MAX_ADVICE_CHARS, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REFERENCE_CHARS,
     DEFAULT_REFERENCE_TIMEOUT_SECS,
 };
+pub use consultation::{consult, consult_problem, Consultation, CONSULT_TOOL_NAME};
 pub use prompts::{
     aggregation_messages, consultation_transcript, escape_xml, moa_section, reference_messages,
     render_reference_proposals, verifier_messages, AGGREGATOR_SYSTEM_PROMPT,
     MOA_PROMPT_SECTION_NAME, REFERENCE_SYSTEM_PROMPT,
 };
+pub use rail::{
+    MoaRail, MOA_OUTCOME_EXTRA_KEY, MOA_PROMPT_SECTION, MOA_RAIL_NAME, MOA_STATE_EXTRA_KEY,
+};
 pub use redaction::redact;
+pub use skill_mount::ConsultationSkillMount;
 pub use state::{
     ConsultationHistory, ConsultationOutcome, ConsultationRecord, MoaSnapshot, MoaState,
     ProposalAttempt, ProposalBatch, ProposalSource, ProposalStore, ProposerFailure, RankedProposal,
     TurnKey,
+};
+pub use verifier::{
+    rank_proposals, rank_with_config, score_progress, score_proposal, LlmVerifier,
+    ProgressVerifier, StructuralVerifier,
 };

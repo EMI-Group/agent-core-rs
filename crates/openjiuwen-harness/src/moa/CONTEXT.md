@@ -17,7 +17,7 @@ Python entry points and persisted JSON keys are preserved where the reference pe
 - `consultation.rs` — bounded concurrent proposer fan-out over injected models with timeout, cancellation and partial-failure accounting.
 - `verifier.rs` — `ProgressVerifier` seam, offline `StructuralVerifier`, model-driven `LlmVerifier`, structural proposal ranking (`rank_proposals`).
 - `aggregate.rs` — `AggregationStrategy`, `Aggregator`: deterministic labelled concatenation by default, optional model synthesis.
-- `rail.rs` — `MoaRail`: harness rail that publishes the MoA system-prompt section, gates on config, and exposes the last consultation outcome.
+- `rail.rs` — `MoaRail`: harness rail that publishes the MoA system-prompt section, installs the per-invocation `MoaState`, publishes the snapshot/outcome diagnostics, and owns the explicit `consult` call, the last outcome and the bounded history.
 - `builtin_skills.rs` — embedded `consult-reference-models` skill descriptor and materialization helper.
 - `skill_mount.rs` — `ConsultationSkillMount`: validates and mounts the consultation skill root into a `crate::skills::SkillLibrary`.
 - `tests.rs` — offline integration-style suite for the whole module.
@@ -71,7 +71,7 @@ Every public item is re-exported from this module root; the crate root adds the 
 - Files around 1000 lines; each file has a single responsibility.
 - Pedantic clippy and `missing_docs` are enforced by `-D warnings`; document every public item and every `# Errors` case.
 - Consultations fail open on partial proposer failure and fail only when every proposer fails; a failed proposer is recorded with its index and error.
-- The rail never calls a model: `consult` is an explicit API the host calls; hooks only read config/outcome and publish the prompt section.
+- The rail hooks never call a model: `consult` is an explicit API the host calls (it asks the proposers and, when configured, the synthesis aggregator); hooks only read config/state/outcome and publish the prompt section.
 - `MoaConfig` holds live `Arc<dyn Model>` handles, so it is not serde; the serde-able knobs live in `VerifierConfig`/`JevConfig` and in the snapshot/outcome types.
 
 ## Test Strategy
@@ -84,9 +84,9 @@ Every public item is re-exported from this module root; the crate root adds the 
 - `consultation.rs`: fan-out preserves configured order, partial failure is recorded and does not sink the batch, all-fail returns an error, per-proposer character caps are applied, pre-cancelled token returns `Error::Cancelled`, timeout is recorded as a failure.
 - `verifier.rs`: structural scores stay in 0..1, longer/structured proposals outrank thin ones, redaction applies before scoring, `LlmVerifier` parses a scripted score and rejects non-numeric output, progress scores detect stalled repetition, config selection picks structural vs LLM.
 - `aggregate.rs`: labelled output shape and source order, empty sources, synthesis required-model error, synthesis through `ScriptedModel`, cancellation.
-- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, consult stores outcome/history, fresh state per invocation.
+- `rail.rs`: disabled config publishes nothing, enabled config publishes exactly one `moa` section into `prompt_sections`, mode-specific text, priority/name, outcome publication, consult stores outcome/history, `before_model_call` upserts, `after_invoke` retires the state, history file round-trip.
 - `skill_mount.rs`: embedded descriptor, explicit directory validation and error messages, mount/unmount ownership, materialization round-trip.
-- `tests.rs`: end-to-end offline scenario (proposers -> verifier -> aggregator -> rail -> history).
+- `tests.rs`: end-to-end offline scenarios (proposers -> verifier -> aggregator -> rail -> history, all-fail, cancellation, synthesis, redaction, config validation, snapshot/history JSON, skill materialization/mount/unmount).
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline`, `--no-default-features`, `--all-features`, `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` warning-free.
 
 ## Deferred items (typed)
