@@ -103,7 +103,8 @@ Missing rows are not errors (`get` `Ok(None)`, `delete` `Ok(false)`, `delete_sco
 `DistributedKvLock` (`async_trait`, `Send + Sync`) has `backend()` (`"in-process"`, `"file"`, or a vendor label) and `acquire(name, options) -> Result<KvLockGuard>`; `KvLockGuard` exposes `name`, `owner`, `backend`, `is_held`, `expires_at`, and `release(self)`, and `Drop` releases too.
 Backends: `InProcessKvLock` (one `tokio::sync::Mutex` per name; `new`, `held_names`), `FileKvLock` (`new(root)` creates the root, `with_timeout`, `root`, `lock_path`, `sidecar_path`, `is_enabled`), and `UnsupportedKvLock` (`new(backend)`, `redis()`).
 
-The lock name is the unit of exclusion (Python's `_lock/{name}` key): a migration run takes `migrate`, the dream worker `dream`, and callers may pick others such as `team_memory`.
+The lock name is the unit of exclusion (Python's `_lock/{name}` key); a caller picks one per store root, for example `migrate` for a migration run or `dream` for a dream-worker sweep.
+Nothing in the crate takes a lock implicitly and no background task is started, so `run_migrations`/`run_due` callers own the acquisition.
 `LockOptions::validate` (called by every backend) rejects an empty/blank/NUL/over-128-character owner and a zero timeout or poll interval with `Error::Validation`; `acquire` also rejects a name containing `/` or `\`.
 A `timeout` bounds the wait and expires with `Error::timeout`; the `ttl` is only recorded on `expires_at` (advisory), because no local backend evicts a holder on expiry.
 Release is drop-based and synchronous — dropping the guard frees the in-process name or closes the `flock` descriptor — so there is no daemon, cleanup task, or background expiry.
