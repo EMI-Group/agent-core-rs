@@ -474,14 +474,13 @@ fn native_engine_reports_the_deferral_as_a_fallback() {
 }
 
 #[test]
-fn loading_a_native_tokenizer_is_a_typed_deferral() {
+fn loading_a_missing_native_tokenizer_is_a_typed_not_found() {
+    // `tokenizer.json` artifacts are decoded in pure Rust; only a missing
+    // artifact (or an unsupported model type) is refused, both typed.
     let error = load_native_tokenizer("/tmp/does-not-exist/tokenizer.json").unwrap_err();
     match error {
-        Error::Unsupported(message) => {
-            assert!(message.contains("native tokenizer.json"));
-            assert!(message.contains("HuggingFace tokenizers"));
-        }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
+        Error::NotFound(message) => assert!(message.contains("tokenizer.json")),
+        other => panic!("expected Error::NotFound, got {other:?}"),
     }
 }
 
