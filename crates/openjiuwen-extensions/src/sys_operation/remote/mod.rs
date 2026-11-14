@@ -90,6 +90,17 @@ pub(crate) fn provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
     }
 }
 
+/// One process-wide guard shared by every teardown suite in this subtree.
+///
+/// [`SandboxSelector::all`] drains the whole process cache, so a drain in one
+/// provider suite can delete the container another teardown test is about to
+/// release. Every teardown test therefore serialises on this single lock
+/// rather than a per-module one.
+#[cfg(test)]
+pub(crate) fn teardown_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &GUARD
+}
 /// Releases the cached containers of one remote sandbox type.
 ///
 /// `aio` has no container-delete API (the gateway reaps idle containers), so it
@@ -103,6 +114,7 @@ pub(crate) fn provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
 /// for the `aio` sandbox type and for an unknown type, and
 /// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
 /// for a selector that names nothing to release.
+
 pub async fn teardown_remote(
     sandbox_type: &str,
     selector: &SandboxSelector,

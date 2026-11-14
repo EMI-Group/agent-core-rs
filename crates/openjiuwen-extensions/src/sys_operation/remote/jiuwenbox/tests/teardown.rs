@@ -14,15 +14,14 @@
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
 use serde_json::json;
-use tokio::sync::Mutex;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::super::{teardown, JiuwenBoxBackend, SandboxBackend, SandboxSelector};
 use super::{mount_create, mount_download, unique_isolation_key, NO_RECREATE, SANDBOX_ID};
 
-/// Serialises the cases: [`SandboxSelector::all`] drains the whole process cache.
-static TEARDOWN_CASES: Mutex<()> = Mutex::const_new(());
+// The cases serialise on `remote::teardown_guard`, which every teardown suite in
+// this subtree shares: [`SandboxSelector::all`] drains the whole process cache.
 
 /// `/api/v1/sandboxes/{id}`: the container-delete path.
 fn container_path(sandbox_id: &str) -> String {
@@ -108,7 +107,7 @@ async fn delete_paths(server: &MockServer) -> Vec<String> {
 
 #[tokio::test]
 async fn teardown_deletes_the_cached_container_and_drains_the_cache() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation = unique_isolation_key();
     mount_create(&server, SANDBOX_ID).await;
@@ -162,7 +161,7 @@ async fn teardown_deletes_the_cached_container_and_drains_the_cache() {
 
 #[tokio::test]
 async fn a_404_delete_counts_as_released() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation = unique_isolation_key();
     mount_create(&server, SANDBOX_ID).await;
@@ -196,7 +195,7 @@ async fn a_404_delete_counts_as_released() {
 
 #[tokio::test]
 async fn a_500_delete_is_recorded_without_panicking() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation = unique_isolation_key();
     mount_create(&server, SANDBOX_ID).await;
@@ -237,7 +236,7 @@ async fn a_500_delete_is_recorded_without_panicking() {
 
 #[tokio::test]
 async fn a_sandbox_id_selector_releases_the_matching_cache_value() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation = unique_isolation_key();
     // A distinct id keeps the cache-value lookup away from other cases' `sb-1`.
@@ -275,7 +274,7 @@ async fn a_sandbox_id_selector_releases_the_matching_cache_value() {
 
 #[tokio::test]
 async fn delete_all_releases_every_entry_built_here() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation_a = unique_isolation_key();
     let isolation_b = unique_isolation_key();
@@ -331,7 +330,7 @@ async fn delete_all_releases_every_entry_built_here() {
 
 #[tokio::test]
 async fn a_scope_selector_leaves_the_other_isolation_key_alone() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation_a = unique_isolation_key();
     let isolation_b = unique_isolation_key();
@@ -404,7 +403,7 @@ async fn a_scope_selector_leaves_the_other_isolation_key_alone() {
 
 #[tokio::test]
 async fn a_default_selector_is_a_validation_error() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
 
     let error = teardown(&SandboxSelector::default()).await.unwrap_err();
 
@@ -414,7 +413,7 @@ async fn a_default_selector_is_a_validation_error() {
 
 #[tokio::test]
 async fn a_shared_key_miss_with_a_sandbox_id_deletes_through_the_key_base_url() {
-    let _serial = TEARDOWN_CASES.lock().await;
+    let _serial = crate::sys_operation::remote::teardown_guard().lock().await;
     let server = MockServer::start().await;
     let isolation = unique_isolation_key();
     // Never created here, so neither the key nor the id is in the cache.

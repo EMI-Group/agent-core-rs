@@ -73,11 +73,11 @@ fn isolation(label: &str) -> String {
 /// other's entries and every "the cache still/again holds my entry" assertion
 /// would race. Holding this guard for the whole test body keeps the drains
 /// deterministic without touching production code.
-static TEARDOWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// The lock itself is shared with the JiuwenBox teardown suite.
 
 /// Waits until no other teardown test is running.
 async fn exclusive_teardown() -> tokio::sync::MutexGuard<'static, ()> {
-    TEARDOWN_LOCK.lock().await
+    crate::sys_operation::remote::teardown_guard().lock().await
 }
 
 /// Mounts one `DELETE` responder answering `status` with `body` for every path.
