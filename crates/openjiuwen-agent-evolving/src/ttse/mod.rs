@@ -40,6 +40,7 @@ mod config;
 mod consult;
 mod dream;
 mod dream_llm;
+mod dream_prompt;
 mod engine;
 mod index;
 mod induce;
@@ -52,7 +53,7 @@ pub use classify::{ClassificationRule, TipClassifier};
 pub use config::TtseConfig;
 pub use consult::{consult, render_tips};
 pub use dream::Dreamer;
-pub use dream_llm::{
+pub use dream_prompt::{
     normalize_merge_subset, parse_merge_verdict, parse_purge_verdicts, MergeDecision, MergeVerdict,
     PurgeDecision, PurgeVerdict, DEFAULT_MAX_LLM_MERGES, DREAM_MERGE_INSTRUCTION,
     DREAM_PURGE_INSTRUCTION,

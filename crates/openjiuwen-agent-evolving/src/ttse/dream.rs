@@ -19,7 +19,7 @@ use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
 
 use crate::ttse::bank::{jaccard, tokenize, TipBank};
 use crate::ttse::config::TtseConfig;
-use crate::ttse::dream_llm::DEFAULT_MAX_LLM_MERGES;
+use crate::ttse::dream_prompt::DEFAULT_MAX_LLM_MERGES;
 use crate::ttse::models::DreamReport;
 
 /// The smallest cluster the dreamer will ever merge.
