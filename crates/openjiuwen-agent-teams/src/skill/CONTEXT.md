@@ -15,7 +15,7 @@ When this process hosts no such team it falls back to the attach socket a hostin
 ```rust
 // descriptor.rs
 pub const TEAM_JOIN_ENV: &str;            // re-exported from crate::constants
-pub const TEAM_SOCKET_ENV: &str;         // "OPENJIUWEN_TEAM_SOCKET"
+pub const TEAM_SOCKET_ENV: &str;         // "OPENJIUWEN_TEAM_SOCKET"; no crate-root or `skill` re-export, reach it as `openjiuwen_agent_teams::skill::descriptor::TEAM_SOCKET_ENV`
 pub enum ClientScope { Operator, Member } // serde "operator" | "member", default operator
 pub struct TeamJoinDescriptor { /* see below */ }
 impl TeamJoinDescriptor {
