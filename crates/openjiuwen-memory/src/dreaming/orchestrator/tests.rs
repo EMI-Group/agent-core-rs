@@ -705,17 +705,16 @@ fn debug_and_status_are_inspectable() {
 }
 
 #[test]
-fn config_serde_round_trips_and_skips_the_lease() {
+fn config_serde_round_trips_with_the_lease_in_milliseconds() {
     let config = DreamOrchestratorConfig::default()
         .with_poll_interval_ms(1_000)
         .with_retention(DreamRetention::new(30))
         .with_lease(lease_options("worker-a", 30));
     let json = serde_json::to_string(&config).unwrap();
-    assert!(!json.contains("lease"), "{json}");
-    let mut expected = config.clone();
-    expected.lease = None;
+    assert!(json.contains("\"owner\":\"worker-a\""), "{json}");
+    assert!(json.contains("\"ttl\":30000"), "{json}");
     let parsed: DreamOrchestratorConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed, expected);
+    assert_eq!(parsed, config);
 
     let partial: DreamOrchestratorConfig =
         serde_json::from_str(r#"{"poll_interval_ms": 1000}"#).unwrap();

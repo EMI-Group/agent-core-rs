@@ -132,12 +132,8 @@ pub struct DreamOrchestratorConfig {
     /// workers safe on one repository. The orchestrator never renews a lease in the
     /// background: the planner renews once per job and this loop does not shorten a TTL.
     ///
-    /// This is the one field JSON does not carry: [`DreamLeaseOptions`] holds a
-    /// [`chrono::Duration`] and a [`std::time::Duration`], and the lease module keeps it a
-    /// plain value rather than a wire type, so the field is skipped by serde and defaults
-    /// to `None` on deserialize. Set it in code with
-    /// [`DreamOrchestratorConfig::with_lease`].
-    #[serde(skip)]
+    /// JSON carries the owner plus `"ttl"` and `"heartbeat"` in whole milliseconds; set it
+    /// in code with [`DreamOrchestratorConfig::with_lease`].
     pub lease: Option<DreamLeaseOptions>,
     /// The retention policy applied on each tick; default `None` (no purge).
     ///

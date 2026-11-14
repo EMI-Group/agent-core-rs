@@ -219,14 +219,67 @@ impl LeaseStatus {
 ///
 /// The heartbeat must be positive and shorter than the TTL; otherwise a worker could
 /// lose its lease between two renewals even while making progress.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// JSON carries the two durations as whole milliseconds (`"ttl": 60000`,
+/// `"heartbeat": 15000`) so a config file stays readable and round-trips exactly.
+/// [`Default`] uses a 60 s TTL and a 15 s heartbeat with an empty owner, which
+/// [`DreamLeaseOptions::validate`] rejects until the owner is set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
 pub struct DreamLeaseOptions {
     /// Identifier of the worker running the sweep.
     pub owner: String,
     /// Lease lifetime handed to every claim and renewal.
+    #[serde(with = "chrono_millis")]
     pub ttl: ChronoDuration,
     /// How often an in-flight attempt renews its lease.
+    #[serde(with = "std_millis")]
     pub heartbeat: StdDuration,
+}
+impl Default for DreamLeaseOptions {
+    fn default() -> Self {
+        Self {
+            owner: String::new(),
+            ttl: ChronoDuration::seconds(60),
+            heartbeat: StdDuration::from_secs(15),
+        }
+    }
+}
+/// Serde support encoding a `chrono::Duration` as whole milliseconds.
+mod chrono_millis {
+    use chrono::Duration as ChronoDuration;
+    use serde::{Deserialize, Deserializer, Serializer};
+    /// Writes the duration as an `i64` millisecond count.
+    pub(super) fn serialize<S: Serializer>(
+        value: &ChronoDuration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(value.num_milliseconds())
+    }
+    /// Reads a millisecond count back into a duration.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ChronoDuration, D::Error> {
+        Ok(ChronoDuration::milliseconds(i64::deserialize(deserializer)?))
+    }
+}
+/// Serde support encoding a `std::time::Duration` as whole milliseconds.
+mod std_millis {
+    use std::time::Duration as StdDuration;
+    use serde::{Deserialize, Deserializer, Serializer};
+    /// Writes the duration as a `u64` millisecond count, saturating beyond `u64::MAX`.
+    pub(super) fn serialize<S: Serializer>(
+        value: &StdDuration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
+    }
+    /// Reads a millisecond count back into a duration.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<StdDuration, D::Error> {
+        Ok(StdDuration::from_millis(u64::deserialize(deserializer)?))
+    }
 }
 
 impl DreamLeaseOptions {
@@ -643,6 +696,27 @@ mod tests {
             assert_eq!(LeaseStatus::Lost(reason).reason(), Some(reason));
             assert_eq!(reason.to_string(), reason.as_str());
         }
+    }
+
+    #[test]
+    fn options_round_trip_through_json_with_millisecond_durations() {
+        let options = DreamLeaseOptions::new(
+            "worker-a",
+            ChronoDuration::seconds(600),
+            StdDuration::from_millis(1_500),
+        );
+        let json = serde_json::to_value(&options).unwrap();
+        assert_eq!(json["owner"], serde_json::json!("worker-a"));
+        assert_eq!(json["ttl"], serde_json::json!(600_000));
+        assert_eq!(json["heartbeat"], serde_json::json!(1_500));
+        let parsed: DreamLeaseOptions = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, options);
+        let default: DreamLeaseOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, DreamLeaseOptions::default());
+        assert!(
+            default.validate().is_err(),
+            "the default owner is empty, so it must not validate"
+        );
     }
 
     #[tokio::test]
