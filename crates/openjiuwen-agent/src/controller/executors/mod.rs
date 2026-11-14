@@ -14,6 +14,15 @@
 //! executor failures, and timeouts become failed results rather than errors, so
 //! a batch always yields a run per dispatched task.
 //!
+//! The background half of Python's `TaskScheduler` (`schedule()`,
+//! `execute_task()`, `pause_task()`, `cancel_task()`, and the completion
+//! signal) lives in [`background`]: [`TaskSchedulerLoop`] scans the
+//! `TaskManager` for submitted tasks, runs them concurrently under
+//! `ControllerConfig::max_concurrent_tasks`, and drives pause/cancel through
+//! the [`TaskExecutor`] hooks plus [`TaskContext::cancellation`]. Every
+//! executor keeps working unchanged: the hooks default to "cannot pause, can
+//! cancel, no-op actions".
+//!
 //! The concrete executors live in [`builtin`] and are re-exported here:
 //! [`ControllerAgent`] runs one [`Agent`](crate::agent::Agent),
 //! [`WorkflowController`] runs a registered workflow, and [`LLMController`] is
@@ -29,10 +38,13 @@ use openjiuwen_session::Session;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+pub mod background;
 pub mod builtin;
 
+pub use background::{SessionProvider, TaskSchedulerLoop};
 pub use builtin::{ControllerAgent, ExecutorInfo, LLMController, WorkflowController};
 
 /// Task type of the built-in agent executor ([`ControllerAgent`]).
@@ -55,12 +67,21 @@ const WORKFLOW_DESCRIPTION: &str = "runs a workflow";
 /// touch session state; executors that need one call
 /// [`require_session`](Self::require_session) to turn its absence into a typed
 /// error.
+///
+/// [`cancellation`](Self::cancellation) is the stop signal of the dispatch: a
+/// background scheduler ([`TaskSchedulerLoop`]) cancels it after a pause or a
+/// cancel request, and once the scheduler stops, so a cooperative executor
+/// selects on it and returns early. A dispatch with no scheduler around it
+/// (`TaskScheduler::dispatch`, `BaseController`) installs a fresh,
+/// never-cancelled token.
 #[derive(Clone, Default)]
 pub struct TaskContext<'a> {
     /// Session shared by the dispatched tasks, when the caller has one.
     pub session: Option<Arc<dyn Session>>,
     /// Id of the controller driving the dispatch, used in diagnostics.
     pub controller_id: &'a str,
+    /// Stop signal of the dispatch; never cancelled unless a scheduler asks.
+    pub cancellation: CancellationToken,
 }
 
 impl<'a> TaskContext<'a> {
@@ -70,7 +91,19 @@ impl<'a> TaskContext<'a> {
         Self {
             session,
             controller_id,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Replaces the dispatch stop signal with `token`.
+    ///
+    /// The scheduler hands the same token to [`TaskExecutor::pause`] and
+    /// [`TaskExecutor::cancel`] handling, so an executor that registered a
+    /// listener on it observes the request it is being told about.
+    #[must_use]
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = token;
+        self
     }
 
     /// Returns the session id, when a session is present.
@@ -120,6 +153,45 @@ pub trait TaskExecutor: Send + Sync {
     /// missing workflow, invalid input); the scheduler maps it onto a failed
     /// task result.
     async fn execute(&self, task: &Task, ctx: &TaskContext<'_>) -> Result<TaskResult>;
+
+    /// Reports whether a running `task` can be paused.
+    ///
+    /// Returns `(true, "")` when the executor supports pausing, and
+    /// `(false, reason)` otherwise. The default cannot pause
+    /// (`"task executor does not support pausing"`), so an executor becomes
+    /// pausable only by overriding this hook and [`pause`](Self::pause).
+    async fn can_pause(&self, _task: &Task, _ctx: &TaskContext<'_>) -> (bool, String) {
+        (false, "task executor does not support pausing".to_owned())
+    }
+
+    /// Pauses `task`, returning whether the executor took the request.
+    ///
+    /// The background scheduler calls this only after [`can_pause`](
+    /// Self::can_pause) said yes, then cancels [`TaskContext::cancellation`]
+    /// and records [`TaskStatus::Paused`] itself; the return value reports the
+    /// executor's own bookkeeping, not the task status. The default is a no-op
+    /// that returns `false`.
+    async fn pause(&self, _task: &Task, _ctx: &TaskContext<'_>) -> bool {
+        false
+    }
+
+    /// Reports whether a running `task` can be cancelled.
+    ///
+    /// The default can cancel (`(true, "")`), matching Python's permissive
+    /// contract: the scheduler cancels [`TaskContext::cancellation`] and marks
+    /// the task [`TaskStatus::Canceled`] regardless of what
+    /// [`cancel`](Self::cancel) does.
+    async fn can_cancel(&self, _task: &Task, _ctx: &TaskContext<'_>) -> (bool, String) {
+        (true, String::new())
+    }
+
+    /// Cancels `task`, returning whether the executor took the request.
+    ///
+    /// The return value is informational (the scheduler records the cancelled
+    /// status itself); the default is a no-op that returns `false`.
+    async fn cancel(&self, _task: &Task, _ctx: &TaskContext<'_>) -> bool {
+        false
+    }
 }
 
 /// Executors keyed by task type.
