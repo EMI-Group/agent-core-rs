@@ -24,37 +24,43 @@
 //! # }
 //! ```
 //!
+//! The context is split by responsibility: `history` holds the [`ModelContext`]
+//! implementation, `state` persists messages and processor checkpoints,
+//! `window_tracking` keeps and diffs the last two LLM-bound windows, `usage`
+//! builds the `context.usage` block, and `prepare` assembles the request
+//! payload.
+//!
 //! [`prepare`]: ConversationContext::prepare
 //! [`ConversationContext`]: crate::context::ConversationContext
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::Result;
 use openjiuwen_foundation::llm::Model;
-use openjiuwen_foundation::prompt::{BaseMessage, MessageContent, Role, TokenCounter};
+use openjiuwen_foundation::prompt::{BaseMessage, TokenCounter};
 use openjiuwen_session::Session;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ContextConfig;
-use crate::engine::PrepareOptions;
-use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
-use crate::policy::{
-    detect_context_window_change, ContextWindowChange, ContextWindowSnapshot, ResolvedContextWindow,
-};
-use crate::processor::{ContextPipeline, ContextProcessor, ProcessorContext};
+use crate::policy::ContextWindowSnapshot;
+use crate::processor::{ContextPipeline, ContextProcessor};
 use crate::recall::RecallArchiveStore;
-use crate::reload::{inject_reload_hint, ReloadLanguage};
 use crate::session_memory::SessionMemoryStore;
-use crate::stats::{compute_stats, ContextStats, PreparedContext};
-use crate::telemetry::{CompressionStatePhase, ContextProcessorStateRecorder};
-use crate::tokens::count_messages;
-use crate::usage::{AnalysisInput, ContextUsageAnalyzer, ContextUsageSnapshot};
-use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
+use crate::stats::ContextStats;
+use crate::telemetry::ContextProcessorStateRecorder;
+use crate::usage::ContextUsageAnalyzer;
+
+mod history;
+mod prepare;
+mod state;
+mod usage;
+mod window_tracking;
+
+pub use state::ContextState;
 
 /// The conversation history an agent talks to.
 ///
@@ -76,21 +82,24 @@ pub trait ModelContext: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when the implementation rejects a message.
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// when the implementation rejects a message.
     async fn set_messages(&self, messages: Vec<BaseMessage>) -> Result<()>;
 
     /// Appends one message.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when the message is malformed.
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// when the message is malformed.
     async fn add_message(&self, message: BaseMessage) -> Result<()>;
 
     /// Removes and returns the newest `count` messages.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] when `count` is zero.
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation)
+    /// when `count` is zero.
     async fn pop_messages(&self, count: usize) -> Result<Vec<BaseMessage>>;
 
     /// Removes every message.
@@ -108,35 +117,6 @@ pub trait ModelContext: Send + Sync {
 
     /// The revision number, incremented on every mutation.
     fn revision(&self) -> u64;
-}
-
-/// The persistable state of a [`ConversationContext`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ContextState {
-    /// The stored messages, oldest first.
-    pub messages: Vec<BaseMessage>,
-    /// The revision the messages were saved at.
-    pub revision: u64,
-    /// Process-level checkpoint state, keyed by processor name.
-    ///
-    /// Filled from [`ContextPipeline::save_state`] and restored through
-    /// [`ContextPipeline::load_state`], so a processor's cross-run counters
-    /// survive the process that wrote them. Empty when no processor keeps
-    /// counters, and when the state was written before processors had any.
-    pub processors: std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-/// Whether a message carries no payload at all.
-///
-/// Only [`MessageContent::Text`] that is empty and a [`MessageContent::Parts`]
-/// list with no entries count as empty; a part list holding an image is *not*
-/// empty, so multimodal messages are never rejected.
-fn is_empty_content(content: &MessageContent) -> bool {
-    match content {
-        MessageContent::Text(text) => text.is_empty(),
-        MessageContent::Parts(parts) => parts.is_empty(),
-    }
 }
 
 /// The last two LLM-bound windows and when the current one was prepared.
@@ -259,7 +239,9 @@ impl ConversationContext {
             windows: StdMutex::new(WindowTracking::default()),
         }
     }
+}
 
+impl ConversationContext {
     /// The engine configuration this context was created with.
     #[must_use]
     pub fn config(&self) -> &ContextConfig {
@@ -342,697 +324,11 @@ impl ConversationContext {
         self.pipeline.recorder().is_some()
     }
 
-    /// The analyzer that fills [`PreparedContext::usage`], when configured.
-    ///
-    /// [`PreparedContext::usage`]: crate::stats::PreparedContext::usage
-    #[must_use]
-    pub fn usage_analyzer(&self) -> Option<&Arc<ContextUsageAnalyzer>> {
-        self.usage_analyzer.as_ref()
-    }
-
-    /// The context window the engine resolves for this context's configuration.
-    #[must_use]
-    pub fn resolved_window(&self) -> ResolvedContextWindow {
-        self.config.resolved_window()
-    }
-
-    /// Diffs the most recently prepared window against the one before it.
-    ///
-    /// The diff is the KV-cache primitive:
-    /// [`ContextWindowChange::Appended`] keeps the whole prefix warm, while a
-    /// system, tool or content change invalidates the corresponding suffix.
-    /// Before the first [`ConversationContext::prepare`] the answer is
-    /// [`ContextWindowChange::Unchanged`] with zero messages, and the call never
-    /// mutates the stored history.
-    #[must_use]
-    pub fn detect_window_change(&self) -> ContextWindowChange {
-        let windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-        match (&windows.previous, &windows.current) {
-            (Some(previous), Some(current)) => detect_context_window_change(previous, current),
-            (None, Some(current)) => detect_context_window_change(current, current),
-            (_, None) => ContextWindowChange::Unchanged { messages: 0 },
-        }
-    }
-
-    /// When the most recent LLM-bound window was prepared.
-    #[must_use]
-    pub fn last_context_window_access(&self) -> Option<Instant> {
-        self.windows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .accessed
-    }
-
-    /// The most recent LLM-bound window, when one was prepared.
-    #[must_use]
-    pub(crate) fn last_window_snapshot(&self) -> Option<ContextWindowSnapshot> {
-        self.windows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .current
-            .clone()
-    }
-
-    /// Records `window` as the current LLM-bound window.
-    fn track_window(&self, window: ContextWindowSnapshot) {
-        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-        let previous = windows.current.take();
-        windows.previous = previous;
-        windows.current = Some(window);
-        windows.accessed = Some(Instant::now());
-    }
-
-    /// Wraps `analyzer` with the resolved window limit when it has none.
-    fn analyzer_with_limit(&self, analyzer: &ContextUsageAnalyzer) -> Option<ContextUsageAnalyzer> {
-        if analyzer.context_window_limit().is_some() {
-            return None;
-        }
-        let limit = u64::try_from(self.resolved_window().tokens).unwrap_or(u64::MAX);
-        Some(
-            ContextUsageAnalyzer::new(
-                Arc::clone(&self.counter),
-                analyzer.counter_identity().clone(),
-            )
-            .with_model(analyzer.model())
-            .with_context_window_limit(Some(limit)),
-        )
-    }
-
-    /// Measures `input` and reconciles it with the provider total.
-    pub(crate) fn analyze_window(
-        &self,
-        analyzer: &ContextUsageAnalyzer,
-        input: &AnalysisInput<'_>,
-    ) -> ContextUsageSnapshot {
-        match self.analyzer_with_limit(analyzer) {
-            Some(derived) => derived.analyze(input),
-            None => analyzer.analyze(input),
-        }
-    }
-
-    /// Freezes the local measurement of `input` into a report.
-    pub(crate) fn build_window_report(
-        &self,
-        analyzer: &ContextUsageAnalyzer,
-        input: &AnalysisInput<'_>,
-    ) -> crate::usage::ContextWindowTokenReport {
-        match self.analyzer_with_limit(analyzer) {
-            Some(derived) => derived.build_report(input),
-            None => analyzer.build_report(input),
-        }
-    }
-
-    /// Builds the `context.usage` block of a prepared window, when configured.
-    fn usage_snapshot_for(
-        &self,
-        window: &ContextWindowSnapshot,
-        stats: &ContextStats,
-    ) -> Option<ContextUsageSnapshot> {
-        let analyzer = self.usage_analyzer.as_ref()?;
-        let mut input = AnalysisInput::new("", &self.session_id);
-        input.context_id = Some(&self.context_id);
-        input.system_messages = Some(&window.system_messages);
-        input.context_messages = &window.context_messages;
-        input.tools = &window.tools;
-        input.context_stats = Some(stats);
-        Some(self.analyze_window(analyzer, &input))
-    }
-
     /// The compression lock, `try_lock`ed by the engine's `compress`.
     pub(crate) fn compression_lock(&self) -> &Mutex<()> {
         &self.compression
     }
-
-    /// Runs the processor pipeline over `messages` in `phase`.
-    ///
-    /// `manual` bypasses the threshold check, which is what an explicit
-    /// compression asks for; `phase` is the context-engine entry point that
-    /// reached the pipeline, so recorded passes carry `add_messages`,
-    /// `get_context_window`, or `active_compress`.
-    pub(crate) async fn run_pipeline(
-        &self,
-        messages: &mut Vec<BaseMessage>,
-        manual: bool,
-        phase: CompressionStatePhase,
-    ) -> Result<Vec<ContextEvent>> {
-        let cx = ProcessorContext {
-            config: &self.config,
-            counter: self.counter.as_ref(),
-            model: self.model.as_ref(),
-            offload: self.offload.as_ref(),
-            scope: &self.scope,
-            budget: self.config.effective_max_tokens(),
-            trigger_tokens: self.config.compression_trigger_tokens(),
-            manual,
-            cancellation: &self.cancellation,
-            recall: self.recall.as_deref(),
-            session_memory: self.session_memory.as_deref(),
-        };
-        self.pipeline.run_in_phase(messages, &cx, phase).await
-    }
-
-    /// Serializes the history and the processor checkpoints for persistence.
-    pub async fn save_state(&self) -> ContextState {
-        ContextState {
-            messages: self.messages().await,
-            revision: self.revision(),
-            processors: self.pipeline.save_state(),
-        }
-    }
-
-    /// Replaces the history with `state` and restores the processor counters it
-    /// carries.
-    ///
-    /// The revision stored in `state` becomes the context's revision, so a
-    /// restored context continues the sequence the saved one used.
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible; the signature keeps the door open for
-    /// implementations that persist eagerly.
-    pub async fn load_state(&self, state: ContextState) -> Result<()> {
-        let ContextState {
-            messages,
-            revision,
-            processors,
-        } = state;
-        *self.messages.write().await = messages;
-        self.revision.store(revision, Ordering::SeqCst);
-        self.invalidate_stats().await;
-        self.pipeline.load_state(&processors);
-        Ok(())
-    }
-
-    /// Builds the payload to send to the model.
-    ///
-    /// The pipeline runs on a copy of the history, so the stored messages are
-    /// never mutated: [`ContextEngine::prepare`] is a read-only operation. The
-    /// window is assembled after the processors ran, and orphan tool results left
-    /// behind by round selection are dropped last.
-    ///
-    /// When [`PrepareOptions::timeout`] is set, the whole body is wrapped in
-    /// [`tokio::time::timeout`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Cancelled`] when the caller's token or the context's own
-    /// token is set, [`Error::Timeout`] when the deadline expires, and the
-    /// pipeline's error (for example [`Error::Llm`]) when a processor fails.
-    ///
-    /// [`ContextEngine::prepare`]: crate::engine::ContextEngine::prepare
-    pub async fn prepare(&self, options: &PrepareOptions) -> Result<PreparedContext> {
-        match options.timeout {
-            Some(timeout) => tokio::time::timeout(timeout, self.prepare_inner(options))
-                .await
-                .map_err(|_| {
-                    Error::Timeout(format!("context preparation timed out after {timeout:?}"))
-                })?,
-            None => self.prepare_inner(options).await,
-        }
-    }
-
-    /// The body of [`ConversationContext::prepare`], without the deadline.
-    async fn prepare_inner(&self, options: &PrepareOptions) -> Result<PreparedContext> {
-        if options.cancellation.is_cancelled() || self.cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let mut working = self.messages().await;
-        let events = self
-            .run_pipeline(&mut working, false, CompressionStatePhase::GetContextWindow)
-            .await?;
-        let mut messages = assemble_window(
-            &working,
-            &options.system_messages,
-            &WindowOptions {
-                window_size: options.window_size,
-                dialogue_rounds: options.dialogue_rounds,
-            },
-            &self.config,
-        );
-        drop_orphan_tool_results(&mut messages);
-        if self.config.enable_reload {
-            let injected = inject_reload_hint(&mut messages, ReloadLanguage::En);
-            tracing::debug!(
-                injected,
-                "reload hint injection for a prepared context window"
-            );
-        }
-        let stats = compute_stats(&messages, self.counter.as_ref());
-        let token_count = count_messages(self.counter.as_ref(), &messages);
-        // The LLM-bound window splits at the leading system messages; the split
-        // feeds both the usage snapshot and the KV-cache diff.
-        let system_count = messages
-            .iter()
-            .take_while(|message| message.role == Role::System)
-            .count();
-        let window = ContextWindowSnapshot::from_messages(
-            &messages[..system_count],
-            &messages[system_count..],
-            &options.tools,
-        );
-        let usage = self.usage_snapshot_for(&window, &stats);
-        self.track_window(window);
-        Ok(PreparedContext {
-            messages,
-            tools: options.tools.clone(),
-            stats,
-            token_count,
-            overflow: token_count > self.config.effective_max_tokens(),
-            window_size: options.window_size.or(self.config.default_window_messages),
-            events,
-            usage,
-        })
-    }
-
-    /// Records one compression pass in the statistics.
-    pub(crate) async fn record_compression(&self, tokens_before: usize, tokens_after: usize) {
-        let mut totals = self.compression_totals.lock().await;
-        totals.0 = totals.0.saturating_add(1);
-        totals.1 = totals.1.saturating_add(tokens_before);
-        totals.2 = totals.2.saturating_add(tokens_after);
-    }
-
-    /// Drops the cached statistics so the next read recomputes them.
-    async fn invalidate_stats(&self) {
-        *self.stats_cache.lock().await = None;
-    }
-
-    /// Bumps the revision and invalidates the statistics cache.
-    ///
-    /// The message guard must already be released: the cache and the message
-    /// vector are locked in that order.
-    async fn bump_revision(&self) {
-        self.revision.fetch_add(1, Ordering::SeqCst);
-        self.invalidate_stats().await;
-    }
-
-    /// Rejects the messages this context cannot store.
-    ///
-    /// The rule is deliberately small: a user or tool message must carry a
-    /// payload, because those roles are meaningless when empty. Assistant
-    /// messages may be empty (a tool-call turn has no text) and system messages
-    /// are left to the caller, matching Python's tolerant context.
-    fn validate_message(message: &BaseMessage) -> Result<()> {
-        match message.role {
-            Role::User | Role::Tool if is_empty_content(&message.content) => {
-                Err(Error::Validation(format!(
-                    "{} message content must not be empty",
-                    message.role
-                )))
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
-#[async_trait]
-impl ModelContext for ConversationContext {
-    fn context_id(&self) -> &str {
-        &self.context_id
-    }
-
-    fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    async fn messages(&self) -> Vec<BaseMessage> {
-        self.messages.read().await.clone()
-    }
-
-    async fn set_messages(&self, messages: Vec<BaseMessage>) -> Result<()> {
-        *self.messages.write().await = messages;
-        self.bump_revision().await;
-        Ok(())
-    }
-
-    async fn add_message(&self, message: BaseMessage) -> Result<()> {
-        Self::validate_message(&message)?;
-        self.messages.write().await.push(message);
-        self.bump_revision().await;
-        Ok(())
-    }
-
-    async fn pop_messages(&self, count: usize) -> Result<Vec<BaseMessage>> {
-        if count == 0 {
-            return Err(Error::Validation(
-                "pop size should be larger than 0".to_owned(),
-            ));
-        }
-        let mut messages = self.messages.write().await;
-        let keep = messages.len().saturating_sub(count);
-        let popped = messages.split_off(keep);
-        drop(messages);
-        if !popped.is_empty() {
-            self.bump_revision().await;
-        }
-        Ok(popped)
-    }
-
-    async fn clear_messages(&self) -> Result<()> {
-        self.messages.write().await.clear();
-        self.bump_revision().await;
-        Ok(())
-    }
-
-    fn token_counter(&self) -> Arc<dyn TokenCounter> {
-        self.counter.clone()
-    }
-
-    async fn statistics(&self) -> ContextStats {
-        let revision = self.revision();
-        let base = {
-            let mut cache = self.stats_cache.lock().await;
-            match cache.as_ref() {
-                Some((cached, stats)) if *cached == revision => stats.clone(),
-                _ => {
-                    let messages = self.messages.read().await.clone();
-                    let stats = compute_stats(&messages, self.counter.as_ref());
-                    *cache = Some((revision, stats.clone()));
-                    stats
-                }
-            }
-        };
-        let totals = *self.compression_totals.lock().await;
-        ContextStats {
-            compressions: totals.0,
-            tokens_before_compression: totals.1,
-            tokens_after_compression: totals.2,
-            ..base
-        }
-    }
-
-    fn revision(&self) -> u64 {
-        self.revision.load(Ordering::SeqCst)
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-    use openjiuwen_foundation::prompt::ApproxTokenCounter;
-
-    use crate::offload::InMemoryOffloadStore;
-    use crate::processor::{ProcessorConfig, TruncationConfig};
-
-    fn counter() -> Arc<dyn TokenCounter + Send + Sync> {
-        Arc::new(ApproxTokenCounter::with_chars_per_token(1))
-    }
-
-    fn config() -> Arc<ContextConfig> {
-        Arc::new(ContextConfig::default())
-    }
-
-    /// A config whose budget is small enough to overflow with a few messages.
-    fn small_config() -> Arc<ContextConfig> {
-        Arc::new(ContextConfig {
-            max_context_tokens: Some(10),
-            ..ContextConfig::default()
-        })
-    }
-
-    fn build(config: Arc<ContextConfig>, processors: Vec<ProcessorConfig>) -> ConversationContext {
-        let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
-        let pipeline = ContextPipeline::from_configs(&processors, None, Arc::clone(&store))
-            .unwrap_or_else(|error| panic!("pipeline should build: {error}"));
-        ConversationContext::new(
-            "main",
-            "session",
-            config,
-            counter(),
-            pipeline,
-            store,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-
-    fn truncating(max_tokens: usize) -> ConversationContext {
-        build(
-            small_config(),
-            vec![ProcessorConfig::Truncation(TruncationConfig {
-                max_tokens: Some(max_tokens),
-                keep_recent_messages: 2,
-                keep_system: true,
-            })],
-        )
-    }
-
-    /// A processor that sleeps so a deadline can expire mid-run.
-    struct Sleeper;
-
-    #[async_trait]
-    impl ContextProcessor for Sleeper {
-        fn name(&self) -> &'static str {
-            "sleeper"
-        }
-
-        async fn process(
-            &self,
-            _messages: &mut Vec<BaseMessage>,
-            _cx: &ProcessorContext<'_>,
-        ) -> Result<Option<ContextEvent>> {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            Ok(None)
-        }
-    }
-
-    #[tokio::test]
-    async fn prepare_does_not_mutate_the_stored_history() {
-        let context = truncating(8);
-        let messages = vec![
-            BaseMessage::user("first question"),
-            BaseMessage::assistant("first answer"),
-            BaseMessage::user("second question"),
-            BaseMessage::assistant("second answer"),
-        ];
-        context.set_messages(messages.clone()).await.unwrap();
-
-        let prepared = context.prepare(&PrepareOptions::default()).await.unwrap();
-        assert!(prepared.messages.len() < messages.len());
-        assert!(prepared.overflow);
-        assert_eq!(context.messages().await, messages);
-    }
-
-    #[tokio::test]
-    async fn prepare_puts_system_messages_first_and_honours_the_window() {
-        let context = build(config(), Vec::new());
-        context
-            .set_messages(vec![
-                BaseMessage::user("q1"),
-                BaseMessage::assistant("a1"),
-                BaseMessage::user("q2"),
-                BaseMessage::assistant("a2"),
-            ])
-            .await
-            .unwrap();
-
-        let options = PrepareOptions {
-            system_messages: vec![BaseMessage::system("persona")],
-            dialogue_rounds: Some(2),
-            window_size: Some(5),
-            tools: vec![serde_json::json!({"name": "read_file"})],
-            ..PrepareOptions::default()
-        };
-        let prepared = context.prepare(&options).await.unwrap();
-        assert_eq!(prepared.messages.len(), 5);
-        assert_eq!(prepared.messages[0].role, Role::System);
-        assert_eq!(prepared.messages[0].text(), "persona");
-        assert_eq!(prepared.messages[1].text(), "q1");
-        assert_eq!(prepared.tools.len(), 1);
-        assert_eq!(prepared.window_size, Some(5));
-        assert!(!prepared.overflow);
-        assert_eq!(prepared.stats.total_messages, 5);
-
-        // A round window keeps only the newest round.
-        let one_round = PrepareOptions {
-            dialogue_rounds: Some(1),
-            ..PrepareOptions::default()
-        };
-        let prepared = context.prepare(&one_round).await.unwrap();
-        assert_eq!(prepared.messages.len(), 2);
-        assert_eq!(prepared.messages[0].text(), "q2");
-    }
-
-    #[tokio::test]
-    async fn prepare_maps_an_expired_deadline_to_timeout() {
-        let store: Arc<dyn OffloadStore> = Arc::new(InMemoryOffloadStore::new());
-        let context = ConversationContext::new(
-            "main",
-            "session",
-            config(),
-            counter(),
-            ContextPipeline::new(vec![Arc::new(Sleeper)]),
-            store,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let options = PrepareOptions {
-            timeout: Some(Duration::from_millis(1)),
-            ..PrepareOptions::default()
-        };
-        let error = context.prepare(&options).await.unwrap_err();
-        assert!(matches!(error, Error::Timeout(_)));
-    }
-
-    #[tokio::test]
-    async fn prepare_refuses_a_cancelled_request_or_context() {
-        let context = build(config(), Vec::new());
-        let cancelled = PrepareOptions {
-            cancellation: CancellationToken::new(),
-            ..PrepareOptions::default()
-        };
-        cancelled.cancellation.cancel();
-        assert!(matches!(
-            context.prepare(&cancelled).await.unwrap_err(),
-            Error::Cancelled
-        ));
-
-        context.cancel();
-        assert!(context.cancellation().is_cancelled());
-        assert!(matches!(
-            context
-                .prepare(&PrepareOptions::default())
-                .await
-                .unwrap_err(),
-            Error::Cancelled
-        ));
-    }
-
-    #[tokio::test]
-    async fn history_mutations_bump_the_revision_and_keep_stats_fresh() {
-        let context = build(config(), Vec::new());
-        assert_eq!(context.revision(), 0);
-
-        context
-            .add_message(BaseMessage::user("abcd"))
-            .await
-            .unwrap();
-        assert_eq!(context.revision(), 1);
-        let stats = context.statistics().await;
-        assert_eq!(stats.total_messages, 1);
-        assert_eq!(stats.user_messages, 1);
-
-        let cached = context.statistics().await;
-        assert_eq!(cached, stats);
-
-        context
-            .add_message(BaseMessage::assistant("ef"))
-            .await
-            .unwrap();
-        assert_eq!(context.revision(), 2);
-        let stats = context.statistics().await;
-        assert_eq!(stats.total_messages, 2);
-        assert_eq!(stats.assistant_messages, 1);
-        assert_eq!(stats.total_dialogues, 1);
-
-        let popped = context.pop_messages(2).await.unwrap();
-        assert_eq!(popped.len(), 2);
-        assert_eq!(context.revision(), 3);
-        assert_eq!(context.messages().await.len(), 0);
-
-        context.add_message(BaseMessage::system("s")).await.unwrap();
-        context.clear_messages().await.unwrap();
-        assert_eq!(context.revision(), 5);
-        assert_eq!(context.statistics().await.total_messages, 0);
-        assert_eq!(context.messages().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn pop_rejects_zero_and_clamps_to_the_history() {
-        let context = build(config(), Vec::new());
-        let error = context.pop_messages(0).await.unwrap_err();
-        assert!(
-            matches!(error, Error::Validation(message) if message == "pop size should be larger than 0")
-        );
-
-        context
-            .set_messages(vec![BaseMessage::user("a"), BaseMessage::user("b")])
-            .await
-            .unwrap();
-        let popped = context.pop_messages(9).await.unwrap();
-        assert_eq!(popped.len(), 2);
-        assert_eq!(popped[0].text(), "a");
-        assert_eq!(context.messages().await.len(), 0);
-        assert_eq!(context.pop_messages(1).await.unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn empty_user_and_tool_messages_are_rejected_but_empty_assistants_are_not() {
-        let context = build(config(), Vec::new());
-        let error = context
-            .add_message(BaseMessage::user(""))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Validation(_)));
-        assert!(context
-            .add_message(BaseMessage::tool("call_1", ""))
-            .await
-            .is_err());
-        context
-            .add_message(BaseMessage::assistant(""))
-            .await
-            .unwrap();
-        assert_eq!(context.messages().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn state_round_trips_and_restores_the_revision() {
-        let context = build(config(), Vec::new());
-        context.add_message(BaseMessage::user("hi")).await.unwrap();
-        let state = context.save_state().await;
-        assert_eq!(state.revision, 1);
-        let json = serde_json::to_string(&state).unwrap();
-        let restored: ContextState = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, state);
-
-        let other = build(config(), Vec::new());
-        other.load_state(restored).await.unwrap();
-        assert_eq!(other.messages().await, state.messages);
-        assert_eq!(other.revision(), 1);
-        assert_eq!(other.statistics().await.total_messages, 1);
-    }
-
-    #[tokio::test]
-    async fn compression_totals_are_merged_into_statistics() {
-        let context = build(config(), Vec::new());
-        context
-            .set_messages(vec![BaseMessage::user("abcd")])
-            .await
-            .unwrap();
-        context.record_compression(40, 10).await;
-        context.record_compression(10, 8).await;
-
-        let stats = context.statistics().await;
-        assert_eq!(stats.compressions, 2);
-        assert_eq!(stats.tokens_before_compression, 50);
-        assert_eq!(stats.tokens_after_compression, 18);
-        assert_eq!(stats.total_messages, 1);
-    }
-
-    #[test]
-    fn context_identity_matches_the_constructor_arguments() {
-        let context = build(config(), Vec::new());
-        assert_eq!(context.context_id(), "main");
-        assert_eq!(context.session_id(), "session");
-        assert_eq!(context.scope().session_id, "session");
-        assert_eq!(context.scope().context_id, "main");
-        assert!(context.model().is_none());
-        assert!(context.session().is_none());
-        assert!(context.processors().is_empty());
-        assert_eq!(
-            context.offload_store().kind(),
-            crate::offload::OffloadKind::InMemory
-        );
-        assert!(format!("{context:?}").contains("ConversationContext"));
-    }
-}
+mod tests;
