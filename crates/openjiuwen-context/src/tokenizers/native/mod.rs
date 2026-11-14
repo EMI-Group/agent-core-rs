@@ -1,6 +1,8 @@
-//! Pure-Rust decoding of a `HuggingFace` `tokenizer.json` artifact.
+//! Pure-Rust decoding of native tokenizer artifacts.
 //!
-//! The artifact is read with `serde_json` and decoded into a model (`BPE`, `WordPiece`, a Unigram-lite branch, `WordLevel`) plus the normalizer, pre-tokenizer, added-token and decoder pipelines, so encoding needs neither the `tokenizers` runtime nor any network access.
+//! Two artifact kinds are supported: a `HuggingFace` `tokenizer.json` document and a `tiktoken` `.model` BPE vocabulary.
+//! A `tokenizer.json` is read with `serde_json` and decoded into a model (`BPE`, `WordPiece`, a Unigram-lite branch, `WordLevel`) plus the normalizer, pre-tokenizer, added-token and decoder pipelines, so encoding needs neither the `tokenizers` runtime nor any network access.
+//! A `.model` vocabulary is decoded with `base64` by [`tiktoken_model::TiktokenModel`] (see [`NativeTokenizer::from_tiktoken_model`]) and shares the same [`NativeTokenizer`] surface.
 //! Loading happens once per context/model binding; every later [`NativeTokenizer::encode`] is pure computation over the in-memory tables.
 //! Shapes this crate cannot reproduce exactly (regex splits, the Unicode-normalization families, unsupported pipeline nodes) are recorded in [`NativeTokenizer::warnings`] and degrade to a coarser but working behaviour instead of failing the load.
 //! A model type this crate does not know is refused with [`Error::Unsupported`], because guessing a vocabulary layout would silently bias every budget decision.
@@ -13,8 +15,12 @@ mod hf_json;
 mod model;
 mod normalizer;
 mod pretokenizer;
+pub mod tiktoken_model;
 mod unigram;
 mod wordpiece;
+
+#[cfg(test)]
+mod modeltests;
 
 use std::path::Path;
 
@@ -41,6 +47,8 @@ pub enum NativeTokenizerKind {
     Unigram,
     /// Whole-piece vocabulary lookup (`"type": "WordLevel"`).
     WordLevel,
+    /// A `tiktoken` `.model` byte-pair vocabulary, which is not a `tokenizer.json` model type.
+    Tiktoken,
 }
 
 impl NativeTokenizerKind {
@@ -52,17 +60,19 @@ impl NativeTokenizerKind {
             Self::WordPiece => "WordPiece",
             Self::Unigram => "Unigram",
             Self::WordLevel => "WordLevel",
+            Self::Tiktoken => "Tiktoken",
         }
     }
 }
 
-/// A tokenizer decoded from a `HuggingFace` `tokenizer.json` artifact.
+/// A tokenizer decoded from a native artifact.
 ///
 /// The type is immutable, `Send` and `Sync`, so one instance can be shared by every context bound to the same model.
 /// Encoding runs the artifact's own pipeline: normalize, cut out added tokens, pre-tokenize, then encode each piece with the model.
+/// A `tiktoken` `.model` vocabulary bypasses that pipeline and uses its own pre-tokenization and merge loop.
 pub struct NativeTokenizer {
-    /// The decoding model and its vocabularies.
-    model: model::NativeModel,
+    /// The decoding model and its vocabularies, for a `tokenizer.json` artifact.
+    model: Option<model::NativeModel>,
     /// The normalization pipeline.
     normalizer: normalizer::Normalizer,
     /// The pre-tokenization pipeline.
@@ -71,6 +81,8 @@ pub struct NativeTokenizer {
     decoder: decoder::Decoder,
     /// Added and special tokens.
     added: added_tokens::AddedTokens,
+    /// The `tiktoken` vocabulary, for a `.model` artifact.
+    tiktoken: Option<tiktoken_model::TiktokenModel>,
     /// The artifact name or model id, when the JSON declares one.
     tokenizer_id: Option<String>,
     /// Everything the load could not reproduce exactly.
@@ -146,32 +158,114 @@ impl NativeTokenizer {
         }
         Ok(Self {
             vocab_size: model.vocab_size() + added.len(),
-            model,
+            model: Some(model),
             normalizer,
             pretokenizer,
             decoder,
             added,
+            tiktoken: None,
             tokenizer_id: name.or(model_id),
             warnings,
         })
     }
 
+    /// Decodes a `tiktoken` `.model` document held in memory.
+    ///
+    /// The vocabulary uses the Kimi pre-tokenization rule and the built-in Kimi K2 special-token fallback, because a document held in memory carries no model name.
+    /// Use [`NativeTokenizer::from_tiktoken_model_file`] for the sibling `tokenizer_config.json` and the K3 selection, or [`NativeTokenizer::from_tiktoken`] with [`tiktoken_model::TiktokenSpecials::for_model`] to choose explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] naming the malformed line when the document is not a valid `.model` vocabulary.
+    pub fn from_tiktoken_model(text: &str) -> Result<Self> {
+        let model = tiktoken_model::TiktokenModel::from_text(text)?;
+        let specials = tiktoken_model::TiktokenSpecials::for_model("", model.mergeable_count());
+        Ok(Self::from_tiktoken(model.with_special_tokens(specials)))
+    }
+
+    /// Reads and decodes a `tiktoken` `.model` file.
+    ///
+    /// Special tokens come from the sibling `tokenizer_config.json` when it declares an `added_tokens_decoder`, else from the built-in Kimi fallback selected by the file stem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when the file does not exist and [`Error::Validation`] when it cannot be read or parsed.
+    pub fn from_tiktoken_model_file(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::from_tiktoken(
+            tiktoken_model::TiktokenModel::from_file(path)?,
+        ))
+    }
+
+    /// Reads a `tiktoken` `.model` file and selects its special tokens by `model`.
+    ///
+    /// A model name containing `kimi-k3` uses the K3 fallback map, anything else K2; the sibling `tokenizer_config.json` still wins when it declares tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when the file does not exist and [`Error::Validation`] when it cannot be read or parsed.
+    pub fn from_tiktoken_model_file_with_model(
+        path: impl AsRef<Path>,
+        model: &str,
+    ) -> Result<Self> {
+        Ok(Self::from_tiktoken(
+            tiktoken_model::TiktokenModel::from_file_with_model(path, model)?,
+        ))
+    }
+
+    /// Wraps an already-loaded `tiktoken` vocabulary.
+    ///
+    /// This is the seam for callers that attach their own [`tiktoken_model::TiktokenSpecials`] or [`tiktoken_model::PretokenizePattern`] before handing the vocabulary to the crate.
+    #[must_use]
+    pub fn from_tiktoken(model: tiktoken_model::TiktokenModel) -> Self {
+        let mut warnings = model.warnings().to_vec();
+        let mut pipeline_warnings = Vec::new();
+        let normalizer = normalizer::Normalizer::from_json(None, &mut pipeline_warnings);
+        let pretokenizer = pretokenizer::Pretokenizer::from_json(None, &mut pipeline_warnings);
+        let decoder = decoder::Decoder::from_json(None, &mut pipeline_warnings);
+        warnings.extend(pipeline_warnings);
+        for warning in &warnings {
+            tracing::warn!(
+                target: "openjiuwen_context::tokenizers::native",
+                %warning,
+                "tiktoken model feature degraded"
+            );
+        }
+        Self {
+            vocab_size: model.vocab_size(),
+            model: None,
+            normalizer,
+            pretokenizer,
+            decoder,
+            added: added_tokens::AddedTokens::default(),
+            tiktoken: Some(model),
+            tokenizer_id: None,
+            warnings,
+        }
+    }
+
     /// Encodes `text` into token ids.
     ///
     /// Added tokens are matched first, so a special token always becomes exactly one id.
+    /// A `tiktoken` vocabulary runs its own special-token split, pre-tokenization and merge loop.
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        if let Some(tiktoken) = &self.tiktoken {
+            return tiktoken.encode(text);
+        }
         let mut ids = Vec::new();
         if text.is_empty() {
             return ids;
         }
+        let Some(model) = self.model.as_ref() else {
+            return ids;
+        };
         let normalized = self.normalizer.normalize(text);
         for chunk in self.added.split(&normalized) {
             match chunk {
                 added_tokens::Chunk::Added { id } => ids.push(id),
                 added_tokens::Chunk::Text(text) => {
                     for piece in self.pretokenizer.apply(text) {
-                        self.model.encode_piece(&piece, &mut ids);
+                        model.encode_piece(&piece, &mut ids);
                     }
                 }
             }
@@ -184,9 +278,20 @@ impl NativeTokenizer {
     /// Ids the artifact does not declare are skipped; special tokens are included, unlike `HuggingFace`'s `skip_special_tokens = true` default.
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> String {
+        if let Some(tiktoken) = &self.tiktoken {
+            return tiktoken.decode(ids);
+        }
+        let Some(model) = self.model.as_ref() else {
+            return String::new();
+        };
         let tokens: Vec<String> = ids
             .iter()
-            .filter_map(|id| self.token(*id).map(str::to_owned))
+            .filter_map(|id| {
+                self.added
+                    .token(*id)
+                    .or_else(|| model.id_to_token(*id))
+                    .map(str::to_owned)
+            })
             .collect();
         self.decoder.decode(&tokens)
     }
@@ -200,7 +305,10 @@ impl NativeTokenizer {
     /// The decoding model the artifact declares.
     #[must_use]
     pub const fn kind(&self) -> NativeTokenizerKind {
-        match &self.model {
+        let Some(model) = &self.model else {
+            return NativeTokenizerKind::Tiktoken;
+        };
+        match model {
             model::NativeModel::Bpe(_) => NativeTokenizerKind::Bpe,
             model::NativeModel::WordPiece(_) => NativeTokenizerKind::WordPiece,
             model::NativeModel::Unigram(_) => NativeTokenizerKind::Unigram,
@@ -217,6 +325,8 @@ impl NativeTokenizer {
     }
 
     /// The artifact name or model id, when the JSON declares one.
+    ///
+    /// A `tiktoken` `.model` artifact carries no name, so this is `None` for it.
     #[must_use]
     pub fn tokenizer_id(&self) -> Option<&str> {
         self.tokenizer_id.as_deref()
@@ -225,12 +335,10 @@ impl NativeTokenizer {
     /// The contents of the tokens the artifact declares special, sorted.
     #[must_use]
     pub fn special_tokens(&self) -> Vec<&str> {
+        if let Some(tiktoken) = &self.tiktoken {
+            return tiktoken.special_tokens().texts();
+        }
         self.added.special_tokens()
-    }
-
-    /// The spelling of `id`.
-    fn token(&self, id: u32) -> Option<&str> {
-        self.added.token(id).or_else(|| self.model.id_to_token(id))
     }
 }
 
@@ -268,6 +376,7 @@ mod tests {
         assert_eq!(NativeTokenizerKind::WordPiece.as_str(), "WordPiece");
         assert_eq!(NativeTokenizerKind::Unigram.as_str(), "Unigram");
         assert_eq!(NativeTokenizerKind::WordLevel.as_str(), "WordLevel");
+        assert_eq!(NativeTokenizerKind::Tiktoken.as_str(), "Tiktoken");
     }
 
     #[test]
