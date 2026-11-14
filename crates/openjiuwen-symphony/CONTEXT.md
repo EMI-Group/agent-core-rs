@@ -409,6 +409,55 @@ With `fail_fast` the first runner error aborts with `Error::Graph("step `<id>` f
 `max_steps` is checked before compilation; the default session is `WorkflowSession::new(<uuid>)`; an empty plan executes to an empty `PlanExecution`.
 A `Cancelled` or `Unsupported` runner error keeps its own [`ErrorKind`] instead of becoming `Error::Graph`.
 
+**Mutation contract** (`src/orchestration/mutation.rs`):
+
+```rust
+pub const REQUEST_SCHEMA_VERSION: &str = "Symphony-skill-graph-mutation-request-v2";
+pub const JOURNAL_SCHEMA_VERSION: &str = "Symphony-skill-graph-mutation-requests-v1";
+pub const MAX_REQUEST_ID_CHARS: usize = 256;      pub const MAX_SOURCE_REVISION_CHARS: usize = 512;
+pub const MAX_CHANGED_IDS: usize = 1024;
+
+#[serde(rename_all = "snake_case")] pub enum MutationOperation { Add, Update, Delete }
+impl MutationOperation { pub fn as_str(self) -> &'static str; }   // "add" | "update" | "delete"
+
+pub struct MutationRequest { pub request_id: String, pub operation: MutationOperation,
+                             pub source_revision: Option<String>, pub changed_skill_ids: Vec<String> }
+impl MutationRequest {
+    pub fn prepare(operation: MutationOperation, changed_skill_ids: &[String], request_id: &str,
+                   source_revision: Option<&str>) -> Result<Self>;   // trim, reject blank/dup/empty/oversized, sort
+    pub fn digest(&self) -> String;
+    pub fn declared_ids(&self) -> BTreeSet<&str>;
+}
+pub fn request_digest(request: &MutationRequest) -> String;   // sha256 hex over canonical JSON of Python's field set
+pub fn validate_mutation_against_inventory(request: &MutationRequest, changed: &[String],
+                                           inventory_ids: &[String]) -> Result<()>;
+
+pub struct JournalRecord { pub digest: String, pub operation: MutationOperation, pub revision: String,
+                           pub inserted_at: String, pub result: Option<Value> }
+impl JournalRecord {
+    pub fn new(operation: MutationOperation, revision: impl Into<String>, digest: impl Into<String>) -> Self;
+    pub fn with_inserted_at(self, inserted_at: impl Into<String>) -> Self;   // metadata override
+    pub fn with_result(self, result: Value) -> Self;
+}
+pub struct MutationJournal;
+impl MutationJournal {
+    pub fn new(path: impl Into<PathBuf>) -> Self;
+    pub async fn open(path: impl Into<PathBuf>) -> Result<Self>;   // absent = empty; malformed envelope = Error::Validation naming the file
+    pub fn path(&self) -> &Path;
+    pub fn len(&self) -> usize;   pub fn is_empty(&self) -> bool;   pub fn contains(&self, request_id: &str) -> bool;
+    pub fn request_ids(&self) -> impl Iterator<Item = &str>;
+    pub async fn lookup(&self, request_id: &str) -> Option<JournalRecord>;     // in-memory, cannot fail
+    pub async fn record(&mut self, request_id: impl Into<String>, record: JournalRecord) -> Result<()>;
+    pub async fn clear(&mut self) -> Result<()>;
+}
+```
+
+`prepare` rejects a blank or oversized `request_id`, a blank or oversized `source_revision`, an empty batch (including a `delete` without ids), a blank id, and duplicate ids after trimming, always naming the offending field.
+The digest is order-independent by construction (ids are sorted/deduped) and sensitive to each declared field; it covers the declared id batch, not the descriptor payloads, so a replay is keyed on the batch identity.
+`validate_mutation_against_inventory` requires the applied change set to equal the declared batch (`Error::Validation` naming the missing/extra ids) — add and update batches are also checked against the catalog before anything is written.
+The journal is one JSON document (`{"schema_version", "records"}`) with records in a `BTreeMap` (sorted by request id) written through a temp sibling plus rename; a malformed record is warned about and skipped so one bad entry cannot cost the rest of the journal its idempotency.
+`inserted_at` is metadata only and never participates in a lookup; `result` is a Rust-only extension so a reopened runtime can answer a replay with the exact recorded result.
+
 ### `evaluation` (`src/evaluation/`)
 
 Fail-soft evaluation over capability cards and recorded traces: static card metrics, trace metrics, event-time case windows, status-aware aggregation, and the LLM judge.
@@ -467,7 +516,7 @@ Aggregation follows Python's precedence (`Error` > `Observed` > `NotApplicable`,
 `evaluation::LlmJudgedMetric` is a thin delegating wrapper over [`llm::LlmJudgeMetric`](crate::llm::LlmJudgeMetric): it owns only the `"llm_judged"` name and the default rubric and forwards `with_model`/`with_rubric`/`with_fallback` plus `Metric::evaluate`, so there is one judge implementation and `with_llm_judge()` scores a card offline with the deterministic rubric instead of recording an error.
 See [`evaluation`](src/evaluation/CONTEXT.md) for the per-metric rubrics, check lists and thresholds.
 
-### `runtime` (`src/runtime.rs`)
+### `runtime` (`src/runtime/`)
 
 ```rust
 #[serde(rename_all = "snake_case")] pub enum RuntimeState { Created, Running, Stopped }
@@ -475,6 +524,7 @@ See [`evaluation`](src/evaluation/CONTEXT.md) for the per-metric rubrics, check 
 pub struct SymphonyConfig {
     pub graph_artifact_root: Option<PathBuf>,   // None = in-memory artifacts
     pub graph_scope_id: String,                 // default "default"
+    pub mutation_journal_path: Option<PathBuf>, // None = in-memory request ledger
     pub plan: PlanConfig,
     pub executor: ExecutorConfig,
     pub candidates: CandidateConfig,
@@ -490,6 +540,7 @@ impl SymphonyRuntimeBuilder {
     pub fn with_runner(self, runner: Arc<dyn CapabilityRunner>) -> Self;
     pub fn with_planner(self, planner: Planner) -> Self;
     pub fn with_semantic_index(self, index: Arc<SemanticIndex>) -> Self;
+    pub fn with_mutation_journal(self, journal: MutationJournal) -> Self;   // takes precedence over the config path
     pub async fn open(self) -> Result<SymphonyRuntime>;
 }
 
@@ -512,7 +563,8 @@ impl SymphonyRuntime {
     pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>>;
     pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>>;   // lazily synchronized; `top_k == 0` = unlimited
     pub async fn reindex_semantics(&self) -> Result<usize>;          // force a full re-embed; returns the indexed count
-    pub async fn add_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
+    pub async fn mutate(&self, request: MutationRequest, descriptors: Vec<CapabilityDescriptor>) -> Result<GraphMutationResult>;
+    pub async fn add_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;   // delegates to `mutate`
     pub async fn update_capabilities(&self, descriptors: Vec<CapabilityDescriptor>, request_id: &str) -> Result<GraphMutationResult>;
     pub async fn remove_capabilities(&self, keys: &[CapabilityKey], request_id: &str) -> Result<GraphMutationResult>;
     pub async fn submit_evolution(&self, execution: &PlanExecution) -> Result<EvolutionResult>;
@@ -527,16 +579,24 @@ impl InvokeRequest { pub fn new(query: impl Into<String>) -> Self; pub fn execut
 pub struct InvokeResponse { pub plan: OrchestrationPlan, pub execution: Option<PlanExecution>, pub graph_status: GraphArtifactStatus }
 
 #[serde(rename_all = "snake_case")] pub enum MutationOperation { Add, Update, Delete }
+#[serde(rename_all = "snake_case")] pub enum MutationStatus { Published, Noop, Replayed }   // default Published
 pub struct GraphMutationResult {
     pub operation: MutationOperation, pub request_id: String, pub changed: Vec<String>,
     pub added_edges: usize, pub removed_edges: usize, pub revision: String, pub replayed: bool,
+    // additive, serde-defaulted bookkeeping
+    pub status: MutationStatus, pub digest: String,
+    pub source_revision: Option<String>, pub diagnostics: Vec<String>,
 }
 pub struct EvolutionResult { pub accepted_edges: usize, pub rejected_edges: usize, pub revision: String }
 ```
 
 Lifecycle: `Created` → `start` → `Running` → `stop`/`close` → `Stopped`; both `start` and `stop` are idempotent and `close` is `stop` plus artifact flush, and `start` also restarts a `Stopped` runtime.
 `start` builds and publishes the graph when no revision exists, flipping to `Running` only after the build succeeds; `build` re-derives the graph from the registry plus candidate edges and publishes a new revision.
-`add/update/remove_capabilities` mutate the registry, re-derive and publish the graph, and are idempotent per `request_id` (a replay returns the recorded result with `replayed = true`).
+`add/update/remove_capabilities` delegate to `mutate` with a prepared request; the mutations mutate the registry, re-derive and publish the graph, and are idempotent per `request_id` (a replay returns the recorded result with `replayed = true` and `status = replayed`).
+The mutation path is ordered: request preparation → replay lookup (in-memory ledger, then the journal) → digest-conflict check → `Running` gate → active-state snapshot → `source_revision` compare-and-swap → apply (add/update validate the whole batch first) → change-set check → publish → record.
+`request_digest` is SHA-256 over canonical JSON of `{schema_version, request_id, operation, source_revision, changed_skill_ids}`, so it covers the declared id batch and not the descriptor payloads: the same batch under the same id replays, changed content under a new id does not.
+A replay whose digest differs from the recorded one is `Error::Validation` naming `request_id`; a declared `source_revision` that is not the current artifact revision is `Error::Validation` naming `source_revision`.
+The ledger is in memory by default; `SymphonyConfig::mutation_journal_path` or `SymphonyRuntimeBuilder::with_mutation_journal` makes it durable (see [`orchestration::mutation`](src/orchestration/mutation.rs)), so a runtime rebuilt over the same journal still answers replays.
 `invoke` and the three mutations require `Running` (`Error::Validation` naming `runtime.state` otherwise); planning, graph reads, search, build, evolution and the accessors work in every state.
 `invoke` plans, optionally executes when `execute` is set, and returns both; a `NoPlan` result with `execute` set returns `execution: None` rather than an error.
 A blank `request_id` is `Error::Validation`; `update` requires every key to exist (`Error::NotFound`, whole batch rejected) while `remove` skips absent keys.
@@ -562,8 +622,35 @@ See [`experience`](src/experience/CONTEXT.md) for the full surface and rules.
 
 ### `flow` (`src/flow/`)
 
-Trace ingestion and normalization, structural distillation into versioned `ExperienceRecipe`s, content-addressed `SkillPack` packaging with a ten-check review (`structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`, `integrity`, `meta_naming`, `materials`, `permissions`, `license`), and an eager atomic flow store.
+Trace ingestion and normalization, structural distillation into versioned `ExperienceRecipe`s, content-addressed `SkillPack` packaging with a ten-check review (`structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`, `integrity`, `meta_naming`, `materials`, `permissions`, `license`), `SwarmFlow` script generation, package rendering, and an eager atomic flow store.
 Every model-written narrative and trace-derived free-text field is redacted before it enters a recipe or package.
+A recipe-derived package now carries the generated script (`swarmflow_script`) and the trigger conditions (`trigger_conditions`) in its materials, and renders them as the `swarmflow/run.py` artifact, so both participate in the package id.
+
+```rust
+// src/flow/codegen.rs
+pub const SWARMFLOW_MODULE: &str = "swarmflow";   pub const ALLOWED_OPERATOR: &str = "agent";
+pub const SCRIPT_FILENAME: &str = "swarmflow/run.py";
+pub const SCRIPT_MATERIAL_KEY: &str = "swarmflow_script";   pub const TRIGGER_CONDITIONS_KEY: &str = "trigger_conditions";
+pub const DEFAULT_STEP_DESCRIPTION: &str = "协作成员能力";   pub const META_NAME_FALLBACK: &str = "skill-pack";
+pub const IDENTIFIER_PREFIX: &str = "combo-";   pub const IDENTIFIER_HASH_LENGTH: usize = 12;
+
+pub struct SwarmflowScript { pub identifier: String, pub source: String, pub meta: Value, pub task: String, pub steps: Vec<String> }
+pub fn swarmflow_identifier(materials: &Value, recipe_id: &str) -> String;   // "combo-<12 hex>" over the canonical materials hash
+pub fn generate_swarmflow_script(recipe: &ExperienceRecipe) -> Result<SwarmflowScript>;
+pub fn python_string_literal(value: &str) -> String;               // CPython repr-style, UTF-8 preserved
+pub fn validate_generated_script(source: &str) -> Result<()>;      // line-oriented, names the first offending line
+
+// src/flow/render.rs
+pub struct RenderedArtifact { pub target: String, pub path: String, pub content: String }
+pub trait SkillAdapter: Send + Sync { fn target(&self) -> &str; fn render(&self, pack: &SkillPack) -> Result<RenderedArtifact>; }
+pub struct SkillPackAdapter;
+impl SkillPackAdapter { pub fn new() -> Self; pub fn validate_members(pack: &SkillPack) -> Result<()>; }
+pub fn render_package(pack: &SkillPack, target_kind: &str) -> Result<RenderedArtifact>;   // "" = "skill"; anything else is Unsupported
+```
+
+The generated script has Python's shape: docstring, `from swarmflow import agent`, `META = {"name", "phases"}`, `TASK`, `async def run(args):` with one `await agent(prompt, label=…, phase='step_N')` per capability in topological order, and `return step_N` (`None` for an empty combination).
+`validate_generated_script` is a documented line-oriented approximation of Python's AST whitelist (masked strings/comments, bracket and quote balance, the `META`/`TASK`/`run` markers, `agent(...)` only) plus the review gate's forbidden tokens; in-expression syntax errors are not detected.
+`SkillPackAdapter` checks member presence, uniqueness and a linear `can_feed` chain — the `active` + `verified` half of Python's contract is enforced at pack time because a pack does not retain the recipe status.
 See [`flow`](src/flow/CONTEXT.md) for the full surface and rules.
 
 ### `redaction` (`src/redaction/`)
@@ -626,7 +713,7 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - Only files under `crates/openjiuwen-symphony/` may change; the root manifest, sibling crates, and `docs/` are read-only from this node.
 - Depend downward only: `openjiuwen-common`, `openjiuwen-foundation`, `openjiuwen-graph`, `openjiuwen-retrieval`, `openjiuwen-session`, and the `openjiuwen-core` umbrella.
 - No `unsafe`; no `println!`/`eprintln!` (use `tracing`); no panics on user input (no `unwrap`/`expect` outside tests).
-- Every public item has a doc comment; files stay ≲1000 lines and split by responsibility (`src/runtime.rs` is the documented composition-root exception).
+- Every public item has a doc comment; files stay ≲1000 lines and split by responsibility (`src/runtime/mod.rs` is the documented composition-root exception; `src/flow/pack.rs` sits just over the soft cap with the script plumbing kept in `codegen.rs`).
 - All public data types are `serde`-serializable with `snake_case` field names, tolerant unknown fields, and empty collections as defaults.
 - Async-first: tokio; `std::sync::RwLock` is never held across `.await` (snapshot, drop, then await); blocking filesystem work uses tokio's `fs`.
 - Errors use `openjiuwen_common::error::Error` only; validation errors name the offending field.
@@ -659,6 +746,9 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **The graph engine facade maps onto `openjiuwen-graph` for execution.** `CapabilityGraph`/`GraphArtifactStore` keep the JGF document semantics; `PlanExecutor` compiles a plan into a real `openjiuwen_graph::CompiledGraph`.
 - **Revisions are immutable and atomically published**, and object-store publications serialize through an async mutex; one store is the writer of its root or prefix.
 - **Evolution feedback is an EMA on observed edge weight**, reducing Python's append-only evidence and merged revisions to one observable weight update.
+- **The mutation digest covers the declared batch, not the payloads.** `request_digest` hashes `{schema_version, request_id, operation, source_revision, changed_skill_ids}` exactly as Python does, so replaying an id batch answers the recorded result even if the descriptor content changed under the same ids; a conflicting digest for a used id is rejected instead of silently answered.
+- **The mutation journal is opt-in and separate from the artifact store.** In-memory is the default so nothing changes for callers; a configured journal survives rebuilds, holds one record per `request_id` sorted by id, and writes through atomically. Python embeds the journal in the graph artifact store — a different storage choice with the same replay contract.
+- **SwarmFlow generation is content-addressed and validator-gated.** The identifier is `combo-<sha256(materials)[:12]>`, the script enters the pack's materials so the package id moves with it, and the existing `code_safety` review check re-validates the generated source before a verdict.
 - **`FlowEngine::close` is a no-op**: every ingestion, recipe version, and package is written eagerly and atomically.
 - **A generated version bumps past pinned ids**, so an explicit `v2` never makes a later generated publish fail; an illegal version is a validation error on read as well as write.
 - **One judge implementation.** `evaluation::LlmJudgedMetric` is a thin delegating wrapper over `llm::LlmJudgeMetric`, so the prompt, the single repair retry and the deterministic rubric live in one place; `with_llm_judge()` therefore scores offline instead of recording a fail-soft error.
@@ -681,15 +771,14 @@ Pure-logic Python areas not ported:
 
 - `observation/` — graph-evolution input contract, append-only evidence log, qualification/rebind and merged overlays (`runtime::submit_evolution` takes a `PlanExecution` and applies only an EMA).
 - `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors); `SkillFs` provides `visible_skill_names`, `prompt_snapshot` and the persistable `SkillNoticeState` cursor.
-- `flow/{codegen,render}.py` — Swarmflow `run.py` generation (packs carry `SKILL.md`, `dependencies.yaml`, the review report and the embedded graph) and single-skill `SkillAdapter` rendering; credential redaction and the `code_safety`/`secrets`/`artifact_paths` review checks are implemented.
-- `orchestration/{mutations,mutation_service,artifacts}.py` — request digests, a persistent mutation journal, source-revision CAS and provider change-set validation (the runtime keeps an in-memory `request_id` ledger instead).
+- `orchestration/graph/artifacts.py`'s artifact-embedded journal and any diffing beyond the request contract — the request digest, durable journal, source-revision CAS and change-set validation are implemented (see [`orchestration::mutation`](src/orchestration/mutation.rs) and `runtime::mutations`); the journal is a separate JSON document, its digests are not chained over the file, and `source_revision` is optional.
 - `orchestration/graph/matcher/{protocol,model}.py` — the `matches_by_candidate`/`diagnostics_by_candidate` helpers and the cache's file lock/pending-merge batching; the persistent match cache, identity digests, endpoint hashing and `sanitize_metadata` are implemented.
 - `shared/fingerprint/normalization.py` — IO-name vocabulary, alias merging and normalization audit records.
 - `retrieval/search/runtime/{lexical,selector,disclosure}.py` and `retrieval/build/io/*` — field-weighted lexical scoring, prebuilt-index loading and prompt disclosure rendering.
 - `retrieval/build/**` and `agent/retrieval_toolkit.py` — LLM-driven index construction over the progressive retriever (~9k lines, overlapping `llm::TreeRetriever`).
 - `experience/cluster.py`'s faiss k-means and LLM pattern distillation — replaced by deterministic token-Jaccard clustering and the collector's similarity merge.
 
-Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review and `SkillPack` packaging; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging.
+Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review, `SkillPack` packaging, `SwarmFlow` script generation and package rendering; the mutation request contract, digest, durable idempotency journal and source-revision CAS; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging.
 Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the stub shape, and `tests/{artifact_gcs,artifact_azure,experience_index}.rs` assert the remaining GPU/vendor boundaries.
 
 ## Error Strategy
@@ -713,13 +802,15 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
 - `tests/artifact.rs` — memory/file artifact stores, immutability, `current` pointer, atomicity, illegal versions, reopen hydration.
 - `tests/planner.rs` — candidate strategies/ordering, plan selection, filters, depth, scoring/ties, statuses, serialization, `stages`.
 - `tests/executor.rs` — compile + execute with a fake runner, per-step state keys, input overlay, `max_steps`, `fail_fast=false`, `UnsupportedRunner`.
-- `tests/runtime.rs` — lifecycle idempotency, invoke, build revisions, mutation idempotency, evolution EMA, lazy semantic re-embedding, stopped-runtime errors, snapshot.
+- `tests/runtime.rs` — lifecycle idempotency, invoke, build revisions, mutation idempotency, `MutationStatus`/`digest`/`source_revision` shape, digest conflict, payload-vs-ids replay, request/payload mismatch, stale vs current `source_revision`, builder journal persistence across a rebuild, default in-memory behaviour, evolution EMA, lazy semantic re-embedding, stopped-runtime errors, snapshot.
+- `tests/mutation_journal.rs` — request preparation normalization and rejections, pinned digests (order independence, per-field sensitivity), change-set validation, journal round-trip/reopen, atomic layout, clear, and malformed documents.
 - `tests/discovery.rs` — immediate/recursive scans, front-matter diagnostics, content-hash stability, inventory fingerprint, catalog search/excerpts, disabled skills, symlinks, settings.
 - `tests/skill_prompt.rs` — visible-name ordering/filtering, pinned snapshot text (plain/category/empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated`/fingerprint bookkeeping, fingerprint stability, and added/removed/changed notices with the exact reminder wording, ordering, idempotence and serde persistence.
 - `tests/experience.rs` — generated/explicit ids, dedupe merging, lexical and cosine ranking, skill filters, JSONL/SQLite persistence, id-counter continuity.
 - `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, and the IVF/unknown-algorithm errors.
 - `tests/experience_trace.rs` — section fixtures → exact `TraceRecord`s, idempotent re-parse, malformed-session tolerance, single-quoted payloads, clustering/centroid determinism, collector drop/auto-flush/merge/stats, end-to-end bank search, and the persisted index sink.
-- `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, narrative fallback, and the ten-check review including `code_safety`/`secrets`/`artifact_paths`.
+- `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, the rendered `swarmflow/run.py` artifact, narrative fallback, and the ten-check review including `code_safety`/`secrets`/`artifact_paths`.
+- `tests/flow_codegen.rs` — the pinned two-step `SwarmFlow` script, the empty combination, identifier stability and content sensitivity, quote/newline/CJK escaping, validator accept plus first-bad-line rejects, member-validation failures, the unsupported render target, script participation in the package identity, and a full pack → review → install path carrying `run.py` (with a broken script failing `code_safety`).
 - `tests/redaction.rs` — every redaction entry point, idempotence, non-ASCII input, the JSON depth cap and key order, and a flow run whose model emits a key and a PEM block (recipe and pack materials must contain `<redacted>` and no secret).
 - `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
@@ -753,7 +844,9 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
   - `./src/object_artifact/http.rs` → shared non-2xx error mapping and the hand-rolled HMAC-SHA256
 - `./src/discovery/` → SKILL.md discovery, the lexical skill catalog, prompt snapshot, notice cursor; see [`src/discovery/CONTEXT.md`](src/discovery/CONTEXT.md)
 - `./src/experience/` → the experience bank, the persisted `ExperienceIndex`, trace ingestion, clustering and collector; see [`src/experience/CONTEXT.md`](src/experience/CONTEXT.md)
-- `./src/flow/` → trace distillation, recipes, SkillPacks, review; see [`src/flow/CONTEXT.md`](src/flow/CONTEXT.md)
+- `./src/flow/` → trace distillation, recipes, SkillPacks, review, `SwarmFlow` codegen, package rendering; see [`src/flow/CONTEXT.md`](src/flow/CONTEXT.md)
+  - `./src/flow/codegen.rs` → `generate_swarmflow_script`, `swarmflow_identifier`, `python_string_literal`, `validate_generated_script`
+  - `./src/flow/render.rs` → `SkillPackAdapter`, `SkillAdapter`, `RenderedArtifact`, `render_package`
 - `./src/redaction/` → credential/PII redaction: scanner, sensitive-name matching, JSON redaction
 - `./src/llm/` → LLM-guided stages with deterministic fallbacks, model/metadata identity, match cache; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
 - `./src/orchestration/` → planning and execution
@@ -761,7 +854,10 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
   - `./src/orchestration/candidates.rs` → `CandidateGenerator`, relation candidates
   - `./src/orchestration/planner.rs` → `Planner`, `PlanConfig`, `SemanticScorer`, language helpers
   - `./src/orchestration/executor.rs` → `PlanExecutor`, `CapabilityRunner`, plan → `openjiuwen-graph`
+  - `./src/orchestration/mutation.rs` → `MutationRequest`, `request_digest`, `MutationJournal`, `validate_mutation_against_inventory`; see [`src/orchestration/CONTEXT.md`](src/orchestration/CONTEXT.md)
 - `./src/evaluation/` → fail-soft evaluation: shared contract, static and trace metrics, suite aggregation, windows; see [`src/evaluation/CONTEXT.md`](src/evaluation/CONTEXT.md)
-- `./src/runtime.rs` → `SymphonyRuntime`, config, lifecycle, mutations, evolution
+- `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution
+  - `./src/runtime/mod.rs` → lifecycle, planning/invocation, lazy semantic sync, evolution
+  - `./src/runtime/mutations.rs` → the mutation path, `GraphMutationResult`, `MutationStatus`, journal-backed replay and source-revision CAS
 - `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
-- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`
+- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `mutation_journal`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `flow_codegen`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`
