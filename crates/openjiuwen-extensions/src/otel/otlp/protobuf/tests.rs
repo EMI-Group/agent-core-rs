@@ -136,7 +136,7 @@ fn fixed32(fields: &Fields, field: u32) -> Option<u32> {
 }
 
 /// The first length-delimited payload stored under `field`.
-fn bytes<'a>(fields: &'a Fields, field: u32) -> Option<&'a [u8]> {
+fn bytes(fields: &Fields, field: u32) -> Option<&[u8]> {
     fields.get(&field).and_then(|values| match values.first() {
         Some(Wire::Bytes(value)) => Some(value.as_slice()),
         _ => None,
@@ -573,10 +573,15 @@ fn one_span_encodes_every_field() {
     }
 
     // The child span points at its parent; its status is the proto3 default.
-    let child = &decoded[1];
+    assert_child_span(&decoded[1], &context);
+}
+
+/// The child span of the fixture batch names its parent, and its status is the
+/// proto3 default, so both status members are omitted.
+fn assert_child_span(child: &Fields, parent: &SpanContext) {
     assert_eq!(
         bytes(child, 4),
-        Some(context.span_id().to_bytes().as_slice())
+        Some(parent.span_id().to_bytes().as_slice())
     );
     assert_eq!(string(child, 5).as_deref(), Some("client.child"));
     let child_status = messages(child, 15).remove(0);
@@ -852,91 +857,105 @@ fn json_and_protobuf_describe_the_same_batch() {
     );
 
     for (span, encoded) in decoded.iter().zip(json_spans) {
-        assert_eq!(
-            json::hex(bytes(span, 1).expect("trace id")),
-            encoded["traceId"].as_str().expect("traceId")
-        );
-        assert_eq!(
-            json::hex(bytes(span, 2).expect("span id")),
-            encoded["spanId"].as_str().expect("spanId")
-        );
-        match bytes(span, 4) {
-            Some(parent) => assert_eq!(
-                json::hex(parent),
-                encoded["parentSpanId"].as_str().expect("parentSpanId")
-            ),
-            None => assert!(
-                encoded.get("parentSpanId").is_none(),
-                "a root span has no parentSpanId in either encoding"
-            ),
-        }
-        assert_eq!(string(span, 5), encoded["name"].as_str().map(str::to_owned));
-        assert_eq!(
-            span_kind_name(varint(span, 6).unwrap_or(0)),
-            encoded["kind"].as_str().expect("kind")
-        );
-        assert_eq!(
-            fixed64(span, 7).unwrap_or(0).to_string(),
-            encoded["startTimeUnixNano"]
-                .as_str()
-                .expect("startTimeUnixNano")
-        );
-        assert_eq!(
-            fixed64(span, 8).unwrap_or(0).to_string(),
-            encoded["endTimeUnixNano"]
-                .as_str()
-                .expect("endTimeUnixNano")
-        );
-        assert_eq!(
-            attributes_map(&messages(span, 9)),
-            json_attributes_map(&encoded["attributes"])
-        );
+        assert_span_matches_json(span, encoded);
+        assert_events_match_json(span, encoded);
+        assert_links_match_json(span, encoded);
+    }
+}
 
-        let statuses = messages(span, 15);
-        assert_eq!(statuses.len(), 1);
+/// Asserts one decoded span's id, name, kind, timestamps, attributes and status
+/// against the JSON encoder's span object.
+fn assert_span_matches_json(span: &Fields, encoded: &Value) {
+    assert_eq!(
+        json::hex(bytes(span, 1).expect("trace id")),
+        encoded["traceId"].as_str().expect("traceId")
+    );
+    assert_eq!(
+        json::hex(bytes(span, 2).expect("span id")),
+        encoded["spanId"].as_str().expect("spanId")
+    );
+    match bytes(span, 4) {
+        Some(parent) => assert_eq!(
+            json::hex(parent),
+            encoded["parentSpanId"].as_str().expect("parentSpanId")
+        ),
+        None => assert!(
+            encoded.get("parentSpanId").is_none(),
+            "a root span has no parentSpanId in either encoding"
+        ),
+    }
+    assert_eq!(string(span, 5), encoded["name"].as_str().map(str::to_owned));
+    assert_eq!(
+        span_kind_name(varint(span, 6).unwrap_or(0)),
+        encoded["kind"].as_str().expect("kind")
+    );
+    assert_eq!(
+        fixed64(span, 7).unwrap_or(0).to_string(),
+        encoded["startTimeUnixNano"]
+            .as_str()
+            .expect("startTimeUnixNano")
+    );
+    assert_eq!(
+        fixed64(span, 8).unwrap_or(0).to_string(),
+        encoded["endTimeUnixNano"]
+            .as_str()
+            .expect("endTimeUnixNano")
+    );
+    assert_eq!(
+        attributes_map(&messages(span, 9)),
+        json_attributes_map(&encoded["attributes"])
+    );
+
+    let statuses = messages(span, 15);
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(
+        status_code_name(varint(&statuses[0], 3).unwrap_or(0)),
+        encoded["status"]["code"].as_str().expect("status code")
+    );
+    assert_eq!(
+        string(&statuses[0], 2),
+        encoded["status"]["message"].as_str().map(str::to_owned)
+    );
+}
+
+/// Asserts one decoded span's events against the JSON span's `events` array.
+fn assert_events_match_json(span: &Fields, encoded: &Value) {
+    let events = messages(span, 11);
+    let json_events = encoded["events"].as_array().expect("events");
+    assert_eq!(events.len(), json_events.len());
+    for (event, expected) in events.iter().zip(json_events) {
         assert_eq!(
-            status_code_name(varint(&statuses[0], 3).unwrap_or(0)),
-            encoded["status"]["code"].as_str().expect("status code")
+            fixed64(event, 1).unwrap_or(0).to_string(),
+            expected["timeUnixNano"].as_str().expect("timeUnixNano")
         );
         assert_eq!(
-            string(&statuses[0], 2),
-            encoded["status"]["message"].as_str().map(str::to_owned)
+            string(event, 2),
+            expected["name"].as_str().map(str::to_owned)
         );
+        assert_eq!(
+            attributes_map(&messages(event, 3)),
+            json_attributes_map(&expected["attributes"])
+        );
+    }
+}
 
-        let events = messages(span, 11);
-        let json_events = encoded["events"].as_array().expect("events");
-        assert_eq!(events.len(), json_events.len());
-        for (event, expected) in events.iter().zip(json_events) {
-            assert_eq!(
-                fixed64(event, 1).unwrap_or(0).to_string(),
-                expected["timeUnixNano"].as_str().expect("timeUnixNano")
-            );
-            assert_eq!(
-                string(event, 2),
-                expected["name"].as_str().map(str::to_owned)
-            );
-            assert_eq!(
-                attributes_map(&messages(event, 3)),
-                json_attributes_map(&expected["attributes"])
-            );
-        }
-
-        let links = messages(span, 13);
-        let json_links = encoded["links"].as_array().expect("links");
-        assert_eq!(links.len(), json_links.len());
-        for (link, expected) in links.iter().zip(json_links) {
-            assert_eq!(
-                json::hex(bytes(link, 1).expect("link trace id")),
-                expected["traceId"].as_str().expect("traceId")
-            );
-            assert_eq!(
-                json::hex(bytes(link, 2).expect("link span id")),
-                expected["spanId"].as_str().expect("spanId")
-            );
-            assert_eq!(
-                attributes_map(&messages(link, 4)),
-                json_attributes_map(&expected["attributes"])
-            );
-        }
+/// Asserts one decoded span's links against the JSON span's `links` array.
+fn assert_links_match_json(span: &Fields, encoded: &Value) {
+    let links = messages(span, 13);
+    let json_links = encoded["links"].as_array().expect("links");
+    assert_eq!(links.len(), json_links.len());
+    for (link, expected) in links.iter().zip(json_links) {
+        assert_eq!(
+            json::hex(bytes(link, 1).expect("link trace id")),
+            expected["traceId"].as_str().expect("traceId")
+        );
+        assert_eq!(
+            json::hex(bytes(link, 2).expect("link span id")),
+            expected["spanId"].as_str().expect("spanId")
+        );
+        assert_eq!(
+            attributes_map(&messages(link, 4)),
+            json_attributes_map(&expected["attributes"])
+        );
     }
 }
