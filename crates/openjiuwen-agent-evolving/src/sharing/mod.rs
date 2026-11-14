@@ -8,18 +8,22 @@
 //! - [`SharedExperience`] / [`SharedSkillBundle`] — the published records.
 //! - [`KeywordExtractor`] — deterministic keyword/summary extraction.
 //! - [`ShareStager`] — approval gating and bundle assembly.
-//! - [`SharingBackend`] — the pluggable store seam with a local-file backend.
+//! - [`SharingBackend`] — the pluggable store seam, with a local-file backend,
+//!   an in-memory backend and the remote hub client.
 //!
-//! The remote hub client is deferred; the backend seam is real and testable
-//! offline.
+//! The local backends are the offline port; the remote hub client and its HTTP
+//! protocol are new design (the Python package only knows the local filesystem),
+//! so a hub can be swapped in without touching the stager.
 
 mod backend;
 mod keywords;
+mod remote;
 mod stager;
 mod types;
 
 pub use backend::{LocalFileSharingBackend, MemorySharingBackend, SharingBackend};
 pub use keywords::KeywordExtractor;
+pub use remote::{RemoteHubOptions, RemoteHubSharingBackend, HUB_API_KEY_ENV, HUB_URL_ENV};
 pub use stager::{ShareStager, StagedBundle};
 pub use types::{
     QueryKeywords, SharedExperience, SharedSkillBundle, SharingMeta, SkillPackageMeta,
