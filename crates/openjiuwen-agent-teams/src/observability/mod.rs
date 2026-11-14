@@ -130,8 +130,9 @@ mod tests {
     #[cfg(feature = "otlp")]
     #[test]
     fn the_otlp_feature_upgrades_only_the_memory_bridge() {
+        let export_available = OTLP_EXPORT_AVAILABLE;
         assert!(
-            !OTLP_EXPORT_AVAILABLE,
+            !export_available,
             "the crate-wide promise is still no exporter"
         );
         let observer = otlp_memory_observer("s-1").expect("the memory provider builds");

@@ -506,9 +506,9 @@ mod tests {
             .failed("");
         let span = span_for(&blank, None);
 
-        assert!(span.meta_data.get(AT_MEMORY_MEMBER_ID).is_none());
-        assert!(span.meta_data.get(AT_MEMORY_KIND).is_none());
-        assert!(span.meta_data.get(AT_MEMORY_ERROR).is_none());
+        assert!(!span.meta_data.contains_key(AT_MEMORY_MEMBER_ID));
+        assert!(!span.meta_data.contains_key(AT_MEMORY_KIND));
+        assert!(!span.meta_data.contains_key(AT_MEMORY_ERROR));
         assert_eq!(
             span.meta_data.get(AT_MEMORY_OUTCOME),
             Some(&Value::from("failed"))
@@ -580,7 +580,7 @@ mod tests {
             &TeamMemoryEvent::new(TeamMemoryOperation::Search, "team-1"),
             None,
         );
-        assert!(span.session_id.is_empty());
+        assert_eq!(span.session_id, "");
     }
 
     #[test]
