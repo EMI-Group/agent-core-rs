@@ -1,11 +1,13 @@
-//! OTLP/HTTP span exporter with JSON payloads.
+//! OTLP/HTTP span exporter with JSON and protobuf payloads.
 //!
 //! Ports the OTLP exporter wiring of `openjiuwen/extensions/tracer_otel/setup.py`
-//! (v0.1.20). The transport is OTLP/HTTP with `Content-Type: application/json`
-//! ("http/json" in the spec): gRPC and protobuf need `opentelemetry-otlp`,
-//! `prost` and `tonic`, and this workspace builds offline from a registry that
-//! does not carry them, so protobuf encoding is not an option. JSON is a
-//! first-class OTLP encoding — every collector accepts it on `:4318`.
+//! (v0.1.20). Both OTLP/HTTP encodings are supported: `http/json`
+//! (`Content-Type: application/json`, [`OtlpEncoding::Json`], the default) and
+//! `http/protobuf` (`application/x-protobuf`, [`OtlpEncoding::Protobuf`]).
+//! Protobuf bodies come from the hand-written encoder in `protobuf.rs`, so
+//! neither `prost` nor `opentelemetry-otlp` is required. gRPC stays
+//! unsupported: it needs `tonic`/`prost` plus an HTTP/2 stack that this offline
+//! workspace does not carry.
 //!
 //! # Runtime model
 //!
@@ -24,7 +26,7 @@
 //! use std::collections::BTreeMap;
 //! use std::time::Duration;
 //!
-//! use openjiuwen_extensions::otel::otlp::OtlpHttpExporter;
+//! use openjiuwen_extensions::otel::otlp::{OtlpEncoding, OtlpHttpExporter};
 //!
 //! let exporter = OtlpHttpExporter::new(
 //!     "http://localhost:4318",
@@ -32,6 +34,15 @@
 //!     Duration::from_secs(5),
 //! )?;
 //! assert_eq!(exporter.traces_url(), "http://localhost:4318/v1/traces");
+//! assert_eq!(exporter.content_type(), "application/json");
+//!
+//! let protobuf = OtlpHttpExporter::with_encoding(
+//!     "http://localhost:4318",
+//!     BTreeMap::new(),
+//!     Duration::from_secs(5),
+//!     OtlpEncoding::Protobuf,
+//! )?;
+//! assert_eq!(protobuf.content_type(), "application/x-protobuf");
 //! # Ok::<(), openjiuwen_common::error::Error>(())
 //! ```
 //!
@@ -39,6 +50,8 @@
 
 mod endpoint;
 mod json;
+mod model;
+mod protobuf;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -72,7 +85,32 @@ const WORKER_GONE: &str = "the OTLP HTTP worker is not running";
 /// Message reported when the worker dropped the reply channel.
 const REPLY_LOST: &str = "the OTLP HTTP worker dropped the export result";
 
-/// Exports finished spans to an OTLP/HTTP collector as JSON.
+/// Body encoding of an OTLP/HTTP export.
+///
+/// [`OtlpEncoding::Json`] is the OTLP `http/json` encoding and the default;
+/// [`OtlpEncoding::Protobuf`] is `http/protobuf`. The choice drives both the
+/// `Content-Type` request header and the encoder used for every batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OtlpEncoding {
+    /// `application/json`: the OTLP `http/json` encoding.
+    #[default]
+    Json,
+    /// `application/x-protobuf`: the OTLP `http/protobuf` encoding.
+    Protobuf,
+}
+
+impl OtlpEncoding {
+    /// The HTTP `Content-Type` of a body in this encoding.
+    #[must_use]
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Protobuf => "application/x-protobuf",
+        }
+    }
+}
+
+/// Exports finished spans to an OTLP/HTTP collector as JSON or protobuf.
 ///
 /// Construction starts the worker thread but performs no I/O; the first export
 /// opens the connection. The exporter is `Send + Sync`, so the SDK can own it
@@ -86,6 +124,8 @@ pub struct OtlpHttpExporter {
     headers: HeaderMap,
     /// Per-request timeout handed to the `reqwest::Client`.
     timeout: Duration,
+    /// The body encoding, which also fixes the `Content-Type`.
+    encoding: OtlpEncoding,
     /// The resource the provider handed over in `set_resource`.
     resource: Mutex<Option<Resource>>,
     /// Job channel; `None` once shut down closes the channel.
@@ -95,12 +135,14 @@ pub struct OtlpHttpExporter {
 }
 
 impl OtlpHttpExporter {
-    /// Builds an exporter for `endpoint` and starts its worker thread.
+    /// Builds a JSON-encoding exporter for `endpoint` and starts its worker
+    /// thread.
     ///
     /// `endpoint` may be a base URL (`http://host:4318`) or a complete traces
     /// URL; the `/v1/traces` suffix is appended when absent. `headers` are sent
-    /// verbatim with every request, except `content-type`, which is always
-    /// `application/json`. `timeout` bounds each HTTP request.
+    /// verbatim with every request, except `content-type`, which is always the
+    /// encoding's (`application/json` here). `timeout` bounds each HTTP
+    /// request. This is [`Self::with_encoding`] with [`OtlpEncoding::Json`].
     ///
     /// # Errors
     ///
@@ -114,6 +156,31 @@ impl OtlpHttpExporter {
         endpoint: impl Into<String>,
         headers: BTreeMap<String, String>,
         timeout: Duration,
+    ) -> Result<Self> {
+        Self::with_encoding(endpoint, headers, timeout, OtlpEncoding::Json)
+    }
+
+    /// Builds an exporter that encodes its bodies as `encoding` and starts its
+    /// worker thread.
+    ///
+    /// Endpoint and header validation, normalization, and worker startup are
+    /// those of [`Self::new`]. `content-type` is always
+    /// [`OtlpEncoding::content_type`] and cannot be overridden through
+    /// `headers`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] when `endpoint` is empty, is not an absolute
+    /// `http`/`https` URL, or when a header name or value is not a valid HTTP
+    /// header. [`Error::Config`] when the worker thread cannot be started.
+    ///
+    /// [`Error::Validation`]: openjiuwen_common::error::Error::Validation
+    /// [`Error::Config`]: openjiuwen_common::error::Error::Config
+    pub fn with_encoding(
+        endpoint: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        timeout: Duration,
+        encoding: OtlpEncoding,
     ) -> Result<Self> {
         let endpoint = endpoint.into();
         let endpoint = endpoint.trim();
@@ -144,6 +211,7 @@ impl OtlpHttpExporter {
             traces_url,
             headers,
             timeout,
+            encoding,
             resource: Mutex::new(None),
             sender: Some(sender),
             worker: Mutex::new(Some(worker)),
@@ -157,15 +225,24 @@ impl OtlpHttpExporter {
         &self.traces_url
     }
 
-    /// Serializes the batch with the cached resource into the OTLP/JSON body.
-    fn body(&self, batch: &[SpanData]) -> std::result::Result<String, OTelSdkError> {
+    /// The `Content-Type` sent with every request, taken from the encoding.
+    #[must_use]
+    pub fn content_type(&self) -> &'static str {
+        self.encoding.content_type()
+    }
+
+    /// Encodes the batch with the cached resource into the exporter's encoding.
+    fn body(&self, batch: &[SpanData]) -> std::result::Result<Vec<u8>, OTelSdkError> {
         let resource = lock(&self.resource).clone();
-        let body = json::encode_body(resource.as_ref(), batch);
-        serde_json::to_string(&body).map_err(|error| {
-            OTelSdkError::InternalFailure(format!(
-                "the OTLP JSON body could not be serialized: {error}"
-            ))
-        })
+        match self.encoding {
+            OtlpEncoding::Json => serde_json::to_vec(&json::encode_body(resource.as_ref(), batch))
+                .map_err(|error| {
+                    OTelSdkError::InternalFailure(format!(
+                        "the OTLP JSON body could not be serialized: {error}"
+                    ))
+                }),
+            OtlpEncoding::Protobuf => Ok(protobuf::encode_body(resource.as_ref(), batch)),
+        }
     }
 
     /// Reports whether the worker still accepts batches.
@@ -183,6 +260,7 @@ impl fmt::Debug for OtlpHttpExporter {
             .field("traces_url", &self.traces_url)
             .field("timeout", &self.timeout)
             .field("headers", &header_names)
+            .field("encoding", &self.encoding)
             .field("shutdown", &self.is_shutdown())
             .finish_non_exhaustive()
     }
@@ -199,7 +277,14 @@ impl SpanExporter for OtlpHttpExporter {
         };
         let body = self.body(&batch)?;
         let (reply, response) = tokio::sync::oneshot::channel();
-        if sender.send(Job { body, reply }).is_err() {
+        if sender
+            .send(Job {
+                body,
+                content_type: self.encoding.content_type(),
+                reply,
+            })
+            .is_err()
+        {
             warn!(target: LOG_TARGET, "rejected a span batch: {WORKER_GONE}");
             return Err(OTelSdkError::InternalFailure(WORKER_GONE.to_owned()));
         }
