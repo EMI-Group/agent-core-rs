@@ -31,9 +31,8 @@ pub const SUPPORTED_SUBJECT_KINDS: [EvolutionSubjectKind; 2] = [
 
 /// Which artefact a draft targets.
 ///
-/// The wire literals are the Python protocol values `skill` and `swarm-skill`;
-/// the legacy alias `team-skill` is accepted on input and normalized to
-/// [`EvolutionSubjectKind::SwarmSkill`].
+/// The wire literals are `skill` and `swarm-skill`; the legacy alias `team-skill`
+/// is accepted on input and normalized to [`EvolutionSubjectKind::SwarmSkill`].
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -161,9 +160,8 @@ impl EvolutionSubject {
 ///
 /// # Errors
 ///
-/// [`Error::validation`] when `raw` is not an object, when `kind` is missing or
-/// unsupported, when `name` is blank, or when `scope` is present but not an
-/// object.
+/// [`Error::validation`] when `raw` is not an object, `kind` is missing or unsupported,
+/// `name` is blank, or `scope` is present but not an object.
 pub fn normalize_subject(raw: &Value) -> Result<EvolutionSubject> {
     let Some(object) = raw.as_object() else {
         return Err(Error::validation("subject must be an object"));
@@ -192,8 +190,7 @@ pub fn normalize_subject(raw: &Value) -> Result<EvolutionSubject> {
 
 /// Where inside a skill document a draft experience belongs.
 ///
-/// The Python protocol restricts this target to three values, unlike the wider
-/// [`crate::signal::EvolutionTarget`] routing vocabulary.
+/// The protocol restricts this to three values, unlike [`crate::signal::EvolutionTarget`].
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -309,14 +306,13 @@ impl DraftSection {
 
 /// One normalized experience in an [`EvolveDraft`].
 ///
-/// The optional script fields are only populated for
-/// [`EvolutionTarget::Script`] items, and `source_refs` holds the run-scoped
-/// evidence references the approval view shows but the persistence view drops.
+/// Script fields are only populated for [`EvolutionTarget::Script`] items, and
+/// `source_refs` holds the run-scoped evidence the approval view shows and the
+/// persistence view drops.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DraftExperience {
-    /// One-line lesson summary, whitespace-collapsed and at most
-    /// [`SUMMARY_LIMIT`] characters.
+    /// One-line lesson summary, whitespace-collapsed and bounded by [`SUMMARY_LIMIT`].
     pub summary: String,
     /// The Markdown lesson body.
     pub content: String,
@@ -344,16 +340,14 @@ pub struct DraftExperience {
 impl DraftExperience {
     /// Normalizes one raw draft item.
     ///
-    /// `target` defaults to `body`; `section` is forced to `Scripts` for script
-    /// targets and otherwise defaults to `Instructions` (description) or
-    /// `Troubleshooting` (body).
+    /// `target` defaults to `body`; `section` is forced to `Scripts` for script targets and
+    /// otherwise defaults to `Instructions` (description) or `Troubleshooting` (body).
     ///
     /// # Errors
     ///
-    /// [`Error::validation`] when `raw` is not an object, `content` or
-    /// `summary` is missing/blank, the summary exceeds [`SUMMARY_LIMIT`], the
-    /// target or section literal is invalid, `script_filename` is not a plain
-    /// file name, or `source_refs` is not a list.
+    /// [`Error::validation`] on a non-object item, missing/blank `content` or `summary`,
+    /// an over-long summary, an invalid target or section, a non-plain `script_filename`,
+    /// or a non-list `source_refs`.
     pub fn normalize(raw: &Value) -> Result<Self> {
         let Some(object) = raw.as_object() else {
             return Err(Error::validation("experience must be an object"));
@@ -531,15 +525,13 @@ pub struct SimplifyAction {
 impl SimplifyAction {
     /// Normalizes one raw maintenance action.
     ///
-    /// `new_content` is only retained for `REFINE`/`MERGE`, matching Python's
-    /// normalization, and `merge_remove_ids` rejects empty ids, the target's own
-    /// id and duplicates.
+    /// `new_content` is only retained for `REFINE`/`MERGE`, matching Python, and
+    /// `merge_remove_ids` rejects empty ids, the target's own id and duplicates.
     ///
     /// # Errors
     ///
-    /// [`Error::validation`] on a malformed action, a missing `record_id`, a
-    /// `REFINE` without content, a `MERGE` without content or merge ids, or a
-    /// malformed `merge_remove_ids` entry.
+    /// [`Error::validation`] on a malformed action or `record_id`, a `REFINE` without
+    /// content, a `MERGE` without content or merge ids, or a bad `merge_remove_ids` entry.
     pub fn normalize(raw: &Value) -> Result<Self> {
         let Some(object) = raw.as_object() else {
             return Err(Error::validation("action must be an object"));
@@ -766,9 +758,8 @@ fn normalize_merge_remove_ids(value: Option<&Value>, record_id: &str) -> Result<
 
 /// Reads a raw JSON value as text, treating absent/null as empty.
 ///
-/// Strings, numbers and booleans have their natural spelling; arrays and objects
-/// have no textual form here and read as empty, so a wrongly typed field fails
-/// the required-field check instead of being stringified.
+/// Strings, numbers and booleans have their natural spelling; arrays and objects read as
+/// empty, so a wrongly typed field fails the required-field check instead of stringifying.
 fn raw_text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
