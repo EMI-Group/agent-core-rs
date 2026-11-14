@@ -4,8 +4,8 @@
 
 Port of `openjiuwen/extensions/tracer_otel/` (v0.1.20): turn session trace frames into OpenTelemetry spans with the Python span names, attributes, statuses, redaction, and parent/child links.
 Python registers async handler callbacks on the session tracer registry; Rust sessions emit synchronous [`TraceSink`] frames instead, so the primary seam is a sink (`OtelTraceSink`) plus typed handlers (`OtelAgentHandler`, `OtelWorkflowHandler`) for callers that already hold a `TraceSpan`.
-Finished spans leave the process through one of four exporters: in-memory capture (`Memory`), one `tracing` line per span (`Console`), nothing (`None`), or OTLP/HTTP with JSON payloads (`Otlp`, in `otlp/`).
-Two presets wrap the OTLP exporter for hosted backends: the Grafana Cloud gateway (`grafana/`) and Langfuse (`langfuse/`).
+Finished spans leave the process through one of four exporters: in-memory capture (`Memory`), one `tracing` line per span (`Console`), nothing (`None`), or OTLP/HTTP with JSON or protobuf payloads (`Otlp`, in `otlp/`).
+Two presets wrap the OTLP exporter for hosted backends and for a local collector: the Grafana Cloud gateway and the self-hosted Grafana Agent/Alloy preset (`grafana/`), and Langfuse (`langfuse/`).
 Everything that decides *what a span looks like* — configuration, environment resolution, semantic conventions, redaction, span names — plus both presets compile without the `otel` feature; only the SDK-backed exporter, sink, and handlers need it.
 Without the feature, `init_otel_tracer` validates the configuration and returns an inactive handle for every exporter type instead of failing.
 
@@ -14,7 +14,9 @@ Without the feature, `init_otel_tracer` validates the configuration and returns 
 ```rust
 // config.rs (always compiled)
 pub enum ExporterType { None, Memory, Console, Otlp }   // serde snake_case; Default = Otlp (Python default)
-pub enum OtlpProtocol { Grpc, Http }                    // Default = Grpc (Python default); Http = JSON payloads
+pub enum OtlpProtocol { Grpc, Http, HttpProtobuf }      // Default = Grpc (Python default), still unsupported
+                                                        // Http = JSON, HttpProtobuf = protobuf; Serialize "grpc"/"http"/"http_protobuf"
+                                                        // Deserialize accepts any case/whitespace and `/`/`-`/`_` separators
 pub struct OtelTracerConfig {
     pub tracer_name: String,            // "openjiuwen.tracer.otel"
     pub exporter_type: ExporterType,    // "otlp"
@@ -62,8 +64,8 @@ pub fn env_protocol_value() -> Option<String>;                    // OPENJIUWEN_
 pub fn env_service_name() -> Option<String>;                      // OPENJIUWEN_* then OTEL_SERVICE_NAME
 pub fn resolve_endpoint(explicit: Option<&str>) -> String;        // explicit -> env -> DEFAULT_OTLP_HTTP_ENDPOINT
 pub fn resolve_headers(explicit: &BTreeMap<String, String>) -> BTreeMap<String, String>; // explicit only when non-empty
-pub fn resolve_protocol(explicit: OtlpProtocol) -> Result<OtlpProtocol>; // Http wins; else env; else explicit unchanged
-pub fn parse_protocol(raw: &str) -> Result<OtlpProtocol>;         // case-insensitive; unsupported/validation errors
+pub fn resolve_protocol(explicit: OtlpProtocol) -> Result<OtlpProtocol>; // any non-Grpc explicit wins; else env; else explicit unchanged
+pub fn parse_protocol(raw: &str) -> Result<OtlpProtocol>;         // case-insensitive; protobuf spellings -> HttpProtobuf; grpc unsupported
 pub fn resolve_service_name(explicit: &str) -> String;            // "openjiuwen" counts as unset
 
 // redaction.rs (always compiled)
@@ -132,13 +134,18 @@ pub fn init_otel_tracer_with_exporter<E: SpanExporter + 'static>(config, exporte
 // the injected exporter wins for every ExporterType, including Otlp (config protocol/endpoint unused)
 
 // otlp/ (feature "otel")
-pub struct OtlpHttpExporter { .. }   // Debug + Send + Sync; Debug shows header names, never values
+pub enum OtlpEncoding { Json, Protobuf }   // Default = Json; content_type() -> "application/json" / "application/x-protobuf"
+pub struct OtlpHttpExporter { .. }   // Debug + Send + Sync; Debug shows encoding and header names, never values
 impl OtlpHttpExporter {
-    pub fn new(endpoint: impl Into<String>, headers: BTreeMap<String, String>, timeout: Duration) -> Result<Self>;
+    pub fn new(endpoint: impl Into<String>, headers: BTreeMap<String, String>, timeout: Duration) -> Result<Self>;  // JSON
+    pub fn with_encoding(endpoint: impl Into<String>, headers: BTreeMap<String, String>, timeout: Duration, encoding: OtlpEncoding) -> Result<Self>;
     pub fn traces_url(&self) -> &str;               // always ends in /v1/traces
+    pub fn content_type(&self) -> &'static str;     // the body encoding's content type
 }
 // impl SpanExporter: export / shutdown_with_timeout / force_flush (no-op) / set_resource
 pub fn traces_url(endpoint: &str) -> String;        // base or traces URL -> exactly one /v1/traces
+// otlp/ internals: model.rs groups spans by instrumentation scope for both encoders,
+// json.rs encodes ExportTraceServiceRequest as serde_json::Value, protobuf.rs as OTLP protobuf bytes.
 
 // grafana/ (always compiled; `exporter()` is feature "otel")
 pub struct GrafanaCloudConfig { .. }
@@ -156,8 +163,11 @@ impl GrafanaCloudConfig {
     pub fn from_env() -> Result<Self>;
     #[cfg(feature = "otel")] pub fn exporter(&self) -> Result<OtlpHttpExporter>;
 }
-pub struct GrafanaAgentConfig { .. }   // new(endpoint), with_service_name, endpoint, service_name -> Option<&str>,
-                                      // otel_config()/exporter() always Error::Unsupported (external collector)
+pub struct GrafanaAgentConfig { .. }   // new(endpoint), with_service_name, with_header(s), endpoint, service_name,
+                                      // headers, DEFAULT_LOCAL_OTLP_ENDPOINT -> http://localhost:4318
+                                      // otel_config() = ExporterType::Otlp + OtlpProtocol::Http targeting that collector
+                                      // (blank endpoint = default; non-absolute/non-http(s) = Error::Validation);
+                                      // exporter() builds the matching OtlpHttpExporter under feature "otel"
 pub const GRAFANA_INSTANCE_ID, GRAFANA_API_TOKEN, GRAFANA_ZONE, GRAFANA_OTLP_ZONE, GRAFANA_OTLP_ENDPOINT: &str;
 
 // langfuse/ (always compiled; `exporter()` is feature "otel")
@@ -271,12 +281,15 @@ The crate root re-exports `ExporterType`, `OtelTracerConfig`, `OtlpProtocol`, `g
 
 ## OTLP export
 
-`ExporterType::Otlp` installs `OtlpHttpExporter`, which posts finished spans to a collector over OTLP/HTTP with JSON payloads (`Content-Type: application/json`, the spec's `http/json`).
-That is the only transport this crate speaks: gRPC and protobuf framing need `opentelemetry-otlp`, `prost`, and `tonic`, which the offline registry does not carry.
-`OtlpProtocol::Grpc` is therefore the configuration default (Python parity) *and* unsupported: building the exporter answers `Error::Unsupported` with a message naming `http/json`, so nothing is downgraded silently.
-`OtlpProtocol::Http` (or `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`) selects the supported transport, and an explicitly configured `Http` always wins over the environment.
+`ExporterType::Otlp` installs `OtlpHttpExporter`, which posts finished spans to a collector over OTLP/HTTP in one of the two standard encodings: JSON (`Content-Type: application/json`, the spec's `http/json`) or protobuf (`Content-Type: application/x-protobuf`, `http/protobuf`).
+`OtlpEncoding::{Json, Protobuf}` carries that choice; `OtlpHttpExporter::new` is JSON (source-compatible default) and `OtlpHttpExporter::with_encoding(..)` takes the encoding, which drives both the request `Content-Type` and the body encoder of every batch.
+`OtlpProtocol::Http` selects JSON and `OtlpProtocol::HttpProtobuf` selects protobuf; both are supported, and an explicit non-`Grpc` value always wins over the environment.
+`OtlpProtocol::Grpc` stays the configuration default (Python parity) *and* unsupported: gRPC framing needs `opentelemetry-otlp`, `prost`, and `tonic`, which the offline registry does not carry, so building the exporter answers `Error::Unsupported` with a message naming both `http/json` and `http/protobuf` — nothing is downgraded silently.
+The protobuf encoder is hand-written (`otlp/protobuf.rs`) because `prost`/`tonic` are absent offline; it emits the `ExportTraceServiceRequest` subset the exporter produces (resource, scope, span, `KeyValue`/`AnyValue`/array, event, link, status, dropped counts) with correct wire types — varint, `fixed64` for nanosecond timestamps and doubles, length-delimited for strings/messages/bytes, raw 16/8-byte ids, proto3 defaults omitted.
+`otlp/model.rs` owns the span→instrumentation-scope grouping both encoders consume, so JSON and protobuf cannot disagree on grouping or ordering.
 
-Protocol mapping (`env::parse_protocol`, ASCII case-insensitive): `http/json` → `Http`; `http` → `Http` — Python's alias, transported here as JSON rather than protobuf (the documented deviation; the endpoint and collector contract are identical); `http/protobuf` → `Error::Unsupported` (no protobuf encoder); `grpc` → `Error::Unsupported` (no gRPC transport); anything else → `Error::Validation` naming the accepted values.
+Protocol mapping (`env::parse_protocol`, ASCII case-insensitive; `OtlpProtocol`'s `Deserialize` applies the same normalization): `http/json` → `Http`; `http` → `Http` — Python's alias, transported here as JSON; `http/protobuf`, `http_protobuf`, `http-protobuf`, `protobuf` → `HttpProtobuf`; `grpc` → `Error::Unsupported` (no gRPC transport); anything else → `Error::Validation` naming the accepted values.
+Serialization stays backward compatible: `grpc`, `http`, `http_protobuf`.
 
 Endpoint, headers, protocol, and `service.name` resolve in one order per setting: the value on `OtelTracerConfig`, then the `OPENJIUWEN_OTEL_*` variable, then the standard `OTEL_*` variable, then the built-in default (`http://localhost:4318`, `openjiuwen`, no extra headers).
 A blank (empty or whitespace-only) value counts as unset at every stage.
@@ -289,7 +302,7 @@ Construction starts the worker thread but performs no I/O; the first export open
 
 The transport exists because of a hard SDK constraint: `opentelemetry_sdk` 0.31's batch processor calls `SpanExporter::export` on a plain `std::thread` driven by `futures_executor::block_on`, where no tokio reactor is installed — building or awaiting a `reqwest` request there panics ("there is no reactor running").
 `otlp/transport.rs` therefore owns one `std::thread` (named `openjiuwen-otlp-http`) that builds a current-thread tokio runtime and the single `reqwest::Client`, drains an unbounded tokio channel with `blocking_recv`, and reports each job over a oneshot channel; `export` awaits that reply under whatever executor called it (the batch processor's `block_on`, a tokio task, or a plain test).
-Headers are attached to every request, `content-type` is always `application/json`, and header *values* are never logged (`Debug` prints the names only).
+Headers are attached to every request, the `content-type` follows the job's encoding (`application/json` or `application/x-protobuf`), and header *values* are never logged (`Debug` prints the encoding and the names only).
 
 `export_timeout_ms` sizes the per-request HTTP timeout (minimum 1 ms) and the default `TracerHandle::shutdown` budget; the batch processor keeps its SDK default because `BatchConfigBuilder::with_max_export_timeout` is gated behind the SDK's `experimental_trace_batch_span_processor_with_async_runtime` feature, which this crate does not enable (`OTEL_BSP_EXPORT_TIMEOUT` therefore governs it).
 `schedule_delay_millis` and `max_export_batch_size` configure the processor as before.
@@ -307,7 +320,8 @@ Attribute values encode as `boolValue`, `intValue` (decimal string), `doubleValu
 ## Integrations
 
 `grafana::GrafanaCloudConfig` turns a Grafana Cloud stack into an OTLP/HTTP JSON preset: the gateway endpoint `https://otlp-gateway-<zone>.grafana.net/otlp` plus the Basic `authorization` header `base64(instance_id:token)`, exposed through `otel_config()` and, with `otel`, `exporter()`.
-`grafana::GrafanaAgentConfig` keeps the self-hosted Grafana Agent/Alloy push API-shaped and answers `Error::Unsupported`: a collector service has to exist and run outside this process, and this crate neither starts nor discovers one.
+`grafana::GrafanaAgentConfig` targets an already-running local Grafana Agent/Alloy collector: `otel_config()` resolves a blank endpoint to `GrafanaAgentConfig`'s `DEFAULT_LOCAL_OTLP_ENDPOINT` (`http://localhost:4318`), validates that the endpoint is an absolute `http`/`https` URL (`Error::Validation` otherwise), applies the optional headers, and selects `ExporterType::Otlp` with `OtlpProtocol::Http`.
+Installing, starting, discovering, and supervising the collector stays a host concern, and no probe is attempted at configuration time.
 
 `langfuse::LangfuseConfig` addresses the OTLP endpoint `{host}/api/public/otel` with `base64(public_key:secret_key)` as Basic credentials, and `langfuse::LangfuseClient` posts batched `trace-create`/`span-create`/`generation-create` events to `POST {host}/api/public/ingestion`.
 `IngestionBatch` buffers events in insertion order and `LangfuseClient::ingest` splits them into requests of at most `max_batch_size` events (`DEFAULT_MAX_BATCH_SIZE` = 1000) and returns an `IngestionSummary { events, requests }`.
@@ -334,13 +348,14 @@ Both presets and their environment variables (`GRAFANA_*`, `LANGFUSE_*`) compile
 - `./agent_handler/tests.rs`: the LLM/tool/prompt/chain/retriever/embedding/memory/evaluator/workflow callbacks over a `CaptureExporter`, tool dedup (`bug #2046`), error attributes, session fallback, `from_handle`.
 - `./workflow_handler/tests.rs`: root/component naming and kinds, retrieval query/documents, layer-root and sub-workflow parenting, cross-workflow isolation, buffer flushes, error/interrupt paths, stale-span cleanup on trace-id change.
 - Unit tests beside `redaction.rs` (all `test_redaction.py` cases: exact truncation marker, hash formula, field override truth table, system-prompt non-truncation), `span_names.rs` (every naming rule), `config.rs` (sample-rate validation, env toggle precedence, `from_env`/`apply_env` default-only filling and ignored unusable protocols), `handle.rs` (no-op vs active, OTLP/HTTP builds an active handle without a capture API, post-shutdown deactivation), `attrs.rs`, `llm_attrs.rs`.
-- `./env.rs` unit tests (port of the `test_setup.py` env cases): header grammar, `OPENJIUWEN_*` before `OTEL_*`, trace-specific before generic endpoint, blank-as-unset, protocol mapping including both `Unsupported` values and the validation error, and every `resolve_*` fallback; they share one `ENV_LOCK` and an `EnvGuard` that clears and restores the process environment.
+- `./env.rs` unit tests (port of the `test_setup.py` env cases): header grammar, `OPENJIUWEN_*` before `OTEL_*`, trace-specific before generic endpoint, blank-as-unset, the full protocol matrix (`grpc` unsupported, every protobuf spelling accepted, unknown value validation), and every `resolve_*` fallback; they share one `ENV_LOCK` and an `EnvGuard` that clears and restores the process environment.
 - `./otlp/tests.rs` drives `export()` from plain `#[test]` functions with `futures::executor::block_on` — deliberately reactor-free, so a reactor dependency in the exporter would hang or panic — and covers endpoint normalization, constructor validation, `Send + Sync + Debug`, the JSON body field by field (scope grouping, hex ids, kinds, decimal nanosecond timestamps, typed attributes, events, links, statuses, resource-less bodies), posting to the traces path through `wiremock`, non-2xx handling, the client timeout, and resource/shutdown/post-shutdown behavior.
-- `./grafana/tests.rs` covers endpoint derivation for every accepted zone form, the exact Basic credentials, `otel_config()` field by field, every validation error, `from_env()` precedence, the collector deferral, and `exporter().traces_url()` under `otel`.
+- `./otlp/protobuf/tests.rs` covers the hand-written encoder with a matching hand-written test decoder: varint and 64-bit edges, tag composition, little-endian fixed-width words, every `AnyValue` scalar variant, status/kind mapping, scope grouping and the empty batch, and the cross-encoding test that encodes ONE batch as JSON and as protobuf and asserts identical ids, names, kinds, timestamps, attributes and status.
+- `./grafana/tests.rs` covers endpoint derivation for every accepted zone form, the exact Basic credentials, `otel_config()` field by field for both presets, the local collector default endpoint and header validation, every validation error, `from_env()` precedence, serde round-trip, and `exporter().traces_url()` under `otel`.
 - `./langfuse/tests.rs` covers the preset (default and custom hosts, path normalization, credentials, `otel_config()`, validation, `from_env()` precedence, `exporter()`), and `./langfuse/client/tests.rs` drives `wiremock` for the POST path, headers, the per-type batch body, the success summary, a 207 with `errors`, a 500, a non-JSON 2xx, chunking, the empty batch, and `max_batch_size(0)`.
 - Every test module that reads captured `SpanData` calls `force_flush()` first; Python counterparts are named in comments, and environment tests serialize on a `static Mutex` and never contact the network.
 - Doctests that compile as external crates: `./mod.rs` carries six (the seam, the `TraceSink` integration, the two typed-handler examples, the OTLP/HTTP handle, and the presets), while `./otlp/mod.rs` and `./otlp/endpoint.rs` document the exporter and `traces_url`; the SDK-backed examples are wrapped in `# #[cfg(feature = "otel")] # { .. # }` so the default build stays green.
-- The crate-boundary suites assert the public surface from outside the crate: `../tests/otel.rs` (`#![cfg(feature = "otel")]`) pins one exported `chat {model}` span through a session `Tracer`, the default error-status path, and the `bug #2046` tool dedup; `../tests/otel_seam.rs` (both builds) pins `init_otel_tracer` for all four exporter types with `OtlpProtocol::Http`, the `Grpc` default answering `Error::Unsupported`, and idempotent shutdown; `../tests/otel_otlp.rs` (`otel`) posts a whole batch to a loopback `wiremock` collector and asserts the wire payload, environment precedence at both levels, the typed failure paths (status, timeout, post-shutdown), and the gRPC rejection; `../tests/otel_integrations.rs` (both builds, with `otel` branches) covers both presets and the Langfuse ingestion contract.
+- The crate-boundary suites assert the public surface from outside the crate: `../tests/otel.rs` (`#![cfg(feature = "otel")]`) pins one exported `chat {model}` span through a session `Tracer`, the default error-status path, and the `bug #2046` tool dedup; `../tests/otel_seam.rs` (both builds) pins `init_otel_tracer` for all four exporter types with `OtlpProtocol::Http` and `HttpProtobuf`, the `Grpc` default answering `Error::Unsupported` with both HTTP alternatives named, and idempotent shutdown; `../tests/otel_otlp.rs` (`otel`) posts a whole JSON batch to a loopback `wiremock` collector and asserts the wire payload, environment precedence at both levels, the serde/`parse_protocol` protocol matrix, the typed failure paths (status, timeout, post-shutdown), and the gRPC rejection; `../tests/otel_otlp_protobuf.rs` (`otel`) builds a protobuf exporter and handle against the loopback collector and byte-decodes the body (raw ids, name, kind, `fixed64` timestamps, every attribute variant, status, resource, scope) after asserting `Content-Type: application/x-protobuf` on `POST /v1/traces`; `../tests/otel_integrations.rs` (both builds, with `otel` branches) covers both Grafana presets, the local collector target, and the Langfuse ingestion contract.
 
 ## Routing Table
 
@@ -350,8 +365,8 @@ Both presets and their environment variables (`GRAFANA_*`, `LANGFUSE_*`) compile
 - `./redaction.rs` → truncate/hash/redact helpers
 - `./span_names.rs` → span naming rules for agent/workflow spans
 - `./handle.rs` → `TracerHandle`, `init_otel_tracer`, exporter dispatch (including OTLP), timed shutdown, no-op seam when the feature is off
-- `./otlp/` → OTLP/HTTP JSON exporter: `mod.rs` public type + `SpanExporter` impl, `json.rs` body encoder, `transport.rs` dedicated-thread runtime and job channel, `endpoint.rs` `/v1/traces` normalization, `tests.rs`
-- `./grafana/` → Grafana Cloud gateway preset and the deferred Grafana Agent/Alloy preset (`mod.rs`, `tests.rs`)
+- `./otlp/` → OTLP/HTTP exporter (JSON + protobuf): `mod.rs` public types (`OtlpHttpExporter`, `OtlpEncoding`) and `SpanExporter` impl, `model.rs` shared span→scope grouping, `json.rs` JSON body encoder, `protobuf.rs` hand-written protobuf encoder (`protobuf/tests.rs`), `transport.rs` dedicated-thread runtime and byte job channel, `endpoint.rs` `/v1/traces` normalization, `tests.rs`
+- `./grafana/` → Grafana Cloud gateway preset and the self-hosted local collector (Agent/Alloy) preset (`mod.rs`, `tests.rs`)
 - `./langfuse/` → Langfuse OTLP preset (`mod.rs`), `events.rs` wire bodies, `batch.rs` `IngestionBatch`, `client.rs` REST ingestion, `tests.rs`, `client/tests.rs`
 - `./provider.rs` → SDK provider construction, in-memory + console exporters, `CaptureExporter`, `tracing_layer`
 - `./attrs.rs` → shared span start/end/error/interrupt attribute writers and string helpers
