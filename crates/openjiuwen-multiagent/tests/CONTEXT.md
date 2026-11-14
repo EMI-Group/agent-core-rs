@@ -43,7 +43,11 @@ Everything is offline and deterministic: members are in-process closures, sessio
 - `./pyrepr.rs` → `parse_python_literal`/`literal_or_json` parsing and `render_python_value` rendering, including the depth cap.
 - `./member_checkpoint.rs` → member-scoped keys/ids and per-member save/restore over one shared `MemoryCheckpointer`.
 - `./resources.rs` → `LocalResourceMgr` inherent surface and `TeamResourceMgr` trait-object defaults, duplicates, listings, revision and `clear`.
-- `./transport.rs` → `TeamTransport` backends: in-process delegation, the loopback Redis backend, key scheme, subscribers, deadlines, and the `Unsupported` Pulsar path.
+- `./transport.rs` → `TeamTransport` in-process delegation (ordering, fan-out, subscribers, deadlines, introspection) and backend selection (`Pulsar` `Unsupported`, Redis-without-settings `Config`).
+- `./transport_redis.rs` → the Redis Streams backend over a loopback fake RESP server with a stream + group + SET registry state machine: cross-instance round-trip, one delivery per consumer group, reconnect/claim, poison-entry ack, pub/sub fan-out across instances, registry refresh convergence, write-failure resilience, `stop` cleanup, `Cluster`/`Sentinel` `Unsupported`, and the "no list commands" assertion.
+- `./routing.rs` → `GroupRegistry`, `broadcast_targets`, `broadcast_to_group` (metadata stamp, skipped members, isolated failures, one group event), `RoutingTable` resolution and serde.
+- `./inbox.rs` → `InboxFilter` rules, `InboxFilterRegistry` default-accept, and runtime P2P/pub-sub enforcement.
+- `./communicable.rs` → `CommunicableAgent` binding lifecycle and an in-process messaging round trip.
 - `./ability.rs` → `P2PAbilityManager` batch dispatch: P2P vs local routing, input-order results, per-call failures, parallel cap.
 
 ## Test Strategy
