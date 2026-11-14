@@ -92,7 +92,10 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::graph::CAN_FEED;
-use crate::llm::cache::{cache_key, CachedMatch, MatchCache, CACHE_SCHEMA_VERSION};
+use crate::llm::cache::{
+    cache_key, candidate_identity, covers, decode_cached_matches, CachedMatch, MatchCache,
+    CACHE_SCHEMA_VERSION,
+};
 use crate::llm::identity::{
     canonical_json, graph_identity_sha256, stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION,
 };
@@ -383,39 +386,30 @@ impl OntologyMatcher {
         self.config
             .model
             .as_deref()
-            .map(CompletionModel::name)
-            .unwrap_or(NO_MODEL_BACKEND)
+            .map_or(NO_MODEL_BACKEND, CompletionModel::name)
     }
 
     /// Builds the canonical signature document.
     fn signature_document(&self) -> Value {
         let identity = ModelIdentity::of(&self.model_config(), self.backend());
         let mut document = Map::new();
-        document.insert(
-            "matcher_version".to_string(),
-            Value::String(MATCHER_VERSION.to_string()),
-        );
-        document.insert(
-            "prompt_version".to_string(),
-            Value::String(PROMPT_VERSION.to_string()),
-        );
+        document.insert("matcher_version".to_string(), Value::from(MATCHER_VERSION));
+        document.insert("prompt_version".to_string(), Value::from(PROMPT_VERSION));
         document.insert(
             "match_schema_version".to_string(),
-            Value::String(MATCH_SCHEMA_VERSION.to_string()),
+            Value::from(MATCH_SCHEMA_VERSION),
         );
         document.insert(
             "cache_schema_version".to_string(),
-            Value::String(CACHE_SCHEMA_VERSION.to_string()),
+            Value::from(CACHE_SCHEMA_VERSION),
         );
         document.insert(
             "identity_version".to_string(),
-            Value::String(IDENTITY_VERSION.to_string()),
+            Value::from(IDENTITY_VERSION),
         );
         document.insert(
             "system_prompt_sha256".to_string(),
-            Value::String(stable_metadata_sha256(&Value::String(
-                SYSTEM_PROMPT.to_string(),
-            ))),
+            Value::from(stable_metadata_sha256(&Value::from(SYSTEM_PROMPT))),
         );
         document.insert(
             "model".to_string(),
@@ -430,21 +424,14 @@ impl OntologyMatcher {
             "max_candidates".to_string(),
             Value::from(u64::try_from(self.config.max_candidates).unwrap_or(u64::MAX)),
         );
-        document.insert("relation".to_string(), Value::String(CAN_FEED.to_string()));
+        document.insert("relation".to_string(), Value::from(CAN_FEED));
         document.insert(
             "directions".to_string(),
-            Value::Array(vec![
-                Value::String(DIRECTION_FORWARD.to_string()),
-                Value::String(DIRECTION_REVERSE.to_string()),
-            ]),
+            Value::from(vec![DIRECTION_FORWARD, DIRECTION_REVERSE]),
         );
         document.insert(
             "methods".to_string(),
-            Value::Array(vec![
-                Value::String(METHOD_LLM.to_string()),
-                Value::String(METHOD_CONSENSUS.to_string()),
-                Value::String(METHOD_DETERMINISTIC.to_string()),
-            ]),
+            Value::from(vec![METHOD_LLM, METHOD_CONSENSUS, METHOD_DETERMINISTIC]),
         );
         document.insert(
             "description_limit".to_string(),
@@ -508,19 +495,17 @@ impl OntologyMatcher {
             // model call.
             let guard = cache.lock().await;
             for (index, entry) in batch.iter().enumerate() {
-                match guard.lookup(&keys[index]).await {
-                    Some(record) => match decode_cached_matches(&record) {
-                        Some(matches) => resolved.extend(matches),
-                        None => {
-                            tracing::warn!(
-                                candidate = %candidate_identity(entry.candidate),
-                                "ontology matcher: cached answer is unusable; asking the model"
-                            );
-                            misses.push((index, entry.clone()));
-                        }
-                    },
-                    None => misses.push((index, entry.clone())),
+                if let Some(record) = guard.lookup(&keys[index]).await {
+                    if let Some(matches) = decode_cached_matches(&record) {
+                        resolved.extend(matches);
+                        continue;
+                    }
+                    tracing::warn!(
+                        candidate = %candidate_identity(entry.candidate),
+                        "ontology matcher: cached answer is unusable; asking the model"
+                    );
                 }
+                misses.push((index, entry.clone()));
             }
         }
         if misses.is_empty() {
@@ -895,35 +880,6 @@ fn cache_key_for(entry: &BatchEntry<'_>, signature: &str) -> String {
         &graph_identity_sha256(entry.target),
         signature,
     )
-}
-
-/// The documented candidate identity recorded with a cached answer
-/// (Python's `RelationCandidate.key`: `source->target:relation`).
-fn candidate_identity(candidate: &RelationCandidate) -> String {
-    let relation = if candidate.relation.trim().is_empty() {
-        CAN_FEED
-    } else {
-        candidate.relation.as_str()
-    };
-    format!("{}->{}:{relation}", candidate.source, candidate.target)
-}
-
-/// Reports whether `item` answers the `candidate` pair, in either orientation.
-fn covers(item: &OntologyMatch, candidate: &RelationCandidate) -> bool {
-    let forward = item.source_id == candidate.source && item.target_id == candidate.target;
-    let reverse = item.source_id == candidate.target && item.target_id == candidate.source;
-    forward || reverse
-}
-
-/// Decodes the match list of a cached record, answering `None` when it is unusable.
-fn decode_cached_matches(record: &CachedMatch) -> Option<Vec<OntologyMatch>> {
-    match serde_json::from_value::<Vec<OntologyMatch>>(record.matches.clone()) {
-        Ok(matches) => Some(matches),
-        Err(error) => {
-            tracing::warn!(%error, "ontology matcher: cached matches could not be decoded");
-            None
-        }
-    }
 }
 
 /// Builds the compact request batch, pruning blank fields and empty arrays.

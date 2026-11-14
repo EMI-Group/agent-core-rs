@@ -124,8 +124,7 @@ impl ModelIdentity {
         let model = config
             .model
             .as_deref()
-            .map(CompletionModel::name)
-            .unwrap_or(NO_MODEL_BACKEND);
+            .map_or(NO_MODEL_BACKEND, CompletionModel::name);
         let backend = backend.trim();
         let mut identity = Self {
             model: model.to_string(),
@@ -396,12 +395,14 @@ pub fn graph_identity_sha256(descriptor: &CapabilityDescriptor) -> String {
 ///
 /// Ports `openjiuwen.symphony.shared.identity.sanitize_metadata`:
 ///
-/// - an endpoint key ([`ENDPOINT_FIELDS`]) is replaced by `<key>_sha256` holding
+/// - an endpoint key (`api_base`, `api_url`, `base_url`, `endpoint`, `endpoint_url`) is
+///   replaced by `<key>_sha256` holding
 ///   [`endpoint_sha256`] of its string value (a non-string value is hashed canonically,
 ///   and a `null` value is dropped);
 /// - a key [`is_sensitive_name`] recognizes — or one whose normalized form ends in
 ///   `_key`, `secret`, `token`, or `password` — is dropped entirely;
-/// - the five [`SAFE_KEY_FIELDS`] are exceptions that never count as credentials;
+/// - the five safe key fields (`cache_key`, `key_type`, `partition_key`, `public_key`,
+///   `routing_key`) are exceptions that never count as credentials;
 /// - every other key is kept in its original position with its value sanitized
 ///   recursively (objects and arrays included).
 ///
@@ -688,7 +689,7 @@ mod tests {
         assert_eq!(sanitize_metadata(&Value::from(5)), Value::from(5));
         assert_eq!(
             sanitize_metadata(&parse(r#"[{"token": "x"}, 1]"#)),
-            parse(r#"[{}, 1]"#)
+            parse(r"[{}, 1]")
         );
     }
 
@@ -727,7 +728,7 @@ mod tests {
         assert_eq!(identity.temperature, Some(f64::from(0.2_f32)));
         assert_eq!(identity.max_tokens, Some(64));
         assert_eq!(identity.top_p, None);
-        assert!(identity.stop.is_empty());
+        assert_eq!(identity.stop, [] as [String; 0]);
         assert_eq!(identity.request_config_sha256.len(), 64);
         assert_eq!(identity.client_config_sha256.len(), 64);
 

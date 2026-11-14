@@ -274,7 +274,7 @@ async fn the_cache_file_layout_is_byte_stable() {
     }
     for (key, id) in entries.iter().rev() {
         second
-            .record((*key).to_string(), stable_entry(*id))
+            .record((*key).to_string(), stable_entry(id))
             .await
             .unwrap();
     }

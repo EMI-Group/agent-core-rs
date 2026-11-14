@@ -30,7 +30,8 @@
 //! # Failures
 //!
 //! An absent or empty file opens as an empty cache. Malformed JSON, a non-object
-//! envelope, or an unexpected `schema_version` is [`Error::Validation`] naming the file —
+//! envelope, or an unexpected `schema_version` is
+//! [`Error::Validation`](crate::error::Error::Validation) naming the file —
 //! a cache is never silently reset. A single malformed record is warned about and
 //! skipped, so one bad entry cannot cost the rest of the catalog its answers.
 use std::collections::BTreeMap;
@@ -41,7 +42,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::{validation, Error, Result};
+use crate::graph::CAN_FEED;
 use crate::llm::identity::{canonical_json, stable_metadata_sha256};
+use crate::llm::ontology::OntologyMatch;
+use crate::orchestration::RelationCandidate;
 
 use openjiuwen_common::utils::id::now_rfc3339;
 
@@ -112,7 +116,7 @@ impl CachedMatch {
 ///
 /// The cache is authoritative in memory after [`MatchCache::open`]: lookups never touch
 /// the filesystem, and every mutation writes the whole record map through atomically.
-/// Wrap it in a [`tokio::sync::Mutex`](tokio::sync::Mutex) to share it between matchers;
+/// Wrap it in a [`tokio::sync::Mutex`] to share it between matchers;
 /// the struct itself is not synchronized.
 #[derive(Debug, Clone)]
 pub struct MatchCache {
@@ -254,7 +258,9 @@ impl MatchCache {
     /// This is an in-memory read: it performs no I/O and cannot fail. The `async`
     /// signature keeps callers uniform with the write path (which does touch the
     /// filesystem).
-    #[allow(clippy::unused_async)] // kept async so lookups and recordings compose alike
+    // Kept async so a lookup and a recording compose alike, even though this read is
+    // purely in memory.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn lookup(&self, key: &str) -> Option<CachedMatch> {
         self.records.get(key).cloned()
     }
@@ -358,6 +364,35 @@ pub fn cache_key_document(
         target_fingerprint_hash,
         signature,
     ))
+}
+
+/// The documented candidate identity recorded with a cached answer
+/// (Python's `RelationCandidate.key`: `source->target:relation`).
+pub(crate) fn candidate_identity(candidate: &RelationCandidate) -> String {
+    let relation = if candidate.relation.trim().is_empty() {
+        CAN_FEED
+    } else {
+        candidate.relation.as_str()
+    };
+    format!("{}->{}:{relation}", candidate.source, candidate.target)
+}
+
+/// Reports whether `item` answers the `candidate` pair, in either orientation.
+pub(crate) fn covers(item: &OntologyMatch, candidate: &RelationCandidate) -> bool {
+    let forward = item.source_id == candidate.source && item.target_id == candidate.target;
+    let reverse = item.source_id == candidate.target && item.target_id == candidate.source;
+    forward || reverse
+}
+
+/// Decodes the match list of a cached record, answering `None` when it is unusable.
+pub(crate) fn decode_cached_matches(record: &CachedMatch) -> Option<Vec<OntologyMatch>> {
+    match serde_json::from_value::<Vec<OntologyMatch>>(record.matches.clone()) {
+        Ok(matches) => Some(matches),
+        Err(error) => {
+            tracing::warn!(%error, "ontology matcher: cached matches could not be decoded");
+            None
+        }
+    }
 }
 
 /// Builds the cache-key document as a JSON value.
@@ -562,7 +597,7 @@ mod tests {
             serde_json::from_value(json!({"unknown": true})).expect("tolerant");
         assert_eq!(record.matches, json!([]));
         assert_eq!(record.diagnostics, json!([]));
-        assert!(record.candidate_id.is_empty());
-        assert!(record.updated_at.is_empty());
+        assert_eq!(record.candidate_id, "");
+        assert_eq!(record.updated_at, "");
     }
 }
