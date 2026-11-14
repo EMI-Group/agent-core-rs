@@ -11,6 +11,7 @@
 //! literal layout is documented once, in the [`crate::online`] module docs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::Result;
@@ -89,6 +90,55 @@ pub(crate) mod keys {
     /// The terminal reward projection record of the task.
     pub(crate) fn reward(rl_task_id: &str) -> String {
         format!("{PREFIX}:task:{rl_task_id}:reward")
+    }
+
+    /// Serialized `SampleRecord` of one training sample.
+    pub(crate) fn sample(sample_id: &str) -> String {
+        format!("{PREFIX}:sample:{sample_id}")
+    }
+
+    /// Index set of the sample ids in one [`SampleStatus`](crate::online::SampleStatus).
+    pub(crate) fn samples_by_status(status: &str) -> String {
+        format!("{PREFIX}:samples:{status}")
+    }
+
+    /// Monotonic creation-sequence counter of the sample ledger.
+    pub(crate) fn sample_seq() -> String {
+        format!("{PREFIX}:sample:seq")
+    }
+
+    /// Serialized `TrainingRunRecord` of one training run.
+    pub(crate) fn training_run(training_run_id: &str) -> String {
+        format!("{PREFIX}:training_run:{training_run_id}")
+    }
+
+    /// The single training run the service is currently executing.
+    ///
+    /// This key shares the `rl:v1:training_run` prefix with the run records, so a
+    /// training-run id must never be the literal `active`; run ids are allocated
+    /// by [`TrainingRunner`](crate::online::TrainingRunner) as `run-{seq}`.
+    pub(crate) fn active_training_run() -> String {
+        format!("{PREFIX}:training_run:active")
+    }
+
+    /// Index set of every training-run id ever claimed (recovery and stats).
+    pub(crate) fn training_runs() -> String {
+        format!("{PREFIX}:training_runs")
+    }
+
+    /// Monotonic training-run sequence counter.
+    pub(crate) fn training_run_seq() -> String {
+        format!("{PREFIX}:training_run:seq")
+    }
+
+    /// Serialized `TrainingArtifact` of a succeeded training run.
+    pub(crate) fn training_artifact(training_run_id: &str) -> String {
+        format!("{PREFIX}:training_run:{training_run_id}:artifact")
+    }
+
+    /// The `LoraActivation` a no-op activator recorded for a training run.
+    pub(crate) fn training_activation(training_run_id: &str) -> String {
+        format!("{PREFIX}:training_run:{training_run_id}:activation")
     }
 }
 
@@ -234,5 +284,80 @@ impl OnlineStore for MemoryOnlineStore {
             .get(key)
             .map(|members| members.iter().cloned().collect())
             .unwrap_or_default())
+    }
+}
+
+/// A shared store is a store: [`Arc`] delegation lets the sample ledger, the
+/// task registry and the training runner all run over one backend instance.
+#[async_trait]
+impl<S: OnlineStore + ?Sized> OnlineStore for Arc<S> {
+    async fn get(&self, key: &str) -> Result<Option<String>> {
+        (**self).get(key).await
+    }
+
+    async fn set(&self, key: &str, value: &str) -> Result<()> {
+        (**self).set(key, value).await
+    }
+
+    async fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        (**self).set_if_absent(key, value).await
+    }
+
+    async fn del(&self, key: &str) -> Result<bool> {
+        (**self).del(key).await
+    }
+
+    async fn set_add(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_add(key, member).await
+    }
+
+    async fn set_remove(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_remove(key, member).await
+    }
+
+    async fn set_members(&self, key: &str) -> Result<Vec<String>> {
+        (**self).set_members(key).await
+    }
+
+    async fn set_contains(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_contains(key, member).await
+    }
+}
+
+/// A borrowed store is a store, so a component that only needs to read (the
+/// training runner borrowing its own store for ledger operations) can hand out
+/// a [`SampleLedger`](crate::online::SampleLedger) without cloning the backend.
+#[async_trait]
+impl<S: OnlineStore + ?Sized> OnlineStore for &S {
+    async fn get(&self, key: &str) -> Result<Option<String>> {
+        (**self).get(key).await
+    }
+
+    async fn set(&self, key: &str, value: &str) -> Result<()> {
+        (**self).set(key, value).await
+    }
+
+    async fn set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        (**self).set_if_absent(key, value).await
+    }
+
+    async fn del(&self, key: &str) -> Result<bool> {
+        (**self).del(key).await
+    }
+
+    async fn set_add(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_add(key, member).await
+    }
+
+    async fn set_remove(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_remove(key, member).await
+    }
+
+    async fn set_members(&self, key: &str) -> Result<Vec<String>> {
+        (**self).set_members(key).await
+    }
+
+    async fn set_contains(&self, key: &str, member: &str) -> Result<bool> {
+        (**self).set_contains(key, member).await
     }
 }
