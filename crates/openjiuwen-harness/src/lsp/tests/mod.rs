@@ -9,8 +9,11 @@
 )]
 mod client;
 mod client_ext;
+mod diagnostics;
+mod discovery;
 mod fake_server;
 mod framing;
+mod retry;
 mod tool;
 mod transport;
 mod uri;
