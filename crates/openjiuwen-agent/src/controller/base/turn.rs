@@ -82,6 +82,12 @@ impl BaseController {
         }
         let output = output.unwrap_or_else(|| self.fallback_output());
         self.save_state(session.as_ref()).await?;
+        // An idle session gets Python's `all_tasks_processed` sentinel; the
+        // loop is only present when this controller started one, and the
+        // session must still be bound for the loop's session lookup.
+        if let Some(scheduler) = self.scheduler_loop() {
+            scheduler.ensure_completion_signal(session.id()).await;
+        }
         self.unbind_session(session.id()).await;
         run.finish().await;
         Ok(output)
@@ -263,8 +269,9 @@ impl BaseController {
     /// Moves the persisted task targeted by a control intent to `status`.
     fn set_task_status(&self, intent: &Intent, status: TaskStatus) -> Option<ControllerOutput> {
         let id = intent.target_task_id.as_deref()?;
-        let mut tasks = self.inner.tasks.write();
-        tasks.get_mut(id)?.status = status;
+        let manager = self.task_manager();
+        manager.task(id)?;
+        manager.update_task_status(id, status, false, false, None);
         let reply = match status {
             TaskStatus::Canceled => CANCELED_REPLY,
             _ => PAUSED_REPLY,
@@ -277,12 +284,19 @@ impl BaseController {
     }
 
     /// Returns the persisted task targeted by a resume intent, re-queued.
+    ///
+    /// The task is claimed for this turn's synchronous dispatch, so the
+    /// background scheduler cannot pick up the same run in parallel; the run's
+    /// outcome is upserted back into the store by
+    /// [`dispatch_runs`](Self::dispatch_runs).
     fn resume_task(&self, intent: &Intent) -> Option<Task> {
         let id = intent.target_task_id.as_deref()?;
-        let mut tasks = self.inner.tasks.write();
-        let task = tasks.get_mut(id)?;
+        let manager = self.task_manager();
+        let mut task = manager.task(id)?;
+        manager.update_task_status(id, TaskStatus::Submitted, false, false, None);
+        let _ = manager.claim_task(id);
         task.status = TaskStatus::Submitted;
-        Some(task.clone())
+        Some(task)
     }
 
     /// Dispatches `tasks` and aggregates the runs into one output.
@@ -314,9 +328,21 @@ impl BaseController {
             }));
         }
         {
-            let mut stored = self.inner.tasks.write();
+            // The turn's batch enters the store only after it ran, so the
+            // background scheduler never sees a submitted task of this turn.
+            let manager = self.task_manager();
             for run in &runs {
-                stored.insert(run.task.task_id.clone(), run.task.clone());
+                let task = run.task.clone();
+                if manager.update_task(task.clone()) {
+                    continue;
+                }
+                if let Err(error) = manager.add_task(task) {
+                    warn!(
+                        task_id = %run.task.task_id,
+                        %error,
+                        "cannot store the dispatched task"
+                    );
+                }
             }
         }
         let status = aggregate_status(&runs);
@@ -407,8 +433,8 @@ impl BaseController {
         text: &str,
         chunk: &ControllerOutputChunk,
     ) {
-        let mut tasks = self.inner.tasks.write();
-        let Some(task) = tasks.get_mut(task_id) else {
+        let manager = self.task_manager();
+        let Some(mut task) = manager.task(task_id) else {
             debug!(
                 task_id,
                 "controller signal names a task that is not persisted"
@@ -426,6 +452,7 @@ impl BaseController {
             task.input_required_fields = Some(json!({"fields": []}));
         }
         task.outputs.push(chunk.clone());
+        let _ = manager.update_task(task);
     }
 
     /// Output of a turn that produced nothing: the configured default response.
