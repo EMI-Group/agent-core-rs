@@ -3,7 +3,11 @@
 // `allow` would be stripped with it, leaving the denied `missing_docs` lint to
 // fire on the empty crate root.
 #![allow(missing_docs)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines // scenarios read as one narrative, like the sibling suites
+)]
 #![cfg(feature = "otel")]
 //! Team-memory observability: lifecycle hook events projected onto OTLP spans.
 //!
@@ -305,12 +309,10 @@ fn json_attribute(span: &Value, key: &str) -> Value {
 
 /// One span attribute decoded as JSON, or `Null` when the span has no such key.
 fn optional_json_attribute(span: &Value, key: &str) -> Value {
-    text_attribute(span, key)
-        .map(|text| {
-            serde_json::from_str(&text)
-                .unwrap_or_else(|error| panic!("attribute {key} is not JSON ({error}): {text}"))
-        })
-        .unwrap_or(Value::Null)
+    text_attribute(span, key).map_or(Value::Null, |text| {
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("attribute {key} is not JSON ({error}): {text}"))
+    })
 }
 
 /// The `openjiuwen.meta_data` of one span, decoded.
