@@ -26,6 +26,20 @@ impl Default for QueueMessage                      // empty id, null payload, SU
 }
 
 // queue.rs
+pub struct QueueStats {                             // the report a backend can honestly give
+    pub started: bool,                              // between start and stop
+    pub topics: usize,                              // topics the backend owns
+    pub handlers: usize,                            // topics with a handler installed
+    pub deliveries: u64,                            // deliveries a worker started
+    pub dropped_no_worker: u64,                     // no topic worker (unsubscribed, or its worker stopped)
+    pub dropped_no_handler: u64,                    // no handler installed
+    pub handler_errors: u64,                        // handler Err on the publish or request path
+    pub rejected_not_started: u64,                  // operations refused on a stopped queue
+}                                                   // derives Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize (snake_case, default)
+impl QueueStats {
+    pub fn is_empty(&self) -> bool;                 // equals QueueStats::default()
+    pub fn dropped(&self) -> u64;                   // dropped_no_worker + dropped_no_handler
+}
 #[async_trait] pub trait MessageQueue: Send + Sync {
     async fn start(&self) -> Result<()>;               // idempotent
     async fn stop(&self) -> Result<()>;                // idempotent; joins topic workers
@@ -37,12 +51,13 @@ impl Default for QueueMessage                      // empty id, null payload, SU
     async fn request(&self, topic: &str, message: QueueMessage, timeout: Option<Duration>) -> Result<Value>;
     fn topics(&self) -> Vec<String>;                   // sorted
     fn has_subscriber(&self, topic: &str) -> bool;     // a handler is installed
+    fn stats(&self) -> QueueStats { QueueStats::default() }   // defaulted, synchronous, object-safe
 }
 pub struct InMemoryMessageQueue { .. }
 impl InMemoryMessageQueue {
     pub fn new(config: MessageQueueConfig) -> Arc<Self>;   // uses capacity + default request timeout
     pub fn with_capacity(capacity: usize) -> Arc<Self>;
-    pub fn deliveries(&self) -> u64;                       // counter for tests/observability
+    pub fn deliveries(&self) -> u64;                       // delegates to stats().deliveries
 }
 pub async fn create_message_queue(config: &MessageQueueConfig) -> Result<Arc<dyn MessageQueue>>;  // in_memory only; Error::Unsupported otherwise
 pub fn build_message_queue(config: &MessageQueueConfig) -> Arc<dyn MessageQueue>;                 // infallible: deferred kind → DeferredMessageQueue
@@ -53,10 +68,12 @@ impl DeferredMessageQueue {
     pub fn kind(&self) -> MessageQueueKind;                // the configured transport
 }
 // impl MessageQueue for DeferredMessageQueue: is_started() == false, topics() == [], has_subscriber() == false,
-// and start/stop/subscribe/unsubscribe/add_handler/publish/request all return Error::Unsupported.
+// stats() == QueueStats::default(), and start/stop/subscribe/unsubscribe/add_handler/publish/request
+// all return Error::Unsupported.
 
-// mod.rs re-exports: QueueMessage, MessageHandler, MessageQueue, InMemoryMessageQueue, DeferredMessageQueue,
-//                    create_message_queue, build_message_queue, MessageQueueKind, MessageQueueConfig (from config)
+// mod.rs re-exports: QueueMessage, MessageHandler, MessageQueue, QueueStats, InMemoryMessageQueue,
+//                    DeferredMessageQueue, create_message_queue, build_message_queue,
+//                    MessageQueueKind, MessageQueueConfig (from config)
 ```
 
 ## Semantics (the contract)
@@ -69,6 +86,10 @@ impl DeferredMessageQueue {
 - **Lifecycle**: `publish`/`request`/`subscribe`/`add_handler` before `start` fail with `Error::Config("message queue is not started")`. `start` after `stop` re-enables the queue but does not resurrect old topics (topics are emptied by `stop`). `stop` unsubscribes every topic (closing channels and joining workers) and is idempotent.
 - **Backends**: `create_message_queue` builds `InMemoryMessageQueue` for `MessageQueueKind::InMemory` and returns `Error::Unsupported` naming the deferred backend otherwise (`"<kind> message queue is not supported: use `in_memory`"`); `MessageQueueConfig::url` is carried untouched for that future implementation.
 - **A deferred kind is never misrepresented**: `build_message_queue` (used by `Runner::with_config`, which cannot fail) yields `DeferredMessageQueue` for `pulsar`/`zeromq`. Its `kind()` and `Debug` report the configured transport, `is_started()` is `false`, `topics()` is empty, and every fallible operation returns the same typed `Error::Unsupported` naming the transport — so `Runner::message_queue()` fails loudly before `start`, and `Runner::start` returns that same error. There is no silent downgrade to in-memory.
+- **Statistics go through the trait, synchronously**: `MessageQueue::stats()` returns a `QueueStats` report and is defaulted to `QueueStats::default()`, so a third-party backend keeps compiling and object safety survives (`Arc<dyn MessageQueue>` samples the report without an `.await` or a downcast). A backend that cannot report statistics answers the empty report; nothing fabricates a counter.
+- **`InMemoryMessageQueue` reports real counters**: `started`/`topics`/`handlers` are read from the topic table under one short lock, and the monotonic totals (`deliveries`, `dropped_no_worker`, `dropped_no_handler`, `handler_errors`, `rejected_not_started`) are `AtomicU64`s shared with the topic workers. `deliveries()` delegates to `stats().deliveries`, so there is one counter.
+- **The counters move where the code logs**: a publish to an unsubscribed topic (or to a channel whose worker stopped) is `dropped_no_worker`; a delivery with no handler installed is `dropped_no_handler`; a handler returning `Err` on either path is `handler_errors`; any `publish`/`request`/`subscribe`/`add_handler` refused on a stopped queue is `rejected_not_started`. A drop is not a delivery, and `QueueStats::dropped()` sums only the two drop counters.
+- **The report outlives the topics**: `stop` empties the topic table (`topics`/`handlers` return to `0`) but keeps the monotonic totals, so a host can still read what a queue did after it was stopped.
 
 ## Constraints
 
@@ -83,6 +104,7 @@ impl DeferredMessageQueue {
 - A handler panic ends that topic's worker (contained by `tokio::spawn`) while the topic stays in the table: later `publish`es become logged no-ops, later `request`s fail with `Error::Transport`, and `unsubscribe`/`subscribe` on the topic is the way back.
 - `publish` to a subscribed topic with no handler returns before enqueueing, so it consumes no capacity in the bounded channel (same logged-no-op contract).
 - `deliveries()` counts the deliveries a worker actually started (handler present), including ones whose handler returned `Err`; requests rejected before enqueueing are not counted.
+- `stats()` is the full report: use it instead of `deliveries()` when a host needs drops, handler errors, or refusals. A `request` whose handler was removed after the delivery was queued answers `Error::NotFound` and counts as `dropped_no_handler`.
 - A handler that calls `request` on its own topic deadlocks (the worker awaits that handler); this is the price of strict per-topic FIFO and is not worked around.
 - `DeferredMessageQueue` is a placeholder, not a backend: even `stop` returns `Error::Unsupported` (a host that wants a working queue uses `in_memory`). `Runner::start` also installs it in the queue slot when the configured kind is deferred, so `message_queue()` keeps reporting the configured transport after a `set_config`.
 

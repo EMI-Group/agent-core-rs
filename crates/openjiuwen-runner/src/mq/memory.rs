@@ -20,7 +20,6 @@
 //!   `True` to both).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,8 +32,9 @@ use tokio::task::JoinHandle;
 
 use crate::config::MessageQueueConfig;
 use crate::error::{not_started, request_timeout, transport};
+use crate::mq::counters::Counters;
 use crate::mq::message::{MessageHandler, QueueMessage};
-use crate::mq::MessageQueue;
+use crate::mq::{MessageQueue, QueueStats};
 
 /// `tracing` target of every event this module emits.
 const TRACING_TARGET: &str = "openjiuwen_runner::mq";
@@ -89,8 +89,8 @@ pub struct InMemoryMessageQueue {
     /// Topic table and start flag; held only for map operations, never across
     /// an `.await`.
     state: Mutex<QueueState>,
-    /// Number of deliveries a worker actually started (tests/observability).
-    deliveries: Arc<AtomicU64>,
+    /// Delivery and drop counters, shared with every topic worker.
+    counters: Arc<Counters>,
 }
 
 impl InMemoryMessageQueue {
@@ -101,7 +101,7 @@ impl InMemoryMessageQueue {
         Arc::new(Self {
             config,
             state: Mutex::new(QueueState::default()),
-            deliveries: Arc::new(AtomicU64::new(0)),
+            counters: Arc::new(Counters::default()),
         })
     }
 
@@ -119,15 +119,19 @@ impl InMemoryMessageQueue {
     /// before enqueueing are not counted.
     #[must_use]
     pub fn deliveries(&self) -> u64 {
-        self.deliveries.load(Ordering::Relaxed)
+        self.stats().deliveries
     }
 
     /// Fails with `Error::Config` unless [`start`](MessageQueue::start) ran and
     /// [`stop`](MessageQueue::stop) did not.
+    ///
+    /// A refusal is counted in [`QueueStats::rejected_not_started`], so a host
+    /// sampling the report sees calls made against a stopped queue.
     fn ensure_started(&self) -> Result<()> {
         if self.state.lock().started {
             Ok(())
         } else {
+            Counters::bump(&self.counters.rejected_not_started);
             Err(not_started("message queue"))
         }
     }
@@ -148,7 +152,7 @@ impl InMemoryMessageQueue {
     fn create_topic(
         topic: &str,
         config: &MessageQueueConfig,
-        deliveries: Arc<AtomicU64>,
+        counters: Arc<Counters>,
     ) -> TopicState {
         let capacity = config.capacity.max(1);
         let (sender, receiver) = mpsc::channel(capacity);
@@ -156,7 +160,7 @@ impl InMemoryMessageQueue {
         let worker = TopicWorker {
             topic: topic.to_owned(),
             slot: Arc::clone(&slot),
-            deliveries,
+            counters,
         };
         let task = tokio::spawn(worker.run(receiver));
         TopicState { sender, slot, task }
@@ -204,7 +208,7 @@ impl MessageQueue for InMemoryMessageQueue {
                 "message queue topic '{topic}' is already subscribed"
             )));
         }
-        let entry = Self::create_topic(topic, &self.config, Arc::clone(&self.deliveries));
+        let entry = Self::create_topic(topic, &self.config, Arc::clone(&self.counters));
         state.topics.insert(topic.to_owned(), entry);
         Ok(())
     }
@@ -243,7 +247,7 @@ impl MessageQueue for InMemoryMessageQueue {
             *slot.write() = Some(handler);
             return Ok(());
         }
-        let entry = Self::create_topic(topic, &self.config, Arc::clone(&self.deliveries));
+        let entry = Self::create_topic(topic, &self.config, Arc::clone(&self.counters));
         *entry.slot.write() = Some(handler);
         state.topics.insert(topic.to_owned(), entry);
         Ok(())
@@ -252,6 +256,7 @@ impl MessageQueue for InMemoryMessageQueue {
     async fn publish(&self, topic: &str, message: QueueMessage) -> Result<()> {
         self.ensure_started()?;
         let Some((sender, has_handler)) = self.topic_target(topic) else {
+            Counters::bump(&self.counters.dropped_no_worker);
             tracing::debug!(
                 target: TRACING_TARGET,
                 topic = %topic,
@@ -260,6 +265,7 @@ impl MessageQueue for InMemoryMessageQueue {
             return Ok(());
         };
         if !has_handler {
+            Counters::bump(&self.counters.dropped_no_handler);
             tracing::debug!(
                 target: TRACING_TARGET,
                 topic = %topic,
@@ -270,6 +276,7 @@ impl MessageQueue for InMemoryMessageQueue {
         // A full topic applies backpressure here; a closed channel means the
         // worker stopped, and a publisher can neither observe nor fix that.
         if sender.send(Delivery::Publish(message)).await.is_err() {
+            Counters::bump(&self.counters.dropped_no_worker);
             tracing::warn!(
                 target: TRACING_TARGET,
                 topic = %topic,
@@ -323,6 +330,30 @@ impl MessageQueue for InMemoryMessageQueue {
             .get(topic)
             .is_some_and(|entry| entry.slot.read().is_some())
     }
+
+    /// Reads the topic table (topic and handler counts) under one short lock and
+    /// the counters without one.
+    fn stats(&self) -> QueueStats {
+        let (started, topics, handlers) = {
+            let state = self.state.lock();
+            let handlers = state
+                .topics
+                .values()
+                .filter(|entry| entry.slot.read().is_some())
+                .count();
+            (state.started, state.topics.len(), handlers)
+        };
+        QueueStats {
+            started,
+            topics,
+            handlers,
+            deliveries: Counters::read(&self.counters.deliveries),
+            dropped_no_worker: Counters::read(&self.counters.dropped_no_worker),
+            dropped_no_handler: Counters::read(&self.counters.dropped_no_handler),
+            handler_errors: Counters::read(&self.counters.handler_errors),
+            rejected_not_started: Counters::read(&self.counters.rejected_not_started),
+        }
+    }
 }
 
 /// The task draining one topic in FIFO order.
@@ -331,8 +362,8 @@ struct TopicWorker {
     topic: String,
     /// The handler installed by `add_handler`; looked up per delivery.
     slot: HandlerSlot,
-    /// Shared delivery counter.
-    deliveries: Arc<AtomicU64>,
+    /// Shared delivery and drop counters.
+    counters: Arc<Counters>,
 }
 
 impl TopicWorker {
@@ -342,6 +373,7 @@ impl TopicWorker {
             match delivery {
                 Delivery::Publish(message) => {
                     let Some(handler) = self.handler() else {
+                        Counters::bump(&self.counters.dropped_no_handler);
                         tracing::debug!(
                             target: TRACING_TARGET,
                             topic = %self.topic,
@@ -349,8 +381,9 @@ impl TopicWorker {
                         );
                         continue;
                     };
-                    self.deliveries.fetch_add(1, Ordering::Relaxed);
+                    Counters::bump(&self.counters.deliveries);
                     if let Err(error) = handler.handle(message).await {
+                        Counters::bump(&self.counters.handler_errors);
                         // Publish-path errors are unobservable by the publisher.
                         tracing::warn!(
                             target: TRACING_TARGET,
@@ -363,13 +396,21 @@ impl TopicWorker {
                 Delivery::Request { message, reply } => {
                     let response = match self.handler() {
                         Some(handler) => {
-                            self.deliveries.fetch_add(1, Ordering::Relaxed);
-                            handler.handle(message).await
+                            Counters::bump(&self.counters.deliveries);
+                            let response = handler.handle(message).await;
+                            if response.is_err() {
+                                Counters::bump(&self.counters.handler_errors);
+                            }
+                            response
                         }
-                        None => Err(Error::NotFound(format!(
-                            "message queue topic '{}' has no handler",
-                            self.topic
-                        ))),
+                        None => {
+                            // The handler was removed after the request was queued.
+                            Counters::bump(&self.counters.dropped_no_handler);
+                            Err(Error::NotFound(format!(
+                                "message queue topic '{}' has no handler",
+                                self.topic
+                            )))
+                        }
                     };
                     // A failed send only means the caller timed out or went away.
                     let _ = reply.send(response);
@@ -434,6 +475,20 @@ mod tests {
     #[async_trait]
     impl MessageHandler for FailingHandler {
         async fn handle(&self, _message: QueueMessage) -> Result<Value> {
+            Err(Error::Tool("handler rejected".to_owned()))
+        }
+    }
+
+    /// Signals that it ran, then fails: the publish path has no reply channel, so
+    /// the signal is how a test learns the delivery was handled.
+    struct FailingReporter {
+        seen: mpsc::UnboundedSender<Value>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for FailingReporter {
+        async fn handle(&self, message: QueueMessage) -> Result<Value> {
+            let _ = self.seen.send(message.payload);
             Err(Error::Tool("handler rejected".to_owned()))
         }
     }
@@ -822,5 +877,99 @@ mod tests {
             .await
             .expect("request");
         assert_eq!(reply, json!("bounded"));
+    }
+
+    #[tokio::test]
+    async fn stats_count_topics_handlers_and_deliveries() {
+        let queue = started_queue(4).await;
+        assert!(queue.stats().started);
+        assert!(
+            !queue.stats().is_empty(),
+            "a started queue reports its state"
+        );
+        queue.subscribe("idle").await.expect("subscribe");
+        queue
+            .add_handler("echo", Arc::new(EchoHandler))
+            .await
+            .expect("handler");
+        let reply = queue
+            .request("echo", QueueMessage::new(json!(1)), None)
+            .await
+            .expect("request");
+        assert_eq!(reply, json!(1));
+
+        let stats = queue.stats();
+        assert_eq!(stats.topics, 2);
+        assert_eq!(stats.handlers, 1, "only the echo topic has a handler");
+        assert_eq!(stats.deliveries, 1);
+        assert_eq!(stats.deliveries, queue.deliveries(), "one counter");
+        assert_eq!(stats.dropped(), 0);
+        assert_eq!(stats.handler_errors, 0);
+        assert_eq!(stats.rejected_not_started, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_count_drops_errors_and_refusals() {
+        let queue = InMemoryMessageQueue::with_capacity(4);
+        // Refused while stopped: rejected, not dropped, and no topic is created.
+        let stopped = queue.publish("nobody", QueueMessage::new(json!(0))).await;
+        assert!(stopped.is_err());
+        let stats = queue.stats();
+        assert!(!stats.started);
+        assert_eq!(stats.rejected_not_started, 1);
+        assert_eq!(stats.dropped(), 0);
+
+        queue.start().await.expect("start");
+        // A publish to a topic without a worker.
+        queue
+            .publish("nobody", QueueMessage::new(json!(1)))
+            .await
+            .expect("publish");
+        // A publish to a worker without a handler.
+        queue.subscribe("idle").await.expect("subscribe");
+        queue
+            .publish("idle", QueueMessage::new(json!(2)))
+            .await
+            .expect("publish");
+        let stats = queue.stats();
+        assert_eq!(stats.dropped_no_worker, 1);
+        assert_eq!(stats.dropped_no_handler, 1);
+        assert_eq!(stats.dropped(), 2);
+        assert_eq!(stats.deliveries, 0, "a drop is not a delivery");
+
+        // A handler error on the request path and on the publish path.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        queue
+            .add_handler("boom", Arc::new(FailingReporter { seen: seen_tx }))
+            .await
+            .expect("handler");
+        queue
+            .request("boom", QueueMessage::new(json!(3)), None)
+            .await
+            .expect_err("handler failure");
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(json!(3)),
+            "the request delivery ran"
+        );
+        queue
+            .publish("boom", QueueMessage::new(json!(4)))
+            .await
+            .expect("publish");
+        assert_eq!(seen_rx.recv().await, Some(json!(4)), "the delivery ran");
+        let stats = queue.stats();
+        assert_eq!(stats.handler_errors, 2);
+        assert_eq!(stats.deliveries, 2);
+        assert_eq!(stats.topics, 2);
+        assert_eq!(stats.handlers, 1);
+
+        // Stopping empties the topics and keeps the counters.
+        queue.stop().await.expect("stop");
+        let stats = queue.stats();
+        assert!(!stats.started);
+        assert_eq!(stats.topics, 0);
+        assert_eq!(stats.handlers, 0);
+        assert_eq!(stats.deliveries, 2);
+        assert_eq!(stats.dropped(), 2);
     }
 }
