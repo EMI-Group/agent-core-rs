@@ -9,19 +9,22 @@
 //! # The span tree
 //!
 //! One team run owns one trace, rooted at `team.{team_name}`
-//! ([`TeamSpan::root_for`](crate::observability::TeamSpan::root_for)). The runtime derives three
+//! ([`TeamSpan::root_for`](crate::observability::TeamSpan::root_for)). The runtime derives four
 //! kinds of children from it:
 //!
 //! ```text
 //! team.{team_name}
 //! ├── member.{member_name}          one per spawned member
 //! │   └── round.{member}.{round}    one per member round
-//! └── task.{task_id}                one per task-board entry
+//! ├── task.{task_id}                one per task-board entry
+//! └── memory.{operation}            one per observed team-memory operation
 //! ```
 //!
 //! [`TeamObservability`] holds the root of the team it
 //! observes, so two teams running at once never share a trace and a hooked test can build the
-//! facade per case.
+//! facade per case. The `memory.*` branch comes from
+//! [`MemorySpanObserver`], the bridge onto the team-memory observer seam
+//! ([`openjiuwen_memory::team::TeamMemoryObserver`]).
 //!
 //! # Attribute inheritance
 //!
@@ -48,7 +51,9 @@
 //! The baseline build ships the span/hook seam only: events are structured values, and anything
 //! that wants them subscribes with a hook. The `otel` feature adds an in-memory span sink — spans
 //! are also emitted as structured `tracing` events so a subscriber can consume them without an
-//! SDK. Real OTLP export is not part of this crate (see below).
+//! SDK. [`MemorySpanObserver`] follows the same split: it always emits one `tracing` event per
+//! observed team-memory operation, and only with `otel` does it also carry a sink
+//! (`MemorySpanObserver::with_sink`). Real OTLP export is not part of this crate (see below).
 //!
 //! # Deferrals
 //!
@@ -63,6 +68,7 @@
 //!   local to the team that owns it.
 
 pub mod hooks;
+pub mod memory;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod span;
@@ -71,6 +77,10 @@ pub use hooks::{
     DelegationEvent, MemberObservableEvent, NoopHooks, ObservabilityHooks, ObservableEvent,
     RecordedEvent, RecordingHooks, RoundObservableEvent, TaskTransitionEvent, TeamObservability,
     TurnMetrics,
+};
+pub use memory::{
+    memory_observer, MemorySpanObserver, AT_MEMORY_COUNT, AT_MEMORY_ERROR, AT_MEMORY_KIND,
+    AT_MEMORY_MEMBER_ID, AT_MEMORY_OPERATION, AT_MEMORY_OUTCOME, AT_MEMORY_TEAM_ID,
 };
 #[cfg(feature = "otel")]
 pub use otel::{OtelHooks, OtelSpanSink, SpanRecord};
