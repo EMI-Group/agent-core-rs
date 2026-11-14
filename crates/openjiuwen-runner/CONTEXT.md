@@ -183,7 +183,7 @@ Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`T
 ## Routing Table
 
 - `./src/runner.rs` → `Runner` facade, lifecycle (`start`/`stop`/`release`), global singleton, monitor/hub/pool accessors, team + HITL facade methods, security wiring
-- `./src/runner_seams.rs` → the replaceable-seam half of the facade: `set_monitor`, `set_hitl`, `set_message_queue` and what a replacement does not migrate
+- `./src/runner_seams.rs` → the replaceable-seam half of the facade: `set_monitor`, `set_hitl`, `set_message_queue`, `queue_stats`, and what a replacement does not migrate
 - `./src/runner_spawn.rs` → the spawn half of the facade: single spawner and registry installation, backend introspection, registry-first routing, monitored spawn observation, `active_spawns`
 - `./src/config.rs` → `RunnerConfig`, `TeamPoolConfig`, `MessageQueueConfig`, `MessageQueueKind`, `DistributedConfig`, defaults
 - `./src/error.rs` → error constructors and message wording
@@ -195,12 +195,12 @@ Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`T
 - `./src/monitor/` → run status, events, `RunKind::Spawn`, bounded history/retention (`monitor/CONTEXT.md`)
 - `./src/hitl/` → live-run registry, payload delivery, interaction answering (`hitl/CONTEXT.md`)
 - `./src/pool/` → team runtime pool, leases, concurrency, reaper (`pool/CONTEXT.md`)
-- `./tests/` → integration suites (`tests/CONTEXT.md`)
+- `./tests/` → integration suites, including the compile-level seam inventory in `seams.rs` (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
 - Unit tests beside every module: config defaults/serde, error wording, registry insert/lookup/policy/revision, managers (tags/models/prompts/sysops/MCP), event-name mapping, framework ordering/isolation/verdicts, filters/chains/decorators, queue delivery ordering/errors/timeouts plus the deferred-kind placeholder, spawn frame framing and protocol round-trips, spawn backend labels/health/snapshots/deadlines/`describe`, registry routing, monitored lifecycle, subprocess and remote backends, monitor transitions/retention/lag, hub delivery/answering/cancel, pool admission/leases/eviction, session-id resolution, ref parsing.
-- Integration suites in `./tests/`: `resources.rs`, `managers.rs`, `managers_mcp.rs`, `callbacks.rs`, `callback_filters.rs`, `callback_chains.rs`, `callback_decorators.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `runner_facade.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `spawn_subprocess.rs`, `spawn_remote.rs`, `spawn_seam.rs` (every handle through `Arc<dyn SpawnedAgent>`), `spawn_routing.rs` (registry routing, monitored spawn lifecycle, bounded invocation), `runner_team_attach.rs` (pool try-start/acquire/payload drain), `monitor.rs`, `hitl.rs`, `team_pool.rs`, `team_pool_leases.rs`, `team_pool_lifecycle.rs`, `team_pool_hitl.rs`, `api_surface.rs`.
+- Integration suites in `./tests/`: `resources.rs`, `managers.rs`, `managers_mcp.rs`, `callbacks.rs`, `callback_filters.rs`, `callback_chains.rs`, `callback_decorators.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `runner_facade.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `spawn_subprocess.rs`, `spawn_remote.rs`, `spawn_seam.rs` (every handle through `Arc<dyn SpawnedAgent>`), `spawn_routing.rs` (registry routing, monitored spawn lifecycle, bounded invocation), `runner_team_attach.rs` (pool try-start/acquire/payload drain), `monitor.rs`, `hitl.rs`, `team_pool.rs`, `team_pool_leases.rs`, `team_pool_lifecycle.rs`, `team_pool_hitl.rs`, `api_surface.rs`, and `seams.rs` (the pluggable/deferred seam inventory: trait-object coercions, the typed refusals, and `Runner::queue_stats`).
 - Subprocess tests re-exec the test binary as a hermetic fake child (no external script, no network); remote tests use `wiremock` on loopback; pool eviction is proven with short idle timeouts and paused/bounded time, never wall-clock sleeps.
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/runner/test_resource_manager.py`).
 - Gates: `cargo fmt -p openjiuwen-runner`, `cargo test -p openjiuwen-runner --offline`, `cargo clippy -p openjiuwen-runner --all-targets --all-features --offline -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc -p openjiuwen-runner --no-deps --offline`, all clean and offline.

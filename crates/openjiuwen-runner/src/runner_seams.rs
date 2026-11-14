@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::hitl::InteractionHub;
 use crate::monitor::RunMonitor;
-use crate::mq::MessageQueue;
+use crate::mq::{MessageQueue, QueueStats};
 use crate::runner::Runner;
 
 /// `tracing` target every seam-installation log uses.
@@ -124,6 +124,34 @@ impl Runner {
         );
         previous
     }
+
+    /// A snapshot of the live message queue's counters
+    /// ([`MessageQueue::stats`]).
+    ///
+    /// Answers whichever backend is installed at that moment: the configured
+    /// backend in its stopped state before [`Runner::start`], the started backend
+    /// after it, a host backend installed with [`Runner::set_message_queue`] until
+    /// the next `start`, and the placeholder
+    /// [`DeferredMessageQueue`](crate::mq::DeferredMessageQueue) when the
+    /// configuration names a deferred transport
+    /// ([`MessageQueueKind::Pulsar`](crate::config::MessageQueueKind)/`ZeroMq`) —
+    /// that one performs no work, so it reports the empty report
+    /// ([`QueueStats::default`]).
+    ///
+    /// The report is a sample, not a subscription: every counter is a monotonic
+    /// total since the backend was created, so a host samples repeatedly and
+    /// derives rates itself.
+    ///
+    /// ```
+    /// use openjiuwen_runner::Runner;
+    ///
+    /// let runner = Runner::new();
+    /// assert!(runner.queue_stats().is_empty(), "stopped before `start`");
+    /// ```
+    #[must_use]
+    pub fn queue_stats(&self) -> QueueStats {
+        self.message_queue().stats()
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +221,22 @@ mod tests {
         let retired = runner.set_message_queue(Arc::clone(&broker));
         assert!(Arc::ptr_eq(&retired, &previous));
         assert!(Arc::ptr_eq(&runner.message_queue(), &broker));
+    }
+
+    #[tokio::test]
+    async fn queue_stats_reads_the_installed_queue() {
+        let runner = Runner::new();
+        assert!(
+            runner.queue_stats().is_empty(),
+            "the configured backend is stopped and has done no work"
+        );
+
+        let broker = InMemoryMessageQueue::with_capacity(8);
+        broker.start().await.expect("start");
+        runner.set_message_queue(broker);
+
+        let stats = runner.queue_stats();
+        assert!(stats.started, "the report comes from the installed queue");
+        assert!(!stats.is_empty());
     }
 }

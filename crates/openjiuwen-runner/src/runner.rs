@@ -35,7 +35,36 @@
 //! [`Runner::set_message_queue`] replace the monitor, the hub, and the queue for
 //! every run started afterwards and return the instance they displaced (the
 //! `runner_seams` module, beside this file).
-
+//!
+//! # Pluggable seams
+//!
+//! Everything a host may replace, and everything that refuses instead of degrading
+//! silently (the inventory `tests/seams.rs` pins at compile time):
+//!
+//! - **Resources** — `crate::resources::Provider` closures, called on every lookup
+//!   by `ResourceMgr::register_agent` / `register_workflow` / `register_team` /
+//!   `register_tool`.
+//! - **Callbacks** — `crate::callback::CallbackHandler` via
+//!   `CallbackFramework::register`, `crate::callback::EventFilter`,
+//!   `CallbackChain`/`ChainEntry`, and the `GuardrailPipeline` binding of
+//!   [`Runner::set_guardrails`].
+//! - **Queue** — [`MessageQueue`] via [`Runner::set_message_queue`], rebuilt from
+//!   `RunnerConfig::message_queue` by [`Runner::start`]; `pulsar`/`zeromq` yield
+//!   `crate::mq::DeferredMessageQueue` (every operation `Error::Unsupported`,
+//!   naming the transport), and [`Runner::queue_stats`] samples the live backend.
+//! - **Spawn** — [`AgentSpawner`] via [`Runner::set_spawner`] or [`SpawnerRegistry`]
+//!   via [`Runner::set_spawner_registry`]; `crate::spawn::SpawnBackend`'s
+//!   `subprocess`/`external_command`/`in_process`/`remote_http` work, while
+//!   [`SpawnerRegistry::with_deferred`] registers `remote_mq`/`remote_a2a` as
+//!   `Error::Unsupported` `DeferredSpawner`s; every spawn answers
+//!   `Arc<dyn SpawnedAgent>` (`SpawnedProcess`, `InProcessAgent`, `RemoteAgent`).
+//! - **Observation and persistence** — [`Runner::set_monitor`] / [`Runner::set_hitl`]
+//!   replace the [`RunMonitor`] / [`InteractionHub`]; the checkpointer is configured
+//!   (`RunnerConfig::checkpointer`) and built by [`Runner::start`].
+//! - **Team transports** — `openjiuwen_multiagent::{TeamTransport, TransportKind,
+//!   build_transport}`, reached through the `Team` seam only: `Pulsar` is
+//!   `Error::Unsupported`, `RunnerConfig::distributed_mode` is refused by
+//!   [`Runner::start`], and `RemoteProtocol::{Mq, A2a}` are deferred.
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
 use crate::error;
