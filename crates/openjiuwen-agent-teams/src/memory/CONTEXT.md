@@ -183,7 +183,7 @@ Caveats, stated because they are visible from this node:
 - A disabled config (`enabled: false`) touches nothing: no hook call, no buffered turn, no session,
   no export, no observer, and `flush` answers an empty `TeamMemoryFlush`.
 - `tracing` only; no `println!`/`eprintln!`; log target `openjiuwen_agent_teams::memory`.
-- Files around ≤1000 lines; `wiring.rs` is the only one that approaches it.
+- Files around ≤1000 lines; `wiring.rs` (1281 lines, about two thirds inline tests) is the one justified exception: it owns a single contract (the per-team handle), and splitting the tests out would scatter the lifecycle ordering assertions from the code they pin.
 
 ## Routing Table
 
