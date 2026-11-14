@@ -1,10 +1,34 @@
 //! End-to-end coverage for the `notify`-backed workspace watcher, driven through the crate root.
 //!
-//! One debounced watcher is started over a `tempfile` workspace with a skill root, an
-//! `IDENTITY.md` and an MCP configuration, and each target is then mutated so the matching
-//! [`WatchUpdate`] has to arrive. Every await is bounded by [`WAIT`], and the only event count
-//! asserted is the one the debouncer itself owns: a burst of writes to a single path inside one
-//! window publishes exactly one event.
+//! Every test builds its own `tempfile` workspace, starts one debounced watcher and mutates
+//! exactly one target, so a slow or lost notification can only fail the step that produced it.
+//! Each await carries its own delivery budget ([`WAIT`]); no test shares one deadline across
+//! several targets, and no assertion depends on the order in which two independent targets are
+//! mutated.
+//!
+//! # Why the fixture pre-creates the skill directory
+//!
+//! The flake this file used to have came from `write_skill` creating `skills/demo/` *after* the
+//! watcher had started and then immediately writing `skills/demo/SKILL.md`:
+//!
+//! - a recursive target registers one inotify watch per **existing** directory, and `notify`
+//!   walks the tree synchronously while `Watcher::watch` blocks until its event loop
+//!   acknowledges the registration — so everything that exists before `start()` returns is
+//!   watched, with no extra readiness handshake to wait for;
+//! - a directory created later is only watched after that same event loop thread processes the
+//!   `Create(IsDir)` notification and adds the new watch (`add_watch_by_event` in
+//!   `notify/src/inotify.rs`). That happens asynchronously on the backend's own thread, so a
+//!   write issued immediately afterwards can reach the kernel **before** the watch exists, and
+//!   the kernel then has no notification to deliver: the event is not delayed, it is lost.
+//! - the directory creation itself is still reported by the parent watch, but as an event whose
+//!   path is `skills/demo` — which the `SKILL.md` predicate rejects — so the test simply waited
+//!   out its whole budget and failed.
+//!
+//! Under a loaded `--all-features` run (many binaries and unit tests competing for CPUs) the
+//! backend thread is scheduled late and the window widens, which is why the suite passed alone
+//! and failed intermittently in CI. [`Fixture::new`] therefore creates every watched parent
+//! directory *before* `start()`, and the tests only write files below them; never re-introduce a
+//! create-directory-then-immediately-write-inside-it step here.
 //!
 //! The whole file is gated on the feature, so `--no-default-features` compiles it to an empty
 //! suite; the feature-off `Unsupported` path is covered by `tests/public_surface.rs`.
@@ -24,30 +48,57 @@ use openjiuwen_harness::{
 use tempfile::TempDir;
 use tokio::time::Instant;
 
-/// Upper bound of every wait in this file: a lost notification fails the test instead of hanging.
+/// Delivery budget of **one** awaited event.
+///
+/// The budget is deliberately generous and applied per await rather than once for the whole
+/// test: a single inotify notification is delivered in microseconds, but a heavily loaded
+/// `--all-features` run can deschedule the backend, the intake task and this task for a while,
+/// so anything tighter risks a second, different flake. Reaching the budget is still a failure
+/// (a lost notification must not turn into a hang), and every test awaits at most one event per
+/// mutation, so the suite time stays bounded by a small multiple of this value.
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Debounce window of the watchers under test.
 const DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Debounce window of the coalescing test.
+///
+/// Wider than [`DEBOUNCE`] because that test asserts *how many* events a burst produces: the
+/// five writes are synchronous, but a page-cache stall of one scheduling slice on a loaded
+/// machine must not be able to split them across two windows. The crate's own unit test uses the
+/// same window for the same reason. [`SETTLE`] still exceeds it, so a second window would be
+/// observed rather than missed.
+const BURST_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Quiet window that proves no further event is due for one path: four debounce windows, so a
+/// second pending window would already have been published.
+const SETTLE: Duration = Duration::from_millis(400);
 
 /// The workspace/home layout the watcher plan discovers.
 struct Fixture {
     workspace: PathBuf,
     home: OpenJiuwenHome,
     skills: PathBuf,
+    skill_dir: PathBuf,
     identity: PathBuf,
     mcp: PathBuf,
 }
 
 impl Fixture {
-    /// Creates `skills/`, `IDENTITY.md` and `.openjiuwen/mcp.json` before any watcher starts.
+    /// Creates `skills/demo/`, `IDENTITY.md` and `.openjiuwen/mcp.json` before any watcher
+    /// starts, so registration covers every path a test later mutates.
+    ///
+    /// `skills/demo` (not only `skills`) exists up front on purpose: see the module docs — a
+    /// directory created after `start()` is watched asynchronously, and a file written into it
+    /// right away can be missed outright.
     fn new(root: &Path) -> Result<Self> {
         let workspace = root.join("workspace");
         let home = OpenJiuwenHome::from_root(root.join("home"));
         std::fs::create_dir_all(&workspace)?;
         std::fs::create_dir_all(home.root())?;
         let skills = workspace.join("skills");
-        std::fs::create_dir_all(&skills)?;
+        let skill_dir = skills.join("demo");
+        std::fs::create_dir_all(&skill_dir)?;
         let identity = workspace.join("IDENTITY.md");
         write(&identity, "identity v1\n")?;
         let mcp = workspace.join(".openjiuwen").join("mcp.json");
@@ -57,19 +108,36 @@ impl Fixture {
             workspace,
             home,
             skills,
+            skill_dir,
             identity,
             mcp,
         })
     }
 
+    /// The skill file the skills-target tests write: `skills/demo/SKILL.md`.
+    fn skill_file(&self) -> PathBuf {
+        self.skill_dir.join("SKILL.md")
+    }
+
     /// Starts a debounced watcher over the whole discovered workspace plan.
+    ///
+    /// `start()` returns only once the backend has acknowledged every watch registration, so
+    /// returning means "every path that existed at this point is watched".
     async fn watcher(&self) -> Result<WatcherHandle> {
-        Ok(
-            WorkspaceWatcher::for_workspace(&self.workspace, &self.home, &MapEnv::new())
-                .debounce(DEBOUNCE)
-                .start()
-                .await?,
-        )
+        let watcher = WorkspaceWatcher::for_workspace(&self.workspace, &self.home, &MapEnv::new())
+            .debounce(DEBOUNCE)
+            .start()
+            .await?;
+        ensure!(
+            watcher.target_count() >= 3,
+            "the plan covers skills, the instruction file and the MCP config, got {}",
+            watcher.target_count()
+        );
+        ensure!(
+            !watcher.is_shutdown(),
+            "a freshly started watcher is running"
+        );
+        Ok(watcher)
     }
 }
 
@@ -78,7 +146,9 @@ fn write(path: &Path, contents: &str) -> Result<()> {
     Ok(std::fs::write(path, contents)?)
 }
 
-/// Writes the skill directory `<root>/<name>/SKILL.md` with a front-matter description.
+/// Writes the skill file `<root>/<name>/SKILL.md` with a front-matter description.
+///
+/// The skill directory itself must already exist when the watcher runs; see [`Fixture::new`].
 fn write_skill(root: &Path, name: &str, description: &str) -> Result<()> {
     let directory = root.join(name);
     std::fs::create_dir_all(&directory)?;
@@ -89,6 +159,9 @@ fn write_skill(root: &Path, name: &str, description: &str) -> Result<()> {
 }
 
 /// Awaits the next `Event` update matching `matches`, skipping failures and other targets.
+///
+/// Only this one await is bounded by [`WAIT`]; the caller issues the mutation immediately before
+/// it, so a passing call proves that mutation was delivered.
 async fn next_event_for<F>(subscription: &mut Subscription, mut matches: F) -> Result<WatchEvent>
 where
     F: FnMut(&WatchEvent) -> bool,
@@ -107,6 +180,9 @@ where
 }
 
 /// Collects every event for `path` that arrives within `window`.
+///
+/// Used only after the expected event was already observed, to prove that no *further* event is
+/// published (a coalescing window or a shutdown must not leak one).
 async fn events_for(
     subscription: &mut Subscription,
     path: &Path,
@@ -123,80 +199,149 @@ async fn events_for(
     }
 }
 
-/// Every discovered workspace target delivers its own typed event when it changes.
+/// The recursive `skills` target delivers a new skill file inside an existing directory.
 #[tokio::test]
-async fn each_workspace_target_delivers_its_change() -> Result<()> {
+async fn skills_target_delivers_a_new_skill_file() -> Result<()> {
     let temp = TempDir::new()?;
     let fixture = Fixture::new(temp.path())?;
     let watcher = fixture.watcher().await?;
-    ensure!(
-        watcher.target_count() >= 3,
-        "the plan covers skills, the instruction file and the MCP config, got {}",
-        watcher.target_count()
-    );
     let mut subscription = watcher.subscribe();
 
-    // A new skill directory arrives under the recursive `skills` target.
+    // `skills/demo/` exists since the fixture, so the recursive registration already watches it
+    // and this write is delivered; creating the directory here instead would race registration.
     write_skill(&fixture.skills, "demo", "demo skill")?;
-    let skill_event = next_event_for(&mut subscription, |event| {
+    let event = next_event_for(&mut subscription, |event| {
         event.kind == WatchTargetKind::Skills && event.path.ends_with("SKILL.md")
     })
     .await?;
+
+    let expected = fixture.skill_file();
     ensure!(
-        skill_event
-            .path
-            .ends_with(Path::new("demo").join("SKILL.md")),
-        "the event names the new skill file, got {:?}",
-        skill_event.path
+        event.path == expected,
+        "the event names the new skill file, expected {expected:?}, got {:?}",
+        event.path
     );
     ensure!(
-        skill_event.label.as_deref() == Some("skills:workspace"),
+        event.change == ChangeKind::Created,
+        "a file that appears after start is Created, got {:?}",
+        event.change
+    );
+    ensure!(
+        event.label.as_deref() == Some("skills:workspace"),
         "the workspace skill target keeps its label, got {:?}",
-        skill_event.label
+        event.label
     );
-    ensure!(skill_event.sequence >= 1, "sequences start at one");
+    ensure!(event.sequence >= 1, "sequences start at one");
+    ensure!(
+        watcher.dropped_notifications() == 0 && watcher.dropped_dispatches() == 0,
+        "a single notification must not fill either bounded queue"
+    );
+    watcher.shutdown().await?;
+    ensure!(watcher.is_shutdown(), "the handle reports the shutdown");
+    Ok(())
+}
 
-    // The instruction file is a single-file target, so a rewrite is `Modified`.
+/// The single-file `IDENTITY.md` target delivers a rewrite as `Modified`.
+#[tokio::test]
+async fn instruction_file_target_delivers_a_rewrite() -> Result<()> {
+    let temp = TempDir::new()?;
+    let fixture = Fixture::new(temp.path())?;
+    let watcher = fixture.watcher().await?;
+    let mut subscription = watcher.subscribe();
+
     write(&fixture.identity, "identity v2\n")?;
-    let identity_event =
-        next_event_for(&mut subscription, |event| event.path == fixture.identity).await?;
-    ensure!(
-        identity_event.kind == WatchTargetKind::InstructionFile,
-        "got {:?}",
-        identity_event.kind
-    );
-    ensure!(
-        identity_event.change == ChangeKind::Modified,
-        "an existing file rewrite is Modified, got {:?}",
-        identity_event.change
-    );
-    ensure!(
-        identity_event.label.as_deref() == Some("instruction:workspace:IDENTITY.md"),
-        "got {:?}",
-        identity_event.label
-    );
+    let event = next_event_for(&mut subscription, |event| event.path == fixture.identity).await?;
 
-    // The MCP configuration is watched as a single file too.
+    ensure!(
+        event.kind == WatchTargetKind::InstructionFile,
+        "got {:?}",
+        event.kind
+    );
+    ensure!(
+        event.change == ChangeKind::Modified,
+        "an existing file rewrite is Modified, got {:?}",
+        event.change
+    );
+    ensure!(
+        event.label.as_deref() == Some("instruction:workspace:IDENTITY.md"),
+        "got {:?}",
+        event.label
+    );
+    watcher.shutdown().await?;
+    ensure!(watcher.is_shutdown(), "the handle reports the shutdown");
+    Ok(())
+}
+
+/// The single-file MCP configuration target delivers a rewrite of the existing file.
+#[tokio::test]
+async fn mcp_config_target_delivers_a_rewrite() -> Result<()> {
+    let temp = TempDir::new()?;
+    let fixture = Fixture::new(temp.path())?;
+    let watcher = fixture.watcher().await?;
+    let mut subscription = watcher.subscribe();
+
     write(
         &fixture.mcp,
         r#"{"mcpServers":{"demo":{"command":"demo"}}}"#,
     )?;
-    let mcp_event = next_event_for(&mut subscription, |event| event.path == fixture.mcp).await?;
-    ensure!(
-        mcp_event.kind == WatchTargetKind::McpConfig,
-        "got {:?}",
-        mcp_event.kind
-    );
-    ensure!(
-        mcp_event.label.as_deref() == Some("mcp:workspace"),
-        "got {:?}",
-        mcp_event.label
-    );
-    ensure!(
-        identity_event.sequence < mcp_event.sequence,
-        "sequences are monotonic across targets"
-    );
+    let event = next_event_for(&mut subscription, |event| event.path == fixture.mcp).await?;
 
+    ensure!(
+        event.kind == WatchTargetKind::McpConfig,
+        "got {:?}",
+        event.kind
+    );
+    ensure!(
+        event.change == ChangeKind::Modified,
+        "an existing config rewrite is Modified, got {:?}",
+        event.change
+    );
+    ensure!(
+        event.label.as_deref() == Some("mcp:workspace"),
+        "got {:?}",
+        event.label
+    );
+    watcher.shutdown().await?;
+    ensure!(watcher.is_shutdown(), "the handle reports the shutdown");
+    Ok(())
+}
+
+/// One watcher numbers its events monotonically across targets, one mutation at a time.
+///
+/// Every step awaits its own event under its own [`WAIT`] budget before the next mutation is
+/// issued, so the sequence order is causal rather than a timing guess, and no deadline is
+/// shared between the three targets.
+#[tokio::test]
+async fn sequences_increase_across_targets_of_one_watcher() -> Result<()> {
+    let temp = TempDir::new()?;
+    let fixture = Fixture::new(temp.path())?;
+    let watcher = fixture.watcher().await?;
+    let mut subscription = watcher.subscribe();
+
+    write(&fixture.identity, "identity v2\n")?;
+    let identity =
+        next_event_for(&mut subscription, |event| event.path == fixture.identity).await?;
+
+    write(
+        &fixture.mcp,
+        r#"{"mcpServers":{"demo":{"command":"demo"}}}"#,
+    )?;
+    let mcp = next_event_for(&mut subscription, |event| event.path == fixture.mcp).await?;
+
+    write_skill(&fixture.skills, "demo", "demo skill")?;
+    let skill = next_event_for(&mut subscription, |event| {
+        event.kind == WatchTargetKind::Skills && event.path == fixture.skill_file()
+    })
+    .await?;
+
+    ensure!(
+        identity.sequence < mcp.sequence && mcp.sequence < skill.sequence,
+        "sequences are monotonic across targets, got {identity:?} < {mcp:?} < {skill:?}"
+    );
+    ensure!(
+        mcp.kind == WatchTargetKind::McpConfig && skill.kind == WatchTargetKind::Skills,
+        "each event keeps the kind of its own target"
+    );
     watcher.shutdown().await?;
     ensure!(watcher.is_shutdown(), "the handle reports the shutdown");
     Ok(())
@@ -208,7 +353,7 @@ async fn a_burst_of_writes_coalesces_into_one_event() -> Result<()> {
     let temp = TempDir::new()?;
     let fixture = Fixture::new(temp.path())?;
     let watcher = WorkspaceWatcher::new()
-        .debounce(DEBOUNCE)
+        .debounce(BURST_DEBOUNCE)
         .watch_dir(WatchTargetKind::Skills, &fixture.skills)
         .start()
         .await?;
@@ -217,26 +362,31 @@ async fn a_burst_of_writes_coalesces_into_one_event() -> Result<()> {
     for revision in 0..5 {
         write(&path, &format!("revision {revision}\n"))?;
     }
-    let events = events_for(&mut subscription, &path, WAIT).await;
+
+    // The burst is written synchronously, so every write falls inside one debounce window; the
+    // awaited event is the coalesced one, and the settle window proves no second one follows.
+    let first = next_event_for(&mut subscription, |event| event.path == path).await?;
     ensure!(
-        events.len() == 1,
-        "one debounce window publishes one event, got {events:?}"
+        matches!(first.change, ChangeKind::Created | ChangeKind::Modified),
+        "the first observation is the creation (or an in-place rewrite), got {:?}",
+        first.change
     );
     ensure!(
-        events[0].change == ChangeKind::Created,
-        "the first observation is the creation, got {:?}",
-        events[0].change
-    );
-    ensure!(
-        events[0].kind == WatchTargetKind::Skills,
+        first.kind == WatchTargetKind::Skills,
         "got {:?}",
-        events[0].kind
+        first.kind
+    );
+    let further = events_for(&mut subscription, &path, SETTLE).await;
+    ensure!(
+        further.is_empty(),
+        "one debounce window publishes one event, got {further:?}"
     );
     watcher.shutdown().await?;
     Ok(())
 }
 
-/// Shutdown is clean and idempotent, and a single-file target still watches a missing file.
+/// Shutdown is clean and idempotent, publishes nothing afterwards, and a single-file target
+/// still watches a file that appears after start.
 #[tokio::test]
 async fn shutdown_is_idempotent_and_file_targets_survive_creation() -> Result<()> {
     let temp = TempDir::new()?;
@@ -261,8 +411,18 @@ async fn shutdown_is_idempotent_and_file_targets_survive_creation() -> Result<()
         "got {:?}",
         event.kind
     );
+
     watcher.shutdown().await?;
     watcher.shutdown().await?;
     ensure!(watcher.is_shutdown(), "the second shutdown is a no-op");
+
+    // `shutdown` awaits both tasks, so no update may be produced afterwards; the OS watch is
+    // gone too, so this rewrite cannot reach the pipeline at all.
+    write(&missing, "workspace instructions, revised\n")?;
+    let late = events_for(&mut subscription, &missing, SETTLE).await;
+    ensure!(
+        late.is_empty(),
+        "a shut-down watcher publishes nothing, got {late:?}"
+    );
     Ok(())
 }

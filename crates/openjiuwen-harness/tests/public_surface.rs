@@ -8,10 +8,10 @@
 //! `openjiuwen_harness::moa::…`) and then makes one behavioural assertion on it, so the export is
 //! proven to resolve *and* to be the working type rather than a placeholder:
 //!
-//! - [`MoaConfig`] / [`MoaRail`] publish the mixture-of-agents prompt section;
+//! - [`MoaConfig`] / [`MoaRail`] publish the mixture-of-agents consultation protocol text;
 //! - [`ExecutionLog`] / [`WindowAssembler`] append, reopen and rebuild a window;
-//! - [`WorkspaceWatcher`] accepts a plan without the feature, starts with it, and reports the
-//!   typed `Unsupported` when `notify` is off;
+//! - [`WorkspaceWatcher`] accepts a plan without the feature, observes a real write (and publishes
+//!   nothing after shutdown) with it, and reports the typed `Unsupported` when `notify` is off;
 //! - [`HeartbeatRail`] fires on its injected clock and queues one event;
 //! - [`PersonalContextStore`] derives its paths from a temporary home;
 //! - [`WorktreeLock`] / [`SparseConfig`] acquire a repository lock and refuse a hostile path;
@@ -67,9 +67,18 @@ async fn moa_config_and_rail_come_from_the_crate_root() -> Result<()> {
         section.name == "moa",
         "unexpected section name: {section:?}"
     );
+    // Assert on the published *text*, not merely on a non-empty string: the default mode is
+    // `AggregatorOnDemand`, whose English protocol must name the consultation tool.
+    let rendered = section.render("en");
     ensure!(
-        !section.render("en").trim().is_empty(),
-        "the published MoA section must carry text"
+        rendered.contains("Reference Consultation")
+            && rendered.contains("consult_reference_models"),
+        "the published MoA section must carry the consultation protocol, got: {rendered}"
+    );
+    ensure!(
+        section.render("cn").contains("参考模型咨询"),
+        "the section must stay bilingual, got: {}",
+        section.render("cn")
     );
 
     let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeModelCall);
@@ -410,7 +419,38 @@ async fn workspace_watcher_reports_unsupported_without_notify() -> Result<()> {
     Ok(())
 }
 
-/// With the feature a watcher starts on a real directory and shuts down cleanly.
+/// Delivery budget of one awaited watcher event in this smoke suite.
+#[cfg(feature = "notify")]
+const WATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Quiet window proving a shut-down watcher publishes nothing more.
+#[cfg(feature = "notify")]
+const WATCH_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Awaits the next event whose path is `path`, within `budget`.
+///
+/// This is the smoke-level observation helper: it proves the re-exported watcher really watches,
+/// not merely that it constructs.
+#[cfg(feature = "notify")]
+async fn await_event_for(
+    subscription: &mut openjiuwen_harness::Subscription,
+    path: &std::path::Path,
+    budget: std::time::Duration,
+) -> Option<openjiuwen_harness::WatchEvent> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match tokio::time::timeout_at(deadline, subscription.recv()).await {
+            Ok(Some(openjiuwen_harness::WatchUpdate::Event(event))) if event.path == path => {
+                return Some(event)
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// With the feature a watcher starts on a real directory, observes a write and shuts down
+/// cleanly without publishing anything afterwards.
 #[cfg(feature = "notify")]
 #[tokio::test]
 async fn workspace_watcher_starts_with_notify() -> Result<()> {
@@ -419,16 +459,53 @@ async fn workspace_watcher_starts_with_notify() -> Result<()> {
     std::fs::create_dir_all(&skills)?;
     let handle = WorkspaceWatcher::new()
         .debounce(std::time::Duration::from_millis(50))
-        .watch_dir(WatchTargetKind::Skills, skills)
+        .watch_dir(WatchTargetKind::Skills, skills.clone())
         .start()
         .await?;
     ensure!(
-        handle.target_count() == 1 && !handle.is_shutdown(),
-        "a started watcher observes one target"
+        handle.target_count() == 1,
+        "a started watcher observes one target, got {}",
+        handle.target_count()
     );
+    ensure!(!handle.is_shutdown(), "a started watcher is running");
+    ensure!(
+        handle.dropped_notifications() == 0 && handle.dropped_dispatches() == 0,
+        "nothing may be dropped before the first event"
+    );
+
+    // Registration completed inside `start`, so this write must be delivered.
+    let mut subscription = handle.subscribe();
+    let notes = skills.join("notes.md");
+    std::fs::write(&notes, "notes\n")?;
+    let event = await_event_for(&mut subscription, &notes, WATCH_BUDGET)
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "the started watcher must publish the write to {}",
+                notes.display()
+            )
+        })?;
+    ensure!(
+        event.kind == WatchTargetKind::Skills && event.sequence >= 1,
+        "unexpected watcher event: {event:?}"
+    );
+    ensure!(
+        handle.dropped_notifications() == 0 && handle.dropped_dispatches() == 0,
+        "one notification must not fill either bounded queue"
+    );
+
     handle.shutdown().await?;
     ensure!(handle.is_shutdown(), "shutdown must be observable");
     handle.shutdown().await?;
     ensure!(handle.is_shutdown(), "shutdown must stay idempotent");
+
+    // `shutdown` joins both tasks and releases the OS watch, so a later write is never published.
+    std::fs::write(&notes, "after shutdown\n")?;
+    ensure!(
+        await_event_for(&mut subscription, &notes, WATCH_QUIET)
+            .await
+            .is_none(),
+        "a shut-down watcher must not publish another update"
+    );
     Ok(())
 }
