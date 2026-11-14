@@ -37,7 +37,7 @@ pub use runtime::transcript::{
     TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription,
     TranscriptSummary, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
-pub use runtime::{clock, persistence, quota, transcript};
+pub use runtime::{activity, clock, lifecycle, persistence, quota, transcript};
 pub use runtime::{
     LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
     SubAgentSpawnRequest, SubagentMetadata, SubagentStatus, EVICTION_REASON,
