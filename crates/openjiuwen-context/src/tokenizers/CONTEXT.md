@@ -45,7 +45,7 @@ Everything here is offline by construction: BPE vocabularies come from `tiktoken
 - `TokenCounter::count_text` is `encode().len()`; message framing uses the workspace default (a fixed per-message overhead) rather than Python's `<|start|>role` convention, so a native count stays comparable with every other counter.
 - No `unsafe`, no `println!`, no `unwrap`/`expect` in library code; errors are typed `openjiuwen_common::error::Error`.
 - Decoding includes special tokens (unlike `HuggingFace`'s `skip_special_tokens = true` default) and skips ids the artefact does not declare; a `.model` vocabulary allows special tokens by default (`allowed_special="all"` parity).
-- Files stay around 1000 lines: `spec.rs`, `counter.rs` and `selector.rs` hold the split public surface, and `native/tiktoken_model.rs` (1037 lines) owns the rank table, merge loop and both pre-tokenizers.
+- Files stay around 1000 lines: `spec.rs`, `counter.rs` and `selector.rs` hold the split public surface, and `native/tiktoken_model/` splits the rank table and merge loop (`mod.rs`) from the Kimi/GPT-2 pre-tokenizers (`pretokenize.rs`) and the special-token maps (`specials.rs`).
 
 ## Design Decisions
 
@@ -92,5 +92,5 @@ Everything here is offline by construction: BPE vocabularies come from `tiktoken
 - `./native/added_tokens.rs` → added/special token matching and chunking
 - `./native/decoder.rs` → byte-level, metaspace, word-piece, `Fuse`, `Replace`, `Sequence` decoding
 - `./native/bytes.rs` → the byte↔unicode alphabet
-- `./native/tiktoken_model.rs` → `.model` ranks/merges, Kimi and GPT-2 pre-tokenization, `.model` special-token maps and `tokenizer_config.json` parsing
+- `./native/tiktoken_model/` → `.model` ranks/merges and encode/decode (`mod.rs`), Kimi and GPT-2 pre-tokenization (`pretokenize.rs`), special-token maps and `tokenizer_config.json` parsing (`specials.rs`)
 - `./native/modeltests.rs` → shared test fixtures for the native loaders

@@ -62,7 +62,7 @@ The two acceptance gates are Python's: `meets_savings_ratio` (at least `RuleCont
 - `./pipeline.rs` → per-pass budgets, metadata stamping, the `tracing` line
 - `./dump.rs` → dump naming, directory resolution, JSON writing
 - `./compressors/mod.rs` → the `RuleCompressor` trait and re-exports
-- `./compressors/html.rs` → dependency-free extractor and renderer
+- `./compressors/html/` → `mod.rs` (`HtmlCompressor` gating/rendering), `extract.rs` (dependency-free extractor and renderer), `tests.rs`
 - `./compressors/json_array.rs` → CSV/JSONL rendering and salient-row digests
 - `./compressors/log.rs` → level classification, dedupe, context widening, caps
 - `./compressors/diff.rs` → unified-diff parsing, hunk selection, offload decision

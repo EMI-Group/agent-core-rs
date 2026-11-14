@@ -64,7 +64,7 @@ A later pass wires the recorder into `processor::ContextPipeline`; this node is 
 ## Routing Table
 
 - `./state.rs` → the `context.compression_state` value objects, status/phase vocabularies, constructors and setters
-- `./recorder.rs` → `ContextProcessorStateRecorder`, `ContextProcessorStateInput`, the rewrite diffing, summaries, metric/saved math, the timestamp formatter, sinks
+- `./recorder/` → `mod.rs` (`ContextProcessorStateRecorder`, `ContextProcessorStateInput`, rewrite diffing, sinks), `metrics.rs` (timestamp formatter, metric/saved math, compact summaries), `tests.rs`
 - `./scope.rs` → `CompressionOperation`, the task-local scope, the request stamping helpers
 
 ## Test Strategy

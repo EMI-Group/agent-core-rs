@@ -105,7 +105,7 @@ let recovered = engine
 - Offloaders rewrite only plain text content: an assistant message that carries `tool_calls`, non-text content, and any text that already contains `[[OFFLOAD:` are left untouched, and role/`name`/`metadata`/`tool_call_id` survive every rewrite.
 - Dependencies are `base64` (a `tiktoken` `.model` vocabulary is base64 ranks) and `sha2` (artefact validation, measurement-cache keys, window fingerprints); dev-dependencies add `wiremock` (download and `OpenRouter` paths) and `tempfile` (artefact caches).
 - The only process-global mutable state in this crate is the TTL-bounded `policy::global_openrouter_window_cache()`, the documented exception after the workspace `Runner`; its lock is never held across an `await` and callers inject a cache when they can.
-- No `unsafe`; `tracing` only; files stay around 1000 lines (`engine.rs` sits at the limit, and `tokenizers/native/tiktoken_model.rs` is 1 037 lines because it owns the rank table, the tiktoken merge loop and the Kimi/GPT-2 pre-tokenizers — split it before adding unrelated logic).
+- No `unsafe`; `tracing` only; every file stays under ~1000 lines — the largest are `processor/compressor/adaptive/strategy.rs` and `processor/rule_compression/compressors/html/extract.rs`, so split by responsibility before adding unrelated logic.
 
 ## Design Decisions
 
@@ -179,8 +179,10 @@ let recovered = engine
 - `./src/stats.rs` → `ContextStats`, `PreparedContext` (incl. the usage block), `compute_stats`, per-role accounting
 - `./src/events.rs` → `ContextEvent`, `ContextEventKind`, `CompressionStatus`, `CompressReport`, `RecoveryOutcome`, `ObserveOutcome`
 - `./src/window.rs` → dialogue rounds, window assembly, tool-pair helpers, round-aware truncation
-- `./src/context.rs` → `ModelContext` trait, `ConversationContext`, `ContextState`, window tracking/diffing, prepare runner, usage block and reload injection
-- `./src/engine.rs` → `ContextEngine`, context pool, `observe`/`compress`/recovery, resolved window, usage reports, KV-cache rollups, session persistence, store resolution
+- `./src/context.rs` → module root: `ModelContext` trait, `ConversationContext` (state, session/scope/cancel accessors), re-exports
+- `./src/context/` → `history.rs` (message storage, revision), `prepare.rs` (prepare + pipeline phase), `state.rs` (`ContextState` save/load), `window_tracking.rs` (window snapshot, diffing, access time), `usage.rs` (usage block), `tests.rs`
+- `./src/engine.rs` → module root: `ContextEngine` construction, config, prepare, persisted-state key, re-exports
+- `./src/engine/` → `pool.rs` (context pool, store/recorder resolution), `observe.rs`, `compression.rs` (compress + overflow recovery), `usage.rs` (usage reports, KV-cache rollups, resolved window, window diff), `persistence.rs` (`save_contexts`/`load_contexts`), `tests.rs`
 - `./src/engine_options.rs` → `PrepareOptions`, `ContextOptions` (recorder + analyzer seams), `DEFAULT_SESSION_ID`
 - `./src/offload.rs` → `OffloadStore` implementations, `OffloadScope`/`OffloadRecord`/markers, rehydration
 - `./src/recall/` → recall archive types, stores, cross-archive retrieval, markers, chunking, BM25
@@ -216,7 +218,7 @@ let recovered = engine
 - `./src/tokenizers/selector.rs` → `TokenizerSelector` and its artefact/tiktoken/estimate ladder, `load_native_tokenizer` (both artefact kinds)
 - `./src/tokenizers/artifacts.rs` → module docs, cache-layout contract, `mod` declarations, public re-exports
 - `./src/tokenizers/artifacts/` → `manager.rs` (resolution order, downloads, codes), `cache.rs` (dir precedence, naming, search, sha256), `lock.rs` (advisory download lock)
-- `./src/tokenizers/native/` → `mod.rs` (pipeline, kind, byte alphabet, counter impl), `hf_json.rs`, `model.rs`, `bpe.rs`, `wordpiece.rs`, `unigram.rs`, `normalizer.rs`, `pretokenizer.rs`, `added_tokens.rs`, `decoder.rs`, `bytes.rs`, `tiktoken_model.rs` (ranks, merges, Kimi/GPT-2 pre-tokenizers, specials), `modeltests.rs`
+- `./src/tokenizers/native/` → `mod.rs` (pipeline, kind, byte alphabet, counter impl), `hf_json.rs`, `model.rs`, `bpe.rs`, `wordpiece.rs`, `unigram.rs`, `normalizer.rs`, `pretokenizer.rs`, `added_tokens.rs`, `decoder.rs`, `bytes.rs`, `tiktoken_model/` (`mod.rs` ranks/merges/encode, `pretokenize.rs` Kimi and GPT-2 matchers, `specials.rs` K2/K3 and `tokenizer_config.json` maps), `modeltests.rs`
 - `./src/tokenizers/CONTEXT.md` → the tokenizer node's own API, constraints and design notes
 - `./tests/engine_usage.rs` → engine wiring: prepared `usage` block, window-resolution ladder, `usage_report`/`usage_snapshot`, recorder phases, KV-cache rollup, window diffing, compaction-operation correlation
 - `./tests/*.rs` → the other suites listed under Test Strategy
