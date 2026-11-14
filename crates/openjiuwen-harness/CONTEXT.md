@@ -100,7 +100,7 @@ Every public item is also re-exported flat from the crate root.
 - CLI behaviour is testable by construction: IO, environment, home directory, shell runner and model are injected, so every command, prompt and wizard path is exercised without a terminal or network.
 - Rail-queued events drain through `RailEventDrain`, a `HarnessRail` at `i32::MIN` priority registered last on both the harness and kernel registries; it moves `harness.goal_events` and any `harness.events.*` payload out of `ctx.extra` into the invocation stream, and non-streaming hosts collect the retained copy with `DeepAgent::drain_rail_events()`.
 - The watcher is a typed event pipeline, not a callback tangle: OS notifications feed a per-path trailing debounce, the resulting `WatchEvent`s publish through bounded subscribers, and `ReloadHub` dispatches named reload handlers (skills, instruction files, MCP config) with reload failures reported as `WatchUpdate::ReloadFailed` instead of aborting the watcher.
-- MoA rails never call a model: `MoaRail` publishes the consultation prompt section and state, while `consult`/`verify_progress` are explicit calls the host drives.
+- MoA rails never call a model: `MoaRail` publishes the consultation prompt section and state, while `consult`/`verify_progress` are explicit calls the host drives. `DeepAgentConfig` has no `moa` field, so a host either registers a `MoaRail` through `DeepAgentBuilder::rail`/`DeepAgent::add_rail` or drives the module standalone.
 - The persistent-agent journal is JSONL plus atomic metadata, so a crashed run is resumable by reopening the directory; window assembly is deterministic and reports exactly what it elided.
 - Worktree mutations are serialized by a `flock`-backed `WorktreeLock` (bounded wait, pid/timestamp sidecar, stale recovery); `enter_worktree`/`exit_worktree` report the target and original directory instead of mutating the process cwd.
 - Subagent activity is published as throttled, bounded, sequenced frames with explicit truncation/lag accounting; background eviction is opt-in, skips running instances and fires lifecycle hooks after the state lock is dropped.
@@ -166,7 +166,7 @@ Every public item is also re-exported flat from the crate root.
 - Worktree offline: `WorktreeManager::new(repo_root).with_runner(Arc::new(scripted_runner))` or a `tempfile` git repo when `git` is installed.
 - Watcher offline: `WorkspaceWatcher::for_workspace(&workspace).start()` (feature `notify`) with a temp workspace, then mutate `skills/`, `IDENTITY.md` or the MCP config and read `Subscription::recv`; without the feature `start()` is a typed `Unsupported`.
 - MoA offline: `MoaConfig` with two `ScriptedModel` proposers → `consult` → `rank_with_config` → `Aggregator`, all without a network.
-- Persistent agent offline: `ExecutionLog::open(dir)` + `resume(dir, capacity)` over a temp dir; `LocalHandoff`/`ShareFile` stay on disk.
+- Persistent agent offline: `ExecutionLog::open(dir, identity, capacity)` (or `open_with_clock`) appends journal entries; `FileSessionStore` + `FileLinkStore` + `RootLogSource` feed `resume(&store, &logs, &links, &binding, request_id, &continuation, &WindowAssembler::new(Capacity::default()))`, which returns a `ResumePlan`; `LocalHandoff`/`ShareFile` stay on disk.
 - No default path opens a network connection; web fetch/search, MCP resources and the LSP server are only reached when a tool is invoked with a configured backend.
 
 ## Test Strategy
