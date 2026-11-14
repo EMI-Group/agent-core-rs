@@ -82,7 +82,7 @@ use serde_json::Value;
 pub use inproc::InProcessTransport;
 pub use redis::{
     RedisTopology, RedisTransport, RedisTransportConfig, DEFAULT_CLAIM_IDLE_MS,
-    DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_POLL_INTERVAL_MS, DEFAULT_REGISTRY_INTERVAL_MS,
 };
 
 use crate::envelope::MessageEnvelope;

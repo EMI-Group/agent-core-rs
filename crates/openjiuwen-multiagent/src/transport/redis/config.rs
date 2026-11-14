@@ -20,6 +20,10 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 10;
 /// Default idle time after which a pending entry may be claimed, in milliseconds.
 pub const DEFAULT_CLAIM_IDLE_MS: u64 = 30_000;
 
+/// Default idle delay between two refreshes of the shared subscription registry,
+/// in milliseconds.
+pub const DEFAULT_REGISTRY_INTERVAL_MS: u64 = 250;
+
 /// The Redis deployment topology a transport targets.
 ///
 /// Only [`RedisTopology::Single`] is implemented. The other variants are
@@ -105,6 +109,9 @@ pub struct RedisTransportConfig {
     /// Idle time after which a worker claims another consumer's pending
     /// entries, in milliseconds.
     pub claim_idle_ms: u64,
+    /// Idle delay between two refreshes of the shared subscription registry,
+    /// in milliseconds.
+    pub registry_interval_ms: u64,
     /// Deployment topology; only [`RedisTopology::Single`] is implemented.
     pub topology: RedisTopology,
 }
@@ -119,6 +126,7 @@ impl Default for RedisTransportConfig {
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             consumer_group: None,
             claim_idle_ms: DEFAULT_CLAIM_IDLE_MS,
+            registry_interval_ms: DEFAULT_REGISTRY_INTERVAL_MS,
             topology: RedisTopology::Single,
         }
     }
@@ -180,6 +188,14 @@ impl RedisTransportConfig {
         self
     }
 
+    /// Sets the idle delay between two refreshes of the shared subscription
+    /// registry.
+    #[must_use]
+    pub const fn with_registry_interval_ms(mut self, registry_interval_ms: u64) -> Self {
+        self.registry_interval_ms = registry_interval_ms;
+        self
+    }
+
     /// Sets the deployment topology.
     #[must_use]
     pub const fn with_topology(mut self, topology: RedisTopology) -> Self {
@@ -191,6 +207,12 @@ impl RedisTransportConfig {
     #[must_use]
     pub fn poll_interval(&self) -> Duration {
         Duration::from_millis(self.poll_interval_ms.max(1))
+    }
+
+    /// Returns the registry refresh delay, never smaller than one millisecond.
+    #[must_use]
+    pub fn registry_interval(&self) -> Duration {
+        Duration::from_millis(self.registry_interval_ms.max(1))
     }
 }
 
@@ -209,8 +231,10 @@ mod tests {
         assert_eq!(config.db, None);
         assert_eq!(config.consumer_group, None);
         assert_eq!(config.claim_idle_ms, DEFAULT_CLAIM_IDLE_MS);
+        assert_eq!(config.registry_interval_ms, DEFAULT_REGISTRY_INTERVAL_MS);
         assert_eq!(config.topology, RedisTopology::Single);
         assert_eq!(config.poll_interval(), Duration::from_millis(10));
+        assert_eq!(config.registry_interval(), Duration::from_millis(250));
     }
 
     #[test]
@@ -223,6 +247,7 @@ mod tests {
             .with_poll_interval_ms(0)
             .with_consumer_group("crew")
             .with_claim_idle_ms(5)
+            .with_registry_interval_ms(0)
             .with_topology(RedisTopology::Cluster);
         assert_eq!(config.addr, "redis:6380");
         assert_eq!(config.username.as_deref(), Some("agent"));
@@ -232,6 +257,8 @@ mod tests {
         assert_eq!(config.poll_interval(), Duration::from_millis(1));
         assert_eq!(config.consumer_group.as_deref(), Some("crew"));
         assert_eq!(config.claim_idle_ms, 5);
+        // The registry interval is clamped the same way the poll interval is.
+        assert_eq!(config.registry_interval(), Duration::from_millis(1));
         assert_eq!(config.topology, RedisTopology::Cluster);
     }
 

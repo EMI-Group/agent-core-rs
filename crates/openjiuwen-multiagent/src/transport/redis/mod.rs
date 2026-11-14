@@ -15,6 +15,8 @@
 //! | `{prefix}:{team}:p2p:{recipient}` | [`RedisTransport::send`] (`XADD envelope .. reply ..`) | the recipient's worker (`XREADGROUP`) |
 //! | `{prefix}:{team}:reply:{message_id}` | the recipient's worker (`XADD frame ..`) | the waiting [`RedisTransport::send`] (`XREAD`, then `DEL`) |
 //! | `{prefix}:{team}:pubsub:{subscriber}` | [`RedisTransport::publish`] (`XADD envelope ..`) | the subscriber's worker (`XREADGROUP`) |
+//! | `{prefix}:{team}:subs` | [`TeamTransport::add_subscription`] (`SADD`) | a registry refresh (`SMEMBERS`) |
+//! | `{prefix}:{team}:subs:{pattern}` | [`TeamTransport::add_subscription`] (`SADD`), [`TeamTransport::remove_subscription`] (`SREM`) | a registry refresh (`SMEMBERS`) |
 //!
 //! A P2P request carries its own [`MessageEnvelope`] plus the reply stream key,
 //! so `sender`, `session_id` and the correlation
@@ -56,9 +58,26 @@
 //! transport stops. `publish` is fire-and-forget per subscriber: it appends one
 //! copy per sorted subscriber and returns once every append succeeded, which —
 //! unlike the in-process transport, whose `publish` awaits the fan-out — can be
-//! before any handler ran. Subscriptions are registry entries of this transport
-//! instance, so both sides of a cross-process pub/sub pair must register the
-//! same `(agent, topic)` pairs.
+//! before any handler ran. The subscribers `publish` fans out to come from the
+//! local registry, which the shared registry keeps converging (see
+//! [Subscriptions](#subscriptions)).
+//!
+//! # Subscriptions
+//!
+//! A subscription is an `(agent, topic pattern)` pair. The local
+//! [`SubscriptionManager`] decides this transport's own fan-out, and every pair
+//! is mirrored into the shared Redis registry (`{prefix}:{team}:subs` plus
+//! `{prefix}:{team}:subs:{pattern}`) on a spawned best-effort task, so the
+//! synchronous `add_subscription`/`remove_subscription` never wait for the
+//! network. A refresher task started by [`start`](TeamTransport::start) re-reads
+//! that registry every [`RedisTransportConfig::registry_interval_ms`] and
+//! replaces the local view with `remote ∪ owned`, which is how a process
+//! publishes to a subscriber registered elsewhere; a failed write is logged and
+//! leaves the local pair in place, so it survives the merge.
+//! [`RedisTransport::refresh_subscriptions`] runs the same refresh on demand, and
+//! [`stop`](TeamTransport::stop) removes the entries this instance owns so a
+//! clean shutdown leaves no stale routes (a crashed process may; a stale entry
+//! only causes `XADD`s into a stream no worker consumes).
 //!
 //! # Topology
 //!
@@ -68,23 +87,22 @@
 //! [`Error::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
 //! instead of silently degrading to a single node.
 
+mod backend;
 mod config;
+mod registry;
 mod streams;
 mod worker;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_v4;
 use openjiuwen_foundation::store::external::redis::client::RedisAuth;
 use openjiuwen_foundation::store::external::redis::codec::RespValue;
 use openjiuwen_foundation::store::external::redis::RedisConnection;
 use parking_lot::Mutex;
-use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -94,12 +112,14 @@ use crate::message_bus::MessageHandler;
 use crate::subscription::SubscriptionManager;
 
 use self::config::topology_unsupported;
-use self::streams::{decode_reply, del, group_name, stream_key, xadd, xread};
+use self::registry::SubscriptionRegistry;
+use self::streams::{group_name, stream_key};
 use self::worker::{Worker, WorkerMode};
 use super::{TeamTransport, TransportKind, DEFAULT_KEY_PREFIX};
 
 pub use config::{
     RedisTopology, RedisTransportConfig, DEFAULT_CLAIM_IDLE_MS, DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_REGISTRY_INTERVAL_MS,
 };
 
 /// Team id used when the configured one is empty.
@@ -119,6 +139,8 @@ struct State {
     watched: BTreeSet<String>,
     /// One worker task per stream key.
     workers: BTreeMap<String, JoinHandle<()>>,
+    /// The task refreshing the shared subscription registry.
+    refresher: Option<JoinHandle<()>>,
 }
 
 /// A team transport that moves envelopes through Redis Streams.
@@ -138,6 +160,8 @@ pub struct RedisTransport {
     handler: Arc<dyn MessageHandler>,
     /// Logical subscriber registry used for fan-out.
     subscriptions: Arc<SubscriptionManager>,
+    /// Shared cross-process mirror of `subscriptions`.
+    registry: Arc<SubscriptionRegistry>,
     /// The lazily connected RESP2 link shared by every task.
     link: Arc<AsyncMutex<RedisLink>>,
     /// Lifecycle state.
@@ -190,22 +214,33 @@ impl RedisTransport {
         let team_id = team_id.into();
         let key_prefix = key_prefix.into();
         let link = RedisLink::new(&config);
+        let team_id = if team_id.is_empty() {
+            DEFAULT_TEAM_ID.to_owned()
+        } else {
+            team_id
+        };
+        let key_prefix = if key_prefix.is_empty() {
+            DEFAULT_KEY_PREFIX.to_owned()
+        } else {
+            key_prefix
+        };
+        let subscriptions = Arc::new(SubscriptionManager::new());
+        let link = Arc::new(AsyncMutex::new(link));
+        let registry = Arc::new(SubscriptionRegistry::new(
+            Arc::clone(&subscriptions),
+            Arc::clone(&link),
+            &key_prefix,
+            &team_id,
+        ));
         Arc::new(Self {
             config,
-            team_id: if team_id.is_empty() {
-                DEFAULT_TEAM_ID.to_owned()
-            } else {
-                team_id
-            },
-            key_prefix: if key_prefix.is_empty() {
-                DEFAULT_KEY_PREFIX.to_owned()
-            } else {
-                key_prefix
-            },
+            team_id,
+            key_prefix,
             consumer: uuid_v4(),
             handler,
-            subscriptions: Arc::new(SubscriptionManager::new()),
-            link: Arc::new(AsyncMutex::new(link)),
+            subscriptions,
+            registry,
+            link,
             state: Mutex::new(State::default()),
         })
     }
@@ -352,16 +387,6 @@ impl RedisTransport {
             self.state.lock().workers.insert(key, handle);
         }
     }
-
-    /// Starts the transport lazily when a caller skipped
-    /// [`start`](TeamTransport::start).
-    async fn ensure_started(&self) -> Result<()> {
-        if self.is_started() {
-            Ok(())
-        } else {
-            self.start().await
-        }
-    }
 }
 
 impl fmt::Debug for RedisTransport {
@@ -394,161 +419,6 @@ impl Drop for RedisTransport {
         if let Some(cancel) = state.cancel.take() {
             cancel.cancel();
         }
-    }
-}
-
-#[async_trait]
-impl TeamTransport for RedisTransport {
-    fn kind(&self) -> TransportKind {
-        TransportKind::Redis
-    }
-
-    fn team_id(&self) -> &str {
-        &self.team_id
-    }
-
-    async fn start(&self) -> Result<()> {
-        if self.is_started() {
-            return Ok(());
-        }
-        // Belt and braces: `try_new` already rejects these, `new` does not.
-        if !self.config.topology.is_single() {
-            return Err(topology_unsupported(self.config.topology));
-        }
-        // A handshake failure (bad address, rejected `AUTH`) surfaces here
-        // instead of on the first delivery.
-        {
-            let mut link = self.link.lock().await;
-            link.ping().await?;
-        }
-        let cancel = CancellationToken::new();
-        let watched = {
-            let mut state = self.state.lock();
-            if state.started {
-                return Ok(());
-            }
-            state.started = true;
-            state.cancel = Some(cancel.clone());
-            state.watched.clone()
-        };
-        for agent in watched {
-            self.spawn_workers(&agent, &cancel);
-        }
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<()> {
-        let (cancel, workers) = {
-            let mut state = self.state.lock();
-            state.started = false;
-            (state.cancel.take(), std::mem::take(&mut state.workers))
-        };
-        let Some(cancel) = cancel else {
-            return Ok(());
-        };
-        cancel.cancel();
-        for (key, handle) in workers {
-            if let Err(error) = handle.await {
-                tracing::warn!(key = %key, %error, "redis transport worker did not stop cleanly");
-            }
-        }
-        Ok(())
-    }
-
-    async fn send(&self, envelope: MessageEnvelope, timeout: Option<Duration>) -> Result<Value> {
-        let recipient = envelope
-            .recipient
-            .clone()
-            .filter(|recipient| !recipient.is_empty())
-            .ok_or_else(|| Error::validation("recipient is required"))?;
-        self.ensure_started().await?;
-        let sender = envelope.sender.clone().unwrap_or_default();
-        let request_key = self.p2p_queue(&recipient);
-        let reply_key = self.reply_queue(&envelope.message_id);
-        let payload = encode_envelope(&envelope)?;
-        xadd(
-            &self.link,
-            &request_key,
-            &[("envelope", &payload), ("reply", reply_key.as_bytes())],
-        )
-        .await?;
-
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let poll_interval = self.config.poll_interval();
-        loop {
-            let entries = xread(&self.link, &reply_key, 1).await?;
-            if let Some(entry) = entries.into_iter().next() {
-                let frame = entry.field("frame").map(<[u8]>::to_vec);
-                // The reply is consumed once: delete the stream so a later
-                // request cannot read a stale frame and so the key expires.
-                if let Err(error) = del(&self.link, &reply_key).await {
-                    tracing::warn!(key = %reply_key, %error, "redis transport could not delete a consumed reply stream");
-                }
-                if let Some(frame) = frame.as_deref().and_then(decode_reply) {
-                    return frame.into_result();
-                }
-                tracing::warn!(
-                    key = %reply_key,
-                    "redis transport skipped a reply entry without a decodable frame"
-                );
-            }
-            let wait = match deadline {
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(Error::timeout(format!(
-                            "Message from '{sender}' to '{recipient}' timed out after {}s",
-                            timeout.map_or(0.0, |timeout| timeout.as_secs_f64())
-                        )));
-                    }
-                    poll_interval.min(deadline - now)
-                }
-                None => poll_interval,
-            };
-            tokio::time::sleep(wait).await;
-            if !self.is_started() {
-                return Err(Error::transport(format!(
-                    "redis transport for team '{}' stopped before '{recipient}' replied",
-                    self.team_id
-                )));
-            }
-        }
-    }
-
-    async fn publish(&self, envelope: MessageEnvelope) -> Result<()> {
-        let topic_id = envelope
-            .topic_id
-            .clone()
-            .filter(|topic_id| !topic_id.is_empty())
-            .ok_or_else(|| Error::validation("topic_id is required"))?;
-        self.ensure_started().await?;
-        let subscribers = self.subscriptions.subscribers(&topic_id);
-        if subscribers.is_empty() {
-            tracing::debug!(topic_id, team = %self.team_id, "redis team publish has no subscribers");
-            return Ok(());
-        }
-        let payload = encode_envelope(&envelope)?;
-        for subscriber in subscribers {
-            xadd(
-                &self.link,
-                &self.pubsub_queue(&subscriber),
-                &[("envelope", &payload)],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    fn add_subscription(&self, agent_id: &str, topic: &str) {
-        self.subscriptions.subscribe(agent_id, topic);
-    }
-
-    fn remove_subscription(&self, agent_id: &str, topic: &str) {
-        self.subscriptions.unsubscribe(agent_id, topic);
-    }
-
-    fn subscribers(&self, topic_id: &str) -> Vec<String> {
-        self.subscriptions.subscribers(topic_id)
     }
 }
 
