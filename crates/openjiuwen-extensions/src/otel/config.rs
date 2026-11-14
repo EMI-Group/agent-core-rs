@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use openjiuwen_common::config::env::{flag, OPENJIUWEN_OTEL_GLOBAL_INSTRUMENT_ENABLE};
 use openjiuwen_common::error::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::env;
 
@@ -26,6 +26,9 @@ const MIN_SAMPLE_RATE: f64 = 0.0;
 /// Highest accepted sampling probability (inclusive).
 const MAX_SAMPLE_RATE: f64 = 1.0;
 
+/// Canonical [`OtlpProtocol`] wire spellings, named in deserialization errors.
+const ACCEPTED_PROTOCOLS: [&str; 3] = ["grpc", "http", "http_protobuf"];
+
 /// Which span exporter the tracer provider should install.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,34 +39,74 @@ pub enum ExporterType {
     Memory,
     /// Write one `tracing` line per finished span at `debug`.
     Console,
-    /// Ship spans to an OTLP collector over HTTP with JSON payloads.
+    /// Ship spans to an OTLP collector over HTTP, as JSON or protobuf payloads.
     ///
     /// The endpoint, headers, and protocol resolve from the configuration,
     /// then from the `OPENJIUWEN_OTEL_*` variables, then from the standard
-    /// `OTEL_*` ones, then from the built-in defaults. This exporter requires
-    /// [`OtlpProtocol::Http`]; [`OtlpProtocol::Grpc`] (the default) answers
-    /// [`Error::Unsupported`] because gRPC/protobuf support (`tonic`/`prost`)
-    /// is unavailable in offline builds.
+    /// `OTEL_*` ones, then from the built-in defaults. Both HTTP encodings are
+    /// supported: [`OtlpProtocol::Http`] (`http/json`) and
+    /// [`OtlpProtocol::HttpProtobuf`] (`http/protobuf`).
+    /// [`OtlpProtocol::Grpc`] (the default) answers
+    /// [`Error::Unsupported`] because gRPC framing needs `tonic`/`prost`, which
+    /// are unavailable in offline builds.
     #[default]
     Otlp,
 }
 
 /// Transport selector for the OTLP exporter.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serialization uses canonical `snake_case` spellings (`grpc`, `http`,
+/// `http_protobuf`). Deserialization is tolerant: it trims, folds case, and
+/// treats `-` and `/` like `_`, so `http/json`, `http_json` and `json` all mean
+/// [`OtlpProtocol::Http`], and `http/protobuf`, `http-protobuf`, `http_protobuf`
+/// and `protobuf` all mean [`OtlpProtocol::HttpProtobuf`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
     /// OTLP over gRPC.
     ///
     /// Retained for Python and configuration compatibility, but unsupported:
-    /// building the exporter answers [`Error::unsupported`].
+    /// building the exporter answers [`Error::unsupported`] because gRPC
+    /// framing needs `tonic`/`prost`, which the offline build cannot reach.
     #[default]
     Grpc,
-    /// OTLP over HTTP with **JSON** payloads.
+    /// OTLP over HTTP with **JSON** payloads (`http/json`).
     ///
-    /// Deviation from Python, which encodes OTLP/HTTP payloads as protobuf:
-    /// the endpoint and collector contract are identical and only the payload
-    /// encoding differs, because no protobuf encoder is available offline.
+    /// Python spells this `"http"`; both spellings select this transport and
+    /// the payload is JSON, exactly as Python's `http/json` exporter does.
     Http,
+    /// OTLP over HTTP with **protobuf** payloads (`http/protobuf`).
+    ///
+    /// The body comes from the crate's hand-written protobuf encoder, so no
+    /// `prost`/`opentelemetry-otlp` dependency is needed.
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    /// Parses one wire spelling, tolerating case and `-`/`/` separators.
+    ///
+    /// Returns `None` for a value that is not an accepted protocol.
+    fn from_wire(raw: &str) -> Option<Self> {
+        match env::normalize_protocol(raw).as_str() {
+            "grpc" => Some(Self::Grpc),
+            "http" | "http_json" | "json" => Some(Self::Http),
+            "http_protobuf" | "protobuf" => Some(Self::HttpProtobuf),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OtlpProtocol {
+    /// Accepts every documented spelling and reports the canonical ones when
+    /// the value is unknown.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_wire(&raw)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&raw, &ACCEPTED_PROTOCOLS))
+    }
 }
 
 /// Immutable configuration for the `OTel` tracer extension.
@@ -191,9 +234,9 @@ impl OtelTracerConfig {
     /// ones, and blank values count as unset.
     ///
     /// Infallible by design: a `*_PROTOCOL` value that cannot be honoured
-    /// (`grpc`, `http/protobuf`, or an unknown string) is ignored here, leaving
-    /// the default [`OtlpProtocol::Grpc`] in place. Building the exporter
-    /// reports the requested protocol with [`Error::unsupported`] or
+    /// (`grpc` or an unknown string) is ignored here, leaving the default
+    /// [`OtlpProtocol::Grpc`] in place. Building the exporter reports the
+    /// requested protocol with [`Error::unsupported`] or
     /// [`Error::validation`], so a typo cannot make configuration loading fail.
     #[must_use]
     pub fn from_env() -> Self {
@@ -209,8 +252,9 @@ impl OtelTracerConfig {
     ///   `env_endpoint()`,
     /// - an empty [`Self::headers`] map takes `env_headers()`,
     /// - [`OtlpProtocol::Grpc`] (the default) takes the parsed environment
-    ///   protocol when that protocol is supported — an unusable value is
-    ///   ignored and the default is kept,
+    ///   protocol when that protocol is supported — an unusable value (`grpc`
+    ///   or an unknown string) is ignored and the default is kept; an explicit
+    ///   [`OtlpProtocol::Http`] or [`OtlpProtocol::HttpProtobuf`] always wins,
     /// - the default `service.name` (`"openjiuwen"`) takes `env_service_name()`.
     ///
     /// Variables that are unset, blank, or unparsable leave their field alone,
@@ -354,6 +398,47 @@ mod tests {
         assert_eq!(value["exporter_type"], json!("memory"));
         assert_eq!(value["service_name"], json!("svc"));
         assert_eq!(value["service_version"], Value::Null);
+    }
+
+    #[test]
+    fn protocol_wire_spellings_normalize_to_the_canonical_names() {
+        // Every accepted spelling in, the canonical snake_case name out.
+        for (raw, expected, canonical) in [
+            ("grpc", OtlpProtocol::Grpc, "grpc"),
+            (" http ", OtlpProtocol::Http, "http"),
+            ("http/json", OtlpProtocol::Http, "http"),
+            ("http_json", OtlpProtocol::Http, "http"),
+            ("JSON", OtlpProtocol::Http, "http"),
+            ("http/protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+            ("http_protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+            ("http-protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+            (
+                "  HTTP/PROTOBUF  ",
+                OtlpProtocol::HttpProtobuf,
+                "http_protobuf",
+            ),
+            ("protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+        ] {
+            let config: OtelTracerConfig =
+                serde_json::from_value(json!({"protocol": raw})).unwrap();
+            assert_eq!(config.protocol, expected, "value {raw:?}");
+
+            let value = serde_json::to_value(&config).unwrap();
+            assert_eq!(value["protocol"], json!(canonical), "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn protocol_deserialize_failure_names_the_accepted_values() {
+        let error =
+            serde_json::from_value::<OtelTracerConfig>(json!({"protocol": "thrift"})).unwrap_err();
+        let message = error.to_string();
+        for accepted in ["grpc", "http", "http_protobuf"] {
+            assert!(
+                message.contains(accepted),
+                "the error must name {accepted:?}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -552,11 +637,16 @@ mod tests {
     #[test]
     fn apply_env_ignores_an_unusable_protocol() {
         let _guard = EnvGuard::new();
-        for raw in ["grpc", "http/protobuf", "carrier-pigeon"] {
+        for raw in ["grpc", "carrier-pigeon"] {
             set_env(OTEL_EXPORTER_OTLP_PROTOCOL, raw);
             let config = OtelTracerConfig::default().apply_env();
             assert_eq!(config.protocol, OtlpProtocol::Grpc, "value {raw:?}");
         }
+
+        // `http/protobuf` is usable now, so it is no longer ignored.
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf");
+        let config = OtelTracerConfig::default().apply_env();
+        assert_eq!(config.protocol, OtlpProtocol::HttpProtobuf);
     }
 
     #[test]

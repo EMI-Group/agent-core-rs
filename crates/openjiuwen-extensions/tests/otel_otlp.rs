@@ -4,9 +4,15 @@
 //! — the exporter selection of `OtelTracer.setup` plus the collector wiring
 //! that Python hands to `OTLPSpanExporter`. Python's suite stops at the SDK
 //! boundary; here the public surface — `init_otel_tracer`, `TracerHandle`,
-//! `OtlpHttpExporter`, and `env` — is driven end to end and the *wire payload*
-//! is asserted, because the batch is posted to a loopback `wiremock` collector
-//! rather than to a real one.
+//! `OtlpHttpExporter`, `OtlpProtocol`, and `env` — is driven end to end and the
+//! *wire payload* is asserted, because the batch is posted to a loopback
+//! `wiremock` collector rather than to a real one.
+//!
+//! Both OTLP/HTTP encodings are supported: `http/json`
+//! (`application/json`) and `http/protobuf` (`application/x-protobuf`). This
+//! file covers the JSON payload end to end, the transport selection at both the
+//! environment and the serde level, and the handle wiring; the protobuf body
+//! itself is decoded field by field in `tests/otel_otlp_protobuf.rs`.
 //!
 //! What the file pins:
 //!
@@ -17,10 +23,14 @@
 //!   values, events, links, error status), and an idempotent shutdown;
 //! - the environment precedence (`OPENJIUWEN_OTEL_*` before `OTEL_*`, the
 //!   trace-specific endpoint before the generic one, explicit values first) at
-//!   both the end-to-end and the pure-function level;
+//!   both the end-to-end and the pure-function level, for `http/json` and
+//!   `http/protobuf` alike;
+//! - every protocol spelling of `OtlpProtocol` deserializes to the right
+//!   transport and serializes back to the canonical `snake_case` name;
 //! - every failure mode is typed (`InternalFailure`) and bounded in time, with
 //!   no tokio reactor required on the caller's thread;
-//! - OTLP/gRPC stays `Error::Unsupported` instead of being downgraded.
+//! - OTLP/gRPC stays `Error::Unsupported` instead of being downgraded, while
+//!   both HTTP encodings build an active provider.
 //!
 //! Everything is offline and deterministic: the only endpoint is `127.0.0.1`,
 //! environment mutation is serialized through [`ENV_LOCK`] and undone on drop.
@@ -46,7 +56,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_extensions::otel::env;
 use openjiuwen_extensions::otel::{
-    init_otel_tracer, ExporterType, OtelTracerConfig, OtlpHttpExporter, OtlpProtocol, TracerHandle,
+    init_otel_tracer, ExporterType, OtelTracerConfig, OtlpEncoding, OtlpHttpExporter, OtlpProtocol,
+    TracerHandle,
 };
 
 /// Serialises the tests that read or write the OTLP process environment.
@@ -548,22 +559,83 @@ fn the_precedence_is_visible_at_the_pure_function_level() {
         env::resolve_protocol(OtlpProtocol::Http).expect("an explicit HTTP protocol wins"),
         OtlpProtocol::Http,
     );
+
+    // An explicit `HttpProtobuf` protocol outranks the same conflicting
+    // variable, which is what makes the configuration authoritative.
+    assert_eq!(
+        env::resolve_protocol(OtlpProtocol::HttpProtobuf)
+            .expect("an explicit protobuf protocol wins"),
+        OtlpProtocol::HttpProtobuf,
+    );
+
+    // With the default (`Grpc`) left in charge, the variable decides — and
+    // `grpc` itself stays typed-unsupported, naming both HTTP encodings.
     let error = env::resolve_protocol(OtlpProtocol::Grpc).expect_err("grpc is unsupported");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(
+        error.message().contains("http/json"),
+        "the reason names the JSON alternative: {error}",
+    );
+    assert!(
+        error.message().contains("http/protobuf"),
+        "the reason names the protobuf alternative: {error}",
+    );
 
-    // `grpc` and `http/protobuf` are typed-unsupported, a typo is a validation
-    // error naming the accepted values.
-    for raw in ["grpc", "http/protobuf"] {
-        let error = env::parse_protocol(raw).expect_err("no protobuf encoder is available");
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "value {raw:?}");
-        assert!(
-            error.message().contains("http/json"),
-            "the reason names the alternative: {error}",
+    // Every documented `http/protobuf` spelling selects the protobuf transport,
+    // including the mixed-case and padded ones.
+    for raw in [
+        "http/protobuf",
+        "http_protobuf",
+        "http-protobuf",
+        "protobuf",
+        "  HTTP/Protobuf  ",
+        "Protobuf",
+    ] {
+        assert_eq!(
+            env::parse_protocol(raw).expect("protobuf is a supported encoding"),
+            OtlpProtocol::HttpProtobuf,
+            "value {raw:?}",
         );
     }
+
+    // ... while the JSON spellings keep selecting the JSON transport.
+    for raw in ["http", "http/json", "http_json", "json", "HTTP/JSON"] {
+        assert_eq!(
+            env::parse_protocol(raw).expect("JSON is a supported encoding"),
+            OtlpProtocol::Http,
+            "value {raw:?}",
+        );
+    }
+
+    // A protobuf variable selects protobuf when the configuration keeps the
+    // default, and a JSON variable keeps selecting JSON.
+    set_env(env::OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf");
+    assert_eq!(
+        env::resolve_protocol(OtlpProtocol::Grpc).expect("protobuf is supported"),
+        OtlpProtocol::HttpProtobuf,
+    );
+    set_env(env::OTEL_EXPORTER_OTLP_PROTOCOL, "http/json");
+    assert_eq!(
+        env::resolve_protocol(OtlpProtocol::Grpc).expect("JSON is supported"),
+        OtlpProtocol::Http,
+    );
+
+    // A typo is a validation error naming every accepted value.
     for raw in ["", "thrift"] {
         let error = env::parse_protocol(raw).expect_err("unknown protocols are rejected");
         assert_eq!(error.kind(), ErrorKind::Validation, "value {raw:?}");
+        for accepted in [
+            "http/json",
+            "http",
+            "http/protobuf",
+            "http_protobuf",
+            "protobuf",
+        ] {
+            assert!(
+                error.message().contains(accepted),
+                "the reason names {accepted:?}: {error}",
+            );
+        }
     }
 
     // The openJiuwen endpoint outranks the standard generic one.
@@ -659,8 +731,10 @@ fn an_export_after_shutdown_is_a_typed_failure() {
 
 #[test]
 fn otlp_grpc_stays_typed_unsupported() {
-    // Clearing both protocol variables keeps the configuration default
-    // (`OtlpProtocol::Grpc`) in charge.
+    // test_setup.py: the protocol selection. Clearing both protocol variables
+    // keeps the configuration default (`OtlpProtocol::Grpc`) in charge, and that
+    // transport is rejected instead of being downgraded to one of the HTTP
+    // encodings.
     let _environment = EnvGuard::new();
     let config = OtelTracerConfig {
         exporter_type: ExporterType::Otlp,
@@ -673,12 +747,133 @@ fn otlp_grpc_stays_typed_unsupported() {
     assert_eq!(error.kind(), ErrorKind::Unsupported);
     let message = error.to_string();
     assert!(message.contains("gRPC"), "unexpected message: {message}");
+    // The rejection is about gRPC *framing* (tonic/prost/HTTP2), never about a
+    // missing encoding: both OTLP/HTTP encodings exist and are named.
     assert!(
-        message.contains("protobuf"),
-        "the reason names the payload encoding: {message}",
+        message.contains("framing"),
+        "the reason is the gRPC framing: {message}",
     );
     assert!(
         message.contains("http/json"),
-        "the reason names the supported alternative: {message}",
+        "the reason names the JSON alternative: {message}",
+    );
+    assert!(
+        message.contains("http/protobuf"),
+        "the reason names the protobuf alternative: {message}",
+    );
+}
+
+#[test]
+fn every_protocol_spelling_deserializes_to_its_transport() {
+    // test_setup.py: Python reads the protocol as a plain string; the Rust
+    // configuration accepts the same spellings and normalizes them.
+    for (raw, expected, canonical) in [
+        ("grpc", OtlpProtocol::Grpc, "grpc"),
+        ("grpc ", OtlpProtocol::Grpc, "grpc"),
+        ("http", OtlpProtocol::Http, "http"),
+        ("http/json", OtlpProtocol::Http, "http"),
+        ("http_json", OtlpProtocol::Http, "http"),
+        ("json", OtlpProtocol::Http, "http"),
+        ("  HTTP/JSON  ", OtlpProtocol::Http, "http"),
+        ("http/protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+        ("http_protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+        ("http-protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+        ("protobuf", OtlpProtocol::HttpProtobuf, "http_protobuf"),
+        (
+            "  HTTP/Protobuf  ",
+            OtlpProtocol::HttpProtobuf,
+            "http_protobuf",
+        ),
+    ] {
+        let protocol: OtlpProtocol = serde_json::from_value(json!(raw))
+            .unwrap_or_else(|error| panic!("{raw:?} must deserialize: {error}"));
+        assert_eq!(protocol, expected, "value {raw:?}");
+
+        // The canonical snake_case spelling is what the configuration writes
+        // back, so a round trip is stable.
+        assert_eq!(
+            serde_json::to_value(protocol).expect("the protocol serializes"),
+            json!(canonical),
+            "value {raw:?}",
+        );
+        let restored: OtlpProtocol =
+            serde_json::from_value(json!(canonical)).expect("the canonical name deserializes");
+        assert_eq!(restored, expected, "value {raw:?}");
+    }
+
+    // An unknown value names every accepted variant.
+    let error = serde_json::from_value::<OtlpProtocol>(json!("thrift"))
+        .expect_err("an unknown protocol is rejected");
+    let message = error.to_string();
+    for accepted in ["grpc", "http", "http_protobuf"] {
+        assert!(
+            message.contains(accepted),
+            "the error names {accepted:?}: {message}",
+        );
+    }
+}
+
+#[test]
+fn the_otlp_http_protobuf_configuration_builds_an_active_handle() {
+    // test_setup.py: the exporter selection for the protobuf encoding. No span
+    // is created, so the loopback endpoint is never contacted.
+    let _environment = EnvGuard::new();
+    let config = OtelTracerConfig {
+        exporter_type: ExporterType::Otlp,
+        protocol: OtlpProtocol::HttpProtobuf,
+        exporter_endpoint: Some("http://127.0.0.1:9".to_owned()),
+        export_timeout_ms: 500,
+        ..OtelTracerConfig::default()
+    };
+
+    let handle = init_otel_tracer(config).expect("OTLP/HTTP protobuf initializes offline");
+    assert!(handle.is_active());
+    assert!(
+        handle.tracer().is_some(),
+        "an active handle exposes a tracer"
+    );
+    assert!(
+        handle.capture().is_none(),
+        "the OTLP exporter exposes no capture API",
+    );
+
+    handle.force_flush();
+    handle.shutdown();
+    assert!(!handle.is_active(), "shutdown deactivates the handle");
+    handle.shutdown(); // idempotent
+    handle.shutdown_with_timeout(Duration::from_millis(50)); // idempotent
+    handle.force_flush(); // harmless after shutdown
+
+    // The encoding fixes the content type of every request and is visible in
+    // the exporter's (credential-free) debug view.
+    let exporter = OtlpHttpExporter::with_encoding(
+        "http://127.0.0.1:9",
+        BTreeMap::new(),
+        Duration::from_secs(1),
+        OtlpEncoding::Protobuf,
+    )
+    .expect("the protobuf exporter builds without I/O");
+    assert_eq!(exporter.content_type(), "application/x-protobuf");
+    assert_eq!(
+        exporter.traces_url(),
+        "http://127.0.0.1:9/v1/traces",
+        "the traces suffix is appended",
+    );
+    let debug = format!("{exporter:?}");
+    assert!(
+        debug.contains("Protobuf"),
+        "the debug view names the encoding: {debug}",
+    );
+    let json = OtlpHttpExporter::new(
+        "http://127.0.0.1:9",
+        BTreeMap::new(),
+        Duration::from_secs(1),
+    )
+    .expect("the JSON exporter builds without I/O");
+    assert_eq!(json.content_type(), "application/json");
+    assert_eq!(
+        OtlpEncoding::default(),
+        OtlpEncoding::Json,
+        "JSON stays the default encoding",
     );
 }

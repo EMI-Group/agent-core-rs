@@ -1,4 +1,4 @@
-//! Dedicated-thread HTTP transport for OTLP/JSON.
+//! Dedicated-thread HTTP transport for OTLP/HTTP.
 //!
 //! `opentelemetry_sdk` 0.31 runs `SpanExporter::export` from its batch
 //! processor on a plain `std::thread` driven by `futures_executor::block_on`,
@@ -10,8 +10,9 @@
 //! Jobs travel over an unbounded tokio channel: the sender is
 //! `Send + Sync + Clone`, and the worker drains the channel with
 //! `blocking_recv` (legal there because the thread sits outside any runtime
-//! context). Each job carries a pre-serialized body plus a oneshot sender, so
-//! `export` can await the outcome under any executor.
+//! context). Each job carries a pre-encoded body (OTLP/JSON or OTLP/protobuf),
+//! its `Content-Type`, and a oneshot sender, so `export` can await the outcome
+//! under any executor.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -37,8 +38,10 @@ const MAX_ERROR_BODY: usize = 512;
 /// One export job handed to the worker thread.
 #[derive(Debug)]
 pub(super) struct Job {
-    /// The pre-serialized OTLP/JSON request body.
-    pub(super) body: String,
+    /// The pre-encoded OTLP request body (JSON text or protobuf bytes).
+    pub(super) body: Vec<u8>,
+    /// The `Content-Type` of `body`, taken from the exporter's encoding.
+    pub(super) content_type: &'static str,
     /// Where the worker reports the outcome of the POST.
     pub(super) reply: oneshot::Sender<Result<(), String>>,
 }
@@ -151,7 +154,7 @@ fn run(
         }
     };
     while let Some(job) = jobs.blocking_recv() {
-        let outcome = runtime.block_on(post(&client, url, headers, &job.body));
+        let outcome = runtime.block_on(post(&client, url, headers, &job.body, job.content_type));
         // A closed reply channel only means the exporter was dropped while the
         // request was in flight; the span is already lost either way.
         if job.reply.send(outcome).is_err() {
@@ -165,18 +168,20 @@ fn run(
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
-/// Posts one OTLP/JSON body and maps the response to an error message.
+/// Posts one OTLP body with the job's encoding and maps the response to an
+/// error message.
 async fn post(
     client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
-    body: &str,
+    body: &[u8],
+    content_type: &'static str,
 ) -> Result<(), String> {
     let request = client
         .post(url)
         .headers(headers.clone())
-        .header(CONTENT_TYPE, "application/json")
-        .body(body.to_owned());
+        .header(CONTENT_TYPE, content_type)
+        .body(body.to_vec());
     let response = request.send().await.map_err(|error| describe(&error))?;
     let status = response.status();
     if status.is_success() {

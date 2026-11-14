@@ -3,9 +3,9 @@
 ## Intent
 
 Langfuse integration compiled in every feature mode: an OTLP preset for `{host}/api/public/otel` and a REST ingestion client for `POST {host}/api/public/ingestion`.
-Ports the Langfuse target of `openjiuwen/extensions/observability/exporters/langfuse.py` (v0.1.20) onto the Rust OTLP/HTTP JSON exporter plus the v2/v3 ingestion API.
+Ports the Langfuse target of `openjiuwen/extensions/observability/exporters/langfuse.py` (v0.1.20) onto the Rust OTLP/HTTP exporter plus the v2/v3 ingestion API.
 Requires a Langfuse project (public + secret key) and network access to the host; Langfuse Cloud (`https://cloud.langfuse.com`) is the default, a self-hosted instance is set with `with_host` or `LANGFUSE_HOST`/`LANGFUSE_BASEURL`.
-Only OTLP/HTTP **JSON** is available offline (`gRPC` needs `tonic`/`prost`); the REST ingestion API is plain JSON over HTTPS.
+Both OTLP/HTTP encodings are available offline (JSON by default, protobuf through the hand-written encoder); only `gRPC` is deferred because it needs `tonic`/`prost`, and the REST ingestion API is plain JSON over HTTPS.
 
 ## API Surface
 

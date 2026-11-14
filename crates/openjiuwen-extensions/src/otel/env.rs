@@ -31,17 +31,20 @@
 //! # Protocol mapping
 //!
 //! Python selects between the gRPC and HTTP exporters with
-//! `protocol in {"grpc", "http"}`. The Rust exporter speaks **OTLP/HTTP with
-//! JSON payloads** only (`opentelemetry-otlp`, `prost`, and `tonic` are absent
-//! from the offline registry), so the mapping is:
+//! `protocol in {"grpc", "http"}`. The Rust exporter speaks **OTLP/HTTP** with
+//! either JSON or protobuf payloads (`opentelemetry-otlp`, `prost`, and `tonic`
+//! are absent from the offline registry, but the protobuf body has a
+//! hand-written encoder), so the mapping is:
 //!
 //! | Value | Result |
 //! | --- | --- |
-//! | `http/json` | [`OtlpProtocol::Http`] (supported) |
+//! | `http/json`, `http_json`, `json` | [`OtlpProtocol::Http`] (supported, JSON payloads) |
 //! | `http` | [`OtlpProtocol::Http`] — Python's alias, transported as JSON |
-//! | `http/protobuf` | [`Error::unsupported`] (no protobuf encoder offline) |
+//! | `http/protobuf`, `http_protobuf`, `http-protobuf`, `protobuf` | [`OtlpProtocol::HttpProtobuf`] (supported, protobuf payloads) |
 //! | `grpc` | [`Error::unsupported`] (no gRPC transport offline) |
 //! | anything else | [`Error::validation`] naming the accepted values |
+//!
+//! Matching trims, folds ASCII case, and treats `-` and `/` like `_`.
 //!
 //! [`Error::unsupported`]: openjiuwen_common::error::Error::unsupported
 //! [`Error::validation`]: openjiuwen_common::error::Error::validation
@@ -86,7 +89,8 @@ pub const DEFAULT_OTLP_HTTP_ENDPOINT: &str = "http://localhost:4318";
 const DEFAULT_SERVICE_NAME: &str = "openjiuwen";
 
 /// Protocol values accepted by [`parse_protocol`], named in validation errors.
-const ACCEPTED_PROTOCOLS: &str = "\"http/json\" or \"http\"";
+const ACCEPTED_PROTOCOLS: &str = "\"http/json\", \"http\", \"http/protobuf\", \"http_protobuf\", \
+                                  \"http-protobuf\" or \"protobuf\"";
 
 /// Parses a `k=v,k2=v2` header list (`OTEL_*_HEADERS` wire format).
 ///
@@ -189,22 +193,34 @@ pub fn resolve_headers(explicit: &BTreeMap<String, String>) -> BTreeMap<String, 
     }
 }
 
+/// Normalizes one raw protocol spelling.
+///
+/// Trims surrounding whitespace, folds ASCII case, and folds `-` and `/` into
+/// `_`, so `" HTTP/Protobuf "` becomes `"http_protobuf"`. The normal form is
+/// what [`parse_protocol`] matches on and what names the variants in
+/// serialization errors.
+#[must_use]
+pub(crate) fn normalize_protocol(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(['-', '/'], "_")
+}
+
 /// Resolves the OTLP transport protocol.
 ///
-/// An explicit [`OtlpProtocol::Http`] always wins. Otherwise the environment is
-/// consulted, so [`OtlpProtocol::Grpc`] — the Python/Rust configuration default
-/// — can be overridden by `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`; when the
+/// An explicit [`OtlpProtocol::Http`] or [`OtlpProtocol::HttpProtobuf`] always
+/// wins. Otherwise the environment is consulted, so [`OtlpProtocol::Grpc`] —
+/// the Python/Rust configuration default — can be overridden by
+/// `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` (or `http/protobuf`); when the
 /// variable is unset the explicit value is returned unchanged.
 ///
 /// # Errors
 ///
-/// - [`Error::unsupported`] when the environment asks for `grpc` or
-///   `http/protobuf`: neither transport is available offline, and the message
-///   names `http/json` as the alternative.
+/// - [`Error::unsupported`] when the environment asks for `grpc`: gRPC framing
+///   needs `tonic`/`prost`, which are unavailable offline, and the message
+///   names both `http/json` and `http/protobuf` as the alternatives.
 /// - [`Error::validation`] for any other value, listing the accepted ones.
 pub fn resolve_protocol(explicit: OtlpProtocol) -> Result<OtlpProtocol> {
-    if explicit == OtlpProtocol::Http {
-        return Ok(OtlpProtocol::Http);
+    if explicit != OtlpProtocol::Grpc {
+        return Ok(explicit);
     }
     match env_protocol_value() {
         Some(raw) => parse_protocol(&raw),
@@ -214,38 +230,33 @@ pub fn resolve_protocol(explicit: OtlpProtocol) -> Result<OtlpProtocol> {
 
 /// Parses one raw OTLP protocol string into an [`OtlpProtocol`].
 ///
-/// Matching is ASCII case-insensitive, so `HTTP/JSON` and `http/json` agree.
-/// Python's `"http"` is accepted as an alias for the HTTP exporter; in Rust it
-/// is transported as JSON rather than protobuf (documented deviation, see the
-/// module docs).
+/// The value is normalized first (trimmed, lowercased, `-`/`/` folded to `_`),
+/// so `HTTP/JSON`, `http_json` and `http/json` agree. Python's `"http"` is
+/// accepted as an alias for the JSON transport, and
+/// `http/protobuf`/`http_protobuf`/`http-protobuf`/`protobuf` all select the
+/// protobuf transport.
 ///
 /// # Errors
 ///
-/// - [`Error::unsupported`] for `grpc` and `http/protobuf`: the exporter here
-///   speaks OTLP/HTTP with JSON payloads, and no gRPC or protobuf encoder is
-///   available offline.
+/// - [`Error::unsupported`] for `grpc`: gRPC framing needs `tonic`/`prost`,
+///   which are unavailable offline; the message names both OTLP/HTTP
+///   encodings as the alternatives.
 /// - [`Error::validation`] for every other (including blank) value, naming the
 ///   accepted values.
 pub fn parse_protocol(raw: &str) -> Result<OtlpProtocol> {
-    let value = raw.trim();
-    if value.eq_ignore_ascii_case("http/json") || value.eq_ignore_ascii_case("http") {
-        return Ok(OtlpProtocol::Http);
-    }
-    if value.eq_ignore_ascii_case("http/protobuf") {
-        return Err(Error::unsupported(
-            "otlp protocol \"http/protobuf\" is not available: the exporter speaks OTLP/HTTP \
-             with JSON payloads and no protobuf encoder is available offline; use \"http/json\"",
-        ));
-    }
-    if value.eq_ignore_ascii_case("grpc") {
-        return Err(Error::unsupported(
+    let value = normalize_protocol(raw);
+    match value.as_str() {
+        "http" | "http_json" | "json" => Ok(OtlpProtocol::Http),
+        "http_protobuf" | "protobuf" => Ok(OtlpProtocol::HttpProtobuf),
+        "grpc" => Err(Error::unsupported(
             "otlp protocol \"grpc\" is not available: OTLP/gRPC needs tonic and prost, which are \
-             not available offline; use \"http/json\"",
-        ));
+             not available offline; use \"http/json\" or \"http/protobuf\"",
+        )),
+        _ => Err(Error::validation(format!(
+            "unknown otlp protocol {:?}, supported: {ACCEPTED_PROTOCOLS}",
+            raw.trim()
+        ))),
     }
-    Err(Error::validation(format!(
-        "unknown otlp protocol {value:?}, supported: {ACCEPTED_PROTOCOLS}"
-    )))
 }
 
 /// Resolves the `service.name` resource attribute.
@@ -472,6 +483,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_http_protobuf_beats_a_conflicting_environment_value() {
+        let _guard = EnvGuard::new();
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "grpc");
+        assert_eq!(
+            resolve_protocol(OtlpProtocol::HttpProtobuf).unwrap(),
+            OtlpProtocol::HttpProtobuf
+        );
+
+        set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "http/json");
+        assert_eq!(
+            resolve_protocol(OtlpProtocol::HttpProtobuf).unwrap(),
+            OtlpProtocol::HttpProtobuf
+        );
+    }
+
+    #[test]
     fn protocol_env_overrides_the_default_config_value() {
         let _guard = EnvGuard::new();
         set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "http/json");
@@ -512,10 +539,30 @@ mod tests {
         assert_eq!(parse_protocol("http/json").unwrap(), OtlpProtocol::Http);
         assert_eq!(parse_protocol("  http  ").unwrap(), OtlpProtocol::Http);
         assert_eq!(parse_protocol("HTTP/JSON").unwrap(), OtlpProtocol::Http);
+        assert_eq!(parse_protocol("http_json").unwrap(), OtlpProtocol::Http);
+        assert_eq!(parse_protocol("json").unwrap(), OtlpProtocol::Http);
     }
 
     #[test]
-    fn parse_protocol_rejects_grpc_with_the_alternative() {
+    fn parse_protocol_accepts_every_protobuf_spelling() {
+        for raw in [
+            "http/protobuf",
+            "http_protobuf",
+            "http-protobuf",
+            "protobuf",
+            " HTTP/Protobuf ",
+            "PROTOBUF",
+        ] {
+            assert_eq!(
+                parse_protocol(raw).unwrap(),
+                OtlpProtocol::HttpProtobuf,
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_protocol_rejects_grpc_with_the_alternatives() {
         for raw in ["grpc", "GRPC", " grpc "] {
             let error = parse_protocol(raw).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Unsupported, "value {raw:?}");
@@ -523,20 +570,13 @@ mod tests {
             assert!(message.contains("grpc"), "unexpected message: {message}");
             assert!(
                 message.contains("http/json"),
-                "the message must name the alternative: {message}"
+                "the message must name the JSON alternative: {message}"
+            );
+            assert!(
+                message.contains("http/protobuf"),
+                "the message must name the protobuf alternative: {message}"
             );
         }
-    }
-
-    #[test]
-    fn parse_protocol_rejects_protobuf_with_the_alternative() {
-        let error = parse_protocol("http/protobuf").unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.to_string();
-        assert!(
-            message.contains("http/protobuf") && message.contains("http/json"),
-            "unexpected message: {message}"
-        );
     }
 
     #[test]
@@ -563,8 +603,8 @@ mod tests {
 
         set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf");
         assert_eq!(
-            resolve_protocol(OtlpProtocol::Grpc).unwrap_err().kind(),
-            ErrorKind::Unsupported
+            resolve_protocol(OtlpProtocol::Grpc).unwrap(),
+            OtlpProtocol::HttpProtobuf
         );
 
         set_env(OTEL_EXPORTER_OTLP_PROTOCOL, "carrier-pigeon");

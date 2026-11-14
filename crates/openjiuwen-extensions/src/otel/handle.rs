@@ -15,24 +15,27 @@
 //! - with `feature = "otel"`, every [`ExporterType`] builds a real private
 //!   provider: `Memory` keeps finished spans in memory, `Console` logs one
 //!   `tracing` line per span, `None` records nothing, and `Otlp` posts batches
-//!   to a collector over OTLP/HTTP with JSON payloads.
+//!   to a collector over OTLP/HTTP as JSON or protobuf payloads.
 //!
 //! # OTLP transport
 //!
 //! `Otlp` first resolves the transport with
-//! [`env::resolve_protocol`](super::env::resolve_protocol):
-//! [`OtlpProtocol::Http`] builds an `OtlpHttpExporter`, while
-//! [`OtlpProtocol::Grpc`] — the configuration default — answers
-//! `Error::Unsupported`, because gRPC framing needs `opentelemetry-otlp`,
-//! `prost` and `tonic`, none of which the offline build can reach. A
-//! configuration or an `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` variable selects
-//! the supported transport; nothing is downgraded silently. The endpoint, the
+//! [`env::resolve_protocol`](super::env::resolve_protocol): both
+//! [`OtlpProtocol::Http`] (`http/json`) and [`OtlpProtocol::HttpProtobuf`]
+//! (`http/protobuf`) build an `OtlpHttpExporter` with the matching encoding —
+//! JSON is the default, protobuf is opt-in. [`OtlpProtocol::Grpc`] — the
+//! configuration default — answers `Error::Unsupported`, because gRPC framing
+//! needs `opentelemetry-otlp`, `prost` and `tonic`, none of which the offline
+//! build can reach. A configuration value or an
+//! `OTEL_EXPORTER_OTLP_PROTOCOL=http/json|http/protobuf` variable selects a
+//! supported transport; nothing is downgraded silently. The endpoint, the
 //! headers, and the request timeout come from the configuration first, then the
 //! `OPENJIUWEN_OTEL_*` variables, then the `OTEL_*` ones, then the built-in
 //! defaults described in [`super::env`].
 //!
 //! [`ExporterType`]: super::config::ExporterType
 //! [`OtlpProtocol::Http`]: super::config::OtlpProtocol::Http
+//! [`OtlpProtocol::HttpProtobuf`]: super::config::OtlpProtocol::HttpProtobuf
 //! [`OtlpProtocol::Grpc`]: super::config::OtlpProtocol::Grpc
 //! [`init_otel_tracer`]: self::init_otel_tracer
 
@@ -54,7 +57,7 @@ use super::config::OtelTracerConfig;
 #[cfg(feature = "otel")]
 use super::config::{ExporterType, OtlpProtocol};
 #[cfg(feature = "otel")]
-use super::otlp::OtlpHttpExporter;
+use super::otlp::{OtlpEncoding, OtlpHttpExporter};
 #[cfg(feature = "otel")]
 use super::provider::{
     build_provider, build_provider_without_exporter, CaptureExporter, ConsoleExporter,
@@ -62,10 +65,11 @@ use super::provider::{
 
 /// Reason reported when the configuration asks for OTLP/gRPC.
 #[cfg(feature = "otel")]
-const OTLP_GRPC_UNSUPPORTED: &str = "OTLP/gRPC span export is unsupported: gRPC with protobuf \
-     payloads needs opentelemetry-otlp, prost, and tonic, which are unavailable offline; use \
-     OTLP/HTTP with JSON payloads instead (OtlpProtocol::Http or \
-     OTEL_EXPORTER_OTLP_PROTOCOL=http/json)";
+const OTLP_GRPC_UNSUPPORTED: &str = "OTLP/gRPC span export is unsupported: gRPC framing needs \
+     opentelemetry-otlp, prost, and tonic, which are unavailable offline; use OTLP/HTTP instead, \
+     with JSON payloads (OtlpProtocol::Http or OTEL_EXPORTER_OTLP_PROTOCOL=http/json) or \
+     protobuf payloads (OtlpProtocol::HttpProtobuf or \
+     OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf)";
 
 /// `tracing` target for handle-level failures.
 #[cfg(feature = "otel")]
@@ -280,17 +284,19 @@ pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
 /// `Memory` attaches a [`CaptureExporter`], `Console` exports one `tracing`
 /// line per span at `debug`, `None` builds a provider whose spans are dropped,
 /// and `Otlp` builds an [`OtlpHttpExporter`] against the resolved collector
-/// endpoint (see [`super::env`] for the precedence).
+/// endpoint, encoding its bodies as JSON ([`OtlpProtocol::Http`]) or protobuf
+/// ([`OtlpProtocol::HttpProtobuf`]); see [`super::env`] for the precedence.
 ///
 /// # Errors
 ///
 /// Returns [`openjiuwen_common::error::Error::validation`] when the
 /// configuration is invalid, and
 /// [`openjiuwen_common::error::Error::Unsupported`] when `Otlp` resolves to
-/// [`OtlpProtocol::Grpc`] — gRPC needs `tonic`/`prost`, which are unavailable
-/// offline; OTLP/HTTP with JSON payloads
-/// ([`OtlpProtocol::Http`]) is the supported transport. A rejected endpoint or
-/// header surfaces as [`openjiuwen_common::error::Error::Validation`].
+/// [`OtlpProtocol::Grpc`] — gRPC framing needs `tonic`/`prost`, which are
+/// unavailable offline; both OTLP/HTTP encodings ([`OtlpProtocol::Http`] and
+/// [`OtlpProtocol::HttpProtobuf`]) are supported transports. A rejected
+/// endpoint or header surfaces as
+/// [`openjiuwen_common::error::Error::Validation`].
 #[cfg(feature = "otel")]
 pub fn init_otel_tracer(config: OtelTracerConfig) -> Result<TracerHandle> {
     config.validate()?;
@@ -355,26 +361,27 @@ where
 
 /// Builds the OTLP/HTTP exporter described by `config`.
 ///
-/// The transport is resolved first: an explicit [`OtlpProtocol::Http`] wins,
-/// and the `http/json`/`http` variables select it too, while a configuration
-/// that still asks for [`OtlpProtocol::Grpc`] is rejected instead of being
-/// downgraded silently. The endpoint, headers, and request timeout follow the
-/// precedence documented in [`super::env`]; `export_timeout_ms` bounds one HTTP
-/// request.
+/// The transport is resolved first: an explicit [`OtlpProtocol::Http`] or
+/// [`OtlpProtocol::HttpProtobuf`] wins, and the matching environment spellings
+/// select them too, while a configuration that still asks for
+/// [`OtlpProtocol::Grpc`] is rejected instead of being downgraded silently. The
+/// endpoint, headers, and request timeout follow the precedence documented in
+/// [`super::env`]; `export_timeout_ms` bounds one HTTP request.
 #[cfg(feature = "otel")]
 fn otlp_exporter(config: &OtelTracerConfig) -> Result<OtlpHttpExporter> {
-    match super::env::resolve_protocol(config.protocol)? {
-        OtlpProtocol::Http => {}
-        OtlpProtocol::Grpc => {
-            return Err(openjiuwen_common::error::Error::unsupported(
-                OTLP_GRPC_UNSUPPORTED,
-            ));
-        }
-    }
+    let protocol = super::env::resolve_protocol(config.protocol)?;
     let endpoint = super::env::resolve_endpoint(config.exporter_endpoint.as_deref());
     let headers = super::env::resolve_headers(&config.headers);
     let timeout = Duration::from_millis(config.export_timeout_ms.max(1));
-    OtlpHttpExporter::new(endpoint, headers, timeout)
+    match protocol {
+        OtlpProtocol::Http => OtlpHttpExporter::new(endpoint, headers, timeout),
+        OtlpProtocol::HttpProtobuf => {
+            OtlpHttpExporter::with_encoding(endpoint, headers, timeout, OtlpEncoding::Protobuf)
+        }
+        OtlpProtocol::Grpc => Err(openjiuwen_common::error::Error::unsupported(
+            OTLP_GRPC_UNSUPPORTED,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +413,15 @@ mod tests {
             ..OtelTracerConfig::default()
         }
         .with_exporter_type(ExporterType::Otlp)
+    }
+
+    /// The same offline config, selecting the protobuf encoding.
+    #[cfg(feature = "otel")]
+    fn otlp_http_protobuf_config() -> OtelTracerConfig {
+        OtelTracerConfig {
+            protocol: OtlpProtocol::HttpProtobuf,
+            ..otlp_http_config()
+        }
     }
 
     #[test]
@@ -503,6 +519,31 @@ mod tests {
 
     #[cfg(feature = "otel")]
     #[test]
+    fn otlp_http_protobuf_exporter_encodes_bodies_as_protobuf() {
+        // Building the exporter starts its worker thread but performs no I/O,
+        // so no collector has to listen on the endpoint.
+        let _guard = crate::otel::env::test_support::EnvGuard::new();
+        let config = otlp_http_protobuf_config();
+
+        let exporter = otlp_exporter(&config).unwrap();
+        assert_eq!(exporter.content_type(), "application/x-protobuf");
+        let debug = format!("{exporter:?}");
+        assert!(
+            debug.contains("encoding: Protobuf"),
+            "unexpected exporter: {debug}"
+        );
+        drop(exporter);
+
+        let handle = init_otel_tracer(config).unwrap();
+        assert!(handle.is_active());
+        assert!(handle.provider().is_some());
+        assert!(handle.capture().is_none());
+        handle.shutdown_with_timeout(Duration::from_millis(200));
+        assert!(!handle.is_active());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
     fn otlp_grpc_is_rejected_with_the_http_alternative() {
         let _guard = crate::otel::env::test_support::EnvGuard::new();
         let config = OtelTracerConfig::default().with_exporter_type(ExporterType::Otlp);
@@ -525,7 +566,11 @@ mod tests {
         );
         assert!(
             message.contains("http/json"),
-            "the reason must name the supported alternative: {message}"
+            "the reason must name the JSON alternative: {message}"
+        );
+        assert!(
+            message.contains("http/protobuf"),
+            "the reason must name the protobuf alternative: {message}"
         );
     }
 
