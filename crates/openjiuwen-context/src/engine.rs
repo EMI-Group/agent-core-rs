@@ -610,7 +610,7 @@ impl ContextEngine {
         let analyzer = context
             .usage_analyzer()
             .map(Arc::as_ref)
-            .ok_or_else(|| missing_analyzer())?;
+            .ok_or_else(missing_analyzer)?;
         let (system, messages, tools, stats) = self.usage_window(context).await;
         let mut input = AnalysisInput::new("", context.session_id());
         input.context_id = Some(context.context_id());
@@ -648,7 +648,7 @@ impl ContextEngine {
         let analyzer = context
             .usage_analyzer()
             .map(Arc::as_ref)
-            .ok_or_else(|| missing_analyzer())?;
+            .ok_or_else(missing_analyzer)?;
         let (system, messages, tools, stats) = self.usage_window(context).await;
         let mut input = AnalysisInput::new("", context.session_id());
         input.context_id = Some(context.context_id());

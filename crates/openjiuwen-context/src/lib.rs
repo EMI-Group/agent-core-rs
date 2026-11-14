@@ -14,7 +14,7 @@
 //! - [`offload`] — durable storage for content that leaves the window.
 //! - [`usage`] — `context.usage` snapshots, window token reports, KV-cache aggregation.
 //! - [`telemetry`] — the compression-state recorder and its request-correlation scope.
-//! - [`policy`] — context-window resolution (overrides, model table, OpenRouter cache) and
+//! - [`policy`] — context-window resolution (overrides, model table, `OpenRouter` cache) and
 //!   prompt-cache window diffing.
 //! - [`tokenizers`] — encoding selection plus offline artefact discovery, including native
 //!   `tokenizer.json` and `tiktoken` `.model` loading.
