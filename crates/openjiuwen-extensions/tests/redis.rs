@@ -15,17 +15,23 @@
 mod fake;
 use fake::Server;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
+use openjiuwen_core::foundation::store::{
+    CollectionSchema, FieldSchema, Metric, SortOrder, VectorDataType,
+};
 use openjiuwen_extensions::checkpointer::redis::{
     RedisCheckpointer, RedisCheckpointerConfig, RedisConnectionConfig, RedisTTLConfig,
 };
 use openjiuwen_extensions::checkpointer::{Checkpoint, CheckpointNamespace, Checkpointer};
 use openjiuwen_extensions::redis::codec::{encode_command, parse_reply, Reply};
 use openjiuwen_extensions::redis::Client;
-use openjiuwen_extensions::store::redis::{RedisStore, RedisStoreConfig};
-use openjiuwen_extensions::store::{
-    build_document_store, build_kv_store, build_vector_store, KvStore, KvValue, StoreBackend,
+use openjiuwen_extensions::store::redis::{
+    RedisDocumentStore, RedisStore, RedisStoreConfig, RedisVectorStore,
 };
-use serde_json::{json, Value};
+use openjiuwen_extensions::store::{
+    build_document_store, build_kv_store, build_vector_store, Document, DocumentStore,
+    InMemoryDocumentStore, KvStore, KvValue, Query, StoreBackend, VectorQuery, VectorStore,
+};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -572,6 +578,9 @@ async fn factory_rejects_a_missing_url_and_unavailable_redis_stores() {
     let configured = StoreBackend::Redis {
         url: Some("redis://127.0.0.1:6379/0".to_owned()),
     };
+    // `RedisDocumentStore` and `RedisVectorStore` are live and reachable from
+    // `store::redis`; the factories are wired to them separately, so until that
+    // lands they keep answering `Unsupported` and naming the backend.
     let errors = [
         expect_error(build_document_store(&configured).await),
         expect_error(build_vector_store(&configured).await),
@@ -637,4 +646,505 @@ async fn a_closed_port_is_a_transport_error() {
     for error in errors {
         assert_eq!(error.kind(), ErrorKind::Transport);
     }
+}
+// ---------------------------------------------------------------------------
+// RedisDocumentStore (kernel `DocumentStore` contract)
+// ---------------------------------------------------------------------------
+/// Connects a document store through the crate boundary.
+async fn connect_documents(fake: &Server) -> Arc<dyn DocumentStore> {
+    let config = RedisStoreConfig {
+        url: Some(fake.url()),
+        ..RedisStoreConfig::default()
+    };
+    RedisDocumentStore::connect(config).await.unwrap()
+}
+/// Connects a vector store through the crate boundary.
+async fn connect_vectors(fake: &Server) -> Arc<dyn VectorStore> {
+    let config = RedisStoreConfig {
+        url: Some(fake.url()),
+        ..RedisStoreConfig::default()
+    };
+    RedisVectorStore::connect(config).await.unwrap()
+}
+/// A configuration carrying only `url`.
+fn url_config(url: &str) -> RedisStoreConfig {
+    RedisStoreConfig {
+        url: Some(url.to_owned()),
+        ..RedisStoreConfig::default()
+    }
+}
+/// A document with a name and an age, the fixture the query tests use.
+fn person(id: &str, name: &str, age: i64) -> Document {
+    Document::new(id)
+        .with_field("name", name)
+        .with_field("age", age)
+}
+/// The ids of `documents`, in order.
+fn doc_ids(documents: &[Document]) -> Vec<String> {
+    documents.iter().map(|doc| doc.id.clone()).collect()
+}
+/// The schema every vector suite uses: keyword primary key, one 3-dimensional
+/// embedding, and a `kind` field that carries a `default_value`.
+fn vector_schema() -> CollectionSchema {
+    CollectionSchema::new(vec![
+        FieldSchema {
+            is_primary: true,
+            ..FieldSchema::new("id", VectorDataType::Varchar)
+        },
+        FieldSchema {
+            dim: Some(3),
+            ..FieldSchema::new("embedding", VectorDataType::FloatVector)
+        },
+        FieldSchema {
+            default_value: Some(json!("note")),
+            ..FieldSchema::new("kind", VectorDataType::Varchar)
+        },
+    ])
+}
+/// The JSON object of `value`, for the document fixtures.
+fn obj(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+/// A vector document with a three-component embedding.
+fn vector_doc(id: &str, embedding: [f32; 3]) -> Map<String, Value> {
+    obj(json!({
+        "id": id,
+        "embedding": embedding.to_vec(),
+    }))
+}
+/// The primary keys of `hits`, in order.
+fn hit_ids(hits: &[openjiuwen_extensions::store::VectorSearchResult]) -> Vec<String> {
+    hits.iter()
+        .map(|hit| {
+            hit.fields
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+#[tokio::test]
+async fn document_store_round_trips_collections_and_documents() {
+    let fake = Server::start().await;
+    let store = connect_documents(&fake).await;
+    assert_eq!(
+        store.list_collections().await.unwrap(),
+        Vec::<String>::new(),
+        "a fresh peer holds no collections"
+    );
+
+    // Creating is idempotent and listed in ascending order; `upsert` registers.
+    store.create_collection("beta").await.unwrap();
+    store.create_collection("alpha").await.unwrap();
+    store.create_collection("alpha").await.unwrap();
+    assert_eq!(store.list_collections().await.unwrap(), ["alpha", "beta"]);
+    assert_eq!(
+        store
+            .upsert("gamma", vec![person("g", "Gina", 30)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.list_collections().await.unwrap(),
+        ["alpha", "beta", "gamma"]
+    );
+
+    // Every JSON shape survives the round trip, nested members included.
+    let nested = Document::new("nested")
+        .with_field("meta", json!({"owner": "ada", "tags": ["rust", "redis"]}))
+        .with_field("ratio", 0.5)
+        .with_field("count", 9_007_199_254_740_991_i64)
+        .with_field("flag", true);
+    store
+        .upsert("docs", vec![nested.clone(), person("a", "Ada", 36)])
+        .await
+        .unwrap();
+    assert_eq!(store.get("docs", "nested").await.unwrap(), Some(nested));
+    let ada = store.get("docs", "a").await.unwrap().expect("stored");
+    assert_eq!(ada.field("name"), Some(&json!("Ada")));
+    assert_eq!(ada.field("age"), Some(&json!(36)));
+
+    // A second upsert replaces the document rather than merging into it.
+    store
+        .upsert("docs", vec![Document::new("a").with_field("age", 37)])
+        .await
+        .unwrap();
+    let replaced = store.get("docs", "a").await.unwrap().expect("replaced");
+    assert_eq!(replaced.field("age"), Some(&json!(37)));
+    assert_eq!(replaced.field("name"), None);
+
+    // Reads, filters, ordering, and counts all come from the kernel reference.
+    let thirty_plus = Query {
+        filter: json!({"age": {"$gte": 30}}),
+        ..Query::default()
+    };
+    assert_eq!(
+        doc_ids(&store.query("docs", &thirty_plus).await.unwrap()),
+        ["a"]
+    );
+    assert_eq!(store.count("docs", &thirty_plus).await.unwrap(), 1);
+    let ordered = Query {
+        order_by: vec![("id".to_string(), SortOrder::Desc)],
+        ..Query::default()
+    };
+    assert_eq!(
+        doc_ids(&store.query("docs", &ordered).await.unwrap()),
+        ["nested", "a"]
+    );
+
+    // `delete` honors the filter only, and repeats remove nothing.
+    assert_eq!(store.delete("docs", &thirty_plus).await.unwrap(), 1);
+    assert_eq!(store.delete("docs", &thirty_plus).await.unwrap(), 0);
+    assert!(store.get("docs", "a").await.unwrap().is_none());
+    assert_eq!(store.count("docs", &Query::default()).await.unwrap(), 1);
+
+    // Dropping is idempotent and takes the document keys with it.
+    store.drop_collection("gamma").await.unwrap();
+    store.drop_collection("gamma").await.unwrap();
+    assert!(!store
+        .list_collections()
+        .await
+        .unwrap()
+        .contains(&"gamma".to_owned()));
+    assert!(store.get("gamma", "g").await.unwrap().is_none());
+    assert!(
+        fake.state().keys().iter().all(|key| !key.contains("gamma")),
+        "the dropped collection keeps keys: {:?}",
+        fake.state().keys()
+    );
+}
+#[tokio::test]
+async fn document_store_query_windows_match_the_reference_store() {
+    let fake = Server::start().await;
+    let store = connect_documents(&fake).await;
+    let reference = InMemoryDocumentStore::new();
+    let documents: Vec<Document> = (0..25)
+        .map(|index| {
+            person(
+                &format!("doc-{index:02}"),
+                &format!("name-{index:02}"),
+                i64::from(index % 5) * 10,
+            )
+        })
+        .collect();
+    store.upsert("paged", documents.clone()).await.unwrap();
+    reference.upsert("paged", documents).await.unwrap();
+
+    // Paging across more than one page, a filtered multi-key order, and an
+    // unpaged scan must all return the identical window the reference returns.
+    let queries = [
+        Query {
+            order_by: vec![("id".to_string(), SortOrder::Asc)],
+            offset: 5,
+            limit: Some(10),
+            ..Query::default()
+        },
+        Query {
+            order_by: vec![("id".to_string(), SortOrder::Asc)],
+            offset: 20,
+            limit: Some(10),
+            ..Query::default()
+        },
+        Query {
+            filter: json!({"age": {"$gte": 20}}),
+            order_by: vec![
+                ("age".to_string(), SortOrder::Desc),
+                ("id".to_string(), SortOrder::Asc),
+            ],
+            offset: 2,
+            limit: Some(7),
+            ..Query::default()
+        },
+        Query {
+            order_by: vec![("age".to_string(), SortOrder::Asc)],
+            ..Query::default()
+        },
+    ];
+    for query in &queries {
+        let expected = reference.query("paged", query).await.unwrap();
+        let actual = store.query("paged", query).await.unwrap();
+        assert_eq!(doc_ids(&actual), doc_ids(&expected), "query {query:?}");
+    }
+    assert_eq!(store.count("paged", &Query::default()).await.unwrap(), 25);
+}
+#[tokio::test]
+async fn document_store_rejects_invalid_names_and_unreachable_peers() {
+    // Construction validates the URL but performs no I/O.
+    let invalid_scheme = expect_error(RedisDocumentStore::new(url_config("https://127.0.0.1:1")));
+    assert_eq!(invalid_scheme.kind(), ErrorKind::Validation);
+    assert!(
+        invalid_scheme.message().contains("redis://"),
+        "unexpected: {invalid_scheme}"
+    );
+    let missing = expect_error(RedisDocumentStore::new(RedisStoreConfig::default()));
+    assert_eq!(missing.kind(), ErrorKind::Validation);
+    // TLS is rejected when connecting, since construction performs no I/O.
+    let tls = RedisDocumentStore::connect(url_config("rediss://127.0.0.1:6379"))
+        .await
+        .err()
+        .expect("TLS is unsupported");
+    assert_eq!(tls.kind(), ErrorKind::Unsupported);
+    assert!(
+        tls.message().to_ascii_lowercase().contains("tls"),
+        "unexpected: {tls}"
+    );
+
+    let fake = Server::start().await;
+    let store = connect_documents(&fake).await;
+    // The kernel's collection-name rule is replicated once and shared, so both
+    // stores reject the same names with a validation error naming the collection.
+    for name in ["", ".", "..", "a/b", "a\\b", "nul\0byte"] {
+        let error = store
+            .create_collection(name)
+            .await
+            .expect_err("invalid collection name");
+        assert_eq!(error.kind(), ErrorKind::Validation, "name {name:?}");
+        assert!(
+            error.message().contains("invalid collection name"),
+            "unexpected: {error}"
+        );
+    }
+    let error = store
+        .get("a/b", "x")
+        .await
+        .expect_err("invalid collection name");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+
+    // A refused connection surfaces as a transport error, never a panic.
+    let error = RedisDocumentStore::connect(url_config(&closed_port_url().await))
+        .await
+        .err()
+        .expect("an unreachable peer must fail");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+}
+// ---------------------------------------------------------------------------
+// RedisVectorStore (kernel `VectorStore` contract)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn vector_store_round_trips_schema_documents_and_searches() {
+    let fake = Server::start().await;
+    let store = connect_vectors(&fake).await;
+    assert!(!store.collection_exists("docs").await.unwrap());
+    assert_eq!(store.get_schema("docs").await.unwrap(), None);
+
+    store
+        .create_collection("docs", vector_schema())
+        .await
+        .unwrap();
+    // Creating an existing collection is a validation error, like the reference.
+    let duplicate = store
+        .create_collection("docs", vector_schema())
+        .await
+        .expect_err("duplicate collection");
+    assert_eq!(duplicate.kind(), ErrorKind::Validation);
+    assert!(
+        duplicate.message().contains("docs"),
+        "unexpected: {duplicate}"
+    );
+    assert!(store.collection_exists("docs").await.unwrap());
+    // The schema round-trips exactly, flags and dimensions included.
+    let schema = store.get_schema("docs").await.unwrap().expect("schema");
+    assert_eq!(schema, vector_schema());
+    assert_eq!(schema.fields[1].dim, Some(3));
+    assert_eq!(
+        schema.fields[2].default_value,
+        Some(json!("note")),
+        "the field default survives the round trip"
+    );
+    assert_eq!(store.list_collection_names().await.unwrap(), ["docs"]);
+
+    // `add_docs` fills the default and stores the documents.
+    assert_eq!(
+        store
+            .add_docs(
+                "docs",
+                vec![
+                    vector_doc("a", [1.0, 0.0, 0.0]),
+                    vector_doc("b", [0.0, 1.0, 0.0]),
+                    vector_doc("c", [-1.0, 0.0, 0.0]),
+                ],
+            )
+            .await
+            .unwrap(),
+        3
+    );
+    let hits = store
+        .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(2))
+        .await
+        .unwrap();
+    assert_eq!(hit_ids(&hits).first().map(String::as_str), Some("a"));
+    assert_eq!(hits.len(), 2, "top_k truncates");
+    assert_eq!(hits[0].fields["kind"], "note", "the default was applied");
+
+    // Filters and paging arrive through the kernel reference untouched.
+    let filtered = store
+        .search(
+            "docs",
+            &VectorQuery::new(vec![0.0, 1.0, 0.0])
+                .with_top_k(5)
+                .with_filters(json!({"id": {"$in": ["b", "c"]}})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hit_ids(&filtered), ["b", "c"]);
+
+    // Deletions by id and by filter both report the reference count.
+    assert_eq!(
+        store
+            .delete_docs_by_ids("docs", &["a".to_string(), "missing".to_string()])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .delete_docs_by_filters("docs", &json!({"kind": "note"}))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]))
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // Deleting a collection removes the documents and the schema.
+    store.delete_collection("docs").await.unwrap();
+    store.delete_collection("docs").await.unwrap();
+    assert!(!store.collection_exists("docs").await.unwrap());
+    assert_eq!(store.get_schema("docs").await.unwrap(), None);
+    assert_eq!(
+        store.list_collection_names().await.unwrap(),
+        Vec::<String>::new()
+    );
+    let error = store
+        .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]))
+        .await
+        .expect_err("missing collection");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(error.message().contains("docs"), "unexpected: {error}");
+}
+#[tokio::test]
+async fn vector_store_metric_defaults_to_cosine_and_can_be_changed() {
+    let fake = Server::start().await;
+    // The default metric is cosine; `with_metric` swaps it at the store level
+    // because the kernel schema carries no metric field.
+    let cosine = RedisVectorStore::new(url_config(&fake.url())).unwrap();
+    assert_eq!(cosine.metric(), Metric::Cosine);
+    let euclidean = RedisVectorStore::new(url_config(&fake.url()))
+        .unwrap()
+        .with_metric(Metric::Euclidean);
+    assert_eq!(euclidean.metric(), Metric::Euclidean);
+    cosine
+        .create_collection("docs", vector_schema())
+        .await
+        .unwrap();
+    cosine
+        .add_docs(
+            "docs",
+            vec![
+                vector_doc("near", [1.0, 0.0, 0.0]),
+                vector_doc("far", [0.0, 0.0, 1.0]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let query = VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(2);
+    let by_cosine = cosine.search("docs", &query).await.unwrap();
+    let by_euclidean = euclidean.search("docs", &query).await.unwrap();
+    assert_eq!(hit_ids(&by_cosine), hit_ids(&by_euclidean), "same ranking");
+    let expected = Metric::Cosine.score(&[1.0, 0.0, 0.0], &[0.0, 0.0, 1.0]);
+    assert!(
+        (by_cosine[1].score - expected).abs() < 1e-6,
+        "cosine scores disagree with `Metric::score`: {by_cosine:?}"
+    );
+    let expected = Metric::Euclidean.score(&[1.0, 0.0, 0.0], &[0.0, 0.0, 1.0]);
+    assert!(
+        (by_euclidean[1].score - expected).abs() < 1e-6,
+        "euclidean scores disagree with `Metric::score`: {by_euclidean:?}"
+    );
+    assert_ne!(
+        by_cosine[1].score, by_euclidean[1].score,
+        "the metric must change the score"
+    );
+    // `connect` hands out the default-metric store as a trait object.
+    let connected = connect_vectors(&fake).await;
+    let via_trait = connected.search("docs", &query).await.unwrap();
+    assert_eq!(hit_ids(&via_trait), hit_ids(&by_cosine));
+}
+#[tokio::test]
+async fn vector_store_rejects_invalid_collections_and_unreachable_peers() {
+    let fake = Server::start().await;
+    let store = connect_vectors(&fake).await;
+
+    // An invalid schema is rejected before anything is written.
+    let invalid = CollectionSchema::new(vec![
+        FieldSchema {
+            is_primary: true,
+            ..FieldSchema::new("id", VectorDataType::Varchar)
+        },
+        FieldSchema::new("embedding", VectorDataType::FloatVector),
+    ]);
+    let error = store
+        .create_collection("broken", invalid)
+        .await
+        .expect_err("a vector field without `dim` is invalid");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(!store.collection_exists("broken").await.unwrap());
+
+    // The shared collection-name rule is applied here too.
+    let error = store
+        .create_collection("a/b", vector_schema())
+        .await
+        .expect_err("invalid collection name");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(
+        error.message().contains("invalid collection name"),
+        "unexpected: {error}"
+    );
+
+    // Validation failures from the reference store surface unchanged and persist
+    // nothing: a duplicate primary key aborts the whole batch.
+    store
+        .create_collection("docs", vector_schema())
+        .await
+        .unwrap();
+    let error = store
+        .add_docs(
+            "docs",
+            vec![
+                vector_doc("a", [1.0, 0.0, 0.0]),
+                vector_doc("a", [0.0, 1.0, 0.0]),
+            ],
+        )
+        .await
+        .expect_err("duplicate primary key");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("duplicate"), "unexpected: {error}");
+    assert_eq!(
+        store
+            .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]))
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "a rejected batch persists nothing"
+    );
+
+    // Construction validates without I/O; an unreachable peer is a transport
+    // error when connecting.
+    let invalid_scheme = expect_error(RedisVectorStore::new(url_config("https://127.0.0.1:1")));
+    assert_eq!(invalid_scheme.kind(), ErrorKind::Validation);
+    let error = RedisVectorStore::connect(url_config(&closed_port_url().await))
+        .await
+        .err()
+        .expect("an unreachable peer must fail");
+    assert_eq!(error.kind(), ErrorKind::Transport);
 }

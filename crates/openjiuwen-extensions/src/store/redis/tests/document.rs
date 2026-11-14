@@ -27,7 +27,9 @@ fn store_for(fake: &FakeRedis) -> RedisDocumentStore {
 
 /// A document with a name and an age, the fixture the query tests use.
 fn person(id: &str, name: &str, age: i64) -> Document {
-    Document::new(id).with_field("name", name).with_field("age", age)
+    Document::new(id)
+        .with_field("name", name)
+        .with_field("age", age)
 }
 
 /// The ids of `documents`, in order.
@@ -42,7 +44,10 @@ fn ids(documents: &[Document]) -> Vec<String> {
 async fn document_store_creates_lists_and_drops_collections() {
     let fake = FakeRedis::start().await;
     let store = store_for(&fake);
-    assert_eq!(store.list_collections().await.unwrap(), Vec::<String>::new());
+    assert_eq!(
+        store.list_collections().await.unwrap(),
+        Vec::<String>::new()
+    );
 
     store.create_collection("beta").await.unwrap();
     store.create_collection("alpha").await.unwrap();
@@ -60,11 +65,7 @@ async fn document_store_creates_lists_and_drops_collections() {
         .unwrap();
     assert_eq!(
         store.list_collections().await.unwrap(),
-        vec![
-            "alpha".to_string(),
-            "beta".to_string(),
-            "gamma".to_string()
-        ]
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
     );
 
     store.drop_collection("beta").await.unwrap();
@@ -78,10 +79,7 @@ async fn document_store_creates_lists_and_drops_collections() {
     store.drop_collection("gamma").await.unwrap();
     assert!(store.get("gamma", "g").await.unwrap().is_none());
     assert!(
-        fake.state()
-            .keys()
-            .iter()
-            .all(|key| !key.contains("gamma")),
+        fake.state().keys().iter().all(|key| !key.contains("gamma")),
         "the dropped collection keeps keys: {:?}",
         fake.state().keys()
     );
@@ -237,22 +235,13 @@ async fn document_store_delete_removes_the_matching_documents() {
     assert_eq!(store.delete("deleting", &query).await.unwrap(), 0);
     assert!(store.get("deleting", "a").await.unwrap().is_none());
     assert!(store.get("deleting", "b").await.unwrap().is_some());
-    assert_eq!(
-        store.count("deleting", &Query::default()).await.unwrap(),
-        1
-    );
+    assert_eq!(store.count("deleting", &Query::default()).await.unwrap(), 1);
 
     assert_eq!(
-        store
-            .delete("deleting", &Query::default())
-            .await
-            .unwrap(),
+        store.delete("deleting", &Query::default()).await.unwrap(),
         1
     );
-    assert_eq!(
-        store.count("deleting", &Query::default()).await.unwrap(),
-        0
-    );
+    assert_eq!(store.count("deleting", &Query::default()).await.unwrap(), 0);
     // The id set shrank with the documents, so the collection is empty, not gone.
     assert!(store
         .list_collections()
@@ -271,14 +260,8 @@ async fn document_store_missing_collections_read_like_empty() {
         store.query("absent", &Query::default()).await.unwrap(),
         Vec::<Document>::new()
     );
-    assert_eq!(
-        store.count("absent", &Query::default()).await.unwrap(),
-        0
-    );
-    assert_eq!(
-        store.delete("absent", &Query::default()).await.unwrap(),
-        0
-    );
+    assert_eq!(store.count("absent", &Query::default()).await.unwrap(), 0);
+    assert_eq!(store.delete("absent", &Query::default()).await.unwrap(), 0);
     assert!(!store
         .list_collections()
         .await
@@ -334,7 +317,12 @@ async fn document_store_keys_do_not_cross_talk() {
         .await
         .unwrap();
     assert_eq!(
-        store.get("a:b", "c").await.unwrap().expect("outer").field("v"),
+        store
+            .get("a:b", "c")
+            .await
+            .unwrap()
+            .expect("outer")
+            .field("v"),
         Some(&json!(1))
     );
     assert_eq!(
@@ -350,10 +338,7 @@ async fn document_store_keys_do_not_cross_talk() {
 
     // Glob metacharacters in a collection name or an id never leak into a scan.
     store
-        .upsert(
-            "glob*a",
-            vec![Document::new("id?[1]").with_field("v", 3)],
-        )
+        .upsert("glob*a", vec![Document::new("id?[1]").with_field("v", 3)])
         .await
         .unwrap();
     assert!(store.get("glob*a", "id?[1]").await.unwrap().is_some());
@@ -406,9 +391,7 @@ async fn document_store_tolerates_a_dangling_id_and_reports_corruption() {
         .expect_err("corrupt document");
     assert_eq!(error.kind(), ErrorKind::Transport);
     assert!(
-        error
-            .message()
-            .contains("openjiuwen:doc:doc:docs:b"),
+        error.message().contains("openjiuwen:doc:doc:docs:b"),
         "unexpected: {error}"
     );
     fake.shutdown().await;

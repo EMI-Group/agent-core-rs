@@ -113,7 +113,10 @@ async fn vector_store_round_trips_the_collection_schema() {
         description: Some("notes".to_string()),
         enable_dynamic_field: true,
     };
-    store.create_collection("docs", schema.clone()).await.unwrap();
+    store
+        .create_collection("docs", schema.clone())
+        .await
+        .unwrap();
 
     let stored = store.get_schema("docs").await.unwrap().expect("schema");
     assert_eq!(stored, schema);
@@ -251,7 +254,10 @@ async fn vector_store_add_fills_defaults_and_mints_auto_ids() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].fields["kind"], "unknown", "default applied");
     assert_eq!(hits[0].fields["embedding"], json!([1.0]));
-    let generated = hits[0].fields["id"].as_str().expect("generated id").to_string();
+    let generated = hits[0].fields["id"]
+        .as_str()
+        .expect("generated id")
+        .to_string();
     assert!(!generated.is_empty());
 
     // The prepared document was persisted, so a fresh store sees it.
@@ -292,7 +298,10 @@ async fn vector_store_rejects_duplicate_primary_keys_without_persisting() {
     // A batch that repeats a key and a batch with a mistyped field both fail
     // whole, so the stored view is unchanged.
     let error = store
-        .add_docs("docs", vec![doc("x", [0.0, 0.0, 1.0]), doc("x", [1.0, 1.0, 1.0])])
+        .add_docs(
+            "docs",
+            vec![doc("x", [0.0, 0.0, 1.0]), doc("x", [1.0, 1.0, 1.0])],
+        )
         .await
         .expect_err("duplicate key inside the batch");
     assert_eq!(error.kind(), ErrorKind::Validation);
@@ -306,7 +315,10 @@ async fn vector_store_rejects_duplicate_primary_keys_without_persisting() {
     assert_eq!(error.kind(), ErrorKind::Validation);
 
     let hits = store
-        .search("docs", &VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(10))
+        .search(
+            "docs",
+            &VectorQuery::new(vec![1.0, 0.0, 0.0]).with_top_k(10),
+        )
         .await
         .unwrap();
     let mut stored = ids(&hits);
@@ -325,7 +337,10 @@ async fn vector_store_search_orders_by_score_then_primary_key_and_truncates() {
         .await
         .unwrap();
     assert_eq!(ids(&hits), ["a", "d", "b", "c"]);
-    assert!((hits[0].score - 1.0).abs() < 1e-6, "identical vector is 1.0");
+    assert!(
+        (hits[0].score - 1.0).abs() < 1e-6,
+        "identical vector is 1.0"
+    );
     assert!(hits.windows(2).all(|pair| pair[0].score >= pair[1].score));
     assert!(hits.iter().all(|hit| hit.score.is_finite()));
     assert!(hits.iter().all(|hit| (0.0..=1.0).contains(&hit.score)));
@@ -467,7 +482,11 @@ async fn vector_store_metric_defaults_to_cosine_and_can_be_changed() {
     let euclidean = store_for(&fake).with_metric(Metric::Euclidean);
     assert_eq!(euclidean.metric(), Metric::Euclidean);
     let hits = euclidean.search("docs", &query).await.unwrap();
-    assert_eq!(ids(&hits), ids(&cosine), "the ranking is metric-independent");
+    assert_eq!(
+        ids(&hits),
+        ids(&cosine),
+        "the ranking is metric-independent"
+    );
     for hit in &hits {
         let embedding: Vec<f32> = serde_json::from_value(hit.fields["embedding"].clone())
             .expect("stored embedding is a float array");
