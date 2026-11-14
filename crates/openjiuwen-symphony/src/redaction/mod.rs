@@ -18,8 +18,8 @@
 //!
 //! # Pattern set
 //!
-//! [`redact_sensitive_text`] runs these passes in order, replacing only the
-//! matched span:
+//! [`redact_sensitive_text`](crate::redaction::redact_sensitive_text) runs these
+//! passes in order, replacing only the matched span:
 //!
 //! 1. `-----BEGIN … PRIVATE KEY-----` … `-----END … PRIVATE KEY-----` blocks;
 //! 2. `Bearer <token>` (case-insensitive, at least 8 token characters);
@@ -27,12 +27,14 @@
 //! 4. OpenAI-style `sk-…` keys;
 //! 5. AWS access key ids (`AKIA`/`ASIA` plus 16 uppercase alphanumerics);
 //! 6. `key=value` and `"key": "value"` assignments whose key
-//!    [`is_sensitive_name`] recognizes.
+//!    [`is_sensitive_name`](crate::redaction::is_sensitive_name) recognizes.
 //!
 //! Every pass is idempotent: redacting an already redacted text returns it
-//! unchanged. [`sanitize_distilled_text`] adds the two flow-level passes Python
-//! applies to model-derived prose (verbatim request replacement and a length
-//! cut), and [`redact_sensitive_json`]/[`redact_private_json`] are the JSON
+//! unchanged. [`sanitize_distilled_text`](crate::redaction::sanitize_distilled_text)
+//! adds the two flow-level passes Python applies to model-derived prose (verbatim
+//! request replacement and a length cut), and
+//! [`redact_sensitive_json`](crate::redaction::redact_sensitive_json) /
+//! [`redact_private_json`](crate::redaction::redact_private_json) are the JSON
 //! entry points used when a metadata blob is embedded in a recipe or package.
 //!
 //! # Example

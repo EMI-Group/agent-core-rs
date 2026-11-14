@@ -284,7 +284,7 @@ fn sanitize_orders_passes_and_truncates() {
 }
 
 /// Builds one capability node payload.
-fn node(description: &str, inputs: Value, outputs: Value) -> Value {
+fn node(description: &str, inputs: &Value, outputs: &Value) -> Value {
     json!({
         "label": "capability",
         "metadata": {
@@ -328,13 +328,13 @@ async fn a_flow_run_keeps_credentials_out_of_recipes_and_packs() {
             "nodes": {
                 "search": node(
                     &format!("search with password: hunter2 and {FAKE_PEM}"),
-                    json!([{"name": "query", "type": "string", "required": true, "description": format!("input token: {FAKE_API_KEY}")}]),
-                    json!([{"name": "results", "type": "array", "required": true, "description": "ranked hits"}]),
+                    &json!([{"name": "query", "type": "string", "required": true, "description": format!("input token: {FAKE_API_KEY}")}]),
+                    &json!([{"name": "results", "type": "array", "required": true, "description": "ranked hits"}]),
                 ),
                 "summarize": node(
                     &format!("summarize with Bearer {FAKE_BEARER}"),
-                    json!([{"name": "results", "type": "array", "required": true, "description": "ranked hits"}]),
-                    json!([{"name": "summary", "type": "text", "required": false, "description": "final answer"}]),
+                    &json!([{"name": "results", "type": "array", "required": true, "description": "ranked hits"}]),
+                    &json!([{"name": "summary", "type": "text", "required": false, "description": "final answer"}]),
                 ),
             },
             "edges": [{"source": "search", "target": "summarize", "relation": "can_feed", "metadata": {"success": true}}],
@@ -389,5 +389,8 @@ async fn a_flow_run_keeps_credentials_out_of_recipes_and_packs() {
     }
 
     // The pack review agrees: nothing left to redact.
-    assert!(redact_private_json(&pack.materials(), &[]) == pack.materials());
+    assert_eq!(
+        redact_private_json(&pack.materials(), &[]),
+        pack.materials()
+    );
 }

@@ -387,19 +387,22 @@ fn escaping_material_path(name: &str) -> Option<String> {
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Some(format!("material path `{name}` has a drive prefix"));
     }
-    let mut parts: Vec<&str> = Vec::new();
-    for part in name.split(['/', '\\']) {
-        match part {
-            "" | "." => continue,
-            ".." => {
-                if parts.pop().is_none() {
-                    return Some(format!("material path `{name}` escapes the package root"));
-                }
+    let parts: Vec<&str> = name
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let mut depth = 0usize;
+    for part in parts {
+        if part == ".." {
+            if depth == 0 {
+                return Some(format!("material path `{name}` escapes the package root"));
             }
-            other => parts.push(other),
+            depth -= 1;
+        } else {
+            depth += 1;
         }
     }
-    if parts.is_empty() {
+    if depth == 0 {
         return Some(format!("material path `{name}` does not name a file"));
     }
     None
