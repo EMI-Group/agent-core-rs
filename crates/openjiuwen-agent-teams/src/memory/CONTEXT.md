@@ -131,7 +131,7 @@ The observer is `observability::memory::memory_observer(team_id)`, plus
 Every store selection (in-memory, and the file store that falls back to in-memory) funnels through
 `trace::facade`, so "traced or not" is one decision.
 `TeamMemoryWiring::observer` holds a second handle on the same object the facade owns, and
-`trace_enabled()` reports `config.enabled && observer.is_some()`.
+`trace_enabled()` reports whether one is attached (true only when `enabled` and `trace` are both set).
 `TeamMemoryWiring::with_extractor` rebuilds the hooks over the same facade and carries the observer
 over unchanged.
 
