@@ -38,7 +38,7 @@ pub struct InboxFilter {
     /// Rejected sender ids; checked before the allow-list.
     pub deny_senders: BTreeSet<String>,
     /// Accepted topic patterns, matched with
-    /// [`topic_matches`](crate::subscription::topic_matches).
+    /// `crate::subscription::topic_matches`.
     pub topics: Vec<String>,
     /// Metadata entries the envelope must carry exactly.
     pub metadata: BTreeMap<String, String>,

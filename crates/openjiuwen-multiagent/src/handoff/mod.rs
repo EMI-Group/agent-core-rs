@@ -742,7 +742,11 @@ mod tests {
             ..HandoffTeamConfig::default()
         };
         let team = handoff_team(team_card("timing-out"), config);
-        let slow = SlowAgent::new("a", Duration::from_millis(50));
+        // The delay must dwarf any plausible scheduler stall: `tokio::time::timeout`
+        // polls the inner future first, so a member that only sleeps a few
+        // milliseconds can win the race against the 10 ms deadline on a loaded
+        // machine and turn this test into a late success.
+        let slow = SlowAgent::new("a", Duration::from_secs(5));
         team.add_agent(agent_card("a"), slow_provider(slow))
             .unwrap();
 

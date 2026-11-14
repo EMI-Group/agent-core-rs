@@ -274,7 +274,7 @@ impl RoutingTable {
     ///
     /// A known group id resolves to its members. Otherwise `destination` is
     /// matched against every topic pattern with
-    /// [`topic_matches`](crate::subscription::topic_matches), so a concrete
+    /// `crate::subscription::topic_matches`, so a concrete
     /// topic such as `news.tech` also resolves through a `news.*` subscription.
     /// An unknown destination resolves to an empty vector.
     #[must_use]
