@@ -121,7 +121,7 @@ impl MessageStore {
 ```
 `id` is deterministic: `msg_{fnv64(content + role + millis):016x}_{millis}` (Python's `msg_{sha256(...)}_{ms}` shape, no crypto dependency). Collection `messages`; documents are the flat `StoredMessage` JSON. `recent` queries `user_id`/`scope_id`/optional `session_id`, orders by `timestamp` desc, limit, then reverses. `content` is the plain-text view of `BaseMessage::content`; non-text parts are JSON-rendered into content. `role` uses the `Role` serde name (`system`/`user`/`assistant`/`tool`).
 
-### `migration.rs`
+### `migration/` (`registry.rs` + `runner.rs`)
 ```rust
 pub struct Migration { pub version: u32, pub name: &'static str, pub description: &'static str, pub up_sql: &'static [&'static str] }
 pub struct MigrationRegistry { /* Vec<Migration> */ }
@@ -173,7 +173,7 @@ All legacy fallback mechanics live here so `storage.rs` stays a thin caller: cur
 - Builtin baseline mirrors the foundation DDL exactly and is idempotent on an already-populated database: v1 `kv_store` (+ `kv_store_expiry_idx`), v2 `documents` (`document_collections`, `documents`, `documents_collection_idx`).
 - Version reservation: the builtin registry ships only real steps (v1, v2). The next free version numbers are reserved for the modules being added elsewhere in the crate — v3 for `src/dreaming/` tables, v4 for `src/team/` tables — appended later via `register`/`with` with their real DDL. No placeholder or no-op migration is ever shipped.
 - Python mapping: KV's `MEMORY_MIGRATION_KV_SCHEMA_VERSION` and SQL's per-table `memory_meta` rows collapse into this single global version table.
-- `migration.rs` is legitimately ~1000 lines: registry + validation + runner + report types + their rollback/idempotency suite are one cohesive unit; split it only when a second migration backend arrives.
+- `migration` is split by responsibility: `registry.rs` holds the steps, their validation, and the builtin plan, `runner.rs` holds the version table and the forward-only execution; both stay cohesive units of their own, and the placeholder submodules reserve the per-family migrator seams.
 
 ## Legacy Prefix Compatibility
 
@@ -215,9 +215,16 @@ Python v0.1.20 registers **no** legacy prefix (`UserMemStore.LEGACY_PREFIXES` an
 
 - `./mod.rs` → `MemoryStores` and backend constructors
 - `./keys.rs` → KV key and vector collection naming, current↔legacy prefix mapping (`legacy_alternatives`, `current_equivalent`)
+- `./prefix.rs` → empty placeholder for the runtime key-prefix registry over the logical memory families
+- `./backup.rs` → empty placeholder for backup/restore of the memory KV keyspace
+- `./lock.rs` → empty placeholder for the distributed KV lock seam
+- `./mapping.rs` → empty placeholder for the persisted scope↔user mapping keys
 - `./storage.rs` → record/vector/variable/scope-config persistence (thin caller over `legacy` for fallback)
 - `./legacy.rs` → crate-private legacy key-layout read/scan/delete fallback helpers
-- `./migration.rs` → forward-only SQLite schema migration registry, runner, status, builtin baseline
+- `./migration/mod.rs` → module docs (forward-only semantics, version table, atomic steps) and the submodule table
+- `./migration/registry.rs` → `Migration`, `MigrationRegistry`, `builtin_migrations`, `default_registry`, the DDL constants, `validate`
+- `./migration/runner.rs` → feature `sqlite`: `SCHEMA_VERSION_TABLE`, `MigrationRunner`, `MigrationReport`, `MigrationStatus`, `AppliedMigration`, `migrate_sqlite`, and the bootstrap/fetch/apply helpers
+- `./migration/plan.rs`, `./migration/operation.rs`, `./migration/standard.rs`, `./migration/sql.rs`, `./migration/vector.rs`, `./migration/message.rs`, `./migration/index_version.rs` → empty placeholders for the per-family migrator seams
 - `./messages.rs` → `StoredMessage`, `MessageStore`
 - `./json.rs` → internal record (de)serialization helpers and `plain_text` for `BaseMessage`
 
@@ -225,6 +232,7 @@ Python v0.1.20 registers **no** legacy prefix (`UserMemStore.LEGACY_PREFIXES` an
 
 - Unit tests beside each file: key shapes and legacy↔current mapping round-trips, sanitization/collision resistance, record JSON round-trip, malformed-record tolerance, vector collection naming.
 - `legacy.rs` tests seed a legacy key directly in a public `MemoryStores` bundle and read/delete through `MemoryStorage`: legacy record read, current-wins, listing dedupe, user vs session variable namespaces, scope config, delete-removes-both.
-- `migration.rs` tests (feature `sqlite`, `tempfile`): fresh DB status/run/status, idempotent second run, a failing migration rolls back both its DDL and its version row, a pre-populated foundation database migrates cleanly, `migrate_sqlite` idempotency, and an out-of-range recorded version is left alone; the non-gated tests cover every registry validation rule.
+- `migration/registry.rs` tests every registry validation rule (duplicate version, gap, start at v1, backwards step, empty name/description/SQL, duplicate name) plus the builtin plan and appends.
+- `migration/runner.rs` tests (feature `sqlite`, `tempfile`): fresh DB status/run/status, idempotent second run, a failing migration rolls back both its DDL and its version row, a pre-populated foundation database migrates cleanly, `migrate_sqlite` idempotency, an out-of-range recorded version left alone, and report JSON round trips.
 - Integration tests `tests/crud.rs`, `tests/scoping.rs`, `tests/sqlite.rs` exercise the public facade against these stores; `tests/recall.rs` covers vector candidate retrieval.
 - Local-file tests use `tempfile::tempdir`; SQLite tests use a temp path and reopen the store to prove persistence.
