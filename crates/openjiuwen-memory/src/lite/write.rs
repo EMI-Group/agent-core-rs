@@ -3,12 +3,11 @@
 //! checker.
 //!
 //! Ports Python's `WriteMode` from `openjiuwen/core/memory/lite/conflict_types.py` and the
-//! `_MAX_CONFLICT_RETRIES = 2` loop from `coding_memory_tool_ops.py`, and extends both for
-//! the local Markdown store. Python's `WriteResult` maps onto
-//! [`WriteOutcome`](crate::lite::write::WriteOutcome): `success` is "the outcome is not
-//! `Skipped`", `path`/`type` live on the returned
-//! [`CodingFact`], and `conflict_detected`/`note` keep their
-//! names.
+//! `_MAX_CONFLICT_RETRIES = 2` loop from `coding_memory_tool_ops.py`, extending both for the
+//! local Markdown store. Python's `WriteResult` maps onto
+//! [`WriteOutcome`](crate::lite::write::WriteOutcome): `success` means "not `Skipped`",
+//! `path`/`type` live on the returned [`CodingFact`], and `conflict_detected`/`note` keep
+//! their names.
 //!
 //! # Modes
 //!
@@ -20,38 +19,36 @@
 //! | `replace` | the incoming fact overwrites the stored one (`None` path clears it) | writes it |
 //! | `skip` | changes nothing and reports the skip | writes it |
 //!
-//! The two modes Python does not have are `merge` and `replace`: the local store is
-//! name-keyed, so overwriting an entry is naturally what a plain write does (`replace`),
-//! and `merge` is the friendlier default because it only touches the fields the caller
-//! actually filled in.
+//! Python has neither `merge` nor `replace`: the local store is name-keyed, so overwriting an
+//! entry is naturally what a plain write does (`replace`), while `merge` is the friendlier
+//! default because it only touches the fields the caller actually filled in.
 //!
 //! # Retry and backoff
 //!
 //! [`MemUpdateChecker::plan`](crate::lite::write::MemUpdateChecker::plan) is a pure decision
-//! function: it never reads or writes storage, so a caller can compute the outcome from the
-//! snapshot it read. The retry driver,
+//! function — it never touches storage, so a caller computes the outcome from the snapshot it
+//! read. The retry driver,
 //! [`MemUpdateChecker::run`](crate::lite::write::MemUpdateChecker::run), wraps a
-//! read-decide-write closure: the closure returns `Ok(None)` when it observed the store
-//! change underneath it (a lost race), and the checker then sleeps for
-//! `backoff * 2^attempt`, capped at `max_backoff`, before retrying.
-//! Retries are bounded by `max_attempts` (default 2, i.e. one retry), so `max_attempts == 1`
-//! means "no retry — a conflict is an error".
+//! read-decide-write closure that returns `Ok(None)` when it observed the store change
+//! underneath it (a lost race); the checker then sleeps `backoff * 2^attempt`, capped at
+//! `max_backoff`, before retrying. Retries are bounded by `max_attempts` (default 2, i.e. one
+//! retry), so `max_attempts == 1` means "no retry — a conflict is an error".
 //!
 //! # Deviation from Python: exhaustion is a typed error
 //!
-//! Python's retry loop degrades to a last-writer-wins write once `_MAX_CONFLICT_RETRIES` is
-//! exhausted, so a lost race can silently overwrite a concurrent edit. This port
-//! deliberately does not: an exhausted budget returns
-//! [`Error::Memory`] naming the operation and the
-//! attempt count, so the caller decides whether to re-read and rewrite. A conflict is never
-//! reported as a skip or as a success, and `run` never writes on its own.
+//! Python degrades to a last-writer-wins write once `_MAX_CONFLICT_RETRIES` is exhausted, so a
+//! lost race can silently overwrite a concurrent edit. This port deliberately does not: an
+//! exhausted budget returns [`Error::Memory`] naming the operation and the attempt count, so
+//! the caller decides whether to re-read and rewrite. A conflict is never reported as a skip
+//! or as a success, and `run` never writes on its own.
 //!
 //! # No global state
 //!
-//! The checker is an ordinary value holding only a [`WritePolicy`](crate::lite::write::WritePolicy); it is constructed per
-//! store and injected, so tests and multi-store processes stay isolated. Nothing is
-//! registered process-globally and no background task, timer, or lock is owned here — the
-//! store's own file lock (or engine) serializes the actual mutation.
+//! The checker is an ordinary value holding only a
+//! [`WritePolicy`](crate::lite::write::WritePolicy); it is constructed per store and
+//! injected, so tests and multi-store processes stay isolated. Nothing is registered
+//! process-globally and no background task, timer, or lock is owned here — the store's own
+//! file lock (or the engine) serializes the actual mutation.
 
 use std::fmt;
 use std::future::Future;
@@ -89,8 +86,7 @@ pub enum WriteMode {
 }
 
 impl WriteMode {
-    /// Every write mode, in the canonical order
-    /// `create`, `append`, `merge`, `replace`, `skip`.
+    /// Every write mode, in the canonical order `create`, `append`, `merge`, `replace`, `skip`.
     pub const ALL: [Self; 5] = [
         Self::Create,
         Self::Append,
@@ -228,8 +224,8 @@ pub enum WritePlan {
 
 /// The result of a completed write.
 ///
-/// The counterpart of Python's `WriteResult`; combined with
-/// [`MemUpdateChecker::run`] it also reports how many attempts the write needed.
+/// The counterpart of Python's `WriteResult`; combined with [`MemUpdateChecker::run`] it also
+/// reports how many attempts the write needed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteOutcome {
     /// The fact as stored (the existing fact for a skip).
@@ -248,8 +244,8 @@ pub struct WriteOutcome {
 
 /// The retry driver plus the pure plan computation.
 ///
-/// Holds only a [`WritePolicy`]: it is constructed per store, injected by the caller, and
-/// keeps no global state. [`MemUpdateChecker::plan`] never touches storage and
+/// Holds only a [`WritePolicy`]: it is constructed per store, injected by the caller, and keeps
+/// no global state. [`MemUpdateChecker::plan`] never touches storage and
 /// [`MemUpdateChecker::run`] never writes — the closure passed to `run` owns the
 /// read-decide-write sequence.
 #[derive(Debug, Clone)]
@@ -263,8 +259,8 @@ impl MemUpdateChecker {
     ///
     /// # Errors
     ///
-    /// Propagates [`WritePolicy::validate`]: [`Error::Validation`] for an attempt budget of
-    /// 0 or a first backoff above the cap.
+    /// Propagates [`WritePolicy::validate`]: [`Error::Validation`] for an attempt budget of 0
+    /// or a first backoff above the cap.
     pub fn new(policy: WritePolicy) -> Result<Self> {
         policy.validate()?;
         Ok(Self { policy })
@@ -293,30 +289,30 @@ impl MemUpdateChecker {
 
     /// Pure decision function for one write, given the current snapshot of the fact.
     ///
-    /// `now` becomes the fact's `updated_at` on every variant that writes. The semantics
-    /// per [`WriteMode`]:
+    /// `now` becomes the fact's `updated_at` on every variant that writes. Per
+    /// [`WriteMode`]:
     ///
     /// - [`WriteMode::Create`] with a stored fact is [`Error::Memory`] naming the fact; a
-    ///   `create` collision is not retried by this function, and the caller may still treat
-    ///   it as a conflict.
-    /// - [`WriteMode::Skip`] with a stored fact is [`WritePlan::Skipped`] carrying it;
-    ///   without one the fact is written ([`WritePlan::Created`]), as for every other mode.
-    /// - [`WriteMode::Replace`] keeps nothing from the stored fact, so a `None` incoming
-    ///   path clears the stored path.
-    /// - [`WriteMode::Append`] joins the trimmed bodies with one blank line, keeps the
-    ///   stored `name`/`type`/`scope`/`tags`, and lets a non-blank incoming `description` or
-    ///   `path` win. When the incoming body is empty, or is already the trailing part of the
-    ///   stored body (equal, or preceded by a blank line), the append would change nothing
-    ///   and the plan is [`WritePlan::Skipped`].
-    /// - [`WriteMode::Merge`] takes a non-blank incoming `content`/`description`/`path`
-    ///   (a blank description or absent path keeps the stored value), unions the tags in
-    ///   order (stored tags first, then unseen incoming tags, case-sensitive), and keeps the
-    ///   stored `name`, `fact_type`, and `scope`.
+    ///   `create` collision is not retried here, and the caller may still treat it as a
+    ///   conflict.
+    /// - [`WriteMode::Skip`] with a stored fact is [`WritePlan::Skipped`] carrying it; without
+    ///   one the fact is written ([`WritePlan::Created`]), as for every other mode.
+    /// - [`WriteMode::Replace`] keeps nothing from the stored fact, so a `None` incoming path
+    ///   clears the stored path.
+    /// - [`WriteMode::Append`] joins the trimmed bodies with one blank line, keeps the stored
+    ///   `name`/`type`/`scope`/`tags`, and lets a non-blank incoming `description` or `path`
+    ///   win. When the incoming body is empty, or is already the trailing part of the stored
+    ///   body (equal, or preceded by a blank line), the append would change nothing and the
+    ///   plan is [`WritePlan::Skipped`].
+    /// - [`WriteMode::Merge`] takes a non-blank incoming `content`/`description`/`path` (a
+    ///   blank description or absent path keeps the stored value), unions the tags in order
+    ///   (stored tags first, then unseen incoming tags, case-sensitive), and keeps the stored
+    ///   `name`, `fact_type`, and `scope`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming the offending field when the incoming fact's
-    /// name or scope is invalid, and [`Error::Memory`] for a `create` collision.
+    /// Returns [`Error::Validation`] naming the offending field when the incoming fact's name
+    /// or scope is invalid, and [`Error::Memory`] for a `create` collision.
     pub fn plan(
         &self,
         mode: WriteMode,
@@ -346,8 +342,8 @@ impl MemUpdateChecker {
     /// `op` receives the 0-based attempt index, performs one read-decide-write, and returns
     /// `Ok(Some(value))` when it committed, `Ok(None)` when the store changed underneath it,
     /// or an error that is propagated unchanged. When every attempt reports a conflict the
-    /// call returns [`Error::Memory`] naming `what` and the attempt count: exhaustion is
-    /// never turned into a silent skip, and `max_attempts == 1` means no retry at all.
+    /// call returns [`Error::Memory`] naming `what` and the attempt count: exhaustion is never
+    /// turned into a silent skip, and `max_attempts == 1` means no retry at all.
     ///
     /// # Errors
     ///
@@ -428,8 +424,8 @@ fn merged(existing: &CodingFact, incoming: &CodingFact, now: DateTime<Utc>) -> C
     }
 }
 
-/// The [`WriteMode::Append`] plan: one blank line between the two bodies, or a skip when
-/// the incoming body would add nothing.
+/// The [`WriteMode::Append`] plan: one blank line between the two bodies, or a skip when the
+/// incoming body would add nothing.
 fn appended(existing: &CodingFact, incoming: &CodingFact, now: DateTime<Utc>) -> WritePlan {
     let existing_body = existing.content.trim();
     let incoming_body = incoming.content.trim();
@@ -486,27 +482,17 @@ mod tests {
     }
 
     #[test]
-    fn write_mode_serde_round_trips_snake_case() {
+    fn write_mode_names_serde_and_default() {
+        assert_eq!(WriteMode::default(), WriteMode::Merge);
+        let names: Vec<&str> = WriteMode::ALL.iter().map(|mode| mode.as_str()).collect();
+        assert_eq!(names, vec!["create", "append", "merge", "replace", "skip"]);
         for mode in WriteMode::ALL {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(json, format!("\"{}\"", mode.as_str()));
-            let back: WriteMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, mode);
+            assert_eq!(serde_json::from_str::<WriteMode>(&json).unwrap(), mode);
+            assert_eq!(mode.to_string(), mode.as_str());
         }
-        assert_eq!(
-            serde_json::from_str::<WriteMode>("\"skip\"").unwrap(),
-            WriteMode::Skip
-        );
         assert!(serde_json::from_str::<WriteMode>("\"overwrite\"").is_err());
-    }
-
-    #[test]
-    fn write_mode_all_as_str_and_display() {
-        let names: Vec<&str> = WriteMode::ALL.iter().map(|mode| mode.as_str()).collect();
-        assert_eq!(names, vec!["create", "append", "merge", "replace", "skip"]);
-        assert_eq!(WriteMode::Merge.to_string(), "merge");
-        assert_eq!(WriteMode::Create.to_string(), "create");
-        assert_eq!(WriteMode::default(), WriteMode::Merge);
     }
 
     #[test]
@@ -521,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_defaults_and_builders() {
+    fn policy_defaults_validation_and_builders() {
         let policy = WritePolicy::default();
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.backoff, Duration::from_millis(5));
@@ -533,24 +519,20 @@ mod tests {
             .with_backoff(Duration::from_millis(2), Duration::from_millis(9));
         assert_eq!(tweaked.max_attempts, 4);
         assert_eq!(tweaked.backoff, Duration::from_millis(2));
-        assert_eq!(tweaked.max_backoff, Duration::from_millis(9));
         assert!(tweaked.validate().is_ok());
-    }
 
-    #[test]
-    fn policy_validation_names_the_offending_field() {
-        let zero = WritePolicy::default().with_max_attempts(0);
+        let zero = policy.with_max_attempts(0);
         let message = zero.validate().unwrap_err().to_string();
         assert!(message.contains("max_attempts"), "{message}");
+        assert_eq!(
+            MemUpdateChecker::new(zero).unwrap_err().kind(),
+            ErrorKind::Validation
+        );
 
-        let inverted = WritePolicy::default()
-            .with_backoff(Duration::from_millis(50), Duration::from_millis(10));
+        let inverted = policy.with_backoff(Duration::from_millis(50), Duration::from_millis(10));
         let message = inverted.validate().unwrap_err().to_string();
         assert!(message.contains("backoff"), "{message}");
         assert!(message.contains("max_backoff"), "{message}");
-
-        let err = MemUpdateChecker::new(zero).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Validation);
     }
 
     #[test]
@@ -561,12 +543,10 @@ mod tests {
             max_backoff: Duration::from_millis(80),
         })
         .unwrap();
-        assert_eq!(checker.backoff_for(0), Duration::from_millis(5));
-        assert_eq!(checker.backoff_for(1), Duration::from_millis(10));
-        assert_eq!(checker.backoff_for(2), Duration::from_millis(20));
-        assert_eq!(checker.backoff_for(3), Duration::from_millis(40));
-        assert_eq!(checker.backoff_for(4), Duration::from_millis(80));
-        assert_eq!(checker.backoff_for(5), Duration::from_millis(80));
+        let delays: Vec<u128> = (0..=5)
+            .map(|attempt| checker.backoff_for(attempt).as_millis())
+            .collect();
+        assert_eq!(delays, vec![5, 10, 20, 40, 80, 80]);
         assert_eq!(checker.backoff_for(usize::MAX), Duration::from_millis(80));
     }
 
@@ -575,35 +555,25 @@ mod tests {
         let checker = checker(2);
         let now = Utc::now();
         let incoming = fact("build", "how to build");
-        for mode in [
-            WriteMode::Create,
-            WriteMode::Append,
-            WriteMode::Merge,
-            WriteMode::Replace,
-            WriteMode::Skip,
-        ] {
+        for mode in WriteMode::ALL {
             let plan = checker.plan(mode, &incoming, None, now).unwrap();
-            match plan {
-                WritePlan::Created(planned) => {
-                    assert_eq!(planned.name, incoming.name);
-                    assert_eq!(planned.content, incoming.content);
-                    assert_eq!(planned.fact_type, incoming.fact_type);
-                    assert_eq!(planned.updated_at, now);
-                }
-                other => panic!("{mode} without a stored fact planned {other:?}"),
-            }
+            let WritePlan::Created(planned) = plan else {
+                panic!("{mode} without a stored fact planned {plan:?}");
+            };
+            assert_eq!(planned.name, incoming.name);
+            assert_eq!(planned.content, incoming.content);
+            assert_eq!(planned.fact_type, incoming.fact_type);
+            assert_eq!(planned.updated_at, now);
         }
     }
 
     #[test]
     fn plan_create_refuses_an_existing_fact() {
-        let checker = checker(2);
-        let stored = fact("build", "old");
-        let err = checker
+        let err = checker(2)
             .plan(
                 WriteMode::Create,
                 &fact("build", "new"),
-                Some(&stored),
+                Some(&fact("build", "old")),
                 Utc::now(),
             )
             .unwrap_err();
@@ -613,9 +583,8 @@ mod tests {
 
     #[test]
     fn plan_skip_keeps_the_stored_fact() {
-        let checker = checker(2);
         let stored = fact("build", "old");
-        let plan = checker
+        let plan = checker(2)
             .plan(
                 WriteMode::Skip,
                 &fact("build", "new"),
@@ -651,13 +620,9 @@ mod tests {
         );
         assert_eq!(planned.updated_at, now);
 
+        let with_path = incoming.with_path("docs/NEW.md");
         let plan = checker
-            .plan(
-                WriteMode::Replace,
-                &incoming.clone().with_path("docs/NEW.md"),
-                Some(&stored),
-                now,
-            )
+            .plan(WriteMode::Replace, &with_path, Some(&stored), now)
             .unwrap();
         let WritePlan::Replaced(planned) = plan else {
             panic!("replace planned {plan:?}");
@@ -666,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_merge_unions_fields_and_keeps_the_stored_identity() {
+    fn plan_merge_unions_fields_and_keeps_stored_identity() {
         let checker = checker(2);
         let now = Utc::now();
         let stored = fact("build", "old body")
@@ -710,7 +675,9 @@ mod tests {
         let checker = checker(2);
         let now = Utc::now();
         let stored = fact("build", "  first line  ").with_tags(vec!["kept".to_owned()]);
-        let incoming = fact("build", " second line ").with_description("  more  ");
+        let incoming = fact("build", " second line ")
+            .with_description("  more  ")
+            .with_path("docs/NEW.md");
 
         let plan = checker
             .plan(WriteMode::Append, &incoming, Some(&stored), now)
@@ -721,21 +688,18 @@ mod tests {
         assert_eq!(planned.content, "first line\n\nsecond line");
         assert_eq!(planned.description, "  more  ");
         assert_eq!(planned.tags, vec!["kept"]);
-        assert!(planned.path.is_none());
+        assert_eq!(planned.path.as_deref(), Some("docs/NEW.md"));
         assert_eq!(planned.updated_at, now);
 
+        let bare = fact("build", "second line");
         let plan = checker
-            .plan(
-                WriteMode::Append,
-                &incoming.clone().with_path("docs/NEW.md"),
-                Some(&stored),
-                now,
-            )
+            .plan(WriteMode::Append, &bare, Some(&stored), now)
             .unwrap();
         let WritePlan::Appended(planned) = plan else {
             panic!("append planned {plan:?}");
         };
-        assert_eq!(planned.path.as_deref(), Some("docs/NEW.md"));
+        assert_eq!(planned.description, "");
+        assert!(planned.path.is_none());
     }
 
     #[test]
@@ -743,7 +707,6 @@ mod tests {
         let checker = checker(2);
         let now = Utc::now();
         let stored = fact("build", "one\n\ntwo");
-
         for body in ["two", "one\n\ntwo", "  two  ", ""] {
             let plan = checker
                 .plan(WriteMode::Append, &fact("build", body), Some(&stored), now)
@@ -785,8 +748,7 @@ mod tests {
 
     #[test]
     fn plan_rejects_a_blank_incoming_name() {
-        let checker = checker(2);
-        let err = checker
+        let err = checker(2)
             .plan(WriteMode::Merge, &fact("   ", "body"), None, Utc::now())
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Validation);
@@ -795,9 +757,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_completes_on_the_first_attempt() {
-        let checker = checker(3);
         let mut calls = 0_usize;
-        let (value, attempts) = checker
+        let (value, attempts) = checker(3)
             .run("sync fact", |attempt| {
                 calls += 1;
                 async move {
@@ -807,38 +768,33 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(value, 7);
-        assert_eq!(attempts, 1);
-        assert_eq!(calls, 1);
+        assert_eq!((value, attempts, calls), (7, 1, 1));
     }
 
     #[tokio::test]
     async fn run_retries_a_conflict_then_succeeds() {
-        let checker = checker(3);
         let mut seen = Vec::new();
-        let (value, attempts) = checker
+        let (value, attempts) = checker(3)
             .run("sync fact", |attempt| {
                 seen.push(attempt);
                 async move {
                     if attempt == 0 {
                         Ok(None)
                     } else {
-                        Ok(Some(format!("attempt {attempt}")))
+                        Ok(Some(attempt))
                     }
                 }
             })
             .await
             .unwrap();
-        assert_eq!(value, "attempt 1");
-        assert_eq!(attempts, 2);
+        assert_eq!((value, attempts), (1, 2));
         assert_eq!(seen, vec![0, 1]);
     }
 
     #[tokio::test]
     async fn run_reports_exhaustion_as_a_memory_error() {
-        let checker = checker(3);
         let mut calls = 0_usize;
-        let err = checker
+        let err = checker(3)
             .run::<u8, _, _>("sync fact", |_attempt| {
                 calls += 1;
                 async move { Ok(None) }
@@ -855,9 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_one_attempt_does_not_retry() {
-        let checker = checker(1);
         let mut calls = 0_usize;
-        let err = checker
+        let err = checker(1)
             .run::<u8, _, _>("sync fact", |_attempt| {
                 calls += 1;
                 async move { Ok(None) }
@@ -867,7 +822,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Memory);
         assert_eq!(calls, 1);
 
-        let (value, attempts) = checker
+        let (value, attempts) = checker(1)
             .run("sync fact", |_attempt| async move { Ok(Some(1_u8)) })
             .await
             .unwrap();
@@ -876,9 +831,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_propagates_an_error_without_retrying() {
-        let checker = checker(3);
         let mut calls = 0_usize;
-        let err = checker
+        let err = checker(3)
             .run::<u8, _, _>("sync fact", |_attempt| {
                 calls += 1;
                 async move { Err(Error::validation("bad fact")) }
