@@ -63,7 +63,7 @@ impl RecordingHook {
 
 #[async_trait::async_trait]
 impl SubagentLifecycleHook for RecordingHook {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         self.name
     }
 
@@ -93,7 +93,7 @@ struct FailingBeforeEvict;
 
 #[async_trait::async_trait]
 impl SubagentLifecycleHook for FailingBeforeEvict {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "failing-before-evict"
     }
 
@@ -110,7 +110,7 @@ struct ReentrantHook {
 
 #[async_trait::async_trait]
 impl SubagentLifecycleHook for ReentrantHook {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "reentrant"
     }
 
@@ -143,7 +143,7 @@ struct GatedBeforeEvict {
 
 #[async_trait::async_trait]
 impl SubagentLifecycleHook for GatedBeforeEvict {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "gated-before-evict"
     }
 
@@ -291,7 +291,10 @@ async fn capacity_pressure_eviction_fires_close_with_evicted_only() {
     assert_eq!(closes[0].reason.as_deref(), Some(EVICTION_REASON));
     assert_eq!(closes[0].status, SubagentStatus::Closed);
     // The capacity-pressure path cannot await `BeforeEvict`: it fires `Close` only.
-    assert!(calls_for(&seen, LifecycleStage::BeforeEvict).is_empty());
+    assert_eq!(
+        calls_for(&seen, LifecycleStage::BeforeEvict),
+        Vec::<Call>::new()
+    );
     assert_eq!(calls_for(&seen, LifecycleStage::Spawn).len(), 2);
     assert_eq!(calls_for(&seen, LifecycleStage::Ready).len(), 2);
 }

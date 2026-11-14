@@ -21,6 +21,9 @@ impl SubAgentRuntime {
     /// that is already present replaces it in place (see [`LifecycleHooks::register`]). Repeating
     /// the call with the same registry is therefore idempotent, while two calls with different
     /// registries stack their hooks. Call it before sharing the runtime.
+    // The registry is a builder element: taking ownership reads naturally and the caller can
+    // clone it when it wants to keep a handle.
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn with_lifecycle_hooks(self, hooks: LifecycleHooks) -> Self {
         for hook in hooks.hooks() {

@@ -778,8 +778,8 @@ impl SubAgentRuntime {
         reason: Option<&str>,
     ) -> Option<SubagentLifecycleEvent> {
         let now_ms = self.clock.now_ms();
-        let state = self.shared.state.lock();
-        state
+        let locked = self.shared.state.lock();
+        locked
             .instances
             .get(id)
             .map(|instance| instance.lifecycle_event(stage, reason, now_ms))

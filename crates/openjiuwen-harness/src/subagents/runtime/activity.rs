@@ -379,6 +379,9 @@ impl FrameSpec {
 /// [`ActivityThrottle::text_max_len`] characters or [`ActivityThrottle::throttle_ms`]
 /// milliseconds pass; a terminal frame flushes pending thinking and makes every later
 /// non-terminal publisher return an empty vector.
+// The recorder genuinely tracks four independent flags: recording enabled, per-turn truncation,
+// terminal suppression, and whether the thinking phase is open.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ActivityStream {
     /// Identity stamped on every frame.
     subagent_id: String,
