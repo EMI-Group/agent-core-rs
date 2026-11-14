@@ -11,7 +11,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 - `src/lib.rs` — marker module (`crate_name()`); the crate has no runtime API.
 - `tests/support/mod.rs` — the cross-scenario helper contract: `BOUND` (10 s per-await deadline), `within(what, future)`, `collect_bounded(stream, max)`. Scenario-specific fixtures stay in `openjiuwen-test-support` or beside the scenario.
-- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 23 of them:
+- Test binaries (each `tests/*.rs` is its own binary; no `[[test]]` entries), 24 of them:
   `kernel_flow`, `workflow_components`, `context_engine`, `context_tokenizers`, `retrieval_pipeline`, `memory_recall`, `memory_dreaming`, `team_memory`, `deep_agent`, `harness_cli_tools`, `provider_native`, `team_flow`, `team_backend`, `runner_subprocess`, `runner_hosting`, `federation_transports`, `a2a_roundtrip`, `symphony_plan`, `symphony_artifacts`, `self_improvement`, `evaluation_ledger`, `plugin_observability`, `cli_binary`.
 - Features: `default = []`;
   `a2a` (enables `openjiuwen/a2a` + `openjiuwen-extensions/a2a`, gates `a2a_roundtrip.rs`);
@@ -25,7 +25,7 @@ The crate is dev-only (`publish = false`) and never a dependency of a library cr
 
 ## Scenario Matrix
 
-112 test functions across 23 scenario binaries: 111 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
+112 test functions across 24 scenario binaries: 111 pass with `--features sqlite,a2a,otel` (102 with default features), and exactly 1 documented `#[ignore]`.
 
 | Binary | Scenario | Crates / seams exercised |
 |---|---|---|
