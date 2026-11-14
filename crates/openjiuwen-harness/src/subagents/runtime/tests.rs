@@ -487,6 +487,7 @@ fn status_wire_strings_and_finality() {
     assert!(outcome.is_final());
 }
 
+mod activity_eviction;
 mod activity_runtime;
 mod eviction;
 mod lifecycle;
