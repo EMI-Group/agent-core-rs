@@ -121,8 +121,12 @@ pub use evaluator_pipeline::{
 };
 /// Experience records, archives, extraction, and lifecycle rules.
 pub use experience::{
-    ExperienceArchive, ExperienceExtractor, ExperienceLifecycle, ExperienceMatch, ExperienceQuery,
-    ExperienceRecord, ExperienceSection, ExperienceStats, LifecycleConfig, LifecycleReport,
+    initial_confidence, parse_draft_text, summarize_skill_content, DraftExperience, DraftInput,
+    DraftSection, EvolutionRequest, EvolutionStatus, EvolutionSubject, EvolutionSubjectKind,
+    EvolveDraft, ExperienceArchive, ExperienceDrafter, ExperienceExtractor, ExperienceLifecycle,
+    ExperienceMatch, ExperienceQuery, ExperienceRecord, ExperienceSection, ExperienceStats,
+    LifecycleConfig, LifecycleReport, OnlineEvolutionOrchestrator, OnlineEvolutionResult,
+    SimplifyAction, SimplifyActionKind, SimplifyDraft,
 };
 /// Candidates, the optimizer baseline, research optimizers, and checkpoints.
 pub use optimizer::{
@@ -140,9 +144,12 @@ pub use rails::{
 };
 /// Reward records, aggregation, normalisation, and reward packs.
 pub use reward::{
-    aggregate_scores, default_pack, reward_from_score, score_evaluated_cases,
-    MissingDimensionPolicy, RewardAggregator, RewardDimension, RewardPack, RewardSignal,
-    RewardSummary, ScoreNormalisation, ScoreStats,
+    aggregate_scores, default_pack, reward_from_score, score_criterion, score_evaluated_cases,
+    to_reward_signal, total, CheckOutcome, CheckRewardReport, CheckRunner, CheckTool,
+    CriterionKind, CriterionReport, CriterionStatus, EvidenceAgent, EvidenceCriterion,
+    EvidenceGathered, EvidenceTask, MissingDimensionPolicy, ModelRewardJudge, RewardAggregator,
+    RewardCheck, RewardDimension, RewardPack, RewardSignal, RewardSummary, ScoreNormalisation,
+    ScoreStats,
 };
 /// RL batches, rollouts, policy seams, checkpoints, and the trainer loop.
 pub use rl::{
@@ -157,9 +164,10 @@ pub use service::{
 };
 /// Shared-experience packaging, keyword extraction, and the backend seam.
 pub use sharing::{
-    KeywordExtractor, LocalFileSharingBackend, MemorySharingBackend, QueryKeywords, ShareStager,
-    SharedExperience, SharedSkillBundle, SharingBackend, SharingMeta, SkillPackageMeta,
-    SkillSearchResult, StagedBundle,
+    KeywordExtractor, LocalFileSharingBackend, MemorySharingBackend, QueryKeywords,
+    RemoteHubOptions, RemoteHubSharingBackend, ShareStager, SharedExperience, SharedSkillBundle,
+    SharingBackend, SharingMeta, SkillPackageMeta, SkillSearchResult, StagedBundle,
+    HUB_API_KEY_ENV, HUB_URL_ENV,
 };
 /// Evolution signals, feedback extraction, and the signal tracker.
 pub use signal::{
@@ -181,7 +189,8 @@ pub use trajectory::{
 };
 /// Test-time skill experience: banks, induction, dreaming, and consultation.
 pub use ttse::{
-    consult, render_tips, AddOutcome, ClassificationRule, ConsultResult, DreamReport, Dreamer,
-    SuccessAssessment, SuccessDetector, TipBank, TipBankStats, TipCategory, TipClassifier,
-    TipInducer, TipParser, TipRecord, TtseConfig, TtseEngine,
+    consult, consult_async, rank, render_tips, AddOutcome, ClassificationRule, ConsultResult,
+    DreamReport, Dreamer, EmbeddingIndex, IndexMatch, RankedTip, RetrieveMode, SuccessAssessment,
+    SuccessDetector, TipBank, TipBankStats, TipCategory, TipClassifier, TipInducer, TipParser,
+    TipRecord, TtseConfig, TtseEngine, RRF_K,
 };
