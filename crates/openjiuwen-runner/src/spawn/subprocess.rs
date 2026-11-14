@@ -22,6 +22,12 @@
 //! **No child outlives its handle.** Dropping the last reference kills and reaps
 //! the process, and the stderr drain and health tasks are aborted with it;
 //! `Command::kill_on_drop` is the final net for a runtime already shutting down.
+//!
+//! **The health cadence is per handle.** A child starts probing at its
+//! configuration's [`SubprocessConfig::health_check_interval_secs`], and
+//! [`SpawnedProcess::set_health_interval`] re-tunes that live handle (a zero
+//! interval stops the background loop, explicit probes keep working) without
+//! touching the child or the configuration the spawner reports.
 
 #[path = "subprocess_config.rs"]
 mod subprocess_config;
@@ -32,8 +38,8 @@ pub use subprocess_config::SubprocessConfig;
 // The exchange layer is a child module, so the helpers it owns are bound
 // explicitly; the rest of it is reached through them.
 use subprocess_io::{
-    force_kill_impl, health_impl, is_alive_impl, kill_child, send_impl, shutdown_impl,
-    spawn_health_task, spawn_stderr_task, stream_impl, write_frame,
+    force_kill_impl, health_impl, is_alive_impl, kill_child, send_impl, set_health_interval_impl,
+    shutdown_impl, spawn_health_task, spawn_stderr_task, stream_impl, write_frame,
 };
 
 use crate::error;
@@ -189,6 +195,8 @@ impl SubprocessSpawner {
             desynchronized: AtomicBool::new(false),
             healthy: AtomicBool::new(true),
             health_failures: AtomicU32::new(0),
+            health_interval: parking_lot::Mutex::new(self.config.health_interval()),
+            health_tuning: Mutex::new(()),
             health_task: Mutex::new(None),
             stderr_task: Mutex::new(None),
         });
@@ -234,7 +242,9 @@ impl AgentSpawner for SubprocessSpawner {
 /// Shared with the wrapper backends so a backend that reuses this protocol
 /// reports the settings it inherits: the program, its arguments, the working
 /// directory, the environment **names** (never their values), and the configured
-/// deadlines and caps.
+/// deadlines and caps. `health_check_interval_secs` is the interval a new child
+/// starts with — a live handle may have re-tuned its own cadence since — and no
+/// value here is ever read from an environment variable.
 pub(super) fn describe_settings(config: &SubprocessConfig) -> Map<String, Value> {
     let mut summary = Map::new();
     summary.insert("program".to_owned(), json!(config.program));
@@ -338,6 +348,39 @@ impl SpawnedProcess {
         health_impl(&self.state).await
     }
 
+    /// The background health interval currently in effect for this handle.
+    ///
+    /// It starts as the configuration's
+    /// [`SubprocessConfig::health_check_interval_secs`] and follows every
+    /// [`SpawnedProcess::set_health_interval`] call, so two handles of the same
+    /// spawner can supervise themselves at different rates.
+    #[must_use]
+    pub fn health_interval(&self) -> Duration {
+        self.state.health_interval()
+    }
+
+    /// Re-tunes the background health interval of this live child.
+    ///
+    /// The value is stored and the background loop is restarted so it uses it; a
+    /// [`Duration::ZERO`] interval stops the loop entirely, while explicit
+    /// [`SpawnedProcess::health`] probes keep working. The restarted loop starts
+    /// with a fresh delay, so the first probe of the new cadence comes one new
+    /// interval from now.
+    ///
+    /// A re-tune touches no protocol exchange: the child stays in sync, the
+    /// `healthy` flag is left as it was, and the consecutive-failure count is
+    /// preserved. Repeating a re-tune (with the same or a different value) is
+    /// idempotent and leaves exactly one loop running.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Validation`] when the handle's child is
+    /// no longer alive (a graceful shutdown, a kill, or a child that exited on its
+    /// own): a stopped handle supervises nothing, so respawn the agent instead.
+    pub async fn set_health_interval(&self, interval: Duration) -> Result<()> {
+        set_health_interval_impl(&self.state, interval).await
+    }
+
     /// Sends one invocation and awaits its terminal output.
     ///
     /// # Errors
@@ -432,6 +475,7 @@ impl fmt::Debug for SpawnedProcess {
             .field("pid", &self.state.pid)
             .field("alive", &self.is_alive())
             .field("healthy", &self.is_healthy())
+            .field("health_interval", &self.health_interval())
             .finish_non_exhaustive()
     }
 }
@@ -475,6 +519,12 @@ impl SpawnedAgent for SpawnedProcess {
     /// error rules.
     async fn health(&self) -> Result<bool> {
         health_impl(&self.state).await
+    }
+
+    /// The same re-tune as [`SpawnedProcess::set_health_interval`], reached
+    /// through the seam.
+    async fn set_health_interval(&self, interval: Duration) -> Result<()> {
+        set_health_interval_impl(&self.state, interval).await
     }
 
     async fn send(&self, inputs: Value) -> Result<AgentOutput> {
@@ -541,10 +591,27 @@ struct ProcessState {
     healthy: AtomicBool,
     /// Consecutive failed health probes.
     health_failures: AtomicU32,
+    /// The effective background health interval, re-tunable at runtime.
+    ///
+    /// A short synchronous `parking_lot` lock: it is never held across an `.await`.
+    /// It starts as [`SubprocessConfig::health_check_interval_secs`] and is what
+    /// the background loop reads, so a re-tune outlives the configuration value.
+    health_interval: parking_lot::Mutex<Duration>,
+    /// Serialises re-tuning so two callers cannot leave two loops behind.
+    health_tuning: Mutex<()>,
     /// The background health task, aborted when the handle stops.
-    health_task: Mutex<Option<JoinHandle<()>>>,
+    health_task: Mutex<Option<HealthTask>>,
     /// The stderr drain task, aborted when the handle stops.
     stderr_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// One running background health loop and the signal that stops it.
+struct HealthTask {
+    /// The loop itself; aborting it is the last resort, because an aborted
+    /// exchange leaves a stray reply behind.
+    handle: JoinHandle<()>,
+    /// Cancels the loop between probes, so a re-tune never abandons an exchange.
+    stop: tokio_util::sync::CancellationToken,
 }
 
 impl ProcessState {
@@ -554,6 +621,16 @@ impl ProcessState {
             Some(pid) => format!("child process {pid}"),
             None => format!("child process '{}'", self.id),
         }
+    }
+
+    /// The background health interval currently in effect.
+    fn health_interval(&self) -> Duration {
+        *self.health_interval.lock()
+    }
+
+    /// Stores a new background health interval.
+    fn store_health_interval(&self, interval: Duration) {
+        *self.health_interval.lock() = interval;
     }
 
     /// The request deadline from the configuration.
@@ -581,9 +658,9 @@ impl ProcessState {
 
     /// Aborts the background health task and waits for it to stop.
     async fn stop_health_task(&self) {
-        if let Some(handle) = self.health_task.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+        if let Some(task) = self.health_task.lock().await.take() {
+            task.handle.abort();
+            let _ = task.handle.await;
         }
     }
 
@@ -598,8 +675,8 @@ impl ProcessState {
 
 impl Drop for ProcessState {
     fn drop(&mut self) {
-        if let Some(handle) = self.health_task.get_mut().take() {
-            handle.abort();
+        if let Some(task) = self.health_task.get_mut().take() {
+            task.handle.abort();
         }
         if let Some(handle) = self.stderr_task.get_mut().take() {
             handle.abort();

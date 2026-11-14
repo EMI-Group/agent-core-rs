@@ -436,6 +436,21 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
         result
     }
 
+    /// Forwards a health-interval re-tune to the inner handle.
+    ///
+    /// A monitored subprocess handle therefore stays re-tunable; nothing extra is
+    /// recorded, because a cadence change is a configuration choice, not a
+    /// lifecycle transition.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner handle reports — including
+    /// [`openjiuwen_common::error::Error::Unsupported`] from a backend with no
+    /// background loop.
+    async fn set_health_interval(&self, interval: Duration) -> Result<()> {
+        self.inner.set_health_interval(interval).await
+    }
+
     /// Forwards task cancellation to the inner handle.
     ///
     /// # Errors

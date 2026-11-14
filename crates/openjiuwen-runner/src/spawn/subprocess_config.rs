@@ -14,6 +14,12 @@
 //! disables the background health task (explicit probes still work), and a `0`
 //! failure count never kills on health.
 //!
+//! The health interval is the initial value for each child: a live
+//! [`SpawnedProcess`](crate::spawn::SpawnedProcess) keeps its own effective
+//! interval and can re-tune it with
+//! [`SpawnedProcess::set_health_interval`](crate::spawn::SpawnedProcess::set_health_interval),
+//! so the configuration is never rewritten by a re-tune.
+//!
 //! [`SubprocessConfig::shutdown_timeout`] is the graceful-shutdown deadline a
 //! caller asks for with `Duration::ZERO`; a non-zero caller timeout wins over
 //! it, so the configuration is the default, never a silent no-op.
@@ -66,6 +72,11 @@ pub struct SubprocessConfig {
     /// Deadline for a graceful shutdown before a kill, in seconds.
     pub shutdown_timeout_secs: f64,
     /// Interval between background health probes, in seconds.
+    ///
+    /// This is the **initial** interval a new child starts with: a live handle
+    /// re-tunes its own cadence with
+    /// [`SpawnedProcess::set_health_interval`](crate::spawn::SpawnedProcess::set_health_interval),
+    /// so the configuration and the handle can disagree after a re-tune.
     ///
     /// `0.0` disables the background task; explicit
     /// [`SpawnedProcess::health`](crate::spawn::SpawnedProcess::health) calls
