@@ -68,6 +68,8 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `ServerSupervisor::run` retries the operation exactly once on a fresh client after sleeping `delay_for(attempt)` on the injected timer.
 - `RestartPolicy` defaults: 3 attempts, 500 ms base, exponential doubling, 8 s cap, no jitter (deterministic).
 - A successful start resets `attempts` to 0; exhausting the budget sets `ServerState::Failed` and returns `Error::Transport("LSP server '<name>' exceeded max crash recovery attempts (N); last error: ...")`.
+- A refused start (budget already exhausted) also records `Failed` with the underlying `last_error` under the same status lock, so a status read after a failed `restart()` never shows a stale `Stopped`/`Starting`.
+- Lock order is `client` before `status` on every path (`status`, `live_client`, `stop_current`); no lock is held across `.await` except the start serialization mutex.
 - `LspTool::shutdown`/`ServerSupervisor::shutdown` stop servers idempotently and permanently inhibit restarts (later calls fail with a typed "has been shut down" error).
 - Status and attempt counters are exposed through `LspTool::server_status()` / `ServerSupervisor::status()`.
 
@@ -76,9 +78,11 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `publish` is version-aware: a non-empty publish with a lower `version` than the stored one is ignored; otherwise it replaces the URI's set and records the version.
 - An empty diagnostic list clears the URI, resets its delivered-key history, and emits `DiagnosticsChange::Cleared`.
 - Entries dedupe by `message|severity|line:character|code`, are severity-sorted (Error first, unknown severity treated as 3), and are capped per file and per registry (`max_files`, least-recently-updated URI evicted).
+- `max_files` bounds *all* per-document state: the delivered-key history is capped at the same URI count (least-recently-drained dropped first), and a document evicted from the buffer loses its history with it, so a long session keeps no key set per URI ever seen.
 - `drain` mirrors Python `get_and_clear`: intra-round dedupe, cross-round suppression of delivered keys, per-file and global caps, local paths resolved from URIs.
 - The registry is an owned value per tool (shared through `LspTool::with_diagnostics`), not a process-global singleton; Python's `get_instance` singleton is deliberately not reproduced because the crate forbids undocumented global mutable state.
 - Push data wins over pull for a file; pull is attempted only when push is empty and the server advertises `diagnosticProvider`.
+- An `unchanged` pull answer without a cached full report triggers exactly one extra pull without `previousResultId`; if the server still answers `unchanged`, the payload carries `stale: true` (never a silently empty "clean" list).
 
 ## Constraints
 
