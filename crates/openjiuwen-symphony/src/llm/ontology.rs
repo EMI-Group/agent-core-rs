@@ -58,6 +58,29 @@
 //! candidates survive is deterministic. Candidates naming a capability that is not in
 //! the matcher's catalog carry no name or IO description to show the model and are
 //! skipped.
+//!
+//! # The persistent cache
+//!
+//! [`OntologyMatcher::with_cache`] installs a [`MatchCache`] (shared through a
+//! [`tokio::sync::Mutex`]), and [`OntologyMatcher::match_candidates_with`] then serves a
+//! repeated answer from disk instead of asking the model again:
+//!
+//! - every candidate is keyed by [`cache_key`] over the candidate's own JSON, the
+//!   [graph identity digests](graph_identity_sha256) of its source and target, and
+//!   [`OntologyMatcher::matcher_signature`] — a canonical document covering the matcher,
+//!   prompt, and reply-schema versions, the [`ModelIdentity`], the threshold, the
+//!   consensus switch, and the relation/direction/method strategy constants;
+//! - cached candidates are replayed and only the rest are sent to the model (in one
+//!   batch, exactly as before), so a fully cached call performs **no** model calls;
+//! - a fresh model answer is written back per candidate immediately; a deterministic
+//!   fallback answer is never cached, so a later run with a working model still asks;
+//! - [`MatchOptions::force`] ignores every hit and refreshes the entries;
+//! - a cache read, decode, or write problem is logged with `tracing::warn!` and the call
+//!   degrades to a normal model call — the model result is always returned, and a
+//!   changed signature or model identity simply means a miss, never a stale hit.
+//!
+//! Without a cache the matcher behaves exactly as it did before: one batch per call (two
+//! with consensus), same numbering, same validation, same fallbacks.
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -65,14 +88,20 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::graph::CAN_FEED;
+use crate::llm::cache::{cache_key, CachedMatch, MatchCache, CACHE_SCHEMA_VERSION};
+use crate::llm::identity::{
+    canonical_json, graph_identity_sha256, stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION,
+};
 use crate::model::{CapabilityDescriptor, CapabilityIo};
 use crate::orchestration::{MatchStrategy, RelationCandidate};
 
 use super::{
     clamp_unit, complete_json, dedupe_strings, truncate_text, CompletionModel, FallbackMode,
+    ModelConfig,
 };
 
 /// The `method` recorded for a single LLM pass.
@@ -81,6 +110,14 @@ pub const METHOD_LLM: &str = "llm_ontology_match";
 pub const METHOD_CONSENSUS: &str = "llm_consensus_match";
 /// The `method` recorded when the deterministic candidate confidence was used.
 pub const METHOD_DETERMINISTIC: &str = "deterministic_fallback";
+/// The matcher version folded into [`OntologyMatcher::matcher_signature`].
+pub const MATCHER_VERSION: &str = "Symphony-ontology-matcher-v2";
+/// The prompt version folded into [`OntologyMatcher::matcher_signature`].
+pub const PROMPT_VERSION: &str = "Orchestration-graph-match-v2";
+/// The reply-schema version folded into [`OntologyMatcher::matcher_signature`].
+pub const MATCH_SCHEMA_VERSION: &str = "Symphony-ontology-match-schema-v1";
+/// The backend recorded when no model is configured.
+const NO_MODEL_BACKEND: &str = "none";
 /// The default acceptance threshold (Python's `can_feed` gate).
 const DEFAULT_THRESHOLD: f64 = 0.7;
 /// The default cap on candidates matched per call.
@@ -222,6 +259,32 @@ impl fmt::Debug for OntologyConfig {
     }
 }
 
+/// Per-call behaviour for [`OntologyMatcher::match_candidates_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
+pub struct MatchOptions {
+    /// Ignore cached answers and refresh them from the model.
+    ///
+    /// `false` (the default) serves a cache hit without calling the model; `true` makes
+    /// every candidate a miss while still writing the fresh answers back.
+    pub force: bool,
+}
+
+impl MatchOptions {
+    /// Builds the default options (the cache is honoured).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets whether the cache is bypassed.
+    #[must_use]
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+}
+
 /// Validates `can_feed` relation candidates with a model, or with their own rule.
 #[derive(Debug, Clone)]
 pub struct OntologyMatcher {
@@ -229,6 +292,8 @@ pub struct OntologyMatcher {
     capabilities: Vec<CapabilityDescriptor>,
     /// The thresholds, model, and fallback in use.
     config: OntologyConfig,
+    /// The optional persistent answer cache shared between matchers.
+    cache: Option<Arc<Mutex<MatchCache>>>,
 }
 
 impl OntologyMatcher {
@@ -238,6 +303,7 @@ impl OntologyMatcher {
         Self {
             capabilities: capabilities.into_iter().collect(),
             config: OntologyConfig::default(),
+            cache: None,
         }
     }
 
@@ -255,6 +321,23 @@ impl OntologyMatcher {
         self
     }
 
+    /// Installs the persistent match cache.
+    ///
+    /// The cache is only consulted when a model is configured (without one the
+    /// deterministic path is already free), and it is shared through the supplied mutex
+    /// so several matchers can memoize into one file.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<Mutex<MatchCache>>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The installed match cache, if any.
+    #[must_use]
+    pub fn cache(&self) -> Option<&Arc<Mutex<MatchCache>>> {
+        self.cache.as_ref()
+    }
+
     /// The configuration in use.
     #[must_use]
     pub fn config(&self) -> &OntologyConfig {
@@ -267,10 +350,115 @@ impl OntologyMatcher {
         &self.capabilities
     }
 
+    /// The matcher identity folded into every cache key.
+    ///
+    /// The signature is canonical JSON (sorted keys, no whitespace) over:
+    /// [`MATCHER_VERSION`], [`PROMPT_VERSION`], [`MATCH_SCHEMA_VERSION`],
+    /// [`CACHE_SCHEMA_VERSION`], [`IDENTITY_VERSION`], a digest of the system prompt, the
+    /// [`ModelIdentity`], the acceptance threshold, the consensus switch, the candidate
+    /// cap, and the relation/direction/method/description-limit strategy constants.
+    ///
+    /// Any change to those inputs produces a different signature, which invalidates
+    /// every entry recorded under the previous one.
+    #[must_use]
+    pub fn matcher_signature(&self) -> String {
+        canonical_json(&self.signature_document())
+    }
+
+    /// The [`ModelConfig`] view of this matcher, used for its model identity.
+    fn model_config(&self) -> ModelConfig {
+        ModelConfig {
+            model: self.config.model.clone(),
+            temperature: None,
+            max_tokens: None,
+            fallback: self.config.fallback,
+        }
+    }
+
+    /// The backend name folded into the model identity.
+    ///
+    /// The crate has no separate provider field on [`OntologyConfig`], so the completion
+    /// model's own name identifies the backend.
+    fn backend(&self) -> &str {
+        self.config
+            .model
+            .as_deref()
+            .map(CompletionModel::name)
+            .unwrap_or(NO_MODEL_BACKEND)
+    }
+
+    /// Builds the canonical signature document.
+    fn signature_document(&self) -> Value {
+        let identity = ModelIdentity::of(&self.model_config(), self.backend());
+        let mut document = Map::new();
+        document.insert(
+            "matcher_version".to_string(),
+            Value::String(MATCHER_VERSION.to_string()),
+        );
+        document.insert(
+            "prompt_version".to_string(),
+            Value::String(PROMPT_VERSION.to_string()),
+        );
+        document.insert(
+            "match_schema_version".to_string(),
+            Value::String(MATCH_SCHEMA_VERSION.to_string()),
+        );
+        document.insert(
+            "cache_schema_version".to_string(),
+            Value::String(CACHE_SCHEMA_VERSION.to_string()),
+        );
+        document.insert(
+            "identity_version".to_string(),
+            Value::String(IDENTITY_VERSION.to_string()),
+        );
+        document.insert(
+            "system_prompt_sha256".to_string(),
+            Value::String(stable_metadata_sha256(&Value::String(
+                SYSTEM_PROMPT.to_string(),
+            ))),
+        );
+        document.insert(
+            "model".to_string(),
+            serde_json::to_value(&identity).unwrap_or(Value::Null),
+        );
+        document.insert("threshold".to_string(), Value::from(self.config.threshold));
+        document.insert(
+            "require_consensus".to_string(),
+            Value::Bool(self.config.require_consensus),
+        );
+        document.insert(
+            "max_candidates".to_string(),
+            Value::from(u64::try_from(self.config.max_candidates).unwrap_or(u64::MAX)),
+        );
+        document.insert("relation".to_string(), Value::String(CAN_FEED.to_string()));
+        document.insert(
+            "directions".to_string(),
+            Value::Array(vec![
+                Value::String(DIRECTION_FORWARD.to_string()),
+                Value::String(DIRECTION_REVERSE.to_string()),
+            ]),
+        );
+        document.insert(
+            "methods".to_string(),
+            Value::Array(vec![
+                Value::String(METHOD_LLM.to_string()),
+                Value::String(METHOD_CONSENSUS.to_string()),
+                Value::String(METHOD_DETERMINISTIC.to_string()),
+            ]),
+        );
+        document.insert(
+            "description_limit".to_string(),
+            Value::from(u64::try_from(DESCRIPTION_LIMIT).unwrap_or(u64::MAX)),
+        );
+        Value::Object(document)
+    }
+
     /// Validates `candidates`, answering one [`OntologyMatch`] per usable candidate.
     ///
     /// Matches are sorted by `(source_id, target_id)`; low-confidence verdicts are
-    /// returned with `accepted: false` so a caller can log them.
+    /// returned with `accepted: false` so a caller can log them. Cache hits are honoured;
+    /// use [`OntologyMatcher::match_candidates_with`] with
+    /// [`MatchOptions::with_force`] to bypass them.
     ///
     /// # Errors
     ///
@@ -280,6 +468,21 @@ impl OntologyMatcher {
         &self,
         candidates: &[RelationCandidate],
     ) -> Result<Vec<OntologyMatch>> {
+        self.match_candidates_with(candidates, &MatchOptions::default())
+            .await
+    }
+
+    /// Validates `candidates` with explicit [`MatchOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Llm`] when [`FallbackMode::Error`] is configured and the model
+    /// call fails or its reply is unusable.
+    pub async fn match_candidates_with(
+        &self,
+        candidates: &[RelationCandidate],
+        options: &MatchOptions,
+    ) -> Result<Vec<OntologyMatch>> {
         let batch = self.select_batch(candidates);
         if batch.is_empty() {
             return Ok(Vec::new());
@@ -287,18 +490,114 @@ impl OntologyMatcher {
         let Some(model) = self.config.model.as_deref() else {
             return Ok(self.deterministic_matches(&batch));
         };
-        let forward = match self.ask(model, &batch, false).await {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(self.resolve(model, &batch).await?.matches);
+        };
+
+        let signature = self.matcher_signature();
+        let keys: Vec<String> = batch
+            .iter()
+            .map(|entry| cache_key_for(entry, &signature))
+            .collect();
+        let mut resolved: Vec<OntologyMatch> = Vec::new();
+        let mut misses: Vec<(usize, BatchEntry<'_>)> = Vec::new();
+        if options.force {
+            misses.extend(batch.iter().cloned().enumerate());
+        } else {
+            // The async mutex is held only for the in-memory lookups, never across a
+            // model call.
+            let guard = cache.lock().await;
+            for (index, entry) in batch.iter().enumerate() {
+                match guard.lookup(&keys[index]).await {
+                    Some(record) => match decode_cached_matches(&record) {
+                        Some(matches) => resolved.extend(matches),
+                        None => {
+                            tracing::warn!(
+                                candidate = %candidate_identity(entry.candidate),
+                                "ontology matcher: cached answer is unusable; asking the model"
+                            );
+                            misses.push((index, entry.clone()));
+                        }
+                    },
+                    None => misses.push((index, entry.clone())),
+                }
+            }
+        }
+        if misses.is_empty() {
+            sort_matches(&mut resolved);
+            return Ok(resolved);
+        }
+
+        let miss_batch: Vec<BatchEntry<'_>> =
+            misses.iter().map(|(_, entry)| entry.clone()).collect();
+        let fresh = self.resolve(model, &miss_batch).await?;
+        if fresh.from_model {
+            let mut guard = cache.lock().await;
+            for (index, entry) in &misses {
+                let selected: Vec<OntologyMatch> = fresh
+                    .matches
+                    .iter()
+                    .filter(|item| covers(item, entry.candidate))
+                    .cloned()
+                    .collect();
+                let recorded = match serde_json::to_value(&selected) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "ontology matcher: a model answer could not be serialized; not cached"
+                        );
+                        continue;
+                    }
+                };
+                let record = CachedMatch::new(candidate_identity(entry.candidate), recorded);
+                if let Err(error) = guard.record(keys[*index].clone(), record).await {
+                    tracing::warn!(
+                        %error,
+                        "ontology matcher: match-cache write failed; the model answer is still used"
+                    );
+                }
+            }
+        }
+        resolved.extend(fresh.matches);
+        sort_matches(&mut resolved);
+        Ok(resolved)
+    }
+
+    /// Runs the model passes for `batch`, applying the configured fallback.
+    async fn resolve(
+        &self,
+        model: &dyn CompletionModel,
+        batch: &[BatchEntry<'_>],
+    ) -> Result<Resolved> {
+        let forward = match self.ask(model, batch, false).await {
             Ok(matches) => matches,
-            Err(error) => return self.on_failure(&batch, &error),
+            Err(error) => {
+                return Ok(Resolved {
+                    matches: self.on_failure(batch, &error)?,
+                    from_model: false,
+                });
+            }
         };
         if !self.config.require_consensus {
-            return Ok(forward);
+            return Ok(Resolved {
+                matches: forward,
+                from_model: true,
+            });
         }
-        let reverse = match self.ask(model, &batch, true).await {
+        let reverse = match self.ask(model, batch, true).await {
             Ok(matches) => matches,
-            Err(error) => return self.on_failure(&batch, &error),
+            Err(error) => {
+                return Ok(Resolved {
+                    matches: self.on_failure(batch, &error)?,
+                    from_model: false,
+                });
+            }
         };
-        Ok(self.consensus(&forward, &reverse))
+        Ok(Resolved {
+            matches: self.consensus(&forward, &reverse),
+            from_model: true,
+        })
     }
 
     /// Filters `candidates` to the describable ones, sorts them, and numbers them.
@@ -560,6 +859,7 @@ impl OntologyMatcher {
 }
 
 /// One numbered candidate, resolved against the catalog.
+#[derive(Clone)]
 struct BatchEntry<'a> {
     /// The batch id (`c1`, `c2`, …).
     id: String,
@@ -569,6 +869,61 @@ struct BatchEntry<'a> {
     target: &'a CapabilityDescriptor,
     /// The candidate being validated.
     candidate: &'a RelationCandidate,
+}
+
+/// The outcome of one model resolution (with or without consensus).
+struct Resolved {
+    /// The matches the passes produced.
+    matches: Vec<OntologyMatch>,
+    /// Whether they came from the model (`false` means the deterministic fallback ran).
+    from_model: bool,
+}
+
+/// Returns the cache key for one batch entry and the matcher `signature`.
+fn cache_key_for(entry: &BatchEntry<'_>, signature: &str) -> String {
+    let candidate = serde_json::to_value(entry.candidate).unwrap_or_else(|error| {
+        tracing::warn!(
+            %error,
+            candidate = %candidate_identity(entry.candidate),
+            "ontology matcher: candidate could not be serialized for its cache key"
+        );
+        Value::Null
+    });
+    cache_key(
+        &candidate,
+        &graph_identity_sha256(entry.source),
+        &graph_identity_sha256(entry.target),
+        signature,
+    )
+}
+
+/// The documented candidate identity recorded with a cached answer
+/// (Python's `RelationCandidate.key`: `source->target:relation`).
+fn candidate_identity(candidate: &RelationCandidate) -> String {
+    let relation = if candidate.relation.trim().is_empty() {
+        CAN_FEED
+    } else {
+        candidate.relation.as_str()
+    };
+    format!("{}->{}:{relation}", candidate.source, candidate.target)
+}
+
+/// Reports whether `item` answers the `candidate` pair, in either orientation.
+fn covers(item: &OntologyMatch, candidate: &RelationCandidate) -> bool {
+    let forward = item.source_id == candidate.source && item.target_id == candidate.target;
+    let reverse = item.source_id == candidate.target && item.target_id == candidate.source;
+    forward || reverse
+}
+
+/// Decodes the match list of a cached record, answering `None` when it is unusable.
+fn decode_cached_matches(record: &CachedMatch) -> Option<Vec<OntologyMatch>> {
+    match serde_json::from_value::<Vec<OntologyMatch>>(record.matches.clone()) {
+        Ok(matches) => Some(matches),
+        Err(error) => {
+            tracing::warn!(%error, "ontology matcher: cached matches could not be decoded");
+            None
+        }
+    }
 }
 
 /// Builds the compact request batch, pruning blank fields and empty arrays.
