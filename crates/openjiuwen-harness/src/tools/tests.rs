@@ -1016,9 +1016,7 @@ async fn mcp_resource_tools_without_a_provider_report_the_typed_failure() {
 #[tokio::test]
 async fn mcp_resource_subscription_tool_uses_the_registry() {
     let dir = tempfile::tempdir().expect("temp workspace");
-    let provider = Arc::new(
-        super::mcp_subscriptions::FakeMcpResourceSubscriptionProvider::new(),
-    );
+    let provider = Arc::new(super::mcp_subscriptions::FakeMcpResourceSubscriptionProvider::new());
     let subscriptions = Arc::new(
         super::mcp_subscriptions::McpResourceSubscriptions::new()
             .with_provider(provider.clone())
@@ -1034,11 +1032,11 @@ async fn mcp_resource_subscription_tool_uses_the_registry() {
         json!({"action": "subscribe", "uri": "mem://notes"}),
     )
     .await;
-    assert_eq!(subscribed["success"], true, "subscribe failed: {subscribed}");
     assert_eq!(
-        subscribed["data"]["subscription"]["capacity"],
-        json!(4)
+        subscribed["success"], true,
+        "subscribe failed: {subscribed}"
     );
+    assert_eq!(subscribed["data"]["subscription"]["capacity"], json!(4));
 
     assert!(provider.push_notification("mem://notes", "changed"));
     let polled = invoke(
@@ -1050,7 +1048,12 @@ async fn mcp_resource_subscription_tool_uses_the_registry() {
     assert_eq!(polled["data"]["count"], json!(1));
     assert_eq!(polled["data"]["events"][0]["reason"], "changed");
 
-    let listed = invoke(&tools, "mcp_resource_subscription", json!({"action": "list"})).await;
+    let listed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "list"}),
+    )
+    .await;
     assert_eq!(listed["data"]["count"], json!(1));
     assert_eq!(listed["data"]["capacity"], json!(4));
 
@@ -1061,10 +1064,7 @@ async fn mcp_resource_subscription_tool_uses_the_registry() {
     )
     .await;
     assert_eq!(closed["success"], true, "unsubscribe failed: {closed}");
-    assert_eq!(
-        provider.unsubscribe_calls(),
-        vec!["mem://notes".to_owned()]
-    );
+    assert_eq!(provider.unsubscribe_calls(), vec!["mem://notes".to_owned()]);
 }
 
 #[tokio::test]
@@ -1079,7 +1079,10 @@ async fn mcp_resource_subscription_tool_without_a_registry_reports_the_typed_fai
     .await;
     assert_eq!(payload["success"], false);
     let error = payload["error"].as_str().expect("error text");
-    assert!(error.contains("no subscription registry is configured"), "error: {error}");
+    assert!(
+        error.contains("no subscription registry is configured"),
+        "error: {error}"
+    );
 }
 
 #[test]

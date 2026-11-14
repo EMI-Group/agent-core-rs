@@ -118,7 +118,10 @@ impl McpResourceSubscriptionTool {
     /// A `None` registry is legal: [`Tool::invoke`] then reports the "not available" failure
     /// instead of pretending the action succeeded.
     #[must_use]
-    pub fn new(registry: Option<Arc<McpResourceSubscriptions>>, language: impl Into<String>) -> Self {
+    pub fn new(
+        registry: Option<Arc<McpResourceSubscriptions>>,
+        language: impl Into<String>,
+    ) -> Self {
         let language = language.into();
         Self {
             card: Self::card_for(&language),
@@ -261,7 +264,10 @@ fn resolve_limit(value: Option<u64>) -> usize {
 /// Installs the action-shaped property hints the generated schema cannot express.
 fn install_input_params(input_params: &mut Value, language: &str) {
     let english = crate::tools::is_english(language);
-    let Some(properties) = input_params.get_mut("properties").and_then(Value::as_object_mut) else {
+    let Some(properties) = input_params
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
         return;
     };
     let limit = if english {
@@ -328,21 +334,21 @@ mod tests {
         assert_eq!(card.name, TOOL_NAME);
         assert!(!card.parallel_safe);
         assert_eq!(card.input_params["required"], json!(["action"]));
-        assert_eq!(
-            card.description,
-            descriptions::description(TOOL_NAME, "en")
-        );
+        assert_eq!(card.description, descriptions::description(TOOL_NAME, "en"));
         let properties = card.input_params["properties"].as_object().unwrap();
         let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["action", "limit", "uri"]);
-        assert!(!properties["limit"]["description"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert_ne!(
+            properties["limit"]["description"].as_str().unwrap(),
+            String::new()
+        );
 
         let chinese = McpResourceSubscriptionTool::card_for("cn");
-        assert_eq!(chinese.description, descriptions::description(TOOL_NAME, "cn"));
+        assert_eq!(
+            chinese.description,
+            descriptions::description(TOOL_NAME, "cn")
+        );
         assert!(chinese.input_params["properties"]["uri"]["description"]
             .as_str()
             .unwrap()
@@ -359,7 +365,10 @@ mod tests {
         ] {
             assert_eq!(SubscriptionAction::parse(action.as_str()), Some(action));
         }
-        assert_eq!(SubscriptionAction::parse(" poll "), Some(SubscriptionAction::Poll));
+        assert_eq!(
+            SubscriptionAction::parse(" poll "),
+            Some(SubscriptionAction::Poll)
+        );
         assert_eq!(SubscriptionAction::parse("get"), None);
     }
 
@@ -378,7 +387,10 @@ mod tests {
 
         let subscribed = invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
         assert_eq!(subscribed["success"], json!(true));
-        assert_eq!(subscribed["data"]["message"], json!("subscribed to mem://a"));
+        assert_eq!(
+            subscribed["data"]["message"],
+            json!("subscribed to mem://a")
+        );
         assert_eq!(subscribed["data"]["subscription"]["uri"], "mem://a");
         assert_eq!(
             subscribed["data"]["subscription"]["capacity"],
@@ -430,7 +442,11 @@ mod tests {
             assert!(provider.push_notification("mem://a", text));
         }
 
-        let polled = invoke(&tool, json!({"action": "poll", "uri": "mem://a", "limit": 2})).await;
+        let polled = invoke(
+            &tool,
+            json!({"action": "poll", "uri": "mem://a", "limit": 2}),
+        )
+        .await;
         assert_eq!(polled["data"]["count"], json!(2));
         assert_eq!(polled["data"]["events"][0]["reason"], "one");
         assert_eq!(polled["data"]["events"][1]["reason"], "two");
@@ -444,10 +460,7 @@ mod tests {
         let bare = McpResourceSubscriptionTool::new(None, "en");
         let payload = invoke(&bare, json!({"action": "list"})).await;
         assert_eq!(payload["success"], json!(false));
-        assert_eq!(
-            payload["error"],
-            json!(NO_REGISTRY_MESSAGE)
-        );
+        assert_eq!(payload["error"], json!(NO_REGISTRY_MESSAGE));
 
         let provider = Arc::new(FakeMcpResourceSubscriptionProvider::unsupported());
         let tool = McpResourceSubscriptionTool::new(Some(registry(provider)), "en");

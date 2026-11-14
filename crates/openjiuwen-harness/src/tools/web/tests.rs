@@ -342,7 +342,11 @@ async fn loopback_search_encodes_the_query_and_clamps_the_result_count() {
     let tool = loopback_search_tool(server.url("/search"));
 
     // `max_results: 0` is clamped up to the minimum of one.
-    let payload = search(&tool, json!({"query": "rust & async/await", "max_results": 0})).await;
+    let payload = search(
+        &tool,
+        json!({"query": "rust & async/await", "max_results": 0}),
+    )
+    .await;
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
         payload["data"]["results"],
@@ -357,9 +361,8 @@ async fn loopback_search_encodes_the_query_and_clamps_the_result_count() {
     let requests = requests.lock();
     assert_eq!(requests.len(), 3);
     assert!(
-        requests[0].starts_with(
-            "GET /search?q=rust%20%26%20async%2Fawait&max_results=1 HTTP/1.1\r\n"
-        ),
+        requests[0]
+            .starts_with("GET /search?q=rust%20%26%20async%2Fawait&max_results=1 HTTP/1.1\r\n"),
         "request: {}",
         requests[0]
     );

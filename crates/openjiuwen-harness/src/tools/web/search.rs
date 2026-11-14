@@ -480,10 +480,7 @@ impl WebSearchTool {
     /// reports the typed configuration gap on every call, exactly like a tool with no backend.
     #[must_use]
     pub fn with_endpoint(endpoint: impl Into<String>, language: impl Into<String>) -> Self {
-        Self::new(
-            Some(Arc::new(HttpSearchBackend::new(endpoint))),
-            language,
-        )
+        Self::new(Some(Arc::new(HttpSearchBackend::new(endpoint))), language)
     }
 
     /// Builds the model-facing card in `language`.
@@ -759,26 +756,24 @@ mod tests {
             "with_search_backend",
             "not ported",
         ] {
-            assert!(reason.contains(needle), "reason: {reason} (misses {needle})");
+            assert!(
+                reason.contains(needle),
+                "reason: {reason} (misses {needle})"
+            );
         }
     }
 
     #[test]
     fn endpoint_lookup_reads_and_trims_the_documented_variable() {
-        let backend =
-            HttpSearchBackend::from_lookup(|key| {
-                (key == ENDPOINT_ENV).then(|| "  https://api.example/s  ".to_owned())
-            })
-            .unwrap();
+        let backend = HttpSearchBackend::from_lookup(|key| {
+            (key == ENDPOINT_ENV).then(|| "  https://api.example/s  ".to_owned())
+        })
+        .unwrap();
         assert!(backend.is_configured());
         assert_eq!(backend.endpoint, "https://api.example/s");
 
         // Unset, blank and non-matching keys are the same typed configuration gap.
-        for lookup in [
-            None,
-            Some(String::new()),
-            Some("   ".to_owned()),
-        ] {
+        for lookup in [None, Some(String::new()), Some("   ".to_owned())] {
             let error = HttpSearchBackend::from_lookup(|_| lookup.clone())
                 .err()
                 .unwrap();
@@ -797,7 +792,11 @@ mod tests {
         let error = backend.search("rust", 2).await.unwrap_err();
         assert!(matches!(error, Error::Unsupported(_)), "error: {error:?}");
         assert_eq!(&*error.message(), not_configured_reason().as_str());
-        assert_eq!(fetcher.calls(), 0, "no request is issued for a blank endpoint");
+        assert_eq!(
+            fetcher.calls(),
+            0,
+            "no request is issued for a blank endpoint"
+        );
     }
 
     /// A provider that is configured but cannot serve the deployment (for example a vendor SDK

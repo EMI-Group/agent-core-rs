@@ -63,7 +63,8 @@ pub const MAX_BUFFER_CAPACITY: usize = 1024;
 ///
 /// Provider implementations may reuse it verbatim; it names the missing capability so a host
 /// can tell "this server cannot subscribe" apart from a transport or permission failure.
-pub const SUBSCRIBE_UNSUPPORTED: &str = "MCP resource subscriptions are not supported by this provider: \
+pub const SUBSCRIBE_UNSUPPORTED: &str =
+    "MCP resource subscriptions are not supported by this provider: \
      it exposes list_resources/read_resource but no resources/subscribe callback";
 
 /// The reason [`McpResourceSubscriptionProvider::unsubscribe`]'s default reports.
@@ -313,7 +314,10 @@ impl std::fmt::Debug for McpResourceSubscriptions {
             .debug_struct("McpResourceSubscriptions")
             .field("capacity", &self.capacity)
             .field("provider", &self.provider.is_some())
-            .field("subscriptions", &self.subscriptions.lock().keys().collect::<Vec<_>>())
+            .field(
+                "subscriptions",
+                &self.subscriptions.lock().keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -391,9 +395,12 @@ impl McpResourceSubscriptions {
         };
         let state = Arc::new(SubscriptionState::new(uri, self.capacity));
         provider
-            .subscribe(uri, &McpResourceSink {
-                state: Arc::clone(&state),
-            })
+            .subscribe(
+                uri,
+                &McpResourceSink {
+                    state: Arc::clone(&state),
+                },
+            )
             .await?;
         self.subscriptions
             .lock()
@@ -413,12 +420,10 @@ impl McpResourceSubscriptions {
         if uri.is_empty() {
             return Err(Error::validation("uri is required"));
         }
-        let state = self
-            .subscriptions
-            .lock()
-            .get(uri)
-            .cloned()
-            .ok_or_else(|| Error::not_found(format!("no MCP resource subscription for `{uri}`")))?;
+        let state =
+            self.subscriptions.lock().get(uri).cloned().ok_or_else(|| {
+                Error::not_found(format!("no MCP resource subscription for `{uri}`"))
+            })?;
         if let Some(provider) = self.provider.clone() {
             provider.unsubscribe(uri).await?;
         }
@@ -646,9 +651,7 @@ impl McpResourceSubscriptionProvider for FakeMcpResourceSubscriptionProvider {
         if let Some(message) = failure {
             return Err(Error::tool(message));
         }
-        self.sinks
-            .lock()
-            .insert(uri.to_owned(), sink.clone());
+        self.sinks.lock().insert(uri.to_owned(), sink.clone());
         Ok(())
     }
 
@@ -689,9 +692,7 @@ mod tests {
     }
 
     /// A registry over `provider` with the default capacity.
-    fn registry(
-        provider: Arc<FakeMcpResourceSubscriptionProvider>,
-    ) -> McpResourceSubscriptions {
+    fn registry(provider: Arc<FakeMcpResourceSubscriptionProvider>) -> McpResourceSubscriptions {
         McpResourceSubscriptions::new().with_provider(provider)
     }
 
@@ -725,7 +726,7 @@ mod tests {
         assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
         assert!(error.message().contains("resources/subscribe"));
         assert!(!subscriptions.is_subscribed("mem://a"));
-        assert!(subscriptions.list().is_empty());
+        assert_eq!(subscriptions.list().len(), 0);
     }
 
     #[tokio::test]
@@ -762,13 +763,16 @@ mod tests {
         let events = subscriptions.poll("mem://a", 1).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 1);
-        assert_eq!(events[0].content.as_ref().unwrap().text.as_deref(), Some("one"));
+        assert_eq!(
+            events[0].content.as_ref().unwrap().text.as_deref(),
+            Some("one")
+        );
         assert_eq!(events[0].uri, "mem://a");
 
         let rest = subscriptions.poll("mem://a", 0).unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].reason.as_deref(), Some("touched"));
-        assert!(subscriptions.poll("mem://a", 10).unwrap().is_empty());
+        assert_eq!(subscriptions.poll("mem://a", 10).unwrap().len(), 0);
         assert_eq!(subscriptions.info("mem://a").unwrap().buffered, 0);
     }
 
@@ -802,7 +806,10 @@ mod tests {
 
     #[test]
     fn capacity_is_clamped() {
-        assert_eq!(McpResourceSubscriptions::new().capacity(), DEFAULT_BUFFER_CAPACITY);
+        assert_eq!(
+            McpResourceSubscriptions::new().capacity(),
+            DEFAULT_BUFFER_CAPACITY
+        );
         assert_eq!(
             McpResourceSubscriptions::new().with_capacity(0).capacity(),
             MIN_BUFFER_CAPACITY
@@ -882,7 +889,9 @@ mod tests {
         for error in [
             subscriptions.info("mem://a").unwrap_err(),
             subscriptions.poll("mem://a", 1).unwrap_err(),
-            subscriptions.publish("mem://a", content("mem://a", "x")).unwrap_err(),
+            subscriptions
+                .publish("mem://a", content("mem://a", "x"))
+                .unwrap_err(),
             subscriptions.sink("mem://a").unwrap_err(),
             subscriptions.events("mem://a").unwrap_err(),
         ] {
@@ -895,7 +904,9 @@ mod tests {
     #[tokio::test]
     async fn publish_and_sink_publish_into_an_open_subscription() {
         let subscriptions = McpResourceSubscriptions::new().with_capacity(4);
-        subscriptions.subscribe("mem://a").await.unwrap_err();
+        // Without a provider the subscribe fails, which is what leaves the registry empty here.
+        let error = subscriptions.subscribe("mem://a").await.err().unwrap();
+        assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
 
         // Registered out of band: a host that opened the subscription itself.
         let state = Arc::new(SubscriptionState::new("mem://a", 4));
@@ -904,7 +915,12 @@ mod tests {
             .lock()
             .insert("mem://a".to_owned(), Arc::clone(&state));
 
-        assert_eq!(subscriptions.publish("mem://a", content("mem://a", "a")).unwrap(), 1);
+        assert_eq!(
+            subscriptions
+                .publish("mem://a", content("mem://a", "a"))
+                .unwrap(),
+            1
+        );
         let sink = subscriptions.sink("mem://a").unwrap();
         assert_eq!(sink.uri(), "mem://a");
         sink.notified("touched");

@@ -820,7 +820,7 @@ mod tests {
 
     #[async_trait]
     impl McpClient for StubClient {
-        fn server_name(&self) -> &str {
+        fn server_name(&self) -> &'static str {
             "stub"
         }
 
@@ -902,7 +902,12 @@ mod tests {
         assert_eq!(read["data"]["resource"]["byte_size"], 5);
         assert_eq!(read["data"]["resource"]["blob_base64"], Value::Null);
         assert_eq!(client.read_calls.lock().clone(), vec!["mem://a".to_owned()]);
-        assert_eq!(McpClientResourceProvider::new(client).client().server_name(), "stub");
+        assert_eq!(
+            McpClientResourceProvider::new(client)
+                .client()
+                .server_name(),
+            "stub"
+        );
     }
 
     #[tokio::test]
@@ -913,7 +918,7 @@ mod tests {
         )));
         let error = empty.read_resource("mem://a").await.unwrap_err();
         assert!(matches!(error, Error::NotFound(_)), "error: {error}");
-        assert!(empty.list_resources().await.unwrap().is_empty());
+        assert_eq!(empty.list_resources().await.unwrap().len(), 0);
 
         let binary = Arc::new(McpClientResourceProvider::new(StubClient::new(
             Vec::new(),
@@ -949,7 +954,10 @@ mod tests {
             .with_provider(Arc::new(provider));
         let error = registry.subscribe("mem://a").await.unwrap_err();
         assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
-        assert!(error.message().contains("resources/subscribe"), "error: {error}");
+        assert!(
+            error.message().contains("resources/subscribe"),
+            "error: {error}"
+        );
         assert!(!registry.is_subscribed("mem://a"));
     }
 

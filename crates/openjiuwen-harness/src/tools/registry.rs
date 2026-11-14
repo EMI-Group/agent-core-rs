@@ -17,10 +17,9 @@ use crate::worktree::{WorktreeManager, WorktreeTool};
 
 use super::{
     cron, discovery, goal, mcp_resources, mcp_subscription_tool, mcp_subscriptions, media, web,
-    AskUserTool, BashTool, BuiltinTool,
-    EditFileTool, GlobTool, GrepTool, ListDirTool, MemoryTool, MemoryToolBackend, MemoryToolKind,
-    ReadFileTool, ReadStateRegistry, TodoCreateTool, TodoGetTool, TodoListTool, TodoModifyTool,
-    TodoStore, ToolEnv, UserAsker, WriteFileTool,
+    AskUserTool, BashTool, BuiltinTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MemoryTool,
+    MemoryToolBackend, MemoryToolKind, ReadFileTool, ReadStateRegistry, TodoCreateTool,
+    TodoGetTool, TodoListTool, TodoModifyTool, TodoStore, ToolEnv, UserAsker, WriteFileTool,
 };
 
 /// Maps a memory [`BuiltinTool`] variant to its [`MemoryToolKind`].
