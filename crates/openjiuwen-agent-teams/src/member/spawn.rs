@@ -21,7 +21,7 @@
 //! [`SpawnRegistry::cancel_all`].
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,6 +34,8 @@ use tracing::debug;
 
 use super::runtime::MemberRuntime;
 use super::spawn_config::{MemberSpawnOptions, StdioCommand};
+use crate::runtime::checkpoints::CHECKPOINT_DIR;
+use crate::runtime::spec_meta::{CheckpointConfig, CheckpointStoreConfig};
 
 /// Environment variable carrying the owning team name to a spawned member process.
 pub const TEAM_NAME_ENV: &str = "OPENJIUWEN_TEAM_NAME";
@@ -43,6 +45,22 @@ pub const MEMBER_NAME_ENV: &str = "OPENJIUWEN_MEMBER_NAME";
 pub const SESSION_ID_ENV: &str = "OPENJIUWEN_SESSION_ID";
 /// Environment variable carrying the member's workspace root to a spawned member process.
 pub const MEMBER_WORKSPACE_ENV: &str = "OPENJIUWEN_MEMBER_WORKSPACE";
+/// Environment variable telling a spawned member process whether to capture checkpoints.
+///
+/// [`CHECKPOINT_OFF`] disables every capture and resume attempt; any other value — and an absent
+/// variable — leaves checkpointing enabled, so a leader that exports nothing keeps the served
+/// member on its own enabled default.
+pub const CHECKPOINT_ENV: &str = "OPENJIUWEN_MEMBER_CHECKPOINTS";
+/// Environment variable naming the directory a spawned member writes file-backed checkpoints into.
+///
+/// The leader exports the absolute directory it resolved for the member, so a file-backed store
+/// with no pinned directory reaches the child as `<workspace root>/.openjiuwen/checkpoints`. An
+/// absent or blank variable leaves the served member on its process-local in-memory store.
+pub const CHECKPOINT_DIR_ENV: &str = "OPENJIUWEN_MEMBER_CHECKPOINT_DIR";
+/// Value of [`CHECKPOINT_ENV`] that disables checkpointing in a spawned member.
+pub const CHECKPOINT_OFF: &str = "off";
+/// Value of [`CHECKPOINT_ENV`] that keeps checkpointing enabled in a spawned member.
+pub const CHECKPOINT_ON: &str = "on";
 
 /// Everything a spawner needs to bring one member up.
 ///
@@ -66,6 +84,14 @@ pub struct MemberSpawnRequest {
     /// Defaults to in-process, so a payload without `options` spawns the member the way this
     /// crate has always done it.
     pub options: MemberSpawnOptions,
+    /// Checkpoint settings the leader resolved for this member.
+    ///
+    /// A child-process transport exports them as [`CHECKPOINT_ENV`]/[`CHECKPOINT_DIR_ENV`] (see
+    /// [`Self::checkpoint_env`]); `None` — the default — exports nothing, so a served member keeps
+    /// its own enabled default. The field stays out of the JSON form: it travels to a spawner
+    /// in-process and never crosses a wire.
+    #[serde(skip)]
+    pub checkpoint: Option<CheckpointConfig>,
 }
 
 impl MemberSpawnRequest {
@@ -83,6 +109,7 @@ impl MemberSpawnRequest {
             session_id: session_id.into(),
             workspace_root: workspace_root.into(),
             options: MemberSpawnOptions::default(),
+            checkpoint: None,
         }
     }
 
@@ -93,16 +120,27 @@ impl MemberSpawnRequest {
         self
     }
 
+    /// Attaches the checkpoint settings the leader resolved for this member.
+    ///
+    /// The build path reads them from `metadata["checkpoint"]`; a request that never sets them
+    /// leaves [`Self::checkpoint`] `None` and therefore exports nothing.
+    #[must_use]
+    pub fn with_checkpoint_config(mut self, checkpoint: CheckpointConfig) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Returns the identity environment a child-process spawner exports to the member.
     ///
     /// A spawned member process cannot inherit the request, and the JSON-lines member protocol
     /// carries only the session id in its `start` frame, so the team name, member name, session id
-    /// and workspace root cross the process boundary as environment variables. Empty values are
-    /// omitted so an unset field never blanks a variable the child already has.
+    /// and workspace root cross the process boundary as environment variables, together with the
+    /// checkpoint settings of [`Self::checkpoint_env`]. Empty values are omitted so an unset field
+    /// never blanks a variable the child already has.
     #[must_use]
     pub fn identity_env(&self) -> BTreeMap<String, String> {
         let workspace = self.workspace_root.to_string_lossy().into_owned();
-        [
+        let mut env: BTreeMap<String, String> = [
             (TEAM_NAME_ENV, self.team_name.as_str()),
             (MEMBER_NAME_ENV, self.member_name.as_str()),
             (SESSION_ID_ENV, self.session_id.as_str()),
@@ -111,7 +149,39 @@ impl MemberSpawnRequest {
         .into_iter()
         .filter(|(_, value)| !value.is_empty())
         .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
+        .collect();
+        env.extend(self.checkpoint_env());
+        env
+    }
+
+    /// Returns the checkpoint environment a child-process spawner exports to the member.
+    ///
+    /// The served member cannot read the leader's configuration any other way, so two variables
+    /// carry it: [`CHECKPOINT_ENV`] ([`CHECKPOINT_OFF`] for a disabled policy, [`CHECKPOINT_ON`]
+    /// otherwise) and — for a file-backed store — [`CHECKPOINT_DIR_ENV`] with the absolute
+    /// directory to write into, an unpinned file root resolving to
+    /// `<workspace root>/.openjiuwen/checkpoints`.
+    ///
+    /// An absent [`checkpoint`](Self::checkpoint) configuration exports nothing at all, so the
+    /// served member keeps its own enabled default on a process-local in-memory store.
+    #[must_use]
+    pub fn checkpoint_env(&self) -> BTreeMap<String, String> {
+        let Some(config) = &self.checkpoint else {
+            return BTreeMap::new();
+        };
+        let enabled = config.policy.is_enabled();
+        let mut env = BTreeMap::new();
+        env.insert(
+            CHECKPOINT_ENV.to_owned(),
+            if enabled { CHECKPOINT_ON } else { CHECKPOINT_OFF }.to_owned(),
+        );
+        if let Some(dir) = checkpoint_dir(config, &self.workspace_root) {
+            env.insert(
+                CHECKPOINT_DIR_ENV.to_owned(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
+        env
     }
 
     /// Applies [`Self::identity_env`] to `command` without overriding an explicitly configured value.
@@ -323,6 +393,22 @@ impl SpawnRegistry {
     }
 }
 
+/// Resolves the directory a child-process member writes file-backed checkpoints into.
+///
+/// `None` when the policy is disabled or the store stays in memory, the pinned directory when the
+/// configuration names one, and `<workspace root>/.openjiuwen/checkpoints` for the file backend
+/// without a pinned root — the same rule the in-process member build applies.
+fn checkpoint_dir(config: &CheckpointConfig, workspace_root: &Path) -> Option<PathBuf> {
+    if !config.policy.is_enabled() {
+        return None;
+    }
+    match &config.store {
+        CheckpointStoreConfig::Memory => None,
+        CheckpointStoreConfig::File { dir: Some(dir) } => Some(dir.clone()),
+        CheckpointStoreConfig::File { dir: None } => Some(workspace_root.join(CHECKPOINT_DIR)),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -331,6 +417,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::harness::MemberCheckpointPolicy;
     use crate::member::spawn_config::{MemberSpawnKind, MemberSpawnOptions, SshTransportSpec};
 
     fn finished_handle(member_name: &str) -> InProcessSpawnHandle {
@@ -523,6 +610,112 @@ mod tests {
             command.env().get(TEAM_NAME_ENV).map(String::as_str),
             Some("alpha")
         );
+    }
+
+    #[test]
+    fn checkpoint_env_is_absent_without_a_configuration() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws");
+        assert!(request.checkpoint_env().is_empty());
+        let env = request.identity_env();
+        assert!(!env.contains_key(CHECKPOINT_ENV));
+        assert!(!env.contains_key(CHECKPOINT_DIR_ENV));
+    }
+
+    #[test]
+    fn checkpoint_env_carries_the_resolved_directory() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig {
+                policy: MemberCheckpointPolicy::default(),
+                store: CheckpointStoreConfig::File {
+                    dir: Some(PathBuf::from("/tmp/cp")),
+                },
+            });
+        let env = request.identity_env();
+        assert_eq!(
+            env.get(CHECKPOINT_ENV).map(String::as_str),
+            Some(CHECKPOINT_ON)
+        );
+        assert_eq!(
+            env.get(CHECKPOINT_DIR_ENV).map(String::as_str),
+            Some("/tmp/cp")
+        );
+    }
+
+    #[test]
+    fn an_unpinned_file_root_is_exported_under_the_workspace() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig {
+                policy: MemberCheckpointPolicy::default(),
+                store: CheckpointStoreConfig::File { dir: None },
+            });
+        assert_eq!(
+            request.checkpoint_env().get(CHECKPOINT_DIR_ENV),
+            Some(&"/tmp/ws/.openjiuwen/checkpoints".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_memory_store_exports_enabled_without_a_directory() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig::default());
+        let env = request.checkpoint_env();
+        assert_eq!(
+            env.get(CHECKPOINT_ENV).map(String::as_str),
+            Some(CHECKPOINT_ON)
+        );
+        assert!(!env.contains_key(CHECKPOINT_DIR_ENV));
+    }
+
+    #[test]
+    fn a_disabled_policy_exports_off_and_no_directory() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig {
+                policy: MemberCheckpointPolicy::disabled(),
+                store: CheckpointStoreConfig::File {
+                    dir: Some(PathBuf::from("/tmp/cp")),
+                },
+            });
+        let env = request.checkpoint_env();
+        assert_eq!(
+            env.get(CHECKPOINT_ENV).map(String::as_str),
+            Some(CHECKPOINT_OFF)
+        );
+        assert!(!env.contains_key(CHECKPOINT_DIR_ENV));
+    }
+
+    #[test]
+    fn checkpoint_env_respects_an_explicit_override() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig {
+                policy: MemberCheckpointPolicy::default(),
+                store: CheckpointStoreConfig::File {
+                    dir: Some(PathBuf::from("/tmp/cp")),
+                },
+            });
+        let mut command =
+            StdioCommand::new("team-member").with_env(CHECKPOINT_DIR_ENV, "/explicit/cp");
+        request.apply_identity_env(&mut command);
+        assert_eq!(
+            command.env().get(CHECKPOINT_DIR_ENV).map(String::as_str),
+            Some("/explicit/cp")
+        );
+        assert_eq!(
+            command.env().get(CHECKPOINT_ENV).map(String::as_str),
+            Some(CHECKPOINT_ON)
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_configuration_stays_out_of_the_json_form() {
+        let request = MemberSpawnRequest::new("alpha", "dev-1", "sess-1", "/tmp/ws")
+            .with_checkpoint_config(CheckpointConfig {
+                policy: MemberCheckpointPolicy::disabled(),
+                store: CheckpointStoreConfig::Memory,
+            });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("checkpoint"));
+        let decoded: MemberSpawnRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.checkpoint, None);
     }
 
     #[test]

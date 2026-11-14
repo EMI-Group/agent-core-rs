@@ -26,6 +26,8 @@ fn context() -> ServeContext {
         member_name: "dev-1".to_owned(),
         session_id: "s1".to_owned(),
         workspace_root: PathBuf::from("/tmp/workspace"),
+        checkpoint_enabled: true,
+        checkpoint_dir: None,
         language: DEFAULT_LANGUAGE.to_owned(),
     }
 }
@@ -319,9 +321,16 @@ impl Leader {
 
 /// Spawns the server over an in-memory pipe and returns the leader end plus its exit code.
 fn spawn_server(factory: Arc<dyn MemberHarnessFactory>) -> (Leader, JoinHandle<i32>) {
+    spawn_server_with(factory, context())
+}
+
+/// [`spawn_server`] with an explicit serve context (checkpoint knobs, identity).
+fn spawn_server_with(
+    factory: Arc<dyn MemberHarnessFactory>,
+    context: ServeContext,
+) -> (Leader, JoinHandle<i32>) {
     let (member_side, leader_side) = tokio::io::duplex(64 * 1024);
     let (read, write) = tokio::io::split(member_side);
-    let context = context();
     let handle =
         tokio::spawn(async move { serve_with_context(read, write, factory, &context).await });
     (
@@ -575,3 +584,85 @@ fn a_blank_start_session_id_keeps_the_context_session() {
     assert_eq!(named.harness_context().session_id, "s2");
     assert_eq!(named.harness_context().member_name, "dev-1");
 }
+
+#[test]
+fn checkpoint_env_defaults_to_enabled_on_the_memory_store() {
+    let context = ServeContext::from_env_map(|_| None);
+    assert!(context.checkpoint_enabled);
+    assert_eq!(context.checkpoint_dir, None);
+    assert!(context.checkpoint_config().policy.is_enabled());
+    assert_eq!(context.checkpoint_config().store, CheckpointStoreConfig::Memory);
+}
+
+#[test]
+fn checkpoint_env_reads_the_directory_and_the_switch() {
+    let env = |key: &str| match key {
+        CHECKPOINT_ENV => Some("on".to_owned()),
+        CHECKPOINT_DIR_ENV => Some("/tmp/cp".to_owned()),
+        _ => None,
+    };
+    let context = ServeContext::from_env_map(env);
+    assert!(context.checkpoint_enabled);
+    assert_eq!(context.checkpoint_dir, Some(PathBuf::from("/tmp/cp")));
+
+    for value in ["off", "OFF", " false ", "False", "0"] {
+        let disabled = ServeContext::from_env_map(|_| Some(value.to_owned()));
+        assert!(!disabled.checkpoint_enabled, "{value} disables checkpointing");
+        assert!(!disabled.checkpoint_config().policy.is_enabled());
+        assert_eq!(
+            disabled.checkpoint_config().store,
+            CheckpointStoreConfig::Memory,
+            "a disabled member captures nothing"
+        );
+    }
+    for value in ["on", "ON", "true", "1", "yes"] {
+        let enabled = ServeContext::from_env_map(|_| Some(value.to_owned()));
+        assert!(enabled.checkpoint_enabled, "{value} keeps checkpointing on");
+    }
+
+    // Blank variables count as absent, so both defaults apply.
+    let blank = ServeContext::from_env_map(|_| Some(String::new()));
+    assert!(blank.checkpoint_enabled);
+    assert_eq!(blank.checkpoint_dir, None);
+}
+
+#[test]
+fn checkpoint_config_uses_the_file_backend_when_a_directory_is_known() {
+    let context = context().with_checkpoint_dir("/tmp/cp");
+    assert_eq!(context.checkpoint_dir, Some(PathBuf::from("/tmp/cp")));
+    let config = context.checkpoint_config();
+    assert!(config.policy.is_enabled());
+    assert_eq!(
+        config.store,
+        CheckpointStoreConfig::File {
+            dir: Some(PathBuf::from("/tmp/cp"))
+        }
+    );
+    // The identity the harness context carries is untouched by the checkpoint knobs.
+    assert_eq!(context.harness_context().workspace_root, PathBuf::from("/tmp/workspace"));
+}
+
+#[tokio::test]
+async fn a_served_member_writes_its_checkpoint_under_the_configured_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let factory = FakeFactory::new();
+    let serve_context = context().with_checkpoint_dir(directory.path());
+    let (mut leader, server) = spawn_server_with(factory.clone(), serve_context);
+
+    start_member(&mut leader).await;
+    leader.send("{\"type\":\"stop\"}\n").await;
+    assert_eq!(server.await.unwrap(), 0);
+
+    // The stop capture persists `<dir>/<session>/<member>/checkpoint.json`: the session comes from
+    // the start handshake and the card id from the member name of the default spec.
+    let record_path = crate::harness::FileMemberCheckpointStore::new(directory.path())
+        .path_for("s1", "dev-1");
+    let bytes = tokio::fs::read(&record_path)
+        .await
+        .unwrap_or_else(|error| panic!("no checkpoint at {}: {error}", record_path.display()));
+    let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record["checkpoint"]["session_id"], json!("s1"));
+    assert_eq!(record["checkpoint"]["card_id"], json!("dev-1"));
+    assert_eq!(record["checkpoint"]["cwd"], json!("/tmp/workspace"));
+}
+

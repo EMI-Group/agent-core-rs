@@ -27,9 +27,19 @@
 //! A spawned member process cannot inherit the leader's in-memory state, so the leader exports the
 //! identity through the environment variables in [`crate::member::spawn`]
 //! (`OPENJIUWEN_TEAM_NAME`, `OPENJIUWEN_MEMBER_NAME`, `OPENJIUWEN_SESSION_ID`,
-//! `OPENJIUWEN_MEMBER_WORKSPACE`). [`ServeContext::from_env`] reads them and documents one default
-//! per absent variable. Language has no environment carrier in the spawn contract, so a served
-//! member always starts in [`DEFAULT_LANGUAGE`].
+//! `OPENJIUWEN_MEMBER_WORKSPACE`), plus its checkpoint settings
+//! (`OPENJIUWEN_MEMBER_CHECKPOINTS`, `OPENJIUWEN_MEMBER_CHECKPOINT_DIR`). [`ServeContext::from_env`]
+//! reads them and documents one default per absent variable. Language has no environment carrier in
+//! the spawn contract, so a served member always starts in [`DEFAULT_LANGUAGE`].
+//!
+//! # Checkpoints
+//!
+//! The served member is wired like an in-process one: `build_member` applies the card id (its
+//! member name, because the default spec carries no card), the policy and store of
+//! [`ServeContext::checkpoint_config`], and the workspace root as the working directory. A directory
+//! in the environment selects the file backend, so the records land under
+//! `<dir>/<session>/<member>/checkpoint.json`; an absent one keeps the process-local in-memory
+//! store, and `OPENJIUWEN_MEMBER_CHECKPOINTS=off` disables capture entirely.
 //!
 //! # Testability
 //!
@@ -61,11 +71,16 @@ use tracing::{debug, warn};
 
 use crate::constants::{DEFAULT_LANGUAGE, DEFAULT_TEAM_NAME};
 use crate::harness::{
-    HarnessMemberRuntime, MemberHarnessContext, MemberHarnessFactory, NativeMemberFactory,
+    HarnessMemberRuntime, MemberCheckpointPolicy, MemberHarnessContext, MemberHarnessFactory,
+    NativeMemberFactory,
 };
 use crate::member::protocol::{MemberRequest, MemberResponse};
-use crate::member::spawn::{MEMBER_NAME_ENV, MEMBER_WORKSPACE_ENV, SESSION_ID_ENV, TEAM_NAME_ENV};
+use crate::member::spawn::{
+    CHECKPOINT_DIR_ENV, CHECKPOINT_ENV, MEMBER_NAME_ENV, MEMBER_WORKSPACE_ENV, SESSION_ID_ENV,
+    TEAM_NAME_ENV,
+};
 use crate::member::{MemberObserver, MemberRuntime};
+use crate::runtime::spec_meta::{CheckpointConfig, CheckpointStoreConfig};
 use crate::schema::{DeepAgentSpec, MemberMode, RoundOutcome};
 
 /// Session id a served member runs under when `OPENJIUWEN_SESSION_ID` is absent and the `start`
@@ -94,6 +109,12 @@ pub struct ServeContext {
     /// Root directory the member's tools resolve against (`OPENJIUWEN_MEMBER_WORKSPACE`, default
     /// the process working directory, then `.` when even that cannot be read).
     pub workspace_root: PathBuf,
+    /// Whether the member captures checkpoints (`OPENJIUWEN_MEMBER_CHECKPOINTS`, default `true`;
+    /// `off`, `false` or `0` — case-insensitively — disables them).
+    pub checkpoint_enabled: bool,
+    /// Directory a file-backed checkpoint store writes into (`OPENJIUWEN_MEMBER_CHECKPOINT_DIR`,
+    /// default `None`, which keeps the process-local in-memory store).
+    pub checkpoint_dir: Option<PathBuf>,
     /// Prompt language; [`DEFAULT_LANGUAGE`] because the spawn contract carries no language.
     pub language: String,
 }
@@ -122,7 +143,44 @@ impl ServeContext {
                 || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 PathBuf::from,
             ),
+            checkpoint_enabled: value(CHECKPOINT_ENV).is_none_or(|text| !is_checkpoint_off(&text)),
+            checkpoint_dir: value(CHECKPOINT_DIR_ENV).map(PathBuf::from),
             language: DEFAULT_LANGUAGE.to_owned(),
+        }
+    }
+
+    /// Sets the directory a file-backed checkpoint store writes into.
+    ///
+    /// The returned context captures checkpoints on the default policy, persisted through
+    /// [`FileMemberCheckpointStore`](crate::harness::FileMemberCheckpointStore) rooted at `dir`.
+    #[must_use]
+    pub fn with_checkpoint_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.checkpoint_dir = Some(dir.into());
+        self
+    }
+
+    /// The checkpoint wiring this served member runs with.
+    ///
+    /// [`checkpoint_enabled`](Self::checkpoint_enabled) `false` is a disabled policy, so the member
+    /// captures nothing; otherwise the default policy runs on a file store rooted at
+    /// [`checkpoint_dir`](Self::checkpoint_dir) when one is known and on the process-local
+    /// in-memory store when it is not.
+    #[must_use]
+    pub fn checkpoint_config(&self) -> CheckpointConfig {
+        if !self.checkpoint_enabled {
+            return CheckpointConfig {
+                policy: MemberCheckpointPolicy::disabled(),
+                store: CheckpointStoreConfig::Memory,
+            };
+        }
+        CheckpointConfig {
+            policy: MemberCheckpointPolicy::default(),
+            store: self
+                .checkpoint_dir
+                .clone()
+                .map_or(CheckpointStoreConfig::Memory, |dir| {
+                    CheckpointStoreConfig::File { dir: Some(dir) }
+                }),
         }
     }
 
@@ -304,6 +362,11 @@ where
 }
 
 /// Builds the member's runtime from a default member spec and the served identity.
+///
+/// The runtime is wired exactly like an in-process member: its checkpoint identity is the spec card
+/// id (the member name for the default spec, which carries no card), the policy and store come from
+/// [`ServeContext::checkpoint_config`], and the working directory is the served workspace root. The
+/// child process owns its store, so nothing is shared with the leader.
 async fn build_member(
     factory: &Arc<dyn MemberHarnessFactory>,
     context: &ServeContext,
@@ -311,10 +374,26 @@ async fn build_member(
     let spec = DeepAgentSpec::default();
     let harness_context = context.harness_context();
     let harness = factory.create(&spec, &harness_context).await?;
-    Ok(Arc::new(HarnessMemberRuntime::new(
-        harness,
-        context.session_id.clone(),
-    )))
+    let card_id = crate::runtime::checkpoints::member_card_id(&spec, &context.member_name);
+    let runtime = crate::runtime::checkpoints::wire_runtime(
+        HarnessMemberRuntime::new(harness, context.session_id.clone()),
+        &card_id,
+        &context.checkpoint_config(),
+        None,
+        &context.workspace_root,
+    );
+    Ok(Arc::new(runtime))
+}
+
+/// Whether an `OPENJIUWEN_MEMBER_CHECKPOINTS` value disables checkpointing.
+///
+/// `off`, `false` and `0` disable it case-insensitively; every other value — and an absent
+/// variable — leaves it enabled.
+fn is_checkpoint_off(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "off" | "false" | "0"
+    )
 }
 
 /// Writes the handshake answer: `ready` with the member's own session id, then one `state` frame.
