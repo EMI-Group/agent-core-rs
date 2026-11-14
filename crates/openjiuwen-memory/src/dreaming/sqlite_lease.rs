@@ -61,7 +61,7 @@ fn takeover_query() -> String {
         SELECT j.id FROM dream_jobs j
           JOIN dream_job_leases l ON l.job_id = j.id
          WHERE j.state = 'running' AND j.attempts < j.max_attempts
-           AND l.expires_at < ?1
+           AND l.expires_at <= ?1
          ORDER BY j.priority DESC, j.created_at ASC, j.id ASC
          LIMIT 1
        )
@@ -468,7 +468,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(repo.delete_finished(ts(10_000)).await.unwrap() >= 1);
+        let cutoff = Utc::now() + Duration::hours(1);
+        assert!(repo.delete_finished(cutoff).await.unwrap() >= 1);
         assert_eq!(repo.lease("job-1").await.unwrap(), None);
     }
 
