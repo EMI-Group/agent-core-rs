@@ -20,6 +20,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+/// Teardown cases live in their own file: they address the process-global
+/// container cache, which the request-shape cases deliberately never touch.
+mod teardown;
+
 /// The sandbox id every create mock hands out.
 const SANDBOX_ID: &str = "sb-1";
 
