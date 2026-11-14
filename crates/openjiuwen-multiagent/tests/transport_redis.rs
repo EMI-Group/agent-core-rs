@@ -7,15 +7,17 @@
 //! Streams state machine — per-key entries, per-(key, group) delivery cursors and
 //! pending lists. It answers `PING`, `AUTH`, `SELECT`, `XADD`, `XGROUP CREATE`
 //! (with `MKSTREAM` and `BUSYGROUP`), `XREADGROUP` (both `>` and explicit ids),
-//! `XREAD`, `XACK`, `XAUTOCLAIM` and `DEL`.
+//! `XREAD`, `XACK`, `XAUTOCLAIM`, `DEL`, and the subscription-registry SET
+//! commands `SADD`, `SREM`, `SMEMBERS` and `SCARD` (with a switch that makes
+//! them answer `-ERR`, to test write failures).
 //!
 //! No credentials, no real server, and every wait is bounded well under ten
 //! seconds.
 
 mod common;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -129,10 +131,14 @@ struct Group {
 struct ServerState {
     /// One stream per Redis key.
     streams: Mutex<HashMap<String, Stream>>,
+    /// One Redis SET per key (the subscription registry).
+    sets: Mutex<HashMap<String, BTreeSet<String>>>,
     /// One consumer group per `(key, group)` pair.
     groups: Mutex<HashMap<(String, String), Group>>,
     /// Every command received, arguments rendered as text.
     commands: Mutex<Vec<Vec<String>>>,
+    /// When set, every SET command answers an error frame.
+    fail_sets: AtomicBool,
     /// Connections opened before the current generation are dropped.
     generation: AtomicU64,
 }
@@ -163,8 +169,101 @@ impl ServerState {
             "XACK" => self.xack(args),
             "XAUTOCLAIM" => self.xautoclaim(args),
             "DEL" => self.del(args),
+            "SADD" => self.sadd(args),
+            "SREM" => self.srem(args),
+            "SMEMBERS" => self.smembers(args),
+            "SCARD" => self.scard(args),
             other => server_error(&format!("ERR unknown command '{other}'")),
         }
+    }
+
+    /// Answers every set command with `-ERR` while the failure switch is on.
+    fn registry_error(&self) -> Option<Vec<u8>> {
+        self.fail_sets
+            .load(Ordering::SeqCst)
+            .then(|| server_error("ERR subscription registry unavailable"))
+    }
+
+    /// Handles `SADD key member [member ...]`, returning how many were added.
+    fn sadd(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        if let Some(error) = self.registry_error() {
+            return error;
+        }
+        if args.len() < 3 {
+            return server_error("ERR wrong number of arguments for 'sadd'");
+        }
+        let key = text(&args[1]);
+        let mut sets = self.sets.lock().expect("sets");
+        let set = sets.entry(key).or_default();
+        let added = args[2..]
+            .iter()
+            .filter(|member| set.insert(text(member)))
+            .count();
+        integer(added)
+    }
+
+    /// Handles `SREM key member [member ...]`, returning how many were removed.
+    fn srem(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        if let Some(error) = self.registry_error() {
+            return error;
+        }
+        if args.len() < 3 {
+            return server_error("ERR wrong number of arguments for 'srem'");
+        }
+        let key = text(&args[1]);
+        let mut sets = self.sets.lock().expect("sets");
+        let Some(set) = sets.get_mut(&key) else {
+            return integer(0);
+        };
+        let removed = args[2..]
+            .iter()
+            .filter(|member| set.remove(&text(member)))
+            .count();
+        if set.is_empty() {
+            sets.remove(&key);
+        }
+        integer(removed)
+    }
+
+    /// Handles `SMEMBERS key`, returning the members sorted.
+    fn smembers(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        if let Some(error) = self.registry_error() {
+            return error;
+        }
+        if args.len() < 2 {
+            return server_error("ERR wrong number of arguments for 'smembers'");
+        }
+        let key = text(&args[1]);
+        let members: Vec<String> = self
+            .sets
+            .lock()
+            .expect("sets")
+            .get(&key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut out = array(members.len());
+        for member in members {
+            out.extend(bulk(member.as_bytes()));
+        }
+        out
+    }
+
+    /// Handles `SCARD key`, returning the cardinality.
+    fn scard(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        if let Some(error) = self.registry_error() {
+            return error;
+        }
+        if args.len() < 2 {
+            return server_error("ERR wrong number of arguments for 'scard'");
+        }
+        let key = text(&args[1]);
+        let count = self
+            .sets
+            .lock()
+            .expect("sets")
+            .get(&key)
+            .map_or(0, BTreeSet::len);
+        integer(count)
     }
 
     /// Handles `XADD key * field value [field value ...]`.
@@ -581,6 +680,22 @@ impl FakeRedis {
         self.state.commands_named(name)
     }
 
+    /// Makes every SET command answer `-ERR` (or clears that switch).
+    fn fail_sets(&self, fail: bool) {
+        self.state.fail_sets.store(fail, Ordering::SeqCst);
+    }
+
+    /// Returns the members of the SET `key`.
+    fn set_members(&self, key: &str) -> Vec<String> {
+        self.state
+            .sets
+            .lock()
+            .expect("sets")
+            .get(key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Closes every connection opened so far on its next command.
     fn drop_connections(&self) {
         self.state.generation.fetch_add(1, Ordering::SeqCst);
@@ -665,6 +780,20 @@ async fn wait_for_pubsub(recorder: &RecordingHandler, count: usize) {
         "recorder saw {} pub/sub deliveries, expected {count}",
         recorder.pubsub.lock().len()
     );
+}
+
+/// Waits until the server recorded a command named `name` matching `matches`.
+async fn wait_for_command(
+    server: &FakeRedis,
+    name: &str,
+    matches: impl Fn(&[String]) -> bool,
+    what: &str,
+) {
+    wait_until(
+        || server.commands_named(name).iter().any(|args| matches(args)),
+        what,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1097,4 +1226,307 @@ async fn redis_empty_team_and_prefix_fall_back_to_defaults() {
     // Debug output exposes the scheme but never a password.
     let rendered = format!("{transport:?}");
     assert!(rendered.contains("RedisTransport"), "{rendered}");
+}
+
+#[tokio::test]
+async fn redis_publish_reaches_a_subscriber_registered_by_another_transport() {
+    let server = FakeRedis::start().await;
+    let (receiver_recorder, receiver_handler) = recording_handler();
+    // A long registry interval keeps the automatic refresher out of the way, so
+    // the explicit refresh below is what makes the delivery happen.
+    let receiver = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-shared-registry",
+        "team",
+        receiver_handler,
+    );
+    receiver.watch_agent("a").unwrap();
+    receiver.add_subscription("a", "news");
+    receiver.start().await.unwrap();
+
+    let (_publisher_recorder, publisher_handler) = recording_handler();
+    let publisher = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-shared-registry",
+        "team",
+        publisher_handler,
+    );
+    publisher.start().await.unwrap();
+
+    // The publisher knows nothing about `a`: its local registry is empty, so
+    // the message is fanned out to nobody.
+    assert!(publisher.list_subscriptions().is_empty());
+    publisher
+        .publish(MessageEnvelope::pubsub(
+            json!({"story": 1}),
+            "publisher",
+            "news",
+        ))
+        .await
+        .unwrap();
+    assert!(receiver_recorder.pubsub.lock().is_empty());
+    assert!(server.commands_named("XADD").is_empty());
+
+    // Once the receiver's write-through landed, one refresh is enough.
+    wait_for_command(
+        &server,
+        "SADD",
+        |args| args.len() == 3 && args[1] == "team:team-shared-registry:subs" && args[2] == "news",
+        "the shared subscription index",
+    )
+    .await;
+    publisher.refresh_subscriptions().await.unwrap();
+    assert_eq!(
+        publisher.list_subscriptions(),
+        BTreeMap::from([("news".to_owned(), vec!["a".to_owned()])])
+    );
+    assert_eq!(publisher.agent_subscriptions("a"), vec!["news"]);
+
+    publisher
+        .publish(MessageEnvelope::pubsub(
+            json!({"story": 2}),
+            "publisher",
+            "news",
+        ))
+        .await
+        .unwrap();
+    wait_for_pubsub(&receiver_recorder, 1).await;
+    assert_eq!(receiver_recorder.pubsub_order(), vec!["a"]);
+    assert_eq!(
+        receiver_recorder.pubsub.lock()[0].1.message,
+        json!({"story": 2})
+    );
+
+    // The fan-out used the shared registry, so `a` is the routed subscriber.
+    let pushed: Vec<String> = server
+        .commands_named("XADD")
+        .iter()
+        .filter(|args| args.len() == 5)
+        .map(|args| args[1].clone())
+        .collect();
+    assert_eq!(pushed, vec!["team:team-shared-registry:pubsub:a"]);
+
+    receiver.stop().await.unwrap();
+    publisher.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn redis_refresh_converges_subscriptions_in_both_directions() {
+    let server = FakeRedis::start().await;
+    let (recorder_a, handler_a) = recording_handler();
+    let publisher = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-converge",
+        "team",
+        handler_a,
+    );
+    publisher.watch_agent("a").unwrap();
+    publisher.start().await.unwrap();
+    let (recorder_b, handler_b) = recording_handler();
+    let subscriber = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-converge",
+        "team",
+        handler_b,
+    );
+    subscriber.watch_agent("b").unwrap();
+    subscriber.start().await.unwrap();
+
+    // An addition made on one instance becomes visible to the other.
+    subscriber.add_subscription("b", "news");
+    wait_for_command(
+        &server,
+        "SADD",
+        |args| args.len() == 3 && args[1] == "team:team-converge:subs" && args[2] == "news",
+        "the shared subscription index",
+    )
+    .await;
+    publisher.refresh_subscriptions().await.unwrap();
+    assert_eq!(publisher.agent_subscriptions("b"), vec!["news"]);
+    publisher
+        .publish(MessageEnvelope::pubsub(
+            json!({"story": 1}),
+            "publisher",
+            "news",
+        ))
+        .await
+        .unwrap();
+    wait_for_pubsub(&recorder_b, 1).await;
+    assert_eq!(recorder_b.pubsub_order(), vec!["b"]);
+    assert!(recorder_a.pubsub.lock().is_empty());
+
+    // ...and a removal propagates the same way.
+    subscriber.remove_subscription("b", "news");
+    wait_for_command(
+        &server,
+        "SREM",
+        |args| args.len() == 3 && args[1] == "team:team-converge:subs" && args[2] == "news",
+        "the dropped shared subscription index",
+    )
+    .await;
+    publisher.refresh_subscriptions().await.unwrap();
+    assert_eq!(publisher.agent_subscriptions("b"), Vec::<String>::new());
+    publisher
+        .publish(MessageEnvelope::pubsub(
+            json!({"story": 2}),
+            "publisher",
+            "news",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .commands_named("XADD")
+            .iter()
+            .filter(|args| args.len() == 5)
+            .count(),
+        1,
+        "a removed subscriber is no longer fanned out to"
+    );
+
+    publisher.stop().await.unwrap();
+    subscriber.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn redis_introspection_mirrors_the_local_registry() {
+    let server = FakeRedis::start().await;
+    let (_recorder, handler) = recording_handler();
+    let transport = RedisTransport::new(server.config(5), "team-introspect", "team", handler);
+    transport.add_subscription("zoe", "news");
+    transport.add_subscription("alice", "news");
+    transport.add_subscription("alice", "alerts");
+
+    assert_eq!(
+        transport.list_subscriptions(),
+        BTreeMap::from([
+            ("alerts".to_owned(), vec!["alice".to_owned()]),
+            (
+                "news".to_owned(),
+                vec!["alice".to_owned(), "zoe".to_owned()]
+            ),
+        ])
+    );
+    assert_eq!(
+        transport.agent_subscriptions("alice"),
+        vec!["alerts", "news"]
+    );
+    assert_eq!(
+        transport.agent_subscriptions("nobody"),
+        Vec::<String>::new()
+    );
+    assert_eq!(transport.subscribers("news"), vec!["alice", "zoe"]);
+    assert_eq!(transport.subscription_count(), 3);
+
+    transport.remove_subscription("alice", "alerts");
+    assert_eq!(transport.subscription_count(), 2);
+    assert_eq!(transport.agent_subscriptions("alice"), vec!["news"]);
+    assert_eq!(
+        transport.list_subscriptions(),
+        BTreeMap::from([(
+            "news".to_owned(),
+            vec!["alice".to_owned(), "zoe".to_owned()]
+        )])
+    );
+    // The count matches the in-process definition: the sum over all patterns.
+    assert_eq!(
+        transport.subscription_count(),
+        transport
+            .list_subscriptions()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+}
+
+#[tokio::test]
+async fn redis_registry_errors_never_break_local_subscriptions() {
+    let server = FakeRedis::start().await;
+    let (_recorder, handler) = recording_handler();
+    let transport = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-registry-error",
+        "team",
+        handler,
+    );
+    // Every SET command fails while the switch is on.
+    server.fail_sets(true);
+    transport.add_subscription("a", "news");
+    // The synchronous call neither fails nor panics: the pair is local at once.
+    assert_eq!(transport.agent_subscriptions("a"), vec!["news"]);
+    wait_for_command(
+        &server,
+        "SADD",
+        |args| args.len() == 3,
+        "the failed write-through",
+    )
+    .await;
+
+    let error = transport.refresh_subscriptions().await.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("subscription registry unavailable"),
+        "{}",
+        error.message()
+    );
+
+    // A later refresh reconnects and merges the owned pair back in.
+    server.fail_sets(false);
+    transport.refresh_subscriptions().await.unwrap();
+    assert_eq!(transport.agent_subscriptions("a"), vec!["news"]);
+    assert_eq!(transport.subscription_count(), 1);
+    assert_eq!(
+        server.set_members("team:team-registry-error:subs:news"),
+        Vec::<String>::new(),
+        "the failed write never reached the registry"
+    );
+}
+
+#[tokio::test]
+async fn redis_stop_clears_this_instance_owned_registry_entries() {
+    let server = FakeRedis::start().await;
+    let (_recorder, handler) = recording_handler();
+    let transport = RedisTransport::new(
+        server.config(5).with_registry_interval_ms(60_000),
+        "team-cleanup",
+        "team",
+        handler,
+    );
+    transport.add_subscription("a", "news");
+    transport.add_subscription("b", "news");
+    transport.start().await.unwrap();
+    wait_for_command(
+        &server,
+        "SADD",
+        |args| args.len() == 3 && args[1] == "team:team-cleanup:subs" && args[2] == "news",
+        "the shared subscription index",
+    )
+    .await;
+    assert_eq!(
+        server.set_members("team:team-cleanup:subs:news"),
+        vec!["a", "b"]
+    );
+
+    transport.stop().await.unwrap();
+
+    let removals = server.commands_named("SREM");
+    for agent in ["a", "b"] {
+        assert!(
+            removals.iter().any(|args| args.len() == 3
+                && args[1] == "team:team-cleanup:subs:news"
+                && args[2] == agent),
+            "{removals:?}"
+        );
+    }
+    // The pattern set emptied, so its index entry was dropped too.
+    assert!(
+        removals.iter().any(|args| args.len() == 3
+            && args[1] == "team:team-cleanup:subs"
+            && args[2] == "news"),
+        "{removals:?}"
+    );
+    assert!(!server.commands_named("SCARD").is_empty());
+    assert!(server.set_members("team:team-cleanup:subs").is_empty());
+    assert!(server.set_members("team:team-cleanup:subs:news").is_empty());
 }
