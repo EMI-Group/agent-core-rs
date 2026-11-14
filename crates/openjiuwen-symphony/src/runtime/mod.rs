@@ -25,8 +25,8 @@
 //!
 //! # State discipline
 //!
-//! [`SymphonyRuntime::invoke`](crate::runtime::SymphonyRuntime::invoke) and the three
-//! capability mutations require
+//! [`SymphonyRuntime::invoke`](crate::runtime::SymphonyRuntime::invoke) and the capability
+//! mutations require
 //! [`RuntimeState::Running`](crate::runtime::RuntimeState::Running); in
 //! [`RuntimeState::Created`](crate::runtime::RuntimeState::Created) or
 //! [`RuntimeState::Stopped`](crate::runtime::RuntimeState::Stopped)
@@ -34,6 +34,30 @@
 //! `plan`, `graph`, `graph_status`, `read_graph`, `search`, `semantic_search`, `build`,
 //! `submit_evolution`, `capture_graph_snapshot`, and the read-only accessors — works in
 //! every state, so a stopped engine can still be inspected, planned against, and rebuilt.
+//!
+//! # Graph mutations
+//!
+//! [`SymphonyRuntime::mutate`](crate::runtime::SymphonyRuntime::mutate) takes a
+//! [`MutationRequest`](crate::orchestration::mutation::MutationRequest) — the Rust port of
+//! Python's mutation contract — plus the payload to apply, and the three positional
+//! methods ([`add_capabilities`](crate::runtime::SymphonyRuntime::add_capabilities),
+//! [`update_capabilities`](crate::runtime::SymphonyRuntime::update_capabilities),
+//! [`remove_capabilities`](crate::runtime::SymphonyRuntime::remove_capabilities)) are thin
+//! delegations that build such a request without a `source_revision`.
+//!
+//! - **Idempotency.** Every request carries a caller `request_id` and a
+//!   [digest](crate::orchestration::mutation::request_digest) covering its operation, id,
+//!   optional source revision, and sorted id batch. A repeated `request_id` answers the
+//!   recorded result with [`MutationStatus::Replayed`] instead of applying the batch twice,
+//!   and reusing it for a *different* batch is [`Error::Validation`] naming `request_id`.
+//! - **Durability.** With a journal configured — [`SymphonyRuntimeBuilder::with_mutation_journal`]
+//!   or [`SymphonyConfig::mutation_journal_path`] — every recorded result is written
+//!   through atomically, so a rebuilt runtime replays it instead of re-applying it. The
+//!   default is an in-memory ledger only.
+//! - **Compare-and-swap.** A request that declares
+//!   [`source_revision`](crate::orchestration::mutation::MutationRequest::source_revision)
+//!   must name the current artifact revision; otherwise the batch is stale and rejected
+//!   with [`Error::Validation`] naming `source_revision` before anything is published.
 //!
 //! # Concurrency
 //!
@@ -43,7 +67,8 @@
 //! critical section (`build`, the mutations, `submit_evolution`) is serialized by a
 //! [`tokio::sync::Mutex`], an async-aware lock that legitimately spans the `.await`s
 //! persisting a revision; holding it is what makes mutation replay and the edge diff
-//! meaningful.
+//! meaningful. The mutation ledger (in-memory records plus the optional journal) lives
+//! inside that mutex, so its journal writes are serialized with the publication they record.
 //!
 //! A second [`tokio::sync::Mutex`] (`semantic_sync`) serializes semantic (re)indexing. It
 //! may span the registry snapshot read plus the embedding calls — that serialization is
@@ -54,6 +79,15 @@
 //! index reflects, so an
 //! unchanged catalog embeds only the query; a stale record just costs one extra reindex,
 //! never wrong results.
+
+mod mutations;
+
+pub use crate::orchestration::mutation::{
+    request_digest, validate_mutation_against_inventory, JournalRecord, MutationJournal,
+    MutationOperation, MutationRequest,
+};
+use mutations::MutationLedger;
+pub use mutations::{GraphMutationResult, MutationStatus};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -71,7 +105,7 @@ use crate::artifact::{
     FileGraphArtifactStore, GraphArtifactStatus, GraphArtifactStore, GraphRevision,
     MemoryGraphArtifactStore,
 };
-use crate::error::{unsupported, validation, Error, Result};
+use crate::error::{unsupported, validation, Result};
 use crate::graph::CapabilityGraph;
 use crate::model::{CapabilityDescriptor, CapabilityKey};
 use crate::orchestration::executor::StepOutcome;
@@ -114,11 +148,17 @@ pub struct SymphonyConfig {
     pub executor: ExecutorConfig,
     /// The deterministic `can_feed` candidate rules.
     pub candidates: CandidateConfig,
+    /// Path of the durable mutation-idempotency journal; `None` keeps it in memory.
+    ///
+    /// When set, every recorded mutation result is written through to this JSON file, so a
+    /// rebuilt runtime replays a repeated `request_id` instead of applying the batch again.
+    /// [`SymphonyRuntimeBuilder::with_mutation_journal`] takes precedence over this path.
+    pub mutation_journal_path: Option<PathBuf>,
 }
 
 impl Default for SymphonyConfig {
-    /// Returns in-memory artifacts, the `"default"` graph scope, and the default planner,
-    /// executor, and candidate configurations.
+    /// Returns in-memory artifacts, the `"default"` graph scope, the default planner,
+    /// executor, and candidate configurations, and an in-memory mutation journal.
     fn default() -> Self {
         Self {
             graph_artifact_root: None,
@@ -126,13 +166,15 @@ impl Default for SymphonyConfig {
             plan: PlanConfig::default(),
             executor: ExecutorConfig::default(),
             candidates: CandidateConfig::default(),
+            mutation_journal_path: None,
         }
     }
 }
 
 /// Assembles a [`SymphonyRuntime`] from explicit parts; every setter is optional and an
 /// unset part falls back to its documented default (an empty registry, in-memory
-/// artifacts, a lexical planner, [`UnsupportedRunner`], no semantic index).
+/// artifacts, a lexical planner, [`UnsupportedRunner`], no semantic index, an in-memory
+/// mutation journal).
 pub struct SymphonyRuntimeBuilder {
     /// The engine configuration.
     config: SymphonyConfig,
@@ -148,6 +190,8 @@ pub struct SymphonyRuntimeBuilder {
     runner: Option<Arc<dyn CapabilityRunner>>,
     /// The supplied semantic index, if any.
     semantic_index: Option<Arc<SemanticIndex>>,
+    /// The supplied mutation journal, if any.
+    journal: Option<MutationJournal>,
 }
 
 impl SymphonyRuntimeBuilder {
@@ -162,6 +206,7 @@ impl SymphonyRuntimeBuilder {
             planner: None,
             runner: None,
             semantic_index: None,
+            journal: None,
         }
     }
 
@@ -210,13 +255,26 @@ impl SymphonyRuntimeBuilder {
         self
     }
 
+    /// Records mutation results in `journal` instead of an in-memory ledger.
+    ///
+    /// The journal is durable: a runtime rebuilt over the same file replays a repeated
+    /// `request_id` with [`MutationStatus::Replayed`] instead of applying the batch again.
+    /// Takes precedence over [`SymphonyConfig::mutation_journal_path`]; open the journal
+    /// with [`MutationJournal::open`] to hydrate it from an existing file.
+    #[must_use]
+    pub fn with_mutation_journal(mut self, journal: MutationJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
     /// Assembles the runtime in [`RuntimeState::Created`], seeding the graph pointer from
     /// the store's current revision so a reopened file-backed root is reported as-is.
     ///
     /// # Errors
     ///
     /// Returns the asset store's hydration error, the artifact backend's open/status
-    /// error, or [`Error::Config`] when [`SymphonyConfig::graph_artifact_root`] is unusable.
+    /// error, the journal's open error, or [`Error::Config`] when
+    /// [`SymphonyConfig::graph_artifact_root`] is unusable.
     pub async fn open(self) -> Result<SymphonyRuntime> {
         let artifacts: Arc<dyn GraphArtifactStore> = match self.artifacts {
             Some(artifacts) => artifacts,
@@ -238,6 +296,13 @@ impl SymphonyRuntimeBuilder {
         let runner = self
             .runner
             .unwrap_or_else(|| Arc::new(UnsupportedRunner::new()) as Arc<dyn CapabilityRunner>);
+        let journal = match self.journal {
+            Some(journal) => Some(journal),
+            None => match self.config.mutation_journal_path.clone() {
+                Some(path) => Some(MutationJournal::open(path).await?),
+                None => None,
+            },
+        };
         let status = artifacts.status().await?;
         let runtime = SymphonyRuntime {
             config: self.config,
@@ -251,7 +316,7 @@ impl SymphonyRuntimeBuilder {
             // `None`: a `with_registry` catalog may already hold descriptors this index
             // has never seen, so the first search must synchronize.
             semantic_sync: AsyncMutex::new(None),
-            ledger: AsyncMutex::new(MutationLedger::default()),
+            ledger: AsyncMutex::new(MutationLedger::with_journal(journal)),
         };
         debug!(
             graph_scope_id = %runtime.config.graph_scope_id,
@@ -277,6 +342,7 @@ impl fmt::Debug for SymphonyRuntimeBuilder {
                     self.planner.is_some(),
                     self.runner.is_some(),
                     self.semantic_index.is_some(),
+                    self.journal.is_some(),
                 ),
             )
             .finish()
@@ -307,7 +373,8 @@ pub struct SymphonyRuntime {
     /// The catalog revision the semantic index currently reflects; `None` means the index
     /// has not been synchronized yet. Serializes semantic (re)indexing.
     semantic_sync: AsyncMutex<Option<u64>>,
-    /// Serializes derive-and-publish and records mutation results per `request_id`.
+    /// Serializes derive-and-publish and records mutation results per `request_id`
+    /// (in memory, and through the optional journal).
     ledger: AsyncMutex<MutationLedger>,
 }
 
@@ -586,57 +653,74 @@ impl SymphonyRuntime {
 
     /// Upserts `descriptors` into the catalog and publishes a new revision.
     ///
-    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` (a replay
-    /// returns the recorded result with `replayed = true` and no side effect). Every
-    /// descriptor is validated first, so a bad batch changes nothing.
+    /// A thin delegation to [`Self::mutate`] with an [`MutationOperation::Add`] request
+    /// built from the descriptors' qualified ids, no `source_revision`, and `request_id` as
+    /// the idempotency key: a replay returns the recorded result with
+    /// [`GraphMutationResult::replayed`] set and no side effect, while reusing the id for a
+    /// different batch is rejected. Every descriptor is validated first, so a bad batch
+    /// changes nothing. Requires [`RuntimeState::Running`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`, or a descriptor,
-    /// plus the store's and artifact backend's errors.
+    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`,
+    /// `changed_skill_ids`, or a descriptor, plus the store's and artifact backend's errors.
     pub async fn add_capabilities(
         &self,
         descriptors: Vec<CapabilityDescriptor>,
         request_id: &str,
     ) -> Result<GraphMutationResult> {
-        self.mutate(MutationSubject::Add(descriptors), request_id)
-            .await
+        let request = MutationRequest::prepare(
+            MutationOperation::Add,
+            &qualified_ids(&descriptors),
+            request_id,
+            None,
+        )?;
+        self.mutate(request, descriptors).await
     }
 
     /// Upserts only already-registered `descriptors` and publishes a new revision.
     ///
-    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` like
-    /// [`Self::add_capabilities`]; an unknown key rejects the whole batch.
+    /// A thin delegation to [`Self::mutate`] with an [`MutationOperation::Update`] request,
+    /// governed by the same replay and digest rules as [`Self::add_capabilities`]; an
+    /// unknown key rejects the whole batch.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state`/`request_id` or a descriptor,
-    /// [`Error::NotFound`] naming the first unregistered id, and backend errors.
+    /// Returns [`Error::Validation`] naming `runtime.state`/`request_id`/`changed_skill_ids`
+    /// or a descriptor, [`Error::NotFound`] naming the first unregistered id, and backend
+    /// errors.
     pub async fn update_capabilities(
         &self,
         descriptors: Vec<CapabilityDescriptor>,
         request_id: &str,
     ) -> Result<GraphMutationResult> {
-        self.mutate(MutationSubject::Update(descriptors), request_id)
-            .await
+        let request = MutationRequest::prepare(
+            MutationOperation::Update,
+            &qualified_ids(&descriptors),
+            request_id,
+            None,
+        )?;
+        self.mutate(request, descriptors).await
     }
 
     /// Removes the listed keys and publishes a new revision.
     ///
-    /// Requires [`RuntimeState::Running`] and is idempotent per `request_id` like
-    /// [`Self::add_capabilities`]; an unregistered key is skipped, not reported.
+    /// A thin delegation to [`Self::mutate`] with a [`MutationOperation::Delete`] request
+    /// whose batch is the keys' qualified ids; an unregistered key is skipped, not reported,
+    /// which is why such a batch reports [`MutationStatus::Noop`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state` or `request_id`, and backend
-    /// errors.
+    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`, or
+    /// `changed_skill_ids` (an empty batch cannot be prepared), and backend errors.
     pub async fn remove_capabilities(
         &self,
         keys: &[CapabilityKey],
         request_id: &str,
     ) -> Result<GraphMutationResult> {
-        self.mutate(MutationSubject::Remove(keys.to_vec()), request_id)
-            .await
+        let ids: Vec<String> = keys.iter().map(CapabilityKey::qualified).collect();
+        let request = MutationRequest::prepare(MutationOperation::Delete, &ids, request_id, None)?;
+        self.mutate(request, Vec::new()).await
     }
 
     /// Applies observed step transitions to the graph as an exponentially weighted moving
@@ -731,13 +815,20 @@ impl SymphonyRuntime {
         ])
     }
 
-    /// Re-derives and publishes a revision; the caller holds the ledger lock.
+    /// Re-derives the graph from the catalog and publishes a revision; the caller holds the
+    /// ledger lock.
     async fn rebuild(&self) -> Result<GraphRevision> {
         let capabilities = self.registry.list().await;
+        self.publish_graph(&capabilities).await
+    }
+
+    /// Derives the graph of `capabilities` and publishes it as a new revision; the caller
+    /// holds the ledger lock.
+    async fn publish_graph(&self, capabilities: &[CapabilityDescriptor]) -> Result<GraphRevision> {
         let mut graph =
-            CapabilityGraph::from_descriptors(self.config.graph_scope_id.clone(), &capabilities);
+            CapabilityGraph::from_descriptors(self.config.graph_scope_id.clone(), capabilities);
         let generator = CandidateGenerator::new(self.config.candidates.clone());
-        let candidates = generator.generate(&capabilities);
+        let candidates = generator.generate(capabilities);
         for edge in generator.edges(&candidates) {
             graph.add_edge(edge)?;
         }
@@ -758,88 +849,6 @@ impl SymphonyRuntime {
             self.config.graph_scope_id.clone(),
             &self.registry.list().await,
         )
-    }
-
-    /// Runs one mutation under the ledger lock: replay check, apply, rebuild, diff.
-    async fn mutate(
-        &self,
-        subject: MutationSubject,
-        request_id: &str,
-    ) -> Result<GraphMutationResult> {
-        self.require_running()?;
-        if request_id.trim().is_empty() {
-            return Err(validation("request_id", "must not be blank"));
-        }
-        let mut ledger = self.ledger.lock().await;
-        if let Some(recorded) = ledger.recorded.get(request_id) {
-            let mut replayed = recorded.clone();
-            replayed.replayed = true;
-            debug!(request_id, "replayed a recorded capability mutation");
-            return Ok(replayed);
-        }
-        let operation = subject.operation();
-        let previous = self.edge_set().await?;
-        let changed = self.apply(subject).await?;
-        let revision = self.rebuild().await?;
-        let current = self.edge_set().await?;
-        let result = GraphMutationResult {
-            operation,
-            request_id: request_id.to_string(),
-            changed,
-            added_edges: current.difference(&previous).count(),
-            removed_edges: previous.difference(&current).count(),
-            revision: revision.version,
-            replayed: false,
-        };
-        ledger
-            .recorded
-            .insert(request_id.to_string(), result.clone());
-        info!(
-            operation = ?result.operation,
-            changed = result.changed.len(),
-            added_edges = result.added_edges,
-            removed_edges = result.removed_edges,
-            revision = %result.revision,
-            "applied a capability mutation"
-        );
-        Ok(result)
-    }
-
-    /// Applies `subject` to the catalog and reports the sorted changed qualified ids.
-    async fn apply(&self, subject: MutationSubject) -> Result<Vec<String>> {
-        match subject {
-            MutationSubject::Add(descriptors) => {
-                for descriptor in &descriptors {
-                    descriptor.validate()?;
-                }
-                let changed = qualified_ids(&descriptors);
-                self.registry.register_all(descriptors).await?;
-                Ok(changed)
-            }
-            MutationSubject::Update(descriptors) => {
-                for descriptor in &descriptors {
-                    descriptor.validate()?;
-                    if !self.registry.contains(&descriptor.key()).await {
-                        return Err(Error::not_found(format!(
-                            "capability `{}` is not registered",
-                            descriptor.qualified_id()
-                        )));
-                    }
-                }
-                let changed = qualified_ids(&descriptors);
-                self.registry.register_all(descriptors).await?;
-                Ok(changed)
-            }
-            MutationSubject::Remove(keys) => {
-                let mut removed = BTreeSet::new();
-                for key in keys {
-                    if self.registry.remove(&key).await? {
-                        removed.insert(key.qualified());
-                    }
-                }
-                Ok(removed.into_iter().collect())
-            }
-        }
     }
 
     /// The `(source, target)` pairs of the current revision, or an empty set.
@@ -929,35 +938,6 @@ impl GraphPointer {
         Self {
             current_version: status.current_version.clone(),
             graph_id: status.graph_id.clone(),
-        }
-    }
-}
-
-/// The recorded results of past mutations, keyed by caller `request_id`.
-#[derive(Debug, Default)]
-struct MutationLedger {
-    /// Mutations in `request_id` order; replays read from here instead of re-applying.
-    recorded: BTreeMap<String, GraphMutationResult>,
-}
-
-/// What one mutation changes in the catalog.
-#[derive(Debug)]
-enum MutationSubject {
-    /// Descriptors to upsert unconditionally.
-    Add(Vec<CapabilityDescriptor>),
-    /// Descriptors to upsert only when already registered.
-    Update(Vec<CapabilityDescriptor>),
-    /// Keys to delete; absent keys are skipped.
-    Remove(Vec<CapabilityKey>),
-}
-
-impl MutationSubject {
-    /// The [`MutationOperation`] this subject performs.
-    fn operation(&self) -> MutationOperation {
-        match self {
-            Self::Add(_) => MutationOperation::Add,
-            Self::Update(_) => MutationOperation::Update,
-            Self::Remove(_) => MutationOperation::Delete,
         }
     }
 }
@@ -1055,46 +1035,6 @@ pub struct InvokeResponse {
     pub execution: Option<PlanExecution>,
     /// The graph revision status observed after handling the request.
     pub graph_status: GraphArtifactStatus,
-}
-
-/// The kind of change a capability mutation applied.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MutationOperation {
-    /// Descriptors were inserted or replaced.
-    #[default]
-    Add,
-    /// Already-registered descriptors were replaced.
-    Update,
-    /// Keys were deleted.
-    Delete,
-}
-
-/// What one capability mutation changed.
-///
-/// `changed` holds the sorted qualified ids the mutation touched (inserted/replaced for
-/// add and update, actually removed for delete), and `added_edges`/`removed_edges` count
-/// the `(source, target)` graph pairs that appeared or disappeared. A replay of a
-/// recorded `request_id` returns the same result with [`Self::replayed`] set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case", default)]
-pub struct GraphMutationResult {
-    /// Which mutation ran.
-    pub operation: MutationOperation,
-    /// The caller's idempotency key.
-    pub request_id: String,
-    /// The sorted qualified ids that changed.
-    pub changed: Vec<String>,
-    /// The number of `(source, target)` edge pairs the mutation added.
-    pub added_edges: usize,
-    /// The number of `(source, target)` edge pairs the mutation removed.
-    pub removed_edges: usize,
-    /// The version of the revision published by this mutation.
-    pub revision: String,
-    /// Whether this result is a replay of an earlier mutation with the same id.
-    pub replayed: bool,
 }
 
 /// What [`SymphonyRuntime::submit_evolution`] applied.

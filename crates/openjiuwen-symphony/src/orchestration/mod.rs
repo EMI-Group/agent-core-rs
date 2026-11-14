@@ -20,6 +20,11 @@
 //!   [`openjiuwen_graph::CompiledGraph`] and runs it through a
 //!   [`executor::CapabilityRunner`](crate::orchestration::executor::CapabilityRunner),
 //!   recording per-step outcomes.
+//! - [`mutation`](crate::orchestration::mutation) is the graph-mutation request contract:
+//!   [`mutation::MutationRequest`](crate::orchestration::mutation::MutationRequest),
+//!   [`mutation::request_digest`](crate::orchestration::mutation::request_digest), the
+//!   change-set check, and the durable
+//!   [`mutation::MutationJournal`](crate::orchestration::mutation::MutationJournal).
 //!
 //! Every ordering in this module is explicit: candidates sort by strategy rank,
 //! confidence, source, and target; plans rank on a fixed tuple; graph node ids are
@@ -27,6 +32,7 @@
 
 pub mod candidates;
 pub mod executor;
+pub mod mutation;
 pub mod plan;
 pub mod planner;
 
@@ -34,6 +40,11 @@ pub use candidates::{CandidateConfig, CandidateGenerator, MatchStrategy, Relatio
 pub use executor::{
     CapabilityRunner, ExecutorConfig, PlanExecution, PlanExecutor, RunnerContext, StepOutcome,
     UnsupportedRunner,
+};
+pub use mutation::{
+    request_digest, validate_mutation_against_inventory, JournalRecord, MutationJournal,
+    MutationOperation, MutationRequest, JOURNAL_SCHEMA_VERSION, MAX_CHANGED_IDS,
+    MAX_REQUEST_ID_CHARS, MAX_SOURCE_REVISION_CHARS, REQUEST_SCHEMA_VERSION,
 };
 pub use plan::{OrchestrationPlan, PlanEdge, PlanStatus, PlanStep};
 pub use planner::{
