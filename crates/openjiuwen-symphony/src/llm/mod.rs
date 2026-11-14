@@ -55,10 +55,14 @@ use serde_json::Value;
 
 use crate::error::Result;
 
+/// Persistent ontology-match cache.
+pub mod cache;
 /// Fingerprint extraction: model-authored semantic profiles.
 pub mod fingerprint;
 /// A [`CompletionModel`] adapter over a foundation `Model`.
 pub mod foundation;
+/// Model and metadata identity fingerprints used by the cache.
+pub mod identity;
 /// LLM-judged evaluation metrics.
 pub mod judge;
 /// LLM-validated `can_feed` ontology matching.
@@ -70,10 +74,18 @@ pub mod tree;
 
 pub use openjiuwen_retrieval::{extract_json_object, CompletionModel, StaticCompletionModel};
 
+pub use cache::{cache_key, CachedMatch, MatchCache, CACHE_SCHEMA_VERSION};
 pub use fingerprint::{FingerprintConfig, FingerprintExtractor};
 pub use foundation::FoundationCompletionModel;
+pub use identity::{
+    canonical_json, endpoint_sha256, graph_identity_sha256, sanitize_metadata,
+    stable_metadata_sha256, ModelIdentity, IDENTITY_VERSION, MAX_METADATA_DEPTH,
+};
 pub use judge::{LlmJudgeMetric, DEFAULT_JUDGE_NAME, DEFAULT_RUBRIC};
-pub use ontology::{OntologyConfig, OntologyMatch, OntologyMatcher};
+pub use ontology::{
+    MatchOptions, OntologyConfig, OntologyMatch, OntologyMatcher, MATCHER_VERSION,
+    MATCH_SCHEMA_VERSION, PROMPT_VERSION,
+};
 pub use scoring::{DeterministicScorer, LlmSemanticScorer};
 pub use tree::{
     LlmTreeRetriever, RetrieverItem, RetrieverNode, TreeRetriever, TreeRetrieverConfig,
