@@ -48,7 +48,9 @@
 //! `Ok(None)`, a missing bucket is [`Error::NotFound`]). The reply's error message is the only
 //! signal: the bucket case says the bucket does not exist. That check is best effort, so an
 //! emulator that answers a bare 404 is read as a missing object. `list` maps every 404 to a
-//! missing bucket, because a listing names no object.
+//! missing bucket, because a listing names no object, and `exists`/`delete` treat every 404 as
+//! "absent" (`false` and a no-op) — the same tolerance the S3 backend has, where the two cases
+//! are indistinguishable.
 //!
 //! # Timestamps
 //!
@@ -97,7 +99,7 @@ const MAX_RESULTS_PER_PAGE: usize = 1000;
 /// call loop forever.
 const MAX_PAGES: usize = 1000;
 
-/// The RFC 3986 unreserved characters plus the hexadecimal digits used by the encoder.
+/// Uppercase hexadecimal digits of a percent escape.
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Timeout used when the configuration does not set one.
