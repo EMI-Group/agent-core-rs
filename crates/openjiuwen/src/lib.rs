@@ -36,14 +36,17 @@
 //! | --- | --- |
 //! | `core::{controller, kv_cache, operator}` | controller stack, KV-cache runtime, tunable operators (hosted by `openjiuwen-agent`) |
 //! | `core::session::{session_controller, vcs, checkpoint}` | disk-backed product sessions, local session version history, checkpointers (the `sqlite` member is behind the `sqlite` feature) |
-//! | `core::runner::{pool, resources, callback, hitl, monitor, spawn}` | team pool, resource registry, callbacks, HITL, run monitor, subprocess spawn |
+//! | `core::runner::{pool, resources, callback, hitl, monitor, spawn, dreaming}` | team pool, resource registry, callbacks, HITL, run monitor, subprocess spawn, the dreaming service |
 //! | `core::foundation::store::external` | external-store registry and provider seams |
 //! | `core::memory::{lite, analyzer, external, team, dreaming, store}` | coding memory, extraction/consolidation, external providers, team memory, dreaming, pluggable stores (the `sqlite` constructor is behind the `sqlite` feature) |
 //! | `core::retrieval::{sparse, rewrite, graph, multimodal, parsing}` | BM25, query rewriting, graph/multimodal/parsed retrieval |
 //! | `core::sys_operation::sandbox::provider` | sandbox provider registry (the `sandbox` transport is behind the `sandbox` feature) |
 //! | `harness::{lsp, spec, worktree, subagents, tools}` | LSP client, spec registry, git worktrees, subagents, built-in tool catalog (the `browser`/`cua`/`mobile` presets are behind the matching features and report `Unsupported`) |
 //! | `harness_providers::providers::{native, native_v2, vendor, claudecode, codex, dsh}` | the built-in provider table: `native` is always compiled in, `native_v2` is behind the `native-v2` feature, the vendor tree (`vendor`, `claudecode`, `codex`, `dsh`) is behind the `vendor` feature |
-//! | `agent_teams::{attach, org, monitor, models, kv_cache, observability, storage}` | cross-process attach (`attach` is feature-free; its transport seams are not), org namespacing, member cache affinity, model routing, monitoring, observability (the `OTel` sink is behind the `otel` feature), team stores (the SQLite store is behind the `sqlite` feature) |
+//! | `agent_teams::{attach, org, monitor, models, kv_cache, memory, observability, storage}` | cross-process attach (`attach` is feature-free; its transport seams are not), org namespacing, member cache affinity, model routing, monitoring, team memory configuration, tools and wiring, observability (the `OTel` sink is behind the `otel` feature, the OTLP memory bridge behind `otlp`), team stores (the SQLite store is behind the `sqlite` feature) |
+//! | `core::single_agent::{memory_provider, usage, policy, prompt_pack}` | provider-memory rail and tools, usage telemetry, client-tool/exposure policy, prompt packs (`core::{controller, kv_cache, operator}` above are the same crate's other top-level packages) |
+//! | `core::context_engine::{usage, telemetry, policy, tokenizers}` | usage accounting, compression telemetry and recorder, window/change policy, tokenizer selection (native artifacts are pure Rust; remote downloads are typed `Unsupported`) |
+//! | `core::foundation::llm::{external_provider, responses}` | external-provider auth/catalog registry and factories; the OpenAI `Responses` transport helpers |
 //! | `symphony::{discovery, experience, flow, llm, object_artifact, store}` | skill discovery, experience bank, distillation flow, LLM judges, artifact persistence, capability-asset store (the `sqlite` constructor is behind the `sqlite` feature) |
 //! | `dev_tools::{judge, tune, skill_creator, agent_builder}` | LLM-as-judge, prompt tuning, skill creation, agent/workflow builder |
 //! | `extensions::{context_evolver, store, message_queue}` | context-evolution pipeline, store adapters (Redis behind `redis`, SQLite behind `sqlite`), message queues (Pulsar behind `pulsar`) |
@@ -57,6 +60,11 @@
 //! `openjiuwen-foundation`'s `mcp`/`tiktoken` defaults cannot be switched off from here.
 //! Every feature that is off by default keeps the default build free of network access
 //! and external services.
+//!
+//! `otlp` and `otel` are deliberately separate forwards: `openjiuwen-agent-teams` keeps
+//! its in-memory/tracing span seam and its OTLP memory bridge behind two features, and
+//! enabling `otlp` alone still compiles `extensions::otel`, because the agent-teams edge
+//! pulls `openjiuwen-extensions` with that feature.
 //!
 //! ## Harness and providers
 //!
@@ -82,7 +90,7 @@
 //! | --- | --- | --- | --- |
 //! | `a2a` | no | `openjiuwen-extensions/a2a` | Agent-to-Agent client/server modules |
 //! | `mcp` | no | `openjiuwen-extensions/mcp` | the extensions' MCP adapter surface (it currently gates no source; agent-teams' MCP server is always built) |
-//! | `redis` | no | `openjiuwen-extensions/redis` | the Redis store surface, whose construction returns `Unsupported` |
+//! | `redis` | no | `openjiuwen-extensions/redis`, `openjiuwen-agent-evolving/redis` | the extensions' Redis store surface (construction returns `Unsupported`) and the RL online service's Redis-backed `OnlineStore` (`agent_evolving::online::{RedisOnlineStore, RedisOnlineStoreOptions}`; `rediss://` TLS and cluster stay `Unsupported`) |
 //! | `pulsar` | no | `openjiuwen-extensions/pulsar` | the Pulsar message-queue surface, whose construction returns `Unsupported` |
 //! | `distributed` | no | `openjiuwen-agent-teams/distributed` | the distributed `PyZmqMessager` seam, which rejects at construction |
 //!
@@ -91,8 +99,9 @@
 //! | Feature | Default | Forwards to | Effect |
 //! | --- | --- | --- | --- |
 //! | `otel` | no | `openjiuwen-extensions/otel`, `openjiuwen-core/otel`, `openjiuwen-session/otel`, `openjiuwen-agent-teams/otel` | live OpenTelemetry exporters and sink, the kernel trace-sink hook (`core::session::install_trace_sink` really installs the sink), and the team `OTel` span sink (`agent_teams::observability::OtelSpanSink`) |
+//! | `otlp` | no | `openjiuwen-agent-teams/otlp` | the team-memory OTLP bridge (`agent_teams::observability::{OtlpMemoryObserver, otlp_memory_observer}`), which forwards memory events into `openjiuwen-extensions`' `OtelTraceSink`; it also turns on that crate's `otel` feature transitively, while `OTLP_EXPORT_AVAILABLE` stays `false` |
 //! | `sandbox` | no | `openjiuwen-sysop/sandbox` | the sandbox provider transport (`core::sys_operation::sandbox`) |
-//! | `live-tests` | no | `openjiuwen-foundation/live-tests`, `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests` | opt-in network/vendor test gates |
+//! | `live-tests` | no | `openjiuwen-foundation/live-tests`, `openjiuwen-harness/live-tests`, `openjiuwen-harness-providers/live-tests`, `openjiuwen-agent-teams/live-tests`, `openjiuwen-extensions/live-tests`, `openjiuwen-core/live-tests` | opt-in network/vendor test gates (`openjiuwen-core/live-tests` only re-forwards the foundation gate) |
 //!
 //! # Getting started
 //!

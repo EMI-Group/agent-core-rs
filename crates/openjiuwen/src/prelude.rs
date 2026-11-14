@@ -16,6 +16,13 @@
 //! Feature-gated trees (`harness_providers::providers`, `agent_teams::observability`,
 //! `extensions::store`, …) stay reachable by module path instead of through the prelude,
 //! which keeps it feature-free and capped at the agent-construction entry points.
+//! The newer kernel trees (`single_agent::{usage, memory_provider, policy, prompt_pack}`,
+//! `context_engine::{usage, telemetry, policy, tokenizers}`,
+//! `foundation::llm::{external_provider, responses}`, `runner::dreaming`) and the team
+//! trees (`agent_teams::{memory, observability}`) are deliberately omitted for the same
+//! reason: they are diagnostics and configuration surfaces rather than agent-construction
+//! entry points, so they are reached by module path and the cap stays at the ~40
+//! agent-construction items.
 
 // --- errors -----------------------------------------------------------------
 pub use openjiuwen_core::common::error::{Error, Result};
