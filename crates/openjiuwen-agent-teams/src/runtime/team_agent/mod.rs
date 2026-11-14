@@ -303,6 +303,15 @@ impl TeamAgent {
         Arc::clone(&self.inner.backend)
     }
 
+    /// Returns the team-memory wiring the team runs with, when memory is enabled.
+    ///
+    /// A team with no injected wiring and no `metadata["memory"]` block (or one that configures
+    /// `{"enabled": false}`) answers `None`, and nothing is written anywhere.
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<crate::memory::TeamMemoryWiring>> {
+        self.inner.backend.memory()
+    }
+
     /// Returns the fork directive the team was built with, when one is configured.
     ///
     /// Later teammates inherit the directive through the spawner; this accessor exposes it to

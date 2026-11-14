@@ -18,7 +18,11 @@
 //!    row is written before any member row; the organisation layer is bound when configured.
 //! 5. The leader row, its workspace and its harness (with the pool-selected model and its own
 //!    checkpoint identity — derived member session id + card id, policy, store and cwd), then the
-//!    observer that feeds status, rounds, chunks, observability and the monitor.
+//!    observer that feeds status, rounds, chunks, observability and the monitor. The leader's
+//!    workspace root also anchors the team-memory wiring: `memory_bind::resolve_memory` runs once
+//!    per team (injected wiring → `metadata["memory"]` → none), installs the wiring on the backend
+//!    (the turn seam) and on the spawner (the teammate toolkits), and mounts the leader's own
+//!    `MemberMemoryToolkit` on its harness context. A resolution failure fails the build.
 //! 6. One `unstarted` row per roster teammate, so `snapshot()` answers before the first spawn.
 //! 7. One bus subscription for the leader (drained only by [`leader`]) and the interaction
 //!    gate/inbox.
@@ -50,6 +54,7 @@ use tracing::{debug, warn};
 use super::backend::TeamBackend;
 use super::checkpoints::{member_card_id, team_checkpoint_store, wire_runtime};
 use super::deps::TeamBuildDeps;
+use super::memory_bind::resolve_memory;
 use super::observability_bind::TeamSignals;
 use super::observer::MemberStreamObserver;
 use super::org_bind::{org_task_sink, OrgBinding};
@@ -192,6 +197,22 @@ impl SpecBuild for TeamAgentSpec {
             .await?;
         let card_id = member_card_id(&leader_effective, &leader_name);
         let member_session = MemberHarnessContext::member_session_id(&session_id, &leader_name);
+        // Team memory is resolved once here, now that the leader's workspace gives the team its
+        // document root; the spawner and the backend receive the same wiring, so the leader, every
+        // teammate and the turn buffer share one team scope. Memory is a configured capability, so
+        // a wiring that cannot be opened fails the build (the freshly allocated workspace goes back
+        // rather than leaking for a team that never ran).
+        let memory = match resolve_memory(self, &deps, &team_name, &workspace.root).await {
+            Ok(memory) => memory,
+            Err(error) => {
+                abandon_workspace(&deps, &workspace, &team_name).await;
+                return Err(error);
+            }
+        };
+        if let Some(wiring) = memory.as_ref() {
+            spawner.install_memory(Arc::clone(wiring));
+            backend.install_memory(Arc::clone(wiring));
+        }
         let context = MemberHarnessContext::new(
             team_name.clone(),
             leader_name.clone(),
@@ -201,6 +222,16 @@ impl SpecBuild for TeamAgentSpec {
             self.teammate_mode,
         )
         .with_card_id(card_id.clone());
+        let context = match memory.as_ref() {
+            Some(wiring) => match wiring.toolkit(&leader_name, Some(&session_id)) {
+                Ok(toolkit) => context.with_memory_toolkit(toolkit),
+                Err(error) => {
+                    abandon_workspace(&deps, &workspace, &team_name).await;
+                    return Err(error);
+                }
+            },
+            None => context,
+        };
         let harness = deps
             .harness_factory
             .create(&leader_effective, &context)
@@ -280,6 +311,26 @@ impl SpecBuild for TeamAgentSpec {
             events: Mutex::new(Some(rx)),
             steer_batch_size: self.steer_batch_size,
         }))
+    }
+}
+
+/// Hands an allocated leader workspace back after the build aborted before retaining it.
+///
+/// A memory failure is the only new abort point after the allocation, and a team that never runs
+/// must not leave a directory (or a worktree) behind. A release failure is logged, never returned:
+/// the caller is already reporting the build error.
+async fn abandon_workspace(
+    deps: &TeamBuildDeps,
+    workspace: &crate::workspace::MemberWorkspace,
+    team: &str,
+) {
+    if let Err(error) = deps.workspace.release(workspace).await {
+        warn!(
+            team,
+            root = %workspace.root.display(),
+            %error,
+            "failed to release the leader workspace after an aborted build"
+        );
     }
 }
 

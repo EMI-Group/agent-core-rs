@@ -58,6 +58,7 @@ use crate::member::{
     MemberSpawnOptions, MemberSpawnRequest, MemberSpawner, ProcessMemberConfig,
     ProcessMemberSpawner, SshMemberSpawner, SshTransportSpec,
 };
+use crate::memory::TeamMemoryWiring;
 use crate::org::{fork_member_context, ForkSource, ForkedMemberSpec};
 use crate::schema::{DeepAgentSpec, TeamAgentSpec, TeamMemberSpec, TeamRole};
 
@@ -96,6 +97,12 @@ pub struct TeamMemberSpawner {
     kinds: Mutex<BTreeMap<String, MemberSpawnKind>>,
     /// Forked child contexts produced by [`MemberSpawner::spawn`], for the caller to inspect.
     forks: Mutex<BTreeMap<String, ForkedMemberSpec>>,
+    /// Team-memory wiring the spawned members mount their tools from.
+    ///
+    /// Seeded from [`TeamBuildDeps::memory`] and replaced by the build path once it has resolved
+    /// the team's wiring (`install_memory`), because the document lives under the leader's
+    /// workspace, which is allocated after this spawner is built.
+    memory: Mutex<Option<Arc<TeamMemoryWiring>>>,
 }
 impl TeamMemberSpawner {
     /// Builds a spawner for `spec` over `deps`, opening member harnesses under `session_id`.
@@ -129,6 +136,7 @@ impl TeamMemberSpawner {
         fork: Option<ForkDirective>,
         routing: Arc<TeamModelRouter>,
     ) -> Arc<Self> {
+        let memory = deps.memory.clone();
         Arc::new(Self {
             spec,
             deps,
@@ -141,6 +149,7 @@ impl TeamMemberSpawner {
             ssh: SshMemberSpawner::new(SshTransportSpec::default()),
             kinds: Mutex::new(BTreeMap::new()),
             forks: Mutex::new(BTreeMap::new()),
+            memory: Mutex::new(memory),
         })
     }
     /// Returns the blueprint this spawner materializes members from.
@@ -177,6 +186,20 @@ impl TeamMemberSpawner {
     #[must_use]
     pub fn routing(&self) -> &Arc<TeamModelRouter> {
         &self.routing
+    }
+
+    /// Returns the team-memory wiring a spawned member mounts its tools from, when enabled.
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<TeamMemoryWiring>> {
+        self.memory.lock().clone()
+    }
+
+    /// Installs (or replaces) the team-memory wiring after the build path resolved it.
+    ///
+    /// The build path resolves the wiring once the leader's workspace exists and installs it here
+    /// before the first spawn, so every teammate mounts the team's tools from the same wiring.
+    pub fn install_memory(&self, memory: Arc<TeamMemoryWiring>) {
+        *self.memory.lock() = Some(memory);
     }
     /// Returns the backend a member was spawned with (`None` before its first spawn).
     #[must_use]
@@ -330,6 +353,12 @@ impl TeamMemberSpawner {
             self.spec.teammate_mode,
         )
         .with_card_id(card_id.clone());
+        let context = match self.memory() {
+            Some(memory) => {
+                context.with_memory_toolkit(memory.toolkit(member_name, Some(self.session_id()))?)
+            }
+            None => context,
+        };
         let harness = self.deps.harness_factory.create(spec, &context).await?;
         Ok(wire_runtime(
             HarnessMemberRuntime::new(harness, member_session),
@@ -343,6 +372,10 @@ impl TeamMemberSpawner {
     async fn spawn_child(&self, mut request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>> {
         let kind = request.options.kind;
         let member_name = request.member_name.clone();
+        // The served member reads its checkpoint policy from the request's env, so the leader's own
+        // `metadata["checkpoint"]` block has to travel with the spawn; without it the child falls
+        // back to its defaults.
+        request = request.with_checkpoint_config(checkpoint_config(&self.spec));
         self.apply_kv_env(&mut request);
         let runtime = match kind {
             MemberSpawnKind::InProcess => unreachable!("in-process is handled before dispatch"),
