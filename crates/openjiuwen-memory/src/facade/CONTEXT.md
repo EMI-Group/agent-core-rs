@@ -52,16 +52,33 @@ impl LongTermMemory {
                               agent_config: &AgentMemoryConfig, options: &AddOptions) -> Result<AddMemResult>;
     pub async fn get_recent_messages(&self, scope: &MemoryScope, num: usize) -> Result<Vec<BaseMessage>>;
     pub async fn clear_messages(&self, filter: &MemoryFilter, options: &CallOptions) -> Result<usize>;
+    pub async fn get_message_page(&self, scope: &MemoryScope, page_size: usize, cursor: Option<&str>,
+                                  filter: Option<&MemoryFilter>) -> Result<MessagePage>;
+    pub async fn page_messages(&self, scope: &MemoryScope, page_size: usize,
+                               cursor: Option<&str>) -> Result<MessagePage>;
 
     // --- variables ---
     pub async fn set_variable(&self, scope: &MemoryScope, name: &str, value: &str) -> Result<()>;
     pub async fn get_variables(&self, scope: &MemoryScope, names: Option<&[String]>) -> Result<BTreeMap<String, String>>;
     pub async fn delete_variables(&self, scope: &MemoryScope, names: &[String]) -> Result<usize>;
+    pub async fn assign_variable(&self, scope: &MemoryScope, name: &str, value: &str,
+                                 options: &AddOptions) -> Result<VariableWrite>;
+    pub async fn variable_records(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>>;
+    pub async fn remember_variables(&self, scope: &MemoryScope, facts: &[ExtractedFact],
+                                    options: &AddOptions) -> Result<VariableAssignmentReport>;
+    pub async fn remember_with_assignments(&self, scope: &MemoryScope, input: &ExtractionInput,
+                                           options: &AddOptions) -> Result<VariableAssignmentReport>;
 
     // --- scope config ---
     pub async fn set_scope_config(&self, scope_id: &str, config: MemoryScopeConfig) -> Result<bool>;
     pub async fn get_scope_config(&self, scope_id: &str) -> Result<Option<MemoryScopeConfig>>;
     pub async fn delete_scope_config(&self, scope_id: &str) -> Result<bool>;
+
+    // --- per-scope analyzer overrides (`overrides.rs`) ---
+    pub async fn set_scope_overrides(&self, scope_id: &str, spec: &ScopeAnalyzerOverrideSpec) -> Result<()>;
+    pub async fn get_scope_overrides(&self, scope_id: &str) -> Result<Option<ScopeAnalyzerOverrideSpec>>;
+    pub async fn delete_scope_overrides(&self, scope_id: &str) -> Result<bool>;
+    pub async fn resolve_scope_overrides(&self, scope: &MemoryScope) -> Result<ScopeAnalyzerOverrides>;
 
     // --- Python parity aliases ---
     pub async fn search_user_mem(&self, query: &str, num: usize, user_id: &str, scope_id: &str,
@@ -90,6 +107,11 @@ impl LongTermMemory {
 }
 ```
 
+Per-scope analyzer overrides (`overrides`):
+- `ScopeAnalyzerOverrideSpec` — the serializable document (`extractor`, `classifier`, `min_importance`, `max_facts`, `default_importance`, `stages`, `model`, `embedding`), `snake_case`, `#[serde(default)]`, tolerant of unknown fields; `new`, the `with_*` builders, `is_empty`, `validate`, and `resolve(&ScopeOverrideHandles) -> Result<ScopeAnalyzerOverrides>`.
+- `ScopeOverrideHandles` — the in-memory handles a spec's names resolve against (`model: Option<Arc<dyn Model>>`, `embedding: Option<Arc<dyn Embedding>>`); `Debug` reports names only, never credentials.
+- `RememberReport` gains `gated: Option<String>`: why the proactive stage withheld the write under a scope override (it stays `None` in the unconfigured path).
+
 ## Wiring Rules
 
 - `in_memory` / `local_file` / `sqlite` build `MemoryStores`, then call `build`.
@@ -106,16 +128,26 @@ impl LongTermMemory {
   1. Validate/truncate messages (`input_msg_max_len`), append them to message history (`store::MessageStore`) with now.
   2. Build candidates from message text. With a `Model`, run one extraction prompt requesting `{"facts":[{"content":"...","type":"user_profile|semantic_memory|episodic_memory|summary","importance":0.0}],"variables":{"name":"value"}}`, parse tolerantly, retry `model_retries`; on failure fall back to heuristics with a warning.
   3. Heuristic fallback: every user/assistant message with `trim().len() >= min_message_len` becomes an `EpisodicMemory`; a concatenated last-N summary becomes a `Summary`; variables are not inferred.
-  4. Filter by `AgentMemoryConfig::kind_enabled`, `forbidden_variables`, and `max_facts`; add records via the engine (dedupe applies); set inferred variables via `set_variable` for `mem_variables` only.
+  4. Filter by `AgentMemoryConfig::kind_enabled`, `forbidden_variables`, and `max_facts`; add records via the engine (dedupe applies); set inferred variables via `assign_variable` for `mem_variables` only, so each one gets the KV entry *and* its `Variable` record projection; a name the variable write path still rejects (a case/whitespace variant of a forbidden name) is skipped with a warning, never failing the turn.
   5. Return `AddMemResult` grouped by kind (records actually added/merged, `coding` normally empty).
   A model failure never fails `add_messages`; it degrades to the heuristic path. Cancellation returns `Error::Cancelled` and leaves already-added records.
 - `get_recent_messages` uses the message store (scope's `session_id`, else all sessions) with `num` clamped to `message_history_limit` and returns chronological `BaseMessage`s; `Role` maps from the stored role name (unknown roles default to `User` with a warning).
+- `get_message_page(scope, page_size, cursor, filter)` is the forward keyset walk over the same history: `page_size == 0` returns an empty `MessagePage`, an oversized page returns everything (no `message_history_limit` clamp — that limit belongs to the newest-N window), and `filter` is `AND`ed with the scope clauses by the store, so it can never widen the page past its scope. A garbage or tampered cursor is `Error::Validation`. `page_messages` is the same call without a filter.
 - `clear_messages` deletes conversation history rows matching the filter (records and variables are untouched); cancellation is checked before the delete.
-- Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` lists all user-scope variables (not session variables); session variables are addressed by `scope.session_id`.
+- Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` reads the KV entries (all user-scope variables, not session variables; session variables are addressed by `scope.session_id`).
+- `set_variable` keeps its signature and delegating shape: it is `assign_variable` with `AddOptions::default()`, so the write is the KV entry **plus** the `MemoryType::Variable` record projection built by `MemoryEngine::write_variable`; a name in `forbidden_variables` is `Error::Validation` naming the variable before any write. `assign_variable` is the options-aware (cancellable, timeout, `skip_embedding`) form returning `VariableWrite { record_id, created }`.
+- `delete_variables` validates every name first, then removes both representations per name through `MemoryEngine::delete_variable_everywhere` (KV entry plus projection row and vector) and counts the names that existed. `variable_records` lists the projections ascending by `(timestamp, id)`; the same `(user, scope, session, name)` always maps to one deterministic id, so a rewrite updates in place and never enters the text-similarity dedupe scan.
+- `remember_variables(scope, facts, options)` is the opt-in variable path for analyzer facts: a fact tagged `variable` whose metadata carries `variable` (name) and `value` writes a `Variable` projection (`VariableAssignmentReport::variables`), every other fact is stored as a record exactly like `remember` (`records_added`/`records_merged`/`records_skipped`). `remember` itself still stores such a fact as a `SemanticMemory` record, which keeps `tests/analyzer_wiring.rs` behaviour unchanged.
+- `remember_with_assignments(scope, input, options)` is the end-to-end variant: `analyze_for_write` (exactly `remember`'s staged pipeline and override gate) followed by the same write split as `remember_variables`, reporting `extracted`/`variables`/`records_*` plus the pipeline's `degraded` and `gated` reasons on `VariableAssignmentReport`.
+- `analyze_for_write(scope, input, options)` is the shared `remember` analysis pass: it returns the facts to write plus a `RememberReport` carrying only `extracted`/`degraded`/`gated`, so `remember` and `remember_with_assignments` cannot drift; a gated batch returns no facts.
+- `record_input(fact)` in `mod.rs` is the facade's single `ExtractedFact` → `NewMemory` conversion (tags under `TAGS_KEY = "tags"`, an existing key wins); `remember`, `remember_variables` and `remember_with_assignments` all use it.
+- `write_assignment_facts` is the shared write loop of both variable paths: cancellation between facts, one engine call per fact, a rejected variable name failing the call with the fact index and name.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
+- Scope analyzer overrides (`overrides.rs`): the serializable `ScopeAnalyzerOverrideSpec` (`extractor`, `classifier`, `min_importance`, `max_facts`, `default_importance`, `stages`, `model`, `embedding`) is stored as JSON under `memory_scope_overrides/{scope_id}`; `set` validates the document's shape only, `get` rejects a mis-shaped payload with `Error::Validation` naming the scope, and `resolve_scope_overrides` resolves it against `ScopeOverrideHandles` (the engine's model/embedding, `Debug` reports names only). A named `model` the facade does not hold, or any embedding name that differs from the engine's, is `Error::Unsupported` naming the requested handle — the engine embedding is fixed at construction. `delete_scope_overrides` is separate: `delete_scope_config` keeps its signature and clears `memory_scope_config/{scope_id}` only.
 - `analyzer` defaults to `MemoryAnalyzer::from_engine(config, model)`: rules unless `config.extraction.extractor` asks for the LLM *and* a model is attached; `builder().analyzer(...)` replaces it (tests use this to inject a scripted extractor).
-- `remember(scope, input, options)`: `ExtractionInput` carries no scope, so the scope is an explicit parameter. Runs `analyzer.analyze(input, &options.call)`, writes every fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces `ExtractionResult::degraded` on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
-- `consolidate(scope, incoming, options)` validates the content, recalls candidates at `dedupe.candidate_top_k` with threshold `0.0` (a keyword-only blended score never clears a positive floor), converts `incoming` into one `ExtractedFact`, and delegates to `MemoryAnalyzer::consolidate` with `config.dedupe`. It returns a plan only; nothing is applied.
+- `remember(scope, input, options)` resolves the scope overrides and runs `StagedAnalyzer::from_engine(config, engine.model())` with `.with_overrides(resolved)` and `.with_dedupe(config.dedupe)`, so extraction, reasoning, and the proactive decision all see the effective (base + scope) configuration. It writes each fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces the staged `degraded` reason on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
+- `remember` keeps two documented stability rules: (a) a builder-injected analyzer keeps owning extraction while the scope carries no overrides (the staged pipeline cannot reach a custom `FactExtractor`), and (b) the proactive decision is advisory (every fact is written) unless overrides are in effect — then `should_write()` gates the batch, `writable_facts()` selects it, and `RememberReport::gated` names the decision's reason with nothing written.
+- `consolidate(scope, incoming, options)` validates the content, resolves the scope overrides, recalls candidates at `dedupe.candidate_top_k` with threshold `0.0` (a keyword-only blended score never clears a positive floor), converts `incoming` into one `ExtractedFact`, and delegates to `StagedAnalyzer::consolidate` (same engine config, scope overrides, `config.dedupe`). It returns a plan only; nothing is applied, and the plan is dedupe-policy work — the classifier is never consulted.
 - `provider()` returns an `EngineProvider` over the same engine — a stable SPI view, capabilities reflecting the attached embedding model.
 - `team_memory` / `team_memory_sqlite` build a team facade over its own store; `dreaming_in_memory` / `dreaming_sqlite` build a `DreamPlanner` with `NoopConsolidator` and `DreamConfig::default()` (they return `Result` because construction validates the config).
 - Nothing here starts a background task, timer, watcher, or purge: the caller owns `run_due`/`run_once`/`purge`, and no cross-process lease exists.
@@ -132,14 +164,18 @@ impl LongTermMemory {
 
 ## Routing Table
 
-- `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports
+- `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports, and the shared `record_input`/`TAGS_KEY` conversion
 - `./records.rs` → CRUD/listing/stats methods and Python parity aliases
 - `./recall.rs` → `search`, `recall`, `search_all`
-- `./messages.rs` → `add_messages`, `get_recent_messages`, `clear_messages`, extraction/fallback
-- `./variables.rs` → variable and scope-config methods
-- `./integrations.rs` → analyzer/remember/consolidate, provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
+- `./messages.rs` → `add_messages`, `get_recent_messages`, `get_message_page`/`page_messages`, `clear_messages`, extraction/fallback
+- `./variables.rs` → variable methods (`set`/`assign`/`get`/`delete`, `variable_records`, `remember_variables`, `remember_with_assignments`), `VariableAssignmentReport` (`extracted`, `variables`, `records_added`, `records_merged`, `records_skipped`, `degraded`, `gated`), and scope-config methods
+- `./overrides.rs` → `ScopeAnalyzerOverrideSpec`/`ScopeOverrideHandles`, persisted per-scope overrides, resolution, and the value the staged pipeline consumes
+- `./integrations.rs` → analyzer/remember/consolidate (staged pipeline + scope overrides + the shared `analyze_for_write`), provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
 
 ## Test Strategy
 
 - Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails.
+- `variables.rs` adds KV-plus-projection, in-place rewrite, forbidden-name, delete-both, cancellation and `remember_variables` coverage, plus `remember_with_assignments` end-to-end coverage (rule assignment, in-place rewrite, forbidden name keeping earlier facts, LLM-fallback `degraded`, pre-cancelled and mid-loop cancellation via a cancelling `Embedding`) and a direct `record_input` tag assertion; `messages.rs` adds the page walk, tampered cursor, empty/oversized page, filter-composition and projected-variable coverage.
+- `overrides.rs` unit tests pin the spec's JSON round trip (unknown/absent fields), empty detection, scalar resolution, the typed `Unsupported` errors for unresolvable names, and persistence across in-memory, local-file, and SQLite facades (including a malformed stored payload).
+- `integrations.rs` unit tests pin the override→pipeline wiring: `max_facts` changing what `remember` writes, an empty spec matching the unconfigured run, the proactive gate reporting on `gated`, a degraded model fallback under an `llm` override, cancellation writing nothing, and `consolidate` resolving a scope classifier while still returning a plan only.
 - The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `lite_local.rs`, `sqlite.rs`, `analyzer_wiring.rs`, `external_provider.rs`, `team_memory.rs`, `dreaming.rs`, `migration.rs`).

@@ -127,6 +127,10 @@ impl super::MemoryEngine {
 
     /// Resolves the kinds a recall searches: the caller's list, or the engine's
     /// searchable kinds, filtered to searchable kinds and deduplicated in order.
+    ///
+    /// [`MemoryType::Variable`] is the one exception: a caller that names it explicitly
+    /// searches the variable projections, which no default or configured kind list can
+    /// select (the configuration rejects `variable` in `searchable_kinds`).
     fn search_kinds(&self, requested: &[MemoryType]) -> Result<Vec<MemoryType>> {
         let source = if requested.is_empty() {
             self.config.searchable_kinds.as_slice()
@@ -135,7 +139,8 @@ impl super::MemoryEngine {
         };
         let mut kinds = Vec::with_capacity(source.len());
         for kind in source {
-            if kind.is_searchable() && !kinds.contains(kind) {
+            let recallable = kind.is_searchable() || *kind == MemoryType::Variable;
+            if recallable && !kinds.contains(kind) {
                 kinds.push(*kind);
             }
         }
@@ -442,11 +447,22 @@ mod tests {
             .expect("search");
         assert_eq!(only_coding.len(), 1);
         assert_eq!(only_coding[0].record.id, coding);
+        let variables = engine
+            .search(
+                &scope,
+                "cargo clippy",
+                &SearchOptions::default()
+                    .with_threshold(0.0)
+                    .with_kinds(vec![MemoryType::Variable]),
+            )
+            .await
+            .expect("an explicitly requested variable kind is recallable");
+        assert!(variables.is_empty(), "no variable projection exists here");
         let error = engine
             .search(
                 &scope,
                 "cargo clippy",
-                &SearchOptions::default().with_kinds(vec![MemoryType::Variable]),
+                &SearchOptions::default().with_kinds(vec![MemoryType::Unknown]),
             )
             .await
             .expect_err("no searchable kind");

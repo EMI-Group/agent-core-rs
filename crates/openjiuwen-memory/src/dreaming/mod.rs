@@ -20,7 +20,8 @@
 //!   hands each claimed job to an injected [`DreamConsolidator`], and records the
 //!   transition; `DreamPlanner::run_leased` does the same behind a [`DreamLeaseGuard`] so
 //!   two processes cannot run the same job; [`DreamOrchestrator`] owns the idle/backoff
-//!   loop and drives the planner, the retention purge, and the lease renewal;
+//!   loop and drives the planner, the retention purge, and the lease renewal, and can hold
+//!   the caller-injected cross-process [`DREAM_SWEEP_LOCK_NAME`] around a whole tick;
 //! - the consolidation implementations: [`LlmConsolidator`] asks a
 //!   [`Model`](openjiuwen_foundation::llm::Model) which records to merge, keep, summarize,
 //!   or forget and falls back to [`deterministic_plan`] with a recorded reason, and
@@ -51,6 +52,7 @@ mod prompts;
 mod repository;
 mod retention;
 mod salience;
+mod sweep_lock;
 pub use config::*;
 pub use lease::*;
 pub use model::*;
@@ -62,6 +64,7 @@ pub use prompts::*;
 pub use repository::*;
 pub use retention::*;
 pub use salience::*;
+pub use sweep_lock::*;
 
 #[cfg(feature = "sqlite")]
 mod sqlite;

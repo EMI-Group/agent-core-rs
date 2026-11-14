@@ -14,6 +14,10 @@
 //! The collection name comes from the [`KvPrefixRegistry`] (`messages` by default), so a
 //! deployment can rename it exactly like the KV families; existing rows then stay reachable
 //! through [`MessageStore::with_prefixes`].
+//!
+//! History beyond "the newest N" ([`MessageStore::recent`]) is a keyset page
+//! ([`MessageStore::page`]) ordered by `(timestamp, id)`: the position travels as an
+//! opaque [`MessageCursor`] token, so pages survive a store reopen and need no offsets.
 
 use std::sync::Arc;
 
@@ -22,13 +26,18 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::prompt::BaseMessage;
 use openjiuwen_foundation::store::{Document, DocumentStore, Query, SortOrder};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 use crate::record::{MemoryFilter, MemoryScope};
 
 use super::json::plain_text;
 use super::keys;
 use super::prefix::KvPrefixRegistry;
+
+mod cursor;
+
+pub use cursor::{MessageCursor, MessagePage};
+
+use cursor::{message_filter, page_filter, scope_filter};
 
 /// The 64-bit FNV-1a offset basis.
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -40,6 +49,8 @@ const FIELD_USER_ID: &str = "user_id";
 const FIELD_SCOPE_ID: &str = "scope_id";
 /// Document field holding the session id, when the scope is session-bound.
 const FIELD_SESSION_ID: &str = "session_id";
+/// Document field holding the message id (the document primary key).
+const FIELD_ID: &str = "id";
 /// Document field holding the author role (`system`/`user`/`assistant`/`tool`).
 const FIELD_ROLE: &str = "role";
 /// Document field holding the plain-text message content.
@@ -158,20 +169,78 @@ impl MessageStore {
             order_by: vec![(FIELD_TIMESTAMP.to_owned(), SortOrder::Desc)],
         };
         let documents = self.document.query(self.collection(), &query).await?;
-        let mut messages = Vec::with_capacity(documents.len());
-        for document in documents {
-            match serde_json::from_value::<StoredMessage>(document.to_value()) {
-                Ok(message) => messages.push(message),
-                Err(error) => tracing::warn!(
-                    target: "openjiuwen_memory::store",
-                    %error,
-                    id = %document.id,
-                    "skipping a malformed stored message"
-                ),
-            }
-        }
+        let mut messages = decode(documents);
         messages.reverse();
         Ok(messages)
+    }
+
+    /// Returns one keyset page of the history of `scope`, oldest row first.
+    ///
+    /// Rows are ordered strictly ascending by `(timestamp, id)`, so rows sharing a
+    /// timestamp paginate in ascending id order with no duplicates and no gaps. The
+    /// page resumes strictly after `cursor` (a token from
+    /// [`MessageCursor::encode`] or [`MessagePage::next_cursor`]); `filter` narrows the
+    /// page further and is `AND`ed with the scope clauses rather than replacing them.
+    /// One extra row is read to decide `has_more`, and `next_cursor` is the position
+    /// of the last returned row (`None` on the last page).
+    ///
+    /// `page_size == 0` and a missing collection both yield an empty page with
+    /// `has_more == false`; a malformed `cursor` is [`Error::Validation`].
+    ///
+    /// [`Error::Validation`]: openjiuwen_common::error::Error::Validation
+    pub(crate) async fn page(
+        &self,
+        scope: &MemoryScope,
+        page_size: usize,
+        cursor: Option<&str>,
+        filter: Option<&MemoryFilter>,
+    ) -> Result<MessagePage> {
+        if page_size == 0 {
+            return Ok(MessagePage::default());
+        }
+        let boundary = cursor.map(MessageCursor::decode).transpose()?;
+        let query = Query {
+            filter: page_filter(scope, filter, boundary.as_ref()),
+            offset: 0,
+            order_by: vec![
+                (FIELD_TIMESTAMP.to_owned(), SortOrder::Asc),
+                (FIELD_ID.to_owned(), SortOrder::Asc),
+            ],
+            ..Query::default()
+        };
+        // The filter language has no `$or`, so the cursor bound is inclusive and the
+        // rows at the cursor's timestamp that sort at or before it are dropped here.
+        // Their number is unknown up front, so the read window grows until it holds a
+        // full page plus the look-ahead row or the history ends.
+        let growth = page_size.saturating_add(1);
+        let mut window = growth;
+        let mut rows = loop {
+            let windowed = Query {
+                limit: Some(window),
+                ..query.clone()
+            };
+            let documents = self.document.query(self.collection(), &windowed).await?;
+            let exhausted = documents.len() < window;
+            let rows: Vec<StoredMessage> = decode(documents)
+                .into_iter()
+                .filter(|message| boundary.as_ref().is_none_or(|at| at.is_before(message)))
+                .collect();
+            if rows.len() > page_size || exhausted {
+                break rows;
+            }
+            window = window.saturating_add(growth);
+        };
+        let has_more = rows.len() > page_size;
+        rows.truncate(page_size);
+        let next_cursor = match rows.last() {
+            Some(last) if has_more => Some(MessageCursor::of(last).encode()),
+            _ => None,
+        };
+        Ok(MessagePage {
+            items: rows,
+            next_cursor,
+            has_more,
+        })
     }
 
     /// Deletes every message matching `filter`, returning how many rows were removed.
@@ -227,68 +296,23 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The document filter selecting every message of `scope`.
+/// Decodes stored documents into messages, warning about and skipping malformed rows.
 ///
-/// `user_id` and `scope_id` always participate; `session_id` only when the scope is
-/// session-bound, so a session-free scope reads every session's history.
-fn scope_filter(scope: &MemoryScope) -> Value {
-    let mut filter = Map::new();
-    filter.insert(
-        FIELD_USER_ID.to_owned(),
-        Value::String(scope.user_id.clone()),
-    );
-    filter.insert(
-        FIELD_SCOPE_ID.to_owned(),
-        Value::String(scope.scope_id.clone()),
-    );
-    if let Some(session_id) = &scope.session_id {
-        filter.insert(
-            FIELD_SESSION_ID.to_owned(),
-            Value::String(session_id.clone()),
-        );
+/// A corrupt row never fails a history read; it is logged with its id and left out.
+fn decode(documents: Vec<Document>) -> Vec<StoredMessage> {
+    let mut messages = Vec::with_capacity(documents.len());
+    for document in documents {
+        match serde_json::from_value::<StoredMessage>(document.to_value()) {
+            Ok(message) => messages.push(message),
+            Err(error) => tracing::warn!(
+                target: "openjiuwen_memory::store",
+                %error,
+                id = %document.id,
+                "skipping a malformed stored message"
+            ),
+        }
     }
-    Value::Object(filter)
-}
-
-/// Translates a [`MemoryFilter`] into the document filter language.
-fn message_filter(filter: &MemoryFilter) -> Value {
-    let mut clauses = Map::new();
-    if let Some(user_id) = &filter.user_id {
-        clauses.insert(FIELD_USER_ID.to_owned(), Value::String(user_id.clone()));
-    }
-    if let Some(scope_id) = &filter.scope_id {
-        clauses.insert(FIELD_SCOPE_ID.to_owned(), Value::String(scope_id.clone()));
-    }
-    if let Some(session_id) = &filter.session_id {
-        clauses.insert(
-            FIELD_SESSION_ID.to_owned(),
-            Value::String(session_id.clone()),
-        );
-    }
-    if let Some(agent_id) = &filter.agent_id {
-        clauses.insert("agent_id".to_owned(), Value::String(agent_id.clone()));
-    }
-    if !filter.ids.is_empty() {
-        let ids = filter
-            .ids
-            .iter()
-            .map(|id| Value::String(id.clone()))
-            .collect();
-        let mut in_clause = Map::new();
-        in_clause.insert("$in".to_owned(), Value::Array(ids));
-        clauses.insert("id".to_owned(), Value::Object(in_clause));
-    }
-    let mut timestamp = Map::new();
-    if let Some(after) = filter.created_after {
-        timestamp.insert("$gt".to_owned(), Value::String(after.to_rfc3339()));
-    }
-    if let Some(before) = filter.created_before {
-        timestamp.insert("$lt".to_owned(), Value::String(before.to_rfc3339()));
-    }
-    if !timestamp.is_empty() {
-        clauses.insert(FIELD_TIMESTAMP.to_owned(), Value::Object(timestamp));
-    }
-    Value::Object(clauses)
+    messages
 }
 
 #[cfg(test)]
@@ -297,8 +321,10 @@ mod tests {
     use super::super::prefix::KvFamily;
     use super::*;
     use chrono::TimeZone;
+    use openjiuwen_common::error::Error;
     use openjiuwen_foundation::prompt::{BaseMessage, ContentPart, ImageUrl, MessageContent};
-    use openjiuwen_foundation::store::{InMemoryDocumentStore, Query};
+    use openjiuwen_foundation::store::{InMemoryDocumentStore, LocalFileDocumentStore, Query};
+    use serde_json::Value;
 
     fn store() -> MessageStore {
         MessageStore::new(Arc::new(InMemoryDocumentStore::new()))
@@ -546,5 +572,227 @@ mod tests {
             1
         );
         assert!(store.recent(&scope, 10).await.expect("recent").is_empty());
+    }
+
+    fn page_ids(page: &MessagePage) -> Vec<&str> {
+        page.items.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn page_walks_the_whole_history_in_ascending_order() {
+        let store = store();
+        let scope = scope();
+        let mut expected = Vec::new();
+        for (offset, text) in [
+            (0, "one"),
+            (1, "two"),
+            (2, "three"),
+            (3, "four"),
+            (4, "five"),
+        ] {
+            expected.push(append_user(&store, &scope, text, offset).await);
+        }
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = store
+                .page(&scope, 2, cursor.as_deref(), None)
+                .await
+                .expect("page");
+            pages += 1;
+            seen.extend(page_ids(&page).into_iter().map(str::to_owned));
+            if let Some(next) = page.next_cursor {
+                assert!(page.has_more);
+                assert_eq!(page.items.len(), 2);
+                cursor = Some(next);
+            } else {
+                assert!(!page.has_more);
+                break;
+            }
+            assert!(pages <= 5, "pagination must terminate");
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(
+            seen,
+            expected.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+        let first = store.page(&scope, 2, None, None).await.expect("first page");
+        assert_eq!(
+            MessageCursor::decode(first.next_cursor.as_deref().expect("cursor")).expect("decode"),
+            MessageCursor::of(&expected[1])
+        );
+        let last = store
+            .page(&scope, 2, first.next_cursor.as_deref(), None)
+            .await
+            .expect("second page")
+            .next_cursor
+            .expect("second cursor");
+        let third = store
+            .page(&scope, 2, Some(&last), None)
+            .await
+            .expect("third");
+        assert_eq!(third.items.len(), 1);
+        assert!(!third.has_more);
+        assert!(third.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn identical_timestamps_page_in_ascending_id_order() {
+        let store = store();
+        let scope = scope();
+        let mut expected = Vec::new();
+        for text in ["a", "b", "c", "d", "e"] {
+            expected.push(append_user(&store, &scope, text, 0).await);
+        }
+        expected.sort_by(|left, right| {
+            (left.timestamp, left.id.as_str()).cmp(&(right.timestamp, right.id.as_str()))
+        });
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = store
+                .page(&scope, 2, cursor.as_deref(), None)
+                .await
+                .expect("page");
+            assert!(page.items.len() <= 2);
+            seen.extend(page_ids(&page).into_iter().map(str::to_owned));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            expected.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no row may repeat");
+    }
+
+    #[tokio::test]
+    async fn malformed_cursors_are_rejected_by_page() {
+        let store = store();
+        let scope = scope();
+        append_user(&store, &scope, "one", 0).await;
+        let valid = MessageCursor::new(time(0), "msg_x_1700000000000").encode();
+        let truncated = &valid[..valid.len() - 2];
+        for token in ["nonsense", truncated, "mc1.1.0000000000000000."] {
+            let error = store
+                .page(&scope, 2, Some(token), None)
+                .await
+                .expect_err(token);
+            assert!(matches!(error, Error::Validation(_)), "{token}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_page_size_and_empty_history_are_empty_pages() {
+        let store = store();
+        let scope = scope();
+        append_user(&store, &scope, "one", 0).await;
+        let zero = store.page(&scope, 0, None, None).await.expect("zero size");
+        assert_eq!(zero, MessagePage::default());
+        let missing = store
+            .page(&MemoryScope::new("bob", "ws"), 5, None, None)
+            .await
+            .expect("missing history");
+        assert_eq!(missing, MessagePage::default());
+        assert!(!missing.has_more);
+        assert!(missing.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn page_composes_the_scope_with_the_caller_filter() {
+        let store = store();
+        let scope = scope();
+        let first = append_user(&store, &scope, "one", 0).await;
+        let second = append_user(&store, &scope, "two", 1).await;
+        let third = append_user(&store, &scope, "three", 2).await;
+        append_user(
+            &store,
+            &MemoryScope::new("bob", "ws").session("s1"),
+            "other user",
+            1,
+        )
+        .await;
+        append_user(
+            &store,
+            &MemoryScope::new("alice", "other").session("s1"),
+            "other scope",
+            1,
+        )
+        .await;
+        let mut by_ids = MemoryFilter::new();
+        by_ids.ids = vec![first.id.clone(), third.id.clone()];
+        let page = store
+            .page(&scope, 10, None, Some(&by_ids))
+            .await
+            .expect("page ids");
+        assert_eq!(page_ids(&page), [first.id.as_str(), third.id.as_str()]);
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+        let mut after = MemoryFilter::new();
+        after.created_after = Some(time(0));
+        let page = store
+            .page(&scope, 10, None, Some(&after))
+            .await
+            .expect("page after");
+        assert_eq!(page_ids(&page), [second.id.as_str(), third.id.as_str()]);
+        // A conflicting scope clause narrows the page to nothing; it never widens it.
+        let mut foreign = MemoryFilter::new();
+        foreign.user_id = Some("bob".to_owned());
+        let page = store
+            .page(&scope, 10, None, Some(&foreign))
+            .await
+            .expect("page foreign");
+        assert!(page.items.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn cursor_tokens_survive_a_store_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("documents");
+        let scope = scope();
+        let cursor = {
+            let document = Arc::new(
+                LocalFileDocumentStore::new(&root)
+                    .await
+                    .expect("open documents"),
+            );
+            let store = MessageStore::new(document);
+            for (offset, text) in [(0, "one"), (1, "two"), (2, "three")] {
+                append_user(&store, &scope, text, offset).await;
+            }
+            let page = store.page(&scope, 2, None, None).await.expect("first page");
+            assert!(page.has_more);
+            page.next_cursor.expect("cursor")
+        };
+        // The token carries the position of the last returned row (`timestamp`, `id`), not
+        // an offset, so it stays valid against a store instance this process did not open.
+        assert!(cursor.starts_with("mc1."), "{cursor}");
+        let reopened = MessageStore::new(Arc::new(
+            LocalFileDocumentStore::new(&root)
+                .await
+                .expect("reopen documents"),
+        ));
+        // Appending an older row after the first page shifts every offset by one; an
+        // offset-based resume would repeat `two`, a position-based one still yields `three`.
+        append_user(&reopened, &scope, "zero", -1).await;
+        let page = reopened
+            .page(&scope, 2, Some(&cursor), None)
+            .await
+            .expect("resumed page");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["three"]
+        );
+        assert!(!page.has_more);
     }
 }
