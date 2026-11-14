@@ -217,6 +217,7 @@ impl RailEventBus {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)] // the channel is reported through the counters
 impl fmt::Debug for RailEventBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RailEventBus")
@@ -380,7 +381,8 @@ mod tests {
         );
         ctx.extra_mut()
             .insert(format!("{RAIL_EVENTS_EXTRA_PREFIX}single"), custom);
-        ctx.extra_mut().insert("scratch".to_string(), json!({"keep": true}));
+        ctx.extra_mut()
+            .insert("scratch".to_string(), json!({"keep": true}));
         ctx.extra_mut()
             .insert("harness.other".to_string(), json!([goal("nope")]));
 
@@ -395,7 +397,7 @@ mod tests {
         assert_eq!(events[2].payload.get("goal"), Some(&json!({"id": "g-1"})));
 
         // The channels are consumed; unrelated entries survive.
-        assert!(drain_rail_events(&mut ctx).is_empty());
+        assert_eq!(drain_rail_events(&mut ctx).len(), 0);
         assert!(ctx.extra().contains_key("scratch"));
         assert!(ctx.extra().contains_key("harness.other"));
         assert!(!ctx.extra().contains_key(GOAL_EVENT_EXTRA_KEY));
@@ -420,7 +422,7 @@ mod tests {
     fn retained_buffer_is_bounded_and_reports_drops() {
         let bus = RailEventBus::new(2);
         assert_eq!(bus.capacity(), 2);
-        assert!(bus.is_empty());
+        assert_eq!(bus.len(), 0);
         bus.push(goal("1"));
         bus.push(goal("2"));
         bus.push(goal("3"));
@@ -430,14 +432,14 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload.get("goal"), Some(&json!({"id": "2"})));
         assert_eq!(events[1].payload.get("goal"), Some(&json!({"id": "3"})));
-        assert!(bus.is_empty());
+        assert_eq!(bus.len(), 0);
     }
 
     #[test]
     fn zero_capacity_retains_nothing() {
         let bus = RailEventBus::new(0);
         bus.push(goal("1"));
-        assert!(bus.is_empty());
+        assert_eq!(bus.len(), 0);
         assert_eq!(bus.dropped(), 0);
     }
 
@@ -453,8 +455,10 @@ mod tests {
         assert_eq!(drain.priority(), i32::MIN);
 
         let mut ctx = context();
-        ctx.extra_mut()
-            .insert(GOAL_EVENT_EXTRA_KEY.to_string(), json!([goal("g").to_output_value()]));
+        ctx.extra_mut().insert(
+            GOAL_EVENT_EXTRA_KEY.to_string(),
+            json!([goal("g").to_output_value()]),
+        );
         drain.before_invoke(&mut ctx).await.unwrap();
         assert!(ctx.extra().get(GOAL_EVENT_EXTRA_KEY).is_none());
         assert_eq!(bus.len(), 1);

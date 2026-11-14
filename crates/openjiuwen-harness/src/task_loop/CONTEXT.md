@@ -70,6 +70,7 @@ All public items are re-exported flat from `crate::task_loop` (submodules are pr
 
 - Depends only on `crate::schema` (plus std, tokio, tokio-util, async-trait, parking_lot, serde_json, tracing, `openjiuwen_common::error`); never on `crate::agent`, `crate::rails` or any live agent handle.
 - `RoundExecutor` is object-safe and `Send + Sync`; the controller stores no agent, model or session.
+- Rail firing belongs to the executor: `RoundExecutor::run_round` (`crate::agent`) fires `before_task_iteration`/`after_task_iteration` and drains the rail-queued interaction events into the agent's rail event bus; this module never builds a `HarnessRailContext`, so there is no rail firing point or event drain here.
 - Cancellation via `tokio_util::sync::CancellationToken`; `parking_lot` guards are never held across `.await` (only brief read/insert/counter sections).
 - Hooks fire exactly once per round in this order: `prepare_round` → `handle_input` → `handle_interaction` (0..n drained steering) → one of `handle_task_completion`/`handle_task_failed`/`on_abort` → `after_round`.
 - A hook returning `Err` never panics and never escapes: the round becomes `RoundOutcome::failed("handler_error", message)`; an `after_round` failure is logged only.

@@ -18,6 +18,9 @@
 //!   config merge, one-call assembly)
 //! - `prompt_rail` — [`PromptRail`] and [`PromptState`]: system-prompt
 //!   assembly plus steering injection before every model call
+//! - `rail_events` — the rail event channels (`harness.goal_events`,
+//!   `harness.events.*`), the [`RailEventDrain`] rail and the [`RailEventBus`]
+//!   that forwards drained events to the invocation stream
 //! - `round` — input normalization, [`RoundState`] and the task-loop
 //!   [`RoundExecutorHandle`]
 //! - `state_store` — the session-persisted [`DeepAgentState`]

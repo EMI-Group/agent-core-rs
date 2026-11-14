@@ -833,7 +833,10 @@ impl HarnessRail for QueueRail {
 }
 
 /// Builds a task-loop agent with `rails` mounted.
-fn build_event_agent(model: impl Model + 'static, rails: Vec<Arc<dyn HarnessRail>>) -> Arc<DeepAgent> {
+fn build_event_agent(
+    model: impl Model + 'static,
+    rails: Vec<Arc<dyn HarnessRail>>,
+) -> Arc<DeepAgent> {
     let config = DeepAgentConfig::default()
         .with_language("en".to_string())
         .with_enable_task_loop(true);
@@ -860,17 +863,21 @@ fn interaction_frames(chunks: &[Result<AgentChunk>]) -> Vec<Value> {
 #[tokio::test]
 async fn rail_events_of_both_task_iterations_reach_the_stream_in_order() {
     let rail = QueueRail::new("queue_goal", GOAL_EVENT_EXTRA_KEY)
-        .before_task(InteractionEvent::goal_updated(Some(json!({"id": "before"}))))
+        .before_task(InteractionEvent::goal_updated(Some(
+            json!({"id": "before"}),
+        )))
         .after_task(InteractionEvent::goal_updated(Some(json!({"id": "after"}))))
         .with_scratch();
     let agent = build_event_agent(ScriptedModel::text("answered"), vec![Arc::new(rail)]);
 
-    let chunks: Vec<Result<AgentChunk>> = agent
-        .stream(json!({"query": "hi"}), None)
-        .collect()
-        .await;
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
     let frames = interaction_frames(&chunks);
-    assert_eq!(frames.len(), 2, "both queued events must surface: {frames:?}");
+    assert_eq!(
+        frames.len(),
+        2,
+        "both queued events must surface: {frames:?}"
+    );
     assert_eq!(frames[0]["type"], json!("goal.updated"));
     assert_eq!(frames[0]["index"], json!(0));
     assert_eq!(frames[0]["payload"]["goal"], json!({"id": "before"}));
@@ -885,7 +892,7 @@ async fn rail_events_of_both_task_iterations_reach_the_stream_in_order() {
     let retained = agent.drain_rail_events();
     assert_eq!(retained.len(), 2);
     assert_eq!(retained[0].event_type, InteractionEventType::GoalUpdated);
-    assert!(agent.drain_rail_events().is_empty());
+    assert_eq!(agent.drain_rail_events().len(), 0);
 }
 
 #[tokio::test]
@@ -902,13 +909,17 @@ async fn a_terminal_goal_event_is_collected_once_by_drain_rail_events() {
     assert_eq!(output.result_type, ResultType::Answer);
 
     let events = agent.drain_rail_events();
-    assert_eq!(events.len(), 1, "the settled goal is reported once: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "the settled goal is reported once: {events:?}"
+    );
     assert_eq!(events[0].event_type, InteractionEventType::GoalUpdated);
     assert_eq!(
         events[0].payload.get("goal"),
         Some(&json!({"id": "g-1", "status": "complete"}))
     );
-    assert!(agent.drain_rail_events().is_empty());
+    assert_eq!(agent.drain_rail_events().len(), 0);
 }
 
 #[tokio::test]
@@ -928,7 +939,11 @@ async fn a_rail_event_queued_in_after_invoke_is_drained() {
     agent.invoke(json!({"query": "hi"}), None).await.unwrap();
 
     let events = agent.drain_rail_events();
-    assert_eq!(events.len(), 1, "the after_invoke event must survive: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "the after_invoke event must survive: {events:?}"
+    );
     assert_eq!(
         events[0].payload.get("goal"),
         Some(&json!({"id": "kernel"}))
@@ -939,20 +954,15 @@ async fn a_rail_event_queued_in_after_invoke_is_drained() {
 async fn several_rails_drain_in_a_deterministic_key_order() {
     let goal = QueueRail::new("queue_goal", GOAL_EVENT_EXTRA_KEY)
         .before_task(InteractionEvent::goal_updated(Some(json!({"id": "g"}))));
-    let custom = QueueRail::new(
-        "queue_custom",
-        &format!("{RAIL_EVENTS_EXTRA_PREFIX}alpha"),
-    )
-    .before_task(InteractionEvent::execution_error("code-1", "first", None));
+    let custom = QueueRail::new("queue_custom", &format!("{RAIL_EVENTS_EXTRA_PREFIX}alpha"))
+        .before_task(InteractionEvent::execution_error("code-1", "first", None));
     let agent = build_event_agent(
         ScriptedModel::text("answered"),
         vec![Arc::new(goal), Arc::new(custom)],
     );
 
-    let chunks: Vec<Result<AgentChunk>> = agent
-        .stream(json!({"query": "hi"}), None)
-        .collect()
-        .await;
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
     let frames = interaction_frames(&chunks);
     assert_eq!(frames.len(), 2, "every rail event must drain: {frames:?}");
     // `harness.events.alpha` sorts before `harness.goal_events`.
@@ -978,14 +988,15 @@ async fn several_rails_drain_in_a_deterministic_key_order() {
 async fn a_round_without_queued_events_drains_nothing() {
     let agent = build_agent(ScriptedModel::text("plain"));
     agent.invoke(json!({"query": "hi"}), None).await.unwrap();
-    assert!(agent.drain_rail_events().is_empty());
+    assert_eq!(agent.drain_rail_events().len(), 0);
 
     let agent = build_agent(ScriptedModel::text("plain"));
-    let chunks: Vec<Result<AgentChunk>> = agent
-        .stream(json!({"query": "hi"}), None)
-        .collect()
-        .await;
-    assert!(interaction_frames(&chunks).is_empty());
-    assert!(chunks.last().unwrap().as_ref().unwrap().kind == openjiuwen_agent::output::ANSWER);
-    assert!(agent.drain_rail_events().is_empty());
+    let chunks: Vec<Result<AgentChunk>> =
+        agent.stream(json!({"query": "hi"}), None).collect().await;
+    assert_eq!(interaction_frames(&chunks).len(), 0);
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap().kind,
+        openjiuwen_agent::output::ANSWER
+    );
+    assert_eq!(agent.drain_rail_events().len(), 0);
 }
