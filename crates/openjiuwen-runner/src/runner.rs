@@ -29,6 +29,12 @@
 //! [`crate::monitor::RunKind::Spawn`] status on [`Runner::monitor`] until it is
 //! shut down, killed, or dropped. The spawn accessors live in the crate's
 //! `runner_spawn` module, beside this file.
+//!
+//! The observation seams are installable, not only constructed:
+//! [`Runner::set_monitor`], [`Runner::set_hitl`], and
+//! [`Runner::set_message_queue`] replace the monitor, the hub, and the queue for
+//! every run started afterwards and return the instance they displaced (the
+//! `runner_seams` module, beside this file).
 
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
@@ -166,7 +172,9 @@ impl Runner {
     /// The checkpointer is not built until [`Runner::start`]. The monitor, the
     /// human-in-the-loop hub, and the team pool are built here (from
     /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
-    /// before [`Runner::start`]. No spawn registry is installed: the
+    /// before [`Runner::start`]. All three are also installable afterwards
+    /// ([`Runner::set_monitor`], [`Runner::set_hitl`],
+    /// [`Runner::set_message_queue`]). No spawn registry is installed: the
     /// [`UnsupportedSpawner`] default routes every spawn until a host installs a
     /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
     ///

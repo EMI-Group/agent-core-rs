@@ -14,7 +14,7 @@ No crate below depends on it: the runner drives lower layers through their publi
 
 Everything below is re-exported flat at the crate root; the module paths stay available for hosts that prefer them.
 
-### Facade — `src/runner.rs` + `src/runner_spawn.rs`
+### Facade — `src/runner.rs` + `src/runner_spawn.rs` + `src/runner_seams.rs`
 ```rust
 pub struct Runner { /* config, ResourceMgr, CallbackFramework, MessageQueue, checkpointer, guardrails, spawner + spawner registry, RunMonitor, InteractionHub, TeamPool */ }
 impl Runner {
@@ -29,8 +29,11 @@ impl Runner {
     pub fn callbacks(&self) -> &Arc<CallbackFramework>;
     pub fn message_queue(&self) -> Arc<dyn MessageQueue>;
     pub fn checkpointer(&self) -> Option<Arc<dyn Checkpointer>>;
-    pub fn monitor(&self) -> &Arc<RunMonitor>;                  // the seam every run path reports into
-    pub fn hitl(&self) -> &Arc<InteractionHub>;                 // the live-run interaction broker
+    pub fn monitor(&self) -> Arc<RunMonitor>;                   // cheap snapshot of the installed seam
+    pub fn set_monitor(&self, monitor: Arc<RunMonitor>) -> Arc<RunMonitor>;        // installs for later runs; returns the previous one
+    pub fn hitl(&self) -> Arc<InteractionHub>;                  // cheap snapshot of the installed hub
+    pub fn set_hitl(&self, hub: Arc<InteractionHub>) -> Arc<InteractionHub>;       // installs as given; returns the previous hub
+    pub fn set_message_queue(&self, queue: Arc<dyn MessageQueue>) -> Arc<dyn MessageQueue>;  // until the next `start`; returns the previous queue
     pub fn team_pool(&self) -> TeamPool;                        // cheap clone of the pool handle
     pub fn is_started(&self) -> bool;
     pub async fn start(&self) -> Result<()>;                    // idempotent; queue + checkpointer + fresh pool; refuses distributed/deferred transports
@@ -74,7 +77,9 @@ impl Runner {
 `global()` is the ONE documented process-global: a `OnceLock<RwLock<Option<Arc<Runner>>>>` slot, created on first use with `RunnerConfig::default()`, replaced wholesale by `reset_global()`.
 Everything else is per-instance and `Runner::new()` is what tests use.
 The monitor, the hub, and the pool are built per instance; `services()` attaches the monitor and the hub to every run, so all six execution entry points are observable without extra wiring.
-The spawn facade lives in `src/runner_spawn.rs` (`impl Runner`, private module) to keep `runner.rs` under the size budget.
+The monitor, the hub, and the queue are replaceable after construction (`set_monitor`, `set_hitl`, `set_message_queue`), each returning the instance it displaced.
+The observation seams live behind a `parking_lot::RwLock`, so the accessors hand out owned `Arc` clones rather than references.
+The spawn facade lives in `src/runner_spawn.rs` and the seam setters live in `src/runner_seams.rs` (both `impl Runner` in private modules) to keep `runner.rs` under the size budget.
 
 ### Configuration — `src/config.rs`
 `RunnerConfig` (`runner_id`, `distributed_mode=false`, `distributed`, `message_queue`, `team_pool`, `default_session_id="default_session"`, `checkpointer: Option<CheckpointerConfig>`, `default_run_timeout_secs`, `shutdown_timeout_secs=5.0`), `TeamPoolConfig` (`max_concurrent_runs`, `idle_timeout_secs`, `run_timeout_secs`, `payload_capacity`, `retain_finished`, `frame_capacity`, `reaper_interval_secs`, `stop_timeout_secs`), `MessageQueueConfig`, `MessageQueueKind { InMemory = "in_memory", Pulsar, ZeroMq }`, `DistributedConfig` (data only), and the `DEFAULT_*` constants (including the `DEFAULT_TEAM_POOL_*` family).
@@ -166,6 +171,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 ## Routing Table
 
 - `./src/runner.rs` → `Runner` facade, lifecycle (`start`/`stop`/`release`), global singleton, monitor/hub/pool accessors, team + HITL facade methods, security wiring
+- `./src/runner_seams.rs` → the replaceable-seam half of the facade: `set_monitor`, `set_hitl`, `set_message_queue` and what a replacement does not migrate
 - `./src/runner_spawn.rs` → the spawn half of the facade: single spawner and registry installation, backend introspection, registry-first routing, monitored spawn observation, `active_spawns`
 - `./src/config.rs` → `RunnerConfig`, `TeamPoolConfig`, `MessageQueueConfig`, `MessageQueueKind`, `DistributedConfig`, defaults
 - `./src/error.rs` → error constructors and message wording
@@ -212,6 +218,9 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - Pool: one live run per `(team_name, session_id)`; a second `start` on a live key is `PoolError::Busy`, while `acquire` joins and refcounts. `stop_all()` closes the pool permanently — the facade replaces it.
 - HITL: `deliver` needs a pool-registered run with an open inbox (otherwise `NoInbox`/`MissingTarget`); `answer` needs a run whose session was attached by the run path. Pause/resume are signals, not suspension.
 - Monitor: `update` refuses terminal phases (only `finish` ends a run); finished runs are retained up to `LIVE_RUN_LIMIT`, so `history`/`snapshot` still work after completion but not indefinitely.
+- `set_monitor` installs a monitor for every run started afterwards and re-points the installed hub at it (`InteractionHub::attach_monitor`); it does not migrate anything: in-flight runs keep the monitor they were admitted with, and the retired monitor keeps its live statuses, its retention history, and its subscribers.
+- `set_hitl` installs a hub as given — the caller wires it to the runner's monitor with `InteractionHub::with_monitor`/`attach_monitor` if it wants mirroring — and it does not migrate live registrations, so runs in flight stay addressable on the retired hub only.
+- `set_message_queue` installs a host-owned queue (the point being a broker backend) in whatever started state the host left it — the runner never starts it implicitly — and the next `Runner::start` replaces it with the configured backend again.
 - Subprocess: a handle desynchronizes after an abandoned stream or a probe that hits its deadline and is then single-use; `shutdown(Duration::ZERO)` means "use `SubprocessConfig::shutdown_timeout_secs`", a non-zero timeout wins; `RemoteAgent::pid()` is always `None`; a remote `shutdown` is `stop()`, and a remote handle spawned through `RemoteSpawner` is started at spawn (a directly constructed `RemoteAgent` is lazy).
 - Spawn routing: install one backend with `Runner::set_spawner` or a multi-backend `SpawnerRegistry` with `Runner::set_spawner_registry` (the registry wins; `set_spawner` clears it). With a single spawner installed, a `SpawnSpec::backend` hint that contradicts it is `Error::Config`; an unlabelled (`Unknown`) spawner accepts the hint. `RunOptions` has no spawner field and `ResourceMgr` takes no part.
 - Every successful `Runner::spawn_agent*` returns a `MonitoredSpawnedAgent`: a `RunKind::Spawn` status exists while the child is live, `health()` records an observation, and a probe or failed call that sees `is_alive() == false` — or `shutdown`/`force_kill`/drop — finishes it with `Failed`/`Completed`/`Cancelled`. `active_spawns()` therefore lists spawns not yet reported finished, not necessarily processes still running.

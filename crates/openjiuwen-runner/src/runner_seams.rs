@@ -110,7 +110,8 @@ impl Runner {
     /// queue from the live configuration, so an installed queue is in force
     /// until the next `start` (or the next `start` after a
     /// [`Runner::set_config`]), which replaces it with the configured backend;
-    /// [`Runner::stop`] stops whatever queue is installed at that moment.
+    /// [`Runner::stop`] stops whichever queue is installed at that moment (when
+    /// the runner was started) and leaves it in the slot.
     /// The queue is used in whatever started state the host left it in — the
     /// runner does not call [`MessageQueue::start`] on it implicitly, so a host
     /// that wants it serving subscribes and starts it itself.
@@ -143,7 +144,9 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&runner.monitor(), &dashboard));
 
-        let hub_monitor = runner.hitl().monitor().expect("the hub mirrors a monitor");
+        let Some(hub_monitor) = runner.hitl().monitor() else {
+            panic!("the hub mirrors a monitor");
+        };
         assert!(
             Arc::ptr_eq(&hub_monitor, &dashboard),
             "the installed hub follows the runner's monitor"

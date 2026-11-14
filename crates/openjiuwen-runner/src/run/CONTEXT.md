@@ -66,6 +66,7 @@ pub fn stream_team(services: RunServices, team: TeamRef, inputs: Value, options:
 **Session id resolution (Python precedence).** `inputs["conversation_id"]` (non-empty string) → `RunOptions::session_id` → `RunnerConfig::default_session_id` for agents/workflows; agents and teams treat an empty/non-string value as absent, and an empty `RunOptions::session_id` counts as absent too (`resolve_session_id`).
 
 **Run status and HITL seam.** Every invocation uses one run id (UUID v4) shared by the monitor status and the hub registration; both seams are inert when `RunServices::monitor`/`RunServices::hitl` is `None`.
+The facade builds this snapshot once per call, so a seam installed afterwards (`Runner::set_monitor`/`set_hitl`) governs later runs only; an in-flight run keeps the monitor and hub it was admitted with.
 Admission — the monitor's `Queued` begin plus the hub register/attach — is deferred until after every setup step that can fail (reference resolution, session preparation, and the `*InvokeInput`/`*StreamInput` callback), so a failed setup never leaves a run registered or begun.
 `Running` is set immediately before the invocation.
 Every terminal exit finishes the status as `Completed`, `Failed`, or `Cancelled` and then unregisters the hub entry.
