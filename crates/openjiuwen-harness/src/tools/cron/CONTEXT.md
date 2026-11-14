@@ -9,6 +9,7 @@ There is no daemon thread: the host polls `CronScheduler::due(now)` with its own
 ## API Surface
 
 - `CronSchedule` — `parse(&str) -> Result<Self>`, `next_after(DateTime<Utc>) -> Option<DateTime<Utc>>`, `next_occurrences(DateTime<Utc>, count) -> Vec<DateTime<Utc>>`, `expression() -> &str`, `has_seconds() -> bool`.
+  - Parsing internals (all private to `schedule.rs`): `FieldTexts::split` names the field slots and rejects a bad field count, `require_single_day_field` enforces the Quartz `?` rule, `parse_values`/`parse_optional_values` return sorted vectors, and `ParsedField::into_parts` returns the owned `FieldParts { values, last_day_offsets, last_weekdays, nth_weekdays }` the schedule stores.
   - Accepted forms: 5-field classic `minute hour day-of-month month day-of-week`; 6-field Quartz `second minute hour day-of-month month day-of-week`; 7-field Quartz with a trailing `year`.
   - Shared value grammar: `*`, `*/n`, `a`, `a-b`, `a-b/n`, `a/n` (read as `a-max/n`), comma lists, month names `JAN..DEC`, day names `SUN..SAT` (case-insensitive), day-of-week `0..=7` with `7` = Sunday, and wrap-around ranges (`22-2` in hours, `FRI-MON` in weekdays).
   - Shorthands: `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually` (expanded into the 5-field form).
@@ -80,7 +81,7 @@ Also deferred: the 7-field Quartz token `W` (nearest weekday, including `LW`), `
 ## Routing Table
 
 - `./mod.rs` → module docs (both grammars, layout, deviations), declarations and flat re-exports
-- `./schedule.rs` → `CronSchedule`, field grammar (classic + Quartz), shorthands, day rules, extensions, bounded `next_after`/`next_occurrences`
+- `./schedule.rs` → `CronSchedule`, field grammar (classic + Quartz), shorthands, day rules, extensions, `FieldTexts`/`ParsedField`/`FieldParts` field split, bounded `next_after`/`next_occurrences`
 - `./store.rs` → `CronJob`, `CronUpdate`, `CronStatus`, `CronScheduler`, atomic persistence, injected-clock `update`/`toggle`/`preview`/`run_now`/`status`/`due`
 - `./history.rs` → `CronRun`, `CronRunTrigger`, the bounded `runs.json` history and its rotation caps
 - `./actions.rs` → `CronAction`, `CronArgs`, the ten action handlers, message/`stamp`/validation helpers
