@@ -89,6 +89,7 @@ The monitor, the hub, and the pool are built per instance; `services()` attaches
 The monitor, the hub, and the queue are replaceable after construction (`set_monitor`, `set_hitl`, `set_message_queue`), each returning the instance it displaced.
 The observation seams live behind a `parking_lot::RwLock`, so the accessors hand out owned `Arc` clones rather than references.
 The spawn facade lives in `src/runner_spawn.rs`, the seam setters in `src/runner_seams.rs`, and the dreaming accessors in `src/runner_dreaming.rs` (all `impl Runner` in private modules) to keep `runner.rs` under the size budget.
+The facade's unit tests live in `src/runner_tests.rs`, loaded with `#[path]` for the same reason.
 
 ### Dreaming driver — `src/dreaming.rs` + `src/runner_dreaming.rs`
 `DreamService` (`new(Arc<DreamOrchestrator>) -> Arc<Self>`, `with_in_memory(consolidator, DreamConfig, DreamOrchestratorConfig) -> Result<Arc<Self>>`, `orchestrator() -> &Arc<DreamOrchestrator>`, `is_running()`, `status()`, `start()`, `stop()`, `tick(now)`), `DreamServiceStatus` (`running`, `orchestrator: DreamOrchestratorStatus`, optional `last_stop_error`), and `DEFAULT_DREAMING_STOP_TIMEOUT` (5 s).
@@ -203,6 +204,7 @@ Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`T
 ## Routing Table
 
 - `./src/runner.rs` → `Runner` facade, lifecycle (`start`/`stop`/`release`), global singleton, monitor/hub/pool accessors, team + HITL facade methods, security wiring
+- `./src/runner_tests.rs` → inline unit tests of `runner.rs` (loaded via `#[path]`): construction defaults and the fixed `runner_id`
 - `./src/runner_seams.rs` → the replaceable-seam half of the facade: `set_monitor`, `set_hitl`, `set_message_queue`, `queue_stats`, and what a replacement does not migrate
 - `./src/runner_spawn.rs` → the spawn half of the facade: single spawner and registry installation, backend introspection, registry-first routing, monitored spawn observation, `active_spawns`
 - `./src/runner_dreaming.rs` → the dreaming half of the facade: service installation, orchestrator start/stop/status with the typed `Config` absence, and the quiet stop `Runner::stop` performs
