@@ -685,7 +685,7 @@ pub trait Operator: Send + Sync {
         let next = apply_merge(&current, &update);
         spec.validate(&next)?;
         let mut result = self.set_parameter(target, next)?;
-        result.operator_id = self.operator_id().to_owned();
+        self.operator_id().clone_into(&mut result.operator_id);
         result.mode = update.mode;
         result.effect = update.effect;
         result.value = update.payload;

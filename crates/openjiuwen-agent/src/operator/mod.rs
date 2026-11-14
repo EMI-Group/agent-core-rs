@@ -58,6 +58,7 @@ pub use context_evolve::{
     ContextEvolveOperator, MetisContextEvolveOperator, UpdatePolicy, MAX_MESSAGES,
     METIS_SUMMARY_HEADER,
 };
+pub use legacy::{LLMCall, OptimizerCallback, OptimizerTrace, OptimizerTraceFuture};
 pub use llm_call::{LLMCallOperator, DEFAULT_USER_PROMPT, QUERY_PLACEHOLDER};
 pub use memory_call::{
     MemoryCallOperator, MemoryRecall, DEFAULT_MAX_RETRIES, DEFAULT_THRESHOLD, DEFAULT_TOP_K,
@@ -70,4 +71,9 @@ pub use protocol::{
     TASK_MEMORY_ENTRY, TASK_MEMORY_TARGET,
 };
 pub use skill_call::{SkillCallOperator, DEFAULT_MAX_SKILLS, MAX_MAX_SKILLS};
+pub use skill_experience::SkillExperienceOperator;
+pub use staging::{
+    build_local_apply_preview, InMemorySkillExperienceStore, LocalApplyPreview, PendingChange,
+    PendingChangeOutcome, PendingChangeStatus, PendingChangeStore, SkillExperienceStore,
+};
 pub use tool_call::{ToolCallOperator, TOOL_DESCRIPTION_PREFIX, TOOL_DESCRIPTION_TARGET};
