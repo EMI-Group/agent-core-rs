@@ -425,9 +425,7 @@ impl DreamRepository for InMemoryDreamRepository {
         if candidate.is_none() {
             let mut expired: Vec<&DreamJob> = jobs
                 .values()
-                .filter(|job| {
-                    job.state == DreamState::Running && job.attempts < job.max_attempts
-                })
+                .filter(|job| job.state == DreamState::Running && job.attempts < job.max_attempts)
                 .filter(|job| {
                     leases
                         .get(&job.id)
@@ -455,7 +453,10 @@ impl DreamRepository for InMemoryDreamRepository {
             attempts = claimed.attempts,
             "claimed dream job under a lease"
         );
-        Ok(Some(LeasedJob { job: claimed, lease }))
+        Ok(Some(LeasedJob {
+            job: claimed,
+            lease,
+        }))
     }
 
     async fn renew_lease(

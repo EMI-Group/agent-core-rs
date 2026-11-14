@@ -16,7 +16,9 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::dreaming::lease::{DreamLease, LeaseLostReason, LeaseRequest, LeaseStatus, LeasedJob};
 
-use super::{claim_query, column, decode_time, format_time, row_to_job, SqliteDreamRepository, COLUMNS};
+use super::{
+    claim_query, column, decode_time, format_time, row_to_job, SqliteDreamRepository, COLUMNS,
+};
 
 /// Lease table DDL, applied idempotently by the parent's constructors.
 pub(super) const SCHEMA_LEASES: &str = "
@@ -77,9 +79,7 @@ impl SqliteDreamRepository {
     ) -> Result<Option<LeasedJob>> {
         request.validate()?;
         let mut transaction = self.pool.begin().await.map_err(Error::external)?;
-        let claimed = self
-            .claim_and_lease(&mut transaction, now, request)
-            .await?;
+        let claimed = self.claim_and_lease(&mut transaction, now, request).await?;
         if let Some(leased) = &claimed {
             transaction.commit().await.map_err(Error::external)?;
             tracing::debug!(
