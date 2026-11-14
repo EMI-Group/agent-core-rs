@@ -34,6 +34,7 @@ impl Runner {
     pub fn hitl(&self) -> Arc<InteractionHub>;                  // cheap snapshot of the installed hub
     pub fn set_hitl(&self, hub: Arc<InteractionHub>) -> Arc<InteractionHub>;       // installs as given; returns the previous hub
     pub fn set_message_queue(&self, queue: Arc<dyn MessageQueue>) -> Arc<dyn MessageQueue>;  // until the next `start`; returns the previous queue
+    pub fn queue_stats(&self) -> QueueStats;                    // snapshot of the live backend (`MessageQueue::stats`)
     pub fn team_pool(&self) -> TeamPool;                        // cheap clone of the pool handle
     pub fn is_started(&self) -> bool;
     pub async fn start(&self) -> Result<()>;                    // idempotent; queue + checkpointer + fresh pool; refuses distributed/deferred transports
@@ -103,7 +104,9 @@ Security binding: `bind_guardrails`, `GuardrailHandler`, `scan_stage_for`, `even
 
 ### `src/mq/` — the message queue
 `QueueMessage`, `MessageHandler`, `MessageQueue` trait, `InMemoryMessageQueue`, `DeferredMessageQueue`, `create_message_queue` (fallible), `build_message_queue` (infallible: in-memory, or a deferred placeholder for a transport this build lacks), `MessageQueueKind`.
-The configured kind is never misrepresented: a `pulsar`/`zeromq` configuration yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport and pointing at `in_memory`.
+`MessageQueue::stats() -> QueueStats` is synchronous, object-safe, and defaulted to the empty report, so a host samples an `Arc<dyn MessageQueue>` without an `.await` or a downcast; `Runner::queue_stats()` is the facade's snapshot of whichever backend is installed.
+The counters are `started`, `topics`, `handlers`, `deliveries`, `dropped_no_worker`, `dropped_no_handler`, `handler_errors`, and `rejected_not_started`, with the `is_empty()`/`dropped()` helpers; the report is `snake_case` JSON tolerant of unknown fields.
+The configured kind is never misrepresented: a `pulsar`/`zeromq` configuration yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport and pointing at `in_memory` — and whose `stats()` is the empty report, because it performs no work.
 
 ### `src/run/` — execution APIs
 `RunOptions` (session, timeout, cancellation, envs, metadata, `team_session`), `AgentRef`, `WorkflowRef`, `TeamRef`, `RunServices` (registries, callbacks, config, checkpointer, guardrails, optional `monitor`/`hitl`), session resolution, per-run cancellation/timeout (`run_with_limits`, `next_stream_step`), teardown, and tracing spans.
@@ -134,6 +137,15 @@ See `./src/pool/CONTEXT.md`.
 
 ### `src/error.rs`
 Thin constructors for the runner's error vocabulary (`not_found`, `invalid_session`, `timeout`, `run_timeout`, `unsupported`, `not_started`) over `openjiuwen_common::error::{Error, Result}`; no parallel error enum.
+
+## Pluggable Seams
+
+The seam inventory a host reads before wiring a process is the `# Pluggable seams` section of `src/runner.rs`'s module docs; `tests/seams.rs` pins the same list at compile time.
+Plugged in through a setter: the message queue (`MessageQueue` + `Runner::set_message_queue`), the spawn backends (`AgentSpawner` + `Runner::set_spawner`, `SpawnerRegistry` + `Runner::set_spawner_registry`), the run monitor (`Runner::set_monitor`), the HITL hub (`Runner::set_hitl`), and the guardrails (`Runner::set_guardrails`).
+Plugged in through a registration: resource providers (`ResourceMgr::register_*` takes a `Provider<T>` closure called per lookup), callback handlers/filters/chains (`CallbackFramework::register`, `EventFilter`, `CallbackChain`).
+Configured rather than plugged in: the checkpointer (`RunnerConfig::checkpointer`, built by `Runner::start`).
+Refused with `Error::Unsupported` naming the transport: `MessageQueueKind::{Pulsar, ZeroMq}` (→ `DeferredMessageQueue`), `SpawnerRegistry::with_deferred()`'s `RemoteMq`/`RemoteA2a` (→ `DeferredSpawner`), `RemoteProtocol::{Mq, A2a}`, and `RunnerConfig::distributed_mode` (refused by `start`).
+Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`TeamTransport`/`TransportKind`/`build_transport`, where `Pulsar` is `Error::Unsupported`) and are reached only through the `Team` seam.
 
 ## Constraints
 
