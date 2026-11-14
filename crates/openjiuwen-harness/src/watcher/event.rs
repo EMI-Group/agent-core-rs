@@ -7,7 +7,9 @@
 //! the filesystem.
 //!
 //! [`WatchUpdate`] is the envelope a `Subscription` publishes: an event, a
-//! failed reload handler, or a runtime failure of the OS watcher itself.
+//! failed reload handler, a notice that the watcher had to drop notifications
+//! because one of its bounded queues was full, or a runtime failure of the OS
+//! watcher itself.
 //!
 //! Wire form is `snake_case` throughout and unknown fields are ignored, so a
 //! record written by a newer release still deserializes.
@@ -166,11 +168,56 @@ pub struct WatchFailure {
     pub message: String,
 }
 
+/// The stage of the watcher pipeline that had to drop notifications.
+///
+/// Both stages use bounded queues, so a producer that outruns a consumer loses
+/// notifications instead of growing without limit; the loss is never silent and
+/// is reported as a [`WatchUpdate::Dropped`] notice plus a counter on
+/// [`WatcherHandle`](crate::watcher::WatcherHandle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropStage {
+    /// The bounded queue between the OS callback and the debounce loop; wire
+    /// name `intake`.
+    Intake,
+    /// The bounded queue between the debounce loop and the reload dispatcher;
+    /// wire name `dispatch`.
+    Dispatch,
+}
+
+impl DropStage {
+    /// Returns the serde wire name of the stage (`"intake"` or `"dispatch"`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+/// Notifications one stage of the watcher dropped because its queue was full.
+///
+/// `dropped` counts the notifications this notice covers (the ones lost since
+/// the previous notice for the same stage), `total` counts everything that
+/// stage lost since the watcher started. A consumer should treat a drop notice
+/// as "reload from disk" rather than "apply these deltas", because the lost
+/// notifications may have been the only ones for a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedUpdates {
+    /// The stage that dropped the notifications.
+    pub stage: DropStage,
+    /// Notifications this notice covers.
+    pub dropped: u64,
+    /// Notifications this stage dropped since the watcher started.
+    pub total: u64,
+}
+
 /// The envelope a subscription yields.
 ///
-/// Tagged with `"type"` on the wire, so the three variants are
-/// `{"type": "event", …}`, `{"type": "reload_failed", …}` and
-/// `{"type": "watcher_failed", …}`.
+/// Tagged with `"type"` on the wire, so the variants are
+/// `{"type": "event", …}`, `{"type": "reload_failed", …}`,
+/// `{"type": "dropped", …}` and `{"type": "watcher_failed", …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WatchUpdate {
@@ -178,6 +225,8 @@ pub enum WatchUpdate {
     Event(WatchEvent),
     /// A reload handler rejected an event.
     ReloadFailed(ReloadFailure),
+    /// The watcher dropped notifications because a bounded queue was full.
+    Dropped(DroppedUpdates),
     /// The OS watcher reported a runtime failure.
     WatcherFailed(WatchFailure),
 }
@@ -185,15 +234,15 @@ pub enum WatchUpdate {
 impl WatchUpdate {
     /// Returns the sequence number this update belongs to.
     ///
-    /// [`Self::Event`] and [`Self::ReloadFailed`] carry one;
-    /// [`Self::WatcherFailed`] does not describe a single event and returns
+    /// [`Self::Event`] and [`Self::ReloadFailed`] carry one; [`Self::Dropped`]
+    /// and [`Self::WatcherFailed`] do not describe a single event and return
     /// `None`.
     #[must_use]
     pub fn sequence(&self) -> Option<u64> {
         match self {
             Self::Event(event) => Some(event.sequence),
             Self::ReloadFailed(failure) => Some(failure.sequence),
-            Self::WatcherFailed(_) => None,
+            Self::Dropped(_) | Self::WatcherFailed(_) => None,
         }
     }
 }
@@ -396,6 +445,19 @@ mod tests {
         let decoded: WatchUpdate = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, reload_update);
 
+        let dropped_update = WatchUpdate::Dropped(DroppedUpdates {
+            stage: DropStage::Intake,
+            dropped: 3,
+            total: 11,
+        });
+        let value = serde_json::to_value(&dropped_update).unwrap();
+        assert_eq!(value["type"], json!("dropped"));
+        assert_eq!(value["stage"], json!("intake"));
+        assert_eq!(value["total"], json!(11));
+        assert_eq!(dropped_update.sequence(), None);
+        let decoded: WatchUpdate = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, dropped_update);
+
         let watcher_update = WatchUpdate::WatcherFailed(WatchFailure {
             error_kind: "config".to_owned(),
             message: "backend rejected the plan".to_owned(),
@@ -405,5 +467,20 @@ mod tests {
         assert_eq!(watcher_update.sequence(), None);
         let decoded: WatchUpdate = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, watcher_update);
+    }
+
+    #[test]
+    fn drop_stage_wire_names_round_trip() {
+        let expected = [
+            (DropStage::Intake, "intake"),
+            (DropStage::Dispatch, "dispatch"),
+        ];
+        for (stage, wire) in expected {
+            assert_eq!(stage.as_str(), wire);
+            assert_eq!(serde_json::to_value(stage).unwrap(), json!(wire));
+            let decoded: DropStage =
+                serde_json::from_str(&serde_json::to_string(&stage).unwrap()).unwrap();
+            assert_eq!(decoded, stage);
+        }
     }
 }

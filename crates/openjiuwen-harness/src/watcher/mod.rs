@@ -24,14 +24,21 @@
 //!   event to the handlers interested in its kind and recording their failures.
 //! - `handlers` — the concrete reload bodies for skills, instruction files and
 //!   MCP configuration, each with its handler adapter.
+//! - `intake` — the bounded intake and dispatch queues plus the drop policy
+//!   behind [`DropStage`] and [`WatcherHandle::dropped_notifications`].
 //! - `backend` — the `notify`-gated OS adapter that registers the plan's watch
 //!   paths, debounces raw notifications and drives the reload hub. It is private
 //!   and only reached through [`WorkspaceWatcher::start`].
 //!
 //! The builder is the public front door: [`WatcherConfig`] holds the debounce
-//! window and the broadcast capacity, [`WorkspaceWatcher`] accumulates the plan
-//! and the reload handlers, and [`WorkspaceWatcher::start`] turns them into a
-//! running [`WatcherHandle`].
+//! window, the broadcast capacity and the two queue capacities,
+//! [`WorkspaceWatcher`] accumulates the plan and the reload handlers, and
+//! [`WorkspaceWatcher::start`] turns them into a running [`WatcherHandle`].
+//!
+//! Reload handlers run on a dispatcher task of their own, so a slow handler
+//! delays neither the debounce loop nor the publication of events; what it can
+//! do is fill the bounded dispatch queue, and the resulting drops are counted and
+//! announced as [`WatchUpdate::Dropped`].
 //!
 //! Every type above compiles and is fully usable without the `notify` feature;
 //! only [`WorkspaceWatcher::start`] then reports the missing backend with
@@ -44,6 +51,7 @@ mod event;
 mod handle;
 mod handlers;
 mod hub;
+mod intake;
 mod targets;
 #[cfg(all(test, feature = "notify"))]
 mod tests;
@@ -59,7 +67,8 @@ use crate::cli::EnvSource;
 
 pub use debounce::{DebounceInput, Debouncer, DEFAULT_MAX_PENDING};
 pub use event::{
-    ChangeKind, ReloadFailure, WatchEvent, WatchFailure, WatchTargetKind, WatchUpdate,
+    ChangeKind, DropStage, DroppedUpdates, ReloadFailure, WatchEvent, WatchFailure,
+    WatchTargetKind, WatchUpdate,
 };
 pub use handle::{Subscription, WatcherHandle};
 pub use handlers::{
@@ -77,9 +86,17 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 /// [`WatcherHandle::subscribe`].
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
+/// Default capacity of the bounded queue between the OS callback and the
+/// debounce loop.
+pub const DEFAULT_INTAKE_CAPACITY: usize = 1024;
+
+/// Default capacity of the bounded queue between the debounce loop and the
+/// reload dispatcher.
+pub const DEFAULT_DISPATCH_CAPACITY: usize = 256;
+
 /// Tunables of a [`WorkspaceWatcher`].
 ///
-/// Both values are pure data, so a caller can construct, compare and reuse a
+/// Every value is pure data, so a caller can construct, compare and reuse a
 /// configuration without starting a watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatcherConfig {
@@ -98,15 +115,36 @@ pub struct WatcherConfig {
     /// blocks. A value of `0` is raised to `1`, because a broadcast channel
     /// cannot have zero capacity.
     pub event_capacity: usize,
+    /// Number of raw OS notifications buffered between the `notify` callback and
+    /// the debounce loop.
+    ///
+    /// The queue is bounded so a notification burst cannot grow memory while the
+    /// loop is busy; when it is full the **newest** notification is dropped. The
+    /// loss is never silent: it is counted in
+    /// [`WatcherHandle::dropped_notifications`], logged at `warn` and published
+    /// as [`WatchUpdate::Dropped`] with [`DropStage::Intake`]. A value of `0` is
+    /// raised to `1`, because a bounded channel cannot have zero capacity.
+    pub intake_capacity: usize,
+    /// Number of debounced events buffered for the reload dispatcher.
+    ///
+    /// The reload handlers run on their own task, so a slow handler never delays
+    /// debouncing or publication — it only fills this queue, and the events that
+    /// no longer fit are dropped (newest first) and reported like an intake drop,
+    /// with [`DropStage::Dispatch`]. Subscribers still receive those events;
+    /// only their reload bodies did not run. A value of `0` is raised to `1`.
+    pub dispatch_capacity: usize,
 }
 
 impl Default for WatcherConfig {
-    /// Returns the 250 ms / 256 defaults
-    /// ([`DEFAULT_DEBOUNCE`], [`DEFAULT_EVENT_CAPACITY`]).
+    /// Returns the 250 ms / 256 / 1024 / 256 defaults ([`DEFAULT_DEBOUNCE`],
+    /// [`DEFAULT_EVENT_CAPACITY`], [`DEFAULT_INTAKE_CAPACITY`],
+    /// [`DEFAULT_DISPATCH_CAPACITY`]).
     fn default() -> Self {
         Self {
             debounce: DEFAULT_DEBOUNCE,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            intake_capacity: DEFAULT_INTAKE_CAPACITY,
+            dispatch_capacity: DEFAULT_DISPATCH_CAPACITY,
         }
     }
 }
@@ -129,6 +167,20 @@ impl WatcherConfig {
     #[must_use]
     pub fn with_event_capacity(mut self, event_capacity: usize) -> Self {
         self.event_capacity = event_capacity;
+        self
+    }
+
+    /// Replaces the raw-intake capacity and returns the configuration.
+    #[must_use]
+    pub fn with_intake_capacity(mut self, intake_capacity: usize) -> Self {
+        self.intake_capacity = intake_capacity;
+        self
+    }
+
+    /// Replaces the reload-dispatch capacity and returns the configuration.
+    #[must_use]
+    pub fn with_dispatch_capacity(mut self, dispatch_capacity: usize) -> Self {
+        self.dispatch_capacity = dispatch_capacity;
         self
     }
 }
@@ -200,6 +252,26 @@ impl WorkspaceWatcher {
     #[must_use]
     pub fn event_capacity(mut self, event_capacity: usize) -> Self {
         self.config.event_capacity = event_capacity;
+        self
+    }
+
+    /// Replaces the raw-intake capacity and returns the watcher.
+    ///
+    /// Shorthand for [`WatcherConfig::with_intake_capacity`] on the current
+    /// configuration.
+    #[must_use]
+    pub fn intake_capacity(mut self, intake_capacity: usize) -> Self {
+        self.config.intake_capacity = intake_capacity;
+        self
+    }
+
+    /// Replaces the reload-dispatch capacity and returns the watcher.
+    ///
+    /// Shorthand for [`WatcherConfig::with_dispatch_capacity`] on the current
+    /// configuration.
+    #[must_use]
+    pub fn dispatch_capacity(mut self, dispatch_capacity: usize) -> Self {
+        self.config.dispatch_capacity = dispatch_capacity;
         self
     }
 
@@ -280,10 +352,13 @@ impl WorkspaceWatcher {
     /// Starts the watcher and returns its handle.
     ///
     /// The plan is validated first, then the OS backend is created and the
-    /// watch paths are registered, and finally one tokio task is spawned that
-    /// owns the backend, debounces its notifications, publishes
-    /// [`WatchUpdate::Event`] values on the handle's broadcast channel and runs
-    /// the reload handlers.
+    /// watch paths are registered, and finally two tokio tasks are spawned: one
+    /// owns the backend, debounces its notifications and publishes
+    /// [`WatchUpdate::Event`] values on the handle's broadcast channel, and one
+    /// runs the reload handlers for the published events. A slow handler
+    /// therefore cannot delay debouncing or publication; if it falls behind, the
+    /// bounded dispatch queue drops events and the loss is reported through
+    /// [`WatcherHandle::dropped_dispatches`] and [`WatchUpdate::Dropped`].
     ///
     /// # Errors
     ///

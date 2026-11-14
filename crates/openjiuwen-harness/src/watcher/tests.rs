@@ -31,13 +31,14 @@ use openjiuwen_common::config::OpenJiuwenHome;
 use openjiuwen_common::error::ErrorKind;
 use tempfile::TempDir;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::{instruction::InstructionFiles, mcp_config::McpConfiguration, MapEnv};
 use crate::skills::SkillLibrary;
 use crate::watcher::{
-    ChangeKind, InstructionReloadHandler, InstructionReloader, McpConfigReloadHandler,
-    McpConfigReloader, SkillLibraryReloader, SkillsReloadHandler, Subscription, WatchEvent,
-    WatchPlan, WatchTargetKind, WatchUpdate, WorkspaceWatcher,
+    ChangeKind, DropStage, FnReloadHandler, InstructionReloadHandler, InstructionReloader,
+    McpConfigReloadHandler, McpConfigReloader, SkillLibraryReloader, SkillsReloadHandler,
+    Subscription, WatchEvent, WatchPlan, WatchTargetKind, WatchUpdate, WorkspaceWatcher,
 };
 
 /// Upper bound of every wait and every poll loop in this file.
@@ -467,18 +468,246 @@ async fn shutdown_is_idempotent_and_closes_subscriptions() {
     let mut subscription = handle.subscribe();
     assert!(!handle.is_shutdown());
 
-    handle.shutdown().await.unwrap();
+    assert!(handle.shutdown().await.is_ok());
     assert!(handle.is_shutdown());
-    // A second shutdown finds no task left and still succeeds.
-    handle.shutdown().await.unwrap();
+    // A second shutdown finds no task left, still succeeds and does not
+    // resurrect the watcher.
+    assert!(
+        handle.shutdown().await.is_ok(),
+        "a second shutdown must be a no-op"
+    );
     assert!(handle.is_shutdown());
+    assert_eq!(handle.dropped_notifications(), 0);
+    assert_eq!(handle.dropped_dispatches(), 0);
+
+    // The subscription outlives the handle: while the sender still lives nothing
+    // is delivered, so this bounded wait times out.
+    let held = tokio::time::timeout(SETTLE, subscription.recv()).await;
+    assert!(
+        held.is_err(),
+        "the subscription must stay open while the handle lives: {held:?}"
+    );
 
     drop(handle);
     let closed = tokio::time::timeout(WAIT, subscription.recv()).await;
-    assert!(
-        closed.unwrap().is_none(),
+    assert_eq!(
+        closed,
+        Ok(None),
         "the subscription must end once the handle is gone"
     );
+    // The stream is fused, so a second poll over the closed channel is `None` too.
+    let again = tokio::time::timeout(WAIT, subscription.recv()).await;
+    assert_eq!(again, Ok(None));
+}
+
+#[tokio::test]
+async fn a_panicking_reload_handler_is_reported_through_shutdown() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("skills");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let handle = WorkspaceWatcher::new()
+        .debounce(Duration::from_millis(50))
+        .watch_dir(WatchTargetKind::Other, &root)
+        .on_reload(FnReloadHandler::new(
+            "exploding",
+            vec![WatchTargetKind::Other],
+            |_event| Box::pin(async { panic!("reload handler exploded") }),
+        ))
+        .start()
+        .await
+        .unwrap();
+    let mut subscription = handle.subscribe();
+
+    let broken = root.join("boom.md");
+    write(&broken, "boom\n");
+    let _event = next_event_for(&mut subscription, |event| event.path == broken).await;
+
+    // The dispatcher task panicked while running the handler; the handle turns
+    // the join failure into a typed `SysOp` error instead of hiding it.
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("a panicked dispatcher must fail the shutdown");
+    assert_eq!(error.kind(), ErrorKind::SysOp);
+    assert!(
+        error.to_string().contains("workspace watcher task failed"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("reload handler exploded"),
+        "{error}"
+    );
+    assert!(handle.is_shutdown());
+    // The tasks were consumed, so the handle is still safely idempotent.
+    assert!(handle.shutdown().await.is_ok());
+}
+
+#[tokio::test]
+async fn a_slow_reload_handler_does_not_delay_publication_for_another_target() {
+    let temp = TempDir::new().unwrap();
+    let slow_root = temp.path().join("slow");
+    let fast_root = temp.path().join("fast");
+    std::fs::create_dir_all(&slow_root).unwrap();
+    std::fs::create_dir_all(&fast_root).unwrap();
+
+    // The slow handler blocks until the test releases it, so the test does not
+    // depend on any timing: publication has to happen while the handler is
+    // provably still running.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = CancellationToken::new();
+    let handler_started = Arc::clone(&started);
+    let handler_release = release.clone();
+    let slow_handler = FnReloadHandler::new("slow", vec![WatchTargetKind::Spec], move |_event| {
+        let started = Arc::clone(&handler_started);
+        let release = handler_release.clone();
+        Box::pin(async move {
+            started.notify_one();
+            release.cancelled().await;
+            Ok(())
+        })
+    });
+
+    let handle = WorkspaceWatcher::new()
+        .debounce(Duration::from_millis(50))
+        .watch_dir(WatchTargetKind::Spec, &slow_root)
+        .watch_dir(WatchTargetKind::Skills, &fast_root)
+        .on_reload(slow_handler)
+        .start()
+        .await
+        .unwrap();
+    let mut subscription = handle.subscribe();
+
+    write(&slow_root.join("a.md"), "slow\n");
+    tokio::time::timeout(WAIT, started.notified())
+        .await
+        .expect("the slow reload handler never started");
+
+    // While that handler is blocked, an event of the other target is still
+    // published: publication must not be serialised behind the handler.
+    let fast_file = fast_root.join("b.md");
+    write(&fast_file, "fast\n");
+    let published = next_event_for(&mut subscription, |event| event.path == fast_file).await;
+    assert_eq!(published.kind, WatchTargetKind::Skills);
+    assert_eq!(published.change, ChangeKind::Created);
+    assert_eq!(handle.dropped_notifications(), 0);
+
+    release.cancel();
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_overflowing_intake_queue_counts_and_announces_its_drops() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("burst");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let handle = WorkspaceWatcher::new()
+        .debounce(Duration::from_millis(50))
+        .intake_capacity(1)
+        .event_capacity(4096)
+        .watch_dir(WatchTargetKind::Other, &root)
+        .start()
+        .await
+        .unwrap();
+    let mut subscription = handle.subscribe();
+
+    // One synchronous burst: this test runs on a current-thread runtime, so the
+    // intake task cannot drain while the writes happen and a one-slot queue must
+    // overflow instead of growing.
+    for index in 0..200 {
+        write(&root.join(format!("file-{index}.md")), "burst\n");
+    }
+
+    let deadline = Instant::now() + WAIT;
+    let observed = wait_until(deadline, || handle.dropped_notifications() > 0).await;
+    let dropped = handle.dropped_notifications();
+    assert!(
+        observed,
+        "the one-slot intake queue never reported a drop (counter {dropped})"
+    );
+
+    // The loss is not silent: a typed notice carries the same loss to the
+    // subscriber, with the running total behind the counter.
+    let notice = loop {
+        match tokio::time::timeout_at(deadline, subscription.recv()).await {
+            Ok(Some(WatchUpdate::Dropped(notice))) => break notice,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the subscription closed before the drop notice"),
+            Err(elapsed) => panic!("waited {elapsed:?} for the drop notice"),
+        }
+    };
+    assert_eq!(notice.stage, DropStage::Intake);
+    assert!(notice.dropped >= 1, "{notice:?}");
+    assert!(notice.total >= notice.dropped, "{notice:?}");
+    assert!(
+        notice.total <= handle.dropped_notifications(),
+        "the notice announced more drops than the handle counted: {notice:?}"
+    );
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_blocked_handler_overflowing_the_dispatch_queue_reports_its_drops() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("skills");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = CancellationToken::new();
+    let handler_started = Arc::clone(&started);
+    let handler_release = release.clone();
+    let slow_handler = FnReloadHandler::new("slow", vec![WatchTargetKind::Other], move |_event| {
+        let started = Arc::clone(&handler_started);
+        let release = handler_release.clone();
+        Box::pin(async move {
+            started.notify_one();
+            release.cancelled().await;
+            Ok(())
+        })
+    });
+
+    let handle = WorkspaceWatcher::new()
+        .debounce(Duration::from_millis(50))
+        .dispatch_capacity(1)
+        .watch_dir(WatchTargetKind::Other, &root)
+        .on_reload(slow_handler)
+        .start()
+        .await
+        .unwrap();
+    let mut subscription = handle.subscribe();
+
+    let first = root.join("first.md");
+    write(&first, "first\n");
+    tokio::time::timeout(WAIT, started.notified())
+        .await
+        .expect("the slow reload handler never started");
+
+    // The handler is blocked with the one-slot dispatch queue behind it, so the
+    // events of this burst are still published but no longer all dispatched.
+    let mut later = Vec::new();
+    for index in 0..3 {
+        let file = root.join(format!("later-{index}.md"));
+        write(&file, "later\n");
+        later.push(file);
+    }
+    for file in &later {
+        let event = next_event_for(&mut subscription, |event| &event.path == file).await;
+        assert_eq!(event.kind, WatchTargetKind::Other);
+    }
+
+    let deadline = Instant::now() + WAIT;
+    let observed = wait_until(deadline, || handle.dropped_dispatches() > 0).await;
+    assert!(
+        observed,
+        "a blocked handler never overflowed the one-slot dispatch queue \
+         (counter {})",
+        handle.dropped_dispatches()
+    );
+
+    release.cancel();
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
