@@ -64,6 +64,26 @@ pub enum WorktreeEvent {
         /// Absolute path of the worktree directory.
         path: std::path::PathBuf,
     },
+    /// A worktree session was entered through the `enter_worktree` tool.
+    Entered {
+        /// Requested name.
+        name: String,
+        /// Absolute path of the worktree directory.
+        path: std::path::PathBuf,
+        /// Branch checked out in the worktree.
+        branch: String,
+        /// Whether the worktree already existed.
+        existed: bool,
+    },
+    /// A worktree session was exited through the `exit_worktree` tool.
+    Exited {
+        /// Requested name.
+        name: String,
+        /// Absolute path of the worktree directory.
+        path: std::path::PathBuf,
+        /// Action taken: `keep` or `remove`.
+        action: String,
+    },
     /// Stale registry entries and prunable git worktrees were cleaned up.
     Pruned {
         /// Number of registry records dropped.
@@ -108,6 +128,8 @@ impl WorktreeEvent {
             Self::Locked { .. } => "locked",
             Self::Unlocked { .. } => "unlocked",
             Self::Pruned { .. } => "pruned",
+            Self::Entered { .. } => "entered",
+            Self::Exited { .. } => "exited",
             Self::SparseConfigured { .. } => "sparse_configured",
             Self::Cleaned { .. } => "cleaned",
             Self::Error { .. } => "error",

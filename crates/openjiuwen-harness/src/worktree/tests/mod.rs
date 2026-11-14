@@ -22,6 +22,7 @@ mod lock;
 mod manager;
 mod sparse;
 mod tool;
+mod tools;
 
 /// One recorded git invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -884,6 +884,15 @@ impl WorktreeManager {
         }
     }
 
+    /// Emits a lifecycle event to the configured sink.
+    ///
+    /// Exposed to the worktree tools, which report their own session events
+    /// ([`WorktreeEvent::Entered`]/[`WorktreeEvent::Exited`]) through the same
+    /// sink as the manager's lifecycle events.
+    pub(crate) async fn emit(&self, event: WorktreeEvent) {
+        self.events.emit(event).await;
+    }
+
     /// Builds the registry record of a worktree.
     fn record_for(
         &self,

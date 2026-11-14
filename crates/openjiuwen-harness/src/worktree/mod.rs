@@ -43,6 +43,12 @@
 //!   [`BuiltinTool::Worktree`](crate::tools::BuiltinTool::Worktree), the last of
 //!   the extended tools, and built from a [`WorktreeManager`] plus the registry
 //!   language and permission engine.
+//! - [`EnterWorktreeTool`] / [`ExitWorktreeTool`] — the model-facing
+//!   `enter_worktree`/`exit_worktree` tools (Python's session tools): entering
+//!   creates or recovers a worktree and records a [`WorktreeSessionState`] in a
+//!   [`WorktreeSessionStore`]; exiting keeps the worktree or removes it after a
+//!   two-phase confirmation. Rust has no safe process-wide cwd switch, so the
+//!   tools report the target path in the payload and the host applies it.
 //! - [`SparseConfig`] / [`SparseMode`] — the sparse-checkout selection (cone by
 //!   default, `--no-cone` patterns otherwise) with host-side path validation;
 //!   `git::sparse_checkout_set` and friends are the command helpers, and
@@ -72,8 +78,7 @@
 //! - Deferred (documented in this module's `CONTEXT.md`): post-creation setup
 //!   beyond sparse checkout (symlinked heavy directories, include-pattern
 //!   copying, hook-path configuration), lifecycle policies and auto-cleanup
-//!   timers, and the Python `enter_worktree`/`exit_worktree` tools plus the
-//!   rails integration.
+//!   timers, and the Python rails integration of the enter/exit tools.
 mod changes;
 mod cleanup;
 mod events;
@@ -85,6 +90,7 @@ mod slug;
 mod sparse;
 mod store;
 mod tool;
+mod tools;
 
 pub use changes::{
     change_summary, parse_diff_stat, render_change_summary, status_paths, WorktreeChangeSummary,
@@ -127,6 +133,11 @@ pub use slug::{
 pub use sparse::{validate_sparse_path, SparseConfig, SparseMode, MAX_SPARSE_PATHS};
 pub use store::{index_path, WorktreeIndex, INDEX_DIR, INDEX_FILE, INDEX_VERSION};
 pub use tool::{WorktreeArgs, WorktreeTool, ACTIONS, TOOL_NAME};
+pub use tools::{
+    EnterWorktreeArgs, EnterWorktreeTool, ExitWorktreeArgs, ExitWorktreeTool,
+    MemoryWorktreeSessionStore, SharedWorktreeSessions, WorktreeSessionState, WorktreeSessionStore,
+    ENTER_TOOL_NAME, EXIT_ACTIONS, EXIT_TOOL_NAME, WORKTREE_DEFAULT_NAME_KEY, WORKTREE_SESSION_KEY,
+};
 
 #[cfg(test)]
 mod tests;
