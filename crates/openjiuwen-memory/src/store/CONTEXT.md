@@ -12,7 +12,7 @@ Per-file responsibilities are in the Routing Table.
 
 ### `keys.rs` — key layout
 
-Prefix constants: `RECORD_PREFIX = "UMD"` (the Python KV namespace), `VARIABLE_PREFIX = "user_var"`, `SESSION_VARIABLE_PREFIX = "session_var"`, `SCOPE_CONFIG_PREFIX = "memory_scope_config"`, `SCOPE_USER_MAPPING_PREFIX = "scope_user_mapping"`, `MESSAGES_COLLECTION = "messages"`.
+Prefix constants: `RECORD_PREFIX = "UMD"` (the Python KV namespace), `VARIABLE_PREFIX = "user_var"`, `SESSION_VARIABLE_PREFIX = "session_var"`, `SCOPE_CONFIG_PREFIX = "memory_scope_config"`, `SCOPE_OVERRIDES_PREFIX = "memory_scope_overrides"`, `SCOPE_USER_MAPPING_PREFIX = "scope_user_mapping"`, `MESSAGES_COLLECTION = "messages".
 
 | Data | Builder | Shape |
 | --- | --- | --- |
@@ -21,6 +21,7 @@ Prefix constants: `RECORD_PREFIX = "UMD"` (the Python KV namespace), `VARIABLE_P
 | user variable | `variable_key(scope, name)` | `user_var/{user}/{scope}/{name}` |
 | session variable | `session_variable_key(scope, session_id, name)` | `session_var/{user}/{scope}/{session}/{name}` |
 | scope config | `scope_config_key(scope_id)` | `memory_scope_config/{scope_id}` |
+| scope analyzer overrides | `scope_overrides_key(scope_id)` | `memory_scope_overrides/{scope_id}` |
 | scope-user mapping | `scope_user_mapping_key_in(prefixes, scope_id, user_id)` | `<current>/{scope_id}/{user_id}` |
 | message history | `messages_collection_in(prefixes)` | document collection `messages` |
 | embedding | `vector_collection(scope, kind: MemoryType)` | `uid_{user}_gid_{scope}_mtype_{kind}` |
@@ -31,6 +32,7 @@ They are the same builders under a `legacy_` prefix (`legacy_record_key`, `legac
 The `*_in` variants are the same shapes with the head taken from the caller's `KvPrefixRegistry`; the plain builders are the default-registry form and a test pins both to the same output.
 `legacy_alternatives_in` emits one candidate per alias of the key's family (registration order, never the segment of `key` itself), and `current_equivalent_in` maps an alias head back to the current prefix, returning `None` when the head is current, unknown, or absent.
 Vector collections are not a KV family, so `keys::vector_collection` stays prefix-independent, and `scope_user_mapping_*_in` are that family's only builders (Python ships no legacy prefix for it).
+`memory_scope_overrides` is not a KV family either: `scope_overrides_key` is the only builder, so the registry never renames it, `backup` never dumps it, and it has no legacy alias.
 
 ### `prefix.rs`
 
@@ -54,7 +56,7 @@ Constructors: `in_memory()` (includes an `InMemoryGraphStore`), `local_file(root
 ### `storage.rs` (crate-internal)
 
 `MemoryStorage { stores: MemoryStores, prefixes: KvPrefixRegistry }` with `new(stores)` (default layout), `with_prefixes(stores, prefixes)`, and `prefixes()`.
-Records: `put_record`, `get_record(scope, id)`, `list_records(filter)`, `delete_record(record) -> Result<bool>`; embeddings: `index_embedding`, `delete_embedding`, `search_embeddings(scope, kind, vector, top_k) -> Vec<(String, f32)>`; variables: `set_variable`, `get_variable`, `list_variables`, `delete_variable(scope, session_id, name)`; scope config: `set_scope_config`, `get_scope_config`, `delete_scope_config(scope_id)`.
+Records: `put_record`, `get_record(scope, id)`, `list_records(filter)`, `delete_record(record) -> Result<bool>`; embeddings: `index_embedding`, `delete_embedding`, `search_embeddings(scope, kind, vector, top_k) -> Vec<(String, f32)>`; variables: `set_variable`, `get_variable`, `list_variables`, `delete_variable(scope, session_id, name)`; scope config: `set_scope_config`, `get_scope_config`, `delete_scope_config(scope_id)`; scope analyzer overrides: `set_scope_overrides(scope_id, value: serde_json::Value)`, `get_scope_overrides(scope_id) -> Option<serde_json::Value>`, `delete_scope_overrides(scope_id) -> bool`.
 Every method is `pub(crate) async fn … -> Result<…>` and derives keys through the `keys::*_in` builders and the `legacy::*_in` helpers with `self.prefixes`; vector collection names stay prefix-independent.
 
 - `put_record` serializes the record with `embedding: None` (the embedding column is authoritative) to the record key; the scope is already flattened in the JSON.
@@ -64,15 +66,24 @@ Every method is `pub(crate) async fn … -> Result<…>` and derives keys throug
 - The vector collection schema is `id VARCHAR(256) PRIMARY KEY` plus `embedding FLOAT_VECTOR(dim)`; `index_embedding` creates the collection on first use, deletes the id if present, then calls `add_docs` (foundation is insert-only), and `search_embeddings` checks `collection_exists`, so a missing collection yields an empty vector and scores are foundation-normalized `[0,1]`.
 - Variables keep the raw string as `KvValue::Text`; `get_variable` returns text only (legacy fallback applies, non-text stays `None`) and `list_variables` lets a current value win for the same name.
 - `set_scope_config` serializes the config JSON under `memory_scope_config/{scope_id}`; malformed stored JSON is `Error::Validation`, and reads fall back to `scope_config/{scope_id}`.
+- `set_scope_overrides`/`get_scope_overrides`/`delete_scope_overrides` store the analyzer-override payload verbatim as JSON text under `memory_scope_overrides/{scope_id}`: the store never interprets it, a missing key is `None`/`false`, and a stored non-text or non-JSON value is `Error::Validation`.
+- `validate_scope_id` (the `MemoryScope` rule for `scope_id`: non-empty, no `/`, `\`, NUL, at most 128 characters) runs before the override keys are derived, so an invalid scope id writes and reads nothing; the scope-config methods keep their crate-internal callers' validation.
 - Graph storage is carried by `MemoryStores::graph` and used by the `graph` module; this module implements no graph semantics.
 
-### `messages.rs`
+### `messages/mod.rs` and `messages/cursor.rs`
 
 `StoredMessage { id, user_id, scope_id, session_id, role, content, timestamp }` derives `Debug + Clone + Default + PartialEq + Serialize + Deserialize`.
-`MessageStore { document: Arc<dyn DocumentStore>, prefixes: KvPrefixRegistry }` has `new(document)` (default collection name), `with_prefixes(document, prefixes)`, `append(scope, messages, timestamp)`, `recent(scope, limit)`, and `delete_for(filter) -> Result<usize>`; the crate-visible helpers are `derived_message_id(content, role, timestamp)` and `stored_document(message) -> Document`.
+`MessageStore { document: Arc<dyn DocumentStore>, prefixes: KvPrefixRegistry }` has `new(document)` (default collection name), `with_prefixes(document, prefixes)`, `append(scope, messages, timestamp)`, `recent(scope, limit)`, `page(scope, page_size, cursor, filter) -> MessagePage`, and `delete_for(filter) -> Result<usize>`; the crate-visible helpers are `derived_message_id(content, role, timestamp)`, `stored_document(message) -> Document`, and `decode(documents)` (warns and skips malformed rows).
 `derived_message_id` is the single source of the deterministic id `msg_{fnv64(content + role + millis):016x}_{millis}` (Python's `msg_{sha256(…)}` shape, no crypto dependency), and `append` and the legacy-row import both call it, so re-importing a row replaces the same document.
 `stored_document` is the flat document shape (`user_id`, `scope_id`, optional `session_id`, `role`, `content`, RFC 3339 `timestamp`) that `append` and the message migrator both write through, so the import cannot drift from the append path.
 The collection name comes from `keys::messages_collection_in(&self.prefixes)` (`messages` by default); `recent` queries `user_id`/`scope_id`/optional `session_id`, orders by `timestamp` desc, applies the limit, then reverses so the newest message is last, and `content` is the plain-text view of `BaseMessage::content` (non-text parts are JSON-rendered).
+`page` walks history oldest-first by `(timestamp asc, id asc)` (`Query.order_by` is a priority list, so identical timestamps tie-break on the document id), reads one look-ahead row to set `has_more`, and returns `next_cursor` only when `has_more`.
+`page` is `#[cfg_attr(not(test), allow(dead_code))]` until an in-crate caller wires history pagination; its `page_size == 0` path returns an empty page without touching the store.
+`MessageCursor { timestamp, id }` is the `(timestamp, id)` keyset position of one row: `encode()` yields the opaque `mc1.{millis}.{checksum}.{id}` token and `decode(token)` returns `Error::Validation` naming the token for garbage, truncated, or tampered input (`mc1` is the token version, the checksum is the 64-bit FNV-1a of `{millis}.{id}`, and a millisecond stamp out of range is rejected), so no offset or row number ever reaches the caller.
+`MessagePage { items, next_cursor, has_more }` is `serde` snake_case and tolerant of unknown fields; `items` are oldest-first and `next_cursor` is the encoded position of the last item (absent when `has_more` is false).
+`page_filter(scope, filter, cursor)` is the single page filter: the scope clauses AND the caller `MemoryFilter` clauses AND an inclusive `timestamp >= cursor.timestamp` bound, merged per field (equal conditions collapse, contradicting ones become `$in` over an empty list, range operators keep the stricter bound), because the filter language has no `$or`.
+The cursor tie-break happens in memory: `page` reads a growing window of `timestamp >= cursor.timestamp` rows ordered by `(timestamp, id)`, drops rows at or before the cursor, and stops once it holds a full page plus one look-ahead row or the history is exhausted.
+`messages/cursor.rs` also owns `scope_filter`/`message_filter` (shared with `recent`/`delete_for`) and `CURSOR_VERSION`.
 
 ### `backup.rs`
 
@@ -292,7 +303,8 @@ Gaps relative to the Python package, each typed rather than silent:
 - `./migration/vector.rs` → `VectorMigrator`, `RecollectionPair`, the embedding recollection operation
 - `./migration/index_version.rs` → `IndexStamp`, `IndexVersionOptions`, `IndexVersionMigrator`, `INDEX_VERSION_PREFIX`, `CURRENT_INDEX_VERSION`, the stamp/purge operations
 - `./migration/standard.rs` → the standard migrator set, planner/registry, and plan/run entry points
-- `./messages.rs` → `StoredMessage`, `MessageStore`, `derived_message_id`, `stored_document`
+- `./messages/mod.rs` → `StoredMessage`, `MessageStore` (`append`, `recent`, `page`, `delete_for`), `derived_message_id`, `stored_document`, `decode`
+- `./messages/cursor.rs` → `MessageCursor`, `MessagePage`, `CURSOR_VERSION`, `scope_filter`/`message_filter`/`page_filter` and the per-field merge of filter clauses
 - `./json.rs` → internal record (de)serialization helpers and `plain_text` for `BaseMessage`
 
 ## Test Strategy
@@ -300,7 +312,8 @@ Gaps relative to the Python package, each typed rather than silent:
 Every suite is offline (in-memory stores, `tempfile`, scripted fixtures, no wall-clock ordering), and unit tests live beside each file.
 
 - `keys.rs`/`prefix.rs`: key shapes, legacy↔current round trips, registry defaults/demotion/dedup/`family_of`/validation/JSON, collection sanitization, `*_in` parity.
-- `legacy.rs`/`storage.rs`/`messages.rs`: current-wins reads, listing dedupe, deletes removing both layouts, malformed tolerance, store round trips, SQLite reopen, renamed families/collections, deterministic message ids.
+- `legacy.rs`/`storage.rs`/`messages/mod.rs`: current-wins reads, listing dedupe, deletes removing both layouts, malformed tolerance, store round trips, SQLite reopen, renamed families/collections, deterministic message ids, scope-override round trips/overwrite/delete/malformed/invalid-id/local-file+SQLite reopen.
+- `messages/cursor.rs`/`messages/mod.rs` pagination: three pages over five messages, identical timestamps paging by id with no repeats or gaps, tampered/truncated cursors, `page_size == 0` and empty history, filter composition (`ids`, `created_after`, a conflicting user clause), cursor survival across a local-file reopen, and the exact merged filter shape.
 - `backup.rs`: in-memory and local-file round trips, normalisation, current-wins, dry-run restore, target-registry remapping, `verify` rejections.
 - `mapping.rs`: CRUD, key/JSON shape, invalid ids writing nothing, missing/malformed rows, renamed prefix, reopen.
 - `kv_lock.rs`: option defaults, invalid names/options, acquire/release/serialisation/contention+timeout, `#[cfg(unix)]` file lock across handles, typed `Unsupported` brokers.

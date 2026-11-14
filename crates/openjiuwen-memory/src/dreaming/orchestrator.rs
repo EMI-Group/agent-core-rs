@@ -46,6 +46,24 @@
 //! sweep renews it before recording the transition, and it is released afterwards. The
 //! orchestrator uses its own `repository` handle only for retention and as the lease store;
 //! callers should pass the planner's repository so both halves see the same queue.
+//!
+//! ## The sweep lock
+//!
+//! Leasing excludes one *job*, not one *sweep*: two workers could still scan the queue and
+//! purge retention at the same time. [`DreamOrchestrator::with_sweep_lock`] injects a
+//! [`DistributedKvLock`] that each tick holds over
+//! [`DREAM_SWEEP_LOCK_NAME`](crate::dreaming::DREAM_SWEEP_LOCK_NAME) for the whole sweep plus
+//! its retention pass, and drops at the end of the tick.
+//!
+//! The handle is deliberately *not* part of [`DreamOrchestratorConfig`]: a backend is a
+//! runtime capability, not a serializable setting. Without one, a tick behaves exactly as it
+//! did before and always sweeps. When the lock cannot be obtained — another sweeper holds it
+//! and the caller's [`LockOptions`] timeout expired, or the backend is a typed `Unsupported`
+//! seam — the tick does not claim, does not purge, and does not fail: it returns an empty
+//! [`DreamRunSummary`] carrying the typed skip reason, records
+//! [`DreamOrchestratorStatus::lock_skips`] and
+//! [`DreamOrchestratorStatus::last_skip_reason`], and logs a warning. Only cancellation and
+//! genuine storage errors still travel out of a tick as errors.
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,12 +75,14 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::record::CallOptions;
+use crate::store::kv_lock::{DistributedKvLock, KvLockGuard, LockOptions};
 
 use super::lease::DreamLeaseOptions;
 use super::outcome::DreamRunSummary;
 use super::planner::DreamPlanner;
 use super::repository::DreamRepository;
 use super::retention::{DreamRetention, RetentionReport};
+use super::sweep_lock::{acquire_sweep_lock, SweepLockOutcome, SweepLockSkip};
 
 #[cfg(test)]
 mod tests;
@@ -375,6 +395,19 @@ pub struct DreamOrchestratorStatus {
     /// failing the tick. Because this is a `String` and not an [`Error`], the status stays
     /// serializable.
     pub last_error: Option<String>,
+    /// Ticks that skipped their sweep because the sweep lock was unavailable; default `0`.
+    ///
+    /// A skipped tick claims nothing, purges nothing, and does not count as a tick, so
+    /// [`DreamOrchestratorStatus::ticks`] and the backoff are untouched by it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lock_skips: u64,
+    /// Why the last skipped tick skipped, rendered from its
+    /// [`SweepLockSkip`](crate::dreaming::SweepLockSkip); default `None`.
+    ///
+    /// Only a skip sets this, and nothing clears it: it is the last observed lock problem,
+    /// not the current state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skip_reason: Option<String>,
 }
 
 /// One tick's retention outcome, before it is folded into the status.
@@ -386,6 +419,29 @@ enum RetentionStep {
     /// Retention failed; the message goes to
     /// [`DreamOrchestratorStatus::last_error`] and the tick still succeeds.
     Failed(String),
+}
+
+/// The caller-injected sweep lock: one backend plus the options used to acquire it.
+struct SweepLockHandle {
+    /// The backend; shared, because one lock is normally shared by several orchestrators.
+    lock: Arc<dyn DistributedKvLock>,
+    /// The caller's acquisition options, validated by the backend on every tick.
+    options: LockOptions,
+}
+
+/// The sweep lock's verdict for one tick.
+enum SweepGate {
+    /// The sweep may run; the guard (when a lock is configured) releases at the end of the
+    /// tick.
+    Run(Option<KvLockGuard>),
+    /// The lock was unavailable; the tick skips its sweep and its retention pass.
+    Skip(SweepLockSkip),
+}
+
+/// `serde` predicate that omits an absent (zero) counter.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` requires `&T`.
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The caller-driven idle/backoff loop over one [`DreamPlanner`].
@@ -405,6 +461,8 @@ pub struct DreamOrchestrator {
     planner: Arc<DreamPlanner>,
     /// The queue used for retention and leasing.
     repository: Arc<dyn DreamRepository>,
+    /// The optional cross-process lock every tick holds; `None` means "always sweep".
+    sweep_lock: Option<SweepLockHandle>,
     /// The schedule and its switches.
     config: DreamOrchestratorConfig,
     /// The observable snapshot, updated once per tick.
@@ -441,9 +499,32 @@ impl DreamOrchestrator {
         Ok(Self {
             planner,
             repository,
+            sweep_lock: None,
             config,
             state: Mutex::new(DreamOrchestratorStatus::default()),
         })
+    }
+
+    /// Returns the orchestrator holding `lock` (acquired with `options`) around every tick.
+    ///
+    /// The backend excludes whatever it excludes — tasks of one process for
+    /// [`InProcessKvLock`](crate::store::kv_lock::InProcessKvLock), other processes sharing a
+    /// root for [`FileKvLock`](crate::store::kv_lock::FileKvLock) — and the guard covers the
+    /// sweep *and* the retention pass of one tick, so two workers never sweep one queue
+    /// together. See the module docs for the skip path.
+    ///
+    /// `options` is kept as given and validated by the backend on every acquisition, so an
+    /// unusable owner or a zero timeout surfaces as an error from the first tick rather than
+    /// from this builder. A lock is not a configuration value: it is injected here and never
+    /// travels through [`DreamOrchestratorConfig`].
+    #[must_use]
+    pub fn with_sweep_lock(
+        mut self,
+        lock: Arc<dyn DistributedKvLock>,
+        options: LockOptions,
+    ) -> Self {
+        self.sweep_lock = Some(SweepLockHandle { lock, options });
+        self
     }
 
     /// The schedule this orchestrator follows.
@@ -462,6 +543,16 @@ impl DreamOrchestrator {
     #[must_use]
     pub fn repository(&self) -> &Arc<dyn DreamRepository> {
         &self.repository
+    }
+
+    /// The injected sweep lock, when one is configured; default `None`.
+    ///
+    /// The acquisition options are not exposed because the backend validates them on every
+    /// tick and a caller never needs to read them back; this accessor exists so an embedding
+    /// application can share one backend between orchestrators.
+    #[must_use]
+    pub fn sweep_lock(&self) -> Option<&Arc<dyn DistributedKvLock>> {
+        self.sweep_lock.as_ref().map(|handle| &handle.lock)
     }
 
     /// A snapshot of the status, copied out so no lock is held by the caller.
@@ -512,6 +603,15 @@ impl DreamOrchestrator {
     /// The tick never spawns a task and never sleeps; a caller that wants the schedule
     /// applies [`DreamOrchestrator::interval_for_empty_sweeps`] itself (or uses
     /// [`DreamOrchestrator::run_until_cancelled`]).
+    ///
+    /// When a sweep lock is configured it is acquired *before* the sweep and its guard is
+    /// held across the sweep and the retention pass, then dropped. A lock that cannot be
+    /// obtained (held elsewhere past the caller's timeout, or a typed `Unsupported` backend)
+    /// is not an error: the tick returns an empty [`DreamRunSummary`] whose
+    /// [`DreamRunSummary::lock_skip`] names the reason, records
+    /// [`DreamOrchestratorStatus::lock_skips`] and
+    /// [`DreamOrchestratorStatus::last_skip_reason`], and claims nothing. Cancellation and
+    /// genuine storage errors still propagate.
     pub async fn tick_with(
         &self,
         now: DateTime<Utc>,
@@ -524,6 +624,21 @@ impl DreamOrchestrator {
             );
             return Ok(DreamRunSummary::new());
         }
+        let guard = match self.open_sweep_gate().await? {
+            SweepGate::Run(guard) => guard,
+            SweepGate::Skip(skip) => {
+                tracing::warn!(
+                    target: TARGET,
+                    kind = skip.kind.as_str(),
+                    lock = %skip.lock,
+                    backend = %skip.backend,
+                    reason = %skip.reason,
+                    "the dream sweep lock is unavailable; the tick skips its sweep and its retention pass"
+                );
+                self.record_lock_skip(&skip);
+                return Ok(DreamRunSummary::lock_skipped(skip));
+            }
+        };
         let sweep = match self.sweep(now, ctx).await {
             Ok(summary) => summary,
             Err(error) => {
@@ -537,6 +652,7 @@ impl DreamOrchestrator {
             }
         };
         let retention = self.retention_step(now).await;
+        drop(guard);
         self.record_tick(now, &sweep, retention);
         Ok(sweep)
     }
@@ -618,6 +734,22 @@ impl DreamOrchestrator {
         }
     }
 
+    /// Decides whether this tick may sweep: no lock configured, the lock held, or a skip.
+    ///
+    /// One acquisition attempt, bounded only by the caller's
+    /// [`LockOptions::timeout`](crate::store::kv_lock::LockOptions::timeout). A lock failure
+    /// that is *not* unavailability (bad options, an I/O failure in the file backend,
+    /// cancellation) is returned as `Err` and reaches the caller unchanged.
+    async fn open_sweep_gate(&self) -> Result<SweepGate> {
+        let Some(handle) = &self.sweep_lock else {
+            return Ok(SweepGate::Run(None));
+        };
+        match acquire_sweep_lock(handle.lock.as_ref(), &handle.options).await? {
+            SweepLockOutcome::Acquired(guard) => Ok(SweepGate::Run(Some(guard))),
+            SweepLockOutcome::Skipped(skip) => Ok(SweepGate::Skip(skip)),
+        }
+    }
+
     /// Applies the retention policy for this tick, if there is one to apply.
     async fn retention_step(&self, now: DateTime<Utc>) -> RetentionStep {
         if !self.config.run_retention_on_tick {
@@ -660,6 +792,17 @@ impl DreamOrchestrator {
         status.ticks = status.ticks.saturating_add(1);
         status.last_tick_at = Some(now);
         status.last_error = Some(error.to_string());
+    }
+
+    /// Records a tick that was skipped because its sweep lock was unavailable.
+    ///
+    /// A skip is not a tick: `ticks`, `last_tick_at`, the backoff counter, and the next
+    /// interval are left as they were, because no sweep happened to schedule around. Only
+    /// the skip counters move.
+    fn record_lock_skip(&self, skip: &SweepLockSkip) {
+        let mut status = self.state.lock();
+        status.lock_skips = status.lock_skips.saturating_add(1);
+        status.last_skip_reason = Some(skip.to_string());
     }
 
     /// Records a successful tick's sweep and retention outcome.

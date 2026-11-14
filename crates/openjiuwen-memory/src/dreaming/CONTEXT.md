@@ -3,7 +3,7 @@
 ## Intent
 
 Dreaming is the durable memory-consolidation queue plus the workers that drain it: compaction work (dedupe, summarize, forget, graph extraction) is enqueued as a `DreamJob`, claimed through a lease, handed to a `DreamConsolidator`, recorded, and purged after the retention window.
-It is a memory-kernel service: it depends on `crate::record` (scopes, `CallOptions`), `crate::recall` (jaccard, recency), `openjiuwen_common::error`, `chrono`, `serde`, `tokio`/`tokio-util`, and (behind `sqlite`) `sqlx`.
+It is a memory-kernel service: it depends on `crate::record` (scopes, `CallOptions`), `crate::recall` (jaccard, recency), `crate::store::kv_lock` (the injected sweep lock), `openjiuwen_common::error`, `chrono`, `serde`, `tokio`/`tokio-util`, and (behind `sqlite`) `sqlx`.
 Only `pipeline` calls a model, and it receives `openjiuwen_foundation::llm::Model` by injection; nothing here touches `openjiuwen-context` or `openjiuwen-session`.
 No operation reads a clock of its own: every queue, planner, retention, salience, and orchestrator entry point takes `now` (the sole exception is `DreamOrchestrator::run_until_cancelled`, the caller-owned loop, which reads `Utc::now()` between sleeps).
 The module spawns no task, starts no process, and keeps no global state; the queue and its design are this crate's, not a transliteration of the Python `openjiuwen.core.memory.dreaming` idle scheduler.
@@ -19,7 +19,7 @@ The module spawns no task, starts no process, and keeps no global state; the que
 
 `outcome.rs`:
 - `DreamOutcome { job_id, state, metrics, notes }` with `new`, `succeeded`, `skipped`, `cancelled`, `failed`, `with_metrics`, `with_note`, `validate` (non-empty id, terminal state).
-- `DreamRunSummary { scanned, succeeded, failed, skipped, cancelled, outcomes }` with `new`, `is_empty`, `record`, `merge`.
+- `DreamRunSummary { scanned, succeeded, failed, skipped, cancelled, outcomes, lock_skip: Option<SweepLockSkip> }` with `new`, `lock_skipped(skip)`, `is_empty`, `is_lock_skip`, `record`, `merge` (a skip marker is sticky).
 
 `config.rs`:
 - `DreamConfig { enabled = true, min_interval_secs = 60, initial_delay_secs = 120, batch_size = 10, max_attempts = 3, retention_secs = 604_800, message_threshold = 100, idle_secs = 300, dedupe_similarity = 0.92 }` with builder setters, `retention()`, `validate`.
@@ -59,9 +59,10 @@ The module spawns no task, starts no process, and keeps no global state; the que
 
 `orchestrator.rs`:
 - `DreamOrchestratorConfig { enabled = true, poll_interval_ms = 60_000, initial_delay_ms = 120_000, max_interval_ms = 600_000, backoff_multiplier = 2.0, max_backoff_steps = 4, run_retention_on_tick = true, lease: Option<DreamLeaseOptions> = None, retention: Option<DreamRetention> = None }` with `with_*` setters, `poll_interval()`, `initial_delay()`, `max_interval()`, `interval_for(empty_sweeps)`, `validate`.
-- `DreamOrchestratorStatus { ticks, consecutive_empty_sweeps, next_interval_ms, last_tick_at, last_summary, last_retention, last_error }` (`Debug + Clone + Default + PartialEq`, serde).
-- `DreamOrchestrator { planner, repository, config, state }` with `new(planner, repository, config)` (validates), `config`, `planner`, `repository`, `status` (clone), `interval_for_empty_sweeps`, `tick(now)`, `tick_with(now, ctx)`, `run_until_cancelled(cancel) -> Result<DreamRunSummary>`.
+- `DreamOrchestratorStatus { ticks, consecutive_empty_sweeps, next_interval_ms, last_tick_at, last_summary, last_retention, last_error, lock_skips: u64, last_skip_reason: Option<String> }` (`Debug + Clone + Default + PartialEq`, serde).
+- `DreamOrchestrator { planner, repository, sweep_lock: Option<SweepLockHandle>, config, state }` with `new(planner, repository, config)` (validates), `config`, `planner`, `repository`, `sweep_lock`, `with_sweep_lock(lock, options)`, `status` (clone), `interval_for_empty_sweeps`, `tick(now)`, `tick_with(now, ctx)`, `run_until_cancelled(cancel) -> Result<DreamRunSummary>`.
 - The orchestrator uses its repository handle for retention and as the lease store only; callers pass the planner's repository so both halves see one queue.
+- The sweep lock is a runtime handle, never `DreamOrchestratorConfig`: `None` (the default) always sweeps, and a configured lock is acquired before the sweep and dropped after the retention pass.
 
 `retention.rs`:
 - `DreamRetention { retention_secs = 604_800, max_per_state: Option<usize> = None }` with `new`, `disabled`, `from_config`, `with_retention_secs`, `with_max_per_state`, `retention()`, `is_enabled`, `validate` (rejects `Some(0)`).
@@ -117,21 +118,25 @@ The loop selects between `cancel.cancelled()` and `tokio::time::sleep(delay)`; a
 A non-cancellation tick error is logged, stored in `status.last_error`, and the loop continues; only cancellation ends it.
 `tick`/`tick_with` are the injectable-clock entry points: they run exactly one leased or unleased sweep of `batch_size` jobs, optionally run retention (a retention error warns and sets `last_error` but does not fail the tick), advance `ticks`/`last_tick_at`/`consecutive_empty_sweeps`/`next_interval_ms`/`last_summary`, and never sleep or spawn.
 A disabled orchestrator ticks nothing, purges nothing, and leaves its status untouched.
+A configured sweep lock is acquired before the sweep and its guard is held across the sweep and the retention pass, then dropped; no task is spawned and nothing polls.
+When the lock is unavailable (`Error::Timeout` from a holder and the caller's timeout, or `Error::Unsupported` from a vendor backend) the tick claims nothing, purges nothing, and returns `Ok` with `DreamRunSummary::lock_skip` set, incrementing `lock_skips` and setting `last_skip_reason` without counting a tick or advancing the backoff.
+Any other lock failure (`Validation`, `Cancelled`, `External`) still propagates as an error, so only lock unavailability is the skip path.
 
 ## Constraints
 
-- No `unwrap`/`expect`/`panic` outside `#[cfg(test)]`; `tracing` only (no `println!`/`eprintln!`), targets `openjiuwen_memory::dreaming::{config,model,outcome,repository,planner,pipeline,lease,retention,salience,sqlite,orchestrator}`.
+- No `unwrap`/`expect`/`panic` outside `#[cfg(test)]`; `tracing` only (no `println!`/`eprintln!`), targets `openjiuwen_memory::dreaming::{config,model,outcome,repository,planner,pipeline,lease,retention,salience,sqlite,orchestrator,sweep_lock}`.
 - Errors are `openjiuwen_common::error::{Error, Result}`: `Validation` for bad input and illegal transitions, `NotFound` for unknown ids, `Unsupported` for a repository without leasing and for ML salience, `External` for storage/decoding failures, cancellation via `Error::Cancelled`.
 - Every public data type is `serde`-serializable `snake_case` and tolerant of missing/unknown fields (including `DreamLeaseOptions`, whose durations are milliseconds and whose `Default` is deliberately not yet valid).
 - The SQL backends are feature-gated behind `sqlite`; the default build compiles and tests fully offline with the in-memory backend and `RecordOnlySink`.
 - No blocking I/O on async tasks; `sqlx` uses the tokio runtime; a `parking_lot` guard is never held across `.await` (status/lost-reason locks are taken, cloned, and dropped).
-- Files stay around ≤1000 lines and are split by responsibility (`model`/`outcome`/`config`, `repository`/`sqlite`/`sqlite_lease`, `planner`/`planner/lease`, `pipeline`/`pipeline/plan`, `lease`, `retention`, `salience`, `orchestrator`).
+- Files stay around ≤1000 lines and are split by responsibility (`model`/`outcome`/`config`, `repository`/`sqlite`/`sqlite_lease`, `planner`/`planner/lease`, `pipeline`/`pipeline/plan`, `lease`, `retention`, `salience`, `sweep_lock`, `orchestrator`).
 - No new dependencies for the orchestration work: timers use `tokio::time`, cancellation uses `tokio_util::sync::CancellationToken`, and leases use the existing repositories rather than a broker.
 
 ## Design Decisions
 
 - **A durable queue, not Python's idle scheduler.** Python's `dreaming` package contributes a busy-checker + interval loop; this crate makes the job itself durable so a pass survives the request that asked for it, can be retried, and can be inspected.
 - **The orchestrator is caller-owned.** `DreamOrchestrator::run_until_cancelled` is a future an application drives (and cancels) itself; the crate never spawns it, so tests and embeddings control lifetime and there is no hidden daemon.
+- **The sweep lock is injected, not configured.** `with_sweep_lock` takes the `DistributedKvLock` backend and the caller's `LockOptions` and keeps them beside the orchestrator, so `DreamOrchestratorConfig` stays serializable; the backend validates the options on every acquisition.
 - **Two scheduling knobs, one clock.** `DreamConfig` keeps the Python-facing interval/settle/trigger knobs while `DreamOrchestratorConfig` carries the loop's millisecond schedule, the exponential backoff, the lease options, and the retention policy; both are plain values so a caller can persist them.
 - **Leases are repository rows, not files.** The SQLite lease table and the in-memory map are claimed in the same statement/transaction as the job, so there is no window between claim and lease; renew-before-record means a worker that lost its lease cannot overwrite the new owner's row, and the guard latches the first loss so the worker stops.
 - **Deterministic fallback is a first-class result.** Every LLM failure produces the rule plan plus a `degraded` reason that travels into `DreamOutcome::notes`; there is no silent degradation and no partial model output applied.
@@ -145,6 +150,7 @@ A disabled orchestrator ticks nothing, purges nothing, and leaves its status unt
 - A plan sink backed by `LongTermMemory` (`RecordOnlySink` records counters and mutates nothing), provider-specific prompt tuning, and cross-job learning.
 - Background lease heartbeats and lease brokers: a sweep renews once per job; a consolidation longer than its TTL must renew through its own guard, and there is no broker/fencing-token service.
 - Daemon-side retention: nothing purges automatically unless the orchestrator is driven (or a caller invokes `purge_expired`), and no cross-process lease supervises retention.
+- Distributed sweep-lock backends: `UnsupportedKvLock` (Redis/ZooKeeper/etcd) is a typed skip, no lease renewal or TTL eviction exists for a sweep lock, and a held lock with an unbounded `LockOptions` timeout parks the tick instead of skipping.
 - The Python dreaming package's idle-layer extras (busy-checker hooks, trigger wiring into session/message events) and any graph-extraction consolidator implementation.
 
 ## Test Strategy
@@ -155,7 +161,7 @@ A disabled orchestrator ticks nothing, purges nothing, and leaves its status unt
 `planner` tests use a scripted consolidator (a `Step` queue behind `parking_lot::Mutex`, `tokio::sync::Notify` for blocking) to cover success with metrics, retry-until-`max_attempts` with an advancing clock, pre-cancelled and mid-consolidation cancellation, timeout as a failed attempt, non-terminal and mismatched outcome ids, skip semantics, disabled config, zero limit, ordering plus limit, and `run_due` batch size.
 `planner/lease.rs` adds leased-sweep coverage: completion releases the lease, racing sweeps claim one job once, an expired lease is taken over and the old owner records nothing, cancellation releases, terminal/requeued failures release, a non-leasing repository reports `Unsupported`, and invalid options are rejected before claiming.
 `pipeline/tests.rs` covers the LLM happy path, retry-then-fallback for prose and provider errors, no-model/disabled/no-candidate degradation, invented ids, the empty plan, sink success/failure, cancellation, config bounds, prompt truncation, both candidate sources, candidate serde, and the pure decision layer — all offline through `openjiuwen_test_support::ScriptedModel`.
-`orchestrator/tests.rs` covers a tick claiming and completing a due job, the full backoff schedule up to the cap and its reset, config validation, disabled behaviour, retention on tick (idempotent, absent policy, error tolerated), leased ticks and the non-leasing error, two orchestrators on one repository (one winner), expiry takeover, `run_until_cancelled` cancellation and mid-consolidation cancellation leaving no `Running` job, and `Debug`/serde of the status and config.
+`orchestrator/tests.rs` covers a tick claiming and completing a due job, the sweep-lock tick paths (no lock, a held lock skipping the sweep and the retention pass, release after every tick, `UnsupportedKvLock::redis()`, unusable options as an error, disabled ignoring the lock), the full backoff schedule up to the cap and its reset, config validation, disabled behaviour, retention on tick (idempotent, absent policy, error tolerated), leased ticks and the non-leasing error, two orchestrators on one repository (one winner), expiry takeover, `run_until_cancelled` cancellation and mid-consolidation cancellation leaving no `Running` job, and `Debug`/serde of the status and config.
 Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory --offline` and `--all-features`, `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, and `cargo doc -p openjiuwen-memory --no-deps` warning-free.
 
 ## Routing Table
@@ -169,7 +175,8 @@ Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-me
 - `./lease.rs` → `DreamLease`, `LeaseRequest`, `LeasedJob`, `LeaseStatus`, `LeaseLostReason`, `DreamLeaseOptions`, `DreamLeaseGuard`
 - `./planner.rs` → `DreamConsolidator`, `NoopConsolidator`, `DreamPlanner`/`DreamingEngine` unleased sweeps
 - `./planner/lease.rs` → `DreamPlanner::run_leased`/`run_due_leased` and the leased-sweep tests
-- `./orchestrator.rs` → `DreamOrchestratorConfig`, `DreamOrchestratorStatus`, `DreamOrchestrator` (tick, `run_until_cancelled`)
+- `./sweep_lock.rs` → `DREAM_SWEEP_LOCK_NAME`, `SweepLockSkipKind`, `SweepLockSkip`, `SweepLockOutcome`, `acquire_sweep_lock`, plus the additive-serde test for the new status/summary fields
+- `./orchestrator.rs` → `DreamOrchestratorConfig`, `DreamOrchestratorStatus`, `DreamOrchestrator` (tick, sweep lock, `run_until_cancelled`)
 - `./orchestrator/tests.rs` → the orchestrator unit suite
 - `./retention.rs` → `DreamRetention`, `RetentionReport`, `purge_expired`
 - `./salience.rs` → `SalienceBackend`, `SalienceWeights`, `KindWeights`, `SalienceConfig`, `SalienceScore`, `salience_score`, `rank_by_salience`

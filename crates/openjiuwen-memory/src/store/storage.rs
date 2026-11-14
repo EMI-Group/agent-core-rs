@@ -318,6 +318,69 @@ impl MemoryStorage {
         let key = keys::scope_config_key_in(&self.prefixes, scope_id);
         legacy::delete_with_legacy_in(self.stores.kv.as_ref(), &key, &self.prefixes).await
     }
+
+    /// Stores the analyzer-override payload of `scope_id` as raw JSON.
+    ///
+    /// The payload is opaque to the store: it is the analyzer layer's document, so this
+    /// module never interprets, defaults, or validates its shape. An existing payload is
+    /// replaced. `scope_id` is validated like every other scope-keyed namespace, so it
+    /// cannot escape the `memory_scope_overrides/{scope_id}` key.
+    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
+    pub(crate) async fn set_scope_overrides(&self, scope_id: &str, value: Value) -> Result<()> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let text = serde_json::to_string(&value).map_err(|error| {
+            Error::external(error).with_context(format!(
+                "serializing the memory scope overrides `{scope_id}`"
+            ))
+        })?;
+        self.stores.kv.set(&key, KvValue::text(text)).await
+    }
+
+    /// Reads the analyzer-override payload of `scope_id`, or `None` when it is absent.
+    ///
+    /// A missing key is not an error. A stored value that is not UTF-8 text or not valid
+    /// JSON is [`Error::Validation`], never a silent default.
+    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
+    pub(crate) async fn get_scope_overrides(&self, scope_id: &str) -> Result<Option<Value>> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let Some(value) = self.stores.kv.get(&key).await? else {
+            return Ok(None);
+        };
+        let text = value.as_str().ok_or_else(|| {
+            Error::validation(format!(
+                "memory scope overrides `{key}` are not stored as UTF-8 text"
+            ))
+        })?;
+        let decoded = serde_json::from_str(text).map_err(|error| {
+            Error::validation(format!(
+                "malformed memory scope overrides JSON for `{key}`: {error}"
+            ))
+        })?;
+        Ok(Some(decoded))
+    }
+
+    /// Deletes the analyzer-override payload of `scope_id`, returning whether it existed.
+    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
+    pub(crate) async fn delete_scope_overrides(&self, scope_id: &str) -> Result<bool> {
+        validate_scope_id(scope_id)?;
+        let key = keys::scope_overrides_key(scope_id);
+        let existed = self.stores.kv.exists(&key).await?;
+        self.stores.kv.delete(&key).await?;
+        Ok(existed)
+    }
+}
+
+/// Validates a bare `scope_id` before it becomes a storage-key segment.
+///
+/// The rules are the [`MemoryScope`] rules (non-empty, no `/`, `\` or NUL, at most 128
+/// characters), so an invalid id is [`Error::Validation`] rather than a key that
+/// collides with a neighbouring scope's namespace.
+#[cfg_attr(not(test), allow(dead_code))] // called by the scope-override methods only
+fn validate_scope_id(scope_id: &str) -> Result<()> {
+    MemoryScope::new(crate::record::DEFAULT_ID, scope_id).validate()?;
+    Ok(())
 }
 
 /// Creates the vector collection when it does not exist.
@@ -773,6 +836,158 @@ mod tests {
             .await
             .expect("delete again"));
         assert_eq!(storage.get_scope_config("ws").await.expect("absent"), None);
+    }
+    #[tokio::test]
+    async fn scope_overrides_round_trip_overwrite_and_delete() {
+        let storage = storage();
+        let payload = serde_json::json!({
+            "extractor": "llm",
+            "classifier": {"kind": "rule", "threshold": 0.75},
+            "tags": ["a", "b"],
+        });
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("absent"),
+            None
+        );
+        storage
+            .set_scope_overrides("ws", payload.clone())
+            .await
+            .expect("set overrides");
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload.clone())
+        );
+        let stored = storage
+            .stores
+            .kv
+            .get(&keys::scope_overrides_key("ws"))
+            .await
+            .expect("read key")
+            .expect("key exists");
+        assert_eq!(
+            serde_json::from_str::<Value>(stored.as_str().expect("text")).expect("raw JSON"),
+            payload
+        );
+        // The scope configuration namespace is untouched by the overrides.
+        assert_eq!(storage.get_scope_config("ws").await.expect("config"), None);
+        let replaced = serde_json::json!({"extractor": "rule"});
+        storage
+            .set_scope_overrides("ws", replaced.clone())
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(replaced)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+        assert!(!storage
+            .delete_scope_overrides("ws")
+            .await
+            .expect("delete again"));
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("absent"),
+            None
+        );
+    }
+    #[tokio::test]
+    async fn scope_overrides_reject_invalid_scope_ids() {
+        let storage = storage();
+        for scope_id in ["", "ws/one", "ws\\one", "ws\0one", &"x".repeat(129)] {
+            let error = storage
+                .set_scope_overrides(scope_id, serde_json::json!({}))
+                .await
+                .expect_err(scope_id);
+            assert_eq!(error.kind(), ErrorKind::Validation, "{scope_id:?}");
+            assert!(matches!(
+                storage.get_scope_overrides(scope_id).await,
+                Err(Error::Validation(_))
+            ));
+            assert!(matches!(
+                storage.delete_scope_overrides(scope_id).await,
+                Err(Error::Validation(_))
+            ));
+        }
+        // The accepted boundary is exactly the `MemoryScope` rule for `scope_id`.
+        for scope_id in ["ws", &"x".repeat(128)] {
+            assert!(storage
+                .get_scope_overrides(scope_id)
+                .await
+                .expect("valid scope id")
+                .is_none());
+        }
+    }
+    #[tokio::test]
+    async fn scope_overrides_reject_malformed_payloads() {
+        let storage = storage();
+        let key = keys::scope_overrides_key("bad");
+        storage
+            .stores
+            .kv
+            .set(&key, KvValue::text("{not json"))
+            .await
+            .expect("write malformed");
+        let error = storage
+            .get_scope_overrides("bad")
+            .await
+            .expect_err("malformed overrides");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        storage
+            .stores
+            .kv
+            .set(&key, KvValue::bytes(vec![0_u8, 1, 2]))
+            .await
+            .expect("write bytes");
+        let error = storage
+            .get_scope_overrides("bad")
+            .await
+            .expect_err("byte overrides");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+    #[tokio::test]
+    async fn scope_overrides_persist_across_a_local_file_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let payload = serde_json::json!({"model": "local-scripted", "retries": 2});
+        {
+            let stores = MemoryStores::local_file(directory.path())
+                .await
+                .expect("open local file");
+            let storage = MemoryStorage::new(stores);
+            storage
+                .set_scope_overrides("ws", payload.clone())
+                .await
+                .expect("set overrides");
+        }
+        let stores = MemoryStores::local_file(directory.path())
+            .await
+            .expect("reopen local file");
+        let storage = MemoryStorage::new(stores);
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+    }
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scope_overrides_persist_across_a_sqlite_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("overrides.db");
+        let payload = serde_json::json!({"extractor": "llm", "attempts": [1, 2]});
+        {
+            let storage =
+                MemoryStorage::new(MemoryStores::sqlite(&path).await.expect("open sqlite"));
+            storage
+                .set_scope_overrides("ws", payload.clone())
+                .await
+                .expect("set overrides");
+        }
+        let storage = MemoryStorage::new(MemoryStores::sqlite(&path).await.expect("reopen sqlite"));
+        assert_eq!(
+            storage.get_scope_overrides("ws").await.expect("get"),
+            Some(payload)
+        );
+        assert!(storage.delete_scope_overrides("ws").await.expect("delete"));
+        assert_eq!(storage.get_scope_overrides("ws").await.expect("gone"), None);
     }
 
     #[cfg(feature = "sqlite")]
