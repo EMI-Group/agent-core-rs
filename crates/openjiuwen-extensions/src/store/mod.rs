@@ -35,8 +35,8 @@ pub mod redis;
 pub use openjiuwen_core::foundation::store::{
     CollectionSchema, Document, DocumentStore, ElasticsearchConfig, ElasticsearchDocumentStore,
     InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
-    LocalFileDocumentStore, LocalFileKvStore, LocalFileVectorStore, Metric, Query, VectorQuery,
-    VectorSearchResult, VectorStore,
+    LocalFileDocumentStore, LocalFileKvStore, LocalFileVectorStore, Metric, Query, SortOrder,
+    VectorQuery, VectorSearchResult, VectorStore,
 };
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::foundation::store::{SqliteDocumentStore, SqliteKvStore};
@@ -248,7 +248,7 @@ pub async fn build_kv_store(backend: &StoreBackend) -> Result<Arc<dyn KvStore>> 
 /// Returns the kernel's construction error for `file` and `sqlite` backends
 /// (an unavailable `sqlite` feature is reported as
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
-/// the [`elasticsearch_document_store`] configuration errors for the
+/// the `elasticsearch_document_store` configuration errors for the
 /// `elasticsearch` backend, and
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
 /// for the `redis` backend, which has no document store.
@@ -310,7 +310,7 @@ pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn Vector
 }
 /// Builds the live REST document store behind the `elasticsearch` backend.
 ///
-/// Construction validates the configuration ([`elasticsearch_document_config`])
+/// Construction validates the configuration (`elasticsearch_document_config`)
 /// and performs no I/O, so a factory call stays offline; every request happens
 /// inside a [`DocumentStore`] operation.
 ///
@@ -476,6 +476,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_common::security::SecretString;
     use openjiuwen_core::foundation::store::{FieldSchema, VectorDataType};
     use serde_json::json;
     #[test]
@@ -650,9 +651,10 @@ mod tests {
         );
         // `index_prefix` and the credential fields all default, so the minimal
         // JSON shape keeps working.
-        let minimal: StoreBackend =
-            serde_json::from_value(json!({"kind": "elasticsearch", "url": "http://localhost:9200"}))
-                .unwrap();
+        let minimal: StoreBackend = serde_json::from_value(
+            json!({"kind": "elasticsearch", "url": "http://localhost:9200"}),
+        )
+        .unwrap();
         assert_eq!(minimal, decoded);
     }
     #[tokio::test]
@@ -801,7 +803,7 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:9200");
         assert_eq!(config.username.as_deref(), Some("alice"));
         assert_eq!(
-            config.password.as_ref().map(|password| password.expose_secret()),
+            config.password.as_ref().map(SecretString::expose_secret),
             Some("wonderland")
         );
         // Explicit fields replace the userinfo halves.
@@ -816,21 +818,26 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:9200");
         assert_eq!(config.username.as_deref(), Some("bob"));
         assert_eq!(
-            config.password.as_ref().map(|password| password.expose_secret()),
+            config.password.as_ref().map(SecretString::expose_secret),
             Some("builder")
         );
         assert_eq!(
-            config.api_key.as_ref().map(|key| key.expose_secret()),
+            config.api_key.as_ref().map(SecretString::expose_secret),
             Some("api-key-123")
         );
         // A user name without a password sends an empty password, like the
         // vector backend's URL userinfo handling.
-        let config =
-            elasticsearch_document_config("http://alice@127.0.0.1:9200", "agent_vector", None, None, None)
-                .unwrap();
+        let config = elasticsearch_document_config(
+            "http://alice@127.0.0.1:9200",
+            "agent_vector",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(config.username.as_deref(), Some("alice"));
         assert_eq!(
-            config.password.as_ref().map(|password| password.expose_secret()),
+            config.password.as_ref().map(SecretString::expose_secret),
             Some("")
         );
         // A password without a user name is not sent: basic auth needs both.
@@ -844,7 +851,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.username, None);
         assert_eq!(
-            config.password.as_ref().map(|password| password.expose_secret()),
+            config.password.as_ref().map(SecretString::expose_secret),
             Some("orphan")
         );
         // The store exposes exactly the configuration the helper produced.
@@ -867,14 +874,9 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::Validation, "url: {url:?}");
             assert!(error.message().contains("url"), "{}", error.message());
         }
-        let error = elasticsearch_document_config(
-            "localhost:9200",
-            "agent_vector",
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
+        let error =
+            elasticsearch_document_config("localhost:9200", "agent_vector", None, None, None)
+                .unwrap_err();
         assert!(
             error.message().contains("http://"),
             "the message names the scheme requirement: {}",
@@ -899,7 +901,7 @@ mod tests {
                 .config()
                 .password
                 .as_ref()
-                .map(|password| password.expose_secret()),
+                .map(SecretString::expose_secret),
             Some("wonderland"),
             "the explicit user name keeps the userinfo password"
         );
@@ -908,7 +910,7 @@ mod tests {
                 .config()
                 .api_key
                 .as_ref()
-                .map(|key| key.expose_secret()),
+                .map(SecretString::expose_secret),
             Some("api-key-123")
         );
     }
