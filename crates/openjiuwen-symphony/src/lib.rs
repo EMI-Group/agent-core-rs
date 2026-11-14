@@ -28,19 +28,20 @@
 //! - [`evaluation`] — fail-soft evaluation suite with deterministic static metrics.
 //! - [`discovery`] — `SKILL.md` folder scanning ([`discovery::SkillFolderScanner`]) and
 //!   the lexical [`discovery::SkillFs`] catalog over installed skills.
-//! - [`experience`] — [`experience::ExperienceBank`]: distilled capability combinations
+//! - [`experience`] — [`experience::ExperienceBank`] and the persisted,
+//!   embedding-backed [`experience::ExperienceIndex`]: distilled capability combinations
 //!   with deterministic ranking and persistence.
 //! - [`flow`] — flow distillation ([`flow::FlowEngine`]) and reusable `SkillPack` artifacts.
 //! - [`llm`] — LLM-guided stages (tree retrieval, ontology matching, semantic scoring,
 //!   fingerprint extraction, judging) with deterministic offline fallbacks.
-//! - [`object_artifact`] — S3/OBS and GCS graph artifact persistence over foundation's
-//!   object stores and the Google Cloud Storage JSON API.
+//! - [`object_artifact`] — S3/OBS, GCS and Azure Blob graph artifact persistence over
+//!   foundation's object stores and the Google Cloud Storage and Azure Blob REST APIs.
 //! - [`runtime`] — [`runtime::SymphonyRuntime`], the composition root: configuration,
 //!   lifecycle (`start`/`stop`/`close`), graph build, plan, invoke, mutations, and
 //!   evolution feedback.
-//! - [`deferred`] — API-shaped, documented `Error::Unsupported` stubs for the only
-//!   remaining deferred backends, which need a native ML/GPU stack: the faiss
-//!   experience index and `vLLM` logit selection.
+//! - [`deferred`] — an API-shaped, documented `Error::Unsupported` stub for the only
+//!   remaining deferred backend, which needs a native GPU inference stack: `vLLM` logit
+//!   selection.
 //!
 //! # Contracts
 //!

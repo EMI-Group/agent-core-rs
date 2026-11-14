@@ -31,7 +31,7 @@ use crate::experience::ranking::{
     rank_by_embedding, rank_lexically, ExperienceHit, ExperienceRanking, SearchOptions,
 };
 use crate::experience::store::{ExperienceStore, JsonFileExperienceStore, MemoryExperienceStore};
-use crate::experience::{ExperienceItem, ID_DIGITS, ID_PREFIX};
+use crate::experience::{merge_item, ordinal_of, ExperienceItem, ID_DIGITS, ID_PREFIX};
 
 /// The outcome of [`ExperienceBank::add`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -255,9 +255,10 @@ impl ExperienceBank {
             return Err(validation("query_pattern", "must not be blank"));
         }
         let dedupe_key = item.dedupe_key();
-        if let Some(existing) = self.duplicate(&dedupe_key) {
-            let merged = merge_items(existing, item);
-            self.store.put(&merged).await?;
+        if let Some(mut existing) = self.duplicate(&dedupe_key) {
+            merge_item(&mut existing, item);
+            self.store.put(&existing).await?;
+            let merged = existing;
             self.note_ordinal(&merged.id);
             self.write_items().insert(merged.id.clone(), merged.clone());
             return Ok(AddOutcome::merged_into(merged.id));
@@ -440,32 +441,6 @@ impl Default for ExperienceBank {
     }
 }
 
-/// Merges `incoming` into `existing`, keeping `existing`'s id, pattern, and embedding.
-fn merge_items(mut existing: ExperienceItem, incoming: ExperienceItem) -> ExperienceItem {
-    existing.success_count = existing
-        .success_count
-        .saturating_add(incoming.success_count);
-    for example in incoming.query_examples {
-        if !existing.query_examples.contains(&example) {
-            existing.query_examples.push(example);
-        }
-    }
-    existing.last_hit_at = existing.last_hit_at.max(incoming.last_hit_at);
-    if existing.embedding.is_empty() {
-        existing.embedding = incoming.embedding;
-    }
-    existing
-}
-
-/// Parses the ordinal of a generated `exp_NNNN` id.
-fn ordinal_of(id: &str) -> Option<u64> {
-    let digits = id.strip_prefix(ID_PREFIX)?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
 /// Embeds every item whose stored embedding does not match `dimension`.
 ///
 /// Items with blank text are left alone: the provider rejects blank input, and a
@@ -501,36 +476,6 @@ async fn embed_missing(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ordinals_are_parsed_from_generated_ids_only() {
-        assert_eq!(ordinal_of("exp_0001"), Some(1));
-        assert_eq!(ordinal_of("exp_42"), Some(42));
-        assert_eq!(ordinal_of("exp_"), None);
-        assert_eq!(ordinal_of("exp_x"), None);
-        assert_eq!(ordinal_of("custom_7"), None);
-        assert_eq!(ordinal_of("exp_999999999999999999999999"), None);
-    }
-
-    #[test]
-    fn merge_unions_examples_and_counts() {
-        let existing = ExperienceItem::new("Summarize")
-            .with_id("exp_0001")
-            .with_query_examples(["one", "two"])
-            .with_success_count(2)
-            .with_last_hit_at(5.0);
-        let incoming = ExperienceItem::new("summarize")
-            .with_query_examples(["two", "three"])
-            .with_success_count(3)
-            .with_last_hit_at(9.0)
-            .with_embedding(vec![1.0]);
-        let merged = merge_items(existing, incoming);
-        assert_eq!(merged.id, "exp_0001");
-        assert_eq!(merged.success_count, 5);
-        assert_eq!(merged.query_examples, vec!["one", "two", "three"]);
-        assert!((merged.last_hit_at - 9.0).abs() < f64::EPSILON);
-        assert_eq!(merged.embedding, vec![1.0]);
-    }
 
     #[tokio::test]
     async fn generated_ids_skip_taken_ones() {

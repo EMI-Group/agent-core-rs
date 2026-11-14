@@ -4,10 +4,10 @@
 
 The capability-asset engine of openJiuwen, mapping to the Python package `openjiuwen.symphony` (v0.1.20, ~52k lines, 201 files).
 Python's engine is host-driven: it fingerprints capability assets, indexes them, builds a capability relationship graph, plans asset compositions with an LLM, and distils observed flows into skills.
-This crate ports that engine end to end: the asset cards, a real registry with CRUD and search, keyword and embedding-backed retrieval, SKILL.md discovery with a lexical skill catalog, a versioned `can_feed` capability graph with atomic artifact publication in-memory, on disk and in an object store, a bounded deterministic planner, a plan executor over `openjiuwen-graph`, flow distillation into versioned recipes and reviewed `SkillPack` artifacts, and a deduplicating experience bank.
+This crate ports that engine end to end: the asset cards, a real registry with CRUD and search, keyword and embedding-backed retrieval, SKILL.md discovery with a lexical skill catalog, a versioned `can_feed` capability graph with atomic artifact publication in-memory, on disk and in an object store, a bounded deterministic planner, a plan executor over `openjiuwen-graph`, flow distillation into versioned recipes and reviewed `SkillPack` artifacts, a deduplicating experience bank, and a persisted embedding-backed experience index.
 Every LLM-guided stage (progressive tree retrieval, ontology matching, semantic plan scoring, fingerprint extraction, LLM judging, flow narratives) sits behind the `CompletionModel` seam and carries a documented deterministic fallback, so the crate is fully usable offline with no model configured.
 Everything here is offline, deterministic, and free of external services by default.
-The only remaining gaps are the Python areas that need a GPU/ML stack (a faiss + sentence-transformers experience index, `transformers`/`vLLM` logit selection) and two object-storage transports; they keep typed `Error::Unsupported` stubs in [`deferred`] and [`object_artifact`].
+The only remaining gaps are the Python areas that need a GPU/ML stack (faiss IVF index training, `transformers`/`vLLM` logit selection) and two object-storage transports; they keep typed `Error::Unsupported` stubs in [`deferred`] and [`object_artifact`].
 
 ## API Surface
 
@@ -517,6 +517,7 @@ See [`discovery`](src/discovery/CONTEXT.md) for the full surface and rules.
 ### `experience` (`src/experience/`)
 
 The experience bank: query patterns bound to skill sets, deterministic dedupe/merge, embedding-optional ranking (cosine or lexical term coverage), and memory/JSONL/SQLite stores with atomic writes.
+`ExperienceIndex` is the persisted embedding catalog: one vector per item, Python's `index_dir` layout (`meta.json`, `scalar/metadata.jsonl`, and a JSON vector matrix instead of faiss/numpy files), digest-verified loads, and exact flat cosine search; `ivf*` algorithm names stay `Error::Unsupported` (faiss training).
 See [`experience`](src/experience/CONTEXT.md) for the full surface and rules.
 
 ### `flow` (`src/flow/`)
@@ -580,7 +581,7 @@ Each stub documents the Python class it mirrors, and its data types stay ordinar
 - **Flow distillation is structural, not narrative.** Evidence groups on its cycle-broken successful-edge signature, versions are content-addressed and immutable, and a model can only write prose.
 - **A SkillPack is a frozen, reviewable artifact.** Only an `active` + `verified` linear chain can be packed; the package id hashes canonical materials; a static seven-check review decides the verdict without a model or network.
 - **Object storage is the third artifact backend, not a new abstraction.** `ObjectGraphArtifactStore` reuses the revision envelope and key layout of `FileGraphArtifactStore`, so in-memory, local, and S3-compatible stores are interchangeable.
-- **File and artifact writes are atomic everywhere.** Flow stores, experience JSON documents, and graph artifacts write a temp sibling and rename; an object store writes the revision before the pointer.
+- **File and artifact writes are atomic everywhere.** Flow stores, experience JSON documents, experience-index artifacts, and graph artifacts write a temp sibling and rename; an object store writes the revision before the pointer.
 - **Timestamps never decide behavior.** `reviewed_at`, `created_at`, and `last_hit_at` are metadata; ordering always comes from sorted ids or content hashes.
 - **Semantic search uses embeddings** via `openjiuwen_retrieval::{Embedding, InMemoryVectorStore}` (with `HashEmbedding` for deterministic tests), additively over the shared `SearchHit` type.
 - **The semantic index is catalog-revision-driven.** `CapabilityRegistry::revision()` lets `semantic_search` re-embed only after a mutation; `reindex_semantics` covers changes the counter cannot see.
@@ -610,7 +611,7 @@ The following pure-logic Python areas are not ported yet — the capability is a
 
 | Python area | Why deferred |
 |---|---|
-| `experience/` — faiss + sentence-transformers vector index | A GPU/ML stack (`faiss`, `sentence-transformers`, OpenAI embeddings) is out of scope; deterministic lexical ranking and optional `Embedding`-backed cosine ranking are implemented instead |
+| `experience/` — faiss IVF index training | Needs faiss' k-means/inverted lists (a GPU/ML stack); `ExperienceIndex` implements the exact flat cosine index instead, so `ivf`/`ivfpq` names return `Error::Unsupported` while every item remains searchable |
 | `retrieval/` — `transformers`/`vLLM` logit-based branch selection | GPU inference stack; the LLM tree walk over `CompletionModel` and its lexical fallback are implemented |
 | `shared/storage.py` — GCS and Azure Blob artifact transports | No in-crate transport; typed `Error::Unsupported` variants of `object_artifact::ArtifactTransport`, while S3-compatible and local object stores are implemented |
 
@@ -640,6 +641,7 @@ Deferred areas are proven, not just documented: `tests/deferred.rs` asserts ever
 - `tests/runtime.rs` — lifecycle idempotency, invoke, build revisions, mutation idempotency, evolution EMA, lazy semantic re-embedding, stopped-runtime errors, snapshot.
 - `tests/discovery.rs` — immediate/recursive scans, front-matter diagnostics, content-hash stability, inventory fingerprint, catalog search/excerpts, disabled skills, symlinks, settings.
 - `tests/experience.rs` — generated/explicit ids, dedupe merging, lexical and cosine ranking, skill filters, JSONL/SQLite persistence, id-counter continuity.
+- `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, and the IVF/unknown-algorithm errors.
 - `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, narrative fallback.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
 - `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, unsupported transports, blank bucket, malformed `current.json`.
@@ -666,7 +668,7 @@ Deferred areas are proven, not just documented: `tests/deferred.rs` asserts ever
 - `./src/artifact.rs` → `GraphArtifactStore`, immutable revisions, `current` pointer
 - `./src/object_artifact.rs` → `ObjectGraphArtifactStore` over `ObjectStore` (in-memory/local/S3), `ArtifactTransport`
 - `./src/discovery/` → SKILL.md discovery and the lexical skill catalog; see [`src/discovery/CONTEXT.md`](src/discovery/CONTEXT.md)
-- `./src/experience/` → the experience bank; see [`src/experience/CONTEXT.md`](src/experience/CONTEXT.md)
+- `./src/experience/` → the experience bank and the persisted `ExperienceIndex`; see [`src/experience/CONTEXT.md`](src/experience/CONTEXT.md)
 - `./src/flow/` → trace distillation, recipes, SkillPacks, review; see [`src/flow/CONTEXT.md`](src/flow/CONTEXT.md)
 - `./src/llm/` → LLM-guided stages with deterministic fallbacks; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
 - `./src/orchestration/` → planning and execution
@@ -677,4 +679,4 @@ Deferred areas are proven, not just documented: `tests/deferred.rs` asserts ever
 - `./src/evaluation.rs` → fail-soft evaluation suite and static metrics
 - `./src/runtime.rs` → `SymphonyRuntime`, config, lifecycle, mutations, evolution
 - `./src/deferred.rs` → the remaining `Error::Unsupported` ML/GPU stubs
-- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `planner`, `executor`, `runtime`, `discovery`, `experience`, `flow`, `llm`, `object_artifact`, `deferred`
+- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `planner`, `executor`, `runtime`, `discovery`, `experience`, `experience_index`, `flow`, `llm`, `object_artifact`, `deferred`
