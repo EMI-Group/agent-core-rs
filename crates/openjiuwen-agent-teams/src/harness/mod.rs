@@ -15,6 +15,7 @@
 //! | [`checkpoint`] | [`NativeCheckpoint`], the portable member snapshot |
 //! | [`checkpoint_store`] | per-member checkpoint persistence, policy and the protocol sink |
 //! | [`native`] | [`NativeMemberFactory`], [`ModelResolver`], [`EnvModelResolver`] |
+//! | `memory_tools` | the context's team-memory toolkit projection and its identity rule |
 //!
 //! The harness handle itself is `Arc<dyn openjiuwen_harness_protocol::HarnessProtocol>`; the
 //! in-process implementation is `openjiuwen_harness::NativeHarness`, which already conforms to
@@ -23,6 +24,7 @@ pub mod adapter;
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod mapping;
+mod memory_tools;
 pub mod native;
 pub use adapter::{HarnessMemberRuntime, MemberHarnessContext, MemberHarnessFactory};
 pub use checkpoint::NativeCheckpoint;

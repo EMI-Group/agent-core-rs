@@ -62,17 +62,24 @@ impl IdleDebounce { pub const fn new(window: Duration) -> Self;
 
 // spawn.rs — the spawner seam and the in-process task handle
 pub struct MemberSpawnRequest { pub team_name, pub member_name, pub session_id: String,
-                                pub workspace_root: PathBuf, pub options: MemberSpawnOptions }
+                                pub workspace_root: PathBuf, pub options: MemberSpawnOptions,
+                                pub checkpoint: Option<CheckpointConfig> } // serde-skipped, in-process only
 impl MemberSpawnRequest {
     pub fn new(team_name, member_name, session_id, workspace_root) -> Self;  // options default (in-process)
     pub fn with_options(self, options: MemberSpawnOptions) -> Self;
-    pub fn identity_env(&self) -> BTreeMap<String, String>;
+    pub fn with_checkpoint_config(self, checkpoint: CheckpointConfig) -> Self;
+    pub fn identity_env(&self) -> BTreeMap<String, String>;         // identity + checkpoint vars
+    pub fn checkpoint_env(&self) -> BTreeMap<String, String>;       // empty without a configuration
     pub fn apply_identity_env(&self, command: &mut StdioCommand);
 }
 pub const TEAM_NAME_ENV: &str = "OPENJIUWEN_TEAM_NAME";
 pub const MEMBER_NAME_ENV: &str = "OPENJIUWEN_MEMBER_NAME";
 pub const SESSION_ID_ENV: &str = "OPENJIUWEN_SESSION_ID";
 pub const MEMBER_WORKSPACE_ENV: &str = "OPENJIUWEN_MEMBER_WORKSPACE";
+pub const CHECKPOINT_ENV: &str = "OPENJIUWEN_MEMBER_CHECKPOINTS";        // "off" disables
+pub const CHECKPOINT_DIR_ENV: &str = "OPENJIUWEN_MEMBER_CHECKPOINT_DIR"; // file-backed store root
+pub const CHECKPOINT_OFF: &str = "off";
+pub const CHECKPOINT_ON: &str = "on";
 #[async_trait] pub trait MemberSpawner: Send + Sync {
     async fn spawn(&self, request: MemberSpawnRequest) -> Result<Arc<dyn MemberRuntime>>;
     async fn despawn(&self, member_name: &str) -> Result<()>;
@@ -178,6 +185,7 @@ The three child-process spawners (`ProcessMemberSpawner`, `ExternalCliMemberSpaw
 Each spawner keeps its launched runtimes in its own `parking_lot::Mutex<HashMap<String, Arc<StdioMemberRuntime>>>`; re-spawn replaces the entry (the replaced runtime is stopped and dropped, killing its child), `despawn` removes first and then `stop`s, and an unknown member is `Ok(())`.
 Per-request precedence is uniform: a request whose `options.kind` matches the spawner's kind and carries the per-kind config overrides the spawner's own config for that spawn only; otherwise the spawner's config applies (a request of another kind never picks up that kind's config).
 `ProcessMemberSpawner` defaults to `team-member serve` and exports the identity through `MemberSpawnRequest::apply_identity_env` (`OPENJIUWEN_TEAM_NAME`, `OPENJIUWEN_MEMBER_NAME`, `OPENJIUWEN_SESSION_ID`, `OPENJIUWEN_MEMBER_WORKSPACE`); a spec that pre-sets one of those variables wins.
+The same seam carries the checkpoint settings: `MemberSpawnRequest::checkpoint_env` folds `OPENJIUWEN_MEMBER_CHECKPOINTS` (`off` for a disabled policy, `on` otherwise) and, for a file-backed store, `OPENJIUWEN_MEMBER_CHECKPOINT_DIR` (an unpinned file root resolving to `<workspace root>/.openjiuwen/checkpoints`) into `identity_env`, so the process, external-CLI and SSH transports all deliver them.
 `ExternalCliMemberSpawner` launches a configured third-party CLI with the same env contract; `cli_agent`/`provider`/`model` are diagnostic labels only (logged, never on argv, never turned into env variables), and credentials come from the inherited environment plus `StdioCommand::env`.
 `SshMemberSpawner` builds `ssh -p <port> [-i <key_file>] [-o ConnectTimeout=<s>] [-o UserKnownHostsFile=<p>] [-o StrictHostKeyChecking=no (only when disable_host_key_check)] [-o K=V …sorted] -- <user@host> '<remote command>'` and speaks the protocol over the ssh pipe.
 SSH identity crosses as a remote `export …;` prologue inside the single quoted remote-command word (sshd drops channel env; the spawner never injects `-o SendEnv`, `BatchMode` or host-key flags of its own; `password` never reaches the argv).
@@ -201,7 +209,7 @@ A missing `ssh`, `team-member` or CLI binary is `ErrorKind::Config` from `StdioC
 - `./lifecycle.rs` → `TeamMember`: cached row, `mark`/`mark_execution`, `note_round`, `start`+rollback, `shutdown`, `error`
 - `./lifecycle_tests.rs` → status-machine suite with `FakeMemberRuntime` (`#[cfg(test)]`)
 - `./activity.rs` → `MemberActivityRegistry`, `IdleDebounce`, `DEFAULT_IDLE_DEBOUNCE`
-- `./spawn.rs` → `MemberSpawner`, `MemberSpawnRequest` + `identity_env`/`apply_identity_env`, identity env constants, `InProcessSpawnHandle`, `SpawnRegistry`
+- `./spawn.rs` → `MemberSpawner`, `MemberSpawnRequest` + `identity_env`/`checkpoint_env`/`apply_identity_env`, identity and checkpoint env constants, `InProcessSpawnHandle`, `SpawnRegistry`
 - `./spawn_config.rs` → `MemberSpawnKind`, `MemberSpawnOptions`, `StdioCommand`, `ProcessMemberConfig`, `ExternalCliRuntimeConfig`, `SshTransportSpec`
 - `./spawn_config_tests.rs` → serde/shape, `resolve_program`, ssh argv construction, options precedence
 - `./protocol.rs` → `MemberRequest`, `MemberResponse`, frame codec and response accessors
@@ -219,7 +227,7 @@ A missing `ssh`, `team-member` or CLI binary is `ErrorKind::Config` from `StdioC
 ## Test Strategy
 
 Unit tests live beside each file under `#[cfg(test)]`; `cargo test -p openjiuwen-agent-teams --lib` runs them offline and deterministically (1245 crate tests, **196 in this node**).
-`lifecycle_tests.rs` (28) covers the status machine; `runtime.rs` (3) recording order and fan-out; `activity.rs` (14) movement, settled members, idempotent markers, sorted snapshots and the `IdleDebounce` boundary; `spawn.rs` (17) handle cancel/join/abort, registry bookkeeping, request serde and the identity-env contract; `spawn_config_tests.rs` (30) serde wire values, `resolve_program` failures, literal ssh argv shapes, quoting/escaping and options builders; `protocol_tests.rs` (31) every frame's exact JSON, defaults, unknown fields, error kinds and accessors; `stdio_tests.rs` (21) handshake, ordered frame fan-out, pause/resume/abort, refused start, immediate exit, garbage-line tolerance, stderr tail, idempotent stop of a silent child, termination notified exactly once, drop-kills-child (`kill -0` poll), cancellation, missing program, short-IO-timeout, fail-fast after exit and concurrent-write serialization; `process_spawner_tests.rs` (17), `external_cli_spawner_tests.rs` (14) and `ssh_spawner_tests.rs` (16) cover launch, per-request precedence, identity env (written to a temp file by the child and polled), missing binaries, despawn idempotence, re-spawn replacement, sorted `live_members` and object safety.
+`lifecycle_tests.rs` (28) covers the status machine; `runtime.rs` (3) recording order and fan-out; `activity.rs` (14) movement, settled members, idempotent markers, sorted snapshots and the `IdleDebounce` boundary; `spawn.rs` (24) handle cancel/join/abort, registry bookkeeping, request serde and the identity-env and checkpoint-env contracts; `spawn_config_tests.rs` (30) serde wire values, `resolve_program` failures, literal ssh argv shapes, quoting/escaping and options builders; `protocol_tests.rs` (31) every frame's exact JSON, defaults, unknown fields, error kinds and accessors; `stdio_tests.rs` (21) handshake, ordered frame fan-out, pause/resume/abort, refused start, immediate exit, garbage-line tolerance, stderr tail, idempotent stop of a silent child, termination notified exactly once, drop-kills-child (`kill -0` poll), cancellation, missing program, short-IO-timeout, fail-fast after exit and concurrent-write serialization; `process_spawner_tests.rs` (17), `external_cli_spawner_tests.rs` (14) and `ssh_spawner_tests.rs` (16) cover launch, per-request precedence, identity env (written to a temp file by the child and polled), missing binaries, despawn idempotence, re-spawn replacement, sorted `live_members` and object safety.
 `FakeChild` writes a `#!/bin/sh` script with a unique name per fixture into a `tempfile::TempDir`, flushes it, `sync_all`s it and closes the descriptor before any test can spawn it.
 The stdio, process and external-CLI suites launch it through `FakeChild::sh_command` (`sh <path>`): `sh` itself is never written, so those execs cannot be refused with `ETXTBSY` while parallel tests fork.
 The SSH suite must exec the script directly (it stands in for the `ssh` binary and the spawner renders the whole argv), so its spawns go through `spawn_with_retry` — three attempts, 20 ms apart, retried only on a `Transport`-level `Text file busy` — and take the forgiving `SPAWN_BOUND` (30 s) while protocol awaits keep `BOUND` (10 s).
@@ -242,6 +250,8 @@ Definition of done for this node: `cargo fmt -p openjiuwen-agent-teams`, `cargo 
 - `MemberSpawner` builds but never starts a runtime: `MemberRuntime::start` is called by `TeamMember::start` so a failed start can roll the row back. `StdioMemberRuntime::spawn` therefore only launches the child; `start` performs the `ready` handshake.
 - `MemberSpawnRequest::options` is the seam the runtime dispatches on: `MemberSpawnKind::InProcess` (default) keeps the harness path, and the three child-process kinds are opt-in per member. Nothing in this node selects a spawner automatically.
 - The child-process identity contract is env-only because the protocol's `start` frame carries just the session id; `apply_identity_env` skips empty request fields and never overrides an explicitly configured value.
+- The checkpoint half of that contract is `MemberSpawnRequest::checkpoint`, a `runtime::spec_meta::CheckpointConfig` carried in-process and kept out of the JSON form (`#[serde(skip)]`); `checkpoint_env` exports `off`/`on` plus the resolved file directory and exports nothing at all when the request carries no configuration, so a served member keeps its own enabled default.
+- The leader-side call site that fills `MemberSpawnRequest::checkpoint` from `runtime::spec_meta::checkpoint_config` lives in `../runtime/spawner.rs` and is owned by the runtime node: until it is wired, a child-process member receives the served-side defaults rather than the leader's `metadata["checkpoint"]` block.
 - `StdioMemberRuntime::start` ignores the `Option<Arc<dyn Session>>` argument: only the session id can cross a process boundary, and harness-state persistence belongs to the child. `session_id()` is fixed at construction, so a `ready` frame naming a different id only logs a warning.
 - A child-process runtime's `state()` starts at `Idle`, follows the child's `state` frames, and becomes `Terminated` on exit; `start` itself changes no state.
 - `StdioMemberRuntime::stop` is idempotent and `despawn` relies on that: best-effort `stop` frame, kill, bounded wait, then `Terminated` + one observer notification.

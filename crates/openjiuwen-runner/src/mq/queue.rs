@@ -13,12 +13,78 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{MessageQueueConfig, MessageQueueKind};
 use crate::error::unsupported;
 use crate::mq::message::{MessageHandler, QueueMessage};
 use crate::mq::InMemoryMessageQueue;
+
+/// What a queue backend can report about the work it has done.
+///
+/// Every counter is a plain monotonic total since the backend was created, so a
+/// host can sample the report repeatedly and derive rates itself. The report is
+/// serializable (`snake_case`, unknown fields tolerated, missing fields default)
+/// so a host can ship it to whatever observes its process.
+///
+/// A backend that cannot keep one of these counters leaves it at `0`; only
+/// [`stats`](MessageQueue::stats) decides what it can honestly answer.
+///
+/// ```
+/// use openjiuwen_runner::mq::QueueStats;
+///
+/// let stats = QueueStats { deliveries: 3, ..QueueStats::default() };
+/// assert!(!stats.is_empty());
+/// assert_eq!(stats.dropped(), 0);
+/// assert_eq!(QueueStats::default(), QueueStats::default());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct QueueStats {
+    /// Whether the backend is between `start` and `stop`.
+    pub started: bool,
+    /// Topics the backend currently owns (subscribed or carrying a handler).
+    pub topics: usize,
+    /// Topics that currently have a handler installed.
+    pub handlers: usize,
+    /// Deliveries a worker actually started (a handler was present).
+    pub deliveries: u64,
+    /// Delivered messages dropped because their topic had no worker: a publish to
+    /// an unsubscribed topic, or a publish whose worker had already stopped.
+    pub dropped_no_worker: u64,
+    /// Delivered messages dropped because their topic had no handler installed.
+    pub dropped_no_handler: u64,
+    /// Handler invocations that returned an error, on the publish and the request
+    /// path alike.
+    pub handler_errors: u64,
+    /// Operations refused because the queue was stopped.
+    pub rejected_not_started: u64,
+}
+
+impl QueueStats {
+    /// Returns `true` when this is the empty report ([`QueueStats::default`]):
+    /// the queue is stopped, owns nothing, and has recorded no counter.
+    ///
+    /// That is the report a backend performing no work (a deferred transport)
+    /// answers, and the one a fresh [`InMemoryMessageQueue`] answers before
+    /// [`start`](MessageQueue::start).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The number of messages dropped instead of delivered
+    /// ([`dropped_no_worker`](Self::dropped_no_worker) +
+    /// [`dropped_no_handler`](Self::dropped_no_handler)).
+    ///
+    /// Handler failures are not drops: the handler ran and its error was reported
+    /// (see [`handler_errors`](Self::handler_errors)).
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped_no_worker + self.dropped_no_handler
+    }
+}
 
 /// The runner-owned topic queue: publish/subscribe plus request/reply.
 ///
@@ -116,6 +182,17 @@ pub trait MessageQueue: Send + Sync {
 
     /// Returns `true` when `topic` has a handler installed.
     fn has_subscriber(&self, topic: &str) -> bool;
+
+    /// Returns the counters this backend can honestly report.
+    ///
+    /// The default is the empty report ([`QueueStats::default`]): a backend that
+    /// cannot report statistics returns it rather than fabricating counters — a
+    /// report never claims work the backend did not do. The method is synchronous
+    /// and object-safe on purpose, so a host holding `Arc<dyn MessageQueue>` can
+    /// sample a queue from synchronous code without an `.await` or a downcast.
+    fn stats(&self) -> QueueStats {
+        QueueStats::default()
+    }
 }
 
 /// The typed refusal of a transport this build does not compile.
@@ -243,6 +320,12 @@ impl MessageQueue for DeferredMessageQueue {
     fn has_subscriber(&self, _topic: &str) -> bool {
         false
     }
+
+    /// Always the empty report: a deferred transport performs no work, so an
+    /// empty [`QueueStats`] is the truth rather than a placeholder.
+    fn stats(&self) -> QueueStats {
+        QueueStats::default()
+    }
 }
 
 /// Builds the backend `config` selects, **without failing**.
@@ -292,6 +375,7 @@ mod tests {
 
     use super::*;
     use openjiuwen_common::error::ErrorKind;
+    use serde_json::json;
 
     #[tokio::test]
     async fn in_memory_backend_is_created_stopped() {
@@ -371,6 +455,75 @@ mod tests {
                 assert!(text.contains("in_memory"), "points at the port: {text}");
             }
         }
+    }
+
+    #[test]
+    fn the_empty_report_is_the_default_and_exposes_helpers() {
+        let empty = QueueStats::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.dropped(), 0);
+        assert!(!empty.started);
+        assert_eq!(empty.topics, 0);
+        assert_eq!(empty.handlers, 0);
+
+        let busy = QueueStats {
+            started: true,
+            topics: 2,
+            handlers: 1,
+            deliveries: 7,
+            dropped_no_worker: 3,
+            dropped_no_handler: 5,
+            handler_errors: 2,
+            rejected_not_started: 4,
+        };
+        assert!(
+            !busy.is_empty(),
+            "a started queue is never the empty report"
+        );
+        assert_eq!(busy.dropped(), 8);
+        assert!(!QueueStats {
+            rejected_not_started: 1,
+            ..QueueStats::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn queue_stats_round_trip_with_a_tolerated_unknown_field() {
+        let stats = QueueStats {
+            started: true,
+            topics: 3,
+            handlers: 2,
+            deliveries: 11,
+            dropped_no_worker: 1,
+            dropped_no_handler: 2,
+            handler_errors: 3,
+            rejected_not_started: 4,
+        };
+        let text = serde_json::to_string(&stats).expect("serialize");
+        assert!(
+            text.contains("\"dropped_no_worker\":1"),
+            "snake_case: {text}"
+        );
+        let back: QueueStats = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back, stats);
+
+        // An unknown (future) counter is tolerated and the missing ones default.
+        let partial: QueueStats =
+            serde_json::from_value(json!({"deliveries": 5, "future_counter": 9}))
+                .expect("deserialize with an unknown field");
+        assert_eq!(partial.deliveries, 5);
+        assert!(!partial.started);
+        assert_eq!(partial.topics, 0);
+        assert_eq!(partial.dropped(), 0);
+    }
+
+    #[test]
+    fn a_deferred_queue_reports_the_empty_report() {
+        let queue = DeferredMessageQueue::new(MessageQueueKind::Pulsar);
+        let stats = queue.stats();
+        assert_eq!(stats, QueueStats::default());
+        assert!(stats.is_empty());
     }
 
     /// A handler that is never reached by a deferred queue.

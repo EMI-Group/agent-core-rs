@@ -25,11 +25,18 @@
 //!   invoke, model, tool, and iteration steps.
 //! - [`InterruptRequest`] / [`InterruptionState`] — a paused run is an output,
 //!   not an error; resuming is a normal invoke with interactive input.
+//! - [`KVCacheModelCallHook`] — best-effort prefix affinity around the model
+//!   calls of a run, installed with [`ReActAgent::enable_kv_cache`] or
+//!   [`ReActAgent::set_kv_cache_hook`]; absent by default.
 //!
 //! # Modules
 //!
 //! - [`agent`] — the [`Agent`] trait every runnable agent implements.
 //! - [`card`] — [`AgentCard`], the registry-safe identity of an agent.
+//! - [`controller`] — the controller stack: events, intents, the task store, the
+//!   background scheduler, and the turn loop that routes work to executors.
+//! - [`kv_cache`] — KV-cache prefix identities, the in-process runtimes, and the
+//!   model-call affinity hook.
 //! - [`input`] — [`AgentInput`] parsing of the caller's JSON payload.
 //! - [`output`] — [`AgentOutput`], [`AgentChunk`], and the interrupt frame model.
 //! - [`prompt`] — [`SystemPromptBuilder`] and its ordered [`PromptSection`]s.
@@ -40,7 +47,11 @@
 //! - [`rails`] — model/tool/loop hooks and the rails the kernel hosts itself.
 //! - [`react`] — the [`ReActAgent`] loop and its configuration.
 //! - [`llm_agent`] — [`LlmAgent`], a configured `ReActAgent` composition.
+//! - [`memory_provider`] — the external long-term-memory provider bridge: a rail
+//!   and the provider's model-facing tools.
 //! - [`workflow_agent`] — [`WorkflowAgent`] over one or more workflows.
+//! - [`usage`] — the context usage telemetry seam: analyzer/recorder ownership,
+//!   KV-cache scope keys, and the drained [`UsageTelemetry`] buffer.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod abilities;
@@ -53,6 +64,7 @@ pub mod input;
 pub mod interrupt;
 pub mod kv_cache;
 pub mod llm_agent;
+pub mod memory_provider;
 pub mod operator;
 pub mod output;
 pub mod policy;
@@ -63,21 +75,32 @@ pub mod react;
 pub mod run;
 pub mod skills;
 pub mod steering;
+pub mod usage;
 pub mod workflow_agent;
 pub use abilities::{
     parse_tool_arguments, AbilityManager, AddAbilityResult, ToolCallResult, ToolExecutionOptions,
 };
 pub use agent::Agent;
 pub use card::AgentCard;
+pub use controller::{
+    BaseController, Controller, ControllerConfig, GroupRouter, TaskManager, TaskQueue,
+    TaskSchedulerLoop, TaskSchedulerState,
+};
 pub use input::{AgentInput, InputQuery};
 pub use interrupt::{
     approval_value, match_answers, parse_approval, reject_feedback, InterruptAnswer, InterruptKind,
     InterruptRequest, InterruptionState, MatchedAnswers, AUTO_CONFIRM_STATE_KEY,
     DEFAULT_REJECT_FEEDBACK, INTERRUPTION_STATE_KEY,
 };
+pub use kv_cache::{
+    InProcessKVCacheRuntime, InProcessKvCacheActionProvider, KVCacheAffinityConfig, KVCacheEntry,
+    KVCacheIdentity, KVCacheModelCallHook, KVCacheRuntimeConfig, KVCacheRuntimeProtocol,
+    KvCacheActionProvider, KvCacheActionRuntime, KvCacheAdmission, KvCacheInferenceLease,
+};
 pub use llm_agent::{
     create_llm_agent_config, ConstrainConfig, LlmAgent, LlmAgentConfig, ModelConfig, ModelInfo,
 };
+pub use memory_provider::{provider_tool_cards, provider_tools, ProviderMemoryRail, ProviderTool};
 pub use output::{AgentChunk, AgentOutput, Observation, OutputFrame, ResultType};
 pub use prompt::{PromptSection, SystemPromptBuilder};
 pub use rails::{
@@ -87,6 +110,7 @@ pub use rails::{
 };
 pub use react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
 pub use run::{resolve_session, AgentRun};
+pub use usage::{default_usage_analyzer, UsageTelemetry};
 pub use workflow_agent::{DefaultResponse, WorkflowAgent, WorkflowAgentConfig};
 /// Returns the crate name as reported by `cargo`.
 #[must_use]

@@ -7,8 +7,10 @@ Ports Python `react_agent.py`'s `_inner_invoke`/`_finish_max_iterations` control
 
 ## API Surface
 
-- `mod.rs` — `AgentRuntime` (owned snapshot: card id/name, config, model, request config, rails, context engine, tool map, callback framework, steering queue, exposure policy, MCP allowlist, client-tool registry, resilience policy, optional final check, projected `visible_tool_info`/`visible_cards`), `snapshot`, `run`, `run_with`, `run_inner`, `request_for`, `reset_ctx`, `with_progress`, and the `#[cfg(test)] mod tests;` declaration.
+- `mod.rs` — `AgentRuntime` (owned snapshot: card id/name, config, model, request config, rails, context engine, tool map, callback framework, steering queue, exposure policy, MCP allowlist, client-tool registry, resilience policy, optional final check, optional KV-cache hook, projected `visible_tool_info`/`visible_cards`), `snapshot`, `run`, `run_with`, `run_inner`, `request_for`, `reset_ctx`, `with_progress`, and the `#[cfg(test)] mod tests;` declaration.
+- `kv_cache.rs` — the loop's only KV-cache touch point: `prepare(runtime, session, messages, request) -> Option<KvCacheCall>` (identity, `prepare`, `begin_inference`, `affinity`) and `finish(Option<KvCacheCall>, succeeded, Option<u64>)` (`end_inference`, `note_usage` on success); both are exported to `mod.rs` only as `pub(super)`, and `None`/no-hook runs do no work.
 - `tests.rs` — the module's unit tests (tool call → answer, empty-response retry, iteration limit, `FinalAnswer` policy, confirm pause/resume, ask-user answer, multimodal parts, memory variables reaching every model call, `request_for`, `reset_ctx`, `with_progress`).
+`kv_cache.rs` carries its own two unit tests (`finish` with no call is a no-op; usage is recorded only for a successful call).
 
 ## Constraints
 

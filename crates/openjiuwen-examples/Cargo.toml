@@ -31,13 +31,16 @@ schemars.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
-# The umbrella forwards `sqlite` to `openjiuwen-extensions` and
-# `openjiuwen-symphony` only, so the two examples that demonstrate the SQLite
-# backends (16 lite memory FTS, 17 team persistence) take those crates directly
-# to switch the backend feature on. Both are workspace crates, so the build stays
+# The umbrella exposes `sqlite` as an opt-in feature that is off by default, so
+# the examples that demonstrate a SQLite backend (16 lite memory FTS, 17 team
+# persistence, 23 memory dreaming) take the owning crate directly to switch the
+# backend feature on. All of them are workspace crates, so the build stays
 # offline.
 openjiuwen-memory = { workspace = true, features = ["sqlite"] }
 openjiuwen-agent-teams = { workspace = true, features = ["sqlite"] }
+# Dream ticks take an injected `DateTime<Utc>`, and a `TempDir` alone cannot
+# produce one, so example 23 reads the workspace-pinned clock crate.
+chrono.workspace = true
 
 [features]
 default = []
@@ -135,6 +138,32 @@ path = "examples/19_symphony_skills.rs"
 [[example]]
 name = "20_prompt_tuning"
 path = "examples/20_prompt_tuning.rs"
+
+# 21-26: the newest seams (tokenizers, telemetry, dreaming, spawn registry,
+# MoA + persistent agent, online training service). All offline.
+[[example]]
+name = "21_native_tokenizers"
+path = "examples/21_native_tokenizers.rs"
+
+[[example]]
+name = "22_context_telemetry"
+path = "examples/22_context_telemetry.rs"
+
+[[example]]
+name = "23_memory_dreaming"
+path = "examples/23_memory_dreaming.rs"
+
+[[example]]
+name = "24_runner_spawn_registry"
+path = "examples/24_runner_spawn_registry.rs"
+
+[[example]]
+name = "25_harness_moa_persistent"
+path = "examples/25_harness_moa_persistent.rs"
+
+[[example]]
+name = "26_online_training_service"
+path = "examples/26_online_training_service.rs"
 
 [lints]
 workspace = true

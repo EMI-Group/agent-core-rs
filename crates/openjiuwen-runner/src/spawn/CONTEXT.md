@@ -60,6 +60,7 @@ impl SpawnSpec { pub fn class_agent(module, class) -> Self; pub fn team_agent(pa
     fn is_healthy(&self) -> bool;                          // == is_alive(): no probe ⇒ liveness is the answer
     fn health_snapshot(&self) -> SpawnHealth;              // backend/is_alive/is_healthy/pid, last_error: None
     async fn health(&self) -> Result<bool>;                // Unsupported("agent health probe", <backend> hint)
+    async fn set_health_interval(&self, interval: Duration) -> Result<()>;  // Unsupported("runtime health-interval re-tuning", <backend> hint)
     async fn cancel_task(&self, task_id: &str) -> Result<()>;  // Unsupported("spawned task cancellation", <backend> hint)
     async fn send_with_timeout(&self, inputs, timeout: Option<Duration>) -> Result<AgentOutput>;   // default: send(inputs)
     fn stream_with_timeout(&self, inputs, timeout: Option<Duration>) -> BoxStream<...>;            // default: stream(inputs)
@@ -82,7 +83,8 @@ Its per-backend shapes are `{"backend": "subprocess", "program", "args", "cwd", 
 No secret is ever reported: the environment and the HTTP headers appear as **names only** (`env_names`, `header_names`), so a configured `Authorization: Bearer <token>` or `API_KEY=<value>` never reaches the summary.
 
 `SpawnSpec::backend` is a routing hint for `SpawnerRegistry`, not a wire change: it is additive metadata a Python child ignores (unknown fields are tolerated) and it never alters the frames.
-A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`cancel_task` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
+A minimal `SpawnedAgent` (only the required methods) reports `SpawnBackend::Unknown`, `is_healthy() == is_alive()`, an `Unsupported` `health`/`set_health_interval`/`cancel_task` whose message names its backend, and ignores the `send_with_timeout`/`stream_with_timeout` deadline hint (they call `send`/`stream`).
+`set_health_interval` is the one seam method that re-configures a running backend instead of exchanging a message: only the process backends run a background health loop, so `InProcessAgent`, `RemoteAgent` and every host backend keep the default and report the gap by name.
 The deadline on the bounded variants is advisory and never reaches the wire: `None` means "the backend's own default", `SpawnedProcess` and `RemoteAgent` honour a `Some(..)`, and `InProcessAgent` keeps the defaults.
 
 ### Wire — `protocol.rs`
@@ -118,7 +120,7 @@ pub struct SubprocessConfig {                              // serde snake_case, 
     pub env: BTreeMap<String, String>,                        // {} added on top of the parent env
     pub request_timeout_secs: f64,                            // 30.0
     pub shutdown_timeout_secs: f64,                           // 10.0
-    pub health_check_interval_secs: f64,                      // 5.0, 0.0 disables the background task
+    pub health_check_interval_secs: f64,                      // 5.0 initial value; 0.0 starts with no background task
     pub health_check_timeout_secs: f64,                       // 5.0
     pub max_health_failures: u32,                             // 3, 0 never kills on health
     pub max_frame_bytes: usize,                               // 8 MiB
@@ -129,6 +131,8 @@ pub struct SubprocessSpawner;                              // new(config) / with
                                                             // spawn_process(spec) -> Result<Arc<SpawnedProcess>>
 pub struct SpawnedProcess;                                  // id, backend, pid, is_alive, is_healthy, health, send, stream,
                                                             // send_with_timeout, stream_with_timeout, shutdown, force_kill,
+                                                            // health_interval() -> Duration,
+                                                            // set_health_interval(interval: Duration) -> Result<()>,
                                                             // into_agent(self: Arc<Self>) -> Arc<dyn SpawnedAgent>
 ```
 
@@ -141,6 +145,10 @@ The handle's `Debug` output shows that label beside its id, pid, liveness, and h
 `send_with_timeout(inputs, timeout)`/`stream_with_timeout(inputs, timeout)` bound one exchange: `Some(..)` is that exchange's deadline and `None` falls back to the configured `request_timeout_secs` (`send`/`stream` are the `None` form), so a host holding `Arc<dyn SpawnedAgent>` can bound a single invocation.
 `shutdown(timeout)` treats `Duration::ZERO` as "the configured `shutdown_timeout_secs`" (read through the clamped `SubprocessConfig::shutdown_timeout()`); a non-zero caller timeout wins over the configuration, and a child that does not exit within it is killed and reported `false`.
 `is_healthy` is the last observed probe result (fresh child = `true`); `health()` runs one probe synchronously.
+The background health cadence is per handle: it starts as `SubprocessConfig::health_check_interval_secs` (held in the child state behind a short synchronous `parking_lot` lock, never across an `.await`) and `set_health_interval` re-tunes it.
+A re-tune stores the value, stops the old loop cooperatively (its stop token cancels only the wait between probes, so an exchange in flight consumes its reply) and starts a fresh loop that reads the stored value; `Duration::ZERO` leaves no loop running and explicit `health()` probes keep working.
+A re-tune never exchanges a frame, so it never desynchronises the handle, and it leaves the `healthy` flag and the consecutive-failure count untouched; repeating it is idempotent and a stopped child (graceful shutdown, kill, or an exited child) is `Error::Validation` naming the child — a dead handle supervises nothing, so respawn instead.
+`describe()` keeps reporting the configured initial values; a re-tune changes the handle, never the spawner's configuration.
 Configured timeouts are clamped to `[0, 86_400]` seconds, so `Instant + Duration` cannot overflow and nonsense configuration means "no deadline".
 `SubprocessConfig` env wins over the inherited environment and `SpawnSpec::envs` wins over `SubprocessConfig` env.
 The handle, its state, and the launch/bootstrap path are in `subprocess.rs`; the exchange and supervision layer is the private `subprocess_io` child module declared there — the request guard and its desync rule, `send`/`stream`/`health`/`shutdown`/`force_kill`, the frame I/O, the health loop, the stderr drain, and the kill escalation.
@@ -271,7 +279,7 @@ pub struct MonitoredSpawnedAgent;                           // new(inner, monito
                                                             // inner(), run_id(), is_finished()
 ```
 
-`MonitoredSpawnedAgent` implements `SpawnedAgent` and forwards the whole seam surface to the wrapped handle: `id`, `is_alive`, `pid`, `backend`, `is_healthy`, `health_snapshot`, `send`, `stream`, `shutdown`, `force_kill`, `cancel_task`, and the bounded `send_with_timeout`/`stream_with_timeout` (the caller's `Option<Duration>` deadline reaches the inner handle verbatim, so a bounded invocation stays bounded through the decorator instead of falling back to the trait's `send`/`stream` default).
+`MonitoredSpawnedAgent` implements `SpawnedAgent` and forwards the whole seam surface to the wrapped handle: `id`, `is_alive`, `pid`, `backend`, `is_healthy`, `health_snapshot`, `send`, `stream`, `shutdown`, `force_kill`, `set_health_interval` (a cadence change is not a lifecycle transition, so nothing extra is recorded), `cancel_task`, and the bounded `send_with_timeout`/`stream_with_timeout` (the caller's `Option<Duration>` deadline reaches the inner handle verbatim, so a bounded invocation stays bounded through the decorator instead of falling back to the trait's `send`/`stream` default).
 Only its own observation differs: `track`/`new` admit the run, `health` records the probe, `shutdown`/`force_kill`/`Drop` finish it, and an error from `send`, `stream`, `send_with_timeout` or `stream_with_timeout` finishes it as failed when the inner handle reports `is_alive() == false` (the shared `SpawnWatch`/`finish_if_child_exited` latch, never a second latch path); a failure against a live child — a caller deadline that elapsed, for instance — leaves the run `Running`.
 
 ## Wire Contract
@@ -312,6 +320,7 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - **Kill on drop.** `tokio::process::Child::drop` does not kill and can leak a zombie, so dropping the last handle reference (its `Drop`) arms `start_kill` plus a detached reap, with `kill_on_drop(true)` as the final net when no runtime is available.
 - **stderr is always drained.** A child that fills its stderr pipe would block, so a task drains it into the debug log (first 512 chars per line) and is aborted with the handle.
 - **The health task holds a `Weak`.** It upgrades per tick, so it can never outlive or resurrect the handle; it is aborted on drop and on shutdown, and an interval of `0` disables it entirely (`health()` still works).
+- **Re-tuning replaces the loop, never the child.** `set_health_interval` stores the value in the handle's state and restarts the loop around it: the old loop is stopped by a `CancellationToken` that only fires between probes (a probe in flight finishes, so no reply is stranded and the handle stays in sync), and it is aborted only if it cannot stop within 5 s because it is queued behind a caller's exchange. The child, its `healthy` flag and its consecutive-failure count are untouched, so a cadence change can never look like a health observation; a stopped child refuses the call with `Error::Validation` instead of starting a loop on a dead process.
 - **Health escalation.** `max_health_failures` consecutive failed probes kill the child and mark it unhealthy; `0` disables killing; a healthy probe resets the run.
 - **A failed bootstrap is fatal.** When the bootstrap frame cannot be written, the child is killed and the error returned instead of handing back a broken handle.
 - **Caller deadlines are hints that two backends honour.** `send_with_timeout`/`stream_with_timeout` are defaulted on the trait (the default is plain `send`/`stream`), so adding the capability breaks no implementor; the subprocess backend falls back to `request_timeout_secs` for `None`, the remote backend to `timeout_secs`, and both are bounded per exchange rather than per handle.
@@ -368,6 +377,8 @@ Status mapping: `404` → `Error::NotFound`, any other non-2xx → `Error::Trans
 - A handle is single-use once desynchronized: respawn rather than retry, and never assume a timed-out exchange can be recovered.
 - `send_with_timeout`/`stream_with_timeout` are the only way to bound *one* exchange: `send`/`stream` always use the backend's configured deadline, and the trait defaults ignore the hint (so an in-process handle or a host's own backend simply behaves like `send`/`stream`). `MonitoredSpawnedAgent` forwards both bounded variants, so a handle from `Runner::spawn_agent` keeps a caller's per-request deadline.
 - `shutdown(Duration::ZERO)` is not "kill now": it means "use the configured `shutdown_timeout_secs`". Pass a non-zero duration to override the configuration for one shutdown.
+- `SpawnedProcess::health_interval()` is the interval *this handle* currently supervises at: the configured `health_check_interval_secs` until `set_health_interval` changes it, and `Duration::ZERO` means "no background task". A re-tune is per handle, so two children of one spawner can probe at different rates; it is idempotent, and it is `Error::Validation` once the child has stopped (shutdown, kill, or an exit of its own) — respawn instead.
+- `set_health_interval` reaches a handle through the seam too, where `InProcessAgent`, `RemoteAgent` and any host backend keep the default and answer `Error::Unsupported` naming the backend and the missing background loop.
 - `RemoteSpawner::spawn` returns a *started* `RemoteAgent` (readiness is `true` without a request); `RemoteAgent::new` is lazy, so a directly constructed handle reports not-alive until its first request or an explicit `RemoteClient::start`.
 - There is no child-side serve helper (no `serve_child_stdio`): a host's child program must read/write NDJSON itself — read one `input` bootstrap frame (`{"spawn_spec": …}`), then answer `input` (`{"inputs": …}`) frames with `output`/`stream_chunk`/`done`/`error` and reply to `health_check`/`shutdown`; `SpawnMessage::from_line`/`to_line` and `read_frame`/`frame_bytes` are reusable on that side.
 - The reference child implementation is `tests/spawn_subprocess.rs`'s `#[ignore]`d `fake_child` libtest case re-executed with `fake_child --exact --ignored --test-threads=1 --nocapture` (`--nocapture` is mandatory or libtest redirects the child's stdout and no frame reaches the pipe).

@@ -273,6 +273,9 @@ mod tests {
             client_tools: Arc::new(ClientToolRegistry::new()),
             resilience: crate::policy::ToolResiliencePolicy::new(),
             final_check: None,
+            kv_cache_hook: None,
+            memory_provider: None,
+            usage_telemetry: Arc::new(crate::usage::UsageTelemetry::new()),
             visible_tool_info: Vec::new(),
             visible_cards: Vec::new(),
         }

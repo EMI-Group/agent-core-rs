@@ -14,6 +14,7 @@
 //! | [`workspace`] | `metadata["workspace"]` → `IsolationMode`, `None` by default |
 //! | [`attach`] | `metadata["attach"]` / env → a bound Unix socket served by the backend handler |
 //! | [`checkpoints`] | `metadata["checkpoint"]` → team store, member identity, turn/stop capture |
+//! | [`memory`] | `metadata["memory"]` → wiring, lifecycle hooks, member toolkits, turn seam, export |
 //!
 //! Everything here is offline, deterministic and bounded: scripted harnesses, recording
 //! workspace providers, in-memory stores, temp directories and [`BOUND`]-limited waits.
@@ -38,6 +39,7 @@ pub(crate) use crate::runtime::team_agent::test_support::{
 mod attach;
 mod checkpoints;
 mod kv_affinity;
+mod memory;
 mod organization;
 mod routing;
 mod signals;

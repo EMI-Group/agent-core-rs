@@ -2,19 +2,21 @@
 
 ## Intent
 
-The process-level orchestrator of the kernel: one `Runner` owns the resource registries, the callback framework, the message queue, the run monitor, the HITL broker, the spawn backends, and the team runtime pool.
+The process-level orchestrator of the kernel: one `Runner` owns the resource registries, the callback framework, the message queue, the run monitor, the HITL broker, the spawn backends, the team runtime pool, and an installable dreaming driver.
 Ports Python `openjiuwen/core/runner/` (v0.1.20, ~13.9k lines, 53 files) with real in-process behaviour kept and only network/broker/process-pool machinery deferred:
 `runner.py` + `runner_config.py` (facade, config, lifecycle), `resources_manager/` (registries plus the tag/model/prompt/sys-operation/MCP managers), `callback/` (framework, filters, chains, decorators, guardrail binding), `message_queue_base.py` (in-process queue), `spawn/` (real `tokio::process` child + NDJSON protocol), `drunner/remote_client/`'s HTTP path (`RemoteAgent`), `team_runner.py`'s in-process team path with its pool, and the HITL/monitor surface (`interact_agent_team`, `pause`/`stop`, `list_active_teams`, `get_agent_team_monitor`).
+Python's `DreamingOrchestrator` background task has no counterpart in `openjiuwen-memory` (that crate deliberately spawns nothing), so this crate hosts it: `DreamService` owns the one loop task over `openjiuwen_memory::dreaming::DreamOrchestrator` and a host drives it through the facade.
 Deferred in `## Deferred Python Behavior` below: Pulsar/ZeroMQ/A2A transports, Python's `python -m` child bootstrap/pool nuances, live in-loop `InteractGate` enforcement, the org layer, cross-process attach, OS-process members, and monitor persistence/export.
 
-The crate sits at layer 4 (`../docs/ARCHITECTURE.md` §1): it depends on `common`, `foundation`, `session`, `workflow`, `agent`, `multiagent`, `security`, and `sysop`, and is consumed by `openjiuwen-core` (kernel umbrella), `openjiuwen-harness`, `openjiuwen-agent-teams`, and `openjiuwen-cli`.
-No crate below depends on it: the runner drives lower layers through their public seams (`Agent`, `Workflow`, `Team`, `Session`), never by reaching into internals.
+The crate sits at layer 4 (`../docs/ARCHITECTURE.md` §1): it depends on `common`, `foundation`, `session`, `workflow`, `agent`, `multiagent`, `security`, `sysop`, and `memory`, and is consumed by `openjiuwen-core` (kernel umbrella), `openjiuwen-harness`, `openjiuwen-agent-teams`, and `openjiuwen-cli`.
+The layer-2 `memory` edge exists for one reason: the dreaming orchestrator's caller-driven loop needs a task owner, and the runner is the process-level orchestrator, so `openjiuwen-memory` stays spawn-free and the runner hosts the loop.
+No crate below depends on it: the runner drives lower layers through their public seams (`Agent`, `Workflow`, `Team`, `Session`, `DreamOrchestrator`), never by reaching into internals.
 
 ## API Surface
 
 Everything below is re-exported flat at the crate root; the module paths stay available for hosts that prefer them.
 
-### Facade — `src/runner.rs` + `src/runner_spawn.rs`
+### Facade — `src/runner.rs` + `src/runner_spawn.rs` + `src/runner_seams.rs` + `src/runner_dreaming.rs`
 ```rust
 pub struct Runner { /* config, ResourceMgr, CallbackFramework, MessageQueue, checkpointer, guardrails, spawner + spawner registry, RunMonitor, InteractionHub, TeamPool */ }
 impl Runner {
@@ -29,8 +31,12 @@ impl Runner {
     pub fn callbacks(&self) -> &Arc<CallbackFramework>;
     pub fn message_queue(&self) -> Arc<dyn MessageQueue>;
     pub fn checkpointer(&self) -> Option<Arc<dyn Checkpointer>>;
-    pub fn monitor(&self) -> &Arc<RunMonitor>;                  // the seam every run path reports into
-    pub fn hitl(&self) -> &Arc<InteractionHub>;                 // the live-run interaction broker
+    pub fn monitor(&self) -> Arc<RunMonitor>;                   // cheap snapshot of the installed seam
+    pub fn set_monitor(&self, monitor: Arc<RunMonitor>) -> Arc<RunMonitor>;        // installs for later runs; returns the previous one
+    pub fn hitl(&self) -> Arc<InteractionHub>;                  // cheap snapshot of the installed hub
+    pub fn set_hitl(&self, hub: Arc<InteractionHub>) -> Arc<InteractionHub>;       // installs as given; returns the previous hub
+    pub fn set_message_queue(&self, queue: Arc<dyn MessageQueue>) -> Arc<dyn MessageQueue>;  // until the next `start`; returns the previous queue
+    pub fn queue_stats(&self) -> QueueStats;                    // snapshot of the live backend (`MessageQueue::stats`)
     pub fn team_pool(&self) -> TeamPool;                        // cheap clone of the pool handle
     pub fn is_started(&self) -> bool;
     pub async fn start(&self) -> Result<()>;                    // idempotent; queue + checkpointer + fresh pool; refuses distributed/deferred transports
@@ -69,12 +75,29 @@ impl Runner {
     pub async fn spawn_agent(&self, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;              // registry-first, else the single spawner; observed as RunKind::Spawn
     pub async fn spawn_agent_with(&self, backend: SpawnBackend, spec: SpawnSpec) -> Result<Arc<dyn SpawnedAgent>>;  // needs a registry; never falls back
     pub fn active_spawns(&self) -> Vec<RunStatus>;              // spawns not yet reported finished
+    // dreaming (see ./src/dreaming.rs and ./src/runner_dreaming.rs)
+    pub fn set_dreaming_service(&self, service: Option<Arc<DreamService>>) -> Option<Arc<DreamService>>;  // install/replace/clear; returns the previous one
+    pub fn dreaming_service(&self) -> Option<Arc<DreamService>>;
+    pub async fn start_dreaming(&self) -> Result<DreamServiceStatus>;    // idempotent; typed Config without an installed service
+    pub async fn stop_dreaming(&self) -> Result<DreamServiceStatus>;     // cancels + joins the loop; idempotent
+    pub fn dreaming_status(&self) -> Result<DreamServiceStatus>;         // typed Config without an installed service
 }
 ```
 `global()` is the ONE documented process-global: a `OnceLock<RwLock<Option<Arc<Runner>>>>` slot, created on first use with `RunnerConfig::default()`, replaced wholesale by `reset_global()`.
 Everything else is per-instance and `Runner::new()` is what tests use.
 The monitor, the hub, and the pool are built per instance; `services()` attaches the monitor and the hub to every run, so all six execution entry points are observable without extra wiring.
-The spawn facade lives in `src/runner_spawn.rs` (`impl Runner`, private module) to keep `runner.rs` under the size budget.
+The monitor, the hub, and the queue are replaceable after construction (`set_monitor`, `set_hitl`, `set_message_queue`), each returning the instance it displaced.
+The observation seams live behind a `parking_lot::RwLock`, so the accessors hand out owned `Arc` clones rather than references.
+The spawn facade lives in `src/runner_spawn.rs`, the seam setters in `src/runner_seams.rs`, and the dreaming accessors in `src/runner_dreaming.rs` (all `impl Runner` in private modules) to keep `runner.rs` under the size budget.
+The facade's unit tests live in `src/runner_tests.rs`, loaded with `#[path]` for the same reason.
+
+### Dreaming driver — `src/dreaming.rs` + `src/runner_dreaming.rs`
+`DreamService` (`new(Arc<DreamOrchestrator>) -> Arc<Self>`, `with_in_memory(consolidator, DreamConfig, DreamOrchestratorConfig) -> Result<Arc<Self>>`, `orchestrator() -> &Arc<DreamOrchestrator>`, `is_running()`, `status()`, `start()`, `stop()`, `tick(now)`), `DreamServiceStatus` (`running`, `orchestrator: DreamOrchestratorStatus`, optional `last_stop_error`), and `DEFAULT_DREAMING_STOP_TIMEOUT` (5 s).
+The crate root re-exports the memory dreaming types a host needs to build and inspect a service (`DreamOrchestrator`, `DreamOrchestratorConfig`, `DreamOrchestratorStatus`, `DreamPlanner`, `DreamConsolidator`, `DreamConfig`, `DreamRepository`, `InMemoryDreamRepository`, `DreamJob`/`DreamKind`/`DreamTrigger`, `DreamOutcome`, `DreamRunSummary`, `DreamState`, `DreamMetrics`, `NoopConsolidator`).
+`DreamService` owns exactly one loop task: `start` is idempotent (a live loop is reported, never doubled), `stop` cancels the token and joins the task within the bound (aborting it and recording `last_stop_error` if it overruns), and cancellation — the documented shutdown path — is `Ok`.
+`DreamService::tick` is the host-owned-timer entry point and delegates to `DreamOrchestrator::tick`; it does not touch the loop.
+The facade (`src/runner_dreaming.rs`) adds the `Runner` install/start/stop/status methods; each of `start_dreaming`, `stop_dreaming`, and `dreaming_status` answers `Error::Config` naming `Runner::set_dreaming_service` when no service is installed.
+Not ported from Python's dreaming orchestration: a `Runner`-configuration section for it (a repository provider and a consolidator are runtime capabilities, not serializable settings) and any automatic start (see `## Notes for Agents`).
 
 ### Configuration — `src/config.rs`
 `RunnerConfig` (`runner_id`, `distributed_mode=false`, `distributed`, `message_queue`, `team_pool`, `default_session_id="default_session"`, `checkpointer: Option<CheckpointerConfig>`, `default_run_timeout_secs`, `shutdown_timeout_secs=5.0`), `TeamPoolConfig` (`max_concurrent_runs`, `idle_timeout_secs`, `run_timeout_secs`, `payload_capacity`, `retain_finished`, `frame_capacity`, `reaper_interval_secs`, `stop_timeout_secs`), `MessageQueueConfig`, `MessageQueueKind { InMemory = "in_memory", Pulsar, ZeroMq }`, `DistributedConfig` (data only), and the `DEFAULT_*` constants (including the `DEFAULT_TEAM_POOL_*` family).
@@ -98,16 +121,18 @@ Security binding: `bind_guardrails`, `GuardrailHandler`, `scan_stage_for`, `even
 
 ### `src/mq/` — the message queue
 `QueueMessage`, `MessageHandler`, `MessageQueue` trait, `InMemoryMessageQueue`, `DeferredMessageQueue`, `create_message_queue` (fallible), `build_message_queue` (infallible: in-memory, or a deferred placeholder for a transport this build lacks), `MessageQueueKind`.
-The configured kind is never misrepresented: a `pulsar`/`zeromq` configuration yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport and pointing at `in_memory`.
+`MessageQueue::stats() -> QueueStats` is synchronous, object-safe, and defaulted to the empty report, so a host samples an `Arc<dyn MessageQueue>` without an `.await` or a downcast; `Runner::queue_stats()` is the facade's snapshot of whichever backend is installed.
+The counters are `started`, `topics`, `handlers`, `deliveries`, `dropped_no_worker`, `dropped_no_handler`, `handler_errors`, and `rejected_not_started`, with the `is_empty()`/`dropped()` helpers; the report is `snake_case` JSON tolerant of unknown fields.
+The configured kind is never misrepresented: a `pulsar`/`zeromq` configuration yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport and pointing at `in_memory` — and whose `stats()` is the empty report, because it performs no work.
 
 ### `src/run/` — execution APIs
 `RunOptions` (session, timeout, cancellation, envs, metadata, `team_session`), `AgentRef`, `WorkflowRef`, `TeamRef`, `RunServices` (registries, callbacks, config, checkpointer, guardrails, optional `monitor`/`hitl`), session resolution, per-run cancellation/timeout (`run_with_limits`, `next_stream_step`), teardown, and tracing spans.
 
 ### `src/spawn/` — the spawn seam and its four backends
 Seam: `SpawnAgentKind`, `SpawnSpec` (incl. `backend: Option<SpawnBackend>` + `with_backend`), `SpawnedAgent`, `AgentSpawner`, `SpawnBackend`, `SpawnHealth`, `UnsupportedSpawner` (the documented default).
-`SpawnedAgent` exposes `id`, `backend`, `is_alive`, `is_healthy`, `pid`, `health_snapshot`, `health`, `send`/`send_with_timeout`, `stream`/`stream_with_timeout`, `cancel_task`, `shutdown`, `force_kill`; every accessor added beyond the original six is defaulted, so a minimal handle still implements the trait.
+`SpawnedAgent` exposes `id`, `backend`, `is_alive`, `is_healthy`, `pid`, `health_snapshot`, `health`, `set_health_interval`, `send`/`send_with_timeout`, `stream`/`stream_with_timeout`, `cancel_task`, `shutdown`, `force_kill`; every accessor added beyond the original six is defaulted, so a minimal handle still implements the trait.
 `AgentSpawner` exposes `backend()` and `describe()` (a JSON-safe, secret-free configuration summary: env/header names only).
-Backends: `SubprocessConfig`/`SubprocessSpawner`/`SpawnedProcess` (real `tokio::process` child over NDJSON, env/cwd merge, per-request and shutdown deadlines, background health checks with escalation, kill-on-drop); `ExternalCommandSpawner` (the same child protocol plus `PATH`/search-path command resolution, children labelled `ExternalCommand`); `InProcessSpawner`/`InProcessAgent` (a host-bound `InProcessHandler` in the same process, no pid); `RemoteAgentConfig`/`RemoteClient`/`RemoteAgent`/`RemoteSpawner`/`RemoteProtocol`/`create_remote_client` (HTTP invoke/stream/cancel over `reqwest`, NDJSON stream, started at spawn); `DeferredSpawner` (typed `Unsupported` naming a missing transport).
+Backends: `SubprocessConfig`/`SubprocessSpawner`/`SpawnedProcess` (real `tokio::process` child over NDJSON, env/cwd merge, per-request and shutdown deadlines, background health checks with escalation and a per-handle re-tunable interval, kill-on-drop); `ExternalCommandSpawner` (the same child protocol plus `PATH`/search-path command resolution, children labelled `ExternalCommand`); `InProcessSpawner`/`InProcessAgent` (a host-bound `InProcessHandler` in the same process, no pid); `RemoteAgentConfig`/`RemoteClient`/`RemoteAgent`/`RemoteSpawner`/`RemoteProtocol`/`create_remote_client` (HTTP invoke/stream/cancel over `reqwest`, NDJSON stream, started at spawn); `DeferredSpawner` (typed `Unsupported` naming a missing transport).
 `SpawnerRegistry`: `register*`/`unregister`/`get`/`backends`/`set_default`/`route`/`spawn`/`spawn_with`, with routing precedence `SpawnSpec::backend` → explicit default → sole registered spawner → typed failure; `with_deferred()` pre-registers `RemoteMq`/`RemoteA2a` as deferred.
 `MonitoredSpawnedAgent`: the decorator `Runner::spawn_agent` returns; forwards the whole seam (including the bounded variants) and records the child's lifecycle into `RunMonitor` under `RunKind::Spawn`.
 Frame helpers: `SpawnMessage`, `SpawnMessageKind`, `frame_bytes`, `parse_frame_line`, `read_frame`, `DEFAULT_MAX_FRAME_BYTES`.
@@ -129,6 +154,15 @@ See `./src/pool/CONTEXT.md`.
 
 ### `src/error.rs`
 Thin constructors for the runner's error vocabulary (`not_found`, `invalid_session`, `timeout`, `run_timeout`, `unsupported`, `not_started`) over `openjiuwen_common::error::{Error, Result}`; no parallel error enum.
+
+## Pluggable Seams
+
+The seam inventory a host reads before wiring a process is the `# Pluggable seams` section of `src/runner.rs`'s module docs; `tests/seams.rs` pins the same list at compile time.
+Plugged in through a setter: the message queue (`MessageQueue` + `Runner::set_message_queue`), the spawn backends (`AgentSpawner` + `Runner::set_spawner`, `SpawnerRegistry` + `Runner::set_spawner_registry`), the run monitor (`Runner::set_monitor`), the HITL hub (`Runner::set_hitl`), and the guardrails (`Runner::set_guardrails`).
+Plugged in through a registration: resource providers (`ResourceMgr::register_*` takes a `Provider<T>` closure called per lookup), callback handlers/filters/chains (`CallbackFramework::register`, `EventFilter`, `CallbackChain`).
+Configured rather than plugged in: the checkpointer (`RunnerConfig::checkpointer`, built by `Runner::start`).
+Refused with `Error::Unsupported` naming the transport: `MessageQueueKind::{Pulsar, ZeroMq}` (→ `DeferredMessageQueue`), `SpawnerRegistry::with_deferred()`'s `RemoteMq`/`RemoteA2a` (→ `DeferredSpawner`), `RemoteProtocol::{Mq, A2a}`, and `RunnerConfig::distributed_mode` (refused by `start`).
+Team transports are not the runner's: they belong to `openjiuwen-multiagent` (`TeamTransport`/`TransportKind`/`build_transport`, where `Pulsar` is `Error::Unsupported`) and are reached only through the `Team` seam.
 
 ## Constraints
 
@@ -163,10 +197,17 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - **Monitoring is bounded and observable.** One event per transition on a broadcast channel, a bounded per-run history (128) and a bounded retention for finished runs (64), with `RecvError::Lagged` surfaced rather than hidden.
 - **No hidden retries or fallbacks.** A missing registry id is `Error::NotFound` with the id in the message, an unfinished `start()` is `Error::Config`, an MCP server that cannot connect is recorded `Failed { reason }`, a delivery with no consumer is `DeliverResult::NoInbox`, a deferred backend is `Error::Unsupported` naming the seam, a deferred queue kind is a `DeferredMessageQueue` rather than a working in-memory stand-in, and `distributed_mode` refuses to start instead of running in-process silently.
 
+- **Dreaming is an installed service with its own lifecycle.** `openjiuwen-memory` exposes the orchestrator as a value the caller drives; the runner is that caller, so one `Runner` installs at most one `DreamService`, owns its single loop task, and never auto-starts it from `start()` — consolidation obeys its own schedule, and a host that already owns a timer calls `DreamService::tick` instead.
+- **Absence is typed, not silent.** With no service installed, `start_dreaming`/`stop_dreaming`/`dreaming_status` are `Error::Config` naming `Runner::set_dreaming_service` — not `Ok`, and not `Unsupported` (nothing about the platform is missing; the host has simply not wired an orchestrator).
+- **`Runner::stop` owns the loop, its result does not.** `stop()` cancels and joins a running dreaming service before the pool sweep and before its started early return, logs any failure, and keeps the service installed; the shutdown result stays the queue's, so dreaming can never make `stop()` fail.
+
 ## Routing Table
 
 - `./src/runner.rs` → `Runner` facade, lifecycle (`start`/`stop`/`release`), global singleton, monitor/hub/pool accessors, team + HITL facade methods, security wiring
+- `./src/runner_tests.rs` → inline unit tests of `runner.rs` (loaded via `#[path]`): construction defaults and the fixed `runner_id`
+- `./src/runner_seams.rs` → the replaceable-seam half of the facade: `set_monitor`, `set_hitl`, `set_message_queue`, `queue_stats`, and what a replacement does not migrate
 - `./src/runner_spawn.rs` → the spawn half of the facade: single spawner and registry installation, backend introspection, registry-first routing, monitored spawn observation, `active_spawns`
+- `./src/runner_dreaming.rs` → the dreaming half of the facade: service installation, orchestrator start/stop/status with the typed `Config` absence, and the quiet stop `Runner::stop` performs
 - `./src/config.rs` → `RunnerConfig`, `TeamPoolConfig`, `MessageQueueConfig`, `MessageQueueKind`, `DistributedConfig`, defaults
 - `./src/error.rs` → error constructors and message wording
 - `./src/resources/` → `ResourceMgr`, four registries, tag/model/prompt/sysop/MCP managers (`resources/CONTEXT.md`)
@@ -177,12 +218,12 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - `./src/monitor/` → run status, events, `RunKind::Spawn`, bounded history/retention (`monitor/CONTEXT.md`)
 - `./src/hitl/` → live-run registry, payload delivery, interaction answering (`hitl/CONTEXT.md`)
 - `./src/pool/` → team runtime pool, leases, concurrency, reaper (`pool/CONTEXT.md`)
-- `./tests/` → integration suites (`tests/CONTEXT.md`)
+- `./tests/` → integration suites, including the compile-level seam inventory in `seams.rs` (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
-- Unit tests beside every module: config defaults/serde, error wording, registry insert/lookup/policy/revision, managers (tags/models/prompts/sysops/MCP), event-name mapping, framework ordering/isolation/verdicts, filters/chains/decorators, queue delivery ordering/errors/timeouts plus the deferred-kind placeholder, spawn frame framing and protocol round-trips, spawn backend labels/health/snapshots/deadlines/`describe`, registry routing, monitored lifecycle, subprocess and remote backends, monitor transitions/retention/lag, hub delivery/answering/cancel, pool admission/leases/eviction, session-id resolution, ref parsing.
-- Integration suites in `./tests/`: `resources.rs`, `managers.rs`, `managers_mcp.rs`, `callbacks.rs`, `callback_filters.rs`, `callback_chains.rs`, `callback_decorators.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `runner_facade.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `spawn_subprocess.rs`, `spawn_remote.rs`, `spawn_seam.rs` (every handle through `Arc<dyn SpawnedAgent>`), `spawn_routing.rs` (registry routing, monitored spawn lifecycle, bounded invocation), `runner_team_attach.rs` (pool try-start/acquire/payload drain), `monitor.rs`, `hitl.rs`, `team_pool.rs`, `team_pool_leases.rs`, `team_pool_lifecycle.rs`, `team_pool_hitl.rs`, `api_surface.rs`.
+- Unit tests beside every module: config defaults/serde, error wording (including the dreaming `Config` absence), registry insert/lookup/policy/revision, managers (tags/models/prompts/sysops/MCP), event-name mapping, framework ordering/isolation/verdicts, filters/chains/decorators, queue delivery ordering/errors/timeouts plus the deferred-kind placeholder and `QueueStats`, spawn frame framing and protocol round-trips, spawn backend labels/health/snapshots/deadlines/`describe`, registry routing, monitored lifecycle, subprocess and remote backends, monitor transitions/retention/lag, hub delivery/answering/cancel, pool admission/leases/eviction, session-id resolution, ref parsing, dreaming service ownership/idempotency/cancellation/status serde.
+- Integration suites in `./tests/`: `resources.rs`, `managers.rs`, `managers_mcp.rs`, `callbacks.rs`, `callback_filters.rs`, `callback_chains.rs`, `callback_decorators.rs`, `security_binding.rs`, `message_queue.rs`, `runner_lifecycle.rs`, `runner_facade.rs`, `run_agent.rs`, `run_workflow.rs`, `run_team.rs`, `spawn_subprocess.rs`, `spawn_remote.rs`, `spawn_seam.rs` (every handle through `Arc<dyn SpawnedAgent>`), `spawn_routing.rs` (registry routing, monitored spawn lifecycle, bounded invocation), `runner_team_attach.rs` (pool try-start/acquire/payload drain), `monitor.rs`, `hitl.rs`, `team_pool.rs`, `team_pool_leases.rs`, `team_pool_lifecycle.rs`, `team_pool_hitl.rs`, `dreaming.rs` (the host-driven tick, the runner-hosted start/stop, cancellation of the initial delay, the typed absence, and `Runner::stop` stopping the loop), `api_surface.rs`, and `seams.rs` (the pluggable/deferred seam inventory: trait-object coercions, the typed refusals, and `Runner::queue_stats`).
 - Subprocess tests re-exec the test binary as a hermetic fake child (no external script, no network); remote tests use `wiremock` on loopback; pool eviction is proven with short idle timeouts and paused/bounded time, never wall-clock sleeps.
 - Behavior ports cite the Python test they mirror in a comment (e.g. `// ports tests/unit_tests/core/runner/test_resource_manager.py`).
 - Gates: `cargo fmt -p openjiuwen-runner`, `cargo test -p openjiuwen-runner --offline`, `cargo clippy -p openjiuwen-runner --all-targets --all-features --offline -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc -p openjiuwen-runner --no-deps --offline`, all clean and offline.
@@ -191,7 +232,7 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 
 - **Distributed mode**: `drunner/` transports (Pulsar backend, ZeroMQ, `message_queue_fake.py` wire envelopes, reply-topic subscription, `ResponseCollector`, `MqRemoteClient`/`MqServerAdapter`) — `RemoteProtocol::Mq`/`SpawnBackend::RemoteMq` and `MessageQueueKind::{Pulsar, ZeroMq}` are typed `Unsupported` naming the transport, `DeferredMessageQueue` stands in for a deferred queue kind, `RemoteProtocol::A2a`/`SpawnBackend::RemoteA2a` are `Unsupported` (A2A lives in `openjiuwen-extensions`), and `RunnerConfig::distributed_mode` is refused by `start()`.
 - **Subprocess spawn extras**: Python's `python -m <module> <class>` bootstrap inside the child, the process pool, Windows stdio emulation, and Python's exact graceful→force escalation timings. The trait, spec, NDJSON protocol, health checks (including per-call health control), deadlines, and kill-on-drop are implemented; the child program is host-configured.
-- **Spawn extras**: spawner configuration introspection beyond `AgentSpawner::describe`, runtime re-tuning of the background health interval, and downcasting a seam handle to its concrete backend.
+- **Spawn extras**: spawner configuration introspection beyond `AgentSpawner::describe`, downcasting a seam handle to its concrete backend, and re-tuning the *request* deadline or the health-probe deadline of a live child (only the background health *interval* is re-tunable).
 - **Team pool extras**: OS-process/external-CLI members and SSH transport, cross-process attach over a network transport (lease joining is available in-process through `Runner::acquire_agent_team`), `member=True` spawn routing, `delete_agent_team`, `register_human_agent_inbound`, `start_agent_team_streaming`'s leader-lifecycle frames, `TeamStreamLogger`/monitor TUI, `run_context`, and the org layer.
 - **HITL extras**: Python's in-loop `InteractGate` enforcement (pausing does not suspend an in-flight invocation), auth/ACL on who may answer, and cross-process interaction routing. Payloads delivered to a pooled run are buffered for host replay rather than waking a member mid-turn.
 - **Monitor extras**: persistence, MQ/WebSocket/OTLP export, metrics/aggregation, and a cross-process view.
@@ -212,6 +253,9 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - Pool: one live run per `(team_name, session_id)`; a second `start` on a live key is `PoolError::Busy`, while `acquire` joins and refcounts. `stop_all()` closes the pool permanently — the facade replaces it.
 - HITL: `deliver` needs a pool-registered run with an open inbox (otherwise `NoInbox`/`MissingTarget`); `answer` needs a run whose session was attached by the run path. Pause/resume are signals, not suspension.
 - Monitor: `update` refuses terminal phases (only `finish` ends a run); finished runs are retained up to `LIVE_RUN_LIMIT`, so `history`/`snapshot` still work after completion but not indefinitely.
+- `set_monitor` installs a monitor for every run started afterwards and re-points the installed hub at it (`InteractionHub::attach_monitor`); it does not migrate anything: in-flight runs keep the monitor they were admitted with, and the retired monitor keeps its live statuses, its retention history, and its subscribers.
+- `set_hitl` installs a hub as given — the caller wires it to the runner's monitor with `InteractionHub::with_monitor`/`attach_monitor` if it wants mirroring — and it does not migrate live registrations, so runs in flight stay addressable on the retired hub only.
+- `set_message_queue` installs a host-owned queue (the point being a broker backend) in whatever started state the host left it — the runner never starts it implicitly — and the next `Runner::start` replaces it with the configured backend again.
 - Subprocess: a handle desynchronizes after an abandoned stream or a probe that hits its deadline and is then single-use; `shutdown(Duration::ZERO)` means "use `SubprocessConfig::shutdown_timeout_secs`", a non-zero timeout wins; `RemoteAgent::pid()` is always `None`; a remote `shutdown` is `stop()`, and a remote handle spawned through `RemoteSpawner` is started at spawn (a directly constructed `RemoteAgent` is lazy).
 - Spawn routing: install one backend with `Runner::set_spawner` or a multi-backend `SpawnerRegistry` with `Runner::set_spawner_registry` (the registry wins; `set_spawner` clears it). With a single spawner installed, a `SpawnSpec::backend` hint that contradicts it is `Error::Config`; an unlabelled (`Unknown`) spawner accepts the hint. `RunOptions` has no spawner field and `ResourceMgr` takes no part.
 - Every successful `Runner::spawn_agent*` returns a `MonitoredSpawnedAgent`: a `RunKind::Spawn` status exists while the child is live, `health()` records an observation, and a probe or failed call that sees `is_alive() == false` — or `shutdown`/`force_kill`/drop — finishes it with `Failed`/`Completed`/`Cancelled`. `active_spawns()` therefore lists spawns not yet reported finished, not necessarily processes still running.
@@ -222,4 +266,10 @@ Thin constructors for the runner's error vocabulary (`not_found`, `invalid_sessi
 - `message_queue()` always returns a queue: before `start` it is the configured backend in the stopped state (operations fail with `Error::Config`), not `None`; a configuration naming a deferred transport (`pulsar` / `zeromq`) yields `DeferredMessageQueue`, whose every operation is `Error::Unsupported` naming the transport.
 - `start()` refuses `distributed_mode` and deferred queue transports with `Error::Unsupported` and leaves the runner stopped.
 - `set_guardrails` unregisters the previous binding first, so calling it twice replaces rather than double-scans.
+- Dreaming has its own lifecycle: `Runner::start` never starts it and `Runner::start_dreaming` never starts the runner. `Runner::stop` *does* stop a running service (bounded, log-only on failure) and leaves it installed, so a later `start_dreaming` runs it again.
+- `set_dreaming_service` replaces the slot but does not stop what it displaced: a replaced service keeps its loop task until its own `DreamService::stop`, and `Runner::stop` only stops the service installed at that moment.
+- Without an installed service the three entry points are `Error::Config` naming `Runner::set_dreaming_service`; never paper over that with a no-op or an `Unsupported`.
+- `DreamService::start` is idempotent (a live loop is reported, not doubled) and `stop` maps the loop's `Error::Cancelled` to `Ok`; a task panic or an overrun of `DEFAULT_DREAMING_STOP_TIMEOUT` (the task is then aborted) is recorded in `DreamServiceStatus::last_stop_error` and cleared by the next `start`.
+- `dreaming_status()` copies the orchestrator's own `DreamOrchestratorStatus` out under its lock: the returned value is one snapshot, and no lock is held across an await.
+- Tests drive the loop with millisecond intervals (`initial_delay_ms: 0`, `poll_interval_ms: 1`, `max_interval_ms: 5`) and bounded `eventually` polls; the injected clock belongs to `DreamService::tick`, never to the loop, which reads `Utc::now()`.
 - `RunBinding::run_id` and `RunStatusGuard` stay `pub(crate)` and carry `#[allow(dead_code)]` for that reason; do not widen them to silence lints.

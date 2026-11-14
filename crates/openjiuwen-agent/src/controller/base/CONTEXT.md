@@ -13,11 +13,12 @@ Ports the driver half of Python `openjiuwen/core/controller/base.py` (`invoke`, 
 - Seams — `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner(Planner)`.
 - Executors — `add_executor(task_type, executor) -> &Self` (chainable, re-keyed), `add_default_executor(executor) -> &Self`, `remove_executor`, `executor`, `task_types()` (sorted), `registry()` (snapshot), `scheduler()` (snapshot `TaskScheduler` with `max_tasks` and `task_timeout_ms`).
 - Task store — `task_manager() -> TaskManager` (shared handle), `async tasks() -> Vec<Task>` (every task in the shared store, all sessions, creation order).
-- Lifecycle — `start()`, `stop()`, `async shutdown()`, `is_running()`, `scheduler_loop() -> Option<Arc<TaskSchedulerLoop>>`.
+- Lifecycle — `start()`, `stop()`, `async shutdown()`, `is_running()`, `scheduler_loop() -> Option<Arc<TaskSchedulerLoop>>`, `scheduler_state() -> TaskSchedulerState`, `wake_scheduler() -> bool`, `running_tasks() -> Vec<String>`.
+- `TaskSchedulerState` — `Stopped`/`Running`/`Stopping` (serde snake_case, `as_str`/`Display`), derived from `is_running()` plus `scheduler_loop()`; `is_running()` keeps its own meaning (the flag).
 - Task control — `async pause_task(&str) -> bool`, `async cancel_task(&str) -> bool`, plus `impl TaskControl` (`pause`, `cancel`, `resume`).
 - Sessions — `async bind_session(Arc<dyn Session>) -> bool`, `async unbind_session(&str) -> Option<Arc<dyn Session>>`, `bound_sessions() -> Vec<String>`.
 - Reasoner — `reasoner() -> Reasoner` (the controller installed as `TaskControl`), `async apply_task_ops(&[TaskOp], session_id, Option<&Arc<dyn Session>>) -> Vec<TaskOpOutcome>`.
-- Group routing — `set_group(Arc<dyn GroupRouter>)`, `clear_group()`, `group()`, `async send_to_agent(agent_id, &Event, Option<Arc<dyn Session>>) -> Result<Value>`, `async publish(&Event, Option<Arc<dyn Session>>) -> Result<Vec<Value>>`.
+- Group routing — `set_group(Arc<dyn GroupRouter>)`, `clear_group()`, `group()`, `group_router()` (alias of `group()`), `with_group(router)` (builder-style `set_group`), `async send_to_agent(agent_id, &Event, Option<Arc<dyn Session>>) -> Result<Value>`, `async publish(&Event, Option<Arc<dyn Session>>) -> Result<Vec<Value>>`.
 - `EventHandler` (async trait) — `name()`, `async handle(&Event, &TaskContext<'_>) -> Result<EventHandlerOutcome>`.
 - `EventHandlerOutcome` — `Intents(Vec<Intent>)`, `Output(Box<ControllerOutput>)`, `Ignored`.
 - `TASKS_STATE_KEY` — `"__controller_tasks__"`; the persisted value is a `TaskManagerState` (`{"tasks": [...], "next_seq": n}`) under that one session key.
@@ -54,6 +55,8 @@ Ports the driver half of Python `openjiuwen/core/controller/base.py` (`invoke`, 
 - Without a loop, `pause_task` flips `Submitted`/`Working` to `Paused` and refuses anything else; `cancel_task` cancels a `Submitted` task, returns `true` unchanged for a terminal one, and refuses a `Working` one; `resume` behaves as above but has no loop to wake.
 - `reasoner()` builds a `Reasoner` from the current config with the controller as its `TaskControl`; `apply_task_ops` takes the planner out of its lock for the batch, applies the ops, writes it back, and wakes the loop when one exists.
 - Group routing resolves the owner as the card name (or id when the name is empty) and fails with `Error::config("{owner}: Cannot {method}. Agent is not part of a group with a controller.")`; `send_to_agent` and `publish` forward the event and session unchanged.
+- `scheduler_state` reports `Stopped` when the flag is false, `Running` when the flag is set and the loop is live, and `Stopping` when the flag is set without a live loop (a `start` outside a runtime, or a loop winding down); `wake_scheduler` returns `false` without a running loop and `running_tasks` returns the loop's in-flight ids (empty otherwise).
+- The per-conversation `TaskQueue` is not owned here: turns dispatch synchronously and track no per-conversation turn, so the queue belongs to the legacy wrapper only.
 - The completion sentinel is not produced here: the turn only calls `TaskSchedulerLoop::ensure_completion_signal` when a loop exists.
 
 ## Divergences from Python
@@ -67,10 +70,10 @@ Ports the driver half of Python `openjiuwen/core/controller/base.py` (`invoke`, 
 
 ## Test Strategy
 
-- 24 offline tests: `tests.rs` 17, `state.rs` 5, `mod.rs` 2.
-- `tests.rs` covers router selection and the single-executor shortcut, unregistered task types with the default response, stream shape, the three handler outcomes, signal events, `max_intents`, the started loop running a manager-inserted task, start/stop idempotency, shutdown of an in-flight run, manager-only pause/cancel fallbacks, loop-delegated pause/cancel/resume, group routing with typed errors, reasoner create → loop execution, and the sentinel written once per idle stretch.
+- 28 offline tests: `tests.rs` 18, `state.rs` 5, `mod.rs` 5.
+- `tests.rs` covers router selection and the single-executor shortcut, unregistered task types with the default response, stream shape, the three handler outcomes, signal events, `max_intents`, the started loop running a manager-inserted task, start/stop idempotency, shutdown of an in-flight run, manager-only pause/cancel fallbacks, loop-delegated pause/cancel/resume, group routing with typed errors, the `with_group`/`group_router` round-trip, reasoner create → loop execution, and the sentinel written once per idle stretch.
 - `state.rs` covers persistence across turns and instances, pause/cancel status persistence, corrupt-state recovery, disabling persistence, and the exact snapshot wire shape.
-- `mod.rs` covers the state key and lifecycle/queue behaviour (binding, executor registry, queue capacity and FIFO drain).
+- `mod.rs` covers the state key, lifecycle/queue behaviour (binding, executor registry, queue capacity and FIFO drain), the `TaskSchedulerState` wire names, the `Stopped → Running → Stopped` transitions around `start`/`stop`, `Stopping` outside a runtime, and `wake_scheduler`/`running_tasks` with and without a loop.
 - `fixtures.rs` supplies `StubExecutor`, `CooperativeExecutor` (pause/cancel aware, token-driven), `StubHandler`, `CountingRecognizer`, `RecordingSession`, and the session/controller/control-turn helpers; `ScriptedModel` is used only by the router test.
 
 ## Routing Table

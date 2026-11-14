@@ -35,7 +35,7 @@
 //! handle's [`crate::spawn::subprocess::SpawnedProcess`] state is dropped, so
 //! neither can outlive or resurrect a child.
 
-use super::ProcessState;
+use super::{HealthTask, ProcessState};
 use crate::error;
 use crate::spawn::frames;
 use crate::spawn::protocol::{SpawnMessage, SpawnMessageKind};
@@ -50,6 +50,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 /// `tracing` target for the spawn seam.
@@ -57,6 +58,15 @@ const TARGET: &str = "openjiuwen_runner::spawn";
 
 /// How long a killed child is given to be reaped.
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a background health loop is given to stop cooperatively before it is
+/// aborted.
+///
+/// A loop waiting for the request lock behind a caller's exchange can take up to
+/// the configured `request_timeout_secs`, which is too long to make a re-tune
+/// wait: past this bound the loop is aborted, which is the one case where a
+/// re-tune can leave a stray frame behind.
+const HEALTH_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest prefix of a child's stderr line echoed into the debug log.
 pub(super) const STDERR_PREVIEW_CHARS: usize = 512;
@@ -479,15 +489,21 @@ pub(super) fn spawn_stderr_task(pid: Option<u32>, stderr: ChildStderr) -> JoinHa
     })
 }
 
-/// Starts the background health loop, if the configuration enables it.
+/// Starts the background health loop, if the handle's live interval enables it.
 ///
-/// The task holds only a [`Weak`] reference, so it never keeps the handle alive,
-/// and it exits when the child dies or a probe finds it unusable.
+/// The interval is read from the handle
+/// ([`ProcessState::health_interval`]), not from
+/// [`crate::spawn::subprocess::SubprocessConfig`], so a restart from
+/// [`crate::spawn::subprocess::SpawnedProcess::set_health_interval`] takes
+/// effect. The task holds only a [`Weak`] reference, so it never keeps the handle
+/// alive, and it exits when the child dies or a probe finds it unusable.
 pub(super) async fn spawn_health_task(state: &Arc<ProcessState>) {
-    let interval = state.config.health_interval();
+    let interval = state.health_interval();
     if interval.is_zero() {
         return;
     }
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
     let weak = Arc::downgrade(state);
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -496,7 +512,12 @@ pub(super) async fn spawn_health_task(state: &Arc<ProcessState>) {
         // the delay before the first probe.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                // The stop signal only ever cancels the wait *between* probes, so
+                // a re-tune never abandons an exchange half-way.
+                () = task_stop.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             let Some(state) = Weak::upgrade(&weak) else {
                 return;
             };
@@ -530,7 +551,59 @@ pub(super) async fn spawn_health_task(state: &Arc<ProcessState>) {
             }
         }
     });
-    *state.health_task.lock().await = Some(handle);
+    *state.health_task.lock().await = Some(HealthTask { handle, stop });
+}
+
+/// Re-tunes the background health interval of a live child.
+///
+/// The new interval is stored first, so the restarted loop reads it; the previous
+/// loop is then stopped cooperatively and replaced. `Duration::ZERO` leaves no
+/// background task running (explicit `health` probes still work); a non-zero value
+/// starts one.
+///
+/// The child is not touched, so a re-tune never desynchronises the handle, never
+/// clears the `healthy` flag and never resets the consecutive-failure count: a
+/// `health_fail` child that already failed twice keeps that count.
+pub(super) async fn set_health_interval_impl(
+    state: &Arc<ProcessState>,
+    interval: Duration,
+) -> Result<()> {
+    // One re-tune at a time, so two callers cannot leave two loops behind.
+    let _tuning = state.health_tuning.lock().await;
+    if !is_alive_impl(state) {
+        return Err(stopped(state));
+    }
+    state.store_health_interval(interval);
+    stop_health_task_gracefully(state).await;
+    spawn_health_task(state).await;
+    Ok(())
+}
+
+/// Stops the background health loop without abandoning an exchange.
+///
+/// The loop's stop signal cancels only its wait between probes: a probe already in
+/// flight runs to completion (it is bounded by `health_check_timeout_secs`), so its
+/// reply is consumed and the handle stays in sync. A loop that cannot stop within
+/// [`HEALTH_TASK_STOP_TIMEOUT`] — it is queued behind a caller's exchange for the
+/// request lock — is aborted as a last resort.
+async fn stop_health_task_gracefully(state: &ProcessState) {
+    let Some(task) = state.health_task.lock().await.take() else {
+        return;
+    };
+    task.stop.cancel();
+    let mut handle = task.handle;
+    if tokio::time::timeout(HEALTH_TASK_STOP_TIMEOUT, &mut handle)
+        .await
+        .is_err()
+    {
+        debug!(
+            target: TARGET,
+            pid = ?state.pid,
+            "the background health loop did not stop in time; aborting it"
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 /// The invocation frame: one request's inputs.
@@ -568,6 +641,17 @@ pub(super) fn health_payload(payload: &Value) -> bool {
 fn out_of_sync(state: &ProcessState) -> Error {
     Error::validation(format!(
         "{} is out of sync after an abandoned stream; respawn the agent",
+        state.describe()
+    ))
+}
+
+/// The error for a re-tune of a handle whose child already stopped.
+///
+/// A stopped handle has nothing left to supervise: starting a loop would probe a
+/// dead child and, for a killed one, only inflate the failure count.
+fn stopped(state: &ProcessState) -> Error {
+    Error::validation(format!(
+        "{} has stopped; the background health interval can only be re-tuned while the child is alive",
         state.describe()
     ))
 }

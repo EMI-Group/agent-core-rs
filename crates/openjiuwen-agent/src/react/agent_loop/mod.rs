@@ -13,7 +13,10 @@
 //!   the system prompt, prepare the window with `ContextEngine::prepare`, emit a
 //!   `context.usage` frame, fire `BeforeModelCall`, call the model through
 //!   [`call_model_streaming`](crate::react::model_step::call_model_streaming),
-//!   and fire `AfterModelCall`;
+//!   and fire `AfterModelCall`; the call itself is wrapped in best-effort
+//!   KV-cache affinity ([`kv_cache`]): the request scope is prepared, its
+//!   inference admitted, its prefix recorded, and the provider's input tokens
+//!   reported afterwards, without ever changing the run's outcome;
 //! - execute the model's tool calls in model order through
 //!   [`execute_calls_with`](crate::abilities::execute::execute_calls_with),
 //!   firing `BeforeToolCall`/`AfterToolCall` around each call and appending the
@@ -29,11 +32,14 @@
 //! - persist contexts with `ContextEngine::save_contexts` and interruption state
 //!   under `__react_agent_interruption__`;
 //! - terminate with `termination_reason` `max_iterations` or `token_budget`.
+mod kv_cache;
+
 use crate::abilities::execute::execute_calls_with;
 use crate::abilities::{ToolCallResult, ToolExecutionOptions};
 use crate::callbacks::CallbackFramework;
 use crate::input::AgentInput;
 use crate::interrupt::{InterruptKind, InterruptRequest};
+use crate::memory_provider::{finalize_session, injected_prompt_block};
 use crate::output::{AgentChunk, AgentOutput, Observation};
 use crate::policy::{
     ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
@@ -43,17 +49,19 @@ use crate::rails::memory::MEMORY_VARIABLES_KEY;
 use crate::rails::{RailContext, RailEvent, RailRegistry};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
 use crate::react::pause::pause_output;
-use crate::react::prompt::build_system;
+use crate::react::prompt::build_system_with_block;
 use crate::react::resume::{resume_or_seed, ResumeOutcome};
 use crate::react::{exposure, frames, hooks};
 use crate::react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
 use crate::steering::SteeringQueue;
+use crate::usage::{self, UsageTelemetry};
 use indexmap::IndexMap;
 use openjiuwen_common::error::Result;
-use openjiuwen_context::{ContextEngine, PrepareOptions};
+use openjiuwen_context::{ContextEngine, ConversationContext, PrepareOptions};
 use openjiuwen_foundation::{
     BaseMessage, Model, ModelRequestConfig, Tool, ToolCall, ToolCard, Usage,
 };
+use openjiuwen_memory::{ConversationTurn, MemoryProvider};
 use openjiuwen_session::{InvokeType, Session};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -73,6 +81,8 @@ const TOKEN_BUDGET_MSG: &str = "Token budget exceeded";
 const FINAL_ANSWER_NUDGE: &str = "Provide your best final answer now without calling any tools.";
 /// Metadata key marking the injected empty-response notice.
 const EMPTY_RESPONSE_SOURCE_KEY: &str = "_openjiuwen_message_source_kind";
+/// The `phase` a snapshot of a completed model call reports.
+const POST_CALL_PHASE: &str = "post_call";
 
 /// Owned snapshot of everything one run needs from an [`ReActAgent`].
 ///
@@ -116,6 +126,12 @@ pub(crate) struct AgentRuntime {
     pub(crate) resilience: ToolResiliencePolicy,
     /// Check run before a final model request, when installed.
     pub(crate) final_check: Option<Arc<dyn FinalRequestCheck>>,
+    /// KV-cache hook the model calls record their prefix affinity through.
+    pub(crate) kv_cache_hook: Option<Arc<crate::kv_cache::KVCacheModelCallHook>>,
+    /// External long-term-memory provider, when the agent has one installed.
+    pub(crate) memory_provider: Option<Arc<dyn MemoryProvider>>,
+    /// Buffer the post-call usage snapshots; shared with the agent.
+    pub(crate) usage_telemetry: Arc<UsageTelemetry>,
 }
 
 impl AgentRuntime {
@@ -169,6 +185,9 @@ impl AgentRuntime {
             client_tools: agent.client_tools(),
             resilience: agent.tool_resilience(),
             final_check: agent.final_request_check(),
+            kv_cache_hook: agent.kv_cache_hook(),
+            memory_provider: agent.memory_provider(),
+            usage_telemetry: agent.usage_telemetry(),
         };
         let (visible_tool_info, visible_cards) = exposure::visible_tools(
             &tool_info,
@@ -182,12 +201,99 @@ impl AgentRuntime {
     }
 }
 
+/// One successful model call's usage reporting.
+///
+/// Grouping the loop-invariant parts keeps [`UsageCall::report`] a one-argument
+/// call at both firing points (an iteration's streamed call and the
+/// `FinalAnswer` finalization call), so neither has to rebuild the identity of
+/// the call by hand.
+struct UsageCall<'a> {
+    /// The run's snapshot: the engine and the telemetry buffer.
+    runtime: &'a AgentRuntime,
+    /// The run's session, which supplies the session id.
+    session: &'a Arc<dyn Session>,
+    /// The stream publisher, when the caller streams.
+    publisher: Option<&'a UnboundedSender<AgentChunk>>,
+    /// The iteration the call belongs to.
+    iteration: usize,
+    /// The request the call was made with; it names the model.
+    request: &'a ModelRequestConfig,
+    /// The conversation window the call was measured against.
+    context: &'a ConversationContext,
+    /// The window fields the post-call frame repeats.
+    window: frames::WindowSummary,
+}
+
+impl UsageCall<'_> {
+    /// Records the provider's accounting and publishes the post-call snapshot.
+    ///
+    /// The KV-cache aggregator entry is written under the deterministic
+    /// [`usage::request_id`] of this call, so a retried call updates it instead
+    /// of double counting. The post-call snapshot is only produced when an
+    /// analyzer is installed; both steps are best effort, because telemetry must
+    /// never change a run's outcome: an error is logged at debug level and the
+    /// frame is simply not emitted.
+    ///
+    /// The engine's `usage_snapshot` measures the window, so the snapshot it
+    /// returns is labelled `pre_call` and carries no request id; the agent
+    /// stamps both (`phase = "post_call"`, `request_id = "<session>#<iteration>"`)
+    /// so a drained snapshot names the call it belongs to, exactly like the
+    /// frame that carries it.
+    async fn report(&self, usage: &Usage) {
+        let scope = usage::cache_scope_key(
+            self.session.id(),
+            self.runtime.model.provider(),
+            self.request,
+        );
+        let request_id = usage::request_id(self.session.id(), self.iteration);
+        let reported = usage::provider_usage_value(usage);
+        if let Err(error) = self
+            .runtime
+            .engine
+            .record_provider_usage(scope, &request_id, &reported)
+        {
+            tracing::debug!(%error, "provider usage was not recorded in the KV-cache rollup");
+        }
+        match self
+            .runtime
+            .engine
+            .usage_snapshot(self.context, Some(usage.input_tokens))
+            .await
+        {
+            Ok(mut snapshot) => {
+                // The engine measures a window, so its own snapshot is always
+                // labelled `pre_call` and carries no request id. This call has
+                // already happened, so the agent stamps the phase the frame
+                // publishes and the id the KV-cache entry was recorded under.
+                POST_CALL_PHASE.clone_into(&mut snapshot.phase);
+                snapshot.request_id.clone_from(&request_id);
+                self.runtime.usage_telemetry.record(snapshot.clone());
+                frames::context_usage_post_call(
+                    self.publisher,
+                    self.session,
+                    self.iteration,
+                    usage,
+                    &snapshot,
+                    self.window,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "no post-call context usage snapshot was produced");
+            }
+        }
+    }
+}
+
 /// Runs one invoke of the `ReAct` loop to completion.
 ///
 /// `agent` supplies the model, tools, rails, and context engine; `input` is the
 /// parsed caller payload (a text query or an interactive resume); `session` is
-/// the resolved session the run reads state from and writes histories to; and
-/// `publisher`, when present, receives each [`AgentChunk`] as it is produced.
+/// the resolved session the run reads state from and writes histories to;
+/// `publisher`, when present, receives each [`AgentChunk`] as it is produced; and
+/// `owned` records whether this run created `session` (see
+/// [`AgentRun`](crate::AgentRun)), which decides whether the external memory
+/// provider finalizes the conversation at the end.
 ///
 /// # Errors
 ///
@@ -199,9 +305,10 @@ pub(crate) async fn run(
     input: AgentInput,
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
+    owned: bool,
 ) -> Result<AgentOutput> {
     let runtime = AgentRuntime::snapshot(agent)?;
-    run_with(&runtime, input, session, publisher).await
+    run_with(&runtime, input, session, publisher, owned).await
 }
 
 /// Runs one invoke against an already snapshotted runtime.
@@ -209,7 +316,12 @@ pub(crate) async fn run(
 /// The wrapper owns the invocation-wide concerns: the root span, the single
 /// [`RailContext`] shared by every firing point, and the unconditional
 /// finalization (`AfterInvoke` rails, context persistence, the final `answer`
-/// frame, and the span status) that must happen even when the loop fails.
+/// frame, the external memory provider's session end, and the span status) that
+/// must happen even when the loop fails.
+///
+/// `owned` marks a session this run created: only then does the memory provider
+/// receive [`on_session_end`](openjiuwen_memory::MemoryProvider::on_session_end),
+/// and never for an interrupt pause, which ends no conversation.
 ///
 /// # Errors
 ///
@@ -219,6 +331,7 @@ pub(crate) async fn run_with(
     input: AgentInput,
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
+    owned: bool,
 ) -> Result<AgentOutput> {
     let span = session.tracer().map(|tracer| {
         let span = tracer.start_span(runtime.card_name.clone(), InvokeType::Chain);
@@ -230,7 +343,18 @@ pub(crate) async fn run_with(
         .with_agent_id(runtime.card_id.clone())
         .with_input(input.clone());
 
-    let result = run_inner(runtime, &input, &session, publisher.as_ref(), &mut ctx).await;
+    // The run's text turns, forwarded to the memory provider when this run owns
+    // the session.
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    let result = run_inner(
+        runtime,
+        &input,
+        &session,
+        publisher.as_ref(),
+        &mut ctx,
+        &mut turns,
+    )
+    .await;
 
     let output = match &result {
         Ok(output) => output.clone(),
@@ -259,6 +383,10 @@ pub(crate) async fn run_with(
     }
     // The invocation-end callback observes both successful and failed runs.
     hooks::invoke_end(runtime, &session, &output).await;
+    // An owned session ends here, so the external memory provider finalizes the
+    // conversation; a borrowed session stays the caller's to finalize. Best
+    // effort: a provider failure never changes the run's output.
+    finalize_session(runtime.memory_provider.as_ref(), &turns, owned, &output).await;
     if let Some(span) = span {
         match &result {
             Ok(output) => span.finish(output.to_value()),
@@ -324,7 +452,21 @@ fn memory_render_fields(ctx: &RailContext) -> Option<&serde_json::Map<String, Va
         .and_then(Value::as_object)
 }
 
+/// Builds the system message of one iteration: the rendered identity plus the
+/// external memory provider's prompt block, when a rail published one.
+fn system_message(runtime: &AgentRuntime, input: &AgentInput, ctx: &RailContext) -> BaseMessage {
+    build_system_with_block(
+        &runtime.config,
+        input,
+        memory_render_fields(ctx),
+        injected_prompt_block(ctx),
+    )
+}
+
 /// Drives the iteration loop and turns its termination into an [`AgentOutput`].
+///
+/// `turns` collects the run's text turns (the user query and every assistant
+/// reply, in order) for the external memory provider's session finalization.
 #[allow(clippy::too_many_lines)]
 async fn run_inner(
     runtime: &AgentRuntime,
@@ -332,11 +474,12 @@ async fn run_inner(
     session: &Arc<dyn Session>,
     publisher: Option<&UnboundedSender<AgentChunk>>,
     ctx: &mut RailContext,
+    turns: &mut Vec<ConversationTurn>,
 ) -> Result<AgentOutput> {
     let config = &runtime.config;
     let context = runtime
         .engine
-        .create_context("main", Some(Arc::clone(session)))
+        .create_context(usage::MAIN_CONTEXT_ID, Some(Arc::clone(session)))
         .await?;
 
     reset_ctx(ctx, RailEvent::BeforeInvoke);
@@ -377,6 +520,8 @@ async fn run_inner(
     let mut total_usage = Usage::default();
     let mut empty_notice_sent = false;
 
+    turns.push(ConversationTurn::new("user", original_query.clone()));
+
     hooks::invoke_start(runtime, session, &original_query, limit).await;
 
     for iteration in start..=limit {
@@ -384,7 +529,7 @@ async fn run_inner(
         // Steering pushed before the run lands in the first request; one pushed
         // mid-run lands in the next iteration's window.
         hooks::drain_steering(runtime, &context).await?;
-        let system = build_system(config, input, memory_render_fields(ctx));
+        let system = system_message(runtime, input, ctx);
         let prepared = runtime
             .engine
             .prepare(
@@ -396,6 +541,7 @@ async fn run_inner(
                 },
             )
             .await?;
+        let window = frames::WindowSummary::of(&prepared);
         frames::context_usage(publisher, session, iteration, &prepared).await;
 
         reset_ctx(ctx, RailEvent::BeforeModelCall);
@@ -439,9 +585,16 @@ async fn run_inner(
                 .await;
             }
             let mut sink = DeltaSink::new(publisher, Some(session));
+            // Best-effort prefix affinity: prepared per attempt, so a retried
+            // call records its own scope and never leaves a lease dangling.
+            let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
             match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
-                Ok(reply) => break reply,
+                Ok(reply) => {
+                    kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
+                    break reply;
+                }
                 Err(error) => {
+                    kv_cache::finish(cache, false, None).await;
                     reset_ctx(ctx, RailEvent::OnModelException);
                     ctx.iteration = iteration;
                     ctx.extra
@@ -464,6 +617,17 @@ async fn run_inner(
             }
         };
         total_usage.add(&reply.usage);
+        UsageCall {
+            runtime,
+            session,
+            publisher,
+            iteration,
+            request: &request,
+            context: &context,
+            window,
+        }
+        .report(&reply.usage)
+        .await;
 
         reset_ctx(ctx, RailEvent::AfterModelCall);
         ctx.iteration = iteration;
@@ -481,6 +645,9 @@ async fn run_inner(
         let raw = reply.message.text().into_owned();
         let calls = reply.message.tool_calls.clone();
         hooks::step_end(runtime, session, iteration, &reply, calls.len()).await;
+        if !raw.trim().is_empty() {
+            turns.push(ConversationTurn::new("assistant", raw.clone()));
+        }
 
         if calls.is_empty() {
             if model_continue {
@@ -676,7 +843,7 @@ async fn run_inner(
         return Ok(output);
     }
 
-    let system = build_system(config, input, memory_render_fields(ctx));
+    let system = system_message(runtime, input, ctx);
     let prepared = runtime
         .engine
         .prepare(
@@ -687,12 +854,28 @@ async fn run_inner(
             },
         )
         .await?;
+    let window = frames::WindowSummary::of(&prepared);
     let mut messages = prepared.messages;
     messages.push(BaseMessage::user(FINAL_ANSWER_NUDGE));
-    match call_model(&runtime.model, &messages, request_for(runtime, &[])).await {
+    let request = request_for(runtime, &[]);
+    let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
+    match call_model(&runtime.model, &messages, request.clone()).await {
         Ok(reply) => {
+            kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
+            UsageCall {
+                runtime,
+                session,
+                publisher,
+                iteration: used,
+                request: &request,
+                context: &context,
+                window,
+            }
+            .report(&reply.usage)
+            .await;
             let text = reply.message.text().into_owned();
             if !text.trim().is_empty() && reply.message.tool_calls.is_empty() {
+                turns.push(ConversationTurn::new("assistant", text.clone()));
                 let mut answer = AgentOutput::answer(text)
                     .with_reasoning_present(reply.reasoning_present)
                     .with_iterations_used(used)
@@ -706,6 +889,7 @@ async fn run_inner(
             Ok(output)
         }
         Err(error) => {
+            kv_cache::finish(cache, false, None).await;
             output.finalization_error = Some(error.to_string());
             Ok(output)
         }

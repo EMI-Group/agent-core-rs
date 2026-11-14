@@ -61,6 +61,7 @@ Ports Python `openjiuwen/core/controller/modules/task_scheduler.py` (executor co
 
 - Deterministic ordering is a Rust choice: Python iterates an unspecified selection and blocks every admission when `max_concurrent_tasks == 0`.
 - Synchronous turn dispatch is kept; the loop only picks up tasks left `Submitted` in the store.
+- The loop's knobs are set on `ControllerConfig` through the `with_max_concurrent_tasks`, `with_schedule_interval` and `with_task_timeout` builders and read live from the shared config handle; dependency gating has no config field (it reads `metadata["depends_on"]` per task).
 
 ## Design Decisions
 

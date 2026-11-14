@@ -464,3 +464,60 @@ fn the_accessors_expose_the_resolved_configuration() {
     assert_eq!(client.base_url(), "https://example.test");
     assert_eq!(client.request_config().model_name, MODEL);
 }
+
+/// Builds the pure Messages body for one message, with no server involved.
+fn pure_body(request: &ModelRequestConfig) -> serde_json::Value {
+    build_messages_body(&[BaseMessage::user("hello")], request, false).expect("the body builds")
+}
+
+#[test]
+fn the_request_purpose_and_metadata_never_reach_the_body() {
+    let request = ModelRequestConfig::new(MODEL)
+        .with_purpose_compaction()
+        .with_metadata_entry("run_id", json!("eval-7"))
+        .with_context_operation_id("op-1")
+        .with_extra(json!({
+            "top_k": 5,
+            "request_purpose": "compaction",
+            "purpose": "compaction",
+            "metadata": {"run_id": "eval-7"},
+            "context_operation_id": "op-1",
+        }));
+    let body = pure_body(&request);
+    for key in [
+        "purpose",
+        "request_purpose",
+        "metadata",
+        "context_operation_id",
+    ] {
+        assert!(body.get(key).is_none(), "{key} is client-side only");
+    }
+    assert_eq!(
+        body["top_k"],
+        json!(5),
+        "unrelated extra keys still merge last"
+    );
+    assert_eq!(body["model"], json!(MODEL));
+}
+
+#[test]
+fn a_legacy_extra_purpose_is_honoured_and_stripped() {
+    let request =
+        ModelRequestConfig::new(MODEL).with_extra(json!({"request_purpose": "compaction"}));
+    assert!(request.is_compaction());
+    assert!(pure_body(&request).get("request_purpose").is_none());
+}
+
+#[test]
+fn a_non_object_extra_leaves_the_body_unchanged() {
+    let plain = pure_body(&ModelRequestConfig::new(MODEL));
+    for extra in [
+        serde_json::Value::Null,
+        json!("compaction"),
+        json!([1, 2]),
+        json!(7),
+    ] {
+        let request = ModelRequestConfig::new(MODEL).with_extra(extra.clone());
+        assert_eq!(pure_body(&request), plain, "extra {extra} is ignored");
+    }
+}

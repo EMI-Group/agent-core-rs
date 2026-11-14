@@ -67,6 +67,14 @@ Provider actions are explicit trait objects (`KvCacheActionProvider`) instead of
 - A disabled `KVCacheAffinityConfig` makes `prepare`/`suspend`/`release` return `false` and `begin_inference` return `None` without registering or spawning anything; `register_binding` (bookkeeping only) and the introspection accessors stay available.
 - The hook's wrappers return `false`/`None` when no action runtime is attached; `end_inference` is then a no-op (a lease can only come from an attached runtime).
 
+## ReAct integration
+
+- `ReActAgent::enable_kv_cache(KVCacheRuntimeConfig) -> Result<()>` builds `KVCacheRuntimeConfig::build_runtime()` and installs `KVCacheModelCallHook::new(runtime, config.affinity)`; `set_kv_cache_hook(Option<Arc<KVCacheModelCallHook>>)`, `kv_cache_hook()`, and `clear_kv_cache()` are the raw seam (a host attaches a provider action runtime with `KVCacheModelCallHook::with_action_runtime` and installs that hook, because `enable_kv_cache` builds no provider).
+- The loop touches the cache only in `react::agent_loop::kv_cache::{prepare, finish}`: before each model call (the streamed iteration call per attempt, and the `FinalAnswer` finalization call) it derives `identity(session.id(), None, request.model_name, messages, visible_cards)`, calls `prepare` (false without an action runtime), `begin_inference`, and `affinity`; afterwards it calls `end_inference(&lease, succeeded)` and, on success, `note_usage(&identity, reply.usage.input_tokens)`.
+- The loop snapshots the hook into `AgentRuntime::kv_cache_hook`, so a hook installed mid-run affects later invocations only; a run with `None` does no cache work at all.
+- Affinity is opt-in twice: `KVCacheAffinityConfig::enabled` decides whether the hook records prefixes, and an attached action runtime decides whether provider prefetch/offload/evict runs. `KVCacheRuntimeConfig::default()` therefore installs an inert hook.
+- Every hook result is best effort: `enable_kv_cache` propagates only the typed backend error (before storing anything), and runtime errors inside a run are logged at `tracing::debug!` without changing the output.
+
 ## Design Decisions
 
 - The prefix runtime is keyed by the full `KVCacheIdentity` (exact-match `HashMap`), so a prefix is reusable only when its lineage, model, counts, and hash all match.

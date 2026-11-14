@@ -36,10 +36,12 @@ use crate::member::{MemberObserver, MemberRuntime};
 use crate::schema::MemberMode;
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::tool::Tool;
 use openjiuwen_harness_protocol::{
     json_object_to_value, AbortMode, DeliveryMode, HarnessContext, HarnessError, HarnessEvent,
     HarnessInput, HarnessProtocol, HarnessState,
 };
+use openjiuwen_memory::team::MemberMemoryToolkit;
 use openjiuwen_session::Session;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
@@ -53,8 +55,9 @@ const PUMP_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The factory receives the member's cold [`DeepAgentSpec`](crate::schema::DeepAgentSpec) plus this
 /// runtime context because parts of the identity (team, member, session, workspace, language,
-/// mode) live in the team runtime rather than in the spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// mode) live in the team runtime rather than in the spec — and so do the live member handles the
+/// cold blueprint cannot carry, such as the team-memory toolkit.
+#[derive(Clone)]
 pub struct MemberHarnessContext {
     /// Name of the team the member belongs to.
     pub team_name: String,
@@ -73,7 +76,54 @@ pub struct MemberHarnessContext {
     /// Empty when the team build path supplies none. A changed card invalidates a restored
     /// checkpoint, so this value is part of the member's checkpoint identity.
     pub card_id: String,
+    /// Team-memory toolkit of this member, when the runtime supplies one.
+    ///
+    /// Private: it is a live engine handle rather than part of the member's identity, so a factory
+    /// only mounts its tools — see [`MemberHarnessContext::memory_tools`] — and never reads or
+    /// mutates it, and the derived traits below treat it as presence only.
+    memory_toolkit: Option<Arc<MemberMemoryToolkit>>,
 }
+/// The identity fields plus whether a team-memory toolkit is attached.
+///
+/// Written by hand (rather than derived) because the toolkit is a live engine handle: it is not a
+/// plain value, so it is printed as present/absent instead of dumping the whole engine, and two
+/// contexts are equal when they either both lack a toolkit or share the *same* `Arc`
+/// ([`Arc::ptr_eq`]). Two distinct toolkits over the same team and member are therefore unequal,
+/// which keeps `Eq` honest (a handle never compares equal to a different handle).
+impl std::fmt::Debug for MemberHarnessContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemberHarnessContext")
+            .field("team_name", &self.team_name)
+            .field("member_name", &self.member_name)
+            .field("session_id", &self.session_id)
+            .field("workspace_root", &self.workspace_root)
+            .field("language", &self.language)
+            .field("mode", &self.mode)
+            .field("card_id", &self.card_id)
+            .field(
+                "memory_toolkit",
+                &self.memory_toolkit.as_ref().map(|_| "present"),
+            )
+            .finish()
+    }
+}
+impl PartialEq for MemberHarnessContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.team_name == other.team_name
+            && self.member_name == other.member_name
+            && self.session_id == other.session_id
+            && self.workspace_root == other.workspace_root
+            && self.language == other.language
+            && self.mode == other.mode
+            && self.card_id == other.card_id
+            && super::memory_tools::same_toolkit(
+                self.memory_toolkit.as_ref(),
+                other.memory_toolkit.as_ref(),
+            )
+    }
+}
+impl Eq for MemberHarnessContext {}
 impl MemberHarnessContext {
     /// Builds the context from the six runtime identity values.
     #[must_use]
@@ -93,6 +143,7 @@ impl MemberHarnessContext {
             language: language.into(),
             mode,
             card_id: String::new(),
+            memory_toolkit: None,
         }
     }
     /// Pins the identifier of the agent card the member was built from.
@@ -100,6 +151,30 @@ impl MemberHarnessContext {
     pub fn with_card_id(mut self, card_id: impl Into<String>) -> Self {
         self.card_id = card_id.into();
         self
+    }
+    /// Attaches the member's team-memory toolkit, whose four tools a factory mounts.
+    #[must_use]
+    pub fn with_memory_toolkit(mut self, toolkit: Arc<MemberMemoryToolkit>) -> Self {
+        self.memory_toolkit = Some(toolkit);
+        self
+    }
+    /// Returns the attached team-memory toolkit, if the runtime supplied one.
+    #[must_use]
+    pub fn memory_toolkit(&self) -> Option<&Arc<MemberMemoryToolkit>> {
+        self.memory_toolkit.as_ref()
+    }
+    /// Returns the member's model-facing team-memory tools, in toolkit order.
+    ///
+    /// Empty when no toolkit is attached, so a factory can mount the result unconditionally. The
+    /// tools are the four `team_memory_*` handles of
+    /// [`crate::memory::team_memory_tools`], built from the toolkit's own schemas; the toolkit
+    /// itself stays owned by the runtime, which shares it with the lifecycle hooks.
+    #[must_use]
+    pub fn memory_tools(&self) -> Vec<Arc<dyn Tool>> {
+        match &self.memory_toolkit {
+            Some(toolkit) => super::memory_tools::memory_tools(toolkit),
+            None => Vec::new(),
+        }
     }
     /// Returns the per-member session id `"<team session>:<member_name>"`.
     ///
@@ -1381,5 +1456,94 @@ mod tests {
         assert!(pinned_runtime.checkpoint_store().is_none());
         assert!(pinned_runtime.latest_checkpoint().await.is_none());
         assert!(pinned_runtime.capture_checkpoint().await.unwrap().is_none());
+    }
+    #[test]
+    fn the_same_identity_arguments_build_equal_contexts() {
+        let left = MemberHarnessContext::new(
+            "team",
+            "dev-1",
+            "team:1:dev-1",
+            "/work",
+            "en",
+            MemberMode::BuildMode,
+        );
+        let right = MemberHarnessContext::new(
+            "team",
+            "dev-1",
+            "team:1:dev-1",
+            "/work",
+            "en",
+            MemberMode::BuildMode,
+        );
+        assert_eq!(left, right);
+        assert_eq!(left.clone(), left);
+        // Every identity field still participates in equality.
+        assert_ne!(left.clone().with_card_id("card-1"), left);
+        assert_ne!(
+            left.clone(),
+            MemberHarnessContext::new(
+                "team",
+                "dev-2",
+                "team:1:dev-1",
+                "/work",
+                "en",
+                MemberMode::BuildMode,
+            )
+        );
+    }
+    #[tokio::test]
+    async fn a_memory_toolkit_changes_a_context_identity_by_handle() {
+        let plain = MemberHarnessContext::new(
+            "team",
+            "dev-1",
+            "team:1:dev-1",
+            "/work",
+            "en",
+            MemberMode::BuildMode,
+        );
+        assert!(plain.memory_toolkit().is_none());
+        assert!(plain.memory_tools().is_empty());
+        let toolkit = Arc::new(MemberMemoryToolkit::new(
+            Arc::new(openjiuwen_memory::team::TeamMemory::in_memory()),
+            openjiuwen_memory::team::MemberMemoryContext::new("team").with_member("dev-1"),
+        ));
+        let with_memory = plain.clone().with_memory_toolkit(Arc::clone(&toolkit));
+        let attached = with_memory
+            .memory_toolkit()
+            .expect("the toolkit is attached");
+        assert!(Arc::ptr_eq(attached, &toolkit));
+        assert_eq!(with_memory.memory_tools().len(), 4);
+        // The toolkit is compared by handle: attaching one breaks equality, and so does a second
+        // handle for the same member, while a clone of the same handle keeps it.
+        assert_ne!(with_memory, plain);
+        assert_eq!(with_memory, plain.clone().with_memory_toolkit(toolkit));
+        let other = Arc::new(MemberMemoryToolkit::new(
+            Arc::new(openjiuwen_memory::team::TeamMemory::in_memory()),
+            openjiuwen_memory::team::MemberMemoryContext::new("team").with_member("dev-1"),
+        ));
+        assert_ne!(with_memory, plain.clone().with_memory_toolkit(other));
+    }
+    #[test]
+    fn the_debug_view_reports_toolkit_presence_only() {
+        let plain = MemberHarnessContext::new(
+            "team",
+            "dev-1",
+            "team:1:dev-1",
+            "/work",
+            "en",
+            MemberMode::BuildMode,
+        );
+        assert!(format!("{plain:?}").contains("memory_toolkit: None"));
+        let toolkit = Arc::new(MemberMemoryToolkit::new(
+            Arc::new(openjiuwen_memory::team::TeamMemory::in_memory()),
+            openjiuwen_memory::team::MemberMemoryContext::new("team").with_member("dev-1"),
+        ));
+        let with_memory = plain.with_memory_toolkit(toolkit);
+        let rendered = format!("{with_memory:?}");
+        assert!(
+            rendered.contains("memory_toolkit: Some(\"present\")"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("member_name: \"dev-1\""), "{rendered}");
     }
 }

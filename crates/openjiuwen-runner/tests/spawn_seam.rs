@@ -462,6 +462,16 @@ async fn the_in_process_backend_serves_calls_through_the_seam() {
         "an open handle reports itself healthy"
     );
 
+    let re_tune = child
+        .set_health_interval(Duration::from_secs(1))
+        .await
+        .expect_err("an in-process handle has no background health loop");
+    assert_eq!(re_tune.kind(), ErrorKind::Unsupported);
+    assert!(
+        re_tune.to_string().contains("in_process"),
+        "the message names the backend: {re_tune}"
+    );
+
     let output = send_bounded(&child, json!({"query": "in-process"}))
         .await
         .expect("the handler answers through the seam");
@@ -615,6 +625,22 @@ async fn the_remote_backend_reports_health_and_cancels_through_the_seam() {
         json!({"task_id": "t-1"})
     );
 
+    // No background health loop runs behind an HTTP handle, so a re-tune
+    // reports the seam instead of pretending to change a cadence.
+    let re_tune = child
+        .set_health_interval(Duration::from_secs(1))
+        .await
+        .expect_err("a remote handle has no background health loop");
+    assert_eq!(re_tune.kind(), ErrorKind::Unsupported);
+    assert!(
+        re_tune.to_string().contains("remote_http"),
+        "the message names the backend: {re_tune}"
+    );
+    assert!(
+        re_tune.to_string().contains("background health loop"),
+        "the message names the missing capability: {re_tune}"
+    );
+
     let snapshot = child.health_snapshot();
     assert_eq!(snapshot.backend, SpawnBackend::RemoteHttp);
     assert_eq!(snapshot.pid, None);
@@ -746,6 +772,20 @@ async fn the_defaulted_seam_methods_report_the_missing_capability() {
     assert!(
         probe.to_string().contains("no probe"),
         "the message points at the fallbacks: {probe}"
+    );
+
+    let re_tune = child
+        .set_health_interval(Duration::from_secs(1))
+        .await
+        .expect_err("a default handle runs no background health loop");
+    assert_eq!(re_tune.kind(), ErrorKind::Unsupported);
+    assert!(
+        re_tune.to_string().contains("unknown"),
+        "the message names the backend: {re_tune}"
+    );
+    assert!(
+        re_tune.to_string().contains("background health loop"),
+        "the message explains why: {re_tune}"
     );
 
     let cancel = child

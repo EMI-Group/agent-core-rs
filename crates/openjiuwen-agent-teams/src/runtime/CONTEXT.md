@@ -7,7 +7,7 @@ path from a `TeamAgentSpec`, the leader's run loop, the organisation facade over
 the pool and process-global runtime manager used by the CLI/MCP, and the model-pool router.
 Python parity sources: `openjiuwen/agent_teams/agent/team_agent.py`, `agent/agent_configurator.py`,
 `runtime/{manager,dispatch,pool,gate}.py`, `models/allocator.py`.
-This node also owns the seven **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity, attach hosting and per-member checkpoints.
+This node also owns the eight **metadata-driven wiring points**: member spawn kind, fork, workspace isolation, the organisation layer, KV-cache affinity, attach hosting, per-member checkpoints and team memory.
 Model routing, observability signals and the monitor stream are wired at build time as well (they are not metadata keys).
 
 The module owns *policy and orchestration*: who runs, what a run means, when a team is done, how an
@@ -31,6 +31,8 @@ pub struct TeamBuildDeps {
     pub kv_cache: Option<Arc<TeamKvCacheAffinity>>,       // None = built from metadata
     pub routing: Option<Arc<TeamModelRouter>>,            // None = built from model_pool
     pub checkpoints: Option<Arc<dyn MemberCheckpointStore>>,   // None = resolved from metadata
+    pub memory: Option<Arc<TeamMemoryWiring>>,                 // None = resolved from metadata
+    pub memory_observer: Option<Arc<dyn TeamMemoryObserver>>,  // None = the built-in bridge
     pub store_injected: bool,                             // set by `with_store`, cleared by `default()`
 }
 impl TeamBuildDeps {
@@ -45,10 +47,14 @@ impl TeamBuildDeps {
     pub fn with_routing(self, Arc<TeamModelRouter>) -> Self;
     pub fn with_checkpoint_store(self, Arc<dyn MemberCheckpointStore>) -> Self;
     pub fn has_injected_checkpoints(&self) -> bool;        // `checkpoints.is_some()`
+    pub fn with_memory(self, Arc<TeamMemoryWiring>) -> Self;
+    pub fn has_injected_memory(&self) -> bool;             // `memory.is_some()`
+    pub fn with_memory_observer(self, Arc<dyn TeamMemoryObserver>) -> Self;
+    pub fn has_memory_observer(&self) -> bool;             // `memory_observer.is_some()`
     pub fn resolved_language(&self) -> &'static str;       // unknown/None -> "cn"
 }
 // Default: NativeMemberFactory::from_env(), InMemoryTeamStore, LocalWorkspaceProvider rooted at
-// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing/checkpoints.
+// std::env::temp_dir().join("openjiuwen-agent-teams"), language None, no hooks/kv/routing/checkpoints/memory/observer.
 
 // spec_meta.rs — the metadata parsers (all tolerant; an absent key keeps the default)
 pub const SPAWN_METADATA_KEY: &str = "spawn";        pub const FORK_METADATA_KEY: &str = "fork";
@@ -200,6 +206,8 @@ impl TeamMemberSpawner {
     pub fn session_id(&self) -> &str;       pub fn team_name(&self) -> &str;
     pub fn options(&self) -> &MemberSpawnOptions;  pub fn fork(&self) -> Option<&ForkDirective>;
     pub fn routing(&self) -> &Arc<TeamModelRouter>;
+    pub fn memory(&self) -> Option<Arc<TeamMemoryWiring>>;   // teammates mount their tools from it
+    pub fn install_memory(&self, Arc<TeamMemoryWiring>);     // the build path installs the resolved wiring
     pub fn spawn_kind(&self, &str) -> Option<MemberSpawnKind>;
     pub fn forked_member(&self, &str) -> Option<ForkedMemberSpec>;
     pub fn forked_context(&self, &str) -> Result<Option<ForkedMemberSpec>>;
@@ -223,6 +231,7 @@ impl TeamAgent {
     pub fn activity(&self) -> Arc<MemberActivityRegistry>;
     pub fn spawner(&self) -> Arc<TeamMemberSpawner>;
     pub fn kv_cache(&self) -> Arc<TeamKvCacheAffinity>;  pub fn kv_env(&self, &str) -> Option<BTreeMap<String,String>>;
+    pub fn memory(&self) -> Option<Arc<TeamMemoryWiring>>;   // the team's wiring, `None` when disabled
     pub fn signals(&self) -> TeamSignals;  pub fn monitor_stream(&self, usize, BackpressurePolicy) -> Option<MonitorReceiver>;
     pub fn fork_directive(&self) -> Option<&ForkDirective>;  pub fn org(&self) -> Option<Arc<OrgBinding>>;
     pub fn attach_socket(&self) -> Option<PathBuf>;
@@ -268,8 +277,9 @@ signals and forwarded chunks, so every member (not only the leader) feeds the sa
 
 ## Metadata-driven wiring
 
-Seven optional keys under `TeamAgentSpec::metadata` tune the runtime; `spec_meta.rs` parses them and every
-parser except `organization` degrades to its default with a `warn!` on a malformed value.
+Eight optional keys under `TeamAgentSpec::metadata` tune the runtime; `spec_meta.rs` parses seven of them and
+every parser except `organization` degrades to its default with a `warn!` on a malformed value.
+`memory` is parsed by `crate::memory::memory_config` (memory node) and resolved by `memory_bind.rs`.
 
 | key | accepted shapes | effect |
 | --- | --- | --- |
@@ -281,9 +291,10 @@ parser except `organization` degrades to its default with a `warn!` on a malform
 | `attach` | `"/path/team.sock"` or `{"socket"\|"path": "…", "required": bool}`; blank ⇒ unset; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins | `start()` binds an `AttachHost` that serves `AttachOp`s over a Unix socket |
 
 | `checkpoint` | `CheckpointConfig`: `enabled`, `resume`, `policy` and `store` (`"memory"` or `{"store": "file", "dir": "…"}`); absent ⇒ enabled, in-memory, resume-if-available | the store, policy and card id every member runtime is wired with (`./checkpoints.rs`); the build path resolves the team-shared store once, and `file` roots each member under its own workspace unless `dir` is named |
+| `memory` | `MemoryConfig`: `enabled`, `store`, `extractor`, `export_on_stop`, `import_on_build`, `hooks`; absent or `null` ⇒ **no team memory**, `{"enabled": false}` ⇒ no wiring either | the team-memory wiring (`./memory_bind.rs`): one per team, its `TEAM_MEMORY.md` at the leader's workspace root, its toolkit on every member context and its turn buffer fed by `TeamBackend::send_message`; an injected `TeamBuildDeps::memory_observer` is copied onto the resolved configuration's `observer` |
 Per-kind launch shapes (`process`, `external_cli`, `ssh`) live in `src/member/CONTEXT.md`; the org chart
 shapes (`OrganizationSpec`, `DelegationRules`, `OrgTaskSpec`) live in `src/org/CONTEXT.md`.
-`TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`.
+`TeamBuildDeps` adds only *injection* hooks: `with_observability_hook`, `with_kv_cache`, `with_routing`, `with_checkpoint_store`, `with_memory`, `with_memory_observer`.
 It has no monitor/org/attach builder — those come from the metadata; `monitor_stream` is the monitor knob.
 
 ### Checkpoint wiring
@@ -292,6 +303,30 @@ It has no monitor/org/attach builder — those come from the metadata; `monitor_
 Identity is `(member session id, card id)`: the member session is `"<team session>:<member>"` — both the runtime session and the harness `host_session_id`, because `start(None)` makes the derived id the host session — and the card id is the effective spec's card id, else the member name.
 `start` restores a compatible record's provider envelope (a payload-only, mismatched or unreadable record starts cold), a finished turn and `stop` capture one record for the identity, and a disabled policy neither resolves a store nor attaches a sink.
 A retired (shut-down) roster row cannot be re-spawned — `MemberStatus` has no `shut_down → unstarted` edge — so a member restart is a fresh row (`TeamBackend::remove_member` + `TeamAgent::spawn_member`).
+### Memory wiring
+`memory_bind::resolve_memory` runs **once per team**, right after the leader's workspace exists (the workspace root anchors the document), and answers the one `Arc<TeamMemoryWiring>` the whole team shares.
+Resolution order: an injected `deps.memory` wins (a configured `metadata["memory"]` block is then `warn!`-logged as ignored, like an injected store) → a present non-null `metadata["memory"]` block opens one through `TeamMemoryWiring::open` (which also performs the `import_on_build` read of an existing `TEAM_MEMORY.md`) → no block means no wiring.
+A block that parses to `enabled: false` allocates no wiring, so no hook runs, no turn is buffered and nothing is written.
+`open` failing fails the build (`Error::Validation` / the store's error) and hands the freshly allocated leader workspace back; every *hook* failure is advisory and never fails the operation that triggered it.
+`build_with` installs the wiring on the backend (`install_memory`, the turn seam) and the spawner (`install_memory`, the teammate toolkits) and mounts the leader's `MemberMemoryToolkit` on its own context.
+An injected `deps.memory_observer` is copied onto the resolved configuration's `MemoryConfig::observer` before the wiring is opened, so the host's observer (the OTLP bridge on the `otlp` build, or any other sink) replaces the crate's built-in `MemorySpanObserver`.
+The observer is applied only on the metadata path: an injected `deps.memory` is used verbatim and the observer is ignored, with one `debug!` naming that rule (`has_memory_observer()` still reports the injection).
+`MemoryConfig::trace` keeps the last word, so a `{"trace": false}` block attaches nothing even when an observer is injected.
+
+| hook | call site | failure rule |
+| --- | --- | --- |
+| `on_session_start(team session)` | `TeamAgent::run_start`, after the transport starts and before the leader runtime does | `warn!`, `start` continues |
+| `on_member_join(member)` | `TeamAgent::spawn_member`, after the runtime start succeeded and the KV identity registered | `warn!`, the spawn still succeeds |
+| `on_member_leave(member)` | `TeamAgent::shutdown_member` (only when the pre-shutdown row was live) and `TeamAgent::stop` for every row still live | `warn!`, the retirement continues |
+| `flush()` then `export()` | end of `TeamAgent::stop`, after the workspaces are released | each logged, the teardown still completes |
+| `export()` | `TeamAgent::snapshot`, after the roster/board read | logged; the snapshot stays infallible and its shape unchanged |
+| `on_turn_message(from, to, content, now)` | `TeamBackend::direct_row` / `broadcast_row`, after the row is persisted and published | `warn!`, the send still succeeds |
+
+Live means `memory_bind::is_live`: a row that started at least once and has not departed — so a failed spawn leaves no join record and an unstarted row gets no handoff note, keeping the join/leave pair symmetric.
+The turn seam is the mailbox, not the leader loop: every coordination message (member send, human-agent delivery, leader-bound operator/group-chat/god-view payload) ends in exactly one `direct_row` (one addressee, one turn) or one `broadcast_row` (`to: None`), so relayed content is never buffered twice and the memory tools' own `remember`/`forget` writes buffer nothing.
+`stop` closes memory out last: handoff notes for live members, then `flush`, then `export` when `MemoryConfig::export_on_stop` is set (the export gates on that flag itself); a repeated `stop`/`export` flushes nothing new and stores no new record, though the rendered document's `generated_at` header moves.
+The toolkit reaches a member through `MemberHarnessContext::with_memory_toolkit(wiring.toolkit(member, Some(team session)))`: the build path does it for the leader, `TeamMemberSpawner::build_harness_runtime` for a teammate, and `NativeMemberFactory` turns it into the four `team_memory_*` tools in `src/harness/`.
+A teammate's toolkit lookup happens before the factory call, so an unusable member/session id fails that member's spawn with the same `Validation` error kind as the surrounding build.
 
 ### Model routing
 
@@ -378,6 +413,7 @@ config therefore just logs.
    `checkpoint_config` is resolved into the team store before the spawner is built
    (`team_checkpoint_store`: the injected store wins, `memory` mints one `InMemoryMemberCheckpointStore`,
    `file` pins none) and written back into `deps.checkpoints`, so the leader and every teammate share it.
+   Team memory is *not* resolved yet: its document root is the leader's workspace, allocated in step 9.
 5. `TaskBoard::new(store, team_name, TaskBoardLimits::new().with_default_max_review_rounds(..)
    .with_max_subtask_depth(..))`, then `TeamBackend::new(..).with_signals(signals)`.
 6. `organization_block(spec)?` → `OrgBinding::build(block, store, Some(org_task_sink(backend)))` →
@@ -390,6 +426,12 @@ config therefore just logs.
    `member_session_id(session_id, leader)`), the factory receives that context with `.with_card_id(..)`, and
    `wire_runtime(HarnessMemberRuntime::new(harness, member_session), ..)` attaches the policy, the store and
    `cwd = workspace root` before `TeamMember::attach_runtime`.
+   The same workspace root anchors team memory: `memory_bind::resolve_memory(spec, deps, team, root)?` (injected
+   wiring → non-null `metadata["memory"]` → none; an injected `memory_observer` lands on the resolved
+   `MemoryConfig::observer`) runs here, `install_memory` puts it on the backend (the turn
+   seam) and the spawner (the teammate toolkits), and the leader's context gains
+   `.with_memory_toolkit(wiring.toolkit(leader, Some(team session)))`; a resolution failure fails the build and
+   releases the leader workspace.
 10. `kv_cache.register_member(leader_key, model)` — the root allocation.
 11. `leader_member.observe(MemberStreamObserver::new(activity, weak leader, Leader, signals, chunk_sinks))`.
 12. `insert_teammate_rows` — one `Unstarted` row per roster teammate (`predefined_members` ∪ `agents` keys
@@ -403,9 +445,10 @@ config therefore just logs.
 2. Each delivery is handed to `deliver` without touching the leader runtime: `HumanAgent` → inbox push +
    persisted message row + `message` event; `Operator`/`GroupChat`/`GodView` → gate + leader mailbox;
    `ExternalTeam` → `DeliverResult::unsupported`.
-3. `start()` (idempotent): messager start, leader `MemberRuntime::start(None)` — which restores the stored
-   checkpoint envelope for the leader's `(derived session, card id)` when one exists — attach bind (see
-   policy), `signals.team_started`. A teammate's `spawn_member` start does the same restore before its pump.
+3. `start()` (idempotent): messager start, the team-memory session install (`on_session_start`, `warn!`-and-
+   continue), leader `MemberRuntime::start(None)` — which restores the stored checkpoint envelope for the
+   leader's `(derived session, card id)` when one exists — attach bind (see policy), `signals.team_started`.
+   A teammate's `spawn_member` start does the same restore before its pump and records the memory join after it.
 4. The leader query is sent with `immediate = false` (a follow-up turn).
 5. Loop on `tokio::select!`: member chunks, bus events, caller cancellation, and a settle tick.
    - teammate/leader chunks are forwarded tagged with `TeamOutputSchema{source_member, role, chunk}`;
@@ -541,6 +584,9 @@ of 2 s polling every 5 ms, no `#[ignore]`).
 - `org_bind.rs`: chart validation, delegation accept/refuse, org task pool, mailbox drain/ack, `org_task` payloads.
 - `attach_host.rs`: op → backend mapping for every op, error mapping (`not_found`/`validation`/`unsupported`), shutdown.
 - `dispatch.rs`: every row of the truth table.
+- `memory_bind.rs`: the resolution order (unconfigured, configured, `{"enabled": false}`, null, injected), the
+  document path at the workspace root, the `is_live` rule for handoff notes, and the observer injection
+  (applied on the metadata path, ignored with an injected wiring).
 - `initial_input.rs`: `$human @ai body` → one `HumanAgent` delivery and no leader query; `@dev-1 body` →
   delivery with the `user` sender; plain text, `#text`, `@all text` → leader query verbatim; nested
   `{"input":{"query":…}}` and plain-string inputs.
@@ -559,7 +605,7 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   `stop_team` tearing the attach socket down.
 - `adapter.rs`: `team_id() == team_name`, `agent_count()`, `invoke` delegation, `kind() == "agent_teams"`.
 
-`./wiring_tests/` (67 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
+`./wiring_tests/` (84 tests, one module per wiring point; the shared `Wiring` harness builds a team over a
 `ScriptedFactory` + `RecordingWorkspaceProvider` and returns the agent, the factory and the workspace):
 
 - `spawn_modes.rs` (9): the default blueprint stays in-process; `metadata["spawn"]` selects
@@ -592,6 +638,13 @@ of 2 s polling every 5 ms, no `#[ignore]`).
   store once; a restarted member `start`s with the stored provider envelope, `ResumeIfAvailable` and
   `host_session_id == "<team session>:<member>"`; `{"enabled": false}` attaches no sink, restores nothing and
   captures nothing; an explicit `dir` receives one `checkpoint.json` per member.
+- `memory.rs` (17): no wiring without configuration; `metadata["memory"]` opens one at the leader's workspace
+  root; `{"enabled": false}` opens none; the injected wiring wins; `start` installs the session; a
+  spawn/shutdown records the join and the handoff note; a failed spawn records no join; a delivered message
+  buffers exactly one turn; `stop`/`snapshot` flush and export (idempotently); a failing hook cannot fail
+  `stop`; the member contexts carry the team toolkit; an injected observer replaces the built-in bridge and
+  sees a spawn's write, while a build without one keeps the bridge, `{"trace": false}` attaches nothing even
+  when an observer is injected, and an injected wiring keeps its own observer.
 
 Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` (1411 lib
 tests in the default build, 1430 with `--features sqlite`, 1439 with `--all-features`, plus 219 integration
@@ -675,6 +728,28 @@ tests over 15 binaries),
   per-tool spans. The monitor stream has no TUI/consumer here.
 - The organisation layer is in-process only: no cross-process org messaging, summary teams, runtime
   swarmflow lanes or org-level observability; the chart shapes and their semantics belong to `src/org/`.
+- Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor here (an
+  `extractor: "llm"` block degrades to the rules — drive `open_with_model` yourself for the LLM path), no
+  distributed store, and the document is the only durable artefact (this crate does not enable the
+  `openjiuwen-memory` `sqlite` feature). The hooks are advisory by design, so a broken memory store never
+  fails a start, spawn, shutdown or stop.
+- A roster removal that bypasses `shutdown_member` (`TeamBackend::remove_member`) records no handoff note: the
+  hook is async and the removal seam is sync, and the documented restart path is
+  `shutdown_member` → `remove_member` → `spawn_member`, so the leave hook already ran.
+- Child-process members receive the leader's `metadata["checkpoint"]` block through
+  `MemberSpawnRequest::with_checkpoint_config` (the two `OPENJIUWEN_MEMBER_CHECKPOINT*` env vars); team memory
+  is *not* transported to a child, which mounts no toolkit of its own.
+- Team memory is in-process and per-team: no cross-team/hub sync, no LLM-backed extractor on the build path
+  (an `extractor: "llm"` block degrades to the rules — `TeamMemoryWiring::open_with_model` is the seam), no
+  distributed store, and the `TEAM_MEMORY.md` document is the only durable artefact (this crate does not enable
+  the `openjiuwen-memory` `sqlite` feature). The hooks are advisory by design, so a broken memory store never
+  fails a start, spawn, shutdown or stop.
+- A roster removal that bypasses `shutdown_member` (`TeamBackend::remove_member`) records no handoff note: the
+  hook is async and the removal seam is sync, and the documented restart path is
+  `shutdown_member` → `remove_member` → `spawn_member`, so the leave hook already ran.
+- Child-process members receive the leader's `metadata["checkpoint"]` block through
+  `MemberSpawnRequest::with_checkpoint_config` (the two `OPENJIUWEN_MEMBER_CHECKPOINT*` env vars); team memory
+  is *not* transported to a child, which mounts no toolkit of its own.
 - Checkpointing has no team-level resume policy, no retention/pruning or TTL, and no leader restart: only
   `TeamAgentSpec::metadata["checkpoint"]` + `TeamBuildDeps::with_checkpoint_store` decide, and a retired
   member row cannot be revived in place (`TeamBackend::remove_member` + `spawn_member` is the restart path).

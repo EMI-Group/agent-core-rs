@@ -29,9 +29,51 @@
 //! [`crate::monitor::RunKind::Spawn`] status on [`Runner::monitor`] until it is
 //! shut down, killed, or dropped. The spawn accessors live in the crate's
 //! `runner_spawn` module, beside this file.
-
+//!
+//! The observation seams are installable, not only constructed:
+//! [`Runner::set_monitor`], [`Runner::set_hitl`], and
+//! [`Runner::set_message_queue`] replace the monitor, the hub, and the queue for
+//! every run started afterwards and return the instance they displaced (the
+//! `runner_seams` module, beside this file).
+//!
+//! # Pluggable seams
+//!
+//! Everything a host may replace, and everything that refuses instead of degrading
+//! silently (the inventory `tests/seams.rs` pins at compile time):
+//!
+//! - **Resources** — `crate::resources::Provider` closures, called on every lookup
+//!   by `ResourceMgr::register_agent` / `register_workflow` / `register_team` /
+//!   `register_tool`.
+//! - **Callbacks** — `crate::callback::CallbackHandler` via
+//!   `CallbackFramework::register`, `crate::callback::EventFilter`,
+//!   `CallbackChain`/`ChainEntry`, and the `GuardrailPipeline` binding of
+//!   [`Runner::set_guardrails`].
+//! - **Queue** — [`MessageQueue`] via [`Runner::set_message_queue`], rebuilt from
+//!   `RunnerConfig::message_queue` by [`Runner::start`]; `pulsar`/`zeromq` yield
+//!   `crate::mq::DeferredMessageQueue` (every operation `Error::Unsupported`,
+//!   naming the transport), and [`Runner::queue_stats`] samples the live backend.
+//! - **Spawn** — [`AgentSpawner`] via [`Runner::set_spawner`] or [`SpawnerRegistry`]
+//!   via [`Runner::set_spawner_registry`]; `crate::spawn::SpawnBackend`'s
+//!   `subprocess`/`external_command`/`in_process`/`remote_http` work, while
+//!   [`SpawnerRegistry::with_deferred`] registers `remote_mq`/`remote_a2a` as
+//!   `Error::Unsupported` `DeferredSpawner`s; every spawn answers
+//!   `Arc<dyn SpawnedAgent>` (`SpawnedProcess`, `InProcessAgent`, `RemoteAgent`).
+//! - **Observation and persistence** — [`Runner::set_monitor`] / [`Runner::set_hitl`]
+//!   replace the [`RunMonitor`] / [`InteractionHub`]; the checkpointer is configured
+//!   (`RunnerConfig::checkpointer`) and built by [`Runner::start`].
+//! - **Dreaming** — [`DreamService`] via [`Runner::set_dreaming_service`], driven by
+//!   [`Runner::start_dreaming`]/[`Runner::stop_dreaming`] and read through
+//!   [`Runner::dreaming_status`]; it has a lifecycle of its own, so [`Runner::start`]
+//!   never starts it, while [`Runner::stop`] does stop a running service (bounded and
+//!   log-only on failure, so the runner's shutdown result stays the queue's). The
+//!   accessors live in the crate's `runner_dreaming` module, beside this file.
+//! - **Team transports** — `openjiuwen_multiagent::{TeamTransport, TransportKind,
+//!   build_transport}`, reached through the `Team` seam only: `Pulsar` is
+//!   `Error::Unsupported`, `RunnerConfig::distributed_mode` is refused by
+//!   [`Runner::start`], and `RemoteProtocol::{Mq, A2a}` are deferred.
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
+use crate::dreaming::DreamService;
 use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
@@ -96,8 +138,9 @@ pub struct Runner {
     resources: Arc<ResourceMgr>,
     /// The callback framework (shared with hosts).
     callbacks: Arc<CallbackFramework>,
-    /// The live message queue; rebuilt from the config by [`Runner::start`].
-    queue: RwLock<Arc<dyn MessageQueue>>,
+    /// The live message queue; rebuilt from the config by [`Runner::start`] and
+    /// replaceable by [`Runner::set_message_queue`] in between.
+    pub(crate) queue: RwLock<Arc<dyn MessageQueue>>,
     /// The checkpointer built by [`Runner::start`]; `None` before `start`.
     checkpointer: RwLock<Option<Arc<dyn Checkpointer>>>,
     /// Whether [`Runner::start`] completed and [`Runner::stop`] has not.
@@ -113,13 +156,18 @@ pub struct Runner {
     /// The installed multi-backend spawn registry; routing takes precedence over
     /// [`Runner::spawner`] while one is installed.
     pub(crate) spawner_registry: RwLock<Option<Arc<SpawnerRegistry>>>,
-    /// The run status monitor every execution path mirrors into.
-    monitor: Arc<RunMonitor>,
-    /// The human-in-the-loop hub every execution path registers on.
-    hitl: Arc<InteractionHub>,
+    /// The run status monitor every execution path mirrors into, replaceable by
+    /// [`Runner::set_monitor`].
+    pub(crate) monitor: RwLock<Arc<RunMonitor>>,
+    /// The human-in-the-loop hub every execution path registers on, replaceable
+    /// by [`Runner::set_hitl`].
+    pub(crate) hitl: RwLock<Arc<InteractionHub>>,
     /// The team runtime pool; rebuilt from the live configuration by
     /// [`Runner::start`] and [`Runner::stop`].
     team_pool: RwLock<TeamPool>,
+    /// The installed dreaming service (no orchestrator by default); installed by
+    /// [`Runner::set_dreaming_service`], stopped by [`Runner::stop`].
+    pub(crate) dreaming: RwLock<Option<Arc<DreamService>>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -137,6 +185,7 @@ impl std::fmt::Debug for Runner {
             .field("checkpointer", &self.checkpointer().is_some())
             .field("guardrails", &self.guardrails().is_some())
             .field("pooled_teams", &self.team_pool().len())
+            .field("dreaming", &self.dreaming_service().is_some())
             .field("active_runs", &self.monitor().list_active().len())
             .finish_non_exhaustive()
     }
@@ -163,7 +212,9 @@ impl Runner {
     /// The checkpointer is not built until [`Runner::start`]. The monitor, the
     /// human-in-the-loop hub, and the team pool are built here (from
     /// `config.team_pool`) and are **open**: pooled team runs and plain runs work
-    /// before [`Runner::start`]. No spawn registry is installed: the
+    /// before [`Runner::start`]. All three are also installable afterwards
+    /// ([`Runner::set_monitor`], [`Runner::set_hitl`],
+    /// [`Runner::set_message_queue`]). No spawn registry is installed: the
     /// [`UnsupportedSpawner`] default routes every spawn until a host installs a
     /// backend with [`Runner::set_spawner`] or [`Runner::set_spawner_registry`].
     ///
@@ -191,9 +242,10 @@ impl Runner {
             guardrail_ids: RwLock::new(Vec::new()),
             spawner: RwLock::new(Arc::new(UnsupportedSpawner)),
             spawner_registry: RwLock::new(None),
-            monitor,
-            hitl,
+            monitor: RwLock::new(monitor),
+            hitl: RwLock::new(hitl),
             team_pool: RwLock::new(team_pool),
+            dreaming: RwLock::new(None),
         })
     }
 
@@ -294,24 +346,28 @@ impl Runner {
 
     /// The run status monitor every execution path mirrors into.
     ///
-    /// The instance is fixed at construction and shared by every run path, the
-    /// human-in-the-loop hub, and the team pool, so a host that subscribes here
-    /// observes the transitions of every run this runner executes.
+    /// The returned `Arc` is a cheap snapshot of the currently installed seam:
+    /// every run path, the human-in-the-loop hub, and the team pool share the
+    /// installed instance, so a host that subscribes here observes the
+    /// transitions of every run this runner executes. [`Runner::set_monitor`]
+    /// replaces the installed instance (a snapshot taken earlier keeps observing
+    /// the retired monitor).
     #[must_use]
-    pub fn monitor(&self) -> &Arc<RunMonitor> {
-        &self.monitor
+    pub fn monitor(&self) -> Arc<RunMonitor> {
+        Arc::clone(&self.monitor.read())
     }
 
     /// The human-in-the-loop hub every execution path registers on.
     ///
-    /// The instance is fixed at construction and mirrors its transitions into
-    /// [`Runner::monitor`]. Use it to list the live runs, pause/resume/cancel a
-    /// registered run, and answer the interaction requests a run published; the
-    /// facade shortcuts over it are [`Runner::interact_agent_team`] and
-    /// [`Runner::answer_interaction`].
+    /// The returned `Arc` is a cheap snapshot of the currently installed seam.
+    /// Use it to list the live runs, pause/resume/cancel a registered run, and
+    /// answer the interaction requests a run published; the facade shortcuts over
+    /// it are [`Runner::interact_agent_team`] and [`Runner::answer_interaction`].
+    /// [`Runner::set_hitl`] replaces the installed hub (a snapshot taken earlier
+    /// keeps addressing the retired one).
     #[must_use]
-    pub fn hitl(&self) -> &Arc<InteractionHub> {
-        &self.hitl
+    pub fn hitl(&self) -> Arc<InteractionHub> {
+        Arc::clone(&self.hitl.read())
     }
 
     /// A cheap clone of the live team runtime pool.
@@ -341,6 +397,11 @@ impl Runner {
     ///
     /// The spawn seam is not part of the lifecycle: the installed spawner and
     /// registry survive `start`/`stop` and keep routing spawns.
+    ///
+    /// Dreaming is not part of it either: an installed
+    /// [`crate::dreaming::DreamService`] is left exactly as it is — start it with
+    /// [`Runner::start_dreaming`], because a memory-consolidation loop obeys its
+    /// own schedule rather than the queue's.
     ///
     /// Rebuilding the pool **retires** the previous one: its live pooled team runs
     /// are stopped (bounded by `TeamPoolConfig::stop_timeout`) and a fresh open
@@ -419,11 +480,18 @@ impl Runner {
     /// reported through `tracing` only, so the queue's result stays the return
     /// value.
     ///
+    /// The installed dreaming service is stopped too, before the pool sweep and
+    /// before the started early return — best effort, never affecting the result
+    /// — while [`Runner::start`] never starts one: consolidation has a lifecycle
+    /// of its own. The service stays installed, so a later
+    /// [`Runner::start_dreaming`] runs it again.
+    ///
     /// # Errors
     ///
     /// Returns the queue's error when it fails to stop.
     pub async fn stop(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.stop_dreaming_quietly().await;
         self.sweep_team_pool().await;
         if !self.started.swap(false, Ordering::AcqRel) {
             tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");
@@ -738,7 +806,7 @@ impl Runner {
             team_name: Some(team_name.to_owned()),
             session_id: Some(session_id.to_owned()),
         };
-        self.hitl.deliver(target, payload)
+        self.hitl().deliver(target, payload)
     }
 
     /// Answers the interaction request published by a live run.
@@ -750,7 +818,7 @@ impl Runner {
     ///
     /// `Error::NotFound` when no active run has that request id pending.
     pub async fn answer_interaction(&self, response: InteractionResponse) -> Result<()> {
-        self.hitl.answer(response).await
+        self.hitl().answer(response).await
     }
 
     /// The monitor snapshot of the live (or retained finished) team run addressed
@@ -765,7 +833,7 @@ impl Runner {
     pub fn agent_team_status(&self, team_name: &str, session_id: &str) -> Option<RunStatus> {
         let key = PoolKey::new(team_name, session_id);
         if let Some(info) = self.team_pool().get(&key) {
-            if let Ok(status) = self.monitor.snapshot(&info.run_id) {
+            if let Ok(status) = self.monitor().snapshot(&info.run_id) {
                 return Some(status);
             }
         }
@@ -774,12 +842,12 @@ impl Runner {
             session_id: Some(session_id.to_owned()),
         };
         let run_id = self
-            .hitl
+            .hitl()
             .list_active()
             .into_iter()
             .find(|info| target.matches(info))
             .map(|info| info.run_id)?;
-        self.monitor.snapshot(&run_id).ok()
+        self.monitor().snapshot(&run_id).ok()
     }
 
     // ----------------------------------------------------------- security --
@@ -840,8 +908,8 @@ impl Runner {
             self.config(),
             self.checkpointer(),
         )
-        .with_monitor(Arc::clone(&self.monitor))
-        .with_hitl(Arc::clone(&self.hitl));
+        .with_monitor(self.monitor())
+        .with_hitl(self.hitl());
         if let Some(pipeline) = self.guardrails() {
             services = services.with_guardrails(pipeline);
         }
@@ -900,51 +968,5 @@ async fn sweep_pool(pool: &TeamPool, runner_id: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_uses_documented_defaults() {
-        let runner = Runner::new();
-        assert_eq!(runner.runner_id(), "global");
-        assert!(!runner.is_started());
-        assert!(runner.guardrails().is_none());
-        assert!(runner.checkpointer().is_none());
-        assert!(runner.resource_mgr().is_empty());
-        assert!(runner.callbacks().is_empty());
-        // The observation seams and the pool exist from construction, open and
-        // empty, so runs do not require `start`.
-        assert_eq!(runner.monitor().list_active(), Vec::new());
-        assert!(runner.hitl().is_empty());
-        let Some(hub_monitor) = runner.hitl().monitor() else {
-            panic!("the hub mirrors its transitions into a monitor");
-        };
-        assert!(Arc::ptr_eq(&hub_monitor, runner.monitor()));
-        assert_eq!(runner.list_active_teams(), Vec::new());
-        assert_eq!(runner.team_pool().capacity(), 8);
-        assert!(!runner.team_pool().is_closed());
-        assert!(runner.agent_team_status("crew", "s-1").is_none());
-        let debug = format!("{runner:?}");
-        assert!(debug.starts_with("Runner {"));
-        assert!(debug.contains("runner_id: \"global\""));
-        assert!(debug.contains("started: false"));
-        assert!(debug.contains("guardrails: false"));
-        assert!(debug.contains("pooled_teams: 0"));
-        assert!(debug.contains("active_runs: 0"));
-    }
-
-    #[test]
-    fn runner_id_is_fixed_at_construction() {
-        let runner = Runner::with_config(RunnerConfig {
-            runner_id: "custom".to_owned(),
-            ..RunnerConfig::default()
-        });
-        assert_eq!(runner.runner_id(), "custom");
-        runner.set_config(RunnerConfig {
-            runner_id: "other".to_owned(),
-            ..RunnerConfig::default()
-        });
-        assert_eq!(runner.runner_id(), "custom");
-        assert_eq!(runner.config().runner_id, "custom");
-    }
-}
+#[path = "runner_tests.rs"]
+mod runner_tests;

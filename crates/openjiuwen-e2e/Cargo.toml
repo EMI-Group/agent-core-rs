@@ -36,13 +36,13 @@ tokio-util.workspace = true
 default = []
 # Enables the A2A client/server scenario (`tests/a2a_roundtrip.rs`).
 a2a = ["openjiuwen/a2a", "openjiuwen-extensions/a2a"]
-# Declared for parity with the umbrella; the OTel seam is covered by the
-# `openjiuwen-extensions` unit tests and has no cross-crate scenario here.
+# Enables the OTLP/HTTP export scenario (`tests/plugin_observability.rs`).
 otel = ["openjiuwen/otel", "openjiuwen-extensions/otel"]
-# The umbrella's `sqlite` feature forwards to extensions/symphony but not to
-# `openjiuwen-agent-teams`, so the team-store scenario (`tests/team_backend.rs`)
-# enables the agent-teams SQLite backend here.
-sqlite = ["openjiuwen-agent-teams/sqlite"]
+# The kernel crates are only reachable through the umbrella, so their SQLite
+# backends are enabled through `openjiuwen/sqlite`; `openjiuwen-agent-teams` is
+# also a direct dependency (same crate, explicit feature keeps `team_backend.rs`
+# independent of how the umbrella forwards).
+sqlite = ["openjiuwen/sqlite", "openjiuwen-agent-teams/sqlite"]
 
 [lints]
 workspace = true

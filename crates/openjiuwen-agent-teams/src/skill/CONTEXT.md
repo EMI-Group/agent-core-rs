@@ -80,11 +80,14 @@ pub fn run_skill_cli(argv: Vec<String>) -> i32;
 pub const SERVE_DEFAULT_SESSION_ID: &str;   // "serve"
 pub const SERVE_DEFAULT_MEMBER_NAME: &str;   // "member"
 pub struct ServeContext { pub team_name: String, pub member_name: String, pub session_id: String,
-                          pub workspace_root: PathBuf, pub language: String }
+                          pub workspace_root: PathBuf, pub checkpoint_enabled: bool,
+                          pub checkpoint_dir: Option<PathBuf>, pub language: String }
 impl ServeContext {
-    pub fn from_env() -> Self;                                        // TEAM_NAME/MEMBER_NAME/SESSION_ID/workspace env
+    pub fn from_env() -> Self;                                        // TEAM_NAME/MEMBER_NAME/SESSION_ID/workspace + checkpoint env
     pub fn from_env_map(get: impl Fn(&str) -> Option<String>) -> Self; // injectable, blank = absent
     pub fn with_session_id(self, session_id: impl Into<String>) -> Self; // blank keeps the env value
+    pub fn with_checkpoint_dir(self, dir: impl Into<PathBuf>) -> Self;   // file-backed checkpoint root
+    pub fn checkpoint_config(&self) -> CheckpointConfig;              // disabled | file(dir) | memory
     pub fn harness_context(&self) -> MemberHarnessContext;            // build mode
 }
 pub async fn serve_stdio() -> i32;                                    // NativeMemberFactory::from_env, /dev streams
@@ -106,6 +109,9 @@ The command enums are re-exported from `src/skill/mod.rs`; the clap root structs
 
 `serve` is scope-independent: it is the child end of the JSON-lines member protocol (see `../member/protocol.rs`), takes its identity from the environment (the same variables `member::spawn` exports), needs no join descriptor, and is dispatched before the descriptor is loaded.
 It reads one `MemberRequest` per line from stdin, writes `MemberResponse` frames (`ready`, `state`, `round`, `chunk`, `error`) to stdout, and keeps every diagnostic on stderr.
+It also reads the two checkpoint variables `member::spawn` exports — `OPENJIUWEN_MEMBER_CHECKPOINTS` (`off`/`false`/`0`, case-insensitively, disables; absent or any other value enables) and `OPENJIUWEN_MEMBER_CHECKPOINT_DIR` (a file-backed store root; absent or blank keeps the process-local in-memory store) — and defaults both the way the served member documents them.
+`serve`'s member runtime is wired like an in-process one: `build_member` goes through `runtime::checkpoints::wire_runtime` with the card id (`runtime::checkpoints::member_card_id` over the default spec, so the member name), the policy and store of `ServeContext::checkpoint_config` and the workspace root as the working directory, with no shared store (`shared = None`) because the child process owns its store.
+A file-backed served member therefore writes `<dir>/<session>/<member>/checkpoint.json`, while an enabled member without a directory captures into a process-local in-memory store that dies with the process.
 
 `TeamJoinDescriptor` (serde snake_case, `#[serde(default)]`, unknown fields ignored):
 
@@ -217,7 +223,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `./cli/member.rs` → member-scope dispatch (real teammate tool set)
 - `./cli/operator.rs` → operator-scope dispatch (board, messaging, roster)
 - `./cli/output.rs` → line renderers shared by both scopes
-- `./serve.rs` → the `team-member serve` loop: env identity, factory-built runtime, frame writer task, request dispatch, teardown
+- `./serve.rs` → the `team-member serve` loop: env identity and checkpoint knobs, factory-built runtime wired with card id/policy/store, frame writer task, request dispatch, teardown
 - `./serve_tests.rs` → the serve framing tests over an in-memory duplex pipe and a scripted fake factory/harness
 
 ## Test Strategy
@@ -231,7 +237,8 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - `live_socket_tests.rs` (unix, 6 tests): the resolution order, driven with an explicit manager and an injected `get` closure — no process-global registry and no environment mutation. `socket_fallback_resolves_when_no_team_is_hosted`, `descriptor_path_wins_over_the_environment`, `environment_path_is_the_fallback` (live path, blank value, `None`), `nothing_configured_or_not_a_socket_resolves_to_none` (no path, regular file, nonexistent path), `the_in_process_registry_is_preferred_over_the_socket` (a team activated over the scripted fakes wins over a socket that answers a distinctive inbox text) and `unhosted_team_without_a_socket_stays_none`.
 - `cli/`: parsing of every subcommand, `--descriptor-json` before and after the subcommand, unknown command → 2, refusal → 1 with the reason, happy-path output lines for every operator command, member `inbox`/`view_task`/`claim_task`/`send_message`, roster ordering; `parsed_shapes_are_publicly_inspectable` pins one operator and one member invocation through `SkillCli::command()`/`descriptor_args()`.
 - `cli/` help parity: `--help` exits `0` with help on stdout and empty stderr (with a descriptor, before/after the subcommand, and with a malformed descriptor — help is answered before the descriptor is required); an unknown flag still exits `2` with stdout empty; `tests/bins.rs` pins the same contract on the real `team-member` binary with no descriptor at all.
-- `serve_tests.rs` (11 tests over an in-memory duplex pipe and a scripted fake factory/harness): `start_frame_answers_ready_then_state`, `the_start_frame_session_id_is_authoritative`, `send_frame_streams_round_and_chunk_frames`, `unparsable_line_is_answered_and_the_loop_keeps_serving`, `send_before_start_is_answered_with_an_error`, `stop_frame_stops_the_member_and_exits_zero`, `end_of_input_stops_the_member_and_exits_zero`, `factory_failure_answers_with_an_error_and_exits_one`, `abort_pause_and_resume_are_forwarded_to_the_runtime`, plus `context_defaults_match_the_documented_contract` and `a_blank_start_session_id_keeps_the_context_session` for the env/default contract.
+- `serve_tests.rs` (15 tests over an in-memory duplex pipe and a scripted fake factory/harness): `start_frame_answers_ready_then_state`, `the_start_frame_session_id_is_authoritative`, `send_frame_streams_round_and_chunk_frames`, `unparsable_line_is_answered_and_the_loop_keeps_serving`, `send_before_start_is_answered_with_an_error`, `stop_frame_stops_the_member_and_exits_zero`, `end_of_input_stops_the_member_and_exits_zero`, `factory_failure_answers_with_an_error_and_exits_one`, `abort_pause_and_resume_are_forwarded_to_the_runtime`, plus `context_defaults_match_the_documented_contract` and `a_blank_start_session_id_keeps_the_context_session` for the env/default contract.
+- `serve_tests.rs` checkpoint cases: `checkpoint_env_defaults_to_enabled_on_the_memory_store`, `checkpoint_env_reads_the_directory_and_the_switch` (`off`/`false`/`0` case-insensitively, blank as absent), `checkpoint_config_uses_the_file_backend_when_a_directory_is_known`, and `a_served_member_writes_its_checkpoint_under_the_configured_directory`, which drives `start` → `ready` → `stop` against a temp checkpoint directory and reads back the persisted `<dir>/s1/dev-1/checkpoint.json` (session, card id and cwd).
 - `cli/` serve: `serve` and `serve --help` parse through the scope-independent root, `serve --help` reaches stdout and exits `0` with no descriptor, an unknown `serve` flag exits `2`, and `names_serve` ignores flag values.
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --no-default-features`, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings` green for these files.
 
@@ -242,7 +249,7 @@ Failure output: the operation's `reason` on stderr (or on `out` when `run` is us
 - No streaming or subscriptions on the socket: every call is one request/response, so `--watch` stays a one-shot inbox read, and `tools()` stays local metadata rather than a remote catalogue read.
 - No cross-process attach through a shared sqlite DB; a descriptor whose team is hosted elsewhere and whose socket path does not resolve reports `no live team '<name>' in this process` and exits `1`.
 - `serve` reopens the process streams as `/dev/stdin` and `/dev/stdout` (the workspace does not enable tokio's `io-std` feature), so on non-Unix targets it reports `Unsupported` and exits `1`.
-- `serve` builds the member from `DeepAgentSpec::default()`: only identity (team/member/session/workspace) and the model environment cross the process boundary, so per-member tools, rails, MCP servers and prompts configured on the leader side are not carried into the child yet.
+- `serve` builds the member from `DeepAgentSpec::default()`: only identity (team/member/session/workspace), the checkpoint settings and the model environment cross the process boundary, so per-member tools, rails, MCP servers and prompts configured on the leader side are not carried into the child yet.
 - Vendor CLI member adapters (`claude`/`codex` protocol translation), hybrid WebSocket publishing, file-backed SQLite descriptors and workspace metadata tools are not ported (see the crate "Deferred" list).
 
 ## Notes for Agents

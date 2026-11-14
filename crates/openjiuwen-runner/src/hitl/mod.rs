@@ -337,6 +337,37 @@ mod tests {
     }
 
     #[test]
+    fn attach_monitor_swaps_the_mirror_at_runtime() {
+        let first = Arc::new(RunMonitor::new());
+        let hub = InteractionHub::new().with_monitor(Arc::clone(&first));
+        let second = Arc::new(RunMonitor::new());
+
+        let previous = hub.attach_monitor(Some(Arc::clone(&second)));
+        match previous {
+            Some(retired) => assert!(Arc::ptr_eq(&retired, &first)),
+            None => panic!("the hub had a monitor"),
+        }
+        let attached = hub.monitor();
+        match attached {
+            Some(current) => assert!(Arc::ptr_eq(&current, &second)),
+            None => panic!("the hub mirrors the installed monitor"),
+        }
+
+        // The next transition mirrors into the new monitor only.
+        let handle = hub.register(spec("assistant", Some("s-1")));
+        assert!(second.snapshot(handle.run_id()).is_ok());
+        assert!(first.snapshot(handle.run_id()).is_err());
+
+        // Detaching restores the inert behaviour and returns the monitor back.
+        let detached = hub.attach_monitor(None);
+        match detached {
+            Some(previous) => assert!(Arc::ptr_eq(&previous, &second)),
+            None => panic!("a monitor was attached"),
+        }
+        assert!(hub.monitor().is_none());
+    }
+
+    #[test]
     fn list_active_is_sorted_by_run_id() {
         let hub = InteractionHub::new();
         for run_id in ["b", "a", "c"] {

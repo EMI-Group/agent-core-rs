@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, warn};
 
 use super::super::build::teammate_record;
+use super::super::memory_bind;
 use super::super::observer::MemberStreamObserver;
 use super::{ensure_leader_role, TeamAgent};
 use crate::kv_cache::MemberCacheKey;
@@ -193,6 +194,10 @@ impl TeamAgent {
         // Register the KV identity only after the start succeeded: a failed start would otherwise
         // leave a live affinity entry for a member that never ran.
         self.register_kv_affinity(name);
+        // Same rule for the memory join: a member that never became live never joined, so a failed
+        // spawn leaves no join record (and no orphan handoff note behind) either.
+        memory_bind::member_joined(self.inner.backend.memory().as_ref(), self.team_name(), name)
+            .await;
         self.inner.signals.member_spawned(name, member.role());
         self.publish_member_status(name, previous, member.status())
             .await;
@@ -253,7 +258,9 @@ impl TeamAgent {
     ///
     /// After the runtime is stopped and the child despawned, the member's retained workspace is
     /// released through the injected provider (a release failure is logged, never propagated).
-    /// Idempotent: a second shutdown of the same member releases nothing.
+    /// A member that became live also leaves a handoff note in team memory (best-effort: a memory
+    /// failure is logged and never blocks the retirement).
+    /// Idempotent: a second shutdown of the same member releases nothing and joins nothing twice.
     ///
     /// # Errors
     ///
@@ -272,12 +279,18 @@ impl TeamAgent {
             )));
         };
         let previous = member.status();
+        // Only a member that became live has something to hand over; an unstarted row never joined.
+        let live = memory_bind::is_live(previous);
         if let Some(runtime) = member.runtime() {
             if let Err(error) = runtime.stop().await {
                 warn!(team = self.team_name(), member = name, error = %error, "failed to stop a member runtime");
             }
         }
         let status = member.shutdown(lifetime, force).await?;
+        if live {
+            memory_bind::member_left(self.inner.backend.memory().as_ref(), self.team_name(), name)
+                .await;
+        }
         if let Err(error) = self.inner.spawner.despawn(name).await {
             debug!(team = self.team_name(), member = name, %error, "failed to reap a member child process");
         }

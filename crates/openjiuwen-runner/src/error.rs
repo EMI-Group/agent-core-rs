@@ -67,6 +67,21 @@ pub fn invalid_session(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
 }
 
+/// A dreaming lifecycle call on a runner with no dreaming service installed:
+/// `Error::Config`, naming the fix.
+///
+/// Dreaming is installed, not configured, so there is nothing to start, stop, or
+/// report until the host hands over a
+/// [`DreamService`](crate::dreaming::DreamService). The wording names the setter
+/// so a caller reads the fix instead of a bare "not configured".
+pub fn no_dreaming_service() -> Error {
+    Error::Config(
+        "no dreaming service is installed; call `Runner::set_dreaming_service` with a \
+         `DreamService` before `start_dreaming`, `stop_dreaming`, or `dreaming_status`"
+            .to_owned(),
+    )
+}
+
 /// A transport-level failure: `Error::Transport`.
 pub fn transport(message: impl Into<String>) -> Error {
     Error::Transport(message.into())
@@ -128,5 +143,16 @@ mod tests {
         let error = not_started("message queue");
         assert_eq!(error.kind(), ErrorKind::Config);
         assert_eq!(error.to_string(), "config: message queue is not started");
+    }
+
+    #[test]
+    fn a_missing_dreaming_service_names_the_setter() {
+        let error = no_dreaming_service();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(
+            error.to_string().contains("Runner::set_dreaming_service"),
+            "`{error}` should name the fix"
+        );
+        assert!(!matches!(error, Error::Unsupported(_)));
     }
 }

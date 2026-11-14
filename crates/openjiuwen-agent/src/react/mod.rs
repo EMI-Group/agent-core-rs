@@ -39,7 +39,10 @@
 //! preparation plus an `llm_route` frame when a rail swapped the model.
 //! `exposure` owns the model-facing projection computed once per run: tools
 //! the exposure policy or MCP allowlist denies never reach the model, while
-//! execution still sees the full tool map.
+//! execution still sees the full tool map. A KV-cache hook
+//! ([`ReActAgent::enable_kv_cache`] / [`ReActAgent::set_kv_cache_hook`]) adds
+//! best-effort prefix affinity around every model call, and is absent by
+//! default.
 //!
 //! [`Agent::stream`] runs the same loop in a spawned task and yields
 //! [`AgentChunk`] frames: model deltas, one usage frame per call, context and
@@ -63,6 +66,8 @@ use crate::abilities::{AbilityManager, AddAbilityResult};
 use crate::agent::Agent;
 use crate::callbacks::{AgentCallback, AgentCallbackEvent, CallbackFramework};
 use crate::card::AgentCard;
+use crate::kv_cache::{KVCacheModelCallHook, KVCacheRuntimeConfig};
+use crate::memory_provider::{provider_tools, ProviderMemoryRail, PROVIDER_RAIL_NAME};
 use crate::output::{AgentChunk, AgentOutput};
 use crate::policy::{
     ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
@@ -71,11 +76,16 @@ use crate::policy::{
 use crate::prompt::{PromptSection, SystemPromptBuilder, IDENTITY_PRIORITY};
 use crate::rails::{AgentRail, RailRegistry};
 use crate::steering::SteeringQueue;
+use crate::usage::{UsageTelemetry, MAIN_CONTEXT_ID};
 use agent_loop::AgentRuntime;
 use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
-use openjiuwen_context::{ContextConfig, ContextEngine};
+use openjiuwen_context::{
+    ContextConfig, ContextEngine, ContextProcessorStateRecorder, ContextUsageAnalyzer,
+    ContextUsageSnapshot, ContextWindowTokenReport,
+};
 use openjiuwen_foundation::{Model, ModelRequestConfig, Tool, ToolCard};
+use openjiuwen_memory::{ConversationTurn, MemoryProvider};
 use openjiuwen_session::Session;
 use serde_json::Value;
 use std::fmt;
@@ -122,6 +132,9 @@ pub struct ReActAgent {
     rails: parking_lot::RwLock<Arc<RailRegistry>>,
     prompt_builder: parking_lot::RwLock<SystemPromptBuilder>,
     engine: parking_lot::RwLock<Arc<ContextEngine>>,
+    usage_analyzer: parking_lot::RwLock<Option<Arc<ContextUsageAnalyzer>>>,
+    context_recorder: parking_lot::RwLock<Option<Arc<ContextProcessorStateRecorder>>>,
+    usage_telemetry: Arc<UsageTelemetry>,
     callbacks: parking_lot::RwLock<Arc<CallbackFramework>>,
     steering: SteeringQueue,
     exposure: parking_lot::RwLock<ToolExposurePolicy>,
@@ -129,6 +142,8 @@ pub struct ReActAgent {
     client_tools: parking_lot::RwLock<Arc<ClientToolRegistry>>,
     resilience: parking_lot::RwLock<ToolResiliencePolicy>,
     final_check: parking_lot::RwLock<Option<Arc<dyn FinalRequestCheck>>>,
+    kv_cache_hook: parking_lot::RwLock<Option<Arc<KVCacheModelCallHook>>>,
+    memory_provider: parking_lot::RwLock<Option<Arc<dyn MemoryProvider>>>,
 }
 
 impl ReActAgent {
@@ -154,6 +169,9 @@ impl ReActAgent {
             engine: parking_lot::RwLock::new(Arc::new(
                 ContextEngine::new(ContextConfig::default()),
             )),
+            usage_analyzer: parking_lot::RwLock::new(None),
+            context_recorder: parking_lot::RwLock::new(None),
+            usage_telemetry: Arc::new(UsageTelemetry::new()),
             callbacks: parking_lot::RwLock::new(Arc::new(CallbackFramework::new())),
             steering: SteeringQueue::new(),
             exposure: parking_lot::RwLock::new(ToolExposurePolicy::allow_all()),
@@ -161,6 +179,8 @@ impl ReActAgent {
             client_tools: parking_lot::RwLock::new(Arc::new(ClientToolRegistry::new())),
             resilience: parking_lot::RwLock::new(ToolResiliencePolicy::new()),
             final_check: parking_lot::RwLock::new(None),
+            kv_cache_hook: parking_lot::RwLock::new(None),
+            memory_provider: parking_lot::RwLock::new(None),
         }
     }
 
@@ -172,6 +192,11 @@ impl ReActAgent {
     /// rebuilt from the system-role entries of
     /// [`ReActAgentConfig::prompt_template`]: their rendered contents are
     /// joined with a blank line into one identity section.
+    ///
+    /// A usage analyzer or context recorder installed with
+    /// [`ReActAgent::set_usage_analyzer`]/[`ReActAgent::set_context_recorder`]
+    /// survives the rebuild: the replacement engine carries them again, so
+    /// configuring an agent after instrumenting it keeps the instrumentation.
     pub fn configure(&self, config: ReActAgentConfig) {
         let identity = config
             .prompt_template
@@ -185,9 +210,25 @@ impl ReActAgent {
             builder.add_section(PromptSection::new("identity", identity, IDENTITY_PRIORITY));
         }
         self.request_config.write().clone_from(&config.model_config);
-        *self.engine.write() = Arc::new(ContextEngine::new(config.context_engine_config.clone()));
         *self.prompt_builder.write() = builder;
         *self.config.write() = config;
+        self.rebuild_engine();
+    }
+
+    /// Rebuilds the context engine from the current configuration, analyzer and
+    /// recorder.
+    ///
+    /// The engine is replaced, not mutated, so a running loop keeps the engine
+    /// it snapshotted and the replacement starts with no contexts.
+    fn rebuild_engine(&self) {
+        let config = self.config.read().context_engine_config.clone();
+        let analyzer = self.usage_analyzer.read().clone();
+        let recorder = self.context_recorder.read().clone();
+        *self.engine.write() = Arc::new(
+            ContextEngine::new(config)
+                .with_usage_analyzer(analyzer)
+                .with_recorder(recorder),
+        );
     }
 
     /// Returns a copy of the current configuration.
@@ -282,6 +323,104 @@ impl ReActAgent {
     #[must_use]
     pub fn context_engine(&self) -> Arc<ContextEngine> {
         Arc::clone(&*self.engine.read())
+    }
+
+    /// Installs (or removes) the context usage analyzer of later windows.
+    ///
+    /// Like [`ReActAgent::configure`], this **replaces** the context engine:
+    /// the new engine carries `analyzer` (plus any installed recorder), and the
+    /// old engine's contexts — and therefore its recorded conversation
+    /// history — are dropped. Call it between invocations, not during one;
+    /// every run snapshots the engine it started with.
+    ///
+    /// With an analyzer installed, `ContextEngine::prepare` attaches a measured
+    /// `usage` block to every prepared window and the loop publishes a
+    /// post-call `context.usage` frame plus a [`UsageTelemetry`] snapshot after
+    /// every successful model call; without one, windows are still prepared and
+    /// the pre-call frame is still emitted, but its `usage` block is `null`.
+    pub fn set_usage_analyzer(&self, analyzer: Option<Arc<ContextUsageAnalyzer>>) {
+        *self.usage_analyzer.write() = analyzer;
+        self.rebuild_engine();
+    }
+
+    /// Returns the installed context usage analyzer, if any.
+    #[must_use]
+    pub fn usage_analyzer(&self) -> Option<Arc<ContextUsageAnalyzer>> {
+        self.usage_analyzer.read().clone()
+    }
+
+    /// Installs (or removes) the context processor state recorder.
+    ///
+    /// The recorder observes compression states inside the processors; it is
+    /// engine-owned state like the analyzer, so this rebuilds the context
+    /// engine (dropping its contexts) exactly like
+    /// [`ReActAgent::set_usage_analyzer`]. The recorder is independent of the
+    /// analyzer: either, both, or neither may be installed.
+    pub fn set_context_recorder(&self, recorder: Option<Arc<ContextProcessorStateRecorder>>) {
+        *self.context_recorder.write() = recorder;
+        self.rebuild_engine();
+    }
+
+    /// Returns the installed context processor state recorder, if any.
+    #[must_use]
+    pub fn context_recorder(&self) -> Option<Arc<ContextProcessorStateRecorder>> {
+        self.context_recorder.read().clone()
+    }
+
+    /// Returns the handle of this agent's usage telemetry buffer.
+    ///
+    /// Every clone shares one buffer, so a host can keep the handle and drain it
+    /// while invocations run. A non-streaming [`Agent::invoke`] publishes no
+    /// frames, which makes this the way to read the post-call measurements of a
+    /// plain invocation.
+    #[must_use]
+    pub fn usage_telemetry(&self) -> Arc<UsageTelemetry> {
+        Arc::clone(&self.usage_telemetry)
+    }
+
+    /// Returns the most recent post-call usage snapshot, without draining it.
+    #[must_use]
+    pub fn last_usage(&self) -> Option<ContextUsageSnapshot> {
+        self.usage_telemetry.last()
+    }
+
+    /// Removes and returns every buffered post-call usage snapshot.
+    ///
+    /// The snapshots are ordered oldest first, one per successful model call
+    /// since the previous drain; without an analyzer nothing was recorded.
+    #[must_use]
+    pub fn drain_usage_events(&self) -> Vec<ContextUsageSnapshot> {
+        self.usage_telemetry.drain()
+    }
+
+    /// Builds the frozen token report of the run context of `session`.
+    ///
+    /// The context is this agent's `"main"` context for the session, created on
+    /// demand, so the report works before the first invocation and after it
+    /// alike. `provider_input_tokens` makes the provider total authoritative: the
+    /// report's `context_window.tokens` becomes that total and the category parts
+    /// are reconciled to it, exactly like the emitted `context.usage` snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when no [`ContextUsageAnalyzer`] is installed (the engine
+    /// refuses to measure without one) and the engine's own error when the
+    /// context cannot be created.
+    pub async fn usage_report(
+        &self,
+        session: &Arc<dyn Session>,
+        provider_input_tokens: Option<u64>,
+    ) -> Result<ContextWindowTokenReport> {
+        let engine = self.context_engine();
+        let context = match engine.get_context(session.id(), MAIN_CONTEXT_ID).await {
+            Some(context) => context,
+            None => {
+                engine
+                    .create_context(MAIN_CONTEXT_ID, Some(Arc::clone(session)))
+                    .await?
+            }
+        };
+        engine.usage_report(&context, provider_input_tokens).await
     }
 
     /// Replaces the whole callback registry.
@@ -386,6 +525,135 @@ impl ReActAgent {
     pub fn final_request_check(&self) -> Option<Arc<dyn FinalRequestCheck>> {
         self.final_check.read().clone()
     }
+
+    /// Installs a KV-cache model-call hook, or detaches it with `None`.
+    ///
+    /// The hook is best-effort affinity bookkeeping, never a correctness
+    /// requirement: with one installed, every model call of a run opens the
+    /// request's cache scope, admits its inference, records the request prefix,
+    /// and reports the provider's input tokens afterwards; a cache failure is
+    /// logged and never changes the run's output.
+    ///
+    /// [`ReActAgent::enable_kv_cache`] builds a hook that only records prefixes.
+    /// To also get provider-side prefetch/offload/evict actions, build the hook
+    /// with [`KVCacheModelCallHook::with_action_runtime`] and install it here;
+    /// a bare hook's lifecycle calls are no-ops.
+    ///
+    /// Like the other seams, a running loop keeps the hook snapshot it started
+    /// with, so a replacement affects later invocations.
+    pub fn set_kv_cache_hook(&self, hook: Option<Arc<KVCacheModelCallHook>>) {
+        *self.kv_cache_hook.write() = hook;
+    }
+
+    /// Returns the installed KV-cache hook; `None` by default, which means a run
+    /// does no cache bookkeeping at all.
+    #[must_use]
+    pub fn kv_cache_hook(&self) -> Option<Arc<KVCacheModelCallHook>> {
+        self.kv_cache_hook.read().clone()
+    }
+
+    /// Installs a KV-cache hook built from `config`.
+    ///
+    /// The runtime comes from [`KVCacheRuntimeConfig::build_runtime`], and the
+    /// hook records prefixes according to [`KVCacheRuntimeConfig::affinity`] —
+    /// with the default config affinity is disabled, so the installed hook is
+    /// inert and a run touches no cache state. Provider-side prefetch/offload is
+    /// a separate seam: use [`ReActAgent::set_kv_cache_hook`] with a hook built
+    /// through [`KVCacheModelCallHook::with_action_runtime`] for it.
+    ///
+    /// The runtime is built before anything is stored, so a failure leaves a
+    /// previously installed hook (and its recorded prefixes) untouched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed error of
+    /// [`KVCacheBackend::runtime`](crate::kv_cache::KVCacheBackend::runtime):
+    /// the deferred `Redis` and `Distributed` backends answer
+    /// `Error::Unsupported` naming the backend.
+    pub fn enable_kv_cache(&self, config: KVCacheRuntimeConfig) -> Result<()> {
+        let runtime = config.build_runtime()?;
+        let hook = KVCacheModelCallHook::new(runtime, config.affinity);
+        *self.kv_cache_hook.write() = Some(Arc::new(hook));
+        Ok(())
+    }
+
+    /// Detaches the KV-cache hook; later runs do no cache bookkeeping.
+    pub fn clear_kv_cache(&self) {
+        *self.kv_cache_hook.write() = None;
+    }
+
+    /// Installs an external long-term-memory provider.
+    ///
+    /// Three things happen, in this order:
+    ///
+    /// 1. the provider is stored (replacing a previously installed one);
+    /// 2. a [`ProviderMemoryRail`] over it is registered under the fixed rail name
+    ///    `"memory_provider"`, replacing any rail already registered under it, so
+    ///    prompt block, prefetch, and turn write-back take effect on the next
+    ///    invocation;
+    /// 3. the provider's advertised tool schemas are mounted with
+    ///    [`ReActAgent::add_tools`] ([`provider_tools`]).
+    ///
+    /// Mounting does **not** depend on [`MemoryProvider::is_available`]: an
+    /// unavailable provider is still stored, its rail and tools are still
+    /// mounted, and it reports its own behaviour through them (a fail-soft
+    /// `prefetch`, `{"error": …}` tool payloads). The only difference is one
+    /// `tracing::warn!` naming the provider, so the misconfiguration is visible
+    /// without silently disabling the seam.
+    ///
+    /// Like [`ReActAgent::register_rail`], a running loop keeps the registry
+    /// snapshot it started with.
+    pub fn set_memory_provider(&self, provider: Arc<dyn MemoryProvider>) {
+        if !provider.is_available() {
+            tracing::warn!(
+                target: "openjiuwen_agent::memory_provider",
+                provider = %provider.name(),
+                "memory provider reports itself unavailable; mounting its rail and tools anyway"
+            );
+        }
+        *self.memory_provider.write() = Some(Arc::clone(&provider));
+        self.register_rail(Arc::new(ProviderMemoryRail::new(Arc::clone(&provider))));
+        self.add_tools(provider_tools(provider));
+    }
+
+    /// Returns the installed external memory provider, if any.
+    #[must_use]
+    pub fn memory_provider(&self) -> Option<Arc<dyn MemoryProvider>> {
+        self.memory_provider.read().clone()
+    }
+
+    /// Uninstalls the external memory provider.
+    ///
+    /// The `"memory_provider"` rail is dropped and later runs neither prefetch,
+    /// nor receive the provider's prompt block, nor write turns back. Tools the
+    /// provider mounted stay mounted: they are ordinary agent tools by then, and
+    /// removed tools the caller may have renamed or reused would be surprising —
+    /// drop them with [`ReActAgent::remove_tool`] for each name in
+    /// `crate::memory_provider::provider_tool_cards` when that is what the
+    /// caller wants.
+    pub fn clear_memory_provider(&self) {
+        *self.memory_provider.write() = None;
+        self.unregister_rail(PROVIDER_RAIL_NAME);
+    }
+
+    /// Finalizes the conversation with the external memory provider.
+    ///
+    /// Runs [`MemoryProvider::on_session_end`] on the installed provider and
+    /// propagates its error; with no provider installed it is a successful
+    /// no-op. The loop calls this itself for a run whose session it created, so
+    /// a caller only needs it after an invocation that reused a supplied
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// The provider's own error when the finalization write fails.
+    pub async fn end_memory_session(&self, messages: &[ConversationTurn]) -> Result<()> {
+        let provider = self.memory_provider.read().clone();
+        match provider {
+            Some(provider) => provider.on_session_end(messages).await,
+            None => Ok(()),
+        }
+    }
 }
 
 // The model, rails, and context engine are trait objects or lock guards, so the
@@ -422,7 +690,12 @@ impl Agent for ReActAgent {
             input.parent_session_id.as_deref(),
         )
         .await?;
-        let result = agent_loop::run(self, input, Arc::clone(run.session()), None).await;
+        let owned = run.is_owned();
+        // Boxed so the loop's large future does not inflate this trait method's
+        // own future (`clippy::large_futures`); the allocation happens once per
+        // invocation, next to the ones the run already makes.
+        let loop_future = agent_loop::run(self, input, Arc::clone(run.session()), None, owned);
+        let result = Box::pin(loop_future).await;
         run.finish().await;
         result
     }
@@ -484,9 +757,15 @@ impl Agent for ReActAgent {
                     return;
                 }
             };
-            let result =
-                agent_loop::run_with(&runtime, input, Arc::clone(run.session()), Some(frame_tx))
-                    .await;
+            let owned = run.is_owned();
+            let result = agent_loop::run_with(
+                &runtime,
+                input,
+                Arc::clone(run.session()),
+                Some(frame_tx),
+                owned,
+            )
+            .await;
             // Every frame the loop produced reaches the caller before the
             // terminal item: the forwarder ends once the loop dropped its sender.
             let _ = forwarder.await;
@@ -511,6 +790,7 @@ impl Agent for ReActAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::{KVCacheAffinityConfig, KVCacheBackend};
     use futures::StreamExt;
     use openjiuwen_common::error::ErrorKind;
     use openjiuwen_foundation::BaseMessage;
@@ -701,6 +981,37 @@ mod tests {
         assert_eq!(agent.client_tools().names(), Vec::<String>::new());
         assert!(agent.tool_resilience().is_empty());
         assert!(agent.final_request_check().is_none());
+        assert!(agent.kv_cache_hook().is_none());
+    }
+
+    #[test]
+    fn kv_cache_seam_round_trips_and_keeps_the_hook_on_a_deferred_backend() {
+        let agent = agent();
+        let hook = Arc::new(KVCacheModelCallHook::new(
+            KVCacheRuntimeConfig::default()
+                .with_affinity(KVCacheAffinityConfig::enabled())
+                .build_runtime()
+                .unwrap(),
+            KVCacheAffinityConfig::enabled(),
+        ));
+        agent.set_kv_cache_hook(Some(Arc::clone(&hook)));
+        let installed = agent.kv_cache_hook().expect("the hook is installed");
+        assert!(Arc::ptr_eq(&hook, &installed));
+        assert!(installed.capabilities().affinity);
+
+        // A deferred backend fails before anything is stored, so the installed
+        // hook (and its recorded prefixes) survives the attempt.
+        let error = agent
+            .enable_kv_cache(KVCacheRuntimeConfig::default().with_backend(KVCacheBackend::Redis))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(Arc::ptr_eq(
+            &hook,
+            &agent.kv_cache_hook().expect("the old hook survives")
+        ));
+
+        agent.clear_kv_cache();
+        assert!(agent.kv_cache_hook().is_none());
     }
 
     #[test]

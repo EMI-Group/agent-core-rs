@@ -38,11 +38,12 @@ pub struct ActiveRunInfo { pub run_id: String, pub label: String, pub team_name:
 pub struct RunHandle { .. }                                              // Clone+Debug
 impl RunHandle { pub fn run_id(&self) -> &str; pub fn cancellation(&self) -> CancellationToken; }
 
-// hub.rs — Clone is cheap (one Arc); Default == new()
+// hub.rs — Clone is cheap (one Arc table) and copies the monitor setting; Default == new()
 pub const INBOX_CAPACITY: usize = 64;
 pub struct InteractionHub { .. }
 impl InteractionHub {
     pub fn new() -> Self;
+    pub fn attach_monitor(&self, monitor: Option<Arc<RunMonitor>>) -> Option<Arc<RunMonitor>>;
     pub fn with_monitor(self, monitor: Arc<RunMonitor>) -> Self;
     pub fn monitor(&self) -> Option<Arc<RunMonitor>>;
     pub fn register(&self, spec: ActiveRunSpec) -> RunHandle;
@@ -92,6 +93,8 @@ The crate root re-exports these items from `openjiuwen_runner::hitl` (added by t
 - `list_active` returns every registered run sorted by run id; a cancelled run stays listed until it is unregistered.
 - `ActiveRunInfo::queued` counts the pending interaction ids the hub observed, not the inbox depth.
 - Monitor mirroring is best-effort: a rejected transition (a run already finished or evicted) is logged with `tracing::warn!` (target `openjiuwen_runner::hitl`) and never fails a hub operation.
+- `attach_monitor` swaps the mirrored monitor at runtime and returns the previous one; it is what `Runner::set_monitor` uses to re-point the installed hub, and `with_monitor` is its builder form.
+- The monitor sits behind a `parking_lot::RwLock` read for the length of one mirror call; a clone copies the setting it was made with, so re-pointing the original never retroacts onto an earlier clone.
 
 ## Constraints
 - In-process only: one `Arc<parking_lot::Mutex<BTreeMap<run_id, Entry>>>` per hub, shared by clones; nothing is persisted or transported.

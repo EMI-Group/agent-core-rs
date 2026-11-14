@@ -15,6 +15,7 @@ openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
 openjiuwen-multiagent.workspace = true
+openjiuwen-memory.workspace = true
 openjiuwen-session.workspace = true
 openjiuwen-agent.workspace = true
 serde.workspace = true
@@ -33,6 +34,7 @@ rmcp = { workspace = true, optional = true }
 clap.workspace = true
 sqlx = { workspace = true, optional = true }
 which.workspace = true
+openjiuwen-extensions = { workspace = true, optional = true, features = ["otel"] }
 
 [dev-dependencies]
 openjiuwen-test-support.workspace = true
@@ -43,6 +45,7 @@ mcp = ["dep:rmcp"]
 distributed = []
 sqlite = ["dep:sqlx"]
 otel = []
+otlp = ["dep:openjiuwen-extensions"]
 live-tests = []
 
 [[bin]]

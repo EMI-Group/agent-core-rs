@@ -28,7 +28,9 @@ pub mod schema;
 /// The `Tool` contract, `ToolOutput`, and the render helpers.
 pub mod traits;
 
-pub use card::{ToolCard, ToolExecution, ToolExposure, ToolFunctionInfo, ToolInfo};
+pub use card::{
+    flat_tools, from_wire_tools, ToolCard, ToolExecution, ToolExposure, ToolFunctionInfo, ToolInfo,
+};
 pub use context::ToolContext;
 pub use function::{FunctionTool, FunctionToolBuilder, ToolHandler};
 #[cfg(feature = "mcp")]

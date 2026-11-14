@@ -4,18 +4,25 @@
 
 Agent runtime of the kernel: the `Agent` seam, `ReActAgent` (model → tools → observation loop), abilities (tool mounting/execution), rails (model/tool/loop hooks), interrupts/HITL, and the two application agents `LLMAgent` and `WorkflowAgent`.
 Ports Python `openjiuwen.core.single_agent` (`base.py`, `agents/react_agent.py`, `ability_manager.py`, `rail/`, `interrupt/`, `schema/`) and `openjiuwen.core.application` (`llm_agent/`, `workflow_agent/`) onto `openjiuwen-foundation` (`Model`, `BaseMessage`, `Tool`), `openjiuwen-session` (`Session`, `AgentSession`, `StreamItem`, `InteractionRequest`), `openjiuwen-context` (`ContextEngine`), `openjiuwen-workflow` (`Workflow`), `openjiuwen-memory` and `openjiuwen-security`.
-The crate is the only place that owns the ReAct control flow; it never resolves tools or models from a global registry (the `Runner` injects them via `AbilityManager`/`set_model`).
-Python's legacy controller machinery is now ported as the `controller` module: `ControllerAgent`/`LLMController`/`WorkflowController` and the `IntentDetectionController` lineage route events to registered agents/workflows, while `LLMAgent` stays a thin configured `ReActAgent` composition.
-It also hosts the seams Python keeps beside the loop: tool exposure/MCP allowlists, client tools, per-tool resilience, the final-request check (`policy`), the lifecycle callback framework (`callbacks`), the steering queue (`steering`), and the Markdown skill library (`skills`).
-`controller` (event → intent → task store routing with background scheduling, pause/cancel, per-conversation preemption, group routing and the task-op reasoner), `kv_cache` (cache identity, in-process prefix runtime, model-call affinity hook and the provider prefetch/offload action runtime), `operator` (tunable LLM/tool/memory/skill/context-evolve handles, the legacy `LLMCall` wrapper and experience staging), `evolve` (`ReActAgentEvolve`), and `prompt_pack` (YAML packs plus Python prompt-directory loading) are implemented modules with their own `CONTEXT.md`; `openjiuwen-core` re-exports them under the Python package paths.
+The crate is the only place that owns the ReAct control flow; it never resolves tools, models, or memory providers from a global registry (the `Runner` injects tools/models via `AbilityManager`/`set_model`, and a host installs a memory provider with `ReActAgent::set_memory_provider`).
+Python's legacy controller machinery is ported as the `controller` module: `ControllerAgent`/`LLMController`/`WorkflowController` and the `IntentDetectionController` lineage route events to registered agents/workflows, while `LLMAgent` stays a thin configured `ReActAgent` composition.
+It also hosts the seams Python keeps beside the loop: tool exposure/MCP allowlists, client tools, per-tool resilience, the final-request check (`policy`), the lifecycle callback framework (`callbacks`), the steering queue (`steering`), the Markdown skill library (`skills`), the external long-term-memory provider bridge (`memory_provider`), and the context usage telemetry seam (`usage`).
+`controller` (event → intent → task store routing with background scheduling, pause/cancel, per-conversation preemption, group routing and the task-op reasoner, plus the scheduler state/`running_tasks`/`wake_scheduler` facade on `BaseController`), `kv_cache` (cache identity, in-process prefix runtime, model-call affinity hook and the provider prefetch/offload action runtime, installed through `ReActAgent::enable_kv_cache`/`set_kv_cache_hook`), `operator` (tunable LLM/tool/memory/skill/context-evolve handles, the legacy `LLMCall` wrapper and experience staging), `evolve` (`ReActAgentEvolve`), and `prompt_pack` (YAML packs plus Python prompt-directory loading) are implemented modules with their own `CONTEXT.md`; `openjiuwen-core` re-exports them under the Python package paths.
 See `docs/PARITY.md` for the port status of each area.
 
 ## API Surface
 
 ### `lib.rs` — crate root
 
-Re-exports the public seams: `Agent`, `AgentCard`, `AgentOutput`, `AgentChunk`, `ResultType`, `Observation`, `OutputFrame`, `AgentInput`; `ReActAgent`, `ReActAgentConfig`, `MaxIterationsPolicy`; `LlmAgent`, `LlmAgentConfig`, `ModelConfig`, `ModelInfo`; `WorkflowAgent`, `WorkflowAgentConfig`, `ConstrainConfig`, `DefaultResponse`; `AbilityManager`, `AddAbilityResult`, `ToolCallResult`, `ToolExecutionOptions`; rails (`AgentRail`, `RailContext`, `RailEvent`, `RailRegistry`, `GuardrailRail`, `MemoryRail`, `ModelBackupRail`, `BaseInterruptRail`, `ConfirmInterruptRail`, `AskUserRail`, `ToolFilter`); interrupts (`InterruptKind`, `InterruptRequest`, `InterruptAnswer`, `InterruptionState`, `match_answers`).
-The extension trees are `pub mod` only (not crate-root re-exports): `callbacks`, `steering`, `policy`, `skills`, `controller`, `kv_cache`, `operator`, `evolve`, `prompt_pack`.
+Re-exports the public seams: `Agent`, `AgentCard`, `AgentOutput`, `AgentChunk`, `ResultType`, `Observation`, `OutputFrame`, `AgentInput`, `InputQuery`; `ReActAgent`, `ReActAgentConfig`, `MaxIterationsPolicy`; `LlmAgent`, `LlmAgentConfig`, `create_llm_agent_config`, `ModelConfig`, `ModelInfo`; `WorkflowAgent`, `WorkflowAgentConfig`, `ConstrainConfig`, `DefaultResponse`; `AbilityManager`, `AddAbilityResult`, `ToolCallResult`, `ToolExecutionOptions`, `parse_tool_arguments`; rails (`AgentRail`, `RailContext`, `RailEvent`, `RailRegistry`, `RetryRequest`, `StageFlags`, `ToolFilter`, `DEFAULT_RAIL_PRIORITY`, `GuardrailRail`, `MemoryRail`, `ModelBackupRail`, `BaseInterruptRail`, `ConfirmInterruptRail`, `AskUserRail`); interrupts (`InterruptKind`, `InterruptRequest`, `InterruptAnswer`, `InterruptionState`, `MatchedAnswers`, `match_answers`, `approval_value`, `parse_approval`, `reject_feedback`, `INTERRUPTION_STATE_KEY`, `AUTO_CONFIRM_STATE_KEY`, `DEFAULT_REJECT_FEEDBACK`); the memory provider bridge (`ProviderMemoryRail`, `ProviderTool`, `provider_tools`, `provider_tool_cards`); usage telemetry (`UsageTelemetry`, `default_usage_analyzer`); the controller and KV-cache facades (listed under Crate-root promotions below); and session/prompt helpers (`resolve_session`, `AgentRun`, `PromptSection`, `SystemPromptBuilder`).
+The remaining extension trees are reached by module path only: `callbacks`, `steering`, `policy`, `skills`, `operator`, `evolve`, and `prompt_pack`; `controller` and `kv_cache` stay `pub mod` too, so their module paths keep resolving beside the promoted crate-root names.
+
+### Crate-root promotions (`controller/`, `kv_cache/`)
+
+The controller and KV-cache facades are exported from the crate root as well as their module paths; each promoted name aliases the same type.
+
+- Controller: `BaseController`, `Controller`, `ControllerConfig`, `GroupRouter`, `TaskManager`, `TaskQueue`, `TaskSchedulerLoop`, `TaskSchedulerState`.
+- KV cache: `KVCacheIdentity`, `KVCacheEntry`, `KVCacheRuntimeProtocol`, `KVCacheRuntimeConfig`, `KVCacheAffinityConfig`, `KVCacheModelCallHook`, `InProcessKVCacheRuntime`, `InProcessKvCacheActionProvider`, `KvCacheActionProvider`, `KvCacheActionRuntime`, `KvCacheAdmission`, `KvCacheInferenceLease`.
 
 ### Agent seam (`agent.rs`, `output.rs`, `card.rs`, `input.rs`)
 
@@ -119,7 +126,8 @@ impl ReActAgentConfig { pub fn new() -> Self; /* configure_model, configure_mode
     configure_context_engine, configure_mem_scope, configure_custom_headers (all builder-style) */ }
 
 pub struct ReActAgent { /* card, RwLock<ReActAgentConfig>, RwLock<Option<Arc<dyn Model>>>, RwLock<SystemPromptBuilder>,
-                            RwLock<AbilityManager>, RwLock<Arc<RailRegistry>>, RwLock<Arc<ContextEngine>> */ }
+                            RwLock<AbilityManager>, RwLock<Arc<RailRegistry>>, RwLock<Arc<ContextEngine>>,
+                            the KV-cache hook, memory provider, and usage telemetry */ }
 impl ReActAgent {
     pub fn new(card: AgentCard) -> Self;
     pub fn configure(&self, config: ReActAgentConfig);          // idempotent; rebuilds prompt builder + context engine
@@ -145,6 +153,23 @@ impl ReActAgent {
     pub fn set_tool_resilience(&self, ToolResiliencePolicy);     pub fn tool_resilience(&self) -> ToolResiliencePolicy;
     pub fn set_final_request_check(&self, Arc<dyn FinalRequestCheck>);
     pub fn final_request_check(&self) -> Option<Arc<dyn FinalRequestCheck>>;
+    // memory provider, usage telemetry, and KV-cache seams (all off by default)
+    pub fn set_memory_provider(&self, provider: Arc<dyn MemoryProvider>);   // stores it, registers the rail, mounts its tools
+    pub fn memory_provider(&self) -> Option<Arc<dyn MemoryProvider>>;
+    pub fn clear_memory_provider(&self);                                    // drops the provider and the rail, keeps mounted tools
+    pub async fn end_memory_session(&self, turns: &[ConversationTurn]) -> Result<()>;
+    pub fn set_usage_analyzer(&self, Option<Arc<ContextUsageAnalyzer>>);  pub fn usage_analyzer(&self) -> Option<Arc<ContextUsageAnalyzer>>;
+    pub fn set_context_recorder(&self, Option<Arc<ContextProcessorStateRecorder>>);
+    pub fn context_recorder(&self) -> Option<Arc<ContextProcessorStateRecorder>>;
+    pub fn usage_telemetry(&self) -> Arc<UsageTelemetry>;
+    pub fn last_usage(&self) -> Option<ContextUsageSnapshot>;
+    pub fn drain_usage_events(&self) -> Vec<ContextUsageSnapshot>;
+    pub async fn usage_report(&self, session: &Arc<dyn Session>, provider_input_tokens: Option<u64>)
+        -> Result<ContextWindowTokenReport>;                                // Error::Config without an analyzer
+    pub fn set_kv_cache_hook(&self, hook: Option<Arc<KVCacheModelCallHook>>);
+    pub fn kv_cache_hook(&self) -> Option<Arc<KVCacheModelCallHook>>;
+    pub fn enable_kv_cache(&self, config: KVCacheRuntimeConfig) -> Result<()>;   // typed error for Redis/Distributed
+    pub fn clear_kv_cache(&self);
 }
 impl Agent for ReActAgent { .. }
 ```
@@ -153,6 +178,62 @@ No tool calls → `{"output": content, "result_type": "answer"}`; empty content 
 Exhaustion → `termination_reason: "max_iterations"`, `iterations_used`, `truncated_by_max_iterations: true` and the configured policy (`Error` → error output; `ReturnObservations` → observations attached; `FinalAnswer` → one extra tool-free model call).
 Interrupts pause the loop into an `AgentOutput` with `result_type: "interrupt"`, `state` frames and `interrupt_ids`; state is persisted under `__react_agent_interruption__` and cleared on resume.
 Cancellation (`CancellationToken` from the session config / tool context) yields `Error::Cancelled` and sanitizes the partial turn when `retain_tool_facts_on_abort = false`.
+
+### Context usage frames (`react/frames.rs`)
+
+Both are `context.usage` chunks: they go to the publisher when the run has one and are mirrored into the session's `StreamItem` stream.
+- Pre-call, one per successful `ContextEngine::prepare`: `iteration`, `phase: "pre_call"`, `message_count`, `tool_count`, `token_count`, `overflow`, `window_size`, `usage`, `result_type`.
+- Post-call, one per successful model call: `iteration`, `phase: "post_call"`, `input_tokens`, `output_tokens`, `total_tokens`, `tokens`, `overflow`, `window_size`, `usage`, `result_type`.
+`usage` is the prepared window's measured `ContextUsageSnapshot` in the pre-call frame (`null` without an analyzer; the frame is published either way) and that same snapshot stamped `phase = "post_call"` with the call's `request_id` in the post-call frame, where `tokens` is its reconciled window total (the provider input total when the provider reported one).
+
+### External long-term-memory provider (`memory_provider/`)
+
+```rust
+pub struct ProviderMemoryRail { /* provider, name */ }   // AgentRail; default rail name "memory_provider"
+impl ProviderMemoryRail {
+    pub fn new(provider: Arc<dyn MemoryProvider>) -> Self;
+    pub fn with_name(self, name: impl Into<String>) -> Self;
+    pub fn provider(&self) -> &Arc<dyn MemoryProvider>;
+}
+// before_invoke: MemoryProvider::system_prompt_block (when non-blank) -> ctx.extra["memory_provider_block"]
+// before_model_call: prefetch once per invoke (last user text as the query), inserted after the leading system messages
+// after_invoke: MemoryProvider::sync_turn(query, output) for an Answer with a non-empty text query; failures are logged
+
+pub struct ProviderTool { /* provider, card */ }
+impl ProviderTool {
+    pub fn new(provider: Arc<dyn MemoryProvider>, card: ToolCard) -> Self;
+    pub fn from_schema(provider: Arc<dyn MemoryProvider>, schema: &Value) -> Option<Self>;
+    pub fn provider(&self) -> &Arc<dyn MemoryProvider>;
+}
+// Tool::invoke -> MemoryProvider::handle_tool_call(card.name, args), payload returned verbatim
+// ({"error": …} is a normal tool result); cancellation is checked first
+
+pub fn provider_tools(provider: Arc<dyn MemoryProvider>) -> Vec<Arc<dyn Tool>>;
+pub fn provider_tool_cards(provider: &Arc<dyn MemoryProvider>) -> Vec<ToolCard>;
+// one entry per MemoryProvider::get_tool_schemas() spec, in provider order; ToolCard metadata `provider = <name>`;
+// a spec without an object `function` and a non-blank `name` is skipped with a `tracing::warn!`
+```
+`ReActAgent::set_memory_provider` stores the provider, registers a `ProviderMemoryRail` under the fixed name `"memory_provider"` (replacing a rail already registered under it) and mounts `provider_tools`; `MemoryProvider::is_available` only adds one `tracing::warn!`, and `clear_memory_provider` drops the provider and the rail while leaving the mounted tools in place.
+The loop calls `MemoryProvider::on_session_end` once per run whose session it created itself, with the run's text turns (user query plus every assistant reply, in order); `end_memory_session` is the caller's path for a supplied session.
+
+### Usage telemetry (`usage/`)
+
+```rust
+pub const MAIN_CONTEXT_ID: &str = "main";        // context id of a run's window (usage_report reads the same one)
+pub const MAX_TELEMETRY_EVENTS: usize = 128;
+pub fn default_usage_analyzer() -> ContextUsageAnalyzer;   // ApproxTokenCounter + CounterIdentity::approx, no model/window
+pub fn cache_scope_key(session_id: &str, provider: &str, request: &ModelRequestConfig) -> CacheAggregationKey;  // (session, provider, model)
+pub fn request_id(session_id: &str, iteration: usize) -> String;    // "<session>#<iteration>"
+pub fn provider_usage_value(usage: &Usage) -> Value;                // the usage_metadata object record_provider_usage parses
+
+pub struct UsageTelemetry { .. }   // cloneable, Arc-shared per-agent buffer
+impl UsageTelemetry { pub fn new() -> Self; pub fn record(&self, snapshot: ContextUsageSnapshot);
+                      pub fn drain(&self) -> Vec<ContextUsageSnapshot>; pub fn last(&self) -> Option<ContextUsageSnapshot>;
+                      pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool;
+                      pub fn recorded_total(&self) -> u64; pub fn clear(&self); }
+```
+The loop records every successful model call through `ContextEngine::record_provider_usage` (the `cache_scope_key` scope with the `request_id` id), builds `ContextEngine::usage_snapshot` with the provider's input total, stamps the result `phase = "post_call"` with that id, pushes it into `UsageTelemetry` and publishes it as the post-call frame; every step fails open, and without an analyzer there is no snapshot at all (one `tracing::debug!`).
+`UsageTelemetry` is the read path of a non-streaming `invoke` (no publisher, so no frames): clones share one buffer, `drain` empties it, `last` polls without draining, and it keeps the newest `MAX_TELEMETRY_EVENTS` while `recorded_total` stays a monotonic lifetime counter.
 
 ### Abilities (`abilities/`)
 
@@ -188,7 +269,6 @@ pub struct McpToolAbility;    // new(card, Arc<dyn McpClient>, tool_name), with_
 pub struct McpAbilityOptions; // new/with_namespace/with_allowlist/with_prefix/without_prefix
 pub async fn load_mcp_abilities(client: Arc<dyn McpClient>, options: McpAbilityOptions) -> Result<Vec<Arc<dyn Tool>>>;
 // MCP names are namespaced "<namespace>__<tool>" (default namespace = server name); allowlist key = server id.
-```
 
 pub fn parse_tool_arguments(raw: &str) -> Result<Value>;        // empty -> {}; repairs truncated JSON
 ```
@@ -241,6 +321,7 @@ impl RailRegistry { pub fn new() -> Self; pub fn register(&mut self, rail: Arc<d
 `fire` dispatches only the hook for `ctx.event`, in descending priority (stable), and stops on the first `Err` (which aborts the loop).
 
 Built-in rails (no upper-layer dependency): `GuardrailRail` (`GuardrailPipeline` input/output/tool scans; blocking → `Error::Security`), `MemoryRail` (`LongTermMemory` recall into a system message on `BeforeModelCall`, message write on `AfterInvoke`; failures are logged, never fatal), `ModelBackupRail` (on model exception: swap to the next `Arc<dyn Model>` via `ctx.model_override` and `request_retry`).
+The external long-term-memory provider rail lives in `memory_provider` (`ProviderMemoryRail`, registered under the name `"memory_provider"`).
 Interrupt rails: `BaseInterruptRail`, `ConfirmInterruptRail` (kind `confirm`, message `"Please approve or reject?"`, payload `{approved, feedback, auto_confirm, persist_allow}`), `AskUserRail` (kind `ask_user`, answer becomes the tool result).
 Rails living above this crate (harness `ConfirmInterruptRail` extensions, tool trackers, OTel tracing, steering) are out of scope — the trait and event set are the seam.
 
@@ -316,26 +397,26 @@ Outputs: completed → `result_type: "answer"`, `output` = JSON text of the work
 ### Session, history, streaming (`run.rs`, `prompt.rs`)
 
 `run::resolve_session(session, agent_id, agent_name, conversation_id, parent_session_id)` returns an `AgentRun { session, owned }`: a caller session is used as-is; otherwise an `AgentSession` is created with `session_id = conversation_id || "default_session"` and committed/closed at the end (`owned`).
-History lives in `openjiuwen-context`: the loop calls `ContextEngine::create_context`, `prepare`, `observe`, and `save_contexts` (session state key `"context"`), matching Python's `context_engine` usage.
+History lives in `openjiuwen-context`: the loop calls `ContextEngine::create_context`, `prepare`, `observe`, `save_contexts` (session state key `"context"`), and — per successful model call — `record_provider_usage`/`usage_snapshot`, matching Python's `context_engine` usage.
 Streaming: every frame is `AgentChunk`; when a session is present the loop also writes `StreamItem`s to the session (`llm_output`, `llm_reasoning`, `llm_usage`, `answer`, `__interaction__`).
 Traces: the loop opens an agent span on `session.tracer()` (`InvokeType::Chain`), model spans (`Llm`), and tool spans (`Plugin`), finishing with outputs/status.
 `prompt::SystemPromptBuilder` holds `PromptSection { name, content, priority, category }`; `build()` joins sections by `"\n\n"` in ascending priority (identity = 10), matching Python's builder ordering.
 
 ### Extensions (`callbacks/`, `steering/`, `policy/`, `skills/`, `controller/`, `kv_cache/`, `operator/`, `evolve/`, `prompt_pack/`)
 
-These modules are `pub mod` in `lib.rs` but not re-exported from the crate root; reach them by module path. Each has its own `CONTEXT.md` with the full API.
+These modules are `pub mod` in `lib.rs`; `callbacks`, `steering`, `policy`, `skills`, `operator`, `evolve`, and `prompt_pack` are reached by module path only, while `controller` and `kv_cache` also promote their facade types to the crate root.
+Each has its own `CONTEXT.md` with the full API.
 
 - `policy` — `ToolExposurePolicy`/`ToolExposureMode`/`McpToolAllowlist` (which tools reach the model), `ClientToolRegistry`/`ClientToolHandler`/`FnClientToolHandler` (tools the connected client executes), `ToolResilience`/`ToolResiliencePolicy` (per-tool timeout/attempts/backoff), `FinalRequestCheck`/`DefaultFinalRequestCheck`/`FinalRequestContext`/`FinalRequestDecision`.
 - `callbacks` — `AgentCallbackEvent` (six events), typed payloads, the `AgentCallback` trait, and `CallbackFramework` (priority-ordered registry); a failing handler is logged, never fatal.
 - `steering` — `SteeringMessage` and the cloneable `SteeringQueue` (`push`/`push_text`/`drain`/`drain_messages`/`drain_prompt`); the loop drains the backlog at the top of every iteration as one batch of `user` messages.
 - `skills` — `Skill` (+ YAML front matter), `SkillManager` (`tokio::fs` discovery), `SkillUtil`, and `SkillRail` (renders the catalog as the first system message on `BeforeModelCall`).
-- `controller` — `Controller`/`BaseController` (turn loop: event queue → intent recognizer → planner → executor) over a shared `TaskManager` (indexes, filters, hierarchy, `claim_task`, per-session persistence under `__controller_tasks__`); `TaskSchedulerLoop` (spawned scan loop with `Notify` wakeups, `max_concurrent_tasks`, `task_timeout_ms`, dependency gating from `metadata["depends_on"]`, `all_tasks_processed` sentinel); `TaskExecutor` pause/cancel hooks; `TaskQueue` (one running task per conversation, new message preempts); `GroupRouter` (`send_to_agent`/`publish`); the `reasoner` task-op layer (create/pause/resume/cancel/continue/supplement/modify behind the confidence gate); schemas, `ControllerAgent`, `WorkflowController`, `LLMController`, `IntentRecognizer`/`LlmIntentRecognizer`/`Planner`, and the `legacy` `IntentDetectionController`/`IntentDetector`.
-- `kv_cache` — `KVCacheIdentity`/`KVCacheEntry`/`KVCacheLookup`/`KVCacheStats`, `KVCacheRuntimeProtocol`, `InProcessKVCacheRuntime` (LRU + session eviction + FNV-1a prefix hashing), `KVCacheAffinityConfig`/`KVCacheRuntimeConfig`, metadata helpers (`resolve_session_lineage`, `first_changed_index`, range kwargs, compressor/team identities), `KVCacheModelCallHook`, and the provider-action seam `KvCacheActionProvider`/`InProcessKvCacheActionProvider`/`KvCacheActionRuntime` (prefetch/offload/evict with admission, residency, fail-open and timeout budgets); `KVCacheBackend::{Redis, Distributed}` return `Error::Unsupported`.
+- `controller` — `Controller`/`BaseController` (turn loop: event queue → intent recognizer → planner → executor) over a shared `TaskManager`, the background `TaskSchedulerLoop` (dependency gating from `metadata["depends_on"]`), `TaskQueue`, `GroupRouter`, the `reasoner` task-op layer, and the `legacy` `IntentDetectionController`; details in `controller/CONTEXT.md`.
+- `kv_cache` — cache identity/entry/lookup/stats, `InProcessKVCacheRuntime`, `KVCacheAffinityConfig`/`KVCacheRuntimeConfig`, metadata helpers, `KVCacheModelCallHook`, and the provider-action seam `KvCacheActionProvider`/`InProcessKvCacheActionProvider`/`KvCacheActionRuntime`; details in `kv_cache/CONTEXT.md`.
 - `operator` — `Operator`/`PreviewableOperator` traits with `TunableSpec`/`UpdateValue`/`ApplyResult` (full Python metadata: mode/effect/records/change type/lifecycle stage/pending id/errors/metadata) and the protocol normalizers; `LLMCallOperator` (prompt tunables + `render_messages`/`call`), `ToolCallOperator` (`apply_to_cards`), `MemoryCallOperator` (recall seam with `max_retries`), `SkillCallOperator` (selection), `SkillExperienceOperator` + `PendingChangeStore` staging, the distinct executing `legacy::LLMCall` wrapper (optimizer callback, invoke/stream), `ContextEvolveOperator`/`MetisContextEvolveOperator` (deterministic evolve policies; Metis `learn` is `Unsupported`).
 - `evolve` — `ReActAgentEvolve` delegating execution to an inner `ReActAgent`, exposing `get_operators()` (`react_llm`, `react_tool`) whose parameter callbacks sync prompt templates back into the live config and tool descriptions through `DescriptionOverrideTool` wrappers.
 - `prompt_pack` — `PromptPack` YAML schema (prompts/template/sections, tool policy, MCP allowlist, resilience, rails), `from_yaml`/`from_yaml_file`/`to_yaml`, `apply_to`/`apply_to_with` returning `AppliedPack` (built vs deferred rails), `PromptSectionsRail`, and `PromptDirectory`/`PromptPack::from_prompt_dir` for the Python prompt-file layouts (`cn/en/*.md`, `<name>.<lang>.md`, YAML front matter, language fallback, evolved hash).
-- `rails::MemoryRail` — recall before the model call plus `BeforeInvoke` memory prompt variables: `ctx.extra["memory_variables"]` carries `sys_memory_variables` (filtered user variables as a JSON object) and `sys_long_term_memory` (labeled fragment/summary hits as a JSON array), rendered into `prompt_template` system messages once per invoke.
-- `ReActAgent` seam setters: `set_callback_framework`, `callbacks`, `register_callback`, `steering`, `steer`, `set_tool_exposure_policy`, `set_mcp_tool_allowlist`, `set_client_tools`, `client_tools`, `set_tool_resilience`, `set_final_request_check` (details in `react/CONTEXT.md`).
+- `rails::MemoryRail` — recall before the model call plus `BeforeInvoke` memory prompt variables (`ctx.extra["memory_variables"]`), rendered into `prompt_template` system messages once per invoke.
 
 ## Constraints
 
@@ -368,13 +449,13 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 - `AgentOutput::truncated_by_max_iterations` is omitted from the wire object unless it is `true`.
 - `AgentOutput::termination_reason` is a free-form `Option<String>`, not an enum: `"max_iterations"` / `"token_budget"` / `"cancelled"` from the ReAct loop and `"workflow_error"` from `WorkflowAgent`.
 - The `AgentChunk` frame-kind constants (`LLM_OUTPUT`, `LLM_REASONING`, `LLM_USAGE`, `ANSWER`, `INTERACTION`, `WORKFLOW_FINAL`, `CONTEXT_USAGE`, `LLM_ROUTE`) live in the `output` module but are not re-exported from the crate root; refer to them as `openjiuwen_agent::output::*`.
-- `context.usage` frames are emitted after every successful `ContextEngine::prepare` (`iteration`, `message_count`, `tool_count`, `token_count`, `overflow`, `window_size`); `llm_route` frames are emitted only when a rail's `model_override` makes the run diverge from the primary model (`route`, `model`, `reason`).
+- `context.usage` frames are emitted twice per iteration: a pre-call frame after every successful `ContextEngine::prepare` (`phase: "pre_call"`, `iteration`, `message_count`, `tool_count`, `token_count`, `overflow`, `window_size`, `usage`) and a post-call frame after every successful model call (`phase: "post_call"`, `iteration`, `input_tokens`, `output_tokens`, `total_tokens`, `tokens`, `overflow`, `window_size`, `usage`); `llm_route` frames are emitted only when a rail's `model_override` makes the run diverge from the primary model (`route`, `model`, `reason`).
 - `abilities::AbilityManager::execute` batches runs of consecutive `parallel_safe` tools (capped by `MAX_PARALLEL_BATCH`), treats any other call as a barrier, and applies `ToolExecutionOptions::timeout` per call.
 - `parse_tool_arguments` strips a Markdown fence and repairs trailing commas and truncation before reporting an error.
 - `ReActAgent::tools()` returns owned `ToolCard` snapshots in model-visible order and the agent exposes no accessor to its `AbilityManager`, so callers needing `Arc<dyn Tool>` handles (or a name/description other than through `tool.card().name`/`.description`; the `Tool` trait has only `card()`) must keep their own references to the mounted tools.
-- There is no `set_context_engine`/`with_context_engine`: `ReActAgent.engine` is private, built by `new`/`configure` from `ReActAgentConfig::context_engine_config`, and exposed only as an `Arc<ContextEngine>` clone through `context_engine()`; calling `configure` again replaces the engine and drops its contexts.
+- There is no `set_context_engine`/`with_context_engine`: `ReActAgent.engine` is private, built by `new`/`configure` (and rebuilt by `set_usage_analyzer`/`set_context_recorder` from the same `ReActAgentConfig::context_engine_config`), and exposed only as an `Arc<ContextEngine>` clone through `context_engine()`; every rebuild replaces the engine and drops its contexts.
 - `ContextConfig.processors` (a `Vec<ProcessorConfig>`) is the only way to install context processors on the agent's engine — the engine builds its pipeline per context and offers no `add_processor`.
-- The loop only calls `ContextEngine::create_context`, `prepare`, `observe`, and `save_contexts` (the last writes session state key `context`); it never calls `compress`, `recover_from_model_exception`, `load_contexts`, or `observe_tool_result`, so compression happens only inside `prepare` and overflow recovery is not agent-driven.
+- The loop only calls `ContextEngine::create_context`, `prepare`, `observe`, `save_contexts` (the last writes session state key `context`), and — after a successful model call — `record_provider_usage` plus `usage_snapshot`; it never calls `compress`, `recover_from_model_exception`, `load_contexts`, or `observe_tool_result`, so compression happens only inside `prepare` and overflow recovery is not agent-driven.
 - A `ContextEngine` works standalone with no agent (`create_context("main", None)`, `observe`, `prepare`/`compress`), so compressing a long transcript does not require a `ReActAgent`/`LlmAgent`; see `crates/openjiuwen-examples/examples/05_context_and_memory.rs` and `crates/openjiuwen-context/tests/engine.rs`.
 - `LlmAgent` reaches the engine only through `LlmAgent::react()`; its `constrain.reserved_max_chat_rounds` is copied into `context_engine_config.default_window_rounds` and it exposes no other context setting.
 - `LlmAgent` and `WorkflowAgent` define no tool methods of their own: mount/read on an `LlmAgent` through `LlmAgent::react()`, and `WorkflowAgent` has no tool surface at all.
@@ -382,12 +463,19 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 - `LlmAgentConfig::agent_memory_config` is host-visible only: `ReActAgentConfig` has no memory-toggle field, so it does not change the composed `ReAct` configuration.
 - `rails::StageFlags` is a type alias of `openjiuwen_security::ScanTargets`.
 - `react::model_step::ModelReply` is public because `RailContext::response` exposes it; the loop calls the model through `call_model_streaming` (the session-scoped path that emits `llm_reasoning`/`llm_output`/`llm_usage` frames) and uses `call_model` only for the tool-free `FinalAnswer` finalization call.
-- `controller`, `evolve`, `kv_cache`, `operator`, and `prompt_pack` are implemented `pub mod` trees with their own `CONTEXT.md`; the crate root does not re-export their types, so reach them by module path.
+- The external memory provider is not a config field: `ReActAgentConfig` derives `Serialize`/`Deserialize`/`PartialEq`, so the provider lives in a `parking_lot::RwLock<Option<Arc<dyn MemoryProvider>>>` on the agent and in the run's immutable `AgentRuntime` snapshot.
+- `set_usage_analyzer`/`set_context_recorder` rebuild the context engine like `configure`: the replacement carries the installed analyzer/recorder but starts with no contexts, so recorded history is dropped; a run snapshots the engine it started with, and `configure` re-applies both, so instrumenting before or after it keeps the instrumentation.
+- A provider usage report is recorded under the deterministic `<session>#<iteration>` id (`usage::request_id`) in the `(session, provider, model)` scope, so a retried model call updates its entry instead of double counting (the engine rejects only blank ids).
+- `MemoryProvider::on_session_end` fires only for runs that created their own session (`AgentRun::is_owned`) and never for an interrupt pause, because the conversation is not over; a caller-supplied session is finalized through `end_memory_session`.
+- KV-cache affinity is off by default (`KVCacheAffinityConfig::default().enabled == false`), so `enable_kv_cache` with a default `KVCacheRuntimeConfig` installs an inert hook; `Redis`/`Distributed` answer the typed `Error::Unsupported` before anything is stored (an installed hook survives), `clear_kv_cache` detaches it, and provider-side prefetch/offload needs a hook built through `KVCacheModelCallHook::with_action_runtime`.
+- The crate-root promotion is additive: `openjiuwen_agent::controller::…` and `openjiuwen_agent::kv_cache::…` keep resolving, and the promoted names alias the same types.
+- `controller`, `evolve`, `kv_cache`, `operator`, and `prompt_pack` are implemented `pub mod` trees with their own `CONTEXT.md`; `controller` and `kv_cache` also promote their facade types to the crate root, while `evolve`, `operator`, and `prompt_pack` are reached by module path only.
 - The controller has two execution modes: `BaseController::invoke`/`stream` stay single-turn and in-process, while `start()` launches the background `TaskSchedulerLoop` that only runs tasks the shared `TaskManager` holds (or that a reasoner/host added). `stop()` aborts the loop and every in-flight task; `shutdown()` also drains.
 - Dependency scheduling is a documented extension: a task with `metadata["depends_on"] = [ids]` and status `Waiting` is promoted to `Submitted` once every dependency is `Completed`; Python declares the `waiting` status but never gates on it.
 - The background scheduler admits in deterministic priority-descending order (`created_seq`, then `task_id` tiebreaks), treats `max_concurrent_tasks = 0` as unlimited (documented divergence from Python's bug), and emits `all_tasks_processed` once per idle stretch unless `suppress_completion_signal` is set.
 - `TaskExecutor` pause/cancel hooks are defaulted, so every executor that does not support them keeps compiling; a `Submitted` cancel short-circuits to `Canceled`, terminal states are idempotent, and a resume flips `Paused` → `Submitted`.
 - `TaskQueue` (legacy `IntentDetectionController`) allows one running task per conversation: a new message aborts the previous handler fire-and-forget, cancels the tracked run, then enqueues. `GroupRouter` is optional; without one `send_to_agent`/`publish` return `Error::Config` naming the method (and agent).
+- `TaskQueue` is legacy-only (`BaseController` exposes no queue); `BaseController::scheduler_state()`/`running_tasks()`/`wake_scheduler()` are the live background-scheduler view, with `TaskSchedulerState::{Stopped, Running, Stopping}` derived from the running flag plus a live `TaskSchedulerLoop`.
 - `reasoner` is the task-operation layer behind Python's intent tools: `plan_ops` maps create/pause/resume/cancel/continue/supplement/modify intents, degrades to `Unknown` below `intent_confidence_threshold`, and `apply_task_ops` never aborts a batch.
 - The KV-cache action runtime is a separate seam from prefix bookkeeping: `prepare` returns once the prefetch provider call starts (not completes), `suspend`/`release` schedule offload/evict, offload/evict wait for the active-inference counter to reach zero, every provider error/timeout fails open, and the in-process backend exists for deterministic hosts/tests.
 - `KvCacheActionProvider` is the network boundary: real provider HTTP (Python's `model.prefetch_kvc`/`offload_kvc`/`evict_kvc`) is not reimplemented here; attach any provider implementation to `KVCacheActionRuntime`.
@@ -401,6 +489,8 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 - Not ported: the `before_steering_drain` rail hook (`RailEvent` has no variant for it and `openjiuwen-harness` matches that enum exhaustively; the loop drains the `SteeringQueue` at its own safe point, rail-free).
 - Not ported: the process-global `Runner.callback_framework`; `CallbackFramework` is a per-agent value owned by the host.
 - Not ported: KV-cache Redis/distributed prefix backends (`KVCacheBackend::runtime` returns `Error::Unsupported`) and vendor HTTP transports for prefetch/offload/evict — the action runtime is a trait seam with a deterministic in-process backend.
+- Not ported: the memory-provider backends themselves — this crate only bridges an `Arc<dyn MemoryProvider>` into the loop; vendor providers and their stores are deferred in `openjiuwen-memory`.
+- Not ported: tokenizer artifacts and provider-specific window policies behind the usage analyzer — measurement belongs to `openjiuwen-context`, and the agent installs the analyzer it is given.
 - Not ported: controller `event_timeout_ms`, `history_limit`, `expose_reasoning`, and `stream_first_frame_timeout_ms` enforcement (no stream host/context engine), and Python's `ReasonerConfig`/`ProactiveIdentifier`/`Reflector` configuration surface; `max_concurrent_tasks = 0` means unlimited and scheduler admission is deterministic (documented divergences).
 - Not ported: the ML-backed Metis learner (`MetisContextEvolveOperator::learn` is `Unsupported`), `approved_record_ids` subset approval, pending-change subject/trajectory/messages, and Python's `execute_updates` operator-map loop (callers drive operators directly).
 - Not ported: `MemoryRail`'s `ctx.extra["is_resume"]` skip guard and `_original_query` recording (the Rust loop sets neither), and the legacy `LLMController`'s per-iteration memory re-query (the ReAct path renders once per invoke).
@@ -408,7 +498,7 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 
 ## Test Strategy
 
-- Unit tests beside every module (898) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection and memory prompt variables, model-backup ordering, interrupt rail flows, tool-argument repair, parallel tool batching, callback dispatch ordering, steering FIFO/thread sharing, exposure/allowlist projection, client-tool registry, resilience backoff, final-request decisions, skill front matter/discovery/rail, multimodal part extraction, controller routing/intents/tasks/legacy controllers, task-manager filters/indexes/persistence, background scheduling/timeouts/cancellation/sentinel, executor pause/cancel, `TaskQueue` preemption, group routing, reasoner task ops, KV-cache identity/LRU/eviction/metadata plus the action runtime (non-blocking prefetch, idle-gated offload, fail-open, revision guard), operator tunables/state/propagation plus the legacy `LLMCall`, memory `max_retries`, experience preview/staging, `ReActAgentEvolve` parameter sync, and prompt-pack YAML + directory/front-matter loading.
+- Unit tests beside every module (936) cover the seams in isolation: card/`AgentInput`/`AgentOutput` serde, `match_answers`/`parse_approval`, prompt section ordering, rail registry dispatch, guardrail stages, memory recall injection and memory prompt variables, model-backup ordering, interrupt rail flows, tool-argument repair, parallel tool batching, callback dispatch ordering, steering FIFO/thread sharing, exposure/allowlist projection, client-tool registry, resilience backoff, final-request decisions, skill front matter/discovery/rail, multimodal part extraction, controller routing/intents/tasks/legacy controllers, task-manager filters/indexes/persistence, background scheduling/timeouts/cancellation/sentinel, executor pause/cancel, `TaskQueue` preemption, group routing, the controller scheduler facade and `group_router` round-trip, reasoner task ops, KV-cache identity/LRU/eviction/metadata plus the action runtime (non-blocking prefetch, idle-gated offload, fail-open, revision guard), the loop's KV-cache touch point, the memory provider rail/tools/prompt block/finalization gate, the usage identity helpers and telemetry buffer, operator tunables/state/propagation plus the legacy `LLMCall`, memory `max_retries`, experience preview/staging, `ReActAgentEvolve` parameter sync, and prompt-pack YAML + directory/front-matter loading.
 - `src/react/wiring/` holds the loop-integration suites for the six side seams (callbacks, steering, exposure/MCP/resilience, client tools, final-request check); they live under `src/` to observe crate-internal state (`react/wiring/CONTEXT.md`).
 - `tests/agent_card.rs` (16) pins the wire contract: `AgentCard` field set/`Card` trait/JSON round-trip, `AgentOutput` result-type strings and `state` frames, the absent-when-empty key shapes, Python-shaped result dicts, and the `AgentChunk` ↔ `StreamItem` bridge.
 - `tests/react_agent.rs` (12) drives the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
@@ -417,12 +507,18 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 - `tests/interrupt.rs` (8) covers the HITL contract: confirm pause shape and persistence, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as the tool result, two pending calls pausing once and resuming individually, and the streaming pause path emitting and mirroring its `__interaction__` frame.
 - `tests/llm_agent.rs` (7) covers config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, and interrupt pass-through.
 - `tests/workflow_agent.rs` (5) covers single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, and the no-workflow error.
-- The crate suite (898 unit + 59 integration + 5 doc tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
+- `tests/memory_provider.rs` (9) drives the provider end to end: prompt block and prefetch in the model window, an empty block leaving the identity alone, schema-mounted tools and dispatch, `sync_turn` plus `on_session_end` for an owned session, a supplied session left unfinalized, failing provider calls not changing the output, an unavailable provider still mounted, `clear_memory_provider` dropping the rail but keeping the tools, and no-provider `end_memory_session`.
+- `tests/usage.rs` (7) pins the usage seam: pre/post-call `context.usage` frames with their snapshots and session mirror, one buffered snapshot per model call on a plain `invoke`, the provider report reaching the KV-cache rollup, the analyzer-less run (pre-call frame, no snapshot, `Error::Config` from `usage_report`), `usage_report` reconciling a supplied provider total, and `configure` keeping an installed analyzer/recorder.
+- `tests/kv_cache_seam.rs` (6) pins the KV-cache seam: the default config installing an inert hook, enabled affinity recording the prefix and input tokens, an action runtime prefetching and releasing its lease without changing the answer, `Redis`/`Distributed` surfacing `Error::Unsupported` while the hook survives, an unchanged run without a hook, and the promoted types reachable from the crate root.
+- The crate suite (936 unit + 81 integration + 5 doc tests) is offline and deterministic on `ScriptedModel`; no network and no wall-clock assertions beyond short timeouts.
 
 ## Routing Table
 
 - `./src/react/` → `ReActAgent`, config, iteration loop, model step, exposure, frames, hooks, pause/resume (`react/CONTEXT.md`)
 - `./src/react/agent_loop/` → the invoke loop (`mod.rs`) and its unit tests (`agent_loop/CONTEXT.md`)
+- `./src/react/agent_loop/kv_cache.rs` → best-effort KV-cache affinity around each model call (`prepare`/`finish`, no-hook no-ops)
+- `./src/memory_provider/` → external long-term-memory provider rail, provider tools, owned-session finalization (`memory_provider/CONTEXT.md`)
+- `./src/usage/` → usage telemetry seam: analyzer/recorder helpers, usage-report identity, `UsageTelemetry` buffer (`usage/CONTEXT.md`)
 - `./src/react/wiring/` → `#[cfg(test)]` loop-integration suites for the six side seams (`react/wiring/CONTEXT.md`)
 - `./src/abilities/` → ability manager, argument repair, tool execution (`abilities/CONTEXT.md`)
 - `./src/rails/` → rail trait/context/registry and built-in rails (`rails/CONTEXT.md`)
@@ -430,11 +526,11 @@ These modules are `pub mod` in `lib.rs` but not re-exported from the crate root;
 - `./src/callbacks/` → lifecycle callback events, payloads, framework (`callbacks/CONTEXT.md`)
 - `./src/steering/` → steering queue drained by the loop (`steering/CONTEXT.md`)
 - `./src/skills/` → Markdown skill library, manager, `SkillRail` (`skills/CONTEXT.md`)
-- `./src/controller/` → controller stack: turn loop, executors, intent recognition, legacy `IntentDetectionController` (`controller/CONTEXT.md`)
+- `./src/controller/` → controller stack: turn loop, executors, intent recognition, legacy `IntentDetectionController`, scheduler/group facade (`controller/CONTEXT.md`; facade types promoted to the crate root)
 - `./src/controller/task_manager/` → shared task store: indexes, filters, hierarchy, claim/persistence (`task_manager/CONTEXT.md`)
 - `./src/controller/reasoner/` → intent → task-op planning and application (`reasoner/CONTEXT.md`)
 - `./src/controller/executors/` → executor trait/registry, built-ins, and the background scheduler (`executors/CONTEXT.md`)
-- `./src/kv_cache/` → cache identity/prefix runtime/metadata, the model-call hook, and the prefetch/offload action runtime (`kv_cache/CONTEXT.md`)
+- `./src/kv_cache/` → cache identity/prefix runtime/metadata, the model-call hook, and the prefetch/offload action runtime (`kv_cache/CONTEXT.md`; facade types promoted to the crate root)
 - `./src/operator/` → tunable operators, rich update/apply results, experience staging (`operator/CONTEXT.md`)
 - `./src/operator/legacy/` → the executing `LLMCall` wrapper distinct from `LLMCallOperator` (`operator/legacy/CONTEXT.md`)
 - `./src/evolve/` → `ReActAgentEvolve` and operator parameter sync (`evolve/CONTEXT.md`)

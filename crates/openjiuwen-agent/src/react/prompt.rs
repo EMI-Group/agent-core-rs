@@ -83,7 +83,29 @@ pub(crate) fn build_system(
     input: &AgentInput,
     extra_fields: Option<&Map<String, Value>>,
 ) -> BaseMessage {
-    BaseMessage::system(build_identity(config, input, extra_fields))
+    build_system_with_block(config, input, extra_fields, None)
+}
+
+/// Wraps [`build_identity`] and appends `block` to the resulting system message.
+///
+/// `block` is the external memory provider's `system_prompt_block`: provider
+/// guidance belongs in the identity section, so it follows the rendered
+/// template text after a blank line. A blank block changes nothing, and a block
+/// with no rendered identity becomes the whole content.
+#[allow(dead_code)] // used by the loop's prompt construction
+pub(crate) fn build_system_with_block(
+    config: &ReActAgentConfig,
+    input: &AgentInput,
+    extra_fields: Option<&Map<String, Value>>,
+    block: Option<&str>,
+) -> BaseMessage {
+    let identity = build_identity(config, input, extra_fields);
+    let content = match block.map(str::trim).filter(|block| !block.is_empty()) {
+        Some(block) if identity.trim().is_empty() => block.to_owned(),
+        Some(block) => format!("{identity}\n\n{block}"),
+        None => identity,
+    };
+    BaseMessage::system(content)
 }
 
 #[cfg(test)]

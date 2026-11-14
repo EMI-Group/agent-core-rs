@@ -29,7 +29,7 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_common::utils::id::uuid_v4;
 use openjiuwen_session::interaction::InteractionResponse;
 use openjiuwen_session::Session;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -107,12 +107,29 @@ pub(super) struct Inner {
 /// See the [crate-level docs](crate::hitl) for the hub's Python correspondence
 /// and in-process boundaries, and this module's docs for what a hub owns.
 /// Cloning shares one table.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct InteractionHub {
     /// The run table.
     inner: Arc<Mutex<Inner>>,
     /// The optional monitor mirrored with the hub's transitions.
-    monitor: Option<Arc<RunMonitor>>,
+    ///
+    /// Behind a lock so [`InteractionHub::attach_monitor`] can re-point a hub a
+    /// host already holds (the runner re-points it when a host installs its own
+    /// monitor); every read takes a short guard and never holds it across an
+    /// `.await`.
+    monitor: RwLock<Option<Arc<RunMonitor>>>,
+}
+
+impl Clone for InteractionHub {
+    /// Clones share the run table and copy the monitor setting as it is now, so a
+    /// later [`InteractionHub::attach_monitor`] on the original does not retroact
+    /// onto an earlier clone (the behaviour documented on `with_monitor`).
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            monitor: RwLock::new(self.monitor.read().clone()),
+        }
+    }
 }
 
 impl InteractionHub {
@@ -122,20 +139,33 @@ impl InteractionHub {
         Self::default()
     }
 
+    /// Attaches (or, with `None`, detaches) the monitor the hub mirrors its state
+    /// transitions into, returning the previously attached monitor.
+    ///
+    /// Runtime counterpart of [`InteractionHub::with_monitor`]: the runner calls
+    /// it to re-point the installed hub when a host installs its own monitor with
+    /// [`Runner::set_monitor`](crate::Runner::set_monitor). Only this hub observes
+    /// the change; a clone made earlier keeps the setting it was cloned with.
+    #[must_use]
+    pub fn attach_monitor(&self, monitor: Option<Arc<RunMonitor>>) -> Option<Arc<RunMonitor>> {
+        std::mem::replace(&mut *self.monitor.write(), monitor)
+    }
+
     /// Attaches a monitor the hub mirrors its state transitions into.
     ///
     /// Only this hub (and clones made afterwards) observe the monitor; a clone
-    /// made earlier keeps its own setting.
+    /// made earlier keeps its own setting. Builder form of
+    /// [`InteractionHub::attach_monitor`].
     #[must_use]
-    pub fn with_monitor(mut self, monitor: Arc<RunMonitor>) -> Self {
-        self.monitor = Some(monitor);
+    pub fn with_monitor(self, monitor: Arc<RunMonitor>) -> Self {
+        let _ = self.attach_monitor(Some(monitor));
         self
     }
 
     /// Returns the attached monitor, if any.
     #[must_use]
     pub fn monitor(&self) -> Option<Arc<RunMonitor>> {
-        self.monitor.clone()
+        self.monitor.read().clone()
     }
 
     /// Registers a run and returns its handle.
@@ -186,7 +216,7 @@ impl InteractionHub {
             previous.watcher.cancel();
         }
 
-        if let Some(monitor) = self.monitor.as_ref() {
+        if let Some(monitor) = self.monitor() {
             let kind = if team_name.is_some() {
                 RunKind::Team
             } else {
@@ -225,7 +255,7 @@ impl InteractionHub {
         entry.watcher.cancel();
         drop(entry);
 
-        if let Some(monitor) = self.monitor.as_ref() {
+        if let Some(monitor) = self.monitor() {
             match monitor.snapshot(run_id) {
                 Ok(status) if !status.is_terminal() => {
                     if let Err(error) = monitor.finish(run_id, RunOutcome::completed()) {
@@ -618,7 +648,7 @@ impl InteractionHub {
 
     /// Mirrors `phase` into the monitor, logging a rejected transition.
     fn mirror(&self, run_id: &str, phase: RunPhase) {
-        let Some(monitor) = self.monitor.as_ref() else {
+        let Some(monitor) = self.monitor() else {
             return;
         };
         if let Err(error) = monitor.update(run_id, phase, Value::Null) {
@@ -637,7 +667,7 @@ impl InteractionHub {
     /// `finished_at` stamped and enters the retention queue. A monitor that does
     /// not track the run, or that already finished it, is logged and ignored.
     fn mirror_cancelled(&self, run_id: &str) {
-        let Some(monitor) = self.monitor.as_ref() else {
+        let Some(monitor) = self.monitor() else {
             return;
         };
         match monitor.snapshot(run_id) {

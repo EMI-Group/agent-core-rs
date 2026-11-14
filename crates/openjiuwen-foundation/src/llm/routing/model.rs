@@ -115,6 +115,16 @@ impl RoutingEntry {
             },
             context_window: caller.context_window.or(base.context_window),
             reasoning: caller.reasoning.clone().or_else(|| base.reasoning.clone()),
+            // The client-side purpose and diagnostic metadata are hints about the
+            // caller's intent, so they are forwarded even when the route carries
+            // none: a failover attempt is still the same logical call.
+            purpose: caller.purpose.clone().or_else(|| base.purpose.clone()),
+            metadata: base
+                .metadata
+                .iter()
+                .chain(caller.metadata.iter())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             tools: caller.tools.clone().or_else(|| base.tools.clone()),
             tool_choice: caller
                 .tool_choice

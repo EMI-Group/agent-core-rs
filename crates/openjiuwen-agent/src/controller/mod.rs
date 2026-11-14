@@ -34,6 +34,20 @@
 //!   configuration error of [`group::send_without_group`] /
 //!   [`group::publish_without_group`].
 //!
+//! A host that only uses the public API reaches those seams directly:
+//! [`BaseController::task_manager`] is the shared task store,
+//! [`BaseController::scheduler_state`] reports a [`TaskSchedulerState`],
+//! [`BaseController::wake_scheduler`] asks for an immediate scan,
+//! [`BaseController::running_tasks`] lists the scheduler's in-flight runs, and
+//! [`BaseController::with_group`] / [`BaseController::group_router`] wire and
+//! read the group router. The scheduling knobs are set through the
+//! [`ControllerConfig`] builders ([`ControllerConfig::with_max_concurrent_tasks`],
+//! [`ControllerConfig::with_schedule_interval`],
+//! [`ControllerConfig::with_task_timeout`]). The per-conversation [`TaskQueue`]
+//! is legacy-scoped: [`BaseController`] dispatches each turn synchronously and
+//! tracks no per-conversation turn, so the queue lives only on
+//! [`IntentDetectionController`].
+//!
 //! # Modules
 //!
 //! - [`schema`] — the data model: payload frames, events, intents, tasks,
@@ -87,7 +101,10 @@ pub mod queue;
 pub mod reasoner;
 pub mod schema;
 pub mod task_manager;
-pub use base::{BaseController, Controller, EventHandler, EventHandlerOutcome, TASKS_STATE_KEY};
+pub use base::{
+    BaseController, Controller, EventHandler, EventHandlerOutcome, TaskSchedulerState,
+    TASKS_STATE_KEY,
+};
 pub use config::{ControllerConfig, DefaultResponse};
 pub use executors::{
     ControllerAgent, ExecutorInfo, LLMController, SessionProvider, TaskContext, TaskExecutor,

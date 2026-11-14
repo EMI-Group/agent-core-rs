@@ -183,6 +183,12 @@ impl Default for ControllerConfig {
         }
     }
 }
+/// Builder helpers for the controller's behaviour knobs.
+///
+/// Dependency gating has no builder here because it has no field: the
+/// background scheduler reads the `depends_on` array off each task's metadata
+/// (`metadata["depends_on"]`), so a host configures it per task, not per
+/// controller.
 impl ControllerConfig {
     /// Builds a configuration with the Python defaults; same as [`Default`].
     #[must_use]
@@ -237,6 +243,28 @@ impl ControllerConfig {
         self.suppress_completion_signal = suppress;
         self
     }
+    /// Sets how many tasks the background scheduler runs at once (`0` =
+    /// unlimited).
+    #[must_use]
+    pub fn with_max_concurrent_tasks(mut self, max_concurrent_tasks: usize) -> Self {
+        self.max_concurrent_tasks = max_concurrent_tasks;
+        self
+    }
+    /// Sets the background scheduler's scan interval in milliseconds.
+    ///
+    /// A submit or a completion wakes the loop sooner; this is the longest it
+    /// waits between scans.
+    #[must_use]
+    pub fn with_schedule_interval(mut self, schedule_interval_ms: u64) -> Self {
+        self.schedule_interval_ms = schedule_interval_ms;
+        self
+    }
+    /// Sets the per-task timeout in milliseconds; `None` disables it.
+    #[must_use]
+    pub fn with_task_timeout(mut self, task_timeout_ms: Option<u64>) -> Self {
+        self.task_timeout_ms = task_timeout_ms;
+        self
+    }
     /// Whether `intent_type` is in [`intent_type_list`](Self::intent_type_list).
     #[must_use]
     pub fn accepts(&self, intent_type: IntentType) -> bool {
@@ -287,6 +315,22 @@ mod tests {
         assert!(restricted.accepts(IntentType::CancelTask));
         assert!(!restricted.accepts(IntentType::CreateTask));
     }
+    #[test]
+    fn scheduler_builders_set_their_fields() {
+        let config = ControllerConfig::new()
+            .with_max_concurrent_tasks(1)
+            .with_schedule_interval(25)
+            .with_task_timeout(Some(500));
+        assert_eq!(config.max_concurrent_tasks, 1);
+        assert_eq!(config.schedule_interval_ms, 25);
+        assert_eq!(config.task_timeout_ms, Some(500));
+        assert_eq!(config.clone().with_task_timeout(None).task_timeout_ms, None);
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["max_concurrent_tasks"], json!(1));
+        assert_eq!(wire["schedule_interval_ms"], json!(25));
+        assert_eq!(wire["task_timeout_ms"], json!(500));
+    }
+
     #[test]
     fn default_response_helpers() {
         let unset = DefaultResponse::new();
