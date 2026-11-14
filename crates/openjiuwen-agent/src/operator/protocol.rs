@@ -160,10 +160,14 @@ mod tests {
         assert_eq!(plain.effect, UpdateEffect::State);
         assert_eq!(plain.payload, json!("be terse"));
 
-        let experience = normalize_update_value(json!({"text": "always retry"}), Some("experiences"));
+        let experience =
+            normalize_update_value(json!({"text": "always retry"}), Some("experiences"));
         assert_eq!(experience.mode, UpdateMode::Append);
         assert_eq!(experience.effect, UpdateEffect::PendingChange);
-        assert_eq!(experience.change_type.as_deref(), Some(SKILL_EXPERIENCE_ENTRY));
+        assert_eq!(
+            experience.change_type.as_deref(),
+            Some(SKILL_EXPERIENCE_ENTRY)
+        );
         assert_eq!(
             experience.metadata.get("change_type"),
             Some(&json!(SKILL_EXPERIENCE_ENTRY))
@@ -203,7 +207,10 @@ mod tests {
             ),
         ]);
         assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].0, ("react_llm".to_owned(), "system_prompt".to_owned()));
+        assert_eq!(
+            updates[0].0,
+            ("react_llm".to_owned(), "system_prompt".to_owned())
+        );
         assert_eq!(updates[0].1, UpdateValue::set(json!("terse")));
         assert_eq!(updates[1].1.effect, UpdateEffect::PendingChange);
     }

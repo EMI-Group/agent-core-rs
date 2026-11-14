@@ -372,7 +372,13 @@ mod tests {
         let names: Vec<&str> = tunables.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(
             names,
-            ["top_k", "threshold", "memory_scope_id", "enabled", "max_retries"]
+            [
+                "top_k",
+                "threshold",
+                "memory_scope_id",
+                "enabled",
+                "max_retries"
+            ]
         );
         assert_eq!(tunables[4].kind, TunableKind::Number);
         assert_eq!(
@@ -421,7 +427,9 @@ mod tests {
         assert_eq!(operator.threshold(), 0.0);
         operator.set_parameter("threshold", json!(2.0)).unwrap();
         assert_eq!(operator.threshold(), 1.0);
-        operator.set_parameter("max_retries", json!(10_000)).unwrap();
+        operator
+            .set_parameter("max_retries", json!(10_000))
+            .unwrap();
         assert_eq!(operator.max_retries(), MAX_RETRIES);
         operator.set_parameter("max_retries", json!(-1)).unwrap();
         assert_eq!(operator.max_retries(), MAX_RETRIES);
@@ -430,10 +438,7 @@ mod tests {
             .iter()
             .map(|(target, _)| target.clone())
             .collect();
-        assert_eq!(
-            targets,
-            ["top_k", "threshold", "threshold", "max_retries"]
-        );
+        assert_eq!(targets, ["top_k", "threshold", "threshold", "max_retries"]);
         assert!(!operator.set_parameter("unknown", json!(1)).unwrap().applied);
         assert!(
             !operator
