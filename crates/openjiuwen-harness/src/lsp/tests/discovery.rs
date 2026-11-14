@@ -462,23 +462,37 @@ fn an_unreadable_cargo_manifest_is_logged_and_still_falls_back() {
         .with_root_markers(["Cargo.toml"]);
     let index = index(root, vec![config]);
 
-    let log = std::sync::Arc::new(EventLog::default());
-    let resolved =
-        tracing::subscriber::with_default(SharedLog(std::sync::Arc::clone(&log)), || {
-            // The callsite may have been cached as "never" by an earlier test running under
-            // the no-op dispatcher; rebuild the cache so this subscriber sees the event.
-            tracing::callsite::rebuild_interest_cache();
-            index.resolve(&root.join("crate/src/lib.rs"))
-        });
     // The unreadable manifest counts as "not a workspace root", so inference keeps walking up
     // to the real workspace manifest: the fallback behaviour is unchanged.
-    let resolved = resolved.expect("the marker directory still resolves the server");
+    let resolved = index
+        .resolve(&root.join("crate/src/lib.rs"))
+        .expect("the marker directory still resolves the server");
     assert_eq!(
         resolved.key.root,
         root.join("crate"),
         "an unreadable manifest is not a workspace root, so inference stops at it"
     );
-    let entries = log.entries();
+    // A callsite's interest is cached process-wide, and the other tests in this binary run
+    // under the no-op dispatcher, so a concurrent re-evaluation can cache it as "never"
+    // between the rebuild and the event. Retry a bounded number of times instead of asserting
+    // on a single attempt, and let the final failure print what was captured.
+    let log = std::sync::Arc::new(EventLog::default());
+    let mut entries = log.entries();
+    for _ in 0..20 {
+        tracing::subscriber::with_default(SharedLog(std::sync::Arc::clone(&log)), || {
+            tracing::callsite::rebuild_interest_cache();
+            let _ = index.resolve(&root.join("crate/src/lib.rs"));
+        });
+        entries = log.entries();
+        let captured = entries.iter().any(|(level, line)| {
+            *level == tracing::Level::DEBUG
+                && line.contains("cannot read Cargo.toml")
+                && line.contains("Cargo.toml")
+        });
+        if captured {
+            break;
+        }
+    }
     assert!(
         entries
             .iter()
