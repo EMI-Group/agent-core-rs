@@ -42,6 +42,7 @@ use crate::workspace::Workspace;
 
 use super::factory::{default_goal_rail, is_goal_tool_name, GOAL_RAIL_NAME};
 use super::prompt_rail::{PromptRail, PromptState};
+use super::rail_events::{RailEventBus, RailEventDrain};
 use super::{subagent_factory, DeepAgent, Driver};
 
 /// Prompt priority of the identity section (matches [`identity`]).
@@ -281,6 +282,9 @@ impl DeepAgentBuilder {
         for rail in extra_rails {
             rails.register(rail);
         }
+        // Registered last so it fires after every rail of equal (lowest) priority.
+        let rail_events = Arc::new(RailEventBus::default());
+        rails.register(Arc::new(RailEventDrain::new(rail_events.clone())));
 
         let inner = Arc::new(ReActAgent::new(card.clone()));
         let model_slot = Arc::new(RwLock::new(model.clone()));
@@ -310,6 +314,7 @@ impl DeepAgentBuilder {
                 tokio_util::sync::CancellationToken::new(),
             )),
             state: crate::agent::RoundState::new(),
+            rail_events,
             plan_mode: Arc::new(RwLock::new(plan_mode_for(&config))),
             last_session: Arc::new(parking_lot::Mutex::new(None)),
             last_state: Arc::new(parking_lot::Mutex::new(

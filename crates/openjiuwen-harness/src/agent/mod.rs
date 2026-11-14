@@ -45,6 +45,7 @@
 mod builder;
 mod factory;
 mod prompt_rail;
+mod rail_events;
 mod round;
 mod state_store;
 mod subagent_factory;
@@ -72,8 +73,8 @@ use crate::permission::{PermissionEngine, PermissionHost};
 use crate::prompts::{mode_instructions, SectionName};
 use crate::rails::{HarnessRail, HarnessRailAdapter, HarnessRailRegistry};
 use crate::schema::{
-    AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionPhase, PlanModeState,
-    SendInputRequest,
+    AgentMode, DeepAgentConfig, DeepAgentState, InputDispatchMode, InteractionEvent,
+    InteractionPhase, PlanModeState, SendInputRequest,
 };
 use crate::subagents::SubAgentRuntime;
 use crate::task_loop::{
@@ -86,6 +87,10 @@ pub use factory::{
     apply_deep_agent_parts, create_deep_agent, resolve_deep_agent_parts, DeepAgentParts,
 };
 pub use prompt_rail::{PromptRail, PromptState};
+pub use rail_events::{
+    drain_rail_events, RailEventBus, RailEventDrain, DEFAULT_RAIL_EVENT_CAPACITY,
+    RAIL_EVENTS_EXTRA_PREFIX, RAIL_EVENT_DRAIN_NAME, RAIL_EVENT_DRAIN_PRIORITY,
+};
 pub use round::{normalize_inputs, RoundExecutorHandle, RoundState};
 pub use state_store::{clear_state, load_state, save_state, SESSION_STATE_KEY};
 pub use subagent_factory::DeepAgentSubAgentFactory;
@@ -146,6 +151,8 @@ pub struct DeepAgent {
     cancelled: Arc<Mutex<CancellationToken>>,
     /// Last round output and cumulative token usage.
     state: Arc<RoundState>,
+    /// Events queued by rails, drained by [`RailEventDrain`] after every firing point.
+    rail_events: Arc<RailEventBus>,
     /// Plan-mode bookkeeping.
     plan_mode: Arc<RwLock<PlanModeState>>,
     /// Session of the most recent invocation, when one was supplied.
@@ -170,6 +177,8 @@ impl DeepAgent {
         let queues = LoopQueues::default();
         let rails = HarnessRailRegistry::new();
         rails.register(Arc::new(PromptRail::new(prompt.clone(), queues.clone())));
+        let rail_events = Arc::new(RailEventBus::default());
+        rails.register(Arc::new(RailEventDrain::new(rail_events.clone())));
         let inner = Arc::new(ReActAgent::new(card.clone()));
         builder::apply_react_config(&inner, &config, &prompt.system_text());
         for rail in rails.to_agent_rails() {
@@ -193,6 +202,7 @@ impl DeepAgent {
             running: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(Mutex::new(CancellationToken::new())),
             state: RoundState::new(),
+            rail_events,
             plan_mode: Arc::new(RwLock::new(PlanModeState::default())),
             last_session: Arc::new(Mutex::new(None)),
             last_state: Arc::new(Mutex::new(DeepAgentState::default())),
@@ -467,6 +477,20 @@ impl DeepAgent {
         &self.rails
     }
 
+    /// Returns and removes the interaction events rails have queued so far.
+    ///
+    /// [`RailEventDrain`] moves every `InteractionEvent` a rail queued under
+    /// `harness.goal_events` or a [`RAIL_EVENTS_EXTRA_PREFIX`] key into the
+    /// agent's buffer after each rail firing point. A streaming caller observes
+    /// the same events as `__interaction__` frames; this entry point serves
+    /// hosts that invoke without a stream. Events survive across rounds and
+    /// invocations until they are collected, and the buffer keeps at most
+    /// [`DEFAULT_RAIL_EVENT_CAPACITY`] events, dropping the oldest first.
+    #[must_use]
+    pub fn drain_rail_events(&self) -> Vec<InteractionEvent> {
+        self.rail_events.drain()
+    }
+
     /// Mounts additional tools and refreshes the tools prompt section.
     ///
     /// Used by [`apply_deep_agent_parts`] (and upper layers that add tools after
@@ -508,6 +532,7 @@ impl DeepAgent {
             wired: self.wired.clone(),
             cancelled: self.cancelled.clone(),
             state: self.state.clone(),
+            rail_events: self.rail_events.clone(),
             plan_mode: self.plan_mode.clone(),
             last_session: self.last_session.clone(),
             last_state: self.last_state.clone(),
@@ -639,6 +664,8 @@ pub(crate) struct Driver {
     pub(crate) cancelled: Arc<Mutex<CancellationToken>>,
     /// Last round output and token usage.
     pub(crate) state: Arc<RoundState>,
+    /// Events queued by rails and drained after every firing point.
+    pub(crate) rail_events: Arc<RailEventBus>,
     /// Plan-mode bookkeeping.
     pub(crate) plan_mode: Arc<RwLock<PlanModeState>>,
     /// Session of the most recent invocation.
@@ -659,13 +686,28 @@ impl Driver {
 
     /// Runs one whole invocation: normalize, execute, persist, return.
     ///
-    /// `stream_tx` forwards stream frames when the caller wants them.
+    /// `stream_tx` forwards stream frames when the caller wants them; the rail
+    /// event bus forwards its drained events to the same channel for the
+    /// duration of the invocation and drops the sender afterwards.
     ///
     /// # Errors
     ///
     /// Propagates input validation, model-resolution, session-read and
     /// round-execution errors.
     pub(crate) async fn invoke_inner(
+        &self,
+        inputs: Value,
+        session: Option<Arc<dyn Session>>,
+        stream_tx: Option<UnboundedSender<Result<AgentChunk>>>,
+    ) -> Result<AgentOutput> {
+        self.rail_events.set_stream(stream_tx.clone());
+        let result = self.invoke_streaming(inputs, session, stream_tx).await;
+        self.rail_events.set_stream(None);
+        result
+    }
+
+    /// Body of [`Self::invoke_inner`] with the stream already installed.
+    async fn invoke_streaming(
         &self,
         inputs: Value,
         session: Option<Arc<dyn Session>>,
@@ -813,7 +855,8 @@ impl Driver {
             self.cancel_token(),
             session,
             self.state.clone(),
-        );
+        )
+        .with_rail_events(self.rail_events.clone());
         match stream_tx {
             Some(tx) => handle.with_stream_sender(tx),
             None => handle,
