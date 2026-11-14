@@ -687,4 +687,68 @@ mod tests {
             .unwrap();
         assert!(fs.supports_conditional_write());
     }
+
+    /// Serialises the cases that drain the process-global provider container caches.
+    static TEARDOWN_CACHE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn shutdown_remote_refuses_aio_with_the_gateway_reason() {
+        let error = shutdown_remote("aio", &SandboxSelector::all())
+            .await
+            .expect_err("the aio gateway owns its container lifetime");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_string();
+        assert!(message.contains("aio"), "{message}");
+        assert!(message.contains("gateway"), "{message}");
+        assert!(message.contains("no container-delete API"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_remote_names_the_supported_types_for_an_unknown_one() {
+        let error = shutdown_remote("nope", &SandboxSelector::all())
+            .await
+            .expect_err("'nope' is not a remote sandbox type");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_string();
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
+            assert!(message.contains(sandbox_type), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_remote_needs_a_selection() {
+        let error = shutdown_remote("jiuwenbox", &SandboxSelector::default())
+            .await
+            .expect_err("the default selector names nothing to release");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+
+    #[tokio::test]
+    async fn shutdown_remote_all_reports_every_type_in_order() {
+        let _guard = TEARDOWN_CACHE.lock().await;
+        let reports = shutdown_remote_all().await.unwrap();
+        assert_eq!(reports.len(), REMOTE_SANDBOX_TYPES.len());
+        for (report, sandbox_type) in reports.iter().zip(REMOTE_SANDBOX_TYPES) {
+            assert_eq!(report.sandbox_type, sandbox_type);
+        }
+        // Only the `aio` report may be a "cannot tear down" report, and only it carries
+        // no containers: the other two release whatever the process cache holds, which
+        // other tests in this binary may have populated.
+        let aio = &reports[0];
+        assert_eq!(aio.sandbox_type, "aio");
+        let reason = aio
+            .unsupported
+            .as_deref()
+            .expect("the aio report carries the reason it cannot be torn down");
+        assert!(reason.contains("gateway"), "{reason}");
+        assert!(aio.released_keys.is_empty(), "{:?}", aio.released_keys);
+        assert!(aio.deleted.is_empty(), "{:?}", aio.deleted);
+        for report in &reports[1..] {
+            assert!(
+                report.unsupported.is_none(),
+                "{} has a teardown path",
+                report.sandbox_type
+            );
+        }
+    }
 }

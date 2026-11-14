@@ -30,6 +30,9 @@ use super::*;
 use tokio::fs;
 use tokio::sync::Mutex;
 
+/// The conditional-write cases, kept in their own file so this one stays readable.
+mod conditional;
+
 /// An in-memory backend with scripted executions.
 #[derive(Default)]
 struct FakeBackend {
@@ -39,6 +42,10 @@ struct FakeBackend {
     search_entries: Mutex<Vec<RemoteEntry>>,
     executions: Mutex<Vec<ExecResult>>,
     requests: Mutex<Vec<ExecRequest>>,
+    /// `(path, bytes)` of every successful write, in order.
+    writes: Mutex<Vec<(String, usize)>>,
+    /// Number of `read_bytes` calls, so a test can prove a path was never read.
+    reads: Mutex<usize>,
 }
 
 impl FakeBackend {
@@ -63,6 +70,16 @@ impl FakeBackend {
 
     async fn contents(&self, path: &str) -> Option<Vec<u8>> {
         self.files.lock().await.get(path).cloned()
+    }
+
+    /// Every write the backend accepted, as `(path, bytes written)`.
+    async fn writes(&self) -> Vec<(String, usize)> {
+        self.writes.lock().await.clone()
+    }
+
+    /// How many times the backend was asked to read a path.
+    async fn read_count(&self) -> usize {
+        *self.reads.lock().await
     }
 
     async fn set_entries(&self, entries: Vec<RemoteEntry>) {
@@ -97,6 +114,7 @@ impl SandboxBackend for FakeBackend {
     }
 
     async fn read_bytes(&self, path: &str) -> std::result::Result<Vec<u8>, RemoteError> {
+        *self.reads.lock().await += 1;
         self.files
             .lock()
             .await
@@ -120,6 +138,11 @@ impl SandboxBackend for FakeBackend {
         } else {
             files.insert(path.to_string(), data.to_vec());
         }
+        drop(files);
+        self.writes
+            .lock()
+            .await
+            .push((path.to_string(), data.len()));
         Ok(())
     }
 
