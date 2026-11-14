@@ -9,6 +9,10 @@
 //! capture and turn tests live in the `capture` child module, and the ledger,
 //! executor, training-run and LoRA-repository suites in `sample`, `executor`,
 //! `training`, `training_stop` and `lora`.
+//!
+//! With the `redis` feature the `redis` child module drives every machine over
+//! `RedisOnlineStore` against the in-process fake `RESP2` server in
+//! `fake_redis`, so the same rules are proven on a durable backend offline.
 
 use std::sync::Arc;
 
@@ -23,7 +27,11 @@ use super::task::{
 
 mod capture;
 mod executor;
+#[cfg(all(test, feature = "redis"))]
+mod fake_redis;
 mod lora;
+#[cfg(feature = "redis")]
+mod redis;
 mod sample;
 mod support;
 mod training;

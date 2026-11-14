@@ -12,11 +12,37 @@
 //! [`TaskRegistry`](crate::online::TaskRegistry), [`SampleLedger`](crate::online::SampleLedger) and
 //! [`TrainingRunner`](crate::online::TrainingRunner) hold no state of their own: every operation is a
 //! sequence of [`OnlineStore`](crate::online::OnlineStore) primitives (string get/set, conditional set,
-//! set add/remove/members). That is deliberate — the in-memory store and the
-//! Redis store share one implementation of every rule, so a behaviour proven
-//! offline holds on Redis, and no rule lives in two places. Python gets the same
-//! effect with WATCH/MULTI pipelines; Rust gets it with a linearizable per-key
-//! seam plus [`OnlineStore::set_if_absent`](crate::online::OnlineStore::set_if_absent) on the create and claim paths.
+//! set add/remove/members). That is deliberate — [`MemoryOnlineStore`](crate::online::MemoryOnlineStore)
+//! and the Redis store share one implementation of every rule, so a behaviour
+//! proven offline holds on Redis, and no rule lives in two places. Python gets
+//! the same effect with WATCH/MULTI pipelines; Rust gets it with a linearizable
+//! per-key seam plus [`OnlineStore::set_if_absent`](crate::online::OnlineStore::set_if_absent) on
+//! the create and claim paths.
+//!
+//! # Backends
+//!
+//! [`MemoryOnlineStore`](crate::online::MemoryOnlineStore) is the default: process-local,
+//! deterministic, and what the test suites run on.
+//!
+//! The crate feature `redis` adds `RedisOnlineStore` (module `redis_store`),
+//! which maps the same primitives onto `GET`/`SET`/`SET … NX`/`DEL` and
+//! `SADD`/`SREM`/`SMEMBERS`/`SISMEMBER` over `openjiuwen_extensions::redis`, and
+//! writes every key under the prefix `openjiuwen:rl` (configurable; the durable
+//! key is `{prefix}:{key}`, so the layout below stays `rl:v1`-shaped underneath).
+//! Only `redis://` is supported: `rediss://` (no TLS stack is vendored) and
+//! cluster URLs are rejected with `Error::Unsupported` by the store's option
+//! validation.
+//!
+//! Durability has one operational caveat. The state machines compose several
+//! primitives per operation and the Redis backend issues them as ordered single
+//! commands, not as a Lua script or a `WATCH`/`MULTI` transaction: one
+//! serialized connection gives every caller read-your-writes, but concurrent
+//! processes can interleave between the commands of one sequence. The two
+//! single-flight paths stay correct because each is one command — `SET … NX` on
+//! `rl:v1:training_run:active` for the training claim and `SET … NX` on
+//! `rl:v1:task:{id}` for task start adoption. Everything else follows Python's
+//! rule: one writable service process per database. The HTTP routes over the
+//! machine are in [`routes`](crate::online::routes).
 //!
 //! # State machines
 //!
@@ -105,6 +131,8 @@ pub mod checkpoint;
 pub mod error;
 pub mod executor;
 pub mod lora;
+#[cfg(feature = "redis")]
+pub mod redis_store;
 pub mod routes;
 pub mod sample;
 pub mod store;
@@ -148,6 +176,8 @@ pub use executor::{
 pub use lora::{
     parse_version_literal, version_literal, LoraAvailability, LoraRepository, LoraVersion,
 };
+#[cfg(feature = "redis")]
+pub use redis_store::{RedisOnlineStore, RedisOnlineStoreOptions};
 pub use routes::RlServiceState;
 pub use sample::{SampleLedger, SampleRecord, SampleStatus, SampleStore};
 pub use store::{MemoryOnlineStore, OnlineStore};

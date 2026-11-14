@@ -6,7 +6,7 @@
 //! ships two implementations: [`NoopLoraActivator`], which records the request in
 //! the [`OnlineStore`] so tests and local runs stay deterministic, and
 //! [`UnsupportedLoraActivator`], which answers with a typed
-//! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) naming the
+//! [`Error::Unsupported`] naming the
 //! gateway that is missing.
 //!
 //! Both are idempotent: activating the same artifact twice succeeds, which is what
