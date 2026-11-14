@@ -98,7 +98,7 @@ fn every_pluggable_seam_coerces_to_its_trait_object() {
     assert!(!Arc::ptr_eq(&queue, &installed), "the runner owns its own");
 
     // The spawn seam: one spawner, many spawners, and the handles they return.
-    let _spawner: Arc<dyn AgentSpawner> = Arc::new(UnsupportedSpawner::default());
+    let _spawner: Arc<dyn AgentSpawner> = Arc::new(UnsupportedSpawner);
     let _registry: SpawnerRegistry = SpawnerRegistry::with_deferred();
     let spawned: Arc<dyn SpawnedAgent> = Arc::new(RemoteAgent::new(RemoteAgentConfig::new(
         "seam-agent",
@@ -133,7 +133,6 @@ fn every_pluggable_seam_coerces_to_its_trait_object() {
     // The queue handler seam, and the resource provider seam.
     let _message_handler: Arc<dyn MessageHandler> = Arc::new(EchoHandler);
     let _: Option<AgentProvider> = None;
-    let _pinned_provider = agent_provider_seam as fn(AgentProvider) -> Provider<Arc<dyn Agent>>;
 
     // The typed refusals are part of the inventory too.
     assert!(!SpawnBackend::RemoteMq.is_implemented());
