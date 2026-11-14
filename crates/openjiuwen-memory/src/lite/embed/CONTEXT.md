@@ -12,9 +12,9 @@ Everything runs offline: the cache has an in-memory backend, `SQLite` is an opti
 - `crate::lite::embed::content_hash(text: &str) -> String` — 16 lowercase hex characters of a 64-bit FNV-1a digest.
 - `crate::lite::embed::CacheKey { model: String, hash: String }` — `Debug + Clone + PartialEq + Eq + PartialOrd + Ord + Hash + Serialize + Deserialize`, usable as a `BTreeMap`/`HashMap` key.
 - `crate::lite::embed::EmbeddingCache` — `Clone` handle (`Arc`): `in_memory()`, `sqlite(SqlitePool)` (feature `sqlite`), `is_persistent()`, `get(model, hash)`, `put(model, hash, vector)`, `len()`, `is_empty()`, `clear()`.
-- `crate::lite::embed::IndexedChunk { id: String, chunk: MemChunk, vector: Option<Vec<f32>> }` — `id` is `"<document>:<start_line>:<end_line>"`.
+- `crate::lite::embed::IndexedChunk { id: String, document: String, chunk: MemChunk, vector: Option<Vec<f32>> }` — `id` is `"<document>:<start_line>:<end_line>"` and `document` is the source key the chunk was cut from (a fact name, or `"<path>:<line>"` for a session record).
 - `crate::lite::embed::EmbeddingStats { chunks: usize, embedded: usize, cached: usize, dimension: Option<usize> }` — what one `reindex` pass did.
-- `crate::lite::embed::ScoredChunk { id: String, chunk: MemChunk, similarity: f32 }` — one recall hit with its `0.0..=1.0` similarity.
+- `crate::lite::embed::ScoredChunk { id: String, document: String, chunk: MemChunk, similarity: f32 }` — one recall hit with its `0.0..=1.0` similarity; `id` and `document` carry the same two keys as `IndexedChunk`.
 - `crate::lite::embed::EmbeddingIndex` — `Clone`: `new(model, cache)`, `model()`, `len()`, `is_empty()`, `chunks()`, `clear()`, `reindex(&dyn Embedding, &[(String, String)], &ChunkingConfig)`, `search(&dyn Embedding, &str, limit)`.
 - `crate::lite::embed::cosine_similarity(left: &[f32], right: &[f32]) -> f32` — `-1.0..=1.0`, `0.0` when not comparable.
 - `crate::lite::embed::similarity_from_cosine(cosine: f32) -> f32` — `(cosine + 1) / 2` clamped to `0.0..=1.0`.
@@ -24,6 +24,7 @@ Everything runs offline: the cache has an in-memory backend, `SQLite` is an opti
 - No new dependencies: the cache key hash is a locally implemented 64-bit FNV-1a formatted as 16 hex characters, standing in for Python's SHA-256 digest truncated to the same shape.
 - The `sqlite` feature gates exactly `EmbeddingCache::sqlite`, the `lite_embedding_cache` table DDL, the vector blob codec, and the SQLite test module; every other path compiles and is tested without the feature.
 - Cache key composition is `(embedding.model_name(), content_hash(chunk.text))`; `EmbeddingIndex::model()` is a label only and never a cache key part, and query vectors from `embed_query` are never cached.
+- `reindex` takes `(document key, content)` pairs and keeps the key on every chunk it cuts: the local store passes a fact name for a fact and `"<path>:<line>"` for a session record, and `search` returns the same key on `ScoredChunk::document`, so a caller maps a hit back to its source without parsing the id.
 - `chunk_markdown` never splits a line, an oversized line becomes its own chunk, the overlap is the longest suffix of the flushed chunk that fits the overlap budget, and `start_line` is recomputed as `line_number - overlap.len()`; empty content yields no chunks.
 - `blend` clamps both scores to `0.0..=1.0`, treats non-finite or negative weights as `0.0`, renormalizes by the weight sum, returns `max(semantic, keyword)` when both weights are zero, and never returns `NaN`.
 - `cosine_similarity` returns `0.0` for a dimension mismatch, an empty slice, a zero norm, or a non-finite result; `search` scores a chunk without a vector, or with one of another dimension, as `similarity = 0.0` instead of dropping it.
@@ -32,7 +33,7 @@ Everything runs offline: the cache has an in-memory backend, `SQLite` is an opti
 - Errors are `openjiuwen_common::error::{Error, Result}`: `Validation` for a bad config or blank query, `Memory` for a corrupt cache row or a model returning the wrong vector count, `External` (source preserved) for `sqlx` failures, and the model's own kind when embedding fails; nothing is swallowed.
 - No `unsafe`, no `println!`/`eprintln!`; diagnostics use `tracing` with target `openjiuwen_memory::lite::embed`; no `unwrap`/`expect` outside tests.
 - A `parking_lot` mutex only guards the in-memory map and is never held across an `.await`; the `SqlitePool` is cheaply cloned.
-- `index.rs` is ~880 lines because its 21 tests live in-file (the implementation half is ~390 lines); `cache.rs` stays under 700 and `chunk.rs` under 450.
+- `index.rs` is 895 lines because its 21 tests live in-file (the implementation half is about 390 lines); `cache.rs` stays under 700 and `chunk.rs` under 450.
 ## Routing Table
 - `./mod.rs` → module documentation, submodule declarations, public re-exports, the tracing `TARGET`
 - `./chunk.rs` → `ChunkingConfig`, `MemChunk`, `estimate_tokens`, `chunk_markdown`, the chunking algorithm and its 15 unit tests

@@ -66,5 +66,5 @@ The module owns append-only writes, recursive discovery, tolerant decoding, chun
 - No per-session scoping and no `MemoryScope` filtering; the store is rooted at one memory root.
 - No watcher or background session sync in this module (`lite::sync` owns caller-driven triggers).
 - No deletion, compaction, rotation, or retention policy for logs.
-- No embedding index or cosine similarity; `SessionHit::similarity` is always `0.0`.
-- Session logs are not yet merged into `daily_memory` rollups or the `MEMORY.md` index by this module.
+- No embedding index or cosine similarity in this module: `rank_chunks` sets `SessionHit::similarity` to `0.0` (the store's `search_sessions` layers the optional semantic signal on top through `crate::lite::local::session_mode`).
+- Session logs are never copied into `MEMORY.md`/`USER.md`; they are their own recall surface, and `crate::lite::daily` composes their timestamped lines into `daily_memory` rollups.

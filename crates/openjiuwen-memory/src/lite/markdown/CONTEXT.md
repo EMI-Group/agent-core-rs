@@ -4,14 +4,14 @@
 
 The Markdown source of truth of the lite coding memory: one `MEMORY.md` document per scope, with a `---` front-matter block, a title, and one section per coding-fact type.
 Parsing is total for free-form input; rendering emits the single canonical shape that parsing round-trips byte for byte.
-Split from a single `markdown.rs` into a directory module without behaviour change; the public paths `crate::lite::markdown::MarkdownMemory` and `crate::lite::markdown::FrontMatter` are unchanged.
+The directory splits the format in three: `front_matter.rs` owns the `---` block, `document.rs` owns the document model and the fact entries, and `tests.rs` holds the contract tests; the public paths are `crate::lite::markdown::MarkdownMemory` and `crate::lite::markdown::FrontMatter`.
 
 ## API Surface
 
 - `crate::lite::markdown::MarkdownMemory` — `new`, `parse`, `render`, `scope`/`with_scope`/`set_scope`, `front_matter`/`with_front_matter`, `title`/`with_title`/`set_title`, `upsert_fact`, `remove`, `fact`, `facts`, `is_empty`.
 - `crate::lite::markdown::FrontMatter` — `new`, `get`, `insert`, `remove`, `iter`, `len`, `is_empty`.
 - `mod.rs` re-exports both types and holds the module documentation (format, normalization rules).
-- `front_matter` is crate-internal: the four schema constants and `parse_lines`/`render` are `pub(super)` so only the document module can reach them.
+- `front_matter` is crate-internal: the four schema constants and `parse_lines`/`render` are `pub(super)`, so only code in `lite::markdown` (the document module and the tests) can reach them.
 
 ## Constraints
 

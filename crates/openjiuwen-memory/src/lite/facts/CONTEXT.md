@@ -4,7 +4,7 @@
 
 Per-fact Markdown files under `facts/` plus the `MEMORY.md`/`USER.md` rendered index split, porting the file layout of Python `openjiuwen.core.memory.lite` (`frontmatter.py`, the per-fact `.md` files, and the summary index) to async Rust.
 `facts/` is the source of truth: one Markdown file per coding fact, and the two top-level documents are derived views that may be regenerated at any time.
-The module owns the file and document formats only; scanning, re-import diffing, and index regeneration are caller-driven, so nothing here starts a task, timer, or watcher.
+The module owns the file and document formats only: `render_level`/`parse_level` produce and consume the two index documents as strings, and writing them to disk is the store's job (`crate::lite::local::facts_mode`); scanning, re-import diffing, and index regeneration are caller-driven, so nothing here starts a task, timer, or watcher.
 
 ## API Surface
 
@@ -13,6 +13,7 @@ The module owns the file and document formats only; scanning, re-import diffing,
 - `slug::file_name_for(name)` → `<slug>-<hash>.md`, where `hash` is the first eight lowercase hex digits (the high 32 bits) of a 64-bit FNV-1a digest of the exact name.
 - `file::FactDocument { front_matter: FrontMatter, body: String }` with `new`, `parse`, `render`, `from_fact`, `to_fact`, `name`, `fact_type`, `description`, `tags`, `path`, `updated_at`.
 - `split::IndexLevel { Memory, User }` with `ALL`, `file_name`, `title`, `contains`; `level_of` maps a fact type to its level, and `render_level`/`parse_level` render and parse a level's document.
+- `render_level` renders every fact of the level and applies no line cap: the `max_index_lines` truncation exists only in the prompt-facing `crate::lite::index::render_index`.
 - `DirStamp { files, total_len, newest_ms }` is the change stamp of one `facts/` directory.
 - `FactFiles { root, scope }` is a cloneable handle with `new`, `root`, `scope`, `dir`, `path_for`, `write`, `read`, `read_all`, `remove`, `contains`, `stamp`; all I/O methods are `async`.
 
@@ -37,7 +38,9 @@ The module owns the file and document formats only; scanning, re-import diffing,
 - `path` is optional and absent from a fact without one; an empty value decodes as absent.
 - `updated_at` is RFC 3339 with nanosecond precision (`SecondsFormat::Nanos`, `Z`), so a fact's timestamp round-trips exactly; a missing or non-RFC-3339 value decodes to `DateTime<Utc>::default()` (the Unix epoch), never "now".
 - `description` and `path` are single line by construction (embedded newlines are folded to spaces on render), and `name` is trimmed.
-- Unknown `key: value` lines are kept in the block and re-rendered in place; a line inside the block that is not a `key: value` pair is skipped on parse (the `FrontMatter` raw tail has no public setter, so such a line is not preserved).
+- Unknown `key: value` lines survive `FactDocument::parse` and are re-rendered in place by `FactDocument::render`, but a rewrite through `FactDocument::from_fact` (which `FactFiles::write` uses) emits only the canonical key set, so an unknown key does not survive a fact write.
+- A line inside the block that is not a `key: value` pair is skipped on parse (the `FrontMatter` raw tail has no public setter, so such a line is not preserved).
+- Only index-level documents, round-tripped through `crate::lite::markdown::MarkdownMemory`, keep unknown attributes across a parse/render cycle.
 - Rendering emits LF and exactly one trailing newline; an empty front matter renders no fence block at all (an empty document renders as the empty string), and the body is trimmed of leading/trailing blank lines with inner blank lines and Markdown kept.
 
 ## Index and level rules
@@ -53,7 +56,7 @@ The module owns the file and document formats only; scanning, re-import diffing,
 - `FactDocument::from_fact` → `render` → `parse` → `to_fact` reproduces every `CodingFact` field except the scope (a fact file holds one scope, supplied by the caller): name, description, fact type, content, tags, path, and timestamp.
 - `parse(render(document))` equals `document` for a document in the shape `render` produces (edge-trimmed body), and `render` is idempotent under `parse`.
 - `parse_level(render_level(facts, level))` equals the level's facts sorted by (type order, name), with the default scope and second-precision timestamps.
-- A hand-edited index re-imports losslessly: `parse_level` → `FactFiles::write` per fact → `read_all` → `render_level` reproduces the edited document byte for byte, because both representations carry the same field set.
+- A hand-edited index re-imports losslessly when its entries use the canonical attribute set: `parse_level` → `FactFiles::write` per fact → `read_all` → `render_level` reproduces the edited document byte for byte, and an unknown attribute is dropped by the fact-file rewrite (line 41).
 
 ## Atomic writes and tolerance
 
@@ -77,6 +80,6 @@ The module owns the file and document formats only; scanning, re-import diffing,
 - `slug.rs`: 8 unit tests — slug folding/casing/fallbacks, 48-character cap and trimming, determinism, distinct names sharing a slug, path-separator and NUL safety, FNV-1a reference vectors.
 - `file.rs`: 20 unit tests — fact round trip, fixed key order, optional `path`/`tags`, single trailing newline, Markdown body preservation, missing/CRLF/hostile front matter, space tolerance, JSON and comma-separated tags, name/type validation errors, optional-field defaults, nanosecond timestamps, accessors.
 - `split.rs`: 9 unit tests — level mapping and `contains`, empty-level rendering, split/order/sorting, field-preserving round trip with path and tags, input-order independence, hand-edit tolerance, unterminated block error.
-- `mod.rs`: 14 `#[tokio::test]` integration tests over `tempfile::tempdir()` — path derivation, write/read round trip, directory creation with no leftover temporary file, replacement of the same name, absent facts, remove, blank-name rejection, scope rebinding, non-fact Markdown tolerance, symlink escape, stamp tracking, `facts → files → read_all`, the level round trip, and the byte-for-byte hand-edit re-import.
+- `mod.rs`: 14 tests over `tempfile::tempdir()` (13 `#[tokio::test]` plus one synchronous path-derivation test) — path derivation, write/read round trip, directory creation with no leftover temporary file, replacement of the same name, absent facts, remove, blank-name rejection, scope rebinding, non-fact Markdown tolerance, symlink escape, stamp tracking, `facts → files → read_all`, the level round trip, and the byte-for-byte hand-edit re-import.
 - Gates (all must be green): `cargo fmt -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --offline --lib lite::facts`, the same with `--features sqlite`, `cargo clippy -p openjiuwen-memory --offline --all-targets -- -D warnings` with and without `--features sqlite`, and `cargo doc -p openjiuwen-memory --no-deps` with and without the feature.
 - Everything is offline and deterministic: temporary directories, pinned `DateTime::from_timestamp` values, no network, no credentials, no wall-clock assertions.
