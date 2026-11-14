@@ -100,7 +100,7 @@ impl fmt::Debug for TeamMemoryWiring {
             .field("document_path", &self.document_path)
             .field("extractor", &self.hooks.extractor_name())
             .field("toolkits", &self.toolkits.lock().len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(wiring.config(), &MemoryConfig::default());
         assert_eq!(wiring.document_path(), dir.path().join(TEAM_MEMORY_FILE));
         assert_eq!(wiring.hooks().extractor_name(), "rule");
-        assert!(stored(&wiring).await.is_empty());
+        assert_eq!(stored(&wiring).await.len(), 0);
     }
 
     #[tokio::test]
@@ -641,7 +641,7 @@ mod tests {
         assert!(wiring.flush().await.unwrap().is_empty());
         assert!(wiring.export().await.unwrap().is_none());
         assert!(!dir.path().join(TEAM_MEMORY_FILE).exists());
-        assert!(stored(&wiring).await.is_empty());
+        assert_eq!(stored(&wiring).await.len(), 0);
         assert_eq!(wiring.hooks().pending_turns(), 0);
         assert_eq!(wiring.hooks().session_id(), None);
     }
@@ -825,7 +825,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wiring = opened(&dir, MemoryConfig::default()).await;
         assert_eq!(wiring.import().await.unwrap(), 0);
-        assert!(stored(&wiring).await.is_empty());
+        assert_eq!(stored(&wiring).await.len(), 0);
     }
 
     #[tokio::test]
@@ -838,7 +838,7 @@ mod tests {
         // Opening never fails on a stale document: the store just stays empty.
         assert!(error.is_none());
         let wiring = opened(&dir, MemoryConfig::default()).await;
-        assert!(stored(&wiring).await.is_empty());
+        assert_eq!(stored(&wiring).await.len(), 0);
         assert!(wiring.import().await.is_err());
         // A second open with the import switched off says nothing at all.
         let quiet = MemoryConfig {
@@ -846,7 +846,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let wiring = opened(&dir, quiet).await;
-        assert!(stored(&wiring).await.is_empty());
+        assert_eq!(stored(&wiring).await.len(), 0);
     }
 
     #[tokio::test]

@@ -63,21 +63,16 @@ const DIR_KEY: &str = "dir";
 /// Deserialization is as tolerant as the metadata parser: it accepts a bare name
 /// (`"memory"`, `"file"`), a bare directory path, or a `{"kind": …, "dir": …}` object, and an
 /// unrecognized value resolves to [`MemoryStoreConfig::Memory`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MemoryStoreConfig {
     /// The process-local in-memory store.
+    #[default]
     Memory,
     /// A durable store rooted at `dir`; `None` keeps the workspace root.
     File {
         /// Directory holding the `TEAM_MEMORY.md` document.
         dir: Option<PathBuf>,
     },
-}
-
-impl Default for MemoryStoreConfig {
-    fn default() -> Self {
-        Self::Memory
-    }
 }
 
 impl MemoryStoreConfig {
@@ -161,12 +156,11 @@ impl MemoryStoreConfig {
 
 /// Reads an optional store directory: a blank string, `null` or a non-string is absent.
 fn dir_from(value: Option<&Value>) -> Option<PathBuf> {
-    match value {
-        None | Some(Value::Null) => None,
-        Some(Value::String(path)) if path.trim().is_empty() => None,
-        Some(Value::String(path)) => Some(PathBuf::from(path.trim())),
-        Some(_) => None,
-    }
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 impl Serialize for MemoryStoreConfig {
@@ -198,19 +192,14 @@ impl<'de> Deserialize<'de> for MemoryStoreConfig {
 }
 
 /// Which extractor turns a buffered session into team memories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryExtractorKind {
     /// The deterministic rule extractor (the default; no model call).
+    #[default]
     Rule,
     /// The model-backed extractor, which degrades to the rules on failure.
     Llm,
-}
-
-impl Default for MemoryExtractorKind {
-    fn default() -> Self {
-        Self::Rule
-    }
 }
 
 impl fmt::Display for MemoryExtractorKind {
