@@ -43,6 +43,7 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - Every event emits one structured `tracing` event at target `openjiuwen_agent_teams::memory`: `debug!` on `TeamMemoryOutcome::Ok`, `warn!` on `Failed`, both carrying trace/span id plus `team`, `operation`, `outcome`, `count`, `member_id`, `kind` and (on failure) `error` — the same fields the span carries.
 - Attribute constants (`"team_id"`, `"operation"`, `"outcome"`, `"count"`, `"member_id"`, `"kind"`, `"error"`): `AT_MEMORY_TEAM_ID`, `AT_MEMORY_OPERATION`, `AT_MEMORY_OUTCOME`, `AT_MEMORY_COUNT`, `AT_MEMORY_MEMBER_ID`, `AT_MEMORY_KIND`, `AT_MEMORY_ERROR`.
 - `observe` is infallible and non-blocking: no `.await`, and the only lock is the short one inside the sink.
+
 ### `mod.rs`
 
 - Re-exports every public item above; `#[cfg(feature = "otel")]` additionally exports the sink and hooks.

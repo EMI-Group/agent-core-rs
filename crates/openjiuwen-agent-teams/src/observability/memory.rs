@@ -28,10 +28,9 @@
 //! # Feature split
 //!
 //! The baseline build records the span as a `tracing` event only. With the `otel` feature the
-//! observer also carries an [`OtelSpanSink`](crate::observability::otel::OtelSpanSink) —
-//! [`MemorySpanObserver::with_sink`] — and appends one
-//! [`SpanRecord`](crate::observability::otel::SpanRecord) per event, so an in-process consumer can
-//! inspect what the team memory did without an exporter.
+//! observer also carries an `OtelSpanSink` (`MemorySpanObserver::with_sink`) and appends one
+//! `SpanRecord` per event, so an in-process consumer can inspect what the team memory did without
+//! an exporter.
 //!
 //! Real OTLP export and the `opentelemetry` SDK are deliberately *not* part of this crate:
 //! [`OTLP_EXPORT_AVAILABLE`](crate::observability::OTLP_EXPORT_AVAILABLE) stays `false` because
@@ -47,6 +46,7 @@
 //! Attaching is purely additive — the memory facade's results, ordering and cancellation
 //! behaviour are unchanged.
 
+#[cfg(feature = "otel")]
 use std::sync::Arc;
 
 use openjiuwen_memory::team::{
@@ -83,7 +83,7 @@ pub const AT_MEMORY_ERROR: &str = "error";
 /// ([`TeamSpan::root_for`](crate::observability::TeamSpan::root_for)) and every event derives a
 /// child from it, so a trace never leaks between teams. Build it with [`MemorySpanObserver::new`]
 /// (or the [`memory_observer`] shortcut), optionally attach a sink with
-/// [`MemorySpanObserver::with_sink`] on the `otel` build, and hand it to the facade with
+/// `MemorySpanObserver::with_sink` on the `otel` build, and hand it to the facade with
 /// `TeamMemory::with_observer(Arc::new(observer))`.
 #[derive(Debug, Clone)]
 pub struct MemorySpanObserver {
@@ -211,7 +211,7 @@ impl TeamMemoryObserver for MemorySpanObserver {
 }
 
 /// Builds an observer for `team_name`; the sink form is attached afterwards with
-/// [`MemorySpanObserver::with_sink`] on the `otel` build.
+/// `MemorySpanObserver::with_sink` on the `otel` build.
 #[must_use]
 pub fn memory_observer(team_name: impl Into<String>) -> MemorySpanObserver {
     MemorySpanObserver::new(team_name)
@@ -228,6 +228,7 @@ mod tests {
     };
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn text(value: &str) -> Value {
         Value::String(value.to_owned())
