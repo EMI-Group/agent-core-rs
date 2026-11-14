@@ -21,9 +21,6 @@
 // Size note: the implementation is ~800 lines; the file exceeds the crate's 1000-line guideline
 // only because the inline `#[cfg(test)]` module below covers throttling, truncation, ring drops,
 // terminal ordering, lag reporting and serde round-trips.
-// The runtime wires this module in a follow-up change: until `subagents/mod.rs` re-exports it,
-// nothing in the crate constructs a stream, so both reachability lints would fire on every item.
-#![allow(dead_code, unreachable_pub)]
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -385,6 +382,8 @@ impl FrameSpec {
 pub struct ActivityStream {
     /// Identity stamped on every frame.
     subagent_id: String,
+    /// Whether frames are recorded and published at all.
+    enabled: bool,
     /// Ring size, per-turn cap, summary limit and thinking window.
     throttle: ActivityThrottle,
     /// Bounded live feed; the subscription side holds it weakly.
@@ -426,6 +425,7 @@ impl ActivityStream {
         let (sender, _receiver) = broadcast::channel(throttle.capacity());
         Self {
             subagent_id: subagent_id.into(),
+            enabled: true,
             throttle,
             sender: Arc::new(sender),
             frames: VecDeque::with_capacity(throttle.capacity()),
@@ -440,6 +440,25 @@ impl ActivityStream {
             phase_id: 0,
             phase_open: false,
         }
+    }
+
+    /// Creates a recorder that stores and publishes nothing.
+    ///
+    /// The stream still owns a feed, so [`Self::subscribe`] hands out a subscription that never
+    /// yields a frame; [`Self::is_enabled`] reports `false`, which lets a consumer distinguish
+    /// "activity recording is disabled" from "the instance produced no activity yet" and from
+    /// "the instance is closed" (a terminal stream has `is_terminal() == true` instead).
+    #[must_use]
+    pub fn disabled(subagent_id: impl Into<String>, throttle: ActivityThrottle) -> Self {
+        let mut stream = Self::new(subagent_id, throttle);
+        stream.enabled = false;
+        stream
+    }
+
+    /// Whether this recorder stores and publishes frames.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// The sub-agent instance this stream belongs to.
@@ -466,24 +485,70 @@ impl ActivityStream {
         self.phase_open = false;
     }
 
+    /// Clears the terminal flag and the per-turn state so a closed instance can publish again.
+    ///
+    /// A resumed instance keeps its sequence numbers, ring drops, retained frames and thinking
+    /// phase counter, so the frames it publishes after the resume carry higher sequence numbers
+    /// than the tombstone frame. Like [`Self::begin_turn`], the throttle window restarts at
+    /// `at_ms`. Resuming a disabled stream re-enables nothing: frames stay suppressed until the
+    /// runtime is rebuilt with activity recording enabled.
+    pub fn resume(&mut self, at_ms: i64) {
+        self.terminal = false;
+        self.turn_frames = 0;
+        self.truncated = false;
+        self.thinking_buffer.clear();
+        self.last_emit_ms = at_ms;
+        self.phase_open = false;
+    }
+
+    /// Records a generic frame of `kind`; terminal kinds end the stream.
+    ///
+    /// `summary` is the one-line payload, `tool_name`/`ok` are the optional tool and outcome
+    /// fields, and `at_ms` comes from the caller's clock. Terminal kinds
+    /// ([`ActivityKind::is_terminal`]) flush pending thinking and suppress every later frame;
+    /// otherwise the frame honours the per-turn cap and the truncation/terminal suppression.
+    /// A disabled stream records nothing, so the returned vector is always empty.
+    pub fn record(
+        &mut self,
+        kind: ActivityKind,
+        summary: &str,
+        tool_name: Option<&str>,
+        ok: Option<bool>,
+        at_ms: i64,
+    ) -> Vec<SubagentActivityFrame> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut spec = FrameSpec::new(kind, summary);
+        if let Some(tool_name) = tool_name {
+            spec = spec.named(tool_name);
+        }
+        spec.ok = ok;
+        if kind.is_terminal() {
+            self.terminal(spec, at_ms)
+        } else {
+            self.boundary(spec, at_ms)
+        }
+    }
+
     /// Records the spawn milestone carrying the delegated task description.
     pub fn spawn(&mut self, summary: &str, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        self.record(FrameSpec::new(ActivityKind::Spawn, summary), at_ms)
+        self.record_spec(FrameSpec::new(ActivityKind::Spawn, summary), at_ms)
     }
 
     /// Records that the instance reserved a slot and waits for its first turn.
     pub fn queued(&mut self, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        self.record(lifecycle(ActivityKind::Queued), at_ms)
+        self.record_spec(lifecycle(ActivityKind::Queued), at_ms)
     }
 
     /// Records that a turn of the sub-agent started.
     pub fn running(&mut self, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        self.record(lifecycle(ActivityKind::Running), at_ms)
+        self.record_spec(lifecycle(ActivityKind::Running), at_ms)
     }
 
     /// Records that the instance finished a turn and is idle again.
     pub fn idle(&mut self, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        self.record(lifecycle(ActivityKind::Idle), at_ms)
+        self.record_spec(lifecycle(ActivityKind::Idle), at_ms)
     }
 
     /// Buffers reasoning `text` and emits a thinking frame when the phase is due.
@@ -493,7 +558,7 @@ impl ActivityStream {
     /// empty or whitespace-only chunk never emits, and returning to a thinking phase after a tool
     /// frame opens a new phase id.
     pub fn thinking(&mut self, text: &str, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        if self.terminal || self.truncated || text.trim().is_empty() {
+        if !self.enabled || self.terminal || self.truncated || text.trim().is_empty() {
             return Vec::new();
         }
         if self.turn_frames >= self.throttle.capacity {
@@ -591,7 +656,7 @@ impl ActivityStream {
     pub fn flush_thinking(&mut self, at_ms: i64) -> Vec<SubagentActivityFrame> {
         let pending = std::mem::take(&mut self.thinking_buffer);
         self.phase_open = false;
-        if pending.trim().is_empty() || self.truncated {
+        if !self.enabled || pending.trim().is_empty() || self.truncated {
             return Vec::new();
         }
         vec![self.emit_thinking(&pending, at_ms)]
@@ -692,8 +757,8 @@ impl ActivityStream {
     }
 
     /// Records a non-terminal frame unless the turn is truncated or the stream is terminal.
-    fn record(&mut self, spec: FrameSpec, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        if self.terminal || self.truncated {
+    fn record_spec(&mut self, spec: FrameSpec, at_ms: i64) -> Vec<SubagentActivityFrame> {
+        if !self.enabled || self.terminal || self.truncated {
             return Vec::new();
         }
         if self.turn_frames >= self.throttle.capacity {
@@ -705,16 +770,19 @@ impl ActivityStream {
 
     /// Flushes pending thinking, then records a frame that ends the current thinking phase.
     fn boundary(&mut self, spec: FrameSpec, at_ms: i64) -> Vec<SubagentActivityFrame> {
-        if self.terminal {
+        if !self.enabled || self.terminal {
             return Vec::new();
         }
         let mut frames = self.flush_thinking(at_ms);
-        frames.extend(self.record(spec, at_ms));
+        frames.extend(self.record_spec(spec, at_ms));
         frames
     }
 
     /// Flushes pending thinking, then records a frame that always passes and ends the stream.
     fn terminal(&mut self, spec: FrameSpec, at_ms: i64) -> Vec<SubagentActivityFrame> {
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut frames = self.flush_thinking(at_ms);
         frames.push(self.push_frame(spec, at_ms));
         self.terminal = true;
@@ -778,6 +846,7 @@ impl fmt::Debug for ActivityStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActivityStream")
             .field("subagent_id", &self.subagent_id)
+            .field("enabled", &self.enabled)
             .field("throttle", &self.throttle)
             .field("frames", &self.frames.len())
             .field("next_seq", &self.next_seq)
@@ -1167,6 +1236,60 @@ mod tests {
             .await
             .expect("the feed ends");
         assert!(ended.is_none());
+    }
+
+    #[test]
+    fn disabled_streams_store_and_publish_nothing() {
+        let mut stream = ActivityStream::disabled("sub-1", ActivityThrottle::default());
+        assert!(!stream.is_enabled());
+        let mut subscription = stream.subscribe();
+        stream.begin_turn("t1", 0);
+        for frames in [
+            stream.spawn("task", 1),
+            stream.running(2),
+            stream.record(ActivityKind::ToolCall, "bash", Some("bash"), None, 3),
+            stream.completed("answer", 4),
+        ] {
+            silent(&frames);
+        }
+        assert!(stream.is_empty());
+        assert_eq!((stream.next_seq(), stream.dropped()), (1, 0));
+        assert!(!stream.is_terminal());
+        assert!(subscription.try_recv().is_none());
+    }
+
+    #[test]
+    fn resume_clears_the_terminal_flag_and_keeps_the_sequence() {
+        let mut stream = recorder(8, 2000, 0);
+        stream.begin_turn("t1", 0);
+        stream.spawn("task", 1);
+        let closed = stream.closed("manual", 2);
+        assert!(stream.is_terminal());
+        assert_eq!(closed[0].seq, 2);
+        silent(&stream.running(3));
+
+        stream.resume(4);
+        assert!(!stream.is_terminal());
+        stream.begin_turn("t2", 4);
+        let idle = stream.idle(5);
+        assert_eq!(kinds(&idle), vec![ActivityKind::Idle]);
+        assert_eq!(idle[0].seq, 3);
+        assert!(stream.next_seq() > closed[0].seq);
+
+        let recorded = stream.record(
+            ActivityKind::ToolResult,
+            "done",
+            Some("bash"),
+            Some(true),
+            6,
+        );
+        assert_eq!(recorded[0].kind, ActivityKind::ToolResult);
+        assert_eq!(recorded[0].tool_name.as_deref(), Some("bash"));
+        assert_eq!(recorded[0].ok, Some(true));
+        let terminal = stream.record(ActivityKind::Failed, "boom", None, Some(false), 7);
+        assert_eq!(kinds(&terminal), vec![ActivityKind::Failed]);
+        assert!(stream.is_terminal());
+        silent(&stream.record(ActivityKind::Running, "running", None, None, 8));
     }
 
     #[test]

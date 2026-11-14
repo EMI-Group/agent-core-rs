@@ -12,9 +12,6 @@
 //! builds; the runtime calls these hooks outside its state lock, so a hook may call back into the
 //! runtime (or register another hook) without deadlocking, and a failing hook never fails the
 //! runtime — it is logged and reported in [`LifecycleReport::failures`].
-// The runtime re-export table (`subagents/mod.rs`) does not surface these hooks yet, so nothing in
-// the crate uses them until the runtime is wired; both lints are scoped to this module until then.
-#![allow(dead_code, unreachable_pub)]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -202,6 +199,15 @@ impl LifecycleHooks {
     pub fn with_hook(self, hook: Arc<dyn SubagentLifecycleHook>) -> Self {
         self.register(hook);
         self
+    }
+
+    /// Returns a snapshot of the registered hooks in registration order.
+    ///
+    /// The runtime uses it to copy a caller-supplied registry into its own; the clone shares the
+    /// hook objects, not the registry, so later changes to the source registry do not leak in.
+    #[must_use]
+    pub fn hooks(&self) -> Vec<Arc<dyn SubagentLifecycleHook>> {
+        self.hooks.read().clone()
     }
 
     /// Returns the registered hook names in registration order.
