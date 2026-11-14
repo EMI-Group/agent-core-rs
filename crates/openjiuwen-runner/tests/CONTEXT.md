@@ -2,7 +2,7 @@
 
 ## Intent
 
-Behaviour-level tests for the crate's public seams: the registries and their sub-managers, the callback framework with its filters/chains/combinators, the guardrail binding, the in-process queue, the run monitor, the HITL hub, the team runtime pool, every spawn backend and the spawn seam's health/snapshot/cancel accessors, the runner's spawn routing and spawn observability, the runner lifecycle, and the three execution paths (agent, workflow, team) with their streaming variants.
+Behaviour-level tests for the crate's public seams: the registries and their sub-managers, the callback framework with its filters/chains/combinators, the guardrail binding, the in-process queue, the run monitor, the HITL hub, the team runtime pool, every spawn backend and the spawn seam's health/snapshot/cancel accessors, the runner's spawn routing and spawn observability, the runner lifecycle, the runner-hosted dreaming driver, and the three execution paths (agent, workflow, team) with their streaming variants.
 Every suite is offline and deterministic and drives only the public API, exactly as `openjiuwen-harness` and `openjiuwen-cli` will.
 
 ## API Surface
@@ -33,11 +33,12 @@ Suites (one file per area):
 - `team_pool_lifecycle.rs` — admission beyond capacity (queueing until a permit frees), `pause`/`resume`, `stop`/`stop_all`, and the closed-pool rejection.
 - `team_pool_hitl.rs` — a pooled run's inbound payload delivery, the payload buffer and its frame, the drain, and unbinding on finalisation.
 - `runner_team_attach.rs` — the facade's attach primitives over the pool: `try_start_agent_team` refusing at capacity while `start_agent_team` queues, `acquire_agent_team` joining one live entry with two leases (the joining request's inputs ignored), and `take_team_payloads` draining a delivered HITL payload / answering an unknown key with an empty vec.
+- `dreaming.rs` — the runner-hosted dreaming driver over a recording consolidator and an in-memory queue: a host-driven `DreamService::tick` consolidating two enqueued jobs (summary counters, stored terminal states, status counters); `set_dreaming_service` + `start_dreaming` + a bounded `eventually` wait for a tick + `stop_dreaming` leaving `running == false` with an idempotent second stop; a long `initial_delay_ms` proving `stop_dreaming` interrupts the wait promptly with `ticks == 0`; the typed `Error::Config` absence of all three lifecycle/status calls on a runner with no service plus `set_dreaming_service(None)` returning the previous service; `Runner::stop` stopping a running service and staying idempotent with the service still installed; and a second `start_dreaming` never spawning a second loop (the counters freeze after one stop).
 - `api_surface.rs` — compile-time pinning of the crate-root surface: every re-export (dispatch core, chains, filters, handler combinators, monitor, HITL, pool, spawn backends, resource sub-managers), trait-object coercion (`AgentRef`/`WorkflowRef`/`TeamRef`/`MessageHandler`/`CallbackHandler`/`AgentSpawner`/`RemoteClient`/`McpConnector`), `Send + Sync` and serde checks, the deliberate module-only scoping of the free combinators, `RunOptions` builder reachability, `CallbackEvent::ALL` length/round-trip, and JSON round-trips (`SpawnMessage`'s `f64` timestamp compared with the documented tolerance, never exact equality).
 
 ## Constraints
 
-- Only the public API of `openjiuwen-runner` (plus `openjiuwen-test-support`, `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-workflow`, `openjiuwen-multiagent`, `openjiuwen-security` for fixtures).
+- Only the public API of `openjiuwen-runner` (plus `openjiuwen-test-support`, `openjiuwen-agent`, `openjiuwen-session`, `openjiuwen-workflow`, `openjiuwen-multiagent`, `openjiuwen-security`, and `openjiuwen-memory` for the dreaming fixtures).
 - No network, no sleeps for ordering, no wall-clock assertions; timeouts are short and prove a deadline only.
 - `wiremock` is the only loopback server (used by `spawn_remote.rs` and `spawn_seam.rs`); the subprocess and external-command cases in `spawn_subprocess.rs` and `spawn_seam.rs` re-execute this test binary, never an external program.
 - The fake-child bootstrap is duplicated per binary, never shared: the child is the binary's own `#[ignore]`d `fake_child` test selected with `fake_child --exact --ignored --test-threads=1 --nocapture`; `--nocapture` is mandatory (libtest would otherwise capture the protocol frames) and the child body must write a leading newline to close libtest's partial `test fake_child ... ` line before its first frame.

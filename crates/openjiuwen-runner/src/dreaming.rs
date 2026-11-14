@@ -12,8 +12,8 @@
 //! **Lifecycle.** A service is installed on a runner with
 //! [`Runner::set_dreaming_service`](crate::Runner::set_dreaming_service) and
 //! started/stopped through [`Runner::start_dreaming`](crate::Runner::start_dreaming)
-//! and [`Runner::stop_dreaming`](crate::Runner::stop_dreaming); see
-//! [`crate::runner_dreaming`] for the facade. Dreaming has its own lifecycle:
+//! and [`Runner::stop_dreaming`](crate::Runner::stop_dreaming); see the crate's
+//! `runner_dreaming` module for the facade. Dreaming has its own lifecycle:
 //! [`Runner::start`](crate::Runner::start) does **not** start it, and
 //! [`Runner::stop`](crate::Runner::stop) does stop it (bounded, and never failing
 //! the runner's own shutdown).
@@ -21,7 +21,7 @@
 //! **Task ownership.** `start` spawns at most one task: a second call while the
 //! loop is live is a no-op that returns the current status, never a second loop.
 //! The loop is joined by `stop`, which cancels the token first — cancellation is
-//! the documented shutdown path, so the [`Error::Cancelled`] the loop reports is
+//! the documented shutdown path, so the `Error::Cancelled` the loop reports is
 //! mapped to `Ok`. Any *other* loop outcome (a task panic, or a loop that ended
 //! early with an error) is recorded in [`DreamServiceStatus::last_stop_error`]
 //! instead of being swallowed or panicking the caller.
@@ -290,7 +290,7 @@ impl DreamService {
     /// [`DEFAULT_DREAMING_STOP_TIMEOUT`] as the bound; a task still running at
     /// the bound is aborted and the reason is recorded in
     /// [`DreamServiceStatus::last_stop_error`]. Cancellation is the documented
-    /// shutdown path, so the loop's [`Error::Cancelled`] answer is `Ok`, not a
+    /// shutdown path, so the loop's `Error::Cancelled` answer is `Ok`, not a
     /// failure.
     ///
     /// Idempotent: a call when no loop is installed returns the current status.
@@ -349,7 +349,7 @@ impl DreamService {
     /// Cancels and joins `task`, returning why it did not shut down cleanly.
     ///
     /// `None` means the documented path: the loop observed the cancellation and
-    /// returned [`Error::Cancelled`], or it had already returned a summary.
+    /// returned `Error::Cancelled`, or it had already returned a summary.
     async fn join_loop(&self, task: LoopTask) -> Option<String> {
         let LoopTask { cancel, mut join } = task;
         cancel.cancel();

@@ -6,6 +6,7 @@
 //! every wait is a bounded poll ([`eventually`], 10 s) rather than a wall-clock
 //! sleep — the only `sleep` in this file is the observation window that proves no
 //! second loop survived a stop.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::sync::Arc;
 use std::time::Duration;
 
