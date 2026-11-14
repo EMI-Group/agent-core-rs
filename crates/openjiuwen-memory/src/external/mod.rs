@@ -13,6 +13,12 @@
 //!   [`crate::external::ProviderRegistry`].
 //! - [`crate::external::vendor`] — the `AgentArts`, `Jiuwen`, `LakeBase`, `mem0`, and
 //!   `OpenViking` adapter handles.
+//! - [`crate::external::rest`] — the reusable REST transport vendor adapters are built on:
+//!   [`crate::external::WireSpec`], [`crate::external::RestCall`],
+//!   [`crate::external::AuthScheme`], and [`crate::external::RestProvider`].
+//! - [`crate::external::rest_json`] — the tolerant JSON accessors every
+//!   [`crate::external::WireSpec`] uses to decode vendor bodies (re-exported by
+//!   [`crate::external::rest`]).
 //!
 //! # Registry semantics
 //!
@@ -47,11 +53,14 @@
 pub mod local;
 pub mod provider;
 pub mod registry;
+pub mod rest;
+pub mod rest_json;
 pub mod vendor;
 
 pub use local::{EngineProvider, LocalProviderFactory};
 pub use provider::{MemoryProvider, ProviderCapabilities, ProviderHealth};
 pub use registry::{ProviderConfig, ProviderFactory, ProviderKind, ProviderRegistry};
+pub use rest::{resolve_auth, AuthScheme, Op, RestCall, RestProvider, SpecContext, WireSpec};
 pub use vendor::{
     vendor_factories, AgentArtsMemoryProvider, JiuwenMemoryProvider, LakeBaseMemoryProvider,
     Mem0MemoryProvider, OpenVikingMemoryProvider,
