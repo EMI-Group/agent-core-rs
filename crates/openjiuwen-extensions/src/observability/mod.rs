@@ -35,6 +35,7 @@
 //! ownership scope, and never installs a global exporter.
 
 pub mod content_addressing;
+pub mod error_reporting;
 pub mod project_semconv;
 pub mod redaction;
 pub mod tool_outcome;
