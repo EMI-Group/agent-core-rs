@@ -56,7 +56,7 @@ sqlite = [
 # transports / remote backends
 a2a = ["openjiuwen-extensions/a2a"]
 mcp = ["openjiuwen-extensions/mcp"]
-redis = ["openjiuwen-extensions/redis"]
+redis = ["openjiuwen-extensions/redis", "openjiuwen-agent-evolving/redis"]
 pulsar = ["openjiuwen-extensions/pulsar"]
 distributed = ["openjiuwen-agent-teams/distributed"]
 # observability
@@ -66,6 +66,10 @@ otel = [
     "openjiuwen-session/otel",
     "openjiuwen-agent-teams/otel",
 ]
+# The team-memory OTLP bridge: `openjiuwen-agent-teams/otlp` compiles `observability::otlp`
+# and pulls `openjiuwen-extensions` with its `otel` feature. Independent of `otel` above —
+# agent-teams keeps the two features separate, so this mirrors that split.
+otlp = ["openjiuwen-agent-teams/otlp"]
 # sandbox execution
 sandbox = ["openjiuwen-sysop/sandbox"]
 # opt-in network/vendor test gates
