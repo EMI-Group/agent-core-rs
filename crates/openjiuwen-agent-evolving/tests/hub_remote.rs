@@ -67,7 +67,7 @@ fn published_bundle() -> SharedSkillBundle {
 /// A bundle carrying `bundle_id` and no experiences.
 fn named_bundle(bundle_id: &str, skill_id: &str) -> SharedSkillBundle {
     let mut bundle = SharedSkillBundle::new(skill_id, skill_id, "1.0", vec![]).unwrap();
-    bundle.bundle_id = bundle_id.to_owned();
+    bundle_id.clone_into(&mut bundle.bundle_id);
     bundle
 }
 

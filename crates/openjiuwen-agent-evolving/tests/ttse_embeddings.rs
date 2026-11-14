@@ -145,7 +145,7 @@ async fn consult_async_fuses_both_branches_for_an_exact_question() {
 
     let result = engine.consult_async(RG).await.expect("hybrid consult");
     assert_eq!(result.tips[0].rule, RG);
-    assert!(!result.rendered.is_empty());
+    assert_ne!(result.rendered, "");
     assert!(engine
         .embedding_index()
         .expect("index")
@@ -238,8 +238,8 @@ async fn consult_async_is_a_no_op_when_injection_is_disabled() {
     seed(&mut engine, &[RG]);
     engine.sync_index().await.expect("sync");
     let result = engine.consult_async(RG).await.expect("disabled consult");
-    assert!(result.tips.is_empty());
-    assert!(result.rendered.is_empty());
+    assert_eq!(result.tips, Vec::new());
+    assert_eq!(result.rendered, "");
     assert_eq!(engine.consult_count(), 0);
 }
 
