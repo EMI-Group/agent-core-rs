@@ -14,6 +14,7 @@ use openjiuwen_common::error::{Error, Result};
 
 use super::git::{GitOutput, GitRunner};
 
+mod lock;
 mod manager;
 mod tool;
 

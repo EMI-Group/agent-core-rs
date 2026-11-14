@@ -32,6 +32,15 @@ The registry is `<workspace-root>/.worktree/index.json` (default workspace root 
 `create` checks out an existing branch instead of re-creating it; `base` defaults to `HEAD`.
 `remove` refuses a dirty worktree without `force` and reports an unlisted worktree as `Error::not_found`.
 `prune` runs `git worktree prune` and then drops registry records whose directory git no longer lists.
+
+## Lock layout
+The lock is repo-bucketed: the hashed target is `repo_root`, so two worktrees of one repository share one lock and different repositories never contend.
+The sidecar lives in `<repo_root>/.git` when that is an existing directory, otherwise in `<workspace_root>/.worktree`; its name is `<root>/<sha256-of-repo-root>.lock`.
+The lock is always exclusive (write), never read/write, because every worktree critical section mutates shared git state.
+A configured zero timeout becomes a 1 ms budget so one attempt always happens (the seam reads `None` as "wait forever").
+Acquisition writes `pid=<u32>` and `acquired_at=<rfc3339>` into the sidecar best-effort, and only while the exclusive lock is held.
+`flock` is released by the kernel when the holder exits, so a crashed holder never leaves a blocking stale lock; the metadata is what outlives it and `stale_metadata` reports it. The lock file is never broken or unlinked while another process may hold it.
+
 ## Constraints
 Offline and deterministic by default: tests use `ScriptedGitRunner` (queued stdout/failures, recorded calls) and temp directories; the single real-git test skips when `which::which("git")` fails.
 No new dependencies, no `unsafe`, no `println!` (tracing only); errors are `openjiuwen_common::error::{Error, Result}`.
@@ -41,9 +50,12 @@ The registry document is written atomically (sibling `.tmp` + rename) and a miss
 The tool never returns `Err` for expected failures: it returns a `ToolPayload` with `success = false`; only cancellation propagates.
 The tool consults `crate::permission` path guards for the target path on mutating actions and blocks only on `PermissionLevel::Deny` (`ask`/`allow` pass, no engine fails open).
 The tool is mounted by `crate::tools::ToolRegistry` as `BuiltinTool::Worktree`, the last of the extended tools, built from a `WorktreeManager` plus the registry language and permission engine.
-No repo-wide cross-process file lock and no operation serialisation: concurrent managers over one workspace are not coordinated.
+`WorktreeLock` supplies the repo-scoped cross-process advisory lock, but `WorktreeManager` operations do not take it: callers wrap create/remove in `acquire` themselves, so unmodified managers over one workspace are still uncoordinated.
+The lock guard is an OS advisory lock on a `Send` descriptor, not a `parking_lot`/`std` mutex, so it may be held across the manager's git `.await` points; no `parking_lot`/`std` lock is ever held across `.await`.
+Where `flock` is missing (non-Unix) or the lock is disabled, `acquire` returns an inactive guard and writes no metadata: exclusion is best-effort and `is_enabled()` is the check for a caller that needs it.
 ## Deferred
-Python's `lock.py` cross-process `filelock` + per-repo in-process lock and timeout.
+Python's module-level `asyncio.Lock` bucket in `lock.py`: the OS advisory lock already excludes two handles in one process, so the bucket has no extra work to do.
+Python's `filelock`-specific lock file name (`openjiuwen-worktree.lock`) and its beside-the-repo fallback: this port uses the sysop sidecar naming and the workspace `.worktree` fallback.
 Sparse checkout, `symlink_directories`, `include_patterns` copying, `core.longpaths`, hook-path configuration.
 Lifecycle policies (`ephemeral`/`durable`/`auto`), `cleanup_after_days`, auto-cleanup on shutdown, event-log recovery of sessions.
 `enter_worktree`/`exit_worktree` tools, the worktree rails, backend hooks (`WorktreeBackend`), change summaries (commits since creation, unpushed commits), and the `vcs` module.
@@ -53,6 +65,7 @@ Lifecycle policies (`ephemeral`/`durable`/`auto`), `cleanup_after_days`, auto-cl
 - `./models.rs` → `WorktreeInfo`, `WorktreeCreateResult`, `WorktreeStatus`, `WorktreeRecord`, `WorktreeState`
 - `./store.rs` → `WorktreeIndex` registry and atomic JSON writes
 - `./events.rs` → `WorktreeEvent`, `WorktreeEventSink`, noop/broadcast/recording sinks
+- `./lock.rs` → `WorktreeLock`, config, guard, metadata and typed contention/timeout errors
 - `./manager.rs` → `WorktreeManager` lifecycle, layout and refusal rules
 - `./tool.rs` → `WorktreeTool` and `WorktreeArgs` (the model-facing `worktree` tool)
-- `./tests/` → `mod.rs` (scripted runner and fixtures), `manager.rs` (lifecycle scenarios, real-git round trip), `tool.rs` (card, dispatch, payload failures)
+- `./tests/` → `mod.rs` (scripted runner and fixtures), `manager.rs` (lifecycle scenarios, real-git round trip), `lock.rs` (lock layout, contention, timeout, metadata), `tool.rs` (card, dispatch, payload failures)

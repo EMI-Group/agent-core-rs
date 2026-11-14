@@ -29,6 +29,9 @@
 //!   `unlock`, `status`, `cleanup_stale`, plus the layout/registry accessors.
 //! - [`WorktreeEvent`] / [`WorktreeEventSink`] — lifecycle events with a
 //!   broadcast sink and a recording sink.
+//! - [`WorktreeLock`] — the repo-bucketed cross-process advisory lock
+//!   (Python's `lock.py`): one exclusive lock per repository root, a bounded
+//!   wait, and diagnostic `pid`/`acquired_at` metadata in the lock file.
 //! - [`WorktreeTool`] — the model-facing `worktree` tool (actions `create`,
 //!   `list`, `remove`, `lock`, `unlock`, `prune`, `status`), mounted by
 //!   [`crate::tools::ToolRegistry`] as
@@ -44,13 +47,14 @@
 //! - Typed errors only: `openjiuwen_common::error::{Error, Result}`; the tool
 //!   turns expected failures into `success = false` payloads and never panics.
 //! - No `unsafe`, no `println!` (tracing only), no new dependencies.
-//! - Deferred (documented in this module's `CONTEXT.md`): the repo-wide
-//!   cross-process file lock, sparse checkout, symlinked heavy directories,
+//! - Deferred (documented in this module's `CONTEXT.md`): sparse checkout,
+//!   symlinked heavy directories,
 //!   include-pattern copying, hook-path configuration, lifecycle policies and
 //!   auto-cleanup timers, and the Python `enter_worktree`/`exit_worktree` tools
 //!   plus the rails integration.
 mod events;
 mod git;
+mod lock;
 mod manager;
 mod models;
 mod slug;
@@ -68,6 +72,11 @@ pub use git::{
     worktree_add_existing, worktree_list, worktree_lock, worktree_prune, worktree_remove,
     worktree_unlock, GitOutput, GitRunner, ProcessGitRunner, GIT_BINARY, NOT_A_REPOSITORY_MARKER,
     NOT_INSTALLED_MARKER,
+};
+pub use lock::{
+    is_lock_contention, is_lock_timeout, WorktreeLock, WorktreeLockConfig, WorktreeLockError,
+    WorktreeLockGuard, WorktreeLockMetadata, DEFAULT_LOCK_TIMEOUT, LOCK_CONTENTION_MARKER,
+    LOCK_TIMEOUT_MARKER, STALE_LOCK_AGE,
 };
 pub use manager::{WorktreeManager, DEFAULT_BASE};
 pub use models::{
