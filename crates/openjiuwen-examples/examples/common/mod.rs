@@ -1,4 +1,4 @@
-//! Shared helpers for the twelve example binaries.
+//! Shared helpers for the example binaries.
 //!
 //! An example reaches this module with `mod common;` (they all sit in
 //! `examples/`, so the file is `examples/common/mod.rs`) and then calls

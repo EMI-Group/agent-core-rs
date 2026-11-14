@@ -1,6 +1,6 @@
 # openjiuwen examples
 
-Twenty runnable programs that tour the Rust SDK. They mirror the Python reference tree
+Twenty-six runnable programs that tour the Rust SDK. They mirror the Python reference tree
 `examples/` (reduced: the research drops, device/training pipelines and vendor-backed
 stores are not ported), and every one of them runs **offline** out of the box.
 
@@ -39,6 +39,12 @@ cargo run -p openjiuwen-examples --example 11_a2a_server_client --features a2a
 | `18_team_attach.rs` | `AttachServer`/`AttachClient` over a Unix socket | — | Unix socket |
 | `19_symphony_skills.rs` | SKILL.md discovery, fingerprinted inventory, lexical search, registry/graph | — | temp files |
 | `20_prompt_tuning.rs` | `dev_tools::tune`: cases, scoring, optimiser, trainer | `examples/agent_evolving/react_agent_evolving.py` | `ScriptedPromptRunner` |
+| `21_native_tokenizers.rs` | a generated `tokenizer.json` and tiktoken `.model`, the selector fallback ladder, the artefact cache | — | generated artefacts |
+| `22_context_telemetry.rs` | `context.usage` snapshots over a compressed transcript plus `context.compression_state` records | — | `ApproxTokenCounter` + scripted summary |
+| `23_memory_dreaming.rs` | `DreamOrchestrator` ticks, a deterministic consolidator, backoff and the SQLite job queue | `memory/dreaming/` (no example) | temp SQLite + injected clock |
+| `24_runner_spawn_registry.rs` | `SpawnerRegistry` routing, an in-process and an external-command backend, health probes, `active_spawns` | — | in-process echo + self re-exec |
+| `25_harness_moa_persistent.rs` | MoA consultation/ranking/aggregation and a persistent-agent journal replay + resume plan | — | `ScriptedModel` + file journal |
+| `26_online_training_service.rs` | the online RL state machine (task → capture → ledger → train → status) over the in-memory store | — | `MemoryOnlineStore` + local executor |
 
 ## Offline by default, live on request
 
@@ -46,14 +52,16 @@ Nothing here needs a network. Examples that talk to a model use
 `openjiuwen-test-support`:
 
 - `ScriptedModel` — an in-process `Model` with an ordered response script (the default for
-  01–03, 08, 12, 13).
+  01–03, 08, 12, 13, 22, 25).
 - `MockLlmServer` — a real loopback OpenAI-compatible HTTP server, used where the wire path
   matters (09, 10: the harness provider and the team runtime build their own clients from a
   base URL).
 
 Examples with no model seam use in-memory or generated data instead: `HashEmbedding` and
-`Bm25Index` (06, 15), `ScriptedPromptRunner` + `DeterministicEvaluator` (20), and in-memory
-stores, temp files, a Unix socket, or a temp SQLite database (14, 16–19).
+`Bm25Index` (06, 15), `ScriptedPromptRunner` + `DeterministicEvaluator` (20), generated
+tokenizer artefacts (21), a temp SQLite dream queue (23), pipes and an in-process handler
+(24), a file journal (25), and in-memory stores, temp files, a Unix socket, or a temp
+SQLite database (14, 16–19, 26).
 
 To run an example against a real provider instead, set the live switch and credentials:
 
@@ -77,8 +85,10 @@ crates (workflow, context/memory, retrieval); `07` → `10` climb to the harness
 (MCP, `DeepAgent`, the provider protocol, agent teams); `13` → `16` go deeper into the
 kernel seams (context processors, workflow components, retrieval quality, lite memory);
 `17` and `18` cover durable team state and cross-process attach; `19` and `20` cover
-symphony skill discovery and prompt tuning; `11` and `12` remain the optional protocol
-and self-improvement surfaces.
+symphony skill discovery and prompt tuning; `21` → `26` tour the newest seams (native
+tokenizers, context telemetry, memory dreaming, the spawn registry, MoA plus the persistent
+agent, and the online training service); `11` and `12` remain the optional protocol and
+self-improvement surfaces.
 
 Each example prints its narrative to stdout and its diagnostics to stderr
 (`OPENJIUWEN_LOG_LEVEL=debug` for detail). No example prints a credential. The
@@ -100,8 +110,9 @@ exit code 0 with non-empty stdout. `11_a2a_server_client` joins that run only un
 `cargo test -p openjiuwen-examples --features a2a`; with the feature off its example target
 is not built.
 
-The two SQLite-backed examples (`16` memory FTS index, `17` team store) need no setup: the
-backend is compiled in through the crate's dev-dependencies, so the suite stays offline.
+The three SQLite-backed examples (`16` memory FTS index, `17` team store, `23` dream queue)
+need no setup: the backend is compiled in through the crate's dev-dependencies, so the
+suite stays offline.
 
 ## Notes and known workarounds
 
@@ -120,3 +131,16 @@ backend is compiled in through the crate's dev-dependencies, so the suite stays 
   dependency edge is added — the task board owns that transition.
 - **19** sends `SkillFs` diagnostics (including the absolute skill path) to stderr; the
   narrative prints only relative paths, names, scores, and digests.
+- **21** generates both tokenizer artefacts (BPE JSON and a base64 rank table) in a temp
+  dir, so no download is attempted; cache misses are reported as `None` plus a compact
+  `last_error()` code, not as an error, and the selector's `source`/`fallback_reason` pair
+  is the observable fallback ladder.
+- **22** reads `context.usage` snapshots from the engine (`PreparedContext.usage`,
+  `usage_snapshot`) and processor records from a `RecordingSink`; without an analyzer the
+  engine answers a typed `config` error rather than a silent zero.
+- **23** ticks with an injected `DateTime` (no sleeping), and the dreaming pass only moves
+  `dream_jobs` through its state machine — nothing is merged back into memory records.
+- **24**'s external backend re-execs the example binary as an NDJSON child; child mode must
+  not print a banner, and both children are shut down explicitly so `active_spawns` empties.
+- **25** keeps MoA and the persistent agent standalone (no `DeepAgentConfig.moa` field);
+  the journal is a directory, so dropping the handle and reopening is the crash simulation.
