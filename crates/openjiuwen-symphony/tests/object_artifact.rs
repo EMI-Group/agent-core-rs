@@ -1,6 +1,7 @@
 //! Behaviour tests for the object-storage graph artifact backend: numbered immutable
 //! revisions, the `current` pointer, status reporting, reopen persistence, and the typed
-//! unsupported transports.
+//! unsupported transport. The Google Cloud Storage transport is covered by
+//! `tests/artifact_gcs.rs`.
 //!
 //! Everything is offline and deterministic: the in-memory object store backs most cases, the
 //! local backend publishes into a `tempfile::TempDir`, and no assertion depends on the wall
@@ -318,18 +319,17 @@ async fn the_local_backend_tolerates_a_prefix_free_layout() {
 }
 
 #[tokio::test]
-async fn deferred_transports_are_typed_unsupported_errors() {
-    for transport in [ArtifactTransport::Gcs, ArtifactTransport::AzureBlob] {
-        let name = transport.as_str();
-        let error = ObjectGraphArtifactStore::open(transport, "bucket", "graph")
-            .expect_err("a deferred transport must not resolve to a backend");
-        assert!(is_unsupported(&error), "transport {name}");
-        assert!(
-            error.message().contains(name),
-            "the message must name the transport: {}",
-            error.message()
-        );
-    }
+async fn the_deferred_transport_is_a_typed_unsupported_error() {
+    // Google Cloud Storage is a real transport (see `tests/artifact_gcs.rs`); Azure Blob is
+    // still the one backend with no in-crate client.
+    let error = ObjectGraphArtifactStore::open(ArtifactTransport::AzureBlob, "bucket", "graph")
+        .expect_err("a deferred transport must not resolve to a backend");
+    assert!(is_unsupported(&error));
+    assert!(
+        error.message().contains("azure_blob"),
+        "the message must name the transport: {}",
+        error.message()
+    );
 
     let error = ObjectGraphArtifactStore::open(ArtifactTransport::ObjectStore, "bucket", "graph")
         .expect_err("an unresolvable store must be rejected");
