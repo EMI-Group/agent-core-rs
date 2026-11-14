@@ -216,7 +216,7 @@ async fn a_500_delete_is_recorded_without_panicking() {
         .await
         .unwrap();
 
-    assert!(report.deleted.is_empty());
+    assert_eq!(report.deleted, Vec::<String>::new());
     assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
     let failure = &report.failed[0];
     assert_eq!(failure.key, cache_key(&server, &isolation));
