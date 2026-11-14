@@ -1713,6 +1713,7 @@ dependencies = [
  "futures",
  "openjiuwen-common",
  "openjiuwen-core",
+ "openjiuwen-extensions",
  "openjiuwen-harness",
  "openjiuwen-test-support",
  "schemars",
