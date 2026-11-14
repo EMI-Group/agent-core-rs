@@ -58,8 +58,8 @@ The current pipeline ([`crate::controller::base`]) supersedes this lineage; the 
 
 ## Test Strategy
 
-- 42 offline tests: `mod.rs` 15, `schema.rs` 18, `reasoner.rs` 9.
-- `mod.rs` covers delegation (invoke/stream/intent detection), chainable builders, group forwarding and typed errors with `clear_group`, the value-object re-exports, conversation-id resolution, the inline no-runtime path, same-conversation preemption, cross-conversation isolation, `interrupt` on idle and running conversations, residue-free failed turns, and stream preemption of an in-flight invoke.
+- 42 offline tests: `tests.rs` 15, `schema.rs` 18, `reasoner.rs` 9 (`tests.rs` holds the `mod.rs` suite).
+- `tests.rs` covers delegation (invoke/stream/intent detection), chainable builders, group forwarding and typed errors with `clear_group`, the value-object re-exports, conversation-id resolution, the inline no-runtime path, same-conversation preemption, cross-conversation isolation, `interrupt` on idle and running conversations, residue-free failed turns, and stream preemption of an in-flight invoke.
 - `schema.rs` covers wire round-trips for tasks and events, defaults and unknown fields, status strings and terminality, dependency/input defaults, priority integers, predicates and context setters, `get_query` precedence, extensions, source helpers, routing-field omission/round-trip, and handoff resolution precedence.
 - `reasoner.rs` covers tolerant parsing (plain, fenced, numeric strings, out-of-range, malformed), classification fallback, configurable categories and prompt, model-driven detection, failure fallback, and the planner stub; it uses `ScriptedModel`.
 - Doubles: `StubExecutor`, `SlowExecutor` (100 ms hold), `StubRecognizer`, `FailingRecognizer`, `StubRouter`, `RecordingGroup`, `StubHandler`; waits poll every 1 ms with a 5 s bound, and the only timings are the slow executor's hold and that bound.
@@ -67,5 +67,6 @@ The current pipeline ([`crate::controller::base`]) supersedes this lineage; the 
 ## Routing Table
 
 - `./mod.rs` → module docs, re-exports, `IntentDetectionController` and its preemption/group surface
+- `./tests.rs` → the wrapper's offline suite (delegation, preemption, group forwarding, lifecycle)
 - `./schema.rs` → legacy task/event value objects and handoff translation
 - `./reasoner.rs` → `IntentDetector`, `LegacyPlanner`

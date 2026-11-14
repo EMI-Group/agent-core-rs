@@ -87,7 +87,7 @@ Two Python generations live here without sharing types: the current event-queue 
 - `invoke` is single-turn and in-process; the background loop is additive and only runs what the manager holds after a turn (or what a `Reasoner`/host added to it).
 - No panics, `unwrap`, or `expect` outside tests; `tracing` for diagnostics; no new dependencies beyond the crate's existing set.
 - No `parking_lot` guard is held across an `.await`: the scheduler clones what it needs, drops the guard, then awaits.
-- Files stay around ≤1000 lines; `intent.rs` (918), `legacy/mod.rs` (1093, test-heavy), `executors/background/tests.rs` (917) and `legacy/schema.rs` (900) are data- and test-heavy with documented roles.
+- Files stay around ≤1000 lines; `intent.rs` (918), `executors/background/tests.rs` (917), `legacy/schema.rs` (900) and `legacy/tests.rs` (586) are data- and test-heavy with documented roles.
 - Only this node's files are edited; `src/lib.rs`, `src/CONTEXT.md`, the crate `CONTEXT.md`, and `docs/` belong to other nodes.
 
 ## Design Decisions
@@ -138,7 +138,7 @@ Two Python generations live here without sharing types: the current event-queue 
 
 ## Test Strategy
 
-- Inline `#[cfg(test)]` modules in every file, offline and deterministic; the controller suite is the largest in the crate and runs in a couple of seconds.
+- Inline `#[cfg(test)]` modules in every file, offline and deterministic; the controller suite is 250 unit tests and runs in a couple of seconds.
 - `task_manager` (46) covers filters and their validation matrix, union/narrowing/`with_children` resolution, deep-copy isolation, duplicate ids, claim atomicity, status updates with children, priority ordering, child promotion, and the snapshot/restore round-trip plus tolerance to corrupt state.
 - `executors` (42) covers the registry, sequential dispatch, unknown types, `max_tasks`, timeouts, executor errors, the built-ins' answer/error/interrupt mapping, and `LLMController` selection — plus the `background` loop: admission order, the concurrency gate (unlimited and serial), dependency promotion, timeout text, two-phase pause/cancel and their idempotency, `stop`, `in_flight`, and the completion sentinel including its suppression.
 - `reasoner` (19) covers `plan_ops` for every op kind, the confidence gate, the clarification state/frame, and each `apply_task_ops` mutation against a real `TaskManager` with fake executors.
