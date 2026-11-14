@@ -4,14 +4,16 @@
 //! [`McpResourceProvider`] seam so they stay independent of the MCP client transport; with no
 //! provider wired they return a typed `success=false` payload instead of degrading silently.
 //!
-//! # Why a seam instead of a client adapter
+//! # Live client adapter
 //!
-//! The foundation [`openjiuwen_foundation::tool::mcp::McpClient`] trait exposes tool discovery
-//! and tool calls but no `list_resources`/`read_resource` methods, so this module does not
-//! ship an adapter over a live client yet: that extension point is the trait below. Wiring one
-//! later means implementing [`McpResourceProvider`] over the MCP transport; neither tool has to
-//! change. [`FakeMcpResourceProvider`] is the in-crate double tests (and upper layers) use
-//! meanwhile, following the precedent of `openjiuwen_foundation::tool::mcp::FakeMcpClient`.
+//! The foundation [`openjiuwen_foundation::tool::mcp::McpClient`] trait exposes
+//! `list_resources`/`read_resource` (raw `rmcp` JSON) next to tool discovery and tool calls, so
+//! [`McpClientResourceProvider`] adapts it to this seam: list and read are delegated and
+//! normalised, and every subscription entry point answers [`Error::Unsupported`] because the
+//! trait exposes no `resources/subscribe` (see [`super::mcp_subscriptions`] for the registry the
+//! deferred capability would feed). [`FakeMcpResourceProvider`] is the in-crate double tests
+//! (and upper layers) use, following the precedent of
+//! `openjiuwen_foundation::tool::mcp::FakeMcpClient`.
 //!
 //! # Model-facing contract
 //!
@@ -36,6 +38,8 @@
 //!   Rust-only additions so binary resources survive the round trip.
 //! - Python's per-tool `render_for_llm` (one resource per line, joined text blocks) is not
 //!   ported: the payload renders through the default [`Tool`] rendering.
+//! - A read that returns several `contents` entries (a multi-part resource) keeps the first and
+//!   logs the rest at `debug`, because this seam models one content per URI.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -47,9 +51,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use openjiuwen_common::error::{Error, Result};
+use openjiuwen_foundation::tool::mcp::McpClient;
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 
 use super::descriptions::description;
+use super::mcp_subscriptions::McpResourceSubscriptionProvider;
 use super::support::{parse_args, schema_for, tool_card, ToolPayload};
 
 /// The failure reported when no MCP resource provider is wired into a tool.
@@ -217,6 +223,175 @@ impl McpResourceProvider for FakeMcpResourceProvider {
             .cloned()
             .ok_or_else(|| Error::tool(format!("unknown MCP resource: {uri}")))
     }
+}
+
+/// An [`McpResourceProvider`] over a live foundation [`McpClient`].
+///
+/// List and read are delegated to
+/// [`McpClient::list_resources`]/[`McpClient::read_resource`] and normalised from the raw
+/// `rmcp` JSON (`mimeType`, `contents[].blob`) to this crate's `snake_case` types. Resources
+/// without a usable `uri` are skipped with a `debug` log, exactly like Python's
+/// `getattr(r, "uri", str(r))` tolerance.
+///
+/// The adapter also implements [`McpResourceSubscriptionProvider`], but only through that
+/// trait's defaults: the foundation client has no `resources/subscribe` call and no
+/// notification callback for `resources/updated`, so subscribing answers
+/// [`super::mcp_subscriptions::SUBSCRIBE_UNSUPPORTED`] instead of pretending. A transport that
+/// gains the capability implements the trait directly.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use openjiuwen_foundation::tool::mcp::McpClient;
+/// # use openjiuwen_harness::tools::McpClientResourceProvider;
+/// # fn wire(client: Arc<dyn McpClient>) {
+/// let provider = Arc::new(McpClientResourceProvider::new(client));
+/// # let _ = provider;
+/// # }
+/// ```
+pub struct McpClientResourceProvider {
+    /// The live client the two resource calls are delegated to.
+    client: Arc<dyn McpClient>,
+}
+
+impl std::fmt::Debug for McpClientResourceProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpClientResourceProvider")
+            .field("server", &self.client.server_name())
+            .field("server_id", &self.client.server_id())
+            .finish()
+    }
+}
+
+impl McpClientResourceProvider {
+    /// Builds the adapter over `client`.
+    #[must_use]
+    pub fn new(client: Arc<dyn McpClient>) -> Self {
+        Self { client }
+    }
+
+    /// The wrapped client.
+    #[must_use]
+    pub fn client(&self) -> &Arc<dyn McpClient> {
+        &self.client
+    }
+}
+
+#[async_trait]
+impl McpResourceProvider for McpClientResourceProvider {
+    async fn list_resources(&self) -> Result<Vec<McpResource>> {
+        let values = self.client.list_resources().await?;
+        Ok(values
+            .iter()
+            .filter_map(|value| {
+                let resource = resource_from_wire(value);
+                if resource.is_none() {
+                    tracing::debug!(
+                        target: "openjiuwen_harness::tools::mcp_resources",
+                        "skipping an MCP resource without a usable uri"
+                    );
+                }
+                resource
+            })
+            .collect())
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<McpResourceContent> {
+        let value = self.client.read_resource(uri).await?;
+        content_from_wire(uri, &value)
+    }
+}
+
+#[async_trait]
+impl McpResourceSubscriptionProvider for McpClientResourceProvider {}
+
+/// Normalises one `rmcp` resource (`{"uri", "name", "mimeType", "description", …}`) — or a bare
+/// URI string, as Python tolerates — into [`McpResource`].
+fn resource_from_wire(value: &Value) -> Option<McpResource> {
+    if let Some(uri) = value.as_str() {
+        let uri = uri.trim();
+        return (!uri.is_empty()).then(|| McpResource {
+            uri: uri.to_owned(),
+            ..McpResource::default()
+        });
+    }
+    let object = value.as_object()?;
+    let uri = wire_string(object, &["uri"])?;
+    Some(McpResource {
+        uri,
+        name: wire_string(object, &["name"]).unwrap_or_default(),
+        mime_type: wire_string(object, &["mimeType", "mime_type"]),
+        description: wire_string(object, &["description"]),
+    })
+}
+
+/// Normalises one `rmcp` `ReadResourceResult` (`{"contents": [...]}`) into
+/// [`McpResourceContent`].
+///
+/// A payload without a `contents` array is treated as a bare content object so a custom
+/// transport can answer with either shape.
+fn content_from_wire(requested: &str, value: &Value) -> Result<McpResourceContent> {
+    let entry = match value.get("contents") {
+        Some(Value::Array(entries)) => {
+            let Some(first) = entries.first() else {
+                return Err(Error::not_found(format!(
+                    "MCP resource `{requested}` has no content"
+                )));
+            };
+            if entries.len() > 1 {
+                tracing::debug!(
+                    target: "openjiuwen_harness::tools::mcp_resources",
+                    uri = requested,
+                    contents = entries.len(),
+                    "MCP resource returned several contents; keeping the first"
+                );
+            }
+            first
+        }
+        Some(_) => {
+            return Err(Error::mcp(
+                "MCP read_resource returned a non-array 'contents' field",
+            ))
+        }
+        None => value,
+    };
+    let object = entry
+        .as_object()
+        .ok_or_else(|| Error::mcp("MCP read_resource returned a non-object content"))?;
+    let text = wire_string(object, &["text"]);
+    let blob_base64 = wire_string(object, &["blob", "blob_base64", "blobBase64"]);
+    let byte_size = text.as_ref().map_or_else(
+        || blob_base64.as_deref().map_or(0, base64_byte_len),
+        |text| u64::try_from(text.len()).unwrap_or(u64::MAX),
+    );
+    Ok(McpResourceContent {
+        uri: wire_string(object, &["uri"]).unwrap_or_else(|| requested.to_owned()),
+        mime_type: wire_string(object, &["mimeType", "mime_type"]),
+        text,
+        blob_base64,
+        byte_size,
+    })
+}
+
+/// Returns the first non-blank string among `keys`.
+fn wire_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = object.get(*key)?.as_str()?.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// The decoded size of a base64 payload, without decoding it.
+fn base64_byte_len(encoded: &str) -> u64 {
+    let trimmed = encoded.trim_end();
+    let padding = trimmed
+        .chars()
+        .rev()
+        .take_while(|character| *character == '=')
+        .count();
+    let length = u64::try_from(trimmed.chars().count()).unwrap_or(u64::MAX);
+    let padding = u64::try_from(padding).unwrap_or(0);
+    (length.saturating_mul(3) / 4).saturating_sub(padding)
 }
 
 /// Lists the resources of the bound MCP server (`list_mcp_resources`).
@@ -616,5 +791,172 @@ mod tests {
         provider.set_resources(vec![resource("mem://a", "alpha")]);
         assert_eq!(provider.resources.lock().len(), 1);
         assert_eq!(FakeMcpResourceProvider::default().list_calls(), 0);
+    }
+
+    /// A minimal live-client stand-in: canned `rmcp` payloads and one canned failure.
+    #[derive(Debug, Default)]
+    struct StubClient {
+        /// Payload of `list_resources`; `None` answers with a transport failure.
+        resources: Option<Vec<Value>>,
+        /// Payload of `read_resource`, when it succeeds.
+        read: Option<Value>,
+        /// Failure `read_resource` reports instead of `read`.
+        read_failure: Option<String>,
+        /// URIs passed to `read_resource`.
+        read_calls: Mutex<Vec<String>>,
+    }
+
+    impl StubClient {
+        /// A client answering with `resources` and `read`.
+        fn new(resources: Vec<Value>, read: Value) -> Arc<Self> {
+            Arc::new(Self {
+                resources: Some(resources),
+                read: Some(read),
+                read_failure: None,
+                read_calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl McpClient for StubClient {
+        fn server_name(&self) -> &str {
+            "stub"
+        }
+
+        async fn connect(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn list_tools(&self) -> Result<Vec<openjiuwen_foundation::tool::mcp::McpRemoteTool>> {
+            Err(Error::unsupported("the stub client exposes no tools"))
+        }
+
+        async fn call_tool_with(
+            &self,
+            _tool_name: &str,
+            _arguments: Value,
+            _timeout: Option<std::time::Duration>,
+            _include_image_content: bool,
+        ) -> Result<openjiuwen_foundation::tool::mcp::McpToolResult> {
+            Err(Error::unsupported("the stub client calls no tools"))
+        }
+
+        async fn list_resources(&self) -> Result<Vec<Value>> {
+            self.resources
+                .clone()
+                .ok_or_else(|| Error::transport("socket closed"))
+        }
+
+        async fn read_resource(&self, uri: &str) -> Result<Value> {
+            self.read_calls.lock().push(uri.to_owned());
+            match (self.read.clone(), self.read_failure.as_deref()) {
+                (_, Some(message)) => Err(Error::tool(message.to_owned())),
+                (Some(value), None) => Ok(value),
+                (None, None) => Err(Error::transport("socket closed")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_client_adapter_normalises_list_and_read() {
+        let client = StubClient::new(
+            vec![
+                json!({
+                    "uri": "mem://a",
+                    "name": "alpha",
+                    "mimeType": "text/markdown",
+                    "description": "notes",
+                    "size": 42,
+                }),
+                json!("mem://bare"),
+                json!({"name": "no uri"}),
+            ],
+            json!({"contents": [{"uri": "mem://a", "mimeType": "text/markdown", "text": "hello"}]}),
+        );
+        let provider: Arc<dyn McpResourceProvider> =
+            Arc::new(McpClientResourceProvider::new(client.clone()));
+
+        let listed = list(Some(provider.clone())).await;
+        assert_eq!(listed["success"], true, "payload: {listed}");
+        let resources = listed["data"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0]["uri"], "mem://a");
+        assert_eq!(resources[0]["name"], "alpha");
+        assert_eq!(resources[0]["mime_type"], "text/markdown");
+        assert_eq!(resources[1]["uri"], "mem://bare");
+        assert_eq!(resources[1]["name"], "");
+
+        let read = read(Some(provider), json!({"uri": "mem://a"})).await;
+        assert_eq!(read["success"], true, "payload: {read}");
+        assert_eq!(read["data"]["resource"]["uri"], "mem://a");
+        assert_eq!(read["data"]["resource"]["text"], "hello");
+        assert_eq!(read["data"]["resource"]["byte_size"], 5);
+        assert_eq!(read["data"]["resource"]["blob_base64"], Value::Null);
+        assert_eq!(client.read_calls.lock().clone(), vec!["mem://a".to_owned()]);
+        assert_eq!(McpClientResourceProvider::new(client).client().server_name(), "stub");
+    }
+
+    #[tokio::test]
+    async fn the_live_client_adapter_reports_empty_and_malformed_reads() {
+        let empty = Arc::new(McpClientResourceProvider::new(StubClient::new(
+            Vec::new(),
+            json!({"contents": []}),
+        )));
+        let error = empty.read_resource("mem://a").await.unwrap_err();
+        assert!(matches!(error, Error::NotFound(_)), "error: {error}");
+        assert!(empty.list_resources().await.unwrap().is_empty());
+
+        let binary = Arc::new(McpClientResourceProvider::new(StubClient::new(
+            Vec::new(),
+            json!({"contents": [{"uri": "mem://b", "blob": "aGVsbG8="}]}),
+        )));
+        let content = binary.read_resource("mem://b").await.unwrap();
+        assert_eq!(content.blob_base64.as_deref(), Some("aGVsbG8="));
+        assert_eq!(content.text, None);
+        assert_eq!(content.byte_size, 5);
+
+        let malformed = Arc::new(McpClientResourceProvider::new(StubClient::new(
+            Vec::new(),
+            json!({"contents": "nope"}),
+        )));
+        let error = malformed.read_resource("mem://c").await.unwrap_err();
+        assert!(matches!(error, Error::Mcp(_)), "error: {error}");
+
+        let failing = Arc::new(McpClientResourceProvider::new(Arc::new(StubClient {
+            resources: None,
+            read: Some(json!({})),
+            read_failure: None,
+            read_calls: Mutex::new(Vec::new()),
+        })));
+        let error = failing.list_resources().await.unwrap_err();
+        assert!(matches!(error, Error::Transport(_)), "error: {error}");
+    }
+
+    #[tokio::test]
+    async fn the_live_client_adapter_cannot_subscribe() {
+        let provider = McpClientResourceProvider::new(StubClient::new(Vec::new(), json!({})));
+        assert!(!provider.supports_subscriptions());
+        let registry = crate::tools::mcp_subscriptions::McpResourceSubscriptions::new()
+            .with_provider(Arc::new(provider));
+        let error = registry.subscribe("mem://a").await.unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "error: {error}");
+        assert!(error.message().contains("resources/subscribe"), "error: {error}");
+        assert!(!registry.is_subscribed("mem://a"));
+    }
+
+    #[test]
+    fn base64_sizes_are_computed_without_decoding() {
+        assert_eq!(base64_byte_len("aGVsbG8="), 5);
+        assert_eq!(base64_byte_len("aGVsbG8h"), 6);
+        assert_eq!(base64_byte_len(""), 0);
     }
 }

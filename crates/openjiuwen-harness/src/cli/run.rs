@@ -768,7 +768,13 @@ mod tests {
     fn cli_extended_tools_are_the_extended_set_minus_lsp() {
         let expected: Vec<BuiltinTool> = BuiltinTool::EXTENDED
             .into_iter()
-            .filter(|tool| *tool != BuiltinTool::Lsp && !BuiltinTool::DEFAULT.contains(tool))
+            .filter(|tool| {
+                // `lsp` needs a per-workspace server config and `mcp_resource_subscription` a
+                // subscription registry; the CLI wires neither, so it mounts neither.
+                *tool != BuiltinTool::Lsp
+                    && *tool != BuiltinTool::McpResourceSubscription
+                    && !BuiltinTool::DEFAULT.contains(tool)
+            })
             .collect();
         assert_eq!(
             CLI_EXTENDED_TOOLS.to_vec(),

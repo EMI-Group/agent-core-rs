@@ -5,7 +5,7 @@
 //! deferred-tool discovery API, and end-to-end calls through one `build()` (so the filesystem
 //! tools share their read state and the extended tools share their seams).
 //!
-//! Size note: this file is long by design — it is one parity suite over all 32 tools rather
+//! Size note: this file is long by design — it is one parity suite over all 33 tools rather
 //! than per-module behaviour tests, which stay beside each tool module.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -52,8 +52,9 @@ const EXPECTED_NAMES: [&str; 20] = [
     "coding_memory_edit",
 ];
 
-/// The twelve extended Python tool names, in registry order.
-const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
+/// The thirteen extended tool names, in registry order (twelve Python tools plus the Rust-only
+/// `mcp_resource_subscription`).
+const EXPECTED_EXTENDED_NAMES: [&str; 13] = [
     "fetch_webpage",
     "web_search",
     "image_metadata",
@@ -61,6 +62,7 @@ const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
     "cron",
     "list_mcp_resources",
     "read_mcp_resource",
+    "mcp_resource_subscription",
     "tool_search",
     "get_current_goal",
     "submit_goal_report",
@@ -69,7 +71,7 @@ const EXPECTED_EXTENDED_NAMES: [&str; 12] = [
 ];
 
 /// The `required` list of each Python card; the empty slices have no `required` key at all.
-const EXPECTED_REQUIRED: [(&str, &[&str]); 32] = [
+const EXPECTED_REQUIRED: [(&str, &[&str]); 33] = [
     ("bash", &["command"]),
     ("read_file", &["file_path"]),
     ("write_file", &["file_path", "content"]),
@@ -97,6 +99,7 @@ const EXPECTED_REQUIRED: [(&str, &[&str]); 32] = [
     ("cron", &["action"]),
     ("list_mcp_resources", &[]),
     ("read_mcp_resource", &["uri"]),
+    ("mcp_resource_subscription", &["action"]),
     ("tool_search", &["query"]),
     ("get_current_goal", &[]),
     ("submit_goal_report", &["status", "evidence"]),
@@ -154,7 +157,7 @@ async fn invoke(tools: &[Arc<dyn Tool>], name: &str, inputs: Value) -> Value {
 fn tool_names_are_exactly_the_twenty_python_names() {
     assert_eq!(tool_names(), &EXPECTED_NAMES);
     assert_eq!(BuiltinTool::DEFAULT.len(), EXPECTED_NAMES.len());
-    assert_eq!(BuiltinTool::ALL.len(), 32);
+    assert_eq!(BuiltinTool::ALL.len(), 33);
     assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
 
     let names: Vec<&str> = BuiltinTool::DEFAULT
@@ -353,6 +356,7 @@ fn parallel_safe_flags_match_the_registry() {
                 | BuiltinTool::EditFile
                 | BuiltinTool::Cron
                 | BuiltinTool::SubmitGoalReport
+                | BuiltinTool::McpResourceSubscription
                 | BuiltinTool::Worktree
         );
         assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
@@ -362,6 +366,7 @@ fn parallel_safe_flags_match_the_registry() {
         "edit_file",
         "cron",
         "submit_goal_report",
+        "mcp_resource_subscription",
         "worktree",
     ] {
         let tool = BuiltinTool::from_name(name).expect("known tool");
@@ -822,7 +827,7 @@ fn extended_registry_builds_every_tool_in_registry_order() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let registry = extended_registry(&dir);
     let tools = registry.build();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
     let names: Vec<&str> = tools.iter().map(|tool| tool.card().name.as_str()).collect();
     assert_eq!(
         names,
@@ -831,7 +836,7 @@ fn extended_registry_builds_every_tool_in_registry_order() {
             .map(|tool| tool.name())
             .collect::<Vec<&str>>()
     );
-    assert_eq!(registry.cards("en").len(), 32);
+    assert_eq!(registry.cards("en").len(), 33);
     assert_eq!(registry.tools(), &BuiltinTool::EXTENDED);
 }
 
@@ -1009,6 +1014,95 @@ async fn mcp_resource_tools_without_a_provider_report_the_typed_failure() {
 }
 
 #[tokio::test]
+async fn mcp_resource_subscription_tool_uses_the_registry() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let provider = Arc::new(
+        super::mcp_subscriptions::FakeMcpResourceSubscriptionProvider::new(),
+    );
+    let subscriptions = Arc::new(
+        super::mcp_subscriptions::McpResourceSubscriptions::new()
+            .with_provider(provider.clone())
+            .with_capacity(4),
+    );
+    let tools = extended_registry(&dir)
+        .with_mcp_subscriptions(subscriptions)
+        .build();
+
+    let subscribed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "subscribe", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(subscribed["success"], true, "subscribe failed: {subscribed}");
+    assert_eq!(
+        subscribed["data"]["subscription"]["capacity"],
+        json!(4)
+    );
+
+    assert!(provider.push_notification("mem://notes", "changed"));
+    let polled = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "poll", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(polled["data"]["count"], json!(1));
+    assert_eq!(polled["data"]["events"][0]["reason"], "changed");
+
+    let listed = invoke(&tools, "mcp_resource_subscription", json!({"action": "list"})).await;
+    assert_eq!(listed["data"]["count"], json!(1));
+    assert_eq!(listed["data"]["capacity"], json!(4));
+
+    let closed = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "unsubscribe", "uri": "mem://notes"}),
+    )
+    .await;
+    assert_eq!(closed["success"], true, "unsubscribe failed: {closed}");
+    assert_eq!(
+        provider.unsubscribe_calls(),
+        vec!["mem://notes".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn mcp_resource_subscription_tool_without_a_registry_reports_the_typed_failure() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let tools = built_extended(&dir);
+    let payload = invoke(
+        &tools,
+        "mcp_resource_subscription",
+        json!({"action": "list"}),
+    )
+    .await;
+    assert_eq!(payload["success"], false);
+    let error = payload["error"].as_str().expect("error text");
+    assert!(error.contains("no subscription registry is configured"), "error: {error}");
+}
+
+#[test]
+fn mcp_resource_subscription_card_is_mounted_and_serialisable() {
+    let dir = tempfile::tempdir().expect("temp workspace");
+    let registry = extended_registry(&dir);
+    let card = registry.card(BuiltinTool::McpResourceSubscription, "en");
+    assert_eq!(card.name, "mcp_resource_subscription");
+    assert!(!card.parallel_safe);
+    assert_eq!(card.input_params["required"], json!(["action"]));
+    assert_eq!(
+        card.description,
+        descriptions::description("mcp_resource_subscription", "en")
+    );
+    assert!(registry.mcp_subscriptions().is_none());
+    let subscriptions = Arc::new(super::mcp_subscriptions::McpResourceSubscriptions::new());
+    assert!(registry
+        .with_mcp_subscriptions(subscriptions)
+        .mcp_subscriptions()
+        .is_some());
+}
+
+#[tokio::test]
 async fn tool_search_finds_the_deferred_tool() {
     let dir = tempfile::tempdir().expect("temp workspace");
     let tools = extended_registry(&dir)
@@ -1070,7 +1164,7 @@ fn extended_names_match_the_variant_table() {
         .map(|tool| tool.name())
         .collect();
     assert_eq!(names, super::extended_tool_names().to_vec());
-    assert_eq!(BuiltinTool::ALL.len(), 32);
+    assert_eq!(BuiltinTool::ALL.len(), 33);
     for (index, name) in super::extended_tool_names().iter().enumerate() {
         assert_eq!(
             BuiltinTool::EXTENDED[index].name(),

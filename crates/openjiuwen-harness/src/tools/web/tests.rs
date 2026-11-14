@@ -18,7 +18,10 @@ use tokio::net::TcpListener;
 use openjiuwen_foundation::tool::{Tool, ToolContext};
 
 use super::fetch::{FetchRequest, FetchWebpageTool, HttpFetcher, ReqwestFetcher};
-use super::search::{FakeSearchBackend, HttpSearchBackend, SearchResult, WebSearchTool};
+use super::search::{
+    not_configured_reason, FakeSearchBackend, HttpSearchBackend, SearchBackend, SearchResult,
+    WebSearchTool, ENDPOINT_ENV,
+};
 use super::test_support::{http_response, StubFetcher, TestServer};
 use crate::permission::{
     NetGuardSection, PermissionEngine, PermissionEngineConfig, PermissionLevel, PermissionsSection,
@@ -289,9 +292,222 @@ async fn missing_search_backend_fails() {
         .await
         .unwrap();
     assert_eq!(payload["success"], json!(false));
+    assert_eq!(payload["error"], json!(not_configured_reason()));
+    let error = payload["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("web search backend is not configured"),
+        "error: {error}"
+    );
+    assert!(error.contains(ENDPOINT_ENV), "error: {error}");
+}
+
+/// Starts a loopback search endpoint answering every request with `status`/`body`.
+///
+/// Returns the server (kept alive by the caller) and the request heads it received, so a test can
+/// assert the exact request line and query encoding the backend produced.
+async fn search_server(
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+) -> (TestServer, Arc<parking_lot::Mutex<Vec<String>>>) {
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let server = TestServer::start(move |request| {
+        recorded.lock().push(request.to_owned());
+        http_response(status, content_type, body.as_bytes())
+    })
+    .await;
+    (server, requests)
+}
+
+/// Builds a `web_search` tool over `endpoint` with the real `reqwest` fetcher.
+fn loopback_search_tool(endpoint: String) -> WebSearchTool {
+    let backend = HttpSearchBackend::with_fetcher(endpoint, Arc::new(ReqwestFetcher::new()));
+    WebSearchTool::new(Some(Arc::new(backend)), "en")
+}
+
+/// Invokes a `web_search` tool and unwraps the payload envelope.
+async fn search(tool: &WebSearchTool, inputs: Value) -> Value {
+    tool.invoke(inputs, &ToolContext::new()).await.unwrap()
+}
+
+#[tokio::test]
+async fn loopback_search_encodes_the_query_and_clamps_the_result_count() {
+    let (server, requests) = search_server(
+        200,
+        "application/json",
+        r#"{"results":[{"title":"Rust","url":"https://rust.example","snippet":"lang"}]}"#,
+    )
+    .await;
+    let tool = loopback_search_tool(server.url("/search"));
+
+    // `max_results: 0` is clamped up to the minimum of one.
+    let payload = search(&tool, json!({"query": "rust & async/await", "max_results": 0})).await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(
+        payload["data"]["results"],
+        json!([{"title": "Rust", "url": "https://rust.example", "snippet": "lang"}])
+    );
+
+    // `max_results: 1000` is clamped down to the maximum of twenty, and the absent count uses the
+    // documented default of eight.
+    let _ = search(&tool, json!({"query": "rust", "max_results": 1000})).await;
+    let _ = search(&tool, json!({"query": "rust"})).await;
+
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0].starts_with(
+            "GET /search?q=rust%20%26%20async%2Fawait&max_results=1 HTTP/1.1\r\n"
+        ),
+        "request: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].starts_with("GET /search?q=rust&max_results=20 HTTP/1.1\r\n"),
+        "request: {}",
+        requests[1]
+    );
+    assert!(
+        requests[2].starts_with("GET /search?q=rust&max_results=8 HTTP/1.1\r\n"),
+        "request: {}",
+        requests[2]
+    );
+    for request in requests.iter() {
+        assert!(
+            request.to_lowercase().contains("accept: application/json"),
+            "request: {request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn loopback_search_uses_the_query_template_when_the_endpoint_has_one() {
+    let (server, requests) = search_server(200, "application/json", r#"{"results":[]}"#).await;
+    let tool = loopback_search_tool(server.url("/find?text={query}"));
+    let payload = search(&tool, json!({"query": "a b&c", "max_results": 5})).await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["results"], json!([]));
+    let head = requests.lock()[0].clone();
+    assert!(
+        head.starts_with("GET /find?text=a%20b%26c HTTP/1.1\r\n"),
+        "request: {head}"
+    );
+    assert!(!head.contains("max_results"), "request: {head}");
+}
+
+#[tokio::test]
+async fn loopback_search_reports_an_http_failure_as_a_runtime_failure() {
+    let (server, _requests) =
+        search_server(500, "application/json", r#"{"error":"upstream is down"}"#).await;
+    let tool = loopback_search_tool(server.url("/search"));
+    let payload = search(&tool, json!({"query": "rust"})).await;
+    assert_eq!(payload["success"], json!(false));
+    let error = payload["error"].as_str().unwrap();
+    assert!(error.starts_with("web search failed: "), "error: {error}");
+    assert!(error.contains("HTTP 500"), "error: {error}");
+    assert!(error.contains("/search?q=rust"), "error: {error}");
+    assert!(!error.contains("not configured"), "error: {error}");
+}
+
+#[tokio::test]
+async fn loopback_search_reports_malformed_json_as_a_runtime_failure() {
+    let (server, _requests) = search_server(200, "application/json", "not json").await;
+    let tool = loopback_search_tool(server.url("/search"));
+    let payload = search(&tool, json!({"query": "rust"})).await;
+    assert_eq!(payload["success"], json!(false));
+    let error = payload["error"].as_str().unwrap();
+    assert!(error.starts_with("web search failed: "), "error: {error}");
+    assert!(error.contains("invalid JSON"), "error: {error}");
+}
+
+#[tokio::test]
+async fn loopback_search_accepts_empty_result_sets() {
+    let (object_server, _) = search_server(200, "application/json", r#"{"results":[]}"#).await;
+    let payload = search(
+        &loopback_search_tool(object_server.url("/search")),
+        json!({"query": "nothing"}),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["results"], json!([]));
+
+    let (array_server, _) = search_server(200, "application/json", "[]").await;
+    let payload = search(
+        &loopback_search_tool(array_server.url("/search")),
+        json!({"query": "nothing"}),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["results"], json!([]));
+}
+
+#[tokio::test]
+async fn endpoint_lookup_configures_the_loopback_backend() {
+    let (server, requests) = search_server(
+        200,
+        "application/json",
+        r#"{"results":[{"title":"Env","url":"https://env.example","snippet":"s"}]}"#,
+    )
+    .await;
+    let endpoint = server.url("/env-search");
+    let backend = HttpSearchBackend::from_lookup(|key| {
+        (key == ENDPOINT_ENV).then(|| format!("  {endpoint}  "))
+    })
+    .unwrap();
+    let tool = WebSearchTool::new(Some(Arc::new(backend)), "en");
+    let payload = search(&tool, json!({"query": "rust"})).await;
+    assert_eq!(
+        payload["data"]["results"],
+        json!([{"title": "Env", "url": "https://env.example", "snippet": "s"}])
+    );
+    let head = requests.lock()[0].clone();
+    assert!(
+        head.starts_with("GET /env-search?q=rust&max_results=8 HTTP/1.1\r\n"),
+        "request: {head}"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_without_a_configured_endpoint_reports_the_typed_gap_without_a_request() {
+    let (server, requests) = search_server(200, "application/json", r#"{"results":[]}"#).await;
+    // The endpoint is blank, so no connection is attempted even though the URL is reachable.
+    let tool = WebSearchTool::with_endpoint("   ", "en");
+    let payload = search(&tool, json!({"query": "rust"})).await;
+    assert_eq!(payload["success"], json!(false));
+    assert_eq!(payload["error"], json!(not_configured_reason()));
+    assert!(requests.lock().is_empty());
+    drop(server);
+
+    let backend = HttpSearchBackend::from_lookup(|_| None).err().unwrap();
+    assert_eq!(&*backend.message(), not_configured_reason().as_str());
+}
+
+/// A configured provider that cannot serve this deployment reports `Unsupported`, which the tool
+/// renders as its bare reason rather than as a runtime failure.
+struct UnsupportedSearchBackend;
+
+#[async_trait::async_trait]
+impl SearchBackend for UnsupportedSearchBackend {
+    async fn search(
+        &self,
+        _query: &str,
+        _max_results: usize,
+    ) -> openjiuwen_common::error::Result<Vec<SearchResult>> {
+        Err(openjiuwen_common::error::Error::unsupported(
+            "web search vendor API keys are not ported",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_provider_reports_its_bare_reason() {
+    let tool = WebSearchTool::new(Some(Arc::new(UnsupportedSearchBackend)), "en");
+    let payload = search(&tool, json!({"query": "rust"})).await;
+    assert_eq!(payload["success"], json!(false));
     assert_eq!(
         payload["error"],
-        json!("web search backend is not configured")
+        json!("web search vendor API keys are not ported")
     );
 }
 

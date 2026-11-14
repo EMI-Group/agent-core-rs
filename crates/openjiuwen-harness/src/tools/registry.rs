@@ -16,7 +16,8 @@ use crate::workspace::Workspace;
 use crate::worktree::{WorktreeManager, WorktreeTool};
 
 use super::{
-    cron, discovery, goal, mcp_resources, media, web, AskUserTool, BashTool, BuiltinTool,
+    cron, discovery, goal, mcp_resources, mcp_subscription_tool, mcp_subscriptions, media, web,
+    AskUserTool, BashTool, BuiltinTool,
     EditFileTool, GlobTool, GrepTool, ListDirTool, MemoryTool, MemoryToolBackend, MemoryToolKind,
     ReadFileTool, ReadStateRegistry, TodoCreateTool, TodoGetTool, TodoListTool, TodoModifyTool,
     TodoStore, ToolEnv, UserAsker, WriteFileTool,
@@ -86,6 +87,8 @@ pub struct ToolRegistry {
     search: Option<Arc<dyn web::SearchBackend>>,
     /// The MCP resource provider behind the two resource tools, when one is wired.
     mcp_provider: Option<Arc<dyn mcp_resources::McpResourceProvider>>,
+    /// The MCP resource subscription registry behind `mcp_resource_subscription`, when wired.
+    mcp_subscriptions: Option<Arc<mcp_subscriptions::McpResourceSubscriptions>>,
     /// The cron scheduler behind the `cron` tool, when one is wired.
     cron_scheduler: Option<Arc<cron::CronScheduler>>,
     /// The goal store behind the two goal tools, when one is wired.
@@ -138,6 +141,7 @@ impl ToolRegistry {
             http_fetcher: None,
             search: None,
             mcp_provider: None,
+            mcp_subscriptions: None,
             cron_scheduler: None,
             goal_store: None,
             lsp_config: None,
@@ -214,6 +218,21 @@ impl ToolRegistry {
         provider: Arc<dyn mcp_resources::McpResourceProvider>,
     ) -> Self {
         self.mcp_provider = Some(provider);
+        self
+    }
+
+    /// Wires the MCP resource subscription registry behind `mcp_resource_subscription`.
+    ///
+    /// Without one every action of that tool reports a typed "not available" payload. The
+    /// provider's `subscribe`/`unsubscribe` live on the registry
+    /// ([`mcp_subscriptions::McpResourceSubscriptions::with_provider`]), so a host that already
+    /// implements the subscription trait shares one instance between the registry and the tool.
+    #[must_use]
+    pub fn with_mcp_subscriptions(
+        mut self,
+        subscriptions: Arc<mcp_subscriptions::McpResourceSubscriptions>,
+    ) -> Self {
+        self.mcp_subscriptions = Some(subscriptions);
         self
     }
 
@@ -349,6 +368,12 @@ impl ToolRegistry {
                     self.mcp_provider.clone(),
                     language,
                 )),
+                BuiltinTool::McpResourceSubscription => {
+                    Arc::new(mcp_subscription_tool::McpResourceSubscriptionTool::new(
+                        self.mcp_subscriptions.clone(),
+                        language,
+                    ))
+                }
                 BuiltinTool::ToolSearch => Arc::new(discovery::ToolSearchTool::new(
                     self.tool_index(&mut caches.tool_index, language),
                     language,
@@ -553,6 +578,9 @@ impl ToolRegistry {
                 mcp_resources::ListMcpResourcesTool::card_for(language)
             }
             BuiltinTool::ReadMcpResource => mcp_resources::ReadMcpResourceTool::card_for(language),
+            BuiltinTool::McpResourceSubscription => {
+                mcp_subscription_tool::McpResourceSubscriptionTool::card_for(language)
+            }
             BuiltinTool::ToolSearch => discovery::ToolSearchTool::card_for(language),
             BuiltinTool::GetCurrentGoal => goal::GetCurrentGoalTool::card_for(language),
             BuiltinTool::SubmitGoalReport => goal::SubmitGoalReportTool::card_for(language),
@@ -682,6 +710,13 @@ impl ToolRegistry {
     #[must_use]
     pub fn mcp_provider(&self) -> Option<&Arc<dyn mcp_resources::McpResourceProvider>> {
         self.mcp_provider.as_ref()
+    }
+
+    /// The MCP resource subscription registry wired into `mcp_resource_subscription`, when one
+    /// is configured.
+    #[must_use]
+    pub fn mcp_subscriptions(&self) -> Option<&Arc<mcp_subscriptions::McpResourceSubscriptions>> {
+        self.mcp_subscriptions.as_ref()
     }
 
     /// The language-server configuration wired into the `lsp` tool, when one is configured.

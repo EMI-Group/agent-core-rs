@@ -3,9 +3,27 @@
 //! Ports the tool surface of `openjiuwen/harness/tools/web/free_search.py` and `paid_search.py`
 //! without their engine internals: the model-facing contract is one `query`, a clamped result
 //! count and a `{title, url, snippet}` result list. The free DuckDuckGo/Bing HTML scrapers, the
-//! paid vendor SDKs (Tavily/Serper/Bing API), redirect unwrapping, relevance assessment and the
-//! LLM quality/budget passes are deferred — a host supplies whatever provider it wants behind
+//! paid vendor SDKs (Bocha/Perplexity/Serper/Jina), redirect unwrapping, relevance assessment and
+//! the LLM quality/budget passes are deferred — a host supplies whatever provider it wants behind
 //! [`SearchBackend`], including an HTTP JSON endpoint through [`HttpSearchBackend`].
+//!
+//! # Configuration, and why "not configured" is typed
+//!
+//! There are three ways to open the backend gap, in increasing order of effort:
+//!
+//! 1. [`HttpSearchBackend::from_env`] reads [`ENDPOINT_ENV`] (`OPENJIUWEN_WEB_SEARCH_ENDPOINT`) and
+//!    builds the HTTP backend from it; [`HttpSearchBackend::from_lookup`] is the same thing over an
+//!    injected environment, so hosts and tests stay deterministic.
+//! 2. [`HttpSearchBackend::new`] takes the endpoint (or a `{query}` template) directly, and
+//!    [`WebSearchTool::with_endpoint`] wraps that in one call.
+//! 3. a host implements [`SearchBackend`] over its vendor of choice and wires it with
+//!    `ToolRegistry::with_search_backend`.
+//!
+//! "No endpoint" is a *configuration* gap, not a provider failure, so it is reported as
+//! [`Error::Unsupported`] carrying [`not_configured_reason`] (which names [`ENDPOINT_ENV`] and the
+//! two constructors). A provider that is configured but fails keeps its own
+//! [`Error::Tool`]/[`Error::Transport`] kind, and the tool renders the two differently: the
+//! configuration gap is the bare reason, a runtime failure is `web search failed: <error>`.
 //!
 //! Every expected failure is a `ToolPayload::fail(...)`; `Err` is reserved for cancellation and
 //! protocol violations.
@@ -46,6 +64,28 @@ pub const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
 
 /// Default body cap of [`HttpSearchBackend`], in bytes.
 pub const DEFAULT_MAX_BYTES: usize = 1_000_000;
+
+/// Environment variable holding the JSON search endpoint: `OPENJIUWEN_WEB_SEARCH_ENDPOINT`.
+///
+/// Its value may be a plain URL (the query is appended as `?q=…&max_results=…`) or a template
+/// containing `{query}`. Blank values count as unset.
+pub const ENDPOINT_ENV: &str = "OPENJIUWEN_WEB_SEARCH_ENDPOINT";
+
+/// How to configure a search backend, appended to every "not configured" reason.
+pub const CONFIG_GUIDANCE: &str = "set OPENJIUWEN_WEB_SEARCH_ENDPOINT to a JSON search endpoint \
+     (it may contain a `{query}` placeholder), construct HttpSearchBackend::new(endpoint) or \
+     WebSearchTool::with_endpoint(..), or wire your own provider with \
+     ToolRegistry::with_search_backend(..); the Python DuckDuckGo/Bing scrapers and the paid \
+     vendor SDKs are not ported, so a vendor needs its own SearchBackend implementation";
+
+/// The typed reason reported when no search endpoint is configured.
+///
+/// The historical `web search backend is not configured` prefix is kept so existing callers that
+/// match on it keep working; the guidance that follows states how to configure it.
+#[must_use]
+pub fn not_configured_reason() -> String {
+    format!("web search backend is not configured: {CONFIG_GUIDANCE}")
+}
 
 /// One search result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +165,46 @@ impl HttpSearchBackend {
         }
     }
 
+    /// Builds a backend from [`ENDPOINT_ENV`], or reports the typed configuration gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] carrying [`not_configured_reason`] when the variable is
+    /// unset or blank.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Builds a backend from an injected environment, which keeps hosts and tests deterministic.
+    ///
+    /// `lookup` receives [`ENDPOINT_ENV`] and returns its raw value when set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] carrying [`not_configured_reason`] when `lookup` yields
+    /// nothing or only whitespace.
+    pub fn from_lookup<F>(lookup: F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let endpoint = lookup(ENDPOINT_ENV)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        match endpoint {
+            Some(endpoint) => Ok(Self::new(endpoint)),
+            None => Err(Error::unsupported(not_configured_reason())),
+        }
+    }
+
+    /// Whether this backend has an endpoint to call.
+    ///
+    /// A backend built with a blank endpoint has none; every call then reports the typed
+    /// configuration gap instead of issuing a request to nowhere.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
+
     /// Overrides the request timeout.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -166,6 +246,9 @@ impl HttpSearchBackend {
 #[async_trait]
 impl SearchBackend for HttpSearchBackend {
     async fn search(&self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+        if !self.is_configured() {
+            return Err(Error::unsupported(not_configured_reason()));
+        }
         let url = self.request_url(query, max_results);
         let request = FetchRequest {
             url: url.clone(),
@@ -391,6 +474,18 @@ impl WebSearchTool {
         }
     }
 
+    /// Builds the tool over an HTTP JSON endpoint (or a `{query}` template).
+    ///
+    /// This is the one-call way to open the backend gap: a blank endpoint builds a backend that
+    /// reports the typed configuration gap on every call, exactly like a tool with no backend.
+    #[must_use]
+    pub fn with_endpoint(endpoint: impl Into<String>, language: impl Into<String>) -> Self {
+        Self::new(
+            Some(Arc::new(HttpSearchBackend::new(endpoint))),
+            language,
+        )
+    }
+
     /// Builds the model-facing card in `language`.
     ///
     /// The description text lives in [`descriptions`] and is empty until the table gains the
@@ -417,10 +512,13 @@ impl WebSearchTool {
         }
         let max_results = resolve_max_results(args.max_results);
         let Some(backend) = self.backend.as_ref() else {
-            return ToolPayload::fail("web search backend is not configured");
+            return ToolPayload::fail(not_configured_reason());
         };
         match backend.search(query, max_results).await {
             Ok(results) => ToolPayload::ok(json!({"success": true, "results": results})),
+            // A configuration gap is reported as its own reason; a provider that is configured
+            // but fails keeps the `web search failed:` prefix and its error kind.
+            Err(Error::Unsupported(message)) => ToolPayload::fail(message),
             Err(error) => ToolPayload::fail(format!("web search failed: {error}")),
         }
     }
@@ -646,14 +744,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_configuration_gap_names_the_environment_variable_and_constructors() {
+        let reason = not_configured_reason();
+        assert!(
+            reason.starts_with("web search backend is not configured"),
+            "reason: {reason}"
+        );
+        for needle in [
+            ENDPOINT_ENV,
+            "{query}",
+            "HttpSearchBackend::new",
+            "WebSearchTool::with_endpoint",
+            "with_search_backend",
+            "not ported",
+        ] {
+            assert!(reason.contains(needle), "reason: {reason} (misses {needle})");
+        }
+    }
+
+    #[test]
+    fn endpoint_lookup_reads_and_trims_the_documented_variable() {
+        let backend =
+            HttpSearchBackend::from_lookup(|key| {
+                (key == ENDPOINT_ENV).then(|| "  https://api.example/s  ".to_owned())
+            })
+            .unwrap();
+        assert!(backend.is_configured());
+        assert_eq!(backend.endpoint, "https://api.example/s");
+
+        // Unset, blank and non-matching keys are the same typed configuration gap.
+        for lookup in [
+            None,
+            Some(String::new()),
+            Some("   ".to_owned()),
+        ] {
+            let error = HttpSearchBackend::from_lookup(|_| lookup.clone())
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::Unsupported(_)), "error: {error:?}");
+            assert_eq!(&*error.message(), not_configured_reason().as_str());
+        }
+        let error = HttpSearchBackend::from_lookup(|_| None).err().unwrap();
+        assert_eq!(&*error.message(), not_configured_reason().as_str());
+    }
+
+    #[tokio::test]
+    async fn a_blank_endpoint_is_a_configuration_gap_not_a_request() {
+        let fetcher = StubFetcher::ok("application/json", "[]");
+        let backend = HttpSearchBackend::with_fetcher("   ", fetcher.clone());
+        assert!(!backend.is_configured());
+        let error = backend.search("rust", 2).await.unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "error: {error:?}");
+        assert_eq!(&*error.message(), not_configured_reason().as_str());
+        assert_eq!(fetcher.calls(), 0, "no request is issued for a blank endpoint");
+    }
+
+    /// A provider that is configured but cannot serve the deployment (for example a vendor SDK
+    /// whose credentials are missing) reports `Unsupported`, which the tool renders bare.
+    struct UnsupportedBackend;
+
+    #[async_trait]
+    impl SearchBackend for UnsupportedBackend {
+        async fn search(&self, _query: &str, _max_results: usize) -> Result<Vec<SearchResult>> {
+            Err(Error::unsupported(
+                "web search provider requires a vendor API key",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tool_renders_configuration_gaps_differently_from_runtime_failures() {
+        // No backend at all: the configuration gap, bare.
+        let payload = invoke(&WebSearchTool::new(None, "en"), json!({"query": "rust"})).await;
+        assert_eq!(payload["error"], json!(not_configured_reason()));
+
+        // A configured endpoint that is blank: the same gap, still bare.
+        let tool = WebSearchTool::with_endpoint("   ", "en");
+        let payload = invoke(&tool, json!({"query": "rust"})).await;
+        assert_eq!(payload["error"], json!(not_configured_reason()));
+
+        // A provider that is configured but unsupported: its own reason, also bare.
+        let tool = WebSearchTool::new(Some(Arc::new(UnsupportedBackend)), "en");
+        let payload = invoke(&tool, json!({"query": "rust"})).await;
+        assert_eq!(
+            payload["error"],
+            json!("web search provider requires a vendor API key")
+        );
+
+        // A runtime failure keeps the `web search failed:` prefix and its error kind.
+        let tool = WebSearchTool::new(Some(Arc::new(FakeSearchBackend::failing("boom"))), "en");
+        let payload = invoke(&tool, json!({"query": "rust"})).await;
+        assert_eq!(payload["error"], json!("web search failed: tool: boom"));
+    }
+
     #[tokio::test]
     async fn tool_without_a_backend_or_query_fails() {
         let tool = WebSearchTool::new(None, "en");
         let payload = invoke(&tool, json!({"query": "rust"})).await;
-        assert_eq!(
-            payload["error"],
-            json!("web search backend is not configured")
-        );
+        assert_eq!(payload["error"], json!(not_configured_reason()));
 
         let backend = Arc::new(FakeSearchBackend::new());
         let tool = WebSearchTool::new(Some(backend), "en");
