@@ -35,14 +35,14 @@ use serde::{Deserialize, Serialize};
 use super::sample::SampleRecord;
 use crate::rl::RlTrainingConfig;
 
-/// Trains one immutable sample batch and exports its versioned LoRA.
+/// Trains one immutable sample batch and exports its versioned `LoRA`.
 ///
 /// Implementations own the training transport only; batching, sample
 /// disposition, activation and recovery belong to the training runner.
 #[async_trait]
 pub trait TrainingExecutor: Send + Sync {
     /// Short executor name (`"local"`, `"ppo"`), used in diagnostics and health.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Trains `request.samples` and returns the exported artifact.
     async fn train_batch(&self, request: &TrainingRequest) -> Result<TrainingArtifact>;
@@ -148,7 +148,7 @@ pub fn artifact_version(model_id: &str, name: &str) -> Option<u32> {
 /// It does not learn anything: it turns the batch into reward statistics and a
 /// policy-version bump (`init_lora_name`'s version + 1, else `v1`), writes the
 /// descriptor as JSON, and returns it. That is enough for the training-run state
-/// machine, the LoRA repository and the service tests to run end to end with no
+/// machine, the `LoRA` repository and the service tests to run end to end with no
 /// GPU, no model and no clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTrainingExecutor {
@@ -213,7 +213,7 @@ pub struct LocalArtifactDescriptor {
 
 #[async_trait]
 impl TrainingExecutor for LocalTrainingExecutor {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "local"
     }
 
@@ -343,7 +343,7 @@ impl Default for PpoTrainingExecutor {
 
 #[async_trait]
 impl TrainingExecutor for PpoTrainingExecutor {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ppo"
     }
 

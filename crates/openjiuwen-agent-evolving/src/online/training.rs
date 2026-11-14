@@ -439,7 +439,7 @@ impl<S: OnlineStore> LoraActivator for NoopLoraActivator<S> {
 
 /// The vendor activation path, retained as a typed seam.
 ///
-/// Python calls the AI gateway (AIGW) to swap the served LoRA; that transport is
+/// Python calls the AI gateway (AIGW) to swap the served `LoRA`; that transport is
 /// vendor HTTP and is not ported, so every activation fails with a reason that
 /// names it. The artifact is still exported and recorded — only the switch is
 /// missing.
@@ -648,7 +648,7 @@ impl<S: OnlineStore> TrainingRunner<S> {
 
     /// Sets the parent policy a new run starts from (`base`/empty by default).
     ///
-    /// Python reads it from an `active_policy` callable — in practice the LoRA
+    /// Python reads it from an `active_policy` callable — in practice the `LoRA`
     /// repository's [`get_latest_available`](crate::online::LoraRepository::get_latest_available).
     /// The port takes the snapshot explicitly so a run never depends on when the
     /// repository was last written.

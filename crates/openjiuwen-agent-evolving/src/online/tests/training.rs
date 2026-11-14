@@ -147,7 +147,7 @@ impl FakeExecutor {
 
 #[async_trait]
 impl TrainingExecutor for FakeExecutor {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fake"
     }
 
@@ -255,7 +255,10 @@ async fn claim_needs_the_configured_minimum_of_pending_samples() {
     ));
     assert_eq!(status_count(&store, SampleStatus::Pending).await, 1);
     assert_eq!(active_marker(&store).await, None);
-    assert!(runner.stats().await.expect("stats").get("total_runs") == Some(&0));
+    assert_eq!(
+        runner.stats().await.expect("stats").get("total_runs"),
+        Some(&0)
+    );
 }
 
 #[tokio::test]
@@ -291,7 +294,7 @@ async fn claim_is_single_flight_and_records_the_batch() {
     let (again, created, samples) = runner.claim().await.expect("second claim");
     assert!(!created);
     assert_eq!(again.training_run_id, run.training_run_id);
-    assert!(samples.is_empty());
+    assert_eq!(samples, Vec::<SampleRecord>::new());
     assert_eq!(status_count(&store, SampleStatus::Training).await, 3);
 }
 
@@ -429,7 +432,7 @@ async fn the_executor_receives_the_parent_policy_and_the_training_config() {
     let runner = runner(
         &store,
         executor.clone(),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         TrainingRunnerConfig {
             batch_size: 16,
             ..config()
@@ -466,7 +469,7 @@ async fn an_executor_failure_restores_the_samples_and_fails_the_run() {
     let runner = runner(
         &store,
         FakeExecutor::new(Outcome::Fail("PPO worker exploded".to_owned())),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     );
 
@@ -498,7 +501,7 @@ async fn an_artifact_with_a_foreign_name_fails_the_run() {
     let runner = runner(
         &store,
         FakeExecutor::new(Outcome::Named("other-model:v1".to_owned())),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     );
 
@@ -545,7 +548,7 @@ async fn a_second_execution_of_a_running_run_conflicts() {
     let runner = Arc::new(runner(
         &store,
         FakeExecutor::gated(Outcome::Succeed, &gate),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     ));
     let (queued, _, _) = runner.claim().await.expect("claim");
@@ -589,7 +592,7 @@ async fn stop_while_queued_cancels_and_requeues_the_samples() {
     let runner = runner(
         &store,
         executor.clone(),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     );
 
@@ -599,7 +602,11 @@ async fn stop_while_queued_cancels_and_requeues_the_samples() {
     assert_eq!(stopped.stage, RunStage::Queued);
     assert_eq!(stopped.finished_at.as_deref(), Some(STAMP));
     assert_eq!(status_count(&store, SampleStatus::Pending).await, 2);
-    assert!(executor.cancelled().await.is_empty(), "nothing was running");
+    assert_eq!(
+        executor.cancelled().await,
+        Vec::<String>::new(),
+        "nothing was running"
+    );
     assert_eq!(active_marker(&store).await, None);
 
     // A terminal run is never executed again.
@@ -623,7 +630,7 @@ async fn stop_while_training_cancels_through_the_executor() {
     let runner = Arc::new(runner(
         &store,
         executor.clone(),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     ));
     let (queued, _, _) = runner.claim().await.expect("claim");
@@ -638,7 +645,10 @@ async fn stop_while_training_cancels_through_the_executor() {
     let stopped = runner.stop(&queued.training_run_id).await.expect("stop");
     assert_eq!(stopped.status, RunStatus::Canceled);
     assert_eq!(stopped.stage, RunStage::Training);
-    assert_eq!(executor.cancelled().await, [queued.training_run_id.clone()]);
+    assert_eq!(
+        executor.cancelled().await,
+        vec![queued.training_run_id.clone()]
+    );
     assert_eq!(status_count(&store, SampleStatus::Pending).await, 2);
 
     // The in-flight run sees the terminal record and does not overwrite it.
@@ -691,7 +701,7 @@ async fn stop_after_a_terminal_run_returns_it_unchanged() {
     let runner = runner(
         &store,
         executor.clone(),
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     );
     let (queued, _, _) = runner.claim().await.expect("claim");
@@ -702,7 +712,7 @@ async fn stop_after_a_terminal_run_returns_it_unchanged() {
         runner.stop(&queued.training_run_id).await.expect("stop"),
         done
     );
-    assert!(executor.cancelled().await.is_empty());
+    assert_eq!(executor.cancelled().await, Vec::<String>::new());
     assert_eq!(status_count(&store, SampleStatus::Trained).await, 2);
 }
 
@@ -727,12 +737,17 @@ async fn recover_fails_a_queued_run_with_the_restart_rule() {
     assert_eq!(active_marker(&store).await, None);
 
     // A second recovery is a no-op: the run is terminal.
-    assert!(runner.recover().await.expect("recover").is_empty());
-    assert!(local_runner(Path::new("/unused"), &store)
-        .recover()
-        .await
-        .expect("recover")
-        .is_empty());
+    assert_eq!(
+        runner.recover().await.expect("recover"),
+        Vec::<TrainingRunRecord>::new()
+    );
+    assert_eq!(
+        local_runner(Path::new("/unused"), &store)
+            .recover()
+            .await
+            .expect("recover"),
+        Vec::<TrainingRunRecord>::new()
+    );
 }
 
 #[tokio::test]
@@ -744,7 +759,7 @@ async fn recover_fails_a_training_run_and_the_in_flight_run_defers() {
     let runner = Arc::new(runner(
         &store,
         executor,
-        Arc::new(RecordingActivator::new(None)),
+        RecordingActivator::new(None),
         config(),
     ));
     let (queued, _, _) = runner.claim().await.expect("claim");
@@ -851,8 +866,9 @@ async fn recover_succeeds_an_activating_run_when_auto_activation_is_off() {
     let recovered = restarted.recover().await.expect("recover");
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].status, RunStatus::Succeeded);
-    assert!(
-        restarted_activator.calls().await.is_empty(),
+    assert_eq!(
+        restarted_activator.calls().await,
+        Vec::<LoraActivation>::new(),
         "auto-activation is off"
     );
 
@@ -879,7 +895,7 @@ async fn recover_with_auto_activation_off_never_calls_the_activator() {
     let done = runner.run(&queued.training_run_id).await.expect("run");
     assert_eq!(done.status, RunStatus::Succeeded);
     assert_eq!(done.lora_name.as_deref(), Some("model-a:v1"));
-    assert!(activator.calls().await.is_empty());
+    assert_eq!(activator.calls().await, Vec::<LoraActivation>::new());
     assert_eq!(status_count(&store, SampleStatus::Trained).await, 2);
 }
 

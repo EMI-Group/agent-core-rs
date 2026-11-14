@@ -82,9 +82,8 @@ impl OnlineError {
             Self::TaskNotFound(_) | Self::TrainingRunNotFound(_) => 404,
             Self::TaskConflict(_) | Self::TurnClosed(_) | Self::InsufficientSamples { .. } => 409,
             Self::InvalidRequest(_) => 400,
-            Self::Execution(_) => 500,
             Self::Unsupported(_) => 503,
-            Self::Store(_) => 500,
+            Self::Execution(_) | Self::Store(_) => 500,
         }
     }
 

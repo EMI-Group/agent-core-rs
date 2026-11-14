@@ -1,4 +1,4 @@
-//! The filesystem LoRA artifact repository.
+//! The filesystem `LoRA` artifact repository.
 //!
 //! Python parity: `agent_rl/storage/lora_repo.py` (`LoRARepository`,
 //! `LoRAPublishRequest`, `LoRAVersion`). The port keeps the repository's
@@ -69,7 +69,7 @@ impl LoraAvailability {
     }
 }
 
-/// One published version of a model's LoRA artifact.
+/// One published version of a model's `LoRA` artifact.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct LoraVersion {

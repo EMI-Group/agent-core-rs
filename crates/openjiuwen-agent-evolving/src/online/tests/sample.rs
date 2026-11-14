@@ -125,8 +125,22 @@ async fn save_once_rejects_blank_ids_and_non_finite_rewards() {
             .count_by_status(SampleStatus::Pending)
             .await
             .expect("count"),
-        1,
-        "only the rejected sample is missing"
+        0,
+        "a rejected batch publishes nothing"
+    );
+
+    // A valid batch still goes through.
+    let saved = ledger(&store)
+        .save_once(&[sample("s1", 0.5)])
+        .await
+        .expect("save");
+    assert_eq!(saved, ["s1"]);
+    assert_eq!(
+        ledger(&store)
+            .count_by_status(SampleStatus::Pending)
+            .await
+            .expect("count"),
+        1
     );
 }
 
@@ -171,11 +185,13 @@ async fn fetch_and_mark_training_takes_the_oldest_ids_up_to_the_limit() {
         .map(|record| record.sample_id.as_str())
         .collect();
     assert_eq!(ids, ["s3", "s4"]);
-    assert!(ledger(&store)
-        .fetch_and_mark_training(1)
-        .await
-        .expect("empty fetch")
-        .is_empty());
+    assert_eq!(
+        ledger(&store)
+            .fetch_and_mark_training(1)
+            .await
+            .expect("empty fetch"),
+        Vec::<SampleRecord>::new()
+    );
 }
 
 #[tokio::test]

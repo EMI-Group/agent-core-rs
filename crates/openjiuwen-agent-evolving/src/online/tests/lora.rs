@@ -1,4 +1,4 @@
-//! Unit tests of the LoRA artifact repository ([`super::super::lora`]).
+//! Unit tests of the `LoRA` artifact repository ([`super::super::lora`]).
 //!
 //! The repository is filesystem-backed, so every test publishes into its own
 //! temp directory and reads the tree back — including through a second repository
@@ -6,7 +6,7 @@
 
 use super::super::executor::TrainingArtifact;
 use super::super::lora::{
-    parse_version_literal, version_literal, LoraAvailability, LoraRepository,
+    parse_version_literal, version_literal, LoraAvailability, LoraRepository, LoraVersion,
 };
 
 fn artifact(model_id: &str, version: u32) -> TrainingArtifact {
@@ -205,11 +205,10 @@ async fn the_repository_is_durable_across_instances() {
 async fn missing_models_and_versions_read_as_empty() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = LoraRepository::new(temp.path().join("missing"));
-    assert!(repo
-        .list_versions("model-a")
-        .await
-        .expect("list")
-        .is_empty());
+    assert_eq!(
+        repo.list_versions("model-a").await.expect("list"),
+        Vec::<LoraVersion>::new()
+    );
     assert!(repo.get_latest("model-a").await.expect("latest").is_none());
     assert!(repo
         .get_latest_available("model-a")
@@ -226,16 +225,18 @@ async fn missing_models_and_versions_read_as_empty() {
         .await
         .expect("artifact")
         .is_none());
-    assert!(repo.list_models().await.expect("models").is_empty());
+    assert_eq!(
+        repo.list_models().await.expect("models"),
+        Vec::<String>::new()
+    );
     // A directory that exists but holds no version is still a model with none.
     tokio::fs::create_dir_all(temp.path().join("model-a").join("notes"))
         .await
         .expect("dir");
-    assert!(repo
-        .list_versions("model-a")
-        .await
-        .expect("list")
-        .is_empty());
+    assert_eq!(
+        repo.list_versions("model-a").await.expect("list"),
+        Vec::<LoraVersion>::new()
+    );
     assert!(repo.get_latest("model-a").await.expect("latest").is_none());
 }
 
