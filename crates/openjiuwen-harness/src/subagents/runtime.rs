@@ -42,6 +42,7 @@ mod lifecycle_api;
 mod persist_api;
 pub mod persistence;
 pub mod quota;
+pub mod scheduler;
 pub mod transcript;
 mod transcript_api;
 mod turn;
