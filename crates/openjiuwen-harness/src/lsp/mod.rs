@@ -7,7 +7,8 @@
 //!
 //! # Layering
 //!
-//! `protocol` owns framing and the wire types, `uri` converts `file://` URIs,
+//! `protocol` owns framing and the navigation wire types, `wire` owns the pull-diagnostics and
+//! call-hierarchy types plus their tolerant parsers, `uri` converts `file://` URIs,
 //! `transport` owns the [`LspTransport`] seam, `config` holds [`LspServerConfig`],
 //! `client` correlates requests, `render` formats results, and `tool` adapts all of it
 //! to the [`Tool`](openjiuwen_foundation::tool::Tool) trait.
@@ -20,10 +21,9 @@
 //!
 //! # Deferred
 //!
-//! Diagnostics (push notification registry and `textDocument/diagnostic` pull), workspace
-//! symbol caching, server auto-discovery per file extension, crash recovery/retry, and the
-//! Python call-hierarchy operations are not ported. Diagnostics requests return a
-//! `success=false` payload, never a panic.
+//! The `lsp` tool still reports `diagnostics`, `implementation` and call-hierarchy actions as
+//! deferred, and there is no diagnostics registry, per-extension server discovery or crash
+//! retry yet. The client and `wire` layer they need are in place.
 mod client;
 mod config;
 pub mod protocol;
@@ -31,6 +31,7 @@ pub mod render;
 mod tool;
 mod transport;
 mod uri;
+mod wire;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -48,3 +49,10 @@ pub use render::symbol_kind_name;
 pub use tool::{LspAction, LspArgs, LspTool, LspToolConfig};
 pub use transport::{ChannelTransport, LspTransport, StdioTransport};
 pub use uri::{path_to_uri, uri_to_path};
+pub use wire::{
+    parse_call_hierarchy_incoming_calls, parse_call_hierarchy_items,
+    parse_call_hierarchy_outgoing_calls, parse_diagnostics, parse_diagnostics_event,
+    parse_document_diagnostic_report, CallHierarchyIncomingCall, CallHierarchyItem,
+    CallHierarchyOutgoingCall, Diagnostic, DiagnosticCode, DiagnosticRelatedInformation,
+    DiagnosticReportKind, DiagnosticsEvent, DocumentDiagnosticReport,
+};

@@ -8,8 +8,10 @@
     clippy::manual_let_else
 )]
 mod client;
+mod client_ext;
 mod fake_server;
 mod framing;
 mod tool;
 mod transport;
 mod uri;
+mod wire;

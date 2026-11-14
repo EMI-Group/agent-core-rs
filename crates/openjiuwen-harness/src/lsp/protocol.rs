@@ -491,7 +491,11 @@ pub struct ServerCapabilities {
     pub document_symbol: bool,
     /// Supports `workspace/symbol`.
     pub workspace_symbol: bool,
-    /// Supports diagnostics (push or pull).
+    /// Supports `textDocument/implementation`.
+    pub implementation: bool,
+    /// Supports `textDocument/prepareCallHierarchy` and the `callHierarchy/*` methods.
+    pub call_hierarchy: bool,
+    /// Supports pull diagnostics (`textDocument/diagnostic`).
     pub diagnostics: bool,
     /// The raw `capabilities` object returned by the server.
     pub raw: Value,
@@ -513,6 +517,8 @@ impl ServerCapabilities {
             completion: provider("completionProvider"),
             document_symbol: provider("documentSymbolProvider"),
             workspace_symbol: provider("workspaceSymbolProvider"),
+            implementation: provider("implementationProvider"),
+            call_hierarchy: provider("callHierarchyProvider"),
             diagnostics: provider("diagnosticProvider"),
             raw,
         }
@@ -531,6 +537,10 @@ impl ServerCapabilities {
             "textDocument/completion" => self.completion,
             "textDocument/documentSymbol" => self.document_symbol,
             "workspace/symbol" => self.workspace_symbol,
+            "textDocument/implementation" => self.implementation,
+            "textDocument/prepareCallHierarchy"
+            | "callHierarchy/incomingCalls"
+            | "callHierarchy/outgoingCalls" => self.call_hierarchy,
             "textDocument/diagnostic" => self.diagnostics,
             _ => true,
         }
@@ -558,6 +568,13 @@ pub fn client_capabilities() -> Value {
             "hover": { "contentFormat": ["markdown", "plaintext"] },
             "completion": { "completionItem": { "snippetSupport": false } },
             "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+            "implementation": { "dynamicRegistration": false },
+            "callHierarchy": { "dynamicRegistration": false },
+            "diagnostic": {
+                "dynamicRegistration": false,
+                "relatedDocumentSupport": true,
+                "versionSupport": true,
+            },
         },
     })
 }

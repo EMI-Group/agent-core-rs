@@ -41,7 +41,7 @@ async fn initialize_captures_capabilities_and_answers_server_requests() {
     assert!(capabilities.completion);
     assert!(capabilities.document_symbol);
     assert!(capabilities.workspace_symbol);
-    assert!(!capabilities.diagnostics);
+    assert!(capabilities.diagnostics);
     assert_eq!(capabilities.raw["hoverProvider"], json!(true));
     assert!(capabilities.supports("textDocument/hover"));
     assert!(capabilities.supports("unknown/method"));
