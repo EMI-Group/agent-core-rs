@@ -14,7 +14,7 @@
 //!   [`KvCacheLifecycleRail`], which observes the subagent tools and forwards
 //!   their lifecycle events to the tracker.
 //!
-//! Lifecycle mapping (spec S_16): start + sticky → prepare; success + sticky →
+//! Lifecycle mapping (spec `S_16`): start + sticky → prepare; success + sticky →
 //! suspend; success + one-shot → release; failure/cancel/any type → release;
 //! explicit eviction → release.
 //!

@@ -7,7 +7,7 @@
 //! [`KvCacheProviderRegistry`] seam with the policy helpers of
 //! [`super::policy`].
 //!
-//! Lifecycle mapping (spec S_16): start + sticky → `Prepare`; success + sticky →
+//! Lifecycle mapping (spec `S_16`): start + sticky → `Prepare`; success + sticky →
 //! `Suspend` (resumable); success + one-shot → `Release`; failure/cancel/any
 //! type → `Release`; explicit eviction → `Release`.
 //!
@@ -321,8 +321,10 @@ impl KvCacheLifecycleRail {
         &self.lifecycle
     }
     /// The subagent type named by the payload, falling back to the tool arguments.
-    fn subagent_type<'a>(data: &'a Value, arguments: &'a Value) -> Option<&'a str> {
-        non_empty(data.get("subagent_type")).or_else(|| non_empty(arguments.get("subagent_type")))
+    fn subagent_type(data: &Value, arguments: &Value) -> Option<String> {
+        non_empty(data.get("subagent_type"))
+            .or_else(|| non_empty(arguments.get("subagent_type")))
+            .map(str::to_owned)
     }
     /// Handles a successful spawn-like payload.
     async fn on_spawn(&self, ctx: &HarnessRailContext, data: &Value, arguments: &Value) {
@@ -351,7 +353,7 @@ impl KvCacheLifecycleRail {
         );
         let subagent = KvCacheSubagent {
             subagent_id: subagent_id.to_owned(),
-            subagent_type: subagent_type.to_owned(),
+            subagent_type,
             sub_session_id,
             parent_cache_id,
         };
@@ -470,7 +472,12 @@ fn terminal_success(status: Option<&str>) -> Option<bool> {
 }
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::assert_is_empty,
+        clippy::needless_pass_by_value
+    )]
     use super::*;
     use openjiuwen_agent::RailEvent;
     use openjiuwen_agent::ToolCallResult;
@@ -479,10 +486,19 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::json;
     /// A [`KvCacheProviderRegistry`] that records every call and can fail on demand.
-    #[derive(Default)]
     struct RecordingRegistry {
         calls: Mutex<Vec<String>>,
         fail: Mutex<bool>,
+        backend: &'static str,
+    }
+    impl Default for RecordingRegistry {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: Mutex::new(false),
+                backend: "recording",
+            }
+        }
     }
     impl RecordingRegistry {
         fn calls(&self) -> Vec<String> {
@@ -502,7 +518,7 @@ mod tests {
     #[async_trait::async_trait]
     impl KvCacheProviderRegistry for RecordingRegistry {
         fn backend(&self) -> &str {
-            "recording"
+            self.backend
         }
         async fn prepare(&self, cache_id: &str) -> Result<()> {
             self.record("prepare", cache_id)
