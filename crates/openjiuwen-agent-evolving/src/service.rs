@@ -238,7 +238,7 @@ impl ApiError {
 
     /// The envelope of a kernel failure raised outside a state machine.
     ///
-    /// A deferred capability keeps the [`DEFERRED_REASON`] wording and answers
+    /// A deferred capability keeps the `DEFERRED_REASON` wording and answers
     /// `501`; a validation failure is a `400`; a missing entity is a `404`;
     /// everything else is an internal error.
     pub fn from_error(error: Error) -> Self {
