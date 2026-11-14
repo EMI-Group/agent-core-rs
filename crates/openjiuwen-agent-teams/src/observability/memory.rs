@@ -85,6 +85,11 @@ pub const AT_MEMORY_ERROR: &str = "error";
 /// (or the [`memory_observer`] shortcut), optionally attach a sink with
 /// `MemorySpanObserver::with_sink` on the `otel` build, and hand it to the facade with
 /// `TeamMemory::with_observer(Arc::new(observer))`.
+///
+/// There is no exporter here on purpose: real OTLP export and the `opentelemetry` SDK belong to
+/// `openjiuwen-extensions`, which sits in the same dependency layer as this crate and therefore
+/// cannot be depended on; a host forwards this observer's `tracing` events (and, under `otel`, its
+/// `SpanRecord`s) through the extensions layer it already runs.
 #[derive(Debug, Clone)]
 pub struct MemorySpanObserver {
     /// The team root every memory span is a child of.
