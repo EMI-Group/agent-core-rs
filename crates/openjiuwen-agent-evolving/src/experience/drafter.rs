@@ -39,15 +39,15 @@ use crate::trajectory::{render_digest, Trajectory};
 
 use crate::experience::prompts::render_template;
 pub use crate::experience::prompts::{DRAFT_PROMPT, FORMAT_REPAIR_PROMPT, SIMPLIFY_PROMPT};
-/// The no-model default for [`ExperienceDrafter::max_items`]: Python's two text
+/// The no-model default for `ExperienceDrafter::max_items`: Python's two text
 /// experiences plus one script experience.
 pub const DEFAULT_MAX_ITEMS: usize = 3;
 
-/// The no-model default for [`ExperienceDrafter::max_summary_chars`]: the
+/// The no-model default for `ExperienceDrafter::max_summary_chars`: the
 /// protocol [`SUMMARY_LIMIT`](crate::experience::draft::SUMMARY_LIMIT).
 pub const DEFAULT_MAX_SUMMARY_CHARS: usize = 160;
 
-/// The no-model default for [`ExperienceDrafter::max_skill_chars`], matching
+/// The no-model default for `ExperienceDrafter::max_skill_chars`, matching
 /// Python's `_SKILL_CONTENT_MAX_CHARS`.
 pub const DEFAULT_MAX_SKILL_CHARS: usize = 6000;
 
@@ -74,7 +74,7 @@ pub struct DraftInput<'a> {
     /// The skill the draft is for; must be non-empty.
     pub skill_name: &'a str,
     /// The current `SKILL.md` content, truncated at
-    /// [`ExperienceDrafter::max_skill_chars`] for the prompt.
+    /// `ExperienceDrafter::max_skill_chars` for the prompt.
     pub skill_content: &'a str,
     /// The evolution signals attributed to the skill.
     pub signals: &'a [EvolutionSignal],
@@ -269,7 +269,7 @@ impl ExperienceDrafter {
     /// least `0.5`) followed by [`ExperienceExtractor::from_trajectories`], and
     /// every experience targets `body` so a reviewer keeps full control over
     /// placement. The summary is the collapsed record content truncated at
-    /// [`Self::max_summary_chars`], the section follows the record section, and
+    /// `Self::max_summary_chars`, the section follows the record section, and
     /// `reason` names the provenance and confidence the record carried.
     #[must_use]
     pub fn draft_offline(&self, subject: &EvolutionSubject, input: &DraftInput<'_>) -> EvolveDraft {

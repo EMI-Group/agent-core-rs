@@ -107,7 +107,8 @@ Every object carries: action (append or skip), skip_reason, target (description,
 Use double quotes only, escape newlines inside strings as \n, and add no prose or Markdown fence.
 ";
 
-/// The maintenance prompt behind [`ExperienceDrafter::simplify`].
+/// The maintenance prompt behind
+/// [`ExperienceDrafter::simplify`](crate::experience::ExperienceDrafter::simplify).
 ///
 /// Its documented placeholders are `{skill_name}`, `{records}` and
 /// `{user_intent}`. The answer contract is a bare JSON array of
