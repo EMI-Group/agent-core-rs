@@ -30,7 +30,7 @@ use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
 
 use crate::tools::descriptions;
-use crate::tools::mcp_subscriptions::McpResourceSubscriptions;
+use crate::tools::mcp_subscriptions::{McpResourceSubscriptions, McpSubscriptionInfo};
 use crate::tools::support::{parse_args, schema_for, tool_card, ToolPayload};
 
 /// The model-facing tool name.
@@ -174,6 +174,7 @@ impl McpResourceSubscriptionTool {
                     "subscriptions": subscriptions,
                     "count": subscriptions.len(),
                     "capacity": registry.capacity(),
+                    "max_subscriptions": registry.max_subscriptions(),
                 }))
             }
             Some(SubscriptionAction::Poll) => {
@@ -207,6 +208,7 @@ async fn subscribe(registry: &McpResourceSubscriptions, uri: &str) -> ToolPayloa
     match registry.subscribe(uri).await {
         Ok(info) => ToolPayload::ok(json!({
             "subscription": info,
+            "present": true,
             "message": format!("subscribed to {uri}"),
         })),
         Err(error) => failure(&error),
@@ -214,6 +216,11 @@ async fn subscribe(registry: &McpResourceSubscriptions, uri: &str) -> ToolPayloa
 }
 
 /// Handles `action=unsubscribe`.
+///
+/// Every path renders the action shape: `removed` says whether this call closed a subscription,
+/// `present` whether one is still open afterwards, and `reason` names the race when the entry was
+/// already gone (a second `unsubscribe`, or another host closing it), so the snapshot is never a
+/// bare `null` a consumer has to guess about.
 async fn unsubscribe(registry: &McpResourceSubscriptions, uri: &str) -> ToolPayload {
     if uri.is_empty() {
         return ToolPayload::fail("uri is required for action=unsubscribe");
@@ -221,9 +228,23 @@ async fn unsubscribe(registry: &McpResourceSubscriptions, uri: &str) -> ToolPayl
     match registry.unsubscribe(uri).await {
         Ok(info) => ToolPayload::ok(json!({
             "subscription": info,
+            "removed": true,
+            "present": false,
             "message": format!("unsubscribed from {uri}"),
         })),
-        Err(error) => failure(&error),
+        Err(error) => {
+            let reason = failure_message(&error);
+            let snapshot = Snapshot::read(registry, uri);
+            ToolPayload::fail_with_data(
+                reason.clone(),
+                json!({
+                    "subscription": snapshot.subscription,
+                    "removed": false,
+                    "present": snapshot.present,
+                    "reason": reason,
+                }),
+            )
+        }
     }
 }
 
@@ -233,22 +254,64 @@ fn poll(registry: &McpResourceSubscriptions, uri: &str, limit: usize) -> ToolPay
         return ToolPayload::fail("uri is required for action=poll");
     }
     match registry.poll(uri, limit) {
-        Ok(events) => ToolPayload::ok(json!({
-            "uri": uri,
-            "events": events,
-            "count": events.len(),
-            "subscription": registry.info(uri).ok(),
-        })),
+        Ok(events) => {
+            let snapshot = Snapshot::read(registry, uri);
+            ToolPayload::ok(json!({
+                "uri": uri,
+                "events": events,
+                "count": events.len(),
+                "subscription": snapshot.subscription,
+                "present": snapshot.present,
+                "reason": snapshot.reason,
+            }))
+        }
         Err(error) => failure(&error),
+    }
+}
+
+/// The `subscription` snapshot fields of an action payload.
+///
+/// A slipped lookup (the entry was reaped between the action and the snapshot) must not render a
+/// bare `null`: `subscription` is `None` only together with `present: false` and the `reason` it
+/// is gone, which the other actions report the same way.
+struct Snapshot {
+    /// The subscription snapshot, while the entry is still registered.
+    subscription: Option<McpSubscriptionInfo>,
+    /// Whether `uri` still has an open subscription.
+    present: bool,
+    /// Why the snapshot is missing (`present: false` only).
+    reason: Option<String>,
+}
+
+impl Snapshot {
+    /// Reads the snapshot of `uri`, keeping the reason of a failed lookup.
+    fn read(registry: &McpResourceSubscriptions, uri: &str) -> Self {
+        match registry.info(uri) {
+            Ok(info) => Self {
+                subscription: Some(info),
+                present: true,
+                reason: None,
+            },
+            Err(error) => Self {
+                subscription: None,
+                present: false,
+                reason: Some(error.message().into_owned()),
+            },
+        }
     }
 }
 
 /// Renders a registry error: an [`Error::Unsupported`] payload carries its bare reason so the
 /// configuration guidance stays readable, everything else keeps the crate's `kind: message` form.
 fn failure(error: &Error) -> ToolPayload {
+    ToolPayload::fail(failure_message(error))
+}
+
+/// The model-facing message of a registry error.
+fn failure_message(error: &Error) -> String {
     match error {
-        Error::Unsupported(message) => ToolPayload::fail(message.clone()),
-        other => ToolPayload::fail(other.message().into_owned()),
+        Error::Unsupported(message) => message.clone(),
+        other => other.message().into_owned(),
     }
 }
 
@@ -313,7 +376,7 @@ mod tests {
     use super::*;
     use crate::tools::mcp_resources::McpResourceContent;
     use crate::tools::mcp_subscriptions::{
-        FakeMcpResourceSubscriptionProvider, DEFAULT_BUFFER_CAPACITY,
+        FakeMcpResourceSubscriptionProvider, DEFAULT_BUFFER_CAPACITY, DEFAULT_MAX_SUBSCRIPTIONS,
     };
 
     /// Invokes the tool with a fresh context and unwraps the payload envelope.
@@ -508,6 +571,97 @@ mod tests {
         assert_eq!(
             invoke(&tool, json!([])).await["error"],
             json!("tool arguments must be an object")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_twice_reports_removed_false_with_a_reason() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let tool = McpResourceSubscriptionTool::new(Some(registry(provider)), "en");
+        let subscribed = invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
+        assert_eq!(subscribed["data"]["present"], json!(true));
+
+        let closed = invoke(&tool, json!({"action": "unsubscribe", "uri": "mem://a"})).await;
+        assert_eq!(closed["success"], json!(true));
+        assert_eq!(closed["data"]["removed"], json!(true));
+        assert_eq!(closed["data"]["present"], json!(false));
+
+        // The race-shaped case: nothing is left to remove, so the payload says so explicitly
+        // instead of shipping a bare `null` snapshot.
+        let again = invoke(&tool, json!({"action": "unsubscribe", "uri": "mem://a"})).await;
+        assert_eq!(again["success"], json!(false));
+        assert_eq!(
+            again["error"],
+            json!("no MCP resource subscription for `mem://a`")
+        );
+        assert_eq!(again["data"]["subscription"], Value::Null);
+        assert_eq!(again["data"]["removed"], json!(false));
+        assert_eq!(again["data"]["present"], json!(false));
+        assert_eq!(again["data"]["reason"], again["error"]);
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_keeps_the_snapshot_and_reports_removed_false() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let tool = McpResourceSubscriptionTool::new(Some(registry(provider.clone())), "en");
+        invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
+        provider.fail_unsubscribe("mem://a", "server is gone");
+
+        let payload = invoke(&tool, json!({"action": "unsubscribe", "uri": "mem://a"})).await;
+        assert_eq!(payload["success"], json!(false));
+        assert_eq!(payload["error"], json!("server is gone"));
+        assert_eq!(payload["data"]["removed"], json!(false));
+        assert_eq!(payload["data"]["present"], json!(true));
+        assert_eq!(payload["data"]["subscription"]["uri"], "mem://a");
+        assert_eq!(payload["data"]["reason"], json!("server is gone"));
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_reported_by_list_and_refuses_an_extra_subscription() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = Arc::new(
+            McpResourceSubscriptions::new()
+                .with_provider(provider)
+                .with_max_subscriptions(1),
+        );
+        let tool = McpResourceSubscriptionTool::new(Some(subscriptions), "en");
+        assert_eq!(
+            invoke(&tool, json!({"action": "list"})).await["data"]["max_subscriptions"],
+            json!(1)
+        );
+
+        invoke(&tool, json!({"action": "subscribe", "uri": "mem://a"})).await;
+        let refused = invoke(&tool, json!({"action": "subscribe", "uri": "mem://b"})).await;
+        assert_eq!(refused["success"], json!(false));
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains("subscription limit reached"),
+            "error: {error}"
+        );
+        assert_eq!(
+            invoke(&tool, json!({"action": "list"})).await["data"]["count"],
+            json!(1)
+        );
+
+        let default =
+            McpResourceSubscriptionTool::new(Some(Arc::new(McpResourceSubscriptions::new())), "en");
+        assert_eq!(
+            invoke(&default, json!({"action": "list"})).await["data"]["max_subscriptions"],
+            json!(DEFAULT_MAX_SUBSCRIPTIONS)
+        );
+    }
+
+    #[test]
+    fn a_missing_snapshot_carries_present_false_and_a_reason() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider);
+        let snapshot = Snapshot::read(&subscriptions, "mem://gone");
+        assert!(!snapshot.present);
+        assert!(snapshot.subscription.is_none());
+        let reason = snapshot.reason.unwrap();
+        assert!(
+            reason.contains("no MCP resource subscription"),
+            "reason: {reason}"
         );
     }
 }

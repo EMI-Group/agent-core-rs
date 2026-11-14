@@ -36,6 +36,17 @@
 //!
 //! Publishing never blocks and never allocates an unbounded queue, so a provider may call
 //! [`McpResourceSink::updated`] straight from a transport pump.
+//!
+//! # Bounded registry
+//!
+//! Each open subscription pins a ring buffer plus a broadcast channel, so the registry holds at
+//! most [`DEFAULT_MAX_SUBSCRIPTIONS`] of them (overridable with
+//! [`McpResourceSubscriptions::with_max_subscriptions`]). Subscribing one more answers
+//! [`Error::Validation`]; [`McpResourceSubscriptions::unsubscribe`] and
+//! [`McpResourceSubscriptions::reap`] free a slot again. A slot is never left behind for a
+//! subscription the provider rejected or no longer knows: a failed open registers nothing, and an
+//! `unsubscribe` the provider answers with [`Error::NotFound`] reaps the local entry instead of
+//! pinning it for the lifetime of the registry.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +69,13 @@ pub const MIN_BUFFER_CAPACITY: usize = 1;
 
 /// Upper bound of the per-subscription buffer capacity.
 pub const MAX_BUFFER_CAPACITY: usize = 1024;
+
+/// Number of concurrently open subscriptions a registry accepts when it is not told otherwise.
+///
+/// Every open subscription owns a ring buffer of [`DEFAULT_BUFFER_CAPACITY`] events plus a
+/// broadcast channel, so the registry caps how many URIs it tracks instead of growing with the
+/// model's input; [`McpResourceSubscriptions::with_max_subscriptions`] overrides the bound.
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 64;
 
 /// The reason a provider without `resources/subscribe` support reports.
 ///
@@ -296,14 +314,17 @@ pub trait McpResourceSubscriptionProvider: Send + Sync {
 /// The per-host registry of MCP resource subscriptions.
 ///
 /// One instance per host (there is no process-global state): it holds the provider, the buffer
-/// capacity and one `SubscriptionState` per subscribed URI. Without a provider every
-/// `subscribe` answers [`NO_PROVIDER_REASON`]; `unsubscribe`, `list`, `poll` and `events` keep
-/// working on subscriptions the host opened through [`Self::sink`] (out-of-band updates).
+/// capacity, the subscription cap and one `SubscriptionState` per subscribed URI. Without a
+/// provider every `subscribe` answers [`NO_PROVIDER_REASON`]; `unsubscribe`, `list`, `poll` and
+/// `events` keep working on subscriptions the host opened through [`Self::sink`] (out-of-band
+/// updates).
 pub struct McpResourceSubscriptions {
     /// The provider asked to open subscriptions, when one is wired.
     provider: Option<Arc<dyn McpResourceSubscriptionProvider>>,
     /// Clamped per-subscription capacity.
     capacity: usize,
+    /// Upper bound of the number of open subscriptions.
+    max_subscriptions: usize,
     /// Open subscriptions, ordered by URI.
     subscriptions: Mutex<BTreeMap<String, Arc<SubscriptionState>>>,
 }
@@ -313,6 +334,7 @@ impl std::fmt::Debug for McpResourceSubscriptions {
         formatter
             .debug_struct("McpResourceSubscriptions")
             .field("capacity", &self.capacity)
+            .field("max_subscriptions", &self.max_subscriptions)
             .field("provider", &self.provider.is_some())
             .field(
                 "subscriptions",
@@ -329,12 +351,14 @@ impl Default for McpResourceSubscriptions {
 }
 
 impl McpResourceSubscriptions {
-    /// Builds a registry with [`DEFAULT_BUFFER_CAPACITY`] and no provider.
+    /// Builds a registry with [`DEFAULT_BUFFER_CAPACITY`], [`DEFAULT_MAX_SUBSCRIPTIONS`] and no
+    /// provider.
     #[must_use]
     pub fn new() -> Self {
         Self {
             provider: None,
             capacity: DEFAULT_BUFFER_CAPACITY,
+            max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             subscriptions: Mutex::new(BTreeMap::new()),
         }
     }
@@ -360,6 +384,23 @@ impl McpResourceSubscriptions {
         self.capacity
     }
 
+    /// Overrides the maximum number of concurrently open subscriptions (at least `1`).
+    ///
+    /// The default is [`DEFAULT_MAX_SUBSCRIPTIONS`]; subscribing past the bound answers
+    /// [`Error::Validation`] without opening anything in the provider, so a model cannot pin an
+    /// unbounded number of ring buffers.
+    #[must_use]
+    pub fn with_max_subscriptions(mut self, max_subscriptions: usize) -> Self {
+        self.max_subscriptions = max_subscriptions.max(1);
+        self
+    }
+
+    /// The configured maximum number of concurrently open subscriptions.
+    #[must_use]
+    pub fn max_subscriptions(&self) -> usize {
+        self.max_subscriptions
+    }
+
     /// The wired provider, when there is one.
     #[must_use]
     pub fn provider(&self) -> Option<&Arc<dyn McpResourceSubscriptionProvider>> {
@@ -376,8 +417,11 @@ impl McpResourceSubscriptions {
     ///
     /// Idempotent: subscribing an already-subscribed URI returns its current snapshot without
     /// calling the provider again. Blank URIs are a validation error, a missing provider and a
-    /// provider without `resources/subscribe` are [`Error::Unsupported`] with a reason, and a
-    /// provider failure is forwarded unchanged (nothing is registered in that case).
+    /// provider without `resources/subscribe` are [`Error::Unsupported`] with a reason, a
+    /// provider failure is forwarded unchanged (nothing is registered in that case), and a
+    /// subscription past [`Self::max_subscriptions`] is [`Error::Validation`] — a subscription
+    /// the registry cannot track is never opened, and one it opened but lost a race for is
+    /// undone in the provider.
     ///
     /// # Errors
     ///
@@ -393,6 +437,8 @@ impl McpResourceSubscriptions {
         let Some(provider) = self.provider.clone() else {
             return Err(Error::unsupported(NO_PROVIDER_REASON));
         };
+        // Fast path: refuse an over-cap subscription before the provider round-trip.
+        self.check_capacity(uri)?;
         let state = Arc::new(SubscriptionState::new(uri, self.capacity));
         provider
             .subscribe(
@@ -402,13 +448,31 @@ impl McpResourceSubscriptions {
                 },
             )
             .await?;
-        self.subscriptions
-            .lock()
-            .insert(uri.to_owned(), Arc::clone(&state));
-        Ok(state.info())
+        match self.register(uri, &state) {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                // A concurrent subscribe filled the last slot while the provider call was in
+                // flight: undo the subscription the registry cannot track instead of pinning
+                // its buffer for the lifetime of the registry.
+                if let Err(undo) = provider.unsubscribe(uri).await {
+                    tracing::debug!(
+                        target: "openjiuwen_harness::tools::mcp_subscriptions",
+                        uri,
+                        error = %undo,
+                        "could not undo an over-cap MCP resource subscription"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Closes the subscription for `uri`.
+    ///
+    /// When the provider reports [`Error::NotFound`] the subscription was already closed on the
+    /// server side, so the local entry is reaped and its snapshot returned: the end state the
+    /// caller asked for holds, and no ring buffer is pinned for a subscription nobody serves. Any
+    /// other provider error keeps the subscription open.
     ///
     /// # Errors
     ///
@@ -420,15 +484,47 @@ impl McpResourceSubscriptions {
         if uri.is_empty() {
             return Err(Error::validation("uri is required"));
         }
-        let state =
-            self.subscriptions.lock().get(uri).cloned().ok_or_else(|| {
-                Error::not_found(format!("no MCP resource subscription for `{uri}`"))
-            })?;
+        // Fail with `NotFound` before touching the provider when nothing is subscribed.
+        let state = self.state(uri)?;
         if let Some(provider) = self.provider.clone() {
-            provider.unsubscribe(uri).await?;
+            if let Err(error) = provider.unsubscribe(uri).await {
+                if !matches!(error, Error::NotFound(_)) {
+                    return Err(error);
+                }
+                tracing::debug!(
+                    target: "openjiuwen_harness::tools::mcp_subscriptions",
+                    uri,
+                    error = %error,
+                    "reaping an MCP resource subscription the provider no longer knows"
+                );
+            }
         }
         self.subscriptions.lock().remove(uri);
         Ok(state.info())
+    }
+
+    /// Drops the local entry of `uri` without calling the provider, returning its last snapshot.
+    ///
+    /// For a host that saw the server close the subscription on its own side (a
+    /// `notifications/resources/list_changed`, a transport reset) and for
+    /// [`Self::unsubscribe`] when the provider no longer knows the subscription: the ring buffer
+    /// is released as soon as the provider drops its [`McpResourceSink`], and the freed slot is
+    /// available to the next `subscribe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when `uri` is not subscribed and [`Error::Validation`] for a
+    /// blank URI.
+    pub fn reap(&self, uri: &str) -> Result<McpSubscriptionInfo> {
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return Err(Error::validation("uri is required"));
+        }
+        self.subscriptions
+            .lock()
+            .remove(uri)
+            .map(|state| state.info())
+            .ok_or_else(|| Error::not_found(format!("no MCP resource subscription for `{uri}`")))
     }
 
     /// Every open subscription, ordered by URI.
@@ -504,30 +600,56 @@ impl McpResourceSubscriptions {
     /// next still-buffered event is returned. Awaiting here holds no lock on the subscription
     /// map, so publishing and polling stay available.
     ///
+    /// Concurrent calls on the same URI do not queue behind each other: the caller that acquires
+    /// the registry's shared receiver awaits it (keeping the lag accounting), and every other
+    /// caller receives from its own [`broadcast::Receiver`] of the same sender — the view
+    /// [`Self::events`] gives — so both observe the events published from then on. A per-call
+    /// receiver only sees events published after it subscribed and never feeds `lagged`.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] when `uri` is not subscribed, and
     /// [`Error::Cancelled`] once the subscription was closed.
     pub async fn recv(&self, uri: &str) -> Result<McpResourceEvent> {
         let state = self.state(uri)?;
-        let mut observer = state.observer.lock().await;
-        loop {
-            match observer.recv().await {
-                Ok(event) => return Ok(event),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    state.lagged.fetch_add(skipped, Ordering::SeqCst);
-                    tracing::debug!(
-                        target: "openjiuwen_harness::tools::mcp_subscriptions",
-                        uri = state.uri,
-                        skipped,
-                        "MCP resource subscription receiver lagged"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err(Error::cancelled());
-                }
-            }
+        recv_once(&state).await
+    }
+
+    /// Refuses a `subscribe` that would exceed [`Self::max_subscriptions`].
+    fn check_capacity(&self, uri: &str) -> Result<()> {
+        let open = self.subscriptions.lock().len();
+        if open < self.max_subscriptions {
+            return Ok(());
         }
+        Err(self.capacity_error(uri, open))
+    }
+
+    /// Registers `state` under `uri`, or returns the entry a concurrent subscribe won with.
+    fn register(&self, uri: &str, state: &Arc<SubscriptionState>) -> Result<McpSubscriptionInfo> {
+        let mut subscriptions = self.subscriptions.lock();
+        if let Some(existing) = subscriptions.get(uri) {
+            return Ok(existing.info());
+        }
+        let open = subscriptions.len();
+        if open >= self.max_subscriptions {
+            // Never call `capacity_error` here: it reads the map this guard already holds.
+            return Err(Self::capacity_message(uri, open, self.max_subscriptions));
+        }
+        subscriptions.insert(uri.to_owned(), Arc::clone(state));
+        Ok(state.info())
+    }
+
+    /// The typed refusal of a `subscribe` past the subscription cap.
+    fn capacity_error(&self, uri: &str, open: usize) -> Error {
+        Self::capacity_message(uri, open, self.max_subscriptions)
+    }
+
+    /// The cap-refusal message for `open` of `max` slots in use.
+    fn capacity_message(uri: &str, open: usize, max: usize) -> Error {
+        Error::validation(format!(
+            "MCP resource subscription limit reached ({open} of {max} open): unsubscribe a \
+             resource before subscribing `{uri}`"
+        ))
     }
 
     /// Looks one subscription up by (trimmed) URI.
@@ -541,6 +663,46 @@ impl McpResourceSubscriptions {
             .get(uri)
             .cloned()
             .ok_or_else(|| Error::not_found(format!("no MCP resource subscription for `{uri}`")))
+    }
+}
+
+/// Receives the next event of `state`, from the registry's shared receiver when it is free and
+/// from a fresh receiver of the same sender otherwise.
+///
+/// The shared receiver keeps the lag accounting and only blocks *its own* caller: a concurrent
+/// caller falls back to a per-call receiver (what [`McpResourceSubscriptions::events`] hands out)
+/// instead of waiting behind the guard, so two `recv` calls on one URI both observe the events
+/// published while they wait.
+async fn recv_once(state: &SubscriptionState) -> Result<McpResourceEvent> {
+    if let Ok(mut observer) = state.observer.try_lock() {
+        recv_through(state, &mut observer).await
+    } else {
+        let mut receiver = state.sender.subscribe();
+        recv_through(state, &mut receiver).await
+    }
+}
+
+/// Receives the next event of `state` through `receiver`, counting its lag on `state`.
+async fn recv_through(
+    state: &SubscriptionState,
+    receiver: &mut broadcast::Receiver<McpResourceEvent>,
+) -> Result<McpResourceEvent> {
+    loop {
+        match receiver.recv().await {
+            Ok(event) => return Ok(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                state.lagged.fetch_add(skipped, Ordering::SeqCst);
+                tracing::debug!(
+                    target: "openjiuwen_harness::tools::mcp_subscriptions",
+                    uri = state.uri,
+                    skipped,
+                    "MCP resource subscription receiver lagged"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return Err(Error::cancelled());
+            }
+        }
     }
 }
 
@@ -612,6 +774,15 @@ impl FakeMcpResourceSubscriptionProvider {
         self.unsubscribe_failures
             .lock()
             .insert(uri.to_owned(), message.into());
+    }
+
+    /// Drops the server-side subscription of `uri` without telling the registry.
+    ///
+    /// Models a server that closed a subscription on its own (`resources/list_changed`, a
+    /// transport reset): the registry still holds the entry, but [`Self::unsubscribe`] now answers
+    /// [`Error::NotFound`]. Returns whether a subscription was open.
+    pub fn drop_subscription(&self, uri: &str) -> bool {
+        self.sinks.lock().remove(uri).is_some()
     }
 
     /// Pushes an update for `uri`; `false` when nothing is subscribed to it.
@@ -845,6 +1016,135 @@ mod tests {
                 .as_deref(),
             Some("four")
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_recv_calls_over_the_same_uri_both_observe_events() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = Arc::new(registry(provider.clone()));
+        subscriptions.subscribe("mem://a").await.unwrap();
+
+        let first = tokio::spawn({
+            let subscriptions = Arc::clone(&subscriptions);
+            async move { subscriptions.recv("mem://a").await }
+        });
+        let second = tokio::spawn({
+            let subscriptions = Arc::clone(&subscriptions);
+            async move { subscriptions.recv("mem://a").await }
+        });
+        // Let both tasks park on their receiver: one takes the registry's shared receiver, the
+        // other fans out through its own instead of queueing behind that guard.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(provider.push_notification("mem://a", "changed"));
+
+        let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            (
+                first.await.unwrap().unwrap(),
+                second.await.unwrap().unwrap(),
+            )
+        })
+        .await
+        .expect("two concurrent recv calls must not deadlock");
+        for event in [one, two] {
+            assert_eq!(event.sequence, 1);
+            assert_eq!(event.reason.as_deref(), Some("changed"));
+        }
+    }
+
+    #[test]
+    fn the_subscription_cap_has_a_default_and_is_configurable() {
+        assert_eq!(
+            McpResourceSubscriptions::new().max_subscriptions(),
+            DEFAULT_MAX_SUBSCRIPTIONS
+        );
+        assert_eq!(
+            McpResourceSubscriptions::new()
+                .with_max_subscriptions(3)
+                .max_subscriptions(),
+            3
+        );
+        // A registry always accepts at least one subscription.
+        assert_eq!(
+            McpResourceSubscriptions::new()
+                .with_max_subscriptions(0)
+                .max_subscriptions(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_past_the_cap_is_a_validation_error_that_frees_slot_on_unsubscribe() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider.clone()).with_max_subscriptions(2);
+        subscriptions.subscribe("mem://a").await.unwrap();
+        subscriptions.subscribe("mem://b").await.unwrap();
+
+        let error = subscriptions.subscribe("mem://c").await.unwrap_err();
+        assert!(matches!(error, Error::Validation(_)), "error: {error}");
+        assert!(error.message().contains("limit reached"), "error: {error}");
+        assert!(error.message().contains("2 of 2"), "error: {error}");
+        assert!(!subscriptions.is_subscribed("mem://c"));
+        // Refused before the provider round-trip: nothing was opened and nothing registered.
+        assert_eq!(
+            provider.subscribe_calls(),
+            vec!["mem://a".to_owned(), "mem://b".to_owned()]
+        );
+        assert_eq!(subscriptions.list().len(), 2);
+
+        // Re-subscribing an already-open URI stays idempotent at the cap.
+        assert_eq!(
+            subscriptions.subscribe("mem://a").await.unwrap().uri,
+            "mem://a"
+        );
+
+        subscriptions.unsubscribe("mem://a").await.unwrap();
+        assert_eq!(
+            subscriptions.subscribe("mem://c").await.unwrap().uri,
+            "mem://c"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_reaps_an_entry_the_provider_no_longer_knows() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider.clone()).with_max_subscriptions(1);
+        subscriptions.subscribe("mem://a").await.unwrap();
+        // The server closed the subscription on its own side.
+        assert!(provider.drop_subscription("mem://a"));
+
+        let reaped = subscriptions.unsubscribe("mem://a").await.unwrap();
+        assert_eq!(reaped.uri, "mem://a");
+        assert!(!subscriptions.is_subscribed("mem://a"));
+        assert!(subscriptions.info("mem://a").is_err());
+        // The reaped slot is free again: the cap must not count a subscription nobody serves.
+        assert_eq!(
+            subscriptions.subscribe("mem://b").await.unwrap().uri,
+            "mem://b"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_drops_one_entry_without_calling_the_provider() {
+        let provider = Arc::new(FakeMcpResourceSubscriptionProvider::new());
+        let subscriptions = registry(provider.clone());
+        subscriptions.subscribe("mem://a").await.unwrap();
+        assert!(provider.push_notification("mem://a", "changed"));
+
+        let snapshot = subscriptions.reap("mem://a").unwrap();
+        assert_eq!(snapshot.uri, "mem://a");
+        assert_eq!(snapshot.received, 1);
+        assert!(!subscriptions.is_subscribed("mem://a"));
+        assert_eq!(provider.unsubscribe_calls(), Vec::<String>::new());
+        assert!(matches!(
+            subscriptions.reap("mem://a").unwrap_err(),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            subscriptions.reap("  ").unwrap_err(),
+            Error::Validation(_)
+        ));
     }
 
     #[tokio::test]
