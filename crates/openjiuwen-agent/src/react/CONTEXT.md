@@ -69,6 +69,7 @@ Ports Python `core/single_agent/agents/react_agent.py` (`ReActAgent`, `ReActAgen
 - `../../tests/react_agent.rs` covers the loop end to end: no-tool answer, single/parallel/failing tools, the three max-iteration policies, empty-response retry, prompt rendering, and input/config errors.
 - `../../tests/streaming.rs` covers frame assembly plus session mirroring, and `../../tests/interrupt.rs` covers the pause/resume flows end to end.
 - `../../tests/memory_provider.rs` covers the external memory provider bridge end to end (prompt block and prefetch in the model window, mounted tool schemas and dispatch, turn write-back, owned-session `on_session_end`, failure tolerance, and `clear_memory_provider`); `../memory_provider/tests.rs` holds the rail/tool unit tests.
+- `../../tests/kv_cache_seam.rs` (6) covers the KV-cache seam end to end: `enable_kv_cache` with the default config installs an inert hook (nothing recorded), enabled affinity records the request prefix with the provider's input tokens (the runtime's own `lookup` hits), a hook with an action runtime prefetches and releases its lease without changing the answer, `Redis`/`Distributed` return `Error::Unsupported` naming the backend while the installed hook survives, a run without a hook is unchanged, and the promoted controller/kv-cache facade types are reachable from the crate root.
 
 ## Routing Table
 
