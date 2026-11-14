@@ -516,6 +516,81 @@ async fn health_reports_liveness_and_failure() {
     assert!(!silent.is_healthy(), "an unanswered probe is unhealthy");
 }
 
+// --- runtime re-tuning of the background health interval --------------------
+
+#[tokio::test]
+async fn the_background_health_interval_is_re_tunable_on_a_live_child() {
+    // A configured cadence starts the background loop; the handle reports it.
+    let process = SubprocessSpawner::new(child_config("echo").with_health_check(
+        Duration::from_millis(250),
+        Duration::from_millis(300),
+        3,
+    ))
+    .spawn_process(spec())
+    .await
+    .expect("the fake child launches");
+    assert_eq!(process.health_interval(), Duration::from_millis(250));
+
+    // Zero stops background probing, and explicit probes still answer.
+    tokio::time::timeout(BOUND, process.set_health_interval(Duration::ZERO))
+        .await
+        .expect("a re-tune must not hang")
+        .expect("a live child accepts a re-tune");
+    assert_eq!(process.health_interval(), Duration::ZERO);
+    assert!(
+        tokio::time::timeout(BOUND, process.health())
+            .await
+            .expect("the probe is bounded")
+            .expect("the child answers a probe without a background loop"),
+        "an explicit probe is independent of the background cadence"
+    );
+
+    // And back: the restarted loop follows the value the handle holds, and the
+    // child itself was never restarted or put out of sync.
+    tokio::time::timeout(
+        BOUND,
+        process.set_health_interval(Duration::from_millis(100)),
+    )
+    .await
+    .expect("a re-tune must not hang")
+    .expect("a live child accepts a re-tune");
+    assert_eq!(process.health_interval(), Duration::from_millis(100));
+    assert!(process.is_alive(), "a re-tune never restarts the child");
+    assert!(
+        process.pid().is_some(),
+        "the same OS process is still there"
+    );
+    let output = send_bounded(process.as_ref(), json!({"query": "after-re-tune"}))
+        .await
+        .expect("a re-tuned handle is still in sync");
+    assert_eq!(output.output, "after-re-tune");
+
+    // Repeating a re-tune is idempotent, and the shutdown still works.
+    for _ in 0..3 {
+        tokio::time::timeout(BOUND, process.set_health_interval(Duration::ZERO))
+            .await
+            .expect("a re-tune must not hang")
+            .expect("a live child accepts a re-tune");
+        assert_eq!(process.health_interval(), Duration::ZERO);
+    }
+    assert!(process.is_alive());
+    assert!(
+        tokio::time::timeout(BOUND, process.shutdown(Duration::from_secs(2)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+
+    // A stopped handle supervises nothing, so it refuses rather than starting a
+    // loop on a dead child.
+    let error = process
+        .set_health_interval(Duration::from_millis(100))
+        .await
+        .expect_err("a stopped child cannot be re-tuned");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("has stopped"), "{error}");
+}
+
 // --- shutdown and ownership -------------------------------------------------
 
 #[tokio::test]

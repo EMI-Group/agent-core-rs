@@ -436,6 +436,21 @@ impl SpawnedAgent for MonitoredSpawnedAgent {
         result
     }
 
+    /// Forwards a health-interval re-tune to the inner handle.
+    ///
+    /// A monitored subprocess handle therefore stays re-tunable; nothing extra is
+    /// recorded, because a cadence change is a configuration choice, not a
+    /// lifecycle transition.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner handle reports — including
+    /// [`openjiuwen_common::error::Error::Unsupported`] from a backend with no
+    /// background loop.
+    async fn set_health_interval(&self, interval: Duration) -> Result<()> {
+        self.inner.set_health_interval(interval).await
+    }
+
     /// Forwards task cancellation to the inner handle.
     ///
     /// # Errors
@@ -481,6 +496,8 @@ mod tests {
         send_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
         /// Deadlines `stream_with_timeout` received, in call order.
         stream_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        /// Health intervals `set_health_interval` received, in call order.
+        health_intervals: Arc<Mutex<Vec<Duration>>>,
         /// How many frames `stream`/`stream_with_timeout` yield.
         stream_frames: i64,
     }
@@ -497,6 +514,7 @@ mod tests {
                 alive: AtomicBool::new(true),
                 send_timeouts: Arc::new(Mutex::new(Vec::new())),
                 stream_timeouts: Arc::new(Mutex::new(Vec::new())),
+                health_intervals: Arc::new(Mutex::new(Vec::new())),
                 stream_frames: 0,
             }
         }
@@ -577,6 +595,11 @@ mod tests {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        async fn set_health_interval(&self, interval: Duration) -> Result<()> {
+            self.health_intervals.lock().unwrap().push(interval);
+            Ok(())
+        }
     }
 
     fn tracked(
@@ -609,6 +632,29 @@ mod tests {
         assert!(!handle.is_finished());
         assert_eq!(handle.inner().id(), child.id());
         assert!(format!("{handle:?}").contains("child-1"));
+    }
+
+    #[tokio::test]
+    async fn forwards_the_health_interval_re_tune_without_recording_a_transition() {
+        let (handle, child, monitor) = tracked("child-15", true);
+        let before = monitor.history(handle.run_id()).unwrap().len();
+
+        handle.set_health_interval(Duration::ZERO).await.unwrap();
+        handle
+            .set_health_interval(Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert_eq!(
+            child.health_intervals.lock().unwrap().clone(),
+            vec![Duration::ZERO, Duration::from_millis(250)],
+            "the decorator forwards every re-tune verbatim"
+        );
+        assert_eq!(
+            monitor.history(handle.run_id()).unwrap().len(),
+            before,
+            "a cadence change is not a lifecycle transition"
+        );
+        assert!(!handle.is_finished(), "the run is still active");
     }
 
     #[tokio::test]

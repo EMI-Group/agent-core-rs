@@ -582,3 +582,234 @@ fn a_wrapper_backend_describes_its_own_label() {
     );
     assert_eq!(spawner.describe()["backend"], json!("external_command"));
 }
+
+// --- runtime re-tuning of the background health interval --------------------
+
+/// Whether a background health loop is registered for `process`.
+async fn health_loop_running(process: &Arc<SpawnedProcess>) -> bool {
+    process.state.health_task.lock().await.is_some()
+}
+
+/// [`child_config`] whose configured (initial) health interval is `interval`.
+fn child_config_with_interval(interval: Duration) -> SubprocessConfig {
+    child_config().with_health_check(interval, Duration::from_secs(2), 3)
+}
+
+/// A handle over the hermetic child, with `config`.
+async fn process_with(config: SubprocessConfig) -> Arc<SpawnedProcess> {
+    tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(config).spawn_process(SpawnSpec::class_agent("tests.spawn", "Fake")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches")
+}
+
+#[tokio::test]
+async fn the_effective_health_interval_starts_from_the_configuration_and_follows_re_tunes() {
+    let config = child_config_with_interval(Duration::from_millis(250));
+    let spawner = SubprocessSpawner::new(config.clone());
+    let process = process_with(config).await;
+
+    assert_eq!(process.health_interval(), Duration::from_millis(250));
+    assert!(
+        health_loop_running(&process).await,
+        "a non-zero configured interval starts the background loop"
+    );
+
+    // Zero stops background probing; explicit probes still work.
+    tokio::time::timeout(BOUND, process.set_health_interval(Duration::ZERO))
+        .await
+        .expect("a re-tune must not hang")
+        .expect("a live child accepts a re-tune");
+    assert_eq!(process.health_interval(), Duration::ZERO);
+    assert!(
+        !health_loop_running(&process).await,
+        "a zero interval leaves no loop running"
+    );
+    assert!(
+        tokio::time::timeout(BOUND, process.health())
+            .await
+            .expect("a probe must not hang")
+            .expect("the fake child answers a probe"),
+        "an explicit probe works without a background loop"
+    );
+
+    // And back again: the loop uses the value the handle now holds.
+    tokio::time::timeout(
+        BOUND,
+        process.set_health_interval(Duration::from_millis(200)),
+    )
+    .await
+    .expect("a re-tune must not hang")
+    .expect("a live child accepts a re-tune");
+    assert_eq!(process.health_interval(), Duration::from_millis(200));
+    assert!(health_loop_running(&process).await);
+
+    // The configuration is the *initial* value, never rewritten by a re-tune.
+    assert!(
+        (spawner.config().health_check_interval_secs - 0.25).abs() < f64::EPSILON,
+        "a re-tune is a per-handle setting, not a configuration change"
+    );
+
+    // The child survived every restart, in sync and still supervised.
+    tokio::time::timeout(BOUND, process.set_health_interval(Duration::ZERO))
+        .await
+        .expect("a re-tune must not hang")
+        .expect("a live child accepts a re-tune");
+    assert!(process.is_alive(), "a re-tune never restarts the child");
+    assert!(process.is_healthy());
+    let output = tokio::time::timeout(BOUND, process.send(json!({"query": "after-re-tune"})))
+        .await
+        .expect("send must not hang")
+        .expect("a re-tuned handle is still in sync");
+    assert_eq!(output.output, "pong");
+
+    assert!(
+        tokio::time::timeout(BOUND, process.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+}
+
+#[tokio::test]
+async fn repeated_re_tunes_are_idempotent_and_preserve_the_supervision_state() {
+    // The configured interval is zero, so only a re-tune starts a loop.
+    let process = process_with(child_config()).await;
+    assert!(!health_loop_running(&process).await);
+
+    // An unhealthy observation with two consecutive failures, which a re-tune
+    // must neither clear nor reset.
+    process.state.record_health(false);
+    process.state.health_failures.store(2, Ordering::SeqCst);
+
+    for _ in 0..3 {
+        tokio::time::timeout(
+            BOUND,
+            process.set_health_interval(Duration::from_millis(200)),
+        )
+        .await
+        .expect("a re-tune must not hang")
+        .expect("a live child accepts a re-tune");
+        assert_eq!(process.health_interval(), Duration::from_millis(200));
+        assert!(
+            health_loop_running(&process).await,
+            "each re-tune leaves exactly one loop registered"
+        );
+    }
+    for _ in 0..2 {
+        tokio::time::timeout(BOUND, process.set_health_interval(Duration::ZERO))
+            .await
+            .expect("a re-tune must not hang")
+            .expect("a live child accepts a re-tune");
+        assert_eq!(process.health_interval(), Duration::ZERO);
+        assert!(!health_loop_running(&process).await);
+    }
+
+    assert_eq!(
+        process.state.health_failures.load(Ordering::SeqCst),
+        2,
+        "a re-tune never resets the consecutive-failure run"
+    );
+    assert!(
+        !process.is_healthy(),
+        "a re-tune never clears the last observation"
+    );
+    assert!(process.is_alive(), "the child was never restarted");
+
+    assert!(
+        tokio::time::timeout(BOUND, process.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_child_refuses_a_re_tune_instead_of_supervising_a_dead_process() {
+    let graceful = process_with(child_config()).await;
+    assert!(
+        tokio::time::timeout(BOUND, graceful.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+
+    let error = graceful
+        .set_health_interval(Duration::from_millis(100))
+        .await
+        .expect_err("a stopped child has nothing left to supervise");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("has stopped"), "{error}");
+    assert!(
+        error.to_string().contains("health interval"),
+        "the message names what cannot be re-tuned: {error}"
+    );
+    assert!(
+        !health_loop_running(&graceful).await,
+        "no loop is started on a dead child"
+    );
+    assert_eq!(
+        graceful
+            .set_health_interval(Duration::ZERO)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Validation,
+        "the refusal is stable, not a one-off"
+    );
+
+    // A killed child answers the same.
+    let killed = process_with(child_config()).await;
+    killed.force_kill().await.expect("the child can be killed");
+    let error = killed
+        .set_health_interval(Duration::from_millis(100))
+        .await
+        .expect_err("a killed child cannot be re-tuned either");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.to_string().contains("has stopped"), "{error}");
+}
+
+#[tokio::test]
+async fn the_seam_re_tunes_a_live_child_and_reports_the_stopped_one() {
+    let agent: Arc<dyn SpawnedAgent> = tokio::time::timeout(
+        BOUND,
+        SubprocessSpawner::new(child_config()).spawn(SpawnSpec::class_agent("tests.spawn", "Fake")),
+    )
+    .await
+    .expect("spawn must not hang")
+    .expect("the fake child launches");
+
+    tokio::time::timeout(BOUND, agent.set_health_interval(Duration::ZERO))
+        .await
+        .expect("a re-tune must not hang")
+        .expect("the subprocess backend implements re-tuning");
+    tokio::time::timeout(BOUND, agent.set_health_interval(Duration::from_millis(150)))
+        .await
+        .expect("a re-tune must not hang")
+        .expect("a live child accepts a re-tune through the seam");
+    assert!(agent.is_alive());
+    assert!(tokio::time::timeout(BOUND, agent.health())
+        .await
+        .expect("a probe must not hang")
+        .expect("the fake child answers a probe"));
+    let output = tokio::time::timeout(BOUND, agent.send(json!({"query": "seam"})))
+        .await
+        .expect("send must not hang")
+        .expect("a re-tuned handle is still in sync");
+    assert_eq!(output.output, "pong");
+
+    assert!(
+        tokio::time::timeout(BOUND, agent.shutdown(Duration::from_secs(5)))
+            .await
+            .expect("shutdown must not hang")
+            .expect("the fake child acknowledges the shutdown")
+    );
+    let error = agent
+        .set_health_interval(Duration::from_millis(100))
+        .await
+        .expect_err("a stopped child refuses a re-tune through the seam too");
+    assert_eq!(error.kind(), ErrorKind::Validation);
+}

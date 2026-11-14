@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_runner::mq::{
     build_message_queue, create_message_queue, DeferredMessageQueue, InMemoryMessageQueue,
-    MessageHandler, MessageQueue, MessageQueueConfig, MessageQueueKind, QueueMessage,
+    MessageHandler, MessageQueue, MessageQueueConfig, MessageQueueKind, QueueMessage, QueueStats,
 };
 use openjiuwen_runner::{Runner, RunnerConfig};
 use serde_json::{json, Value};
@@ -177,6 +177,101 @@ async fn handler_errors_reach_the_requester() {
         .expect_err("handler failure");
     assert_eq!(error.kind(), ErrorKind::Validation);
     assert_eq!(error.to_string(), "validation: handler says no");
+}
+
+#[tokio::test]
+async fn stats_are_read_through_the_trait_object() {
+    // The trait method stays object-safe: a host holding `Arc<dyn MessageQueue>`
+    // samples the report without an `.await` or a downcast.
+    let queue: Arc<dyn MessageQueue> = started_queue(8).await;
+    queue
+        .add_handler("echo", Arc::new(EchoHandler))
+        .await
+        .expect("handler");
+    let reply = queue
+        .request("echo", QueueMessage::new(json!("ping")), None)
+        .await
+        .expect("request");
+    assert_eq!(reply, json!("ping"));
+
+    let stats = queue.stats();
+    assert!(stats.started);
+    assert_eq!(stats.topics, 1);
+    assert_eq!(stats.handlers, 1);
+    assert_eq!(stats.deliveries, 1);
+    assert_eq!(stats.dropped(), 0);
+    assert_eq!(stats.handler_errors, 0);
+    assert_eq!(stats.rejected_not_started, 0);
+    assert!(!stats.is_empty());
+
+    // A stopped queue keeps its counters but owns no topics.
+    queue.stop().await.expect("stop");
+    let stats = queue.stats();
+    assert!(!stats.started);
+    assert_eq!(stats.topics, 0);
+    assert_eq!(stats.handlers, 0);
+    assert_eq!(stats.deliveries, 1);
+}
+
+/// A minimal third-party backend: it implements only the required methods, so the
+/// default [`MessageQueue::stats`] and object safety are what the test exercises.
+struct StatslessBackend;
+
+#[async_trait]
+impl MessageQueue for StatslessBackend {
+    async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+    fn is_started(&self) -> bool {
+        true
+    }
+    async fn subscribe(&self, _topic: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn unsubscribe(&self, _topic: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn add_handler(&self, _topic: &str, _handler: Arc<dyn MessageHandler>) -> Result<()> {
+        Ok(())
+    }
+    async fn publish(&self, _topic: &str, _message: QueueMessage) -> Result<()> {
+        Ok(())
+    }
+    async fn request(
+        &self,
+        _topic: &str,
+        _message: QueueMessage,
+        _timeout: Option<Duration>,
+    ) -> Result<Value> {
+        Ok(Value::Null)
+    }
+    fn topics(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn has_subscriber(&self, _topic: &str) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn a_backend_without_counters_reports_the_empty_report() {
+    // A deferred transport performs no work, so an empty report is the truth.
+    for kind in [MessageQueueKind::Pulsar, MessageQueueKind::ZeroMq] {
+        let deferred: Arc<dyn MessageQueue> = DeferredMessageQueue::new(kind);
+        let stats = deferred.stats();
+        assert_eq!(stats, QueueStats::default());
+        assert!(stats.is_empty());
+        assert!(!stats.started);
+    }
+
+    // A backend that cannot report statistics returns the default, never a
+    // fabricated counter.
+    let backend: Arc<dyn MessageQueue> = Arc::new(StatslessBackend);
+    assert_eq!(backend.stats(), QueueStats::default());
+    assert!(backend.stats().is_empty());
 }
 
 #[tokio::test]
@@ -505,5 +600,6 @@ async fn a_default_runner_still_serves_the_in_memory_queue() {
         .await
         .expect("request");
     assert_eq!(reply, json!("ping"));
+    assert_eq!(queue.stats().deliveries, 2, "one publish, one request");
     queue.stop().await.expect("stop");
 }

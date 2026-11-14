@@ -339,9 +339,10 @@ impl SpawnSpec {
 ///
 /// Only the transport methods are required. [`Self::backend`],
 /// [`Self::is_healthy`], [`Self::health_snapshot`], [`Self::health`],
-/// [`Self::cancel_task`], [`Self::send_with_timeout`] and
-/// [`Self::stream_with_timeout`] carry defaults so a minimal handle — and every
-/// backend that predates them — stays object-safe and compiles unchanged.
+/// [`Self::set_health_interval`], [`Self::cancel_task`],
+/// [`Self::send_with_timeout`] and [`Self::stream_with_timeout`] carry defaults
+/// so a minimal handle — and every backend that predates them — stays
+/// object-safe and compiles unchanged.
 #[async_trait]
 pub trait SpawnedAgent: Send + Sync {
     /// The handle's stable id (not necessarily the OS process id).
@@ -456,6 +457,31 @@ pub trait SpawnedAgent: Send + Sync {
             "agent health probe",
             &format!(
                 "the '{}' backend has no probe; use `is_alive`/`is_healthy` or `health_snapshot`",
+                self.backend()
+            ),
+        ))
+    }
+
+    /// Asks the backend to re-tune its background health-check interval.
+    ///
+    /// Only a backend that runs a background health loop can honour this: the
+    /// subprocess and external-command handles store the interval per child and
+    /// restart their loop, and a [`Duration::ZERO`] interval stops that loop while
+    /// explicit [`Self::health`] probes keep working.
+    ///
+    /// # Errors
+    ///
+    /// [`openjiuwen_common::error::Error::Unsupported`] for every other backend —
+    /// the message names the backend and says that only the process backends
+    /// support re-tuning — plus whatever a re-tune can fail with on a backend that
+    /// does: a stopped child
+    /// ([`openjiuwen_common::error::Error::Validation`]).
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn set_health_interval(&self, _interval: Duration) -> Result<()> {
+        Err(error::unsupported(
+            "runtime health-interval re-tuning",
+            &format!(
+                "the '{}' backend runs no background health loop to re-tune; only the process backends (subprocess, external_command) support it",
                 self.backend()
             ),
         ))

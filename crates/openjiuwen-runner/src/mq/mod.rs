@@ -44,6 +44,7 @@
 //! # }
 //! ```
 
+mod counters;
 pub mod memory;
 pub mod message;
 pub mod queue;
@@ -51,4 +52,6 @@ pub mod queue;
 pub use crate::config::{MessageQueueConfig, MessageQueueKind};
 pub use memory::InMemoryMessageQueue;
 pub use message::{MessageHandler, QueueMessage, SUCCESS};
-pub use queue::{build_message_queue, create_message_queue, DeferredMessageQueue, MessageQueue};
+pub use queue::{
+    build_message_queue, create_message_queue, DeferredMessageQueue, MessageQueue, QueueStats,
+};
