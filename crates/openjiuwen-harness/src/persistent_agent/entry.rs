@@ -433,11 +433,32 @@ impl ExecutionEntry {
     /// Returns the SHA-256 of the entry's canonical JSON.
     ///
     /// The digest is stable across serialization key order, so it identifies the entry's content.
+    /// A serialization failure never collapses entries onto the digest of `null`: the digest then
+    /// falls back to the entry's stable identity fields, so two distinct entries still differ.
     #[must_use]
     pub fn digest(&self) -> String {
-        // Every field of an entry is JSON-representable, so `to_value` cannot fail here.
-        let value = serde_json::to_value(self).unwrap_or_default();
-        digest_hex(&value)
+        self.digest_of(serde_json::to_value(self))
+    }
+
+    /// Digests `serialized`, or the entry's stable identity when it could not be encoded.
+    fn digest_of(&self, serialized: serde_json::Result<Value>) -> String {
+        match serialized {
+            Ok(value) => digest_hex(&value),
+            Err(error) => {
+                tracing::warn!(
+                    seq = self.seq,
+                    kind = self.kind().as_str(),
+                    error = %error,
+                    "execution entry could not be serialized; digesting its stable identity instead"
+                );
+                digest_hex(&json!({
+                    "fallback": "entry_serialization_failed",
+                    "seq": self.seq,
+                    "kind": self.kind().as_str(),
+                    "occurred_at": self.occurred_at,
+                }))
+            }
+        }
     }
 
     /// Validates the sequence number and the timestamp.
@@ -490,9 +511,29 @@ fn scrub(value: &Value) -> Value {
     }
 }
 
+/// Marker substituted when a redacted value cannot be rendered as JSON.
+const UNSERIALIZABLE_MARKER: &str = "<unserializable>";
+
 /// Renders a redacted value as compact JSON.
 fn redacted_json(value: &Value) -> String {
-    serde_json::to_string(&scrub(value)).unwrap_or_default()
+    render_redacted(serde_json::to_string(&scrub(value)))
+}
+
+/// Returns the rendered value, or [`UNSERIALIZABLE_MARKER`] when it could not be encoded.
+///
+/// An empty string would be indistinguishable from a value that legitimately rendered as nothing,
+/// so a failure is reported explicitly instead.
+fn render_redacted(serialized: serde_json::Result<String>) -> String {
+    match serialized {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "a redacted persistent-agent value could not be serialized"
+            );
+            UNSERIALIZABLE_MARKER.to_string()
+        }
+    }
 }
 
 /// Returns `arguments` with values under sensitive key names replaced by `"***"`.
@@ -599,12 +640,17 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        args_summary, operation_id, params_digest, redact_arguments, result_summary, EntryKind,
-        EntryPayload, ExecutionEntry, FinalStatus, ModelUsage, PauseReason, ToolStatus,
-        UsageStatus, SUMMARY_LIMIT,
+        args_summary, operation_id, params_digest, redact_arguments, redacted_json,
+        render_redacted, result_summary, EntryKind, EntryPayload, ExecutionEntry, FinalStatus,
+        ModelUsage, PauseReason, ToolStatus, UsageStatus, SUMMARY_LIMIT, UNSERIALIZABLE_MARKER,
     };
     use crate::persistent_agent::identity::ExecutionIdentity;
     use crate::persistent_agent::util::digest_hex;
+
+    /// A real `serde_json` error, standing in for a serialization failure.
+    fn serialization_error() -> serde_json::Error {
+        serde_json::from_str::<Value>("{").unwrap_err()
+    }
 
     fn identity() -> ExecutionIdentity {
         ExecutionIdentity::new("ns", "agent", "session", "request", "execution", "source").unwrap()
@@ -696,6 +742,39 @@ mod tests {
     }
 
     #[test]
+    fn digest_falls_back_to_stable_identity_on_serialization_failure() {
+        let first = ExecutionEntry::new(1, "2023-11-14T22:13:20.000Z", EntryPayload::note("same"));
+        let second = ExecutionEntry::new(2, "2023-11-14T22:13:20.000Z", EntryPayload::note("same"));
+        let other_kind = ExecutionEntry::new(
+            1,
+            "2023-11-14T22:13:20.000Z",
+            EntryPayload::reply_delta("same"),
+        );
+        let first_digest = first.digest_of(Err(serialization_error()));
+        let second_digest = second.digest_of(Err(serialization_error()));
+        let kind_digest = other_kind.digest_of(Err(serialization_error()));
+        assert_eq!(first_digest.len(), 64);
+        assert_ne!(
+            first_digest, second_digest,
+            "different sequences must not collide"
+        );
+        assert_ne!(
+            first_digest, kind_digest,
+            "different kinds must not collide"
+        );
+        assert_ne!(
+            first_digest,
+            digest_hex(&Value::Null),
+            "a failure must not digest as null"
+        );
+        assert_ne!(
+            first_digest,
+            first.digest(),
+            "the fallback is a distinct digest"
+        );
+    }
+
+    #[test]
     fn entry_validation_rejects_zero_seq_and_bad_timestamps() {
         let bad_seq = ExecutionEntry::new(0, "2023-11-14T22:13:20.000Z", EntryPayload::note("n"));
         let error = bad_seq.validate().unwrap_err();
@@ -783,10 +862,24 @@ mod tests {
         );
         let long = format!(r#"{{"text":"{}"}}"#, "x".repeat(SUMMARY_LIMIT * 2));
         let summary = args_summary(&long);
-        // `truncate_chars` keeps the limit and appends one ellipsis character.
-        assert_eq!(summary.chars().count(), SUMMARY_LIMIT + 1);
+        // `truncate_chars` keeps the limit and spends one character on the ellipsis.
+        assert_eq!(summary.chars().count(), SUMMARY_LIMIT);
         assert!(summary.ends_with('…'));
         assert!(summary.starts_with(r#"{"text":"#));
+    }
+
+    #[test]
+    fn unserializable_redactions_use_a_marker_instead_of_an_empty_string() {
+        assert_eq!(
+            render_redacted(Err(serialization_error())),
+            UNSERIALIZABLE_MARKER
+        );
+        assert_ne!(render_redacted(Err(serialization_error())), "");
+        assert_eq!(render_redacted(Ok(r#"{"a":1}"#.to_string())), r#"{"a":1}"#);
+        assert_eq!(
+            redacted_json(&json!({"password": "p", "ok": 1})),
+            r#"{"password":"***","ok":1}"#
+        );
     }
 
     #[test]
@@ -811,7 +904,7 @@ mod tests {
         assert_eq!(result_summary(&json!({})), "{}");
         assert_eq!(result_summary(&json!([])), "[]");
         let long = json!({"text": "x".repeat(SUMMARY_LIMIT * 2)});
-        assert_eq!(result_summary(&long).chars().count(), SUMMARY_LIMIT + 1);
+        assert_eq!(result_summary(&long).chars().count(), SUMMARY_LIMIT);
         assert!(result_summary(&long).ends_with('…'));
     }
 

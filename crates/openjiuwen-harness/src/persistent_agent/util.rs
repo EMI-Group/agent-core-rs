@@ -177,6 +177,60 @@ where
     atomic_write(path, &bytes).await
 }
 
+/// Writes `bytes` to `path` atomically from a blocking context.
+///
+/// This is the [`atomic_write`] counterpart used by callers that already run on
+/// [`tokio::task::spawn_blocking`].
+///
+/// # Errors
+/// The same errors as [`atomic_write`].
+pub(crate) fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> Result<()> {
+    let fail = |detail: &dyn fmt::Display| {
+        Error::session(format!("failed to write {}: {detail}", path.display()))
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| fail(&error))?;
+        }
+    }
+    let temporary = temporary_path(path);
+    std::fs::write(&temporary, bytes).map_err(|error| fail(&error))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        if let Err(cleanup) = std::fs::remove_file(&temporary) {
+            tracing::debug!(
+                path = %temporary.display(),
+                error = %cleanup,
+                "failed to remove the temporary persistent-agent file"
+            );
+        }
+        return Err(fail(&error));
+    }
+    Ok(())
+}
+
+/// Serializes `value` as pretty JSON with a trailing newline and writes it atomically from a
+/// blocking context.
+///
+/// This is the [`write_json_atomic`] counterpart used by callers that already run on
+/// [`tokio::task::spawn_blocking`].
+///
+/// # Errors
+/// The same errors as [`write_json_atomic`].
+pub(crate) fn write_json_atomic_blocking<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let encoded = serde_json::to_vec_pretty(value).map_err(|error| {
+        Error::validation(format!(
+            "failed to encode JSON for {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = encoded;
+    bytes.push(b'\n');
+    atomic_write_blocking(path, &bytes)
+}
+
 /// Reads and decodes a JSON file.
 ///
 /// A missing file yields `Ok(None)`; any other failure is reported.
@@ -203,15 +257,44 @@ where
         .map_err(|error| Error::validation(format!("invalid JSON in {}: {error}", path.display())))
 }
 
+/// Reads and decodes a JSON file from a blocking context.
+///
+/// This is the [`read_json`] counterpart used by callers that already run on
+/// [`tokio::task::spawn_blocking`].
+///
+/// # Errors
+/// The same errors as [`read_json`].
+pub(crate) fn read_json_blocking<T>(path: &Path) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::session(format!(
+                "failed to read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| Error::validation(format!("invalid JSON in {}: {error}", path.display())))
+}
+
 /// Truncates `text` to at most `max_chars` Unicode scalar values.
 ///
 /// An ellipsis (`…`) is appended only when something was dropped, so an exact-length input is
-/// returned unchanged and truncation never splits a character.
+/// returned unchanged and truncation never splits a character. The ellipsis is part of the budget,
+/// never extra: a truncated result is exactly `max_chars` characters long, `max_chars == 0` yields
+/// an empty string, and `max_chars == 1` yields the ellipsis alone.
 #[must_use]
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let mut truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
+    if chars.next().is_some() && !truncated.is_empty() {
+        truncated.pop();
         truncated.push('…');
     }
     truncated
@@ -302,12 +385,39 @@ mod tests {
 
     #[test]
     fn truncate_chars_adds_an_ellipsis_only_when_truncated() {
-        assert_eq!(truncate_chars("abcdef", 3), "abc…");
+        assert_eq!(truncate_chars("abcdef", 3), "ab…");
         assert_eq!(truncate_chars("abc", 3), "abc");
         assert_eq!(truncate_chars("abc", 9), "abc");
         assert_eq!(truncate_chars("", 3), "");
-        assert_eq!(truncate_chars("héllo", 2), "hé…");
-        assert_eq!(truncate_chars("日本", 1), "日…");
+        assert_eq!(truncate_chars("héllo", 2), "h…");
+        assert_eq!(truncate_chars("日本", 1), "…");
+    }
+
+    #[test]
+    fn truncate_chars_never_exceeds_the_budget() {
+        for (text, max_chars) in [
+            ("abcdef", 0_usize),
+            ("abcdef", 1),
+            ("abcdef", 2),
+            ("abcdef", 5),
+            ("abcdef", 6),
+            ("abcdef", 7),
+            ("héllo", 3),
+            ("世界你好", 4),
+        ] {
+            let truncated = truncate_chars(text, max_chars);
+            assert!(
+                truncated.chars().count() <= max_chars,
+                "`{text}` truncated to {max_chars} chars produced `{truncated}`"
+            );
+        }
+        assert_eq!(truncate_chars("abcdef", 0), "");
+        assert_eq!(truncate_chars("abcdef", 1), "…");
+        assert_eq!(truncate_chars("abcdef", 2), "a…");
+        assert_eq!(truncate_chars("abcdef", 5), "abcd…");
+        assert_eq!(truncate_chars("abcdef", 6), "abcdef");
+        assert_eq!(truncate_chars("abcdef", 7), "abcdef");
+        assert_eq!(truncate_chars("世界你好", 3), "世界…");
     }
 
     #[tokio::test]
