@@ -181,7 +181,10 @@ mod tests {
         let path = dir.path().join("switch.yaml");
         std::fs::write(&path, b"agent_use_enabled: true\n").unwrap();
 
-        assert_eq!(read_bounded(&path, 1024, "switch").unwrap().unwrap().len(), 24);
+        assert_eq!(
+            read_bounded(&path, 1024, "switch").unwrap().unwrap().len(),
+            24
+        );
         let error = read_bounded(&path, 4, "switch").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
     }
