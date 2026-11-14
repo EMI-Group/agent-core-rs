@@ -2,7 +2,7 @@
 ## Intent
 A real git-worktree helper for the DeepAgent harness, ported from `openjiuwen/harness/tools/worktree/`: create, list, lock, unlock, remove, prune and inspect worktrees through `git`, with a persisted registry and lifecycle events.
 It gives an agent (or a team member) an isolated checkout at `<repo-root>/.worktrees/<slug>` without cloning the repository.
-The model-facing entry points are the `worktree`, `enter_worktree` and `exit_worktree` tools; everything else is host API.
+The model-facing entry points are the `worktree`, `enter_worktree` and `exit_worktree` tools; the `WorktreeRail` publishes the bounded worktree context section, and everything else is host API.
 `enter_worktree`/`exit_worktree` are not mounted by `ToolRegistry` yet (the registry still mounts only the action-dispatching `worktree` tool); a host wires them directly.
 ## API Surface
 `WorktreeManager` — `new(repo_root)`, `with_runner(repo_root, Arc<dyn GitRunner>)`, `with_workspace_root`, `with_owner`, `with_events`, `with_broadcast_events(capacity)`, `with_lock_config(WorktreeLockConfig)`, `with_sparse(SparseConfig)`, `repo_root`, `workspace_root`, `owner`, `runner`, `lock_config()`, `repo_lock() -> WorktreeLock`, `lock_path() -> PathBuf`, `sparse()`, `worktrees_dir`, `index_path`, `target_path(name)`, `ensure_repository`, `create(name, branch, base) -> Result<WorktreeCreateResult>`, `create_with_options(name, branch, base, &WorktreeCreateOptions) -> Result<WorktreeCreateResult>`, `list() -> Result<Vec<WorktreeInfo>>`, `remove(name, force) -> Result<WorktreeInfo>`, `prune() -> Result<usize>`, `cleanup_stale() -> Result<usize>`, `cleanup(&CleanupPolicy) -> Result<CleanupReport>`, `lock(name, reason)`, `unlock(name)`, `status(name) -> Result<WorktreeStatus>`, `apply_sparse(name) -> Result<Option<SparseConfig>>`, `change_summary(name) -> Result<WorktreeChangeSummary>`.
@@ -27,6 +27,7 @@ Session arguments — `EnterWorktreeArgs { name: Option<String> }` (`#[serde(den
 Session state (`tools.rs`) — `WorktreeSessionState { original_cwd, worktree_path, worktree_name, worktree_branch, original_branch, original_head_commit, member_name, team_name, hook_based, lifecycle_policy ("auto" default), team_lifecycle, creation_duration_ms, used_sparse_paths }` with `Default`, `new(name, path, branch: Option<String>)`, `to_json()`, `from_json(&Value)`; all fields serde-default and tolerant.
 Session store (`tools.rs`) — `WorktreeSessionStore` (`session()`, `set_session(Option<…>)`, `default_name()`, `set_default_name(Option<String>)`), `MemoryWorktreeSessionStore` (`new()`, `with_session(state)`, `with_default_name(name)`), `SharedWorktreeSessions = Arc<dyn WorktreeSessionStore>`.
 Session constants (`tools.rs`) — `ENTER_TOOL_NAME` ("enter_worktree"), `EXIT_TOOL_NAME` ("exit_worktree"), `EXIT_ACTIONS` (`keep`, `remove`), `WORKTREE_SESSION_KEY` ("_worktree_session"), `WORKTREE_DEFAULT_NAME_KEY` ("_worktree_default_name").
+Rail (`rails.rs`) — `WorktreeRail` (`new(manager, sessions, language)`, `with_worktree(name)`, `with_priority(priority)`, `manager()`, `language()`, `worktree_name()`, impl `HarnessRail`); `WorktreeContext { name, path, branch, summary }` (serde snake_case/default) with `render(language)`; `build_worktree_notice(parent_cwd, worktree_cwd, language)`; `WORKTREE_SECTION_NAME` ("worktree"), `WORKTREE_SECTION_PRIORITY` (85), `WORKTREE_SECTION_MAX_CHARS` (1200), `WORKTREE_RAIL_PRIORITY` (100), `WORKTREE_SUMMARY_EXTRA_KEY` ("harness.worktree_summary").
 ## Lock (`lock.rs`)
 
 `WorktreeLock` — `new(repo_root, workspace_root, config)`, `config()`, `repo_root()`, `root()`, `lock_path()`, `is_enabled()`, `acquire()`, `try_acquire()`, `read_metadata()`, `stale_metadata(now)`.
@@ -96,6 +97,19 @@ Enter stores a `WorktreeSessionState` (original cwd, path, name, branch, HEAD as
 The removal payload carries `discarded_files`/`discarded_commits` from the pre-removal summary; the session is cleared and `Exited { action: "remove" }` is emitted after the manager's `Removed` event.
 Both tools turn every expected failure into a `ToolPayload` with `success = false` and only propagate cancellation; their cards are bilingual (`"en"` exactly selects English) and state that `remove` is destructive and needs explicit user confirmation.
 
+## Rail (`rails.rs`)
+`WorktreeRail` is a `HarnessRail` named `"worktree"` with priority `WORKTREE_RAIL_PRIORITY` (100, Python's `WorktreeRail.priority`); `with_priority` overrides it and `priority()` reports it.
+It publishes one `PromptSection` named `WORKTREE_SECTION_NAME`, priority `WORKTREE_SECTION_PRIORITY` (85), category `SystemPrompt`, carrier `system_message`, and bilingual content (`cn` plus `en`) rendered by `WorktreeContext::render`, from `before_invoke`, `before_model_call` and `after_invoke` through one private async `publish`; publishing is an upsert by name, so repeated firings keep one section.
+The active name is the explicit `with_worktree(name)` (trimmed, non-empty), else the `WorktreeSessionStore` session's `worktree_name`; no name means no section, no `extra` write and no git call.
+Path and branch come from a session naming the same worktree with a non-empty path, then from `WorktreeManager::list()` matched by directory name or its slug, then from `WorktreeManager::target_path(name)` with no branch.
+The summary is `WorktreeManager::change_summary(name)` (lock-free); a failure is logged at `debug` and the section is published without it.
+`WorktreeContext::render` names the worktree, its path and its branch, then either the bounded `render_change_summary` text or a note that no summary is available (the worktree is not listed by git, or `git status` failed).
+The rendering is capped at `WORKTREE_SECTION_MAX_CHARS` and ends with `...` when anything was cut; it reads no clock and no environment.
+The structured summary (serde JSON of `WorktreeChangeSummary`) is written into `HarnessRailContext::extra_mut()` under `WORKTREE_SUMMARY_EXTRA_KEY`; a firing without a summary, or an impossible serialization failure, removes the key instead of leaving a stale entry.
+Hooks never return `Err`: resolution, git and serialization failures are logged at `debug` and swallowed, so a rail never aborts a run.
+`build_worktree_notice` keeps Python's `notice.py` English text (`"en"` exactly) plus a Chinese counterpart and is a host-side helper: the section carries no parent cwd.
+`WorktreeRail`, `WorktreeContext`, `build_worktree_notice` and the five constants are re-exported from `openjiuwen_harness::worktree`, not from the crate root (`src/lib.rs` is untouched).
+
 ## Constraints
 Offline and deterministic by default: tests use `ScriptedGitRunner` (queued stdout/failures, recorded calls) and temp directories; the single real-git test skips when `which::which("git")` fails.
 No new dependencies, no `unsafe`, no `println!` (tracing only); errors are `openjiuwen_common::error::{Error, Result}`.
@@ -116,8 +130,9 @@ Python's module-level `asyncio.Lock` bucket in `lock.py`: the OS advisory lock a
 Python's `filelock`-specific lock file name (`openjiuwen-worktree.lock`) and its beside-the-repo fallback: this port uses the sysop sidecar naming and the workspace `.worktree` fallback.
 `symlink_directories`, `include_patterns` copying, `core.longpaths`, hook-path configuration.
 Lifecycle policies (`ephemeral`/`durable`/`auto`), auto-cleanup timers on shutdown, event-log recovery of sessions (age-based reaping itself lives in `cleanup::run`/`CleanupPolicy`).
-The worktree rails, backend hooks (`WorktreeBackend`), the change-summary rails (`DiffSummaryRail`) and the `vcs` module remain deferred; the session tools (`enter_worktree`/`exit_worktree`) and the session store are implemented in `tools.rs`.
-Mounted through the registry: nothing yet — `enter_worktree`/`exit_worktree` are host-wired, and Python's rails integration of them stays deferred.
+The Python lifecycle rails (`WorktreeLifecycleRail`, `AutoSetupRail` setup commands, commit/sync hooks) and their manager hook chain stay deferred; the prompt-side `WorktreeRail` and the `DiffSummaryRail` summary are implemented in `rails.rs`.
+Backend hooks (`WorktreeBackend`) and the `vcs` module remain deferred; the session tools (`enter_worktree`/`exit_worktree`) and the session store are implemented in `tools.rs`.
+Mounted through the registry: nothing yet — `enter_worktree`/`exit_worktree` are host-wired, and the rail only reads their session store; `WorktreeRail` is host-registered too.
 ## Routing Table
 - `./git.rs` → `GitRunner` seam, `ProcessGitRunner`, porcelain parsers, typed git errors, command helpers
 - `./slug.rs` → raw-name validation, `slugify`, `unique_slug`, branch naming, layout constants
@@ -131,4 +146,5 @@ Mounted through the registry: nothing yet — `enter_worktree`/`exit_worktree` a
 - `./tools.rs` → `EnterWorktreeTool`/`ExitWorktreeTool`, their arguments, `WorktreeSessionState`, the `WorktreeSessionStore` seam and `MemoryWorktreeSessionStore`
 - `./sparse.rs` → `SparseConfig`, `SparseMode`, path validation, normalisation and `MAX_SPARSE_PATHS`
 - `./changes.rs` → `WorktreeChangeSummary`, `change_summary`, bounding, porcelain/diffstat parsing and bilingual rendering
-- `./tests/` → `mod.rs` (scripted runner and fixtures), `manager.rs` (lifecycle scenarios, real-git round trip), `lock.rs` (lock layout, contention, timeout, metadata), `tool.rs` (card, dispatch, payload failures), `tools.rs` (enter/exit cards, argument/session/failure paths, removal confirmation, permission refusal), `sparse.rs` (path validation, command construction), `changes.rs` (parsing, call order, bounding, rendering)
+- `./rails.rs` → `WorktreeRail`, `WorktreeContext`, `build_worktree_notice`, the section/summary constants and the bounded bilingual rendering
+- `./tests/` → `mod.rs` (scripted runner and fixtures), `manager.rs` (lifecycle scenarios, real-git round trip), `lock.rs` (lock layout, contention, timeout, metadata), `tool.rs` (card, dispatch, payload failures), `tools.rs` (enter/exit cards, argument/session/failure paths, removal confirmation, permission refusal), `sparse.rs` (path validation, command construction), `changes.rs` (parsing, call order, bounding, rendering), `rails.rs` (inert path, section/summary payloads, explicit override, failing summary, unlisted worktree, bounds, notice text, hook coverage)

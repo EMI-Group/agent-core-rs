@@ -20,6 +20,7 @@ mod changes;
 mod cleanup;
 mod lock;
 mod manager;
+mod rails;
 mod sparse;
 mod tool;
 mod tools;

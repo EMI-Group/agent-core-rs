@@ -65,6 +65,11 @@
 //!   fail-closed reaping of expired ephemeral worktrees (`teammate-…`,
 //!   `agent-…`), driven by [`WorktreeManager::cleanup`]; a dry run reports the
 //!   candidates without touching git or the registry.
+//! - [`WorktreeRail`] / [`WorktreeContext`] / [`build_worktree_notice`] — the
+//!   harness rail: it publishes one bounded, bilingual `worktree` prompt section
+//!   (path, branch, change summary) from the session or an explicit name, writes
+//!   the structured summary into the rail context's `extra` map, and never fails
+//!   a run for a git or resolution error.
 //!
 //! # Constraints
 //!
@@ -78,7 +83,8 @@
 //! - Deferred (documented in this module's `CONTEXT.md`): post-creation setup
 //!   beyond sparse checkout (symlinked heavy directories, include-pattern
 //!   copying, hook-path configuration), lifecycle policies and auto-cleanup
-//!   timers, and the Python rails integration of the enter/exit tools.
+//!   timers, and Python's lifecycle rail chain (`AutoSetupRail` setup commands,
+//!   commit/sync hooks).
 mod changes;
 mod cleanup;
 mod events;
@@ -86,6 +92,7 @@ mod git;
 mod lock;
 mod manager;
 mod models;
+mod rails;
 mod slug;
 mod sparse;
 mod store;
@@ -125,6 +132,11 @@ pub use lock::{
 pub use manager::{WorktreeCreateOptions, WorktreeManager, DEFAULT_BASE};
 pub use models::{
     WorktreeCreateResult, WorktreeInfo, WorktreeRecord, WorktreeState, WorktreeStatus,
+};
+pub use rails::{
+    build_worktree_notice, WorktreeContext, WorktreeRail, WORKTREE_RAIL_PRIORITY,
+    WORKTREE_SECTION_MAX_CHARS, WORKTREE_SECTION_NAME, WORKTREE_SECTION_PRIORITY,
+    WORKTREE_SUMMARY_EXTRA_KEY,
 };
 pub use slug::{
     branch_name, slugify, unique_slug, validate_raw_name, BRANCH_PREFIX, DEFAULT_SLUG,
