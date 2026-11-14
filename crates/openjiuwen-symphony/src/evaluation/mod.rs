@@ -7,17 +7,24 @@
 //!
 //! # Layers
 //!
-//! - This module owns the shared contract: [`Metric`], [`MetricScore`],
-//!   [`MetricStatus`], [`MetricScope`], [`EvaluationInput`], [`EvaluationReport`],
-//!   [`QualityResult`], [`QualityConfidence`], [`aggregate_metric`], and
-//!   [`EvaluationSuite`].
+//! - This module owns the shared contract: [`Metric`](crate::evaluation::Metric),
+//!   [`MetricScore`](crate::evaluation::MetricScore),
+//!   [`MetricStatus`](crate::evaluation::MetricStatus),
+//!   [`MetricScope`](crate::evaluation::MetricScope),
+//!   [`EvaluationInput`](crate::evaluation::EvaluationInput),
+//!   [`EvaluationReport`](crate::evaluation::EvaluationReport),
+//!   [`QualityResult`](crate::evaluation::QualityResult),
+//!   [`QualityConfidence`](crate::evaluation::QualityConfidence),
+//!   [`aggregate_metric`](crate::evaluation::aggregate_metric), and
+//!   [`EvaluationSuite`](crate::evaluation::EvaluationSuite).
 //! - [`metrics`](crate::evaluation::metrics) owns the static card metrics.
 //! - [`trace_metrics`](crate::evaluation::trace_metrics) owns the trace metrics, and
 //!   [`suite`](crate::evaluation::suite) the metric list, aggregation, and cache
 //!   signature.
 //! - [`trace`](crate::evaluation::trace) owns the caller-supplied evidence: cases,
-//!   capability calls, the event-time [`EvaluationWindow`], and
-//!   [`latency_statistics`].
+//!   capability calls, the event-time
+//!   [`EvaluationWindow`](crate::evaluation::EvaluationWindow), and
+//!   [`latency_statistics`](crate::evaluation::latency_statistics).
 //!
 //! Every public item of the pre-split `evaluation` module is re-exported here, so
 //! `evaluation::CompletenessMetric`, `evaluation::EvaluationSuite`,
@@ -25,51 +32,58 @@
 //!
 //! # Scope
 //!
-//! An [`EvaluationInput`] carries one [`CapabilityDescriptor`](crate::model::CapabilityDescriptor),
-//! an optional judge `target`, and an optional
+//! An [`EvaluationInput`](crate::evaluation::EvaluationInput) carries one
+//! [`CapabilityDescriptor`](crate::model::CapabilityDescriptor), an optional judge
+//! `target`, and an optional
 //! [`EvaluationTrace`](crate::evaluation::EvaluationTrace) plus
 //! [`EvaluationWindow`](crate::evaluation::EvaluationWindow). Static metrics inspect the
 //! card; trace metrics inspect the cases the window selects. Nothing here executes or
 //! installs a capability, and no composite admission decision is invented:
-//! [`QualityResult::score`] is always `None` because Python's suite reports per-metric
-//! facts (`aggregation = "per_metric"`).
+//! [`QualityResult::score`](crate::evaluation::QualityResult::score) is always `None`
+//! because Python's suite reports per-metric facts (`aggregation = "per_metric"`).
 //!
 //! # Case-window rules
 //!
 //! Window selection is deterministic: `start` is inclusive, `end` is exclusive, and a
 //! case without `event_time` is dropped as soon as either boundary is set. Cross-case
-//! aggregation groups samples by metric name and then applies [`aggregate_metric`],
-//! which is Python's status precedence — mean over scored samples with `Pass` only when
-//! every scored sample passed, then `Error`, then `Observed`, then `NotApplicable`.
+//! aggregation groups samples by metric name and then applies
+//! [`aggregate_metric`](crate::evaluation::aggregate_metric), which is Python's status
+//! precedence — mean over scored samples with `Pass` only when every scored sample
+//! passed, then `Error`, then `Observed`, then `NotApplicable`.
 //!
 //! # Fail-soft contract
 //!
-//! A metric that fails does not abort [`EvaluationSuite::evaluate`]: the error is
-//! rendered into [`EvaluationReport::errors`] (prefixed with the metric name) and the
-//! remaining metrics still run. [`EvaluationSuite::evaluate_quality`] instead records a
-//! `status = error` sample, because Python's suite materialises evaluator exceptions as
-//! error results. In practice only a model-backed metric configured with
-//! [`FallbackMode::Error`](crate::llm::FallbackMode) can fail here.
+//! A metric that fails does not abort
+//! [`EvaluationSuite::evaluate`](crate::evaluation::EvaluationSuite::evaluate): the error
+//! is rendered into
+//! [`EvaluationReport::errors`](crate::evaluation::EvaluationReport::errors) (prefixed
+//! with the metric name) and the remaining metrics still run.
+//! [`EvaluationSuite::evaluate_quality`](crate::evaluation::EvaluationSuite::evaluate_quality)
+//! instead records a `status = error` sample, because Python's suite materialises
+//! evaluator exceptions as error results. In practice only a model-backed metric
+//! configured with [`FallbackMode::Error`](crate::llm::FallbackMode) can fail here.
 //!
 //! # Determinism
 //!
 //! Static metrics are pure functions of the card, trace metrics are pure functions of
 //! the supplied evidence, and no metric reads the clock: an `event_time` always comes
-//! from the case. Grouping uses [`BTreeMap`], so per-metric output order is sorted, and
-//! [`EvaluationSuite::cache_signature`] is a digest over a sorted-key document.
+//! from the case. Grouping uses `BTreeMap`, so per-metric output order is sorted, and
+//! [`EvaluationSuite::cache_signature`](crate::evaluation::EvaluationSuite::cache_signature)
+//! is a digest over a sorted-key document.
 //!
 //! # The cache key
 //!
-//! [`SYMPHONY_EVALUATION_PROTOCOL`] is Python's protocol string
-//! (`"symphony-evaluation-suite-v5"`).
-//! [`EvaluationSuite::cache_signature`] returns the lowercase hex SHA-256 of the
-//! canonical, sorted-key JSON document
+//! [`SYMPHONY_EVALUATION_PROTOCOL`](crate::evaluation::SYMPHONY_EVALUATION_PROTOCOL) is
+//! Python's protocol string (`"symphony-evaluation-suite-v5"`).
+//! [`EvaluationSuite::cache_signature`](crate::evaluation::EvaluationSuite::cache_signature)
+//! returns the lowercase hex SHA-256 of the canonical, sorted-key JSON document
 //! `{"metrics":["<name>:<scope>:<key>",…],"protocol":"<protocol>"}`, where `<key>` is
-//! [`Metric::cache_key`] when a metric supplies one and `builtin:<name>` otherwise. The
-//! signature is stable across process runs and independent of JSON key order, so it is a
-//! safe cache key for reused quality results. Unlike Python, the Rust suite always has a
-//! signature: a metric without an explicit key is identified by its name, and metric
-//! order is significant (registration order is part of the contract).
+//! [`Metric::cache_key`](crate::evaluation::Metric::cache_key) when a metric supplies one
+//! and `builtin:<name>` otherwise. The signature is stable across process runs and
+//! independent of JSON key order, so it is a safe cache key for reused quality results.
+//! Unlike Python, the Rust suite always has a signature: a metric without an explicit key
+//! is identified by its name, and metric order is significant (registration order is part
+//! of the contract).
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
@@ -275,7 +289,7 @@ impl EvaluationInput {
     ///
     /// Returns [`crate::error::Error::Validation`] for an invalid window or an
     /// unparseable case `event_time`; see
-    /// [`select_cases`](crate::evaluation::select_cases).
+    /// [`select_cases`].
     pub fn selected_cases(&self) -> Result<Vec<&EvaluationCase>> {
         let Some(trace) = self.trace.as_ref() else {
             return Ok(Vec::new());
@@ -452,7 +466,7 @@ impl Default for QualityResult {
 
 /// One deterministic or model-backed quality check over an [`EvaluationInput`].
 ///
-/// Implementations must be cheap to share (`Send + Sync`, kept behind an [`Arc`]) and
+/// Implementations must be cheap to share (`Send + Sync`, kept behind an `Arc`) and
 /// must not panic on malformed input: an unusable input is a low score or an
 /// [`openjiuwen_common::error::Error`], never a crash.
 #[async_trait]

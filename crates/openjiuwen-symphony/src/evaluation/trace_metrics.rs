@@ -5,16 +5,16 @@
 //!
 //! | Rust metric | Python evaluator | Verdict |
 //! | --- | --- | --- |
-//! | [`SuccessRateMetric`](crate::evaluation::SuccessRateMetric) | `SuccessRateEvaluator` | scored from the recorded call outcomes |
-//! | [`LatencyMetric`](crate::evaluation::LatencyMetric) | `LatencyEvaluator` | `observed`, never scored |
-//! | [`AccuracyMetric`](crate::evaluation::AccuracyMetric) | `AccuracyEvaluator` | exact-match short-circuit, then the judge |
-//! | [`CapabilitySelectionMetric`](crate::evaluation::CapabilitySelectionMetric) | `CapabilitySelectionEvaluator` | no-calls guard, then the judge |
-//! | [`CompositionEffectivenessMetric`](crate::evaluation::CompositionEffectivenessMetric) | `CompositionEffectivenessEvaluator` | fewer-than-two-calls guard, then the judge |
+//! | [`SuccessRateMetric`] | `SuccessRateEvaluator` | scored from the recorded call outcomes |
+//! | [`LatencyMetric`] | `LatencyEvaluator` | `observed`, never scored |
+//! | [`AccuracyMetric`] | `AccuracyEvaluator` | exact-match short-circuit, then the judge |
+//! | [`CapabilitySelectionMetric`] | `CapabilitySelectionEvaluator` | no-calls guard, then the judge |
+//! | [`CompositionEffectivenessMetric`] | `CompositionEffectivenessEvaluator` | fewer-than-two-calls guard, then the judge |
 //!
 //! Every metric reads the cases selected by
 //! [`EvaluationInput::selected_cases`](crate::evaluation::EvaluationInput::selected_cases) and
 //! combines the per-case verdicts with
-//! [`aggregate_metric`](crate::evaluation::aggregate_metric), so one case and many cases take
+//! [`aggregate_metric`], so one case and many cases take
 //! the same code path. The judge-backed metrics run with
 //! [`FallbackMode::Deterministic`](crate::llm::FallbackMode), so an offline suite always
 //! produces a verdict instead of an error.
@@ -160,7 +160,7 @@ impl Metric for LatencyMetric {
 /// A case whose `actual_answer` equals its `expected_answer` passes immediately with
 /// `detail = "evaluation_method: exact_match"`-style wording and never calls a model.
 /// A case with no query or no answer is `not_applicable` (`missing_output`). Everything
-/// else goes to [`LlmJudgeMetric`] with [`ACCURACY_RUBRIC`] and the deterministic
+/// else goes to [`LlmJudgeMetric`] with `ACCURACY_RUBRIC` and the deterministic
 /// fallback.
 #[derive(Debug, Clone)]
 pub struct AccuracyMetric {
@@ -240,7 +240,7 @@ fn accuracy_guard(case: &EvaluationCase) -> Option<MetricScore> {
 ///
 /// Python's guard is "no capability calls in the trace": such a case is
 /// `not_applicable` (`missing_capability_calls`); every other case goes to
-/// [`LlmJudgeMetric`] with [`CAPABILITY_SELECTION_RUBRIC`].
+/// [`LlmJudgeMetric`] with `CAPABILITY_SELECTION_RUBRIC`.
 #[derive(Debug, Clone)]
 pub struct CapabilitySelectionMetric {
     /// The shared judge implementation.
@@ -310,7 +310,7 @@ impl Metric for CapabilitySelectionMetric {
 ///
 /// Python requires at least two observed calls: a case with fewer is `not_applicable`
 /// (`insufficient_composition_calls`); every other case goes to [`LlmJudgeMetric`] with
-/// [`COMPOSITION_RUBRIC`].
+/// `COMPOSITION_RUBRIC`.
 #[derive(Debug, Clone)]
 pub struct CompositionEffectivenessMetric {
     /// The shared judge implementation.

@@ -6,7 +6,7 @@
 //!
 //! Aggregation is per metric: samples are grouped by metric name (sorted, so the result is
 //! deterministic), each group is reduced with [`aggregate_metric`], and the
-//! [`QualityResult`](crate::evaluation::QualityResult) reports the resulting confidence
+//! [`QualityResult`] reports the resulting confidence
 //! tier instead of a composite score (`score` stays `None`, `aggregation` stays
 //! `"per_metric"`).
 use std::collections::BTreeMap;

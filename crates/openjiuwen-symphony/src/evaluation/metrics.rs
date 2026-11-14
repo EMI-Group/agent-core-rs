@@ -8,12 +8,12 @@
 //!
 //! | Rust metric | Python evaluator | Scope | Behaviour |
 //! | --- | --- | --- | --- |
-//! | [`CompletenessMetric`](crate::evaluation::CompletenessMetric) | `CompletenessEvaluator` | static | Rust static substitute: description, tags, described IO |
-//! | [`SchemaValidityMetric`](crate::evaluation::SchemaValidityMetric) | — | static | blank/duplicate names and incoherent `required` flags |
-//! | [`StructureConformanceMetric`](crate::evaluation::StructureConformanceMetric) | `StructureConformanceEvaluator` | static | the seven-field fingerprint contract |
-//! | [`DescriptionQualityMetric`](crate::evaluation::DescriptionQualityMetric) | `DescriptionQualityEvaluator` | static | empty-description guard, then the judge |
-//! | [`ClassificationConsistencyMetric`](crate::evaluation::ClassificationConsistencyMetric) | `ClassificationConsistencyEvaluator` | static | empty classification/tags guard, then the judge |
-//! | [`LlmJudgedMetric`](crate::evaluation::LlmJudgedMetric) | `LLMJudgeEvaluator` | static | card quality, delegated to [`LlmJudgeMetric`](crate::llm::LlmJudgeMetric) |
+//! | [`CompletenessMetric`] | `CompletenessEvaluator` | static | Rust static substitute: description, tags, described IO |
+//! | [`SchemaValidityMetric`] | — | static | blank/duplicate names and incoherent `required` flags |
+//! | [`StructureConformanceMetric`] | `StructureConformanceEvaluator` | static | the seven-field fingerprint contract |
+//! | [`DescriptionQualityMetric`] | `DescriptionQualityEvaluator` | static | empty-description guard, then the judge |
+//! | [`ClassificationConsistencyMetric`] | `ClassificationConsistencyEvaluator` | static | empty classification/tags guard, then the judge |
+//! | [`LlmJudgedMetric`] | `LLMJudgeEvaluator` | static | card quality, delegated to [`LlmJudgeMetric`] |
 //!
 //! Every judge-backed metric runs with
 //! [`FallbackMode::Deterministic`](crate::llm::FallbackMode), so an offline suite always
@@ -268,7 +268,7 @@ impl Metric for StructureConformanceMetric {
 /// Judges description quality, with Python's empty-description fail guard.
 ///
 /// A blank description is a deterministic `Fail` with score `0.0`; otherwise the card
-/// goes to [`LlmJudgeMetric`], which uses [`DESCRIPTION_RUBRIC`] and falls back to the
+/// goes to [`LlmJudgeMetric`], which uses `DESCRIPTION_RUBRIC` and falls back to the
 /// static rubric when no model is configured.
 #[derive(Debug, Clone)]
 pub struct DescriptionQualityMetric {
@@ -331,7 +331,7 @@ impl Metric for DescriptionQualityMetric {
 ///
 /// A card with neither a non-blank classification nor any tag is a deterministic
 /// `Fail`; otherwise the card goes to [`LlmJudgeMetric`] with
-/// [`CLASSIFICATION_RUBRIC`].
+/// `CLASSIFICATION_RUBRIC`.
 #[derive(Debug, Clone)]
 pub struct ClassificationConsistencyMetric {
     /// The shared judge implementation.
@@ -396,7 +396,7 @@ impl Metric for ClassificationConsistencyMetric {
 /// model for a binary verdict plus a reason. This type is the evaluation surface's name
 /// for that judgement: it wraps the crate's single judge implementation, keeping the
 /// metric name `"llm_judged"` and
-/// [`DEFAULT_RUBRIC`].
+/// `DEFAULT_RUBRIC`.
 ///
 /// With no model it scores the card with the deterministic fallback rubric (description,
 /// described input, described output — equal weight, passing at `0.5`, `detail` prefixed
