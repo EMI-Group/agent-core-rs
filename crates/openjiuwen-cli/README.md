@@ -5,15 +5,21 @@ agent SDK.
 
 The binary is a thin process boundary. It owns the operating-system concerns
 (`.env` loading, `tracing` installation, clap's exit codes, the stderr
-diagnostic for a failed run), the outer command grammar, and the
-`auto-harness` command group, which the harness has no words for. Everything
-else — option resolution, the one-shot runner, the interactive REPL, permission
-prompts and session storage — lives in `openjiuwen_harness::cli`.
+diagnostic for a failed run), the outer command grammar, the `auto-harness`
+command group, which the harness has no words for, and the harness-surface
+commands `lsp`, `cron`, `team` and `watch`, which drive the harness tools and
+protocols from a terminal. Everything else — option resolution, the one-shot
+runner, the interactive REPL, permission prompts and session storage — lives in
+`openjiuwen_harness::cli`.
 
 ```console
 $ openjiuwen run "summarise src/lib.rs"
 $ openjiuwen chat
 $ openjiuwen auto-harness run --task "fix the parser" --dry-run
+$ openjiuwen lsp diagnostics --file src/lib.rs
+$ openjiuwen cron list
+$ openjiuwen team --socket /tmp/team.sock members
+$ openjiuwen watch --list
 ```
 
 ## Build and run
@@ -28,6 +34,8 @@ cargo build --release -p openjiuwen-cli   # release binary: target/release/openj
 cargo run -p openjiuwen-cli -- --help
 cargo run -p openjiuwen-cli -- run "hello"
 cargo run -p openjiuwen-cli -- auto-harness run --task "tidy docs" --dry-run
+cargo run -p openjiuwen-cli -- cron list
+cargo run -p openjiuwen-cli -- watch --list
 ```
 
 Definition of done for changes in this crate:
@@ -49,7 +57,7 @@ Without a command the binary chooses one from the terminal: an interactive
 terminal starts `chat`, anything else behaves like `run` with the prompt read
 from stdin. That dispatch belongs to the harness.
 
-### `run [PROMPT] [-f|--output-format <FORMAT>]`
+### `run [PROMPT] [-f|--output-format <FORMAT>] [--worktree <NAME>]`
 
 Runs a single prompt and exits.
 
@@ -57,6 +65,7 @@ Runs a single prompt and exits.
 | --- | --- |
 | `PROMPT` | Prompt text. Omitted or `-` reads stdin to end of input and joins the lines. |
 | `-f`, `--output-format` | `text` (default), `json` or `stream-json`. |
+| `--worktree <NAME>` | Create (or reuse) a git worktree of the workspace's repository and run the prompt inside it. |
 
 Output shapes:
 
@@ -73,14 +82,38 @@ Output shapes:
 An agent turn may call tools, so a run is not limited to one model request; the
 answer is whatever the agent finished with.
 
-### `chat`
+`--worktree <NAME>` creates (or reuses) a git worktree of the repository that
+contains the resolved workspace — `-w`, then `OPENJIUWEN_WORKSPACE`, then
+`settings.json`, then `<home>/workspace`, with a relative value resolved against
+the working directory — at `<repo-root>/.worktrees/<slug>`, on branch
+`worktree-<slug>`. The run's workspace becomes the worktree path; everything
+else (option resolution, permissions, sessions) is unchanged. The creation is
+announced on stderr as one line, `worktree: <slug> -> <path> (branch <branch>)`,
+so stdout stays the result stream. A workspace outside a git repository, or a
+host without git, is a typed `config` error before any model is built.
 
-Starts the interactive REPL on a terminal. It takes no options of its own; the
-global options still apply. The REPL is wired by the harness and provides the
-in-session slash commands `/exit` (`/quit`), `/new`, `/clear`, `/mode`, `/help`,
-`/status`, `/cost`, `/compact`, `/sessions` and `/<skill>`, plus `!<command>`
-shell passthrough, persistent input history, and the first-run onboarding wizard
-when the home directory has no settings file yet.
+### `chat [--watch] [--worktree <NAME>]`
+
+Starts the interactive REPL on a terminal. Beyond the global options it takes
+two flags of its own; without them the REPL behaves exactly as before.
+
+| Flag | Meaning |
+| --- | --- |
+| `--watch` | Watch the workspace and report skill, spec, instruction and MCP reloads on stderr while the REPL runs. |
+| `--worktree <NAME>` | Create (or reuse) a worktree as `run --worktree` does and chat inside it. |
+
+The REPL is wired by the harness and provides the in-session slash commands
+`/exit` (`/quit`), `/new`, `/clear`, `/mode`, `/help`, `/status`, `/cost`,
+`/compact`, `/sessions` and `/<skill>`, plus `!<command>` shell passthrough,
+persistent input history, and the first-run onboarding wizard when the home
+directory has no settings file yet.
+
+`chat --watch` starts the same watcher `openjiuwen watch` uses, with stderr as
+its sink: one line per reported update (a debounced change, a reload failure, a
+dropped-notification notice or a watcher error), preceded by a `watching N
+target(s)` readiness line. The notices are diagnostics only — the running REPL
+keeps the instructions, skills and MCP configuration it started with; a restart
+applies the change. The conversation on stdout is untouched.
 
 ### `auto-harness <COMMAND>`
 
@@ -160,6 +193,195 @@ both ports (no model is wired in): it prints
 exits `0`. With `--json` it prints
 `{"gaps": [], "placeholder": true, "note": "<the placeholder text>"}`.
 
+### `lsp <ACTION> [OPTIONS]`
+
+Drives the harness `lsp` tool from the terminal: the client, the server table
+and the action set belong to `openjiuwen_harness::lsp`, and the command only
+translates a command line into one tool call.
+
+| Argument / flag | Meaning |
+| --- | --- |
+| `ACTION` | `hover`, `definition`, `references`, `completion`, `symbols`, `workspace-symbols`, `diagnostics`, `implementation`, `prepare-call-hierarchy`, `incoming-calls` or `outgoing-calls`. |
+| `--file <PATH>` | File to act on, relative to the workspace or absolute. Every action except `workspace-symbols` needs one, and `diagnostics` without one reports the buffered diagnostics of all files; a missing path is the tool's `path is required for '<action>'` error. |
+| `--line <N>` | One-based line of the position. |
+| `--column <N>` | One-based column of the position (alias `--col`). |
+| `--query <TEXT>` | Query text for `workspace-symbols`. |
+| `--context-lines <N>` | Context lines to include around a position result. |
+| `--server <NAME>` | Built-in server by name: `pyright`, `rust`, `typescript`, `gopls`, `jdtls`. An unknown name is a `validation` error naming that list. |
+| `--server-command <PROGRAM>` | Explicit language-server program; wins over `--server`. |
+| `--server-arg <ARG>` | Argument for `--server-command`; repeatable. |
+| `--language-id <ID>` | LSP language id for `--server-command` (for example `rust`, `python`); without `--server-command` it is a tool-level hint. |
+| `--json` | Print the whole tool payload document instead of text. |
+
+A `--file` that does not exist is rejected as `error: not_found:` before a
+language server is selected or launched.
+
+Output is the tool's own answer: one payload per action. Text mode prints the
+payload's rendered `data.result`; when an action has no textual rendering the
+`data` JSON is pretty-printed instead. `--json` prints the entire payload
+document (`success`, `data`, `error`, plus the optional extras such as
+`extracted_content`) as one object. A payload reporting
+`success: false` is a typed `error: tool:` (exit `1`, empty stdout), so a caller
+can pipe either form without the two being mixed.
+
+### `cron <COMMAND>`
+
+A host-side view of the same scheduler the agent's `cron` tool uses. Jobs live
+at `<workspace>/cron/jobs.json` and the bounded run history at
+`<workspace>/cron/runs.json`; the `-w` workspace is created before the store is
+opened.
+
+| Flag | Meaning |
+| --- | --- |
+| `--json` | Group-global: print one pretty JSON document instead of text. |
+
+| Command | Meaning |
+| --- | --- |
+| `cron list` | List the stored jobs. |
+| `cron status` | Report job counts, the due count and the earliest pending run. |
+| `cron get <JOB_ID>` | Show one job. |
+| `cron create <CRON> --prompt <TEXT> [--description <TEXT>]` | Store a new job from a cron expression: classic five fields, six/seven Quartz fields, or a supported `@` shorthand (`@daily`, …). |
+| `cron toggle <JOB_ID>` | Flip a job between enabled and disabled. |
+| `cron preview <JOB_ID> [--count <N>]` | Show the next occurrences without mutating the job; `--count` defaults to `5` and is clamped to `1..=20`. |
+| `cron run <JOB_ID>` | Record a manual run and advance the job's next occurrence. |
+| `cron runs [--job-id <ID>] [--limit <N>]` | Show the run history, newest first; `--limit` defaults to `10`, and `0` means all. |
+| `cron cancel <JOB_ID>` | Delete a job and its run records. |
+
+Text output, one item per line:
+
+- `list` / `get` — `<id>\t<cron>\tnext <ts>\t<enabled|disabled>`, or
+  `no cron jobs` for an empty store.
+- `status` — `N cron job(s): N enabled, N disabled, N due; N run record(s)`,
+  plus `next run at <ts>` when an enabled job is pending.
+- `create` — `created <job line>`; `toggle` — the new state word followed by the
+  job line (`enabled …` / `disabled …`).
+- `preview` — one RFC 3339 occurrence per line, or `no upcoming occurrences`.
+- `run` — `ran <id>; next run at <ts>`.
+- `runs` — `<recorded>\t<job-id>\t<manual|scheduled>\toccurrence <ts>`, or
+  `no cron runs`.
+- `cancel` — `cancelled <id>`.
+
+`--json` prints exactly one document per command: the job array of `list`, the
+`CronStatus` object of `status`, one `CronJob` for `get`/`create`/`toggle`/
+`cancel`, one `CronRun` for `run`, the occurrence strings of `preview`, and the
+run array of `runs`. Timestamps are RFC 3339 in UTC (`…Z`, fractional seconds
+only when present).
+
+An unknown id is `error: not_found: cron job not found: <id>` (exit `1`, empty
+stdout); an unparsable expression is an `error: validation:` naming the cron
+expression, and stores nothing.
+
+### `team <COMMAND>`
+
+Operates an agent team hosted by **another** process over the
+`openjiuwen-agent-teams` attach protocol: one JSON request/response per line on
+a Unix domain socket. One process opens one connection and performs exactly one
+operation — there is no reconnect and no retry, so a failure is reported as the
+failure it is, with its wire kind (a remote `not_found` reaches the exit path as
+`error: not_found: …`).
+
+| Flag | Meaning |
+| --- | --- |
+| `--socket <PATH>` | Attach socket of the hosting team. Falls back to `OPENJIUWEN_TEAM_SOCKET`; with neither set the command is a `validation` error naming both sources. |
+| `--json` | Group-global: print one pretty JSON document instead of text. |
+
+Both flags are global to the group, so they may follow the subcommand.
+
+| Command | Meaning |
+| --- | --- |
+| `team members` | List the roster. |
+| `team member <NAME>` | Show one member. |
+| `team inbox` | Read and drain the leader's unread inbox. |
+| `team send <TO> <CONTENT>` | Send a direct message. |
+| `team broadcast <CONTENT>` | Send a message to every member. |
+| `team create-task <TITLE> <CONTENT> [--task-id <ID>] [--dep <ID>]…` | Create a board task; `--dep` is repeatable and the team assigns an id when `--task-id` is omitted. |
+| `team task list [--status <STATUS>]` | List tasks, optionally filtered: `pending`, `blocked`, `planning`, `in_progress`, `in_review`, `completed` or `cancelled`. |
+| `team task claimable` | List the tasks this caller may claim. |
+| `team task get <TASK_ID>` | Show one task in full. |
+| `team claim <TASK_ID>` | Claim a task for this caller. |
+| `team complete <TASK_ID>` | Mark a claimed task completed. |
+| `team update <TASK_ID> [--title <TEXT>] [--content <TEXT>]` | Patch a task's title and/or content. |
+| `team snapshot` | Print the whole team snapshot (members, tasks, state). |
+| `team stop` | Ask the hosting team to stop. |
+
+Text output, one item per line:
+
+- `members` / `member` — `<member_name>\t<role>\t<status>\t<execution>`, plus a
+  fifth `<display_name>` column when the roster carries one that differs from
+  the member name; an empty roster prints `no team members`.
+- `inbox` — the text exactly as the host returned it, or `inbox is empty`.
+- `send` / `broadcast` — `<message_id> from <from> to <to|*>` (`*` for a
+  broadcast); a payload without those fields is printed as compact JSON.
+- `create-task` / `update` — `<task_id>\t<status>\t<title>`; any other payload
+  is printed as compact JSON.
+- `task list` / `task claimable` — `<task_id>\t<status>\t<title>`, plus
+  `\t<assignee>` when the task has an owner; `no tasks` / `no claimable tasks`
+  when the board selection is empty.
+- `task get` — `task_id`, `title`, `status` and `assignee` rows (`-` when
+  unowned), then the task content; an id the host does not know is
+  `error: not_found: task not found: <id>`.
+- `claim` / `complete` — `claimed <id>` / `completed <id>` when the payload
+  carries `ok: true`; a payload carrying `ok: false` — the board's policy
+  answer, such as claiming a task somebody else owns — is an
+  `error: tool: <host reason>` (exit `1`, empty stdout) in both output modes; a
+  payload without `ok` is printed as compact JSON.
+- `snapshot` — `team <name> (<state>): N member(s), M task(s)` followed by one
+  member line and one task line each; states are `idle`, `running`, `pausing`,
+  `paused` and `terminated`.
+- `stop` — `stop requested`.
+
+`--json` prints exactly one document per command: the member array of `members`,
+one `MemberSnapshot` for `member`, the inbox text, the operation payload of
+`send`/`broadcast`/`create-task`/`claim`/`complete`/`update`/`stop`, the task
+array of `task list`/`task claimable`, one `TaskDetail` for `task get`, and the
+whole `TeamSnapshot` for `snapshot`.
+
+`invoke_tool` exists on the wire and in the client but is not exposed as a
+command: the in-repo attach host always answers it with `unsupported`.
+
+### `watch [--json] [--list] [--debounce-ms <MS>] [--max-events <N>]`
+
+The terminal end of the harness workspace watcher: a debounced, coalesced change
+stream over the files the harness reloads from — skill libraries,
+agent-template/plugin roots, instruction documents (`OPENJIUWEN.md`,
+`IDENTITY.md` in the workspace and in the home directory) and the MCP
+configurations — plus the reload handlers that re-read them.
+
+| Flag | Meaning |
+| --- | --- |
+| `--list` | Print the resolved watch target plan and exit without starting a watcher. |
+| `--json` | Print one JSON object per update (with `--list`: one pretty document). |
+| `--debounce-ms <MS>` | Debounce window in milliseconds (default `250`). |
+| `--max-events <N>` | Exit after this many updates; without it the watcher runs until Ctrl-C. |
+
+`--list` is the deterministic, offline plan view: nothing has to exist yet, and
+a candidate whose watch root is missing is reported rather than dropped. A
+target line is `<kind>\t<path>`, with ` (recursive)` appended for a directory
+target; kinds are `skills`, `spec`, `instruction_file`, `mcp_config` and
+`other`, and each missing root is printed as `skipped\t<path>`. With `--json`
+the document is `{"targets": […], "skipped": […]}`, where each target carries
+`kind`, `path`, `label` and `recursive`, and every skipped entry is an absolute
+path string.
+
+Watching announces `watching N target(s)` on **stderr** (flushed, so a
+supervisor can use it as a readiness signal) and then reports one line per
+update on stdout:
+
+- a change — `event <kind> <change> <path>`, with ` <- <previous path>` appended
+  after a rename; JSON `{"type": "event", "sequence", "kind", "path", "change",
+  "previous_path"?, "label"?}`;
+- a reload handler failure — `reload failed [<handler>] <path>: <message>`; JSON
+  type `reload_failed`;
+- dropped notifications — `dropped <n> <stage>` (`intake` or `dispatch`, the two
+  bounded queues); JSON type `dropped`;
+- an OS watcher failure — `watcher error: <message>`; JSON type
+  `watcher_failed`.
+
+`--max-events N` shuts the watcher down after the N-th rendered update and exits
+`0`, which is what makes the command scriptable. A plan with no target at all is
+a typed `error: config:` (`… requires at least one watch target`) instead of a
+silently idle process.
+
 ## Global options
 
 | Flag | Meaning |
@@ -181,19 +403,23 @@ built-in default**, blank values skipped at every level.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success, including `--help` and `--version`. |
-| `1` | A runtime failure from the run, the REPL or an `auto-harness` command. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`). |
-| `2` | A usage error, decided by clap before any command runs: unknown subcommand or flag, missing value, invalid enum value (`--pipeline bogus`, `--stage bogus`, `--output-format bogus`). |
+| `0` | Success, including `--help` and `--version`, and a `watch` that stopped at `--max-events`. |
+| `1` | A runtime failure from `run`, `chat`, `auto-harness`, `lsp`, `cron`, `team` or `watch`. Reported as `error: <kind>: <cause>` on stderr (for example `error: unsupported: …`, `error: not_found: cron job not found: …`, `error: validation: team socket is required: …`). |
+| `2` | A usage error, decided by clap before any command runs: unknown subcommand or flag, missing value, invalid enum value (`--pipeline bogus`, `--stage bogus`, `--output-format bogus`, `lsp definitely-not-an-action`). |
 
 ## Streams: logs on stderr, results on stdout
 
 - **stdout is the result stream.** `run -f json` prints exactly one JSON object;
-  `run -f stream-json` prints one JSON object per line; `auto-harness --json`
-  prints one JSON document. `auto-harness run --dry-run` prints only the task
-  array on stdout, while its `[dry-run] task list -> …` note goes to stderr.
+  `run -f stream-json` prints one JSON object per line; `auto-harness --json`,
+  `lsp --json`, `cron --json`, `team --json` and `watch --list --json` print one
+  JSON document; `watch --json` prints one JSON object per reported update. A
+  `watch --list` text plan and every text-mode command print their lines here
+  too. `auto-harness run --dry-run` prints only the task array.
 - **stderr carries everything else**: the `tracing` log stream (always installed
-  with a stderr writer), permission prompts, the `error: …` diagnostic and
-  `warning: …` startup notes. Redirecting stderr therefore leaves a clean,
+  with a stderr writer), permission prompts, the `error: …` diagnostic,
+  `warning: …` startup notes, the `[dry-run] task list -> …` note, the
+  `worktree: …` announcement, the `watching N target(s)` readiness line, and the
+  reload notices of `chat --watch`. Redirecting stderr therefore leaves a clean,
   machine-readable stream on stdout.
 
 ## Environment variables
@@ -215,12 +441,18 @@ treated as absent).
 | `OPENJIUWEN_LOG_LEVEL`, `OPENJIUWEN_LOG_FORMAT` | Log level and format when `RUST_LOG` is unset. |
 | `NO_COLOR` | Disables colour when set to any non-blank value. |
 | `OPENJIUWEN_MCP_CONFIG` | Explicit `mcp.json` path. |
+| `OPENJIUWEN_TEAM_SOCKET` | Attach socket of the hosting team, dialled by `openjiuwen team` when `--socket` is absent. |
 | `OPENJIUWEN_HISTORY`, `OPENJIUWEN_HISTORY_REPLAY` | REPL history file and replay switch. |
 | `OPENJIUWEN_NO_ONBOARDING` | Skips the first-run onboarding wizard. |
 | `SSRF_PROTECT_ENABLED` | Guard for outbound URL fetching tools. |
 
 A `.env` file is loaded from the working directory **and its ancestors** at
 startup; its absence is normal.
+
+`watch` and `chat --watch` need the harness file watcher, so this binary builds
+`openjiuwen-harness` with its `notify` feature enabled. There is no runtime
+switch: the watcher is compiled in, and no environment variable turns it on or
+off.
 
 ## Files the CLI reads and writes
 
@@ -235,6 +467,14 @@ startup; its absence is normal.
     config.yaml                    optional AutoHarnessConfig document
     runs/tasks.json                last --dry-run task list
     experience/experiences.jsonl   experience records (read-only in Rust)
+
+<workspace>/                       -w, OPENJIUWEN_WORKSPACE or <home>/workspace
+  cron/jobs.json                   the cron schedule written by cron create/toggle/cancel/run
+  cron/runs.json                   the bounded run history written by cron run, read by cron runs
+  .openjiuwen/mcp.json             workspace MCP configuration (a watch target)
+  .worktree/index.json             worktree registry shared with the harness worktree tools
+
+<repo>/.worktrees/<slug>/          worktree created by --worktree <NAME> (branch worktree-<slug>)
 ```
 
 `auto-harness run` and the store commands resolve the auto-harness data
@@ -265,26 +505,64 @@ is explicit where it cannot:
 - **`experience` is read-only.** Nothing in the Rust port produces experience
   records yet; the commands read the documented JSONL, and the directory is
   created on first read so scripts can seed it.
+- **`team` needs Unix domain sockets.** The grammar and the wire types compile
+  everywhere, but the attach transport is Unix-only: on a non-Unix target the
+  command keeps its help and returns `unsupported: cross-process attach requires
+  Unix domain sockets`. The socket comes from `--socket` or
+  `OPENJIUWEN_TEAM_SOCKET`; the protocol carries no authentication, so trust is
+  the socket directory's file mode.
+- **`lsp` never probes `PATH`.** A server is either a built-in table entry
+  (`pyright`, `rust`, `typescript`, `gopls`, `jdtls`, each with its fixed
+  program, arguments, language id, extensions and root markers) or an explicit
+  `--server-command`. Nothing is discovered by scanning the filesystem or the
+  environment, so a program that is not installed surfaces as a typed launch
+  failure (`error: tool: …`) on first use instead of a silent fallback.
+- **`watch` reports reloads; it does not hot-swap a running REPL.** The
+  `chat --watch` notices tell the user that an instruction file, skill library or
+  MCP configuration changed and that the harness reloaded it, but the running
+  REPL keeps the instructions, skills and MCP servers it started with — a
+  restart applies them. Only `openjiuwen watch` is a pure observer, and
+  `--max-events` exists so scripts can stop it deterministically.
+- **Persistent-agent resume is not exposed.** `openjiuwen_harness::persistent_agent`
+  ships `resume` and a `ResumePlan` (journalled replay, a rebuilt window, a
+  continuation prompt, share bundles), but nothing in the harness CLI consumes
+  it: there is no helper that enumerates persisted executions
+  (`FileSessionStore` exposes only `path_for`, `RootLogSource` opens one
+  execution id at a time), `ResumePlan` is not `Serialize`, and no seam feeds its
+  window back into `run_once`, `Repl` or `DeepAgent`. This binary therefore has
+  no `--resume`, no execution listing and no session picker: `run`/`chat` always
+  start a new execution, and `chat`'s `/sessions` only *lists* stored session
+  records (id, model, creation time, message count) — there is no way to reopen
+  one.
 - **No remote mode.** Python's client/server (`OPENJIUWEN_SERVER_URL`) path is
   not exposed by this binary: `run` and `chat` always drive an in-process agent.
-- **Rust additions.** `--json` on the `auto-harness` group, the stderr dry-run
-  note (Python prints it on stdout), English user-facing messages, and the
-  `error: <kind>: <cause>` diagnostic on stderr with exit `1`.
+- **Rust additions.** `--json` on the `auto-harness`, `cron`, `team` and `lsp`
+  groups and on `watch`, `--max-events`/`--debounce-ms` on `watch`,
+  `--worktree`/`--watch` on `run`/`chat`, the stderr dry-run note (Python prints
+  it on stdout), English user-facing messages, and the `error: <kind>: <cause>`
+  diagnostic on stderr with exit `1`.
 - **Deferred harness features** are documented in `../openjiuwen-harness/` and
-  `../../docs/PARITY.md`: the browser/CUA/mobile presets, the LSP client, MCP
-  resource tools that need a host backend, and OTel export.
+  `../../docs/PARITY.md`: the browser/CUA/mobile presets, MCP resource tools that
+  need a host backend, and OTel export.
 
 ## Tests
 
 `tests/` holds the process-level suites, all offline and hermetic (temporary
 working directory, temporary `OPENJIUWEN_HOME`, ambient `OPENJIUWEN_*` /
-`OPENAI_*` / `API_KEY` / `API_BASE` / `MODEL_*` removed, bounded child waits):
+`OPENAI_*` / `API_KEY` / `API_BASE` / `MODEL_*` removed, bounded child waits).
+The eight suites hold 78 tests; no case needs the network, credentials or a
+terminal.
 
 | Suite | Covers |
 | --- | --- |
-| `tests/cli_smoke.rs` | `--version`, `--help` rows for `run`/`chat`/`auto-harness`, every subcommand's help, `--no-color` placement, the unknown-subcommand usage error. |
+| `tests/cli_smoke.rs` | `--version`, the `--help` rows of `run`/`chat`/`lsp`/`cron`/`team`/`watch`/`auto-harness`, every subcommand's help and flag list (`lsp` actions, `cron` and `team` subcommands, `watch` flags, `run --worktree`, `chat --watch`/`--worktree`), `--no-color` placement, the unknown-subcommand usage error. |
 | `tests/cli_run.rs` | A real `run` against the loopback mock model server in all three output formats, `--no-color` through a run, and `chat --help`. |
 | `tests/auto_harness.rs` | Task resolution, the dry run and its files, the deferred `run`/`verify-ext` errors, the experience store (ordering, limit, type filter, search, `--json`, empty store), `history` and `gap-analyze`. |
+| `tests/cli_features.rs` | `run --worktree` end to end (worktree created, stderr announcement, run inside it), `--worktree` outside a repository as a typed `config` error, and `chat --watch` starting the watcher on stderr and exiting on stdin EOF. |
+| `tests/cron.rs` | The empty store, `create`/`list`/`get` persistence, `toggle` both ways, `preview --count`, `run` plus the `runs` receipt, `status` counts, `cancel`, and the `not_found`/`validation` failures. |
+| `tests/lsp.rs` | The action and flag help, an unknown action as a usage error, a missing `--file` as `not_found` (also with `--json`), and a failing or unspawnable `--server-command` as a typed `tool` error. |
+| `tests/team.rs` | A stub attach host behind a Unix socket: the grammar, one request per command with the documented arguments, the member/task/message/outcome renderings and empty markers, the JSON documents, a remote `not_found`, an unknown `--status`, and the missing-socket validation error. |
+| `tests/watch.rs` | `watch --list` text and JSON plans (targets plus skipped roots), an empty plan as a typed `config` error, and a live change reported as one JSON event with `--max-events 1` shutting the watcher down. |
 
 In-process CLI behaviour (streaming render, REPL transcripts, permissions) is
 covered by the harness suites; nothing here duplicates it.
