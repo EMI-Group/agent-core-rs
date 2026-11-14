@@ -64,6 +64,13 @@ Writes go through a temporary file plus rename (Windows retries once), and one `
 The history file is capped at `MAX_RUNS_PER_JOB` (20) records per job and `MAX_RUNS_TOTAL` (200) records in total, rotating oldest-first, so a long-running schedule cannot grow the file without bound.
 `list` returns jobs in file order and never mutates; disabled jobs are listed, never due, and still reported by `status` in the `disabled` count.
 
+## External Caller Notes
+
+- Reachable from outside the crate as `openjiuwen_harness::tools::cron::*` (or the flatter `openjiuwen_harness::tools::{Cron…}` / crate-root re-exports); no type here has a public field, so every job/schedule must be built through the constructors and mutated through the scheduler methods.
+- `CronScheduler::new`/`for_workspace` return `Arc<Self>`, and `CronScheduler` is neither `Clone` nor `Debug`; hosts share it as `Arc<CronScheduler>` (`ToolRegistry::with_cron_scheduler`, `CronTool::new`).
+- `CronSchedule` stores only private fields and is not `Serialize`; only `CronJob`/`CronRun`/`CronStatus`/`CronRunTrigger` round-trip through serde.
+- Every `now` argument is a `chrono::DateTime<Utc>`, and `openjiuwen-harness` re-exports neither `chrono` nor a clock helper, so an external caller must depend on `chrono` itself (workspace pin `chrono = { version = "0.4", features = ["serde"] }`).
+
 ## Constraints
 
 - Depends only on `crate::workspace`, `crate::tools::support`, `crate::tools::descriptions`, `openjiuwen_foundation::tool` and `openjiuwen_common::error`; no dependency on `crate::agent`, `crate::rails`, `crate::task_loop`, `crate::subagents` or `crate::prompts`.
