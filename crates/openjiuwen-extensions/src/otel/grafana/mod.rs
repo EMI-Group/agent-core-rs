@@ -16,18 +16,38 @@
 //!   configuration time; the first request happens when a span batch is
 //!   exported.
 //!
-//! Only the **OTLP/HTTP JSON** transport is available in this workspace
-//! (`gRPC` needs `tonic`/`prost`, which the offline registry does not carry), so
-//! [`GrafanaCloudConfig::otel_config`] always selects [`OtlpProtocol::Http`],
-//! which Grafana's gateway accepts on the same endpoint.
+//! Both presets select [`OtlpProtocol::Http`] — the transport Grafana's gateway
+//! and a local collector accept on the same endpoint — and the exporter encodes
+//! every batch as OTLP/HTTP JSON.
 //!
 //! # Self-hosted Grafana
 //!
-//! A self-hosted Grafana Agent or Grafana Alloy deployment is a *collector*
-//! that must already be running; this crate cannot start, discover, or manage
-//! one. [`GrafanaAgentConfig`] keeps that path API-shaped and answers
-//! [`Error::unsupported`] with the requirement spelled out, so a caller can tell
-//! "not configured yet" apart from "wrong credentials".
+//! A self-hosted Grafana Agent or Grafana Alloy deployment is an OTLP/HTTP
+//! *collector*. [`GrafanaAgentConfig`] targets one that is already running: it
+//! resolves the endpoint ([`DEFAULT_LOCAL_OTLP_ENDPOINT`] when none is
+//! configured), carries optional headers, and produces the same
+//! [`OtelTracerConfig`] and exporter the gateway path uses, so finished spans
+//! are pushed to the local collector exactly like to any other collector.
+//!
+//! What stays outside this crate is the collector's *lifecycle*: it cannot
+//! install, start, discover, or supervise an Agent/Alloy process, so that
+//! process has to exist and listen before the first batch arrives.
+//!
+//! ```
+//! use openjiuwen_extensions::otel::grafana::{GrafanaAgentConfig, DEFAULT_LOCAL_OTLP_ENDPOINT};
+//!
+//! let agent = GrafanaAgentConfig::default()
+//!     .with_service_name("checkout")
+//!     .with_header("x-tenant", "acme");
+//! let otel = agent.otel_config()?;
+//! assert_eq!(
+//!     otel.exporter_endpoint.as_deref(),
+//!     Some(DEFAULT_LOCAL_OTLP_ENDPOINT),
+//! );
+//! assert_eq!(otel.service_name, "checkout");
+//! assert_eq!(otel.headers["x-tenant"], "acme");
+//! # Ok::<(), openjiuwen_common::error::Error>(())
+//! ```
 //!
 //! ```
 //! use openjiuwen_extensions::otel::grafana::GrafanaCloudConfig;
@@ -43,8 +63,6 @@
 //! assert_eq!(otel.headers["authorization"], config.authorization());
 //! # Ok::<(), openjiuwen_common::error::Error>(())
 //! ```
-//!
-//! [`Error::unsupported`]: openjiuwen_common::error::Error::unsupported
 
 #[cfg(test)]
 mod tests;
@@ -57,6 +75,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use openjiuwen_common::config::env::var;
 use openjiuwen_common::error::{Error, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -75,6 +94,17 @@ pub const GRAFANA_OTLP_ZONE: &str = "GRAFANA_OTLP_ZONE";
 /// Wins over the zone-derived endpoint, which is how a private or proxied
 /// gateway is addressed.
 pub const GRAFANA_OTLP_ENDPOINT: &str = "GRAFANA_OTLP_ENDPOINT";
+
+/// Default endpoint of a local Grafana Agent / Grafana Alloy OTLP/HTTP
+/// collector: `http://localhost:4318`.
+///
+/// This is the port both products listen on out of the box, and the same value
+/// the generic exporter falls back to
+/// ([`crate::otel::env::DEFAULT_OTLP_HTTP_ENDPOINT`]); the constant is re-used
+/// rather than duplicated so the preset and the exporter cannot drift apart.
+/// It is the **base** endpoint — the `/v1/traces` signal path is appended by
+/// the exporter, never stored here.
+pub const DEFAULT_LOCAL_OTLP_ENDPOINT: &str = crate::otel::env::DEFAULT_OTLP_HTTP_ENDPOINT;
 
 /// `service.name` used when the host does not name one.
 const DEFAULT_SERVICE_NAME: &str = "openjiuwen";
@@ -342,38 +372,77 @@ impl GrafanaCloudConfig {
 
 /// Preset for a local Grafana Agent / Grafana Alloy OTLP push.
 ///
-/// The agent is an external collector process: it has to be installed,
-/// configured, and running before spans can be pushed. This crate cannot start,
-/// discover, or supervise it, so [`Self::otel_config`] documents the requirement
-/// and answers [`Error::unsupported`] instead of pretending to configure a
-/// collector.
+/// The agent is an OTLP/HTTP collector process that has to be installed and
+/// running before the first batch arrives; this preset *targets* it instead of
+/// managing it. [`Self::otel_config`] resolves the collector endpoint
+/// ([`DEFAULT_LOCAL_OTLP_ENDPOINT`] when none is configured) and validates it,
+/// then returns an [`OtelTracerConfig`] selecting [`ExporterType::Otlp`] over
+/// [`OtlpProtocol::Http`], so finished spans leave the process as OTLP/HTTP
+/// JSON batches exactly as they do for [`GrafanaCloudConfig`].
+///
+/// Installing, starting, discovering, and supervising the Agent/Alloy process
+/// remains with the host; nothing here contacts the collector at configuration
+/// time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct GrafanaAgentConfig {
-    /// Collector endpoint the agent listens on (`http://localhost:4318`).
+    /// Collector endpoint the agent listens on; blank means
+    /// [`DEFAULT_LOCAL_OTLP_ENDPOINT`].
     endpoint: String,
     /// `service.name` reported with every span.
     service_name: Option<String>,
+    /// Extra headers sent with every OTLP request.
+    headers: BTreeMap<String, String>,
 }
 
 impl GrafanaAgentConfig {
     /// Builds a preset for a local Grafana Agent / Alloy endpoint.
+    ///
+    /// Use [`Self::default`] to address [`DEFAULT_LOCAL_OTLP_ENDPOINT`]. No
+    /// validation happens here; [`Self::otel_config`] reports an unusable
+    /// endpoint.
     #[must_use]
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             service_name: None,
+            headers: BTreeMap::new(),
         }
     }
 
     /// Returns the preset with a different `service.name`.
+    ///
+    /// A blank name is rejected by [`Self::otel_config`] rather than silently
+    /// replaced by the default, so a typo cannot hide.
     #[must_use]
     pub fn with_service_name(mut self, name: impl Into<String>) -> Self {
         self.service_name = Some(name.into());
         self
     }
 
-    /// Reports the configured collector endpoint.
+    /// Returns the preset with one extra OTLP request header.
+    ///
+    /// The pair is stored verbatim; an invalid header name or value (including
+    /// an empty name or a control character) is reported by [`Self::otel_config`]
+    /// with [`Error::validation`].
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Returns the preset with every pair of `headers` added; an existing name
+    /// is overwritten.
+    ///
+    /// Validation matches [`Self::with_header`].
+    #[must_use]
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers.extend(headers);
+        self
+    }
+
+    /// Reports the configured collector endpoint as given; an empty value means
+    /// [`DEFAULT_LOCAL_OTLP_ENDPOINT`].
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -385,35 +454,50 @@ impl GrafanaAgentConfig {
         self.service_name.as_deref()
     }
 
-    /// Always fails: the self-hosted path needs an external collector.
-    ///
-    /// A Grafana Agent or Alloy push is only possible when a collector service
-    /// is installed and running next to the application. This crate neither
-    /// launches nor discovers one, so the preset cannot produce a working
-    /// configuration. Point [`OtelTracerConfig::with_endpoint`] at the collector
-    /// (or use [`GrafanaCloudConfig`]) instead.
-    ///
-    /// # Errors
-    ///
-    /// Always [`Error::unsupported`], naming the collector requirement.
-    pub fn otel_config(&self) -> Result<OtelTracerConfig> {
-        Err(Error::unsupported(format!(
-            "the Grafana Agent/Alloy preset requires an external collector service: install and run \
-             Grafana Agent or Alloy at {}, or use GrafanaCloudConfig for the Grafana Cloud OTLP \
-             gateway (this crate cannot start, discover, or supervise a collector)",
-            if self.endpoint.trim().is_empty() {
-                "<endpoint>"
-            } else {
-                self.endpoint.trim()
-            }
-        )))
+    /// Reports the extra OTLP request headers.
+    #[must_use]
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
     }
 
-    /// Always fails, for the reason [`Self::otel_config`] reports.
+    /// Builds the OTLP/HTTP tracer configuration for the local collector.
+    ///
+    /// The result selects [`ExporterType::Otlp`] with [`OtlpProtocol::Http`],
+    /// carries the resolved endpoint, applies [`Self::headers`], and reports the
+    /// preset's `service.name` (or `"openjiuwen"` when none is set) with no
+    /// `service.version`.
     ///
     /// # Errors
     ///
-    /// Always [`Error::unsupported`], naming the collector requirement.
+    /// [`Error::validation`] when the resolved endpoint is not an absolute
+    /// `http`/`https` URL, when an explicitly configured `service.name` is
+    /// blank, or when a header name or value is not a valid HTTP header.
+    pub fn otel_config(&self) -> Result<OtelTracerConfig> {
+        let endpoint = self.resolved_endpoint()?;
+        let service_name = self.resolved_service_name()?;
+        validate_headers(&self.headers)?;
+        let mut config = OtelTracerConfig::default()
+            .with_exporter_type(ExporterType::Otlp)
+            .with_endpoint(endpoint)
+            .with_service(service_name, None);
+        config.protocol = OtlpProtocol::Http;
+        config.headers = self.headers.clone();
+        Ok(config)
+    }
+
+    /// Builds an exporter that posts span batches to the local collector.
+    ///
+    /// Uses the configuration from [`Self::otel_config`] and the batch export
+    /// timeout ([`OtelTracerConfig::export_timeout_ms`]) as the per-request
+    /// timeout. Construction starts a worker thread but performs no I/O, so it
+    /// needs no reachable collector.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::otel_config`], plus [`Error::config`] when the
+    /// exporter worker thread cannot be started.
+    ///
+    /// [`Error::config`]: openjiuwen_common::error::Error::config
     #[cfg(feature = "otel")]
     pub fn exporter(&self) -> Result<crate::otel::otlp::OtlpHttpExporter> {
         let config = self.otel_config()?;
@@ -424,6 +508,69 @@ impl GrafanaAgentConfig {
             Duration::from_millis(config.export_timeout_ms),
         )
     }
+
+    /// Resolves the collector endpoint: the configured value, or
+    /// [`DEFAULT_LOCAL_OTLP_ENDPOINT`] when it is blank.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] when the resolved value is not an absolute
+    /// `http`/`https` URL (see [`validate_endpoint`]).
+    fn resolved_endpoint(&self) -> Result<String> {
+        let configured = self.endpoint.trim();
+        let endpoint = if configured.is_empty() {
+            DEFAULT_LOCAL_OTLP_ENDPOINT
+        } else {
+            configured
+        };
+        validate_endpoint(endpoint)
+    }
+
+    /// Resolves `service.name`: the configured name, or
+    /// [`DEFAULT_SERVICE_NAME`] when none is set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::validation`] when a name is set but blank.
+    fn resolved_service_name(&self) -> Result<String> {
+        match self.service_name.as_deref() {
+            Some(name) => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(Error::validation(
+                        "Grafana Agent `service_name` must not be empty",
+                    ));
+                }
+                Ok(trimmed.to_owned())
+            }
+            None => Ok(DEFAULT_SERVICE_NAME.to_owned()),
+        }
+    }
+}
+
+/// Validates every configured OTLP header pair.
+///
+/// Names must be HTTP tokens and values free of control characters, which is
+/// exactly what the exporter itself accepts; checking here turns a late
+/// exporter error into a configuration error naming the offending header.
+///
+/// # Errors
+///
+/// [`Error::validation`] naming the header and the requirement.
+fn validate_headers(headers: &BTreeMap<String, String>) -> Result<()> {
+    for (name, value) in headers {
+        if HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(Error::validation(format!(
+                "Grafana Agent header name must be a non-empty HTTP token: {name:?}"
+            )));
+        }
+        if HeaderValue::from_str(value).is_err() {
+            return Err(Error::validation(format!(
+                "Grafana Agent header value for {name:?} must be a valid HTTP header value"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Normalises a zone into the bare Grafana Cloud zone slug.

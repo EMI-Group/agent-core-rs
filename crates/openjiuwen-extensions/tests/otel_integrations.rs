@@ -11,7 +11,7 @@
 //! Build coverage:
 //!
 //! - the preset *shapes* (`endpoint`, `authorization`, `otel_config`, `Debug`
-//!   redaction, `from_env`, the deferred Grafana Agent preset) compile and are
+//!   redaction, `from_env`, the local Grafana Agent preset) compile and are
 //!   asserted in **every** build, and
 //! - the Langfuse REST ingestion client is plain `reqwest`, so its suites also
 //!   run in a default build;
@@ -34,8 +34,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_extensions::otel::grafana::{
-    GrafanaAgentConfig, GrafanaCloudConfig, GRAFANA_API_TOKEN, GRAFANA_INSTANCE_ID,
-    GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_ZONE, GRAFANA_ZONE,
+    GrafanaAgentConfig, GrafanaCloudConfig, DEFAULT_LOCAL_OTLP_ENDPOINT, GRAFANA_API_TOKEN,
+    GRAFANA_INSTANCE_ID, GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_ZONE, GRAFANA_ZONE,
 };
 use openjiuwen_extensions::otel::langfuse::{
     GenerationBody, IngestionBatch, IngestionEvent, IngestionSummary, LangfuseClient,
@@ -156,15 +156,36 @@ fn the_grafana_cloud_preset_derives_the_gateway_endpoint_and_credentials() {
 }
 
 #[test]
-fn the_grafana_agent_preset_requires_an_external_collector() {
-    let error = GrafanaAgentConfig::new("http://localhost:12345")
+fn the_grafana_agent_preset_targets_the_local_collector() {
+    // A self-hosted Agent/Alloy deployment is an OTLP/HTTP collector on its
+    // default port; the preset configures the push, not the collector lifecycle.
+    let preset = GrafanaAgentConfig::default().with_service_name("checkout");
+    let config = preset.otel_config().expect("the local default is complete");
+    assert_eq!(config.exporter_type, ExporterType::Otlp);
+    assert_eq!(config.protocol, OtlpProtocol::Http);
+    assert_eq!(
+        config.exporter_endpoint.as_deref(),
+        Some(DEFAULT_LOCAL_OTLP_ENDPOINT),
+    );
+    assert_eq!(config.service_name, "checkout");
+    assert!(config.headers.is_empty());
+
+    // An explicit endpoint and header reach the configuration unchanged.
+    let preset = GrafanaAgentConfig::new("http://127.0.0.1:12345").with_header("x-tenant", "acme");
+    let config = preset
         .otel_config()
-        .expect_err("a self-hosted agent needs a running collector");
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    let message = error.message();
-    assert!(message.contains("collector"), "{message}");
-    assert!(message.contains("Grafana Agent"), "{message}");
-    assert!(message.contains("http://localhost:12345"), "{message}");
+        .expect("an absolute endpoint is complete");
+    assert_eq!(
+        config.exporter_endpoint.as_deref(),
+        Some("http://127.0.0.1:12345"),
+    );
+    assert_eq!(config.headers["x-tenant"], "acme");
+    assert_eq!(config.service_name, "openjiuwen");
+
+    let error = GrafanaAgentConfig::new("/v1/traces")
+        .otel_config()
+        .expect_err("a relative endpoint cannot be pushed to");
+    assert_eq!(error.kind(), ErrorKind::Validation);
 }
 
 #[tokio::test]
