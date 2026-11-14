@@ -11,14 +11,16 @@
 use crate::analyzer::config::AnalyzerConfig;
 use crate::analyzer::conflict::{ConflictClassifier, ConflictVerdict};
 use crate::analyzer::fact::{ExtractedFact, ExtractionInput, ExtractionResult};
-use crate::analyzer::stage::plan::{RulePlanStage, LlmPlanStage};
+use crate::analyzer::stage::plan::{LlmPlanStage, RulePlanStage};
 use crate::analyzer::stage::proactive::{
     LlmProactiveStage, ProactiveConfig, ProactiveDecision, RuleProactiveStage,
 };
 use crate::analyzer::stage::reasoning::{
     LlmReasoningStage, RuleReasoningStage, DEFAULT_REASONING_KEY,
 };
-use crate::analyzer::stage::{ExtractionStage, FactReasoning, ScopeAnalyzerOverrides, StageInput, StageOutput};
+use crate::analyzer::stage::{
+    ExtractionStage, FactReasoning, ScopeAnalyzerOverrides, StageInput, StageOutput,
+};
 use crate::analyzer::MemoryAnalyzer;
 use crate::config::{DedupeConfig, MemoryEngineConfig};
 use crate::record::{CallOptions, MemoryRecord};
@@ -100,7 +102,7 @@ impl Default for FactVerdict {
     }
 }
 
-/// The extraction stage: runs the configured [`FactExtractor`] over the planned turns.
+/// The extraction stage: runs the configured [`crate::analyzer::FactExtractor`] over the planned turns.
 pub struct ExtractStage {
     /// The analyzer that owns the extractor and validates the call.
     analyzer: Arc<MemoryAnalyzer>,
@@ -215,12 +217,7 @@ impl ExtractionStage for ConflictStage {
             return Ok(StageOutput::of(self.name()).with_verdicts(Vec::new()));
         }
         let cap = self.max_candidates.max(1);
-        let candidates: Vec<MemoryRecord> = input
-            .candidates
-            .iter()
-            .take(cap)
-            .cloned()
-            .collect();
+        let candidates: Vec<MemoryRecord> = input.candidates.iter().take(cap).cloned().collect();
         let mut verdicts = Vec::new();
         let mut degraded: Vec<String> = Vec::new();
         for (fact_index, fact) in input.facts.iter().enumerate() {
@@ -248,9 +245,9 @@ impl ExtractionStage for ConflictStage {
             }
         }
         let mut output = StageOutput::of(self.name()).with_verdicts(verdicts);
-        if let Some(reason) = crate::analyzer::stage::degraded_reasons(
-            degraded.iter().map(String::as_str),
-        ) {
+        if let Some(reason) =
+            crate::analyzer::stage::degraded_reasons(degraded.iter().map(String::as_str))
+        {
             output = output.degraded(reason);
         }
         Ok(output)
@@ -289,7 +286,9 @@ impl StagedResult {
     /// Returns whether the proactive stage recommends writing memory.
     #[must_use]
     pub fn should_write(&self) -> bool {
-        self.decision.as_ref().is_some_and(|decision| decision.write)
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.write)
     }
 
     /// Returns the facts the proactive decision selected (all facts when no decision ran).
@@ -493,9 +492,8 @@ impl StagedAnalyzer {
         {
             degradations.push(reason);
         }
-        let degradation = crate::analyzer::stage::degraded_reasons(
-            degradations.iter().map(String::as_str),
-        );
+        let degradation =
+            crate::analyzer::stage::degraded_reasons(degradations.iter().map(String::as_str));
         let result = ExtractionResult {
             facts: state.facts,
             degraded: degradation,
@@ -527,9 +525,8 @@ impl StagedAnalyzer {
             .model()
             .cloned()
             .or_else(|| self.model.clone());
-        MemoryAnalyzer::from_config(self.effective_config(), model).consolidate(
-            incoming, existing, dedupe,
-        )
+        MemoryAnalyzer::from_config(self.effective_config(), model)
+            .consolidate(incoming, existing, dedupe)
     }
 
     /// Builds the stage sequence for one run.
@@ -555,10 +552,7 @@ impl StagedAnalyzer {
             }
             (StageKind::Rule, _) => Arc::new(RulePlanStage::new(config.clone())),
         };
-        let analyzer = Arc::new(MemoryAnalyzer::from_config(
-            config.clone(),
-            model.clone(),
-        ));
+        let analyzer = Arc::new(MemoryAnalyzer::from_config(config.clone(), model.clone()));
         let reasoning: Arc<dyn ExtractionStage> = match (selection.reasoning, &model) {
             (StageKind::Llm, Some(model)) => Arc::new(
                 LlmReasoningStage::new(model.clone(), config.clone()).with_fallback(
@@ -621,7 +615,7 @@ impl StagedAnalyzer {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, ConflictKind, ConsolidationAction, ExtractorKind, ExtractionStage,
+        AnalyzerConfig, ConflictKind, ConsolidationAction, ExtractionStage, ExtractorKind,
         MemoryAnalyzer, PlanIntent, ScopeAnalyzerOverrides, StageInput, StageOutput,
     };
     use crate::record::{CallOptions, MemoryScope, MemoryType};
@@ -675,12 +669,17 @@ mod tests {
             assert!(left.metadata.contains_key("rationale"));
         }
         assert_eq!(staged.reasoning.len(), staged.facts().len());
-        assert!(staged.verdicts.is_empty(), "no candidate records were supplied");
+        assert!(
+            staged.verdicts.is_empty(),
+            "no candidate records were supplied"
+        );
         assert!(!staged.is_degraded());
         assert_eq!(staged.result.extractor, "rule");
         assert!(staged.should_write());
         assert_eq!(staged.writable_facts().len(), staged.facts().len());
-        assert!(staged.rationale(0).is_some_and(|text| text.contains("preference")));
+        assert!(staged
+            .rationale(0)
+            .is_some_and(|text| text.contains("preference")));
     }
 
     #[tokio::test]
@@ -729,10 +728,13 @@ mod tests {
         assert!((staged.effective_config().min_importance - 0.8).abs() < f32::EPSILON);
         assert_eq!(staged.effective_config().max_facts, 2);
         let result = staged
-            .analyze(&ExtractionInput::from_text("I prefer dark mode."), &CallOptions::new())
+            .analyze(
+                &ExtractionInput::from_text("I prefer dark mode."),
+                &CallOptions::new(),
+            )
             .await
             .unwrap();
-        assert!(result.facts().is_empty());
+        assert_eq!(result.facts().len(), 0);
         assert!(!result.should_write());
         assert!(!result.is_degraded());
     }
@@ -752,7 +754,10 @@ mod tests {
         let staged = StagedAnalyzer::new(AnalyzerConfig::default()).with_overrides(overrides);
         assert_eq!(staged.effective_config().extractor, ExtractorKind::Llm);
         let result = staged
-            .analyze(&ExtractionInput::from_text("I prefer dark mode."), &CallOptions::new())
+            .analyze(
+                &ExtractionInput::from_text("I prefer dark mode."),
+                &CallOptions::new(),
+            )
             .await
             .unwrap();
         assert_eq!(result.result.extractor, "llm");
@@ -787,11 +792,15 @@ mod tests {
             proactive: StageKind::Llm,
             ..StageConfig::default()
         };
-        let staged = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
-            .with_stage_config(stages);
-        assert_eq!(staged.stage_config().plan, StageKind::Llm);
-        let result = staged
-            .analyze(&ExtractionInput::from_text("I prefer dark mode."), &CallOptions::new())
+        let pipeline =
+            StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+                .with_stage_config(stages);
+        assert_eq!(pipeline.stage_config().plan, StageKind::Llm);
+        let result = pipeline
+            .analyze(
+                &ExtractionInput::from_text("I prefer dark mode."),
+                &CallOptions::new(),
+            )
             .await
             .unwrap();
         assert_eq!(handle.call_count(), 3);
@@ -857,8 +866,8 @@ mod tests {
             }
         }
 
-        let staged = StagedAnalyzer::new(AnalyzerConfig::default())
-            .with_stages(vec![Arc::new(FixedStage)]);
+        let staged =
+            StagedAnalyzer::new(AnalyzerConfig::default()).with_stages(vec![Arc::new(FixedStage)]);
         let result = staged
             .analyze(&ExtractionInput::from_text("anything"), &CallOptions::new())
             .await
@@ -867,7 +876,7 @@ mod tests {
         assert_eq!(result.facts().len(), 1);
         assert_eq!(result.result.extractor, "fixed");
         assert!(result.decision.is_none());
-        assert!(result.reasoning.is_empty());
+        assert_eq!(result.reasoning.len(), 0);
     }
 
     #[tokio::test]
@@ -880,11 +889,12 @@ mod tests {
             proactive: StageKind::Llm,
             ..StageConfig::default()
         };
-        let staged = StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
-            .with_stage_config(stages);
+        let pipeline =
+            StagedAnalyzer::from_config(AnalyzerConfig::default(), Some(Arc::new(model)))
+                .with_stage_config(stages);
         let token = CancellationToken::new();
         token.cancel();
-        let error = staged
+        let error = pipeline
             .analyze(
                 &ExtractionInput::from_text("I prefer dark mode."),
                 &CallOptions::new().with_cancellation(token),
@@ -918,7 +928,14 @@ mod tests {
             .await
             .unwrap();
         let json = serde_json::to_value(&staged).unwrap();
-        for key in ["result", "plan", "decision", "reasoning", "verdicts", "stages"] {
+        for key in [
+            "result",
+            "plan",
+            "decision",
+            "reasoning",
+            "verdicts",
+            "stages",
+        ] {
             assert!(json.get(key).is_some(), "missing {key}");
         }
         assert_eq!(json["stages"][0], json!("plan"));
@@ -927,7 +944,7 @@ mod tests {
         assert_eq!(restored.stages, staged.stages);
         assert_eq!(restored.plan, staged.plan);
         let tolerant: StagedResult = serde_json::from_value(json!({"unknown": 1})).unwrap();
-        assert!(tolerant.facts().is_empty());
+        assert_eq!(tolerant.facts().len(), 0);
         assert!(tolerant.decision.is_none());
 
         let verdict = FactVerdict {

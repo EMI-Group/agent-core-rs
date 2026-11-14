@@ -21,6 +21,7 @@ use openjiuwen_foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_foundation::prompt::BaseMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// The default metadata key a rationale is stored under.
@@ -52,7 +53,7 @@ pub enum ReasoningBasis {
 }
 
 impl ReasoningBasis {
-    /// Returns the stable snake_case name.
+    /// Returns the stable `snake_case` name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -178,7 +179,8 @@ impl RuleReasoningStage {
             .iter()
             .enumerate()
             .map(|(index, fact)| {
-                let basis = ReasoningBasis::from_tags(&fact.tags).unwrap_or(ReasoningBasis::Planned);
+                let basis =
+                    ReasoningBasis::from_tags(&fact.tags).unwrap_or(ReasoningBasis::Planned);
                 let rationale = truncate_chars(
                     &self.rationale(fact, basis, plan_intent),
                     self.config.max_content_chars,
@@ -196,13 +198,12 @@ impl RuleReasoningStage {
             self.config.default_importance
         };
         let subject = match basis {
-            ReasoningBasis::Explicit => {
-                "explicit capture the user asked to remember".to_owned()
-            }
+            ReasoningBasis::Explicit => "explicit capture the user asked to remember".to_owned(),
             ReasoningBasis::Identity => "identity statement about the user".to_owned(),
             ReasoningBasis::Preference => "stated preference of the user".to_owned(),
             ReasoningBasis::Project => "project or technology statement".to_owned(),
-            ReasoningBasis::Variable => match fact.metadata.get("variable").and_then(Value::as_str) {
+            ReasoningBasis::Variable => match fact.metadata.get("variable").and_then(Value::as_str)
+            {
                 Some(key) => format!("variable assignment for {key}"),
                 None => "variable assignment".to_owned(),
             },
@@ -218,7 +219,12 @@ impl RuleReasoningStage {
     }
 
     /// Returns the facts with the rationale metadata attached.
-    fn attach(&self, facts: &[ExtractedFact], reasoning: &[FactReasoning], plan_intent: &str) -> Vec<ExtractedFact> {
+    fn attach(
+        &self,
+        facts: &[ExtractedFact],
+        reasoning: &[FactReasoning],
+        plan_intent: &str,
+    ) -> Vec<ExtractedFact> {
         let mut updated = facts.to_vec();
         for entry in reasoning {
             if let Some(fact) = updated.get_mut(entry.fact_index) {
@@ -312,11 +318,12 @@ impl LlmReasoningStage {
     fn render(&self, input: &StageInput) -> String {
         let mut rendered = format!("PLAN INTENT\n{}\n\nFACTS\n", input.plan.intent.as_str());
         for (index, fact) in input.facts.iter().enumerate() {
-            rendered.push_str(&format!(
-                "FACT {index}: {}: {}\n",
+            let _ = writeln!(
+                rendered,
+                "FACT {index}: {}: {}",
                 fact.kind.as_str(),
                 fact.content.trim()
-            ));
+            );
         }
         truncate_chars(&rendered, self.config.max_input_chars)
     }
@@ -356,8 +363,9 @@ impl ExtractionStage for LlmReasoningStage {
                     {
                         return Ok(self.merge(input, rule_reasoning, answered));
                     }
-                    failure
-                        .get_or_insert_with(|| "the model answer held no usable rationale".to_owned());
+                    failure.get_or_insert_with(|| {
+                        "the model answer held no usable rationale".to_owned()
+                    });
                     tracing::warn!(
                         target: "openjiuwen_memory::analyzer",
                         attempt,
@@ -435,7 +443,9 @@ impl LlmReasoningStage {
         failure: &str,
     ) -> StageOutput {
         let plan_intent = input.plan.intent.as_str();
-        let facts = self.fallback.attach(&input.facts, &rule_reasoning, plan_intent);
+        let facts = self
+            .fallback
+            .attach(&input.facts, &rule_reasoning, plan_intent);
         StageOutput::of(self.name())
             .with_facts(facts)
             .with_reasoning(rule_reasoning)
@@ -569,7 +579,7 @@ mod tests {
         assert_eq!(reasoning.len(), 4);
         for (index, entry) in reasoning.iter().enumerate() {
             assert_eq!(entry.fact_index, index);
-            assert!(!entry.rationale.trim().is_empty());
+            assert_ne!(entry.rationale.trim(), "");
         }
         assert_eq!(reasoning[0].basis, ReasoningBasis::Preference);
         assert_eq!(reasoning[1].basis, ReasoningBasis::Identity);
@@ -582,7 +592,10 @@ mod tests {
             facts[0].metadata.get("rationale"),
             Some(&json!(reasoning[0].rationale))
         );
-        assert_eq!(facts[0].metadata.get("plan_intent"), Some(&json!("preference")));
+        assert_eq!(
+            facts[0].metadata.get("plan_intent"),
+            Some(&json!("preference"))
+        );
         // Deterministic: a second run over the same input is byte-identical.
         let again = stage
             .run(&state(facts_from_builder()), &CallOptions::new())
@@ -652,7 +665,9 @@ mod tests {
 
     #[tokio::test]
     async fn llm_reasoning_unparseable_output_falls_back_to_rules() {
-        let model = ScriptedModel::builder().respond_text("because it matters").build();
+        let model = ScriptedModel::builder()
+            .respond_text("because it matters")
+            .build();
         let handle = model.clone();
         let config = AnalyzerConfig::default();
         let stage = LlmReasoningStage::new(Arc::new(model), config);
@@ -665,7 +680,10 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("fell back to rules")));
         assert_eq!(output.reasoning.len(), 4);
-        assert!(output.reasoning.iter().all(|entry| entry.basis != ReasoningBasis::Modeled));
+        assert!(output
+            .reasoning
+            .iter()
+            .all(|entry| entry.basis != ReasoningBasis::Modeled));
         assert_eq!(handle.call_count(), 4);
     }
 
@@ -721,7 +739,10 @@ mod tests {
             serde_json::from_value(json!({"unknown": 1, "rationale": "x"})).unwrap();
         assert_eq!(tolerant.fact_index, 0);
         assert_eq!(tolerant.basis, ReasoningBasis::Unknown);
-        assert_eq!(ReasoningBasis::from_tags(&["project".to_owned()]), Some(ReasoningBasis::Project));
+        assert_eq!(
+            ReasoningBasis::from_tags(&["project".to_owned()]),
+            Some(ReasoningBasis::Project)
+        );
         assert_eq!(ReasoningBasis::from_tags(&[]), None);
         assert!(REASONING_SYSTEM_PROMPT.contains(REASONING_JSON_SCHEMA));
         let schema: serde_json::Value = serde_json::from_str(REASONING_JSON_SCHEMA).unwrap();

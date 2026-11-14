@@ -128,7 +128,7 @@ pub enum PlanIntent {
 }
 
 impl PlanIntent {
-    /// Returns the stable snake_case name used in JSON and rationales.
+    /// Returns the stable `snake_case` name used in JSON and rationales.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -155,7 +155,9 @@ impl PlanIntent {
         let normalized = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
         Some(match normalized.as_str() {
             "none" | "" => Self::None,
-            "correction" | "correct" | "update" | "delete" | "edit" | "conflict" => Self::Correction,
+            "correction" | "correct" | "update" | "delete" | "edit" | "conflict" => {
+                Self::Correction
+            }
             "directive" | "explicit" | "instruct" | "instruction" => Self::Directive,
             "variable" | "variables" => Self::Variable,
             "preference" | "preferences" | "user_preference" => Self::Preference,
@@ -186,7 +188,7 @@ pub enum PlanOperation {
 }
 
 impl PlanOperation {
-    /// Returns the stable snake_case name used in JSON and rationales.
+    /// Returns the stable `snake_case` name used in JSON and rationales.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -338,7 +340,7 @@ impl RulePlanStage {
             .map(|turn| turn.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let intent = self.intent(&probe, turns);
+        let intent = Self::intent(&probe, turns);
         if !intent.is_actionable() {
             return ExtractionPlan::empty("no memory signal was detected");
         }
@@ -350,7 +352,7 @@ impl RulePlanStage {
             operations.push(PlanOperation::NormalizeTime);
         }
         operations.push(PlanOperation::ExtractFacts);
-        if self.has_assignment(turns) {
+        if Self::has_assignment(turns) {
             operations.push(PlanOperation::ExtractVariables);
         }
         if tokenize(&probe).len() >= SUMMARY_TOKEN_THRESHOLD {
@@ -359,8 +361,14 @@ impl RulePlanStage {
         if matches(CORRECTION.as_ref(), &probe) || matches(UPDATE.as_ref(), &probe) {
             operations.push(PlanOperation::HandleDirectives);
         }
-        let topic = self.topic(&probe, intent);
-        let rationale = self.rationale(intent, topic.as_deref(), &operations, focus_turns.len(), turns.len());
+        let topic = Self::topic(&probe, intent);
+        let rationale = Self::rationale(
+            intent,
+            topic.as_deref(),
+            &operations,
+            focus_turns.len(),
+            turns.len(),
+        );
         ExtractionPlan {
             intent,
             topic,
@@ -372,14 +380,14 @@ impl RulePlanStage {
     }
 
     /// Returns the dominant intent of `probe` (first match wins, correction first).
-    fn intent(&self, probe: &str, turns: &[ConversationTurn]) -> PlanIntent {
+    fn intent(probe: &str, turns: &[ConversationTurn]) -> PlanIntent {
         if matches(CORRECTION.as_ref(), probe) {
             return PlanIntent::Correction;
         }
         if matches(DIRECTIVE.as_ref(), probe) {
             return PlanIntent::Directive;
         }
-        if self.has_assignment(turns) {
+        if Self::has_assignment(turns) {
             return PlanIntent::Variable;
         }
         if matches(PREFERENCE.as_ref(), probe) {
@@ -395,7 +403,7 @@ impl RulePlanStage {
     }
 
     /// Returns `true` when any focused line is a variable assignment.
-    fn has_assignment(&self, turns: &[ConversationTurn]) -> bool {
+    fn has_assignment(turns: &[ConversationTurn]) -> bool {
         turns.iter().any(|turn| {
             turn.text
                 .lines()
@@ -404,7 +412,7 @@ impl RulePlanStage {
     }
 
     /// Derives the plan topic: the most frequent salient token, else the intent label.
-    fn topic(&self, probe: &str, intent: PlanIntent) -> Option<String> {
+    fn topic(probe: &str, intent: PlanIntent) -> Option<String> {
         let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
         for (position, token) in tokenize(probe).into_iter().enumerate() {
             if token.chars().count() < 4 || TOPIC_STOPWORDS.contains(&token.as_str()) {
@@ -415,12 +423,15 @@ impl RulePlanStage {
         }
         let best = counts
             .into_iter()
-            .max_by(|(left_token, (left_count, left_first)), (right_token, (right_count, right_first))| {
-                left_count
-                    .cmp(right_count)
-                    .then(right_first.cmp(left_first))
-                    .then(right_token.cmp(left_token))
-            })
+            .max_by(
+                |(left_token, (left_count, left_first)),
+                 (right_token, (right_count, right_first))| {
+                    left_count
+                        .cmp(right_count)
+                        .then(right_first.cmp(left_first))
+                        .then(right_token.cmp(left_token))
+                },
+            )
             .map(|(token, _)| token);
         best.or_else(|| match intent {
             PlanIntent::Correction
@@ -435,7 +446,6 @@ impl RulePlanStage {
 
     /// Renders the deterministic plan rationale.
     fn rationale(
-        &self,
         intent: PlanIntent,
         topic: Option<&str>,
         operations: &[PlanOperation],
@@ -447,7 +457,8 @@ impl RulePlanStage {
             intent.as_str()
         );
         if let Some(topic) = topic {
-            rationale.push_str(&format!(", topic {topic}"));
+            rationale.push_str(", topic ");
+            rationale.push_str(topic);
         }
         let operations: Vec<&str> = operations
             .iter()
@@ -584,14 +595,13 @@ impl ExtractionStage for LlmPlanStage {
                         .message()
                         .map(|message| message.text().into_owned())
                         .unwrap_or_default();
-                    if let Some(plan) = parse_plan_response(
-                        &raw,
-                        &self.config,
-                        input.conversation.turns.len(),
-                    ) {
+                    if let Some(plan) =
+                        parse_plan_response(&raw, &self.config, input.conversation.turns.len())
+                    {
                         return Ok(StageOutput::of(self.name()).with_plan(plan));
                     }
-                    failure.get_or_insert_with(|| "the model answer held no usable plan".to_owned());
+                    failure
+                        .get_or_insert_with(|| "the model answer held no usable plan".to_owned());
                     tracing::warn!(
                         target: "openjiuwen_memory::analyzer",
                         attempt,
@@ -673,15 +683,17 @@ pub fn parse_plan_response(
         .unwrap_or_default();
     focus_turns.sort_unstable();
     focus_turns.dedup();
-    let rationale = map
+    let rationale = match map
         .get("rationale")
         .or_else(|| map.get("reason"))
         .or_else(|| map.get("why"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(|text| truncate_chars(text, config.max_content_chars))
-        .unwrap_or_else(|| format!("model plan: {} intent", intent.as_str()));
+    {
+        Some(text) => truncate_chars(text, config.max_content_chars),
+        None => format!("model plan: {} intent", intent.as_str()),
+    };
     let topic = map
         .get("topic")
         .and_then(Value::as_str)
@@ -720,17 +732,16 @@ fn parse_operations(value: Option<&Value>) -> Option<Vec<PlanOperation>> {
                 .unwrap_or_default(),
             _ => continue,
         };
-        match PlanOperation::parse(raw) {
-            Some(operation) => {
-                if !operations.contains(&operation) {
-                    operations.push(operation);
-                }
+        if let Some(operation) = PlanOperation::parse(raw) {
+            if !operations.contains(&operation) {
+                operations.push(operation);
             }
-            None => tracing::warn!(
+        } else {
+            tracing::warn!(
                 target: "openjiuwen_memory::analyzer",
                 %raw,
                 "skipping unknown plan operation"
-            ),
+            );
         }
     }
     if operations.is_empty() {
@@ -799,7 +810,8 @@ mod tests {
         assert_eq!(plan.intent, PlanIntent::Variable);
         assert!(plan.has(PlanOperation::ExtractVariables));
 
-        let plan = plan_with_history(&["It runs on postgres."], &["The service handles billing."]).await;
+        let plan =
+            plan_with_history(&["It runs on postgres."], &["The service handles billing."]).await;
         assert!(plan.has(PlanOperation::ResolveReferences));
         assert!(!plan.has(PlanOperation::NormalizeTime));
 
@@ -842,7 +854,10 @@ mod tests {
         let plan = ExtractionPlan {
             intent: PlanIntent::Correction,
             topic: Some("build".to_owned()),
-            operations: vec![PlanOperation::ResolveReferences, PlanOperation::ExtractFacts],
+            operations: vec![
+                PlanOperation::ResolveReferences,
+                PlanOperation::ExtractFacts,
+            ],
             focus_turns: vec![0, 1],
             rationale: "correction intent".to_owned(),
             degraded: None,
@@ -852,20 +867,28 @@ mod tests {
         assert_eq!(json["operations"][1], serde_json::json!("extract_facts"));
         let restored: ExtractionPlan = serde_json::from_value(json).unwrap();
         assert_eq!(restored, plan);
-        let tolerant: ExtractionPlan =
-            serde_json::from_value(serde_json::json!({
-                "intent": "nonsense",
-                "operations": ["extract_facts"],
-                "unknown": 1
-            }))
-            .unwrap();
+        let tolerant: ExtractionPlan = serde_json::from_value(serde_json::json!({
+            "intent": "nonsense",
+            "operations": ["extract_facts"],
+            "unknown": 1
+        }))
+        .unwrap();
         assert_eq!(tolerant.intent, PlanIntent::None);
         assert!(tolerant.is_actionable(), "the operations still replay");
-        assert!(PlanIntent::parse("user_profile") == Some(PlanIntent::Identity));
-        assert!(PlanIntent::parse("delete") == Some(PlanIntent::Correction));
+        assert_eq!(
+            PlanIntent::parse("user_profile"),
+            Some(PlanIntent::Identity)
+        );
+        assert_eq!(PlanIntent::parse("delete"), Some(PlanIntent::Correction));
         assert!(PlanIntent::parse("nope").is_none());
-        assert_eq!(PlanOperation::parse("time reasoning"), Some(PlanOperation::NormalizeTime));
-        assert_eq!(PlanOperation::parse("SUMMARY"), Some(PlanOperation::ExtractSummary));
+        assert_eq!(
+            PlanOperation::parse("time reasoning"),
+            Some(PlanOperation::NormalizeTime)
+        );
+        assert_eq!(
+            PlanOperation::parse("SUMMARY"),
+            Some(PlanOperation::ExtractSummary)
+        );
         assert!(PlanOperation::parse("nope").is_none());
     }
 
@@ -939,10 +962,7 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("fell back to rules")));
         let rule_plan = RulePlanStage::new(config.clone())
-            .run(
-                &StageInput::new(conversation, config),
-                &CallOptions::new(),
-            )
+            .run(&StageInput::new(conversation, config), &CallOptions::new())
             .await
             .unwrap()
             .plan
@@ -962,7 +982,10 @@ mod tests {
         token.cancel();
         let options = CallOptions::new().with_cancellation(token);
         let error = stage
-            .run(&StageInput::new(conversation(&["a fact"]), config), &options)
+            .run(
+                &StageInput::new(conversation(&["a fact"]), config),
+                &options,
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Cancelled), "{error:?}");

@@ -30,6 +30,7 @@ use openjiuwen_foundation::prompt::BaseMessage;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 
 /// A decision/commitment phrase that makes memory worth writing proactively.
@@ -104,7 +105,7 @@ pub enum ProactiveSignal {
 }
 
 impl ProactiveSignal {
-    /// Returns the stable snake_case name used in JSON and reason strings.
+    /// Returns the stable `snake_case` name used in JSON and reason strings.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -217,7 +218,7 @@ impl RuleProactiveStage {
     }
 
     /// Returns the strongest finite importance in `facts`.
-    fn max_importance(&self, facts: &[ExtractedFact]) -> f32 {
+    fn max_importance(facts: &[ExtractedFact]) -> f32 {
         facts
             .iter()
             .filter(|fact| fact.importance.is_finite())
@@ -250,7 +251,7 @@ impl RuleProactiveStage {
                 self.proactive.min_transcript_chars
             ));
         }
-        let importance = self.max_importance(facts);
+        let importance = Self::max_importance(facts);
         let mut signals: Vec<ProactiveSignal> = Vec::new();
         if has_directive_marker(&transcript) {
             signals.push(ProactiveSignal::ExplicitDirective);
@@ -324,13 +325,9 @@ impl RuleProactiveStage {
                 .history
                 .iter()
                 .any(|turn| jaccard(&fact.content, &turn.text) >= threshold)
-                || input
-                    .facts
-                    .iter()
-                    .enumerate()
-                    .any(|(other, candidate)| {
-                        other != index && jaccard(&fact.content, &candidate.content) >= threshold
-                    });
+                || input.facts.iter().enumerate().any(|(other, candidate)| {
+                    other != index && jaccard(&fact.content, &candidate.content) >= threshold
+                });
             if repeated {
                 return true;
             }
@@ -423,10 +420,7 @@ impl LlmProactiveStage {
             input.plan.intent.as_str()
         );
         for (index, fact) in input.facts.iter().enumerate() {
-            rendered.push_str(&format!(
-                "FACT {index}: {}\n",
-                fact.content.trim()
-            ));
+            let _ = writeln!(rendered, "FACT {index}: {}", fact.content.trim());
         }
         truncate_chars(&rendered, self.config.max_input_chars)
     }
@@ -465,8 +459,9 @@ impl ExtractionStage for LlmProactiveStage {
                     {
                         return Ok(StageOutput::of(self.name()).with_decision(decision));
                     }
-                    failure
-                        .get_or_insert_with(|| "the model answer held no usable decision".to_owned());
+                    failure.get_or_insert_with(|| {
+                        "the model answer held no usable decision".to_owned()
+                    });
                     tracing::warn!(
                         target: "openjiuwen_memory::analyzer",
                         attempt,
@@ -498,7 +493,9 @@ impl ExtractionStage for LlmProactiveStage {
             "LLM proactive stage exhausted its retries; falling back to rules"
         );
         let mut decision = self.fallback.decide(input);
-        decision.degraded = Some(format!("llm proactive decision fell back to rules: {failure}"));
+        decision.degraded = Some(format!(
+            "llm proactive decision fell back to rules: {failure}"
+        ));
         Ok(StageOutput::of(self.name())
             .with_decision(decision.clone())
             .degraded(decision.degraded.unwrap_or_default()))
@@ -537,17 +534,16 @@ pub fn parse_proactive_response(
             let Some(raw) = item.as_str() else {
                 continue;
             };
-            match ProactiveSignal::parse(raw) {
-                Some(signal) => {
-                    if !signals.contains(&signal) {
-                        signals.push(signal);
-                    }
+            if let Some(signal) = ProactiveSignal::parse(raw) {
+                if !signals.contains(&signal) {
+                    signals.push(signal);
                 }
-                None => tracing::warn!(
+            } else {
+                tracing::warn!(
                     target: "openjiuwen_memory::analyzer",
                     %raw,
                     "skipping unknown proactive signal"
-                ),
+                );
             }
         }
     }
@@ -575,21 +571,18 @@ pub fn parse_proactive_response(
         .and_then(Value::as_f64)
         .map_or(0.0, |importance| importance as f32)
         .clamp(0.0, 1.0);
-    let reason = map
+    let reason = match map
         .get("reason")
         .or_else(|| map.get("rationale"))
         .or_else(|| map.get("why"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(|text| truncate_chars(text, config.max_content_chars))
-        .unwrap_or_else(|| {
-            if write {
-                "model decided to write memory".to_owned()
-            } else {
-                "model decided not to write memory".to_owned()
-            }
-        });
+    {
+        Some(text) => truncate_chars(text, config.max_content_chars),
+        None if write => "model decided to write memory".to_owned(),
+        None => "model decided not to write memory".to_owned(),
+    };
     Some(ProactiveDecision {
         write,
         reason,
@@ -663,9 +656,11 @@ mod tests {
 
     #[tokio::test]
     async fn plain_smalltalk_skips_with_a_reason() {
-        let facts = vec![ExtractedFact::semantic("the build pipeline has three stages")
-            .with_importance(0.4)
-            .with_tag("statement")];
+        let facts = vec![
+            ExtractedFact::semantic("the build pipeline has three stages")
+                .with_importance(0.4)
+                .with_tag("statement"),
+        ];
         let decision = stage()
             .run(
                 &state("the build pipeline has three stages", facts, &[]),
@@ -676,9 +671,12 @@ mod tests {
             .decision
             .unwrap();
         assert!(!decision.write);
-        assert!(decision.signals.is_empty());
-        assert!(decision.fact_indexes.is_empty());
-        assert!(decision.reason.contains("below the 0.70 threshold"), "{decision:?}");
+        assert_eq!(decision.signals.len(), 0);
+        assert_eq!(decision.fact_indexes.len(), 0);
+        assert!(
+            decision.reason.contains("below the 0.70 threshold"),
+            "{decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -774,7 +772,10 @@ mod tests {
             .decision
             .unwrap();
         assert!(!decision.write);
-        assert!(decision.reason.contains("shorter than 12 characters"), "{decision:?}");
+        assert!(
+            decision.reason.contains("shorter than 12 characters"),
+            "{decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -811,7 +812,9 @@ mod tests {
 
     #[tokio::test]
     async fn llm_proactive_unparseable_output_falls_back_to_rules() {
-        let model = ScriptedModel::builder().respond_text("yes, remember it").build();
+        let model = ScriptedModel::builder()
+            .respond_text("yes, remember it")
+            .build();
         let handle = model.clone();
         let stage = LlmProactiveStage::new(
             Arc::new(model),
@@ -888,8 +891,11 @@ mod tests {
         let tolerant: ProactiveDecision =
             serde_json::from_value(serde_json::json!({"unknown": 1})).unwrap();
         assert!(!tolerant.write);
-        assert!(tolerant.reason.is_empty());
-        assert_eq!(ProactiveSignal::parse("explicit directive"), Some(ProactiveSignal::ExplicitDirective));
+        assert_eq!(tolerant.reason, "");
+        assert_eq!(
+            ProactiveSignal::parse("explicit directive"),
+            Some(ProactiveSignal::ExplicitDirective)
+        );
         assert!(ProactiveSignal::parse("nope").is_none());
         assert!(PROACTIVE_SYSTEM_PROMPT.contains(PROACTIVE_JSON_SCHEMA));
     }
@@ -914,10 +920,11 @@ mod tests {
         let decision =
             parse_proactive_response("{\"write\":false,\"signals\":[]}", 2, &config).unwrap();
         assert!(!decision.write);
-        assert!(decision.fact_indexes.is_empty());
+        assert_eq!(decision.fact_indexes.len(), 0);
         assert_eq!(decision.reason, "model decided not to write memory");
 
-        let decision = parse_proactive_response("{\"write\":true,\"signals\":[]}", 2, &config).unwrap();
+        let decision =
+            parse_proactive_response("{\"write\":true,\"signals\":[]}", 2, &config).unwrap();
         assert_eq!(decision.fact_indexes, vec![0, 1]);
     }
 }

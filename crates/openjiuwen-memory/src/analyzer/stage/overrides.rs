@@ -235,11 +235,8 @@ impl ScopeAnalyzerOverrides {
 impl fmt::Debug for ScopeAnalyzerOverrides {
     /// Reports handle names and thresholds only.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let model = self.model.as_ref().map(|model| model.model_name());
-        let embedding = self
-            .embedding
-            .as_ref()
-            .map(|embedding| embedding.model_name());
+        let model = self.model.as_deref().map(Model::model_name);
+        let embedding = self.embedding.as_deref().map(Embedding::model_name);
         formatter
             .debug_struct("ScopeAnalyzerOverrides")
             .field("model", &model)

@@ -97,7 +97,7 @@ pub use stage::{
     LlmProactiveStage, LlmReasoningStage, PlanIntent, PlanOperation, ProactiveConfig,
     ProactiveDecision, ProactiveSignal, ReasoningBasis, RulePlanStage, RuleProactiveStage,
     RuleReasoningStage, ScopeAnalyzerOverrides, StageConfig, StageInput, StageKind, StageOutput,
-    StagedAnalyzer, StagedResult, DEFAULT_REASONING_KEY, PLAN_JSON_SCHEMA, PLAN_SYSTEM_PROMPT, PROACTIVE_JSON_SCHEMA,
-    PROACTIVE_SYSTEM_PROMPT, REASONING_JSON_SCHEMA, REASONING_SYSTEM_PROMPT,
+    StagedAnalyzer, StagedResult, DEFAULT_REASONING_KEY, PLAN_JSON_SCHEMA, PLAN_SYSTEM_PROMPT,
+    PROACTIVE_JSON_SCHEMA, PROACTIVE_SYSTEM_PROMPT, REASONING_JSON_SCHEMA, REASONING_SYSTEM_PROMPT,
     SUMMARY_TOKEN_THRESHOLD,
 };

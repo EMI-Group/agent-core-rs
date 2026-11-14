@@ -39,20 +39,19 @@ mod reasoning;
 
 pub use overrides::ScopeAnalyzerOverrides;
 pub use pipeline::{
-    ConflictStage, ExtractStage, FactVerdict, StageConfig, StageKind, StagedAnalyzer,
-    StagedResult,
+    ConflictStage, ExtractStage, FactVerdict, StageConfig, StageKind, StagedAnalyzer, StagedResult,
 };
 pub use plan::{
     parse_plan_response, ExtractionPlan, LlmPlanStage, PlanIntent, PlanOperation, RulePlanStage,
     PLAN_JSON_SCHEMA, PLAN_SYSTEM_PROMPT, SUMMARY_TOKEN_THRESHOLD,
 };
 pub use proactive::{
-    LlmProactiveStage, ProactiveConfig, ProactiveDecision, ProactiveSignal, RuleProactiveStage,
-    PROACTIVE_JSON_SCHEMA, PROACTIVE_SYSTEM_PROMPT, parse_proactive_response,
+    parse_proactive_response, LlmProactiveStage, ProactiveConfig, ProactiveDecision,
+    ProactiveSignal, RuleProactiveStage, PROACTIVE_JSON_SCHEMA, PROACTIVE_SYSTEM_PROMPT,
 };
 pub use reasoning::{
-    parse_reasoning_response, FactReasoning, LlmReasoningStage, ReasoningBasis,
-    RuleReasoningStage, DEFAULT_REASONING_KEY, REASONING_JSON_SCHEMA, REASONING_SYSTEM_PROMPT,
+    parse_reasoning_response, FactReasoning, LlmReasoningStage, ReasoningBasis, RuleReasoningStage,
+    DEFAULT_REASONING_KEY, REASONING_JSON_SCHEMA, REASONING_SYSTEM_PROMPT,
 };
 
 use crate::analyzer::config::AnalyzerConfig;
@@ -327,9 +326,12 @@ mod tests {
         assert_eq!(untouched.fact_count(), 2);
         assert_eq!(untouched.reasoning.len(), 1);
         // The plan is only replaced when the output carries one.
-        let mut stated = StageInput::new(ExtractionInput::from_text("x"), AnalyzerConfig::default());
+        let mut stated =
+            StageInput::new(ExtractionInput::from_text("x"), AnalyzerConfig::default());
         let plan = ExtractionPlan::default();
-        StageOutput::of("plan").with_plan(plan.clone()).apply(&mut stated);
+        StageOutput::of("plan")
+            .with_plan(plan.clone())
+            .apply(&mut stated);
         assert_eq!(stated.plan, plan);
         // `StageOutput` itself is plain serde data.
         let json = serde_json::to_value(&output_clone).unwrap();
