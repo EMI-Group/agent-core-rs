@@ -18,10 +18,10 @@
 //!   bounds each rule).
 //! - [`TipInducer`] — proposes tips from failed trajectories and evolution signals,
 //!   offline or through an injected model.
-//! - [`EmbeddingIndex`](crate::ttse::EmbeddingIndex) — cosine index over the tip rules, cold-filled from an
+//! - [`EmbeddingIndex`] — cosine index over the tip rules, cold-filled from an
 //!   `Embedding` provider and persisted as one JSON document.
-//! - [`rank`](crate::ttse::rank) / [`RetrieveMode`](crate::ttse::RetrieveMode) — lexical, embedding and RRF-fused
-//!   ranking; [`consult_async`](crate::ttse::consult_async) is the ranked counterpart of [`consult`].
+//! - [`rank`] / [`RetrieveMode`] — lexical, embedding and RRF-fused
+//!   ranking; [`consult_async`] is the ranked counterpart of [`consult`].
 //! - [`Dreamer`] — merges near-duplicate tips and prunes stale ones, offline or
 //!   ([`Dreamer::dream_with_model`]) through a model.
 //! - [`TtseEngine`] — the pipeline over signals/trajectories that induces and
