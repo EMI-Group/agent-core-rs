@@ -68,7 +68,7 @@ Processors (each a `ContextProcessor`, re-exported at the crate root):
 - `./round_level.rs` → `RoundLevelCompressor` + config, the four-rung ladder, hard truncation
 - `./compact.rs` → `FullCompactProcessor` + config, boundary detection, kept tail, session-memory/LLM paths, reinjection integration
 - `./micro_compact.rs` → `MicroCompactProcessor` + config, per-tool clearing
-- `./adaptive/` → `mod.rs` (`CompressionStrategy`, `AdaptiveStrategy`, ladder, selection), `plan.rs` (`MemoryBlockPlan`, task extraction, JSON schema), `prompt.rs` (decision prompts)
+- `./adaptive/` → `mod.rs` (module docs and re-exports), `strategy.rs` (`CompressionStrategy`, `AdaptiveStrategy`, ladder, selection, outcome), `config.rs` (`AdaptiveConfig`), `render.rs` (block and recommendation rendering), `plan.rs` (`MemoryBlockPlan`, task extraction, JSON schema), `prompt.rs` (decision prompts), `tests.rs` (parsing and ladder tests)
 - `./reinjection/` → `mod.rs` (`ContextSnapshotProvider`, `SnapshotRegistry`, `<recovered_context>` rendering and trimming), `tests.rs` (provider fixtures)
 - `../../tests/compressors_dialogue.rs`, `../../tests/compressors_current_round.rs`, `../../tests/compressors_round_level.rs`, `../../tests/compressors_compact.rs` → per-compressor suites
 - `../../tests/adaptive.rs`, `../../tests/reinjection.rs`, `../../tests/recall_integration.rs` → adaptive selection, state reinjection, and compression-recall integration
@@ -76,6 +76,6 @@ Processors (each a `ContextProcessor`, re-exported at the crate root):
 ## Test Strategy
 
 - Suites: `compressors_dialogue` (12 tests), `compressors_current_round` (11), `compressors_round_level` (10), `compressors_compact` (17), `adaptive` (23), `reinjection` (23), plus `recall_integration` (12) for the archiving paths.
-- Unit tests beside `mod.rs`, `adaptive/plan.rs` and `reinjection/mod.rs` cover the envelope, round grouping, merge ranges, offline summary shape, plan parsing and section trimming.
+- Unit tests beside `adaptive/tests.rs`, `adaptive/plan.rs` and `reinjection/mod.rs` cover the plan parsing, the adaptive ladder and section trimming.
 - Deterministic offline: a one-character-per-token counter, `openjiuwen_test_support::ScriptedModel` when a model path is exercised, no network and no wall-clock ordering.
 - Every suite asserts tool-pair safety and system-message preservation, and the benefit-gate cases assert that a rejected candidate leaves the history and the recall archive unchanged.
