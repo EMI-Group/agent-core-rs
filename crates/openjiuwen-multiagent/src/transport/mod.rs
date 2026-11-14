@@ -52,6 +52,7 @@
 mod inproc;
 mod redis;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,6 +223,33 @@ pub trait TeamTransport: Send + Sync + fmt::Debug {
 
     /// Returns the sorted ids subscribed to `topic_id`.
     fn subscribers(&self, topic_id: &str) -> Vec<String>;
+
+    /// Returns the whole subscription registry as `pattern -> sorted agent ids`.
+    ///
+    /// Python parity: `MessageBus.list_subscriptions()` without an agent filter.
+    /// The default is empty, so a backend without a logical registry still
+    /// supports introspection; the shipped backends override it.
+    #[must_use]
+    fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>> {
+        BTreeMap::new()
+    }
+
+    /// Returns the sorted patterns `agent_id` is subscribed to.
+    ///
+    /// Python parity: the `topics` list of
+    /// `MessageBus.list_subscriptions(agent_id)`. The default is empty.
+    #[must_use]
+    fn agent_subscriptions(&self, _agent_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns the total number of `(agent, pattern)` pairs.
+    ///
+    /// Python parity: `MessageBus.get_subscription_count`. The default is zero.
+    #[must_use]
+    fn subscription_count(&self) -> usize {
+        0
+    }
 }
 
 /// Builds the transport `config` selects for the team `team_id`.

@@ -26,6 +26,7 @@ mod team;
 
 pub mod ability;
 pub mod autosubscribe;
+pub mod communicable;
 pub mod events;
 pub mod member_checkpoint;
 pub mod pyrepr;
@@ -74,6 +75,9 @@ pub use autosubscribe::{
     apply, apply_agent, derive, derive_from_event_card, derive_with_overrides, derived_for_member,
     AutoSubscriptionMode, AutoSubscriptionPlan, SUBSCRIBE_TAG_PREFIX,
 };
+/// One agent id bound to a team runtime, with P2P and pub/sub helpers (Python
+/// `team_runtime/communicable_agent.py`).
+pub use communicable::CommunicableAgent;
 /// Typed team events (the Python `AgentTeamEvents` notifications).
 pub use events::{
     TeamEvent, TeamEventBus, TeamEventFilter, TeamEventKind, TeamEventListener,

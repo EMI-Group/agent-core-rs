@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -372,6 +372,31 @@ async fn in_process_send_publish_and_subscriptions_match_the_bus() {
     assert_eq!(transport.subscribers("news"), vec!["z"]);
     transport.stop().await.unwrap();
     assert!(!transport.bus().is_started());
+}
+
+#[tokio::test]
+async fn in_process_transport_exposes_the_subscription_registry() {
+    let (_recorder, handler) = recording_handler();
+    let transport = InProcessTransport::new("team-introspect", MessageBusConfig::new(), handler);
+
+    transport.add_subscription("z", "news");
+    transport.add_subscription("a", "news");
+    transport.add_subscription("a", "*__p2p__");
+
+    assert_eq!(
+        transport.list_subscriptions(),
+        BTreeMap::from([
+            ("*__p2p__".to_owned(), vec!["a".to_owned()]),
+            ("news".to_owned(), vec!["a".to_owned(), "z".to_owned()]),
+        ])
+    );
+    assert_eq!(transport.agent_subscriptions("a"), vec!["*__p2p__", "news"]);
+    assert_eq!(transport.agent_subscriptions("ghost"), Vec::<String>::new());
+    assert_eq!(transport.subscription_count(), 3);
+
+    transport.remove_subscription("a", "news");
+    assert_eq!(transport.subscription_count(), 2);
+    assert_eq!(transport.agent_subscriptions("a"), vec!["*__p2p__"]);
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -304,6 +305,58 @@ async fn publish_delivers_to_subscribers() {
     let mut seen = delivered.lock().clone();
     seen.sort();
     assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[tokio::test]
+async fn lifecycle_and_subscription_introspection() {
+    let runtime = TeamRuntime::new(RuntimeConfig::new().with_team_id("introspect"));
+    assert!(!runtime.is_running());
+    runtime.start().await.unwrap();
+    assert!(runtime.is_running());
+
+    runtime.register_agent(agent_card("a"), echoing_provider("a"));
+    runtime.register_agent(agent_card("b"), echoing_provider("b"));
+    runtime.subscribe("a", "news").await.unwrap();
+    runtime.subscribe("b", "news").await.unwrap();
+    runtime.subscribe("a", "alerts").await.unwrap();
+
+    assert_eq!(runtime.get_subscription_count(), 3);
+    assert_eq!(
+        runtime.list_agent_subscriptions("a"),
+        vec!["alerts", "news"]
+    );
+    assert_eq!(
+        runtime.list_agent_subscriptions("ghost"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        runtime.list_subscriptions(),
+        BTreeMap::from([
+            ("alerts".to_owned(), vec!["a".to_owned()]),
+            ("news".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
+        ])
+    );
+    assert_eq!(
+        runtime.get_subscription_count(),
+        runtime
+            .list_subscriptions()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+
+    // Unregistering a member drops every subscription it held.
+    let _ = runtime.unregister_agent("a");
+    assert_eq!(runtime.get_subscription_count(), 1);
+    assert_eq!(runtime.list_agent_subscriptions("a"), Vec::<String>::new());
+    assert_eq!(runtime.list_agent_subscriptions("b"), vec!["news"]);
+    assert_eq!(
+        runtime.list_subscriptions(),
+        BTreeMap::from([("news".to_owned(), vec!["b".to_owned()])])
+    );
+
+    runtime.stop().await.unwrap();
+    assert!(!runtime.is_running());
 }
 
 #[tokio::test]
