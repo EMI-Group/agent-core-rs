@@ -105,6 +105,7 @@ pub mod checkpoint;
 pub mod error;
 pub mod executor;
 pub mod lora;
+pub mod routes;
 pub mod sample;
 pub mod store;
 pub mod task;
@@ -147,6 +148,7 @@ pub use executor::{
 pub use lora::{
     parse_version_literal, version_literal, LoraAvailability, LoraRepository, LoraVersion,
 };
+pub use routes::RlServiceState;
 pub use sample::{SampleLedger, SampleRecord, SampleStatus, SampleStore};
 pub use store::{MemoryOnlineStore, OnlineStore};
 pub use task::{

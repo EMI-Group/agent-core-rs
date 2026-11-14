@@ -1,10 +1,10 @@
-//! Offline integration tests for the axum RL service skeleton.
+//! Offline integration tests for the two stateless routes of the RL service.
 //!
 //! The router is driven in-process with [`tower::ServiceExt::oneshot`]: no port is
 //! bound, no model is called, and no environment or clock is read. The tests pin
-//! the HTTP contract that Python's `agent_rl` service exposes — `/health`, the
-//! offline `/v1/evaluate` scorer, and the `501 unsupported` envelope that every
-//! deferred RL/RLOps route answers with.
+//! `/health` and the offline `/v1/evaluate` scorer, plus the envelope the
+//! state-machine routes answer with; the RL state machines themselves are
+//! exercised by `tests/online_service.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -234,70 +234,55 @@ fn evaluate_request_tolerates_defaults_and_unknown_fields() {
 }
 
 #[tokio::test]
-async fn rl_task_start_returns_unsupported_envelope() {
+async fn rl_task_start_requires_a_session_header() {
     let (status, body) = send(
         default_router(),
-        post_json("/v1/rl/tasks/start", &json!({})),
+        post_json("/v1/rl/tasks/start", &json!({"reward_mode": "terminal"})),
     )
     .await;
-
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["code"], "unsupported");
-    let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("docs/PARITY.md"), "{message}");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "missing_session_id");
 }
-
 #[tokio::test]
-async fn rl_task_by_id_returns_unsupported_envelope() {
+async fn rl_task_by_id_reports_not_found() {
     let (status, body) = send(default_router(), get("/v1/rl/tasks/task-1")).await;
-
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["code"], "unsupported");
-    let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("task-1"), "{message}");
-    assert!(message.contains("docs/PARITY.md"), "{message}");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "task_not_found");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("task-1"),
+        "unexpected message: {body}"
+    );
 }
-
 #[tokio::test]
-async fn trajectory_routes_return_unsupported() {
+async fn trajectory_routes_serve_the_sample_ledger() {
     // The static `stats` route must not be shadowed by the `{id}` route.
     let (status, body) = send(default_router(), get("/v1/rl/trajectories/stats")).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["code"], "unsupported");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("/v1/rl/trajectories/stats"),
-        "unexpected message: {body}"
-    );
-
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_samples"], 0);
+    let (status, body) = send(default_router(), get("/v1/rl/trajectories")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 0);
     let (status, body) = send(default_router(), get("/v1/rl/trajectories/traj-1")).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("/v1/rl/trajectories/traj-1"),
-        "unexpected message: {body}"
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "trajectory_not_found");
 }
-
 #[tokio::test]
-async fn internal_completion_route_returns_unsupported() {
+async fn internal_completion_route_validates_its_payload() {
     let (status, body) = send(
         default_router(),
         post_json("/internal/v1/completions:before", &json!({})),
     )
     .await;
-
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["code"], "unsupported");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_completion");
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("/internal/v1/completions:before"),
+            .contains("rl_task_id"),
         "unexpected message: {body}"
     );
 }
