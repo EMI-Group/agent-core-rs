@@ -57,7 +57,10 @@ pub use support::{
 };
 
 pub use ask_user::{AskOption, AskQuestion, AskUserArgs, AskUserTool, UserAsker};
-pub use cron::{CronAction, CronArgs, CronJob, CronSchedule, CronScheduler, CronTool};
+pub use cron::{
+    CronAction, CronArgs, CronJob, CronRun, CronRunTrigger, CronSchedule, CronScheduler, CronStatus,
+    CronTool, CronUpdate,
+};
 pub use discovery::{ToolIndex, ToolSearchArgs, ToolSearchHit, ToolSearchTool};
 pub use goal::{
     GetCurrentGoalArgs, GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord,

@@ -48,9 +48,10 @@ pub mod worktree;
 
 // --- agent -----------------------------------------------------------------
 pub use agent::{
-    apply_deep_agent_parts, clear_state, create_deep_agent, load_state, resolve_deep_agent_parts,
-    save_state, DeepAgent, DeepAgentBuilder, DeepAgentParts, DeepAgentSubAgentFactory,
-    SESSION_STATE_KEY,
+    apply_deep_agent_parts, clear_state, create_deep_agent, drain_rail_events, load_state,
+    resolve_deep_agent_parts, save_state, DeepAgent, DeepAgentBuilder, DeepAgentParts,
+    DeepAgentSubAgentFactory, RailEventBus, RailEventDrain, DEFAULT_RAIL_EVENT_CAPACITY,
+    RAIL_EVENTS_EXTRA_PREFIX, RAIL_EVENT_DRAIN_NAME, RAIL_EVENT_DRAIN_PRIORITY, SESSION_STATE_KEY,
 };
 
 // --- schema ----------------------------------------------------------------
@@ -74,8 +75,8 @@ pub use permission::{
 };
 
 // --- tools -----------------------------------------------------------------
-/// Names of the thirty-two tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
-/// twelve extended ones), in registry order.
+/// Names of the thirty-three tools of [`BuiltinTool::EXTENDED`] (the default twenty plus the
+/// thirteen extended ones), in registry order.
 pub use tools::extended_tool_names;
 /// The goal rail, its tunables, and the `ctx.extra` key under which it queues its events.
 ///
@@ -85,29 +86,75 @@ pub use tools::extended_tool_names;
 pub use tools::goal::{GoalRail, GoalRailConfig, GOAL_EVENT_EXTRA_KEY};
 pub use tools::{
     tool_names, AudioMetadata, AudioMetadataArgs, AudioMetadataTool, BuiltinTool, CronAction,
-    CronArgs, CronJob, CronSchedule, CronScheduler, CronTool, FakeMcpResourceProvider,
-    FakeSearchBackend, FetchRequest, FetchResponse, FetchWebpageArgs, FetchWebpageTool,
-    GetCurrentGoalArgs, GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord,
-    GoalStatus, GoalStore, HttpFetcher, ImageMetadata, ImageMetadataArgs, ImageMetadataTool,
-    ListMcpResourcesTool, McpResource, McpResourceContent, McpResourceProvider, MediaKind,
-    MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool, ReqwestFetcher, SearchBackend,
-    SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool, TokenUsage, ToolIndex, ToolRegistry,
-    ToolSearchArgs, ToolSearchHit, ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
+    CronArgs, CronJob, CronRun, CronRunTrigger, CronSchedule, CronScheduler, CronStatus, CronTool,
+    CronUpdate, FakeMcpResourceProvider, FakeMcpResourceSubscriptionProvider, FakeSearchBackend,
+    FetchRequest, FetchResponse, FetchWebpageArgs, FetchWebpageTool, GetCurrentGoalArgs,
+    GetCurrentGoalTool, GoalAssessment, GoalAssessmentStatus, GoalRecord, GoalStatus, GoalStore,
+    HttpFetcher, ImageMetadata, ImageMetadataArgs, ImageMetadataTool, ListMcpResourcesTool,
+    McpClientResourceProvider, McpResource, McpResourceContent, McpResourceEvent,
+    McpResourceProvider, McpResourceSink, McpResourceSubscriptionArgs,
+    McpResourceSubscriptionProvider, McpResourceSubscriptionTool, McpResourceSubscriptions,
+    McpSubscriptionInfo, MediaKind, MemoryToolBackend, ReadMcpResourceArgs, ReadMcpResourceTool,
+    ReqwestFetcher, SearchBackend, SearchResult, SubmitGoalReportArgs, SubmitGoalReportTool,
+    SubscriptionAction, TokenUsage, ToolIndex, ToolRegistry, ToolSearchArgs, ToolSearchHit,
+    ToolSearchTool, UserAsker, WebSearchArgs, WebSearchTool,
 };
 
 // --- rails -----------------------------------------------------------------
 pub use rails::{
-    default_metrics_clock, evolution_adapter, rail_priority, EvolutionMetrics, EvolutionProposal,
-    EvolutionRail, EvolutionRailAdapter, EvolutionSnapshot, HarnessRail, HarnessRailAdapter,
-    HarnessRailContext, HarnessRailRegistry, IterationRecorder, MemoryRail, MetricsClock,
-    MetricsEvolutionRail, MetricsEvolutionRailConfig, NoopEvolutionRail, ProposalLog, SecurityRail,
-    SkillsRail, SubagentRail, TaskIterationInfo, EVOLUTION_SNAPSHOT_VERSION,
+    affinity_enabled, build_heartbeat_section, default_heartbeat_clock, default_metrics_clock,
+    evolution_adapter, heartbeat_prompt, is_sticky_subagent_type, messages_are_contiguous,
+    normalize_source_locator, rail_priority, resolve_context_relative_path, resolve_sub_session_id,
+    resolve_subagent_parent_cache_id, scope_sub_session_id, search, source_id_for_locator,
+    ContextEntry, EvolutionMetrics, EvolutionProposal, EvolutionRail, EvolutionRailAdapter,
+    EvolutionSnapshot, FetchedSource, HarnessRail, HarnessRailAdapter, HarnessRailContext,
+    HarnessRailRegistry, HeartbeatClock, HeartbeatEvent, HeartbeatRail, HeartbeatRailConfig,
+    HeartbeatReason, IngestReport, IngestedDocument, IterationRecorder, KvCacheAction,
+    KvCacheAffinityConfig, KvCacheLifecycleRail, KvCacheLineage, KvCacheProviderRegistry,
+    KvCacheSubagent, KvCacheSubagentLifecycle, KvCacheSubagentSession, KvCacheSubagentState,
+    LocalDirectoryConfig, LocalFilesProvider, MemoryRail, MetricsClock, MetricsEvolutionRail,
+    MetricsEvolutionRailConfig, NoopEvolutionRail, PersonalContextRail, PersonalContextRailConfig,
+    PersonalContextStatus, PersonalContextStore, ProposalLog, RuntimeSessionLineage, SearchDocument,
+    SearchHit, SecurityRail, SkillsRail, SkillsRailConfig, SourceKind, SourceLink, SourceLinkBook,
+    SourceMetadata, SourceMetadataStore, SourceProvider, SourceProviderRegistry, SubagentRail,
+    TaskIterationInfo, UnsupportedKvCacheBackend, UnsupportedSourceProvider,
+    AFFINITY_PARENT_SESSION_ID_ENV, DEFAULT_HEARTBEAT_EVENT_CAPACITY,
+    DEFAULT_HEARTBEAT_INTERVAL_MS, EVOLUTION_SNAPSHOT_VERSION, HEARTBEAT_RUN_KIND, HEARTBEAT_SECTION,
+    HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY, STICKY_SUBAGENT_TYPE,
+};
+
+// --- moa -------------------------------------------------------------------
+pub use moa::{
+    aggregation_messages, builtin_skill_content, consult, consult_problem, consult_skill,
+    consultation_transcript, escape_xml, materialize_builtin_skill, moa_section, rank_proposals,
+    rank_with_config, redact, reference_messages, render_reference_proposals, score_progress,
+    score_proposal, validate_builtin_skill_name, verifier_messages, AggregationStrategy, Aggregator,
+    Consultation, ConsultationHistory, ConsultationOutcome, ConsultationRecord,
+    ConsultationSkillMount, JevConfig, LlmVerifier, MoaConfig, MoaMode, MoaRail, MoaSnapshot,
+    MoaState, ProgressVerifier, ProposalAttempt, ProposalBatch, ProposalSource, ProposalStore,
+    ProposerFailure, RankedProposal, StructuralVerifier, TurnKey, VerifierConfig, VerifierSelection,
+    AGGREGATOR_SYSTEM_PROMPT, CONSULT_SKILL_BODY, CONSULT_SKILL_DESCRIPTION, CONSULT_SKILL_FILE,
+    CONSULT_SKILL_NAME, CONSULT_TOOL_NAME, DEFAULT_HISTORY_LIMIT, DEFAULT_MAX_ADVICE_CHARS,
+    DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REFERENCE_CHARS, DEFAULT_REFERENCE_TIMEOUT_SECS,
+    MOA_OUTCOME_EXTRA_KEY, MOA_PROMPT_SECTION, MOA_PROMPT_SECTION_NAME, MOA_RAIL_NAME,
+    MOA_STATE_EXTRA_KEY, REFERENCE_SYSTEM_PROMPT,
 };
 
 // --- lsp -------------------------------------------------------------------
 pub use lsp::{
-    ChannelTransport, LspClient, LspServerConfig, LspTool, LspToolConfig, LspTransport,
-    StdioTransport,
+    builtin_server_configs, client_capabilities, parse_call_hierarchy_incoming_calls,
+    parse_call_hierarchy_items, parse_call_hierarchy_outgoing_calls, parse_completion_items,
+    parse_diagnostics, parse_diagnostics_event, parse_document_diagnostic_report,
+    parse_document_symbols, parse_hover, parse_locations, parse_workspace_symbols, path_to_uri,
+    symbol_kind_name, uri_to_path, BackoffTimer, CallHierarchyIncomingCall, CallHierarchyItem,
+    CallHierarchyOutgoingCall, ChannelTransport, CompletionItem, Diagnostic, DiagnosticCode,
+    DiagnosticRegistry, DiagnosticRelatedInformation, DiagnosticReportKind, DiagnosticsChange,
+    DiagnosticsConfig, DiagnosticsEvent, DiagnosticsFile, DiscoveryIndex, DocumentDiagnosticReport,
+    DocumentSymbol, FrameDecoder, Hover, InstantTimer, Location, LspAction, LspArgs, LspClient,
+    LspError, LspServerConfig, LspTool, LspToolConfig, LspTransport, MessageReader, Position, Range,
+    ResolvedServer, RestartPolicy, ServerCapabilities, ServerFactory, ServerKey, ServerState,
+    ServerStatus, ServerSupervisor, StdioTransport, SymbolInformation, TokioTimer,
+    MAX_CONTENT_LENGTH,
 };
 
 // --- prompts ---------------------------------------------------------------
@@ -130,13 +177,19 @@ pub use subagents::EVICTION_REASON;
 pub use subagents::SUBAGENTS_KEY;
 pub use subagents::{
     load_bucket_file, save_bucket_file, select_lru_candidate, subagent_tools,
-    subagent_tools_with_transcript, Clock, LoadReport, LruCandidate, ManualClock,
-    PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport, SpawnBudget, SubAgentFactory,
-    SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry, SubAgentRuntime,
-    SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentMetadata, SubagentStatus,
-    SubagentTranscriptTool, SystemClock, TaskTool, TranscriptBuffer, TranscriptChannel,
-    TranscriptEntry, TranscriptKind, TranscriptSubscription, TranscriptSummary,
-    DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+    subagent_tools_with_transcript, ActivityEvent, ActivityKind, ActivityStream,
+    ActivitySubscription, ActivitySummary, ActivityThrottle, CallbackLifecycleHook, Clock,
+    EvictionSchedulerConfig, EvictionSchedulerHandle, EvictionSchedulerStats, LifecycleCallback,
+    LifecycleFailure, LifecycleHooks, LifecycleReport, LifecycleStage, LoadReport, LruCandidate,
+    ManualClock, PersistedSubAgentBuckets, PersistedSubAgentRecord, ResumeReport, SpawnBudget,
+    SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentPreset, SubAgentQuota, SubAgentRegistry,
+    SubAgentRuntime, SubAgentSpawnRequest, SubAgentSpec, SubagentActivity, SubagentEviction,
+    SubagentLifecycleEvent, SubagentLifecycleHook, SubagentMetadata, SubagentStatus,
+    SubagentTranscriptTool, SweepReport, SystemClock, TaskTool, TranscriptBuffer,
+    TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription, TranscriptSummary,
+    DEFAULT_ACTIVITY_CAPACITY, DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS,
+    DEFAULT_EVICTION_INTERVAL, DEFAULT_IDLE_TTL_MS, DEFAULT_TRANSCRIPT_CAPACITY,
+    DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
 
 // --- skills ----------------------------------------------------------------
@@ -188,8 +241,43 @@ pub use observability::{NoopTelemetry, Observability, TelemetrySink};
 
 // --- worktree --------------------------------------------------------------
 pub use worktree::{
-    slugify, GitRunner, ProcessGitRunner, WorktreeEvent, WorktreeInfo, WorktreeManager,
-    WorktreeRecord, WorktreeTool,
+    build_worktree_notice, change_summary, is_ephemeral_slug, is_lock_timeout, render_change_summary,
+    slugify, CleanupPolicy, CleanupReport, EnterWorktreeTool, ExitWorktreeTool, GitRunner,
+    MemoryWorktreeSessionStore, ProcessGitRunner, SparseConfig, SparseMode, WorktreeChangeSummary,
+    WorktreeCreateOptions, WorktreeEvent, WorktreeInfo, WorktreeLock, WorktreeLockConfig,
+    WorktreeManager, WorktreeRail, WorktreeRecord, WorktreeSessionState, WorktreeTool,
+};
+// --- watcher ---------------------------------------------------------------
+pub use watcher::{
+    ChangeKind, DebounceInput, Debouncer, FnReloadHandler, InstructionReloadHandler,
+    InstructionReloader, McpConfigReloadHandler, McpConfigReloader, ReloadFailure, ReloadHandler,
+    ReloadHub, SkillLibraryReloader, SkillsReloadHandler, Subscription, WatchEvent, WatchFailure,
+    WatchPlan, WatchTarget, WatchTargetKind, WatchUpdate, WatcherConfig, WatcherHandle,
+    WorkspaceWatcher, DEFAULT_DEBOUNCE, DEFAULT_EVENT_CAPACITY, DEFAULT_MAX_PENDING,
+};
+// --- persistent_agent ------------------------------------------------------
+pub use persistent_agent::{
+    atomic_write, canonical_json, deterministic_model_call_id, digest_hex, hand_off, is_read_only_tool,
+    is_logical_path, is_valid_identifier, patch_stopped_calls, percent_encode_identifier, read_json,
+    resume, sha256_hex_str, valid_caption, write_json_atomic, AbortReason, Capacity, CheckpointKind,
+    Continuation, ContinuationCursor, Control, ControlSnapshot, DistributedHandoff, ElidedEntry,
+    ElisionReason, EmittedEvent, Emitter, EntryKind, EntryPayload, EventSink, EventType,
+    ExecutionEntry, ExecutionIdentity, ExecutionLink, ExecutionLinkSource, ExecutionLog,
+    ExecutionLogSource, ExecutionRecordRail, ExtractiveSummarizer, FileLinkStore, FileSessionStore,
+    FinalStatus, HandoffReceipt, HandoffTarget, HandoffTransfer, HandoffTransport, ImportedShareBundle,
+    InMemorySink, InterceptedCall, LinkRelation, LocalHandoff, LogCapacity, LogCursor, LogDigest,
+    LogMeta, LogPreview, LogSnapshot, ModelAdmission, ModelCallGate, ModelCallRail, ModelUsage,
+    PauseReason, ParticipationDecision, ParticipationState, PersistentEvent, PersistentSessionRecord,
+    RecordCheckpoint, RecordEnding, RecordRollover, RemoteHandoff, Replay, ResumePlan, RolloverTrigger,
+    RootLogSource, SessionBinding, SessionStateStore, ShareBundle, ShareFile, ShareMode,
+    SharedFileEntry, ToolRecordPolicy, ToolStatus, UnsupportedModelSummarizer, UsageStatus,
+    WaitingScene, WindowAssembler, WindowAssembly, WindowManager, WindowPlan, WindowPolicy,
+    WindowSummarizer, BUNDLE_FILE, CAPTION_MAX_CHARS, CONTINUATION_RULES, DETAIL_LIMIT,
+    ENTRY_SCHEMA_VERSION, FILE_PATH_MAX_CHARS, HANDOFF_TEXT_PREFIX, IDENTIFIER_MAX_CHARS,
+    LOG_ENCODING, LOG_ENTRY_FILE, LOG_META_FILE, MAX_SHARED_FILES, MODEL_CALL_ID_EXTRA_KEY,
+    PLACEHOLDER_TEXT, READ_ONLY_TOOLS, RECORD_INVALID_PREFIX, SESSION_KEY_PREFIX,
+    SESSION_RECORD_VERSION, SHARE_BUNDLE_SCHEMA_VERSION, SHARE_FILE_MAX_BYTES, SHARE_MODES,
+    SUMMARY_LIMIT,
 };
 
 /// Returns the crate name.
