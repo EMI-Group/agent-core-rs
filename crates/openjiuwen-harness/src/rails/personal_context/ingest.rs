@@ -741,7 +741,7 @@ mod tests {
         assert_eq!(report.scanned, 0);
         assert_eq!(report.skipped, 0);
         assert_eq!(report.failed, 0);
-        assert!(report.warnings.is_empty());
+        assert_eq!(report.warnings, Vec::<String>::new());
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
     fn default_configuration_keeps_the_documented_caps() {
         let config = LocalDirectoryConfig::default();
 
-        assert!(config.service.is_empty());
+        assert_eq!(config.service, String::new());
         assert!(config.directory.as_os_str().is_empty());
         assert_eq!(config.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
         assert_eq!(config.max_files, DEFAULT_MAX_FILES);

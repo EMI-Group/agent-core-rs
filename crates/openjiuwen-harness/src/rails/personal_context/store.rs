@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(report.ingested, 0);
         assert_eq!(report.unchanged, 2);
         assert_eq!(report.updated, 0);
-        assert!(report.documents.is_empty());
+        assert_eq!(report.documents, Vec::<IngestedDocument>::new());
 
         let after = store.entries().unwrap();
         assert_eq!(after.len(), 2);
@@ -585,11 +585,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = PersonalContextStore::new(home.path());
 
-        assert!(store.entries().unwrap().is_empty());
-        assert!(store
-            .search("anything", DEFAULT_SEARCH_LIMIT)
-            .unwrap()
-            .is_empty());
+        assert_eq!(store.entries().unwrap(), Vec::<ContextEntry>::new());
+        assert_eq!(
+            store.search("anything", DEFAULT_SEARCH_LIMIT).unwrap(),
+            Vec::<SearchHit>::new()
+        );
         assert!(store.link_book().unwrap().is_empty());
     }
 
@@ -623,10 +623,10 @@ mod tests {
         let store = PersonalContextStore::new(home.path());
         store.ingest_local(&[config(&home)], T0).unwrap();
 
-        assert!(store
-            .search("   ", DEFAULT_SEARCH_LIMIT)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store.search("   ", DEFAULT_SEARCH_LIMIT).unwrap(),
+            Vec::<SearchHit>::new()
+        );
     }
 
     #[test]

@@ -725,7 +725,7 @@ mod tests {
         let mut registry = SourceProviderRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
-        assert!(registry.kinds().is_empty());
+        assert_eq!(registry.kinds(), Vec::<SourceKind>::new());
 
         registry.register(Arc::new(FakeProvider::new(
             SourceKind::Github,
@@ -747,7 +747,7 @@ mod tests {
             .fetch(SourceKind::Github, &FetchRequest::default())
             .await
             .unwrap();
-        assert!(fetched.is_empty());
+        assert_eq!(fetched, Vec::<FetchedSource>::new());
     }
 
     #[tokio::test]

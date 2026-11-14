@@ -613,11 +613,13 @@ mod tests {
             ErrorKind::Validation
         );
         assert_eq!(store.read(&id).unwrap(), None);
-        assert!(store.list().unwrap().is_empty());
-        assert!(SourceMetadataStore::new(dir.path().join("absent"))
-            .list()
-            .unwrap()
-            .is_empty());
+        assert_eq!(store.list().unwrap(), Vec::<SourceMetadata>::new());
+        assert_eq!(
+            SourceMetadataStore::new(dir.path().join("absent"))
+                .list()
+                .unwrap(),
+            Vec::<SourceMetadata>::new()
+        );
     }
 
     #[test]

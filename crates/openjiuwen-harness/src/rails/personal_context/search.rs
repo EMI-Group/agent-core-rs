@@ -598,8 +598,8 @@ mod tests {
     fn tokenize_drops_punctuation_and_other_scripts() {
         assert_eq!(tokenize("a-b/c.d"), ["a", "b", "c", "d"]);
         assert_eq!(tokenize("— ¡! カタカナ"), Vec::<String>::new());
-        assert!(tokenize("").is_empty());
-        assert!(tokenize("!!!").is_empty());
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize("!!!"), Vec::<String>::new());
     }
 
     #[test]
@@ -711,11 +711,11 @@ mod tests {
     #[test]
     fn search_returns_nothing_for_unknown_terms_and_blank_queries() {
         let documents = [document("a.md", "alpha", "hello world")];
-        assert!(search(&documents, "zebra", 10).is_empty());
-        assert!(search(&documents, "   ", 10).is_empty());
-        assert!(search(&documents, "", 10).is_empty());
-        assert!(search(&documents, "!!!", 10).is_empty());
-        assert!(search(&[], "zebra", 10).is_empty());
+        assert_eq!(search(&documents, "zebra", 10), Vec::<SearchHit>::new());
+        assert_eq!(search(&documents, "   ", 10), Vec::<SearchHit>::new());
+        assert_eq!(search(&documents, "", 10), Vec::<SearchHit>::new());
+        assert_eq!(search(&documents, "!!!", 10), Vec::<SearchHit>::new());
+        assert_eq!(search(&[], "zebra", 10), Vec::<SearchHit>::new());
     }
 
     #[test]
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn snippet_starts_at_the_text_when_nothing_matches() {
-        let text = format!("{}", "q".repeat(400));
+        let text = "q".repeat(400);
         let expected = format!("{}…", "q".repeat(240));
         assert_eq!(snippet(&text, "missing", &[]), expected);
     }

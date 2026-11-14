@@ -1017,7 +1017,7 @@ mod tests {
                 "validation: context proactive_state is invalid, reason: query must be a non-empty string"
             );
         }
-        assert!(rail.search("notes").unwrap().is_empty());
+        assert_eq!(rail.search("notes").unwrap(), Vec::<SearchHit>::new());
     }
 
     #[test]
