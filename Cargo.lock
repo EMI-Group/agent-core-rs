@@ -1740,6 +1740,7 @@ dependencies = [
  "openjiuwen-agent",
  "openjiuwen-common",
  "openjiuwen-core",
+ "openjiuwen-extensions",
  "openjiuwen-foundation",
  "openjiuwen-harness",
  "openjiuwen-harness-protocol",

@@ -151,6 +151,11 @@ pub use skill::{
 pub use org::*;
 // --- model routing ---------------------------------------------------------
 pub use models::*;
+// --- team memory -----------------------------------------------------------
+pub use memory::{
+    memory_config, team_memory_tools, MemoryConfig, MemoryExtractorKind, MemoryStoreConfig,
+    OtelSpanSink, TeamMemoryTool, TeamMemoryWiring, MEMORY_METADATA_KEY, TEAM_MEMORY_FILE,
+};
 // --- KV-cache affinity -----------------------------------------------------
 pub use kv_cache::*;
 // --- observability ---------------------------------------------------------
