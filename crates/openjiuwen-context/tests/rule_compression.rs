@@ -46,9 +46,11 @@ fn ctx(max_tokens: usize) -> RuleContext {
 
 /// `count` copies of one line, so plain-text dedupe has work to do.
 fn repeated_lines(count: usize) -> String {
-    (0..count)
-        .map(|index| format!("the same progress line {}\n", index % 3))
-        .collect()
+    let mut lines = String::new();
+    for index in 0..count {
+        lines.push_str(&format!("the same progress line {}\n", index % 3));
+    }
+    lines
 }
 
 /// A synthetic HTML page that keeps real readable structure.
@@ -278,11 +280,12 @@ fn compressors_decline_when_they_cannot_improve_the_input() {
 
     let mut source_ctx = ctx(100_000);
     source_ctx.file_path = Some("src/report.rs".to_owned());
+    let mut doc_comments = String::new();
+    for index in 0..40 {
+        doc_comments.push_str(&format!("/// doc comment {index}\n"));
+    }
     let source = format!(
-        "// generated file, do not edit\n{}\nfn report() {{\n    println!(\"report\");\n}}\n",
-        (0..40)
-            .map(|index| format!("/// doc comment {index}\n"))
-            .collect::<String>()
+        "// generated file, do not edit\n{doc_comments}\nfn report() {{\n    println!(\"report\");\n}}\n"
     );
     let compressed_source = SourceFileCompressor.compress(&source, &source_ctx);
     assert!(compressed_source.modified);
