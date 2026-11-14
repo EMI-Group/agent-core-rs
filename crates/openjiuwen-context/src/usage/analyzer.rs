@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use openjiuwen_common::utils::id::now_rfc3339;
-use openjiuwen_foundation::prompt::{BaseMessage, TokenCounter};
+use openjiuwen_foundation::prompt::{ApproxTokenCounter, BaseMessage, TokenCounter};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -270,6 +270,21 @@ impl std::fmt::Debug for ContextUsageAnalyzer {
             .field("context_window_limit", &self.context_window_limit)
             .field("measurement_cache", &self.measurement_cache)
             .finish_non_exhaustive()
+    }
+}
+
+/// The analyzer a caller gets without configuring anything: foundation's
+/// approximate counter with its own identity, no model and no window limit.
+///
+/// The window limit stays unset so the engine substitutes the window it
+/// resolves for the context; a caller that wants a specific limit (or a
+/// model-aware counter) builds the analyzer with [`ContextUsageAnalyzer::new`].
+impl Default for ContextUsageAnalyzer {
+    fn default() -> Self {
+        Self::new(
+            Arc::new(ApproxTokenCounter::new()),
+            CounterIdentity::approx(),
+        )
     }
 }
 
