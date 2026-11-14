@@ -20,7 +20,7 @@
 //! # Who attaches what
 //!
 //! The owner of the facade decides what observability means: the agent-team runtime, the
-//! `openjiuwen-team-mcp` server, and the DeepAgent harness all build a
+//! `openjiuwen-team-mcp` server, and the `DeepAgent` harness all build a
 //! [`TeamMemory`](crate::team::TeamMemory), so each of them may attach [`TracingObserver`]
 //! (one structured `tracing` event per operation at target `openjiuwen_memory::team`) or a
 //! custom observer that bridges into its own telemetry. The real OTel/OTLP exporter lives in
