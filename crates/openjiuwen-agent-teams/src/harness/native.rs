@@ -24,11 +24,14 @@
 //! | `skills`, `language`, `prompt_mode` | matching `DeepAgentConfig` fields |
 //! | `enable_security_rail`, `completion_timeout` | matching `DeepAgentConfig` fields |
 //! | team `teammate_mode` | `default_mode`/`enable_plan_mode` (`plan_mode` ⇒ plan-first) |
+//! | context `memory_toolkit` | [`MemberHarnessContext::memory_tools`] mounted next to the coding tools |
 //!
 //! Fields without a factory-level counterpart (`tools`, `mcps`, `subagents`, `rails`,
 //! `approval_required_tools`, model `params`) are ignored here and logged once at `debug`;
 //! mounting tools/MCP servers/rails belongs to the runtime wiring that owns live handles, not to
-//! this cold-blueprint factory.
+//! this cold-blueprint factory. The one exception is the member's team-memory toolkit: it travels
+//! on [`MemberHarnessContext`], not on the spec, because the runtime owns the live handle that
+//! backs it. When the context carries none, the built agent is exactly the agent without it.
 //!
 //! ## Model identity
 //!
@@ -276,7 +279,9 @@ impl NativeMemberFactory {
     /// Builds the concrete native harness; [`MemberHarnessFactory::create`] erases the type.
     ///
     /// The resolved model's identity is copied onto the configuration as well as the model slot,
-    /// because the inner `ReActAgentConfig` takes its model name from the configuration.
+    /// because the inner `ReActAgentConfig` takes its model name from the configuration. The
+    /// member's team-memory tools are mounted last, next to the built-in coding tools; an empty
+    /// list (no toolkit on the context) mounts nothing.
     fn build(
         spec: &DeepAgentSpec,
         ctx: &MemberHarnessContext,
@@ -288,6 +293,7 @@ impl NativeMemberFactory {
             .config(config)
             .model(model)
             .workspace(Workspace::new(ctx.workspace_root.clone()))
+            .tools(ctx.memory_tools())
             .build()?;
         Ok(NativeHarness::new(agent, NativeHarnessOptions::default()))
     }
@@ -316,7 +322,24 @@ mod tests {
     use crate::schema::{DeepAgentSpec, MemberMode, ToolSpec};
     use openjiuwen_common::error::ErrorKind;
     use openjiuwen_harness::AgentMode;
+    use openjiuwen_harness_protocol::{
+        DeliveryMode, HarnessContext, HarnessEventPayload, HarnessInput, TurnEventKind,
+    };
+    use openjiuwen_memory::team::{
+        MemberMemoryContext, MemberMemoryToolkit, TeamMemory, TOOL_FORGET, TOOL_REMEMBER,
+        TOOL_SEARCH, TOOL_STATS,
+    };
     use openjiuwen_test_support::ScriptedModel;
+    use std::time::Duration;
+    /// Deadline applied to every await that must not hang the suite.
+    const WAIT: Duration = Duration::from_secs(10);
+    /// A spec in single-round mode, so one scripted answer closes the driven turn.
+    fn single_round_spec() -> DeepAgentSpec {
+        DeepAgentSpec {
+            enable_task_loop: false,
+            ..DeepAgentSpec::default()
+        }
+    }
     /// Resolver that always fails, for the error path.
     struct FailingResolver;
     #[async_trait]
@@ -500,5 +523,108 @@ mod tests {
         };
         let config = build_config(&spec, &context());
         assert_eq!(config.card.name, "dev-1");
+    }
+    /// One member toolkit of `dev-1` over a fresh in-memory team memory.
+    fn memory_toolkit() -> Arc<MemberMemoryToolkit> {
+        Arc::new(MemberMemoryToolkit::new(
+            Arc::new(TeamMemory::in_memory()),
+            MemberMemoryContext::new("team").with_member("dev-1"),
+        ))
+    }
+    /// Tool names carried by every model request of one driven turn.
+    ///
+    /// The kernel agent keeps its mounted tools private, so the request it sends is the observable
+    /// surface: the inner `ReAct` loop copies the visible tool cards into
+    /// `ModelRequestConfig::tools` before each call, and [`ScriptedModel`] records the requests.
+    async fn requested_tool_names(spec: &DeepAgentSpec, ctx: &MemberHarnessContext) -> Vec<String> {
+        let model = ScriptedModel::text("done");
+        let harness = NativeMemberFactory::build(spec, ctx, Arc::new(model.clone()))
+            .expect("a spec with a resolved model builds");
+        harness
+            .start(HarnessContext::new("dev-1", "team:dev-1", "team:dev-1", ""))
+            .await
+            .expect("the harness starts");
+        let mut cursor = harness.events();
+        let receipt = harness
+            .send(HarnessInput::text("hello"), DeliveryMode::FollowUp)
+            .await
+            .expect("the input is accepted");
+        loop {
+            let event = tokio::time::timeout(WAIT, cursor.next_event())
+                .await
+                .expect("timed out waiting for the turn to finish")
+                .expect("the observation cursor reported an error")
+                .expect("the cursor ended before the turn finished");
+            if event.turn_id.as_deref() == Some(receipt.turn_id.as_str())
+                && matches!(
+                    &event.event,
+                    HarnessEventPayload::TurnLifecycle(payload)
+                        if payload.kind == TurnEventKind::Finished
+                )
+            {
+                break;
+            }
+        }
+        harness.stop().await.expect("the harness stops");
+        let mut names: Vec<String> = Vec::new();
+        for call in model.calls() {
+            let Some(tools) = call
+                .request
+                .tools
+                .as_ref()
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            for tool in tools {
+                if let Some(name) = tool
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !names.iter().any(|known| known == name) {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        names
+    }
+    #[tokio::test]
+    async fn a_context_without_a_toolkit_mounts_no_memory_tool() {
+        let names = requested_tool_names(&single_round_spec(), &context()).await;
+        assert!(
+            !names.is_empty(),
+            "the built-in coding tools are still mounted: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("team_memory_")),
+            "no team memory tool is mounted without a toolkit: {names:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_context_toolkit_mounts_the_four_memory_tools() {
+        let ctx = context().with_memory_toolkit(memory_toolkit());
+        let names = requested_tool_names(&single_round_spec(), &ctx).await;
+        for expected in [TOOL_REMEMBER, TOOL_SEARCH, TOOL_FORGET, TOOL_STATS] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} is mounted: {names:?}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn the_context_tools_ride_next_to_the_built_in_ones() {
+        let plain = requested_tool_names(&single_round_spec(), &context()).await;
+        let ctx = context().with_memory_toolkit(memory_toolkit());
+        let with_memory = requested_tool_names(&single_round_spec(), &ctx).await;
+        assert!(
+            with_memory.len() >= plain.len() + 4,
+            "the four memory tools are added, not substituted: {plain:?} -> {with_memory:?}"
+        );
+        for name in plain {
+            assert!(with_memory.contains(&name), "{name} survives the mount");
+        }
     }
 }

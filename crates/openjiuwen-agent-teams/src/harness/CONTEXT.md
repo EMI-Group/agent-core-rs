@@ -15,10 +15,15 @@ pub struct MemberHarnessContext { pub team_name: String, pub member_name: String
                                   pub workspace_root: PathBuf, pub language: String, pub mode: MemberMode,
                                   pub card_id: String }   // card_id empty by default
 impl MemberHarnessContext {
-    pub fn new(team_name, member_name, session_id, workspace_root, language, mode) -> Self;  // six args, card_id = ""
+    pub fn new(team_name, member_name, session_id, workspace_root, language, mode) -> Self;  // six args, card_id = "", no toolkit
     pub fn with_card_id(self, card_id: impl Into<String>) -> Self;
+    pub fn with_memory_toolkit(self, toolkit: Arc<MemberMemoryToolkit>) -> Self;   // the member's team-memory handle
+    pub fn memory_toolkit(&self) -> Option<&Arc<MemberMemoryToolkit>>;
+    pub fn memory_tools(&self) -> Vec<Arc<dyn Tool>>;   // the four team_memory_* tools, empty without a toolkit
     pub fn member_session_id(host_session_id: &str, member_name: &str) -> String;  // "<host>:<member>"
 }
+// Debug/PartialEq/Eq are hand-written: the private `memory_toolkit` field prints as present/absent and
+// compares by Arc::ptr_eq, so two contexts with distinct handles for the same member are unequal.
 
 #[async_trait] pub trait MemberHarnessFactory: Send + Sync {
     async fn create(&self, spec: &DeepAgentSpec, ctx: &MemberHarnessContext) -> Result<Arc<dyn HarnessProtocol>>;
@@ -162,9 +167,11 @@ Every other event payload is forwarded only through the state/round/chunk projec
 | `cwd`, `project_root`, `skills`, `language`, `prompt_mode` | same-named `DeepAgentConfig` fields |
 | context `workspace_root` | `Workspace` (builder + config) |
 | context `mode` | `default_mode` (`plan_mode` ⇒ `AgentMode::Plan`) and `enable_plan_mode` |
+| context `memory_toolkit` | `DeepAgentBuilder::tools` — the four `team_memory_remember`/`search`/`forget`/`stats` tools, mounted next to the built-in coding tools |
 
 Ignored at factory level (logged once at `debug` when present): `tools`, `mcps`, `subagents`, `rails`, `approval_required_tools`, and model `params`.
 Mounting live tools/MCP servers/rails belongs to the runtime wiring that owns those handles.
+The member's team-memory tools travel on `MemberHarnessContext`, never on the spec, because the runtime owns the live toolkit: without one the built agent is exactly the agent without them.
 Model resolution is always required: a missing provider/model is `Error::config`.
 
 The model identity must live on the config, not only on the model handle: `DeepAgentBuilder` copies `DeepAgentConfig::{model_name, model_provider}` onto the inner `ReActAgentConfig`, and the agent loop inherits a blank config name into every `ModelRequestConfig` whose request name is empty — an empty name makes provider requests and `list_models` fail (Python parity: `native_harness.py` reads `self._react_agent.config.model_name`).
@@ -175,6 +182,8 @@ The model identity must live on the config, not only on the model handle: `DeepA
 `MemberHarnessFactory` is the only way a member's brain is replaced: `TeamBuildDeps::with_harness_factory` swaps the default `NativeMemberFactory::from_env()` for any `Arc<dyn MemberHarnessFactory>`, and `TeamAgentSpec::build_with` creates the leader through it while `TeamMemberSpawner::spawn` creates every teammate through it.
 Both calls pass a `&DeepAgentSpec` (leader: `agents["leader"]`; teammate: `agents[name]` else `agents["teammate"]`) plus a `MemberHarnessContext` whose `session_id` is that member's derived `member_session_id(team_session, member_name)` and whose `card_id` is the effective card id.
 A scripted factory can therefore key its per-member answers on either `member_name` or the derived id; the leader receives the routed `agents["leader"]` spec and a teammate its forked/router-merged blueprint.
+The team runtime attaches each member's own `MemberMemoryToolkit` to that context through `with_memory_toolkit`, so the `team_memory_*` tools reach the member's harness while the toolkit stays owned by the runtime.
+The team runtime attaches each member's own `MemberMemoryToolkit` to that context (`with_memory_toolkit`), so the toolkit-backed `team_memory_*` tools reach the member's harness while the toolkit itself stays owned by the runtime.
 No public fake harness exists: `tests/support/mod.rs::ScriptedHarness`/`FakeHarnessFactory` are crate-private test helpers, so an out-of-crate integration test copies a `HarnessProtocol` impl (13 required methods; `send_auto` and `abort_graceful` have defaults).
 The minimum viable fake: `state()` returns `Idle` after `start`, `events()` returns `VecEventCursor::new(Vec::new())` (an empty cursor ends the pump cleanly) or a scripted one, and `send` emits `turn_lifecycle` started → `output` (channel `answer`) → `turn_lifecycle` finished before settling back to `Idle`.
 All protocol types used by such a fake are reachable from an out-of-crate test through `openjiuwen::harness_protocol`; the crate itself is `openjiuwen::agent_teams`.
@@ -188,7 +197,7 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - Exactly one pump task per started runtime, owned by a `PumpHandle`; it ends on `stop`, on drop of the runtime, on cursor exhaustion/error, or when the harness reports `Terminated`. No detached tasks survive `stop`.
 - `tracing` only; no `println!`/`eprintln!`; no `unsafe`; no `unwrap`/`expect` outside tests.
 - Serde on every public data type (snake_case, unknown fields tolerated); JSON checkpoint only (never pickle).
-- Files around ≤1000 lines, split by responsibility (`adapter`/`mapping`/`checkpoint`/`native`/`checkpoint_store/*`); `adapter.rs` is the documented exception — it pairs the adapter with its unit tests, roughly half of it `#[cfg(test)]`, and carries a top-of-file length note.
+- Files around ≤1000 lines, split by responsibility (`adapter`/`mapping`/`checkpoint`/`memory_tools`/`native`/`checkpoint_store/*`); `adapter.rs` is the documented exception — it pairs the adapter with its unit tests, roughly half of it `#[cfg(test)]`, and carries a top-of-file length note.
 
 ## Routing Table
 
@@ -197,7 +206,8 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - `./mapping.rs` → `HarnessState`/`HarnessEvent` → team status, round and chunk projections
 - `./checkpoint.rs` → `NativeCheckpoint` JSON round-trip and compatibility validation
 - `./checkpoint_store/` → per-member checkpoint persistence (`mod.rs` module map, `policy.rs` policy/resume, `store.rs` record + memory/file backends, `sink.rs` protocol sink adapter)
-- `./native.rs` → `NativeMemberFactory`, `ModelResolver`, `EnvModelResolver`, spec → `DeepAgentConfig` mapping
+- `./native.rs` → `NativeMemberFactory`, `ModelResolver`, `EnvModelResolver`, spec → `DeepAgentConfig` mapping, team-memory tool mounting
+- `./memory_tools.rs` → the context's toolkit → `Tool` projection and its `Arc::ptr_eq` identity rule
 
 ## Test Strategy
 
@@ -207,7 +217,10 @@ A fake-LLM member is also possible without a fake protocol: `NativeMemberFactory
 - `checkpoint_store/` (22 tests) pins policy defaults/`disabled()`/serde/unknown fields/wire strings/resume mapping; memory round-trip, newest-wins, identity independence, revisions; file round-trip, sanitised `path_for` containment, missing file, malformed JSON; sink payload/cwd/state/outputs/envelope/receipt projection and store-failure mapping.
 - `adapter.rs` drives `HarnessMemberRuntime` with a local `FakeHarness` (command recording, recorded `HarnessContext`s, channel-backed cursor, fixed state, scriptable `export_checkpoint`/failure): start publishes `Ready`, delivery/abort/pause/resume argument mapping, observer callback order, cursor drain/close, pump cancellation on `stop`, error translation, sink/restore/capture/stop wiring, a disabled policy writing nothing, and an export error leaving the pump alive. Waits are bounded `yield_now`/1 ms polls.
 - `native.rs` covers factory identity, resolver error propagation, the spec → `DeepAgentConfig` mapping (plan mode, card/language overrides), and model-identity propagation: a spec name/provider wins over the resolved one, a resolver-supplied default name reaches `NativeHarness::agent().config()`, and blank resolved names/providers neither erase a spec name nor invent a provider.
-- Default build: 1411 lib tests (plus the crate's 219 integration tests across 15 binaries, `full_team_sqlite` behind `--features sqlite`, and 37 doctests plus one `ignore`).
+- `native.rs` also drives one scripted turn per mounting case and reads the tool names the model request carried (the mounted tools' only observable surface): a context without a toolkit mounts no `team_memory_*` tool, a context with one mounts all four next to the built-in coding tools, and the built-in tools survive the mount.
+- `memory_tools.rs` pins the four engine tool names in toolkit order and the identity rule (absent matches only absent, a handle matches itself and no fresh handle).
+- `adapter.rs` also pins the context identity: equal `new(...)` arguments build equal contexts, a card id or member name difference breaks equality, attaching a toolkit breaks it, a clone of the same handle keeps it, and the `Debug` view reports presence only.
+- Default build: 1470 lib tests (plus the crate's 219 integration tests across 15 binaries, `full_team_sqlite` behind `--features sqlite`, and 37 doctests plus one `ignore`).
 - Definition of done: `cargo fmt -p openjiuwen-agent-teams`, `cargo clippy -p openjiuwen-agent-teams --all-targets --all-features -- -D warnings`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite` and `--all-features` configurations, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 
 ## Deferred
