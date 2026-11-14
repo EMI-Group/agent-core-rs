@@ -83,6 +83,8 @@ pub mod model;
 pub mod object_artifact;
 /// Deterministic relation candidates, planning, and plan execution.
 pub mod orchestration;
+/// Credential and PII redaction for model-facing and packaged text.
+pub mod redaction;
 /// The in-memory capability registry with write-through persistence.
 pub mod registry;
 /// The symphony composition root: configuration, lifecycle, graph build, plan, invoke.
