@@ -15,6 +15,16 @@ Models — `WorktreeInfo { path, branch, head, bare, detached, locked, lock_reas
 Registry — `WorktreeIndex { version, records }` with `load(path)`, `save(path)`, `get(name)`, `get_by_path`, `upsert`, `remove`, `records`, `retain_existing(paths)`, plus `index_path(workspace_root)`, `INDEX_DIR` (".worktree"), `INDEX_FILE` ("index.json"), `INDEX_VERSION` (1).
 Events — `WorktreeEvent::{Created, Removed, Locked, Unlocked, Pruned, Error}` (serde tag `type`, `kind()`); `WorktreeEventSink` (`async fn emit(&self, WorktreeEvent)`); `NoopWorktreeEvents`, `BroadcastWorktreeEvents` (`new(capacity)`, `subscribe()`, `receiver_count()`), `RecordingWorktreeEvents` (`events()`, `clear()`), `SharedWorktreeEvents`, `DEFAULT_EVENT_CAPACITY` (64).
 Tool — `WorktreeTool::new(manager: Arc<WorktreeManager>, language: &str) -> WorktreeTool`, `WorktreeTool::card_for(language) -> ToolCard`, `with_permission(engine: Arc<PermissionEngine>)`, `manager()`; `WorktreeArgs { action, name, branch, base, force, reason }` with `new(action)`, `with_name(name)`, `is_known_action()`; `TOOL_NAME` ("worktree"), `ACTIONS` (`create`, `list`, `remove`, `lock`, `unlock`, `prune`, `status`).
+## Lock (`lock.rs`)
+
+`WorktreeLock` — `new(repo_root, workspace_root, config)`, `config()`, `repo_root()`, `root()`, `lock_path()`, `is_enabled()`, `acquire()`, `try_acquire()`, `read_metadata()`, `stale_metadata(now)`.
+`WorktreeLockConfig { enabled, timeout }` — `default()` (enabled, 120 s), `disabled()`, `with_timeout(duration)`; `DEFAULT_LOCK_TIMEOUT` (120 s), `STALE_LOCK_AGE` (30 min).
+`WorktreeLockGuard` — `lock_path()`, `is_active()`, `metadata()`; dropping it releases the `flock`.
+`WorktreeLockMetadata { pid, acquired_at }` — RFC 3339 `acquired_at`, diagnostics only.
+`WorktreeLockError` — `Contended`/`TimedOut`/`Io` with `target()`, `lock_path()`, `waited()`, `is_timeout()`, `is_contention()`, `Display`, `std::error::Error`, `From<WorktreeLockError> for Error` (`Error::tool`).
+`is_lock_timeout(&Error)` / `is_lock_contention(&Error)` — marker checks; `LOCK_TIMEOUT_MARKER` ("worktree lock timeout") and `LOCK_CONTENTION_MARKER` ("worktree lock is held").
+The advisory `flock` itself comes from `openjiuwen_sysop::fs::lock::{FileLockManager, LockMode, LockError}`; the module only adds layout, the timeout policy, metadata and the typed error.
+
 ## Layout
 A worktree named `Feature Login!` becomes `slug = "Feature-Login"`, directory `<repo-root>/.worktrees/Feature-Login`, branch `worktree-Feature-Login`.
 The registry is `<workspace-root>/.worktree/index.json` (default workspace root is the repo root), the directory `crate::workspace::Workspace` already uses for worktree links.
