@@ -832,23 +832,149 @@ async fn assert_fixture(stores: &MemoryStores, ids: &[String]) {
     );
 }
 
+/// Both representations of every fixture variable, plus the ordinary record and config keys.
+///
+/// `set_variable` stores a variable twice: the Python-authoritative KV entry
+/// (`user_var/…` or `session_var/…`) and a `MemoryType::Variable` record projection under
+/// the record prefix (`UMD/…/var-<16 hex>`). The projection id is deterministic but
+/// opaque, so it is read back through `variable_records` instead of being spelled out.
+struct FixtureKeys {
+    /// Keys of the ordinary memory records (`UMD/{user}/{scope}/{id}`).
+    records: Vec<String>,
+    /// Keys of the variables' authoritative KV entries.
+    variable_entries: Vec<String>,
+    /// Keys of the variables' `MemoryType::Variable` record projections.
+    variable_records: Vec<String>,
+    /// Key of the fixture's scope configuration.
+    scope_config: String,
+}
+
+impl FixtureKeys {
+    /// Every fixture key, sorted.
+    fn all(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .records
+            .iter()
+            .chain(&self.variable_entries)
+            .chain(&self.variable_records)
+            .cloned()
+            .collect();
+        keys.push(self.scope_config.clone());
+        keys.sort();
+        keys
+    }
+}
+
+/// Derives the key set [`seed_fixture`] writes, straight from the seeded stores.
+async fn fixture_keys(stores: &MemoryStores, ids: &[String]) -> FixtureKeys {
+    let facade = LongTermMemory::with_stores(config(), stores.clone())
+        .await
+        .expect("facade");
+    let mut fixture = FixtureKeys {
+        records: ids
+            .iter()
+            .map(|id| keys::record_key(&scope(), id))
+            .collect(),
+        variable_entries: vec![
+            keys::variable_key(&scope(), "theme"),
+            keys::session_variable_key(&session_scope(), "s1", "step"),
+        ],
+        variable_records: Vec::new(),
+        scope_config: keys::scope_config_key("ws"),
+    };
+    // A session-free scope lists the session projections too (record keys ignore the
+    // session), so one call sees one projection per fixture variable.
+    let projections = facade
+        .variable_records(&scope())
+        .await
+        .expect("variable projections");
+    assert_eq!(
+        projections.len(),
+        fixture.variable_entries.len(),
+        "one projection per fixture variable, got {projections:?}"
+    );
+    let mut names: Vec<&str> = Vec::new();
+    for projection in &projections {
+        assert_eq!(projection.kind, MemoryType::Variable);
+        names.push(projection.metadata_str("name").expect("variable name"));
+        fixture
+            .variable_records
+            .push(keys::record_key(&scope(), &projection.id));
+    }
+    names.sort_unstable();
+    assert_eq!(names, ["step", "theme"], "both fixture variables project");
+    fixture.variable_records.sort();
+    fixture
+}
+
+/// Asserts the per-family counts classify exactly the fixture's key classes.
+fn assert_backup_counts(backup: &MemoryBackup, fixture: &FixtureKeys) {
+    let counts = backup.counts();
+    assert_eq!(
+        counts.records,
+        fixture.records.len() + fixture.variable_records.len(),
+        "every ordinary record and every variable projection is dumped as a record"
+    );
+    assert_eq!(
+        counts.user_variables + counts.session_variables,
+        fixture.variable_entries.len(),
+        "the authoritative KV entry of every variable is dumped"
+    );
+    assert_eq!(
+        counts.scope_configs, 1,
+        "the fixture writes exactly one scope config"
+    );
+    assert_eq!(
+        counts.total,
+        backup.len(),
+        "every dumped entry is classified"
+    );
+}
+
+/// Asserts `backup` carries the whole fixture — ordinary records, both representations of
+/// every variable, and the scope config — and nothing else.
+fn assert_backup_covers_fixture(backup: &MemoryBackup, fixture: &FixtureKeys) {
+    let expected = fixture.all();
+    for key in &expected {
+        assert!(
+            backup.entries.contains_key(key),
+            "the dump is missing {key}; dumped keys: {:?}",
+            backup.entries.keys().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        backup.entries.keys().cloned().collect::<Vec<_>>(),
+        expected,
+        "the dump holds exactly the fixture's keys"
+    );
+    assert_backup_counts(backup, fixture);
+}
+
+/// Asserts a restore into `target` reproduced `backup`: same sorted key set, equal values.
+async fn assert_restored_backup(target: &MemoryStores, backup: &MemoryBackup) {
+    let restored = backup::dump(target)
+        .await
+        .expect("dump the restored target");
+    assert_eq!(
+        restored.entries.keys().collect::<Vec<_>>(),
+        backup.entries.keys().collect::<Vec<_>>(),
+        "a restore reproduces the dumped key set exactly"
+    );
+    assert_eq!(
+        restored.entries, backup.entries,
+        "every restored value decodes equal"
+    );
+    assert_eq!(restored.counts(), backup.counts());
+}
+
 #[tokio::test]
 async fn in_memory_backup_and_restore_preserve_records_variables_and_configs() {
     let stores = MemoryStores::in_memory();
     let ids = seed_fixture(&stores).await;
+    let fixture = fixture_keys(&stores, &ids).await;
 
     let backup = backup::dump(&stores).await.expect("dump");
-    assert_eq!(backup.len(), 5, "{:?}", backup.entries.keys());
-    assert_eq!(
-        backup.counts(),
-        backup::BackupCounts {
-            records: 2,
-            user_variables: 1,
-            session_variables: 1,
-            scope_configs: 1,
-            total: 5,
-        }
-    );
+    assert_backup_covers_fixture(&backup, &fixture);
 
     // Mutate the source after the dump: a restore must bring the dumped values back.
     let facade = LongTermMemory::with_stores(config(), stores.clone())
@@ -875,6 +1001,7 @@ async fn in_memory_backup_and_restore_preserve_records_variables_and_configs() {
     assert_eq!(report.skipped, 0);
     assert_eq!(report.processed(), report.total);
     assert_eq!(report.counts, backup.counts());
+    assert_restored_backup(&fresh, &backup).await;
     assert_fixture(&fresh, &ids).await;
 
     // Restoring the same backup again is additive: every entry already matches.
@@ -914,8 +1041,9 @@ async fn local_file_backup_restore_into_a_fresh_store_survives_a_reopen() {
             .expect("source stores");
         let ids = seed_fixture(&stores).await;
         assert_fixture(&stores, &ids).await;
+        let fixture = fixture_keys(&stores, &ids).await;
         let backup = backup::dump(&stores).await.expect("dump");
-        assert_eq!(backup.len(), 5);
+        assert_backup_covers_fixture(&backup, &fixture);
 
         // Delete one record and overwrite the variable before restoring.
         let facade = LongTermMemory::with_stores(config(), stores.clone())
@@ -931,8 +1059,9 @@ async fn local_file_backup_restore_into_a_fresh_store_survives_a_reopen() {
             .await
             .expect("target stores");
         let report = backup::restore(&target, &backup).await.expect("restore");
-        assert_eq!(report.written, 5);
+        assert_eq!(report.written, backup.len());
         assert_eq!(report.skipped, 0);
+        assert_restored_backup(&target, &backup).await;
         assert_fixture(&target, &ids).await;
         ids
     };
@@ -984,8 +1113,10 @@ async fn backup_verification_and_json_round_trips() {
     assert!(matches!(error, Error::Unsupported(_)), "{error}");
     assert!(error.message().contains("format version"), "{error}");
 
-    // The dump covered every fixture row, so a restore is a full round trip.
-    assert_eq!(backup.counts().records, ids.len());
+    // The dump covered every fixture row — both representations of each variable and every
+    // ordinary record — so a restore is a full round trip.
+    let fixture = fixture_keys(&stores, &ids).await;
+    assert_backup_covers_fixture(&backup, &fixture);
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,11 +1141,32 @@ async fn a_family_rename_survives_a_backup_round_trip() {
     assert!(renamed.contains_prefix(KvFamily::UserVariables, "user_var"));
     assert!(renamed.contains_prefix(KvFamily::UserVariables, "user_variable"));
 
-    // The dump rewrites the alias rows onto the renamed current prefix.
+    // The dump rewrites the alias rows onto the renamed current prefix and otherwise holds
+    // exactly the fixture: both representations of each variable and every ordinary record.
     let dump = backup::dump_with(&stores, &renamed)
         .await
         .expect("renamed dump");
-    assert_eq!(dump.len(), 5);
+    let fixture = fixture_keys(&stores, &ids).await;
+    let renamed_variable_key = keys::variable_key_in(&renamed, &scope(), "theme");
+    let default_variable_key = keys::variable_key(&scope(), "theme");
+    let mut expected: Vec<String> = fixture
+        .all()
+        .into_iter()
+        .map(|key| {
+            if key == default_variable_key {
+                renamed_variable_key.clone()
+            } else {
+                key
+            }
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        dump.entries.keys().cloned().collect::<Vec<_>>(),
+        expected,
+        "the renamed dump holds the fixture's keys with the user-variable family renamed"
+    );
+    assert_backup_counts(&dump, &fixture);
     assert_eq!(
         dump.prefixes.get("user_variables").map(String::as_str),
         Some("vars_v2")
@@ -1030,7 +1182,15 @@ async fn a_family_rename_survives_a_backup_round_trip() {
     // Restoring into a default-layout store brings the rows back under the default prefix.
     let fresh = MemoryStores::in_memory();
     let report = backup::restore(&fresh, &dump).await.expect("restore");
-    assert_eq!(report.written, 5);
+    assert_eq!(report.written, dump.len());
+    let restored = backup::dump(&fresh)
+        .await
+        .expect("dump the restored default-layout store");
+    assert_eq!(
+        restored.entries.keys().cloned().collect::<Vec<_>>(),
+        fixture.all(),
+        "a default-layout restore puts every dumped row back under the documented prefixes"
+    );
     let facade = LongTermMemory::with_stores(config(), fresh.clone())
         .await
         .expect("facade");
@@ -1056,7 +1216,14 @@ async fn a_family_rename_survives_a_backup_round_trip() {
     let renamed_report = backup::restore_with(&renamed_target, &dump, &renamed, false)
         .await
         .expect("renamed restore");
-    assert_eq!(renamed_report.written, 5);
+    assert_eq!(renamed_report.written, dump.len());
+    let renamed_restored = backup::dump_with(&renamed_target, &renamed)
+        .await
+        .expect("dump the renamed target");
+    assert_eq!(
+        renamed_restored.entries, dump.entries,
+        "a restore under the renamed layout reproduces the dump exactly"
+    );
     assert_eq!(
         kv_text(&renamed_target, "vars_v2/alice/ws/theme")
             .await
@@ -1572,14 +1739,16 @@ async fn the_sqlite_backend_migrates_and_restores_a_backup() {
         );
 
         let dump = backup::dump(&stores).await.expect("dump");
-        assert_eq!(dump.len(), 5, "{:?}", dump.entries.keys());
+        let fixture = fixture_keys(&stores, &ids).await;
+        assert_backup_covers_fixture(&dump, &fixture);
 
         let target = MemoryStores::sqlite(&target_path)
             .await
             .expect("sqlite target stores");
         let report = backup::restore(&target, &dump).await.expect("restore");
-        assert_eq!(report.written, 5);
+        assert_eq!(report.written, dump.len());
         assert_eq!(report.skipped, 0);
+        assert_restored_backup(&target, &dump).await;
         assert_fixture(&target, &ids).await;
         ids
     };
