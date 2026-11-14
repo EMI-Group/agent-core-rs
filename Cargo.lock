@@ -1821,6 +1821,7 @@ name = "openjiuwen-context"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "openjiuwen-common",
  "openjiuwen-foundation",
@@ -1828,11 +1829,14 @@ dependencies = [
  "openjiuwen-test-support",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tiktoken-rs",
  "tokio",
  "tokio-util",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
