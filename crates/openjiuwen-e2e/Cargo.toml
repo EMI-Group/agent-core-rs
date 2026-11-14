@@ -37,7 +37,11 @@ default = []
 # Enables the A2A client/server scenario (`tests/a2a_roundtrip.rs`).
 a2a = ["openjiuwen/a2a", "openjiuwen-extensions/a2a"]
 # Enables the OTLP/HTTP export scenario (`tests/plugin_observability.rs`).
-otel = ["openjiuwen/otel", "openjiuwen-extensions/otel"]
+# `openjiuwen-agent-teams/otlp` is what provides the team-memory -> OTel bridge
+# (`OtlpMemoryObserver`) that the scenario drives; it pulls the extensions' `otel`
+# sink itself, and the explicit `openjiuwen-extensions/otel` keeps
+# `openjiuwen/otel`'s kernel trace-sink path in the same unified feature set.
+otel = ["openjiuwen/otel", "openjiuwen-extensions/otel", "openjiuwen-agent-teams/otlp"]
 # The kernel crates are only reachable through the umbrella, so their SQLite
 # backends are enabled through `openjiuwen/sqlite`; `openjiuwen-agent-teams` is
 # also a direct dependency (same crate, explicit feature keeps `team_backend.rs`
