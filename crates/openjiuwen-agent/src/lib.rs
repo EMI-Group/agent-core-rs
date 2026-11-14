@@ -43,6 +43,8 @@
 //! - [`memory_provider`] — the external long-term-memory provider bridge: a rail
 //!   and the provider's model-facing tools.
 //! - [`workflow_agent`] — [`WorkflowAgent`] over one or more workflows.
+//! - [`usage`] — the context usage telemetry seam: analyzer/recorder ownership,
+//!   KV-cache scope keys, and the drained [`UsageTelemetry`] buffer.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod abilities;
@@ -66,6 +68,7 @@ pub mod react;
 pub mod run;
 pub mod skills;
 pub mod steering;
+pub mod usage;
 pub mod workflow_agent;
 pub use abilities::{
     parse_tool_arguments, AbilityManager, AddAbilityResult, ToolCallResult, ToolExecutionOptions,
@@ -91,6 +94,7 @@ pub use rails::{
 };
 pub use react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
 pub use run::{resolve_session, AgentRun};
+pub use usage::{default_usage_analyzer, UsageTelemetry};
 pub use workflow_agent::{DefaultResponse, WorkflowAgent, WorkflowAgentConfig};
 /// Returns the crate name as reported by `cargo`.
 #[must_use]

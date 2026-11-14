@@ -14,6 +14,7 @@ Suites (run with `cargo test -p openjiuwen-agent`):
 - `interrupt.rs` (8) → confirm pause shape and persisted state, approve resume, reject with and without feedback, session-seeded auto-confirm, ask-user answer as tool result, two pending calls pausing once and resuming individually, and the streaming pause emitting plus mirroring its `__interaction__` frame.
 - `llm_agent.rs` (7) → config mapping onto `ReActAgent`, provider fallback, invoke/stream output filtering, prompt-template override, interrupt pass-through.
 - `workflow_agent.rs` (5) → single-workflow invoke/stream, model-driven selection with default-response fallback, workflow interrupt/resume, no-workflow error.
+- `usage.rs` (7) → the usage telemetry seam: pre-call `context.usage` frames carrying the measured block, one post-call frame per model call (provider token counts + snapshot) with its session mirror, the buffered snapshots read by `last_usage`/`drain_usage_events` on a non-streaming `invoke`, the provider report reaching `ContextEngine::kv_cache_usage`, the analyzer-less run (one pre-call frame, no snapshot, `Error::Config` from `usage_report`), `usage_report` reconciling a supplied provider total, and `configure` keeping an installed analyzer/recorder.
 
 ## Model fakes (`ScriptedModel`)
 
