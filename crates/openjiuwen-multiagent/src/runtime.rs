@@ -57,12 +57,15 @@ use serde_json::Value;
 use crate::envelope::MessageEnvelope;
 use crate::error::TeamError;
 use crate::events::{TeamEvent, TeamEventBus};
+use crate::inbox::InboxFilterRegistry;
 use crate::member::{AgentProvider, TeamAgent};
 use crate::member_checkpoint::MemberCheckpointer;
 use crate::message_bus::{MessageBus, MessageBusConfig, MessageHandler};
 use crate::resources::TeamResourceMgr;
+use crate::routing::GroupRegistry;
 use crate::transport::{InProcessTransport, TeamTransport};
 
+mod routing;
 mod seams;
 
 /// Team id used when the configured one is absent or empty.
@@ -172,6 +175,10 @@ pub struct TeamRuntime {
     transport: RwLock<Arc<dyn TeamTransport>>,
     resource_mgr: RwLock<Option<Arc<dyn TeamResourceMgr>>>,
     member_checkpointer: RwLock<Option<Arc<MemberCheckpointer>>>,
+    /// Named agent groups used by [`TeamRuntime::broadcast_to_group`].
+    groups: Arc<GroupRegistry>,
+    /// Per-agent filters consulted before an inbound member is invoked.
+    inbox_filters: Arc<InboxFilterRegistry>,
     /// Whether [`TeamRuntime::start`] succeeded and [`TeamRuntime::stop`] has
     /// not run since; Python parity for `TeamRuntime._running`.
     running: AtomicBool,
@@ -243,6 +250,8 @@ impl TeamRuntime {
                 transport: RwLock::new(transport),
                 resource_mgr: RwLock::new(resource_mgr),
                 member_checkpointer: RwLock::new(None),
+                groups: Arc::new(GroupRegistry::new()),
+                inbox_filters: Arc::new(InboxFilterRegistry::new()),
                 running: AtomicBool::new(false),
             }
         })
@@ -768,6 +777,11 @@ impl TeamRuntime {
             .clone()
             .ok_or_else(|| Error::validation("recipient is required"))?;
         let sender = envelope.sender.clone().unwrap_or_default();
+        if !self.inbox_filters.accepts(&recipient, envelope) {
+            return Err(Error::validation(format!(
+                "inbox of '{recipient}' rejected the message from '{sender}'"
+            )));
+        }
         let mut received =
             TeamEvent::message_received(self.team_id(), &sender, &recipient, &envelope.message_id);
         if let Some(session_id) = &envelope.session_id {
@@ -794,6 +808,15 @@ impl TeamRuntime {
     async fn dispatch_pubsub(&self, envelope: &MessageEnvelope, subscriber: &str) -> Result<()> {
         let sender = envelope.sender.clone().unwrap_or_default();
         let topic = envelope.topic_id.clone().unwrap_or_default();
+        if !self.inbox_filters.accepts(subscriber, envelope) {
+            tracing::debug!(
+                subscriber,
+                sender = %sender,
+                topic = %topic,
+                "team pub/sub delivery rejected by the inbox filter"
+            );
+            return Ok(());
+        }
         let mut received = TeamEvent::pubsub_received(
             self.team_id(),
             &sender,
