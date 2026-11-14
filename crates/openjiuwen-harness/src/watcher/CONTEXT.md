@@ -5,6 +5,8 @@
 Watch the workspace roots that the harness reloads from — skill libraries, agent-spec templates, instruction files and the MCP configuration — and emit debounced, coalesced, typed change events to subscribers plus named reload handlers.
 This is a Rust-native addition: Python `openjiuwen.harness` has no watcher, so there is no parity contract for its shape; it must only compose existing public harness APIs.
 The OS notification layer is owned by the optional `notify` feature (`notify = ["dep:notify"]` in `Cargo.toml`); every other type compiles and behaves identically without it, and only `WorkspaceWatcher::start` reports the missing backend.
+Both internal hops are bounded and both losses are counted, logged and announced, so no producer can grow memory behind a slow consumer.
+Reload handlers run on a dispatcher task of their own, so a slow handler delays neither debouncing nor publication.
 The module is a leaf of the harness: it reads `openjiuwen_common` (errors, `OpenJiuwenHome`), `tokio`, `tokio_util`, `tokio-stream`, `futures`, `async-trait`, `tracing`, and the public surfaces of `crate::skills`, `crate::cli::{instruction, mcp_config, paths}` and `crate::spec`; nothing may depend on `watcher` except callers.
 
 ## API Surface
@@ -19,7 +21,9 @@ Everything public is re-exported flat from `crate::watcher`.
 - `EffectKind` is not introduced: `WatchEvent` stays a pure data record.
 - `ReloadFailure { sequence: u64, handler: String, kind: WatchTargetKind, path: PathBuf, error_kind: String, message: String }` — serde; `sequence` is the triggering event's sequence; `error_kind` is `ErrorKind::as_str()`.
 - `WatchFailure { error_kind: String, message: String }` — serde; a runtime OS-watcher error.
-- `WatchUpdate { Event(WatchEvent), ReloadFailed(ReloadFailure), WatcherFailed(WatchFailure) }` — `#[serde(tag = "type", rename_all = "snake_case")]`, `Debug, Clone, PartialEq, Eq`, `sequence()` accessor (`None` for `WatcherFailed`).
+- `DropStage { Intake, Dispatch }` — `Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize`, `#[serde(rename_all = "snake_case")]`, `as_str()` → `"intake"` / `"dispatch"`; which bounded queue lost notifications.
+- `DroppedUpdates { stage: DropStage, dropped: u64, total: u64 }` — serde; `dropped` is what this notice covers since the previous one, `total` is the stage's running total.
+- `WatchUpdate { Event(WatchEvent), ReloadFailed(ReloadFailure), Dropped(DroppedUpdates), WatcherFailed(WatchFailure) }` — `#[serde(tag = "type", rename_all = "snake_case")]` (`event`, `reload_failed`, `dropped`, `watcher_failed`), `Debug, Clone, PartialEq, Eq`, `sequence()` accessor (`None` for `Dropped` and `WatcherFailed`).
 
 Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path inside one debounce window:
 
@@ -74,20 +78,33 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `McpConfigReloader::new(paths: Vec<PathBuf>) -> Result<Self>` (initial merged load), `reload() -> Result<Option<McpConfiguration>>` (merge later paths over earlier by server name, `None` when no file exists), `current() -> Option<McpConfiguration>`, `servers() -> Result<Vec<McpServerConfig>>`.
 - `McpConfigReloadHandler::new(Arc<McpConfigReloader>)` — `WatchTargetKind::McpConfig`, name `mcp`.
 
+### `intake.rs` — bounded queues and the drop policy
+
+- `pub(crate) DropCounters` — `new()`, `intake()`, `dispatch()`, `total(stage)`, `record_intake()`, `record_dispatch()`; an `Arc<AtomicU64>` pair, so the OS callback thread, the intake task and the handle share one total per stage.
+- `pub(crate) DropReporter` — `new(interval)`, `pending(&DropCounters)`, `next_deadline(&DropCounters, now) -> Option<Instant>` (never in the past), `report(..) -> bool` (throttled to one notice per stage per interval) and `flush(..) -> bool` (ignores the throttle; used on shutdown).
+- Both bounded queues use **drop-newest**: an item arriving while the queue is full is discarded, so admitted items keep FIFO order; a synchronous OS callback cannot implement drop-oldest without blocking.
+- Every drop is counted, logged at `debug` with its reason, logged once at `warn` per notice, and published as `WatchUpdate::Dropped`; a sustained overflow yields one notice per interval, never an error storm.
+- A drop notice means the received deltas are incomplete: consumers must reload from disk instead of applying them.
+- `#[cfg(feature = "notify")] pub(crate) push_raw(&mpsc::Sender<notify::Result<notify::Event>>, &DropCounters, notify::Result<notify::Event>) -> bool` — the callback's only work: `try_send`, counting a `Full` error and ignoring a `Closed` one (shutdown, not a drop).
+
 ### `handle.rs` — subscriptions and shutdown
 
 - `Subscription` — `Stream<Item = WatchUpdate>` (`Send + 'static`) plus `recv() -> Option<WatchUpdate>` and `lagged_updates() -> u64`; a lagging consumer skips the oldest updates (`broadcast` ring buffer, capacity from `WorkspaceWatcher::event_capacity`, default 256), logs one `warn` per lag and never blocks the producer.
-- `WatcherHandle` — `subscribe()`, `target_count()`, `is_shutdown()`, `shutdown() -> Result<()>` (cancel token, drain pending events, await the OS-watcher task, idempotent); dropping the handle also cancels cooperatively.
+- `WatcherHandle` — `subscribe()`, `target_count()`, `is_shutdown()`, `dropped_notifications() -> u64`, `dropped_dispatches() -> u64`, `shutdown() -> Result<()>` (cancel token, drain pending events, await the intake task and then the dispatcher, idempotent); dropping the handle also cancels cooperatively.
+- `shutdown()` consumes the stored `JoinHandle`s, so a panicked task surfaces as `Error::sys_op("workspace watcher task failed: …")` (the `JoinError` message names the panic) and a second call returns `Ok(())`.
 
 ### `mod.rs` — builder
 
-- `WatcherConfig { debounce: Duration, event_capacity: usize }` — `Default` = 250 ms / 256.
-- `WorkspaceWatcher::new()`, `with_config`, `debounce(Duration)`, `event_capacity(usize)`, `watch_target(WatchTarget)`, `watch_dir(kind, path)`, `watch_file(kind, path)`, `watch_plan(WatchPlan)`, `for_workspace(workspace, home, env)`, `on_reload<H: ReloadHandler + 'static>(H)`, `targets()`, `start() -> Result<WatcherHandle>`.
-- `start` validates the plan (an empty plan is `Error::config`), builds the OS watcher, and spawns one task that owns it.
+- `WatcherConfig { debounce: Duration, event_capacity: usize, intake_capacity: usize, dispatch_capacity: usize }` — `Default` = 250 ms / 256 / 1024 / 256 (`DEFAULT_DEBOUNCE`, `DEFAULT_EVENT_CAPACITY`, `DEFAULT_INTAKE_CAPACITY`, `DEFAULT_DISPATCH_CAPACITY`); a zero capacity is raised to 1 before the channel is built.
+- `WorkspaceWatcher::new()`, `with_config`, `debounce(Duration)`, `event_capacity(usize)`, `intake_capacity(usize)`, `dispatch_capacity(usize)`, `watch_target(WatchTarget)`, `watch_dir(kind, path)`, `watch_file(kind, path)`, `watch_plan(WatchPlan)`, `for_workspace(workspace, home, env)`, `on_reload<H: ReloadHandler + 'static>(H)`, `targets()`, `start() -> Result<WatcherHandle>`.
+- `start` validates the plan (an empty plan is `Error::config`), builds the OS watcher, and spawns two tasks: the intake task (owns the backend, debounces, publishes) and the reload dispatcher (drains its bounded queue and runs the handlers).
 
 ## Constraints
 
-- No panics, no `unwrap`/`expect`, no blocking calls on the async task; the `notify` callback only forwards into a tokio `mpsc` channel.
+- No panics, no `unwrap`/`expect`, no blocking calls on an async task; the `notify` callback only does a `try_send` into the bounded intake queue, so it neither blocks the backend thread nor unwinds inside `notify`.
+- Both queues are bounded (`intake_capacity`, `dispatch_capacity`) and both report their loss: exact counters on the handle, one `warn` plus one `WatchUpdate::Dropped` per notice interval, and a `debug` line per dropped item. Silent drops are not acceptable.
+- Reload handlers never run on the intake task: publication and debouncing stay independent of handler latency, and handlers of one event still run sequentially so two bodies never race for the same file.
+- A panicking reload handler kills only the dispatcher task; its events keep being published, the dispatch queue reports `WatchUpdate::Dropped(Dispatch)`, and `shutdown()` reports the panic as `Error::sys_op`.
 - Errors: `openjiuwen_common::error::{Error, Result}`; OS-watcher mapping is `PathNotFound → Error::not_found`, `Io(PermissionDenied) → Error::sys_op`, `MaxFilesWatch → Error::sys_op`, `InvalidConfig`/`Generic`/backend construction → `Error::config`; every message names the path and the target label.
 - Feature-off: the whole module compiles and every type above exists; `WorkspaceWatcher::start` returns `Error::unsupported` naming the `notify` feature. Nothing else is gated, so callers (and tests) can build plans and units without the feature.
 - Runtime OS errors are logged at `warn` and published as `WatchUpdate::WatcherFailed`, with consecutive identical messages collapsed so a removed subtree cannot produce an error storm; a missing path observed at runtime is downgraded to `debug`.
@@ -102,14 +119,18 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `./targets.rs` → `WatchTarget`, `WatchPlan` workspace discovery, classification of raw changes
 - `./hub.rs` → `ReloadHandler` trait, `ReloadHub` dispatch, `FnReloadHandler`
 - `./handlers.rs` → skills/instruction/MCP reload bodies and their named handlers
-- `./handle.rs` → `Subscription`, `WatcherHandle`, broadcast plumbing
-- `./backend.rs` → `notify`-gated OS adapter: plan validation, watch-path registration and deduplication, the debounce/publish/dispatch task, the notify-error mapping table and the runtime-failure quieting policy
+- `./intake.rs` → `DropCounters`, `DropReporter` (notice throttling) and the notify-gated `push_raw` drop-and-count policy of both bounded queues
+- `./handle.rs` → `Subscription`, `WatcherHandle`, drop counters, broadcast plumbing and task shutdown
+- `./backend.rs` → `notify`-gated OS adapter: plan validation, watch-path registration and deduplication, the intake task (debounce/publish/queue), the reload dispatcher task, the notify-error mapping table and the runtime-failure quieting policy
 - `./mod.rs` → `WatcherConfig`, `WorkspaceWatcher` builder, `start`, flat re-exports, module docs
 - `./tests.rs` → `notify`-gated end-to-end watcher tests (the feature-off `Unsupported` assertion lives in `backend.rs`)
 
 ## Test Strategy
 
-- `debounce.rs`, `event.rs` and `targets.rs` unit tests are pure and deterministic: merge table, per-path coalescing, deadline extension, ordered sequence numbers, pending-cap drops, target filtering precedence, rename mapping, plan discovery and validation errors.
-- `tests.rs` drives a real OS watcher on a `tempfile` directory with bounded waits (`tokio::time::timeout`, ≤10 s): create/modify/delete delivery, bursty writes collapsing to one event per window, instruction-file / MCP-config / skills reload handlers observing the new state, a removed directory not error-storming, and clean idempotent shutdown.
+- `debounce.rs`, `event.rs` and `targets.rs` unit tests are pure and deterministic: merge table, per-path coalescing, deadline extension, ordered sequence numbers, pending-cap drops, target filtering precedence, rename mapping, plan discovery and validation errors, plus the `dropped` wire form of `DropStage`/`DroppedUpdates`.
+- `intake.rs` unit tests are deterministic and timer-free: shared counters across clones, first-drop announcement, throttle/coalescing inside one interval, the shutdown flush, an unsubscribed watcher still counting, and `push_raw` dropping the newest into a one-slot queue (a closed queue is not counted).
+- `handle.rs` unit tests cover ordering, lag accounting, fused streams, cooperative cancellation, idempotent shutdown, a failed intake task, a failed dispatcher task and the shared drop counters.
+- `tests.rs` drives a real OS watcher on a `tempfile` directory with bounded waits (`tokio::time::timeout`, ≤10 s): create/modify/delete delivery, bursty writes collapsing to one event per window, instruction-file / MCP-config / skills reload handlers observing the new state, a removed directory not error-storming, clean idempotent shutdown (subscription stays open while the handle lives, ends with `None` after it is dropped), a panicking handler surfacing as a typed `SysOp` shutdown error, a blocked handler not delaying publication for another target, and a one-slot intake / dispatch queue reporting its drops through the counter and the `WatchUpdate::Dropped` notice.
+- Slow-handler tests block the handler on a `CancellationToken` instead of sleeping, so "the handler is still running" is a fact rather than a timing guess.
 - Never assert exact timings or sleep durations; gate on a bounded total deadline and poll/await the condition instead.
 - Definition of done: `cargo fmt`, `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps`.
