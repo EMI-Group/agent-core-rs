@@ -4,7 +4,8 @@
 
 In-process OTel-style span and hook seam for the team runtime — the Rust port of Python `openjiuwen.agent_teams.observability` (v0.1.20).
 Python owns an OpenTelemetry `TracerProvider`, a process-global session-keyed root registry, an async monitor handler and a paired agent-tier rail; this port keeps the observable contract and drops the SDK.
-One team run owns one `TeamSpan` trace, rooted at `team.{team_name}`; the runtime derives `member.{name}`, `round.{member}.{round}` and `task.{id}` children and emits typed events to registered hooks.
+One team run owns one `TeamSpan` trace, rooted at `team.{team_name}`; the runtime derives `member.{name}`, `round.{member}.{round}`, `task.{id}` and `memory.{operation}` children and emits typed events to registered hooks.
+The `memory.*` branch comes from `MemorySpanObserver`, the bridge onto the team-memory observer seam (`openjiuwen_memory::team::TeamMemoryObserver`), so team memory is visible inside the same trace as the members and tasks.
 Everything is synchronous, infallible and free of global state: no network, no `Result`, no `println!`.
 
 ## API Surface
@@ -34,6 +35,14 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - `OtelSpanSink` — bounded `VecDeque<SpanRecord>` behind a mutex: `new(capacity)`, `record`, `records`, `len`, `is_empty`, `clear`, `evicted`; positive capacity is a ring, capacity `0` retains nothing and counts every record as evicted, `clear` leaves the cumulative counter intact.
 - `OtelHooks` — `new(Arc<OtelSpanSink>)`, `sink`; every callback emits one structured `tracing::info!` (trace/span identity plus team, member, task/status/round/metrics fields, `outcome` as the Python wire string) and appends one `SpanRecord` named `member.spawned`, `member.stopped`, `round.started`, `round.finished`, `task.transition`, `delegation` or `turn.metrics`.
 
+### `memory.rs`
+- `MemorySpanObserver` — the team-memory bridge: `Debug + Clone`, `Send + Sync`, implements `openjiuwen_memory::team::TeamMemoryObserver` (`fn observe(&self, &TeamMemoryEvent)`).
+- `MemorySpanObserver::new(team_name)` builds the root with `TeamSpan::root_for(team_name)`, so each observer mints its own trace; `root()` and `trace_id()` expose it, and `memory_observer(team_name)` is the free-function shortcut.
+- `observe` derives one child span named `memory.{operation}` per event via `TeamSpan::child` (same trace, root as parent, root attributes inherited at creation) and stamps the event identity on top; the child span is built by the private `span_for`.
+- `#[cfg(feature = "otel")] MemorySpanObserver::with_sink(Arc<OtelSpanSink>)` makes every observed event also append one `SpanRecord` named `memory.{operation}` to the sink; the baseline build has no sink and no `with_sink`, so it records the `tracing` event only.
+- Every event emits one structured `tracing` event at target `openjiuwen_agent_teams::memory`: `debug!` on `TeamMemoryOutcome::Ok`, `warn!` on `Failed`, both carrying trace/span id plus `team`, `operation`, `outcome`, `count`, `member_id`, `kind` and (on failure) `error` — the same fields the span carries.
+- Attribute constants (`"team_id"`, `"operation"`, `"outcome"`, `"count"`, `"member_id"`, `"kind"`, `"error"`): `AT_MEMORY_TEAM_ID`, `AT_MEMORY_OPERATION`, `AT_MEMORY_OUTCOME`, `AT_MEMORY_COUNT`, `AT_MEMORY_MEMBER_ID`, `AT_MEMORY_KIND`, `AT_MEMORY_ERROR`.
+- `observe` is infallible and non-blocking: no `.await`, and the only lock is the short one inside the sink.
 ### `mod.rs`
 
 - Re-exports every public item above; `#[cfg(feature = "otel")]` additionally exports the sink and hooks.
@@ -50,6 +59,13 @@ Everything is synchronous, infallible and free of global state: no network, no `
 | `member.name` | `member_span`, `round_span` | member name |
 | `member.role` | `member_span` | `TeamRole::as_str()` |
 | `task.id` | `task_span` | task id |
+| `team_id` | `MemorySpanObserver::span_for` | the memory event's `team_id` (its own scope id, distinct from `team.id`) |
+| `operation` | `span_for` | `TeamMemoryOperation::as_str()` (`search`, `write`, `forget`, `clear`, `prune`, `extract`) |
+| `outcome` | `span_for` | `TeamMemoryOutcome::as_str()` (`ok`, `failed`) |
+| `count` | `span_for` | records touched, as a JSON number |
+| `member_id` | `span_for` | the event's `member_id`, only when `Some` and non-empty |
+| `kind` | `span_for` | `TeamMemoryKind::as_str()`, only when `Some` and non-empty |
+| `error` | `span_for` | the failed event's error text, only when `Some` and non-empty |
 
 - A child inherits the parent's attributes at creation; its own `with_attribute` calls win on the child only and never mutate the parent.
 - There is no lazy parent-chain walk: a span handed to a hook is self-contained, `Send + Sync` through `Arc`/clone, and cheap.
@@ -68,6 +84,7 @@ Everything is synchronous, infallible and free of global state: no network, no `
 | `task_span(task_id)` + `on_task_transition` | after a successful `TeamStore::transition_task`/`update_task`, with the previous and new status |
 | `on_delegation` | after dispatch has written the task assignment |
 | `on_turn_metrics` | when the member runtime reports the end of one turn |
+| `TeamMemory::in_memory().with_observer(Arc::new(memory_observer(team_name)))` (plus `.with_sink(sink)` under `otel`) | once per team run, when the team-memory facade is built — the memory wiring in `../memory/wiring.rs` is the natural build site |
 
 - Callbacks are observational only: the trait is infallible, so a hook cannot fail a run; keep hook bodies short because fan-out is synchronous.
 - A runtime that cannot flow a facade into a teammate task should share the same `Arc<TeamObservability>` — there is no ambient or process-global lookup.
@@ -78,7 +95,7 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - The module is infallible — it deliberately does not use `openjiuwen_common::error`; do not introduce `Result` for API shape.
 - No `unsafe`, no `println!`/`eprintln!`; diagnostics go through `tracing`.
 - No undocumented global mutable state: the root span lives on the facade, never in a process-wide registry.
-- `--no-default-features` compiles only the span/hook seam; `otel` adds `otel.rs` and nothing else changes in the baseline.
+- `--no-default-features` compiles the span/hook seam plus the memory bridge; `otel` adds `otel.rs` and `MemorySpanObserver::with_sink`, and nothing else changes in the baseline.
 - Files stay under the workspace ~1000-line baseline; every public item carries a `///` doc and pure getters are `#[must_use]`.
 
 ## Design Decisions
@@ -91,15 +108,19 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - **Root attributes.** `root_for` also stamps `team.id = team_name`, mirroring Python's `get_or_create_team_span`, even though `team.name` alone is enough to identify the team.
 - **Round outcome wire strings.** `RoundOutcome` has no `as_str` in `crate::schema` (read-only), so `otel.rs` carries a private `round_outcome_str` helper and a test pins it to the serde wire values.
 - **Owned span data.** Hooks receive `&TeamSpan`, never a live span handle; recording hooks clone it. This is what makes the seam testable offline and independent of any tracer implementation.
+- **Memory as spans, not a second log stream.** `MemorySpanObserver` bridges the engine's event seam (`openjiuwen_memory::team::TeamMemoryObserver`) instead of the engine learning about spans, so `openjiuwen-memory` stays observability-free and this crate owns the mapping; one observer per team run keeps the memory spans inside the team's trace.
+- **The memory bridge needs no new dependency.** `openjiuwen-memory` is already a dependency of this crate, so the bridge implements the engine's trait directly; the sink half reuses `otel.rs`, and real OTLP export stays out for the same-layer reason as above.
 
 ## Test Strategy
 
-34 inline `#[cfg(test)]` tests, all deterministic and offline; no `#[ignore]`, no sleeps, no wall-clock assertions (33 run under `--features otel` because one `mod.rs` test is `cfg(not(feature = "otel"))`).
+44 inline `#[cfg(test)]` tests, all deterministic and offline; no `#[ignore]`, no sleeps, no wall-clock assertions (32 run in the default build, 43 under `--features otel`, because one `mod.rs` test is `cfg(not(feature = "otel"))` and three `memory.rs` tests are `cfg(feature = "otel")`).
 
 - `span.rs` (10): `root_generates_32_and_16_lowercase_hex_ids`, `root_for_sets_python_parity_attributes`, `root_name_is_the_team_name_attribute`, `child_keeps_trace_and_gets_fresh_span_id`, `child_inherits_attributes_at_creation_time`, `child_override_does_not_touch_parent_attributes`, `with_attribute_replaces_and_absent_key_is_none`, `span_and_context_round_trip_through_json`, `span_tolerates_unknown_and_missing_fields`, `context_child_keeps_trace_and_regenerates_span`.
 - `hooks.rs` (13): `recording_hooks_preserve_call_order_and_counts`, `observable_event_kinds_are_payload_level`, `two_recording_hooks_see_the_same_sequence`, `noop_hooks_are_silent`, `facade_without_hooks_never_panics`, `start_team_stores_root_and_records_session_id`, `finish_team_clears_the_root`, `member_span_is_a_child_of_a_live_root`, `member_span_without_root_is_standalone_with_team_name`, `round_and_task_spans_carry_names_and_attributes`, `add_hook_appends_in_registration_order`, `payloads_round_trip_through_json`, `observable_event_round_trips_with_internal_tag`.
 - `mod.rs` (2): `otlp_export_is_never_available` (both configs), `facade_records_events_without_the_otel_feature` (`cfg(not(feature = "otel"))`).
 - `otel.rs` (9): `sink_retains_oldest_first_up_to_capacity`, `capacity_zero_retains_nothing_and_counts_every_record`, `record_copies_identity_attributes_and_start_time`, `clear_drops_records_but_keeps_the_evicted_counter`, `span_record_round_trips_and_tolerates_unknown_fields`, `span_record_omits_absent_parent_and_keeps_a_present_one`, `round_outcome_str_matches_the_python_wire_values`, `hooks_record_one_span_per_callback`, `hooks_wired_through_the_facade_record_spans`.
+- `memory.rs` (10): `an_ok_event_builds_one_child_span_with_the_documented_attributes`, `span_names_follow_memory_dot_operation`, `a_failed_event_carries_the_failed_outcome_and_the_error`, `optional_identity_attributes_are_present_only_when_set_and_non_empty`, `observing_two_teams_keeps_two_distinct_traces`, `the_observer_is_send_and_sync_and_usable_as_a_trait_object`, `real_facade_events_reach_the_bridge` (drives `TeamMemory::in_memory().with_observer(...)` with a counting delegate), plus the `otel`-only `the_sink_holds_one_record_per_event_with_the_shared_trace`, `a_capacity_zero_sink_stores_nothing` and `the_sink_records_the_failed_outcome_and_the_error`.
+- Without the `otel` feature the bridge's spans are asserted through the private `span_for` builder (there is no sink to inspect) and the facade test proves real events reach `observe`.
 - Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams --offline --lib` (with and without `--no-default-features` and `--features otel`), and `cargo clippy -p openjiuwen-agent-teams --all-targets --offline [--features otel] -- -D warnings`.
 
 ## Routing Table
@@ -107,6 +128,7 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - `./span.rs` → span identity, attribute constants, creation-time attribute inheritance.
 - `./hooks.rs` → event payloads, `ObservabilityHooks`, `NoopHooks`/`RecordingHooks`, `TeamObservability` facade and fan-out.
 - `./otel.rs` → feature-gated structured `tracing` events and the bounded in-memory `SpanRecord` sink.
+- `./memory.rs` → `MemorySpanObserver` (team-memory events → `memory.{operation}` spans), the `AT_MEMORY_*` attribute keys and `memory_observer`.
 - `./mod.rs` → module doc, re-exports and `OTLP_EXPORT_AVAILABLE`.
 
 ## Deferred
@@ -117,6 +139,8 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - Python `setup.py`'s process-global tracer demand bookkeeping (`init/acquire/release/shutdown`), the session-keyed root registry, `attach_to_team_agent` and the ambient `set_ambient_team_span` fallback — replaced by a facade-local root.
 - Span status/end-time/forced-close APIs, span events, sampling and redaction of `openjiuwen.span.output` — no live span object exists here.
 - `rail.py`'s reliability hooks (retry/health remediation) — a separate concern from observation and not ported.
+- Real OTLP export of team-memory spans, the `opentelemetry` SDK and exporter configuration — the same-layer `openjiuwen-extensions` rule again: `MemorySpanObserver` emits `tracing` events plus (under `otel`) `SpanRecord`s, and an extensions-layer adapter forwards them.
+- Team-memory operation *metrics*, aggregation and sampling — the bridge reports one span and one log line per event; counting belongs to whatever consumes them.
 
 ## Notes for Agents
 
@@ -124,3 +148,6 @@ Everything is synchronous, infallible and free of global state: no network, no `
 - To add a new observation: add the payload struct, a default trait method, the facade fan-out method, the `RecordingHooks` kind string, the `OtelHooks` `tracing::info!` + `sink.record` call, and one test per layer.
 - Renaming an `AT_*` constant or span-name format is a breaking change for consumers that pin exact strings.
 - `RecordedEvent` intentionally does not implement `Deserialize` (its `kind` is `&'static str`); record through `RecordingHooks` instead.
+- Attach the memory bridge where the team's `TeamMemory` is built: `TeamMemory::in_memory().with_observer(Arc::new(memory_observer(team_name)))`, plus `.with_sink(sink)` on the observer under `otel`; `TeamMemory::with_observer` consumes the facade, so it must run before the facade is shared.
+- Keep the bridge's `tracing` target `openjiuwen_agent_teams::memory` aligned with `../memory/wiring.rs` — both report the team's memory under one target.
+- `MemorySpanObserver` never joins the `ObservabilityHooks` fan-out: it implements the engine's `TeamMemoryObserver`, and the two seams stay separate because the memory facade calls back synchronously on its own error path.
