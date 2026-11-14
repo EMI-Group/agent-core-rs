@@ -55,7 +55,7 @@
 //!
 //! # Errors
 //!
-//! Every rejected request is [`Error::Validation`](crate::error::Error::Validation) naming
+//! Every rejected request is [`Error::Validation`] naming
 //! the offending field (`request_id`, `source_revision`, `changed_skill_ids`, or
 //! `mutation_journal_path`). Validation never degrades into a silent no-op.
 
@@ -647,6 +647,7 @@ impl MutationJournal {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

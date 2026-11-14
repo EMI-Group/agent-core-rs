@@ -48,10 +48,10 @@
 //! - **Idempotency.** Every request carries a caller `request_id` and a
 //!   [digest](crate::orchestration::mutation::request_digest) covering its operation, id,
 //!   optional source revision, and sorted id batch. A repeated `request_id` answers the
-//!   recorded result with [`MutationStatus::Replayed`] instead of applying the batch twice,
+//!   recorded result with [`MutationStatus::Replayed`](crate::runtime::MutationStatus::Replayed) instead of applying the batch twice,
 //!   and reusing it for a *different* batch is [`Error::Validation`] naming `request_id`.
-//! - **Durability.** With a journal configured — [`SymphonyRuntimeBuilder::with_mutation_journal`]
-//!   or [`SymphonyConfig::mutation_journal_path`] — every recorded result is written
+//! - **Durability.** With a journal configured — [`SymphonyRuntimeBuilder::with_mutation_journal`](crate::runtime::SymphonyRuntimeBuilder::with_mutation_journal)
+//!   or [`SymphonyConfig::mutation_journal_path`](crate::runtime::SymphonyConfig::mutation_journal_path) — every recorded result is written
 //!   through atomically, so a rebuilt runtime replays it instead of re-applying it. The
 //!   default is an in-memory ledger only.
 //! - **Compare-and-swap.** A request that declares
@@ -273,7 +273,7 @@ impl SymphonyRuntimeBuilder {
     /// # Errors
     ///
     /// Returns the asset store's hydration error, the artifact backend's open/status
-    /// error, the journal's open error, or [`Error::Config`] when
+    /// error, the journal's open error, or [`Error::Config`](crate::error::Error::Config) when
     /// [`SymphonyConfig::graph_artifact_root`] is unusable.
     pub async fn open(self) -> Result<SymphonyRuntime> {
         let artifacts: Arc<dyn GraphArtifactStore> = match self.artifacts {
@@ -475,7 +475,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for a rejected derived edge, or the artifact
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for a rejected derived edge, or the artifact
     /// backend's publish error.
     pub async fn build(&self) -> Result<GraphRevision> {
         let _ledger = self.ledger.lock().await;
@@ -515,7 +515,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for an illegal version, or the backend's error.
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for an illegal version, or the backend's error.
     pub async fn read_graph(&self, version: Option<&str>) -> Result<Option<CapabilityGraph>> {
         self.artifacts.read(version).await
     }
@@ -525,7 +525,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for a blank query, the [`Self::build`] errors, or the
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for a blank query, the [`Self::build`] errors, or the
     /// configured planner's scorer error.
     pub async fn plan(&self, request: &PlanRequest) -> Result<OrchestrationPlan> {
         if !self.artifacts.status().await?.is_ready() {
@@ -547,9 +547,9 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state` unless running, the
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming `runtime.state` unless running, the
     /// [`Self::plan`] errors, and the [`PlanExecutor::execute_with_inputs`] errors —
-    /// notably [`Error::Unsupported`] without a runner.
+    /// notably [`Error::Unsupported`](crate::error::Error::Unsupported) without a runner.
     pub async fn invoke(&self, request: InvokeRequest) -> Result<InvokeResponse> {
         self.require_running()?;
         let plan_request = PlanRequest {
@@ -587,7 +587,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] for an invalid `metadata_filter` predicate.
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) for an invalid `metadata_filter` predicate.
     pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
         self.registry.search(request).await
     }
@@ -603,7 +603,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] without a [`SemanticIndex`], or the embedding
+    /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) without a [`SemanticIndex`], or the embedding
     /// model's and vector store's errors.
     pub async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
         let Some(index) = &self.semantic else {
@@ -636,7 +636,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] without a [`SemanticIndex`], or the embedding
+    /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) without a [`SemanticIndex`], or the embedding
     /// model's and vector store's errors.
     pub async fn reindex_semantics(&self) -> Result<usize> {
         let Some(index) = &self.semantic else {
@@ -662,7 +662,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`,
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming `runtime.state`, `request_id`,
     /// `changed_skill_ids`, or a descriptor, plus the store's and artifact backend's errors.
     pub async fn add_capabilities(
         &self,
@@ -686,8 +686,8 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state`/`request_id`/`changed_skill_ids`
-    /// or a descriptor, [`Error::NotFound`] naming the first unregistered id, and backend
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming `runtime.state`/`request_id`/`changed_skill_ids`
+    /// or a descriptor, [`Error::NotFound`](crate::error::Error::NotFound) naming the first unregistered id, and backend
     /// errors.
     pub async fn update_capabilities(
         &self,
@@ -711,7 +711,7 @@ impl SymphonyRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] naming `runtime.state`, `request_id`, or
+    /// Returns [`Error::Validation`](crate::error::Error::Validation) naming `runtime.state`, `request_id`, or
     /// `changed_skill_ids` (an empty batch cannot be prepared), and backend errors.
     pub async fn remove_capabilities(
         &self,

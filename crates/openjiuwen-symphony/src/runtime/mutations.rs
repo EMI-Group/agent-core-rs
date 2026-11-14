@@ -1,12 +1,10 @@
 //! The graph-mutation path: request digests, the durable idempotency journal,
 //! compare-and-swap on the source revision, and the recorded results.
 //!
-//! [`SymphonyRuntime::mutate`](crate::runtime::SymphonyRuntime::mutate) is the one entry
-//! point every capability mutation funnels through; the three positional methods
-//! ([`add_capabilities`](crate::runtime::SymphonyRuntime::add_capabilities),
-//! [`update_capabilities`](crate::runtime::SymphonyRuntime::update_capabilities),
-//! [`remove_capabilities`](crate::runtime::SymphonyRuntime::remove_capabilities)) are thin
-//! delegations that build a [`MutationRequest`] with no `source_revision`.
+//! `SymphonyRuntime::mutate` is the one entry point every capability mutation funnels
+//! through; the three positional methods (`add_capabilities`, `update_capabilities`,
+//! `remove_capabilities`) are thin delegations that build a [`MutationRequest`] with no
+//! `source_revision`.
 //!
 //! # Ordering
 //!
@@ -15,7 +13,10 @@
 //! 1. **journal replay** — a known `request_id` answers from the recorded result (with
 //!    [`MutationStatus::Replayed`]) instead of re-applying the batch, and a reuse of that
 //!    id with a different [digest](crate::orchestration::mutation::request_digest) is
-//!    [`Error::Validation`] naming `request_id`;
+//!    [`Error::Validation`] naming `request_id`. The digest covers the declared id batch,
+//!    not the descriptor payloads (exactly Python's field set), so re-sending the same ids
+//!    with different content is a replay: content identity is the provider's business, not
+//!    the idempotency key's;
 //! 2. **source-revision compare-and-swap** — a declared `source_revision` must equal the
 //!    current artifact revision, otherwise the batch is stale and rejected naming
 //!    `source_revision`;
@@ -202,7 +203,13 @@ impl SymphonyRuntime {
     ///
     /// `descriptors` is ignored for [`MutationOperation::Delete`], whose batch is the
     /// parsed qualified ids of the request; an id that is not `type:id` is
-    /// [`Error::Validation`].
+    /// [`Error::Validation`]. For `add` and `update` the payload's qualified ids must be
+    /// exactly [`MutationRequest::changed_skill_ids`].
+    ///
+    /// The replay identity is the [digest](crate::orchestration::mutation::request_digest),
+    /// which covers the operation, request id, source revision, and declared ids — not the
+    /// descriptor content — so the same batch under the same `request_id` always answers
+    /// the recorded result.
     ///
     /// # Errors
     ///
