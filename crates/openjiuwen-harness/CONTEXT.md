@@ -12,6 +12,7 @@ Fidelity target: public Python entry points, persisted JSON (session state, todo
 Entry points (`openjiuwen_harness::agent`):
 - `DeepAgent` — `new(AgentCard)`, `configure(DeepAgentConfig)`, `invoke`/`stream` (impl `openjiuwen_agent::Agent`), `follow_up`, `steer`, `abort`, `start`/`stop`/`send_input`, `load_state`/`save_state`, `switch_mode`, `add_rail`/`register_rail`.
 - `DeepAgentConfig`, `DeepAgentBuilder`, `create_deep_agent(...)` (async factory), `AgentMode`, `DeepAgentState`, `resolve_deep_agent_parts`, `apply_deep_agent_parts`.
+- Rail-event drain: `drain_rail_events`, `RailEventBus`, `RailEventDrain`, `RAIL_EVENTS_EXTRA_PREFIX`, `DEFAULT_RAIL_EVENT_CAPACITY`; `DeepAgent::drain_rail_events()` collects retained events, and the invocation stream carries rail-queued frames as interaction chunks.
 
 Task loop (`openjiuwen_harness::task_loop`): `TaskLoopController`, `TaskLoopEventHandler`, `LoopCoordinator`, `LoopQueues`, `DeepLoopEvent`.
 Schema (`openjiuwen_harness::schema`): config/state/task/stop-condition/interaction/loop-event types.
@@ -20,23 +21,28 @@ Permissions (`openjiuwen_harness::permission`): `PermissionEngine`, `PermissionL
 
 Tools (`openjiuwen_harness::tools`): `ToolRegistry`, `BuiltinTool`, `tool_names()`, `extended_tool_names()`.
 - `BuiltinTool::DEFAULT` (twenty core names, the registry default) — `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `list_files`, `grep`, `todo_create`/`todo_list`/`todo_get`/`todo_modify`, `ask_user`, `memory_search`/`memory_get`/`write_memory`/`read_memory`/`edit_memory`, `coding_memory_read`/`coding_memory_write`/`coding_memory_edit`.
-- `BuiltinTool::EXTENDED` (twelve opt-in names; `ALL` is core plus extended) — `fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, `list_mcp_resources`, `read_mcp_resource`, `get_current_goal`, `submit_goal_report`, `tool_search`, `lsp`, `worktree`.
-- Registry seams: `HttpFetcher`/`ReqwestFetcher`, `SearchBackend`/`FakeSearchBackend`, `McpResourceProvider`/`FakeMcpResourceProvider`, `ToolIndex`, `CronScheduler`, `GoalStore`, plus `with_lsp_config`, `with_worktree_manager`, `with_worktree_root`, `with_deferred_tools`/`discover`/`reveal`/`deferred_cards` (progressive discovery).
+- `BuiltinTool::EXTENDED` (fifteen opt-in names; `ALL` is the thirty-five-tool union) — `fetch_webpage`, `web_search`, `image_metadata`, `audio_metadata`, `cron`, `list_mcp_resources`, `read_mcp_resource`, `get_current_goal`, `submit_goal_report`, `tool_search`, `lsp`, `worktree`, `mcp_resource_subscription`, `enter_worktree`, `exit_worktree`.
+- Registry seams: `HttpFetcher`/`ReqwestFetcher`, `SearchBackend`/`FakeSearchBackend` (`HttpSearchBackend` with `OPENJIUWEN_WEB_SEARCH_ENDPOINT`), `McpResourceProvider`/`FakeMcpResourceProvider` and `McpClientResourceProvider` (live foundation client), `McpResourceSubscriptionProvider`/`McpResourceSubscriptions`, `ToolIndex`, `CronScheduler`, `GoalStore`, `WorktreeSessionStore`, plus `with_lsp_config`, `with_worktree_manager`, `with_worktree_root`, `with_worktree_session_store`, `with_mcp_subscriptions`, `with_deferred_tools`/`discover`/`reveal`/`deferred_cards` (progressive discovery).
+- Cron: `CronSchedule` accepts 5-field classic and 6/7-field Quartz (`?`, `L`, `nL`, `d#n`, month/day names, wrap-around ranges) with `CronTool` actions `create`/`list`/`cancel`/`get_job`/`update`/`toggle`/`preview`/`run`/`runs`/`status`, `CronUpdate`, `CronStatus`, `CronRun`/`CronRunTrigger` and a bounded run history.
 - `task_tool` and the seven `subagent_*` tools are mounted by `subagents` through `subagent_tools_with_transcript`.
 
 Rails (`openjiuwen_harness::rails`): `HarnessRail`, `HarnessRailContext`, `HarnessRailRegistry`, `SecurityRail`, `MemoryRail`, `SkillsRail`, `SubagentRail`, `EvolutionRail`.
+Additional rails: `HeartbeatRail`, `KvCacheLifecycleRail` (+ `KvCacheSubagentLifecycle`, `KvCacheProviderRegistry`), `PersonalContextRail` (+ `PersonalContextStore`, `SourceMetadataStore`, `SourceLinkBook`, `LocalFilesProvider`, `SourceProviderRegistry`).
 Evolution bodies: `EvolutionMetrics`, `EvolutionSnapshot`, `EvolutionProposal`, `IterationRecorder`, `MetricsClock`, `MetricsEvolutionRail`, `MetricsEvolutionRailConfig`, `ProposalLog`, `evolution_adapter`/`EvolutionRailAdapter`, `NoopEvolutionRail`, `EVOLUTION_SNAPSHOT_VERSION`.
 Goal rail: `tools::goal::GoalRail` + `GoalRailConfig` + `GOAL_EVENT_EXTRA_KEY` (a `HarnessRail`; reachable only under `tools` because `rails` must not depend on `tools`).
 
 Prompts (`openjiuwen_harness::prompts`): `HarnessPromptBuilder`, `PromptSection`, `SectionName`, `PromptMode`, `PromptReport`.
-Subagents (`openjiuwen_harness::subagents`): `SubAgentConfig`, `SubAgentRegistry`, `SubAgentPreset`, `SubAgentRuntime`, `TaskTool`; runtime surface `SubAgentQuota`, `SpawnBudget`, `SubagentMetadata`, `SubagentActivity`, `select_lru_candidate`, `TranscriptBuffer`/`TranscriptEntry`/`TranscriptKind`/`TranscriptSummary`/`TranscriptSubscription`, `PersistedSubAgentBuckets`/`PersistedSubAgentRecord`, `save_bucket_file`/`load_bucket_file`, `subagent_tools_with_transcript`/`SubagentTranscriptTool`, `Clock`/`SystemClock`/`ManualClock`, `LoadReport`, `ResumeReport`.
+Subagents (`openjiuwen_harness::subagents`): `SubAgentConfig`, `SubAgentRegistry`, `SubAgentPreset`, `SubAgentRuntime`, `TaskTool`; runtime surface `SubAgentQuota`, `SpawnBudget`, `SubagentMetadata`, `SubagentActivity`, `select_lru_candidate`, `TranscriptBuffer`/`TranscriptEntry`/`TranscriptKind`/`TranscriptSummary`/`TranscriptSubscription`, activity streams (`ActivityStream`, `ActivitySubscription`, `SubagentActivityFrame`, `ActivityThrottle`), the eviction scheduler (`EvictionSchedulerConfig`, `EvictionSchedulerHandle`, `SweepReport`) and lifecycle hooks (`SubagentLifecycleHook`, `LifecycleHooks`, `CallbackLifecycleHook`), `PersistedSubAgentBuckets`/`PersistedSubAgentRecord`, `save_bucket_file`/`load_bucket_file`, `subagent_tools_with_transcript`/`SubagentTranscriptTool`, `Clock`/`SystemClock`/`ManualClock`, `LoadReport`, `ResumeReport`.
+MoA (`openjiuwen_harness::moa`): `MoaConfig`/`MoaMode`, `consult`/`consult_problem`, `ProposalStore`/`ProposalBatch`, `rank_proposals`/`rank_with_config` (`StructuralVerifier`, `LlmVerifier`, `ProgressVerifier`), `Aggregator`/`AggregationStrategy`, `MoaRail`, `ConsultationHistory`, `ConsultationSkillMount`.
+Persistent agent (`openjiuwen_harness::persistent_agent`): `ExecutionLog`/`ExecutionEntry`/`LogDigest`/`Replay`, `PersistentSessionRecord`/`SessionStateStore`/`FileSessionStore`, `WindowAssembler`/`WindowManager`/`Capacity`/`WindowPolicy`, `Continuation`/`resume`/`ResumePlan`, `hand_off`/`LocalHandoff`/`HandoffTransport`, `Control`, `Emitter`/`EventSink`, `ShareFile`, `ExecutionRecordRail`/`ModelCallRail`.
+Watcher (`openjiuwen_harness::watcher`, feature `notify`): `WorkspaceWatcher`/`WatcherConfig`/`WatcherHandle`, `WatchEvent`/`WatchUpdate`/`WatchTargetKind`/`ChangeKind`, `ReloadHub`/`ReloadHandler`, `SkillLibraryReloader`/`InstructionReloader`/`McpConfigReloader`; without the feature the API still compiles and `start()` returns `Error::Unsupported`.
 Skills (`openjiuwen_harness::skills`): `Skill`, `SkillLibrary`, `SkillRootMount`, `SkillResourceValidator`.
 Manifest (`openjiuwen_harness::manifest`): `ElementKind`, `HarnessElementDescriptor`, `Catalog`.
 Protocol (`openjiuwen_harness::protocol`): `NativeHarness` (impl `HarnessProtocol` + `HarnessModelControl`), `NativeHarnessProvider` (impl `HarnessProvider` + `ModelConfigProvider`).
 Observability (`openjiuwen_harness::observability`): span/event name helpers and the `TelemetrySink` seam.
-LSP (`openjiuwen_harness::lsp`): `LspClient`, `LspTool`, `LspToolConfig`, `LspServerConfig`, `LspTransport`/`StdioTransport`/`ChannelTransport`, normalised wire types (`Position`, `Range`, `Location`, `Hover`, `CompletionItem`, `DocumentSymbol`).
+LSP (`openjiuwen_harness::lsp`): `LspClient` (implementation, call hierarchy, document diagnostic, notification handlers), `LspTool`, `LspToolConfig`, `LspServerConfig`, `LspTransport`/`StdioTransport`/`ChannelTransport`, normalised wire types (`Position`, `Range`, `Location`, `Hover`, `CompletionItem`, `DocumentSymbol`, `Diagnostic`, `CallHierarchyItem`), `DiagnosticRegistry`, `DiscoveryIndex`/`ResolvedServer`/`ServerKey`, `ServerSupervisor`/`RestartPolicy`/`BackoffTimer`.
 Spec (`openjiuwen_harness::spec`): `DeepAgentSpec`, `SpecRegistry`, `SpecEntry`, `SpecSource`, `ResolvedSpec`, `resolve`, `SpecBuildOptions`, `PluginManifest`, `PluginRegistry`.
-Worktree (`openjiuwen_harness::worktree`): `WorktreeManager`, `WorktreeTool`, `WorktreeInfo`, `WorktreeRecord`, `WorktreeEvent`, `GitRunner`/`ProcessGitRunner`, `slugify`.
+Worktree (`openjiuwen_harness::worktree`): `WorktreeManager`, `WorktreeTool`, `EnterWorktreeTool`/`ExitWorktreeTool`, `WorktreeInfo`, `WorktreeRecord`, `WorktreeEvent`, `GitRunner`/`ProcessGitRunner`, `slugify`, `WorktreeLock`/`WorktreeLockConfig`, `SparseConfig`/`SparseMode`, `WorktreeChangeSummary`/`change_summary`, `CleanupPolicy`/`CleanupReport`, `WorktreeRail`, `WorktreeSessionStore`/`MemoryWorktreeSessionStore`.
 CLI (`openjiuwen_harness::cli`): `Cli`, `run`, `run_cli`, `CliOptions`, `Repl`/`ReplCommand`, `CliIo` (`LineReader`/`Writer`), `SessionStore`, `InstructionFiles`, `McpConfig`, `AllowRuleStore`, `History`, `Onboarding`, `Style`, `Usage`.
 Parser seam: the crate re-exports the exact `clap` version `Cli` derives from (`openjiuwen_harness::clap`), so hosts and `openjiuwen-e2e` can call `Cli::try_parse_from`/`Cli::command()` and assert grammar, `clap::error::ErrorKind` and `Error::exit_code()` without adding a clap dependency; it is a build/test seam, not SDK domain API.
 Every public item is also re-exported flat from the crate root.
@@ -69,6 +75,9 @@ Every public item is also re-exported flat from the crate root.
 `protocol` ← `agent`, `schema`, `openjiuwen-harness-protocol`.
 `spec` ← `agent`, `schema`, `tools`, `skills`, `subagents`.
 `lsp`, `worktree` ← `schema`, `permission`, sysop; no harness module above them.
+`moa` ← `schema`, `rails` (`HarnessRail`), `prompts`, `skills`, `subagents` (clock), foundation `Model`.
+`persistent_agent` ← `rails`, `subagents` (clock), `schema`, sysop; no `agent`/`task_loop` dependency.
+`watcher` ← `skills`, `cli` reloaders, `workspace`; nothing above it depends on it.
 `cli` ← `agent`, `protocol`, `permission`, `tools`, `skills`.
 `observability` ← tracing only.
 
@@ -80,7 +89,7 @@ Every public item is also re-exported flat from the crate root.
 - Protocol capability gating: `NativeHarness` declares steer, graceful/force abort, pause_resume, persistent_session, checkpoint, native_tools, mcp_tools, model_selection, model_discovery; anything not declared returns `HarnessError::UnsupportedCapability`.
 - Permission "no opinion" is `None`, folded with `strictest` (deny < ask < allow); absence of a matching rule yields ASK, never ALLOW.
 - Tools never panic and never return `Err` for expected failures: they return a `ToolOutput`-shaped JSON payload with `success=false` and `error`.
-- `BuiltinTool::DEFAULT` keeps the twenty Python core tools as the registry/builder default, so prompt size and permission behaviour stay stable; extended tools are opt-in per registry (`with_tools`), and the CLI opts into eleven of them (`CLI_EXTENDED_TOOLS`, everything but `lsp`). An extended tool that needs a backend (search, MCP resources, LSP server) reports a typed `success=false` reason instead of disappearing.
+- `BuiltinTool::DEFAULT` keeps the twenty Python core tools as the registry/builder default, so prompt size and permission behaviour stay stable; extended tools are opt-in per registry (`with_tools`), and the CLI opts into thirteen of them (`CLI_EXTENDED_TOOLS`, everything but `lsp` and `mcp_resource_subscription`). An extended tool that needs a backend (search, MCP resources, LSP server, worktree manager) reports a typed `success=false` reason instead of disappearing.
 - Progressive tool discovery is a registry concern: deferred tools are carded only after `tool_search` matches and `reveal` mounts them.
 - The goal rail is registered automatically by `DeepAgentBuilder::build` / `resolve_deep_agent_parts` when a goal tool is mounted, and skipped when a caller rail named `goal` exists.
 - Subagent runtime policy is explicit: quota checks run depth → per-parent → cumulative → live, and LRU eviction never closes a running instance.
@@ -89,23 +98,36 @@ Every public item is also re-exported flat from the crate root.
 - The LSP client owns one I/O task per server, correlates ids through oneshot channels, and takes a `Box<dyn LspTransport>` so tests run an in-process fake server over `tokio::io::duplex` with no language server installed.
 - Evolution work stays harness-side: the crate cannot depend on `openjiuwen-rsi`/`openjiuwen-agent-evolving` (they depend on it), so `MetricsEvolutionRail` records metrics/proposals and writes a snapshot JSON, while the LLM/RSI orchestrators implement the same trait from those crates. All evolution hooks are additive and defaulted.
 - CLI behaviour is testable by construction: IO, environment, home directory, shell runner and model are injected, so every command, prompt and wizard path is exercised without a terminal or network.
+- Rail-queued events drain through `RailEventDrain`, a `HarnessRail` at `i32::MIN` priority registered last on both the harness and kernel registries; it moves `harness.goal_events` and any `harness.events.*` payload out of `ctx.extra` into the invocation stream, and non-streaming hosts collect the retained copy with `DeepAgent::drain_rail_events()`.
+- The watcher is a typed event pipeline, not a callback tangle: OS notifications feed a per-path trailing debounce, the resulting `WatchEvent`s publish through bounded subscribers, and `ReloadHub` dispatches named reload handlers (skills, instruction files, MCP config) with reload failures reported as `WatchUpdate::ReloadFailed` instead of aborting the watcher.
+- MoA rails never call a model: `MoaRail` publishes the consultation prompt section and state, while `consult`/`verify_progress` are explicit calls the host drives.
+- The persistent-agent journal is JSONL plus atomic metadata, so a crashed run is resumable by reopening the directory; window assembly is deterministic and reports exactly what it elided.
+- Worktree mutations are serialized by a `flock`-backed `WorktreeLock` (bounded wait, pid/timestamp sidecar, stale recovery); `enter_worktree`/`exit_worktree` report the target and original directory instead of mutating the process cwd.
+- Subagent activity is published as throttled, bounded, sequenced frames with explicit truncation/lag accounting; background eviction is opt-in, skips running instances and fires lifecycle hooks after the state lock is dropped.
 
 ## Known Issues
 
-- Goal events queued under `harness.goal_events` have no consumer: `agent`/`task_loop` build and drop rail contexts, so a host must drain the key to observe `goal.updated` frames. A drain seam would be new API.
 - The default `PermissionsSection` leaves every tool at ASK, and a one-shot `openjiuwen run` handle is non-interactive, so tool calls are refused with `HOST_PERMISSION_FAILED` unless `permissions.yaml` (or the caller) allows them.
-- `lsp` has no CLI mounting: the CLI does not resolve a per-workspace server config yet.
-- `web_search`, `list_mcp_resources` and `read_mcp_resource` need a backend; with none wired they answer with typed failure payloads.
+- `lsp` has no CLI mounting: the CLI does not resolve a per-workspace server config yet, so the CLI excludes it from `CLI_EXTENDED_TOOLS`.
+- `mcp_resource_subscription` has no CLI mounting: the CLI wires no `McpResourceSubscriptions` registry.
+- `web_search` answers with a typed not-configured reason until an endpoint is configured (`OPENJIUWEN_WEB_SEARCH_ENDPOINT` or `ToolRegistry::with_search_backend`); `list_mcp_resources`/`read_mcp_resource` need an `McpResourceProvider`, and resource subscriptions additionally need a provider that supports `resources/subscribe`.
+- LSP server discovery uses the builtin per-extension table plus host-supplied configs; servers that are not in `PATH` or not covered by a config are reported as typed launch failures, and `.gitignore` filtering is not applied to workspace scans.
 
 ## Deferred Python areas
 
 - `subagents/{browser,cua,mobile_gui}_agent.py`, `tools/{browser_move,cua,mobile_gui,cua}` — feature-gated stubs (`browser`, `cua`, `mobile`), return `Error::Unsupported`.
-- `heartbeat_rail`, `personal_context`, `moa/`, `kv_cache/`, `persistent_agent/` — deferred.
 - `observability/` OTel exporter — seam only (`TelemetrySink`); exporter belongs to `openjiuwen-extensions`.
-- Model-backed multimodal tools beyond header metadata (vision question answering, captioning, transcription), paid/vendor search backends, JS rendering, and the LLM quality/assessment pass over fetched pages.
-- LSP diagnostics (push registry and pull requests), call hierarchy/implementation, per-extension server discovery, crash retry/backoff; cron update/toggle/preview/run actions and the 7-field Quartz grammar; MCP resource subscriptions and the live-client adapter (the foundation client exposes tools only).
-- Worktree cross-process locking, sparse checkout, enter/exit-worktree agent tools, worktree rails and change summaries.
-- Subagent activity streams (throttled queue), background eviction scheduler, lifecycle resource hooks; Python's dynamic plugin execution model (`import`, dylib, template evaluation).
+- Model-backed multimodal tools beyond header metadata (vision question answering, captioning, transcription), paid/vendor search backends and their keys, JS/reader-proxy rendering, and the LLM quality/assessment pass over fetched pages.
+- LSP: `.gitignore` filtering, `PATH`/manifest server auto-discovery beyond the builtin table, diagnostics subscriptions and workspace-wide pulls, formatter/rename edits (the tool is read-only), workspace-symbol caching.
+- Cron: `wake`, the `schedule.at`/`schedule.every` job forms, `payload`/`delivery` routing, legacy per-action tools, `W` (nearest weekday), run output capture and any background daemon (the host polls `due(now)`).
+- MCP: server-pushed subscription notifications (the foundation client exposes no `resources/subscribe`), live-transport MCP tools beyond the foundation client, and MCP resource pagination.
+- Worktree: Python lifecycle policies (`ephemeral`/`durable`/`auto`) with shutdown auto-cleanup timers, symlink directories/include-pattern copying/hooks-path/`core.longpaths`, the dead `WorktreeLifecycleRail`/`AutoSetupRail` chain, backend/vcs hooks, and process-global cwd mutation (the tools report the paths instead).
+- Subagents: the stream-chunk milestone projector and parent-session activity-queue drain (typed transition frames stand in), `enable_transcript_stream`, persisted activity frames, cross-process sweepers.
+- MoA: `jev_routed` needs an external System One client (`Error::Unsupported`), automatic per-iteration verifier routing is host-driven, and the `consult_reference_models` tool registration plus Python's ability-manager integration are not ported.
+- Persistent agent: remote/distributed handoff transports and model-backed window summarisation are `Error::Unsupported`; group-chat participation, the budget service, archive storage and the `read_execution_record`/`search_session_history`/`new_context` tools are out of module scope.
+- Personal context: the seven vendor fetchers (GitHub, GitCode, Feishu, browser bookmarks, Zhihu, Toutiao, RSS) return `Error::Unsupported` through `SourceProvider`; `context_pipeline.py`, `agent_support.py`, `file_tools.py`, the context-graph APIs and Markdown link rewriting are not ported.
+- KV cache: Redis/distributed backends and provider prefetch/offload are `UnsupportedKvCacheBackend`; lineage is a seam and identity bookkeeping belongs to the host tracker.
+- Watcher: no target add/remove after `start`, no cross-process watch locking, no automatic re-registration after an OS watch limit (reported as `WatcherFailed`), best-effort rename pairing.
 - `agent_evolving` / RSI orchestrators and LLM-driven evolution bodies live in the layer-6 crates; only the harness-side rail and metrics bodies are here.
 
 ## Routing Table
@@ -119,11 +141,11 @@ Every public item is also re-exported flat from the crate root.
 - `./src/subagents/` → `SubAgentConfig`, registry, presets, quota/LRU/transcript/persistence runtime, task and subagent tools
 - `./src/skills/` → skill discovery/library state, mounting, `SKILL.md` validation
 - `./src/task_loop/` → loop coordinator, queues, event manager, task-loop controller/handler
-- `./src/agent/` → `DeepAgent`, builder, factory, goal-rail assembly, subagent wiring, session state persistence, round execution
+- `./src/agent/` → `DeepAgent`, builder, factory, goal-rail assembly, rail-event drain, subagent wiring, session state persistence, round execution
 - `./src/protocol/` → native harness protocol/provider implementation, event bridge, cursors
-- `./src/lsp/` → JSON-RPC framing/transport, LSP client, rendering, `lsp` tool
+- `./src/lsp/` → JSON-RPC framing/transport, LSP client, diagnostics registry, server discovery/supervisor with retry, rendering, `lsp` tool
 - `./src/spec/` → `DeepAgentSpec` templates, registry/precedence, plugins, embedded `resources/`, resolution into builder parts
-- `./src/worktree/` → git runner, worktree manager/layout/registry, events, `worktree` tool
+- `./src/worktree/` → git runner, worktree manager/layout/registry, locking, sparse checkout, change summaries/cleanup, enter/exit tools, worktree rail, `worktree` tool
 - `./src/cli/` → clap `run`/`chat` grammar, option resolution, one-shot runner, REPL and slash commands, history, styling, instruction files, MCP config, allow-rule write-back, onboarding
 - `./src/manifest.rs` → harness element catalog (`@harness_element` equivalent)
 - `./src/observability.rs` → tracing spans/events and telemetry seam
