@@ -56,6 +56,24 @@
 //! untracked — and an aborted turn never finishes its own session and state
 //! bookkeeping, because it is dropped at the await point it was aborted at.
 //!
+//! # Group routing
+//!
+//! [`IntentDetectionController::set_group`],
+//! [`clear_group`](IntentDetectionController::clear_group), and
+//! [`group`](IntentDetectionController::group) inject, drop, and inspect the
+//! group the controller's agent belongs to;
+//! [`send_to_agent`](IntentDetectionController::send_to_agent) and
+//! [`publish`](IntentDetectionController::publish) route through it. All five
+//! delegate to [`BaseController`], so the wrapper owns no routing of its own and
+//! a direct controller call behaves identically.
+//!
+//! Without a group, sending and publishing fail with the typed configuration
+//! error of [`super::group::send_without_group`]/
+//! [`super::group::publish_without_group`], where Python raises `RuntimeError`.
+//! The owner name those messages interpolate is the inner controller's card name
+//! (its id when the name is empty), because the group sees the wrapped
+//! controller — not the legacy wrapper — as its peer.
+//!
 //! # Deferred Python behaviour
 //!
 //! - `IntentDetector` category-to-`Task` generation (Python's
@@ -68,8 +86,7 @@
 //! - `ReasonerConfig`/`PlannerConfig`/`ProactiveIdentifierConfig`/
 //!   `ReflectorConfig`: the proactive identifier and reflector are not ported,
 //!   and the planner has no configuration beyond its task type.
-//! - `BaseController.group` routing (`set_group`, `send_to_agent`, `publish`)
-//!   and the `Message*` backward-compatibility aliases of `event.py`.
+//! - the `Message*` backward-compatibility aliases of `event.py`.
 //! - `reasoner/agent_reasoner.py` is an empty, unreferenced Python artifact and
 //!   is intentionally not ported.
 pub mod reasoner;
@@ -77,6 +94,7 @@ pub mod schema;
 use super::base::{BaseController, Controller, EventHandler};
 use super::config::ControllerConfig;
 use super::executors::{TaskExecutor, TaskRouter};
+use super::group::GroupRouter;
 use super::intent::IntentRecognizer;
 use super::queue::TaskQueue;
 use super::schema::{ControllerOutput, ControllerOutputChunk, Event, Intent, Task};
@@ -215,6 +233,66 @@ impl IntentDetectionController {
     pub fn set_event_handler(&self, handler: Arc<dyn EventHandler>) -> &Self {
         self.controller.set_event_handler(handler);
         self
+    }
+    /// Injects the group this controller's agent belongs to.
+    ///
+    /// Python's `BaseGroup.add_agent` calls this automatically; a host owning
+    /// its own group injects it explicitly. The reference is stored by the inner
+    /// [`BaseController`], so the wrapper keeps no group state of its own and
+    /// [`send_to_agent`](Self::send_to_agent)/[`publish`](Self::publish) route
+    /// through the same group a direct controller call would.
+    pub fn set_group(&self, group: Arc<dyn GroupRouter>) -> &Self {
+        self.controller.set_group(group);
+        self
+    }
+    /// Removes the group reference, so routing fails again the way it does
+    /// before a group is injected.
+    pub fn clear_group(&self) {
+        self.controller.clear_group();
+    }
+    /// Returns the group router this controller's agent routes through, if any.
+    #[must_use]
+    pub fn group(&self) -> Option<Arc<dyn GroupRouter>> {
+        self.controller.group()
+    }
+    /// Sends `event` to `agent_id` through the group's controller.
+    ///
+    /// The event, the session, and the target travel unchanged to the group, so
+    /// which handoff target an event names stays the caller's choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::config`] when no group is installed; see
+    /// [`BaseController::send_to_agent`] for the message, which names the inner
+    /// controller's card name as the owner. Otherwise propagates whatever the
+    /// group reports for an unknown target or a failing routed turn.
+    pub async fn send_to_agent(
+        &self,
+        agent_id: &str,
+        event: &Event,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<Value> {
+        self.controller
+            .send_to_agent(agent_id, event, session)
+            .await
+    }
+    /// Publishes `event` to every subscriber through the group's controller.
+    ///
+    /// Dispatch (and the subscription key it matches on) belongs to the group,
+    /// so this wrapper only forwards the event and the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::config`] when no group is installed; see
+    /// [`BaseController::publish`] for the message, which names the inner
+    /// controller's card name as the owner. Otherwise propagates whatever the
+    /// group reports for a publish it cannot dispatch.
+    pub async fn publish(
+        &self,
+        event: &Event,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<Vec<Value>> {
+        self.controller.publish(event, session).await
     }
     /// Returns a clone of the per-conversation registry of in-flight turns.
     ///
@@ -429,6 +507,8 @@ mod tests {
     use crate::controller::executors::TaskContext;
     use crate::controller::schema::{OutputKind, TaskResult, TaskStatus};
     use futures::StreamExt;
+    use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_session::sessions::AgentSession;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
@@ -537,6 +617,42 @@ mod tests {
         }
         async fn select(&self, _query: &str, _intents: &[Intent]) -> Result<Option<String>> {
             Ok(None)
+        }
+    }
+    /// Group router that records what reaches it, together with the session id
+    /// it was handed.
+    #[derive(Default)]
+    struct RecordingGroup {
+        /// `(agent_id, event, session id)` of every point-to-point send.
+        sent: Mutex<Vec<(String, Event, Option<String>)>>,
+        /// `(event, session id)` of every publish.
+        published: Mutex<Vec<(Event, Option<String>)>>,
+    }
+    #[async_trait]
+    impl GroupRouter for RecordingGroup {
+        async fn send_to_agent(
+            &self,
+            agent_id: &str,
+            event: &Event,
+            session: Option<Arc<dyn Session>>,
+        ) -> Result<Value> {
+            self.sent.lock().push((
+                agent_id.to_owned(),
+                event.clone(),
+                session.as_deref().map(|session| session.id().to_owned()),
+            ));
+            Ok(json!({"delivered": agent_id}))
+        }
+        async fn publish(
+            &self,
+            event: &Event,
+            session: Option<Arc<dyn Session>>,
+        ) -> Result<Vec<Value>> {
+            self.published.lock().push((
+                event.clone(),
+                session.as_deref().map(|session| session.id().to_owned()),
+            ));
+            Ok(vec![json!({"subscriber": 1}), json!({"subscriber": 2})])
         }
     }
     /// Event handler that ignores every event.
@@ -660,6 +776,89 @@ mod tests {
             controller.controller().task_types(),
             vec![AGENT_TASK_TYPE.to_owned()]
         );
+    }
+    #[tokio::test]
+    async fn group_routing_forwards_the_event_and_session_unchanged() {
+        let controller =
+            IntentDetectionController::new(AgentCard::new("ctrl"), ControllerConfig::new());
+        assert!(
+            controller.group().is_none(),
+            "no group is injected by default"
+        );
+        let recorder = Arc::new(RecordingGroup::default());
+        let group: Arc<dyn GroupRouter> = Arc::clone(&recorder) as Arc<dyn GroupRouter>;
+        let _chained: &IntentDetectionController = controller.set_group(group);
+        assert!(controller.group().is_some());
+
+        let event = Event::user_input("hand off");
+        let session: Option<Arc<dyn Session>> = Some(Arc::new(AgentSession::new("s1")));
+        let value = controller
+            .send_to_agent("a1", &event, session.clone())
+            .await
+            .expect("a group is installed");
+        assert_eq!(value, json!({"delivered": "a1"}));
+        let values = controller
+            .publish(&event, session)
+            .await
+            .expect("a group is installed");
+        assert_eq!(values.len(), 2);
+
+        {
+            let sent = recorder.sent.lock();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, "a1");
+            assert_eq!(sent[0].1, event, "the same event reaches the group");
+            assert_eq!(sent[0].2.as_deref(), Some("s1"));
+        }
+        let published = recorder.published.lock();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, event);
+        assert_eq!(published[0].1.as_deref(), Some("s1"));
+    }
+    #[tokio::test]
+    async fn routing_without_a_group_reports_the_inner_controllers_name() {
+        let controller =
+            IntentDetectionController::new(AgentCard::new("legacy"), ControllerConfig::new());
+        let event = Event::user_input("hi");
+        let send = controller
+            .send_to_agent("a1", &event, None)
+            .await
+            .expect_err("no group is installed");
+        assert_eq!(send.kind(), ErrorKind::Config);
+        assert_eq!(
+            send.message(),
+            "legacy: Cannot send_to_agent('a1'). Agent is not part of a group with a controller."
+        );
+        let publish = controller
+            .publish(&event, None)
+            .await
+            .expect_err("no group is installed");
+        assert_eq!(publish.kind(), ErrorKind::Config);
+        assert_eq!(
+            publish.message(),
+            "legacy: Cannot publish(). Agent is not part of a group with a controller."
+        );
+    }
+    #[tokio::test]
+    async fn clear_group_makes_a_later_send_fail_again() {
+        let controller =
+            IntentDetectionController::new(AgentCard::new("ctrl"), ControllerConfig::new());
+        let recorder = Arc::new(RecordingGroup::default());
+        controller.set_group(Arc::clone(&recorder) as Arc<dyn GroupRouter>);
+        let event = Event::user_input("hi");
+        controller
+            .send_to_agent("a1", &event, None)
+            .await
+            .expect("a group is installed");
+        controller.clear_group();
+        assert!(controller.group().is_none());
+        let error = controller
+            .send_to_agent("a1", &event, None)
+            .await
+            .expect_err("the group reference is gone");
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert!(error.message().contains("Cannot send_to_agent('a1')"));
+        assert_eq!(recorder.sent.lock().len(), 1, "nothing else was forwarded");
     }
     #[test]
     fn legacy_value_objects_are_reachable_from_the_module_root() {

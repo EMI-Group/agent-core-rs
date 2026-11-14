@@ -458,8 +458,15 @@ pub struct LegacyEvent {
     /// Free-form event metadata.
     pub metadata: BTreeMap<String, Value>,
     /// Target agent id for point-to-point routing.
+    ///
+    /// Omitted from the wire form when unset, so an unrouted event keeps the
+    /// shape it had before group routing existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_id: Option<String>,
     /// Custom event kind used by subscription routing.
+    ///
+    /// Omitted from the wire form when unset, like [`Self::receiver_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_event_type: Option<String>,
 }
 impl Default for LegacyEvent {
@@ -485,6 +492,9 @@ impl Default for LegacyEvent {
 fn new_event_id() -> String {
     Uuid::new_v4().to_string()
 }
+/// Extension key Python's `create_agent_handoff` stores the handoff target
+/// under.
+const HANDOFF_EXTENSION_KEY: &str = "to_agent_id";
 impl LegacyEvent {
     /// Builds a normal-priority event of `event_type` with a fresh id.
     #[must_use]
@@ -540,6 +550,46 @@ impl LegacyEvent {
     #[must_use]
     pub fn get_query(&self) -> String {
         self.content.get_query()
+    }
+    /// Sets the point-to-point receiver of the event.
+    ///
+    /// Python's agent-group routing sends an event to [`Self::receiver_id`] when
+    /// it is set, so this is the builder form of a direct handoff.
+    #[must_use]
+    pub fn with_receiver(mut self, receiver_id: impl Into<String>) -> Self {
+        self.receiver_id = Some(receiver_id.into());
+        self
+    }
+    /// Sets the custom event kind subscription routing matches on.
+    ///
+    /// Python's `publish` expects the event to carry one; an unset kind stays
+    /// absent from the wire form.
+    #[must_use]
+    pub fn with_custom_event_type(mut self, kind: impl Into<String>) -> Self {
+        self.custom_event_type = Some(kind.into());
+        self
+    }
+    /// Returns the agent this event routes to, when it routes to one.
+    ///
+    /// [`receiver_id`](Self::receiver_id) wins; otherwise the `to_agent_id`
+    /// string extension of the payload is read, which is the field Python's
+    /// `Event.create_agent_handoff` writes and the one its agent-group routing
+    /// follows on an [`LegacyEventType::AgentHandoff`] event.
+    #[must_use]
+    pub fn handoff_to_agent(&self) -> Option<&str> {
+        self.receiver_id.as_deref().or_else(|| {
+            self.content
+                .extension(HANDOFF_EXTENSION_KEY)
+                .and_then(Value::as_str)
+        })
+    }
+    /// Whether the event hands the conversation to `agent_id`.
+    ///
+    /// Compares [`handoff_to_agent`](Self::handoff_to_agent), so both the
+    /// receiver field and the `to_agent_id` extension count as a handoff.
+    #[must_use]
+    pub fn routed_to(&self, agent_id: &str) -> bool {
+        self.handoff_to_agent() == Some(agent_id)
     }
     /// Projects the event to its JSON wire form.
     ///
@@ -773,5 +823,78 @@ mod tests {
             SourceType::User,
             "user is the default source kind"
         );
+    }
+    #[test]
+    fn routing_fields_are_omitted_from_the_wire_form_when_unset() {
+        let value = LegacyEvent::user_input("hello").to_dict();
+        let object = value.as_object().expect("an event serializes to an object");
+        assert!(
+            !object.contains_key("receiver_id"),
+            "unset receiver is absent"
+        );
+        assert!(
+            !object.contains_key("custom_event_type"),
+            "unset custom kind is absent"
+        );
+        let restored: LegacyEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.receiver_id, None);
+        assert_eq!(restored.custom_event_type, None);
+        assert_eq!(restored.handoff_to_agent(), None);
+        assert!(!restored.routed_to("a1"));
+    }
+    #[test]
+    fn routing_fields_round_trip_when_set() {
+        let event = LegacyEvent::user_input("hello")
+            .with_receiver("a1")
+            .with_custom_event_type("handoff");
+        let value = event.to_dict();
+        assert_eq!(value["receiver_id"], json!("a1"));
+        assert_eq!(value["custom_event_type"], json!("handoff"));
+        let restored: LegacyEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, event);
+        assert_eq!(restored.receiver_id.as_deref(), Some("a1"));
+        assert_eq!(restored.custom_event_type.as_deref(), Some("handoff"));
+        assert_eq!(restored.handoff_to_agent(), Some("a1"));
+        assert!(restored.routed_to("a1"));
+        assert!(!restored.routed_to("a2"));
+    }
+    #[test]
+    fn handoff_extension_translates_to_a_routing_target() {
+        let mut event = LegacyEvent::new(LegacyEventType::AgentHandoff);
+        event.content = EventContent {
+            query: Some("please take over".to_owned()),
+            extensions: BTreeMap::from([("to_agent_id".to_owned(), json!("a2"))]),
+            ..EventContent::default()
+        };
+        assert_eq!(event.event_type.as_str(), "agent_handoff");
+        assert_eq!(event.receiver_id, None);
+        assert_eq!(event.handoff_to_agent(), Some("a2"));
+        assert!(event.routed_to("a2"));
+        assert!(!event.routed_to("a1"));
+
+        let non_string = EventContent {
+            extensions: BTreeMap::from([("to_agent_id".to_owned(), json!({"id": "a2"}))]),
+            ..EventContent::default()
+        };
+        let event = LegacyEvent {
+            content: non_string,
+            ..LegacyEvent::new(LegacyEventType::AgentHandoff)
+        };
+        assert_eq!(
+            event.handoff_to_agent(),
+            None,
+            "only a string extension names an agent"
+        );
+    }
+    #[test]
+    fn receiver_id_wins_over_the_handoff_extension() {
+        let mut event = LegacyEvent::new(LegacyEventType::AgentHandoff).with_receiver("a1");
+        event
+            .content
+            .extensions
+            .insert("to_agent_id".to_owned(), json!("a2"));
+        assert_eq!(event.handoff_to_agent(), Some("a1"));
+        assert!(event.routed_to("a1"));
+        assert!(!event.routed_to("a2"));
     }
 }
