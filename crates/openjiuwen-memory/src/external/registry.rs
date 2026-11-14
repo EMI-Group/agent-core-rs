@@ -343,10 +343,11 @@ mod timeout_millis {
 /// Builds one [`MemoryProvider`] from a [`ProviderConfig`].
 ///
 /// A factory is synchronous and side-effect free: it validates the configuration and
-/// constructs the handle, but performs no network I/O. A backend whose SDK or transport
-/// is absent from this build still builds a handle whose operations return
-/// [`openjiuwen_common::error::Error::Unsupported`], mirroring Python's lazy client
-/// acquisition; a configuration that cannot be interpreted at all returns
+/// constructs the handle, but performs no network I/O. A backend that needs something the
+/// configuration does not carry still builds a handle whose operations return
+/// [`openjiuwen_common::error::Error::Unsupported`] — a REST vendor with no `endpoint`, or
+/// the SDK-only `agentarts` adapter — mirroring Python's lazy client acquisition; a
+/// configuration that cannot be interpreted at all returns
 /// [`openjiuwen_common::error::Error::Validation`].
 pub trait ProviderFactory: Send + Sync {
     /// The kind this factory builds.
@@ -357,9 +358,9 @@ pub trait ProviderFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns [`openjiuwen_common::error::Error::Validation`] when `config` does not
-    /// describe a backend this factory can produce, and
-    /// [`openjiuwen_common::error::Error::Unsupported`] when the backend is known but its
-    /// transport cannot be constructed in this build.
+    /// describe a backend this factory can produce. A backend the configuration leaves
+    /// incomplete still builds: the resulting handle reports
+    /// [`openjiuwen_common::error::Error::Unsupported`] from each operation instead.
     fn build(&self, config: &ProviderConfig) -> Result<Arc<dyn MemoryProvider>>;
 }
 
@@ -403,10 +404,13 @@ impl ProviderRegistry {
 
     /// Builds a registry with the five vendor factories registered.
     ///
-    /// The adapters build successfully but every operation returns
-    /// [`openjiuwen_common::error::Error::Unsupported`] naming the missing SDK or
-    /// transport, so a deployment can be configured for a vendor and fail loudly at first
-    /// use instead of at registration.
+    /// Every adapter builds successfully, so a deployment can be configured for a vendor
+    /// and fail loudly at first use instead of at registration. Four of the five (`mem0`,
+    /// `jiuwen_memory`, `lakebase`, `openviking`) perform real requests once an `endpoint`
+    /// is configured; without one the handle is inert and every operation returns
+    /// [`openjiuwen_common::error::Error::Unsupported`] stating that no endpoint is
+    /// configured. `agentarts` is SDK-only, so it reports `Unsupported` naming
+    /// `agentarts.sdk.memory.MemoryClient` for every operation whatever the configuration.
     #[must_use]
     pub fn with_vendor_stubs() -> Self {
         let registry = Self::new();

@@ -8,8 +8,10 @@
 //!
 //! This module owns only the fallback mechanics, as free helpers over the KV trait
 //! object: [`read_text`], [`list_records`], [`list_variables`], and
-//! [`delete_with_legacy`]. Ranking, record validation, and every other storage
-//! responsibility stay in [`super::storage`], which is the only caller.
+//! [`delete_with_legacy`], each with an `_in` variant taking the caller's
+//! [`KvPrefixRegistry`] (the plain functions use the default registry). Ranking, record
+//! validation, and every other storage responsibility stay in [`super::storage`], which is
+//! the only caller.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,17 +22,28 @@ use crate::record::{MemoryFilter, MemoryRecord};
 
 use super::json;
 use super::keys;
+use super::prefix::KvPrefixRegistry;
 
-/// Reads the UTF-8 text stored under `key`, falling back to the legacy key layout.
+/// Reads the UTF-8 text stored under `key`, falling back to the alias key layout.
 ///
 /// Returns the key that was actually found plus its text. The current key always
-/// wins: a legacy candidate is tried only when `key` is absent. A candidate holding
+/// wins: an alias candidate is tried only when `key` is absent. A candidate holding
 /// a non-text value is `Error::Validation` naming that key, because a point read
 /// must not hide corruption behind a "missing" answer. `None` means no candidate
 /// key exists at all.
+#[cfg_attr(not(test), allow(dead_code))] // default-registry form; `storage` passes its own registry
 pub(crate) async fn read_text(kv: &dyn KvStore, key: String) -> Result<Option<(String, String)>> {
+    read_text_in(kv, key, &KvPrefixRegistry::default()).await
+}
+
+/// [`read_text`] over the alias layout of `prefixes`.
+pub(crate) async fn read_text_in(
+    kv: &dyn KvStore,
+    key: String,
+    prefixes: &KvPrefixRegistry,
+) -> Result<Option<(String, String)>> {
     let mut candidates = vec![key.clone()];
-    candidates.extend(keys::legacy_alternatives(&key));
+    candidates.extend(keys::legacy_alternatives_in(prefixes, &key));
     for (position, candidate) in candidates.into_iter().enumerate() {
         let Some(value) = kv.get(&candidate).await? else {
             continue;
@@ -48,26 +61,37 @@ pub(crate) async fn read_text(kv: &dyn KvStore, key: String) -> Result<Option<(S
     Ok(None)
 }
 
-/// Lists the records under `prefix` plus the records of every legacy prefix.
+/// Lists the records under `prefix` plus the records of every alias prefix.
 ///
-/// Records found only under the legacy layout are appended after the current-layout
+/// Records found only under an alias layout are appended after the current-layout
 /// scan, and a record present in both layouts is reported once from the current one:
 /// entries are deduplicated by the record's *current* key, so the current layout wins
-/// even when only the legacy row carries a given id. The result is sorted newest
+/// even when only the alias row carries a given id. The result is sorted newest
 /// first and by id ascending on ties.
+#[cfg_attr(not(test), allow(dead_code))] // default-registry form; `storage` passes its own registry
 pub(crate) async fn list_records(
     kv: &dyn KvStore,
     prefix: &str,
     filter: &MemoryFilter,
 ) -> Result<Vec<MemoryRecord>> {
+    list_records_in(kv, prefix, filter, &KvPrefixRegistry::default()).await
+}
+
+/// [`list_records`] over the alias layout of `prefixes`.
+pub(crate) async fn list_records_in(
+    kv: &dyn KvStore,
+    prefix: &str,
+    filter: &MemoryFilter,
+    prefixes: &KvPrefixRegistry,
+) -> Result<Vec<MemoryRecord>> {
     let mut records = scan_records(kv, prefix, filter).await?;
     let mut seen: BTreeSet<String> = records
         .iter()
-        .map(|record| keys::record_key(&record.scope, &record.id))
+        .map(|record| keys::record_key_in(prefixes, &record.scope, &record.id))
         .collect();
-    for legacy in keys::legacy_alternatives(prefix) {
+    for legacy in keys::legacy_alternatives_in(prefixes, prefix) {
         for record in scan_records(kv, &legacy, filter).await? {
-            let current = keys::record_key(&record.scope, &record.id);
+            let current = keys::record_key_in(prefixes, &record.scope, &record.id);
             if seen.insert(current.clone()) {
                 log_read(&current, &legacy);
                 records.push(record);
@@ -83,17 +107,27 @@ pub(crate) async fn list_records(
     Ok(records)
 }
 
-/// Lists every variable under `prefix` plus the variables of every legacy prefix.
+/// Lists every variable under `prefix` plus the variables of every alias prefix.
 ///
-/// Legacy names are inserted only when the name is still absent, so a current-layout
+/// Alias names are inserted only when the name is still absent, so a current-layout
 /// variable always wins on a name clash. Non-text values are logged and skipped.
+#[cfg_attr(not(test), allow(dead_code))] // default-registry form; `storage` passes its own registry
 pub(crate) async fn list_variables(
     kv: &dyn KvStore,
     prefix: &str,
 ) -> Result<BTreeMap<String, String>> {
+    list_variables_in(kv, prefix, &KvPrefixRegistry::default()).await
+}
+
+/// [`list_variables`] over the alias layout of `prefixes`.
+pub(crate) async fn list_variables_in(
+    kv: &dyn KvStore,
+    prefix: &str,
+    prefixes: &KvPrefixRegistry,
+) -> Result<BTreeMap<String, String>> {
     let mut candidates = vec![(prefix.to_owned(), false)];
     candidates.extend(
-        keys::legacy_alternatives(prefix)
+        keys::legacy_alternatives_in(prefixes, prefix)
             .into_iter()
             .map(|legacy| (legacy, true)),
     );
@@ -113,7 +147,8 @@ pub(crate) async fn list_variables(
                 continue;
             };
             if from_legacy {
-                let current = keys::current_equivalent(&key).unwrap_or_else(|| prefix.to_owned());
+                let current = keys::current_equivalent_in(prefixes, &key)
+                    .unwrap_or_else(|| prefix.to_owned());
                 log_read(&current, &key);
                 variables
                     .entry(name.to_owned())
@@ -126,10 +161,20 @@ pub(crate) async fn list_variables(
     Ok(variables)
 }
 
-/// Deletes `key` and every legacy alternative, reporting whether any of them existed.
+/// Deletes `key` and every alias alternative, reporting whether any of them existed.
+#[cfg_attr(not(test), allow(dead_code))] // default-registry form; `storage` passes its own registry
 pub(crate) async fn delete_with_legacy(kv: &dyn KvStore, key: &str) -> Result<bool> {
+    delete_with_legacy_in(kv, key, &KvPrefixRegistry::default()).await
+}
+
+/// [`delete_with_legacy`] over the alias layout of `prefixes`.
+pub(crate) async fn delete_with_legacy_in(
+    kv: &dyn KvStore,
+    key: &str,
+    prefixes: &KvPrefixRegistry,
+) -> Result<bool> {
     let mut candidates = vec![key.to_owned()];
-    candidates.extend(keys::legacy_alternatives(key));
+    candidates.extend(keys::legacy_alternatives_in(prefixes, key));
     let mut existed = false;
     for candidate in candidates {
         if kv.exists(&candidate).await? {
@@ -188,6 +233,7 @@ fn log_read(current_key: &str, legacy_key: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::prefix::KvFamily;
     use super::super::{MemoryStorage, MemoryStores};
     use super::*;
 
@@ -513,5 +559,106 @@ mod tests {
             .await
             .expect("list variables");
         assert_eq!(listed, variables(&[("theme", "dark"), ("lang", "en")]));
+    }
+
+    #[tokio::test]
+    async fn default_registry_wrappers_read_and_delete_the_documented_layout() {
+        let stores = stores();
+        let scope = scope();
+        let current_key = keys::variable_key(&scope, "theme");
+        let legacy_key = keys::legacy_variable_key(&scope, "theme");
+        put_legacy(&stores, &legacy_key, "grey").await;
+        let found = read_text(stores.kv.as_ref(), current_key.clone())
+            .await
+            .expect("read")
+            .expect("legacy hit");
+        assert_eq!(found.0, legacy_key);
+        assert_eq!(found.1, "grey");
+        assert!(delete_with_legacy(stores.kv.as_ref(), &current_key)
+            .await
+            .expect("delete"));
+        assert!(!delete_with_legacy(stores.kv.as_ref(), &current_key)
+            .await
+            .expect("delete again"));
+        assert!(read_text(stores.kv.as_ref(), current_key)
+            .await
+            .expect("read")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_registry_reads_and_deletes_every_alias() {
+        let stores = stores();
+        let scope = scope();
+        let prefixes = KvPrefixRegistry::new()
+            .with_current(KvFamily::UserVariables, "vars_v2")
+            .expect("rename user variables");
+        let current = keys::variable_key_in(&prefixes, &scope, "theme");
+        assert_eq!(current, "vars_v2/alice/ws/theme");
+        put_legacy(&stores, &current, "dark").await;
+        put_legacy(
+            &stores,
+            &keys::legacy_variable_key(&scope, "theme"),
+            "older",
+        )
+        .await;
+        put_legacy(&stores, &keys::variable_key(&scope, "theme"), "grey").await;
+        let prefix = keys::variable_prefix_in(&prefixes, &scope);
+        assert_eq!(prefix, "vars_v2/alice/ws/");
+        let listed = list_variables_in(stores.kv.as_ref(), &prefix, &prefixes)
+            .await
+            .expect("list variables");
+        assert_eq!(listed, variables(&[("theme", "dark")]));
+        let found = read_text_in(stores.kv.as_ref(), current.clone(), &prefixes)
+            .await
+            .expect("read")
+            .expect("current hit");
+        assert_eq!(found.0, current);
+        assert_eq!(found.1, "dark");
+        assert!(
+            delete_with_legacy_in(stores.kv.as_ref(), &current, &prefixes)
+                .await
+                .expect("delete")
+        );
+        assert_key_gone(&stores, &current).await;
+        assert_key_gone(&stores, &keys::variable_key(&scope, "theme")).await;
+        assert_key_gone(&stores, &keys::legacy_variable_key(&scope, "theme")).await;
+    }
+
+    #[tokio::test]
+    async fn custom_registry_lists_records_of_the_renamed_family() {
+        let stores = stores();
+        let scope = scope();
+        let prefixes = KvPrefixRegistry::new()
+            .with_current(KvFamily::Records, "MEMV2")
+            .expect("rename records");
+        let current = record("current", "from MEMV2", 1);
+        put_legacy(
+            &stores,
+            &keys::record_key_in(&prefixes, &scope, "current"),
+            &json::record_to_text(&current).expect("serialize current"),
+        )
+        .await;
+        let legacy = record("legacy", "from user_mem", 0);
+        put_legacy(
+            &stores,
+            &keys::legacy_record_key(&scope, "legacy"),
+            &json::record_to_text(&legacy).expect("serialize legacy"),
+        )
+        .await;
+        let prefix = keys::record_prefix_in(&prefixes, &scope);
+        assert_eq!(prefix, "MEMV2/alice/ws/");
+        let listed = list_records_in(
+            stores.kv.as_ref(),
+            &prefix,
+            &MemoryFilter::for_scope(&scope),
+            &prefixes,
+        )
+        .await
+        .expect("list records");
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["current", "legacy"]
+        );
     }
 }

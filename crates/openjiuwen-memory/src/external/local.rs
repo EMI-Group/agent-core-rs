@@ -11,6 +11,13 @@
 //! `get`/`delete`/`list`/`clear` take no per-call options in the SPI; they use the
 //! engine's default (never-cancelled, no deadline) call options and are cancel-safe
 //! through future dropping.
+//!
+//! The tool rail is inherited from [`MemoryProvider`] except where the engine knows more:
+//! the adapter is always available (no credential, no endpoint), it reports the state its
+//! own `initialize` recorded, and [`MemoryProvider::system_prompt_block`] tells the model
+//! that these memories live in this deployment's in-process backend. The rail's scope is
+//! [`MemoryScope::default`], so a tool call and `prefetch` see the same records the facade
+//! sees for the `__default__` user.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +34,7 @@ use crate::record::{
 };
 
 use super::provider::{MemoryProvider, ProviderCapabilities, ProviderHealth};
+use super::rail;
 use super::registry::{ProviderConfig, ProviderFactory, ProviderKind};
 
 /// The tracing target of local-provider diagnostics.
@@ -202,6 +210,32 @@ impl MemoryProvider for EngineProvider {
                 Ok(ProviderHealth::degraded(error.to_string()))
             }
         }
+    }
+
+    /// The engine needs no credential or endpoint, so it is always configured.
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Reports the state [`MemoryProvider::initialize`] recorded.
+    ///
+    /// The flag is read directly instead of through the inherent
+    /// [`EngineProvider::is_initialized`] so the trait implementation states its own
+    /// source of truth.
+    fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Relaxed)
+    }
+
+    /// The local rail guidance: which tools this provider exposes and where it stores.
+    fn system_prompt_block(&self) -> String {
+        format!(
+            "## Local memory\n\
+             Memories are stored in this deployment's in-process memory backend and are not \
+             shared with any external service.\n\
+             Use `{add}` to store a durable fact and `{search}` to recall one.",
+            add = rail::ADD_MEMORY_TOOL,
+            search = rail::SEARCH_MEMORY_TOOL,
+        )
     }
 }
 
@@ -481,5 +515,67 @@ mod tests {
         assert!(debug.contains("EngineProvider"));
         assert!(debug.contains(DEFAULT_NAME));
         assert!(!debug.contains("MemoryEngine {"));
+    }
+
+    #[tokio::test]
+    async fn the_local_provider_is_always_available_and_tracks_initialization() {
+        let provider = local_provider().await;
+        assert!(MemoryProvider::is_available(&provider));
+        assert!(!MemoryProvider::is_initialized(&provider));
+        provider.initialize().await.expect("initialize");
+        assert!(MemoryProvider::is_initialized(&provider));
+        // The inherent accessor keeps answering the same state.
+        assert!(provider.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_block_names_the_local_tools() {
+        let block = local_provider().await.system_prompt_block();
+        assert_ne!(block, "");
+        assert!(block.contains(rail::ADD_MEMORY_TOOL), "{block}");
+        assert!(block.contains(rail::SEARCH_MEMORY_TOOL), "{block}");
+        assert!(block.to_lowercase().contains("local"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn the_rail_writes_and_recalls_through_the_engine() {
+        let memory = LongTermMemory::in_memory(MemoryEngineConfig::default())
+            .await
+            .expect("facade");
+        let provider = EngineProvider::new(Arc::clone(memory.engine()));
+
+        let stored = provider
+            .handle_tool_call(
+                rail::ADD_MEMORY_TOOL,
+                &serde_json::json!({ "content": "alice prefers dark mode" }),
+            )
+            .await;
+        assert_eq!(stored["result"], serde_json::json!("stored"));
+
+        let rendered = provider.prefetch("dark mode").await;
+        assert!(rendered.contains("alice prefers dark mode"), "{rendered}");
+
+        // The rail writes into the provider's default scope, so the facade sees it too.
+        let listed = memory
+            .list(&MemoryScope::default(), &[])
+            .await
+            .expect("facade list");
+        assert_eq!(listed.len(), 1);
+
+        let deleted = provider
+            .handle_tool_call(
+                rail::DELETE_MEMORY_TOOL,
+                &serde_json::json!({ "id": listed[0].id }),
+            )
+            .await;
+        assert_eq!(deleted["result"], serde_json::json!("deleted"));
+        assert_eq!(
+            memory
+                .list(&MemoryScope::default(), &[])
+                .await
+                .expect("facade list"),
+            Vec::new(),
+            "the deleted memory is gone"
+        );
     }
 }

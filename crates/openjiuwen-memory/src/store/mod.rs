@@ -4,6 +4,11 @@
 //! package on top of the `openjiuwen-foundation` storage traits:
 //!
 //! - [`keys`] — KV key and vector collection naming (Python `UMD/...` layout).
+//! - [`prefix`] — the runtime key-prefix registry over the logical memory families.
+//! - [`backup`] — backup and restore of the memory key-value keyspace.
+//! - [`kv_lock`] — the distributed KV lock seam (named `kv_lock` because `lite::lock`
+//!   already owns the crate-root `lock` name).
+//! - [`mapping`] — persisted scope↔user mapping keys.
 //! - `MemoryStorage` — record/embedding/variable/scope-config persistence.
 //! - `MessageStore` — conversation history in the `messages` document collection.
 //! - [`MemoryStores`] — the bundle of concrete backends every other module shares.
@@ -27,8 +32,12 @@ use openjiuwen_foundation::store::{
 #[cfg(feature = "sqlite")]
 use openjiuwen_foundation::store::{SqliteDocumentStore, SqliteKvStore};
 
+pub mod backup;
 pub mod keys;
+pub mod kv_lock;
+pub mod mapping;
 pub mod migration;
+pub mod prefix;
 
 mod json;
 mod legacy;

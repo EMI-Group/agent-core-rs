@@ -13,15 +13,30 @@
 //! cancelled call returns [`Error::Cancelled`] instead of a half-finished batch.
 //! `remember_many`/`from_jsonl` stop at the first failure; records already written stay
 //! written (there is no cross-record transaction in the team memory path).
+//!
+//! # Observability
+//!
+//! The facade carries an optional [`TeamMemoryObserver`] (`None` by default, so nothing is
+//! observed and nothing extra is allocated unless a caller opts in with
+//! [`TeamMemory::with_observer`]). The operations that spend work or change what the team
+//! can recall — `remember`, `remember_many`, `update`, `search`, `forget`, `clear`, and
+//! `prune_expired` — emit one [`TeamMemoryEvent`]; a failed operation emits a failed event
+//! carrying the error text and then returns that same error unchanged.
+//! Direct reads and exports (`get`, `list`, `stats`, `set_expiry`, `to_jsonl`,
+//! `from_jsonl`) emit nothing on purpose: they are how a caller inspects or moves the
+//! store, and making them observable would let a monitoring observer generate its own
+//! traffic. See [`crate::team::observe`] for the seam itself.
 use super::memory::InMemoryTeamMemoryStore;
 use super::{TeamMemoryStore, TeamSearchOptions};
 use crate::record::CallOptions;
 use crate::team::model::{
-    NewTeamMemory, TeamMemoryFilter, TeamMemoryRecord, TeamMemoryScope, TeamMemoryStats,
-    TeamMemoryUpdate, TeamSearchHit, DEFAULT_IMPORTANCE,
+    NewTeamMemory, TeamMemoryFilter, TeamMemoryKind, TeamMemoryRecord, TeamMemoryScope,
+    TeamMemoryStats, TeamMemoryUpdate, TeamSearchHit, DEFAULT_IMPORTANCE,
 };
+use crate::team::observe::{TeamMemoryEvent, TeamMemoryObserver, TeamMemoryOperation};
 use chrono::{DateTime, Utc};
 use openjiuwen_common::error::{Error, Result};
+use std::future::Future;
 use std::sync::Arc;
 use tracing::debug;
 /// The tracing target of every log line this module emits.
@@ -33,14 +48,16 @@ const LOG_TARGET: &str = "openjiuwen_memory::team";
 pub struct TeamMemory {
     store: Arc<dyn TeamMemoryStore>,
     default_importance: f32,
+    observer: Option<Arc<dyn TeamMemoryObserver>>,
 }
 impl TeamMemory {
-    /// Builds a facade over `store`.
+    /// Builds a facade over `store`, with no observer attached.
     #[must_use]
     pub fn new(store: Arc<dyn TeamMemoryStore>) -> Self {
         Self {
             store,
             default_importance: DEFAULT_IMPORTANCE,
+            observer: None,
         }
     }
     /// Builds a facade over a fresh [`InMemoryTeamMemoryStore`].
@@ -88,12 +105,73 @@ impl TeamMemory {
     pub fn store(&self) -> &Arc<dyn TeamMemoryStore> {
         &self.store
     }
+    /// Attaches `observer` to receive one [`TeamMemoryEvent`] per observable operation.
+    ///
+    /// Attaching is purely additive: no operation changes its result, its ordering, or its
+    /// cancellation behaviour because an observer is present. Replacing an observer drops
+    /// the previous one.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn TeamMemoryObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+    /// The attached observer, when there is one.
+    #[must_use]
+    pub fn observer(&self) -> Option<&Arc<dyn TeamMemoryObserver>> {
+        self.observer.as_ref()
+    }
+    /// Forwards `event` to the attached observer; a no-op when none is attached.
+    pub fn emit(&self, event: &TeamMemoryEvent) {
+        if let Some(observer) = &self.observer {
+            observer.observe(event);
+        }
+    }
+    /// Marks `event` failed with `error`'s text, emits it, and returns `error` unchanged.
+    ///
+    /// This keeps the error path of every observed method to one `Err(..)` expression while
+    /// guaranteeing that the typed error the caller sees is exactly the one that was
+    /// reported.
+    fn emit_failure(&self, mut event: TeamMemoryEvent, error: Error) -> Error {
+        event = event.failed(&error);
+        self.emit(&event);
+        error
+    }
+    /// Awaits `work`, emits `base` with the count derived from a success, or the failed
+    /// `base` carrying the error's text, and returns the result untouched.
+    async fn observe_result<T>(
+        &self,
+        base: TeamMemoryEvent,
+        work: impl Future<Output = Result<T>>,
+        count: impl FnOnce(&T) -> usize,
+    ) -> Result<T> {
+        match work.await {
+            Ok(value) => {
+                self.emit(&base.with_count(count(&value)));
+                Ok(value)
+            }
+            Err(error) => Err(self.emit_failure(base, error)),
+        }
+    }
     /// Materializes and stores one new team memory.
     ///
     /// The input is validated and normalized by [`NewTeamMemory::to_record`] (a missing
     /// id is generated, tags and visibility are normalized, and the facade's
     /// [`TeamMemory::default_importance`] fills an absent importance), then upserted.
     pub async fn remember(
+        &self,
+        input: NewTeamMemory,
+        call: &CallOptions,
+    ) -> Result<TeamMemoryRecord> {
+        let event = write_event(
+            &input.team_id,
+            input.member_id.as_deref(),
+            Some(&input.kind),
+        );
+        self.observe_result(event, self.remember_record(input, call), |_| 1)
+            .await
+    }
+    /// The write half of [`TeamMemory::remember`], without observation.
+    async fn remember_record(
         &self,
         input: NewTeamMemory,
         call: &CallOptions,
@@ -108,21 +186,42 @@ impl TeamMemory {
     /// Materializes and stores several team memories in order.
     ///
     /// Processing is sequential and stops at the first error; the records written before
-    /// the failure stay in the store.
+    /// the failure stay in the store. One `Write` event is emitted for the batch, carrying
+    /// the number of records actually stored.
     pub async fn remember_many(
         &self,
         inputs: Vec<NewTeamMemory>,
         call: &CallOptions,
     ) -> Result<Vec<TeamMemoryRecord>> {
-        call.check()?;
+        let event = TeamMemoryEvent::new(
+            TeamMemoryOperation::Write,
+            inputs.first().map_or("", |input| input.team_id.as_str()),
+        );
         let mut stored = Vec::with_capacity(inputs.len());
+        match self.write_batch(inputs, call, &mut stored).await {
+            Ok(()) => {
+                self.emit(&event.with_count(stored.len()));
+                Ok(stored)
+            }
+            Err(error) => Err(self.emit_failure(event.with_count(stored.len()), error)),
+        }
+    }
+    /// The sequential write loop of [`TeamMemory::remember_many`], appending as it goes so
+    /// the caller can report how many records a stopped batch did store.
+    async fn write_batch(
+        &self,
+        inputs: Vec<NewTeamMemory>,
+        call: &CallOptions,
+        stored: &mut Vec<TeamMemoryRecord>,
+    ) -> Result<()> {
+        call.check()?;
         for input in inputs {
             let record = input.to_record(Utc::now(), self.default_importance)?;
             let saved = call.run(self.store.upsert(&record)).await??;
             call.check()?;
             stored.push(saved);
         }
-        Ok(stored)
+        Ok(())
     }
     /// Fetches one record by team and id.
     ///
@@ -137,6 +236,18 @@ impl TeamMemory {
     /// update is validated and applied by [`TeamMemoryUpdate::apply`] (which stamps
     /// `updated_at`) before the record is upserted again.
     pub async fn update(
+        &self,
+        team_id: &str,
+        id: &str,
+        update: &TeamMemoryUpdate,
+        call: &CallOptions,
+    ) -> Result<TeamMemoryRecord> {
+        let event = write_event(team_id, None, None);
+        self.observe_result(event, self.update_record(team_id, id, update, call), |_| 1)
+            .await
+    }
+    /// The read-modify-write half of [`TeamMemory::update`], without observation.
+    async fn update_record(
         &self,
         team_id: &str,
         id: &str,
@@ -173,6 +284,20 @@ impl TeamMemory {
         query: &str,
         options: &TeamSearchOptions,
     ) -> Result<Vec<TeamSearchHit>> {
+        self.observe_result(
+            search_event(scope),
+            self.search_hits(scope, query, options),
+            Vec::len,
+        )
+        .await
+    }
+    /// The store half of [`TeamMemory::search`], without observation.
+    async fn search_hits(
+        &self,
+        scope: &TeamMemoryScope,
+        query: &str,
+        options: &TeamSearchOptions,
+    ) -> Result<Vec<TeamSearchHit>> {
         options.call.check()?;
         let hits = options
             .call
@@ -183,11 +308,17 @@ impl TeamMemory {
     }
     /// Deletes one record, returning `false` when it was already absent.
     pub async fn forget(&self, team_id: &str, id: &str) -> Result<bool> {
-        self.store.delete(team_id, id).await
+        let event = TeamMemoryEvent::new(TeamMemoryOperation::Forget, team_id);
+        self.observe_result(event, self.store.delete(team_id, id), |deleted| {
+            usize::from(*deleted)
+        })
+        .await
     }
     /// Deletes every record matching `filter` and returns how many were removed.
     pub async fn clear(&self, filter: &TeamMemoryFilter) -> Result<usize> {
-        self.store.clear(filter).await
+        let event = TeamMemoryEvent::new(TeamMemoryOperation::Clear, &filter.team_id);
+        self.observe_result(event, self.store.clear(filter), |deleted| *deleted)
+            .await
     }
     /// Aggregates the records matching `filter`.
     pub async fn stats(&self, filter: &TeamMemoryFilter) -> Result<TeamMemoryStats> {
@@ -203,8 +334,14 @@ impl TeamMemory {
         self.store.set_expiry(team_id, id, expires_at).await
     }
     /// Prunes every record that has expired as of now, returning how many were removed.
+    ///
+    /// Pruning is cross-team, so the emitted event carries an empty `team_id`.
     pub async fn prune_expired(&self) -> Result<usize> {
-        self.store.prune_expired(Utc::now()).await
+        let event = TeamMemoryEvent::new(TeamMemoryOperation::Prune, "");
+        self.observe_result(event, self.store.prune_expired(Utc::now()), |pruned| {
+            *pruned
+        })
+        .await
     }
     /// Serializes the records matching `filter` as JSON Lines.
     ///
@@ -255,6 +392,29 @@ impl TeamMemory {
         debug!(target: LOG_TARGET, imported = stored.len(), "imported team memory jsonl");
         Ok(stored)
     }
+}
+/// The `Write` event for a record whose member and kind are known up front.
+fn write_event(
+    team_id: &str,
+    member_id: Option<&str>,
+    kind: Option<&TeamMemoryKind>,
+) -> TeamMemoryEvent {
+    let mut event = TeamMemoryEvent::new(TeamMemoryOperation::Write, team_id);
+    if let Some(member_id) = member_id {
+        event = event.with_member(member_id);
+    }
+    if let Some(kind) = kind {
+        event = event.with_kind(kind.clone());
+    }
+    event
+}
+/// The `Search` event of the read view `scope`.
+fn search_event(scope: &TeamMemoryScope) -> TeamMemoryEvent {
+    let mut event = TeamMemoryEvent::new(TeamMemoryOperation::Search, &scope.team_id);
+    if let Some(member_id) = &scope.member_id {
+        event = event.with_member(member_id);
+    }
+    event
 }
 /// Prefixes a validation error with the 1-based JSONL line number.
 fn with_line_number(number: usize, error: Error) -> Error {
