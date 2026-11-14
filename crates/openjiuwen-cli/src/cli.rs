@@ -167,8 +167,13 @@ impl Cli {
             Some(Command::Chat(args)) => {
                 Some(openjiuwen_harness::cli::Command::Chat(args.base.clone()))
             }
-            Some(Command::Lsp(_) | Command::Cron(_) | Command::Team(_) | Command::Watch(_))
-            | Some(Command::AutoHarness(_))
+            Some(
+                Command::Lsp(_)
+                | Command::Cron(_)
+                | Command::Team(_)
+                | Command::Watch(_)
+                | Command::AutoHarness(_),
+            )
             | None => None,
         };
         openjiuwen_harness::cli::Cli {
