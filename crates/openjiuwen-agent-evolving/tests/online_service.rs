@@ -884,7 +884,7 @@ async fn error_envelopes_carry_only_a_code_and_a_message() {
         let (status, body) = service.send(request).await;
         assert!(status.is_client_error(), "status: {status} body: {body}");
         let (code, message) = envelope(&body);
-        assert!(!code.is_empty());
-        assert!(!message.is_empty());
+        assert_ne!(code, "");
+        assert_ne!(message, "");
     }
 }

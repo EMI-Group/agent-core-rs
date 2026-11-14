@@ -16,7 +16,7 @@ use serde_json::json;
 
 use super::super::checkpoint::TrainingCheckpoint;
 use super::super::redis_store::{RedisOnlineStore, RedisOnlineStoreOptions};
-use super::super::sample::{SampleLedger, SampleStatus};
+use super::super::sample::{SampleLedger, SampleRecord, SampleStatus};
 use super::super::store::{keys, OnlineStore};
 use super::super::task::{
     FinishReason, FixedClock, RewardMode, TaskRegistry, TaskSpec, TaskStatus,
@@ -273,10 +273,10 @@ async fn task_lifecycle_runs_over_redis() {
             .members(&durable(&keys::committed_captures(TASK))),
         ["c1"]
     );
-    assert!(fake
-        .state()
-        .members(&durable(&keys::open_captures(TASK)))
-        .is_empty());
+    assert_eq!(
+        fake.state().members(&durable(&keys::open_captures(TASK))),
+        Vec::<String>::new()
+    );
     assert!(fake
         .state()
         .get(&durable(&keys::pending_sample(TASK, "c1")))
@@ -291,10 +291,10 @@ async fn task_lifecycle_runs_over_redis() {
         fake.state().get(&durable(&keys::active_session(SESSION))),
         None
     );
-    assert!(fake
-        .state()
-        .members(&durable(&keys::active_tasks()))
-        .is_empty());
+    assert_eq!(
+        fake.state().members(&durable(&keys::active_tasks())),
+        Vec::<String>::new()
+    );
 
     // Reward projects onto the committed capture exactly once.
     assert_eq!(registry.record_reward(TASK, 0.25).await.expect("reward"), 1);
@@ -342,11 +342,10 @@ async fn the_sample_ledger_is_first_wins_on_redis() {
     // A replayed id keeps the record the first writer published.
     let mut replay = sample("s1");
     replay.reward = 0.9;
-    assert!(ledger
-        .save_once(&[replay])
-        .await
-        .expect("replay")
-        .is_empty());
+    assert_eq!(
+        ledger.save_once(&[replay]).await.expect("replay"),
+        Vec::<String>::new()
+    );
     let stored = ledger.get("s1").await.expect("get").expect("present");
     assert_eq!(stored.reward, 0.5);
 
@@ -361,10 +360,11 @@ async fn the_sample_ledger_is_first_wins_on_redis() {
     assert!(batch
         .iter()
         .all(|record| record.status == SampleStatus::Training));
-    assert!(fake
-        .state()
-        .members(&durable(&keys::samples_by_status("pending")))
-        .is_empty());
+    assert_eq!(
+        fake.state()
+            .members(&durable(&keys::samples_by_status("pending"))),
+        Vec::<String>::new()
+    );
     assert_eq!(
         fake.state()
             .members(&durable(&keys::samples_by_status("training"))),
@@ -419,7 +419,7 @@ async fn the_training_runner_claims_runs_and_exports_over_redis() {
     let (again, created, nothing) = runner.claim().await.expect("second claim");
     assert!(!created);
     assert_eq!(again.training_run_id, run.training_run_id);
-    assert!(nothing.is_empty());
+    assert_eq!(nothing, Vec::<SampleRecord>::new());
 
     let done = runner.run(&run.training_run_id).await.expect("run");
     assert_eq!(done.status, RunStatus::Succeeded);

@@ -4,9 +4,9 @@
 
 The online-RL service state machines, ported from Python `openjiuwen/agent_evolving/agent_rl/`.
 Four cooperating machines live here: the RL task/capture registry (`task_registry.py` + the registry-owned halves of `capture_pipeline.py`), the sample ledger (`storage/trajectory_store.py`), the training-run runner (`online/training_runner.py`, with the executor seam of `online/abstract/trainer.py` + `online/scheduler/ppo_executor.py`) and the LoRA artifact repository (`storage/lora_repo.py`).
-Every machine is store-agnostic: the in-memory store used offline and the future Redis store share one implementation of every rule.
+Every machine is store-agnostic: the in-memory store used offline and the Redis store of the `redis` feature share one implementation of every rule.
 What stays deferred is typed: the GPU PPO training path and the vendor AI-gateway activation path return `Error::Unsupported` with the missing capability named.
-The HTTP routes and the Redis backend are later steps; nothing here reads the wall clock, a random number or a filesystem mtime.
+The HTTP transport lives in `routes.rs` (+ `routes/`), and the durable backend is `redis_store.rs` behind the crate feature `redis`; nothing here reads the wall clock, a random number or a filesystem mtime.
 
 ## API Surface
 
@@ -18,8 +18,9 @@ The HTTP routes and the Redis backend are later steps; nothing here reads the wa
 - `sample.rs` — `SampleStatus`, `SampleRecord` (+ `pending`, `policy_version`, `validate`, `to_json`/`from_json`), `SampleLedger<S>` (`new`, `store`, `save_once`, `get`, `list_by_status`, `count_by_status`, `pending_count`, `fetch_and_mark_training`, `mark_trained`, `mark_failed`, `reset_to_pending`, `stats`) and the `SampleStore<S>` parity alias.
 - `executor.rs` — `TrainingExecutor` seam (`name`, `train_batch`, `cancel`, `check_health`), `TrainingRequest`, `TrainingArtifact` (+ `validate_name`), `artifact_name`/`artifact_version`/`is_artifact_name`, `LocalTrainingExecutor` (+ `root`, `run_dir`, `descriptor_path`), `LocalArtifactDescriptor`, `PpoTrainingExecutor` (+ `device`).
 - `training.rs` — `RunStatus`, `RunStage`, `TrainingRunRecord` (+ `public`, `to_public_json`, `to_json`/`from_json`, `parent_lora_name`/`parent_lora_path`), `TrainingRunnerConfig` (+ `new`, `validate`), `LoraActivator`/`LoraActivation`, `NoopLoraActivator`, `UnsupportedLoraActivator`, `TrainingCheckpoint`, `TrainingRunner<S>` (`new`, `with_clock`, `with_parent_policy`, `store`, `config`, `executor`, `claim`, `get`, `active_run`, `run`, `stop`, `recover`, `stats`, `export_checkpoint`), `SERVICE_RESTARTED`, `TRAINING_CHECKPOINT_VERSION`.
+- `redis_store.rs` (feature `redis`) — `RedisOnlineStoreOptions` (`url`, `prefix`, `database`, `timeout`, `new`, `validate`, redacting `Debug`), `RedisOnlineStore` (`connect`, `connect_with_options`, `from_client`, `prefix`, `client`, `ping`) and its `OnlineStore` impl over `openjiuwen_extensions::redis`, plus `DEFAULT_PREFIX` and `DEFAULT_TIMEOUT`.
 - `lora.rs` — `LoraAvailability`, `LoraVersion`, `LoraRepository` (`new`, `root`, `model_dir`, `version_dir`, `publish`, `list_versions`, `get_latest`, `get_latest_available`, `get_version`, `artifact`, `set_availability`, `list_models`), `version_literal`, `parse_version_literal`.
-- `tests/` — 92 unit tests across `mod.rs`, `capture.rs`, `sample.rs`, `executor.rs`, `training.rs`, `lora.rs`.
+- `tests/` — 111 unit tests with `--all-features` (94 without the `redis` feature) across `mod.rs`, `capture.rs`, `sample.rs`, `executor.rs`, `training.rs`, `lora.rs`, `redis_store.rs` and `redis.rs`.
 
 ## State Machines
 
@@ -60,6 +61,18 @@ The literal layout (documented once in `mod.rs`): task/capture keys as in step 1
 A training-run id must never be the literal `active` because the marker shares the prefix; run ids are allocated as `run-{seq:012x}` from the store counter.
 The LoRA repository is filesystem-backed (`{root}/{model_id}/v{N}/{version.json,artifact.json}` plus `{root}/{model_id}/latest`) and writes no store key.
 
+## Redis Backend
+
+`RedisOnlineStore` (module `redis_store`, crate feature `redis`) implements the same `OnlineStore` seam, so no state-machine rule changes when the backend does.
+Command mapping: `get` → `GET`, `set` → `SET`, `set_if_absent` → `SET k v NX` (null reply → `false`), `del` → `DEL` (> 0), `set_add` → `SADD` (> 0), `set_remove` → `SREM` (> 0), `set_members` → `SMEMBERS` (sorted locally), `set_contains` → `SISMEMBER`.
+Every key is written as `{prefix}:{key}`; the default prefix is `openjiuwen:rl`, so a sample record lands at `openjiuwen:rl:rl:v1:sample:{id}` and the `rl:v1` layout below is unchanged underneath the namespace.
+Only `redis://` is accepted: `rediss://` (no TLS stack is vendored) and `redis+cluster://` / `rediss+cluster://` (no slot routing) fail `RedisOnlineStoreOptions::validate` with `Error::Unsupported` naming the gap.
+Server error replies are never swallowed: `WRONGTYPE` and unexpected reply types surface as `Error::Validation`, `MOVED`/`ASK` as `Error::Unsupported`, and I/O or timeout failures as `Error::Transport`/`Error::Timeout`; the machines wrap them in `OnlineError::Store`.
+Multi-key sequences are ordered single commands, not Lua or `WATCH`/`MULTI`: one serialized connection gives read-your-writes, but concurrent processes can interleave between the commands of one sequence.
+The two single-flight paths survive because each is one command — `SET … NX` on `rl:v1:training_run:active` for the training claim, and `SET … NX` on `rl:v1:task:{id}` for task start adoption.
+Operationally that means one writable service process per Redis database, as Python's single scheduler ran.
+The fake `RESP2` server in `tests/fake_redis.rs` (`PING`, `ECHO`, `AUTH`, `SELECT`, `GET`, `SET NX`, `DEL`, `EXISTS`, set commands, `FLUSHDB`, `WRONGTYPE` and unknown-command errors) keeps the suite offline.
+
 ## Determinism
 
 Timestamps come from the injected `Clock` (`FixedClock` by default); no code here calls `SystemTime`, `Instant` or `rand`.
@@ -76,6 +89,7 @@ Tests hold a run inside a stage with a `Barrier`+`Semaphore` gate instead of sle
 ## Known Issues
 
 Cross-process claims are not fully atomic: two writers can both fetch pending samples before either marks them, so the loser re-queues ids the winner may already be training. Deployments run one writable service process per store (or one store connection), as Python's single scheduler does.
+On Redis the same limit covers every multi-command sequence (capture commit, reward projection, training finish), which is why the claim and task-start paths are single `SET … NX` commands.
 `fetch_and_mark_training` moves the set membership before rewriting the record; a crash in between leaves a sample indexed as `training` with a `pending` record, which `reset_to_pending` repairs.
 Sample sequence allocation is read-modify-write (Redis `INCR` is the atomic upgrade); concurrent allocation can produce equal `created_seq` values, which ordering then breaks on `sample_id`.
 The LoRA repository's version allocator is atomic across processes through directory creation; a network filesystem with weak directory atomicity and two writers is outside that contract, and `latest` is last-writer-wins.
@@ -91,5 +105,6 @@ The LoRA repository's version allocator is atomic across processes through direc
 - `./executor.rs` → executor seam, local executor, typed PPO stub, artifact-name contract
 - `./training.rs` → training-run records and runner, activation seam, checkpoint export
 - `./lora.rs` → filesystem artifact repository, versions and availability
-- `./tests/` → the unit suite (compiled only under `cfg(test)`): `mod.rs`, `capture.rs`, `sample.rs`, `executor.rs`, `training.rs`, `lora.rs`
+- `./redis_store.rs` → Redis-backed `OnlineStore`, options, prefixing, typed TLS/cluster rejection
+- `./tests/` → the unit suite (compiled only under `cfg(test)`): `mod.rs`, `capture.rs`, `sample.rs`, `executor.rs`, `training.rs`, `lora.rs`; `redis.rs` + `fake_redis.rs` under the `redis` feature
 - `./mod.rs` → module docs, re-exports, JSON helpers

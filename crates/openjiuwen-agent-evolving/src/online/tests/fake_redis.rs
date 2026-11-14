@@ -250,24 +250,32 @@ fn execute(args: &[String], shared: &Shared) -> Reply {
             }
             None => arity_error(&name),
         },
-        "SET" => set_command(args, &mut data),
+        "SET" => write_command(args, &mut data),
         "DEL" => {
             if args.len() < 2 {
                 return arity_error(&name);
             }
             let removed = args[1..].iter().filter(|key| data.remove(key)).count();
-            Reply::Integer(removed as i64)
+            counted(removed)
         }
         "EXISTS" => {
             if args.len() < 2 {
                 return arity_error(&name);
             }
             let existing = args[1..].iter().filter(|key| data.exists(key)).count();
-            Reply::Integer(existing as i64)
+            counted(existing)
         }
+        "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER" => set_command(&name, args, &mut data),
+        _ => Reply::Error(format!("ERR unknown command '{name}'")),
+    }
+}
+
+/// Executes one set command (`SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`).
+fn set_command(name: &str, args: &[String], data: &mut Data) -> Reply {
+    match name {
         "SADD" => {
             if args.len() < 3 {
-                return arity_error(&name);
+                return arity_error(name);
             }
             let key = &args[1];
             if data.values.contains_key(key) {
@@ -278,11 +286,11 @@ fn execute(args: &[String], shared: &Shared) -> Reply {
                 .iter()
                 .filter(|member| set.insert((*member).clone()))
                 .count();
-            Reply::Integer(added as i64)
+            counted(added)
         }
         "SREM" => {
             if args.len() < 3 {
-                return arity_error(&name);
+                return arity_error(name);
             }
             let key = &args[1];
             if data.values.contains_key(key) {
@@ -295,7 +303,7 @@ fn execute(args: &[String], shared: &Shared) -> Reply {
                 .iter()
                 .filter(|member| set.remove(*member))
                 .count();
-            Reply::Integer(removed as i64)
+            counted(removed)
         }
         "SMEMBERS" => match args.get(1) {
             Some(key) => {
@@ -314,11 +322,12 @@ fn execute(args: &[String], shared: &Shared) -> Reply {
                         .unwrap_or_default(),
                 )
             }
-            None => arity_error(&name),
+            None => arity_error(name),
         },
-        "SISMEMBER" => {
+        _ => {
+            // SISMEMBER
             if args.len() < 3 {
-                return arity_error(&name);
+                return arity_error(name);
             }
             let key = &args[1];
             if data.values.contains_key(key) {
@@ -330,12 +339,16 @@ fn execute(args: &[String], shared: &Shared) -> Reply {
                 .is_some_and(|members| members.contains(&args[2]));
             Reply::Integer(i64::from(present))
         }
-        _ => Reply::Error(format!("ERR unknown command '{name}'")),
     }
 }
 
+/// Wraps a command's affected count into an integer reply.
+fn counted(count: usize) -> Reply {
+    Reply::Integer(i64::try_from(count).unwrap_or(i64::MAX))
+}
+
 /// `SET key value [NX]`; the online store only uses the `NX` form.
-fn set_command(args: &[String], data: &mut Data) -> Reply {
+fn write_command(args: &[String], data: &mut Data) -> Reply {
     if args.len() < 3 {
         return arity_error("SET");
     }
