@@ -366,6 +366,12 @@ async fn pack_renders_front_matter_and_workflow_graph() {
         .is_file());
 
     let rendered = pack.render();
+    let script = rendered
+        .get("swarmflow/run.py")
+        .expect("generated SwarmFlow script");
+    assert!(script.starts_with("\"\"\"SwarmFlow script generated from recipe "));
+    assert!(script.contains("label='search'"));
+    assert!(script.contains("label='summarize'"));
     let skill_md = rendered.get("SKILL.md").expect("SKILL.md");
     let (front, body) = skill_md.split_once("\n---\n").expect("front matter");
     let yaml = front.strip_prefix("---\n").expect("leading delimiter");
@@ -690,6 +696,11 @@ async fn install_writes_artifacts_and_rejects_stale_versions() {
     );
     assert!(destination.path().join("SKILL.md").is_file());
     assert!(destination.path().join("dependencies.yaml").is_file());
+    assert!(destination
+        .path()
+        .join("swarmflow")
+        .join("run.py")
+        .is_file());
     let package = preparation.package.expect("approved package");
     assert_eq!(SkillPack::load(destination.path()).await.unwrap(), package);
     assert_eq!(
