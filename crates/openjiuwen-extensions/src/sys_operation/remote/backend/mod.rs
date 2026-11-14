@@ -209,6 +209,18 @@ pub(crate) trait SandboxBackend: Send + Sync + 'static {
     /// Runs a command inside the container.
     async fn execute(&self, request: &ExecRequest) -> std::result::Result<ExecResult, RemoteError>;
 
+    /// Whether this backend can honour a conditional write.
+    ///
+    /// `create_if_absent` and `expected_content_sha256` are evaluated host-side
+    /// by [`RemoteFs`]: it reads the current remote bytes under a per-path
+    /// in-process lock, applies the precondition, and only then writes. A
+    /// backend opts in when a read and a write of the same path reach the same
+    /// container view; the default keeps both options rejected with a clear
+    /// `fs_failure` instead of ignoring them.
+    fn supports_conditional_write(&self) -> bool {
+        false
+    }
+
     /// The command that runs a code snippet.
     ///
     /// The default is the inline form
@@ -306,7 +318,7 @@ where
         .with_fs(Arc::new(
             move |endpoint: &SandboxEndpoint, config: &SandboxGatewayConfig| {
                 let backend = Arc::new(fs_constructor(endpoint, config)?);
-                let operation: Arc<dyn FsOperation> = Arc::new(RemoteFs::new(backend, config));
+                let operation: Arc<dyn FsOperation> = Arc::new(RemoteFs::new(backend));
                 Ok(operation)
             },
         ))

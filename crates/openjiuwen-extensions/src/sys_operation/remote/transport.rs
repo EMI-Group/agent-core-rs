@@ -88,6 +88,7 @@ impl RemoteError {
 /// The base URL, the card's auth headers, and the card's auth query parameters
 /// are resolved once at construction; every request then goes through
 /// [`SandboxHttp::request`].
+#[derive(Clone)]
 pub(crate) struct SandboxHttp {
     client: reqwest::Client,
     base_url: String,
@@ -402,7 +403,7 @@ fn hex_digit(byte: u8) -> std::result::Result<u8, RemoteError> {
 }
 
 /// Strips trailing slashes and adds `http://` when no scheme is present.
-fn normalize_base_url(base_url: &str) -> String {
+pub(crate) fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.contains("://") {
         trimmed.to_string()

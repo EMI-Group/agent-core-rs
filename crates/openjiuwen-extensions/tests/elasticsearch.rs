@@ -1,21 +1,30 @@
-//! Crate-boundary integration suite for the live Elasticsearch vector store.
+//! Crate-boundary integration suite for the live Elasticsearch backends.
 //!
-//! The peer is a `wiremock` server, so every case asserts both directions: the
-//! REST request the store sent (path, query string, body) and the kernel result
-//! it produced from the mocked response. The in-module unit tests cover the pure
-//! builders (`src/store/elasticsearch/tests.rs`).
+//! The vector-store section covers `ElasticsearchVectorStore` and the
+//! document-store section covers the kernel's `ElasticsearchDocumentStore` as
+//! wired by [`build_document_store`]. The peer is a `wiremock` server, so every
+//! case asserts both directions: the REST request the store sent (method, path,
+//! query string, body, headers) and the kernel result it produced from the
+//! mocked response. The in-module unit tests cover the pure builders
+//! (`src/store/elasticsearch/tests.rs`).
 //!
-//! Python counterpart: `tests/unit_tests/extensions/store/test_es_vector_store.py`.
+//! Python counterparts: `tests/unit_tests/extensions/store/test_es_vector_store.py`
+//! (vector store) and `tests/unit_tests/foundation/store/test_es_document_store.py`
+//! (document store).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_core::foundation::store::{FieldSchema, VectorDataType};
 use openjiuwen_extensions::store::elasticsearch::{
     ElasticsearchVectorStore, ElasticsearchVectorStoreConfig,
 };
-use openjiuwen_extensions::store::{CollectionSchema, VectorQuery, VectorStore};
+use openjiuwen_extensions::store::{
+    build_document_store, CollectionSchema, Document, DocumentStore, ElasticsearchConfig,
+    ElasticsearchDocumentStore, Query, SortOrder, StoreBackend, VectorQuery, VectorStore,
+};
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -635,4 +644,661 @@ async fn deleting_a_missing_collection_is_a_no_op() {
         .delete_collection("docs")
         .await
         .expect("a missing collection is a no-op");
+}
+
+// ---------------------------------------------------------------------------
+// Document store (`ElasticsearchDocumentStore`, wired by `build_document_store`)
+//
+// One collection is one index named `"{index_prefix}__{collection}"`, so the
+// cases below reuse [`INDEX`] (`/agent_vector__docs`) with the `agent_vector`
+// prefix that `StoreBackend::Elasticsearch` defaults to.
+// ---------------------------------------------------------------------------
+
+/// The `PUT /{index}` body the document store sends to create an index: only
+/// the keyword primary key is mapped, every other field is dynamic.
+fn document_index_body() -> Value {
+    json!({"mappings": {"properties": {"id": {"type": "keyword"}}}})
+}
+
+/// A document store on `server`, built without any I/O.
+fn document_store(server: &MockServer) -> ElasticsearchDocumentStore {
+    ElasticsearchDocumentStore::new(
+        ElasticsearchConfig::new(server.uri()).with_index_prefix("agent_vector"),
+    )
+    .expect("the document store builds without I/O")
+}
+
+/// The backend value the document-store factory takes for `server`.
+fn document_backend(server: &MockServer) -> StoreBackend {
+    StoreBackend::Elasticsearch {
+        url: server.uri(),
+        index_prefix: "agent_vector".to_string(),
+        username: None,
+        password: None,
+        api_key: None,
+    }
+}
+
+/// Mounts the `HEAD /{index}` existence probe with `status`.
+async fn mount_document_head(server: &MockServer, status: u16) {
+    Mock::given(method("HEAD"))
+        .and(path(INDEX))
+        .respond_with(ResponseTemplate::new(status))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Mounts the `PUT /{index}` index creation of an absent index.
+async fn mount_document_index_creation(server: &MockServer) {
+    Mock::given(method("PUT"))
+        .and(path(INDEX))
+        .and(body_json(document_index_body()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acknowledged": true})))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Mounts the `POST /{index}/_bulk` write that accepts every item.
+async fn mount_document_bulk(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .and(header("content-type", "application/x-ndjson"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1,
+            "errors": false,
+            "items": [
+                {"index": {"_index": "agent_vector__docs", "_id": "a", "status": 201}},
+                {"index": {"_index": "agent_vector__docs", "_id": "b", "status": 201}},
+            ],
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Every request path `server` recorded, in order.
+async fn request_paths(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect()
+}
+
+/// Every `authorization` header `server` recorded, in order.
+async fn authorization_headers(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .map(|value| value.to_str().expect("ASCII header").to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// `Basic <base64(user:pass)>`, the header HTTP basic authentication sends.
+fn basic(user: &str, pass: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    )
+}
+
+/// `server.uri()` with `user:pass` userinfo spliced in.
+fn uri_with_userinfo(server: &MockServer, user: &str, pass: &str) -> String {
+    server
+        .uri()
+        .replacen("http://", &format!("http://{user}:{pass}@"), 1)
+}
+
+#[tokio::test]
+async fn document_upsert_creates_the_index_and_bulks_ndjson() {
+    let server = MockServer::start().await;
+    mount_document_head(&server, 404).await;
+    mount_document_index_creation(&server).await;
+    mount_document_bulk(&server).await;
+
+    let written = document_store(&server)
+        .upsert(
+            "docs",
+            vec![
+                Document::new("a")
+                    .with_field("name", "Ada")
+                    .with_field("age", 36),
+                Document::new("b").with_field("name", "Bob"),
+            ],
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(written, 2, "upsert reports every document it wrote");
+
+    // One NDJSON request: metadata line, source line, per document.
+    let body = request_body(&server, "POST", &format!("{INDEX}/_bulk")).await;
+    let body = String::from_utf8(body).expect("the bulk body is UTF-8");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 4, "two documents are two NDJSON line pairs");
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[0]).unwrap(),
+        json!({"index": {"_id": "a"}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[1]).unwrap(),
+        json!({"id": "a", "name": "Ada", "age": 36})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[2]).unwrap(),
+        json!({"index": {"_id": "b"}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[3]).unwrap(),
+        json!({"id": "b", "name": "Bob"})
+    );
+    assert_eq!(
+        request_paths(&server).await,
+        vec![
+            INDEX.to_string(),
+            INDEX.to_string(),
+            format!("{INDEX}/_bulk")
+        ],
+        "a missing index is probed, created, then written"
+    );
+}
+
+#[tokio::test]
+async fn document_upsert_reuses_an_existing_index() {
+    let server = MockServer::start().await;
+    mount_document_head(&server, 200).await;
+    mount_document_bulk(&server).await;
+
+    let written = document_store(&server)
+        .upsert("docs", vec![Document::new("a").with_field("name", "Ada")])
+        .await
+        .expect("upsert");
+    assert_eq!(written, 1, "upsert reports the documents it sent");
+
+    // No `PUT` follows the successful probe.
+    assert_eq!(
+        request_paths(&server).await,
+        vec![INDEX.to_string(), format!("{INDEX}/_bulk")]
+    );
+}
+
+#[tokio::test]
+async fn document_upsert_surfaces_item_level_errors() {
+    let server = MockServer::start().await;
+    mount_document_head(&server, 200).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": true,
+            "items": [{
+                "index": {
+                    "_id": "a",
+                    "status": 409,
+                    "error": {
+                        "type": "version_conflict_engine_exception",
+                        "reason": "version conflict, document already exists",
+                    },
+                },
+            }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = document_store(&server)
+        .upsert("docs", vec![Document::new("a")])
+        .await
+        .expect_err("an item-level failure fails the write");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let message = error.message();
+    assert!(message.contains("409"), "{message}");
+    assert!(message.contains("agent_vector__docs"), "{message}");
+    assert!(
+        message.contains("version_conflict_engine_exception"),
+        "{message}"
+    );
+    assert!(message.contains("document already exists"), "{message}");
+}
+
+#[tokio::test]
+async fn document_get_reads_a_hit_and_a_miss() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{INDEX}/_doc/a")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_index": "agent_vector__docs",
+            "_id": "a",
+            "_source": {"id": "a", "name": "Ada", "age": 36},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{INDEX}/_doc/missing")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "_index": "agent_vector__docs",
+            "_id": "missing",
+            "found": false,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = document_store(&server);
+    assert_eq!(
+        store.get("docs", "a").await.expect("get"),
+        Some(
+            Document::new("a")
+                .with_field("name", "Ada")
+                .with_field("age", 36)
+        )
+    );
+    assert_eq!(
+        store.get("docs", "missing").await.expect("get"),
+        None,
+        "a missing document reads as absent, not as an error"
+    );
+}
+
+#[tokio::test]
+async fn document_query_sends_the_filter_order_and_paging() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_search")))
+        .and(body_json(json!({
+            "query": {"range": {"age": {"gte": 18}}},
+            "from": 1,
+            "size": 2,
+            "track_total_hits": true,
+            "sort": [{"age": {
+                "order": "desc",
+                "missing": "_last",
+                "unmapped_type": "keyword",
+            }}],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {
+                "total": {"value": 2, "relation": "eq"},
+                "hits": [
+                    {"_id": "b", "_source": {"id": "b", "name": "Bob", "age": 24}},
+                    {"_id": "a", "_source": {"name": "Ada", "age": 20}},
+                ],
+            },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        filter: json!({"age": {"$gte": 18}}),
+        limit: Some(2),
+        offset: 1,
+        order_by: vec![("age".to_string(), SortOrder::Desc)],
+    };
+    let documents = document_store(&server)
+        .query("docs", &query)
+        .await
+        .expect("query");
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[0].id, "b");
+    assert_eq!(
+        documents[0].fields.get("name"),
+        Some(&json!("Bob")),
+        "the hit order of the server is kept"
+    );
+    assert_eq!(
+        documents[1].id, "a",
+        "a `_source` without `id` is completed from `_id`"
+    );
+    assert_eq!(documents[1].fields.get("age"), Some(&json!(20)));
+}
+
+#[tokio::test]
+async fn document_count_sends_the_translated_filter() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_count")))
+        .and(body_json(json!({"query": {"term": {"name": "Ada"}}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count": 3,
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_count")))
+        .and(body_json(json!({"query": {"match_all": {}}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"count": 7})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = document_store(&server);
+    let query = Query {
+        filter: json!({"name": "Ada"}),
+        ..Query::default()
+    };
+    assert_eq!(store.count("docs", &query).await.expect("count"), 3);
+    assert_eq!(
+        store.count("docs", &Query::default()).await.expect("count"),
+        7,
+        "a null filter becomes a `match_all` count"
+    );
+}
+
+#[tokio::test]
+async fn document_delete_uses_delete_by_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_delete_by_query")))
+        .and(body_json(json!({"query": {"range": {"age": {"lt": 30}}}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "deleted": 2,
+            "total": 2,
+            "failures": [],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let query = Query {
+        filter: json!({"age": {"$lt": 30}}),
+        ..Query::default()
+    };
+    assert_eq!(
+        document_store(&server)
+            .delete("docs", &query)
+            .await
+            .expect("delete"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn document_list_collections_strips_the_prefix() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/agent_vector__*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agent_vector__notes": {"mappings": {}},
+            "agent_vector__docs": {"mappings": {}},
+            "unrelated__hidden": {"mappings": {}},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert_eq!(
+        document_store(&server)
+            .list_collections()
+            .await
+            .expect("list"),
+        vec!["docs".to_string(), "notes".to_string()],
+        "foreign indices are ignored and the names are sorted"
+    );
+}
+
+#[tokio::test]
+async fn document_drop_collection_ignores_a_missing_index() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(INDEX))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"type": "index_not_found_exception"},
+            "status": 404,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    document_store(&server)
+        .drop_collection("docs")
+        .await
+        .expect("dropping a missing collection is a no-op");
+}
+
+#[tokio::test]
+async fn document_missing_index_reads_as_absent() {
+    let server = MockServer::start().await;
+    for suffix in ["/_search", "/_count", "/_delete_by_query"] {
+        Mock::given(method("POST"))
+            .and(path(format!("{INDEX}{suffix}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": {"type": "index_not_found_exception"},
+                "status": 404,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let store = document_store(&server);
+    assert_eq!(
+        store.query("docs", &Query::default()).await.expect("query"),
+        Vec::<Document>::new()
+    );
+    assert_eq!(
+        store.count("docs", &Query::default()).await.expect("count"),
+        0
+    );
+    assert_eq!(
+        store
+            .delete("docs", &Query::default())
+            .await
+            .expect("delete"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn document_server_failure_is_a_transport_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{INDEX}/_doc/a")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom: shard unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = document_store(&server)
+        .get("docs", "a")
+        .await
+        .expect_err("500 must fail");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let message = error.message();
+    assert!(message.contains("500"), "{message}");
+    assert!(message.contains("agent_vector__docs"), "{message}");
+    assert!(message.contains("shard unavailable"), "{message}");
+}
+
+#[tokio::test]
+async fn document_store_factory_round_trips_a_document() {
+    let server = MockServer::start().await;
+    mount_document_head(&server, 404).await;
+    mount_document_index_creation(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [
+                {"index": {"_index": "agent_vector__docs", "_id": "a", "status": 201}},
+                {"index": {"_index": "agent_vector__docs", "_id": "b", "status": 201}},
+            ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{INDEX}/_doc/a")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_index": "agent_vector__docs",
+            "_id": "a",
+            "_source": {"id": "a", "name": "Ada"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The factory is the wiring under test: it must reach the kernel document
+    // store with the backend's index prefix and endpoint.
+    let store = build_document_store(&document_backend(&server))
+        .await
+        .expect("the factory builds a live REST document store");
+    assert_eq!(
+        store
+            .upsert("docs", vec![Document::new("a").with_field("name", "Ada")])
+            .await
+            .expect("upsert"),
+        1
+    );
+    assert_eq!(
+        store.get("docs", "a").await.expect("get"),
+        Some(Document::new("a").with_field("name", "Ada"))
+    );
+    for requested in request_paths(&server).await {
+        assert!(
+            requested.starts_with("/agent_vector__docs"),
+            "the backend prefix reaches the wire: {requested}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn document_basic_auth_comes_from_the_url_userinfo() {
+    let server = MockServer::start().await;
+    let expected = basic("elastic", "s3cret");
+    Mock::given(method("HEAD"))
+        .and(path(INDEX))
+        .and(header("authorization", expected.as_str()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .and(header("authorization", expected.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [{"index": {"_id": "a", "status": 201}}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = StoreBackend::Elasticsearch {
+        url: uri_with_userinfo(&server, "elastic", "s3cret"),
+        index_prefix: "agent_vector".to_string(),
+        username: None,
+        password: None,
+        api_key: None,
+    };
+    let store = build_document_store(&backend)
+        .await
+        .expect("the userinfo endpoint is accepted");
+    store
+        .upsert("docs", vec![Document::new("a")])
+        .await
+        .expect("upsert");
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.clone(), expected],
+        "every request carries the userinfo credentials"
+    );
+}
+
+#[tokio::test]
+async fn document_explicit_credentials_win_over_the_url_userinfo() {
+    let server = MockServer::start().await;
+    let expected = basic("alice", "secret");
+    Mock::given(method("HEAD"))
+        .and(path(INDEX))
+        .and(header("authorization", expected.as_str()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .and(header("authorization", expected.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [{"index": {"_id": "a", "status": 201}}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = StoreBackend::Elasticsearch {
+        url: uri_with_userinfo(&server, "bob", "wrong"),
+        index_prefix: "agent_vector".to_string(),
+        username: Some("alice".to_string()),
+        password: Some("secret".to_string()),
+        api_key: None,
+    };
+    let store = build_document_store(&backend)
+        .await
+        .expect("the explicit credentials are accepted");
+    store
+        .upsert("docs", vec![Document::new("a")])
+        .await
+        .expect("upsert");
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.clone(), expected],
+        "the explicit fields replace the userinfo pair"
+    );
+}
+
+#[tokio::test]
+async fn document_api_key_header_comes_from_the_backend() {
+    let server = MockServer::start().await;
+    let expected = "ApiKey api-key-123";
+    Mock::given(method("HEAD"))
+        .and(path(INDEX))
+        .and(header("authorization", expected))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{INDEX}/_bulk")))
+        .and(header("authorization", expected))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": false,
+            "items": [{"index": {"_id": "a", "status": 201}}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = StoreBackend::Elasticsearch {
+        url: server.uri(),
+        index_prefix: "agent_vector".to_string(),
+        username: None,
+        password: None,
+        api_key: Some("api-key-123".to_string()),
+    };
+    let store = build_document_store(&backend)
+        .await
+        .expect("the api key backend is accepted");
+    store
+        .upsert("docs", vec![Document::new("a")])
+        .await
+        .expect("upsert");
+    assert_eq!(
+        authorization_headers(&server).await,
+        vec![expected.to_string(), expected.to_string()]
+    );
 }

@@ -21,6 +21,8 @@ use wiremock::{Mock, MockServer, Request as WireRequest, Respond, ResponseTempla
 use super::super::transport::base64_encode;
 use super::*;
 
+mod teardown;
+
 /// The ADX management-plane environment path.
 const CREATE_PATH: &str = "/api/environment/v1/environments";
 

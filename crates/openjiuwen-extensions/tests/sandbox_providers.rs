@@ -1481,3 +1481,11 @@ fn the_code_surface_accepts_both_languages() {
     assert_eq!(Language::Javascript.as_str(), "javascript");
     let _ = Language::parse("python");
 }
+// ─── module suites ──────────────────────────────────────────────────────────
+// The teardown and conditional-write cases live in sibling files so this one stays
+// within its size budget; both reuse the fixtures above through `use super::*`. A test
+// target's crate root is a file, so the paths are explicit (as `tests/redis.rs` does).
+#[path = "sandbox_providers/conditional_write.rs"]
+mod conditional_write;
+#[path = "sandbox_providers/teardown.rs"]
+mod teardown;

@@ -1,14 +1,15 @@
-//! Unit tests of the Grafana Cloud preset.
+//! Unit tests of the Grafana Cloud and Grafana Agent/Alloy presets.
 //!
 //! `GRAFANA_*` has no Python counterpart in
 //! `tests/unit_tests/extensions/tracer_otel/`, which only covers the generic
-//! OTLP knobs; these tests hold the preset's own contract (endpoint derivation,
-//! Basic credentials, environment precedence, and the collector deferral).
+//! OTLP knobs; these tests hold the presets' own contract (endpoint derivation,
+//! Basic credentials, environment precedence, and the local collector push).
 //!
 //! Environment tests hold a process-wide lock and remove every variable on
 //! entry and on drop, so they neither observe nor leak host configuration.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use base64::engine::general_purpose::STANDARD;
@@ -16,8 +17,8 @@ use base64::Engine as _;
 use openjiuwen_common::error::ErrorKind;
 
 use super::{
-    GrafanaAgentConfig, GrafanaCloudConfig, GRAFANA_API_TOKEN, GRAFANA_INSTANCE_ID,
-    GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_ZONE, GRAFANA_ZONE,
+    GrafanaAgentConfig, GrafanaCloudConfig, DEFAULT_LOCAL_OTLP_ENDPOINT, GRAFANA_API_TOKEN,
+    GRAFANA_INSTANCE_ID, GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_ZONE, GRAFANA_ZONE,
 };
 use crate::otel::config::{ExporterType, OtlpProtocol};
 
@@ -287,16 +288,161 @@ fn from_env_requires_a_zone_without_an_endpoint() {
 }
 
 #[test]
-fn agent_preset_defers_to_an_external_collector() {
-    let agent = GrafanaAgentConfig::new("http://localhost:4318").with_service_name("checkout");
-    assert_eq!(agent.endpoint(), "http://localhost:4318");
+fn agent_preset_selects_the_local_http_exporter() {
+    let agent = GrafanaAgentConfig::new("http://127.0.0.1:4318").with_service_name("checkout");
+    assert_eq!(agent.endpoint(), "http://127.0.0.1:4318");
     assert_eq!(agent.service_name(), Some("checkout"));
+    assert!(agent.headers().is_empty());
 
-    let error = agent.otel_config().unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.message().contains("collector"), "{error}");
-    assert!(error.message().contains("Grafana Agent"), "{error}");
-    assert!(error.message().contains("http://localhost:4318"), "{error}");
+    let otel = agent.otel_config().unwrap();
+    assert_eq!(otel.exporter_type, ExporterType::Otlp);
+    assert_eq!(otel.protocol, OtlpProtocol::Http);
+    assert_eq!(
+        otel.exporter_endpoint.as_deref(),
+        Some("http://127.0.0.1:4318"),
+    );
+    assert_eq!(otel.service_name, "checkout");
+    assert_eq!(otel.service_version, None);
+    assert!(otel.headers.is_empty());
+}
+
+#[test]
+fn agent_preset_defaults_to_the_local_collector_endpoint() {
+    for agent in [
+        GrafanaAgentConfig::default(),
+        GrafanaAgentConfig::new("   "),
+    ] {
+        let otel = agent.otel_config().unwrap();
+        assert_eq!(
+            otel.exporter_endpoint.as_deref(),
+            Some(DEFAULT_LOCAL_OTLP_ENDPOINT),
+            "endpoint: {:?}",
+            agent.endpoint(),
+        );
+        // The Grafana Agent/Alloy OTLP/HTTP default port, shared with the
+        // generic exporter.
+        assert_eq!(DEFAULT_LOCAL_OTLP_ENDPOINT, "http://localhost:4318");
+        assert_eq!(otel.service_name, "openjiuwen");
+        assert_eq!(otel.protocol, OtlpProtocol::Http);
+    }
+}
+
+#[test]
+fn agent_preset_keeps_a_custom_endpoint_without_a_trailing_slash() {
+    let otel = GrafanaAgentConfig::new(" https://alloy.internal:4318/ ")
+        .otel_config()
+        .unwrap();
+    assert_eq!(
+        otel.exporter_endpoint.as_deref(),
+        Some("https://alloy.internal:4318"),
+    );
+}
+
+#[test]
+fn agent_preset_carries_headers() {
+    let agent = GrafanaAgentConfig::new("http://127.0.0.1:4318")
+        .with_header("authorization", "Bearer local")
+        .with_headers(BTreeMap::from([
+            ("x-tenant".to_owned(), "acme".to_owned()),
+            ("x-scope".to_owned(), "traces".to_owned()),
+        ]))
+        .with_header("x-tenant", "rotated");
+    assert_eq!(agent.headers().len(), 3);
+    assert_eq!(agent.headers()["x-tenant"], "rotated");
+
+    let otel = agent.otel_config().unwrap();
+    assert_eq!(otel.headers.len(), 3);
+    assert_eq!(otel.headers["authorization"], "Bearer local");
+    assert_eq!(otel.headers["x-tenant"], "rotated");
+    assert_eq!(otel.headers["x-scope"], "traces");
+}
+
+#[test]
+fn agent_preset_rejects_an_unusable_endpoint() {
+    for endpoint in [
+        "/v1/traces",
+        "127.0.0.1:4318",
+        "ftp://127.0.0.1:4318",
+        "http://",
+    ] {
+        let error = GrafanaAgentConfig::new(endpoint).otel_config().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation, "endpoint: {endpoint}");
+        assert!(
+            error.message().contains("endpoint"),
+            "endpoint: {endpoint} ({error})"
+        );
+    }
+}
+
+#[test]
+fn agent_preset_rejects_an_explicitly_blank_service_name() {
+    let error = GrafanaAgentConfig::default()
+        .with_service_name("   ")
+        .otel_config()
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Validation);
+    assert!(error.message().contains("service_name"), "{error}");
+}
+
+#[test]
+fn agent_preset_rejects_invalid_headers() {
+    let invalid_name = GrafanaAgentConfig::default()
+        .with_header("bad name", "value")
+        .otel_config()
+        .unwrap_err();
+    assert_eq!(invalid_name.kind(), ErrorKind::Validation);
+    assert!(
+        invalid_name.message().contains("header name"),
+        "{invalid_name}"
+    );
+
+    let empty_name = GrafanaAgentConfig::default()
+        .with_header("", "value")
+        .otel_config()
+        .unwrap_err();
+    assert_eq!(empty_name.kind(), ErrorKind::Validation);
+    assert!(empty_name.message().contains("header name"), "{empty_name}");
+
+    let invalid_value = GrafanaAgentConfig::default()
+        .with_header("x-tenant", "line\nbreak")
+        .otel_config()
+        .unwrap_err();
+    assert_eq!(invalid_value.kind(), ErrorKind::Validation);
+    assert!(
+        invalid_value.message().contains("x-tenant"),
+        "{invalid_value}"
+    );
+}
+
+#[test]
+fn agent_preset_round_trips_through_json() {
+    let agent = GrafanaAgentConfig::new("http://alloy.internal:4318")
+        .with_service_name("checkout")
+        .with_header("x-tenant", "acme");
+    let json = serde_json::to_value(&agent).unwrap();
+    assert_eq!(
+        json["endpoint"],
+        serde_json::json!("http://alloy.internal:4318")
+    );
+    assert_eq!(json["service_name"], serde_json::json!("checkout"));
+    assert_eq!(json["headers"], serde_json::json!({"x-tenant": "acme"}));
+
+    let restored: GrafanaAgentConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, agent);
+
+    // A document written before the `headers` field existed still loads.
+    let legacy: GrafanaAgentConfig = serde_json::from_value(serde_json::json!({
+        "endpoint": "http://127.0.0.1:4318",
+        "service_name": "legacy",
+    }))
+    .unwrap();
+    assert_eq!(legacy.endpoint(), "http://127.0.0.1:4318");
+    assert_eq!(legacy.service_name(), Some("legacy"));
+    assert!(legacy.headers().is_empty());
+
+    // An empty object is the default preset (local collector, default name).
+    let empty: GrafanaAgentConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(empty, GrafanaAgentConfig::default());
 }
 
 #[cfg(feature = "otel")]
@@ -314,9 +460,17 @@ fn exporter_posts_to_the_traces_signal_path() {
 
 #[cfg(feature = "otel")]
 #[test]
-fn agent_preset_exporter_reports_the_collector_requirement() {
-    let error = GrafanaAgentConfig::new("http://localhost:4318")
+fn agent_preset_exporter_posts_to_the_local_traces_path() {
+    let exporter = GrafanaAgentConfig::new("http://127.0.0.1:4318")
+        .with_header("x-tenant", "acme")
         .exporter()
-        .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
+        .unwrap();
+    assert_eq!(exporter.traces_url(), "http://127.0.0.1:4318/v1/traces");
+
+    // The default preset targets the local collector as well.
+    let default = GrafanaAgentConfig::default().exporter().unwrap();
+    assert_eq!(
+        default.traces_url(),
+        format!("{DEFAULT_LOCAL_OTLP_ENDPOINT}/v1/traces"),
+    );
 }

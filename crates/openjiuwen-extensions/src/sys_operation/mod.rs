@@ -53,11 +53,12 @@
 //! ```
 #![allow(clippy::module_name_repetitions)] // `FsProviderFactory`/`CodeProviderFactory` are the contract's names.
 pub mod remote;
-use openjiuwen_common::error::{Error, Result};
+use openjiuwen_common::error::{Error, ErrorKind, Result};
 pub use openjiuwen_core::sys_operation::sandbox::config::{SandboxEndpoint, SandboxGatewayConfig};
 use openjiuwen_core::sys_operation::sandbox::provider::{
     CodeProviderFactory, FsProviderFactory, SandboxProviderRegistry, ShellProviderFactory,
 };
+pub use remote::{SandboxSelector, TeardownFailure, TeardownReport};
 use std::sync::Arc;
 /// The sandbox types with a real HTTP transport in [`remote`].
 ///
@@ -316,6 +317,75 @@ pub fn register_gateway_provider(
         SandboxProviderSet { fs, shell, code },
     )
 }
+/// Releases the cached remote containers of one sandbox type.
+///
+/// Python parity: `delete_jiuwenbox_sandbox` / `delete_yuanrong_sandbox`. The
+/// kernel never calls a provider on release, so a host tears containers down
+/// itself through this entry point: the selected entries leave the process-wide
+/// cache and the provider issues its container-delete request (`2xx` and `404`
+/// both count as released).
+///
+/// `aio` has no container-delete API — the AIO gateway owns the container
+/// lifetime and reaps idle containers — so it answers
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// naming the gateway instead of inventing an endpoint.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// for the `aio` sandbox type and for any name outside
+/// [`REMOTE_SANDBOX_TYPES`], and
+/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// for a [`SandboxSelector`] that names nothing to release.
+/// A container whose delete fails is reported in [`TeardownReport::failed`]
+/// rather than failing the whole call.
+///
+/// # Example
+///
+/// ```no_run
+/// use openjiuwen_extensions::sys_operation::{shutdown_remote, SandboxSelector};
+///
+/// # async fn example() -> openjiuwen_common::error::Result<()> {
+/// let selector = SandboxSelector::scope("http://127.0.0.1:8080", Some("agent-1"))
+///     .with_reason("shutdown");
+/// let report = shutdown_remote("jiuwenbox", &selector).await?;
+/// assert!(report.failed.is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn shutdown_remote(
+    sandbox_type: &str,
+    selector: &SandboxSelector,
+) -> Result<TeardownReport> {
+    remote::teardown_remote(sandbox_type, selector).await
+}
+
+/// Drains the cached containers of every remote sandbox type.
+///
+/// Reports arrive in [`REMOTE_SANDBOX_TYPES`] order. A sandbox type without a
+/// teardown path (today `aio`) does not fail the call: its report carries the
+/// reason in [`TeardownReport::unsupported`], so an exit-time cleanup can drain
+/// whatever can be drained.
+///
+/// # Errors
+///
+/// Returns the underlying error when a provider fails for a reason other than
+/// the absence of a teardown path. Per-container delete failures stay in the
+/// reports.
+pub async fn shutdown_remote_all() -> Result<Vec<TeardownReport>> {
+    let mut reports = Vec::with_capacity(REMOTE_SANDBOX_TYPES.len());
+    for sandbox_type in REMOTE_SANDBOX_TYPES {
+        match remote::teardown_remote(sandbox_type, &SandboxSelector::all()).await {
+            Ok(report) => reports.push(report),
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                reports.push(TeardownReport::not_supported(sandbox_type, error.message()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(reports)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -616,5 +686,116 @@ mod tests {
             )
             .unwrap();
         assert!(fs.supports_conditional_write());
+    }
+
+    /// Serialises the cases that share the process-global provider container caches.
+    static TEARDOWN_CACHE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Environment variable that turns a test-binary run into the teardown-drain helper.
+    const TEARDOWN_HELPER_ENV: &str = "OPENJIUWEN_EXTENSIONS_TEARDOWN_HELPER";
+
+    #[tokio::test]
+    async fn shutdown_remote_refuses_aio_with_the_gateway_reason() {
+        let error = shutdown_remote("aio", &SandboxSelector::all())
+            .await
+            .expect_err("the aio gateway owns its container lifetime");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_string();
+        assert!(message.contains("aio"), "{message}");
+        assert!(message.contains("gateway"), "{message}");
+        assert!(message.contains("no container-delete API"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_remote_names_the_supported_types_for_an_unknown_one() {
+        let error = shutdown_remote("nope", &SandboxSelector::all())
+            .await
+            .expect_err("'nope' is not a remote sandbox type");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.message().to_string();
+        for sandbox_type in REMOTE_SANDBOX_TYPES {
+            assert!(message.contains(sandbox_type), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_remote_needs_a_selection() {
+        let error = shutdown_remote("jiuwenbox", &SandboxSelector::default())
+            .await
+            .expect_err("the default selector names nothing to release");
+        assert_eq!(error.kind(), ErrorKind::Validation);
+    }
+
+    /// The drain reports every remote type, in [`REMOTE_SANDBOX_TYPES`] order.
+    ///
+    /// The assertions run in a child process (see [`shutdown_remote_all_drains_a_fresh_process`]).
+    #[test]
+    fn shutdown_remote_all_reports_every_type_in_order() {
+        let executable = std::env::current_exe().expect("the test binary path");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "sys_operation::tests::shutdown_remote_all_helper",
+                "--test-threads",
+                "1",
+            ])
+            .env(TEARDOWN_HELPER_ENV, "1")
+            .output()
+            .expect("the helper process starts");
+        assert!(
+            output.status.success(),
+            "the teardown drain case failed in a child process:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child-process entry point of [`shutdown_remote_all_reports_every_type_in_order`].
+    ///
+    /// Runs as an ordinary (passing) test when [`TEARDOWN_HELPER_ENV`] is unset.
+    #[test]
+    fn shutdown_remote_all_helper() {
+        if std::env::var_os(TEARDOWN_HELPER_ENV).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the helper runtime builds");
+        runtime.block_on(shutdown_remote_all_drains_a_fresh_process());
+    }
+
+    /// Asserts the report shape and order of a whole-cache drain.
+    ///
+    /// `shutdown_remote_all` drains the process-global container caches of
+    /// `jiuwenbox` and `yuanrong`, so this runs in a fresh process: the provider
+    /// suites of this binary (`remote::jiuwenbox::tests::teardown`,
+    /// `remote::yuanrong::tests::teardown`) run in parallel and assert on their own
+    /// cache entries, so an in-process drain would release them first and make those
+    /// suites flaky. [`TEARDOWN_CACHE`] keeps this drain exclusive within the helper.
+    async fn shutdown_remote_all_drains_a_fresh_process() {
+        let _guard = TEARDOWN_CACHE.lock().await;
+        let reports = shutdown_remote_all().await.unwrap();
+        assert_eq!(reports.len(), REMOTE_SANDBOX_TYPES.len());
+        for (report, sandbox_type) in reports.iter().zip(REMOTE_SANDBOX_TYPES) {
+            assert_eq!(report.sandbox_type, sandbox_type);
+        }
+        let aio = &reports[0];
+        assert_eq!(aio.sandbox_type, "aio");
+        let reason = aio
+            .unsupported
+            .as_deref()
+            .expect("the aio report carries the reason it cannot be torn down");
+        assert!(reason.contains("gateway"), "{reason}");
+        assert!(aio.released_keys.is_empty(), "{:?}", aio.released_keys);
+        assert!(aio.deleted.is_empty(), "{:?}", aio.deleted);
+        // The other two have a teardown path, so their reports carry no reason.
+        for report in &reports[1..] {
+            assert!(
+                report.unsupported.is_none(),
+                "{} has a teardown path",
+                report.sandbox_type
+            );
+        }
     }
 }

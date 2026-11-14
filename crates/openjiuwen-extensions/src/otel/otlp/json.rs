@@ -8,6 +8,8 @@
 //! The encoder is pure — it takes the resource the provider handed to the
 //! exporter plus the batch, and returns a [`Value`] — so the exporter and the
 //! tests observe exactly the payload that goes over the wire.
+//!
+//! The scope grouping comes from `model.rs`, shared with the protobuf encoder.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +18,8 @@ use opentelemetry::{Array, InstrumentationScope, KeyValue, Value as OtelValue};
 use opentelemetry_sdk::trace::{SpanData, SpanEvents, SpanLinks};
 use opentelemetry_sdk::Resource;
 use serde_json::{Map, Value};
+
+use super::model::{scope_groups, ScopeGroup};
 
 /// Encodes one export batch as the OTLP/JSON request body.
 ///
@@ -60,51 +64,14 @@ fn resource_json(resource: Option<&Resource>) -> Value {
     Value::Object(object)
 }
 
-/// One instrumentation scope with the spans it produced.
-struct ScopeGroup {
-    /// The scope name, part of the grouping key.
-    name: String,
-    /// The scope version, part of the grouping key.
-    version: Option<String>,
-    /// The encoded `scope` object (first span of the group wins).
-    scope: Value,
-    /// The encoded spans, in export order.
-    spans: Vec<Value>,
-}
-
-/// Groups spans by their `(name, version)` instrumentation scope.
-fn scope_groups(spans: &[SpanData]) -> Vec<ScopeGroup> {
-    let mut groups: Vec<ScopeGroup> = Vec::new();
-    for span in spans {
-        let scope = &span.instrumentation_scope;
-        let name = scope.name().to_owned();
-        let version = scope.version().map(str::to_owned);
-        let index = if let Some(index) = groups
-            .iter()
-            .position(|group| group.name == name && group.version == version)
-        {
-            index
-        } else {
-            groups.push(ScopeGroup {
-                name,
-                version,
-                scope: scope_json(scope),
-                spans: Vec::new(),
-            });
-            groups.len() - 1
-        };
-        if let Some(group) = groups.get_mut(index) {
-            group.spans.push(span_json(span));
-        }
-    }
-    groups
-}
-
-/// Encodes one `ScopeSpans` entry.
-fn scope_group_json(group: &ScopeGroup) -> Value {
+/// Encodes one `ScopeSpans` entry from the shared scope grouping.
+fn scope_group_json(group: &ScopeGroup<'_>) -> Value {
     let mut object = Map::new();
-    object.insert("scope".to_owned(), group.scope.clone());
-    object.insert("spans".to_owned(), Value::Array(group.spans.clone()));
+    object.insert("scope".to_owned(), scope_json(group.scope));
+    object.insert(
+        "spans".to_owned(),
+        Value::Array(group.spans.iter().map(|span| span_json(span)).collect()),
+    );
     Value::Object(object)
 }
 

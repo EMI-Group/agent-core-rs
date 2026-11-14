@@ -51,9 +51,18 @@ pub fn is_deferred(sandbox_type: &str) -> bool;
 
 /// Registers a provider set bound to a shared `SandboxGatewayConfig`.
 pub fn register_gateway_provider(registry: &SandboxProviderRegistry, sandbox_type: &str, gateway: SandboxGatewayConfig, providers: SandboxProviderSet) -> Result<()>;
+
+pub use remote::{SandboxSelector, TeardownFailure, TeardownReport};
+
+/// Deletes the cached containers of one sandbox type; `aio` is a typed `Error::Unsupported`.
+pub async fn shutdown_remote(sandbox_type: &str, selector: &SandboxSelector) -> Result<TeardownReport>;
+/// Tears down every type in `REMOTE_SANDBOX_TYPES`, in declaration order.
+pub async fn shutdown_remote_all() -> Result<Vec<TeardownReport>>;
 ```
 
 `remote_provider_set` and `register_remote` reject an unknown type with `ErrorKind::Unsupported` and the message `sandbox provider '<type>' is not a remote provider; supported types: aio, jiuwenbox, yuanrong` — never a silent success.
+`SandboxSelector` names what to delete: `all()`, `scope(base_url, Option<isolation_key>)`, `for_base_url(base_url)`, `from_shared_key(key)`, `from_sandbox_id(id)`, each optionally `.with_reason(..)` for the logs; an empty selector is `ErrorKind::Validation`, never a silent no-op.
+`TeardownReport { sandbox_type, released_keys, deleted, failed: Vec<TeardownFailure { key, container_id, reason }>, unsupported: Option<String> }` returns the deleted container ids and cache keys in cache order (a `BTreeMap`, so the order is deterministic), records per-container delete failures instead of aborting the drain, and carries a reason in `unsupported` when the type has no delete API.
 `register_remote_providers` installs `aio`, then `jiuwenbox`, then `yuanrong`, stopping at the first failure (a duplicate is the kernel's `ErrorKind::SysOp`).
 
 ## Registration Semantics
@@ -89,6 +98,25 @@ All three providers are always compiled — no Cargo feature gates them — and 
 - A lost container is recreated with bounded retries: JiuwenBox treats a `404` whose body reads `Sandbox '<id>' not found` as gone (`JIUWENBOX_SANDBOX_RECREATE_RETRIES`, default `3`, `0` disables), deletes the stale container best-effort, waits one second, and recreates; YuanRong treats an invoke `404` the same way with `min(retries + 1, 6)` attempts (default five retries).
 - Factories never fail for a missing container: the first operation establishes or authenticates, so building a provider is pure.
 
+## Teardown
+
+`shutdown_remote` / `shutdown_remote_all` are the explicit release path (the kernel still never calls a provider on drop, so nothing is torn down implicitly).
+- JiuwenBox deletes each selected cache entry through `DELETE {base_url}/api/v1/sandboxes/{sandbox_id}` on the same transport (auth headers, timeout) used by its operations; `2xx` and `404` both count as released, any other status or a transport error lands in `report.failed` and the drain continues.
+- YuanRong deletes each selected environment through `DELETE {base_url}/api/environment/v1/environments/{percent-encoded id}` with `Accept: application/json`, with the same success/404/failure accounting; Python's `_delete_environment` swallows per-environment failures, so a failed delete here is a documented parity difference rather than a port bug.
+- AIO has no container-delete API (the gateway owns the container lifetime and reaps idle containers), so `shutdown_remote("aio", ..)` is `ErrorKind::Unsupported` naming the gateway — no endpoint is invented and no request is issued.
+- Selection is by `shared_key`, `sandbox_id`, base URL, or `all()` (drain the whole process cache); a `sandbox_id`-only selector is `Unsupported` for YuanRong, because an ADX environment id carries no base URL to send the delete to. A cache-key miss with a `sandbox_id` still deletes through that key's base URL.
+- The cache entry is popped before the request, so a failed delete never leaves a stale id behind; a backend instance that already resolved an id keeps its own copy (Python's per-instance `_sandbox_id`), so its next operation recreates the container.
+- `shutdown_remote_all` never fails on AIO: it reports the gateway reason in that report's `unsupported` field and tears the other two down.
+
+## Conditional Writes
+
+`supports_conditional_write()` is `true` on all three providers, and `write_file` really honours the kernel's two options — an additive Rust capability, since Python's remote providers implement neither.
+- `create_if_absent` refuses to overwrite but leaves every other kernel flag combination alone; `expected_content_sha256` compares the SHA-256 (lowercase hex) of the current remote bytes. Both are rejected up front when combined with each other, with `append`, or with `create_if_absent` while `create_if_not_exist` is `false` (`199003 conditional write options are incompatible`).
+- The guarantee is host-side read-then-write under one exclusive per-path lock (`tokio::sync::Mutex` from a process-wide `Weak` registry keyed `"{provider}|{path}"`, pruned above 256 entries): it is process-local and serialises writers inside this process, so a rejected write issues no read-modify-write of its own and no write request at all.
+- It is **not** a compare-and-swap against other processes or hosts: the final upload/envelope write is not atomic against a concurrent reader, and the container's own `flock`/`sha256sum`/rename primitives are not used because the three transports speak different shells (AIO only has a gateway-envelope `write_file`). Two cooperating processes can therefore still interleave.
+- A rejected precondition is `199003` with the path in the message: `create_if_absent rejected the write: '<path>' already exists`, `expected_content_sha256 mismatch for '<path>': the remote file hashes to <actual>, not <expected>`, and the not-found variant for an absent file.
+- Reads that fail for a reason other than absence stay gateway failures (`199007`), so a broken transport is never reported as a precondition mismatch.
+
 ## Error Mapping
 
 - Any transport, HTTP-status, or gateway-envelope failure becomes the kernel's `SysOpStatus::SandboxGatewayError` (`199007`) through `sandbox_gateway_message(operation, reason)` — for filesystem, shell, and code operations alike, on every provider.
@@ -112,10 +140,12 @@ All three providers are always compiled — no Cargo feature gates them — and 
 
 ## Known Issues and Gaps
 
-- No teardown on release: the kernel never calls a provider when a handle drops, so containers outlive the process unless the deployment's idle reaper collects them; `on_stop`, `idle_ttl_seconds` (beyond JiuwenBox's idle policy), and gateway idle eviction are not applied at release.
+- Teardown is explicit only: the kernel never calls a provider when a handle drops, so `shutdown_remote`/`shutdown_remote_all` is the release path and nothing reaps containers automatically; `on_stop` lifecycle hooks, the gateway's idle reaper, and cross-process cache eviction are not driven from here.
+- AIO cannot be torn down through this crate: the gateway owns the container and has no delete API in the reference, so its teardown stays `Error::Unsupported` and the deployment must let the gateway reap it.
 - Streaming methods are buffered: no transport offers a streaming endpoint, so each stream performs its buffered call and yields host-side chunks (text by line, bytes by `chunk_size`, shell/code output by line) ending in a terminal `is_last_chunk` frame — the same shape Python produces.
 - Transfers hold the whole file in host memory: `upload_file`/`download_file` and their stream variants read the local file or the remote bytes at once before chunking.
-- Conditional writes are unsupported by the remote transports: `write_file` rejects `expected_content_sha256` and `create_if_absent` with a clear `fs_failure`, and `supports_conditional_write()` reflects `SandboxGatewayConfig.supports_conditional_write` (AIO) rather than a backend capability.
+- Conditional writes are serialised only inside this process: the per-path lock is a process-global `tokio::sync::Mutex` registry, so another process or host can still interleave between the read and the write; no container-side compare-and-swap is used (the three transports expose different shell/wire primitives, and AIO's envelope has only `write_file`).
+- AIO's non-conditional `create_if_not_exist: false` is enforced by the gateway (the flag travels in the envelope, as in Python), while JiuwenBox and YuanRong probe the remote path first through `RemoteFs`; the two paths therefore differ in which side owns that check.
 - `execute_argv` has no Python counterpart; JiuwenBox and YuanRong send argv as a list or a POSIX-quoted command, and AIO sends the POSIX-quoted form through `execute_cmd`.
 - `execute_cmd_background` runs the command detached inside the container and returns a handle-only result where the transport allows it; there is no streamed or interactive background channel, and Windows host quoting is not attempted.
 - JiuwenBox's hybrid local/remote shell routing (`plan_command_rewrite`, tree-sitter classification, `exclude_commands`), the host fallback of `_run_exec_pipeline`, lifecycle hooks, `preserve_files_upload`, Unix-domain-socket transport (`unix://…`, `JIUWENBOX_LISTEN`), and the caller-facing `force_recreate`/`delete` helpers are not ported.
@@ -129,7 +159,7 @@ All three providers are always compiled — no Cargo feature gates them — and 
 - Async-first: tokio I/O with `reqwest`, no blocking calls on async tasks, public streams are `BoxStream<'static, OpResult<T>>`.
 - Errors: `openjiuwen_common::error::{Error, Result}` for construction and validation; operation failures are `OpResult` values built with the kernel's `fs_failure` / `shell_failure` / `code_failure` / gateway-status helpers.
 - Logging: `tracing` only, target `openjiuwen_extensions::sys_operation`; never log auth values, tokens, or payload contents above `debug`.
-- Safety: no `unsafe`, no panics on user input, no global mutable state beyond the documented container caches.
+- Safety: no `unsafe`, no panics on user input, no global mutable state beyond the documented container caches and the per-path conditional-write lock registry.
 - Registration stays synchronous; idempotence is the caller's problem (the kernel rejects duplicates).
 - Files ≤ ~1000 lines, split by concern; `remote/backend/tests.rs` and `remote/aio/tests/fs.rs` are exhaustive operation matrices kept whole on purpose.
 
@@ -138,16 +168,22 @@ All three providers are always compiled — no Cargo feature gates them — and 
 - `mod.rs` unit tests cover the facade: empty `DEFERRED_SANDBOX_TYPES`, the three `REMOTE_SANDBOX_TYPES`, a complete factory set per remote type, unknown-type rejection messages, `is_deferred` semantics, duplicate registration, `register_gateway_provider` binding, and the `register_deferred` no-op.
 - `remote/transport.rs` tests cover base-URL joining, `auth_headers`/`auth_query_params` injection, bearer tokens, timeouts, status rendering, hex/base64 round-trips, and `gateway_failure` producing `199007` with the Python message.
 - `remote/semantics.rs` and `remote/local_io.rs` test the pure host-side helpers: line selection and its mutual-exclusion errors, newline transforms, chunking, POSIX quoting, sorting/filtering, and host reads/writes with `overwrite`/`create_parent_dirs`.
-- `remote/backend/tests.rs` drives the generic wrappers through a recording fake backend: every `FsOperation`/`ShellOperation`/`CodeOperation` method, stream termination, `supports_conditional_write` propagation, and error-code mapping.
-- `remote/aio/tests.rs` plus `aio/tests/{fs,shell,code}.rs` use `wiremock` on `127.0.0.1:0` to assert envelope bodies, `invoke_path` overrides, auth injection, `code != 0` → `199007`, transport failures, conditional-write flags, and stream termination.
+- `remote/backend/tests.rs` drives the generic wrappers through a recording fake backend: every `FsOperation`/`ShellOperation`/`CodeOperation` method, stream termination, capability propagation, and error-code mapping; `remote/backend/tests/conditional.rs` covers the conditional path (capability opt-in, no lock for a plain write, `create_if_absent` success/refusal, digest match/mismatch/absent, incompatible combinations with zero reads and zero writes).
+- `remote/conditional.rs`'s per-path lock and precondition checks are covered indirectly through the three provider suites; the lock registry is process-global, so tests use one path per case.
+- `remote/teardown.rs` and `remote/mod.rs` tests cover selector matching, report ordering, and the AIO/unknown-type `Unsupported` messages; the whole-cache drains run in a child process (`current_exe()` helper with its own env guard) because `SandboxSelector::all()` would otherwise delete other tests' cached containers.
+- `remote/jiuwenbox/tests/{teardown,conditional}.rs` and `remote/yuanrong/tests/teardown.rs` assert the delete path per provider, 404 tolerance, recorded failures, cache draining (a second operation recreates), selector narrowing, and the YuanRong `sandbox_id`-only `Unsupported`; the teardown cases serialise on a module-local mutex.
+- `tests/sandbox_providers/{teardown,conditional_write}.rs` repeat the same behaviour through the crate-boundary facade: `shutdown_remote`, `shutdown_remote_all`, `supports_conditional_write()`, and that a rejected conditional write issues no upload/write request.
+- `remote/aio/tests.rs` plus `aio/tests/{fs,shell,code}.rs` use `wiremock` on `127.0.0.1:0` to assert envelope bodies, `invoke_path` overrides, auth injection, `code != 0` → `199007`, transport failures, the conditional path (a read envelope, then a write envelope only when the precondition holds), and stream termination.
 - `remote/jiuwenbox/tests.rs` and `remote/yuanrong/tests.rs` assert request paths, query parameters, create bodies, argv/exec encoding, id caching and recreate-on-404, idle-timeout dedupe, ADX action payloads, and error mapping.
-- No live network is used: every HTTP interaction targets a loopback `wiremock` server and each test uses a distinct isolation key so the process-global container cache never leaks between tests.
+- No live network is used: every HTTP interaction targets a loopback `wiremock` server and each test uses a distinct isolation key so the process-global container cache never leaks between tests; never assert global cache emptiness.
 - Python counterparts are named in comments (`tests/unit_tests/extensions/sys_operation/sandbox/*.py`).
 
 ## Routing Table
 
-- `./mod.rs` → `SandboxProviderSet`, registration helpers, remote/deferred type lists, `from`-scratch facade tests
-- `./remote/` → the three real providers, shared transport, host-side semantics, and their suites
+- `./mod.rs` → `SandboxProviderSet`, registration helpers, `shutdown_remote`/`shutdown_remote_all`, remote/deferred type lists, `from`-scratch facade tests
+- `./remote/` → the three real providers, shared transport, host-side semantics, teardown and conditional-write helpers, and their suites
+- `./remote/teardown.rs` → `SandboxSelector`, `TeardownReport`/`TeardownFailure`, cache-key sharing, the 2xx/404 delete helper, AIO's `Unsupported`
+- `./remote/conditional.rs` → `Precondition` validation/checking, SHA-256 helper, the process-global per-path write lock
 - `./remote/transport.rs` → `SandboxHttp` (base URL, timeout, auth injection), `RemoteError`/`RawResponse`, `gateway_failure`, hex/base64 codecs
 - `./remote/semantics.rs` → line selection, newline transforms, chunking, path/quoting helpers, list sorting and `file_types` filtering
 - `./remote/local_io.rs` → host-side file reads and writes for transfers

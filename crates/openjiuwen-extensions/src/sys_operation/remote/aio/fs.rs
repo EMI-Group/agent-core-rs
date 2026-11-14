@@ -21,6 +21,7 @@ use openjiuwen_core::sys_operation::fs::types::{
 use openjiuwen_core::sys_operation::operation::{FsOperation, OpStream};
 use openjiuwen_core::sys_operation::result::{fs_failure, OpResult};
 
+use super::super::conditional::{lock_path, Precondition};
 use super::super::local_io::{read_host_file, write_host_file, HostIoError};
 use super::super::semantics::{
     byte_chunks, file_extension, filter_file_types, normalize_line_selection, sort_items,
@@ -105,7 +106,10 @@ impl AioFs {
 #[async_trait]
 impl FsOperation for AioFs {
     fn supports_conditional_write(&self) -> bool {
-        self.client.supports_conditional_write
+        // The provider evaluates the precondition itself (read, check, write),
+        // so the capability is its own and does not depend on the gateway
+        // configuration.
+        true
     }
 
     async fn read_file(&self, params: ReadFileParams) -> OpResult<ReadFileData> {
@@ -149,21 +153,28 @@ impl FsOperation for AioFs {
     }
 
     async fn write_file(&self, params: WriteFileParams) -> OpResult<WriteFileData> {
-        let conditional = if params.expected_content_sha256.is_some() {
-            Some("expected_content_sha256")
-        } else if params.create_if_absent {
-            Some("create_if_absent")
+        let precondition = Precondition::from_params(&params);
+        if let Err(reason) = precondition.validate() {
+            return fs_failure("write_file", &reason);
+        }
+        let conditional = precondition.is_conditional();
+        // The lock makes the read-check-write sequence atomic within this
+        // process; it is only needed when a precondition must be evaluated.
+        let guard = if conditional {
+            Some(lock_path(PROVIDER, &params.path).await)
         } else {
             None
         };
-        if let Some(field) = conditional {
-            return fs_failure(
-                "write_file",
-                &format!(
-                    "{field} is not supported by the {PROVIDER} provider \
-                     (remote sandbox transports have no compare-and-swap)"
-                ),
-            );
+        if conditional {
+            let current = match self.read_remote_bytes(&params.path).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) if is_absent(&error) => None,
+                Err(error) => return gateway_failure("write_file", &error),
+            };
+            if let Err(reason) = precondition.check(&params.path, current.as_deref()) {
+                // No write request is issued for a rejected precondition.
+                return fs_failure("write_file", &reason);
+            }
         }
         let mode = params.content.mode();
         let (content, encoding, payload_len) = match &params.content {
@@ -189,11 +200,13 @@ impl FsOperation for AioFs {
             Ok(data) => data,
             Err(error) => return gateway_failure("write_file", &error),
         };
-        OpResult::success(WriteFileData {
+        let result = OpResult::success(WriteFileData {
             path: text_field(&data, "path").unwrap_or_else(|| params.path.clone()),
             size: json_u64(data.get("size")).unwrap_or(len_u64(payload_len)),
             mode: parse_mode(data.get("mode")).unwrap_or(mode),
-        })
+        });
+        drop(guard);
+        result
     }
 
     async fn upload_file(&self, params: UploadFileParams) -> OpResult<UploadFileData> {

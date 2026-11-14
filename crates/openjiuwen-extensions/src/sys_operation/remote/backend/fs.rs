@@ -19,8 +19,8 @@ use openjiuwen_core::sys_operation::fs::types::{
 };
 use openjiuwen_core::sys_operation::operation::{FsOperation, OpStream};
 use openjiuwen_core::sys_operation::result::{fs_failure, OpResult};
-use openjiuwen_core::sys_operation::sandbox::config::SandboxGatewayConfig;
 
+use super::super::conditional::{lock_path, Precondition};
 use super::super::local_io::{read_host_file, write_host_file, HostIoError};
 use super::super::semantics::{
     apply_text_newlines, byte_chunks, filter_file_types, normalize_line_selection,
@@ -32,18 +32,25 @@ use super::{len_u64, ListRequest, RemoteEntry, SandboxBackend, SearchRequest};
 /// The kernel's ten [`FsOperation`] methods implemented over a [`SandboxBackend`].
 pub(crate) struct RemoteFs<B: SandboxBackend> {
     backend: Arc<B>,
+    /// Whether [`SandboxBackend::supports_conditional_write`] opted this backend in.
     conditional_write: bool,
     provider: &'static str,
 }
 
 impl<B: SandboxBackend> RemoteFs<B> {
-    /// Builds the wrapper; the conditional-write flag comes from the gateway configuration.
+    /// Builds the wrapper.
+    ///
+    /// The conditional-write capability is the backend's, not the gateway's:
+    /// [`SandboxGatewayConfig::supports_conditional_write`] describes a
+    /// gateway-side compare-and-swap primitive, while this wrapper evaluates the
+    /// precondition itself over the backend's read and write primitives, so the
+    /// configuration flag would understate what the provider can honour.
     #[must_use]
-    pub(crate) fn new(backend: Arc<B>, config: &SandboxGatewayConfig) -> Self {
+    pub(crate) fn new(backend: Arc<B>) -> Self {
         Self {
             provider: backend.provider_name(),
+            conditional_write: backend.supports_conditional_write(),
             backend,
-            conditional_write: config.supports_conditional_write,
         }
     }
 }
@@ -123,17 +130,14 @@ impl<B: SandboxBackend> FsOperation for RemoteFs<B> {
     }
 
     async fn write_file(&self, params: WriteFileParams) -> OpResult<WriteFileData> {
-        if params.expected_content_sha256.is_some() {
-            return fs_failure(
-                "write_file",
-                &unsupported_conditional(self.provider, "expected_content_sha256"),
-            );
+        let precondition = Precondition::from_params(&params);
+        if let Err(reason) = precondition.validate() {
+            return fs_failure("write_file", &reason);
         }
-        if params.create_if_absent {
-            return fs_failure(
-                "write_file",
-                &unsupported_conditional(self.provider, "create_if_absent"),
-            );
+        let conditional = precondition.is_conditional();
+        if conditional && !self.conditional_write {
+            let field = precondition.field().unwrap_or("conditional write");
+            return fs_failure("write_file", &unsupported_conditional(self.provider, field));
         }
         let mode = params.content.mode();
         let payload = match &params.content {
@@ -143,7 +147,24 @@ impl<B: SandboxBackend> FsOperation for RemoteFs<B> {
             }
             FileContent::Bytes(bytes) => bytes.clone(),
         };
-        if !params.create_if_not_exist {
+        // The lock makes the read-check-write sequence atomic within this
+        // process; it is only needed when a precondition must be evaluated.
+        let guard = if conditional {
+            Some(lock_path(self.provider, &params.path).await)
+        } else {
+            None
+        };
+        if conditional {
+            let current = match self.backend.read_bytes(&params.path).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.is_not_found() => None,
+                Err(error) => return gateway_failure("write_file", &error),
+            };
+            if let Err(reason) = precondition.check(&params.path, current.as_deref()) {
+                // No write request is issued for a rejected precondition.
+                return fs_failure("write_file", &reason);
+            }
+        } else if !params.create_if_not_exist {
             match self.backend.read_bytes(&params.path).await {
                 Ok(_) => {}
                 Err(error) if error.is_not_found() => {
@@ -156,7 +177,7 @@ impl<B: SandboxBackend> FsOperation for RemoteFs<B> {
             }
         }
         let size = len_u64(payload.len());
-        match self
+        let result = match self
             .backend
             .write_bytes(&params.path, &payload, params.append)
             .await
@@ -167,7 +188,9 @@ impl<B: SandboxBackend> FsOperation for RemoteFs<B> {
                 mode,
             }),
             Err(error) => gateway_failure("write_file", &error),
-        }
+        };
+        drop(guard);
+        result
     }
 
     async fn upload_file(&self, params: UploadFileParams) -> OpResult<UploadFileData> {
@@ -472,7 +495,7 @@ fn file_system_item(entry: RemoteEntry) -> FileSystemItem {
     }
 }
 
-/// The message Python's providers use for an unsupported conditional-write option.
+/// The message a provider uses for a conditional-write option it cannot honour.
 fn unsupported_conditional(provider: &str, field: &str) -> String {
     format!(
         "{field} is not supported by the {provider} provider (remote sandbox transports have no compare-and-swap)"

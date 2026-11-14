@@ -6,7 +6,10 @@
 //! them from a [`StoreBackend`] value. Vendor backends keep their surfaces in
 //! child modules: `redis` (feature `redis`) is a live single-node key-value
 //! store over this crate's RESP client, and [`elasticsearch`] is the vector
-//! backend. A backend without a surface for the requested factory answers
+//! backend. An `elasticsearch` backend also serves the document factory, which
+//! builds the kernel's live REST document store
+//! ([`ElasticsearchDocumentStore`]); it is not a key-value store. A backend
+//! without a surface for the requested factory answers
 //! [`Error::Unsupported`]; the Python `GaussDbStore` has no Rust analogue
 //! because the kernel's document contract replaces the `SQLAlchemy` engine (see
 //! `docs/PARITY.md`).
@@ -25,13 +28,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+use url::Url;
 pub mod elasticsearch;
 #[cfg(feature = "redis")]
 pub mod redis;
 pub use openjiuwen_core::foundation::store::{
-    CollectionSchema, Document, DocumentStore, InMemoryDocumentStore, InMemoryKvStore,
-    InMemoryVectorStore, KvStore, KvValue, LocalFileDocumentStore, LocalFileKvStore,
-    LocalFileVectorStore, Query, VectorQuery, VectorSearchResult, VectorStore,
+    CollectionSchema, Document, DocumentStore, ElasticsearchConfig, ElasticsearchDocumentStore,
+    InMemoryDocumentStore, InMemoryKvStore, InMemoryVectorStore, KvStore, KvValue,
+    LocalFileDocumentStore, LocalFileKvStore, LocalFileVectorStore, Metric, Query, SortOrder,
+    VectorQuery, VectorSearchResult, VectorStore,
 };
 #[cfg(feature = "sqlite")]
 pub use openjiuwen_core::foundation::store::{SqliteDocumentStore, SqliteKvStore};
@@ -53,7 +58,7 @@ pub enum StoreKind {
     /// Redis key-value storage (live over the in-crate client, feature
     /// `redis`).
     Redis,
-    /// Elasticsearch vector storage (live REST backend).
+    /// Elasticsearch storage; live REST backends for documents and vectors.
     Elasticsearch,
 }
 /// A storage backend selected from configuration.
@@ -84,14 +89,28 @@ pub enum StoreBackend {
         /// `rediss+cluster://` URL.
         url: Option<String>,
     },
-    /// Elasticsearch vector storage; the vector factory returns a live REST
-    /// backend, while the key-value and document factories reject it.
+    /// Elasticsearch storage; the document and vector factories build live
+    /// REST stores, while the key-value factory rejects it.
+    ///
+    /// Credentials may come from the URL userinfo
+    /// (`http://user:pass@host:9200`) or from the explicit `username` /
+    /// `password` fields; when both are present the explicit fields win, field
+    /// by field. An `api_key` is sent as `Authorization: ApiKey <key>`.
     Elasticsearch {
         /// Elasticsearch endpoint, `http://` or `https://`.
         url: String,
         /// Index-name prefix; indices are named `"{index_prefix}__{collection}"`.
         #[serde(default = "default_index_prefix")]
         index_prefix: String,
+        /// Optional basic-auth user name, overriding the URL userinfo.
+        #[serde(default)]
+        username: Option<String>,
+        /// Optional basic-auth password, overriding the URL userinfo.
+        #[serde(default)]
+        password: Option<String>,
+        /// Optional API key, sent when no basic-auth pair applies.
+        #[serde(default)]
+        api_key: Option<String>,
     },
 }
 impl StoreBackend {
@@ -111,7 +130,9 @@ impl StoreBackend {
     /// The discriminator is `kind`, with `type` accepted as a fallback, and it
     /// is matched case-insensitively. Required fields are `root` for `file`,
     /// `url` for `sqlite` and `elasticsearch` (plus optional `index_prefix`
-    /// defaulting to `"agent_vector"`), and optional `url` for `redis`.
+    /// defaulting to `"agent_vector"`), and optional `url` for `redis`. The
+    /// `elasticsearch` kind additionally accepts the optional `username`,
+    /// `password`, and `api_key` credential fields.
     ///
     /// # Errors
     ///
@@ -149,6 +170,9 @@ impl StoreBackend {
                 url: required_string(object, "elasticsearch", "url")?,
                 index_prefix: optional_string(object, "elasticsearch", "index_prefix")?
                     .unwrap_or_else(default_index_prefix),
+                username: optional_string(object, "elasticsearch", "username")?,
+                password: optional_string(object, "elasticsearch", "password")?,
+                api_key: optional_string(object, "elasticsearch", "api_key")?,
             }),
             other => Err(Error::validation(format!(
                 "unknown store backend kind `{other}`; expected one of: memory, file, sqlite, redis, elasticsearch"
@@ -199,7 +223,8 @@ fn optional_string(object: &Map<String, Value>, kind: &str, field: &str) -> Resu
 /// error, and an unavailable `sqlite`/`redis` feature is reported as
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
 /// and [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for `elasticsearch`, which is not a key-value store.
+/// for `elasticsearch`, which is a document and vector backend, not a key-value
+/// store.
 pub async fn build_kv_store(backend: &StoreBackend) -> Result<Arc<dyn KvStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryKvStore::new())),
@@ -213,24 +238,40 @@ pub async fn build_kv_store(backend: &StoreBackend) -> Result<Arc<dyn KvStore>> 
 }
 /// Builds a document store from `backend`.
 ///
+/// The `elasticsearch` backend builds the kernel's live REST document store
+/// ([`ElasticsearchDocumentStore`]); construction validates the URL and
+/// performs no I/O, and every request happens inside a [`DocumentStore`]
+/// operation.
+///
 /// # Errors
 ///
 /// Returns the kernel's construction error for `file` and `sqlite` backends
 /// (an unavailable `sqlite` feature is reported as
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
-/// and [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for the `redis` and `elasticsearch` backends, which have no document store.
+/// the `elasticsearch_document_store` configuration errors for the
+/// `elasticsearch` backend, and the `redis` backend's configuration and
+/// connection errors (a missing `url` is a validation error, and a disabled
+/// `redis` feature is reported as
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)).
 pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn DocumentStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryDocumentStore::new())),
         StoreBackend::File { root } => Ok(Arc::new(LocalFileDocumentStore::new(root).await?)),
         StoreBackend::Sqlite { url } => sqlite_document_store(url).await,
-        StoreBackend::Redis { .. } => Err(Error::unsupported(
-            "redis has no document store backend; use the in-memory, file, or sqlite backend",
-        )),
-        StoreBackend::Elasticsearch { .. } => Err(Error::unsupported(
-            "elasticsearch has no document store backend; use the in-memory, file, or sqlite backend",
-        )),
+        StoreBackend::Redis { url } => redis_document_store(url.as_deref()).await,
+        StoreBackend::Elasticsearch {
+            url,
+            index_prefix,
+            username,
+            password,
+            api_key,
+        } => Ok(Arc::new(elasticsearch_document_store(
+            url,
+            index_prefix,
+            username.as_deref(),
+            password.as_deref(),
+            api_key.as_deref(),
+        )?)),
     }
 }
 /// Builds a vector store from `backend`.
@@ -242,8 +283,11 @@ pub async fn build_document_store(backend: &StoreBackend) -> Result<Arc<dyn Docu
 ///
 /// Returns the kernel's construction error for the `file` backend and
 /// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
-/// for `sqlite` (the kernel has no SQLite vector backend) and `redis` (not a
-/// vector store), plus the `elasticsearch` backend's own construction error.
+/// for `sqlite` (the kernel has no SQLite vector backend), the `redis`
+/// backend's configuration and connection errors (a missing `url` is a
+/// validation error, and a disabled `redis` feature is
+/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)),
+/// plus the `elasticsearch` backend's own construction error.
 pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn VectorStore>> {
     match backend {
         StoreBackend::Memory => Ok(Arc::new(InMemoryVectorStore::new())),
@@ -251,10 +295,10 @@ pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn Vector
         StoreBackend::Sqlite { .. } => Err(Error::unsupported(
             "sqlite has no vector store backend; use the in-memory or file vector store",
         )),
-        StoreBackend::Redis { .. } => Err(Error::unsupported(
-            "redis has no vector store backend; use the in-memory or file vector store",
-        )),
-        StoreBackend::Elasticsearch { url, index_prefix } => {
+        StoreBackend::Redis { url } => redis_vector_store(url.as_deref()).await,
+        StoreBackend::Elasticsearch {
+            url, index_prefix, ..
+        } => {
             let config = elasticsearch::ElasticsearchVectorStoreConfig {
                 url: url.clone(),
                 index_prefix: index_prefix.clone(),
@@ -264,6 +308,117 @@ pub async fn build_vector_store(backend: &StoreBackend) -> Result<Arc<dyn Vector
         }
     }
 }
+/// Builds the live REST document store behind the `elasticsearch` backend.
+///
+/// Construction validates the configuration (`elasticsearch_document_config`)
+/// and performs no I/O, so a factory call stays offline; every request happens
+/// inside a [`DocumentStore`] operation.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// for an unusable `url` and the kernel's configuration error for an endpoint it
+/// cannot accept.
+fn elasticsearch_document_store(
+    url: &str,
+    index_prefix: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<ElasticsearchDocumentStore> {
+    let config = elasticsearch_document_config(url, index_prefix, username, password, api_key)?;
+    ElasticsearchDocumentStore::new(config)
+}
+
+/// Translates an `elasticsearch` backend configuration into a kernel
+/// [`ElasticsearchConfig`].
+///
+/// The endpoint handed to the kernel is the parsed URL stripped of userinfo,
+/// query, fragment, and trailing slash. The index prefix is forwarded verbatim.
+///
+/// # Credentials
+///
+/// Basic-auth credentials come from the URL userinfo
+/// (`http://user:pass@host:9200`) unless the explicit `username` / `password`
+/// arguments are set, which win field by field: an explicit user name replaces
+/// the userinfo user name and an explicit password replaces the userinfo
+/// password. A user name without a password (either source) sends an empty
+/// password, matching the vector backend; a password without a user name is not
+/// sent at all, because HTTP basic authentication needs both. An `api_key` is
+/// forwarded as `Authorization: ApiKey <key>`, which the kernel ranks below
+/// basic auth.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// when `url` is empty, does not start with `http://` or `https://`, is not a
+/// parseable URL, or names no host.
+fn elasticsearch_document_config(
+    url: &str,
+    index_prefix: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<ElasticsearchConfig> {
+    let parsed = elasticsearch_url(url)?;
+    let userinfo_username = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
+    let userinfo_password = parsed.password().map(str::to_string);
+    let username = username.map(str::to_string).or(userinfo_username);
+    let password = match (password.map(str::to_string), username.is_some()) {
+        (Some(explicit), _) => Some(explicit),
+        (None, true) => Some(userinfo_password.unwrap_or_default()),
+        (None, false) => None,
+    };
+    let mut config = ElasticsearchConfig::new(endpoint_without_userinfo(&parsed))
+        .with_index_prefix(index_prefix);
+    if let Some(username) = username {
+        config = config.with_username(username);
+    }
+    if let Some(password) = password {
+        config = config.with_password(password);
+    }
+    if let Some(api_key) = api_key {
+        config = config.with_api_key(api_key);
+    }
+    Ok(config)
+}
+
+/// Parses and validates an `elasticsearch` backend URL.
+fn elasticsearch_url(url: &str) -> Result<Url> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(Error::validation(
+            "elasticsearch backend requires a non-empty `url`",
+        ));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(Error::validation(format!(
+            "elasticsearch url `{url}` must start with http:// or https://"
+        )));
+    }
+    let parsed = Url::parse(url).map_err(|error| {
+        Error::validation(format!(
+            "elasticsearch url `{url}` is not a valid URL: {error}"
+        ))
+    })?;
+    if parsed.host_str().is_none() {
+        return Err(Error::validation(format!(
+            "elasticsearch url `{url}` must name a host"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// The endpoint without userinfo, query, fragment, or trailing slash.
+fn endpoint_without_userinfo(parsed: &Url) -> String {
+    let mut stripped = parsed.clone();
+    let _ = stripped.set_username("");
+    let _ = stripped.set_password(None);
+    stripped.set_query(None);
+    stripped.set_fragment(None);
+    stripped.as_str().trim_end_matches('/').to_string()
+}
+
 /// Builds the SQLite key-value store, or reports the missing feature.
 #[cfg(feature = "sqlite")]
 async fn sqlite_kv_store(url: &str) -> Result<Arc<dyn KvStore>> {
@@ -312,6 +467,58 @@ async fn redis_kv_store(_url: Option<&str>) -> Result<Arc<dyn KvStore>> {
         "redis key-value store backend is unavailable; enable the `redis` feature or use the in-memory, file, or sqlite backend",
     ))
 }
+
+/// Builds the Redis document store, or reports a missing `url`.
+///
+/// The backend keeps the kernel [`DocumentStore`] semantics by delegating
+/// filters, ordering, and paging to a throwaway in-memory store (see
+/// [`redis`] for the key layout and the documented limitations).
+#[cfg(feature = "redis")]
+async fn redis_document_store(url: Option<&str>) -> Result<Arc<dyn DocumentStore>> {
+    let url =
+        url.ok_or_else(|| Error::validation("redis document store backend requires a `url`"))?;
+    redis::RedisDocumentStore::connect(redis::RedisStoreConfig {
+        url: Some(url.to_string()),
+        ..redis::RedisStoreConfig::default()
+    })
+    .await
+}
+
+/// Reports that the `redis` feature is off; keeps the factory match arms
+/// uniform.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)] // mirrors the async Redis helper
+async fn redis_document_store(_url: Option<&str>) -> Result<Arc<dyn DocumentStore>> {
+    Err(Error::unsupported(
+        "redis document store backend is unavailable; enable the `redis` feature or use the in-memory, file, or sqlite backend",
+    ))
+}
+
+/// Builds the Redis vector store, or reports a missing `url`.
+///
+/// Search ranking, score normalization, and `top_k` truncation are delegated to
+/// a throwaway [`InMemoryVectorStore`] with the store's metric, so they cannot
+/// drift from the kernel reference (see [`redis`] for the brute-force note).
+#[cfg(feature = "redis")]
+async fn redis_vector_store(url: Option<&str>) -> Result<Arc<dyn VectorStore>> {
+    let url =
+        url.ok_or_else(|| Error::validation("redis vector store backend requires a `url`"))?;
+    redis::RedisVectorStore::connect(redis::RedisStoreConfig {
+        url: Some(url.to_string()),
+        ..redis::RedisStoreConfig::default()
+    })
+    .await
+}
+
+/// Reports that the `redis` feature is off; keeps the factory match arms
+/// uniform.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)] // mirrors the async Redis helper
+async fn redis_vector_store(_url: Option<&str>) -> Result<Arc<dyn VectorStore>> {
+    Err(Error::unsupported(
+        "redis vector store backend is unavailable; enable the `redis` feature or use the in-memory or file vector store",
+    ))
+}
 #[cfg(test)]
 mod tests {
     // Python counterparts: `tests/unit_tests/extensions/store/test_es_vector_store.py`
@@ -321,6 +528,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use openjiuwen_common::error::ErrorKind;
+    use openjiuwen_common::security::SecretString;
     use openjiuwen_core::foundation::store::{FieldSchema, VectorDataType};
     use serde_json::json;
     #[test]
@@ -366,7 +574,10 @@ mod tests {
             es_default,
             StoreBackend::Elasticsearch {
                 url: "http://localhost:9200".to_string(),
-                index_prefix: "agent_vector".to_string()
+                index_prefix: "agent_vector".to_string(),
+                username: None,
+                password: None,
+                api_key: None,
             }
         );
         assert_eq!(es_default.kind(), StoreKind::Elasticsearch);
@@ -378,9 +589,31 @@ mod tests {
             es_explicit,
             StoreBackend::Elasticsearch {
                 url: "http://localhost:9200".to_string(),
-                index_prefix: "custom".to_string()
+                index_prefix: "custom".to_string(),
+                username: None,
+                password: None,
+                api_key: None,
             }
         );
+        let es_credentials = StoreBackend::from_json(&json!({
+            "kind": "elasticsearch",
+            "url": "http://localhost:9200",
+            "username": " elastic ",
+            "password": "s3cret",
+            "api_key": "  api-key-123  ",
+        }))
+        .unwrap();
+        assert_eq!(
+            es_credentials,
+            StoreBackend::Elasticsearch {
+                url: "http://localhost:9200".to_string(),
+                index_prefix: "agent_vector".to_string(),
+                username: Some("elastic".to_string()),
+                password: Some("s3cret".to_string()),
+                api_key: Some("api-key-123".to_string()),
+            }
+        );
+        assert_eq!(es_credentials.kind(), StoreKind::Elasticsearch);
     }
     #[test]
     fn from_json_rejects_invalid_configs() {
@@ -416,6 +649,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Validation);
+        for field in ["username", "password", "api_key"] {
+            let error = StoreBackend::from_json(&json!({
+                "kind": "elasticsearch",
+                "url": "http://x",
+                field: 7,
+            }))
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Validation, "field: {field}");
+            assert!(error.message().contains(field), "{}", error.message());
+        }
     }
     #[test]
     fn store_backend_serde_round_trips() {
@@ -434,6 +677,9 @@ mod tests {
             StoreBackend::Elasticsearch {
                 url: "http://localhost:9200".to_string(),
                 index_prefix: "custom".to_string(),
+                username: Some("elastic".to_string()),
+                password: Some("s3cret".to_string()),
+                api_key: Some("api-key-123".to_string()),
             },
         ];
         for backend in &backends {
@@ -448,9 +694,20 @@ mod tests {
             decoded,
             StoreBackend::Elasticsearch {
                 url: "http://localhost:9200".to_string(),
-                index_prefix: "agent_vector".to_string()
-            }
+                index_prefix: "agent_vector".to_string(),
+                username: None,
+                password: None,
+                api_key: None,
+            },
+            "a credential-less config still decodes with the credential fields empty"
         );
+        // `index_prefix` and the credential fields all default, so the minimal
+        // JSON shape keeps working.
+        let minimal: StoreBackend = serde_json::from_value(
+            json!({"kind": "elasticsearch", "url": "http://localhost:9200"}),
+        )
+        .unwrap();
+        assert_eq!(minimal, decoded);
     }
     #[tokio::test]
     async fn memory_kv_store_round_trips() {
@@ -523,15 +780,19 @@ mod tests {
     }
     /// Python counterpart: `tests/unit_tests/extensions/store/test_es_vector_store.py`.
     ///
-    /// Elasticsearch is a vector store only: the two other factories report it
-    /// and name a backend that does implement their contract, while the vector
-    /// arm builds a live REST-backed store. `ElasticsearchVectorStore::connect`
-    /// performs no I/O at construction, so the assertions stay offline.
+    /// Elasticsearch serves documents and vectors but not key values: the
+    /// key-value factory reports it and names a backend that does implement
+    /// that contract, while the document arm builds the kernel's live REST
+    /// document store and the vector arm builds this crate's live REST vector
+    /// store. Neither constructor performs I/O, so the assertions stay offline.
     #[tokio::test]
     async fn elasticsearch_factories_split_key_value_document_and_vector() {
         let backend = StoreBackend::Elasticsearch {
             url: "http://localhost:9200".to_string(),
             index_prefix: "agent_vector".to_string(),
+            username: None,
+            password: None,
+            api_key: None,
         };
         let error = build_kv_store(&backend)
             .await
@@ -541,14 +802,12 @@ mod tests {
         let message = error.message().to_ascii_lowercase();
         assert!(message.contains("elasticsearch"), "{message}");
         assert!(message.contains("in-memory"), "{message}");
-        let error = build_document_store(&backend)
+        // The document factory builds a live REST store without any I/O, so a
+        // loopback endpoint that is never contacted is enough.
+        let documents: Arc<dyn DocumentStore> = build_document_store(&backend)
             .await
-            .err()
-            .expect("elasticsearch is not a document store");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.message().to_ascii_lowercase();
-        assert!(message.contains("elasticsearch"), "{message}");
-        assert!(message.contains("in-memory"), "{message}");
+            .expect("elasticsearch is a live document store backend");
+        drop(documents);
         build_vector_store(&backend)
             .await
             .expect("elasticsearch is a live vector store backend");
@@ -562,6 +821,150 @@ mod tests {
         let store = elasticsearch::ElasticsearchVectorStore::new(config)
             .expect("a valid elasticsearch config must build without I/O");
         assert_eq!(store.index_name("docs"), "agent_vector__docs");
+    }
+    /// The document helper forwards the endpoint and the index prefix, and
+    /// strips everything a kernel endpoint cannot carry.
+    #[test]
+    fn elasticsearch_document_config_trims_the_endpoint_and_forwards_the_prefix() {
+        let config = elasticsearch_document_config(
+            "  http://localhost:9200/base/?pretty=1#top  ",
+            "custom",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.endpoint, "http://localhost:9200/base");
+        assert_eq!(config.index_prefix, "custom");
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+        assert_eq!(config.api_key, None);
+    }
+    /// Explicit credential fields win over the URL userinfo, field by field.
+    #[test]
+    fn elasticsearch_document_config_prefers_explicit_credentials() {
+        // Userinfo only: both halves come from the URL.
+        let config = elasticsearch_document_config(
+            "http://alice:wonderland@127.0.0.1:9200",
+            "agent_vector",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.endpoint, "http://127.0.0.1:9200");
+        assert_eq!(config.username.as_deref(), Some("alice"));
+        assert_eq!(
+            config.password.as_ref().map(SecretString::expose_secret),
+            Some("wonderland")
+        );
+        // Explicit fields replace the userinfo halves.
+        let config = elasticsearch_document_config(
+            "http://alice:wonderland@127.0.0.1:9200",
+            "agent_vector",
+            Some("bob"),
+            Some("builder"),
+            Some("api-key-123"),
+        )
+        .unwrap();
+        assert_eq!(config.endpoint, "http://127.0.0.1:9200");
+        assert_eq!(config.username.as_deref(), Some("bob"));
+        assert_eq!(
+            config.password.as_ref().map(SecretString::expose_secret),
+            Some("builder")
+        );
+        assert_eq!(
+            config.api_key.as_ref().map(SecretString::expose_secret),
+            Some("api-key-123")
+        );
+        // A user name without a password sends an empty password, like the
+        // vector backend's URL userinfo handling.
+        let config = elasticsearch_document_config(
+            "http://alice@127.0.0.1:9200",
+            "agent_vector",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.username.as_deref(), Some("alice"));
+        assert_eq!(
+            config.password.as_ref().map(SecretString::expose_secret),
+            Some("")
+        );
+        // A password without a user name is not sent: basic auth needs both.
+        let config = elasticsearch_document_config(
+            "http://127.0.0.1:9200",
+            "agent_vector",
+            None,
+            Some("orphan"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.username, None);
+        assert_eq!(
+            config.password.as_ref().map(SecretString::expose_secret),
+            Some("orphan")
+        );
+        // The store exposes exactly the configuration the helper produced.
+        let store = ElasticsearchDocumentStore::new(config)
+            .expect("a host-only endpoint is a valid kernel configuration");
+        assert_eq!(store.config().endpoint, "http://127.0.0.1:9200");
+    }
+    /// An unusable backend URL is rejected before any request is sent.
+    #[test]
+    fn elasticsearch_document_config_validates_the_url() {
+        for url in [
+            "",
+            "   ",
+            "localhost:9200",
+            "ftp://localhost:9200",
+            "http://",
+        ] {
+            let error =
+                elasticsearch_document_config(url, "agent_vector", None, None, None).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Validation, "url: {url:?}");
+            assert!(error.message().contains("url"), "{}", error.message());
+        }
+        let error =
+            elasticsearch_document_config("localhost:9200", "agent_vector", None, None, None)
+                .unwrap_err();
+        assert!(
+            error.message().contains("http://"),
+            "the message names the scheme requirement: {}",
+            error.message()
+        );
+    }
+    /// The factory forwards the credentials of a configured backend.
+    #[tokio::test]
+    async fn elasticsearch_document_factory_forwards_the_credentials() {
+        let store = elasticsearch_document_store(
+            "http://alice:wonderland@127.0.0.1:9200",
+            "agent_vector",
+            Some("bob"),
+            None,
+            Some("api-key-123"),
+        )
+        .expect("the store builds without I/O");
+        assert_eq!(store.config().endpoint, "http://127.0.0.1:9200");
+        assert_eq!(store.config().username.as_deref(), Some("bob"));
+        assert_eq!(
+            store
+                .config()
+                .password
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("wonderland"),
+            "the explicit user name keeps the userinfo password"
+        );
+        assert_eq!(
+            store
+                .config()
+                .api_key
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("api-key-123")
+        );
     }
     #[cfg(feature = "redis")]
     #[tokio::test]
@@ -613,49 +1016,100 @@ mod tests {
     }
     #[cfg(feature = "redis")]
     #[tokio::test]
-    async fn redis_kv_store_requires_a_url() {
-        let error = build_kv_store(&StoreBackend::Redis { url: None })
-            .await
-            .err()
-            .expect("a redis backend without a url must fail");
-        assert_eq!(error.kind(), ErrorKind::Validation);
-        let message = error.message().to_string();
-        assert!(message.contains("url"), "{message}");
+    async fn redis_factories_require_a_url() {
+        let backend = StoreBackend::Redis { url: None };
+        for (name, error) in [
+            ("key-value", build_kv_store(&backend).await.err()),
+            ("document", build_document_store(&backend).await.err()),
+            ("vector", build_vector_store(&backend).await.err()),
+        ] {
+            let error = error.unwrap_or_else(|| panic!("{name}: missing url must fail"));
+            assert_eq!(error.kind(), ErrorKind::Validation, "{name}: {error}");
+            let message = error.message().to_ascii_lowercase();
+            assert!(message.contains("url"), "{name}: {message}");
+            assert!(message.contains("redis"), "{name}: {message}");
+        }
     }
+    #[cfg(feature = "redis")]
     #[tokio::test]
-    async fn redis_backend_has_no_document_or_vector_store() {
+    async fn redis_factories_round_trip_documents_and_vectors_against_the_fake_server() {
+        let fake = crate::redis::testsupport::FakeRedis::start().await;
         let backend = StoreBackend::Redis {
-            url: Some("redis://localhost:6379".to_string()),
+            url: Some(fake.url()),
         };
-        let error = build_document_store(&backend)
+        let documents = build_document_store(&backend).await.unwrap();
+        documents.create_collection("docs").await.unwrap();
+        let written = vec![
+            Document::new("a").with_field("age", 36),
+            Document::new("b").with_field("age", 20),
+        ];
+        assert_eq!(documents.upsert("docs", written).await.unwrap(), 2);
+        assert_eq!(documents.list_collections().await.unwrap(), vec!["docs"]);
+        let read = documents
+            .query(
+                "docs",
+                &Query {
+                    filter: serde_json::json!({"age": {"$gte": 30}}),
+                    ..Query::default()
+                },
+            )
             .await
-            .err()
-            .expect("redis is not a document store");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.message().to_ascii_lowercase();
-        assert!(message.contains("redis"), "{message}");
-        let error = build_vector_store(&backend)
+            .unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].id, "a");
+        let vectors = build_vector_store(&backend).await.unwrap();
+        let schema = CollectionSchema::new(vec![
+            FieldSchema {
+                is_primary: true,
+                ..FieldSchema::new("id", VectorDataType::Varchar)
+            },
+            FieldSchema {
+                dim: Some(2),
+                ..FieldSchema::new("embedding", VectorDataType::FloatVector)
+            },
+        ]);
+        vectors
+            .create_collection("embeddings", schema.clone())
             .await
-            .err()
-            .expect("redis is not a vector store");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.message().to_ascii_lowercase();
-        assert!(message.contains("redis"), "{message}");
+            .unwrap();
+        assert_eq!(
+            vectors.get_schema("embeddings").await.unwrap(),
+            Some(schema)
+        );
+        let batch = vec![
+            serde_json::json!({"id": "near", "embedding": [1.0, 0.0]}),
+            serde_json::json!({"id": "far", "embedding": [0.0, 1.0]}),
+        ]
+        .into_iter()
+        .filter_map(|doc| doc.as_object().cloned())
+        .collect();
+        assert_eq!(vectors.add_docs("embeddings", batch).await.unwrap(), 2);
+        let hits = vectors
+            .search("embeddings", &VectorQuery::new(vec![1.0, 0.0]))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].fields["id"], "near");
+        assert_eq!(hits.len(), 2);
+        fake.shutdown().await;
     }
     #[cfg(not(feature = "redis"))]
     #[tokio::test]
-    async fn redis_kv_store_requires_the_feature() {
+    async fn redis_stores_require_the_feature() {
         let backend = StoreBackend::Redis {
             url: Some("redis://localhost:6379".to_string()),
         };
-        let error = build_kv_store(&backend)
-            .await
-            .err()
-            .expect("redis backend without the feature must fail");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        let message = error.message().to_ascii_lowercase();
-        assert!(message.contains("redis"), "{message}");
-        assert!(message.contains("`redis` feature"), "{message}");
+        for (name, error) in [
+            ("key-value", build_kv_store(&backend).await.err()),
+            ("document", build_document_store(&backend).await.err()),
+            ("vector", build_vector_store(&backend).await.err()),
+        ] {
+            let error =
+                error.unwrap_or_else(|| panic!("{name}: the feature-off backend must fail"));
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{name}: {error}");
+            let message = error.message().to_ascii_lowercase();
+            assert!(message.contains("redis"), "{name}: {message}");
+            assert!(message.contains("`redis` feature"), "{name}: {message}");
+        }
     }
     #[cfg(feature = "sqlite")]
     #[tokio::test]

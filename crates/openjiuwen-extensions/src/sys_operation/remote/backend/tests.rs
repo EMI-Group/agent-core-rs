@@ -30,19 +30,35 @@ use super::*;
 use tokio::fs;
 use tokio::sync::Mutex;
 
+/// The conditional-write cases, kept in their own file so this one stays readable.
+mod conditional;
+
 /// An in-memory backend with scripted executions.
 #[derive(Default)]
 struct FakeBackend {
+    conditional_write: bool,
     files: Mutex<BTreeMap<String, Vec<u8>>>,
     entries: Mutex<Vec<RemoteEntry>>,
     search_entries: Mutex<Vec<RemoteEntry>>,
     executions: Mutex<Vec<ExecResult>>,
     requests: Mutex<Vec<ExecRequest>>,
+    /// `(path, bytes)` of every successful write, in order.
+    writes: Mutex<Vec<(String, usize)>>,
+    /// Number of `read_bytes` calls, so a test can prove a path was never read.
+    reads: Mutex<usize>,
 }
 
 impl FakeBackend {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// A backend that advertises the conditional-write capability.
+    fn conditional() -> Self {
+        Self {
+            conditional_write: true,
+            ..Self::default()
+        }
     }
 
     async fn put(&self, path: &str, data: &[u8]) {
@@ -54,6 +70,16 @@ impl FakeBackend {
 
     async fn contents(&self, path: &str) -> Option<Vec<u8>> {
         self.files.lock().await.get(path).cloned()
+    }
+
+    /// Every write the backend accepted, as `(path, bytes written)`.
+    async fn writes(&self) -> Vec<(String, usize)> {
+        self.writes.lock().await.clone()
+    }
+
+    /// How many times the backend was asked to read a path.
+    async fn read_count(&self) -> usize {
+        *self.reads.lock().await
     }
 
     async fn set_entries(&self, entries: Vec<RemoteEntry>) {
@@ -83,7 +109,12 @@ impl SandboxBackend for FakeBackend {
         "fake"
     }
 
+    fn supports_conditional_write(&self) -> bool {
+        self.conditional_write
+    }
+
     async fn read_bytes(&self, path: &str) -> std::result::Result<Vec<u8>, RemoteError> {
+        *self.reads.lock().await += 1;
         self.files
             .lock()
             .await
@@ -107,6 +138,11 @@ impl SandboxBackend for FakeBackend {
         } else {
             files.insert(path.to_string(), data.to_vec());
         }
+        drop(files);
+        self.writes
+            .lock()
+            .await
+            .push((path.to_string(), data.len()));
         Ok(())
     }
 
@@ -148,8 +184,8 @@ impl SandboxBackend for FakeBackend {
     }
 }
 
-fn fs_backend(backend: &Arc<FakeBackend>, config: &SandboxGatewayConfig) -> RemoteFs<FakeBackend> {
-    RemoteFs::new(Arc::clone(backend), config)
+fn fs_backend(backend: &Arc<FakeBackend>) -> RemoteFs<FakeBackend> {
+    RemoteFs::new(Arc::clone(backend))
 }
 
 fn entry(name: &str, size: u64, modified_time: &str, file_type: Option<&str>) -> RemoteEntry {
@@ -181,7 +217,7 @@ async fn collect<T>(stream: OpStream<T>) -> Vec<OpResult<T>> {
 async fn text_read_applies_head_tail_and_line_range() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/a.txt", b"one\ntwo\nthree\nfour\n").await;
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
 
     let head = fs
         .read_file(ReadFileParams::text("/work/a.txt").with_head(2))
@@ -213,7 +249,7 @@ async fn text_read_applies_head_tail_and_line_range() {
 async fn text_read_reports_a_non_default_encoding() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/a.txt", b"hi").await;
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
     let result = fs
         .read_file(ReadFileParams::text("/work/a.txt").with_encoding("gbk"))
         .await;
@@ -223,7 +259,7 @@ async fn text_read_reports_a_non_default_encoding() {
 #[tokio::test]
 async fn read_validation_errors_use_the_fs_status() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
 
     let bytes_head = fs
         .read_file(ReadFileParams::bytes("/work/a.bin").with_head(1))
@@ -249,7 +285,7 @@ async fn read_validation_errors_use_the_fs_status() {
 #[tokio::test]
 async fn a_missing_file_is_a_gateway_failure() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
     let result = fs
         .read_file(ReadFileParams::text("/work/missing.txt"))
         .await;
@@ -264,7 +300,7 @@ async fn a_missing_file_is_a_gateway_failure() {
 async fn bytes_read_returns_the_raw_payload() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/a.bin", &[0_u8, 1, 2]).await;
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
     let result = fs.read_file(ReadFileParams::bytes("/work/a.bin")).await;
     let data = result.data.unwrap();
     assert_eq!(data.mode, ReadMode::Bytes);
@@ -277,7 +313,7 @@ async fn bytes_read_returns_the_raw_payload() {
 async fn read_stream_emits_one_chunk_per_selected_line() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/a.txt", b"one\ntwo\nthree\n").await;
-    let fs = Arc::new(fs_backend(&backend, &SandboxGatewayConfig::default()));
+    let fs = Arc::new(fs_backend(&backend));
     let chunks =
         collect(fs.read_file_stream(ReadFileParams::text("/work/a.txt").with_head(2))).await;
 
@@ -296,7 +332,7 @@ async fn read_stream_emits_one_chunk_per_selected_line() {
 async fn read_stream_splits_bytes_by_chunk_size() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/a.bin", b"abcde").await;
-    let fs = Arc::new(fs_backend(&backend, &SandboxGatewayConfig::default()));
+    let fs = Arc::new(fs_backend(&backend));
     let mut params = ReadFileParams::bytes("/work/a.bin");
     params.chunk_size = 2;
     let chunks = collect(fs.read_file_stream(params)).await;
@@ -317,7 +353,7 @@ async fn an_empty_stream_always_yields_one_terminal_chunk() {
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/empty.txt", b"").await;
     backend.put("/work/empty.bin", b"").await;
-    let fs = Arc::new(fs_backend(&backend, &SandboxGatewayConfig::default()));
+    let fs = Arc::new(fs_backend(&backend));
 
     let text = collect(
         fs.clone()
@@ -339,7 +375,7 @@ async fn an_empty_stream_always_yields_one_terminal_chunk() {
 #[tokio::test]
 async fn a_failed_stream_yields_exactly_one_terminal_chunk() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = Arc::new(fs_backend(&backend, &SandboxGatewayConfig::default()));
+    let fs = Arc::new(fs_backend(&backend));
     let chunks = collect(fs.read_file_stream(ReadFileParams::text("/work/missing.txt"))).await;
 
     assert_eq!(chunks.len(), 1);
@@ -353,7 +389,7 @@ async fn a_failed_stream_yields_exactly_one_terminal_chunk() {
 #[tokio::test]
 async fn write_file_applies_python_newline_defaults_and_append() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
 
     let written = fs
         .write_file(WriteFileParams::new("/work/a.txt", "hello"))
@@ -386,7 +422,7 @@ async fn write_file_applies_python_newline_defaults_and_append() {
 #[tokio::test]
 async fn write_file_enforces_create_if_not_exist() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
     let params = {
         let mut params = WriteFileParams::raw("/work/new.txt", "x");
         params.create_if_not_exist = false;
@@ -403,7 +439,7 @@ async fn write_file_enforces_create_if_not_exist() {
 #[tokio::test]
 async fn conditional_writes_are_rejected_with_the_provider_name() {
     let backend = Arc::new(FakeBackend::new());
-    let fs = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs = fs_backend(&backend);
 
     let sha = fs
         .write_file(WriteFileParams::raw("/work/a.txt", "x").with_expected_sha256("deadbeef"))
@@ -435,7 +471,7 @@ async fn upload_and_download_round_trip_through_the_host() {
     let local = dir.path().join("payload.bin");
     fs::write(&local, b"payload").await.unwrap();
     let backend = Arc::new(FakeBackend::new());
-    let fs_operation = Arc::new(fs_backend(&backend, &SandboxGatewayConfig::default()));
+    let fs_operation = Arc::new(fs_backend(&backend));
 
     let upload = fs_operation
         .upload_file(UploadFileParams {
@@ -495,7 +531,7 @@ async fn transfers_refuse_existing_destinations() {
     fs::write(&local, b"payload").await.unwrap();
     let backend = Arc::new(FakeBackend::new());
     backend.put("/work/payload.bin", b"remote").await;
-    let fs_operation = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs_operation = fs_backend(&backend);
 
     let upload = fs_operation
         .upload_file(UploadFileParams {
@@ -526,7 +562,7 @@ async fn transfers_refuse_existing_destinations() {
 #[tokio::test]
 async fn upload_reports_an_unreadable_local_file() {
     let backend = Arc::new(FakeBackend::new());
-    let fs_operation = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs_operation = fs_backend(&backend);
     let result = fs_operation
         .upload_file(UploadFileParams {
             local_path: "/definitely/missing/payload.bin".to_string(),
@@ -551,7 +587,7 @@ async fn list_files_sorts_and_filters() {
             entry("sub", 512, "2024-01-01 00:00:00", None),
         ])
         .await;
-    let fs_operation = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs_operation = fs_backend(&backend);
 
     let mut params = ListFilesParams::new("/work");
     params.sort_by = SortBy::Size;
@@ -589,7 +625,7 @@ async fn list_directories_returns_only_directories() {
             entry("sub", 512, "2024-01-01 00:00:00", None),
         ])
         .await;
-    let fs_operation = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs_operation = fs_backend(&backend);
     let listed = fs_operation
         .list_directories(ListDirsParams::new("/work"))
         .await;
@@ -609,7 +645,7 @@ async fn search_files_maps_entries_and_sorts_by_name() {
             entry("a.txt", 1, "2024-01-01 00:00:00", Some(".txt")),
         ])
         .await;
-    let fs_operation = fs_backend(&backend, &SandboxGatewayConfig::default());
+    let fs_operation = fs_backend(&backend);
     let result = fs_operation
         .search_files(SearchFilesParams::new("/work", "*.txt").with_excludes(["*.rs"]))
         .await;
@@ -1005,22 +1041,26 @@ async fn a_failed_code_stream_yields_one_terminal_chunk() {
 }
 
 #[tokio::test]
-async fn provider_set_from_registers_three_factories_and_honours_the_config() {
+async fn provider_set_from_registers_three_factories_and_reports_the_backend_capability() {
     let set = provider_set_from(
         |_endpoint: &SandboxEndpoint, _config: &SandboxGatewayConfig| Ok(FakeBackend::new()),
     );
     assert!(set.fs.is_some());
     assert!(set.shell.is_some());
     assert!(set.code.is_some());
-
+    // The capability is the backend's: the gateway flag does not gate it,
+    // because the precondition is evaluated over the backend's own read and
+    // write primitives rather than a gateway compare-and-swap.
     let conditional = SandboxGatewayConfig {
-        supports_conditional_write: true,
+        supports_conditional_write: false,
         ..SandboxGatewayConfig::default()
     };
-    let fs = set.fs.as_ref().unwrap();
+    let capable = provider_set_from(
+        |_endpoint: &SandboxEndpoint, _config: &SandboxGatewayConfig| Ok(FakeBackend::conditional()),
+    );
+    let fs = capable.fs.as_ref().unwrap();
     let fs = fs(&SandboxEndpoint::default(), &conditional).unwrap();
     assert!(fs.supports_conditional_write());
-
     let plain = set.fs.as_ref().unwrap();
     let plain = plain(
         &SandboxEndpoint::default(),
