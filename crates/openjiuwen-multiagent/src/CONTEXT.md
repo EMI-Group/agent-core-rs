@@ -184,8 +184,10 @@ pub const DEFAULT_KEY_PREFIX: &str = "openjiuwen:team";
 pub enum TransportKind { InProcess /*default*/, Redis, Pulsar }
 impl TransportKind { pub const fn as_str(self) -> &'static str; }
 pub struct RedisTransportConfig { pub addr: String /*"127.0.0.1:6379"*/, pub username: Option<String>,
-                                  pub password: Option<SecretString>, pub db: u32,
-                                  pub poll_interval_ms: u64 /*10*/ }
+                                  pub password: Option<SecretString>, pub db: Option<u32>,
+                                  pub poll_interval_ms: u64 /*10*/, pub consumer_group: Option<String>,
+                                  pub claim_idle_ms: u64 /*30_000*/, pub registry_interval_ms: u64 /*250*/,
+                                  pub topology: RedisTopology /*Single*/ }
 pub struct TransportConfig { pub kind: TransportKind, pub key_prefix: String /*"openjiuwen:team"*/,
                              pub redis: Option<RedisTransportConfig> }
 impl TransportConfig { pub fn new() -> Self; pub const fn with_kind(self, kind: TransportKind) -> Self;
@@ -201,6 +203,10 @@ impl TransportConfig { pub fn new() -> Self; pub const fn with_kind(self, kind: 
     fn add_subscription(&self, agent_id: &str, topic: &str);
     fn remove_subscription(&self, agent_id: &str, topic: &str);
     fn subscribers(&self, topic_id: &str) -> Vec<String>;
+    // introspection, defaulted to an empty registry and overridden by both backends
+    fn list_subscriptions(&self) -> BTreeMap<String, Vec<String>>;
+    fn agent_subscriptions(&self, agent_id: &str) -> Vec<String>;
+    fn subscription_count(&self) -> usize;
 }
 pub fn build_transport(config: &TransportConfig, team_id: impl Into<String>, bus_config: MessageBusConfig,
                        handler: Arc<dyn MessageHandler>) -> Result<Arc<dyn TeamTransport>>;
