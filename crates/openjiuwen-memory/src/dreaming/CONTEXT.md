@@ -42,6 +42,15 @@ The queue is a design of this crate; the Python `openjiuwen.core.memory.dreaming
 - `NoopConsolidator` (`Debug + Clone + Copy + Default`) returns `DreamOutcome::skipped(id, "no consolidator configured")`.
 - `DreamPlanner { repository: Arc<dyn DreamRepository>, consolidator: Arc<dyn DreamConsolidator>, config: DreamConfig }` with manual `Debug`, `new` (validates the config), `with_in_memory`, `repository`, `config`, `run(now, limit, ctx)`, `run_once(now, limit)` (default `CallOptions`), and `run_due(now, ctx)` (uses `config.batch_size`).
 - `DreamingEngine` is a documented alias of `DreamPlanner`.
+`lease.rs`:
+- Lease data: `DreamLease { job_id, owner, acquired_at, expires_at }` (`is_expired(now)`), `LeaseRequest { owner, ttl }`, `LeasedJob { job, lease }`, `LeaseLostReason { Missing, Expired, OwnerMismatch, NotRunning }`, `LeaseStatus { Renewed(DreamLease), Lost(reason) }`, and `DreamLeaseOptions { owner, ttl, heartbeat }` (`heartbeat < ttl`).
+- `DreamLeaseGuard` (`new(repository, lease)`, `lease`, `job_id`, `owner`, `is_lost`, `lost_reason`, `ensure_valid(now)`, `renew(now, ttl)`, `release`) latches a loss so a worker that lost its job cannot resume.
+- The `DreamRepository` lease methods `claim_next_leased`, `renew_lease`, `release_lease`, `lease`, and `delete_job` default to typed `Error::Unsupported`; `InMemoryDreamRepository` and `SqliteDreamRepository` override them, and takeover applies only to a `Running` job whose lease expired.
+
+`planner/lease.rs` (child module of `planner`; inherent methods are still `DreamPlanner` API):
+- `run_leased(now, limit, ctx, options)` validates `DreamLeaseOptions`, applies the same early exits and cancellation check as `run`, claims through `claim_next_leased`, wraps the lease in a `DreamLeaseGuard`, consolidates through the shared `attempt` steps, renews the lease before recording the transition, and releases the lease on every path.
+- A `LeaseStatus::Lost` at renewal records nothing (the job may already belong to the new owner), logs the job id and reason, and stops the sweep; the summary counts recorded outcomes only, so such a job adds nothing.
+- `run_due_leased(now, ctx, options)` is the `batch_size` counterpart of `run_due`; `DreamLeaseOptions::heartbeat` is advisory because one reconciliation renews once per job and spawns no background task.
 
 ## SQL Schema
 
@@ -79,7 +88,7 @@ Repository errors from `claim_next`/`complete`/`fail` abort the sweep with `Err`
 
 - The scheduled background orchestrator and its busy-backoff/idle loop (`DreamingOrchestrator`): callers own the timer and call `run_due`.
 - The LLM-driven consolidation pipeline: `DreamConsolidator` is the injection point, and only the deterministic dedupe rules in `crate::recall` exist in the crate today.
-- Cross-process workers and leases: SQLite row claiming is single-statement concurrency control, not a distributed lock or lease renewal.
+- Background lease heartbeats and lease brokers: leases are rows and a sweep renews once per job, but nothing renews a long-running consolidation in the background.
 - Daemon-side retention enforcement: nothing calls `purge` on a timer, so a caller must invoke it.
 - ML-based salience/importance scoring for choosing which memories are worth consolidating.
 
