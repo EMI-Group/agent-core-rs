@@ -7,7 +7,10 @@ Python's engine is host-driven: it fingerprints capability assets, indexes them,
 This crate ports that engine end to end: the asset cards, a real registry with CRUD and search, keyword and embedding-backed retrieval, SKILL.md discovery with a lexical skill catalog, a versioned `can_feed` capability graph with atomic artifact publication in-memory, on disk and in an object store, a bounded deterministic planner, a plan executor over `openjiuwen-graph`, flow distillation into versioned recipes and reviewed `SkillPack` artifacts, a deduplicating experience bank, and a persisted embedding-backed experience index.
 Every LLM-guided stage (progressive tree retrieval, ontology matching, semantic plan scoring, fingerprint extraction, LLM judging, flow narratives) sits behind the `CompletionModel` seam and carries a documented deterministic fallback, so the crate is fully usable offline with no model configured.
 Everything here is offline, deterministic, and free of external services by default.
-The only remaining gaps are the Python areas that need a GPU/ML stack (faiss IVF index training, `transformers`/`vLLM` logit selection) and two object-storage transports; they keep typed `Error::Unsupported` stubs in [`deferred`] and [`object_artifact`].
+Graph artifacts publish to memory, disk, and three object-storage backends (S3/OBS, Google Cloud Storage, Azure Blob).
+Evaluation covers static card metrics, trace metrics and case windows; analysis runs over ingested session traces; credentials are redacted before text reaches an artifact.
+The typed `Error::Unsupported` gaps that remain are the GPU/ML ones (faiss IVF index training in `ExperienceIndex`, `transformers`/`vLLM` logit selection in [`deferred`]) and two vendor credential flows that need a signing/issuer stack (`GcsObjectStore::from_service_account_file`, `AzureBlobStore::from_client_credentials`).
+A few pure-logic Python areas are still unported; they are listed under `## Deferred Scope` and are absent rather than stubbed.
 
 ## API Surface
 
@@ -406,28 +409,63 @@ With `fail_fast` the first runner error aborts with `Error::Graph("step `<id>` f
 `max_steps` is checked before compilation; the default session is `WorkflowSession::new(<uuid>)`; an empty plan executes to an empty `PlanExecution`.
 A `Cancelled` or `Unsupported` runner error keeps its own [`ErrorKind`] instead of becoming `Error::Graph`.
 
-### `evaluation` (`src/evaluation.rs`)
+### `evaluation` (`src/evaluation/`)
+
+Fail-soft evaluation over capability cards and recorded traces: static card metrics, trace metrics, event-time case windows, status-aware aggregation, and the LLM judge.
 
 ```rust
-pub struct EvaluationInput { pub capability: CapabilityDescriptor, pub target: Option<String> }
-pub struct MetricScore { pub metric: String, pub score: f64, pub passed: bool, pub detail: Option<String> }
-pub struct EvaluationReport { pub capability_id: String, pub scores: Vec<MetricScore>, pub overall: f64, pub errors: Vec<String> }
+pub struct EvaluationInput { pub capability: CapabilityDescriptor, pub target: Option<String>,
+                             pub trace: Option<EvaluationTrace>, pub window: Option<EvaluationWindow> }
+pub struct MetricScore { pub metric: String, pub score: Option<f64>, pub passed: bool,
+                         pub detail: Option<String>, pub status: MetricStatus }
+#[serde(rename_all = "snake_case")] pub enum MetricStatus { Pass, Fail, NotApplicable, Error, Observed }
 #[async_trait]
-pub trait Metric: Send + Sync { fn name(&self) -> &str; async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>; }
-pub struct CompletenessMetric;      // description, tags, and described IO
-pub struct SchemaValidityMetric;    // non-blank unique IO names, required flags coherent
-pub struct LlmJudgedMetric;         // evaluate -> Error::Unsupported
-pub struct EvaluationSuite;
+pub trait Metric: Send + Sync {
+    fn name(&self) -> &str;
+    fn scope(&self) -> MetricScope;                                   // static | trace
+    fn cache_key(&self) -> Option<String>;
+    async fn evaluate(&self, input: &EvaluationInput) -> Result<MetricScore>;
+}
+pub struct CompletenessMetric;          pub struct SchemaValidityMetric;
+pub struct StructureConformanceMetric;  pub struct DescriptionQualityMetric;
+pub struct ClassificationConsistencyMetric;  pub struct LlmJudgedMetric;   // delegates to llm::LlmJudgeMetric
+pub struct SuccessRateMetric;           pub struct LatencyMetric;
+pub struct AccuracyMetric;              pub struct CapabilitySelectionMetric;
+pub struct CompositionEffectivenessMetric;
+
+pub struct CapabilityCall { name, success, duration_ms, event_time, arguments: Value }
+pub struct EvaluationCase { case_id, query, event_time: Option<String>, calls,
+                            expected_answer: Option<String>, actual_answer: Option<String>, metadata }
+pub struct EvaluationTrace { cases: Vec<EvaluationCase> }
+pub struct EvaluationWindow { start: Option<String>, end: Option<String> }   // start inclusive, end exclusive
+pub struct LatencyStatistics { avg_ms, p50_ms, p95_ms, max_ms, count, samples_ms }
+pub struct QualityResult { confidence: QualityConfidence, score: Option<f64>, aggregation, per_metric: BTreeMap<String, MetricScore> }
+
+pub fn percentile(values: &[f64], fraction: f64) -> f64;        // pos = (n-1) * f
+pub fn latency_statistics(samples_ms: &[f64]) -> LatencyStatistics;
+pub fn select_cases(cases: &[EvaluationCase], window: Option<&EvaluationWindow>) -> Vec<&EvaluationCase>;
+pub fn aggregate_metric(scores: &[MetricScore]) -> MetricScore;
+
 impl EvaluationSuite {
     pub fn new(metrics: Vec<Arc<dyn Metric>>) -> Self;
-    pub fn default_suite() -> Self;                 // CompletenessMetric + SchemaValidityMetric
-    pub fn with_llm_judge(self) -> Self;            // adds LlmJudgedMetric (records a fail-soft error)
+    pub fn default_suite() -> Self;                                  // completeness + schema validity
+    pub fn with_llm_judge(self) -> Self;                             // model-free judge, deterministic rubric
+    pub fn with_llm_judge_model(self, model: Arc<dyn CompletionModel>) -> Self;
     pub fn metrics(&self) -> &[Arc<dyn Metric>];
-    pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;  // fail-soft: metric errors -> report.errors
+    pub async fn evaluate(&self, input: &EvaluationInput) -> EvaluationReport;
+    pub async fn evaluate_static(&self, input: &EvaluationInput) -> EvaluationReport;
+    pub async fn evaluate_case(&self, input: &EvaluationInput) -> EvaluationReport;
+    pub async fn evaluate_quality(&self, input: &EvaluationInput) -> QualityResult;
+    pub fn cache_signature(&self) -> Option<String>;                 // SHA-256, SYMPHONY_EVALUATION_PROTOCOL
+    pub fn aggregate(&self, reports: &[EvaluationReport]) -> EvaluationReport;
 }
+pub const SYMPHONY_EVALUATION_PROTOCOL: &str = "symphony-evaluation-suite-v5";
 ```
 
-`evaluation::LlmJudgedMetric` remains the API-shaped in-module stub (`Error::Unsupported`, recorded as a fail-soft report error by `with_llm_judge`); the implemented LLM judge is [`llm::LlmJudgeMetric`](crate::llm::LlmJudgeMetric), which can be inserted into the suite as an ordinary [`Metric`].
+A metric either scores (`score: Some`) or reports a status without a score: latency is always `Observed`, a missing trace or case is `NotApplicable`, a metric failure is `Error` (also recorded in `EvaluationReport::errors`).
+Aggregation follows Python's precedence (`Error` > `Observed` > `NotApplicable`, and a mean `Pass` only when every scored sample passed); `QualityConfidence` maps sample counts 0 / 1 / 2–9 / ≥10 to none / low / normal / high, and `QualityResult.score` stays `None` with `aggregation = "per_metric"`.
+`evaluation::LlmJudgedMetric` is a thin delegating wrapper over [`llm::LlmJudgeMetric`](crate::llm::LlmJudgeMetric): it owns only the `"llm_judged"` name and the default rubric and forwards `with_model`/`with_rubric`/`with_fallback` plus `Metric::evaluate`, so there is one judge implementation and `with_llm_judge()` scores a card offline with the deterministic rubric instead of recording an error.
+See [`evaluation`](src/evaluation/CONTEXT.md) for the per-metric rubrics, check lists and thresholds.
 
 ### `runtime` (`src/runtime.rs`)
 
@@ -511,40 +549,67 @@ Without a semantic index both entry points return `Error::Unsupported`.
 
 ### `discovery` (`src/discovery/`)
 
-SKILL.md discovery plus the lexical skill catalog: both Python scan modes (immediate-child and bounded recursive), per-skill diagnostics instead of scan failure, descriptor derivation with SHA-256 content hashes, an order-independent inventory fingerprint, and BM25 search with excerpts.
-See [`discovery`](src/discovery/CONTEXT.md) for the full surface and rules.
+SKILL.md discovery plus the lexical skill catalog: both Python scan modes (immediate-child and bounded recursive), per-skill diagnostics instead of scan failure, descriptor derivation with SHA-256 content hashes, an order-independent inventory fingerprint, BM25 search with excerpts, and the model-facing prompt surface.
+`SkillFs::{visible_skill_names, prompt_snapshot(&PromptSnapshotOptions), notice_state}` render the prompt snapshot (`PromptSnapshot { rendered, included, omitted, truncated, fingerprint }`) and produce a persistable `SkillNoticeState` whose `consume(&SkillInventory)` reports added/removed/changed skills plus an incremental reminder.
+See [`discovery`](src/discovery/CONTEXT.md) for the full surface, rendering rules and notice semantics.
 
 ### `experience` (`src/experience/`)
 
-The experience bank: query patterns bound to skill sets, deterministic dedupe/merge, embedding-optional ranking (cosine or lexical term coverage), and memory/JSONL/SQLite stores with atomic writes.
+The experience layer: query patterns bound to skill sets, deterministic dedupe/merge, embedding-optional ranking (cosine or lexical term coverage), and memory/JSONL/SQLite stores with atomic writes.
 `ExperienceIndex` is the persisted embedding catalog: one vector per item, Python's `index_dir` layout (`meta.json`, `scalar/metadata.jsonl`, and a JSON vector matrix instead of faiss/numpy files), digest-verified loads, and exact flat cosine search; `ivf*` algorithm names stay `Error::Unsupported` (faiss training).
+The input half is implemented too: `TraceStore` ingests `sessions/<id>/{metadata.json,history.json}` into `TraceRecord`s with an idempotent `trace_store/{records.jsonl,processed_index.json}` cache, `cluster_traces` groups them (skill set, then token Jaccard), and `ExperienceCollector` feeds `ExperienceBank` or `ExperienceIndex` (5-example cap, 0.9 similarity merge, 20-item auto-flush).
 See [`experience`](src/experience/CONTEXT.md) for the full surface and rules.
 
 ### `flow` (`src/flow/`)
 
-Trace ingestion and normalization, structural distillation into versioned `ExperienceRecipe`s, content-addressed `SkillPack` packaging with a seven-check review, and an eager atomic flow store.
+Trace ingestion and normalization, structural distillation into versioned `ExperienceRecipe`s, content-addressed `SkillPack` packaging with a ten-check review (`structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`, `integrity`, `meta_naming`, `materials`, `permissions`, `license`), and an eager atomic flow store.
+Every model-written narrative and trace-derived free-text field is redacted before it enters a recipe or package.
 See [`flow`](src/flow/CONTEXT.md) for the full surface and rules.
+
+### `redaction` (`src/redaction/`)
+
+Credential/PII redaction for model-facing and packaged text, mirroring Python's `flow/privacy.py` and `models/_redaction.py`.
+
+```rust
+pub const REDACTED: &str = "<redacted>";
+pub const REDACTED_CREDENTIAL: &str = "<redacted-credential>";
+pub const REDACTED_REQUEST: &str = "<redacted-request>";
+pub const DISTILLED_TEXT_LIMIT: usize = 2_000;
+
+pub fn redact_sensitive_text(text: &str) -> String;
+pub fn redact_common_credentials(text: &str) -> String;
+pub fn sanitize_distilled_text(text: &str, verbatim_query: Option<&str>) -> String;
+pub fn normalize_sensitive_name(name: &str) -> String;
+pub fn is_sensitive_name(name: &str) -> bool;
+pub fn redact_sensitive_json(value: &Value) -> Value;
+pub fn redact_private_json(value: &Value, private_keys: &[&str]) -> Value;
+```
+
+The scanner is hand rolled (Python's patterns use lookbehind, which `regex` cannot express) and covers PEM private-key blocks, `Bearer` tokens, JWTs, `sk-…` keys, AWS access key ids, and `key=value` / `"key": "value"` assignments whose key `is_sensitive_name` recognizes.
+Every pass is idempotent, operates on char boundaries, and replaces only the secret (surrounding text and line structure survive).
+`redact_sensitive_json`/`redact_private_json` recurse with a depth cap of 64 and preserve object key order.
+`llm::identity::sanitize_metadata` reuses `is_sensitive_name` for the match-cache metadata.
 
 ### `llm` (`src/llm/`)
 
 The single `CompletionModel` seam and its five stages (tree retrieval, ontology matching, semantic scoring, fingerprint extraction, LLM judging), each with a documented deterministic fallback under `FallbackMode::Deterministic`.
+`identity.rs` adds model/metadata identity digests (`ModelIdentity`, `stable_metadata_sha256`, `endpoint_sha256`, `graph_identity_sha256`, `sanitize_metadata`), and `cache.rs` the persistent relation-match cache (`MatchCache`, `CachedMatch`, `cache_key`) that `OntologyMatcher` uses opt-in via `with_cache` + `MatchOptions { force }`, keyed by candidate, both fingerprint digests and `matcher_signature()`.
 See [`llm`](src/llm/CONTEXT.md) for the full surface, the fallback table, and the stage rules.
 
 ### `object_artifact` (`src/object_artifact.rs`)
 
 `ObjectGraphArtifactStore` implements `GraphArtifactStore` over an `ObjectStore`, mirroring the filesystem key layout (`<prefix>/versions/<version>/graph.json`, `<prefix>/current.json`) and the same `{"revision", "graph"}` envelope.
 Revisions are written before the `current` pointer, publications serialize through an async mutex, and generated versions skip pinned ids.
-`ArtifactTransport` exposes `ObjectStore`, `S3`, `Gcs`, `AzureBlob`; GCS and Azure Blob return typed `Error::Unsupported`, and a blank bucket is `Error::Validation`.
-See the module docs for the `ObjectGraphArtifactStore` constructors and transport details.
+`ArtifactTransport` exposes `ObjectStore`, `S3(S3Config)`, `Gcs(GcsConfig)` and `AzureBlob(AzureBlobConfig)`, resolved by `ObjectGraphArtifactStore::{s3, gcs, azure_blob, open}`; a blank bucket is `Error::Validation`.
+`GcsObjectStore` speaks the GCS JSON API (`storage/v1` metadata/list, `upload/storage/v1` media upload, `alt=media` download) with an OAuth bearer token or anonymously; `AzureBlobStore` speaks Blob REST (`x-ms-version 2021-12-02`) with SharedKey HMAC-SHA256 signing, a SAS token, or anonymously.
+`GcsObjectStore::from_service_account_file` and `AzureBlobStore::from_client_credentials` are typed `Error::Unsupported` (RS256 JWT signing / Azure AD token exchange are out of scope).
+See the module docs for the constructors, signing rules and environment variables.
 
 ### `deferred` (`src/deferred.rs`)
 
-Two API-shaped stubs remain, and each entry point returns [`Error::Unsupported`] via [`error::unsupported`]:
-
-- the faiss + sentence-transformers experience index (Python `experience`);
-- the `transformers`/vLLM logit-selection backend (Python `retrieval`).
-
-Each stub documents the Python class it mirrors, and its data types stay ordinary `serde` types so a caller can build a request without depending on the deferred machinery.
+One API-shaped stub remains, and every entry point returns [`Error::Unsupported`] via [`error::unsupported`]: the `transformers`/vLLM logit-selection backend (Python `retrieval`), whose constructor and `select` both report `vLLM logit selection`.
+The stub documents the Python class it mirrors, and its data types stay ordinary `serde` types so a caller can build a request without depending on the deferred machinery.
+The other typed deferrals live with their implementations: `ExperienceIndex`'s `ivf*` algorithms, `GcsObjectStore::from_service_account_file`, and `AzureBlobStore::from_client_credentials`.
 
 ## Notes for Agents
 
