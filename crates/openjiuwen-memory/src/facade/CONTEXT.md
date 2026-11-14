@@ -52,11 +52,20 @@ impl LongTermMemory {
                               agent_config: &AgentMemoryConfig, options: &AddOptions) -> Result<AddMemResult>;
     pub async fn get_recent_messages(&self, scope: &MemoryScope, num: usize) -> Result<Vec<BaseMessage>>;
     pub async fn clear_messages(&self, filter: &MemoryFilter, options: &CallOptions) -> Result<usize>;
+    pub async fn get_message_page(&self, scope: &MemoryScope, page_size: usize, cursor: Option<&str>,
+                                  filter: Option<&MemoryFilter>) -> Result<MessagePage>;
+    pub async fn page_messages(&self, scope: &MemoryScope, page_size: usize,
+                               cursor: Option<&str>) -> Result<MessagePage>;
 
     // --- variables ---
     pub async fn set_variable(&self, scope: &MemoryScope, name: &str, value: &str) -> Result<()>;
     pub async fn get_variables(&self, scope: &MemoryScope, names: Option<&[String]>) -> Result<BTreeMap<String, String>>;
     pub async fn delete_variables(&self, scope: &MemoryScope, names: &[String]) -> Result<usize>;
+    pub async fn assign_variable(&self, scope: &MemoryScope, name: &str, value: &str,
+                                 options: &AddOptions) -> Result<VariableWrite>;
+    pub async fn variable_records(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>>;
+    pub async fn remember_variables(&self, scope: &MemoryScope, facts: &[ExtractedFact],
+                                    options: &AddOptions) -> Result<VariableAssignmentReport>;
 
     // --- scope config ---
     pub async fn set_scope_config(&self, scope_id: &str, config: MemoryScopeConfig) -> Result<bool>;
@@ -106,12 +115,16 @@ impl LongTermMemory {
   1. Validate/truncate messages (`input_msg_max_len`), append them to message history (`store::MessageStore`) with now.
   2. Build candidates from message text. With a `Model`, run one extraction prompt requesting `{"facts":[{"content":"...","type":"user_profile|semantic_memory|episodic_memory|summary","importance":0.0}],"variables":{"name":"value"}}`, parse tolerantly, retry `model_retries`; on failure fall back to heuristics with a warning.
   3. Heuristic fallback: every user/assistant message with `trim().len() >= min_message_len` becomes an `EpisodicMemory`; a concatenated last-N summary becomes a `Summary`; variables are not inferred.
-  4. Filter by `AgentMemoryConfig::kind_enabled`, `forbidden_variables`, and `max_facts`; add records via the engine (dedupe applies); set inferred variables via `set_variable` for `mem_variables` only.
+  4. Filter by `AgentMemoryConfig::kind_enabled`, `forbidden_variables`, and `max_facts`; add records via the engine (dedupe applies); set inferred variables via `assign_variable` for `mem_variables` only, so each one gets the KV entry *and* its `Variable` record projection; a name the variable write path still rejects (a case/whitespace variant of a forbidden name) is skipped with a warning, never failing the turn.
   5. Return `AddMemResult` grouped by kind (records actually added/merged, `coding` normally empty).
   A model failure never fails `add_messages`; it degrades to the heuristic path. Cancellation returns `Error::Cancelled` and leaves already-added records.
 - `get_recent_messages` uses the message store (scope's `session_id`, else all sessions) with `num` clamped to `message_history_limit` and returns chronological `BaseMessage`s; `Role` maps from the stored role name (unknown roles default to `User` with a warning).
+- `get_message_page(scope, page_size, cursor, filter)` is the forward keyset walk over the same history: `page_size == 0` returns an empty `MessagePage`, an oversized page returns everything (no `message_history_limit` clamp — that limit belongs to the newest-N window), and `filter` is `AND`ed with the scope clauses by the store, so it can never widen the page past its scope. A garbage or tampered cursor is `Error::Validation`. `page_messages` is the same call without a filter.
 - `clear_messages` deletes conversation history rows matching the filter (records and variables are untouched); cancellation is checked before the delete.
-- Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` lists all user-scope variables (not session variables); session variables are addressed by `scope.session_id`.
+- Variables: names are validated (non-empty, no `/`, no NUL). `get_variables(None)` reads the KV entries (all user-scope variables, not session variables; session variables are addressed by `scope.session_id`).
+- `set_variable` keeps its signature and delegating shape: it is `assign_variable` with `AddOptions::default()`, so the write is the KV entry **plus** the `MemoryType::Variable` record projection built by `MemoryEngine::write_variable`; a name in `forbidden_variables` is `Error::Validation` naming the variable before any write. `assign_variable` is the options-aware (cancellable, timeout, `skip_embedding`) form returning `VariableWrite { record_id, created }`.
+- `delete_variables` validates every name first, then removes both representations per name through `MemoryEngine::delete_variable_everywhere` (KV entry plus projection row and vector) and counts the names that existed. `variable_records` lists the projections ascending by `(timestamp, id)`; the same `(user, scope, session, name)` always maps to one deterministic id, so a rewrite updates in place and never enters the text-similarity dedupe scan.
+- `remember_variables(scope, facts, options)` is the opt-in variable path for analyzer facts: a fact tagged `variable` whose metadata carries `variable` (name) and `value` writes a `Variable` projection (`VariableAssignmentReport::variables`), every other fact is stored as a record exactly like `remember` (`records_added`/`records_merged`/`records_skipped`). `remember` itself still stores such a fact as a `SemanticMemory` record, which keeps `tests/analyzer_wiring.rs` behaviour unchanged.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
 - `analyzer` defaults to `MemoryAnalyzer::from_engine(config, model)`: rules unless `config.extraction.extractor` asks for the LLM *and* a model is attached; `builder().analyzer(...)` replaces it (tests use this to inject a scripted extractor).
 - `remember(scope, input, options)`: `ExtractionInput` carries no scope, so the scope is an explicit parameter. Runs `analyzer.analyze(input, &options.call)`, writes every fact through `engine.add` (tags are preserved under the crate's `tags` metadata key because `to_new_memory` drops them), checks cancellation before each fact, counts `added`/`merged`/`skipped` from each `AddOutcome`, and surfaces `ExtractionResult::degraded` on `RememberReport::degraded`. A rejected write fails the call with the fact index/content and the engine message — never a silent drop.
@@ -135,11 +148,11 @@ impl LongTermMemory {
 - `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports
 - `./records.rs` → CRUD/listing/stats methods and Python parity aliases
 - `./recall.rs` → `search`, `recall`, `search_all`
-- `./messages.rs` → `add_messages`, `get_recent_messages`, `clear_messages`, extraction/fallback
-- `./variables.rs` → variable and scope-config methods
+- `./messages.rs` → `add_messages`, `get_recent_messages`, `get_message_page`/`page_messages`, `clear_messages`, extraction/fallback
+- `./variables.rs` → variable methods (`set`/`assign`/`get`/`delete`, `variable_records`, `remember_variables`), `VariableAssignmentReport`, and scope-config methods
 - `./integrations.rs` → analyzer/remember/consolidate, provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
 
 ## Test Strategy
 
-- Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails.
+- Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails; `variables.rs` adds KV-plus-projection, in-place rewrite, forbidden-name, delete-both, cancellation and `remember_variables` coverage, and `messages.rs` adds the page walk, tampered cursor, empty/oversized page, filter-composition and projected-variable coverage.
 - The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `lite_local.rs`, `sqlite.rs`, `analyzer_wiring.rs`, `external_provider.rs`, `team_memory.rs`, `dreaming.rs`, `migration.rs`).

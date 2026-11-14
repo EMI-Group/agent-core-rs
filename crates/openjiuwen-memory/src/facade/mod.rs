@@ -38,6 +38,8 @@ mod recall;
 mod records;
 mod variables;
 
+pub use variables::VariableAssignmentReport;
+
 use std::path::Path;
 use std::sync::Arc;
 
