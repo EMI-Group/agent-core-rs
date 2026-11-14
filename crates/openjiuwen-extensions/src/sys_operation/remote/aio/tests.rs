@@ -7,7 +7,7 @@
 //! into the kernel result structs — against a loopback `wiremock` server.
 //!
 //! This root suite covers the envelope, authentication, invoke path, error
-//! mapping, conditional-write flag, and registration; the per-operation wire
+//! mapping, conditional-write capability, and registration; the per-operation wire
 //! contracts live in `tests/fs.rs`, `tests/shell.rs`, and `tests/code.rs`.
 // A test module owns its panics: a failed `unwrap`/`expect` is an assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -351,42 +351,40 @@ async fn a_gateway_that_exceeds_the_configured_timeout_fails_without_panicking()
 // ─── conditional writes ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn the_conditional_write_flag_comes_from_the_gateway_configuration() {
+async fn conditional_writes_are_always_supported_by_the_provider() {
     let server = MockServer::start().await;
-    let config = SandboxGatewayConfig {
-        supports_conditional_write: true,
-        ..SandboxGatewayConfig::default()
-    };
-    let fs = AioFs {
-        client: Arc::new(AioClient::new(&endpoint(&server), &config).unwrap()),
-    };
-    assert!(fs.supports_conditional_write());
-
-    let plain = AioFs {
-        client: Arc::new(AioClient::new(&endpoint(&server), &gateway_config()).unwrap()),
-    };
-    assert!(!plain.supports_conditional_write());
+    for advertised in [true, false] {
+        let config = SandboxGatewayConfig {
+            supports_conditional_write: advertised,
+            ..SandboxGatewayConfig::default()
+        };
+        let fs = AioFs {
+            client: Arc::new(AioClient::new(&endpoint(&server), &config).unwrap()),
+        };
+        assert!(
+            fs.supports_conditional_write(),
+            "the provider evaluates the precondition itself, \
+             so the gateway flag {advertised} must not matter"
+        );
+    }
 }
 
 #[tokio::test]
-async fn the_provider_set_forwards_the_conditional_write_flag() {
-    let config = SandboxGatewayConfig {
-        supports_conditional_write: true,
-        ..SandboxGatewayConfig::default()
-    };
+async fn the_provider_set_factories_advertise_conditional_writes() {
     let endpoint = SandboxEndpoint {
         base_url: "http://127.0.0.1:1".to_string(),
         ..SandboxEndpoint::default()
     };
-    let factory = provider_set().fs.expect("a filesystem factory");
-    assert!(factory(&endpoint, &config)
-        .unwrap()
-        .supports_conditional_write());
-
-    let factory = provider_set().fs.expect("a filesystem factory");
-    assert!(!factory(&endpoint, &gateway_config())
-        .unwrap()
-        .supports_conditional_write());
+    for advertised in [true, false] {
+        let config = SandboxGatewayConfig {
+            supports_conditional_write: advertised,
+            ..SandboxGatewayConfig::default()
+        };
+        let factory = provider_set().fs.expect("a filesystem factory");
+        assert!(factory(&endpoint, &config)
+            .unwrap()
+            .supports_conditional_write());
+    }
 }
 
 // ─── registration ───────────────────────────────────────────────────────────
