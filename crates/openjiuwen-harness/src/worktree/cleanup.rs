@@ -166,6 +166,22 @@ impl CleanupPolicy {
     pub const fn max_age_secs(&self) -> u64 {
         self.max_age_days.saturating_mul(86_400)
     }
+
+    /// The skip reason of a worktree whose unpushed-commit probe answered
+    /// `unpushed`, or `None` when the worktree may be reaped.
+    ///
+    /// Only a verified `Some(false)` is safe: `Some(true)` holds unpushed work
+    /// (`unpushed commits`), and `None` means the probe failed
+    /// (`cannot verify unpushed commits`), so both keep the worktree. Treating
+    /// `None` as "clean" is exactly the failure this rule exists to prevent.
+    #[must_use]
+    pub fn unpushed_skip_reason(unpushed: Option<bool>) -> Option<&'static str> {
+        match unpushed {
+            Some(false) => None,
+            Some(true) => Some("unpushed commits"),
+            None => Some("cannot verify unpushed commits"),
+        }
+    }
 }
 
 /// One worktree the pass would reap.
@@ -282,20 +298,12 @@ pub(crate) async fn run(
                 .push(skip(&name, &info.path, "uncommitted changes"));
             continue;
         }
-        match git::has_unpushed_commits(manager.runner().as_ref(), &info.path).await {
-            Ok(Some(false)) => {}
-            Ok(Some(true)) => {
-                report
-                    .skipped
-                    .push(skip(&name, &info.path, "unpushed commits"));
-                continue;
-            }
-            _ => {
-                report
-                    .skipped
-                    .push(skip(&name, &info.path, "cannot verify unpushed commits"));
-                continue;
-            }
+        // A failed probe is `None`: safety cannot be proven, so keep the
+        // worktree (fail closed) instead of reading it as "no unpushed work".
+        let unpushed = git::has_unpushed_commits(manager.runner().as_ref(), &info.path).await?;
+        if let Some(reason) = CleanupPolicy::unpushed_skip_reason(unpushed) {
+            report.skipped.push(skip(&name, &info.path, reason));
+            continue;
         }
         report.candidates.push(CleanupCandidate {
             name,
@@ -448,6 +456,20 @@ mod tests {
                 "current_worktree": null,
                 "now": null,
             })
+        );
+    }
+
+    #[test]
+    fn unpushed_state_is_fail_closed_at_the_policy_level() {
+        assert_eq!(CleanupPolicy::unpushed_skip_reason(Some(false)), None);
+        assert_eq!(
+            CleanupPolicy::unpushed_skip_reason(Some(true)),
+            Some("unpushed commits")
+        );
+        assert_eq!(
+            CleanupPolicy::unpushed_skip_reason(None),
+            Some("cannot verify unpushed commits"),
+            "an unknown state must keep the worktree"
         );
     }
 

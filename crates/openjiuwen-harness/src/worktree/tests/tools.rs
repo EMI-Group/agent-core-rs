@@ -10,7 +10,7 @@ use std::sync::Arc;
 use openjiuwen_foundation::tool::{Tool, ToolContext};
 use serde_json::{json, Value};
 
-use super::{listing, temp_root, ScriptedGitRunner};
+use super::{listing, temp_root, MessageRecorder, ScriptedGitRunner};
 use crate::permission::{
     PermissionEngine, PermissionEngineConfig, PermissionLevel, PermissionsSection,
 };
@@ -326,6 +326,50 @@ async fn enter_refuses_a_registry_record_git_does_not_list() {
 }
 
 #[tokio::test]
+async fn enter_refuses_when_the_worktree_listing_fails_for_a_registered_target() {
+    let (_dir, repo) = temp_root();
+    let fixture = Fixture::new(&repo);
+    let target = fixture.manager.target_path("feature").unwrap();
+    store_record(
+        &repo,
+        WorktreeRecord::new("feature", target.clone()).with_branch("worktree-feature"),
+    );
+    let recorder = Arc::new(MessageRecorder::default());
+    let guard = recorder.install();
+    fixture.runner.push_ok(&root(&repo));
+    fixture.runner.push_fail("fatal: unable to read repository");
+    let tool = fixture.enter("en");
+
+    let payload = invoke_enter(&tool, json!({"name": "feature"})).await;
+    drop(guard);
+
+    assert!(!payload.success);
+    let error = payload.error.unwrap();
+    assert!(error.starts_with("Could not verify whether"), "{error}");
+    assert!(
+        error.contains("fatal: unable to read repository"),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .runner
+            .commands()
+            .iter()
+            .all(|command| !command.starts_with("worktree add")),
+        "a failed listing must not be treated as 'not listed'"
+    );
+    assert!(fixture.store.session().is_none());
+    let messages = recorder.messages();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("cannot list worktrees")
+                && message.contains("fatal: unable to read repository")),
+        "the dropped listing error must be logged: {messages:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_omitted_name_reenters_the_recorded_default_name() {
     let (_dir, repo) = temp_root();
     let fixture = Fixture::new(&repo);
@@ -570,7 +614,7 @@ async fn exit_remove_on_a_clean_worktree_does_not_force() {
 }
 
 #[tokio::test]
-async fn exit_remove_fails_closed_when_the_state_cannot_be_verified() {
+async fn exit_remove_without_discard_refuses_an_unverifiable_state() {
     let (_dir, repo) = temp_root();
     let fixture = Fixture::new(&repo);
     let session = session(&repo, "feature");
@@ -579,13 +623,58 @@ async fn exit_remove_fails_closed_when_the_state_cannot_be_verified() {
     fixture.runner.push_ok(&listing(&repo, None));
     let tool = fixture.exit("en");
 
-    let payload = invoke_exit(&tool, json!({"action": "remove", "discard_changes": true})).await;
+    let payload = invoke_exit(&tool, json!({"action": "remove"})).await;
     assert!(!payload.success);
     let error = payload.error.unwrap();
     assert!(
         error.starts_with("Could not verify worktree state at "),
         "{error}"
     );
+    assert!(error.contains("not registered with git"), "{error}");
     assert!(error.contains("action='keep'"), "{error}");
     assert!(fixture.store.session().is_some());
+    assert!(
+        fixture
+            .runner
+            .commands()
+            .iter()
+            .all(|command| !command.starts_with("worktree remove")),
+        "an unverifiable state must not be removed without the flag"
+    );
+}
+
+#[tokio::test]
+async fn exit_remove_with_discard_proceeds_when_the_state_cannot_be_verified() {
+    let (_dir, repo) = temp_root();
+    let fixture = Fixture::new(&repo);
+    let session = session(&repo, "feature");
+    let worktree_path = session.worktree_path.clone();
+    fixture.store.set_session(Some(session));
+    fixture.runner.push_ok(&root(&repo)); // change_summary: resolve root
+    fixture
+        .runner
+        .push_ok(&listing(&repo, Some((&worktree_path, "worktree-feature"))));
+    fixture.runner.push_fail("fatal: index file corrupt"); // status fails
+    fixture.runner.push_ok(&root(&repo)); // remove: resolve root
+    fixture
+        .runner
+        .push_ok(&listing(&repo, Some((&worktree_path, "worktree-feature"))));
+    fixture.runner.push_success(); // worktree remove --force
+    let tool = fixture.exit("en");
+
+    let payload = invoke_exit(&tool, json!({"action": "remove", "discard_changes": true})).await;
+    assert!(payload.success, "{:?}", payload.error);
+    let data = payload.data.unwrap();
+    assert_eq!(data["action"], "remove");
+    assert_eq!(
+        data["discarded_files"],
+        Value::Null,
+        "an unverified removal must not claim zero discarded files"
+    );
+    assert_eq!(data["discarded_commits"], Value::Null);
+    assert_eq!(
+        fixture.runner.last_call().unwrap().command(),
+        format!("worktree remove --force {}", worktree_path.display())
+    );
+    assert!(fixture.store.session().is_none());
 }

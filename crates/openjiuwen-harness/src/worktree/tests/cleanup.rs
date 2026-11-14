@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::{temp_root, ScriptedGitRunner};
+use super::{temp_root, MessageRecorder, ScriptedGitRunner};
 use crate::worktree::{
     is_ephemeral_slug, CleanupPolicy, RecordingWorktreeEvents, WorktreeEvent, WorktreeIndex,
     WorktreeManager, WorktreeRecord,
@@ -330,7 +330,10 @@ async fn unpushed_state_is_fail_closed_both_when_true_and_when_unknown() {
         [("agent-0123abc".to_owned(), "unpushed commits".to_owned())]
     );
 
-    // `None`: the probe failed, so safety cannot be proven.
+    // `None`: the probe failed, so safety cannot be proven. The failure is
+    // visible in the log instead of looking like a clean worktree.
+    let recorder = Arc::new(MessageRecorder::default());
+    let guard = recorder.install();
     let runner = Arc::new(ScriptedGitRunner::new());
     runner.push_ok(&repo.to_string_lossy());
     runner.push_ok(&listing(&repo, &[&path]));
@@ -343,6 +346,7 @@ async fn unpushed_state_is_fail_closed_both_when_true_and_when_unknown() {
         .cleanup(&CleanupPolicy::default().with_now(now()))
         .await
         .expect("cleanup");
+    drop(guard);
     assert_eq!(report.removed.len(), 0);
     assert_eq!(
         skip_reasons(&report.skipped),
@@ -352,6 +356,21 @@ async fn unpushed_state_is_fail_closed_both_when_true_and_when_unknown() {
         )]
     );
     assert_eq!(runner.commands().len(), 5, "no removal may run");
+    assert!(
+        !runner
+            .commands()
+            .iter()
+            .any(|command| command.starts_with("worktree remove")),
+        "an unprovable unpushed state must never be reaped"
+    );
+    let messages = recorder.messages();
+    assert!(
+        messages.iter().any(|message| message
+            .contains("command=\"git rev-list --max-count=1 HEAD --not --remotes\"")
+            && message.contains("fatal: no such ref")
+            && message.contains("cannot probe unpushed commits")),
+        "the failed probe must be logged with its command and stderr: {messages:?}"
+    );
 }
 
 #[tokio::test]

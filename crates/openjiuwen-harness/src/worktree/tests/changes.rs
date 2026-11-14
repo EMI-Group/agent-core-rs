@@ -3,10 +3,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use openjiuwen_common::error::ErrorKind;
 
-use super::ScriptedGitRunner;
+use super::{MessageRecorder, ScriptedGitRunner};
 use crate::worktree::{
     change_summary, parse_diff_stat, render_change_summary, status_paths, WorktreeChangeSummary,
     SUMMARY_MAX_CHARS, SUMMARY_MAX_FILES, SUMMARY_MAX_LINES,
@@ -119,6 +120,43 @@ async fn a_failing_commit_count_degrades_to_zero_but_the_probe_still_runs() {
             "rev-list --count base..HEAD",
             "rev-list --max-count=1 HEAD --not --remotes",
         ]
+    );
+}
+
+#[tokio::test]
+async fn failed_rev_list_probes_warn_with_the_command_and_stderr() {
+    let recorder = Arc::new(MessageRecorder::default());
+    let guard = recorder.install();
+
+    let runner = ScriptedGitRunner::new();
+    runner.push_ok("");
+    runner.push_ok("");
+    runner.push_fail("fatal: bad revision");
+    runner.push_fail("fatal: no remotes configured");
+
+    let summary = change_summary(&runner, &worktree(), Some("base"))
+        .await
+        .expect("summary");
+    drop(guard);
+
+    assert_eq!(summary.commits, 0);
+    assert_eq!(summary.unpushed, None);
+    let messages = recorder.messages();
+    assert!(
+        messages.iter().any(
+            |message| message.contains("command=\"git rev-list --count\"")
+                && message.contains("range=base..HEAD")
+                && message.contains("fatal: bad revision")
+                && message.contains("cannot count commits")
+        ),
+        "the count warning must name the command, the range and the stderr: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message
+            .contains("command=\"git rev-list --max-count=1 HEAD --not --remotes\"")
+            && message.contains("fatal: no remotes configured")
+            && message.contains("cannot probe unpushed commits")),
+        "the unpushed warning must name the command and the stderr: {messages:?}"
     );
 }
 
