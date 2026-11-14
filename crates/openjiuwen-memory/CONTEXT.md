@@ -2,208 +2,177 @@
 
 ## Intent
 
-Long-term, entity/graph, lite coding, analyzer, external-provider, migration, dreaming, and team memory for the Rust rewrite of openJiuwen.
-Ports the behavior of the Python package `openjiuwen.core.memory` v0.1.20 (`long_term_memory.py`, `config/`, `manage/`, `graph/`, `lite/`, `process/extract/`, `external/`, `migration/`, `dreaming/`) plus the `agent_teams.memory` data layer to idiomatic async Rust.
-Scope: scoped memory-record CRUD, semantic + keyword recall with a documented ranking blend, deterministic dedupe/merge, entity/graph memory, engine-backed coding facts plus a local Markdown + FTS5 + watcher + lock coding stack, rule-first fact extraction and conflict classification with model fallback, an external memory-provider SPI whose vendor adapters are typed `Unsupported`, a forward-only SQLite migration runner with legacy-prefix read compatibility, durable dream-job data/persistence/planner, and team-scoped memory data/persistence.
-Every subsystem is a documented subset: each module `CONTEXT.md` lists what it defers, and the crate-level list is under Deferred below.
-Memory is a kernel service for `openjiuwen-agent` rails, `openjiuwen-workflow` memory components, and `openjiuwen-harness`; it depends only downward on `openjiuwen-foundation` (storage, messages, model) and `openjiuwen-retrieval` (`Embedding`).
+Long-term, entity/graph, lite coding, analyzer, external-provider, migration, dreaming and team memory for the Rust rewrite of openJiuwen.
+Ports Python `openjiuwen.core.memory` v0.1.20 (`long_term_memory.py`, `config/`, `manage/`, `graph/`, `lite/`, `process/extract/`, `external/`, `migration/`, `dreaming/`) plus the `agent_teams.memory` data layer to async Rust.
+Scope: scoped record CRUD; hybrid recall with a documented blend; deterministic dedupe/merge; a variable namespace with a record projection; per-scope analyzer overrides; graph memory; engine-backed and local (Markdown + FTS5 + watcher + flock) coding memory; a rule-first analyzer plus a composable staged pipeline; a provider SPI carrying Python's tool rail, one vendor REST transport and five vendor handles; a forward-only SQLite schema runner plus a plan/journal/dry-run migration suite, backup, a prefix registry, a scope↔user mapping and a KV lock seam; a durable dream queue with a caller-driven orchestrator; and team records with a `TEAM_MEMORY.md` document, extractor, hooks, toolkit and observer.
+Depends only downward on `openjiuwen-foundation`, `openjiuwen-retrieval` (`Embedding`), `openjiuwen-sysop` (advisory file locks) and `openjiuwen-common`.
+Each module `CONTEXT.md` owns its detail; the crate-level deferred roll-up is below.
+Memory is a kernel service for `openjiuwen-agent` rails, `openjiuwen-workflow` memory components and `openjiuwen-harness`.
 
 ## API Surface
 
-Crate root `openjiuwen_memory` re-exports every public item; `CRATE_NAME`/`CRATE_VERSION` are exported too.
-
-Execution seam (one instance per application; the Python singleton becomes an explicit `Arc`):
+Crate root re-exports the module globs `openjiuwen_memory::{analyzer, config, dreaming, engine, external, facade, graph, lite, prompt, recall, record, store, team}`, plus `CRATE_NAME`, `CRATE_VERSION`, `crate_name()`.
+Root-name disambiguation: `graph::{LlmExtractor, EXTRACTION_SYSTEM_PROMPT}`, `lite::local`, `engine::VariableWrite`, `facade::{ScopeAnalyzerOverrideSpec, ScopeOverrideHandles, VariableAssignmentReport}`, `store::{MessageCursor, MessagePage}`, `store::kv_lock::DistributedKvLock`; `store::kv_lock` versus `lite::lock` stays a module-path choice.
 
 ```rust
 let ltm = LongTermMemory::in_memory(MemoryEngineConfig::default()).await?;
 let scope = MemoryScope::new("alice", "workspace");
 ltm.add(&scope, NewMemory::semantic("Alice prefers dark mode"), &AddOptions::default()).await?;
 let hits = ltm.search(&scope, "theme preference", &SearchOptions::default()).await?;
-let text = openjiuwen_memory::prompt::render_snippets(&hits, 512);
 ```
 
-Record model (`record`):
-- `MemoryType` (`user_profile`, `semantic_memory`, `episodic_memory`, `variable`, `summary`, `coding`, `unknown`).
-- `MemoryScope { user_id, scope_id, session_id, agent_id }`; both required ids default to `DEFAULT_ID = "__default__"`; `validate()` enforces non-empty ids, no NUL, `scope_id` without `/` and at most 128 chars.
-- `MemoryRecord { id, content, kind, importance, timestamp, updated_at, last_access, access_count, metadata, embedding, source, scope }`.
-  JSON is Python-compatible: `content` serializes as `"text"` (accepts `"content"`/`"mem"`), `kind` as `"type"` (accepts `"kind"`/`"mem_type"`), `metadata` as `"fields"` (accepts `"metadata"`), scope fields flattened at top level, timestamps RFC 3339.
-- `NewMemory`, `MemoryUpdate`, `MemoryFilter`, `CallOptions`, `AddOptions`, `AddOutcome`, `SearchOptions`, `SearchMode`, `RecallHit`, `MemoryStats`, `AddMemResult`, `CombinedRecall`.
+`record`/`config`: `MemoryScope` (`DEFAULT_ID = "__default__"`; `validate` rejects empty ids, NUL, `scope_id` with `/`/`\` or over 128 chars), `MemoryType` (`user_profile`, `semantic_memory`, `episodic_memory`, `variable`, `summary`, `coding`, `unknown`), `MemoryRecord`, `NewMemory`, `MemoryUpdate`, `MemoryFilter`, the option and outcome types; record JSON is Python-compatible (`"text"`/`"type"`/`"fields"`, flattened scope, RFC 3339) and tolerant on decode. `MemoryEngineConfig` holds `default_top_k = 5`, `default_threshold = 0.3`, `token_budget`, `searchable_kinds`, `ranking`, `dedupe`, `extraction`, `graph`, `coding`, `forbidden_variables`, message-history limits and `importance_default = 0.5`, with ranking/dedupe/extraction/graph/coding/agent/scope nested configs.
 
-Configuration (`config`):
-- `MemoryEngineConfig` with `default_top_k = 5`, `default_threshold = 0.3`, `token_budget`, `searchable_kinds`, `ranking`, `dedupe`, `extraction`, `graph`, `coding`, `forbidden_variables`, `input_msg_max_len = 8192`, `single_turn_history_summary_max_token = 128`, `message_history_limit = 10`, `importance_default = 0.5`.
-- `RankingConfig`, `DedupeConfig`, `DedupePolicy`, `ExtractionConfig`, `GraphMemoryConfig`, `CodingMemoryConfig`, `AgentMemoryConfig`, `MemoryScopeConfig`, `StorageBackend`.
+`store`: `MemoryStores { kv, vector, document, graph }` (`in_memory`, `local_file`, `sqlite`/`sqlite_migrated` under `sqlite`, `from_parts`, `with_graph`); key layout `UMD/{user}/{scope}/{id}`, `user_var/…`, `session_var/…`, `memory_scope_config/{scope_id}`, `memory_scope_overrides/{scope_id}`, `scope_user_mapping/{scope_id}/{user_id}`, vector collections `uid_{user}_gid_{scope}_mtype_{kind}`, messages in `messages`; `user_mem`/`user_variable`/`session_variable`/`scope_config` are read-only legacy fallbacks.
+`prefix::KvPrefixRegistry` (+ `KvFamily`, `FamilyPrefixes`) is the injectable registry over five KV families and `messages`; `messages::{StoredMessage, MessageStore, MessageCursor, MessagePage}` provide `append`, `recent`, keyset `page` and `delete_for`.
+`migration`: schema runner (`Migration`, `MigrationRegistry`, `builtin_migrations`, `default_registry`; under `sqlite` `MigrationRunner`, `MigrationReport`, `MigrationStatus`, `migrate_sqlite`) and data suite (`Migrator`, `MigrationPlanner`, `MigrationPlan`, `MigrationContext`, `OperationRegistry`, `MigrationJournal`, `run_migrations`, `standard_planner`, plus the `sql`/`message`/`vector`/`index_version` migrators).
+`backup::{dump, dump_with, restore, restore_with, MemoryBackup, RestoreReport}`; `mapping::ScopeUserMappingStore`; `kv_lock::{DistributedKvLock, KvLockGuard, LockOptions, InProcessKvLock, FileKvLock, UnsupportedKvLock}`.
 
-Storage (`store`):
-- `MemoryStores { kv, vector, document, graph }` with async constructors `in_memory()`, `local_file(root)`, `sqlite(path)` (feature `sqlite`), `sqlite_migrated(path)` (feature `sqlite`: migrate the schema first, then open), and `from_parts`.
-- `in_memory`/`local_file`/`sqlite`/`sqlite_migrated` bundle a graph backend; `from_parts(kv, vector, document)` leaves `graph = None`, so graph memory stays absent until `.with_graph(store)`.
-- Key layout: records `UMD/{user_id}/{scope_id}/{id}`, variables `user_var/{user}/{scope}/{name}`, session variables `session_var/{user}/{scope}/{session}/{name}`, scope config `memory_scope_config/{scope_id}`, vector collections `uid_{user}_gid_{scope}_mtype_{kind}`, message history in document collection `messages`.
-- `store::keys` also carries the current↔legacy prefix mapping: `legacy_alternatives`, `current_equivalent`, `legacy_prefix`, `current_prefix`, and the legacy key builders.
+`facade::LongTermMemory` (+ `LongTermMemoryBuilder`): `in_memory`, `local_file`, `sqlite`/`sqlite_migrated`, `with_stores`, `builder`, with `engine`/`config`/`graph`/`coding`/`analyzer` accessors.
+Records `add`, `add_many`, `get`, `update`, `delete`, `clear`, `list`, `stats`; recall `search`, `recall`, `search_all`; messages `add_messages`, `get_recent_messages`, `clear_messages`, `get_message_page`, `page_messages`.
+Variables `set_variable`, `assign_variable`, `get_variables`, `delete_variables`, `variable_records`, `remember_variables`, `remember_with_assignments`; scope config and overrides `set_scope_config`, `get_scope_config`, `delete_scope_config`, `set_scope_overrides`, `get_scope_overrides`, `delete_scope_overrides`, `resolve_scope_overrides` with `ScopeAnalyzerOverrideSpec`, `ScopeOverrideHandles`, `VariableAssignmentReport`.
+Integration `remember`, `consolidate`, `provider`, `team_memory`, `team_memory_sqlite`, `dreaming_in_memory`, `dreaming_sqlite`, `open_local_coding`; Python aliases `search_user_mem`, `search_user_history_summary`, `update_mem_by_id`, `delete_mem_by_id`, `delete_mem_by_user_id`, `delete_mem_by_scope`, `user_mem_total_num`, `get_user_mem_by_page`.
 
-Migrations (`store`):
-- `store::migration`: `Migration`, `MigrationRegistry`, `builtin_migrations`, `default_registry`, and (feature `sqlite`) `MigrationRunner`, `MigrationReport`, `MigrationStatus`, `AppliedMigration`, `SCHEMA_VERSION_TABLE = "memory_schema_version"`, `migrate_sqlite(path)`.
-- `store::legacy` is crate-private: read-only fallback to the legacy prefixes (`user_mem`, `user_variable`, `session_variable`, `scope_config`) with the current layout winning.
-- Layout, migration model, and legacy rules are detailed in `src/store/CONTEXT.md`.
+`engine`: `MemoryEngine`, `MemoryEngineBuilder`, write/recall orchestration, per-scope write locks, and variables `write_variable -> VariableWrite { record_id, created }`, `delete_variable_everywhere`, `variable_records`. `graph`: `GraphMemory`, `Entity`, `Relation`, `EntityExtractor`, `HeuristicExtractor`, `LlmExtractor`, `GraphRecallHit`.
 
-Facade (`facade`):
-- `LongTermMemory` — `in_memory`, `local_file`, `sqlite` (sqlite), `sqlite_migrated` (sqlite), `with_stores`, `builder`, `engine`, `config`, `graph`, `coding`, `analyzer`.
-- CRUD: `add`, `add_many`, `get`, `update`, `delete`, `clear`, `list`, `stats`.
-- Recall: `search`, `recall` (alias), `search_all` (memories + graph entities).
-- Messages: `add_messages`, `get_recent_messages`, `clear_messages` (deletes history rows matching a `MemoryFilter`; records and variables are untouched).
-- Variables: `set_variable`, `get_variables`, `delete_variables`.
-- Scope config: `set_scope_config`, `get_scope_config`, `delete_scope_config`.
-- Analyzer and provider wiring: `remember` (analyze + write, returns `RememberReport`), `consolidate` (returns a `ConsolidationPlan`, applies nothing), `provider` (an `EngineProvider` over the same engine).
-- Subsystem constructors: `team_memory`, `team_memory_sqlite` (sqlite), `dreaming_in_memory`, `dreaming_sqlite` (sqlite), `open_local_coding(root)` for the local lite stack.
-- `LongTermMemoryBuilder::analyzer` injects a custom `MemoryAnalyzer`; `builder().model(..)` supplies the model for the default rule-first analyzer.
-- Python-parity aliases: `search_user_mem`, `search_user_history_summary`, `update_mem_by_id`, `delete_mem_by_id`, `delete_mem_by_user_id`, `delete_mem_by_scope`, `user_mem_total_num`, `get_user_mem_by_page`.
+`lite`: `CodingMemory` (facts as `Coding` records), `CodingFact`, `CodingFactType`, `render_index`, `citation`; `LocalCodingMemory` (Markdown source of truth, derived FTS5, advisory lock, debounced watcher), `MarkdownMemory`/`FrontMatter`, `FtsIndex` (sqlite), `FileLock`, `MemoryWatcher`, `local` constants.
+`lite::embed` (chunking, `EmbeddingCache`/`CacheKey`, `EmbeddingIndex`, `content_hash`, `blend`), `lite::facts` (`FactDocument`, `FactFiles`, `IndexLevel { Memory, User }`), `lite::session` (`SessionStore`, `SessionRecord`, `SessionHit`, `sanitize_session_id`), `lite::sync` (`SyncTrigger`, `SyncReport`, `IntervalScheduler`), `lite::daily` (`DailyRollup`, `write_rollup`), `lite::write` (`WriteMode`, `WritePolicy`, `WritePlan`, `WriteOutcome`, `MemUpdateChecker`).
 
-Graph memory (`graph`):
-- `GraphMemory`, `Entity`, `Relation`, `EntityExtractor` trait, `HeuristicExtractor`, `LlmExtractor`, `Extraction`, `ExtractedEntity`, `ExtractedRelation`, `GraphRecallHit`, `GraphAddOptions`, `GraphSearchOptions`, `GraphMemoryStats`.
+`analyzer`: `FactExtractor` (`RuleExtractor`, `LlmExtractor`), `ConflictClassifier` (`RuleClassifier`, `LlmClassifier`), `MemoryAnalyzer`, `ExtractionResult`, `ConsolidationPlan`, `AnalyzerConfig`, `ExtractorKind`, `ClassifierKind`, `ExtractionInput`, `ConflictVerdict`.
+`analyzer::stage`: `StagedAnalyzer`, `ExtractionStage`, `StageInput`, `StageOutput`, `StageKind`, `StageConfig`, `StagedResult` (executed names in the public field `stages`), `RulePlanStage`/`LlmPlanStage`, `ExtractStage`, `RuleReasoningStage`/`LlmReasoningStage`, `RuleProactiveStage`/`LlmProactiveStage`, `ConflictStage`, `ExtractionPlan`, `PlanIntent`, `PlanOperation`, `FactReasoning`, `ReasoningBasis`, `ProactiveConfig`, `ProactiveDecision`, `ScopeAnalyzerOverrides`.
 
-Lite coding memory (`lite`):
-- Two paths share the fact model: `CodingMemory` (facts as engine records) and `LocalCodingMemory` (Markdown source of truth + derived FTS5 index + advisory lock + watcher).
-- `CodingFact`, `CodingFactType`, `render_index`, `citation`; `MarkdownMemory`/`FrontMatter` own the `MEMORY.md` document format.
-- `FtsIndex`/`FtsHit` (feature `sqlite`) own the derived index, `FileLock` the cross-process `flock`, `MemoryWatcher`/`WatchEvent`/`WatchKind` the debounced file watch.
-- `local::{MEMORY_FILE, STATE_DIR, INDEX_FILE, LOCK_FILE, DEFAULT_DEBOUNCE}`; layout, format, and scoring are in `src/lite/CONTEXT.md`.
+`external`: `MemoryProvider` (`name`, `capabilities`, `initialize`, `add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`) with provided rail methods `get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`, `on_session_end`, `is_available`, `is_initialized`, `default_scope`; `ProviderCapabilities`, `ProviderHealth`, `external::rail` helpers, `ProviderRegistry`, `ProviderFactory`, `ProviderConfig` (redacting `Debug`), `ProviderKind`, `EngineProvider`, `LocalProviderFactory`.
+Transport `rest::{RestProvider, WireSpec, Op, SpecContext, RestCall, AuthScheme, resolve_auth}` and `rest_json`; handles `Mem0MemoryProvider`, `JiuwenMemoryProvider`, `LakeBaseMemoryProvider`, `OpenVikingMemoryProvider`, `AgentArtsMemoryProvider` (+ `vendor_factories()`) — four over HTTP, `agentarts` SDK-only and typed `Unsupported`.
 
-Analyzer (`analyzer`):
-- Two seams: `FactExtractor` (`RuleExtractor` default, `LlmExtractor` with rule fallback) and `ConflictClassifier` (`RuleClassifier` default, `LlmClassifier` with rule fallback).
-- `MemoryAnalyzer` orchestrates both and returns `ExtractionResult` / `ConsolidationPlan`; supporting types are `AnalyzerConfig`, `ExtractorKind`, `ClassifierKind`, `ConversationTurn`, `ExtractionInput`, `ExtractedFact`, `ConflictKind`, `ConflictVerdict`, `ConsolidationAction`.
-- `parse_fact_response`, `parse_conflict_response`, and the extraction/conflict prompts and JSON schemas are public.
-- `analyzer::LlmExtractor` is a distinct type from `graph::LlmExtractor`: the crate root re-exports the graph one (with `EXTRACTION_SYSTEM_PROMPT`), so the analyzer's is reached as `analyzer::LlmExtractor`.
+`dreaming`: `DreamJob`, `DreamState`, `DreamKind`, `DreamTrigger`, `DreamMetrics`, `DreamOutcome`, `DreamRunSummary`, `DreamConfig`, `DreamFilter`; `DreamRepository`, `InMemoryDreamRepository`, `SqliteDreamRepository` (sqlite, table `dream_jobs`); `DreamPlanner` (alias `DreamingEngine`), `DreamConsolidator`, `NoopConsolidator`.
+`orchestrator::{DreamOrchestrator, DreamOrchestratorConfig, DreamOrchestratorStatus}` (`new`, `tick`, `tick_with`, `run_until_cancelled`, `with_sweep_lock`, `sweep_lock`), `sweep_lock::{DREAM_SWEEP_LOCK_NAME, SweepLockOutcome, SweepLockSkip, acquire_sweep_lock}`, `pipeline::{LlmConsolidator, LlmConsolidatorConfig, DreamCandidateSource, ConsolidationSink, RecordOnlySink, DreamConsolidationPlan}`, `lease::{DreamLease, DreamLeaseOptions, DreamLeaseGuard, LeasedJob, LeaseStatus}`, `retention::{DreamRetention, RetentionReport, purge_expired}`, `salience::{SalienceBackend, SalienceConfig, SalienceScore, salience_score, rank_by_salience}`.
 
-External providers (`external`):
-- `MemoryProvider` SPI plus `ProviderCapabilities` and `ProviderHealth`.
-- Registry types: `ProviderRegistry`, `ProviderFactory`, `ProviderConfig`, `ProviderKind`, and `EngineProvider`/`LocalProviderFactory` (`EngineProvider` adapts the local engine).
-- Vendor handles: `AgentArtsMemoryProvider`, `JiuwenMemoryProvider`, `LakeBaseMemoryProvider`, `Mem0MemoryProvider`, `OpenVikingMemoryProvider`, plus `vendor_factories()`; each handle constructs without I/O and returns typed `Unsupported` from every operation (`src/external/CONTEXT.md`).
+`team`: `TeamMemoryRecord`, `TeamMemoryScope`, `TeamMemoryKind`, `TeamVisibility`, `NewTeamMemory`, `TeamMemoryUpdate`, `TeamMemoryFilter`, `TeamMemoryStats`, `TeamSearchHit`; `TeamMemoryStore`, `TeamSearchOptions`, `InMemoryTeamMemoryStore`, `SqliteTeamMemoryStore` (sqlite, table `team_memories`); `TeamMemory`; projection `to_memory_record`/`from_memory_record`, `TEAM_MEMORY_METADATA_KEY`.
+Adapters `document::{TeamMemoryDocument, TEAM_MEMORY_FILE, truncate_for_prompt}`, `extractor::{TeamMemoryExtractor, RuleTeamExtractor, LlmTeamExtractor, TeamTranscript, TeamExtraction}`, `hooks::{TeamMemoryHooks, TeamMemoryHookConfig, TeamMemoryFlush}`, `toolkit::{MemberMemoryToolkit, MemberMemoryContext}` (schemas carry `input_schema`), `observe::{TeamMemoryObserver, NoopObserver, TracingObserver}`.
 
-Dreaming (`dreaming`):
-- Job model: `DreamJob`, `DreamState`, `DreamKind`, `DreamTrigger`, `DreamMetrics`, `DreamOutcome`, `DreamRunSummary`, `DreamConfig`, `DreamFilter`.
-- Persistence seam: `DreamRepository`, `InMemoryDreamRepository`, `SqliteDreamRepository` (feature `sqlite`, table `dream_jobs`).
-- Planner: `DreamPlanner` (alias `DreamingEngine`), the `DreamConsolidator` seam, and `NoopConsolidator` (`src/dreaming/CONTEXT.md`).
-
-Team memory (`team`):
-- Records: `TeamMemoryRecord`, `TeamMemoryScope`, `TeamMemoryKind`, `TeamVisibility`, `NewTeamMemory`, `TeamMemoryUpdate`, `TeamMemoryFilter`, `TeamMemoryStats`, `TeamSearchHit`.
-- Store seam: `TeamMemoryStore`, `TeamSearchOptions`, `InMemoryTeamMemoryStore`, `SqliteTeamMemoryStore` (feature `sqlite`, table `team_memories`).
-- Facade and projection: `TeamMemory` (`in_memory`, `sqlite`, `remember`, `search`, `forget`, `stats`, `to_jsonl`/`from_jsonl`), `TeamMemoryRecord::to_memory_record`/`from_memory_record`, `TEAM_MEMORY_METADATA_KEY` (`src/team/CONTEXT.md`).
-
-Prompt integration (`prompt`):
-- `render_snippets`, `render_records`, `hits_to_system_message`, `hits_to_messages`, `to_memory_json`, `MEMORY_SECTION_TITLE`, `MEMORY_SECTION_TAG`.
-- Depends on `openjiuwen_foundation::prompt::BaseMessage` only; there is **no** dependency on `openjiuwen-context` (no cycle, no window manipulation).
+`prompt`: `render_snippets`, `render_records`, `hits_to_system_message`, `hits_to_messages`, `to_memory_json`, `MEMORY_SECTION_TITLE`, `MEMORY_SECTION_TAG`; depends only on `openjiuwen_foundation::prompt::BaseMessage`, never on `openjiuwen-context`.
 
 ## Constraints
 
-- Errors are `openjiuwen_common::error::{Error, Result}`: validation failures `Error::Validation`, missing records `Error::NotFound`, invalid/absent capability `Error::Unsupported`, cancellation `Error::Cancelled`; storage/embedding errors propagate with their original kind.
-- Async-first on tokio; every public I/O API is `async`; cancellation via `tokio_util::sync::CancellationToken` carried in `CallOptions` and checked at await points; optional `timeout` uses `tokio::time::timeout`.
-- No blocking I/O on async tasks; a `parking_lot` lock is never held across `.await`; per-scope write serialization uses `tokio::sync::Mutex`.
-- Every public data type is `serde`-serializable, `snake_case`, tolerant of unknown/missing fields; configs round-trip through JSON.
-- No `unsafe`; `tracing` only (targets `openjiuwen_memory::<module>`); no `println!`/`eprintln!`.
-- Files stay around ≤1000 lines; split by responsibility inside the owning module directory.
-- `notify` (file watching), `nix` (unix advisory `flock` for `FileLock`) and `regex` (rule extractor) are always-compiled workspace dependencies; on non-unix targets `FileLock` returns `Error::Unsupported` rather than degrading.
-- All SQL lives behind the `sqlite` feature — the FTS5 table `coding_facts_fts`, `memory_schema_version`, `dream_jobs`, `team_memories`; every non-`sqlite` path must compile and be tested without the feature.
-- Cross-process coordination is advisory file locking only: no daemon, no broker, no background process.
-- Default features compile and test offline; no test needs the network, an API key, or wall-clock-dependent ordering.
-- `openjiuwen-test-support` is a dev-dependency only; library code never depends on test crates.
+- Errors are `openjiuwen_common::error::{Error, Result}`: `Validation`, `NotFound`, `Unsupported`, `Cancelled`; storage/embedding errors keep their kind.
+- Async-first on tokio; every public I/O API is `async`; cancellation via `tokio_util::sync::CancellationToken` in `CallOptions`, checked before expensive work and around embedding/model/HTTP calls.
+- No blocking I/O on async tasks; a `parking_lot` lock is never held across `.await`; per-scope writes use `tokio::sync::Mutex`.
+- Public data types are `serde`-serializable, `snake_case`, tolerant of unknown fields; configs, plans and journals round-trip through JSON.
+- No `unsafe` (`#![forbid(unsafe_code)]`); `tracing` only (target `openjiuwen_memory::<module>`); no `println!`/`eprintln!`; public items documented (`missing_docs` via clippy `-D warnings`).
+- Files stay around ≤1000 lines and split by responsibility inside the owning module directory.
+- Dependencies: `openjiuwen-{common,foundation,retrieval,sysop}`, serde/serde_json, async-trait, tokio/tokio-util, futures, tracing, uuid, chrono, parking_lot, notify, nix, regex; `sqlx` only under `sqlite`; HTTP through `openjiuwen_common::http` (no direct `reqwest`); dev: `openjiuwen-test-support`, `tempfile`, `wiremock`.
+- Features: `default = []`; `sqlite` enables `sqlx` and `openjiuwen-foundation/sqlite`. All SQL is behind it (`memory_schema_version`, `dream_jobs`, `team_memories`, fact-keyed `coding_facts_fts`); every non-`sqlite` path must compile and be tested without it.
+- Cross-process coordination is advisory file locking only (`#[cfg(unix)]` `flock` via `openjiuwen_sysop::fs::lock`; elsewhere `FileLock`/`FileKvLock` are typed `Unsupported`): no daemon, broker or background process.
+- Default features compile and test offline: no network, API key or wall-clock ordering; vendor tests use `wiremock`; `openjiuwen-test-support` is a dev-dependency only.
 
 ## Design Decisions
 
-- **Explicit engine instance, not a process-global singleton.** Python's `LongTermMemory` is a singleton with `register_store` + `set_config`; Rust callers build an `Arc<LongTermMemory>` once and inject it. This keeps tests and multi-tenant processes isolated. `Runner`/harness wiring owns the instance.
-- **Richer recall than the Python LTM path.** Python `SearchManager` returns raw vector similarity (`score >= threshold`, top-k) and has no keyword fallback, recency, or importance term. This crate keeps vector similarity as the semantic signal but adds a deterministic hybrid blend so offline keyword-only operation and recency/importance re-ranking are possible. The formula is fixed:
-  `semantic = (w_sim * similarity + w_kw * keyword) / (w_sim + w_kw)`;
-  `final = (w_sem * semantic + w_imp * importance + w_rec * recency) / (w_sem + w_imp + w_rec)`;
-  `similarity = (cosine + 1) / 2` for embedding hits (0 when the record/query has no embedding);
-  `keyword = BM25(query, candidate corpus)` normalized by the maximum candidate score to `[0, 1]`;
-  `recency = 0.5^(age_secs / half_life_secs)` with a 30-day half-life.
-  Defaults: `w_sim = 0.70`, `w_kw = 0.30`, `w_sem = 0.85`, `w_imp = 0.10`, `w_rec = 0.05`. Weights are renormalized per group, so disabling a term is safe. The raw components are returned on `RecallHit` (`similarity`, `keyword`, `importance`, `recency`).
-- **Deterministic dedupe stays the write path.** Duplicates are detected deterministically: exact normalized text, cosine `>= 0.92`, or token Jaccard `>= 0.75`; the policy is `Merge` (default), `Skip`, `Replace`, or `Add`. Merge keeps the existing id/creation time, takes the longer content, unions metadata (incoming wins), and takes the maximum importance/access count. Redundancy and conflict classification is a separate, explicit step: `analyzer::ConflictClassifier` (rules by default, LLM with rule fallback) produces a `ConsolidationPlan`, and `LongTermMemory::consolidate` is its only caller — the write path never applies a plan on its own.
-- **Graph memory is a separate facade, as in Python.** `GraphMemory` is not embedded in `LongTermMemory`'s record path; `LongTermMemory::search_all` merges `search` hits with graph hits when graph memory is enabled. Graph nodes are `openjiuwen_foundation::store::GraphNode` (labels `["Entity", <type>]`, properties carry name/scope/embedding) and relations are `GraphEdge`; extraction is heuristic by default and LLM-assisted when a `Model` is attached.
-- **Two lite paths, deliberately not mirrored.** `CodingMemory` stores coding facts as ordinary `MemoryType::Coding` records, so they inherit scoping, dedupe, recall, and every storage backend. `LocalCodingMemory` is the local stack: a human-editable `MEMORY.md` is the source of truth, an FTS5 index under `.memory/` is derived and may always be rebuilt, an advisory file lock serializes cross-process writes, and a debounced watcher reloads external edits. The two paths are not synchronized in either direction; `LongTermMemory::open_local_coding` is the documented bridge and copies no records.
-- **Rule-first analyzer with model fallback.** `ExtractorKind::Rule`/`ClassifierKind::Rule` are the defaults and work offline; an LLM extractor/classifier retries `model_retries + 1` attempts, counts unparseable output as a failed attempt, records the first failure reason as a `degraded` flag on the result/verdicts, and checks cancellation before the first model call so a cancelled call makes zero model invocations.
-- **External provider SPI is an injected seam.** `MemoryProvider` plus `ProviderRegistry` are passed in, never global. `EngineProvider` adapts the local engine, so the SPI is exercised by real code; the five vendor adapters register factories whose every operation returns `Unsupported` naming the missing SDK/transport (`agentarts-sdk`, `jiuwen_memory`, `httpx.AsyncClient`, `mem0ai`, the OpenViking client), and `ProviderConfig` redacts credentials in `Debug`.
-- **Migrations are forward-only.** Each step's DDL and its `memory_schema_version` row commit in one transaction, the registry must start at v1 and stay contiguous, and a recorded version above the registry is reported as up to date rather than downgraded. Legacy key prefixes are read-only compatibility: the current key wins, writes use the current layout only, and deletes remove both.
-- **Dreaming and team memory are data/persistence/planner layers with injected seams.** `DreamConsolidator` owns the memory mutation and `TeamMemoryStore` owns the rows; the crate starts no background loop, timer, or purge, and no cross-process lease exists — the caller owns `run_due`/`run_once`/`purge`.
-- **Storage seams.** `MemoryStores` injects the foundation traits, so in-memory, local-file, SQLite, and future vendor backends share one engine. Records live in the KV store (JSON, no embedding), embeddings live in one vector collection per `(user, scope, kind)`, message history lives in a document collection, and variables/scope config live in KV. Listing uses prefix scans instead of Python's 24-char concatenated id lists (no stale-index class of bugs).
-- **Embedding is optional.** With no `Embedding`, records are still stored and searched with keyword BM25; `SearchMode::Hybrid` degrades to keyword, `SearchMode::Semantic` returns `Error::Unsupported`. This mirrors the Python lite "keyword-only" degradation and keeps every default test offline.
-- **Retrieval integration is the `Embedding` trait only.** No public API accepts `openjiuwen_retrieval` documents, chunks, or search hits; the hybrid blend operates on embedding similarity plus BM25 (`RankingConfig`), and `CombinedRecall` merges memory hits with graph entities, not retrieval results.
-- **`LocalCodingMemory` works without the `sqlite` feature.** The Markdown document and keyword scan are always available; `sqlite` only adds the derived `FtsIndex` FTS5 merge, so the same lite suites pass in both builds and stay fully offline.
-- **Context seam.** Prompt injection is expressed as `render_snippets` (string for a template placeholder) and `hits_to_system_message` (`BaseMessage`). Agents may interpolate `{{sys_long_term_memory}}` (Python parity) or append the system message; the crate never manipulates a context window.
-- **Time is injectable for tests.** Scoring, dream-job claiming, team filters, and expiry take `now`; record creation uses `Utc::now()`. Tests assert orderings and formulas, never absolute timestamps.
+- **Explicit engine instance.** Python's singleton becomes an injected `Arc<LongTermMemory>` owned by `Runner`/harness wiring, so tests and tenants stay isolated.
+- **Hybrid recall beyond Python's vector score.** `similarity = (cosine + 1) / 2`; `keyword` is BM25 normalized against the best candidate; `recency = 0.5^(age / 30 days)`; `semantic = 0.70·sim + 0.30·kw`; `final = 0.85·semantic + 0.10·importance + 0.05·recency`. Weights renormalize per group and raw components ride on `RecallHit`.
+- **Variables are a namespace with a hidden record projection.** `set_variable`/`assign_variable` write the KV entry and one deterministic `MemoryType::Variable` record (`var-` + 16 hex of an FNV-1a hash of the storage key). Listing, `stats` and `clear` hide projections unless a filter names the kind, recall returns them only on an explicit kind request, and dedupe never sees them. `remember` still stores a rule-extracted assignment as a `SemanticMemory` fact; `remember_with_assignments` is the opt-in route to real writes.
+- **Per-scope analyzer overrides are data, resolved per call.** They persist as JSON under `memory_scope_overrides/{scope_id}` and the store never interprets them; an unresolvable named model/embedding (none attached, wrong name, any embedding swap) is a typed `Unsupported` naming the handle.
+- **Two message read shapes, one row set.** The newest-N window and keyset pages read the same documents; the cursor is an opaque checksummed `mc1.{millis}.{checksum}.{id}` token over `(timestamp, id)` ascending, and a tampered token is `Validation`.
+- **Deterministic dedupe stays the write path.** Duplicates are exact normalized text, cosine `>= 0.92`, or token Jaccard `>= 0.75`, under `Merge` (default), `Skip`, `Replace` or `Add`; a classifier's `ConsolidationPlan` is returned only by `consolidate`.
+- **One staged analyzer, composable stages.** `StagedAnalyzer` runs a `Vec<Arc<dyn ExtractionStage>>` over one mutable `StageInput`; the default is plan → extract → reasoning → proactive → conflict, `with_stages` uses the caller's list verbatim (a plan-less sequence keeps the default non-actionable plan), and `StageOutput` merges field-wise.
+- **Graph memory is a separate facade.** `search_all` merges record hits with graph hits; nodes are `GraphNode` (`["Entity", <type>]`) and extraction is heuristic by default.
+- **Two lite paths, not mirrored.** `CodingMemory` stores facts as ordinary `Coding` records; `LocalCodingMemory` keeps a human-editable `MEMORY.md` as source of truth over a derived, rebuildable FTS5 index, an advisory lock and a debounced watcher, with per-fact files, a chunked embedding index cached by `(model, content hash)`, JSONL sessions, sync triggers, rollups and `WriteMode` as additive caller-driven layers. `open_local_coding` bridges them and copies nothing.
+- **Rule-first with model fallback.** All `Rule` kinds work offline; an LLM extractor/classifier/stage retries `model_retries + 1` times, counts unparseable output as a failure, records the first failure as `degraded`, and checks cancellation before its first call. `StageKind::Llm` without a model builds the rule stage and warns.
+- **Vendor transports are real HTTP over configurable endpoint and auth.** One `WireSpec` per vendor plus one `RestProvider` own validation, auth, cancellation, retries (idempotent verbs only), endpoint failover, status mapping and error typing. `endpoint` is the switch: configured speaks HTTP, endpoint-less is inert with a typed `Unsupported`; `agentarts` has no documented REST contract, so it stays `Unsupported`.
+- **Migrations are a plan, a journal and a dry run; the schema runner stays forward-only.** Each SQLite step commits its DDL with its `memory_schema_version` row in one transaction and treats a newer recorded version as up to date. The data suite plans read-only, journals `Succeeded`/`Failed`/`Skipped` per `namespace.name` operation, resumes from a shared journal, retries with an attempt counter, and invokes no handler in a dry run; `standard_migrators()` plans six operations with default options.
+- **Backup normalizes and is additive.** `dump` rewrites alias keys to the current layout so the current value wins; `restore` maps through the target registry, counts equal values `skipped`, deletes nothing, and writes nothing in a dry run. `KvPrefixRegistry` is a passed-in value whose `*_in(prefixes)` builders keep renamed families readable.
+- **Dreaming and team memory are caller-driven.** `DreamOrchestrator` ticks on demand or loops in `run_until_cancelled`; a caller-injected `DistributedKvLock` is the only cross-process serialization and an unavailable lock is a reported skip. Leases, retention and purge are explicit seams, team rows live behind `TeamMemoryStore` with Python's runtime pieces as adapters, and neither side starts a timer or daemon.
+- **Provider SPI and storage seams are injected.** `MemoryProvider`/`ProviderRegistry` are passed in, never global, and `EngineProvider` adapts the local engine so the SPI is exercised by real code. `MemoryStores` injects the foundation traits; listing uses prefix scans, not Python's concatenated id lists. Without an `Embedding`, records are stored and searched by BM25 (`Hybrid` degrades to keyword, `Semantic` is `Unsupported`), and retrieval integration is the `Embedding` trait only.
+- **Prompt injection is strings and messages.** `render_snippets` fills a template placeholder (agents may interpolate `{{sys_long_term_memory}}`) and `hits_to_system_message` returns a `BaseMessage`; the crate never manipulates a context window.
+- **Time is injectable.** Scoring, dream claiming, retention, team filters and expiry take `now`; tests assert orderings and formulas, never absolute timestamps.
 
 ## Error Strategy
 
-- `MemoryScope::validate` and record/option validation reject bad input with `Error::Validation` naming the offending field and value.
-- `update`/`get` of an unknown id: `update` returns `NotFound`, `get`/`delete` return `None`/`false` (no panic).
-- Vector collection absence is treated as "no embedding hits"; a dimension mismatch raises the foundation validation error.
-- Embedding/model failures keep the provider error kind; batch writes are atomic per record (a failed embedding never stores a half-indexed record).
-- Cancellation is checked before expensive work and around embedding/model calls; a cancelled operation returns `Error::Cancelled` and leaves previously committed records intact.
-- No silent error swallowing: degraded paths (keyword fallback, heuristic extraction, LLM-to-rule fallback, tolerant record decoding, non-unix locking) are explicit `tracing::warn!`, a recorded `degraded` reason, or a typed `Error::Unsupported`, never an invisible `unwrap_or_default`.
+- Scope, record, option, name, lock-option, operation-id, prefix and cursor validation reject bad input with `Error::Validation` naming the field and value; `update` of an unknown id is `NotFound`, while `get`/`delete` return `None`/`false`.
+- Vector collection absence means "no embedding hits"; a dimension mismatch raises the foundation validation error; a failed embedding rolls back the KV row so no half-indexed record survives.
+- Cancellation returns `Error::Cancelled`, leaves committed work intact, makes zero model invocations and is never reported as degraded.
+- Typed `Unsupported` marks every absent capability: unconfigured vendor handles, vendor verbs with no documented endpoint (`jiuwen` get/update/delete/list/clear, `lakebase` update, `openviking` delete/update/clear), `agentarts`, `Semantic` or lite semantic search without an embedding index, per-fact APIs with `fact_files(false)`, unresolvable override handles, `SalienceBackend::Ml`, read-only toolkit writes, `UnsupportedKvLock` brokers, non-unix file locks, unreadable vector collections.
+- Degraded paths are always explicit — a `tracing::warn!`, a recorded `degraded` reason, or a typed error: keyword fallback, heuristic extraction, LLM-to-rule fallback, unparseable rule regex, malformed rows skipped during listing, lock-unavailable sweep skips.
 
 ## Routing Table
 
-- `./src/record/` → `MemoryType`, `MemoryScope`, `MemoryRecord`, `NewMemory`, `MemoryUpdate`, `MemoryFilter`, options, results (`record/CONTEXT.md`)
-- `./src/config/` → `MemoryEngineConfig` and all nested configs, defaults, validation (`config/CONTEXT.md`)
-- `./src/store/` → `MemoryStores`, key layout, legacy prefixes, migrations, record/vector/variable/message/scope-config persistence (`store/CONTEXT.md`)
-- `./src/recall/` → keyword tokenization/BM25, scoring formula, dedupe/merge, candidate ranking (`recall/CONTEXT.md`)
-- `./src/engine/` → `MemoryEngine`, write path, recall pipeline, stats, per-scope write locks (`engine/CONTEXT.md`)
-- `./src/facade/` → `LongTermMemory` facade, messages/variables/scope-config wiring, subsystem constructors, Python-parity aliases (`facade/CONTEXT.md`)
-- `./src/graph/` → entity/relation model, heuristic + LLM extraction, graph store persistence, neighbor expansion (`graph/CONTEXT.md`)
-- `./src/analyzer/` → `FactExtractor`/`ConflictClassifier` seams, rule + LLM implementations, `MemoryAnalyzer` and consolidation plans (`analyzer/CONTEXT.md`)
-- `./src/external/` → `MemoryProvider` SPI, `EngineProvider`, registry/config, vendor `Unsupported` adapters (`external/CONTEXT.md`)
-- `./src/dreaming/` → dream job model, repositories (in-memory/SQLite), planner and consolidator seam (`dreaming/CONTEXT.md`)
-- `./src/team/` → team memory records, store contract, in-memory/SQLite backends, `MemoryRecord` projection (`team/CONTEXT.md`)
-- `./src/lite/` → `CodingMemory` and `LocalCodingMemory`, `MEMORY.md` format, FTS5 index, file lock, watcher, index rendering (`lite/CONTEXT.md`)
-- `./src/prompt/` → memory snippets and `BaseMessage` construction for prompt injection (`prompt/CONTEXT.md`)
-- `./src/lib.rs` → crate docs, module declaration, public re-exports, lint policy
-- `./tests/` → cross-module integration suites (`tests/CONTEXT.md`)
+- `./src/CONTEXT.md` → source-tree layout, cross-module invariants, dependency order, root re-export rules
+- `./src/lib.rs` → crate docs, module declarations, glob re-exports, root disambiguation, lint policy
+- `./src/record/` → kinds, scopes, records, inputs, filters, options, results; `./src/config/` → engine config and knobs
+- `./src/store/` → store bundles, key layout, persistence, messages, migrations, backup, mapping, KV lock
+- `./src/store/migration/` → schema registry/runner, planner/journal/`OperationRegistry`, four migrators, standard entry points
+- `./src/store/messages/` → stored messages, `append`/`recent`/`page`, keyset cursors, filter merging
+- `./src/recall/` → tokenization, BM25, scoring blend, dedupe/merge, candidate ranking
+- `./src/engine/` → write/recall orchestration, per-scope locks, stats, `variables.rs`
+- `./src/facade/` → `LongTermMemory` (records, recall, messages and paging, `variables.rs`, `overrides.rs`, integrations)
+- `./src/graph/` → entity/relation model, extraction, persistence, neighbor recall
+- `./src/analyzer/` → extraction/classification seams, `MemoryAnalyzer`, consolidation plans; `./src/analyzer/stage/` → staged pipeline and overrides
+- `./src/external/` → provider SPI, tool rail, engine provider, registry; `./src/external/rest/` → shared vendor transport; `./src/external/vendor/` → five adapter handles
+- `./src/dreaming/` → job model, repositories, planner, orchestrator, leases, retention, salience; `./src/dreaming/pipeline/` → `LlmConsolidator`, sources, sinks
+- `./src/team/` → team records, stores, facade, projection, and the `document`/`extractor`/`prompts`/`hooks`/`toolkit`/`observe` adapters
+- `./src/lite/` → `CodingMemory`, `LocalCodingMemory`, `MEMORY.md` format, FTS5, lock, watcher; `./src/lite/embed/`, `./src/lite/facts/`, `./src/lite/session/` → embedding index, per-fact files, JSONL sessions
+- `./src/prompt/` → memory snippets and `BaseMessage` construction
+- `./tests/` → the 22 cross-module integration binaries (`tests/CONTEXT.md`)
 
 ## Test Strategy
 
-- Unit tests live beside each module (`#[cfg(test)] mod tests`): record serde/JSON compatibility, config defaults/validation, key derivation and legacy mapping, scoring formula, BM25 ordering, dedupe/merge, heuristic entity extraction, rule/LLM extraction and fallback, conflict verdicts, prompt rendering, citation rendering, Markdown round trips, FTS5 and lock/watcher behavior, migration validation and rollback, dream claim/retry transitions, team visibility and ranking.
-- Integration tests under `tests/` (see `tests/CONTEXT.md` for per-file scope): `crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs` (through the facade), `graph_memory.rs` (`GraphMemory` directly), `lite.rs` (engine-backed `CodingMemory`), `lite_local.rs` (Markdown round trip, FTS5 bookkeeping, reindex, two handles on one root, unix watcher reload), `sqlite.rs` (feature `sqlite`: persistence across reopen; reports 0 tests without the feature), `store_backends.rs` (public `MemoryStores` and local-file reopen), `facade_smoke.rs` (constructors, CRUD, recall, variables, `add_messages` with `ScriptedModel`).
-- Subsystem integration binaries: `analyzer_wiring.rs` (rule extraction through `remember`, LLM fallback surfaced as `degraded`, cancellation writing nothing, `consolidate` plans per `DedupePolicy`), `external_provider.rs` (`provider()` as a view of the same engine, capability/health tracking the embedding model, vendor `Unsupported`, registry semantics, redaction), `migration.rs` (feature `sqlite`: builtin versions, no-op rerun, `sqlite_migrated` reopen, custom registry through `MigrationRunner`), `team_memory.rs` (CRUD/filters/ranking/projection plus SQLite persistence across a reopen), `dreaming.rs` (claim/retry/cancel/noop sweeps plus SQLite job durability).
-- Deterministic offline fakes: `openjiuwen_retrieval::HashEmbedding`, `openjiuwen_test_support::ScriptedModel`, `TeamMemory::in_memory`, `InMemoryDreamRepository`, `tempfile::tempdir` for local-file and SQLite roots.
-- Gates (all must be green): `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory`, `cargo test -p openjiuwen-memory --features sqlite`, `cargo clippy -p openjiuwen-memory --all-targets -- -D warnings` (with and without `--features sqlite`), and `cargo doc -p openjiuwen-memory --no-deps` with no warnings.
+- Unit tests live beside each module (`#[cfg(test)] mod tests`, SQLite cases additionally gated on `feature = "sqlite"`): JSON compatibility, config validation, key/prefix mapping, scoring and BM25, dedupe/merge, rule and LLM fallback, staged-pipeline parity, Markdown/FTS5/lock/watcher, embedding-cache hits, session/rollup/sync/write modes, migration planning/journal/rollback, backup, lock contention, dream claim/lease/retention/salience, team visibility/hooks/toolkit/observer, provider rail and per-vendor wire shape.
+- Module docs carry the per-suite counts (for example `external` 160 unit tests, `team` 185 without `sqlite` and 225 with); the crate-wide totals they record disagree with each other and are not restated here.
+Integration binaries in `tests/`, one line each:
+
+| Binary | Scope |
+|---|---|
+| `crud.rs`, `scoping.rs` | facade CRUD/stats/validation/JSON shape; user/scope/session/agent isolation, variables, scope configs, parity aliases |
+| `recall.rs`, `dedupe.rs` | semantic/keyword/hybrid, thresholds, budgets, `Unsupported`; every dedupe policy, metadata union, batch |
+| `graph.rs`, `graph_memory.rs` | graph memory via the facade / `GraphMemory` directly |
+| `lite.rs`, `lite_local.rs`, `lite_embedding.rs` | engine-backed `CodingMemory`; Markdown + FTS5 + lock + watcher; semantic ranking, cache hits, per-fact files, sessions, rollups, write modes |
+| `sqlite.rs`, `store_backends.rs`, `facade_smoke.rs` | SQLite persistence across reopen; public `MemoryStores` round trip; constructors, CRUD, recall, variables, `add_messages` |
+| `analyzer_wiring.rs`, `analyzer_stages.rs` | `remember`/`consolidate` and degradation / stage order, gating, overrides |
+| `external_provider.rs`, `external_rest.rs` | provider view, redaction, registry / wiremock wire shape, retry, failover |
+| `migration.rs`, `migration_advanced.rs` | schema versions, `sqlite_migrated` / plan/run, journal resume, dry run, backup |
+| `team_memory.rs`, `team_toolkit.rs` | team CRUD/ranking/reopen / hooks, toolkit, `TEAM_MEMORY.md`, observer |
+| `dreaming.rs`, `dreaming_orchestrator.rs` | queue transitions and durability / tick, leases, retention, salience |
+
+- Deterministic offline fakes: `HashEmbedding`, `ScriptedModel`, `wiremock::MockServer`, `TeamMemory::in_memory`, `InMemoryDreamRepository`, `tempfile::tempdir`.
+- Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo test -p openjiuwen-memory` (also `--features sqlite` and `--all-features`), `cargo clippy -p openjiuwen-memory --all-targets --all-features -- -D warnings`, `cargo doc -p openjiuwen-memory --no-deps` warning-free.
 
 ## Deferred (Python `core.memory` features not ported)
 
-- External providers: real vendor transports and SDKs (AgentArts, Jiuwen, LakeBase, mem0, OpenViking), payload shaping, retries, failover, and the Python tool-rail surface (`get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`, `on_session_end`) — the Rust SPI is record-only.
-- Migrations: Python's per-backend migrators (`SQLMigrator`, `VectorMigrator`, `MessageMigrator`, `IndexVersionMigrator`, `OperationRegistry`), the backup/restore keyspace, a runtime `KvPrefixRegistry`, the AES at-rest codec, the distributed KV lock, `scope_user_mapping`, and data migration of legacy message/document rows.
-- Analyzer: provider-specific extraction tuning, Python's proactive-memory stage and the `process/extract` plan/reasoning stages, per-scope model/embedding override resolution, and Python's variable-manager write path (`MemoryType::Variable` is never produced).
-- Full Python graph stack: Milvus-backed `GraphMemory`, LLM entity dedupe/merge and relation rewiring, time validity (`valid_since`/`valid_until`), episode/relation retrieval strategies, reranker integration, BFS at the vector-store layer.
-- Lite: `sqlite_vec`/embeddings (local search is keyword + FTS5, so `SearchMode::Semantic` is `Unsupported`), per-fact `.md` files and the `USER.md` split, chunked embedding index and `embedding_cache`, `.jsonl` session indexing, interval/session-start sync triggers, `daily_memory` rollups, and `WriteMode`/`MemUpdateChecker` retries.
-- Dreaming: the background orchestrator with its idle/backoff loop, the LLM-driven consolidation pipeline, cross-process workers/leases, timer-driven retention, and ML-based salience scoring.
-- Team memory: sync/bus lifecycle hooks and `MemberMemoryToolkit` tools, the `TEAM_MEMORY.md` file format, the LLM extractor, non-SQLite durable backends, OTel observability, and the org/tenant layer above `team_id`.
-- SQL message tables and pagination cursor parity beyond page index/size.
+- External: `agentarts`' real SDK transport, session-mapping KV store and `MemorySearchFilter`; mem0's `rerank`, `queue_prefetch` and 5-failure/120 s circuit breaker; jiuwen's in-process SDK backend (`mode="sdk"`) and circuit breaker; lakebase's branch/version endpoints, `digest`, `traits`, `switch_base`. No workspace code drives `prefetch`/`sync_turn`/`on_session_end` yet; the SPI is record-only; provider pooling and live-API tests are absent (`wiremock` only).
+- Migrations: Python's Alembic column operations and dialect handling; `run_on_stores(&MemoryStores)` (needs a foundation downcast hook); per-collection version stamps with background rebuild; vector/graph/document and incremental backup; an AES at-rest codec; multi-node brokers (Redis/etcd/ZooKeeper behind `UnsupportedKvLock`); `FileKvLock` has no TTL eviction or fencing token.
+- Analyzer: provider-specific extraction tuning and few-shot exemplars; `resolve_references`/`normalize_time` applied to fact text (they are plan metadata); a second prompt pass that re-runs extraction; an LLM redundancy checker.
+- Graph: the Milvus-backed `GraphMemory`, LLM entity dedupe/merge and relation rewiring, time validity, episode/relation retrieval strategies, reranker integration, BFS at the vector-store layer.
+- Lite: `sqlite_vec`/native ANN and Python's `files`/`chunks`/`chunks_vec`/`meta` schema (recall is brute-force cosine); a provider fingerprint in the cache key (`Embedding` exposes only `model_name`, so the key is `(model, content hash)`); the LLM redundancy checker (`MemUpdateChecker` is deterministic); chunk-level trigram FTS and FTS over session/rollup text; harness-written transcripts, watcher-driven session sync, session recency boosts, durable session vectors; an automatic `OnSessionStart` hook and `sync.intervalMinutes`; prompt-rail `daily_memory` injection; non-unix lock parity.
+- Dreaming: an ML salience backend (`SalienceBackend::Ml` is `Unsupported`: no inference runtime or training data); a `LongTermMemory`-backed plan sink (`RecordOnlySink` mutates nothing); background lease heartbeats, fencing tokens and distributed lease brokers; timer-driven retention (every purge is caller-driven); Python's idle-layer extras and a graph-extraction consolidator.
+- Team: Python's `register_tools`/`strip_rails_by_type`/`load_and_inject` and the per-member lite `MemoryIndexManager` (the `openjiuwen-agent-teams` runtime owns tool registration and prompt injection); the DeepAgent extractor that rewrites `TEAM_MEMORY.md` across turns; the `MEMORY_ENABLED` switch and coding-memory tools; cross-process/distributed stores, a cross-process bus, retention daemon, monitor/UI; the OTel exporter (in `openjiuwen-extensions`), an org/tenant layer above `team_id`, and embedding-based team recall (no embedding column).
+- Variables and history: Python's variable-manager extras beyond the KV entry plus projection, and SQL message-table/pagination parity beyond page index/size and keyset cursors.
 
 ## Python Mapping
 
 | Python | Rust |
 |---|---|
 | `long_term_memory.py::LongTermMemory` | `facade::LongTermMemory` |
-| `config/config.py::{MemoryEngineConfig, MemoryScopeConfig, AgentMemoryConfig}` | `config::{MemoryEngineConfig, MemoryScopeConfig, AgentMemoryConfig}` |
-| `manage/mem_model/memory_unit.py::{MemoryType, FragmentMemoryUnit, VariableUnit, SummaryUnit}` | `record::{MemoryType, MemoryRecord, NewMemory}` |
-| `core/foundation/store/base_memory_index.py::MemoryDoc` | `record::MemoryRecord` (JSON `text`/`type`/`fields`) |
-| `manage/index/write_manager.py::WriteManager` | `engine::MemoryEngine` write path |
-| `manage/search/search_manager.py::SearchManager` | `engine::MemoryEngine` recall path + `recall` scoring |
-| `manage/update/mem_update_checker.py::MemUpdateChecker` | `recall::dedupe` deterministic policies |
-| `manage/update/mem_update_checker.py` (conflict classification) | `analyzer::{ConflictClassifier, RuleClassifier, LlmClassifier}`, applied by `LongTermMemory::consolidate` |
-| `process/extract/*` | `analyzer::{RuleExtractor, LlmExtractor, MemoryAnalyzer}` |
-| `external/*` | `external::{MemoryProvider, ProviderRegistry, ProviderConfig, EngineProvider}` plus five vendor adapters, each an `Unsupported` stub |
-| `migration/*` | `store::migration` (registry/runner) + `store::legacy` (read-only prefix fallback) |
-| `dreaming/*` | `dreaming::{DreamJob, DreamRepository, DreamPlanner}` |
-| `agent_teams/memory` | `team::{TeamMemoryRecord, TeamMemoryStore, TeamMemory}` |
-| `manage/index/variable_manager.py` | `store` variable keys + `facade` variable methods |
-| `manage/mem_model/message_manager.py` | `store::messages` + `facade::add_messages`/`get_recent_messages` |
-| `graph/graph_memory/base.py::GraphMemory` | `graph::GraphMemory` |
-| `graph/extraction/*` | `graph::extract::{HeuristicExtractor, LlmExtractor}` |
-| `lite/manager.py::MemoryIndexManager` | `lite::LocalCodingMemory` (Markdown/FTS5/lock/watcher); `lite::CodingMemory` is the engine-backed variant |
-| `lite/{frontmatter,internal}.py` fact model / index | `lite::{CodingFact, CodingFactType}` + `render_index` |
+| `manage/mem_model/memory_unit.py::{MemoryType, FragmentMemoryUnit, VariableUnit, SummaryUnit}`, `core/foundation/store/base_memory_index.py::MemoryDoc` | `record::{MemoryType, MemoryRecord, NewMemory}` (JSON `text`/`type`/`fields`) |
+| `manage/{index/write_manager,search/search_manager}.py` | `engine::MemoryEngine` write and recall paths + `recall` scoring |
+| `manage/update/mem_update_checker.py::MemUpdateChecker` | `recall::dedupe` policies; conflict plans via `analyzer::ConflictClassifier` + `facade::consolidate` |
+| `manage/index/variable_manager.py` | `engine::{write_variable, delete_variable_everywhere, variable_records}` + `store` variable keys + `facade` variable methods |
+| `manage/mem_model/message_manager.py` | `store::messages` (`append`/`recent`/`page`/`delete_for`) + `facade::{add_messages, get_recent_messages, get_message_page}` |
+| `process/extract/*` | `analyzer::{RuleExtractor, LlmExtractor, MemoryAnalyzer}` + `analyzer::stage` |
+| `external/*` | `external::{MemoryProvider, rail, ProviderRegistry, EngineProvider}`, `external::rest`, five vendor handles |
+| `migration/*` | `store::migration` + `store::{prefix, backup, mapping, legacy}` |
+| `dreaming/*` | `dreaming::{DreamJob, DreamRepository, DreamPlanner, DreamOrchestrator, LlmConsolidator, lease, retention, salience}` |
+| `agent_teams/memory` | `team` (records, stores, `TeamMemory`, projection, `document`, `extractor`, `hooks`, `toolkit`, `observe`) |
+| `graph/{graph_memory/base,extraction}/*` | `graph::GraphMemory` + `graph::extract::{HeuristicExtractor, LlmExtractor}` |
+| `lite/manager.py::MemoryIndexManager` and `lite/{frontmatter,internal}.py` | `lite::LocalCodingMemory` (`embed`, `facts`, `session`, `sync`, `daily`, `write`); `lite::CodingMemory` is the engine-backed variant over `lite::{CodingFact, CodingFactType}` + `render_index` |
 
 ## Deviations from `docs/ARCHITECTURE.md`
 
-- `LongTermMemory` is instance-scoped (`Arc`), not a process-global singleton; the Python `register_store`/`set_config` pair becomes `MemoryStores` injection plus `MemoryEngineConfig`.
-- The crate does not depend on `openjiuwen-context` or `openjiuwen-session`; prompt injection is expressed as strings/messages from `openjiuwen-foundation`.
-- Ranking adds keyword/importance/recency terms beyond the Python LTM vector-only score (documented formula above); this is an additive parity extension, not a wire-format change.
-- `MemoryType` adds `coding` (an extension used by `lite`); Python's `unknown` remains the default.
-- The external SPI is record-oriented (`add`/`search`/`get`/`update`/`delete`/`list`/`clear`/`health`) where Python's is tool-rail oriented.
-- Dreaming is a durable job queue (state machine, attempts, metrics, repositories) rather than Python's idle-scheduler only.
-- Team memory is a typed record store plus a `MemoryRecord` projection rather than a `TEAM_MEMORY.md` file.
+- `LongTermMemory` is instance-scoped (`Arc`) with `MemoryStores` injection instead of Python's singleton, and the KV prefix registry is a value rather than a process global.
+- The crate does not depend on `openjiuwen-context` or `openjiuwen-session`; prompt injection is strings and `BaseMessage`s.
+- Ranking adds keyword/importance/recency terms beyond Python's vector-only LTM score (additive, no wire-format change), and `MemoryType` adds `coding` for `lite`.
+- Variables extend Python's variable manager: the KV string keeps its key layout and one deterministic `MemoryType::Variable` record projection is added so a variable can be recalled and filtered.
+- Message paging uses checksummed keyset tokens over `(timestamp, id)` where Python uses offset/page-index cursors, so concurrent appends cannot skip or repeat a row.
+- The provider SPI is record-oriented with Python's tool rail as provided methods, and one shared HTTP transport replaces per-vendor clients; `agentarts` stays SDK-only and typed `Unsupported`.
+- Migrations are a plan/journal/dry-run suite over a forward-only SQLite schema runner instead of Python's per-backend migrators; legacy keys are read-only compatibility, never rewritten.
+- Dreaming is a durable job queue with caller-driven orchestration, lease and retention seams rather than Python's idle scheduler; ML salience is typed `Unsupported`.
+- Team memory is a typed record store with a `MemoryRecord` projection and a lossless `TEAM_MEMORY.md` document view rather than Python's summary-file-only model.
+- `store::kv_lock` carries the lock seam because `lite::lock` already owns `lock` inside `lite`; both stay module paths, never root re-exports.
