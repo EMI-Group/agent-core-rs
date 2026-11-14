@@ -111,7 +111,8 @@ impl DeferredMessageQueue {
 ## Routing Table
 
 - `./src/mq/message.rs` → `QueueMessage`, `MessageHandler`, `SUCCESS`
-- `./src/mq/queue.rs` → `MessageQueue` trait, `create_message_queue`, `build_message_queue`, `DeferredMessageQueue`
+- `./src/mq/queue.rs` → `QueueStats`, `MessageQueue` trait, `create_message_queue`, `build_message_queue`, `DeferredMessageQueue`
 - `./src/mq/memory.rs` → `InMemoryMessageQueue` and its topic workers
+- `./src/mq/counters.rs` → the private atomic counters the in-memory queue reports
 - `./src/mq/mod.rs` → re-exports
 - `../tests/message_queue.rs` → behavior suite (sibling — read-only, escalate writes to the crate root)

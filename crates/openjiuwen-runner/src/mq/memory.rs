@@ -394,23 +394,20 @@ impl TopicWorker {
                     }
                 }
                 Delivery::Request { message, reply } => {
-                    let response = match self.handler() {
-                        Some(handler) => {
-                            Counters::bump(&self.counters.deliveries);
-                            let response = handler.handle(message).await;
-                            if response.is_err() {
-                                Counters::bump(&self.counters.handler_errors);
-                            }
-                            response
+                    let response = if let Some(handler) = self.handler() {
+                        Counters::bump(&self.counters.deliveries);
+                        let response = handler.handle(message).await;
+                        if response.is_err() {
+                            Counters::bump(&self.counters.handler_errors);
                         }
-                        None => {
-                            // The handler was removed after the request was queued.
-                            Counters::bump(&self.counters.dropped_no_handler);
-                            Err(Error::NotFound(format!(
-                                "message queue topic '{}' has no handler",
-                                self.topic
-                            )))
-                        }
+                        response
+                    } else {
+                        // The handler was removed after the request was queued.
+                        Counters::bump(&self.counters.dropped_no_handler);
+                        Err(Error::NotFound(format!(
+                            "message queue topic '{}' has no handler",
+                            self.topic
+                        )))
                     };
                     // A failed send only means the caller timed out or went away.
                     let _ = reply.send(response);
@@ -943,10 +940,11 @@ mod tests {
             .add_handler("boom", Arc::new(FailingReporter { seen: seen_tx }))
             .await
             .expect("handler");
-        queue
+        let failure = queue
             .request("boom", QueueMessage::new(json!(3)), None)
             .await
             .expect_err("handler failure");
+        assert_eq!(failure.kind(), ErrorKind::Tool);
         assert_eq!(
             seen_rx.recv().await,
             Some(json!(3)),
