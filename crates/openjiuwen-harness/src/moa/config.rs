@@ -277,7 +277,7 @@ pub struct MoaConfig {
     pub jev: Option<JevConfig>,
     /// Whether the consultation rail is active.
     pub enabled: bool,
-    /// Number of records kept by the bounded consultation history.
+    /// Number of records kept by the bounded consultation history; `0` disables the history.
     pub history_limit: usize,
     /// Dispatch priority of the consultation rail.
     pub rail_priority: i32,
@@ -654,7 +654,13 @@ mod tests {
         assert_eq!(config.history_limit, DEFAULT_HISTORY_LIMIT);
         assert!(config.enabled);
         assert_eq!(config.rail_priority, crate::rails::rail_priority::MOA);
-        assert!(config.validate().is_ok());
+        // Every defaulted knob sits inside the range validation enforces, and the proposal
+        // count follows the reference list rather than an unvalidated cap.
+        assert!(config.max_concurrency > 0);
+        assert!(config.max_reference_chars > 0);
+        assert!(config.max_advice_chars > 0);
+        assert!(!config.reference_timeout.is_zero());
+        assert_eq!(config.proposal_count(), 3);
     }
 
     #[test]
@@ -733,7 +739,21 @@ mod tests {
         );
 
         let complete = missing.with_verifier_model(model());
-        assert!(complete.validate().is_ok());
+        assert_eq!(complete.mode, MoaMode::VerifierRouted);
+        assert_eq!(complete.verifier_selection, VerifierSelection::Llm);
+        assert!(complete.verifier_model.is_some());
+        complete
+            .validate()
+            .expect("the LLM selection accepts a configured verifier model");
+
+        // The model is only required by the LLM selection: the offline structural verifier
+        // runs in `verifier_routed` mode without one.
+        let structural = config().with_mode(MoaMode::VerifierRouted);
+        assert_eq!(structural.verifier_selection, VerifierSelection::Structural);
+        assert!(structural.verifier_model.is_none());
+        structural
+            .validate()
+            .expect("the structural verifier needs no verifier model");
     }
 
     #[test]
@@ -863,10 +883,17 @@ mod tests {
                 .validate(),
             "JEV max_reference_calls must be a nonnegative integer or None",
         );
-        assert!(config()
-            .with_max_reference_calls(Some(0))
+        // The rule rejects exactly the `usize::MAX` sentinel: an explicit zero ("no calls at
+        // all") and the largest finite budget are both accepted.
+        let zero = config().with_max_reference_calls(Some(0));
+        assert_eq!(zero.max_reference_calls, Some(0));
+        zero.validate().expect("a zero budget is finite");
+
+        let largest = config().with_max_reference_calls(Some(usize::MAX - 1));
+        assert_eq!(largest.max_reference_calls, Some(usize::MAX - 1));
+        largest
             .validate()
-            .is_ok());
+            .expect("the largest finite budget is accepted");
     }
 
     #[test]
@@ -899,8 +926,21 @@ mod tests {
 
         std::fs::write(root.join("SKILL.md"), "---\nname: x\n---\n").unwrap();
         let valid = config().with_consultation_skill_dir(&root);
-        assert!(valid.validate().is_ok());
-        assert_eq!(valid.consultation_skill_dir.as_ref(), Some(&root));
+        assert_eq!(
+            valid.consultation_skill_dir.as_deref(),
+            Some(root.as_path())
+        );
+        valid
+            .validate()
+            .expect("a consult-reference-models directory with SKILL.md is accepted");
+
+        // The rule really inspects the filesystem: deleting SKILL.md invalidates the very
+        // same configuration again.
+        std::fs::remove_file(root.join("SKILL.md")).unwrap();
+        assert_config_error(
+            valid.validate(),
+            "consultation_skill_dir must be a consult-reference-models directory with SKILL.md",
+        );
     }
 
     #[test]

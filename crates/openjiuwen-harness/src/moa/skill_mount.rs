@@ -23,6 +23,10 @@ const INVALID_DIRECTORY: &str =
 const MISSING_DIRECTORY: &str =
     "MoA consultation skill requires a skill directory; materialize the embedded skill first";
 
+/// Error message used when the recorded mount no longer covers the configured directory.
+const STALE_MOUNT: &str =
+    "the recorded MoA consultation skill mount does not cover consultation_skill_dir";
+
 /// Tracks whether the consultation skill root is mounted, and who introduced it.
 ///
 /// A handle is created with an explicit skill directory ([`Self::from_dir`]) or without one
@@ -110,19 +114,36 @@ impl ConsultationSkillMount {
     ///
     /// The root is attached through [`SkillRootMount`], so only a root this call introduced is
     /// released again by [`Self::unmount`]. Mounting twice is idempotent: the stored handle
-    /// re-adds the root when it is absent and nothing else changes.
+    /// re-adds the root when it is absent, keeps its prior ownership and logs the re-add.
     ///
     /// # Errors
     ///
     /// Returns the [`Self::validate`] error when the directory is absent or is not a
-    /// consultation skill directory.
+    /// consultation skill directory, and [`Error::Config`] when the recorded mount no longer
+    /// covers the configured directory: re-adding that root would leave the configured skill
+    /// undiscoverable while `mount` reported success.
     pub fn mount(&mut self, library: &mut SkillLibrary) -> Result<Skill> {
         self.validate()?;
         let skill = self.skill()?;
         match &mut self.mount {
             Some(mount) => {
-                // Keep prior ownership: re-adds the root only when it went missing.
-                let _ = mount.ensure_mounted(&mut library.roots);
+                // Keep prior ownership: the stored handle re-adds the root only when it went
+                // missing, and the re-add is verified because a recorded root that drifted
+                // away from the configured directory would silently mount the wrong tree.
+                if !same_skill_root(mount.root(), &skill.directory) {
+                    tracing::warn!(
+                        recorded_root = %mount.root().display(),
+                        skill_dir = %skill.directory.display(),
+                        "MoA consultation skill mount does not cover the configured directory"
+                    );
+                    return Err(Error::config(STALE_MOUNT));
+                }
+                let owned = mount.ensure_mounted(&mut library.roots);
+                tracing::debug!(
+                    root = %mount.root().display(),
+                    owned,
+                    "reused the recorded MoA consultation skill mount"
+                );
             }
             None => {
                 self.mount = Some(SkillRootMount::mount(&mut library.roots, &skill.directory));
@@ -150,14 +171,24 @@ impl ConsultationSkillMount {
     }
 }
 
+/// Returns `true` when `recorded` and `directory` name the same skill root.
+///
+/// The library owns the path-normalization rules, so the comparison borrows them from
+/// [`SkillRootMount`] instead of re-deriving them here.
+fn same_skill_root(recorded: &Path, directory: &Path) -> bool {
+    SkillRootMount::mount(&mut Vec::new(), recorded).is_mounted(&[directory.to_path_buf()])
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{ConsultationSkillMount, INVALID_DIRECTORY, MISSING_DIRECTORY};
+    use super::{
+        same_skill_root, ConsultationSkillMount, INVALID_DIRECTORY, MISSING_DIRECTORY, STALE_MOUNT,
+    };
     use crate::moa::builtin_skills::{
         materialize_builtin_skill, CONSULT_SKILL_FILE, CONSULT_SKILL_NAME,
     };
-    use crate::skills::SkillLibrary;
+    use crate::skills::{SkillLibrary, SkillRootMount};
     use openjiuwen_common::error::ErrorKind;
 
     #[test]
@@ -243,6 +274,56 @@ mod tests {
         assert!(!mount.is_mounted());
         assert_eq!(library.roots, vec![foreign]);
         assert!(!mount.unmount(&mut library));
+    }
+
+    #[tokio::test]
+    async fn mounting_again_restores_a_root_that_went_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = materialize_builtin_skill(temp.path()).await.unwrap();
+        let mut library = SkillLibrary::new();
+
+        let mut mount = ConsultationSkillMount::from_dir(&skill.directory);
+        mount.mount(&mut library).unwrap();
+        assert_eq!(library.roots, vec![skill.directory.clone()]);
+
+        // The root disappears behind the handle's back.
+        library.roots.clear();
+        assert_eq!(mount.mount(&mut library).unwrap(), skill);
+        assert_eq!(library.roots, vec![skill.directory.clone()]);
+
+        // Prior ownership survives the re-add, so the root is still released on unmount.
+        assert!(mount.unmount(&mut library));
+        assert_eq!(library.roots, Vec::<std::path::PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_a_recorded_root_that_drifted_from_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = materialize_builtin_skill(temp.path()).await.unwrap();
+        let mut library = SkillLibrary::new();
+
+        // A handle that recorded a mount for a different root: re-adding it would mount the
+        // wrong tree and leave the configured consultation skill undiscoverable.
+        let stale = temp.path().join("stale-root");
+        let mut mount = ConsultationSkillMount::from_dir(&skill.directory);
+        mount.mount = Some(SkillRootMount::mount(&mut library.roots, &stale));
+
+        let error = mount.mount(&mut library).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.to_string(), format!("config: {STALE_MOUNT}"));
+        // The failed call leaves the library untouched: the configured skill root is not
+        // mounted, which is exactly what the error reports.
+        assert_eq!(library.roots, vec![stale]);
+        assert!(!library.roots.contains(&skill.directory));
+    }
+
+    #[test]
+    fn same_skill_root_follows_the_library_path_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(CONSULT_SKILL_NAME);
+        assert!(same_skill_root(&root, &root));
+        assert!(same_skill_root(&root.join("."), &root));
+        assert!(!same_skill_root(&root, &temp.path().join("other-skill")));
     }
 
     #[tokio::test]

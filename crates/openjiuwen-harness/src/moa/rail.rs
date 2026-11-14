@@ -35,9 +35,11 @@
 //! # Failure policy
 //!
 //! A disabled configuration (`MoaConfig::enabled == false`) publishes nothing and writes no
-//! diagnostics, and `consult` answers [`Error::Config`]. No hook takes a lock across an
-//! `.await`: every lock guard lives in a synchronous statement and is dropped before the
-//! next suspension point.
+//! diagnostics, and `consult` answers [`Error::Config`]. A diagnostics payload that cannot be
+//! JSON-encoded is logged with `tracing::warn!` and skipped, so a host that sees a stale rail
+//! entry also finds the failure recorded rather than silently dropped. No hook takes a lock
+//! across an `.await`: every lock guard lives in a synchronous statement and is dropped before
+//! the next suspension point.
 // The public names (`MoaRail`, `MOA_PROMPT_SECTION`, ...) mirror the Python contract and
 // intentionally repeat the module name.
 #![allow(clippy::module_name_repetitions)]
@@ -130,8 +132,8 @@ impl fmt::Debug for MoaRail {
 impl MoaRail {
     /// Builds a rail for `config` after applying the Python `__post_init__` checks.
     ///
-    /// The history retains `config.history_limit` records and the prompt language starts at
-    /// `"en"`; the aggregation strategy follows the configuration: an
+    /// The history retains `config.history_limit` records (`0` disables it) and the prompt
+    /// language starts at `"en"`; the aggregation strategy follows the configuration: an
     /// [`MoaConfig::aggregator_model`] selects [`AggregationStrategy::Synthesis`], otherwise
     /// the deterministic, fully offline [`AggregationStrategy::Labelled`] applies.
     ///
@@ -195,7 +197,7 @@ impl MoaRail {
     /// The retained consultation records, oldest first.
     #[must_use]
     pub fn history(&self) -> Vec<ConsultationRecord> {
-        self.history.read().records().to_vec()
+        self.history.read().records().iter().cloned().collect()
     }
 
     /// Asks every configured reference model for an independent proposal about the last user
@@ -311,8 +313,8 @@ impl MoaRail {
     /// [`ConsultationHistory::save`].
     ///
     /// The configured [`MoaConfig::history_limit`] of this rail is preserved; only the
-    /// records are adopted from the file. The file is read before the lock is taken, so no
-    /// guard is held across the `.await`.
+    /// newest records of the file are adopted. The file is read before the lock is taken, so
+    /// no guard is held across the `.await`.
     ///
     /// # Errors
     ///
@@ -321,8 +323,7 @@ impl MoaRail {
     /// history.
     pub async fn load_history(&self, path: &Path) -> Result<()> {
         let loaded = ConsultationHistory::load(path).await?;
-        let mut history = self.history.write();
-        history.records = loaded.records;
+        self.history.write().replace(loaded.records);
         Ok(())
     }
 
@@ -432,9 +433,38 @@ impl MoaRail {
         let Some(outcome) = self.last_outcome() else {
             return;
         };
-        if let Ok(value) = serde_json::to_value(&outcome) {
-            ctx.extra_mut()
-                .insert(MOA_OUTCOME_EXTRA_KEY.to_owned(), value);
+        publish_extra(
+            ctx,
+            MOA_OUTCOME_EXTRA_KEY,
+            "consultation outcome",
+            serde_json::to_value(&outcome),
+        );
+    }
+}
+
+/// Publishes one serialized rail payload under `key`, reporting an encoding failure.
+///
+/// [`MoaSnapshot`] and [`ConsultationOutcome`] are plain serde structs, so encoding them
+/// cannot fail today; should that ever change, a skipped insert would leave the host's rail
+/// state frozen at its previous value while the hook still reported success. The failure is
+/// therefore logged with the key and the payload it concerns instead of being discarded.
+fn publish_extra(
+    ctx: &mut HarnessRailContext,
+    key: &'static str,
+    subject: &'static str,
+    payload: std::result::Result<serde_json::Value, serde_json::Error>,
+) {
+    match payload {
+        Ok(value) => {
+            ctx.extra_mut().insert(key.to_owned(), value);
+        }
+        Err(error) => {
+            tracing::warn!(
+                key = key,
+                payload = subject,
+                error = %error,
+                "MoA rail could not publish its payload; the host keeps the previous value"
+            );
         }
     }
 }
@@ -496,10 +526,12 @@ impl HarnessRail for MoaRail {
         let problem = last_user_text(&ctx.base.messages).unwrap_or_default();
         let snapshot = self.install_state(problem);
         self.publish_section(ctx);
-        if let Ok(value) = serde_json::to_value(snapshot) {
-            ctx.extra_mut()
-                .insert(MOA_STATE_EXTRA_KEY.to_owned(), value);
-        }
+        publish_extra(
+            ctx,
+            MOA_STATE_EXTRA_KEY,
+            "invocation snapshot",
+            serde_json::to_value(&snapshot),
+        );
         self.publish_outcome(ctx);
         Ok(())
     }
@@ -594,6 +626,65 @@ mod tests {
         let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeInvoke);
         ctx.base.messages = vec![BaseMessage::user(text)];
         ctx
+    }
+
+    /// A payload whose JSON encoding always fails, standing in for a snapshot or an outcome
+    /// that the rail cannot render.
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("cannot encode payload"))
+        }
+    }
+
+    #[test]
+    fn publish_extra_logs_and_skips_a_payload_it_cannot_encode() {
+        let mut ctx = HarnessRailContext::for_event(RailEvent::BeforeInvoke);
+
+        publish_extra(
+            &mut ctx,
+            MOA_OUTCOME_EXTRA_KEY,
+            "consultation outcome",
+            serde_json::to_value(FailingSerialize),
+        );
+        assert!(
+            ctx.extra().get(MOA_OUTCOME_EXTRA_KEY).is_none(),
+            "a payload that cannot be encoded must not be inserted"
+        );
+
+        publish_extra(
+            &mut ctx,
+            MOA_STATE_EXTRA_KEY,
+            "invocation snapshot",
+            serde_json::to_value(FailingSerialize),
+        );
+        assert!(ctx.extra().get(MOA_STATE_EXTRA_KEY).is_none());
+
+        // An encodable payload still lands, so the failure branch is the only one skipped.
+        publish_extra(
+            &mut ctx,
+            MOA_STATE_EXTRA_KEY,
+            "invocation snapshot",
+            serde_json::to_value(serde_json::json!({"completed_turns": 1})),
+        );
+        assert_eq!(
+            ctx.extra()[MOA_STATE_EXTRA_KEY],
+            serde_json::json!({"completed_turns": 1})
+        );
+        publish_extra(
+            &mut ctx,
+            MOA_STATE_EXTRA_KEY,
+            "invocation snapshot",
+            serde_json::to_value(serde_json::json!({"completed_turns": 2})),
+        );
+        assert_eq!(
+            ctx.extra()[MOA_STATE_EXTRA_KEY],
+            serde_json::json!({"completed_turns": 2})
+        );
     }
 
     #[test]
@@ -785,6 +876,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn load_history_keeps_the_newest_records_within_the_rail_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("moa-history.json");
+
+        let source = MoaRail::new(config().with_history_limit(4)).unwrap();
+        for problem in ["a", "b", "c"] {
+            source
+                .consult(&[BaseMessage::user(problem)], &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        source.save_history(&path).await.unwrap();
+
+        let bounded = MoaRail::new(config().with_history_limit(2)).unwrap();
+        bounded.load_history(&path).await.unwrap();
+        let problems: Vec<String> = bounded
+            .history()
+            .into_iter()
+            .map(|record| record.problem)
+            .collect();
+        assert_eq!(problems, ["b", "c"]);
+        assert_eq!(bounded.config().history_limit, 2);
+
+        // A disabled history adopts nothing, whatever the file holds.
+        let disabled = MoaRail::new(config().with_history_limit(0)).unwrap();
+        disabled.load_history(&path).await.unwrap();
+        assert_eq!(disabled.history(), Vec::<ConsultationRecord>::new());
+        let outcome = disabled
+            .consult(&[BaseMessage::user("d")], &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(disabled.history(), Vec::<ConsultationRecord>::new());
     }
 
     #[tokio::test]
