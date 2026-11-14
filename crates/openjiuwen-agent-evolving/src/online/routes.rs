@@ -7,21 +7,16 @@
 //! This module owns three things:
 //!
 //! - [`RlServiceState`] — the in-process dependencies every handler needs: one
-//!   shared [`MemoryOnlineStore`](crate::online::MemoryOnlineStore) behind a
-//!   [`TaskRegistry`](crate::online::TaskRegistry), a
-//!   [`SampleLedger`](crate::online::SampleLedger) and a
-//!   [`TrainingRunner`](crate::online::TrainingRunner), plus the optional
-//!   [`LoraRepository`](crate::online::LoraRepository) rooted at
+//!   shared [`MemoryOnlineStore`] behind a [`TaskRegistry`], a [`SampleLedger`]
+//!   and a [`TrainingRunner`], plus the optional [`LoraRepository`] rooted at
 //!   [`RlServiceConfig::lora_root`](crate::service::RlServiceConfig::lora_root).
 //! - The route table itself, split by concern:
-//!   [`tasks`] (task lifecycle and the internal finish/abort actions),
-//!   [`capture`] (the completions before/after/discard hooks),
-//!   [`training`] (training runs) and [`samples`] (batch upload and the
-//!   trajectory read model).
+//!   `tasks` (task lifecycle and the internal finish/abort actions), `capture`
+//!   (the completions before/after/discard hooks), `training` (training runs)
+//!   and `samples` (batch upload and the trajectory read model).
 //! - The helpers those handlers share: body decoding with a caller-chosen error
 //!   code, required/optional field access, request fingerprinting, the
-//!   [`OnlineError`](crate::online::OnlineError) → envelope mapping and delayed
-//!   turn publication.
+//!   [`OnlineError`] → envelope mapping and delayed turn publication.
 //!
 //! # Transport, not policy
 //!
@@ -120,10 +115,9 @@ impl RlServiceState {
     /// Builds the state described by `config`.
     ///
     /// The executor is `"local"` (the deterministic offline
-    /// [`LocalTrainingExecutor`](crate::online::LocalTrainingExecutor)) or
-    /// `"ppo"` (the typed
-    /// [`PpoTrainingExecutor`](crate::online::PpoTrainingExecutor) stub, which
-    /// reports the missing GPU stack). Artifacts are written under `lora_root`,
+    /// [`LocalTrainingExecutor`]) or `"ppo"` (the typed [`PpoTrainingExecutor`]
+    /// stub, which reports the missing GPU stack). Artifacts are written under
+    /// `lora_root`,
     /// or a per-user temporary directory when the config leaves it unset.
     ///
     /// # Errors
@@ -227,8 +221,7 @@ impl RlServiceState {
     ///
     /// # Errors
     ///
-    /// The store failure, or the executor's typed
-    /// [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) —
+    /// The store failure, or the executor's typed [`Error::Unsupported`] —
     /// which is what makes a `ppo` service answer `503` naming the missing GPU
     /// stack instead of claiming it can train.
     pub async fn check_health(&self) -> KernelResult<()> {

@@ -3,9 +3,9 @@
 //! [`OnlineStore`] is intentionally domain-free: it speaks only string keys,
 //! string values and sets of strings. That keeps one implementation of the task
 //! state machine valid for every backend — the in-memory store used offline and
-//! by tests, and the Redis store a later step adds (which maps `get`/`set` onto
-//! `GET`/`SET`, `set_if_absent` onto `SET NX`, and the set operations onto
-//! `SADD`/`SREM`/`SMEMBERS`).
+//! by tests, and the Redis store of the `redis` feature (`redis_store`), which
+//! maps `get`/`set` onto `GET`/`SET`, `set_if_absent` onto `SET NX`, and the set
+//! operations onto `SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`).
 //!
 //! The key namespace every domain module shares is the `keys` module; the
 //! literal layout is documented once, in the [`crate::online`] module docs.
