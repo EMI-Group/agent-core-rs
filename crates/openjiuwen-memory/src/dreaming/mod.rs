@@ -43,6 +43,7 @@
 mod config;
 mod lease;
 mod model;
+mod orchestrator;
 mod outcome;
 mod pipeline;
 mod planner;
@@ -53,6 +54,7 @@ mod salience;
 pub use config::*;
 pub use lease::*;
 pub use model::*;
+pub use orchestrator::*;
 pub use outcome::*;
 pub use pipeline::*;
 pub use planner::*;
