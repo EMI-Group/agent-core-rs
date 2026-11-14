@@ -3,17 +3,18 @@
 //! [`start`] is the only entry point, called by
 //! [`WorkspaceWatcher::start`](crate::watcher::WorkspaceWatcher::start). It
 //! validates the plan, registers every distinct watch path on
-//! `notify::recommended_watcher`, spawns one tokio task that owns that watcher,
-//! and returns the [`WatcherHandle`] the caller keeps.
+//! `notify::recommended_watcher`, spawns the intake task that owns that watcher
+//! plus the reload dispatcher task, and returns the [`WatcherHandle`] the caller
+//! keeps.
 //!
-//! The task is a plain loop, not an actor: it blocks in a `tokio::select!` over
-//! three sources — cancellation, raw `notify` events, and the next debounce (or
-//! drop-notice) deadline. Raw events are converted to the internal `RawChange`
-//! vocabulary, resolved against the plan's targets, and pushed into the
-//! [`Debouncer`](crate::watcher::Debouncer); when a deadline elapses the due
-//! events are published as
+//! The intake task is a plain loop, not an actor: it blocks in a
+//! `tokio::select!` over three sources — cancellation, raw `notify` events, and
+//! the next debounce (or drop-notice) deadline. Raw events are converted to the
+//! internal `RawChange` vocabulary, resolved against the plan's targets, and
+//! pushed into the [`Debouncer`](crate::watcher::Debouncer); when a deadline
+//! elapses the due events are published as
 //! [`WatchUpdate::Event`](crate::watcher::event::WatchUpdate::Event) and queued
-//! for the reload dispatcher.
+//! for the reload dispatcher, which runs the handlers on its own task.
 //!
 //! Four policies keep the task bounded and quiet under stress:
 //!

@@ -32,10 +32,16 @@
 //! applying the deltas it did see.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+// Only the drop policy — which is the `notify` backend plus the tests of this
+// module — needs clocks, the broadcast sender and the wire types. The counters
+// themselves are read by the handle in every build.
+#[cfg(any(feature = "notify", test))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(feature = "notify", test))]
 use tokio::sync::broadcast;
 
+#[cfg(any(feature = "notify", test))]
 use crate::watcher::event::{DropStage, DroppedUpdates, WatchUpdate};
 
 /// Shared counters of the notifications each stage dropped.
@@ -50,6 +56,7 @@ pub(crate) struct DropCounters {
 
 impl DropCounters {
     /// Creates a pair of zeroed counters.
+    #[cfg(any(feature = "notify", test))]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -65,6 +72,7 @@ impl DropCounters {
     }
 
     /// Returns the total of `stage`.
+    #[cfg(any(feature = "notify", test))]
     pub(crate) fn total(&self, stage: DropStage) -> u64 {
         match stage {
             DropStage::Intake => self.intake(),
@@ -73,6 +81,7 @@ impl DropCounters {
     }
 
     /// Counts one intake drop and returns the new total.
+    #[cfg(any(feature = "notify", test))]
     pub(crate) fn record_intake(&self) -> u64 {
         self.intake
             .fetch_add(1, Ordering::Relaxed)
@@ -80,6 +89,7 @@ impl DropCounters {
     }
 
     /// Counts one dispatch drop and returns the new total.
+    #[cfg(any(feature = "notify", test))]
     pub(crate) fn record_dispatch(&self) -> u64 {
         self.dispatch
             .fetch_add(1, Ordering::Relaxed)
@@ -93,6 +103,7 @@ impl DropCounters {
 /// publishes once `interval` has passed since the previous notice, so a queue
 /// that stays full produces a notice per interval rather than one per drop.
 /// [`DropReporter::flush`] ignores the throttle and is what shutdown uses.
+#[cfg(any(feature = "notify", test))]
 pub(crate) struct DropReporter {
     interval: Duration,
     last: Option<Instant>,
@@ -100,6 +111,7 @@ pub(crate) struct DropReporter {
     reported_dispatch: u64,
 }
 
+#[cfg(any(feature = "notify", test))]
 impl DropReporter {
     /// Creates a reporter that announces at most once per `interval`.
     pub(crate) fn new(interval: Duration) -> Self {
@@ -184,15 +196,14 @@ impl DropReporter {
             }
             let dropped = total.saturating_sub(reported);
             self.set_reported(stage, total);
-            let reason = match stage {
-                DropStage::Intake => "the OS notification intake queue was full",
-                DropStage::Dispatch => "the reload dispatch queue was full",
-            };
+            // The reason is on the `debug` line of the item itself; the notice only
+            // reports the stage and the counts, so a queued-because-full and a
+            // dispatcher-gone drop are announced identically.
             tracing::warn!(
                 stage = stage.as_str(),
                 dropped,
                 total,
-                "workspace watcher dropped notifications because {reason}"
+                "workspace watcher dropped notifications"
             );
             let notice = WatchUpdate::Dropped(DroppedUpdates {
                 stage,
@@ -223,6 +234,7 @@ impl DropReporter {
     }
 }
 
+#[cfg(any(feature = "notify", test))]
 impl std::fmt::Debug for DropReporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DropReporter")
