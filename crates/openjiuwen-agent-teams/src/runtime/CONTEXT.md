@@ -534,6 +534,7 @@ a new session instead of being rebuilt.
 - `./wiring_tests.rs` → wiring test root (`Wiring` harness, `with_metadata`, `wait_until`, `take_monitor`, `monitor_kinds`)
 - `./wiring_tests/` → the eight wiring suites (spawn_modes, routing, kv_affinity, signals, organization, workspace, attach, checkpoints)
 - `./checkpoints.rs` → per-member checkpoint identity and store resolution (`member_card_id`, `team_checkpoint_store`, `member_checkpoint_store`, `wire_runtime`, `CHECKPOINT_DIR`)
+- `./memory_bind.rs` → team-memory resolution (`pub(crate) async fn resolve_memory`) and the `warn!`-and-continue lifecycle pass-throughs (`is_live`, `session_started`, `member_joined`, `member_left`, `finish`, `export_document`)
 - `./dispatch.rs` → `RunActionKind`, `RunAction`, `LiveTeamState`, `decide_run_action`
 - `./initial_input.rs` → `InitialInput`, `parse_initial_input`
 - `./backend.rs` → `TeamBackend` (members, mail, events, tasks, snapshot, signals, org handle)
