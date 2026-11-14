@@ -71,9 +71,46 @@ impl LspError {
     }
 
     /// Converts the JSON-RPC error into the crate's typed error.
+    ///
+    /// The whole [`LspError`] is kept as the [`Error::External`] source so the numeric code
+    /// survives the conversion: callers match on [`LspError::is_method_not_found`] through
+    /// [`server_error`] instead of parsing the rendered message. The rendered payload is
+    /// unchanged (`LSP error <code>: <message>`), because [`Error::message`] returns the
+    /// source's display text.
     pub fn into_error(self) -> Error {
-        Error::tool(format!("LSP error {}: {}", self.code, self.message))
+        Error::external(self)
     }
+}
+
+/// The typed JSON-RPC error behind `error`, when it came from a language server.
+///
+/// [`LspError::into_error`] keeps the whole error, so a consumer holding only an [`Error`] can
+/// still match on [`LspError::code`] / [`LspError::is_method_not_found`].
+#[must_use]
+pub fn server_error(error: &Error) -> Option<&LspError> {
+    match error {
+        Error::External(source) => source.downcast_ref::<LspError>(),
+        _ => None,
+    }
+}
+
+/// Whether `error` is a "method not found" answer from a language server.
+///
+/// The typed code ([`LspError::is_method_not_found`]) is authoritative: it is the only evidence
+/// that survives a server whose message says something else entirely. The message check is a
+/// documented last resort for servers that answer "method not found" without the JSON-RPC code
+/// (`-32601`) — a non-standard code on an unimplemented request, or an error object without a
+/// numeric code at all. It looks for the phrase only: the numeric code is matched typely, so a
+/// code that merely appears in text is not treated as evidence.
+#[must_use]
+pub fn is_method_not_found(error: &Error) -> bool {
+    if server_error(error).is_some_and(LspError::is_method_not_found) {
+        return true;
+    }
+    error
+        .message()
+        .to_ascii_lowercase()
+        .contains("method not found")
 }
 
 impl fmt::Display for LspError {

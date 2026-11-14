@@ -675,11 +675,10 @@ fn install_action_enum(schema: &mut Value) {
 
 /// Maps a client error to the model-facing message, naming unsupported methods clearly.
 pub(super) fn map_client_error(error: &Error, method: &str) -> String {
-    let message = error.message().into_owned();
-    if message.contains("-32601") || message.to_ascii_lowercase().contains("method not found") {
+    if super::protocol::is_method_not_found(error) {
         format!("Operation not supported by this language server: {method}")
     } else {
-        format!("LSP request failed: {message}")
+        format!("LSP request failed: {}", error.message())
     }
 }
 

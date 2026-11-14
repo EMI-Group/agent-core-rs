@@ -305,3 +305,84 @@ async fn did_open_publishes_diagnostics_through_the_client() {
     assert!(server.wait_for_count("textDocument/didChange", 1).await);
     client.shutdown().await;
 }
+
+#[test]
+fn delivered_history_is_bounded_by_max_files() {
+    let registry = registry(10, 30, 4);
+    // Two rounds, so six documents are drained even though the buffer holds four at a time.
+    for index in 0..4 {
+        registry.publish(event(
+            &format!("file:///workspace/{index}.rs"),
+            Some(1),
+            vec![diagnostic("warn", Some(2), 0, 0)],
+        ));
+    }
+    assert_eq!(registry.drain().len(), 4, "every document is reported once");
+    for index in 4..6 {
+        registry.publish(event(
+            &format!("file:///workspace/{index}.rs"),
+            Some(1),
+            vec![diagnostic("warn", Some(2), 0, 0)],
+        ));
+    }
+    assert_eq!(registry.drain().len(), 2);
+
+    // Six delivery histories were recorded but `max_files` (4) is the bound, so the two oldest
+    // were dropped: the oldest document reports again, a recent one stays suppressed.
+    registry.publish(event(
+        "file:///workspace/0.rs",
+        Some(2),
+        vec![diagnostic("warn", Some(2), 0, 0)],
+    ));
+    registry.publish(event(
+        "file:///workspace/5.rs",
+        Some(2),
+        vec![diagnostic("warn", Some(2), 0, 0)],
+    ));
+    let files = registry.drain();
+    assert_eq!(files.len(), 1, "only the evicted history reports again");
+    assert_eq!(files[0].uri, "file:///workspace/0.rs");
+}
+
+#[test]
+fn delivered_history_follows_evicted_documents_out_of_the_buffer() {
+    let registry = registry(10, 30, 2);
+    let first = "file:///workspace/1.rs";
+    registry.publish(event(
+        first,
+        Some(1),
+        vec![diagnostic("warn", Some(2), 0, 0)],
+    ));
+    assert_eq!(registry.drain().len(), 1);
+    // Re-publish the first document (now suppressed), then push it out of the buffer with two
+    // fresh documents; the eviction must take its delivered history with it.
+    registry.publish(event(
+        first,
+        Some(2),
+        vec![diagnostic("warn", Some(2), 0, 0)],
+    ));
+    for index in 2..=3 {
+        registry.publish(event(
+            &format!("file:///workspace/{index}.rs"),
+            Some(1),
+            vec![diagnostic("warn", Some(2), 0, 0)],
+        ));
+    }
+    assert!(
+        registry.snapshot(first).is_none(),
+        "evicted from the buffer"
+    );
+    let files = registry.drain();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|file| file.uri != first));
+    // With the history gone the document is reportable again instead of being suppressed by a
+    // key set the registry no longer has any reason to keep.
+    registry.publish(event(
+        first,
+        Some(3),
+        vec![diagnostic("warn", Some(2), 0, 0)],
+    ));
+    let files = registry.drain();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].uri, first);
+}

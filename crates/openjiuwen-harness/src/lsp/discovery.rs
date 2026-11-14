@@ -368,10 +368,23 @@ fn targets_rust(config: &LspServerConfig) -> bool {
 }
 
 /// Whether `path` is a readable file whose text contains a `[workspace]` table.
+///
+/// An unreadable manifest yields `None` (the caller treats that as "not a workspace root"), so
+/// the downgrade is logged at debug level: a permissions problem or a `Cargo.toml` that is a
+/// directory silently changes root inference, and that must be diagnosable.
 fn read_contains_workspace(path: &Path) -> Option<bool> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|text| text.contains("[workspace]"))
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text.contains("[workspace]")),
+        Err(error) => {
+            tracing::debug!(
+                target: "openjiuwen_harness::lsp",
+                path = %path.display(),
+                error = %error,
+                "cannot read Cargo.toml; not treating it as a workspace root"
+            );
+            None
+        }
+    }
 }
 
 /// Lexically normalizes `path`: drops `.` components and resolves `..` against the prefix.

@@ -24,6 +24,14 @@
 //! - [`DiagnosticRegistry::drain`] mirrors Python's `get_and_clear`: merge the stored sets,
 //!   dedupe within the round, suppress keys already delivered in an earlier round, sort by
 //!   severity, apply the per-file and global caps, then mark what it returned as delivered.
+//!
+//! # Bounded memory
+//!
+//! [`DiagnosticsConfig::max_files`] bounds *per-file state*, not just the buffer: the
+//! delivered-key history is capped at the same number of URIs (the least recently drained is
+//! dropped first), and evicting a document from the buffer drops its history with it. A long
+//! session therefore never keeps one `BTreeSet` per URI it has ever seen; the cost is that a
+//! document whose history was dropped reports its diagnostics once more if it comes back.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -51,6 +59,9 @@ pub struct DiagnosticsConfig {
     /// Maximum diagnostics returned by one [`DiagnosticRegistry::drain`].
     pub max_total: usize,
     /// Maximum documents buffered at once; the least recently updated is evicted.
+    ///
+    /// The delivered-key history is bounded by the same count, so this is the cap on all
+    /// per-document state the registry keeps.
     pub max_files: usize,
     /// Capacity of the change broadcast channel.
     pub channel_capacity: usize,
@@ -106,14 +117,23 @@ struct PendingEntry {
     sequence: u64,
 }
 
+/// The keys already delivered for one document, plus its eviction order.
+#[derive(Debug, Default)]
+struct DeliveredEntry {
+    /// Keys already returned by a previous [`DiagnosticRegistry::drain`].
+    keys: BTreeSet<String>,
+    /// Monotonic touch counter, used for the `max_files` bound.
+    sequence: u64,
+}
+
 /// Registry state under one lock.
 #[derive(Debug, Default)]
 struct RegistryState {
     /// Buffered documents keyed by URI.
     pending: BTreeMap<String, PendingEntry>,
     /// Keys already returned by a previous [`DiagnosticRegistry::drain`], per URI.
-    delivered: BTreeMap<String, BTreeSet<String>>,
-    /// Monotonic arrival counter.
+    delivered: BTreeMap<String, DeliveredEntry>,
+    /// Monotonic arrival counter, shared by `pending` and `delivered` ordering.
     sequence: u64,
 }
 
@@ -246,7 +266,7 @@ impl DiagnosticRegistry {
 
         let mut selected: Vec<(String, PendingEntry)> = Vec::new();
         for (uri, mut entry) in entries {
-            let delivered = state.delivered.get(&uri);
+            let delivered = state.delivered.get(&uri).map(|stored| &stored.keys);
             let mut seen: BTreeSet<String> = BTreeSet::new();
             entry.diagnostics.retain(|diagnostic| {
                 let key = diagnostic_key(diagnostic);
@@ -273,12 +293,12 @@ impl DiagnosticRegistry {
             let mut diagnostics = entry.diagnostics;
             diagnostics.truncate(remaining);
             total += diagnostics.len();
+            state.sequence = state.sequence.wrapping_add(1);
+            let sequence = state.sequence;
+            let stored = state.delivered.entry(uri.clone()).or_default();
+            stored.sequence = sequence;
             for diagnostic in &diagnostics {
-                state
-                    .delivered
-                    .entry(uri.clone())
-                    .or_default()
-                    .insert(diagnostic_key(diagnostic));
+                stored.keys.insert(diagnostic_key(diagnostic));
             }
             files.push(DiagnosticsFile {
                 local_path: uri_to_path(&uri).to_string_lossy().into_owned(),
@@ -287,6 +307,9 @@ impl DiagnosticRegistry {
                 diagnostics,
             });
         }
+        // The delivered history is bounded like the buffer: a long session must not retain one
+        // key set per document it has ever drained.
+        evict_excess(&mut state, self.config.max_files);
         files
     }
 
@@ -331,7 +354,10 @@ fn severity_of(diagnostic: &Diagnostic) -> u32 {
     diagnostic.severity.unwrap_or(DEFAULT_SEVERITY)
 }
 
-/// Evicts the least recently updated documents until at most `max_files` remain.
+/// Evicts the least recently updated documents until at most `max_files` remain in state.
+///
+/// Both maps are bounded by the same cap: a document leaves the buffer and its delivered-key
+/// history together, so the registry keeps no per-file state for URIs it no longer buffers.
 fn evict_excess(state: &mut RegistryState, max_files: usize) {
     let cap = max_files.max(1);
     while state.pending.len() > cap {
@@ -344,6 +370,18 @@ fn evict_excess(state: &mut RegistryState, max_files: usize) {
             break;
         };
         state.pending.remove(&oldest);
+        state.delivered.remove(&oldest);
+    }
+    while state.delivered.len() > cap {
+        let oldest = state
+            .delivered
+            .iter()
+            .min_by_key(|(_, entry)| entry.sequence)
+            .map(|(uri, _)| uri.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        state.delivered.remove(&oldest);
     }
 }
 
