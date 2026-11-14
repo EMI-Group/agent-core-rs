@@ -19,11 +19,12 @@ use openjiuwen_common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::analyzer::ExtractedFact;
+use crate::analyzer::{ExtractedFact, ExtractionInput};
 use crate::config::MemoryScopeConfig;
 use crate::engine::VariableWrite;
-use crate::record::{AddOptions, MemoryRecord, MemoryScope, NewMemory, DEFAULT_ID};
+use crate::record::{AddOptions, MemoryRecord, MemoryScope, DEFAULT_ID};
 
+use super::record_input;
 use super::LongTermMemory;
 
 /// The tag the analyzer puts on a variable-assignment fact.
@@ -32,19 +33,20 @@ const VARIABLE_TAG: &str = "variable";
 const VARIABLE_NAME_FIELD: &str = "variable";
 /// The analyzer metadata key holding the variable value.
 const VARIABLE_VALUE_FIELD: &str = "value";
-/// The crate-wide metadata key for free-form tags (the `integrations` convention).
-const TAGS_KEY: &str = "tags";
 
-/// What one [`LongTermMemory::remember_variables`] call did.
+/// What one [`LongTermMemory::remember_variables`] or
+/// [`LongTermMemory::remember_with_assignments`] call did.
 ///
 /// `extracted` is the number of facts considered, `variables` the number written as
 /// [`MemoryType::Variable`](crate::record::MemoryType::Variable) projections, and the
 /// `records_*` counters aggregate the [`AddOutcome`](crate::record::AddOutcome) of every
-/// remaining fact.
+/// remaining fact. `degraded` and `gated` report the `remember` pipeline's two fallback
+/// paths (a model stage that fell back to rules, and the proactive gate withholding a
+/// batch when the scope carries analyzer overrides).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct VariableAssignmentReport {
-    /// Number of facts the caller supplied.
+    /// Number of facts considered (supplied, or extracted from the conversation).
     pub extracted: usize,
     /// Number of variable-tagged facts written as variable records.
     pub variables: usize,
@@ -54,6 +56,17 @@ pub struct VariableAssignmentReport {
     pub records_merged: usize,
     /// Number of remaining facts dropped by the dedupe policy.
     pub records_skipped: usize,
+    /// Why a deterministic fallback ran instead of the model, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+    /// Why the proactive stage withheld the batch, when it did.
+    ///
+    /// Only set by [`LongTermMemory::remember_with_assignments`], and only when the scope
+    /// carries analyzer overrides (that is what turns the pipeline's advisory proactive
+    /// decision into a gate): the report then names the decision's reason and nothing is
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated: Option<String>,
 }
 
 /// Validates a variable name: non-empty after trimming, without `/` or NUL.
@@ -181,6 +194,75 @@ impl LongTermMemory {
             extracted: facts.len(),
             ..VariableAssignmentReport::default()
         };
+        self.write_assignment_facts(scope, facts, options, &mut report)
+            .await?;
+        Ok(report)
+    }
+
+    /// Analyzes `input` like [`LongTermMemory::remember`] and writes the facts it
+    /// produces, turning variable assignments into real variable records.
+    ///
+    /// This is the end-to-end variant of [`LongTermMemory::remember_variables`]: it runs
+    /// [`LongTermMemory::remember`]'s analysis pass (the staged
+    /// [`StagedAnalyzer`](crate::analyzer::StagedAnalyzer) over the engine configuration
+    /// plus the scope's resolved analyzer overrides) and then the same
+    /// write split. A fact carrying the `variable` metadata key (the name) and `value`
+    /// (its value) — the shape [`RuleExtractor`](crate::analyzer::RuleExtractor) emits
+    /// together with the `variable` tag — becomes one
+    /// [`MemoryType::Variable`](crate::record::MemoryType::Variable) projection and never
+    /// a `SemanticMemory` record; every other fact follows the ordinary record path with
+    /// its tags preserved.
+    ///
+    /// [`LongTermMemory::remember`] keeps its documented behaviour: it still stores such
+    /// a fact as a `SemanticMemory` record, so existing callers are unchanged. This method
+    /// is the opt-in route that produces real variable records from a conversation; use
+    /// [`LongTermMemory::remember_variables`] when the facts are already extracted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] for an invalid scope or input, for a malformed
+    /// stored override document, or for a variable name the write path rejects (a
+    /// forbidden name is named in the message); [`Error::Unsupported`] when a stored
+    /// override names a `model`/`embedding` this facade does not hold;
+    /// [`Error::Cancelled`] when `options.call` fires (earlier writes stay stored); and
+    /// the analyzer's, storage's, or embedding error otherwise. A failed write is never
+    /// dropped silently: the error names the fact index and content.
+    pub async fn remember_with_assignments(
+        &self,
+        scope: &MemoryScope,
+        input: &ExtractionInput,
+        options: &AddOptions,
+    ) -> Result<VariableAssignmentReport> {
+        scope.validate()?;
+        options.call.check()?;
+        let (facts, analysis) = self.analyze_for_write(scope, input, options).await?;
+        let mut report = VariableAssignmentReport {
+            extracted: analysis.extracted,
+            degraded: analysis.degraded,
+            gated: analysis.gated,
+            ..VariableAssignmentReport::default()
+        };
+        if report.gated.is_some() {
+            return Ok(report);
+        }
+        self.write_assignment_facts(scope, &facts, options, &mut report)
+            .await?;
+        Ok(report)
+    }
+
+    /// Writes `facts` in order, projecting variable assignments and storing the rest.
+    ///
+    /// The shared write loop of [`LongTermMemory::remember_variables`] and
+    /// [`LongTermMemory::remember_with_assignments`]: cancellation is checked between
+    /// facts, each write is one engine call, a rejected variable name fails the call with
+    /// the fact index and name, and `report` accumulates the counters.
+    async fn write_assignment_facts(
+        &self,
+        scope: &MemoryScope,
+        facts: &[ExtractedFact],
+        options: &AddOptions,
+        report: &mut VariableAssignmentReport,
+    ) -> Result<()> {
         for (index, fact) in facts.iter().enumerate() {
             options.call.check()?;
             let Some((name, value)) = variable_assignment(fact) else {
@@ -207,7 +289,7 @@ impl LongTermMemory {
                 }
             }
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Reads variables of `scope`: every stored variable when `names` is `None`, or the
@@ -334,31 +416,20 @@ fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Converts an extracted fact into an engine write input, keeping its tags.
-///
-/// [`ExtractedFact::to_new_memory`] already carries content, kind, importance, source,
-/// and metadata. Tags are not a [`NewMemory`] field, so they go under the crate's `tags`
-/// metadata key (the convention `crate::facade::integrations` and `lite` use) unless the
-/// fact supplies that key itself.
-fn record_input(fact: &ExtractedFact) -> NewMemory {
-    let mut memory = fact.to_new_memory();
-    if !fact.tags.is_empty() && !memory.metadata.contains_key(TAGS_KEY) {
-        let tags = fact.tags.iter().cloned().map(Value::String);
-        memory
-            .metadata
-            .insert(TAGS_KEY.to_owned(), Value::Array(tags.collect()));
-    }
-    memory
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use openjiuwen_retrieval::embedding::Embedding;
     use tokio_util::sync::CancellationToken;
 
-    use crate::analyzer::ExtractionInput;
+    use crate::analyzer::ExtractorKind;
     use crate::config::MemoryEngineConfig;
+    use crate::facade::{ScopeAnalyzerOverrideSpec, TAGS_KEY};
     use crate::record::MemoryType;
 
     async fn facade() -> std::sync::Arc<LongTermMemory> {
@@ -823,5 +894,301 @@ mod tests {
             .await
             .expect("kv")
             .is_empty());
+    }
+
+    #[test]
+    fn record_input_carries_the_fact_tags_under_the_shared_key() {
+        let fact = ExtractedFact {
+            content: "Alice prefers dark mode".to_owned(),
+            kind: MemoryType::UserProfile,
+            importance: 0.8,
+            tags: vec!["preference".to_owned(), "identity".to_owned()],
+            source: Some("rule".to_owned()),
+            ..ExtractedFact::default()
+        };
+        let memory = record_input(&fact);
+        assert_eq!(memory.content, "Alice prefers dark mode");
+        assert_eq!(memory.kind, MemoryType::UserProfile);
+        assert_eq!(memory.importance, Some(0.8));
+        assert_eq!(memory.source.as_deref(), Some("rule"));
+        assert_eq!(
+            memory.metadata.get(TAGS_KEY),
+            Some(&Value::Array(vec![
+                Value::String("preference".to_owned()),
+                Value::String("identity".to_owned()),
+            ]))
+        );
+
+        // A fact that already supplies the key keeps its own value.
+        let mut explicit = fact.clone();
+        explicit.tags = vec!["ignored".to_owned()];
+        explicit.metadata.insert(
+            TAGS_KEY.to_owned(),
+            Value::Array(vec![Value::String("kept".to_owned())]),
+        );
+        assert_eq!(
+            record_input(&explicit).metadata.get(TAGS_KEY),
+            Some(&Value::Array(vec![Value::String("kept".to_owned())]))
+        );
+
+        // No tags, no empty metadata key.
+        let untagged = ExtractedFact::semantic("plain fact");
+        assert!(!record_input(&untagged).metadata.contains_key(TAGS_KEY));
+    }
+
+    #[tokio::test]
+    async fn remember_with_assignments_projects_a_rule_assignment() {
+        let ltm = facade().await;
+        let scope = scope();
+        let input = ExtractionInput::from_text("I prefer dark mode. set theme to dark");
+        let report = ltm
+            .remember_with_assignments(&scope, &input, &AddOptions::default())
+            .await
+            .expect("remember with assignments");
+        assert_eq!(
+            (
+                report.extracted,
+                report.variables,
+                report.records_added,
+                report.records_merged,
+                report.records_skipped,
+            ),
+            (2, 1, 1, 0, 0),
+            "{report:?}"
+        );
+        assert_eq!(report.degraded, None);
+        assert_eq!(report.gated, None);
+
+        // The assignment became a real variable record (KV entry plus projection).
+        let variables = ltm.variable_records(&scope).await.expect("variables");
+        assert_eq!(variables.len(), 1);
+        assert_eq!(variables[0].kind, MemoryType::Variable);
+        assert_eq!(variables[0].content, "theme=dark");
+        assert_eq!(
+            ltm.get_variables(&scope, None)
+                .await
+                .expect("kv")
+                .get("theme")
+                .map(String::as_str),
+            Some("dark")
+        );
+
+        // The preference stayed an ordinary record; the assignment never did.
+        let records = ltm.list(&scope, &[]).await.expect("list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "I prefer dark mode");
+        assert_eq!(records[0].kind, MemoryType::UserProfile);
+        assert!(records[0]
+            .metadata
+            .get(TAGS_KEY)
+            .and_then(Value::as_array)
+            .is_some_and(|tags| !tags.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_assignment_updates_the_projection_in_place() {
+        let ltm = facade().await;
+        let scope = scope();
+        let first = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("set theme to dark"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("first");
+        assert_eq!((first.extracted, first.variables), (1, 1), "{first:?}");
+        let created = ltm.variable_records(&scope).await.expect("records")[0].timestamp;
+
+        let second = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("set theme to light"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("second");
+        assert_eq!((second.extracted, second.variables), (1, 1), "{second:?}");
+        let records = ltm.variable_records(&scope).await.expect("records");
+        assert_eq!(records.len(), 1, "one projection per variable name");
+        assert_eq!(records[0].content, "theme=light");
+        assert_eq!(records[0].timestamp, created, "creation time is preserved");
+        assert_eq!(
+            ltm.get_variables(&scope, None)
+                .await
+                .expect("kv")
+                .get("theme")
+                .map(String::as_str),
+            Some("light")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_assignment_fails_and_keeps_the_earlier_facts() {
+        let ltm = facade_with(forbidding("api_key")).await;
+        let scope = scope();
+        let error = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("I prefer dark mode. api_key = secret"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect_err("forbidden");
+        assert!(matches!(error, Error::Validation(_)), "{error:?}");
+        let message = format!("{error:?}");
+        assert!(message.contains("api_key"), "{message}");
+        assert!(message.contains("forbidden"), "{message}");
+
+        // The fact written before the rejected one stays; the variable is absent.
+        let records = ltm.list(&scope, &[]).await.expect("list");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].content, "I prefer dark mode");
+        assert_eq!(
+            ltm.variable_records(&scope).await.expect("records").len(),
+            0
+        );
+        assert!(!ltm
+            .get_variables(&scope, None)
+            .await
+            .expect("kv")
+            .contains_key("api_key"));
+    }
+
+    #[tokio::test]
+    async fn remember_with_assignments_folds_a_model_fallback_into_the_report() {
+        // An emptied script makes every model call unusable, so the scope's `llm`
+        // extractor exhausts its retry budget and falls back to the rule extractor.
+        let model = openjiuwen_test_support::ScriptedModel::builder().build();
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .model(Arc::new(model))
+            .build()
+            .expect("facade with a model");
+        ltm.set_scope_overrides(
+            "ws",
+            &ScopeAnalyzerOverrideSpec::new().with_extractor(ExtractorKind::Llm),
+        )
+        .await
+        .expect("override");
+        let scope = scope();
+        let report = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("I prefer dark mode. set theme to dark"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("remember");
+        let degraded = report
+            .degraded
+            .as_deref()
+            .expect("the fallback is recorded");
+        assert!(degraded.contains("fell back to rules"), "{degraded}");
+        assert_eq!(
+            (
+                report.extracted,
+                report.variables,
+                report.records_added,
+                report.gated.as_deref(),
+            ),
+            (2, 1, 1, None),
+            "{report:?}"
+        );
+        // The rule fallback still produced the assignment and the preference.
+        assert_eq!(
+            ltm.variable_records(&scope).await.expect("records")[0].content,
+            "theme=dark"
+        );
+        assert_eq!(ltm.list(&scope, &[]).await.expect("list").len(), 1);
+    }
+
+    /// An embedding model that cancels a token on the second call, so the write loop's
+    /// between-facts cancellation check is exercised deterministically.
+    struct CancelOnSecondEmbed {
+        /// Number of embedding calls so far.
+        calls: AtomicUsize,
+        /// The token to cancel.
+        token: CancellationToken,
+    }
+
+    #[async_trait]
+    impl Embedding for CancelOnSecondEmbed {
+        #[allow(clippy::unnecessary_literal_bound)] // the trait signature ties `&str` to `self`
+        fn model_name(&self) -> &str {
+            "cancel-on-second-embed"
+        }
+
+        fn dimension_hint(&self) -> Option<usize> {
+            Some(4)
+        }
+
+        async fn embed_query(&self, _text: &str) -> openjiuwen_common::error::Result<Vec<f32>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.token.cancel();
+            }
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+
+        async fn embed_documents(
+            &self,
+            texts: &[String],
+            _batch_size: Option<usize>,
+        ) -> openjiuwen_common::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_call_writes_no_facts_or_variables() {
+        let ltm = facade().await;
+        let scope = scope();
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("I prefer dark mode. set theme to dark"),
+                &AddOptions::default().with_cancellation(token),
+            )
+            .await
+            .expect_err("cancelled");
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
+        assert_eq!(ltm.list(&scope, &[]).await.expect("list").len(), 0);
+        assert_eq!(
+            ltm.variable_records(&scope).await.expect("records").len(),
+            0
+        );
+        assert!(ltm
+            .get_variables(&scope, None)
+            .await
+            .expect("kv")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_facts_stops_the_write_loop() {
+        let token = CancellationToken::new();
+        let embedding = Arc::new(CancelOnSecondEmbed {
+            calls: AtomicUsize::new(0),
+            token: token.clone(),
+        });
+        let ltm = LongTermMemory::builder(MemoryEngineConfig::default())
+            .embedding(embedding)
+            .build()
+            .expect("facade with an embedding");
+        let scope = scope();
+        let error = ltm
+            .remember_with_assignments(
+                &scope,
+                &ExtractionInput::from_text("I prefer dark mode. The service uses postgres."),
+                &AddOptions::default().with_cancellation(token),
+            )
+            .await
+            .expect_err("cancelled");
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
+        // The first fact was already committed; nothing after the cancellation was.
+        let records = ltm.list(&scope, &[]).await.expect("list");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].content, "I prefer dark mode");
     }
 }

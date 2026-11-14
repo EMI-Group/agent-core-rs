@@ -66,6 +66,8 @@ impl LongTermMemory {
     pub async fn variable_records(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>>;
     pub async fn remember_variables(&self, scope: &MemoryScope, facts: &[ExtractedFact],
                                     options: &AddOptions) -> Result<VariableAssignmentReport>;
+    pub async fn remember_with_assignments(&self, scope: &MemoryScope, input: &ExtractionInput,
+                                           options: &AddOptions) -> Result<VariableAssignmentReport>;
 
     // --- scope config ---
     pub async fn set_scope_config(&self, scope_id: &str, config: MemoryScopeConfig) -> Result<bool>;
@@ -136,6 +138,10 @@ Per-scope analyzer overrides (`overrides`):
 - `set_variable` keeps its signature and delegating shape: it is `assign_variable` with `AddOptions::default()`, so the write is the KV entry **plus** the `MemoryType::Variable` record projection built by `MemoryEngine::write_variable`; a name in `forbidden_variables` is `Error::Validation` naming the variable before any write. `assign_variable` is the options-aware (cancellable, timeout, `skip_embedding`) form returning `VariableWrite { record_id, created }`.
 - `delete_variables` validates every name first, then removes both representations per name through `MemoryEngine::delete_variable_everywhere` (KV entry plus projection row and vector) and counts the names that existed. `variable_records` lists the projections ascending by `(timestamp, id)`; the same `(user, scope, session, name)` always maps to one deterministic id, so a rewrite updates in place and never enters the text-similarity dedupe scan.
 - `remember_variables(scope, facts, options)` is the opt-in variable path for analyzer facts: a fact tagged `variable` whose metadata carries `variable` (name) and `value` writes a `Variable` projection (`VariableAssignmentReport::variables`), every other fact is stored as a record exactly like `remember` (`records_added`/`records_merged`/`records_skipped`). `remember` itself still stores such a fact as a `SemanticMemory` record, which keeps `tests/analyzer_wiring.rs` behaviour unchanged.
+- `remember_with_assignments(scope, input, options)` is the end-to-end variant: `analyze_for_write` (exactly `remember`'s staged pipeline and override gate) followed by the same write split as `remember_variables`, reporting `extracted`/`variables`/`records_*` plus the pipeline's `degraded` and `gated` reasons on `VariableAssignmentReport`.
+- `analyze_for_write(scope, input, options)` is the shared `remember` analysis pass: it returns the facts to write plus a `RememberReport` carrying only `extracted`/`degraded`/`gated`, so `remember` and `remember_with_assignments` cannot drift; a gated batch returns no facts.
+- `record_input(fact)` in `mod.rs` is the facade's single `ExtractedFact` → `NewMemory` conversion (tags under `TAGS_KEY = "tags"`, an existing key wins); `remember`, `remember_variables` and `remember_with_assignments` all use it.
+- `write_assignment_facts` is the shared write loop of both variable paths: cancellation between facts, one engine call per fact, a rejected variable name failing the call with the fact index and name.
 - Scope config: `scope_id` validated like `MemoryScope`; JSON stored under `memory_scope_config/{scope_id}`.
 - Scope analyzer overrides (`overrides.rs`): the serializable `ScopeAnalyzerOverrideSpec` (`extractor`, `classifier`, `min_importance`, `max_facts`, `default_importance`, `stages`, `model`, `embedding`) is stored as JSON under `memory_scope_overrides/{scope_id}`; `set` validates the document's shape only, `get` rejects a mis-shaped payload with `Error::Validation` naming the scope, and `resolve_scope_overrides` resolves it against `ScopeOverrideHandles` (the engine's model/embedding, `Debug` reports names only). A named `model` the facade does not hold, or any embedding name that differs from the engine's, is `Error::Unsupported` naming the requested handle — the engine embedding is fixed at construction. `delete_scope_overrides` is separate: `delete_scope_config` keeps its signature and clears `memory_scope_config/{scope_id}` only.
 - `analyzer` defaults to `MemoryAnalyzer::from_engine(config, model)`: rules unless `config.extraction.extractor` asks for the LLM *and* a model is attached; `builder().analyzer(...)` replaces it (tests use this to inject a scripted extractor).
@@ -158,18 +164,18 @@ Per-scope analyzer overrides (`overrides`):
 
 ## Routing Table
 
-- `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports
+- `./mod.rs` → `LongTermMemory`, builder, constructors, accessors, re-exports, and the shared `record_input`/`TAGS_KEY` conversion
 - `./records.rs` → CRUD/listing/stats methods and Python parity aliases
 - `./recall.rs` → `search`, `recall`, `search_all`
 - `./messages.rs` → `add_messages`, `get_recent_messages`, `get_message_page`/`page_messages`, `clear_messages`, extraction/fallback
-- `./variables.rs` → variable methods (`set`/`assign`/`get`/`delete`, `variable_records`, `remember_variables`), `VariableAssignmentReport`, and scope-config methods
+- `./variables.rs` → variable methods (`set`/`assign`/`get`/`delete`, `variable_records`, `remember_variables`, `remember_with_assignments`), `VariableAssignmentReport` (`extracted`, `variables`, `records_added`, `records_merged`, `records_skipped`, `degraded`, `gated`), and scope-config methods
 - `./overrides.rs` → `ScopeAnalyzerOverrideSpec`/`ScopeOverrideHandles`, persisted per-scope overrides, resolution, and the value the staged pipeline consumes
-- `./integrations.rs` → analyzer/remember/consolidate (staged pipeline + scope overrides), provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
+- `./integrations.rs` → analyzer/remember/consolidate (staged pipeline + scope overrides + the shared `analyze_for_write`), provider SPI, team memory, dreaming, SQLite migration constructor, local coding bridge
 
 ## Test Strategy
 
 - Thin facade tests cover constructor defaults, builder injection, Python aliases, page math, and `search_all` degradation when graph recall fails.
-- `variables.rs` adds KV-plus-projection, in-place rewrite, forbidden-name, delete-both, cancellation and `remember_variables` coverage; `messages.rs` adds the page walk, tampered cursor, empty/oversized page, filter-composition and projected-variable coverage.
+- `variables.rs` adds KV-plus-projection, in-place rewrite, forbidden-name, delete-both, cancellation and `remember_variables` coverage, plus `remember_with_assignments` end-to-end coverage (rule assignment, in-place rewrite, forbidden name keeping earlier facts, LLM-fallback `degraded`, pre-cancelled and mid-loop cancellation via a cancelling `Embedding`) and a direct `record_input` tag assertion; `messages.rs` adds the page walk, tampered cursor, empty/oversized page, filter-composition and projected-variable coverage.
 - `overrides.rs` unit tests pin the spec's JSON round trip (unknown/absent fields), empty detection, scalar resolution, the typed `Unsupported` errors for unresolvable names, and persistence across in-memory, local-file, and SQLite facades (including a malformed stored payload).
 - `integrations.rs` unit tests pin the override→pipeline wiring: `max_facts` changing what `remember` writes, an empty spec matching the unconfigured run, the proactive gate reporting on `gated`, a degraded model fallback under an `llm` override, cancellation writing nothing, and `consolidate` resolving a scope classifier while still returning a plan only.
 - The heavy behavior suites live in `tests/` (`crud.rs`, `scoping.rs`, `recall.rs`, `dedupe.rs`, `graph.rs`, `lite.rs`, `lite_local.rs`, `sqlite.rs`, `analyzer_wiring.rs`, `external_provider.rs`, `team_memory.rs`, `dreaming.rs`, `migration.rs`).

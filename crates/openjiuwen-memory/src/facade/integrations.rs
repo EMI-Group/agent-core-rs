@@ -22,6 +22,13 @@
 //! - the proactive stage's decision is advisory unless the scope carries explicit
 //!   overrides (the pipeline documents it as advisory); with overrides in effect the
 //!   decision gates the write and [`RememberReport::gated`] records why.
+//!
+//! [`LongTermMemory::analyze_for_write`] is that whole analysis pass; `remember` writes
+//! its facts as records, while
+//! [`LongTermMemory::remember_with_assignments`](crate::facade::LongTermMemory::remember_with_assignments)
+//! writes the variable-assignment facts as real
+//! [`MemoryType::Variable`](crate::record::MemoryType::Variable) projections. Both go
+//! through the facade's single [`record_input`] conversion, which keeps a fact's tags.
 use std::path::Path;
 use std::sync::Arc;
 
@@ -45,10 +52,8 @@ use crate::store::MemoryStores;
 #[cfg(feature = "sqlite")]
 use openjiuwen_common::error::Error;
 
+use super::record_input;
 use super::LongTermMemory;
-
-/// The metadata key the crate uses for free-form tags.
-const TAGS_KEY: &str = "tags";
 
 /// The tracing target of facade diagnostics.
 const TARGET: &str = "openjiuwen_memory::facade";
@@ -117,9 +122,51 @@ impl LongTermMemory {
         options: &AddOptions,
     ) -> Result<RememberReport> {
         scope.validate()?;
+        let (facts, mut report) = self.analyze_for_write(scope, input, options).await?;
+        if report.gated.is_some() {
+            return Ok(report);
+        }
+        for (index, fact) in facts.iter().enumerate() {
+            options.call.check()?;
+            let outcome = self
+                .engine
+                .add(scope, record_input(fact), options)
+                .await
+                .map_err(|error| {
+                    error.with_context(format!("writing fact {index} (`{}`)", fact.content))
+                })?;
+            report.added += outcome.added.len();
+            report.merged += outcome.merged.len();
+            report.skipped += outcome.skipped.len();
+        }
+        Ok(report)
+    }
+
+    /// Runs `remember`'s analysis pass and returns the facts to write.
+    ///
+    /// The returned [`RememberReport`] carries `extracted`, `degraded`, and `gated`; its
+    /// write counters stay at zero for the caller to fill from each
+    /// [`AddOutcome`](crate::record::AddOutcome), so the same analysis feeds both
+    /// [`LongTermMemory::remember`] and
+    /// [`LongTermMemory::remember_with_assignments`]. A gated batch returns no facts at
+    /// all, and a builder-injected analyzer keeps owning extraction while the scope
+    /// carries no overrides (see the module docs).
+    pub(super) async fn analyze_for_write(
+        &self,
+        scope: &MemoryScope,
+        input: &ExtractionInput,
+        options: &AddOptions,
+    ) -> Result<(Vec<ExtractedFact>, RememberReport)> {
         let overrides = self.resolve_scope_overrides(scope).await?;
         if overrides.is_empty() && self.uses_injected_analyzer() {
-            return self.remember_with_analyzer(scope, input, options).await;
+            let extraction = self.analyzer.analyze(input, &options.call).await?;
+            let report = RememberReport {
+                extracted: extraction.facts.len(),
+                degraded: extraction.degraded,
+                gated: None,
+                ..RememberReport::default()
+            };
+            return Ok((extraction.facts, report));
         }
         let staged = StagedAnalyzer::from_engine(self.config(), self.engine.model().cloned())
             .with_overrides(overrides.clone())
@@ -130,10 +177,10 @@ impl LongTermMemory {
             degraded: result.result.degraded.clone(),
             ..RememberReport::default()
         };
-        let facts: Vec<&ExtractedFact> = if overrides.is_empty() {
-            result.facts().iter().collect()
+        let facts: Vec<ExtractedFact> = if overrides.is_empty() {
+            result.facts().to_vec()
         } else if result.should_write() {
-            result.writable_facts()
+            result.writable_facts().into_iter().cloned().collect()
         } else {
             let reason = result.decision.as_ref().map_or_else(
                 || "the proactive stage withheld the write".to_owned(),
@@ -147,55 +194,9 @@ impl LongTermMemory {
                 "remember withheld the write under the scope override gate"
             );
             report.gated = Some(reason);
-            return Ok(report);
+            return Ok((Vec::new(), report));
         };
-        for (index, fact) in facts.iter().enumerate() {
-            options.call.check()?;
-            let outcome = self
-                .engine
-                .add(scope, write_memory(fact), options)
-                .await
-                .map_err(|error| {
-                    error.with_context(format!("writing fact {index} (`{}`)", fact.content))
-                })?;
-            report.added += outcome.added.len();
-            report.merged += outcome.merged.len();
-            report.skipped += outcome.skipped.len();
-        }
-        Ok(report)
-    }
-
-    /// Runs the analyzer the facade was built with (the pre-pipeline `remember` path).
-    ///
-    /// Used only when a builder supplied a custom analyzer *and* the scope carries no
-    /// analyzer overrides: the staged pipeline builds its extract stage from the
-    /// configuration, so it cannot run a caller-supplied [`crate::analyzer::FactExtractor`].
-    async fn remember_with_analyzer(
-        &self,
-        scope: &MemoryScope,
-        input: &ExtractionInput,
-        options: &AddOptions,
-    ) -> Result<RememberReport> {
-        let extraction = self.analyzer.analyze(input, &options.call).await?;
-        let mut report = RememberReport {
-            extracted: extraction.facts.len(),
-            degraded: extraction.degraded,
-            ..RememberReport::default()
-        };
-        for (index, fact) in extraction.facts.iter().enumerate() {
-            options.call.check()?;
-            let outcome = self
-                .engine
-                .add(scope, write_memory(fact), options)
-                .await
-                .map_err(|error| {
-                    error.with_context(format!("writing fact {index} (`{}`)", fact.content))
-                })?;
-            report.added += outcome.added.len();
-            report.merged += outcome.merged.len();
-            report.skipped += outcome.skipped.len();
-        }
-        Ok(report)
+        Ok((facts, report))
     }
 
     /// Whether [`LongTermMemoryBuilder::analyzer`](super::LongTermMemoryBuilder::analyzer)
@@ -389,23 +390,6 @@ impl LongTermMemory {
     }
 }
 
-/// Converts an extracted fact into an engine write input, keeping its tags.
-///
-/// [`ExtractedFact::to_new_memory`] already carries content, kind, importance, source, and
-/// metadata. Tags are not a [`NewMemory`] field, so they go under the crate's `tags`
-/// metadata key (the convention `lite` uses) unless the fact supplies that key itself.
-fn write_memory(fact: &ExtractedFact) -> NewMemory {
-    let mut memory = fact.to_new_memory();
-    if !fact.tags.is_empty() && !memory.metadata.contains_key(TAGS_KEY) {
-        let tags = fact.tags.iter().cloned().map(serde_json::Value::String);
-        memory.metadata.insert(
-            TAGS_KEY.to_owned(),
-            serde_json::Value::Array(tags.collect()),
-        );
-    }
-    memory
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +401,7 @@ mod tests {
     use openjiuwen_common::error::Error;
 
     use super::super::ScopeAnalyzerOverrideSpec;
+    use crate::facade::TAGS_KEY;
 
     async fn ltm() -> Arc<LongTermMemory> {
         LongTermMemory::in_memory(MemoryEngineConfig::default())
