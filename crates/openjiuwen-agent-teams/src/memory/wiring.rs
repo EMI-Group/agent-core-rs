@@ -39,6 +39,28 @@
 //! [`CallOptions::new`] (never cancels, never times out). A caller that needs a deadline drives
 //! [`TeamMemoryWiring::hooks`] directly; the pass-throughs are the convenience path, not the only one.
 //!
+//! # Observability
+//!
+//! A traced configuration ([`MemoryConfig::trace`]) chains the crate's team-memory observer
+//! ([`MemorySpanObserver`](crate::observability::MemorySpanObserver)) onto the facade where the
+//! facade is built — [`TeamMemory::with_observer`] consumes it, so it cannot be added later. Every
+//! observable operation then becomes one `memory.{operation}` span plus one structured `tracing`
+//! event at target `openjiuwen_agent_teams::memory`, and on the `otel` build one
+//! `SpanRecord` in [`MemoryConfig::otel_sink`]. The
+//! facade owns the observer for the wiring's lifetime; [`TeamMemoryWiring::observer`] keeps a second
+//! handle to the same object, and `trace: false` or a disabled configuration attaches none.
+//!
+//! Two caveats belong here because they are visible from this node:
+//!
+//! - The bridge mints its trace from the team name
+//!   ([`TeamSpan::root_for`](crate::observability::TeamSpan::root_for)), so a wiring's `memory.*`
+//!   spans are a *sibling* trace of the runtime's `team.{team_name}` trace, not children of it:
+//!   the wiring never sees the runtime's root span. Joining the two needs a
+//!   `MemorySpanObserver::from_root(TeamSpan)` constructor on the observability node.
+//! - Real OTLP export stays deferred: the `opentelemetry` SDK and the exporter live in
+//!   `openjiuwen-extensions`, which sits in this crate's dependency layer and cannot be depended on
+//!   from here, which is why the `otel` feature only fills an in-memory sink.
+//!
 //! # Failure
 //!
 //! A failing hook is logged once with the team and the member and its error is returned
@@ -58,13 +80,14 @@ use openjiuwen_memory::record::CallOptions;
 use openjiuwen_memory::team::{
     LlmTeamExtractor, MemberMemoryContext, MemberMemoryToolkit, RuleTeamExtractor,
     TeamExtractConfig, TeamMemory, TeamMemoryExtractor, TeamMemoryFilter, TeamMemoryFlush,
-    TeamMemoryHooks, TeamMemoryRecord, TeamTurn, MAX_SCOPE_ID_CHARS,
+    TeamMemoryHooks, TeamMemoryObserver, TeamMemoryRecord, TeamTurn, MAX_SCOPE_ID_CHARS,
 };
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use crate::memory::config::{MemoryConfig, MemoryExtractorKind};
 use crate::memory::tools::team_memory_tools;
+use crate::memory::trace;
 
 /// The tracing target of every log line this module emits.
 const LOG_TARGET: &str = "openjiuwen_agent_teams::memory";
@@ -89,6 +112,9 @@ pub struct TeamMemoryWiring {
     document_path: PathBuf,
     /// One toolkit per member, keyed by member name.
     toolkits: Mutex<BTreeMap<String, Arc<MemberMemoryToolkit>>>,
+    /// The observer the facade reports to, when the configuration traces; the facade holds the
+    /// same object, and this field is the handle a host can inspect without asking the engine.
+    observer: Option<Arc<dyn TeamMemoryObserver>>,
 }
 
 impl fmt::Debug for TeamMemoryWiring {
@@ -99,6 +125,7 @@ impl fmt::Debug for TeamMemoryWiring {
             .field("config", &self.config)
             .field("document_path", &self.document_path)
             .field("extractor", &self.hooks.extractor_name())
+            .field("trace", &self.trace_enabled())
             .field("toolkits", &self.toolkits.lock().len())
             .finish_non_exhaustive()
     }
@@ -162,7 +189,8 @@ impl TeamMemoryWiring {
             || workspace_root.join(TEAM_MEMORY_FILE),
             |dir| dir.join(TEAM_MEMORY_FILE),
         );
-        let memory = Arc::new(TeamMemory::in_memory());
+        let (memory, observer) = trace::facade(&team_id, &config);
+        let memory = Arc::new(memory);
         let hooks = TeamMemoryHooks::new(
             team_id.clone(),
             Arc::clone(&memory),
@@ -176,6 +204,7 @@ impl TeamMemoryWiring {
             hooks,
             document_path,
             toolkits: Mutex::new(BTreeMap::new()),
+            observer,
         });
         if wiring.config.enabled && wiring.config.import_on_build {
             if let Err(error) = wiring.import().await {
@@ -212,6 +241,7 @@ impl TeamMemoryWiring {
             hooks,
             document_path: self.document_path.clone(),
             toolkits: Mutex::new(BTreeMap::new()),
+            observer: self.observer.clone(),
         })
     }
 
@@ -249,6 +279,25 @@ impl TeamMemoryWiring {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Whether this wiring observes its operations, i.e. it is enabled and
+    /// [`MemoryConfig::trace`] is on.
+    ///
+    /// `false` means no `memory.*` span, no `tracing` event and no sink record is produced.
+    #[must_use]
+    pub fn trace_enabled(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// The observer the facade reports to, when [`Self::trace_enabled`].
+    ///
+    /// The facade holds the same object
+    /// ([`TeamMemory::observer`](openjiuwen_memory::team::TeamMemory::observer)), so this is a
+    /// convenience handle rather than a second registration; both are dropped with the wiring.
+    #[must_use]
+    pub fn observer(&self) -> Option<&Arc<dyn TeamMemoryObserver>> {
+        self.observer.as_ref()
     }
 
     /// The toolkit of `member`, building and caching it on first use.
@@ -646,6 +695,72 @@ mod tests {
         assert_eq!(wiring.hooks().session_id(), None);
     }
 
+    /// Builds a configuration the way the runtime does: from `spec.metadata["memory"]`.
+    fn config_from_metadata(value: serde_json::Value) -> MemoryConfig {
+        let mut spec = crate::schema::TeamAgentSpec {
+            team_name: "team-1".to_owned(),
+            ..crate::schema::TeamAgentSpec::default()
+        };
+        spec.metadata = BTreeMap::from([(crate::memory::MEMORY_METADATA_KEY.to_owned(), value)]);
+        crate::memory::memory_config(&spec)
+    }
+
+    #[tokio::test]
+    async fn the_default_configuration_traces_every_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiring = opened(&dir, MemoryConfig::default()).await;
+        assert!(wiring.trace_enabled());
+        let observer = wiring.observer().expect("an observer");
+        let held = wiring.memory().observer().expect("the facade holds it");
+        assert!(
+            Arc::ptr_eq(observer, held),
+            "the wiring and the facade share one observer"
+        );
+        assert!(format!("{wiring:?}").contains("trace: true"));
+    }
+
+    #[tokio::test]
+    async fn trace_false_in_the_metadata_attaches_no_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_from_metadata(json!({"trace": false}));
+        assert!(!config.trace);
+        let wiring = opened(&dir, config).await;
+        assert!(!wiring.trace_enabled());
+        assert!(wiring.observer().is_none());
+        assert!(wiring.memory().observer().is_none());
+        assert!(format!("{wiring:?}").contains("trace: false"));
+        // Nothing else changes: the wiring still records.
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert_eq!(stored(&wiring).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_configuration_attaches_no_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            enabled: false,
+            ..MemoryConfig::default()
+        };
+        let wiring = opened(&dir, config).await;
+        assert!(wiring.config().trace);
+        assert!(!wiring.trace_enabled());
+        assert!(wiring.observer().is_none());
+        assert!(wiring.memory().observer().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_extractor_keeps_the_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiring = opened(&dir, MemoryConfig::default()).await;
+        let rewired = wiring.with_extractor(Arc::new(RuleTeamExtractor::new(
+            TeamExtractConfig::default(),
+        )));
+        let original = wiring.observer().expect("an observer");
+        let kept = rewired.observer().expect("an observer");
+        assert!(Arc::ptr_eq(original, kept));
+        assert!(rewired.trace_enabled());
+    }
+
     #[tokio::test]
     async fn the_session_reaches_the_written_records() {
         let dir = tempfile::tempdir().unwrap();
@@ -927,5 +1042,125 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TeamMemoryWiring>();
         assert_send_sync::<Arc<TeamMemoryWiring>>();
+    }
+
+    #[cfg(not(feature = "otel"))]
+    #[tokio::test]
+    async fn a_traced_wiring_stores_no_span_records_without_the_feature() {
+        // The same code compiles on every build: the sink slot exists but can never be filled.
+        let dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig::default();
+        assert!(config.otel_sink.is_none());
+        let wiring = opened(&dir, config).await;
+        assert!(wiring.trace_enabled());
+        assert!(wiring.config().otel_sink.is_none());
+        wiring.on_member_join("dev-1").await.unwrap();
+        assert_eq!(stored(&wiring).await.len(), 1);
+    }
+
+    #[cfg(feature = "otel")]
+    mod otel_bridge {
+        use super::*;
+        use crate::observability::memory::{
+            AT_MEMORY_MEMBER_ID, AT_MEMORY_OPERATION, AT_MEMORY_OUTCOME, AT_MEMORY_TEAM_ID,
+        };
+        use crate::observability::otel::OtelSpanSink;
+
+        /// Opens a wiring over `dir` whose observer also writes into `sink`.
+        async fn opened_with_sink(
+            dir: &tempfile::TempDir,
+            sink: &Arc<OtelSpanSink>,
+        ) -> Arc<TeamMemoryWiring> {
+            let config = MemoryConfig {
+                otel_sink: Some(Arc::clone(sink)),
+                ..MemoryConfig::default()
+            };
+            opened(dir, config).await
+        }
+
+        #[tokio::test]
+        async fn the_sink_records_one_span_per_operation() {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(OtelSpanSink::new(8));
+            let wiring = opened_with_sink(&dir, &sink).await;
+            assert!(wiring.trace_enabled());
+            wiring.on_member_join("dev-1").await.unwrap();
+
+            let records = sink.records();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0].name, "memory.write");
+            assert!(
+                records[0].parent_span_id.is_some(),
+                "the span is a child of the observer's root"
+            );
+            assert_eq!(
+                records[0].attributes.get(AT_MEMORY_TEAM_ID),
+                Some(&json!("team-1"))
+            );
+            assert_eq!(
+                records[0].attributes.get(AT_MEMORY_OPERATION),
+                Some(&json!("write"))
+            );
+            assert_eq!(
+                records[0].attributes.get(AT_MEMORY_OUTCOME),
+                Some(&json!("ok"))
+            );
+            assert_eq!(
+                records[0].attributes.get(AT_MEMORY_MEMBER_ID),
+                Some(&json!("dev-1"))
+            );
+            assert_eq!(sink.evicted(), 0);
+        }
+
+        #[tokio::test]
+        async fn every_operation_of_the_wiring_lands_in_the_sink() {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(OtelSpanSink::new(16));
+            let wiring = opened_with_sink(&dir, &sink).await;
+            wiring.on_member_join("dev-1").await.unwrap();
+            wiring.on_member_leave("dev-1").await.unwrap();
+            let records = sink.records();
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert_eq!(records[0].name, "memory.write");
+            assert_eq!(records[1].name, "memory.write");
+            // One wiring, one trace: every record shares the observer's trace id.
+            assert_eq!(records[0].trace_id, records[1].trace_id);
+        }
+
+        #[tokio::test]
+        async fn a_second_open_of_the_same_team_mints_a_second_trace() {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(OtelSpanSink::new(16));
+            let first = opened_with_sink(&dir, &sink).await;
+            let second = opened_with_sink(&dir, &sink).await;
+            first.on_member_join("dev-1").await.unwrap();
+            second.on_member_join("dev-2").await.unwrap();
+
+            let records = sink.records();
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert_ne!(
+                records[0].trace_id, records[1].trace_id,
+                "each wiring mints its own trace; there is no global registry"
+            );
+            assert_eq!(
+                records[1].attributes.get(AT_MEMORY_MEMBER_ID),
+                Some(&json!("dev-2"))
+            );
+        }
+
+        #[tokio::test]
+        async fn an_untraced_wiring_never_touches_the_sink() {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = Arc::new(OtelSpanSink::new(8));
+            let config = MemoryConfig {
+                trace: false,
+                otel_sink: Some(Arc::clone(&sink)),
+                ..MemoryConfig::default()
+            };
+            let wiring = opened(&dir, config).await;
+            wiring.on_member_join("dev-1").await.unwrap();
+            assert!(sink.is_empty());
+            assert_eq!(sink.evicted(), 0);
+        }
     }
 }

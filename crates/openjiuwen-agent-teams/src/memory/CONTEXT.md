@@ -4,7 +4,8 @@
 
 The runtime half of team memory: turn the `openjiuwen_memory::team` engine into something a
 `TeamAgent` drives — a per-team wiring handle, the metadata config that selects the backend, the
-model-facing tools each member mounts, and the `TEAM_MEMORY.md` export/import.
+model-facing tools each member mounts, the `TEAM_MEMORY.md` export/import, and the observability
+bridge that makes every operation visible through the crate's own span seam.
 Python parity source: `openjiuwen/agent_teams/memory/` (v0.1.20) — `TeamMemoryManager`,
 `MemberMemoryToolkit` and the shared `TEAM_MEMORY.md` summary.
 The engine (records, store, facade, extractors, hooks, toolkit, observer seam, document format) stays in
@@ -17,12 +18,14 @@ Crate path: `openjiuwen_agent_teams::memory`.
 ```rust
 pub const MEMORY_METADATA_KEY: &str = "memory";
 
-pub struct MemoryConfig {              // Debug, Clone, PartialEq, Serialize, Deserialize
+pub struct MemoryConfig {              // Clone, Serialize, Deserialize; Debug + PartialEq by hand
     pub enabled: bool,                 // default true
     pub store: MemoryStoreConfig,      // default Memory
     pub extractor: MemoryExtractorKind,// default Rule
     pub export_on_stop: bool,          // default true
     pub import_on_build: bool,         // default true
+    pub trace: bool,                   // default true — attach the team-memory observer
+    pub otel_sink: Option<Arc<OtelSpanSink>>, // `#[serde(skip)]`, default None
     pub hooks: TeamMemoryHookConfig,   // TeamMemoryHookConfig::default()
 }
 impl Default for MemoryConfig;         // the fully working configuration
@@ -42,6 +45,12 @@ pub fn memory_config(spec: &TeamAgentSpec) -> MemoryConfig;
 
 pub const TEAM_MEMORY_FILE: &str = "TEAM_MEMORY.md";
 
+// trace.rs — the observability bridge, attached where the facade is built
+#[cfg(feature = "otel")] pub use observability::otel::OtelSpanSink;
+#[cfg(not(feature = "otel"))] pub enum OtelSpanSink {}    // uninhabited stand-in
+pub fn observer_for(team_id: &str, config: &MemoryConfig) -> Option<Arc<dyn TeamMemoryObserver>>;
+pub fn facade(team_id: &str, config: &MemoryConfig) -> (TeamMemory, Option<Arc<dyn TeamMemoryObserver>>);
+
 pub struct TeamMemoryWiring;                      // Send + Sync, manual Debug, share as Arc<Self>
 impl TeamMemoryWiring {
     pub async fn open(team_id: impl Into<String>, config: MemoryConfig,
@@ -56,6 +65,8 @@ impl TeamMemoryWiring {
     pub fn config(&self) -> &MemoryConfig;
     pub fn document_path(&self) -> &Path;
     pub fn is_enabled(&self) -> bool;
+    pub fn trace_enabled(&self) -> bool;
+    pub fn observer(&self) -> Option<&Arc<dyn TeamMemoryObserver>>;
     pub fn toolkit(&self, member: &str, session: Option<&str>) -> Result<Arc<MemberMemoryToolkit>>;
     pub fn tools(&self, member: &str, session: Option<&str>) -> Result<Vec<Arc<dyn Tool>>>;
     pub async fn on_session_start(&self, session_id: &str) -> Result<()>;
@@ -82,7 +93,9 @@ pub fn team_memory_tools(toolkit: Arc<MemberMemoryToolkit>) -> Vec<Arc<dyn Tool>
 
 Flat re-exports at `crate::memory`: `MEMORY_METADATA_KEY`, `MemoryConfig`, `MemoryStoreConfig`,
 `MemoryExtractorKind`, `memory_config`, `TeamMemoryWiring`, `TEAM_MEMORY_FILE`, `TeamMemoryTool`,
-`team_memory_tools`.
+`team_memory_tools`, `OtelSpanSink`.
+The bridge functions live under `crate::memory::trace`; `OtelSpanSink` is the observability crate's
+sink on the `otel` build and an uninhabited stand-in otherwise.
 Re-exported engine items are *not* re-exported here; callers reach them through
 `openjiuwen_memory::team`.
 
@@ -97,13 +110,49 @@ Re-exported engine items are *not* re-exported here; callers reach them through
 | non-object (bool, number, array) | one `tracing::warn!`, `MemoryConfig::default()` |
 | object | parsed key by key; each malformed key logs one warning and keeps that key's default |
 
-- `enabled`, `export_on_stop`, `import_on_build` are booleans; anything else keeps the default.
+- `enabled`, `export_on_stop`, `import_on_build`, `trace` are booleans; anything else keeps the default.
 - `store` is `"memory"`, `"file"`, a bare directory path (any other string is the directory), or
   `{"kind": "memory"|"file", "dir": "…"}`; an unknown kind, a non-string `kind`/`dir`, or a
   non-string value degrades to `Memory`.
 - `extractor` is `"rule"` or `"llm"`; anything else keeps `Rule`.
 - `hooks` is deserialized straight into `TeamMemoryHookConfig`; a malformed block keeps the
   engine defaults.
+- `otel_sink` is never read from metadata: it is `#[serde(skip)]` and `memory_config` always sets it
+  to `None`, so a host that wants the in-memory sink assigns it on the parsed `MemoryConfig`.
+
+## Observability bridge
+
+`TeamMemoryWiring::build` asks `trace::facade(team_id, config)` for the facade, which selects the
+store, then chains `.with_observer(observer)` when `trace::observer_for` answered one.
+`openjiuwen_memory::team::TeamMemory::with_observer` consumes the facade, so the observer is only
+attachable at construction — never later.
+The observer is `observability::memory::memory_observer(team_id)`, plus
+`MemorySpanObserver::with_sink(Arc::clone(sink))` when `config.otel_sink` is `Some` on the `otel` build.
+Every store selection (in-memory, and the file store that falls back to in-memory) funnels through
+`trace::facade`, so "traced or not" is one decision.
+`TeamMemoryWiring::observer` holds a second handle on the same object the facade owns, and
+`trace_enabled()` reports `config.enabled && observer.is_some()`.
+`TeamMemoryWiring::with_extractor` rebuilds the hooks over the same facade and carries the observer
+over unchanged.
+
+What one traced operation yields: one `memory.{operation}` child span of the observer's own
+`team.{team_id}` root (attributes `team_id`, `operation`, `outcome`, `count`, plus `member_id`,
+`kind`, `error` when present), one `tracing` event at target `openjiuwen_agent_teams::memory`
+(`debug!` on success, `warn!` on failure), and — on the `otel` build — one `SpanRecord` in the
+configured sink.
+
+Disabled: `enabled: false` or `trace: false` attaches no observer at all, so no span, no event and
+no sink record is produced; the facade, hooks and document behave exactly as they otherwise would.
+
+Caveats, stated because they are visible from this node:
+
+- The bridge mints its trace from the team name (`TeamSpan::root_for`), so `memory.*` spans are a
+  **sibling trace** of the runtime's `team.{name}` trace, not children of it — the wiring never sees
+  the runtime root span. Joining the two needs a `MemorySpanObserver::from_root(TeamSpan)`
+  constructor in the observability node; hosts correlate by the `team.{name}` attributes both roots carry.
+- Real OTLP export stays deferred: the `opentelemetry` SDK and exporter live in
+  `openjiuwen-extensions`, which is in this crate's dependency layer and cannot be depended on here,
+  so the `otel` feature only fills the in-memory sink and `OTLP_EXPORT_AVAILABLE` stays `false`.
 
 ## Constraints
 
@@ -115,16 +164,19 @@ Re-exported engine items are *not* re-exported here; callers reach them through
   installs the session only after the engine returned `Ok`, and the toolkit cache is filled only
   after the context validated.
 - A disabled config (`enabled: false`) touches nothing: no hook call, no buffered turn, no session,
-  no export, and `flush` answers an empty `TeamMemoryFlush`.
+  no export, no observer, and `flush` answers an empty `TeamMemoryFlush`.
 - `tracing` only; no `println!`/`eprintln!`; log target `openjiuwen_agent_teams::memory`.
 - Files around ≤1000 lines; `wiring.rs` is the only one that approaches it.
 
 ## Routing Table
 
-- `./config.rs` → `MEMORY_METADATA_KEY`, `MemoryConfig`, `MemoryStoreConfig`,
-  `MemoryExtractorKind`, `validate()` and the tolerant `metadata["memory"]` parser `memory_config`
+- `./config.rs` → `MEMORY_METADATA_KEY`, `MemoryConfig` (with `trace` and the skipped `otel_sink`),
+  `MemoryStoreConfig`, `MemoryExtractorKind`, `validate()` and the tolerant `metadata["memory"]`
+  parser `memory_config`
+- `./trace.rs` → `observer_for` and `facade`: the one place the team-memory observer is built and
+  attached to the facade, plus the `OtelSpanSink` re-export and its uninhabited stand-in
 - `./wiring.rs` → `TeamMemoryWiring` and `TEAM_MEMORY_FILE`: facade + hooks + per-member toolkit
-  cache + lifecycle pass-throughs + `TEAM_MEMORY.md` export/import
+  cache + lifecycle pass-throughs + `TEAM_MEMORY.md` export/import + the observer handle
 - `./tools.rs` → `TeamMemoryTool` and `team_memory_tools`: the four `MemberMemoryToolkit` tools as
   `openjiuwen_foundation::tool::Tool` handles
 
@@ -154,9 +206,22 @@ Re-exported engine items are *not* re-exported here; callers reach them through
   cancellation token; callers that need a deadline drive `hooks()` directly.
 - `on_turn_message(from, to, content, at)` is the `TeamTurn` shorthand; `to: None` addresses the
   whole team.
-- The wiring installs no `TeamMemoryObserver`; the facade keeps the engine's `tracing` lines, and
-  the observer seam stays available to a caller that builds its own `TeamMemory`.
+- The wiring installs no `TeamMemoryObserver` of its own beyond the trace bridge; a caller that
+  builds its own `TeamMemory` keeps the observer seam available.
+- `MemoryConfig` hand-writes `Debug` (the sink is rendered as `has_otel_sink: bool`, never dumped)
+  and `PartialEq` (sinks compare by `Arc::ptr_eq`), and carries
+  `#[allow(clippy::struct_excessive_bools)]` because its four switches are independent options.
+- The `otel` sink type is feature-shaped, not the field: `MemoryConfig::otel_sink` exists on every
+  build, but without `otel` it is the uninhabited `trace::OtelSpanSink` and can only be `None`.
 - Nothing here calls a model, reads the network, or needs `git`; the suites use temp directories,
   fixed `DateTime` values and `openjiuwen_test_support::ScriptedModel` for the LLM-extractor
   construction path.
+- The trace tests are offline and deterministic: the default build proves the observer is attached
+  (same `Arc` the facade holds) and that `trace: false` attaches none, and the `otel` build drives
+  `on_member_join` and asserts the sink holds one `memory.write` record per wiring, with one trace
+  per open (two opens of the same team mint two traces — no global registry).
 - `MEMORY_METADATA_KEY` is owned here; the runtime node reads it through `memory_config` only.
+- The runtime needs no new call to get the default tracing: it passes the parsed `MemoryConfig`
+  (from `memory_config`) straight into `TeamMemoryWiring::open`, whose sink slot is `None` unless
+  it assigns one; to collect span records it sets
+  `MemoryConfig { otel_sink: Some(Arc::new(OtelSpanSink::new(capacity))), .. }` before `open`.

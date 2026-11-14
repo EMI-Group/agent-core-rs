@@ -20,6 +20,7 @@
 //!   "extractor": "rule" | "llm",
 //!   "export_on_stop": true,
 //!   "import_on_build": true,
+//!   "trace": true,
 //!   "hooks": {"member_profile_on_join": true, "handoff_importance": 0.6}
 //! }
 //! ```
@@ -27,8 +28,15 @@
 //! The `hooks` block is deserialized straight into
 //! [`TeamMemoryHookConfig`] from `openjiuwen_memory::team`, so every switch and importance the
 //! engine understands is reachable from metadata without a second schema here.
+//!
+//! `trace` is the only observability switch: it selects whether the wiring attaches the crate's
+//! team-memory observer to the facade (see
+//! [`trace`](crate::memory::trace)). The in-memory span sink
+//! ([`MemoryConfig::otel_sink`]) is a process-local handle, so it is not part of the metadata
+//! schema and is never serialized.
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_memory::team::TeamMemoryHookConfig;
@@ -36,6 +44,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::memory::trace::OtelSpanSink;
 use crate::schema::TeamAgentSpec;
 
 /// Metadata key holding the team-memory configuration.
@@ -215,8 +224,17 @@ impl fmt::Display for MemoryExtractorKind {
 ///
 /// [`memory_config`] parses it from [`TeamAgentSpec`] metadata; the defaults are the fully
 /// working configuration (memory on, rule extractor, document exported on stop and imported on
-/// build).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// build, every operation traced).
+///
+/// `Debug` and `PartialEq` are hand-written because the `otel` sink is a shared handle: it is
+/// reported as "present" rather than dumped, and two configurations are equal only when they hold
+/// the *same* sink ([`Arc::ptr_eq`]).
+///
+/// The booleans are independent switches for unrelated parts of the wiring (the master switch, the
+/// two document passes, tracing), not a state machine, so grouping them into enums would flatten
+/// the configuration shape this type mirrors.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct MemoryConfig {
     /// Master switch: when `false`, no hook, export or bundle is built at all.
@@ -229,8 +247,55 @@ pub struct MemoryConfig {
     pub export_on_stop: bool,
     /// Import an existing `TEAM_MEMORY.md` when the team is built.
     pub import_on_build: bool,
+    /// Trace every team-memory operation through the crate's observability seam.
+    ///
+    /// When `true` (the default) the wiring attaches a
+    /// [`MemorySpanObserver`](crate::observability::MemorySpanObserver) to the facade, so each
+    /// operation becomes one `memory.{operation}` span plus one structured `tracing` event. A
+    /// disabled configuration attaches no observer whatever this says.
+    pub trace: bool,
+    /// The in-memory span sink the observer also writes to on the `otel` build.
+    ///
+    /// Never serialized: a sink is a process-local handle and metadata cannot name one. The field
+    /// exists on every build, so the struct shape does not change with features; without `otel`
+    /// the sink type is uninhabited and the slot always stays `None`.
+    #[serde(skip)]
+    pub otel_sink: Option<Arc<OtelSpanSink>>,
     /// The lifecycle-hook switches and importances handed to the engine.
     pub hooks: TeamMemoryHookConfig,
+}
+
+impl fmt::Debug for MemoryConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryConfig")
+            .field("enabled", &self.enabled)
+            .field("store", &self.store)
+            .field("extractor", &self.extractor)
+            .field("export_on_stop", &self.export_on_stop)
+            .field("import_on_build", &self.import_on_build)
+            .field("trace", &self.trace)
+            .field("has_otel_sink", &self.otel_sink.is_some())
+            .field("hooks", &self.hooks)
+            .finish()
+    }
+}
+
+impl PartialEq for MemoryConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.store == other.store
+            && self.extractor == other.extractor
+            && self.export_on_stop == other.export_on_stop
+            && self.import_on_build == other.import_on_build
+            && self.trace == other.trace
+            && self.hooks == other.hooks
+            && match (self.otel_sink.as_ref(), other.otel_sink.as_ref()) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
 }
 
 impl Default for MemoryConfig {
@@ -241,6 +306,8 @@ impl Default for MemoryConfig {
             extractor: MemoryExtractorKind::default(),
             export_on_stop: true,
             import_on_build: true,
+            trace: true,
+            otel_sink: None,
             hooks: TeamMemoryHookConfig::default(),
         }
     }
@@ -248,6 +315,10 @@ impl Default for MemoryConfig {
 
 impl MemoryConfig {
     /// Validates the hook switches and the store directory.
+    ///
+    /// [`MemoryConfig::otel_sink`] is deliberately not validated: it is a process-local handle
+    /// rather than user input, every build carries the field, and without the `otel` feature it can
+    /// never be `Some`.
     ///
     /// # Errors
     ///
@@ -300,6 +371,8 @@ fn parse_block(spec: &TeamAgentSpec, map: &serde_json::Map<String, Value>) -> Me
         extractor: parse_extractor(spec, map.get("extractor")),
         export_on_stop: parse_bool(spec, map, "export_on_stop", default.export_on_stop),
         import_on_build: parse_bool(spec, map, "import_on_build", default.import_on_build),
+        trace: parse_bool(spec, map, "trace", default.trace),
+        otel_sink: None,
         hooks: parse_hooks(spec, map.get("hooks")),
     }
 }
@@ -423,8 +496,24 @@ mod tests {
         assert_eq!(config.extractor, MemoryExtractorKind::Rule);
         assert!(config.export_on_stop);
         assert!(config.import_on_build);
+        assert!(config.trace);
+        assert!(config.otel_sink.is_none());
         assert_eq!(config.hooks, TeamMemoryHookConfig::default());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn trace_is_read_from_the_metadata_and_defaults_to_on() {
+        assert!(!memory_config(&spec_with(json!({"trace": false}))).trace);
+        assert!(memory_config(&spec_with(json!({"trace": true}))).trace);
+        assert!(memory_config(&spec_with(json!({"enabled": true}))).trace);
+        // A malformed switch keeps the default: tracing stays on.
+        for value in [json!("off"), json!(0), json!([])] {
+            assert!(
+                memory_config(&spec_with(json!({"trace": value}))).trace,
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -435,6 +524,7 @@ mod tests {
             "extractor": "llm",
             "export_on_stop": false,
             "import_on_build": false,
+            "trace": false,
             "hooks": {"member_profile_on_join": false, "handoff_importance": 0.9},
         })));
         assert!(!config.enabled);
@@ -442,6 +532,8 @@ mod tests {
         assert_eq!(config.extractor, MemoryExtractorKind::Llm);
         assert!(!config.export_on_stop);
         assert!(!config.import_on_build);
+        assert!(!config.trace);
+        assert!(config.otel_sink.is_none());
         assert!(!config.hooks.member_profile_on_join);
         assert!((config.hooks.handoff_importance - 0.9).abs() < f32::EPSILON);
     }
@@ -569,13 +661,16 @@ mod tests {
             "extractor": "llm",
             "export_on_stop": false,
             "import_on_build": false,
+            "trace": false,
             "hooks": {"handoff_on_leave": false},
         }));
         spec.metadata.insert("other".to_owned(), json!(1));
         let config = memory_config(&spec);
+        assert!(!config.trace);
         let encoded = serde_json::to_value(&config).unwrap();
         let decoded: MemoryConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, config);
+        assert!(!decoded.trace);
         // Unknown fields are tolerated on the way back in.
         let decoded: MemoryConfig = serde_json::from_value(json!({
             "enabled": false, "unknown_key": true,
@@ -583,6 +678,75 @@ mod tests {
         .unwrap();
         assert!(!decoded.enabled);
         assert_eq!(decoded.store, MemoryStoreConfig::Memory);
+        assert!(decoded.trace);
+    }
+
+    #[test]
+    fn the_sink_slot_is_never_serialized() {
+        let encoded = serde_json::to_value(MemoryConfig::default()).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert!(!object.contains_key("otel_sink"), "{encoded}");
+        assert_eq!(object.get("trace"), Some(&json!(true)));
+        // A configuration decoded from JSON carries no sink.
+        let decoded: MemoryConfig = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.otel_sink.is_none());
+    }
+
+    #[test]
+    fn equality_ignores_nothing_but_compares_the_other_fields() {
+        let base = MemoryConfig::default();
+        assert_eq!(base, MemoryConfig::default());
+        for other in [
+            MemoryConfig {
+                enabled: false,
+                ..MemoryConfig::default()
+            },
+            MemoryConfig {
+                trace: false,
+                ..MemoryConfig::default()
+            },
+            MemoryConfig {
+                export_on_stop: false,
+                ..MemoryConfig::default()
+            },
+            MemoryConfig {
+                import_on_build: false,
+                ..MemoryConfig::default()
+            },
+            MemoryConfig {
+                extractor: MemoryExtractorKind::Llm,
+                ..MemoryConfig::default()
+            },
+            MemoryConfig {
+                store: MemoryStoreConfig::File { dir: None },
+                ..MemoryConfig::default()
+            },
+        ] {
+            assert_ne!(base, other);
+        }
+        // The hand-written `Debug` reports the sink as a flag, never its contents.
+        let rendered = format!("{base:?}");
+        assert!(rendered.contains("has_otel_sink: false"), "{rendered}");
+        assert!(rendered.contains("trace: true"), "{rendered}");
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn two_configurations_share_a_sink_only_by_pointer() {
+        let sink = Arc::new(OtelSpanSink::new(4));
+        let traced = MemoryConfig {
+            otel_sink: Some(Arc::clone(&sink)),
+            ..MemoryConfig::default()
+        };
+        let same_sink = traced.clone();
+        assert_eq!(traced, same_sink);
+        assert!(format!("{traced:?}").contains("has_otel_sink: true"));
+        let other_sink = MemoryConfig {
+            otel_sink: Some(Arc::new(OtelSpanSink::new(4))),
+            ..MemoryConfig::default()
+        };
+        assert_ne!(traced, other_sink);
+        assert_ne!(traced, MemoryConfig::default());
     }
 
     #[test]
