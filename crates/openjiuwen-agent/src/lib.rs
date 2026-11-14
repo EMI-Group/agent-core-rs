@@ -40,6 +40,8 @@
 //! - [`rails`] — model/tool/loop hooks and the rails the kernel hosts itself.
 //! - [`react`] — the [`ReActAgent`] loop and its configuration.
 //! - [`llm_agent`] — [`LlmAgent`], a configured `ReActAgent` composition.
+//! - [`memory_provider`] — the external long-term-memory provider bridge: a rail
+//!   and the provider's model-facing tools.
 //! - [`workflow_agent`] — [`WorkflowAgent`] over one or more workflows.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -53,6 +55,7 @@ pub mod input;
 pub mod interrupt;
 pub mod kv_cache;
 pub mod llm_agent;
+pub mod memory_provider;
 pub mod operator;
 pub mod output;
 pub mod policy;
@@ -78,6 +81,7 @@ pub use interrupt::{
 pub use llm_agent::{
     create_llm_agent_config, ConstrainConfig, LlmAgent, LlmAgentConfig, ModelConfig, ModelInfo,
 };
+pub use memory_provider::{provider_tool_cards, provider_tools, ProviderMemoryRail, ProviderTool};
 pub use output::{AgentChunk, AgentOutput, Observation, OutputFrame, ResultType};
 pub use prompt::{PromptSection, SystemPromptBuilder};
 pub use rails::{

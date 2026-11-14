@@ -273,6 +273,7 @@ mod tests {
             client_tools: Arc::new(ClientToolRegistry::new()),
             resilience: crate::policy::ToolResiliencePolicy::new(),
             final_check: None,
+            memory_provider: None,
             visible_tool_info: Vec::new(),
             visible_cards: Vec::new(),
         }

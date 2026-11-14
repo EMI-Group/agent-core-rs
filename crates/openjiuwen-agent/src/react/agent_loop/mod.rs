@@ -34,6 +34,7 @@ use crate::abilities::{ToolCallResult, ToolExecutionOptions};
 use crate::callbacks::CallbackFramework;
 use crate::input::AgentInput;
 use crate::interrupt::{InterruptKind, InterruptRequest};
+use crate::memory_provider::{finalize_session, injected_prompt_block};
 use crate::output::{AgentChunk, AgentOutput, Observation};
 use crate::policy::{
     ClientToolRegistry, FinalRequestCheck, McpToolAllowlist, ToolExposurePolicy,
@@ -43,7 +44,7 @@ use crate::rails::memory::MEMORY_VARIABLES_KEY;
 use crate::rails::{RailContext, RailEvent, RailRegistry};
 use crate::react::model_step::{call_model, call_model_streaming, DeltaSink};
 use crate::react::pause::pause_output;
-use crate::react::prompt::build_system;
+use crate::react::prompt::build_system_with_block;
 use crate::react::resume::{resume_or_seed, ResumeOutcome};
 use crate::react::{exposure, frames, hooks};
 use crate::react::{MaxIterationsPolicy, ReActAgent, ReActAgentConfig};
@@ -54,6 +55,7 @@ use openjiuwen_context::{ContextEngine, PrepareOptions};
 use openjiuwen_foundation::{
     BaseMessage, Model, ModelRequestConfig, Tool, ToolCall, ToolCard, Usage,
 };
+use openjiuwen_memory::{ConversationTurn, MemoryProvider};
 use openjiuwen_session::{InvokeType, Session};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -116,6 +118,8 @@ pub(crate) struct AgentRuntime {
     pub(crate) resilience: ToolResiliencePolicy,
     /// Check run before a final model request, when installed.
     pub(crate) final_check: Option<Arc<dyn FinalRequestCheck>>,
+    /// External long-term-memory provider, when the agent has one installed.
+    pub(crate) memory_provider: Option<Arc<dyn MemoryProvider>>,
 }
 
 impl AgentRuntime {
@@ -169,6 +173,7 @@ impl AgentRuntime {
             client_tools: agent.client_tools(),
             resilience: agent.tool_resilience(),
             final_check: agent.final_request_check(),
+            memory_provider: agent.memory_provider(),
         };
         let (visible_tool_info, visible_cards) = exposure::visible_tools(
             &tool_info,
@@ -186,8 +191,11 @@ impl AgentRuntime {
 ///
 /// `agent` supplies the model, tools, rails, and context engine; `input` is the
 /// parsed caller payload (a text query or an interactive resume); `session` is
-/// the resolved session the run reads state from and writes histories to; and
-/// `publisher`, when present, receives each [`AgentChunk`] as it is produced.
+/// the resolved session the run reads state from and writes histories to;
+/// `publisher`, when present, receives each [`AgentChunk`] as it is produced; and
+/// `owned` records whether this run created `session` (see
+/// [`AgentRun`](crate::AgentRun)), which decides whether the external memory
+/// provider finalizes the conversation at the end.
 ///
 /// # Errors
 ///
@@ -199,9 +207,10 @@ pub(crate) async fn run(
     input: AgentInput,
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
+    owned: bool,
 ) -> Result<AgentOutput> {
     let runtime = AgentRuntime::snapshot(agent)?;
-    run_with(&runtime, input, session, publisher).await
+    run_with(&runtime, input, session, publisher, owned).await
 }
 
 /// Runs one invoke against an already snapshotted runtime.
@@ -209,7 +218,12 @@ pub(crate) async fn run(
 /// The wrapper owns the invocation-wide concerns: the root span, the single
 /// [`RailContext`] shared by every firing point, and the unconditional
 /// finalization (`AfterInvoke` rails, context persistence, the final `answer`
-/// frame, and the span status) that must happen even when the loop fails.
+/// frame, the external memory provider's session end, and the span status) that
+/// must happen even when the loop fails.
+///
+/// `owned` marks a session this run created: only then does the memory provider
+/// receive [`on_session_end`](openjiuwen_memory::MemoryProvider::on_session_end),
+/// and never for an interrupt pause, which ends no conversation.
 ///
 /// # Errors
 ///
@@ -219,6 +233,7 @@ pub(crate) async fn run_with(
     input: AgentInput,
     session: Arc<dyn Session>,
     publisher: Option<UnboundedSender<AgentChunk>>,
+    owned: bool,
 ) -> Result<AgentOutput> {
     let span = session.tracer().map(|tracer| {
         let span = tracer.start_span(runtime.card_name.clone(), InvokeType::Chain);
@@ -230,7 +245,18 @@ pub(crate) async fn run_with(
         .with_agent_id(runtime.card_id.clone())
         .with_input(input.clone());
 
-    let result = run_inner(runtime, &input, &session, publisher.as_ref(), &mut ctx).await;
+    // The run's text turns, forwarded to the memory provider when this run owns
+    // the session.
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    let result = run_inner(
+        runtime,
+        &input,
+        &session,
+        publisher.as_ref(),
+        &mut ctx,
+        &mut turns,
+    )
+    .await;
 
     let output = match &result {
         Ok(output) => output.clone(),
@@ -259,6 +285,10 @@ pub(crate) async fn run_with(
     }
     // The invocation-end callback observes both successful and failed runs.
     hooks::invoke_end(runtime, &session, &output).await;
+    // An owned session ends here, so the external memory provider finalizes the
+    // conversation; a borrowed session stays the caller's to finalize. Best
+    // effort: a provider failure never changes the run's output.
+    finalize_session(runtime.memory_provider.as_ref(), &turns, owned, &output).await;
     if let Some(span) = span {
         match &result {
             Ok(output) => span.finish(output.to_value()),
@@ -324,7 +354,21 @@ fn memory_render_fields(ctx: &RailContext) -> Option<&serde_json::Map<String, Va
         .and_then(Value::as_object)
 }
 
+/// Builds the system message of one iteration: the rendered identity plus the
+/// external memory provider's prompt block, when a rail published one.
+fn system_message(runtime: &AgentRuntime, input: &AgentInput, ctx: &RailContext) -> BaseMessage {
+    build_system_with_block(
+        &runtime.config,
+        input,
+        memory_render_fields(ctx),
+        injected_prompt_block(ctx),
+    )
+}
+
 /// Drives the iteration loop and turns its termination into an [`AgentOutput`].
+///
+/// `turns` collects the run's text turns (the user query and every assistant
+/// reply, in order) for the external memory provider's session finalization.
 #[allow(clippy::too_many_lines)]
 async fn run_inner(
     runtime: &AgentRuntime,
@@ -332,6 +376,7 @@ async fn run_inner(
     session: &Arc<dyn Session>,
     publisher: Option<&UnboundedSender<AgentChunk>>,
     ctx: &mut RailContext,
+    turns: &mut Vec<ConversationTurn>,
 ) -> Result<AgentOutput> {
     let config = &runtime.config;
     let context = runtime
@@ -377,6 +422,8 @@ async fn run_inner(
     let mut total_usage = Usage::default();
     let mut empty_notice_sent = false;
 
+    turns.push(ConversationTurn::new("user", original_query.clone()));
+
     hooks::invoke_start(runtime, session, &original_query, limit).await;
 
     for iteration in start..=limit {
@@ -384,7 +431,7 @@ async fn run_inner(
         // Steering pushed before the run lands in the first request; one pushed
         // mid-run lands in the next iteration's window.
         hooks::drain_steering(runtime, &context).await?;
-        let system = build_system(config, input, memory_render_fields(ctx));
+        let system = system_message(runtime, input, ctx);
         let prepared = runtime
             .engine
             .prepare(
@@ -481,6 +528,9 @@ async fn run_inner(
         let raw = reply.message.text().into_owned();
         let calls = reply.message.tool_calls.clone();
         hooks::step_end(runtime, session, iteration, &reply, calls.len()).await;
+        if !raw.trim().is_empty() {
+            turns.push(ConversationTurn::new("assistant", raw.clone()));
+        }
 
         if calls.is_empty() {
             if model_continue {
@@ -676,7 +726,7 @@ async fn run_inner(
         return Ok(output);
     }
 
-    let system = build_system(config, input, memory_render_fields(ctx));
+    let system = system_message(runtime, input, ctx);
     let prepared = runtime
         .engine
         .prepare(
@@ -693,6 +743,7 @@ async fn run_inner(
         Ok(reply) => {
             let text = reply.message.text().into_owned();
             if !text.trim().is_empty() && reply.message.tool_calls.is_empty() {
+                turns.push(ConversationTurn::new("assistant", text.clone()));
                 let mut answer = AgentOutput::answer(text)
                     .with_reasoning_present(reply.reasoning_present)
                     .with_iterations_used(used)
