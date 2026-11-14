@@ -16,6 +16,8 @@
 //! - [`routing`] — `IntelliRouter` model groups, route compilation, and the
 //!   failover [`RoutingModel`].
 //! - [`oauth`] — `OpenAI` account device-authorization and token storage.
+//! - [`external_provider`] — the external provider registry plus the
+//!   `OpenAIAccount` credential manager and model catalog built on [`oauth`].
 //! - [`dashscope`] — `DashScope` image, speech, and video generation over HTTP.
 //!
 //! The module root re-exports the types call sites need most: the configs, the
@@ -26,6 +28,7 @@
 pub mod anthropic;
 pub mod config;
 pub mod dashscope;
+pub mod external_provider;
 pub mod factory;
 pub mod model;
 pub mod oauth;
@@ -43,6 +46,10 @@ pub use config::{ApiMode, AuthMode, ModelClientConfig, ModelRequestConfig};
 pub use dashscope::{
     AudioGenerationResponse, DashScopeConfig, DashScopeMediaClient, ImageGenerationResponse,
     ImageRequest, SpeechRequest, VideoGenerationResponse, VideoRequest,
+};
+pub use external_provider::{
+    AuthStatus, ExternalAuthProvider, ExternalProviderConfig, ExternalProviderRegistry,
+    ModelCatalogRequest, ProviderModelCatalog,
 };
 pub use factory::{init_model, init_model_with};
 pub use model::{
