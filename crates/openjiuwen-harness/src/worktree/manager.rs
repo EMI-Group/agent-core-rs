@@ -258,6 +258,7 @@ impl WorktreeManager {
                 base,
                 head: info.head,
                 existed: true,
+                sparse: None,
             });
         }
 
@@ -292,6 +293,7 @@ impl WorktreeManager {
             base,
             head,
             existed: false,
+            sparse: None,
         })
     }
 
@@ -528,6 +530,7 @@ impl WorktreeManager {
             tracked: index
                 .get(name)
                 .is_some_and(|record| record.status == WorktreeState::Active),
+            sparse: None,
         })
     }
 

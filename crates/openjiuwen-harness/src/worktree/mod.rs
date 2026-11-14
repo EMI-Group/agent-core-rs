@@ -38,6 +38,13 @@
 //!   [`BuiltinTool::Worktree`](crate::tools::BuiltinTool::Worktree), the last of
 //!   the extended tools, and built from a [`WorktreeManager`] plus the registry
 //!   language and permission engine.
+//! - [`SparseConfig`] / [`SparseMode`] — the sparse-checkout selection (cone by
+//!   default, `--no-cone` patterns otherwise) with host-side path validation;
+//!   `git::sparse_checkout_set` and friends are the command helpers, and
+//!   [`WorktreeRecord::sparse`] persists the selection for re-entry.
+//! - [`WorktreeChangeSummary`] / [`change_summary`] / [`render_change_summary`]
+//!   — bounded change detection (`status`, `<base>..HEAD` diffstat and count,
+//!   unpushed probe) and its deterministic bilingual rendering.
 //!
 //! # Constraints
 //!
@@ -47,31 +54,42 @@
 //! - Typed errors only: `openjiuwen_common::error::{Error, Result}`; the tool
 //!   turns expected failures into `success = false` payloads and never panics.
 //! - No `unsafe`, no `println!` (tracing only), no new dependencies.
-//! - Deferred (documented in this module's `CONTEXT.md`): sparse checkout,
-//!   symlinked heavy directories,
+//! - Deferred (documented in this module's `CONTEXT.md`): automatic sparse
+//!   setup inside `create`/`status` (the helpers and the persisted record exist,
+//!   the manager wiring is pending), symlinked heavy directories,
 //!   include-pattern copying, hook-path configuration, lifecycle policies and
 //!   auto-cleanup timers, and the Python `enter_worktree`/`exit_worktree` tools
 //!   plus the rails integration.
+mod changes;
 mod events;
 mod git;
 mod lock;
 mod manager;
 mod models;
 mod slug;
+mod sparse;
 mod store;
 mod tool;
+
+pub use changes::{
+    change_summary, parse_diff_stat, render_change_summary, status_paths, WorktreeChangeSummary,
+    SUMMARY_MAX_CHARS, SUMMARY_MAX_FILES, SUMMARY_MAX_LINES,
+};
 
 pub use events::{
     BroadcastWorktreeEvents, NoopWorktreeEvents, RecordingWorktreeEvents, SharedWorktreeEvents,
     WorktreeEvent, WorktreeEventSink, DEFAULT_EVENT_CAPACITY,
 };
 pub use git::{
-    branch_exists, current_branch, find_git_root, git_available, git_failure_error,
-    is_not_a_repository, is_not_installed, not_a_repository_error, not_installed_error,
-    parse_status_porcelain, parse_worktree_list, rev_parse, status_porcelain, worktree_add,
-    worktree_add_existing, worktree_list, worktree_lock, worktree_prune, worktree_remove,
-    worktree_unlock, GitOutput, GitRunner, ProcessGitRunner, GIT_BINARY, NOT_A_REPOSITORY_MARKER,
-    NOT_INSTALLED_MARKER,
+    branch_exists, checkout_head, current_branch, diff_stat, find_git_root, git_available,
+    git_failure_error, has_unpushed_commits, is_not_a_repository, is_not_installed,
+    is_sparse_failure, not_a_repository_error, not_installed_error, parse_status_porcelain,
+    parse_worktree_list, rev_list_count, rev_parse, sparse_checkout_disable,
+    sparse_checkout_reapply, sparse_checkout_set, sparse_failure_error, status_porcelain,
+    worktree_add, worktree_add_existing, worktree_add_no_checkout,
+    worktree_add_no_checkout_existing, worktree_list, worktree_lock, worktree_prune,
+    worktree_remove, worktree_unlock, GitOutput, GitRunner, ProcessGitRunner, GIT_BINARY,
+    NOT_A_REPOSITORY_MARKER, NOT_INSTALLED_MARKER, SPARSE_FAILURE_MARKER,
 };
 pub use lock::{
     is_lock_contention, is_lock_timeout, WorktreeLock, WorktreeLockConfig, WorktreeLockError,
@@ -86,6 +104,7 @@ pub use slug::{
     branch_name, slugify, unique_slug, validate_raw_name, BRANCH_PREFIX, DEFAULT_SLUG,
     MAX_SLUG_LENGTH, WORKTREES_DIR,
 };
+pub use sparse::{validate_sparse_path, SparseConfig, SparseMode, MAX_SPARSE_PATHS};
 pub use store::{index_path, WorktreeIndex, INDEX_DIR, INDEX_FILE, INDEX_VERSION};
 pub use tool::{WorktreeArgs, WorktreeTool, ACTIONS, TOOL_NAME};
 
