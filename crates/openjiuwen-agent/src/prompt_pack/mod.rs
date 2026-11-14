@@ -62,14 +62,33 @@
 //! [`openjiuwen_security::GuardrailPipeline`]: the rail is registered (and
 //! reported as such) as a placeholder a host replaces with a configured one.
 //!
+//! # Prompt directories
+//!
+//! [`PromptPack::from_prompt_dir`] is the additive constructor for the Python
+//! `prompts/` layouts: it loads a directory through [`PromptDirectory::load`]
+//! and fills `prompts.sections`, leaving every other pack field empty. The
+//! loaded sections keep their front-matter priorities and are selected per
+//! language with the *requested → en → cn → first* fallback, so the resulting
+//! pack installs a [`PromptSectionsRail`] exactly like a YAML pack does.
+//! Existing YAML parsing semantics are unchanged.
+//!
 //! # Modules
 //!
 //! - [`pack`] — the pack schema plus parse, serialize, and apply methods.
 //! - [`rails`] — [`RailSpec`] and the rail construction.
 //! - [`rail`] — the [`PromptSectionsRail`] that injects pack sections.
+//! - [`directory`] — load a Python-style `prompts/` tree (`{cn,en}/<name>.md`
+//!   language directories and `<name>.<lang>.md` suffixed files) into the same
+//!   section/pack structures, with YAML front matter.
+pub mod directory;
 pub mod pack;
 pub mod rail;
 pub mod rails;
+pub use directory::{
+    body_sha256, is_evolved, normalize_language, read_frontmatter, DirectorySection,
+    PromptDirectory, PromptFile, PromptFileMeta, DEFAULT_PROMPT_PRIORITY, FALLBACK_LANGUAGES,
+    SUPPORTED_LANGUAGES,
+};
 pub use pack::{AppliedPack, PromptPack, PromptPackContext, PromptSpec, SectionSpec, ToolSpec};
 pub use rail::{PromptSectionsRail, PROMPT_SECTIONS_METADATA_KEY};
 pub use rails::RailSpec;
