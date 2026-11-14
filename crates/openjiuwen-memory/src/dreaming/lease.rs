@@ -68,7 +68,9 @@ impl DreamLease {
             job_id: job_id.into(),
             owner: owner.into(),
             acquired_at: now,
-            expires_at: now.checked_add_signed(ttl).unwrap_or(DateTime::<Utc>::MAX_UTC),
+            expires_at: now
+                .checked_add_signed(ttl)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
         }
     }
 
@@ -252,9 +254,8 @@ impl DreamLeaseOptions {
                 "dream lease `heartbeat` must be greater than zero",
             ));
         }
-        let heartbeat = ChronoDuration::from_std(self.heartbeat).map_err(|_| {
-            Error::validation("dream lease `heartbeat` is too large to represent")
-        })?;
+        let heartbeat = ChronoDuration::from_std(self.heartbeat)
+            .map_err(|_| Error::validation("dream lease `heartbeat` is too large to represent"))?;
         if heartbeat >= self.ttl {
             return Err(Error::validation(format!(
                 "dream lease `heartbeat` ({:?}) must be shorter than the lease `ttl` ({}s)",
@@ -444,10 +445,13 @@ mod tests {
     }
 
     async fn claimed(repo: &Arc<InMemoryDreamRepository>, owner: &str) -> LeasedJob {
-        repo.claim_next_leased(ts(10), &LeaseRequest::new(owner, ChronoDuration::seconds(30)))
-            .await
-            .unwrap()
-            .unwrap()
+        repo.claim_next_leased(
+            ts(10),
+            &LeaseRequest::new(owner, ChronoDuration::seconds(30)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -492,11 +496,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("ttl"));
-        let ok = DreamLeaseOptions::new("worker-a", ChronoDuration::seconds(30), StdDuration::from_secs(10));
+        let ok = DreamLeaseOptions::new(
+            "worker-a",
+            ChronoDuration::seconds(30),
+            StdDuration::from_secs(10),
+        );
         assert_eq!(ok.request().owner, "worker-a");
         assert!(ok.validate().is_ok());
-        let zero = DreamLeaseOptions::new("worker-a", ChronoDuration::seconds(30), StdDuration::ZERO);
-        assert!(zero.validate().unwrap_err().to_string().contains("heartbeat"));
+        let zero =
+            DreamLeaseOptions::new("worker-a", ChronoDuration::seconds(30), StdDuration::ZERO);
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("heartbeat"));
         let long = DreamLeaseOptions::new(
             "worker-a",
             ChronoDuration::seconds(30),
@@ -536,7 +549,10 @@ mod tests {
 
         // The lease expires; a second worker takes the job over.
         let second = repo
-            .claim_next_leased(ts(41), &LeaseRequest::new("worker-b", ChronoDuration::seconds(30)))
+            .claim_next_leased(
+                ts(41),
+                &LeaseRequest::new("worker-b", ChronoDuration::seconds(30)),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -550,10 +566,7 @@ mod tests {
         // the cheap and correct diagnosis: the lease is gone either way.
         assert_eq!(status, LeaseStatus::Lost(LeaseLostReason::Expired));
         assert!(stale_guard.is_lost());
-        assert_eq!(
-            stale_guard.lost_reason(),
-            Some(LeaseLostReason::Expired)
-        );
+        assert_eq!(stale_guard.lost_reason(), Some(LeaseLostReason::Expired));
         let error = stale_guard.ensure_valid(ts(42)).unwrap_err();
         assert!(matches!(error, Error::Memory(_)));
         assert!(error.to_string().contains("lost: expired"));
