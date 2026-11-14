@@ -3,7 +3,9 @@
 //!
 //! Every mutation takes the cross-process file lock before the in-process state guard,
 //! reloads the Markdown file when its stamp changed, writes it atomically, and refreshes
-//! the derived index.
+//! the derived index. When an embedding model is configured the chunk index is then
+//! refreshed outside both guards, so the Markdown document is never locked while the
+//! model runs (see `crate::lite::local::embedding`).
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
@@ -29,24 +31,28 @@ impl LocalCodingMemory {
     /// unconfigured type is replaced by
     /// [`CodingMemoryConfig::default_fact_type`](crate::config::CodingMemoryConfig::default_fact_type)), the
     /// scope is the store's scope, and `updated_at` is set to now. Returns the stored
-    /// fact.
+    /// fact. With an embedding model configured the chunk index is refreshed before the
+    /// call returns.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when the fact is invalid, and the lock, filesystem,
-    /// or index error when the write fails.
+    /// index, or embedding error when the write fails.
     pub async fn write(&self, fact: CodingFact) -> Result<CodingFact> {
         fact.validate()?;
         let mut fact = fact;
         fact.fact_type = self.resolve_fact_type(fact.fact_type);
         fact.scope = self.inner.scope.clone();
         fact.updated_at = Utc::now();
-        let (_guard, mut state) = self.lock_for_write().await?;
+        let (guard, mut state) = self.lock_for_write().await?;
         self.ensure_fresh(&mut state).await?;
         let _replaced = state.document.upsert_fact(&fact);
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.upsert(&fact).await?;
+        drop(state);
+        drop(guard);
+        self.refresh_embedding_index().await?;
         Ok(fact)
     }
 
@@ -78,7 +84,7 @@ impl LocalCodingMemory {
                 "coding fact `{name}` content must not be empty"
             )));
         }
-        let (_guard, mut state) = self.lock_for_write().await?;
+        let (guard, mut state) = self.lock_for_write().await?;
         self.ensure_fresh(&mut state).await?;
         let mut fact = state
             .document
@@ -90,6 +96,9 @@ impl LocalCodingMemory {
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.upsert(&fact).await?;
+        drop(state);
+        drop(guard);
+        self.refresh_embedding_index().await?;
         Ok(fact)
     }
 
@@ -97,9 +106,9 @@ impl LocalCodingMemory {
     ///
     /// # Errors
     ///
-    /// Returns the lock, filesystem, or index error when the delete fails.
+    /// Returns the lock, filesystem, index, or embedding error when the delete fails.
     pub async fn delete(&self, name: &str) -> Result<bool> {
-        let (_guard, mut state) = self.lock_for_write().await?;
+        let (guard, mut state) = self.lock_for_write().await?;
         self.ensure_fresh(&mut state).await?;
         if !state.document.remove(name) {
             return Ok(false);
@@ -107,6 +116,9 @@ impl LocalCodingMemory {
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
         self.fts.remove(name).await?;
+        drop(state);
+        drop(guard);
+        self.refresh_embedding_index().await?;
         Ok(true)
     }
 
@@ -137,17 +149,18 @@ impl LocalCodingMemory {
         Ok(render_index(&facts, self.inner.config.max_index_lines))
     }
 
-    /// Rebuilds the derived index from the Markdown file and returns the fact count.
+    /// Rebuilds the derived indices from the Markdown file and returns the fact count.
     ///
     /// The file is re-read unconditionally (it is authoritative), the cached document is
     /// replaced, and the FTS index is rebuilt. Without the `sqlite` feature there is no
-    /// derived index, so only the reload happens.
+    /// full-text index, so only the reload happens. With an embedding model configured the
+    /// chunk index is rebuilt too, after the file lock is released.
     ///
     /// # Errors
     ///
-    /// Returns the lock, filesystem, parse, or index error on failure.
+    /// Returns the lock, filesystem, parse, index, or embedding error on failure.
     pub async fn reindex(&self) -> Result<usize> {
-        let _guard = FileLock::acquire(&self.inner.lock_path).await?;
+        let guard = FileLock::acquire(&self.inner.lock_path).await?;
         let (document, stamp) = load_document(&self.inner.memory_path, &self.inner.scope).await?;
         {
             let mut state = self.inner.state.lock().await;
@@ -155,7 +168,10 @@ impl LocalCodingMemory {
             state.stamp = stamp;
         }
         let _bumped = self.inner.reloads.fetch_add(1, Ordering::Relaxed);
-        self.rebuild_index().await
+        let indexed = self.rebuild_index().await?;
+        drop(guard);
+        self.refresh_embedding_index().await?;
+        Ok(indexed)
     }
 
     /// The number of facts in the derived index (feature `sqlite`).
@@ -197,6 +213,19 @@ impl LocalCodingMemory {
     async fn persist(&self, state: &mut LocalState) -> Result<()> {
         write_document(&self.inner.memory_path, &state.document).await?;
         state.stamp = FileStamp::of(&self.inner.memory_path).await?;
+        Ok(())
+    }
+
+    /// Refreshes the chunk index, when an embedding model is configured.
+    ///
+    /// Callers must have dropped the state guard and the file lock first: an embedding
+    /// call may take arbitrarily long, and the document has to stay readable meanwhile.
+    /// A store without an embedding model has no chunk index and does nothing here.
+    async fn refresh_embedding_index(&self) -> Result<()> {
+        if !self.has_embedding() {
+            return Ok(());
+        }
+        let _stats = self.refresh_embeddings().await?;
         Ok(())
     }
 

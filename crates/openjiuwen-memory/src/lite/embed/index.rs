@@ -10,7 +10,9 @@
 //!
 //! A chunk id is `"<document>:<start_line>:<end_line>"` (for example
 //! `"MEMORY.md:1:12"`), so re-chunking unchanged text produces identical ids and a
-//! caller can relate a hit back to a citable line range.
+//! caller can relate a hit back to a citable line range. The originating document key is
+//! kept beside the id ([`IndexedChunk::document`], [`ScoredChunk::document`]) so a caller
+//! can map a chunk back to the document it came from without parsing the id.
 //!
 //! `EmbeddingIndex::reindex` rebuilds the chunk list from scratch but embeds only cache
 //! misses: each chunk's vector is looked up in the `EmbeddingCache` under
@@ -52,12 +54,16 @@ use super::TARGET;
 
 /// One chunk of a document together with its vector.
 ///
-/// `id` is `"<document>:<start_line>:<end_line>"`; `vector` is the chunk's embedding, and
-/// a chunk without one is kept and scores `0.0` instead of being dropped.
+/// `document` is the key of the document the chunk was cut from (the first element of the
+/// `(document, content)` pair passed to [`EmbeddingIndex::reindex`]); `id` is
+/// `"<document>:<start_line>:<end_line>"`; `vector` is the chunk's embedding, and a chunk
+/// without one is kept and scores `0.0` instead of being dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexedChunk {
     /// The chunk identity: document id plus line range.
     pub id: String,
+    /// The document key the chunk was cut from.
+    pub document: String,
     /// The chunk text and its line range.
     pub chunk: MemChunk,
     /// The chunk's embedding, when one is known.
@@ -83,6 +89,8 @@ pub struct EmbeddingStats {
 pub struct ScoredChunk {
     /// The chunk identity (see [`IndexedChunk::id`]).
     pub id: String,
+    /// The document key the chunk was cut from (see [`IndexedChunk::document`]).
+    pub document: String,
     /// The chunk text and its line range.
     pub chunk: MemChunk,
     /// The `0.0..=1.0` similarity to the query (`0.0` without a comparable vector).
@@ -204,6 +212,7 @@ impl EmbeddingIndex {
                 }
                 next.push(IndexedChunk {
                     id: format!("{document}:{}:{}", chunk.start_line, chunk.end_line),
+                    document: document.clone(),
                     chunk,
                     vector,
                 });
@@ -299,6 +308,7 @@ impl EmbeddingIndex {
                 };
                 ScoredChunk {
                     id: indexed.id.clone(),
+                    document: indexed.document.clone(),
                     chunk: indexed.chunk.clone(),
                     similarity,
                 }
@@ -583,6 +593,7 @@ mod tests {
         assert_eq!(index.model(), "hash-embedding");
         let chunk = &index.chunks()[0];
         assert_eq!(chunk.id, "MEMORY.md:1:3");
+        assert_eq!(chunk.document, "MEMORY.md");
         assert_eq!(chunk.chunk.text, "one\ntwo\nthree");
         assert_eq!((chunk.chunk.start_line, chunk.chunk.end_line), (1, 3));
         assert_eq!(chunk.vector.as_ref().map(Vec::len), Some(DIMENSION));
@@ -770,6 +781,7 @@ mod tests {
         assert!((hits[0].similarity - 1.0).abs() < 1e-5);
         assert!(hits[1].similarity >= hits[2].similarity);
         assert_eq!(hits[0].chunk.text, "alpha beta gamma");
+        assert_eq!(hits[0].document, "d1", "the document key maps a hit back");
         assert_eq!(embedding.query_calls(), 1);
 
         let limited = index
