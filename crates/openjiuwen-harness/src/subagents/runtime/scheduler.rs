@@ -737,12 +737,16 @@ mod tests {
         let id = spawn(&runtime, "one").await;
         wait_completed(&runtime, &id).await;
 
-        // Short period so the test stays bounded, but the first tick is still one period away.
-        let config = EvictionSchedulerConfig::new(Duration::from_millis(20), 1_000);
-        let handle = runtime.start_eviction_scheduler(config);
-        assert_eq!(handle.stats().sweeps, 0);
-
+        // Advance the runtime clock before the scheduler exists, so whichever tick fires first
+        // already sees an expired instance and the assertions stay timing-independent.
         clock.advance(1_000);
+        // Short period so the test stays bounded, but the first tick is still one period away.
+        let config = EvictionSchedulerConfig::new(Duration::from_millis(200), 1_000);
+        let handle = runtime.start_eviction_scheduler(config);
+        // Nothing ran yet: the driver only sweeps once the interval elapsed.
+        assert_eq!(handle.stats().sweeps, 0);
+        assert!(handle.is_running());
+
         let sweeps = timeout(BOUND, handle.wait_for_sweep()).await.unwrap();
         assert!(sweeps >= 1);
         assert_eq!(runtime.get_status(&id), SubagentStatus::Closed);
