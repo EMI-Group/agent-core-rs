@@ -61,7 +61,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 ### `hub.rs` — reload handlers
 
 - `#[async_trait] trait ReloadHandler: Send + Sync { fn name(&self) -> &str; fn target_kinds(&self) -> &[WatchTargetKind]; async fn reload(&self, event: &WatchEvent) -> Result<()>; }`
-- `ReloadHub::new()`, `is_empty()`, `len()`, `handler_names() -> Vec<&str>`, `with_handler<H: ReloadHandler + 'static>(self, H)`, `add_handler(Arc<dyn ReloadHandler>)`, `dispatch(&WatchEvent) -> Vec<ReloadFailure>`.
+- `ReloadHub::new()`, `is_empty()`, `len()`, `handler_names() -> Vec<&str>`, `with_handler<H: ReloadHandler + 'static>(self, H)`, `add_handler(Arc<dyn ReloadHandler>)`, `async dispatch(&WatchEvent) -> Vec<ReloadFailure>` (async because `ReloadHandler::reload` is async).
 - Dispatch runs only handlers whose `target_kinds` contains the event kind, sequentially, and converts every `Error` into a `ReloadFailure` (also logged at `warn`); a failing handler never stops the others.
 - `FnReloadHandler::new(name, kinds, closure)` — closure `for<'a> Fn(&'a WatchEvent) -> BoxFuture<'a, Result<()>>`, the seam for callers and tests.
 
