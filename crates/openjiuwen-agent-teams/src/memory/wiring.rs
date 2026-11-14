@@ -745,7 +745,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wiring = opened(&dir, MemoryConfig::default()).await;
         for member in ["", "dev/1", "dev\n1"] {
-            let error = wiring.toolkit(member, None).unwrap_err();
+            let Err(error) = wiring.toolkit(member, None) else {
+                panic!("member {member:?} was accepted");
+            };
             assert!(matches!(error, Error::Validation(_)), "{error}");
         }
         assert_eq!(wiring.toolkit("dev-1", None).unwrap().tool_names().len(), 4);
