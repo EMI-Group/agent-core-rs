@@ -77,10 +77,14 @@
 //!   snippet is `199005` `code can not be empty`.
 //! - Gateway and transport failures are always `199007` (see above), so they
 //!   never take the operation-specific code of the call.
-//! - `write_file` rejects `expected_content_sha256` and `create_if_absent`
-//!   because a remote transport has no compare-and-swap;
-//!   `supports_conditional_write` reports the gateway configuration's flag
-//!   as-is.
+//! - `write_file` honours `expected_content_sha256` and `create_if_absent`
+//!   host-side: it reads the current remote bytes, checks the precondition, and
+//!   only then posts the `write_file` envelope, all while holding a per-path
+//!   in-process lock (the crate's shared conditional-write support). Python's
+//!   provider has no such options, so this is an additive Rust capability, and
+//!   the guarantee is process-local: the envelope write itself is not atomic
+//!   against a concurrent reader. `supports_conditional_write` is therefore
+//!   always `true`.
 
 //! # Layout
 //!
@@ -171,8 +175,6 @@ pub(crate) struct AioClient {
     invoke_path: String,
     /// Resolved isolation key sent with every request (`null` when absent).
     isolation_key: Option<String>,
-    /// `SandboxGatewayConfig::supports_conditional_write` as resolved at construction.
-    supports_conditional_write: bool,
 }
 
 impl AioClient {
@@ -188,7 +190,6 @@ impl AioClient {
         Ok(Self {
             invoke_path: invoke_path(config),
             isolation_key: endpoint.isolation_key.clone(),
-            supports_conditional_write: config.supports_conditional_write,
             http,
         })
     }

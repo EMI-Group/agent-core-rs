@@ -6,6 +6,9 @@
 //! transfer I/O, and the chunking of streamed reads.
 use super::*;
 
+use crate::sys_operation::remote::conditional::sha256_hex;
+use crate::sys_operation::remote::transport::base64_encode;
+
 // ─── fs parameters ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -103,29 +106,217 @@ async fn write_file_sends_text_content_and_the_request_encoding() {
     assert_eq!(envelope["params"]["prepend_newline"], false);
 }
 
-#[tokio::test]
-async fn conditional_writes_are_rejected_before_calling_the_gateway() {
-    let server = MockServer::start().await;
-    let fs = fs(&server);
+// ─── conditional writes ─────────────────────────────────────────────────────
 
-    let digest = fs
-        .write_file(WriteFileParams::raw("/work/a.txt", "hi").with_expected_sha256("ab"))
+/// Answers the envelopes of one method with `body`.
+async fn respond_method(server: &MockServer, method_name: &str, body: Value) {
+    Mock::given(method("POST"))
+        .and(path(DEFAULT_INVOKE_PATH))
+        .and(body_partial_json(json!({"method": method_name})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
         .await;
-    assert_eq!(digest.code, 199_003);
-    assert_eq!(
-        digest.message,
-        "file system operation execution error, execution: write_file, \
-         reason: expected_content_sha256 is not supported by the aio provider \
-         (remote sandbox transports have no compare-and-swap)"
-    );
+}
 
-    let mut absent = WriteFileParams::raw("/work/a.txt", "hi");
-    absent.create_if_absent = true;
-    let absent = fs.write_file(absent).await;
-    assert_eq!(absent.code, 199_003);
-    assert!(absent
-        .message
-        .contains("create_if_absent is not supported by the aio provider"));
+/// The envelopes of one method the server received, in arrival order.
+async fn method_envelopes(server: &MockServer, method_name: &str) -> Vec<Value> {
+    envelopes(server)
+        .await
+        .into_iter()
+        .filter(|envelope| envelope["method"] == method_name)
+        .collect()
+}
+
+/// The gateway's `read_file` answer for a file holding `content`.
+async fn respond_read(server: &MockServer, path: &str, content: &[u8]) {
+    respond_method(
+        server,
+        "read_file",
+        json!({
+            "code": 0,
+            "message": "OK",
+            "data": {
+                "path": path,
+                "content": base64_encode(content),
+                "content_encoding": "base64",
+            },
+        }),
+    )
+    .await;
+}
+
+/// The gateway's `read_file` answer for a path the container does not have.
+async fn respond_missing(server: &MockServer, path: &str) {
+    respond_method(
+        server,
+        "read_file",
+        json!({"code": 1, "message": format!("file not found: {path}")}),
+    )
+    .await;
+}
+
+/// The gateway's successful `write_file` answer.
+async fn respond_write(server: &MockServer, path: &str, size: u64) {
+    respond_method(
+        server,
+        "write_file",
+        json!({"code": 0, "data": {"path": path, "size": size, "mode": "text"}}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_if_absent_writes_a_missing_path() {
+    let server = MockServer::start().await;
+    respond_missing(&server, "/work/a.txt").await;
+    respond_write(&server, "/work/a.txt", 2).await;
+    let mut params = WriteFileParams::raw("/work/a.txt", "hi");
+    params.create_if_absent = true;
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 0, "{result:?}");
+    assert_eq!(
+        method_envelopes(&server, "read_file").await.len(),
+        1,
+        "the current content must be probed"
+    );
+    let writes = method_envelopes(&server, "write_file").await;
+    assert_eq!(writes.len(), 1, "the precondition held, so the write runs");
+    assert_eq!(writes[0]["params"]["content"], "hi");
+    assert_eq!(writes[0]["params"]["append"], false);
+}
+
+#[tokio::test]
+async fn create_if_absent_rejects_an_existing_path_without_writing() {
+    let server = MockServer::start().await;
+    respond_read(&server, "/work/a.txt", b"hello").await;
+    let mut params = WriteFileParams::raw("/work/a.txt", "hi");
+    params.create_if_absent = true;
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 199_003);
+    assert!(result.message.contains("/work/a.txt"), "{result:?}");
+    assert!(result.message.contains("create_if_absent"), "{result:?}");
+    assert!(
+        method_envelopes(&server, "write_file").await.is_empty(),
+        "a rejected precondition must not post a write_file envelope"
+    );
+}
+
+#[tokio::test]
+async fn expected_sha256_matching_the_remote_content_writes() {
+    let server = MockServer::start().await;
+    respond_read(&server, "/work/a.txt", b"hello").await;
+    respond_write(&server, "/work/a.txt", 7).await;
+    let params =
+        WriteFileParams::raw("/work/a.txt", "goodbye").with_expected_sha256(sha256_hex(b"hello"));
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 0, "{result:?}");
+    let writes = method_envelopes(&server, "write_file").await;
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0]["params"]["content"], "goodbye");
+}
+
+#[tokio::test]
+async fn expected_sha256_mismatch_is_rejected_without_writing() {
+    let server = MockServer::start().await;
+    respond_read(&server, "/work/a.txt", b"goodbye").await;
+    let expected = sha256_hex(b"hello");
+    let params =
+        WriteFileParams::raw("/work/a.txt", "goodbye").with_expected_sha256(expected.clone());
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 199_003);
+    assert!(result.message.contains("/work/a.txt"), "{result:?}");
+    assert!(result.message.contains(&expected), "{result:?}");
+    assert!(
+        result.message.contains(&sha256_hex(b"goodbye")),
+        "the reason must name both digests: {result:?}"
+    );
+    assert!(
+        method_envelopes(&server, "write_file").await.is_empty(),
+        "a rejected precondition must not post a write_file envelope"
+    );
+}
+
+#[tokio::test]
+async fn expected_sha256_on_a_missing_path_is_rejected_without_writing() {
+    let server = MockServer::start().await;
+    respond_missing(&server, "/work/a.txt").await;
+    let params =
+        WriteFileParams::raw("/work/a.txt", "hi").with_expected_sha256(sha256_hex(b"hello"));
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 199_003);
+    assert!(result.message.contains("/work/a.txt"), "{result:?}");
+    assert!(result.message.contains("does not exist"), "{result:?}");
+    assert!(
+        method_envelopes(&server, "write_file").await.is_empty(),
+        "a rejected precondition must not post a write_file envelope"
+    );
+}
+
+#[tokio::test]
+async fn a_conditional_probe_failure_becomes_the_sandbox_gateway_status() {
+    let server = MockServer::start().await;
+    respond_method(
+        &server,
+        "read_file",
+        json!({"code": -1, "message": "container vanished"}),
+    )
+    .await;
+    let mut params = WriteFileParams::raw("/work/a.txt", "hi");
+    params.create_if_absent = true;
+
+    let result = fs(&server).write_file(params).await;
+
+    assert_eq!(result.code, 199_007, "{result:?}");
+    assert!(
+        method_envelopes(&server, "write_file").await.is_empty(),
+        "a failed probe must not post a write_file envelope"
+    );
+}
+
+#[tokio::test]
+async fn incompatible_conditional_options_are_rejected_before_any_envelope() {
+    let server = MockServer::start().await;
+
+    let mut both =
+        WriteFileParams::raw("/work/a.txt", "hi").with_expected_sha256(sha256_hex(b"hello"));
+    both.create_if_absent = true;
+
+    let mut absent_and_append = WriteFileParams::raw("/work/a.txt", "hi");
+    absent_and_append.create_if_absent = true;
+    absent_and_append.append = true;
+
+    let digest_and_append = WriteFileParams::raw("/work/a.txt", "hi")
+        .with_expected_sha256(sha256_hex(b"hello"))
+        .with_append();
+
+    let mut absent_without_create = WriteFileParams::raw("/work/a.txt", "hi");
+    absent_without_create.create_if_absent = true;
+    absent_without_create.create_if_not_exist = false;
+
+    for params in [
+        both,
+        absent_and_append,
+        digest_and_append,
+        absent_without_create,
+    ] {
+        let result = fs(&server).write_file(params).await;
+        assert_eq!(result.code, 199_003, "{result:?}");
+        assert_eq!(
+            result.message,
+            "file system operation execution error, execution: write_file, \
+             reason: conditional write options are incompatible"
+        );
+    }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
