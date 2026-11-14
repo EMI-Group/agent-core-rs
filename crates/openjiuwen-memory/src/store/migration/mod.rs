@@ -13,6 +13,10 @@
 //! - [`registry`] — the versioned steps, their validation, and the builtin plan.
 //! - [`runner`] — the forward-only `SQLite` runner, its report/status types, and
 //!   `migrate_sqlite` (feature `sqlite`).
+//! - [`plan`] — the migration context, steps, serialisable plan, the `Migrator` trait, and
+//!   the planner that chains migrators in registration order.
+//! - [`operation`] — the executable operations, their registry, the operation journal that
+//!   makes a run resumable, and the run/report types.
 //!
 //! # Semantics
 //!
@@ -60,6 +64,8 @@ pub mod sql;
 pub mod standard;
 pub mod vector;
 
+pub use operation::*;
+pub use plan::*;
 pub use registry::*;
 #[cfg(feature = "sqlite")]
 pub use runner::*;
