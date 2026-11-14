@@ -7,8 +7,9 @@
 //!
 //! - [`InProcessTransport`] — 1:1 delegation to the crate's [`MessageBus`](crate::MessageBus)
 //!   (per-topic FIFO workers, awaited pub/sub fan-out, synchronous replies).
-//! - [`RedisTransport`] — envelopes are JSON documents held in Redis lists, so
-//!   several processes can serve one team.
+//! - [`RedisTransport`] — envelopes are entries of Redis Streams, consumed
+//!   through consumer groups, so several processes can serve one team without
+//!   double-delivering and a reconnect does not lose a message.
 //! - [`TransportKind::Pulsar`] — declared but not implemented; building it
 //!   returns [`Error::Unsupported`] with a reason instead of silently degrading
 //!   to another backend.
@@ -20,28 +21,43 @@
 //!
 //! # Redis key scheme
 //!
-//! [`RedisTransport`] derives every key from `{key_prefix}:{team_id}`:
+//! [`RedisTransport`] derives every key from `{key_prefix}:{team_id}` and keeps
+//! envelopes in Redis Streams:
 //!
-//! - `{prefix}:{team}:p2p:{recipient}` — the point-to-point inbox of one agent;
-//!   `send` pushes the envelope JSON with `RPUSH` and a worker of the receiving
-//!   transport polls it with `RPOP`.
-//! - `{prefix}:{team}:reply:{message_id}` — the reply list of one request, keyed
-//!   by [`MessageEnvelope::message_id`]; the worker pushes
-//!   `{"value": ...}` or `{"error": "..."}` and the waiting `send` polls until
-//!   the deadline.
-//! - `{prefix}:{team}:pubsub:{subscriber}` — the pub/sub inbox of one agent; a
-//!   publisher pushes one copy per sorted subscriber.
+//! - `{prefix}:{team}:p2p:{recipient}` — the point-to-point inbox stream of one
+//!   agent; `send` appends `envelope ... reply <reply-key>` with `XADD` and a
+//!   worker of the receiving transport consumes it with `XREADGROUP`.
+//! - `{prefix}:{team}:reply:{message_id}` — the reply stream of one request,
+//!   keyed by [`MessageEnvelope`]'s message id; the worker appends
+//!   `{"value": ...}` or `{"error": "..."}` and the waiting `send` reads it with
+//!   `XREAD`, then deletes the key.
+//! - `{prefix}:{team}:pubsub:{subscriber}` — the pub/sub inbox stream of one
+//!   agent; a publisher appends one copy per sorted subscriber.
+//!
+//! Inbox streams are consumed through consumer groups
+//! (`{prefix}:{team}:p2p:cg` / `{prefix}:{team}:pubsub:cg`, or the configured
+//! [`RedisTransportConfig::consumer_group`]), so a second process watching the
+//! same agent does not double-deliver an entry and a crashed consumer's
+//! unacknowledged entries are claimed later.
 //!
 //! Only agents registered with [`RedisTransport::watch_agent`] get inbox
-//! workers, because `RPOP` removes a message: a transport must never poll a
-//! queue that belongs to another process.
+//! workers: a transport consumes the streams it owns.
 //!
 //! # Divergence from the in-process transport
 //!
-//! Redis delivery is asynchronous: `publish` returns once every `RPUSH`
+//! Redis delivery is asynchronous: `publish` returns once every `XADD`
 //! succeeded, which is before (or even without) any handler running.
 //! `InProcessTransport::publish` instead returns after the fan-out completed.
-//! `send` stays request/response on both backends.
+//! `send` stays request/response on both backends, and Redis delivery is
+//! at-least-once because an entry is acknowledged only after its reply was
+//! written.
+//!
+//! # Topology
+//!
+//! Only a single Redis node is implemented. [`TransportKind::Redis`] with a
+//! [`RedisTopology::Cluster`] or [`RedisTopology::Sentinel`] configuration is
+//! rejected with `Error::Unsupported`, because the workspace has no
+//! cluster- or Sentinel-aware RESP client.
 //!
 //! # `Pulsar`
 //!
@@ -64,7 +80,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use inproc::InProcessTransport;
-pub use redis::{RedisTransport, RedisTransportConfig, DEFAULT_POLL_INTERVAL_MS};
+pub use redis::{
+    RedisTopology, RedisTransport, RedisTransportConfig, DEFAULT_CLAIM_IDLE_MS,
+    DEFAULT_POLL_INTERVAL_MS,
+};
 
 use crate::envelope::MessageEnvelope;
 use crate::message_bus::{MessageBusConfig, MessageHandler};
@@ -83,7 +102,7 @@ pub enum TransportKind {
     /// In-process delivery through the crate's message bus.
     #[default]
     InProcess,
-    /// Shared delivery through Redis lists (RESP2, no vendor SDK).
+    /// Shared delivery through Redis Streams (RESP2, no vendor SDK).
     Redis,
     /// Pulsar delivery; declared but not implemented.
     Pulsar,
@@ -262,7 +281,8 @@ pub trait TeamTransport: Send + Sync + fmt::Debug {
 ///
 /// - [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
 ///   for [`TransportKind::Pulsar`], whose message names Pulsar and states that
-///   it is not implemented.
+///   it is not implemented, and for a Redis topology other than
+///   [`RedisTopology::Single`] (no cluster/Sentinel client exists here).
 /// - [`Error::Config`] when [`TransportKind::Redis`] is selected without
 ///   [`TransportConfig::redis`].
 pub fn build_transport(
@@ -280,12 +300,12 @@ pub fn build_transport(
                      set `transport.redis` (addr, optional username/password/db)",
                 )
             })?;
-            Ok(RedisTransport::new(
+            Ok(RedisTransport::try_new(
                 redis,
                 team_id,
                 config.key_prefix.clone(),
                 handler,
-            ))
+            )?)
         }
         TransportKind::Pulsar => Err(Error::unsupported(
             "Pulsar team transport is not implemented: openjiuwen-multiagent ships the \
