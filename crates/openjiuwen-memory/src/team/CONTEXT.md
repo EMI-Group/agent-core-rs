@@ -301,6 +301,12 @@ Python has only `memory_logger` warning lines, so the event seam is a Rust addit
 - `TeamMemory::in_memory()` is the offline reference backend; `TeamMemory::sqlite(path)` is the durable one and shares the trait.
 - The JSONL format is the record JSON itself (one per line), so an export can be inspected, edited, and re-imported with `from_jsonl`.
 - Adding a backend means implementing `TeamMemoryStore` and (for search) calling `rank_candidates`; do not reimplement the ranking formula.
+- Reach the surface through `team::*`: `document`, `extractor`, `hooks`, `observe`, `toolkit` are glob re-exported, `prompts` is re-exported item by item, and `prompts::EXTRACTION_SYSTEM_PROMPT` stays path-qualified because the crate root already binds `graph::EXTRACTION_SYSTEM_PROMPT`.
+- In a `TEAM_MEMORY.md` document the HTML-comment payload is the source of truth; edit the heading/body only for prose, and change a field in the payload (or through the facade) or it will be lost on parse.
+- `import_markdown` and the session-end flush are idempotent by construction (preserved or deterministic ids): a retry converges instead of duplicating, so a failed flush can simply be retried.
+- `handle_tool_call` returns typed errors, not failure envelopes; render one with `MemberMemoryToolkit::error_envelope` when a wire protocol needs it.
+- Hooks carry no team id from the store — one `TeamMemoryHooks` is bound to one `team_id` at construction, so build one per team.
+- A `TeamMemory` without `with_observer` has no observability cost; attach `TracingObserver` in a binary, never in library default paths.
 
 ## Deferrals
 
