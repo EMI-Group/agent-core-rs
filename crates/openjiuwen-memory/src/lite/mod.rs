@@ -1,4 +1,5 @@
-//! Lite coding memory: typed coding facts and a rendered Markdown memory index.
+//! Lite coding memory: typed coding facts, a rendered Markdown memory index, and the
+//! local search surfaces built on top of it.
 //!
 //! Ports the subset of Python `core/memory/lite/` the harness relies on: coding facts
 //! with a fact type, a one-line description, tags, and an optional source path;
@@ -23,6 +24,23 @@
 //!   owns a Markdown source of truth ([`markdown`]), a derived SQLite FTS5 index
 //!   (`fts`, feature `sqlite`), a cross-process advisory lock ([`lock`]), and a
 //!   debounced filesystem watcher ([`watch`]).
+//!
+//! # Local extensions
+//!
+//! The local store additionally supports, all opt-in or additive:
+//!
+//! - [`embed`] — a chunked vector index with a content-hash cache, so
+//!   [`SearchMode::Semantic`](crate::record::SearchMode::Semantic) and
+//!   [`SearchMode::Hybrid`](crate::record::SearchMode::Hybrid) really work once a
+//!   [`LocalCodingMemoryBuilder`](local::LocalCodingMemoryBuilder) is given an embedding.
+//! - [`facts`] — one Markdown file per fact plus the rendered `MEMORY.md`/`USER.md` index
+//!   split, with a lossless re-import of a hand-edited index.
+//! - [`session`] — append-only JSONL session logs under `sessions/` and their recall.
+//! - [`sync`] — the caller-driven `on_session_start`/`on_interval`/`on_write` triggers and
+//!   a deterministic interval scheduler; no background daemon by default.
+//! - [`daily`] — idempotent `daily_memory/YYYY-MM-DD.md` rollups.
+//! - [`write`](mod@crate::lite::write) — `create`/`append`/`merge`/`replace`/`skip` write modes with a bounded,
+//!   backoff-driven conflict-retry checker.
 //!
 //! Both paths are explicit instances (`Arc<CodingMemory>`, cloned `LocalCodingMemory`
 //! handles) over injected state, never process-global singletons. The remainder of the
