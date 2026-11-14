@@ -92,6 +92,15 @@ Re-exports:
 - Rails never call the model or execute tools; they append records and publish typed extension points (`ModelCallGate`, `ToolRecordPolicy`).
 - Files stay around or below 1000 lines; shared helpers live in `util`.
 
+## Consumer contract (outside the crate)
+
+- Every item in `mod.rs` is `pub` and flat re-exported from the crate root (`src/lib.rs:261-285`), so an external binary can name `resume`, `ResumePlan`, `FileSessionStore`, `RootLogSource`, `FileLinkStore`, `SessionBinding`, `ExecutionIdentity`, `WindowAssembler`, `Capacity`, `WindowPolicy` and `ExecutionLog` without a private path.
+- No other part of the crate consumes this module: `src/cli/`, `src/agent/` and `src/protocol/` contain zero references to `persistent_agent`, `ResumePlan`, `PersistentSessionRecord` or `WindowAssembly`, so nothing feeds a `ResumePlan` or its `WindowAssembly::messages` back into `run_once`, `Repl`, `DeepAgent::invoke`/`stream` or `NativeHarness`.
+- Re-seeding a model window is kernel-shaped, not module-shaped: `ContextOptions::history` / `ContextEngine::load_contexts` (`crates/openjiuwen-context/src/engine_options.rs`, `engine/persistence.rs:60`) or a custom `HarnessRail::before_model_call` mutating `RailContext::messages`.
+- There is no enumeration helper anywhere in the module: `FileSessionStore` exposes only `path_for`, `RootLogSource` opens one execution id at a time (`Error::NotFound` without `meta.json`), `FileLinkStore` exposes only `link_path`; a host must `read_dir` the roots itself.
+- `ResumePlan` derives `Debug + Clone` only (no `Serialize`), so a plan cannot be cached as JSON; `record` and `window` are its serializable parts.
+- Identifier rule: `is_valid_identifier` accepts 1..=512 Unicode scalar values with no whitespace and no control characters (`util.rs:111`); every constructor that takes an id enforces it.
+
 ## Routing Table
 
 - `./mod.rs` → module docs, module declarations, flat re-exports, `#[cfg(test)] mod tests`
