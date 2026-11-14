@@ -42,6 +42,7 @@ mod records;
 mod variables;
 
 pub use overrides::{ScopeAnalyzerOverrideSpec, ScopeOverrideHandles};
+pub use variables::VariableAssignmentReport;
 
 use std::path::Path;
 use std::sync::Arc;
