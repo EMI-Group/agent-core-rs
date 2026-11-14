@@ -2,15 +2,18 @@
 //!
 //! Python keeps a registry of tokenizer artifacts in
 //! `core.context_engine.token` so a context engine can pick the exact counter a
-//! model needs. The Rust port keeps the same seam but resolves tokenizers
-//! offline:
+//! model needs. The Rust port keeps the same seam:
 //!
 //! - [`ModelEncoding`] maps well-known model names to one of the four `OpenAI`
 //!   BPE vocabularies embedded in `tiktoken-rs`.
 //! - [`TokenizerRegistry`] holds [`TokenizerSpec`] entries so deployments can
 //!   declare a provider/family tokenizer without changing code.
+//! - [`artifacts::TokenizerArtifactManager`] resolves, validates, caches and
+//!   (only when explicitly enabled) downloads native artifacts, so selection
+//!   stays network-free by default.
 //! - [`TokenizerSelector`] walks the selection ladder: explicit spec, registry
-//!   match, `tiktoken` encoding, then a conservative string-length estimate.
+//!   match, native artifact, `tiktoken` encoding, then a conservative
+//!   string-length estimate.
 //! - [`ModelTokenCounter`] and [`SelectedTokenizer`] implement the
 //!   [`TokenCounter`] seam used by the rest of the workspace.
 //!
@@ -135,13 +138,19 @@ fn has_prefix(value: &str, prefixes: &[&str]) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenizerEngine {
-    /// Use the best offline engine available (`tiktoken`, then the estimate).
+    /// Use the best offline engine available: a native artefact when one
+    /// resolves, then `tiktoken`, then the estimate.
     #[default]
     Auto,
-    /// Use a `tiktoken` BPE vocabulary.
+    /// Use a `tiktoken` BPE vocabulary, or a `tiktoken.model` artefact when a
+    /// [`artifacts::TokenizerArtifactManager`] resolves one.
     Tiktoken,
-    /// Use a native `tokenizer.json` artifact, which the selector does not
-    /// resolve itself: load it with [`load_native_tokenizer`].
+    /// Use a native `tokenizer.json` artefact.
+    ///
+    /// A [`TokenizerSelector`] carrying a [`artifacts::TokenizerArtifactManager`] resolves
+    /// it from the spec; without a manager the selection degrades through
+    /// `tiktoken` to the estimate, and [`load_native_tokenizer`] loads a file a
+    /// caller already knows.
     Native,
 }
 
@@ -178,11 +187,12 @@ impl TokenizerSource {
 
 /// A declared tokenizer for one provider/model or one model family.
 ///
-/// Specs are declarative metadata: the selector can satisfy `tiktoken` and
-/// `auto` engines, but it does not resolve a `native` artifact from the spec;
-/// [`TokenizerSpec::artifact_path`] is there for a caller that loads it with
-/// [`load_native_tokenizer`]. Every field is optional except the provider/model
-/// pair, and unknown JSON fields are ignored.
+/// Specs are declarative metadata. A [`TokenizerSelector`] without a
+/// [`artifacts::TokenizerArtifactManager`] can only satisfy the `tiktoken` and `auto`
+/// engines; with a manager it resolves [`TokenizerSpec::artifact_path`],
+/// [`TokenizerSpec::tokenizer_id`] through the artefact cache, and the one-hop
+/// [`TokenizerSpec::compatible_fallbacks`]. Every field is optional except the
+/// provider/model pair, and unknown JSON fields are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct TokenizerSpec {
@@ -194,7 +204,9 @@ pub struct TokenizerSpec {
     pub family: Option<String>,
     /// Engine requested by this entry.
     pub engine: TokenizerEngine,
-    /// Tokenizer artifact id, carried through as measurement metadata.
+    /// Tokenizer artifact id, carried through as measurement metadata and used
+    /// as the cache/hub id by a [`artifacts::TokenizerArtifactManager`].
+    #[serde(alias = "id")]
     pub tokenizer_id: Option<String>,
     /// Declared measurement source (`tiktoken`, `native_tokenizer`, ...).
     pub source: Option<String>,
@@ -204,6 +216,11 @@ pub struct TokenizerSpec {
     pub artifact_path: Option<String>,
     /// Expected SHA-256 of a native tokenizer artifact.
     pub sha256: Option<String>,
+    /// One-hop family fallbacks tried when this entry's artifact is missing.
+    ///
+    /// The selector reads at most the first entry, matching Python's
+    /// `compatible_fallbacks[:1]`.
+    pub compatible_fallbacks: Vec<CompatibleTokenizerSpec>,
 }
 
 impl TokenizerSpec {
@@ -229,6 +246,51 @@ impl TokenizerSpec {
             ));
         }
         Ok(())
+    }
+}
+
+/// A tokenizer from the same model family that may be used as a fallback.
+///
+/// The shape matches Python's `CompatibleTokenizerSpec`: the same fields as
+/// [`TokenizerSpec`] minus `provider`, `family` and `compatible_fallbacks`,
+/// because a fallback is chosen for a model of the same family and the chain
+/// stays one hop deep.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct CompatibleTokenizerSpec {
+    /// The model the fallback tokenizer was published for.
+    pub model: String,
+    /// The artifact id the fallback resolves through.
+    #[serde(alias = "id")]
+    pub tokenizer_id: Option<String>,
+    /// Artifact source (`huggingface`, `modelscope`, `provider_official`,
+    /// `local`).
+    pub source: Option<String>,
+    /// Engine requested by the fallback.
+    pub engine: TokenizerEngine,
+    /// Artifact revision.
+    pub revision: Option<String>,
+    /// Local path of a native tokenizer artifact.
+    pub artifact_path: Option<String>,
+    /// Expected SHA-256 of a native tokenizer artifact.
+    pub sha256: Option<String>,
+}
+
+impl From<CompatibleTokenizerSpec> for TokenizerSpec {
+    /// Widens a fallback into a spec the artefact manager can resolve.
+    fn from(fallback: CompatibleTokenizerSpec) -> Self {
+        Self {
+            provider: String::new(),
+            model: fallback.model,
+            family: None,
+            engine: fallback.engine,
+            tokenizer_id: fallback.tokenizer_id,
+            source: fallback.source,
+            revision: fallback.revision,
+            artifact_path: fallback.artifact_path,
+            sha256: fallback.sha256,
+            compatible_fallbacks: Vec::new(),
+        }
     }
 }
 
@@ -764,12 +826,37 @@ impl SelectedTokenizer {
         model: Option<String>,
         tokenizer: Option<String>,
     ) -> Self {
-        Self {
-            backing: SelectedBacking::Native(native),
-            source: TokenizerSource::NativeTokenizer,
+        Self::from_native_with(
+            native,
+            TokenizerSource::NativeTokenizer,
             model,
             tokenizer,
-            fallback_reason: None,
+            None,
+        )
+    }
+
+    /// Builds a native-artifact-backed selection with explicit provenance.
+    ///
+    /// The count itself is exact for the loaded artifact, but
+    /// [`TokenizerSource::NativeTokenizer`] is reserved for a tokenizer that is
+    /// the model's own: a family or one-hop fallback passes
+    /// [`TokenizerSource::FamilyTokenizerFallback`] here, and
+    /// [`SelectedTokenizer::estimated`] then stays `true` so telemetry never
+    /// mistakes a sibling vocabulary for the model's own count.
+    #[must_use]
+    pub fn from_native_with(
+        native: Arc<NativeTokenizer>,
+        source: TokenizerSource,
+        model: Option<String>,
+        tokenizer: Option<String>,
+        fallback_reason: Option<String>,
+    ) -> Self {
+        Self {
+            backing: SelectedBacking::Native(native),
+            source,
+            model,
+            tokenizer,
+            fallback_reason,
         }
     }
 
@@ -865,9 +952,16 @@ impl TokenCounter for SelectedTokenizer {
 /// 3. the model's `tiktoken` vocabulary;
 /// 4. a three-characters-per-token estimate.
 ///
-/// A requested [`TokenizerEngine::Native`] cannot be satisfied offline, so it
-/// falls through to steps 3 and 4 with the reason
-/// `native_tokenizer_unavailable`.
+/// With a [`artifacts::TokenizerArtifactManager`] attached, steps 1 and 2 first try the
+/// spec's own native artifact, then the first
+/// [`TokenizerSpec::compatible_fallbacks`] entry (one hop, reason
+/// `target_tokenizer_unavailable`), and only then continue down the ladder. A
+/// family registry match keeps its `family_tokenizer_fallback` source and
+/// `model_variant_tokenizer_family` reason, and the selection reports
+/// `estimated() == true` for it because the vocabulary is a sibling's.
+///
+/// A requested [`TokenizerEngine::Native`] without a resolvable artifact falls
+/// through to steps 3 and 4 with the reason `native_tokenizer_unavailable`.
 #[derive(Debug, Clone, Default)]
 pub struct TokenizerSelector {
     /// Provider used for registry lookup.
@@ -878,6 +972,8 @@ pub struct TokenizerSelector {
     spec: Option<TokenizerSpec>,
     /// Registry consulted when no explicit spec is set.
     registry: Option<TokenizerRegistry>,
+    /// Artifact resolver; absent means every native rung is unavailable.
+    manager: Option<artifacts::TokenizerArtifactManager>,
 }
 
 impl TokenizerSelector {
@@ -897,6 +993,7 @@ impl TokenizerSelector {
             model: model.into(),
             spec,
             registry,
+            manager: None,
         }
     }
 
@@ -914,6 +1011,18 @@ impl TokenizerSelector {
         self
     }
 
+    /// Sets the artifact manager used to resolve native tokenizers.
+    ///
+    /// Selection is synchronous, so it only ever reads the local cache
+    /// ([`artifacts::TokenizerArtifactManager::resolve_cached`]); a download
+    /// stays an explicit [`artifacts::TokenizerArtifactManager::resolve`] or
+    /// [`artifacts::TokenizerArtifactManager::download`] call.
+    #[must_use]
+    pub fn with_artifact_manager(mut self, manager: artifacts::TokenizerArtifactManager) -> Self {
+        self.manager = Some(manager);
+        self
+    }
+
     /// The provider used for registry lookup.
     #[must_use]
     pub fn provider(&self) -> &str {
@@ -926,12 +1035,25 @@ impl TokenizerSelector {
         &self.model
     }
 
+    /// The artifact manager, when one is attached.
+    #[must_use]
+    pub fn artifact_manager(&self) -> Option<&artifacts::TokenizerArtifactManager> {
+        self.manager.as_ref()
+    }
+
     /// Selects the tokenizer for this provider and model.
     #[must_use]
     pub fn select(&self) -> SelectedTokenizer {
         if let Some(spec) = &self.spec {
             if spec.engine == TokenizerEngine::Native {
-                return self.native_selection(Some(spec));
+                return self
+                    .artifact_chain(spec, TokenizerSource::NativeTokenizer, None)
+                    .unwrap_or_else(|| self.native_selection(Some(spec)));
+            }
+            if let Some(selected) =
+                self.artifact_chain(spec, TokenizerSource::NativeTokenizer, None)
+            {
+                return selected;
             }
             return self.spec_selection(spec);
         }
@@ -944,11 +1066,25 @@ impl TokenizerSelector {
             match hit.kind {
                 TokenizerMatchKind::Exact => {
                     if hit.spec.engine == TokenizerEngine::Native {
-                        return self.native_selection(Some(&hit.spec));
+                        return self
+                            .artifact_chain(&hit.spec, TokenizerSource::NativeTokenizer, None)
+                            .unwrap_or_else(|| self.native_selection(Some(&hit.spec)));
+                    }
+                    if let Some(selected) =
+                        self.artifact_chain(&hit.spec, TokenizerSource::NativeTokenizer, None)
+                    {
+                        return selected;
                     }
                     return self.spec_selection(&hit.spec);
                 }
                 TokenizerMatchKind::Family => {
+                    if let Some(selected) = self.artifact_chain(
+                        &hit.spec,
+                        TokenizerSource::FamilyTokenizerFallback,
+                        Some("model_variant_tokenizer_family"),
+                    ) {
+                        return selected;
+                    }
                     if let Some(selected) = self.tiktoken_selection(
                         TokenizerSource::FamilyTokenizerFallback,
                         Some("model_variant_tokenizer_family"),
@@ -962,6 +1098,66 @@ impl TokenizerSelector {
 
         self.tiktoken_selection(TokenizerSource::Tiktoken, None)
             .unwrap_or_else(|| self.string_length_selection(self.default_reason()))
+    }
+
+    /// Resolves a native artifact for `spec`, then for its one family fallback.
+    ///
+    /// Only the first [`TokenizerSpec::compatible_fallbacks`] entry is tried,
+    /// matching Python's `compatible_fallbacks[:1]`: selection stays O(1) even
+    /// with sloppy configuration.
+    fn artifact_chain(
+        &self,
+        spec: &TokenizerSpec,
+        source: TokenizerSource,
+        reason: Option<&str>,
+    ) -> Option<SelectedTokenizer> {
+        if let Some(selected) = self.artifact_selection(spec, source, reason) {
+            return Some(selected);
+        }
+        let fallback = spec.compatible_fallbacks.first()?.clone();
+        self.artifact_selection(
+            &TokenizerSpec::from(fallback),
+            TokenizerSource::FamilyTokenizerFallback,
+            Some("target_tokenizer_unavailable"),
+        )
+    }
+
+    /// Builds a native selection for one spec, or `None` when its artifact is
+    /// not available locally.
+    fn artifact_selection(
+        &self,
+        spec: &TokenizerSpec,
+        source: TokenizerSource,
+        reason: Option<&str>,
+    ) -> Option<SelectedTokenizer> {
+        let manager = self.manager.as_ref()?;
+        let path = manager.resolve_cached(spec)?;
+        let artifact_display = path.display().to_string();
+        let native = match load_native_artifact(&path, &artifact_display) {
+            Ok(native) => Arc::new(native),
+            Err(error) => {
+                tracing::debug!(
+                    target: "openjiuwen_context::tokenizers",
+                    %error,
+                    artifact = %artifact_display,
+                    "native tokenizer artifact could not be decoded; continuing down the ladder"
+                );
+                return None;
+            }
+        };
+        let tokenizer = spec
+            .tokenizer_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| native.tokenizer_id().map(str::to_owned))
+            .or(Some(artifact_display));
+        Some(SelectedTokenizer::from_native_with(
+            native,
+            source,
+            non_empty(self.model.clone()),
+            tokenizer,
+            reason.map(str::to_owned),
+        ))
     }
 
     /// Builds the selection for an explicit (non-native) spec.

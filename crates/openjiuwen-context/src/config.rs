@@ -15,6 +15,7 @@
 //! ```
 //!
 //! [`ContextEngine`]: crate::engine::ContextEngine
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
@@ -22,6 +23,7 @@ use openjiuwen_foundation::prompt::{ApproxTokenCounter, TiktokenCounter, TokenCo
 use serde::{Deserialize, Serialize};
 
 use crate::processor::{ProcessorConfig, ToolResultConfig, TruncationConfig};
+use crate::tokenizers::artifacts::TokenizerArtifactManager;
 use crate::tokenizers::{TokenizerRegistry, TokenizerSelector, TokenizerSpec};
 
 /// Context budget used when [`ContextConfig::max_context_tokens`] is unset.
@@ -131,6 +133,18 @@ pub struct ContextConfig {
     pub tokenizer_provider: Option<String>,
     /// Declared tokenizers used by [`TokenCounterKind::Model`].
     pub tokenizer_registry: Vec<TokenizerSpec>,
+    /// Directory holding cached tokenizer artifacts.
+    ///
+    /// `None` follows
+    /// [`OPENJIUWEN_TOKENIZER_CACHE_DIR`](crate::tokenizers::artifacts::CACHE_DIR_ENV)
+    /// and then `~/.cache/openjiuwen/tokenizers`.
+    pub tokenizer_cache_dir: Option<PathBuf>,
+    /// Whether a tokenizer artifact may be downloaded when it is not cached.
+    ///
+    /// Off by default: context creation and counting never touch the network.
+    pub enable_tokenizer_download: bool,
+    /// Whether artifact resolution is restricted to the local cache.
+    pub tokenizer_offline: bool,
 }
 
 impl Default for ContextConfig {
@@ -150,6 +164,9 @@ impl Default for ContextConfig {
             model_name: None,
             tokenizer_provider: None,
             tokenizer_registry: Vec::new(),
+            tokenizer_cache_dir: None,
+            enable_tokenizer_download: false,
+            tokenizer_offline: false,
         }
     }
 }
@@ -204,10 +221,27 @@ impl ContextConfig {
                     self.model_name.clone().unwrap_or_default(),
                     None,
                     registry,
-                );
+                )
+                .with_artifact_manager(self.tokenizer_artifact_manager());
                 Arc::new(selector.select())
             }
         }
+    }
+
+    /// The artifact manager the model-aware counter selects with.
+    ///
+    /// Selection is synchronous, so the manager only reads the local cache even
+    /// when `enable_tokenizer_download` is set; a download stays an explicit
+    /// [`TokenizerArtifactManager::download`] call.
+    #[must_use]
+    pub fn tokenizer_artifact_manager(&self) -> TokenizerArtifactManager {
+        let mut manager = TokenizerArtifactManager::new()
+            .with_enable_download(self.enable_tokenizer_download)
+            .with_offline(self.tokenizer_offline);
+        if let Some(cache_dir) = &self.tokenizer_cache_dir {
+            manager = manager.with_cache_dir(cache_dir.clone());
+        }
+        manager
     }
 
     /// Validates the configuration before it is used by an engine.
@@ -217,8 +251,9 @@ impl ContextConfig {
     /// Returns [`Error::Config`] when the compression threshold is outside
     /// `(0, 1]`, the effective maximum is zero, the `characters` counter has a
     /// zero ratio, a tokenizer registry entry names neither a provider nor a
-    /// model, or compression recall is enabled with a chunk size of zero or an
-    /// overlap that is not smaller than the chunk size.
+    /// model, tokenizer downloads are enabled while the cache is offline, or
+    /// compression recall is enabled with a chunk size of zero or an overlap
+    /// that is not smaller than the chunk size.
     pub fn validate(&self) -> Result<()> {
         let threshold = self.compression_threshold;
         if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
@@ -241,6 +276,11 @@ impl ContextConfig {
         }
         for spec in &self.tokenizer_registry {
             spec.validate()?;
+        }
+        if self.enable_tokenizer_download && self.tokenizer_offline {
+            return Err(Error::Config(
+                "enable_tokenizer_download and tokenizer_offline are mutually exclusive".to_owned(),
+            ));
         }
         let recall = &self.compression_recall;
         if recall.enabled {
