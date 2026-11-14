@@ -62,7 +62,7 @@ Rail (`rail.rs`): `MOA_RAIL_NAME`, `MOA_PROMPT_SECTION`, `MOA_STATE_EXTRA_KEY`, 
 
 Skills (`builtin_skills.rs`, `skill_mount.rs`): `CONSULT_SKILL_NAME`, `CONSULT_SKILL_DESCRIPTION`, `CONSULT_SKILL_BODY`, `validate_builtin_skill_name`, `consult_skill`, `materialize_builtin_skill`; `ConsultationSkillMount::{new, embedded, from_dir, skill, mount, unmount, validate}`.
 
-Every public item is re-exported from this module root; the crate root adds the same names (see the parent report).
+Every public item is re-exported from this module root; the crate root does not yet flatten these names.
 
 ## Constraints
 
