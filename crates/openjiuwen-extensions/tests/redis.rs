@@ -703,7 +703,10 @@ fn vector_schema() -> CollectionSchema {
 }
 /// The JSON object of `value`, for the document fixtures.
 fn obj(value: Value) -> Map<String, Value> {
-    value.as_object().cloned().unwrap_or_default()
+    match value {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    }
 }
 /// A vector document with a three-component embedding.
 fn vector_doc(id: &str, embedding: [f32; 3]) -> Map<String, Value> {
@@ -855,7 +858,6 @@ async fn document_store_query_windows_match_the_reference_store() {
             ],
             offset: 2,
             limit: Some(7),
-            ..Query::default()
         },
         Query {
             order_by: vec![("age".to_string(), SortOrder::Asc)],
