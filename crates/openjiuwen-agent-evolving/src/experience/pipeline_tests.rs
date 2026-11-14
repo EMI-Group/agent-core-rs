@@ -72,7 +72,7 @@ fn failed_trajectory(id: &str) -> Trajectory {
     trajectory
 }
 
-fn request<'a>(signals: &'a [EvolutionSignal]) -> EvolutionRequest<'a> {
+fn request(signals: &[EvolutionSignal]) -> EvolutionRequest<'_> {
     EvolutionRequest::new(
         "pdf-report",
         "# PDF report\n\nRead and summarise PDFs.",
@@ -80,7 +80,7 @@ fn request<'a>(signals: &'a [EvolutionSignal]) -> EvolutionRequest<'a> {
     )
 }
 
-fn draft_input<'a>(signals: &'a [EvolutionSignal]) -> DraftInput<'a> {
+fn draft_input(signals: &[EvolutionSignal]) -> DraftInput<'_> {
     DraftInput::new(
         "pdf-report",
         "# PDF report\n\nRead and summarise PDFs.",
@@ -345,7 +345,7 @@ async fn summary_truncation_respects_the_configured_limit() {
     let draft = drafter.draft(&draft_input(&signals)).await.expect("draft");
     let summary = &draft.experiences[0].summary;
     assert_eq!(summary.chars().count(), 24);
-    assert!(SUMMARY_LIMIT > 24);
+    assert_eq!(SUMMARY_LIMIT, 160);
 
     // The schema itself rejects an over-long model summary instead of truncating.
     let too_long = "x".repeat(SUMMARY_LIMIT + 1);

@@ -423,7 +423,7 @@ impl OnlineEvolutionOrchestrator {
         let mut committed = Vec::with_capacity(records.len());
         for record in records {
             match self.archive.add(record) {
-                Ok(AddOutcome::Inserted(id)) | Ok(AddOutcome::Merged { into: id, .. }) => {
+                Ok(AddOutcome::Inserted(id) | AddOutcome::Merged { into: id, .. }) => {
                     committed.push(id);
                 }
                 Err(error) => return Err(error),
@@ -533,7 +533,7 @@ mod tests {
         signal_with("execution_failure", excerpt, 1.0)
     }
 
-    fn request<'a>(signals: &'a [EvolutionSignal]) -> EvolutionRequest<'a> {
+    fn request(signals: &[EvolutionSignal]) -> EvolutionRequest<'_> {
         EvolutionRequest::new("pdf-report", "# PDF report", signals)
     }
 
@@ -615,7 +615,7 @@ mod tests {
             .expect("result");
         assert_eq!(staged.status, EvolutionStatus::Staged);
         assert_eq!(staged.staged.len(), 1);
-        assert!(staged.committed.is_empty());
+        assert_eq!(staged.committed.len(), 0);
         assert!(orchestrator.archive().is_empty());
 
         let auto = orchestrator
@@ -624,7 +624,7 @@ mod tests {
             .expect("result");
         assert_eq!(auto.status, EvolutionStatus::AutoApproved);
         assert_eq!(auto.committed.len(), 1);
-        assert!(auto.staged.is_empty());
+        assert_eq!(auto.staged.len(), 0);
         let records = orchestrator.archive().records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_id, auto.committed[0]);
@@ -677,7 +677,7 @@ mod tests {
         let persisted =
             orchestrator.complete(&request.clone().with_requires_approval(false), Ok(blank));
         assert_eq!(persisted.status, EvolutionStatus::PersistenceFailed);
-        assert!(persisted.committed.is_empty());
+        assert_eq!(persisted.committed.len(), 0);
     }
 
     #[test]

@@ -22,13 +22,12 @@ pub(crate) fn render_template(template: &str, values: &[(&str, &str)]) -> String
             return rendered;
         };
         let key = &after[..close];
-        match values.iter().find(|(name, _)| *name == key) {
-            Some((_, value)) => rendered.push_str(value),
-            None => {
-                rendered.push('{');
-                rendered.push_str(key);
-                rendered.push('}');
-            }
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == key) {
+            rendered.push_str(value);
+        } else {
+            rendered.push('{');
+            rendered.push_str(key);
+            rendered.push('}');
         }
         rest = &after[close + 1..];
     }
@@ -93,7 +92,7 @@ Every object carries these keys:
 /// Its documented placeholders are `{error}` (the parse failure) and
 /// `{previous}` (a bounded preview of the rejected reply). It asks for the same
 /// array contract as [`DRAFT_PROMPT`].
-pub const FORMAT_REPAIR_PROMPT: &str = r#"
+pub const FORMAT_REPAIR_PROMPT: &str = r"
 Your previous reply could not be parsed as the required JSON array. Fix it and reply again.
 
 ## Parse error
@@ -106,7 +105,7 @@ Your previous reply could not be parsed as the required JSON array. Fix it and r
 Reply with only a JSON array, starting with [ and ending with ].
 Every object carries: action (append or skip), skip_reason, target (description, body or script), section, summary, keywords, content, merge_target, script_filename, script_language, script_purpose.
 Use double quotes only, escape newlines inside strings as \n, and add no prose or Markdown fence.
-"#;
+";
 
 /// The maintenance prompt behind [`ExperienceDrafter::simplify`].
 ///
@@ -114,7 +113,7 @@ Use double quotes only, escape newlines inside strings as \n, and add no prose o
 /// `{user_intent}`. The answer contract is a bare JSON array of
 /// `{action, record_id, reason, merge_remove_ids, new_content}` objects with
 /// `action` one of `DELETE | MERGE | REFINE | KEEP`.
-pub const SIMPLIFY_PROMPT: &str = r#"
+pub const SIMPLIFY_PROMPT: &str = r"
 You maintain an experience library. Based on the scores and usage below, propose maintenance actions.
 
 ## Skill name
@@ -145,7 +144,7 @@ Reply with only a JSON array. Every object carries:
 
 ## User intent
 {user_intent}
-"#;
+";
 
 #[cfg(test)]
 mod tests {

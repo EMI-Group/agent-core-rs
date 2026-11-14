@@ -132,7 +132,7 @@ impl<'a> DraftInput<'a> {
 /// explicitly rejected; an explicit all-`skip` answer is a valid empty draft
 /// (`appended == 0`, `skipped > 0`) and is *not* replaced by the deterministic
 /// fallback.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DraftParse {
     /// The normalized draft the reply described.
@@ -141,16 +141,6 @@ pub struct DraftParse {
     pub appended: usize,
     /// How many items the reply explicitly skipped.
     pub skipped: usize,
-}
-
-impl Default for DraftParse {
-    fn default() -> Self {
-        Self {
-            draft: EvolveDraft::default(),
-            appended: 0,
-            skipped: 0,
-        }
-    }
 }
 
 /// Drafts evolution experiences, with an optional model and a deterministic
@@ -328,7 +318,7 @@ impl ExperienceDrafter {
         let prompt = self.build_draft_prompt(input);
         let first = self.invoke(model, &prompt).await?;
         match parse_draft_text(subject, &first) {
-            Ok(parse) => return Some(parse),
+            Ok(parse) => Some(parse),
             Err(error) => {
                 tracing::debug!(
                     model = model.model_name(),
@@ -898,7 +888,7 @@ mod tests {
         EvolutionSubject::for_skill("pdf-report").expect("valid subject")
     }
 
-    fn input<'a>(signals: &'a [EvolutionSignal]) -> DraftInput<'a> {
+    fn input(signals: &[EvolutionSignal]) -> DraftInput<'_> {
         DraftInput::new("pdf-report", "# PDF report\n\nRead and summarise.", signals)
     }
 
@@ -922,7 +912,7 @@ mod tests {
         let value = extract_json_value(prose).expect("outermost array");
         assert!(value.is_array());
         let object = extract_json_value("{\"experiences\": []}").expect("object");
-        assert!(json_items(object, "experiences").expect("items").is_empty());
+        assert_eq!(json_items(object, "experiences").expect("items").len(), 0);
         assert!(extract_json_value("   ").is_err());
         assert!(extract_json_value("no json here").is_err());
         let comments = "// leading\n[{\"summary\":\"s\",\"content\":\"c\"}]";
@@ -980,7 +970,7 @@ mod tests {
         );
         assert!(!prompt.contains("{skill_name}"));
         assert!(prompt.contains("tighten the parser"));
-        assert!(prompt.contains("No existing records") == false);
+        assert!(!prompt.contains("No existing records"));
         assert!(prompt.contains(&format!(
             "[truncated, the original SKILL.md is {} characters]",
             "# PDF report\n\nRead and summarise.".chars().count()

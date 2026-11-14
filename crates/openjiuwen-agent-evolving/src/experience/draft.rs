@@ -312,7 +312,7 @@ impl DraftSection {
 /// The optional script fields are only populated for
 /// [`EvolutionTarget::Script`] items, and `source_refs` holds the run-scoped
 /// evidence references the approval view shows but the persistence view drops.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 pub struct DraftExperience {
     /// One-line lesson summary, whitespace-collapsed and at most
@@ -339,22 +339,6 @@ pub struct DraftExperience {
     /// Run-scoped evidence references; omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<String>,
-}
-
-impl Default for DraftExperience {
-    fn default() -> Self {
-        Self {
-            summary: String::new(),
-            content: String::new(),
-            target: EvolutionTarget::default(),
-            section: DraftSection::default(),
-            reason: String::new(),
-            script_filename: None,
-            script_language: None,
-            script_purpose: None,
-            source_refs: Vec::new(),
-        }
-    }
 }
 
 impl DraftExperience {
@@ -790,7 +774,7 @@ fn raw_text(value: Option<&Value>) -> String {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Number(number)) => number.to_string(),
         Some(Value::Bool(boolean)) => boolean.to_string(),
-        Some(Value::Null) | Some(Value::Array(_)) | Some(Value::Object(_)) | None => String::new(),
+        Some(Value::Null | Value::Array(_) | Value::Object(_)) | None => String::new(),
     }
 }
 
