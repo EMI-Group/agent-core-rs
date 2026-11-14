@@ -15,11 +15,12 @@ doc = false
 
 [dependencies]
 openjiuwen.workspace = true
-openjiuwen-harness.workspace = true
+openjiuwen-harness = { workspace = true, features = ["notify"] }
 openjiuwen-harness-protocol.workspace = true
 openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 clap.workspace = true
+chrono.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

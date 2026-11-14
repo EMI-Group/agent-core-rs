@@ -25,6 +25,11 @@ use openjiuwen_common::logging::{self, LogWriter, LoggingConfig};
 
 mod auto_harness;
 mod cli;
+mod cron;
+mod extras;
+mod lsp;
+mod team;
+mod watch;
 
 /// Exit code of a successful invocation (and of `--help` / `--version`).
 const EXIT_FAILURE: u8 = 1;
