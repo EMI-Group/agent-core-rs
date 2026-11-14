@@ -688,8 +688,11 @@ mod tests {
         assert!(fs.supports_conditional_write());
     }
 
-    /// Serialises the cases that drain the process-global provider container caches.
+    /// Serialises the cases that share the process-global provider container caches.
     static TEARDOWN_CACHE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Environment variable that turns a test-binary run into the teardown-drain helper.
+    const TEARDOWN_HELPER_ENV: &str = "OPENJIUWEN_EXTENSIONS_TEARDOWN_HELPER";
 
     #[tokio::test]
     async fn shutdown_remote_refuses_aio_with_the_gateway_reason() {
@@ -723,17 +726,60 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Validation);
     }
 
-    #[tokio::test]
-    async fn shutdown_remote_all_reports_every_type_in_order() {
+    /// The drain reports every remote type, in [`REMOTE_SANDBOX_TYPES`] order.
+    ///
+    /// The assertions run in a child process (see [`shutdown_remote_all_drains_a_fresh_process`]).
+    #[test]
+    fn shutdown_remote_all_reports_every_type_in_order() {
+        let executable = std::env::current_exe().expect("the test binary path");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "sys_operation::tests::shutdown_remote_all_helper",
+                "--test-threads",
+                "1",
+            ])
+            .env(TEARDOWN_HELPER_ENV, "1")
+            .output()
+            .expect("the helper process starts");
+        assert!(
+            output.status.success(),
+            "the teardown drain case failed in a child process:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child-process entry point of [`shutdown_remote_all_reports_every_type_in_order`].
+    ///
+    /// Runs as an ordinary (passing) test when [`TEARDOWN_HELPER_ENV`] is unset.
+    #[test]
+    fn shutdown_remote_all_helper() {
+        if std::env::var_os(TEARDOWN_HELPER_ENV).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the helper runtime builds");
+        runtime.block_on(shutdown_remote_all_drains_a_fresh_process());
+    }
+
+    /// Asserts the report shape and order of a whole-cache drain.
+    ///
+    /// `shutdown_remote_all` drains the process-global container caches of
+    /// `jiuwenbox` and `yuanrong`, so this runs in a fresh process: the provider
+    /// suites of this binary (`remote::jiuwenbox::tests::teardown`,
+    /// `remote::yuanrong::tests::teardown`) run in parallel and assert on their own
+    /// cache entries, so an in-process drain would release them first and make those
+    /// suites flaky. [`TEARDOWN_CACHE`] keeps this drain exclusive within the helper.
+    async fn shutdown_remote_all_drains_a_fresh_process() {
         let _guard = TEARDOWN_CACHE.lock().await;
         let reports = shutdown_remote_all().await.unwrap();
         assert_eq!(reports.len(), REMOTE_SANDBOX_TYPES.len());
         for (report, sandbox_type) in reports.iter().zip(REMOTE_SANDBOX_TYPES) {
             assert_eq!(report.sandbox_type, sandbox_type);
         }
-        // Only the `aio` report may be a "cannot tear down" report, and only it carries
-        // no containers: the other two release whatever the process cache holds, which
-        // other tests in this binary may have populated.
         let aio = &reports[0];
         assert_eq!(aio.sandbox_type, "aio");
         let reason = aio
@@ -743,6 +789,7 @@ mod tests {
         assert!(reason.contains("gateway"), "{reason}");
         assert!(aio.released_keys.is_empty(), "{:?}", aio.released_keys);
         assert!(aio.deleted.is_empty(), "{:?}", aio.deleted);
+        // The other two have a teardown path, so their reports carry no reason.
         for report in &reports[1..] {
             assert!(
                 report.unsupported.is_none(),
