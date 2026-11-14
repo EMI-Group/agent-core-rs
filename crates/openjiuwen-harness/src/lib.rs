@@ -119,8 +119,9 @@ pub use rails::{
     SourceLinkBook, SourceMetadata, SourceMetadataStore, SourceProvider, SourceProviderRegistry,
     SubagentRail, TaskIterationInfo, UnsupportedKvCacheBackend, UnsupportedSourceProvider,
     AFFINITY_PARENT_SESSION_ID_ENV, DEFAULT_HEARTBEAT_EVENT_CAPACITY,
-    DEFAULT_HEARTBEAT_INTERVAL_MS, EVOLUTION_SNAPSHOT_VERSION, HEARTBEAT_RUN_KIND,
-    HEARTBEAT_SECTION, HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY, STICKY_SUBAGENT_TYPE,
+    DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_SESSION_CAPACITY, EVOLUTION_SNAPSHOT_VERSION,
+    HEARTBEAT_RUN_KIND, HEARTBEAT_SECTION, HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY,
+    STICKY_SUBAGENT_TYPE,
 };
 
 // --- moa -------------------------------------------------------------------
@@ -250,11 +251,12 @@ pub use worktree::{
 };
 // --- watcher ---------------------------------------------------------------
 pub use watcher::{
-    ChangeKind, DebounceInput, Debouncer, FnReloadHandler, InstructionReloadHandler,
-    InstructionReloader, McpConfigReloadHandler, McpConfigReloader, ReloadFailure, ReloadHandler,
-    ReloadHub, SkillLibraryReloader, SkillsReloadHandler, Subscription, WatchEvent, WatchFailure,
-    WatchPlan, WatchTarget, WatchTargetKind, WatchUpdate, WatcherConfig, WatcherHandle,
-    WorkspaceWatcher, DEFAULT_DEBOUNCE, DEFAULT_EVENT_CAPACITY, DEFAULT_MAX_PENDING,
+    ChangeKind, DebounceInput, Debouncer, DropStage, DroppedUpdates, FnReloadHandler,
+    InstructionReloadHandler, InstructionReloader, McpConfigReloadHandler, McpConfigReloader,
+    ReloadFailure, ReloadHandler, ReloadHub, SkillLibraryReloader, SkillsReloadHandler,
+    Subscription, WatchEvent, WatchFailure, WatchPlan, WatchTarget, WatchTargetKind, WatchUpdate,
+    WatcherConfig, WatcherHandle, WorkspaceWatcher, DEFAULT_DEBOUNCE, DEFAULT_DISPATCH_CAPACITY,
+    DEFAULT_EVENT_CAPACITY, DEFAULT_INTAKE_CAPACITY, DEFAULT_MAX_PENDING,
 };
 // --- persistent_agent ------------------------------------------------------
 pub use persistent_agent::{
