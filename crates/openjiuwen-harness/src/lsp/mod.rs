@@ -11,8 +11,9 @@
 //! and call-hierarchy types plus their tolerant parsers, `uri` converts `file://` URIs,
 //! `transport` owns the [`LspTransport`] seam, `config` holds [`LspServerConfig`], `client`
 //! correlates requests, `diagnostics` buffers push diagnostics, `discovery` maps files to
-//! servers, `instance` supervises one server's lifecycle, `render` formats results, and `tool`
-//! adapts all of it to the [`Tool`](openjiuwen_foundation::tool::Tool) trait.
+//! servers, `instance` supervises one server's lifecycle, `render` formats results, `tool`
+//! adapts all of it to the [`Tool`](openjiuwen_foundation::tool::Tool) trait, and its
+//! `tool_ops` submodule executes the actions.
 //!
 //! # Offline testing
 //!
@@ -23,9 +24,11 @@
 //!
 //! # Deferred
 //!
-//! The `lsp` tool still reports `diagnostics`, `implementation` and call-hierarchy actions as
-//! deferred until it owns a [`DiagnosticRegistry`] and a [`ServerSupervisor`]; the client,
-//! `wire`, diagnostics, discovery and supervision layers are in place.
+//! Still deferred, and documented as such: filtering results through `.gitignore`, discovering
+//! servers from `PATH` or a manifest search (definitions come from the built-in table or the
+//! host), diagnostics subscriptions/workspace pulls, LSP formatter edits, and workspace-symbol
+//! caching. Push/pull diagnostics, implementation, call hierarchy, per-extension discovery and
+//! crash retry are implemented.
 mod client;
 mod config;
 mod diagnostics;
@@ -34,6 +37,7 @@ mod instance;
 pub mod protocol;
 pub mod render;
 mod tool;
+mod tool_ops;
 mod transport;
 mod uri;
 mod wire;
