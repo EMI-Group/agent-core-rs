@@ -124,7 +124,8 @@ pub(crate) const COSINE_WEIGHT: f32 = 0.3;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VectorBackend {
-    /// The in-process cosine index ([`MemoryVectorStore`]).
+    /// The in-process cosine index
+    /// ([`MemoryVectorStore`](super::memory_store::MemoryVectorStore)).
     InMemory,
     /// A collection of the kernel `VectorStore` handed to the service.
     VectorStore {
@@ -228,7 +229,7 @@ impl TaskMemoryConfig {
     /// Supplying [`VectorBackend::VectorStore`] makes the deterministic service
     /// require a store at construction: until
     /// [`DeterministicTaskMemoryService::with_vector_store`] is called, every
-    /// scoring attempt answers [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported)
+    /// scoring attempt answers [`Error::Unsupported`]
     /// instead of silently scoring in process memory.
     #[must_use]
     pub fn with_vector_backend(mut self, vector_backend: VectorBackend) -> Self {
@@ -410,7 +411,7 @@ impl fmt::Debug for MemoryBackend {
 /// The returned service scores in process memory, so a `config` whose
 /// [`TaskMemoryConfig::vector_backend`] selects
 /// [`VectorBackend::VectorStore`] has no store wired and fails every scoring
-/// attempt with [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported);
+/// attempt with [`Error::Unsupported`];
 /// use [`create_task_memory_service_with_vector_store`] to supply one.
 #[must_use]
 pub fn create_task_memory_service(

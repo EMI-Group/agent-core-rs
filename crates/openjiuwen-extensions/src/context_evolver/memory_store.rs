@@ -86,7 +86,7 @@ pub struct ScoredNode {
 /// across processes). Both report *raw* cosine similarities in `[-1.0, 1.0]`,
 /// rank descending with deterministic ties (insertion order here, primary key
 /// ascending in the store-backed index), and treat an empty vector as
-/// described on [`cosine_similarity`], so a service's blended scores and its
+/// described on `cosine_similarity`, so a service's blended scores and its
 /// final ordering do not depend on which backend answers.
 ///
 /// The trait is object safe and every method takes `&self`, so a service holds

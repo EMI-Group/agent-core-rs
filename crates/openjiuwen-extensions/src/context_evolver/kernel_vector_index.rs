@@ -4,10 +4,12 @@
 //! `openjiuwen/extensions/context_evolver/core/vector_store/` package: Python
 //! keeps per-user memory embeddings in Milvus and scores retrieval with the
 //! vector database's similarity search. Rust keeps the same seam
-//! ([`VectorIndex`](super::memory_store::VectorIndex)) and implements it over
+//! (`VectorIndex`) and implements it over
 //! any [`VectorStore`] the kernel offers, so a memory index can live in process
-//! memory ([`InMemoryVectorStore`]), in local JSON files
-//! ([`LocalFileVectorStore`]), in `Elasticsearch`
+//! memory ([`InMemoryVectorStore`](openjiuwen_core::foundation::store::InMemoryVectorStore)),
+//! in local JSON files
+//! ([`LocalFileVectorStore`](openjiuwen_core::foundation::store::LocalFileVectorStore)),
+//! in `Elasticsearch`
 //! ([`ElasticsearchVectorStore`](crate::store::elasticsearch::ElasticsearchVectorStore)),
 //! or in a vendor `Milvus` adapter registered with the kernel — the evolver
 //! itself stays offline and dependency-free.
@@ -23,7 +25,7 @@
 //! | [`METADATA_FIELD`] | `json` | [`VectorNode::metadata`] as one object |
 //!
 //! The collection is created lazily on the first
-//! [`VectorIndex::upsert`](super::memory_store::VectorIndex::upsert), from that
+//! `VectorIndex::upsert`, from that
 //! batch's embedding dimension; a later batch of a different dimension fails
 //! with [`Error::Validation`] naming both dimensions, so one collection never
 //! mixes embedding models.
