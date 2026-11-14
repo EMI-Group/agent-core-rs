@@ -1,24 +1,9 @@
-//! HTML compression through a dependency-free readability extractor.
+//! The dependency-free readability extractor behind [`super::HtmlCompressor`].
 //!
-//! Ports `rule_compression/compressors/html_compressor.py` without `BeautifulSoup`
-//! or `trafilatura`: [`HTMLExtractor`] drops `<script>`, `<style>`, `<noscript>`,
-//! `<template>`, `<svg>`, `<nav>`, `<footer>`, `<aside>` and `<form>` subtrees,
-//! decodes the common entities, keeps the title, headings, links, code blocks,
-//! lists, tables and paragraph text, and collapses whitespace into markdown (or
-//! plain text).
-//!
-//! [`HtmlCompressor`] accepts a candidate only when its text is at least
-//! `html_min_content_chars` long and [`meets_savings_ratio`] passes. Report-shaped
-//! HTML (`pytest-html`, `results-table`, or two tables plus two report markers)
-//! prunes the "passed" table rows once a failure row exists, exactly like the
-//! Python `BeautifulSoup` fallback.
-//!
-//! [`meets_savings_ratio`]: crate::processor::rule_compression::common::meets_savings_ratio
-use super::{RuleCompressionResult, RuleCompressor};
-use crate::processor::rule_compression::common::{contains_word, meets_savings_ratio};
-use crate::processor::rule_compression::types::{ContentType, RuleContext};
-use serde_json::json;
+//! Parsing, tag stripping, metadata reading, entity decoding and block rendering live here; the compressor above only gates and renders the report.
+use crate::processor::rule_compression::common::contains_word;
 use std::collections::{BTreeMap, BTreeSet};
+
 /// Elements whose whole subtree is discarded.
 const NOISE_TAGS: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "nav", "footer", "aside", "form", "iframe",
@@ -205,61 +190,9 @@ impl HTMLExtractor {
         }
     }
 }
-/// Compresses HTML through [`HTMLExtractor`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HtmlCompressor {
-    /// The extractor to use.
-    pub extractor: HTMLExtractor,
-}
-impl HtmlCompressor {
-    /// A compressor over `extractor`.
-    #[must_use]
-    pub fn new(extractor: HTMLExtractor) -> Self {
-        Self { extractor }
-    }
-}
-impl RuleCompressor for HtmlCompressor {
-    fn compress(&self, content: &str, ctx: &RuleContext) -> RuleCompressionResult {
-        let report = looks_like_report_html(content);
-        let extracted = self.extractor.extract_with_report(content, report);
-        let candidate = extracted.extracted.trim().to_owned();
-        let extractor_label = if report { "builtin:report" } else { "builtin" };
-        let details = json!({
-            "extractor": extractor_label,
-            "original_length": extracted.original_length,
-            "extracted_length": extracted.extracted_length,
-            "compression_ratio": extracted.compression_ratio,
-            "reduction_percent": extracted.reduction_percent(),
-            "title": extracted.title,
-            "author": extracted.author,
-            "date": extracted.date,
-            "metadata": extracted.metadata,
-            "removed_node_count": extracted.removed_node_count,
-            "report_rows_removed": extracted.report_rows_removed,
-            "duplicate_block_count": extracted.duplicate_block_count,
-            "link_count": extracted.link_count,
-            "table_count": extracted.table_count,
-            "code_block_count": extracted.code_block_count,
-            "output_block_count": extracted.output_block_count,
-        });
-        // `_plain_text` only replaces characters one-for-one, so its length is the
-        // candidate's length; the check is the candidate size against the floor.
-        if candidate.chars().count() < ctx.html_min_content_chars {
-            return RuleCompressionResult::declined(content, ContentType::Html, Some(details));
-        }
-        if candidate != content && meets_savings_ratio(content, &candidate, ctx) {
-            return RuleCompressionResult::applied(
-                candidate,
-                ContentType::Html,
-                true,
-                Some(details),
-            );
-        }
-        RuleCompressionResult::declined(content, ContentType::Html, Some(details))
-    }
-}
+
 /// Whether `html` looks like a generated test report.
-fn looks_like_report_html(html: &str) -> bool {
+pub(super) fn looks_like_report_html(html: &str) -> bool {
     let lowered: String = html.chars().take(20_000).collect::<String>().to_lowercase();
     if lowered.contains("pytest-html") || lowered.contains("results-table") {
         return true;
@@ -979,45 +912,4 @@ fn render_table(rows: &[Vec<String>]) -> String {
         lines.push(format!("| {} |", row.join(" | ")));
     }
     lines.join("\n")
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn noise_is_dropped_and_structure_is_kept() {
-        let html = "<!doctype html><html><head><title>Payment guide</title>\
-            <style>body { color: red; }</style><script>alert('x')</script></head>\
-            <body><nav>menu menu</nav><h1>Payment guide</h1>\
-            <p>Payments are <a href=\"https://example.test/pay\">settled</a> \
-            when the error clears.</p><pre>let x = 1;</pre>\
-            <ul><li>first</li><li>second</li></ul></body></html>";
-        let result = HTMLExtractor::default().extract(html);
-        assert_eq!(result.title.as_deref(), Some("Payment guide"));
-        assert!(!result.extracted.contains("alert"));
-        assert!(!result.extracted.contains("color: red"));
-        assert!(!result.extracted.contains("menu menu"));
-        assert!(result.extracted.starts_with("# Payment guide"));
-        assert!(result
-            .extracted
-            .contains("[settled](https://example.test/pay)"));
-        assert!(result.extracted.contains("```\nlet x = 1;\n```"));
-        assert!(result.extracted.contains("- first"));
-        assert_eq!(result.link_count, 1);
-        assert_eq!(result.code_block_count, 1);
-    }
-    #[test]
-    fn entities_and_tables_are_decoded() {
-        let html = "<table><tr><th>name</th><th>qty</th></tr>\
-            <tr><td>a &amp; b</td><td>2</td></tr></table>";
-        let result = HTMLExtractor::default().extract(html);
-        assert!(result.extracted.contains("| name | qty |"));
-        assert!(result.extracted.contains("| a & b | 2 |"));
-    }
-    #[test]
-    fn tiny_pages_are_declined_by_the_compressor() {
-        let html = "<p>tiny</p>";
-        let result = HtmlCompressor::default().compress(html, &RuleContext::new(100));
-        assert!(!result.modified);
-        assert!(result.details.is_some());
-    }
 }
