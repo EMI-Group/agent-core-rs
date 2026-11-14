@@ -4,7 +4,8 @@
 
 Dreaming is the deferred memory-consolidation job queue: compaction work (dedupe, summarize, forget, graph extraction) is enqueued as a durable `DreamJob` so it can be claimed, retried, observed, and purged after the requesting call returns.
 It is a memory-kernel service only: it depends on `crate::record` (scopes, `CallOptions`), `openjiuwen_common::error`, `chrono`, `serde`, and (behind the `sqlite` feature) `sqlx`.
-It never touches `openjiuwen-context`, `openjiuwen-session`, or an LLM, and it never reads a clock of its own — `now` is always a parameter.
+The queue, planner, and repositories never touch `openjiuwen-context` or `openjiuwen-session`, and never read a clock of their own — `now` is always a parameter.
+The optional `pipeline` module is the only LLM caller in the directory, and it receives the model (`openjiuwen_foundation::llm::Model`) by injection.
 The queue is a design of this crate; the Python `openjiuwen.core.memory.dreaming` package only contributes the idle-scheduler primitive and is not transliterated.
 
 ## API Surface
@@ -43,6 +44,11 @@ The queue is a design of this crate; the Python `openjiuwen.core.memory.dreaming
 - `DreamPlanner { repository: Arc<dyn DreamRepository>, consolidator: Arc<dyn DreamConsolidator>, config: DreamConfig }` with manual `Debug`, `new` (validates the config), `with_in_memory`, `repository`, `config`, `run(now, limit, ctx)`, `run_once(now, limit)` (default `CallOptions`), and `run_due(now, ctx)` (uses `config.batch_size`).
 - `DreamingEngine` is a documented alias of `DreamPlanner`.
 
+`pipeline/` (model-backed consolidation, the implementation of the `DreamConsolidator` seam; details in `pipeline/CONTEXT.md`):
+- `pipeline.rs` — `DreamCandidate`, `DreamCandidateSource` (`StaticCandidateSource`, `PayloadCandidateSource`), `ConsolidationSink`/`RecordOnlySink`, `LlmConsolidatorConfig`, `LlmConsolidator` (`new`, `payload_driven`, `with_sink`, `config`, `plan`, `impl DreamConsolidator`), plus the private request renderer and text bounder.
+- `plan.rs` — the pure, clock-free decision layer: `DreamConsolidationAction`, `DreamConsolidationOrigin`, `DreamConsolidationPlan`, `parse_consolidation_response`, `deterministic_plan` and the private parser/metrics helpers; re-exported so the public path stays `openjiuwen_memory::dreaming::*`.
+- `tests.rs` — the offline unit suite (`#[cfg(test)] mod tests`).
+
 ## SQL Schema
 
 Table `dream_jobs` (this crate's table; it does not share a name with `kv_store`, `documents`, or the teams tables):
@@ -78,7 +84,7 @@ Repository errors from `claim_next`/`complete`/`fail` abort the sweep with `Err`
 ## Deferred
 
 - The scheduled background orchestrator and its busy-backoff/idle loop (`DreamingOrchestrator`): callers own the timer and call `run_due`.
-- The LLM-driven consolidation pipeline: `DreamConsolidator` is the injection point, and only the deterministic dedupe rules in `crate::recall` exist in the crate today.
+- Consolidation decisions beyond the shipped pipeline: `pipeline::LlmConsolidator` is the implementation of the `DreamConsolidator` seam, but the crate still has no plan-application sink backed by `LongTermMemory` (only `RecordOnlySink`), no prompt tuning per provider, and no cross-job learning.
 - Cross-process workers and leases: SQLite row claiming is single-statement concurrency control, not a distributed lock or lease renewal.
 - Daemon-side retention enforcement: nothing calls `purge` on a timer, so a caller must invoke it.
 - ML-based salience/importance scoring for choosing which memories are worth consolidating.
@@ -88,5 +94,6 @@ Repository errors from `claim_next`/`complete`/`fail` abort the sweep with `Err`
 `model`, `outcome`, and `config` tests cover serde compatibility, defaults, builder methods, name parsing/aliases, metrics saturation, and every validation branch.
 `repository` tests cover the in-memory backend end to end: claim ordering, retry eligibility via `started_at`, requeue-then-terminal failure, complete/fail error kinds, filtering, counting, deletion, and the default `purge`.
 `sqlite` tests (feature `sqlite`) use `tempfile::tempdir()` plus `sqlite:{path}` URLs and fixed timestamps from `DateTime::from_timestamp(1_700_000_000, 0)`: enqueue→claim→complete→fail across a reopen of the same file, claim ordering by priority/creation/id, two concurrent `claim_next` calls via `tokio::join!` yielding exactly one winner plus the same-clock retry-marker check, retention deletion and `purge`, exact JSON column round-trips, all six state counts, duplicate-enqueue/unknown-complete/pending-complete errors, and filtered+limited listing.
+`pipeline` tests live beside the module in `pipeline/tests.rs` and cover the LLM happy path, retry-then-fallback for prose and provider errors, no-model/disabled/no-candidate degradation, invented ids, the empty plan, sink success and failure, cancellation, config bounds, prompt truncation, the payload/static candidate sources, candidate serde, and the pure decision layer (all offline through `openjiuwen_test_support::ScriptedModel`).
 `planner` tests use a scripted consolidator (a `Step` queue behind a `parking_lot::Mutex`, with `tokio::sync::Notify` for the blocking case) to cover success with metrics, retry-until-`max_attempts` with an advancing clock, pre-cancelled and mid-consolidation cancellation, a timeout treated as a failed attempt, non-terminal and mismatched outcome ids, `NoopConsolidator` skip semantics, disabled config, zero limit, priority ordering plus limit, `run_due` using `batch_size`, config validation, and `Debug`.
 Gates: `cargo fmt -p openjiuwen-memory`, `cargo check -p openjiuwen-memory` with and without `--features sqlite`, `cargo test -p openjiuwen-memory --lib dreaming` with and without `--features sqlite`, `cargo clippy -p openjiuwen-memory --all-targets -D warnings` with and without `--features sqlite`, and `cargo doc -p openjiuwen-memory --no-deps` warning-free.
