@@ -27,7 +27,8 @@
 //! [`prepare`]: ConversationContext::prepare
 //! [`ConversationContext`]: crate::context::ConversationContext
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
@@ -42,12 +43,17 @@ use crate::config::ContextConfig;
 use crate::engine::PrepareOptions;
 use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
+use crate::policy::{
+    detect_context_window_change, ContextWindowChange, ContextWindowSnapshot, ResolvedContextWindow,
+};
 use crate::processor::{ContextPipeline, ContextProcessor, ProcessorContext};
 use crate::recall::RecallArchiveStore;
 use crate::reload::{inject_reload_hint, ReloadLanguage};
 use crate::session_memory::SessionMemoryStore;
 use crate::stats::{compute_stats, ContextStats, PreparedContext};
+use crate::telemetry::{CompressionStatePhase, ContextProcessorStateRecorder};
 use crate::tokens::count_messages;
+use crate::usage::{AnalysisInput, ContextUsageAnalyzer, ContextUsageSnapshot};
 use crate::window::{assemble_window, drop_orphan_tool_results, WindowOptions};
 
 /// The conversation history an agent talks to.
@@ -133,6 +139,21 @@ fn is_empty_content(content: &MessageContent) -> bool {
     }
 }
 
+/// The last two LLM-bound windows and when the current one was prepared.
+///
+/// [`ConversationContext::detect_window_change`] diffs `previous` against
+/// `current`; keeping only the two most recent windows makes the KV-cache diff
+/// O(messages) and never touches the stored history.
+#[derive(Debug, Default)]
+struct WindowTracking {
+    /// The window prepared before the current one, when there is one.
+    previous: Option<ContextWindowSnapshot>,
+    /// The most recent window `prepare` assembled.
+    current: Option<ContextWindowSnapshot>,
+    /// When the current window was prepared.
+    accessed: Option<Instant>,
+}
+
 /// The built-in [`ModelContext`]: messages behind an `RwLock`, a revision
 /// counter, and the pipeline snapshot taken when the context was created.
 pub struct ConversationContext {
@@ -172,6 +193,12 @@ pub struct ConversationContext {
     recall: Option<Arc<dyn RecallArchiveStore>>,
     /// Session-memory notes full compaction reinjects, when configured.
     session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Recorder every processor pass of this context reports to, when set.
+    recorder: Option<Arc<ContextProcessorStateRecorder>>,
+    /// Analyzer that fills the prepared `context.usage` block, when configured.
+    usage_analyzer: Option<Arc<ContextUsageAnalyzer>>,
+    /// The last LLM-bound windows and their access time, for KV-cache diffing.
+    windows: StdMutex<WindowTracking>,
 }
 
 impl std::fmt::Debug for ConversationContext {
@@ -203,6 +230,8 @@ impl ConversationContext {
         session: Option<Arc<dyn Session>>,
         recall: Option<Arc<dyn RecallArchiveStore>>,
         session_memory: Option<Arc<dyn SessionMemoryStore>>,
+        recorder: Option<Arc<ContextProcessorStateRecorder>>,
+        usage_analyzer: Option<Arc<ContextUsageAnalyzer>>,
     ) -> Self {
         let context_id = context_id.into();
         let session_id = session_id.into();
@@ -225,6 +254,9 @@ impl ConversationContext {
             session,
             recall,
             session_memory,
+            recorder,
+            usage_analyzer,
+            windows: StdMutex::new(WindowTracking::default()),
         }
     }
 
@@ -299,19 +331,149 @@ impl ConversationContext {
         self.cancellation.clone()
     }
 
+    /// The recorder this context reports every processor pass to, when set.
+    #[must_use]
+    pub fn recorder(&self) -> Option<&Arc<ContextProcessorStateRecorder>> {
+        self.recorder.as_ref()
+    }
+
+    /// Whether an instrumented pipeline pass is available.
+    pub(crate) fn has_recorder(&self) -> bool {
+        self.pipeline.recorder().is_some()
+    }
+
+    /// The analyzer that fills [`PreparedContext::usage`], when configured.
+    ///
+    /// [`PreparedContext::usage`]: crate::stats::PreparedContext::usage
+    #[must_use]
+    pub fn usage_analyzer(&self) -> Option<&Arc<ContextUsageAnalyzer>> {
+        self.usage_analyzer.as_ref()
+    }
+
+    /// The context window the engine resolves for this context's configuration.
+    #[must_use]
+    pub fn resolved_window(&self) -> ResolvedContextWindow {
+        self.config.resolved_window()
+    }
+
+    /// Diffs the most recently prepared window against the one before it.
+    ///
+    /// The diff is the KV-cache primitive:
+    /// [`ContextWindowChange::Appended`] keeps the whole prefix warm, while a
+    /// system, tool or content change invalidates the corresponding suffix.
+    /// Before the first [`ConversationContext::prepare`] the answer is
+    /// [`ContextWindowChange::Unchanged`] with zero messages, and the call never
+    /// mutates the stored history.
+    #[must_use]
+    pub fn detect_window_change(&self) -> ContextWindowChange {
+        let windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        match (&windows.previous, &windows.current) {
+            (Some(previous), Some(current)) => detect_context_window_change(previous, current),
+            (None, Some(current)) => detect_context_window_change(current, current),
+            (_, None) => ContextWindowChange::Unchanged { messages: 0 },
+        }
+    }
+
+    /// When the most recent LLM-bound window was prepared.
+    #[must_use]
+    pub fn last_context_window_access(&self) -> Option<Instant> {
+        self.windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .accessed
+    }
+
+    /// The most recent LLM-bound window, when one was prepared.
+    #[must_use]
+    pub(crate) fn last_window_snapshot(&self) -> Option<ContextWindowSnapshot> {
+        self.windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current
+            .clone()
+    }
+
+    /// Records `window` as the current LLM-bound window.
+    fn track_window(&self, window: ContextWindowSnapshot) {
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = windows.current.take();
+        windows.previous = previous;
+        windows.current = Some(window);
+        windows.accessed = Some(Instant::now());
+    }
+
+    /// Wraps `analyzer` with the resolved window limit when it has none.
+    fn analyzer_with_limit(&self, analyzer: &ContextUsageAnalyzer) -> Option<ContextUsageAnalyzer> {
+        if analyzer.context_window_limit().is_some() {
+            return None;
+        }
+        let limit = u64::try_from(self.resolved_window().tokens).unwrap_or(u64::MAX);
+        Some(
+            ContextUsageAnalyzer::new(
+                Arc::clone(&self.counter),
+                analyzer.counter_identity().clone(),
+            )
+            .with_model(analyzer.model())
+            .with_context_window_limit(Some(limit)),
+        )
+    }
+
+    /// Measures `input` and reconciles it with the provider total.
+    pub(crate) fn analyze_window(
+        &self,
+        analyzer: &ContextUsageAnalyzer,
+        input: &AnalysisInput<'_>,
+    ) -> ContextUsageSnapshot {
+        match self.analyzer_with_limit(analyzer) {
+            Some(derived) => derived.analyze(input),
+            None => analyzer.analyze(input),
+        }
+    }
+
+    /// Freezes the local measurement of `input` into a report.
+    pub(crate) fn build_window_report(
+        &self,
+        analyzer: &ContextUsageAnalyzer,
+        input: &AnalysisInput<'_>,
+    ) -> crate::usage::ContextWindowTokenReport {
+        match self.analyzer_with_limit(analyzer) {
+            Some(derived) => derived.build_report(input),
+            None => analyzer.build_report(input),
+        }
+    }
+
+    /// Builds the `context.usage` block of a prepared window, when configured.
+    fn usage_snapshot_for(
+        &self,
+        window: &ContextWindowSnapshot,
+        stats: &ContextStats,
+    ) -> Option<ContextUsageSnapshot> {
+        let analyzer = self.usage_analyzer.as_ref()?;
+        let mut input = AnalysisInput::new("", &self.session_id);
+        input.context_id = Some(&self.context_id);
+        input.system_messages = Some(&window.system_messages);
+        input.context_messages = &window.context_messages;
+        input.tools = &window.tools;
+        input.context_stats = Some(stats);
+        Some(self.analyze_window(analyzer, &input))
+    }
+
     /// The compression lock, `try_lock`ed by the engine's `compress`.
     pub(crate) fn compression_lock(&self) -> &Mutex<()> {
         &self.compression
     }
 
-    /// Runs the processor pipeline over `messages`.
+    /// Runs the processor pipeline over `messages` in `phase`.
     ///
     /// `manual` bypasses the threshold check, which is what an explicit
-    /// compression asks for.
+    /// compression asks for; `phase` is the context-engine entry point that
+    /// reached the pipeline, so recorded passes carry `add_messages`,
+    /// `get_context_window`, or `active_compress`.
     pub(crate) async fn run_pipeline(
         &self,
         messages: &mut Vec<BaseMessage>,
         manual: bool,
+        phase: CompressionStatePhase,
     ) -> Result<Vec<ContextEvent>> {
         let cx = ProcessorContext {
             config: &self.config,
@@ -326,7 +488,7 @@ impl ConversationContext {
             recall: self.recall.as_deref(),
             session_memory: self.session_memory.as_deref(),
         };
-        self.pipeline.run(messages, &cx).await
+        self.pipeline.run_in_phase(messages, &cx, phase).await
     }
 
     /// Serializes the history and the processor checkpoints for persistence.
@@ -395,7 +557,9 @@ impl ConversationContext {
             return Err(Error::Cancelled);
         }
         let mut working = self.messages().await;
-        let events = self.run_pipeline(&mut working, false).await?;
+        let events = self
+            .run_pipeline(&mut working, false, CompressionStatePhase::GetContextWindow)
+            .await?;
         let mut messages = assemble_window(
             &working,
             &options.system_messages,
@@ -415,6 +579,19 @@ impl ConversationContext {
         }
         let stats = compute_stats(&messages, self.counter.as_ref());
         let token_count = count_messages(self.counter.as_ref(), &messages);
+        // The LLM-bound window splits at the leading system messages; the split
+        // feeds both the usage snapshot and the KV-cache diff.
+        let system_count = messages
+            .iter()
+            .take_while(|message| message.role == Role::System)
+            .count();
+        let window = ContextWindowSnapshot::from_messages(
+            &messages[..system_count],
+            &messages[system_count..],
+            &options.tools,
+        );
+        let usage = self.usage_snapshot_for(&window, &stats);
+        self.track_window(window);
         Ok(PreparedContext {
             messages,
             tools: options.tools.clone(),
@@ -423,6 +600,7 @@ impl ConversationContext {
             overflow: token_count > self.config.effective_max_tokens(),
             window_size: options.window_size.or(self.config.default_window_messages),
             events,
+            usage,
         })
     }
 
@@ -589,6 +767,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -689,6 +869,8 @@ mod tests {
             counter(),
             ContextPipeline::new(vec![Arc::new(Sleeper)]),
             store,
+            None,
+            None,
             None,
             None,
             None,

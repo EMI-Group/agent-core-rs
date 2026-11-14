@@ -21,7 +21,7 @@
 //! `prepare` is read-only, `observe` is the append hook, and `compress` is the
 //! only operation that persists a rewritten history.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::prompt::{BaseMessage, Role};
@@ -33,11 +33,17 @@ use crate::config::ContextConfig;
 use crate::context::{ContextState, ConversationContext, ModelContext};
 use crate::events::{CompressReport, CompressionStatus, ObserveOutcome, RecoveryOutcome};
 use crate::offload::{InMemoryOffloadStore, OffloadStore};
+use crate::policy::{ContextWindowChange, ResolvedContextWindow};
 use crate::processor::{ContextPipeline, PipelineDeps, ProcessorConfig};
 use crate::recall::{InMemoryRecallArchiveStore, RecallArchiveStore};
 use crate::session_memory::{InMemorySessionMemoryStore, SessionMemoryStore};
-use crate::stats::PreparedContext;
+use crate::stats::{ContextStats, PreparedContext};
+use crate::telemetry::{CompressionStatePhase, ContextProcessorStateRecorder};
 use crate::tokens::count_messages;
+use crate::usage::{
+    request_usage_from_metadata, AnalysisInput, CacheAggregationKey, ContextUsageAnalyzer,
+    ContextUsageSnapshot, ContextWindowTokenReport, SessionKVCacheAggregator, SessionKVCacheUsage,
+};
 
 pub use crate::engine_options::{ContextOptions, PrepareOptions, DEFAULT_SESSION_ID};
 
@@ -57,6 +63,12 @@ pub struct ContextEngine {
     recall: Option<Arc<dyn RecallArchiveStore>>,
     /// Default session-memory store handed to new contexts.
     session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Recorder new contexts report processor passes to.
+    recorder: Option<Arc<ContextProcessorStateRecorder>>,
+    /// Analyzer new contexts measure the prepared `context.usage` block with.
+    usage_analyzer: Option<Arc<ContextUsageAnalyzer>>,
+    /// Provider KV-cache rollups, one bucket per aggregation key.
+    kv_cache: StdMutex<SessionKVCacheAggregator>,
     /// `(session_id, normalized context_id)` → context.
     contexts: RwLock<HashMap<(String, String), Arc<ConversationContext>>>,
 }
@@ -68,6 +80,12 @@ impl std::fmt::Debug for ContextEngine {
             .field("store", &self.store.kind())
             .field("has_recall", &self.recall.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field("has_recorder", &self.recorder.is_some())
+            .field("has_usage_analyzer", &self.usage_analyzer.is_some())
+            .field(
+                "kv_cache_scopes",
+                &self.kv_cache.lock().map_or(0, |cache| cache.scope_count()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -75,6 +93,15 @@ impl std::fmt::Debug for ContextEngine {
 /// Python's `context_id.replace(".", "_")`: the pool identity of a context.
 fn normalize_context_id(context_id: &str) -> String {
     context_id.replace('.', "_")
+}
+
+/// The error a usage request raises when no analyzer was configured.
+fn missing_analyzer() -> Error {
+    Error::Config(
+        "no context usage analyzer is configured; call ContextEngine::with_usage_analyzer or set \
+         ContextOptions::usage_analyzer"
+            .to_owned(),
+    )
 }
 
 impl ContextEngine {
@@ -113,8 +140,45 @@ impl ContextEngine {
             store,
             recall,
             session_memory,
+            recorder: None,
+            usage_analyzer: None,
+            kv_cache: StdMutex::new(SessionKVCacheAggregator::new()),
             contexts: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Attaches the recorder new contexts report every processor pass to.
+    ///
+    /// A caller configures telemetry once, here, instead of repeating it in
+    /// every [`ContextOptions`]; [`ContextOptions::recorder`] still overrides
+    /// this default per context. Contexts created before this call keep the
+    /// recorder they were built with.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Arc<ContextProcessorStateRecorder>>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// Replaces the default recorder new contexts use.
+    ///
+    /// Contexts already in the pool are unaffected: their pipeline snapshot was
+    /// taken at creation time, matching Python's attachment-order semantics.
+    pub fn set_recorder(&mut self, recorder: Option<Arc<ContextProcessorStateRecorder>>) {
+        self.recorder = recorder;
+    }
+
+    /// Attaches the analyzer new contexts fill the prepared usage block with.
+    ///
+    /// [`ContextOptions::usage_analyzer`] overrides this default per context.
+    #[must_use]
+    pub fn with_usage_analyzer(mut self, analyzer: Option<Arc<ContextUsageAnalyzer>>) -> Self {
+        self.usage_analyzer = analyzer;
+        self
+    }
+
+    /// Replaces the default usage analyzer new contexts use.
+    pub fn set_usage_analyzer(&mut self, analyzer: Option<Arc<ContextUsageAnalyzer>>) {
+        self.usage_analyzer = analyzer;
     }
 
     /// The configuration new contexts are created with.
@@ -210,12 +274,19 @@ impl ContextEngine {
                     Arc::new(InMemorySessionMemoryStore::new()) as Arc<dyn SessionMemoryStore>
                 })
             });
+        // A per-context recorder/analyzer wins over the engine default; when
+        // both are unset the context stays uninstrumented.
+        let recorder = options.recorder.or_else(|| self.recorder.clone());
+        let usage_analyzer = options
+            .usage_analyzer
+            .or_else(|| self.usage_analyzer.clone());
         let pipeline = ContextPipeline::from_configs_with(
             &configs,
             &PipelineDeps::new(Arc::clone(&self.store))
                 .with_model(model.clone())
                 .with_recall(recall.clone())
-                .with_session_memory(session_memory.clone()),
+                .with_session_memory(session_memory.clone())
+                .with_recorder(recorder.clone()),
         )?;
         let context = Arc::new(ConversationContext::new(
             context_id,
@@ -228,6 +299,8 @@ impl ContextEngine {
             options.session,
             recall,
             session_memory,
+            recorder,
+            usage_analyzer,
         ));
         if !options.history.is_empty() {
             context.set_messages(options.history).await?;
@@ -290,6 +363,12 @@ impl ContextEngine {
     /// appended and never a system message, until the history fits
     /// [`ContextConfig::max_context_messages`].
     ///
+    /// When a recorder is configured, the appended message also runs through
+    /// the passive processor chain in the `add_messages` phase purely so the
+    /// record describes what the processors would do to the incoming batch; the
+    /// pass's result is discarded, and a telemetry failure is logged rather
+    /// than propagated. Without a recorder the append path is unchanged.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] when [`ConversationContext::add_message`]
@@ -299,6 +378,7 @@ impl ContextEngine {
         context: &Arc<ConversationContext>,
         message: BaseMessage,
     ) -> Result<ObserveOutcome> {
+        let telemetry_batch = context.has_recorder().then(|| vec![message.clone()]);
         context.add_message(message).await?;
         let mut messages = context.messages().await;
         let mut evicted = 0;
@@ -320,6 +400,14 @@ impl ContextEngine {
             }
             if evicted > 0 {
                 context.set_messages(messages.clone()).await?;
+            }
+        }
+        if let Some(mut batch) = telemetry_batch {
+            if let Err(error) = context
+                .run_pipeline(&mut batch, false, CompressionStatePhase::AddMessages)
+                .await
+            {
+                tracing::debug!(%error, "context observe telemetry pass failed");
             }
         }
         let counter = context.token_counter();
@@ -376,7 +464,9 @@ impl ContextEngine {
         let original = context.messages().await;
         let tokens_before = count_messages(counter.as_ref(), &original);
         let mut working = original.clone();
-        let events = context.run_pipeline(&mut working, true).await?;
+        let events = context
+            .run_pipeline(&mut working, true, CompressionStatePhase::ActiveCompress)
+            .await?;
         if events.is_empty() && working == original {
             drop(lock);
             return Ok(CompressReport {
@@ -476,6 +566,148 @@ impl ContextEngine {
             return true;
         }
         (message.contains("exceed") || message.contains("over limit")) && mentions_input
+    }
+
+    /// The context window the engine resolves for its configuration.
+    ///
+    /// An explicit [`ContextConfig::max_context_tokens`] wins; otherwise a
+    /// configured [`ContextWindowPolicy`](crate::policy::ContextWindowPolicy)
+    /// resolves the window for the configured model/provider, and a completely
+    /// default policy keeps [`DEFAULT_CONTEXT_TOKENS`](crate::DEFAULT_CONTEXT_TOKENS).
+    #[must_use]
+    pub fn resolved_window(&self) -> ResolvedContextWindow {
+        self.config.resolved_window()
+    }
+
+    /// The KV-cache diff of `context`'s most recent LLM-bound window.
+    ///
+    /// The convenience wrapper over [`ConversationContext::detect_window_change`];
+    /// `prepare` keeps the last two windows, so no state is mutated here either.
+    #[must_use]
+    pub fn detect_window_change(&self, context: &ConversationContext) -> ContextWindowChange {
+        context.detect_window_change()
+    }
+
+    /// Builds the `ContextWindowTokenReport` of the context's current window.
+    ///
+    /// The window is the most recently prepared one
+    /// ([`ConversationContext::prepare`]), or an empty-system window over the
+    /// stored history when the context has not been prepared yet. When
+    /// `provider_input_tokens` is supplied the report's window and category
+    /// parts carry the reconciled snapshot values, exactly like
+    /// [`ContextEngine::usage_snapshot`]; without it the report is the frozen
+    /// local measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when neither the engine nor the context was
+    /// given a [`ContextUsageAnalyzer`].
+    pub async fn usage_report(
+        &self,
+        context: &ConversationContext,
+        provider_input_tokens: Option<u64>,
+    ) -> Result<ContextWindowTokenReport> {
+        let analyzer = context
+            .usage_analyzer()
+            .map(Arc::as_ref)
+            .ok_or_else(missing_analyzer)?;
+        let (system, messages, tools, stats) = self.usage_window(context).await;
+        let mut input = AnalysisInput::new("", context.session_id());
+        input.context_id = Some(context.context_id());
+        input.system_messages = Some(&system);
+        input.context_messages = &messages;
+        input.tools = &tools;
+        input.context_stats = Some(&stats);
+        input.provider_input_tokens = provider_input_tokens;
+        let mut report = context.build_window_report(analyzer, &input);
+        if provider_input_tokens.is_some() {
+            let snapshot = context.analyze_window(analyzer, &input);
+            report.context_window = snapshot.context_window;
+            report.parts = snapshot.parts;
+            report.measurement = snapshot.measurement;
+            report.measurement_cache = snapshot.measurement_cache;
+        }
+        Ok(report)
+    }
+
+    /// Builds the `context.usage` snapshot of the context's current window.
+    ///
+    /// The snapshot is the emitted [`ContextUsageSnapshot`]; a supplied
+    /// `provider_input_tokens` total is authoritative and the local categories
+    /// are reconciled to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when neither the engine nor the context was
+    /// given a [`ContextUsageAnalyzer`].
+    pub async fn usage_snapshot(
+        &self,
+        context: &ConversationContext,
+        provider_input_tokens: Option<u64>,
+    ) -> Result<ContextUsageSnapshot> {
+        let analyzer = context
+            .usage_analyzer()
+            .map(Arc::as_ref)
+            .ok_or_else(missing_analyzer)?;
+        let (system, messages, tools, stats) = self.usage_window(context).await;
+        let mut input = AnalysisInput::new("", context.session_id());
+        input.context_id = Some(context.context_id());
+        input.system_messages = Some(&system);
+        input.context_messages = &messages;
+        input.tools = &tools;
+        input.context_stats = Some(&stats);
+        input.provider_input_tokens = provider_input_tokens;
+        Ok(context.analyze_window(analyzer, &input))
+    }
+
+    /// The window and statistics a usage report or snapshot measures.
+    async fn usage_window(
+        &self,
+        context: &ConversationContext,
+    ) -> (Vec<BaseMessage>, Vec<BaseMessage>, Vec<Value>, ContextStats) {
+        let (system, messages, tools) = match context.last_window_snapshot() {
+            Some(window) => (
+                window.system_messages,
+                window.context_messages,
+                window.tools,
+            ),
+            None => (Vec::new(), context.messages().await, Vec::new()),
+        };
+        (system, messages, tools, context.statistics().await)
+    }
+
+    /// Records one provider usage report in the engine's KV-cache aggregator.
+    ///
+    /// `usage` is the provider's `usage_metadata` object parsed by
+    /// [`request_usage_from_metadata`]; a call the parser flags as inconsistent
+    /// is counted as partial and excluded from the hit/miss totals rather than
+    /// recorded as a fake miss. Recording the same `request_id` twice for one
+    /// scope is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] when `request_id` is empty or blank: an
+    /// empty id would be deduplicated against every other empty id.
+    pub fn record_provider_usage(
+        &self,
+        scope: CacheAggregationKey,
+        request_id: &str,
+        usage: &Value,
+    ) -> Result<SessionKVCacheUsage> {
+        if request_id.trim().is_empty() {
+            return Err(Error::Validation("request_id must not be empty".to_owned()));
+        }
+        let parsed = request_usage_from_metadata(usage);
+        let mut aggregator = self.kv_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(aggregator.record(request_id, &scope, &parsed))
+    }
+
+    /// The session-to-date KV-cache rollup of `scope`, when it has calls.
+    #[must_use]
+    pub fn kv_cache_usage(&self, scope: &CacheAggregationKey) -> Option<SessionKVCacheUsage> {
+        let aggregator = self.kv_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let usage = aggregator.snapshot(scope);
+        (usage.calls_total > 0).then_some(usage)
     }
 
     /// Persists every context of `session` under the session state key `context`.

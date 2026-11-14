@@ -622,18 +622,26 @@ impl AdaptiveStrategy {
         }
 
         let user_prompt = prompt::strategy_request(context, &self.config.strategy_allowlist);
-        let request = ModelRequestConfig::default()
+        let mut request = ModelRequestConfig::default()
             .with_model_name(model.model_name())
             .with_max_tokens(u32::try_from(self.config.max_decision_tokens).unwrap_or(u32::MAX));
+        // No-op outside a `with_operation` scope; inside one it tags the request
+        // with the purpose and operation id that correlate the provider call.
+        crate::telemetry::stamp_current_operation(&mut request);
         let messages = [
             BaseMessage::system(prompt::STRATEGY_SYSTEM_PROMPT),
             BaseMessage::user(user_prompt),
         ];
         let reply = match model.invoke(&messages, &request).await {
-            Ok(response) => response
-                .message()
-                .map(|message| message.text().into_owned())
-                .unwrap_or_default(),
+            Ok(response) => {
+                // Usage is observability only: a decision that answered nothing
+                // still cost tokens, so report it before parsing the reply.
+                crate::processor::record_model_usage(&response.usage, model.model_name());
+                response
+                    .message()
+                    .map(|message| message.text().into_owned())
+                    .unwrap_or_default()
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
