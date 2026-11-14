@@ -105,7 +105,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `./handle.rs` → `Subscription`, `WatcherHandle`, broadcast plumbing
 - `./backend.rs` → `notify`-gated OS adapter: plan validation, watch-path registration and deduplication, the debounce/publish/dispatch task, the notify-error mapping table and the runtime-failure quieting policy
 - `./mod.rs` → `WatcherConfig`, `WorkspaceWatcher` builder, `start`, flat re-exports, module docs
-- `./tests.rs` → `notify`-gated end-to-end watcher tests and the feature-off `Unsupported` test
+- `./tests.rs` → `notify`-gated end-to-end watcher tests (the feature-off `Unsupported` assertion lives in `backend.rs`)
 
 ## Test Strategy
 
