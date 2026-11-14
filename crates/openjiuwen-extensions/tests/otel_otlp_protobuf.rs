@@ -4,8 +4,9 @@
 //! — Python hands the encoding to `OTLPSpanExporter` and never inspects the
 //! bytes, so the wire payload is asserted here. The batch is posted to a
 //! loopback `wiremock` collector, decoded with the small hand-written protobuf
-//! reader below (no `prost`, no `opentelemetry-otlp`), and compared against a
-//! fixed fixture whose trace/span ids have recognisable bytes.
+//! reader in [`support`] (no `prost`, no `opentelemetry-otlp`; the same reader
+//! also serves `tests/otel_team_memory.rs`), and compared against a fixed
+//! fixture whose trace/span ids have recognisable bytes.
 //!
 //! What the file pins:
 //!
@@ -25,6 +26,8 @@
 #![cfg(feature = "otel")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,14 +45,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use openjiuwen_extensions::otel::{CaptureExporter, OtlpEncoding, OtlpHttpExporter};
 
-/// Varint wire type: `int32`, `int64`, `uint32`, `uint64`, `bool`, enums.
-const WIRE_VARINT: u8 = 0;
-/// 64-bit wire type: `fixed64` and `double`.
-const WIRE_FIXED64: u8 = 1;
-/// Length-delimited wire type: strings, bytes, and sub-messages.
-const WIRE_LEN: u8 = 2;
-/// 32-bit wire type: `fixed32` and `float`.
-const WIRE_FIXED32: u8 = 5;
+use support::{
+    any_string, bytes, decode, fixed32, fixed64, key_values, messages, string, varint, Fields,
+};
 
 /// The fixture trace id, chosen so every byte is distinguishable.
 const TRACE_ID: [u8; 16] = [
@@ -163,154 +161,6 @@ fn fixture_span() -> SpanData {
         // No events and no links: the seed's collections are empty.
         ..seed_span()
     }
-}
-
-// ---------------------------------------------------------------------------
-// A minimal protobuf reader: just enough to decode an OTLP trace request.
-// ---------------------------------------------------------------------------
-
-/// One decoded protobuf value.
-#[derive(Debug, Clone, PartialEq)]
-enum Wire {
-    /// Wire type 0.
-    Varint(u64),
-    /// Wire type 1.
-    Fixed64(u64),
-    /// Wire type 5.
-    Fixed32(u32),
-    /// Wire type 2: strings, bytes, and buffered sub-messages.
-    Bytes(Vec<u8>),
-}
-
-/// The decoded fields of one message, keyed by field number.
-type Fields = BTreeMap<u32, Vec<Wire>>;
-
-/// Reads one base-128 varint, advancing `offset`.
-fn read_varint(input: &[u8], offset: &mut usize) -> u64 {
-    let mut value = 0_u64;
-    let mut shift = 0_u32;
-    loop {
-        let byte = *input.get(*offset).expect("truncated varint");
-        *offset += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return value;
-        }
-        shift += 7;
-    }
-}
-
-/// Decodes one message into its fields.
-fn decode(input: &[u8]) -> Fields {
-    let mut fields = Fields::new();
-    let mut offset = 0;
-    while offset < input.len() {
-        let key = read_varint(input, &mut offset);
-        let field = u32::try_from(key >> 3).expect("field number out of range");
-        let wire_type = u8::try_from(key & 0x7).expect("wire type out of range");
-        let value = match wire_type {
-            WIRE_VARINT => Wire::Varint(read_varint(input, &mut offset)),
-            WIRE_FIXED64 => {
-                let bytes: [u8; 8] = input
-                    .get(offset..offset + 8)
-                    .expect("truncated fixed64")
-                    .try_into()
-                    .expect("fixed64 is eight bytes");
-                offset += 8;
-                Wire::Fixed64(u64::from_le_bytes(bytes))
-            }
-            WIRE_FIXED32 => {
-                let bytes: [u8; 4] = input
-                    .get(offset..offset + 4)
-                    .expect("truncated fixed32")
-                    .try_into()
-                    .expect("fixed32 is four bytes");
-                offset += 4;
-                Wire::Fixed32(u32::from_le_bytes(bytes))
-            }
-            WIRE_LEN => {
-                let length =
-                    usize::try_from(read_varint(input, &mut offset)).expect("length out of range");
-                let bytes = input
-                    .get(offset..offset + length)
-                    .expect("truncated length-delimited field")
-                    .to_vec();
-                offset += length;
-                Wire::Bytes(bytes)
-            }
-            other => panic!("unsupported wire type {other}"),
-        };
-        fields.entry(field).or_default().push(value);
-    }
-    fields
-}
-
-/// The first varint stored under `field`.
-fn varint(fields: &Fields, field: u32) -> Option<u64> {
-    fields.get(&field).and_then(|values| match values.first() {
-        Some(Wire::Varint(value)) => Some(*value),
-        _ => None,
-    })
-}
-
-/// The first `fixed64`/`double` word stored under `field`.
-fn fixed64(fields: &Fields, field: u32) -> Option<u64> {
-    fields.get(&field).and_then(|values| match values.first() {
-        Some(Wire::Fixed64(value)) => Some(*value),
-        _ => None,
-    })
-}
-
-/// The first `fixed32`/`float` word stored under `field`.
-fn fixed32(fields: &Fields, field: u32) -> Option<u32> {
-    fields.get(&field).and_then(|values| match values.first() {
-        Some(Wire::Fixed32(value)) => Some(*value),
-        _ => None,
-    })
-}
-
-/// The first length-delimited payload stored under `field`.
-fn bytes(fields: &Fields, field: u32) -> Option<&[u8]> {
-    fields.get(&field).and_then(|values| match values.first() {
-        Some(Wire::Bytes(value)) => Some(value.as_slice()),
-        _ => None,
-    })
-}
-
-/// The first string stored under `field`.
-fn string(fields: &Fields, field: u32) -> Option<String> {
-    bytes(fields, field).map(|bytes| String::from_utf8(bytes.to_vec()).expect("UTF-8 string"))
-}
-
-/// Every sub-message stored under `field`, in wire order.
-fn messages(fields: &Fields, field: u32) -> Vec<Fields> {
-    fields.get(&field).map_or_else(Vec::new, |values| {
-        values
-            .iter()
-            .filter_map(|value| match value {
-                Wire::Bytes(bytes) => Some(decode(bytes)),
-                _ => None,
-            })
-            .collect()
-    })
-}
-
-/// Decodes a repeated `KeyValue` field into attribute name → `AnyValue` fields.
-fn key_values(fields: &Fields, field: u32) -> BTreeMap<String, Fields> {
-    messages(fields, field)
-        .iter()
-        .map(|pair| {
-            let key = string(pair, 1).expect("every KeyValue has a key");
-            let mut values = messages(pair, 2);
-            assert_eq!(values.len(), 1, "every KeyValue has one AnyValue");
-            (key, values.remove(0))
-        })
-        .collect()
-}
-
-/// The `string_value` of an `AnyValue`.
-fn any_string(value: &Fields) -> String {
-    string(value, 1).expect("the AnyValue carries a string_value")
 }
 
 #[test]
