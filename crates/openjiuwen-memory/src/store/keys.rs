@@ -7,6 +7,7 @@
 //! - user variables: `user_var/{user_id}/{scope_id}/{name}`
 //! - session variables: `session_var/{user_id}/{scope_id}/{session_id}/{name}`
 //! - scope configuration: `memory_scope_config/{scope_id}`
+//! - scope analyzer overrides: `memory_scope_overrides/{scope_id}`
 //!
 //! Vector collections are named `uid_{user}_gid_{scope}_mtype_{kind}`; every segment
 //! passes through [`sanitize_segment`], because collection names become file names
@@ -60,6 +61,8 @@ pub const VARIABLE_PREFIX: &str = "user_var";
 pub const SESSION_VARIABLE_PREFIX: &str = "session_var";
 /// KV namespace prefix of per-scope configuration (Python `memory_scope_config`).
 pub const SCOPE_CONFIG_PREFIX: &str = "memory_scope_config";
+/// KV namespace prefix of the persisted per-scope analyzer overrides.
+pub const SCOPE_OVERRIDES_PREFIX: &str = "memory_scope_overrides";
 /// KV namespace prefix of the persisted scope↔user mapping (Python `scope_user_mapping`).
 pub const SCOPE_USER_MAPPING_PREFIX: &str = "scope_user_mapping";
 /// Document collection holding conversation messages.
@@ -228,6 +231,14 @@ pub fn scope_config_key_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> Strin
 #[must_use]
 pub fn scope_config_prefix_in(prefixes: &KvPrefixRegistry) -> String {
     format!("{}/", prefixes.current(KvFamily::ScopeConfig))
+}
+/// Key of the analyzer overrides of `scope_id`: `memory_scope_overrides/{scope_id}`.
+///
+/// The namespace is scope-wide like the scope configuration, but it is not a
+/// [`KvFamily`]: its payload is an opaque JSON document owned by the analyzer layer.
+#[must_use]
+pub fn scope_overrides_key(scope_id: &str) -> String {
+    scope_overrides_key_with(SCOPE_OVERRIDES_PREFIX, scope_id)
 }
 
 /// Key of the persisted `scope_id`↔`user_id` mapping: `<current>/{scope_id}/{user_id}`.
@@ -539,6 +550,11 @@ fn scope_config_key_with(prefix: &str, scope_id: &str) -> String {
     format!("{prefix}/{scope_id}")
 }
 
+/// Key of one scope's analyzer overrides under `prefix`.
+fn scope_overrides_key_with(prefix: &str, scope_id: &str) -> String {
+    format!("{prefix}/{scope_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +592,18 @@ mod tests {
     #[test]
     fn scope_config_key_is_scope_wide() {
         assert_eq!(scope_config_key("ws"), "memory_scope_config/ws");
+    }
+    #[test]
+    fn scope_overrides_key_is_scope_wide() {
+        assert_eq!(SCOPE_OVERRIDES_PREFIX, "memory_scope_overrides");
+        assert_eq!(scope_overrides_key("ws"), "memory_scope_overrides/ws");
+        assert_eq!(
+            scope_overrides_key("__default__"),
+            "memory_scope_overrides/__default__"
+        );
+        // Not a KV family: the prefix registry never renames it, and it has no alias.
+        assert_eq!(legacy_alternatives(&scope_overrides_key("ws")).len(), 0);
+        assert_eq!(current_equivalent(&scope_overrides_key("ws")), None);
     }
 
     #[test]

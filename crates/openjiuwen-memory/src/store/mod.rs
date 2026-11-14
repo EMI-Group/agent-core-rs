@@ -10,7 +10,8 @@
 //!   already owns the crate-root `lock` name).
 //! - [`mapping`] — persisted scope↔user mapping keys.
 //! - `MemoryStorage` — record/embedding/variable/scope-config persistence.
-//! - `MessageStore` — conversation history in the `messages` document collection.
+//! - `MessageStore` — conversation history in the `messages` document collection, read
+//!   either as the newest N rows or as keyset pages resuming from a [`MessageCursor`].
 //! - [`MemoryStores`] — the bundle of concrete backends every other module shares.
 //!
 //! A missing key or collection is never an error: reads yield `None`, deletes report
@@ -45,7 +46,7 @@ mod messages;
 mod storage;
 
 pub(crate) use messages::MessageStore;
-pub use messages::StoredMessage;
+pub use messages::{MessageCursor, MessagePage, StoredMessage};
 pub(crate) use storage::MemoryStorage;
 
 /// The concrete backends shared by the engine, facade, graph memory, and lite memory.
