@@ -100,6 +100,16 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `WorkspaceWatcher::new()`, `with_config`, `debounce(Duration)`, `event_capacity(usize)`, `intake_capacity(usize)`, `dispatch_capacity(usize)`, `watch_target(WatchTarget)`, `watch_dir(kind, path)`, `watch_file(kind, path)`, `watch_plan(WatchPlan)`, `for_workspace(workspace, home, env)`, `on_reload<H: ReloadHandler + 'static>(H)`, `targets()`, `start() -> Result<WatcherHandle>`.
 - `start` validates the plan (an empty plan is `Error::config`), builds the OS watcher, and spawns two tasks: the intake task (owns the backend, debounces, publishes) and the reload dispatcher (drains its bounded queue and runs the handlers).
 
+## Consumption from outside the crate
+
+- `WorkspaceWatcher::for_workspace(workspace: &Path, home: &OpenJiuwenHome, env: &dyn EnvSource)` and `WatchPlan::workspace` take `&Path`, not `&Workspace`; `OpenJiuwenHome` is `openjiuwen_common::config::OpenJiuwenHome` and `EnvSource` is `openjiuwen_harness::cli::EnvSource`, and neither is re-exported at the harness crate root.
+- `WorkspaceWatcher`, `WatcherConfig`, `WatcherHandle` and `WatchUpdate` are re-exported flat from both `crate::watcher` and `crate::` (`src/lib.rs`), so `use openjiuwen_harness::watcher::…` and `use openjiuwen_harness::…` are equivalent.
+- `WorkspaceWatcher::start` consumes `self`, is `async`, and returns `Result<WatcherHandle>`; without the `notify` feature it returns a typed `Error::Unsupported`.
+- Construction is crate-private: `Subscription::new` and `WatcherHandle::new` are `pub(crate)`; a consumer only ever gets a `Subscription` from `WatcherHandle::subscribe`.
+- `WatcherConfig` derives `Debug, Clone, PartialEq, Eq` only — no `Serialize`/`Deserialize`; a host that persists watcher settings maps them itself.
+- `Subscription::recv().await` is an inherent method, so consuming updates needs no `futures` import; only `StreamExt`/`BoxStream` usage does (the `futures::Stream` impl at `handle.rs:121` is public).
+- `pub mod watcher` is not feature-gated (`lib.rs:45`), so every type compiles without `notify`; enabling the backend is the single feature line `notify = ["dep:notify"]` (`Cargo.toml:63`) and pulls only already-locked, already-cached crates.
+
 ## Constraints
 
 - No panics, no `unwrap`/`expect`, no blocking calls on an async task; the `notify` callback only does a `try_send` into the bounded intake queue, so it neither blocks the backend thread nor unwinds inside `notify`.

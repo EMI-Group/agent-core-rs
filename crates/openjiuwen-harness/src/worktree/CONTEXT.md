@@ -119,7 +119,7 @@ The rendering is capped at `WORKTREE_SECTION_MAX_CHARS` and ends with `...` when
 The structured summary (serde JSON of `WorktreeChangeSummary`) is written into `HarnessRailContext::extra_mut()` under `WORKTREE_SUMMARY_EXTRA_KEY`; a firing without a summary, or an impossible serialization failure, removes the key instead of leaving a stale entry.
 Hooks never return `Err`: resolution, git and serialization failures are logged at `debug` and swallowed, so a rail never aborts a run.
 `build_worktree_notice` keeps Python's `notice.py` English text (`"en"` exactly) plus a Chinese counterpart and is a host-side helper: the section carries no parent cwd.
-`WorktreeRail`, `WorktreeContext`, `build_worktree_notice` and the five constants are re-exported from `openjiuwen_harness::worktree`, not from the crate root (`src/lib.rs` is untouched).
+`WorktreeContext` and the five section/summary constants are reachable only as `openjiuwen_harness::worktree::…`; `WorktreeRail` and `build_worktree_notice` are additionally flat-exported from the crate root (`src/lib.rs:245`).
 
 ## Constraints
 Offline and deterministic by default: tests use `ScriptedGitRunner` (queued stdout/failures, recorded calls) and temp directories; the single real-git test skips when `which::which("git")` fails.
@@ -129,7 +129,9 @@ No new dependencies, no `unsafe`, no `println!` (tracing only); errors are `open
 The registry document is written atomically (sibling `.tmp` + rename) and a missing file loads as empty while malformed JSON is `ErrorKind::Validation`.
 The tool never returns `Err` for expected failures: it returns a `ToolPayload` with `success = false`; only cancellation propagates.
 `enter_worktree`/`exit_worktree` are mounted by `crate::tools::ToolRegistry` (`BuiltinTool::EnterWorktree`/`BuiltinTool::ExitWorktree`) with one shared `WorktreeSessionStore`; the registry defaults that store to `MemoryWorktreeSessionStore` and `ToolRegistry::with_worktree_session_store` replaces it.
-The session tools are re-exported from `openjiuwen_harness::worktree`, not from the crate root: `src/lib.rs` flat re-exports only a subset of the worktree items (`slugify`, `GitRunner`, `ProcessGitRunner`, `WorktreeEvent`, `WorktreeInfo`, `WorktreeManager`, `WorktreeRecord`, `WorktreeTool`).
+The crate root flat-exports 26 worktree names (`src/lib.rs:244-251`): `build_worktree_notice`, `change_summary`, `is_ephemeral_slug`, `is_lock_timeout`, `render_change_summary`, `slugify`, `CleanupPolicy`, `CleanupReport`, `EnterWorktreeTool`, `ExitWorktreeTool`, `GitRunner`, `MemoryWorktreeSessionStore`, `ProcessGitRunner`, `SparseConfig`, `SparseMode`, `WorktreeChangeSummary`, `WorktreeCreateOptions`, `WorktreeEvent`, `WorktreeInfo`, `WorktreeLock`, `WorktreeLockConfig`, `WorktreeManager`, `WorktreeRail`, `WorktreeRecord`, `WorktreeSessionState`, `WorktreeTool`.
+Everything else is module-path only (`find_git_root`, `GitOutput`, `WorktreeCreateResult`, `WorktreeStatus`, `WorktreeState`, `WorktreeIndex`, `DEFAULT_BASE`, `WorktreeArgs`/`EnterWorktreeArgs`/`ExitWorktreeArgs`, `WorktreeLockGuard`, `validate_raw_name`, `WorktreeContext`, the constants).
+A host outside the crate that fakes `GitRunner` must bring its own `async-trait` (workspace `0.1`); the crate does not re-export the attribute macro, and `openjiuwen-cli` currently has no `async-trait` dependency.
 `tools.rs` never changes the process cwd; a caller must apply the reported `worktree_path`/`original_cwd` in its own cwd stack.
 The session tools consult `crate::permission` path guards for the target path on mutating actions and block only on `PermissionLevel::Deny` (`ask`/`allow` pass, no engine fails open).
 The tool is mounted by `crate::tools::ToolRegistry` as `BuiltinTool::Worktree`, the last of the extended tools, built from a `WorktreeManager` plus the registry language and permission engine.

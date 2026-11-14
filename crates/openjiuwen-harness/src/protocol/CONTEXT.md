@@ -97,6 +97,8 @@ Unknown keys → `Validation("unknown native harness configuration fields: <sort
 
 - `start` consumes only `protocol_version`, `host_capabilities`, `agent_name`, `agent_id`, `host_session_id`, `system_prompt`, `resume_policy`/`checkpoint`, `checkpoint_sink` and `mcp_servers` from `HarnessContext`.
 - `interactions`, `hooks`, `tools`, `telemetry`, `cwd`, `env` and `metadata` are ignored: `ToolApproval`/`UserInput`/`Telemetry` are advertised as optional host capabilities but never called.
+- There is no seam for seeding prior conversation messages or restoring a `persistent_agent`/`ResumePlan`/`PersistentSessionRecord`: each cycle builds a fresh `AgentSession` and a turn is one `HarnessInput`, while `NativeCheckpointState` carries no messages.
+- The module has no occurrences of `persistent_agent`, `ResumePlan`, `PersistentSessionRecord` or `WindowAssembly`; `openjiuwen_harness::persistent_agent` is a sibling tree the protocol node does not consume.
 - A permission `ask` surfaces as a kernel interrupt (`PermissionInterruptRail`) and reaches the host only through the turn's `TurnResult` (`stop_reason: "interrupt"`, `provider_data.pending_interrupt_ids`); the `__interaction__` frame maps to no event and no `HarnessInteractionRequest` is ever issued.
 
 ## Constraints
