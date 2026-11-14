@@ -11,27 +11,29 @@
 //! whole group and are reported as conflicting. The journal is therefore the durability boundary
 //! of a persistent execution — a resume replays it instead of trusting an in-memory transcript.
 //!
-//! One `tokio::sync::Mutex` guards the whole write state, and reads take the same mutex, so a
-//! rotation can never race an append or a read. Every timestamp comes from the injected
-//! [`Clock`], which keeps the module deterministic and offline in tests.
-// Size note: the implementation is ~875 lines; the file exceeds the crate's 1000-line guideline
-// only because the inline `#[cfg(test)]` module below covers rotation, retention and crash
-// recovery against real temporary directories.
+//! One `parking_lot::Mutex` guards the whole write state, and reads take the same mutex, so a
+//! rotation can never race an append or a read. Every file operation runs on
+//! [`tokio::task::spawn_blocking`], and the mutex is only ever taken on that blocking thread, so no
+//! async task holds a lock across an `.await` and no disk IO runs on the async runtime. Every
+//! timestamp comes from the injected [`Clock`], which keeps the module deterministic and offline in
+//! tests.
+// Size note: the implementation sits at the crate's ~1000-line guideline; the inline
+// `#[cfg(test)]` module below adds the rotation, retention, concurrency and crash-recovery suites
+// against real temporary directories.
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 
 use super::entry::{EntryKind, EntryPayload, ExecutionEntry, ToolStatus, UsageStatus};
 use super::identity::ExecutionIdentity;
-use super::util::{read_json, write_json_atomic};
+use super::util::{read_json_blocking, write_json_atomic_blocking};
 use super::{Clock, SystemClock};
 use crate::workspace::Workspace;
 
@@ -350,9 +352,35 @@ pub struct ExecutionLog {
     /// Source of the entry timestamps.
     clock: Arc<dyn Clock>,
     /// Write state, shared with reads so a rotation cannot race either.
-    write_state: Mutex<WriteState>,
+    ///
+    /// The lock is only taken on the blocking pool, never by an async task and never across an
+    /// `.await`, and it is only held for the in-memory reads and mutations.
+    write_state: Arc<Mutex<WriteState>>,
+    /// Serializes journal operations (append, rotate, read).
+    ///
+    /// It is taken on the blocking pool and held for the file work, so an append and a rotation
+    /// can never interleave while the write state stays free for a quick in-memory read.
+    io_gate: Arc<Mutex<()>>,
     /// Journal creation timestamp, preserved across reopens.
     created_at: String,
+}
+
+/// Owned parts of a journal, cloned into a blocking operation.
+struct LogParts {
+    /// Directory holding the metadata and the segments.
+    dir: PathBuf,
+    /// Execution the journal belongs to.
+    identity: ExecutionIdentity,
+    /// Retention limits.
+    capacity: LogCapacity,
+    /// Journal creation timestamp.
+    created_at: String,
+    /// Source of the entry timestamps.
+    clock: Arc<dyn Clock>,
+    /// In-memory write state.
+    write_state: Arc<Mutex<WriteState>>,
+    /// Serializes journal operations.
+    io_gate: Arc<Mutex<()>>,
 }
 
 /// Mutable part of a journal, guarded by [`ExecutionLog::write_state`].
@@ -400,59 +428,29 @@ impl ExecutionLog {
     ) -> Result<Self> {
         capacity.validate()?;
         let dir = dir.as_ref().to_path_buf();
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|error| io_error(&dir, "create", &error))?;
-        let (created_at, mut generation) =
-            match read_json::<LogMeta>(&dir.join(LOG_META_FILE)).await? {
-                Some(meta) => {
-                    if meta.identity != identity {
-                        return Err(Error::validation(
-                            "execution log belongs to a different execution",
-                        ));
-                    }
-                    if meta.encoding != LOG_ENCODING {
-                        return Err(Error::validation(format!(
-                            "unsupported execution log encoding `{}`; expected `{LOG_ENCODING}`",
-                            meta.encoding
-                        )));
-                    }
-                    (meta.created_at, meta.generation.max(1))
-                }
-                None => (clock.now_rfc3339(), 1),
-            };
-        let mut next_seq = 1_u64;
-        let mut lines = 0_usize;
-        let mut bytes = 0_u64;
-        let segments = segment_paths(&dir).await?;
-        let mut highest_segment = 0_u64;
-        for (segment_generation, path) in &segments {
-            highest_segment = highest_segment.max(*segment_generation);
-            next_seq = next_seq.max(highest_seq(path, next_seq).await?);
-        }
-        let active = dir.join(LOG_ENTRY_FILE);
-        if let Some(raw) = read_optional_bytes(&active).await? {
-            let scan = scan_lines(&String::from_utf8_lossy(&raw));
-            lines = scan.lines;
-            bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
-            next_seq = next_seq.max(highest_scanned_seq(&scan, next_seq));
-        }
-        generation = generation.max(highest_segment.saturating_add(1));
-        let log = Self {
+        let write_state = Arc::new(Mutex::new(WriteState {
+            next_seq: 1,
+            lines: 0,
+            bytes: 0,
+            generation: 1,
+        }));
+        let scan_dir = dir.clone();
+        let scan_identity = identity.clone();
+        let scan_clock = Arc::clone(&clock);
+        let scan_state = Arc::clone(&write_state);
+        let created_at = run_blocking(move || {
+            open_scan(&scan_dir, &scan_identity, scan_clock.as_ref(), &scan_state)
+        })
+        .await?;
+        Ok(Self {
             dir,
             identity,
             capacity,
             clock,
-            write_state: Mutex::new(WriteState {
-                next_seq,
-                lines,
-                bytes,
-                generation,
-            }),
+            write_state,
+            io_gate: Arc::new(Mutex::new(())),
             created_at,
-        };
-        log.write_meta(generation).await?;
-        Ok(log)
+        })
     }
 
     /// Opens the journal of `identity` under the workspace's `persistent_agent` node.
@@ -493,15 +491,23 @@ impl ExecutionLog {
     }
 
     /// Sequence number the next append will use.
+    ///
+    /// Reading the in-memory state needs no `.await`; the method stays `async` so callers keep
+    /// the API they had when the state lived behind a `tokio::sync::Mutex`.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     #[must_use]
     pub async fn next_seq(&self) -> u64 {
-        self.write_state.lock().await.next_seq
+        self.write_state.lock().next_seq
     }
 
     /// Live position of the journal.
+    ///
+    /// Reading the in-memory state needs no `.await`; the method stays `async` so callers keep
+    /// the API they had when the state lived behind a `tokio::sync::Mutex`.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     #[must_use]
     pub async fn cursor(&self) -> LogCursor {
-        let state = self.write_state.lock().await;
+        let state = self.write_state.lock();
         LogCursor {
             next_seq: state.next_seq,
             last_seq: state.next_seq.saturating_sub(1),
@@ -512,37 +518,16 @@ impl ExecutionLog {
     /// Appends one payload and returns the persisted entry.
     ///
     /// The active segment is rotated first when it already reached `max_entries` lines or
-    /// `max_bytes` bytes. The counters advance only after the line was written.
+    /// `max_bytes` bytes. The counters advance only after the line was written. Appends and
+    /// rotations are serialized on the blocking pool, so concurrent appends still receive
+    /// contiguous, unique sequence numbers.
     ///
     /// # Errors
     /// `Error::Validation` when the entry cannot be encoded, and `Error::Session` when the segment
     /// or the metadata cannot be written.
     pub async fn append(&self, payload: EntryPayload) -> Result<ExecutionEntry> {
-        let mut state = self.write_state.lock().await;
-        if state.lines >= self.capacity.max_entries || state.bytes >= self.capacity.max_bytes {
-            self.rotate_locked(&mut state).await?;
-        }
-        let seq = state.next_seq;
-        let entry = ExecutionEntry::new(seq, self.clock.now_rfc3339(), payload);
-        let mut line = serde_json::to_string(&entry)
-            .map_err(|error| Error::validation(format!("failed to encode entry: {error}")))?;
-        line.push('\n');
-        let path = self.entry_path();
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|error| io_error(&path, "open", &error))?;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|error| io_error(&path, "append to", &error))?;
-        state.next_seq = seq.saturating_add(1);
-        state.lines = state.lines.saturating_add(1);
-        state.bytes = state
-            .bytes
-            .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
-        Ok(entry)
+        let parts = self.parts();
+        run_blocking(move || append_entry(&parts, payload)).await
     }
 
     /// Appends each payload in order and returns the persisted entries.
@@ -567,8 +552,12 @@ impl ExecutionLog {
     /// # Errors
     /// `Error::Session` when the rename, the metadata write or a prune fails.
     pub async fn rotate_now(&self) -> Result<()> {
-        let mut state = self.write_state.lock().await;
-        self.rotate_locked(&mut state).await
+        let parts = self.parts();
+        run_blocking(move || {
+            let _gate = parts.io_gate.lock();
+            rotate_locked(&parts)
+        })
+        .await
     }
 
     /// Reads every segment and returns the usable entries with the read report.
@@ -576,8 +565,8 @@ impl ExecutionLog {
     /// # Errors
     /// `Error::Session` when a segment or the directory cannot be read.
     pub async fn read(&self) -> Result<LogSnapshot> {
-        let state = self.write_state.lock().await;
-        Ok(self.read_locked(&state).await?.0)
+        let parts = self.parts();
+        run_blocking(move || read_locked(&parts).map(|it| it.0)).await
     }
 
     /// Reads the journal and returns the entries with the cursor to continue from.
@@ -585,17 +574,32 @@ impl ExecutionLog {
     /// # Errors
     /// Every error [`ExecutionLog::read`] reports.
     pub async fn replay(&self) -> Result<Replay> {
-        let state = self.write_state.lock().await;
-        let (snapshot, cursor) = self.read_locked(&state).await?;
-        let truncated = snapshot.is_truncated();
-        Ok(Replay {
-            cursor,
-            digest: snapshot.digest(),
-            entries: snapshot.entries,
-            truncated,
+        let parts = self.parts();
+        run_blocking(move || {
+            let (snapshot, cursor) = read_locked(&parts)?;
+            let truncated = snapshot.is_truncated();
+            Ok(Replay {
+                cursor,
+                digest: snapshot.digest(),
+                entries: snapshot.entries,
+                truncated,
+            })
         })
+        .await
     }
 
+    /// Returns the owned parts a blocking operation needs.
+    fn parts(&self) -> LogParts {
+        LogParts {
+            dir: self.dir.clone(),
+            identity: self.identity.clone(),
+            created_at: self.created_at.clone(),
+            capacity: self.capacity,
+            clock: Arc::clone(&self.clock),
+            write_state: Arc::clone(&self.write_state),
+            io_gate: Arc::clone(&self.io_gate),
+        }
+    }
     /// Returns the digest of the current read.
     ///
     /// # Errors
@@ -603,151 +607,272 @@ impl ExecutionLog {
     pub async fn digest(&self) -> Result<LogDigest> {
         Ok(self.read().await?.digest())
     }
+}
 
-    /// Returns the path of the active segment.
-    fn entry_path(&self) -> PathBuf {
-        self.dir.join(LOG_ENTRY_FILE)
+/// Runs `operation` on the blocking pool.
+///
+/// All journal file IO and every acquisition of the write state happens here: no disk operation
+/// runs on an async worker, and no async task holds the write mutex across an `.await`.
+async fn run_blocking<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(error) => Err(Error::session(format!(
+            "execution journal task failed: {error}"
+        ))),
     }
+}
 
-    /// Returns the path of the archive segment with sequence number `generation`.
-    fn segment_path(&self, generation: u64) -> PathBuf {
-        self.dir
-            .join(format!("{SEGMENT_PREFIX}{generation}{SEGMENT_SUFFIX}"))
-    }
+/// Returns the path of the active segment of `dir`.
+fn entry_path(dir: &Path) -> PathBuf {
+    dir.join(LOG_ENTRY_FILE)
+}
 
-    /// Writes the metadata for `generation`.
-    async fn write_meta(&self, generation: u64) -> Result<()> {
-        let meta = LogMeta {
-            schema_version: LOG_META_VERSION,
-            encoding: LOG_ENCODING.to_string(),
-            identity: self.identity.clone(),
-            created_at: self.created_at.clone(),
-            generation,
-        };
-        write_json_atomic(&self.dir.join(LOG_META_FILE), &meta).await
-    }
+/// Returns the path of the archive segment with sequence number `generation`.
+fn segment_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("{SEGMENT_PREFIX}{generation}{SEGMENT_SUFFIX}"))
+}
 
-    /// Rotates the active segment; the caller holds the write state.
-    async fn rotate_locked(&self, state: &mut WriteState) -> Result<()> {
-        let mut generation = state.generation.max(1);
-        loop {
-            let candidate = self.segment_path(generation);
-            match tokio::fs::try_exists(&candidate).await {
-                Ok(false) => break,
-                Ok(true) => generation = generation.saturating_add(1),
-                Err(error) => return Err(io_error(&candidate, "inspect", &error)),
+/// Writes the metadata of `dir` for `generation`.
+fn write_meta(
+    dir: &Path,
+    identity: &ExecutionIdentity,
+    created_at: &str,
+    generation: u64,
+) -> Result<()> {
+    let meta = LogMeta {
+        schema_version: LOG_META_VERSION,
+        encoding: LOG_ENCODING.to_string(),
+        identity: identity.clone(),
+        created_at: created_at.to_string(),
+        generation,
+    };
+    write_json_atomic_blocking(&dir.join(LOG_META_FILE), &meta)
+}
+
+/// Scans `dir` on the blocking pool and initializes the write state from it.
+fn open_scan(
+    dir: &Path,
+    identity: &ExecutionIdentity,
+    clock: &dyn Clock,
+    state: &Mutex<WriteState>,
+) -> Result<String> {
+    std::fs::create_dir_all(dir).map_err(|error| io_error(dir, "create", &error))?;
+    let (created_at, mut generation) =
+        match read_json_blocking::<LogMeta>(&dir.join(LOG_META_FILE))? {
+            Some(meta) => {
+                if meta.identity != *identity {
+                    return Err(Error::validation(
+                        "execution log belongs to a different execution",
+                    ));
+                }
+                if meta.encoding != LOG_ENCODING {
+                    return Err(Error::validation(format!(
+                        "unsupported execution log encoding `{}`; expected `{LOG_ENCODING}`",
+                        meta.encoding
+                    )));
+                }
+                (meta.created_at, meta.generation.max(1))
             }
+            None => (clock.now_rfc3339(), 1),
+        };
+    let mut next_seq = 1_u64;
+    let mut lines = 0_usize;
+    let mut bytes = 0_u64;
+    let mut highest_segment = 0_u64;
+    for (segment_generation, path) in segment_paths(dir)? {
+        highest_segment = highest_segment.max(segment_generation);
+        next_seq = next_seq.max(highest_seq(&path, next_seq)?);
+    }
+    if let Some(raw) = read_optional_bytes(&entry_path(dir))? {
+        let scan = scan_lines(&String::from_utf8_lossy(&raw));
+        lines = scan.lines;
+        bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+        next_seq = next_seq.max(highest_scanned_seq(&scan, next_seq));
+    }
+    generation = generation.max(highest_segment.saturating_add(1));
+    *state.lock() = WriteState {
+        next_seq,
+        lines,
+        bytes,
+        generation,
+    };
+    write_meta(dir, identity, &created_at, generation)?;
+    Ok(created_at)
+}
+
+/// Appends `payload` to the journal; the caller holds the journal's I/O gate.
+fn append_entry(parts: &LogParts, payload: EntryPayload) -> Result<ExecutionEntry> {
+    let _gate = parts.io_gate.lock();
+    let (rotate, seq) = {
+        let state = parts.write_state.lock();
+        (
+            state.lines >= parts.capacity.max_entries || state.bytes >= parts.capacity.max_bytes,
+            state.next_seq,
+        )
+    };
+    if rotate {
+        rotate_locked(parts)?;
+    }
+    let entry = ExecutionEntry::new(seq, parts.clock.now_rfc3339(), payload);
+    let mut line = serde_json::to_string(&entry)
+        .map_err(|error| Error::validation(format!("failed to encode entry: {error}")))?;
+    line.push('\n');
+    let path = entry_path(&parts.dir);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| io_error(&path, "open", &error))?;
+    file.write_all(line.as_bytes())
+        .map_err(|error| io_error(&path, "append to", &error))?;
+    let mut state = parts.write_state.lock();
+    state.next_seq = seq.saturating_add(1);
+    state.lines = state.lines.saturating_add(1);
+    state.bytes = state
+        .bytes
+        .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+    Ok(entry)
+}
+
+/// Rotates the active segment; the caller holds the journal's I/O gate.
+fn rotate_locked(parts: &LogParts) -> Result<()> {
+    let mut generation = parts.write_state.lock().generation.max(1);
+    loop {
+        let candidate = segment_path(&parts.dir, generation);
+        match candidate.try_exists() {
+            Ok(false) => break,
+            Ok(true) => generation = generation.saturating_add(1),
+            Err(error) => return Err(io_error(&candidate, "inspect", &error)),
         }
-        let active = self.entry_path();
-        match tokio::fs::rename(&active, self.segment_path(generation)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(&active, "rename", &error)),
-        }
-        state.generation = generation.saturating_add(1);
+    }
+    let active = entry_path(&parts.dir);
+    match std::fs::rename(&active, segment_path(&parts.dir, generation)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&active, "rename", &error)),
+    }
+    let next_generation = generation.saturating_add(1);
+    {
+        let mut state = parts.write_state.lock();
+        state.generation = next_generation;
         state.lines = 0;
         state.bytes = 0;
-        self.write_meta(state.generation).await?;
-        self.prune_segments().await
     }
+    write_meta(
+        &parts.dir,
+        &parts.identity,
+        &parts.created_at,
+        next_generation,
+    )?;
+    prune_segments(&parts.dir, parts.capacity)
+}
 
-    /// Deletes the oldest archives beyond `keep_segments`.
-    async fn prune_segments(&self) -> Result<()> {
-        let segments = segment_paths(&self.dir).await?;
-        let excess = segments.len().saturating_sub(self.capacity.keep_segments);
-        for (_, path) in segments.into_iter().take(excess) {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(&path, "remove", &error)),
-            }
+/// Deletes the oldest archives of `dir` beyond `keep_segments`.
+fn prune_segments(dir: &Path, capacity: LogCapacity) -> Result<()> {
+    let segments = segment_paths(dir)?;
+    let excess = segments.len().saturating_sub(capacity.keep_segments);
+    for (_, path) in segments.into_iter().take(excess) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path, "remove", &error)),
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Reads the archives in generation order then the active segment; the caller holds the state.
-    async fn read_locked(&self, state: &WriteState) -> Result<(LogSnapshot, LogCursor)> {
-        let mut sources: Vec<Vec<u8>> = Vec::new();
-        for (_, path) in segment_paths(&self.dir).await? {
-            if let Some(raw) = read_optional_bytes(&path).await? {
-                sources.push(raw);
-            }
-        }
-        if let Some(raw) = read_optional_bytes(&self.entry_path()).await? {
+/// Reads the archives in generation order then the active segment.
+fn read_locked(parts: &LogParts) -> Result<(LogSnapshot, LogCursor)> {
+    let _gate = parts.io_gate.lock();
+    let mut sources: Vec<Vec<u8>> = Vec::new();
+    for (_, path) in segment_paths(&parts.dir)? {
+        if let Some(raw) = read_optional_bytes(&path)? {
             sources.push(raw);
         }
-        let snapshot = self.snapshot_from(&sources);
-        let cursor = LogCursor {
-            next_seq: state.next_seq,
-            last_seq: state.next_seq.saturating_sub(1),
-            generation: state.generation,
-        };
-        Ok((snapshot, cursor))
     }
+    if let Some(raw) = read_optional_bytes(&entry_path(&parts.dir))? {
+        sources.push(raw);
+    }
+    let snapshot = snapshot_from(&parts.identity, parts.capacity, &sources);
+    let state = parts.write_state.lock();
+    let cursor = LogCursor {
+        next_seq: state.next_seq,
+        last_seq: state.next_seq.saturating_sub(1),
+        generation: state.generation,
+    };
+    Ok((snapshot, cursor))
+}
 
-    /// Builds the snapshot of `sources`, which are the segment bytes in read order.
-    fn snapshot_from(&self, sources: &[Vec<u8>]) -> LogSnapshot {
-        let mut by_seq: BTreeMap<u64, Vec<ExecutionEntry>> = BTreeMap::new();
-        let mut total_lines = 0_usize;
-        let mut skipped_invalid = 0_usize;
-        for raw in sources {
-            let scan = scan_lines(&String::from_utf8_lossy(raw));
-            total_lines = total_lines.saturating_add(scan.lines);
-            skipped_invalid = skipped_invalid.saturating_add(scan.skipped);
-            for entry in scan.entries {
-                by_seq.entry(entry.seq).or_default().push(entry);
+/// Builds the snapshot of `sources`, which are the segment bytes in read order.
+fn snapshot_from(
+    identity: &ExecutionIdentity,
+    capacity: LogCapacity,
+    sources: &[Vec<u8>],
+) -> LogSnapshot {
+    let mut by_seq: BTreeMap<u64, Vec<ExecutionEntry>> = BTreeMap::new();
+    let mut total_lines = 0_usize;
+    let mut skipped_invalid = 0_usize;
+    for raw in sources {
+        let scan = scan_lines(&String::from_utf8_lossy(raw));
+        total_lines = total_lines.saturating_add(scan.lines);
+        skipped_invalid = skipped_invalid.saturating_add(scan.skipped);
+        for entry in scan.entries {
+            by_seq.entry(entry.seq).or_default().push(entry);
+        }
+    }
+    let mut entries = Vec::with_capacity(by_seq.len());
+    let mut duplicates_removed = 0_usize;
+    let mut conflicting_seqs = Vec::new();
+    for (seq, group) in by_seq {
+        let mut unique: Vec<ExecutionEntry> = Vec::with_capacity(group.len());
+        for entry in group {
+            let digest = entry.digest();
+            if unique
+                .iter()
+                .any(|existing: &ExecutionEntry| existing.digest() == digest)
+            {
+                duplicates_removed = duplicates_removed.saturating_add(1);
+            } else {
+                unique.push(entry);
             }
         }
-        let mut entries = Vec::with_capacity(by_seq.len());
-        let mut duplicates_removed = 0_usize;
-        let mut conflicting_seqs = Vec::new();
-        for (seq, group) in by_seq {
-            let mut unique: Vec<ExecutionEntry> = Vec::with_capacity(group.len());
-            for entry in group {
-                let digest = entry.digest();
-                if unique
-                    .iter()
-                    .any(|existing: &ExecutionEntry| existing.digest() == digest)
-                {
-                    duplicates_removed = duplicates_removed.saturating_add(1);
-                } else {
-                    unique.push(entry);
-                }
-            }
-            if unique.len() > 1 {
-                conflicting_seqs.push(seq);
-            } else if let Some(entry) = unique.pop() {
-                entries.push(entry);
-            }
+        if unique.len() > 1 {
+            conflicting_seqs.push(seq);
+        } else if let Some(entry) = unique.pop() {
+            entries.push(entry);
         }
-        let missing_ranges = missing_ranges(entries.iter().map(|entry| entry.seq));
-        let retained_out = entries.len().saturating_sub(self.capacity.max_entries);
-        if retained_out > 0 {
-            entries.drain(..retained_out);
-        }
-        let unusable = if total_lines == 0 {
-            Some("empty".to_string())
-        } else if entries.is_empty() {
-            Some("no_usable_entry".to_string())
-        } else {
-            None
-        };
-        LogSnapshot {
-            identity: self.identity.clone(),
-            entries,
-            skipped_invalid,
-            duplicates_removed,
-            conflicting_seqs,
-            missing_ranges,
-            retained_out,
-            unusable,
-        }
+    }
+    let missing_ranges = missing_ranges(entries.iter().map(|entry| entry.seq));
+    let retained_out = entries.len().saturating_sub(capacity.max_entries);
+    if retained_out > 0 {
+        entries.drain(..retained_out);
+    }
+    let unusable = if total_lines == 0 {
+        Some("empty".to_string())
+    } else if entries.is_empty() {
+        Some("no_usable_entry".to_string())
+    } else {
+        None
+    };
+    LogSnapshot {
+        identity: identity.clone(),
+        entries,
+        skipped_invalid,
+        duplicates_removed,
+        conflicting_seqs,
+        missing_ranges,
+        retained_out,
+        unusable,
     }
 }
 
 /// Returns the highest sequence number stored in `path`, plus one, or `fallback`.
-async fn highest_seq(path: &Path, fallback: u64) -> Result<u64> {
-    match read_optional_bytes(path).await? {
+fn highest_seq(path: &Path, fallback: u64) -> Result<u64> {
+    match read_optional_bytes(path)? {
         Some(raw) => Ok(highest_scanned_seq(
             &scan_lines(&String::from_utf8_lossy(&raw)),
             fallback,
@@ -767,18 +892,15 @@ fn highest_scanned_seq(scan: &LineScan, fallback: u64) -> u64 {
 }
 
 /// Returns the archived segments of `dir`, sorted by generation.
-async fn segment_paths(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
-    let mut reader = match tokio::fs::read_dir(dir).await {
+fn segment_paths(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let reader = match std::fs::read_dir(dir) {
         Ok(reader) => reader,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error(dir, "read", &error)),
     };
     let mut segments = Vec::new();
-    while let Some(entry) = reader
-        .next_entry()
-        .await
-        .map_err(|error| io_error(dir, "read", &error))?
-    {
+    for entry in reader {
+        let entry = entry.map_err(|error| io_error(dir, "read", &error))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if let Some(generation) = parse_segment_name(name) {
@@ -801,8 +923,8 @@ fn parse_segment_name(name: &str) -> Option<u64> {
 }
 
 /// Reads `path`, treating a missing file as `Ok(None)`.
-async fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    match tokio::fs::read(path).await {
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error(path, "read", &error)),
@@ -1369,5 +1491,57 @@ mod tests {
         assert_eq!(entries[0].seq, 1);
         assert_eq!(entries[1].seq, 2);
         assert_eq!(log.read().await.unwrap().entries, entries);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_stay_contiguous_and_replayable() {
+        const APPENDS: u64 = 32;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = Arc::new(open(&dir, LogCapacity::default()).await);
+        let mut handles = Vec::with_capacity(usize::try_from(APPENDS).unwrap());
+        for index in 0..APPENDS {
+            let log = Arc::clone(&log);
+            handles.push(tokio::spawn(async move {
+                log.append(EntryPayload::note(format!("n{index}")))
+                    .await
+                    .unwrap()
+                    .seq
+            }));
+        }
+        let mut seqs = Vec::with_capacity(handles.len());
+        for handle in handles {
+            seqs.push(handle.await.unwrap());
+        }
+        seqs.sort_unstable();
+        let expected: Vec<u64> = (1..=APPENDS).collect();
+        assert_eq!(seqs, expected, "every append gets a unique sequence");
+        assert_eq!(log.next_seq().await, APPENDS + 1);
+
+        let replay = log.replay().await.unwrap();
+        assert!(!replay.truncated);
+        assert_eq!(replay.cursor.next_seq, APPENDS + 1);
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            expected,
+            "no interleaved or missing entries"
+        );
+        assert_eq!(replay.entries.len(), usize::try_from(APPENDS).unwrap());
+
+        let text = tokio::fs::read_to_string(dir.path().join(LOG_ENTRY_FILE))
+            .await
+            .unwrap();
+        assert_eq!(text.lines().count(), usize::try_from(APPENDS).unwrap());
+        assert!(text.lines().all(|line| !line.is_empty()));
+        assert_eq!(
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<ExecutionEntry>(line).ok())
+                .count(),
+            usize::try_from(APPENDS).unwrap(),
+            "every persisted line parses back"
+        );
     }
 }

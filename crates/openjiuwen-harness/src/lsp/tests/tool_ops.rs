@@ -331,3 +331,173 @@ async fn diagnostics_without_a_server_and_without_push_data_report_none() {
         .render_for_llm(&payload)
         .contains("No diagnostics found."));
 }
+
+/// The pull requests the fake server received, in order.
+fn pull_requests(server: &FakeServer) -> Vec<Value> {
+    server
+        .messages()
+        .into_iter()
+        .filter(|message| {
+            message.get("method").and_then(Value::as_str) == Some("textDocument/diagnostic")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn unchanged_pull_reuses_the_cached_snapshot_without_a_stale_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_source(dir.path(), "// clean\nfn main() {}\n").await;
+    let (tool, _server) = build_tool(dir.path(), Duration::from_secs(2));
+    // The first pull is a full report; the second one carries its `resultId` and is answered
+    // with `unchanged`, so the cached items are reused.
+    let full = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(full["data"]["diagnostics"].as_array().unwrap().len(), 1);
+    assert!(full["data"].get("stale").is_none(), "{full}");
+    // Drop the push notification the fake published on `didOpen` so the next call pulls again;
+    // only the pull caches matter here.
+    tool.diagnostics().clear();
+    let unchanged = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(unchanged["success"], json!(true), "{unchanged}");
+    assert_eq!(unchanged["data"]["source"], json!("pull"));
+    assert_eq!(
+        unchanged["data"]["diagnostics"].as_array().unwrap().len(),
+        1,
+        "the cached full report answers the unchanged pull"
+    );
+    assert!(
+        unchanged["data"].get("stale").is_none(),
+        "a cached snapshot is authoritative: {unchanged}"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_pull_without_a_snapshot_is_marked_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_file(dir.path(), "stale_pull.rs", "fn main() {}\n").await;
+    let (tool, server) = build_tool(dir.path(), Duration::from_secs(2));
+    let payload = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(payload["success"], json!(true), "{payload}");
+    assert_eq!(payload["data"]["source"], json!("pull"));
+    assert_eq!(
+        payload["data"]["stale"],
+        json!(true),
+        "an unchanged answer without a baseline must not read as \"no problems\": {payload}"
+    );
+    assert_eq!(payload["data"]["diagnostics"], json!([]));
+    let result = payload["data"]["result"].as_str().unwrap();
+    assert!(result.contains("stale"), "{result}");
+    assert!(
+        !result.contains("No diagnostics found."),
+        "the payload must not claim the file is clean: {result}"
+    );
+    let pulls = pull_requests(&server);
+    assert_eq!(
+        pulls.len(),
+        2,
+        "one pull plus exactly one forced full re-pull"
+    );
+    assert!(pulls
+        .iter()
+        .all(|pull| pull["params"].get("previousResultId").is_none()));
+}
+
+#[tokio::test]
+async fn unchanged_pull_without_a_snapshot_forces_one_full_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_file(dir.path(), "late_full.rs", "fn main() {}\n").await;
+    let (tool, server) = build_tool(dir.path(), Duration::from_secs(2));
+    let payload = call(&tool, json!({"action": "diagnostics", "path": &path})).await;
+    assert_eq!(payload["success"], json!(true), "{payload}");
+    assert_eq!(
+        payload["data"]["stale"],
+        json!(null),
+        "the forced re-pull resolved the report: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["diagnostics"].as_array().unwrap().len(),
+        1,
+        "{payload}"
+    );
+    assert!(payload["data"]["result"]
+        .as_str()
+        .unwrap()
+        .contains("cannot find name"));
+    let pulls = pull_requests(&server);
+    assert_eq!(
+        pulls.len(),
+        2,
+        "the bogus unchanged answer triggers one retry, never a loop"
+    );
+    assert!(pulls[1]["params"].get("previousResultId").is_none());
+}
+
+#[tokio::test]
+async fn method_not_found_is_classified_from_the_typed_code() {
+    let dir = tempfile::tempdir().unwrap();
+    // The fake answers with code -32601 but neither "-32601" nor "method not found" in the
+    // message, so only a typed check classifies the answer.
+    let path = write_file(dir.path(), "typedonly.rs", "fn main() {}\n").await;
+    let (tool, _server) = build_tool(dir.path(), Duration::from_secs(2));
+    let payload = call(
+        &tool,
+        json!({"action": "completion", "path": path, "line": 1, "column": 1}),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(false));
+    assert_eq!(
+        payload["error"],
+        json!("Operation not supported by this language server: textDocument/completion")
+    );
+}
+
+#[tokio::test]
+async fn method_not_found_message_is_the_documented_last_resort() {
+    let dir = tempfile::tempdir().unwrap();
+    // A non-standard code with the text: the typed code does not match, the fallback does.
+    let path = write_file(dir.path(), "sniffonly.rs", "fn main() {}\n").await;
+    let (tool, _server) = build_tool(dir.path(), Duration::from_secs(2));
+    let payload = call(
+        &tool,
+        json!({"action": "completion", "path": path, "line": 1, "column": 1}),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(false));
+    assert_eq!(
+        payload["error"],
+        json!("Operation not supported by this language server: textDocument/completion")
+    );
+}
+
+#[test]
+fn method_not_found_detection_prefers_the_typed_code() {
+    use crate::lsp::protocol::{is_method_not_found, server_error, LspError};
+
+    let typed = LspError::new(-32601, "no handler registered").into_error();
+    assert!(
+        !typed
+            .message()
+            .to_ascii_lowercase()
+            .contains("method not found"),
+        "the message carries no textual hint: {}",
+        typed.message()
+    );
+    assert!(
+        server_error(&typed).is_some_and(LspError::is_method_not_found),
+        "the typed code survives the conversion"
+    );
+    assert!(is_method_not_found(&typed));
+
+    let mis_coded = LspError::new(0, "method not found: textDocument/hover").into_error();
+    assert!(
+        !server_error(&mis_coded).is_some_and(LspError::is_method_not_found),
+        "a non-standard code is not a typed match"
+    );
+    assert!(
+        is_method_not_found(&mis_coded),
+        "the message fallback still classifies a server that omits the code"
+    );
+
+    let unrelated = LspError::new(-32000, "internal error").into_error();
+    assert!(!is_method_not_found(&unrelated));
+    assert!(server_error(&unrelated).is_some(), "the error stays typed");
+}

@@ -214,6 +214,10 @@ fn diagnostics_notification(method: &str, message: &Value) -> Option<Value> {
 async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = MessageReader::new(read);
+    // Per-document `textDocument/diagnostic` counts, used by the scripted "the first answer is
+    // `unchanged`" documents.
+    let mut diagnostic_requests: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     loop {
         let message = match reader.next().await {
             Ok(Some(message)) => message,
@@ -288,6 +292,17 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
                     error(
                         id,
                         &LspError::new(-32601, "method not found: textDocument/completion"),
+                    )
+                } else if uri.contains("typedonly") {
+                    // The typed code, without any "method not found" text: only a consumer
+                    // that matches on the code can classify this answer.
+                    error(id, &LspError::new(-32601, "no handler registered"))
+                } else if uri.contains("sniffonly") {
+                    // A non-standard code with the text: only the documented message fallback
+                    // can classify this answer.
+                    error(
+                        id,
+                        &LspError::new(0, "method not found: textDocument/completion"),
                     )
                 } else {
                     response(
@@ -456,36 +471,53 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
                 }
             }
             "textDocument/diagnostic" => {
+                let uri = document_uri(&message);
+                let attempt = {
+                    let count = diagnostic_requests.entry(uri.clone()).or_insert(0);
+                    *count += 1;
+                    *count
+                };
                 let previous = message
                     .get("params")
                     .and_then(|params| params.get("previousResultId"))
                     .and_then(Value::as_str);
-                match previous {
-                    Some("r1") => response(id, json!({ "kind": "unchanged", "resultId": "r1" })),
-                    Some(_) => response(
-                        id,
-                        json!({
-                            "kind": "full",
-                            "resultId": "r2",
-                            "items": [
-                                { "range": range(1, 0), "message": "stale report replaced" },
-                            ],
-                        }),
-                    ),
-                    None => response(
-                        id,
-                        json!({
-                            "kind": "full",
-                            "resultId": "r1",
-                            "items": [{
-                                "range": range(0, 0),
-                                "severity": 1,
-                                "source": "fake",
-                                "code": 2304,
-                                "message": "cannot find name",
-                            }],
-                        }),
-                    ),
+                if uri.contains("stale_pull") {
+                    // `unchanged` even without a `resultId`: the tool has no baseline, so it
+                    // must say so instead of reporting "no problems".
+                    response(id, json!({ "kind": "unchanged", "resultId": "stuck" }))
+                } else if uri.contains("late_full") && attempt == 1 {
+                    // First answer is a bogus `unchanged`; the forced full pull gets items.
+                    response(id, json!({ "kind": "unchanged", "resultId": "late" }))
+                } else {
+                    match previous {
+                        Some("r1") => {
+                            response(id, json!({ "kind": "unchanged", "resultId": "r1" }))
+                        }
+                        Some(_) => response(
+                            id,
+                            json!({
+                                "kind": "full",
+                                "resultId": "r2",
+                                "items": [
+                                    { "range": range(1, 0), "message": "stale report replaced" },
+                                ],
+                            }),
+                        ),
+                        None => response(
+                            id,
+                            json!({
+                                "kind": "full",
+                                "resultId": "r1",
+                                "items": [{
+                                    "range": range(0, 0),
+                                    "severity": 1,
+                                    "source": "fake",
+                                    "code": 2304,
+                                    "message": "cannot find name",
+                                }],
+                            }),
+                        ),
+                    }
                 }
             }
             other => error(

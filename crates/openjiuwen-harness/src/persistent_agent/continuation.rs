@@ -346,13 +346,31 @@ impl ExecutionLogSource for RootLogSource {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LogPreview;
 
+/// Renders `value` as one compact JSON line, or skips it with a warning.
+///
+/// A preview must never emit an empty line: an empty line reads back as a corrupt journal record.
+/// Encoding a snapshot's entries cannot fail in practice, so the failure policy is to drop the
+/// line and say which one it was rather than to break the whole preview.
+fn render_preview_line<T: Serialize>(label: &str, value: &T) -> Option<String> {
+    match serde_json::to_string(value) {
+        Ok(line) => Some(line),
+        Err(error) => {
+            tracing::warn!(
+                label,
+                error = %error,
+                "skipping an unrenderable persistent-agent log preview line"
+            );
+            None
+        }
+    }
+}
+
 impl LogPreview {
     /// Renders `snapshot` as the continuation preview.
     #[must_use]
     pub fn preview(snapshot: &LogSnapshot) -> String {
         let mut model_turns = 0_usize;
         let mut reply_deltas = 0_usize;
-        let mut lines = Vec::new();
         for entry in &snapshot.entries {
             match entry.payload {
                 EntryPayload::ModelTurn { .. } => {
@@ -379,7 +397,11 @@ impl LogPreview {
                 "reply_delta": reply_deltas,
             },
         });
-        lines.push(serde_json::to_string(&header).unwrap_or_default());
+        let mut lines = Vec::new();
+        if let Some(line) = render_preview_line("header", &header) {
+            lines.push(line);
+        }
+        let mut skipped = 0_usize;
         for entry in &snapshot.entries {
             if matches!(
                 entry.payload,
@@ -387,7 +409,17 @@ impl LogPreview {
             ) {
                 continue;
             }
-            lines.push(serde_json::to_string(entry).unwrap_or_default());
+            match render_preview_line(&format!("entry seq {}", entry.seq), entry) {
+                Some(line) => lines.push(line),
+                None => skipped = skipped.saturating_add(1),
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                execution_id = snapshot.identity.execution_id,
+                "persistent-agent log preview omitted unrenderable entries"
+            );
         }
         lines.join("\n")
     }
@@ -622,8 +654,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        continuation_background, resume, Continuation, ExecutionLink, ExecutionLinkSource,
-        ExecutionLogSource, FileLinkStore, LogPreview, RootLogSource, CONTINUATION_RULES,
+        continuation_background, render_preview_line, resume, Continuation, ExecutionLink,
+        ExecutionLinkSource, ExecutionLogSource, FileLinkStore, LogPreview, RootLogSource,
+        CONTINUATION_RULES,
     };
     use crate::persistent_agent::entry::{EntryPayload, ModelUsage};
     use crate::persistent_agent::identity::{ExecutionIdentity, LinkRelation, SessionBinding};
@@ -1124,6 +1157,29 @@ mod tests {
         assert_eq!(header["usable"], false);
         assert_eq!(header["events"], 0);
         assert_eq!(preview.lines().count(), 1);
+    }
+
+    /// A value whose serialization always fails, standing in for an unrepresentable payload.
+    struct Unrenderable;
+
+    impl serde::Serialize for Unrenderable {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            _serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("cannot encode"))
+        }
+    }
+
+    #[test]
+    fn preview_skips_unrenderable_lines_instead_of_emitting_an_empty_one() {
+        assert_eq!(render_preview_line("entry seq 1", &Unrenderable), None);
+        let rendered = render_preview_line("entry seq 2", &serde_json::json!({"kind": "note"}));
+        assert_eq!(rendered.as_deref(), Some(r#"{"kind":"note"}"#));
+        assert!(
+            rendered.as_deref().is_some_and(|line| !line.is_empty()),
+            "a rendered line is never empty"
+        );
     }
 
     #[test]

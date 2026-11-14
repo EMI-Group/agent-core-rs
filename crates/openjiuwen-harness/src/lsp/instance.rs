@@ -21,8 +21,16 @@
 //!
 //! Starts are serialized by a `tokio` mutex that is held only across the launch sequence (never
 //! across a model-facing operation), because one server per key must be spawned exactly once.
-//! The client slot and the status block are separate `parking_lot` mutexes: they are only held
-//! for short, non-async updates.
+//! The client slot and the status block are separate `parking_lot` mutexes held only for short,
+//! non-async updates, and **the lock order is always `client` before `status`**: every path that
+//! needs both (`status`, `live_client`, `stop_current`) takes them in that order, so the
+//! lifecycle cannot deadlock against a concurrent status read. No lock is held across an
+//! `.await`.
+//!
+//! Lifecycle transitions are recorded in one place: [`ServerSupervisor::begin_start`] checks and
+//! marks `Starting` under a single status lock (or records the refused start as `Failed`), and
+//! every later failure goes through `record_failure`. A caller that asks for `/status` therefore
+//! never sees a stale `Stopped`/`Running` after a refused or failed start.
 //!
 //! An explicit [`ServerSupervisor::shutdown`] is final: later `client()`/`run` calls return a
 //! typed "has been shut down" error instead of silently restarting the process.
@@ -314,14 +322,15 @@ impl ServerSupervisor {
     }
 
     /// A snapshot of the lifecycle state.
+    ///
+    /// Locks `client` before `status` (the supervisor-wide order); both are held only for the
+    /// snapshot, so a concurrent start or stop cannot deadlock against it.
     #[must_use]
     pub fn status(&self) -> ServerStatus {
+        let client = self.client.lock();
+        let alive = client.as_ref().is_some_and(|client| client.is_alive());
+        drop(client);
         let state = self.status.lock();
-        let alive = self
-            .client
-            .lock()
-            .as_ref()
-            .is_some_and(|client| client.is_alive());
         ServerStatus {
             key: self.key(),
             language_id: self.config.language_id.clone(),
@@ -456,14 +465,16 @@ impl ServerSupervisor {
         Ok(())
     }
 
-    /// The typed "too many recoveries" error.
+    /// The typed "too many recoveries" error, naming the recorded failure.
     fn budget_error(&self) -> Error {
-        let last = self
-            .status
-            .lock()
-            .last_error
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned());
+        let last = self.status.lock().last_error.clone();
+        self.budget_error_for(last.as_deref())
+    }
+
+    /// The typed "too many recoveries" error for `last_error` (no locking, for callers that
+    /// already hold or just released the status lock).
+    fn budget_error_for(&self, last_error: Option<&str>) -> Error {
+        let last = last_error.unwrap_or("unknown");
         Error::transport(format!(
             "LSP server '{}' exceeded max crash recovery attempts ({}); last error: {last}",
             self.name(),
@@ -494,13 +505,33 @@ impl ServerSupervisor {
         }
     }
 
+    /// Checks the recovery budget and marks the server `Starting`, under one status lock.
+    ///
+    /// A refused start is a failure, not a no-op: the status is set to [`ServerState::Failed`]
+    /// (keeping the underlying `last_error`) before the budget error is returned, so a caller
+    /// that reads [`ServerSupervisor::status`] afterwards sees why the server is not running —
+    /// for example after a `restart()` stopped the previous instance first.
+    fn begin_start(&self) -> Result<()> {
+        let mut status = self.status.lock();
+        if status.attempts >= self.policy.max_attempts.max(1) {
+            let previous = status.last_error.clone();
+            status.state = ServerState::Failed;
+            drop(status);
+            tracing::warn!(
+                target: "openjiuwen_harness::lsp",
+                server = %self.name(),
+                attempts = self.policy.max_attempts.max(1),
+                "refusing to start LSP server: crash recovery budget exhausted"
+            );
+            return Err(self.budget_error_for(previous.as_deref()));
+        }
+        status.state = ServerState::Starting;
+        Ok(())
+    }
+
     /// The serialized launch sequence: factory, client, diagnostics, initialize.
     async fn start(&self) -> Result<Arc<LspClient>> {
-        let attempts = self.attempts();
-        if attempts >= self.policy.max_attempts.max(1) {
-            return Err(self.budget_error());
-        }
-        self.status.lock().state = ServerState::Starting;
+        self.begin_start()?;
         let transport = match (self.factory)(&self.config) {
             Ok(transport) => transport,
             Err(error) => return Err(self.record_failure(error)),

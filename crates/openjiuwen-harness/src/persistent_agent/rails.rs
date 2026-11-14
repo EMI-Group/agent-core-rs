@@ -932,7 +932,7 @@ mod tests {
 
         match &payloads(&log).await[1] {
             EntryPayload::ToolCompleted { result_summary, .. } => {
-                assert_eq!(result_summary, "abcde…");
+                assert_eq!(result_summary, "abcd…");
             }
             other => panic!("expected a tool outcome, got {other:?}"),
         }

@@ -22,9 +22,19 @@
 //! # Shutdown
 //!
 //! [`WatcherHandle::shutdown`] cancels the token, drains the pending debounce
-//! window through the watcher task, and awaits that task, so no update is
-//! produced after `shutdown()` returns. The call is idempotent, and dropping
-//! the handle cancels cooperatively as well.
+//! window through the watcher task, awaits the reload dispatcher and then awaits
+//! both tasks, so no update is produced after `shutdown()` returns. The call is
+//! idempotent, and dropping the handle cancels cooperatively as well.
+//!
+//! # Dropped notifications
+//!
+//! The watcher's two internal queues are bounded (see `intake.rs`), so a
+//! producer that outruns its consumer loses notifications instead of growing
+//! memory. The loss is visible three ways: a
+//! [`WatchUpdate::Dropped`](crate::watcher::WatchUpdate::Dropped) notice on the
+//! subscription, a `tracing::warn!` per notice, and the totals this handle
+//! reports through [`WatcherHandle::dropped_notifications`] and
+//! [`WatcherHandle::dropped_dispatches`].
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -35,6 +45,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, ReusableBoxFuture};
 
 use crate::watcher::event::WatchUpdate;
+use crate::watcher::intake::DropCounters;
 
 /// One in-flight receive: the outcome plus the receiver to poll next.
 ///
@@ -153,33 +164,37 @@ impl std::fmt::Debug for Subscription {
 /// Control handle of a running workspace watcher.
 ///
 /// Owns the update sender, so subscriptions keep working as long as the handle
-/// lives, plus the cancellation token and the task that drives the OS watcher.
-/// See the module documentation for the drop-oldest contract.
+/// lives, plus the cancellation token, the tasks that drive the OS watcher and
+/// its reload dispatcher, and the shared drop counters. See the module
+/// documentation for the drop-oldest and shutdown contracts.
 pub struct WatcherHandle {
     events: broadcast::Sender<WatchUpdate>,
     cancel: CancellationToken,
-    task: Mutex<Option<JoinHandle<()>>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    counters: DropCounters,
     target_count: usize,
 }
 
 impl WatcherHandle {
     /// Builds a handle from its parts.
     ///
-    /// The watcher task must publish through `events` and stop once `cancel` is
-    /// triggered; [`Self::shutdown`] awaits `task` after cancelling it.
-    // The OS-watcher backend and the tests of this module are the only callers;
-    // the builder that exposes it to users lands in the next round.
+    /// The watcher tasks must publish through `events` and stop once `cancel` is
+    /// triggered; [`Self::shutdown`] awaits every task in `tasks` after
+    /// cancelling, so a panic in any of them is reported through its result.
+    // The OS-watcher backend and the tests of this module are the only callers.
     #[allow(dead_code)]
     pub(crate) fn new(
         events: broadcast::Sender<WatchUpdate>,
         cancel: CancellationToken,
-        task: JoinHandle<()>,
+        tasks: Vec<JoinHandle<()>>,
+        counters: DropCounters,
         target_count: usize,
     ) -> Self {
         Self {
             events,
             cancel,
-            task: Mutex::new(Some(task)),
+            tasks: Mutex::new(tasks),
+            counters,
             target_count,
         }
     }
@@ -199,27 +214,51 @@ impl WatcherHandle {
         self.target_count
     }
 
+    /// Returns how many raw OS notifications the intake queue dropped.
+    ///
+    /// The intake queue sits between the `notify` callback and the debounce
+    /// loop and drops the newest notification when it is full, so a burst the
+    /// debounce loop cannot drain fast enough loses notifications instead of
+    /// growing memory. A non-zero value means the deltas in the received events
+    /// are incomplete: reload from disk.
+    #[must_use]
+    pub fn dropped_notifications(&self) -> u64 {
+        self.counters.intake()
+    }
+
+    /// Returns how many debounced events the reload dispatch queue dropped.
+    ///
+    /// The dispatch queue sits between the debounce loop and the reload
+    /// dispatcher and drops the newest event when it is full, which happens when
+    /// a reload handler is slower than the events arrive. Subscribers still
+    /// receive those events; only the matching reload bodies did not run.
+    #[must_use]
+    pub fn dropped_dispatches(&self) -> u64 {
+        self.counters.dispatch()
+    }
+
     /// Returns whether the watcher was cancelled or fully shut down.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         self.cancel.is_cancelled()
     }
 
-    /// Stops the watcher and waits for its task to finish.
+    /// Stops the watcher and waits for its tasks to finish.
     ///
-    /// Cancelling lets the task flush its debounce window, so subscribers still
-    /// receive the last pending events before the sender is dropped. Calling
-    /// this again, or after the task already finished, returns `Ok(())`.
+    /// Cancelling lets the intake task flush its debounce window, so subscribers
+    /// still receive the last pending events and the dispatcher still runs their
+    /// reload handlers. Calling this again, or after the tasks already finished,
+    /// returns `Ok(())`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SysOp`](openjiuwen_common::error::Error::SysOp) when the
+    /// Returns [`Error::SysOp`](openjiuwen_common::error::Error::SysOp) when a
     /// watcher task panicked or was cancelled; the message carries the join
     /// failure.
     pub async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
-        let task = self.task.lock().await.take();
-        if let Some(task) = task {
+        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        for task in tasks {
             task.await.map_err(|error| {
                 Error::sys_op(format!("workspace watcher task failed: {error}"))
             })?;
@@ -233,6 +272,8 @@ impl std::fmt::Debug for WatcherHandle {
         f.debug_struct("WatcherHandle")
             .field("target_count", &self.target_count)
             .field("shutdown", &self.is_shutdown())
+            .field("dropped_notifications", &self.dropped_notifications())
+            .field("dropped_dispatches", &self.dropped_dispatches())
             .finish_non_exhaustive()
     }
 }
@@ -276,7 +317,13 @@ mod tests {
     ) {
         let (events, _) = broadcast::channel(capacity);
         let cancel = CancellationToken::new();
-        let handle = WatcherHandle::new(events.clone(), cancel.clone(), tokio::spawn(async {}), 3);
+        let handle = WatcherHandle::new(
+            events.clone(),
+            cancel.clone(),
+            vec![tokio::spawn(async {})],
+            DropCounters::new(),
+            3,
+        );
         (events, handle, cancel)
     }
 
@@ -364,7 +411,7 @@ mod tests {
             task_cancel.cancelled().await;
             let _ = finished_tx.send(());
         });
-        let handle = WatcherHandle::new(events, cancel, task, 0);
+        let handle = WatcherHandle::new(events, cancel, vec![task], DropCounters::new(), 0);
 
         handle.shutdown().await.unwrap();
         // The task completed, so its completion signal is already there.
@@ -378,11 +425,55 @@ mod tests {
         let task = tokio::spawn(async {
             panic!("watcher task exploded");
         });
-        let handle = WatcherHandle::new(events, cancel, task, 0);
+        let handle = WatcherHandle::new(events, cancel, vec![task], DropCounters::new(), 0);
 
         let error = handle.shutdown().await.unwrap_err();
         assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::SysOp);
         assert!(error.to_string().contains("workspace watcher task failed"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_failed_dispatch_task_and_keeps_both_finished() {
+        let (events, _) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let intake = tokio::spawn(async {});
+        let dispatch = tokio::spawn(async {
+            panic!("reload dispatcher exploded");
+        });
+        let handle = WatcherHandle::new(
+            events,
+            cancel,
+            vec![intake, dispatch],
+            DropCounters::new(),
+            0,
+        );
+
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(error.kind(), openjiuwen_common::error::ErrorKind::SysOp);
+        assert!(
+            error.to_string().contains("reload dispatcher exploded"),
+            "{error}"
+        );
+        // Both tasks were consumed, so a second shutdown has nothing left to await.
+        assert!(handle.shutdown().await.is_ok());
+        assert!(handle.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn the_handle_reports_the_shared_drop_counters() {
+        let (events, _) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let counters = DropCounters::new();
+        let handle = WatcherHandle::new(events, cancel, vec![], counters.clone(), 0);
+        assert_eq!(handle.dropped_notifications(), 0);
+        assert_eq!(handle.dropped_dispatches(), 0);
+
+        counters.record_intake();
+        counters.record_intake();
+        counters.record_dispatch();
+        assert_eq!(handle.dropped_notifications(), 2);
+        assert_eq!(handle.dropped_dispatches(), 1);
+        assert!(format!("{handle:?}").contains("dropped_notifications"));
     }
 
     #[tokio::test]

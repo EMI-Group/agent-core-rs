@@ -5,7 +5,7 @@
 //! drops the stream before answering the first hover so the client reports a dead server. The
 //! clock is [`InstantTimer`], so no test waits for a real back-off.
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -304,4 +304,130 @@ async fn supervisor_exposes_its_config_and_key() -> Result<()> {
     assert_eq!(supervisor.status().state, ServerState::Stopped);
     supervisor.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_start_is_recorded_as_failed_status() {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+    let factory: ServerFactory = Arc::new(move |_config: &LspServerConfig| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Err(Error::config("boom"))
+    });
+    let supervisor = ServerSupervisor::new(config(), factory).with_restart_policy(RestartPolicy {
+        max_attempts: 1,
+        ..RestartPolicy::default()
+    });
+
+    // The first launch fails and exhausts the budget in one step.
+    let first = supervisor.client().await.err().expect("the launch fails");
+    assert!(
+        first
+            .message()
+            .contains("exceeded max crash recovery attempts (1)"),
+        "unexpected error: {first}"
+    );
+    assert_eq!(supervisor.status().state, ServerState::Failed);
+
+    // `restart()` stops the current instance first, so the refused start must not leave the
+    // caller looking at a stale `Stopped` (or `Starting`) status.
+    let refusal = supervisor.restart().await.unwrap_err();
+    assert!(
+        refusal
+            .message()
+            .contains("exceeded max crash recovery attempts (1)"),
+        "unexpected error: {refusal}"
+    );
+    let status = supervisor.status();
+    assert_eq!(
+        status.state,
+        ServerState::Failed,
+        "a refused start is a failure the caller can see"
+    );
+    assert_eq!(status.attempts, 1, "a refusal is not a further attempt");
+    assert!(
+        status.last_error.as_deref().unwrap().contains("boom"),
+        "the underlying cause stays visible: {status:?}"
+    );
+    assert!(!status.healthy);
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the factory is never touched again"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_launch_leaves_the_failure_visible_to_status_readers() {
+    let factory: ServerFactory = Arc::new(|_config: &LspServerConfig| {
+        Err(Error::transport("no binary")) as Result<Box<dyn LspTransport>>
+    });
+    let supervisor = ServerSupervisor::new(config(), factory);
+    assert_eq!(supervisor.status().state, ServerState::Stopped);
+    let error = supervisor.client().await.err().expect("the launch fails");
+    assert!(error.message().contains("no binary"), "{error}");
+    let status = supervisor.status();
+    assert_eq!(
+        status.state,
+        ServerState::Failed,
+        "the launch failure sticks"
+    );
+    assert_eq!(status.attempts, 1);
+    assert!(status.last_error.as_deref().unwrap().contains("no binary"));
+    assert!(!status.healthy);
+}
+
+#[tokio::test]
+async fn status_reads_interleave_with_starts_and_stops_without_deadlock() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let factory = factory(Arc::clone(&starts), |_| HoverMode::Answer);
+    let supervisor = Arc::new(supervisor(factory, Arc::new(InstantTimer::new())));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader = {
+        let supervisor = Arc::clone(&supervisor);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut reads = 0_u32;
+            while !stop.load(Ordering::SeqCst) {
+                let status = supervisor.status();
+                // A status read is always self-consistent: health never outlives `Running`.
+                assert!(
+                    !status.healthy || status.state == ServerState::Running,
+                    "inconsistent snapshot: {status:?}"
+                );
+                reads += 1;
+                tokio::task::yield_now().await;
+            }
+            reads
+        })
+    };
+
+    // `client`/`restart`/`shutdown` take the client slot and the status block in the opposite
+    // order from the reader's pre-fix `status()`; the documented order must make both safe.
+    let work = async {
+        for _ in 0..4 {
+            supervisor.client().await.unwrap();
+            supervisor.restart().await.unwrap();
+        }
+        supervisor.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), work)
+        .await
+        .expect("start/stop completes while a status reader is spinning");
+
+    stop.store(true, Ordering::SeqCst);
+    let reads = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("the status reader finishes")
+        .unwrap();
+    assert!(reads > 0, "the reader observed the supervisor");
+    let status = supervisor.status();
+    assert_eq!(status.state, ServerState::Stopped, "shutdown is final");
+    assert!(!status.healthy);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        5,
+        "one initial start plus one per restart"
+    );
 }

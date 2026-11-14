@@ -1298,7 +1298,12 @@ mod tests {
         );
         let entries = vec![model_turn(1, &"y".repeat(400))];
         let summary = ExtractiveSummarizer::new(20).summarize(&entries).unwrap();
-        assert!(summary.chars().count() <= 21);
+        assert!(summary.chars().count() <= 20);
+        assert_eq!(
+            summary.chars().count(),
+            20,
+            "the ellipsis is part of the budget"
+        );
         assert!(summary.ends_with('…'));
         assert!(summary.starts_with("【窗口摘要】"));
     }

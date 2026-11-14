@@ -3,20 +3,27 @@
 //! [`start`] is the only entry point, called by
 //! [`WorkspaceWatcher::start`](crate::watcher::WorkspaceWatcher::start). It
 //! validates the plan, registers every distinct watch path on
-//! `notify::recommended_watcher`, spawns one tokio task that owns that watcher,
-//! and returns the [`WatcherHandle`] the caller keeps.
+//! `notify::recommended_watcher`, spawns the intake task that owns that watcher
+//! plus the reload dispatcher task, and returns the [`WatcherHandle`] the caller
+//! keeps.
 //!
-//! The task is a plain loop, not an actor: it blocks in a `tokio::select!` over
-//! three sources — cancellation, raw `notify` events, and the next debounce
-//! deadline. Raw events are converted to the internal `RawChange` vocabulary,
-//! resolved against the plan's targets, and pushed into the
-//! [`Debouncer`](crate::watcher::Debouncer); when a deadline elapses the due
-//! events are published as
-//! [`WatchUpdate::Event`](crate::watcher::event::WatchUpdate::Event) and handed to the
-//! [`ReloadHub`](crate::watcher::ReloadHub).
+//! The intake task is a plain loop, not an actor: it blocks in a
+//! `tokio::select!` over three sources — cancellation, raw `notify` events, and
+//! the next debounce (or drop-notice) deadline. Raw events are converted to the
+//! internal `RawChange` vocabulary, resolved against the plan's targets, and
+//! pushed into the [`Debouncer`](crate::watcher::Debouncer); when a deadline
+//! elapses the due events are published as
+//! [`WatchUpdate::Event`](crate::watcher::event::WatchUpdate::Event) and queued
+//! for the reload dispatcher, which runs the handlers on its own task.
 //!
-//! Two policies keep the task quiet under stress:
+//! Four policies keep the task bounded and quiet under stress:
 //!
+//! - the raw intake queue is bounded (`WatcherConfig::intake_capacity`), so a
+//!   notification burst cannot grow memory behind a busy loop; a full queue drops
+//!   the newest notification and the drop is counted, logged and announced;
+//! - reload handlers run on a dispatcher task of their own through a second
+//!   bounded queue, so a slow handler stalls neither debouncing nor publication;
+//!   the overflow of that queue is counted and announced the same way;
 //! - an error whose every path is already gone is logged at `debug` and never
 //!   published, so a removed subtree cannot surface as a backend failure;
 //! - consecutive identical backend failures are published once, and every repeat
@@ -57,14 +64,13 @@ pub(crate) async fn start(_builder: WorkspaceWatcher) -> Result<WatcherHandle> {
 #[allow(clippy::unused_async)]
 pub(crate) async fn start(builder: WorkspaceWatcher) -> Result<WatcherHandle> {
     use std::path::Path;
-    use std::time::Instant;
 
     use notify::{RecursiveMode, Watcher};
     use tokio::sync::{broadcast, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    use crate::watcher::debounce::Debouncer;
-    use crate::watcher::event::WatchUpdate;
+    use crate::watcher::event::{WatchEvent, WatchUpdate};
+    use crate::watcher::intake::{push_raw, DropCounters};
 
     let WorkspaceWatcher { config, plan, hub } = builder;
     if plan.is_empty() {
@@ -78,12 +84,15 @@ pub(crate) async fn start(builder: WorkspaceWatcher) -> Result<WatcherHandle> {
     let target_count = plan.len();
     let targets = plan.targets().to_vec();
 
-    let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
-    // The callback runs on the backend's own thread. An unbounded send neither
-    // blocks nor panics, so a closed receiver (the task is gone) is ignored
-    // instead of unwinding inside `notify`.
+    let counters = DropCounters::new();
+    let (raw_tx, raw_rx) =
+        mpsc::channel::<notify::Result<notify::Event>>(config.intake_capacity.max(1));
+    // The callback runs on the backend's own thread, so it can neither await nor
+    // block: the bounded queue is filled with `try_send`, the newest notification
+    // is dropped when it is full, and the drop is counted (never silent).
+    let callback_counters = counters.clone();
     let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = raw_tx.send(event);
+        let _ = push_raw(&raw_tx, &callback_counters, event);
     })
     .map_err(|error| map_notify_error(&error, Path::new(""), None))?;
 
@@ -109,20 +118,144 @@ pub(crate) async fn start(builder: WorkspaceWatcher) -> Result<WatcherHandle> {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let window = config.debounce;
+    let notice_interval = window.max(MIN_DROP_NOTICE_INTERVAL);
 
-    let task = tokio::spawn(async move {
+    // Reload handlers run on their own task, so a slow body delays neither the
+    // debounce loop nor publication: it can only fill this bounded queue, whose
+    // overflow is counted and announced instead of growing memory. Handlers of
+    // one event still run one after another, so two bodies never race.
+    let (dispatch_tx, dispatch_rx) = mpsc::channel::<WatchEvent>(config.dispatch_capacity.max(1));
+    let dispatch_task = spawn_dispatcher(hub, dispatch_rx, events.clone());
+
+    let intake = IntakeLoop {
+        watcher,
+        targets,
+        channels: IntakeChannels {
+            publisher,
+            dispatches: dispatch_tx,
+            counters: counters.clone(),
+        },
+        cancel: task_cancel,
+        window,
+        notice_interval,
+        raw_rx,
+    };
+    let task = tokio::spawn(intake.run());
+
+    Ok(WatcherHandle::new(
+        events,
+        cancel,
+        vec![task, dispatch_task],
+        counters,
+        target_count,
+    ))
+}
+
+/// The sender side the intake loop publishes and dispatches through.
+#[cfg(feature = "notify")]
+struct IntakeChannels {
+    /// Broadcast sender of the handle's subscription ring buffer.
+    publisher: tokio::sync::broadcast::Sender<crate::watcher::event::WatchUpdate>,
+    /// Bounded queue to the reload dispatcher.
+    dispatches: tokio::sync::mpsc::Sender<crate::watcher::event::WatchEvent>,
+    /// Shared drop counters of both queues.
+    counters: crate::watcher::intake::DropCounters,
+}
+
+/// Spawns the task that runs the reload handlers.
+///
+/// It ends when the intake task drops the sender side of its queue, so it drains
+/// the events already queued and then returns; a panic in a handler surfaces
+/// through the task's join handle, which [`WatcherHandle::shutdown`] reports as
+/// an `Error::sys_op`.
+#[cfg(feature = "notify")]
+fn spawn_dispatcher(
+    hub: crate::watcher::hub::ReloadHub,
+    mut dispatches: tokio::sync::mpsc::Receiver<crate::watcher::event::WatchEvent>,
+    publisher: tokio::sync::broadcast::Sender<crate::watcher::event::WatchUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    use crate::watcher::event::WatchUpdate;
+
+    tokio::spawn(async move {
+        while let Some(event) = dispatches.recv().await {
+            for failure in hub.dispatch(&event).await {
+                let _ = publisher.send(WatchUpdate::ReloadFailed(failure));
+            }
+        }
+        tracing::debug!("workspace watcher reload dispatcher stopped");
+    })
+}
+
+/// Everything one running intake task owns.
+///
+/// The task is a plain loop over three sources — cancellation, raw `notify`
+/// events and the next deadline — and it never awaits a reload handler, so
+/// debouncing and publication stay independent of handler latency.
+#[cfg(feature = "notify")]
+struct IntakeLoop {
+    /// The OS backend; dropping it releases every watch.
+    watcher: notify::RecommendedWatcher,
+    /// The plan's targets, used to classify a raw change.
+    targets: Vec<crate::watcher::WatchTarget>,
+    /// Publication and dispatch plumbing.
+    channels: IntakeChannels,
+    /// Cancelled by [`WatcherHandle::shutdown`] and by dropping the handle.
+    cancel: tokio_util::sync::CancellationToken,
+    /// Trailing debounce window.
+    window: std::time::Duration,
+    /// Throttle of the drop notices.
+    notice_interval: std::time::Duration,
+    /// Bounded queue the OS callback fills.
+    raw_rx: tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+}
+
+#[cfg(feature = "notify")]
+impl IntakeLoop {
+    /// Runs until cancellation or until the backend closes its channel.
+    async fn run(self) {
+        use std::time::Instant;
+
+        use crate::watcher::debounce::Debouncer;
+        use crate::watcher::intake::DropReporter;
+
+        let Self {
+            watcher,
+            targets,
+            channels,
+            cancel,
+            window,
+            notice_interval,
+            mut raw_rx,
+        } = self;
+        let IntakeChannels {
+            publisher,
+            dispatches,
+            counters,
+        } = channels;
         // The backend lives exactly as long as this task: dropping it here (on
         // cancellation or when the channel closes) releases every OS watch.
         let _watcher = watcher;
         let mut debouncer = Debouncer::new(window);
         let mut last_failure: Option<String> = None;
+        let mut reporter = DropReporter::new(notice_interval);
         loop {
-            let deadline = debouncer.next_deadline();
+            // Announce what the bounded queues dropped since the previous notice.
+            // The reporter throttles itself, so a sustained overflow gives one
+            // notice per interval instead of an error storm.
+            reporter.report(&publisher, &counters, Instant::now());
+            // Both timers share one `select!` branch: whichever falls due first
+            // (a debounce window or a throttled drop notice) wakes the loop.
+            let deadline = earliest(
+                debouncer.next_deadline(),
+                reporter.next_deadline(&counters, Instant::now()),
+            );
             tokio::select! {
-                () = task_cancel.cancelled() => {
-                    // Publish what the window already saw before leaving.
+                () = cancel.cancelled() => {
+                    // Publish what the window already saw before leaving, and
+                    // report the drops of the final window.
                     let drained = debouncer.take_all();
-                    publish_events(&publisher, &hub, drained).await;
+                    publish_events(&publisher, &dispatches, &counters, drained);
+                    reporter.flush(&publisher, &counters, Instant::now());
                     tracing::debug!("workspace watcher stopped");
                     break;
                 }
@@ -140,20 +273,45 @@ pub(crate) async fn start(builder: WorkspaceWatcher) -> Result<WatcherHandle> {
                         // The backend dropped its sender, so no further event can
                         // arrive: flush and finish rather than waiting forever.
                         let drained = debouncer.take_all();
-                        publish_events(&publisher, &hub, drained).await;
+                        publish_events(&publisher, &dispatches, &counters, drained);
+                        reporter.flush(&publisher, &counters, Instant::now());
                         tracing::debug!("workspace watcher backend closed its channel");
                         break;
                     }
                 },
                 () = wait_until(deadline) => {
                     let due = debouncer.flush(Instant::now());
-                    publish_events(&publisher, &hub, due).await;
+                    publish_events(&publisher, &dispatches, &counters, due);
                 }
             }
         }
-    });
+        // Dropping `dispatches` here closes the dispatch queue, so the dispatcher
+        // runs the events already queued and then finishes.
+    }
+}
 
-    Ok(WatcherHandle::new(events, cancel, task, target_count))
+/// Shortest interval between two drop notices.
+///
+/// A watcher configured with a tiny debounce window would otherwise announce a
+/// sustained queue overflow almost per notification; the floor keeps the notice
+/// rate bounded without hiding the loss (the counters are exact either way).
+#[cfg(feature = "notify")]
+const MIN_DROP_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Returns the earlier of two optional deadlines.
+///
+/// `None` means "no deadline"; when both are `None` the caller waits for an
+/// event instead of a timer.
+#[cfg(feature = "notify")]
+fn earliest(
+    first: Option<std::time::Instant>,
+    second: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (first, None) => first,
+        (None, second) => second,
+    }
 }
 
 /// One distinct path the backend registers, with the strongest mode and a label.
@@ -243,24 +401,36 @@ async fn wait_until(deadline: Option<std::time::Instant>) {
     }
 }
 
-/// Publishes `events` and runs the reload handlers for each of them.
+/// Publishes `events` and queues each of them for the reload dispatcher.
 ///
 /// Publishing never blocks and fails only when nobody is subscribed, which is
-/// not an error. Handlers are awaited directly, so a handler failure becomes a
-/// [`WatchUpdate::ReloadFailed`](crate::watcher::event::WatchUpdate::ReloadFailed)
-/// rather than an error of the watcher.
+/// not an error. Handing an event to the dispatcher is a `try_send` into a
+/// bounded queue: a full queue (the handlers are slower than the events arrive)
+/// or a closed one (the dispatcher task is gone) drops that event, counts it in
+/// `counters` and is announced through a
+/// [`WatchUpdate::Dropped`](crate::watcher::event::WatchUpdate::Dropped) notice
+/// by the drop reporter. The function is synchronous on purpose: publication and
+/// the debounce loop must never wait for a reload handler.
 #[cfg(feature = "notify")]
-async fn publish_events(
+fn publish_events(
     events: &tokio::sync::broadcast::Sender<crate::watcher::event::WatchUpdate>,
-    hub: &crate::watcher::hub::ReloadHub,
+    dispatches: &tokio::sync::mpsc::Sender<crate::watcher::event::WatchEvent>,
+    counters: &crate::watcher::intake::DropCounters,
     drained: Vec<crate::watcher::event::WatchEvent>,
 ) {
+    use tokio::sync::mpsc::error::TrySendError;
+
     use crate::watcher::event::WatchUpdate;
 
     for event in drained {
         let _ = events.send(WatchUpdate::Event(event.clone()));
-        for failure in hub.dispatch(&event).await {
-            let _ = events.send(WatchUpdate::ReloadFailed(failure));
+        if let Err(error) = dispatches.try_send(event) {
+            counters.record_dispatch();
+            let reason = match error {
+                TrySendError::Full(_) => "the reload dispatch queue is full",
+                TrySendError::Closed(_) => "the reload dispatcher is gone",
+            };
+            tracing::debug!(reason, "workspace watcher could not queue a reload");
         }
     }
 }

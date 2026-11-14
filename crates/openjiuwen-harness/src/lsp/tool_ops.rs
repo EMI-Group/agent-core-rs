@@ -8,7 +8,9 @@
 //! Diagnostics are best effort: push data buffered by the
 //! [`DiagnosticRegistry`](super::DiagnosticRegistry) wins, an empty buffer falls back to a
 //! `textDocument/diagnostic` pull (when the server advertises it), and "nothing anywhere" is a
-//! success payload with `source: "none"` rather than an error.
+//! success payload with `source: "none"` rather than an error. An `unchanged` pull answer with
+//! no cached full report triggers one extra full pull; if the server still refuses to report in
+//! full, the payload carries `stale: true` instead of a silently empty list.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,7 +23,9 @@ use openjiuwen_sysop::workspace::{canonicalize_containing, is_within};
 use crate::tools::ToolPayload;
 
 use super::client::LspClient;
-use super::protocol::{CompletionItem, DocumentSymbol, Hover, Location, Position};
+use super::protocol::{
+    is_method_not_found, CompletionItem, DocumentSymbol, Hover, Location, Position,
+};
 use super::render;
 use super::tool::{map_client_error, LspAction, LspArgs, LspTool, NO_SERVER_CONFIGURED};
 use super::uri::{path_to_uri, uri_to_path};
@@ -320,6 +324,9 @@ impl LspTool {
         let language_id = self.language_for(&resolved);
         let document = uri.to_owned();
         let previous = self.pull_result_ids.lock().get(uri).cloned();
+        // Whether a full report is cached for this document: an `unchanged` answer is only
+        // meaningful as a delta against one.
+        let has_snapshot = self.pull_items.lock().contains_key(uri);
         let outcome = supervisor
             .run(move |client| {
                 let document = document.clone();
@@ -337,6 +344,14 @@ impl LspTool {
                     let report = client
                         .document_diagnostic(&document, previous.as_deref())
                         .await?;
+                    if report.kind == DiagnosticReportKind::Unchanged && !has_snapshot {
+                        // `unchanged` before any full report would otherwise be reported as
+                        // "no problems"; ask once more without a `resultId` so the server has
+                        // to answer in full. Exactly one extra request, never a loop.
+                        return Ok(PullOutcome::Report(
+                            client.document_diagnostic(&document, None).await?,
+                        ));
+                    }
                     Ok(PullOutcome::Report(report))
                 }
             })
@@ -344,7 +359,7 @@ impl LspTool {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                if error.message().contains("-32601") {
+                if is_method_not_found(&error) {
                     return Ok(no_diagnostics_payload(&file_path));
                 }
                 return Err(map_client_error(&error, LspAction::Diagnostics.method()));
@@ -366,7 +381,13 @@ impl LspTool {
                         report.items
                     }
                     DiagnosticReportKind::Unchanged => {
-                        self.pull_items.lock().get(uri).cloned().unwrap_or_default()
+                        // A server can answer `unchanged` even after the forced full pull
+                        // above (or after its own restart dropped the baseline). Reporting an
+                        // empty list here would be a silent "no problems".
+                        match self.pull_items.lock().get(uri) {
+                            Some(items) => items.clone(),
+                            None => return Ok(stale_diagnostics_payload(&file_path)),
+                        }
                     }
                 };
                 Ok(diagnostics_payload(&file_path, &diagnostics, "pull"))
@@ -538,4 +559,22 @@ fn diagnostics_payload(file_path: &str, diagnostics: &[Diagnostic], source: &str
 /// Builds the success payload used when no diagnostics of any kind are available.
 fn no_diagnostics_payload(file_path: &str) -> ToolPayload {
     diagnostics_payload(file_path, &[], "none")
+}
+
+/// Builds the payload for a server that answered `unchanged` with no baseline to apply it to.
+///
+/// The list is empty because nothing was reported, not because the file is clean; `stale` says
+/// so explicitly instead of letting an empty list read as "no problems".
+fn stale_diagnostics_payload(file_path: &str) -> ToolPayload {
+    ToolPayload::ok(json!({
+        "action": LspAction::Diagnostics.as_str(),
+        "file_path": file_path,
+        "result": format!(
+            "The language server reported no changes but this tool has no cached diagnostic \
+             report for {file_path}; its diagnostics are unknown (stale)."
+        ),
+        "diagnostics": Vec::<Diagnostic>::new(),
+        "source": "pull",
+        "stale": true,
+    }))
 }

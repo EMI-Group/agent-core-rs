@@ -13,9 +13,9 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `LspServerConfig` — serde descriptor `{ name, command, args, env, root, language_id, extensions, priority, root_markers, startup_timeout }` with builder setters.
 - `wire` types (all serde + `schemars::JsonSchema`) — `Diagnostic`, `DiagnosticCode` (string or number), `DiagnosticRelatedInformation`, `DiagnosticsEvent`, `DiagnosticReportKind`, `DocumentDiagnosticReport`, `CallHierarchyItem` (flat URI-based), `CallHierarchyIncomingCall`, `CallHierarchyOutgoingCall`.
 - `wire` parsers — `parse_diagnostics`, `parse_diagnostics_event`, `parse_document_diagnostic_report`, `parse_call_hierarchy_items`, `parse_call_hierarchy_incoming_calls`, `parse_call_hierarchy_outgoing_calls`; all tolerate null/malformed input by returning empty/`None`.
-- `protocol` — existing framing (`FrameDecoder`, `MessageReader`, `write_message`, `MAX_CONTENT_LENGTH`), message builders, `Position`/`Range`/`Location`, `Hover`, `CompletionItem`, `DocumentSymbol`, `SymbolInformation`, `LspError`, `client_capabilities`, `ServerCapabilities` (`hover`, `definition`, `references`, `completion`, `document_symbol`, `workspace_symbol`, `implementation`, `call_hierarchy`, `diagnostics`, `raw`), `parse_*` normalisers.
+- `protocol` — existing framing (`FrameDecoder`, `MessageReader`, `write_message`, `MAX_CONTENT_LENGTH`), message builders, `Position`/`Range`/`Location`, `Hover`, `CompletionItem`, `DocumentSymbol`, `SymbolInformation`, `LspError` (+ `server_error(&Error) -> Option<&LspError>`, `is_method_not_found(&Error)`), `client_capabilities`, `ServerCapabilities` (`hover`, `definition`, `references`, `completion`, `document_symbol`, `workspace_symbol`, `implementation`, `call_hierarchy`, `diagnostics`, `raw`), `parse_*` normalisers.
 - `DiagnosticRegistry` — `new(DiagnosticsConfig)`, `publish(DiagnosticsEvent)`, `snapshot(uri)`, `drain()`, `pending_count`, `clear`, `subscribe() -> broadcast::Receiver<DiagnosticsChange>`, `attach(&Arc<Self>, &LspClient)`.
-- `DiagnosticsConfig` — `max_per_file` (10), `max_total` (30), `max_files` (256), `channel_capacity` (16).
+- `DiagnosticsConfig` — `max_per_file` (10), `max_total` (30), `max_files` (256, bounds buffered documents *and* their delivered-key history), `channel_capacity` (16).
 - `DiagnosticsFile` — `{ uri, version, diagnostics, local_path }`.
 - `DiagnosticsChange` — `Published(DiagnosticsEvent)` or `Cleared { uri }`.
 - `DiscoveryIndex` — `new(workspace_root, servers)`, `resolve(path)`, `resolve_by_language(language_id)`, `candidates_for_extension(ext)`, `servers`, `is_empty`.
@@ -44,7 +44,7 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 | `prepare_call_hierarchy` | `textDocument/prepareCallHierarchy` | `textDocument.uri`, `position` | `action`, `file_path`, `result`, `items` |
 | `incoming_calls` | `textDocument/prepareCallHierarchy` then `callHierarchy/incomingCalls` | `textDocument.uri`, `position`; `item` | `action`, `file_path`, `result`, `calls`, `item` |
 | `outgoing_calls` | `textDocument/prepareCallHierarchy` then `callHierarchy/outgoingCalls` | `textDocument.uri`, `position`; `item` | `action`, `file_path`, `result`, `calls`, `item` |
-| `diagnostics` (with path) | push registry, then `textDocument/diagnostic` | `textDocument.uri`, optional `previousResultId` | `action`, `file_path`, `result`, `diagnostics`, `source` (`push`/`pull`/`none`) |
+| `diagnostics` (with path) | push registry, then `textDocument/diagnostic` | `textDocument.uri`, optional `previousResultId` | `action`, `file_path`, `result`, `diagnostics`, `source` (`push`/`pull`/`none`), plus `stale: true` when an `unchanged` answer had no baseline |
 | `diagnostics` (no path) | registry `drain` only | none | `action`, `result`, `files`, `count` |
 
 - Documents are synchronised before a position request (`didOpen`, then full-text `didChange`) and reads are gated by `max_file_size` (10 MiB default).
@@ -68,6 +68,8 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `ServerSupervisor::run` retries the operation exactly once on a fresh client after sleeping `delay_for(attempt)` on the injected timer.
 - `RestartPolicy` defaults: 3 attempts, 500 ms base, exponential doubling, 8 s cap, no jitter (deterministic).
 - A successful start resets `attempts` to 0; exhausting the budget sets `ServerState::Failed` and returns `Error::Transport("LSP server '<name>' exceeded max crash recovery attempts (N); last error: ...")`.
+- A refused start (budget already exhausted) also records `Failed` with the underlying `last_error` under the same status lock, so a status read after a failed `restart()` never shows a stale `Stopped`/`Starting`.
+- Lock order is `client` before `status` on every path (`status`, `live_client`, `stop_current`); no lock is held across `.await` except the start serialization mutex.
 - `LspTool::shutdown`/`ServerSupervisor::shutdown` stop servers idempotently and permanently inhibit restarts (later calls fail with a typed "has been shut down" error).
 - Status and attempt counters are exposed through `LspTool::server_status()` / `ServerSupervisor::status()`.
 
@@ -76,13 +78,17 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `publish` is version-aware: a non-empty publish with a lower `version` than the stored one is ignored; otherwise it replaces the URI's set and records the version.
 - An empty diagnostic list clears the URI, resets its delivered-key history, and emits `DiagnosticsChange::Cleared`.
 - Entries dedupe by `message|severity|line:character|code`, are severity-sorted (Error first, unknown severity treated as 3), and are capped per file and per registry (`max_files`, least-recently-updated URI evicted).
+- `max_files` bounds *all* per-document state: the delivered-key history is capped at the same URI count (least-recently-drained dropped first), and a document evicted from the buffer loses its history with it, so a long session keeps no key set per URI ever seen.
 - `drain` mirrors Python `get_and_clear`: intra-round dedupe, cross-round suppression of delivered keys, per-file and global caps, local paths resolved from URIs.
 - The registry is an owned value per tool (shared through `LspTool::with_diagnostics`), not a process-global singleton; Python's `get_instance` singleton is deliberately not reproduced because the crate forbids undocumented global mutable state.
 - Push data wins over pull for a file; pull is attempted only when push is empty and the server advertises `diagnosticProvider`.
+- An `unchanged` pull answer without a cached full report triggers exactly one extra pull without `previousResultId`; if the server still answers `unchanged`, the payload carries `stale: true` (never a silently empty "clean" list).
 
 ## Constraints
 
 - Errors are `openjiuwen_common::error::{Error, Result}`; malformed frames, EOF, oversize frames, timeouts, JSON-RPC errors, launch failures and exhausted recovery budgets are typed.
+- `LspError::into_error` keeps the whole error as `Error::External`, so the numeric code survives; `protocol::is_method_not_found` matches on `LspError::is_method_not_found` first and falls back to the message phrase "method not found" only for servers that omit or mis-code it.
+- An unreadable `Cargo.toml` during Rust root inference is logged at debug level (path + error) and still treated as "not a workspace root".
 - `LspTool::invoke` always returns `Ok(payload)`; failures set `success=false` and a human-readable `error`.
 - No `unsafe`, no `println!` (tracing only), no locks held across `.await` except the supervisor's tokio start mutex, which exists to start one server per key and is documented.
 - Paths resolve inside `LspToolConfig::workspace_root` only; `..` and absolute paths outside the root are rejected before any read, and `DiscoveryIndex` refuses paths outside its workspace root.
@@ -109,10 +115,10 @@ Python parity target: tool name `lsp`, 1-based model positions, `Defined in path
 - `tests/framing.rs`, `tests/uri.rs`, `tests/transport.rs` cover byte-level framing, URI conversion and both transports (`/bin/cat` as an echo server when present).
 - `tests/client.rs` and `tests/client_ext.rs` cover initialize capability capture, server-initiated requests, notification dispatch (including panicking handlers), typed methods, versions, timeouts, malformed frames, EOF, liveness and shutdown reasons.
 - `tests/wire.rs` covers tolerant parsing of diagnostics, diagnostic reports and call hierarchy (flat vs nested items, string vs numeric codes).
-- `tests/diagnostics.rs` covers version awareness, clearing, caps, cross-round dedupe, `subscribe`, and an end-to-end push through the client.
-- `tests/discovery.rs` covers extension matching, priority/order, language id, root markers, Cargo workspace roots, containment and builtin definitions.
-- `tests/retry.rs` covers one-retry recovery, delay recording, budget exhaustion, shutdown inhibition and backoff doubling/capping.
-- `tests/tool.rs`, `tests/tool_ops.rs`, `tests/tool_lifecycle.rs` cover the 11-action card, every action payload, unsupported-method mapping, diagnostics push→pull→unchanged, per-extension routing with two fake servers, crash retry, shutdown and status.
+- `tests/diagnostics.rs` covers version awareness, clearing, caps, cross-round dedupe, the `max_files` bound on both the buffer and the delivered-key history, `subscribe`, and an end-to-end push through the client.
+- `tests/discovery.rs` covers extension matching, priority/order, language id, root markers, Cargo workspace roots, containment, builtin definitions, and the debug record left behind by an unreadable `Cargo.toml`.
+- `tests/retry.rs` covers one-retry recovery, delay recording, budget exhaustion, refused-start status, shutdown inhibition, concurrent `status()` reads during start/stop, and backoff doubling/capping.
+- `tests/tool.rs`, `tests/tool_ops.rs`, `tests/tool_lifecycle.rs` cover the 11-action card, every action payload, typed and message-fallback method-not-found mapping, diagnostics push→pull→unchanged (including the `stale` marker and the forced full re-pull when no snapshot exists), per-extension routing with two fake servers, crash retry, shutdown and status.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline` (default, `--no-default-features`, `--all-features`), `cargo clippy -p openjiuwen-harness --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-harness --no-deps` all clean and offline.
 
 ## Routing Table
