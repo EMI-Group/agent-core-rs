@@ -17,6 +17,7 @@ Every module directory owns its own `CONTEXT.md`; this file is the routing table
 
 - Variables are their own namespace: `facade::LongTermMemory::set_variable` writes the KV entry and delegates to `engine::MemoryEngine::write_variable`, which maintains one deterministic `MemoryType::Variable` record per `(user, scope, session, name)`.
 - Record listing, statistics and `clear` exclude `Variable` projections unless a `MemoryFilter` names the kind explicitly; recall returns them only for an explicit kind request.
+- `facade::LongTermMemory::remember` keeps storing a rule-extracted assignment as a `SemanticMemory` record; `remember_with_assignments` (and the model payload's `variables` map in `add_messages`) is the opt-in route that writes real `MemoryType::Variable` projections.
 - Per-scope analyzer overrides are persisted as `memory_scope_overrides/{scope_id}` (`store::keys::scope_overrides_key`), resolved by `facade::overrides`, and consumed by `remember`/`consolidate` through `analyzer::stage::StagedAnalyzer`.
 - Message history is read two ways over the same document rows: the legacy newest-N window and keyset pages resumed from an opaque `store::MessageCursor` (`(timestamp, id)` ascending, tampered token → `Validation`).
 - Dreaming stays caller-driven: `dreaming::DreamOrchestrator` sweeps on `tick`, and a caller-injected `store::kv_lock::DistributedKvLock` (`DreamOrchestrator::with_sweep_lock`) is the only cross-process serialization.
