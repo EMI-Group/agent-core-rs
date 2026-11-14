@@ -1,7 +1,7 @@
 //! Live `Redis` document backend over the crate's RESP client.
 //!
 //! The Python `extensions/store` package has no document store (its `db/`
-//! backend is GaussDB/SQLAlchemy), so this backend is a Rust-side extension of
+//! backend is `GaussDB`/`SQLAlchemy`), so this backend is a Rust-side extension of
 //! the family: it implements the kernel
 //! [`DocumentStore`](openjiuwen_core::foundation::store::DocumentStore) contract
 //! on the key layout documented in [`super`]:

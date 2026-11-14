@@ -1,7 +1,7 @@
 //! Unit tests for the live `Redis` document backend.
 //!
 //! Python counterpart: none — `openjiuwen/extensions/store` has no document
-//! backend (its `db/` family is GaussDB), so these suites verify the Rust-side
+//! backend (its `db/` family is `GaussDB`), so these suites verify the Rust-side
 //! extension against the kernel `InMemoryDocumentStore` reference instead.
 
 use super::*;
@@ -166,7 +166,6 @@ async fn document_store_query_matches_the_reference_window() {
             ],
             offset: 2,
             limit: Some(7),
-            ..Query::default()
         },
         Query {
             filter: json!({"name": "name-13"}),

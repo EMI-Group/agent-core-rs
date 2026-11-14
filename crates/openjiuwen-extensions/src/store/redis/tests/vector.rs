@@ -39,7 +39,10 @@ fn schema() -> CollectionSchema {
 
 /// The JSON object of `value`, for the document fixtures.
 fn obj(value: Value) -> Map<String, Value> {
-    value.as_object().cloned().unwrap_or_default()
+    match value {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    }
 }
 
 /// A document with a three-component embedding.
@@ -258,7 +261,7 @@ async fn vector_store_add_fills_defaults_and_mints_auto_ids() {
         .as_str()
         .expect("generated id")
         .to_string();
-    assert!(!generated.is_empty());
+    assert_ne!(generated, "");
 
     // The prepared document was persisted, so a fresh store sees it.
     let fresh = store_for(&fake);
@@ -276,11 +279,13 @@ async fn vector_store_add_fills_defaults_and_mints_auto_ids() {
             .unwrap(),
         1
     );
-    assert!(store
-        .search("auto", &VectorQuery::new(vec![1.0]))
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store
+            .search("auto", &VectorQuery::new(vec![1.0]))
+            .await
+            .unwrap(),
+        Vec::<VectorSearchResult>::new()
+    );
     fake.shutdown().await;
 }
 
@@ -570,11 +575,13 @@ async fn vector_store_deletes_by_ids_and_filters() {
             .unwrap(),
         1
     );
-    assert!(store
-        .search("docs", &VectorQuery::new(vec![1.0, 0.0]))
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store
+            .search("docs", &VectorQuery::new(vec![1.0, 0.0]))
+            .await
+            .unwrap(),
+        Vec::<VectorSearchResult>::new()
+    );
     fake.shutdown().await;
 }
 

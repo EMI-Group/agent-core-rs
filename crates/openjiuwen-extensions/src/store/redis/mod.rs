@@ -10,7 +10,7 @@
 //! - [`RedisVectorStore`] — embeddings with the kernel [`VectorStore`] contract.
 //!
 //! The document and vector backends have **no Python counterpart** (the Python
-//! `extensions/store` package holds only the Redis key-value store, GaussDB and
+//! `extensions/store` package holds only the `Redis` key-value store, `GaussDB` and
 //! the Elasticsearch vector store), so their key layout and semantics are
 //! documented here as a Rust-side extension of that family.
 //!
@@ -144,7 +144,9 @@ impl fmt::Debug for RedisConnection {
             .field("url", &self.config.url.as_deref().map(redact_url))
             .field("cluster_mode", &self.config.cluster_mode)
             .field("connection_args", &connection_args)
-            .field("connected", &self.is_connected())
+            // The client owns the socket and its buffers; summarising it keeps
+            // the rendering useful without leaking either.
+            .field("client", &self.is_connected())
             .finish()
     }
 }

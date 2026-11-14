@@ -2,7 +2,7 @@
 //!
 //! Python counterpart: the reference tree has no dedicated `RedisStore` unit
 //! test (`tests/unit_tests/extensions/store/` covers only the Elasticsearch
-//! vector store and GaussDB) and ships no Redis document or vector backend at
+//! vector store and `GaussDB`) and ships no `Redis` document or vector backend at
 //! all, so the key-value suites stand in for
 //! `tests/unit_tests/extensions/checkpointer/test_redis_checkpointer.py` and the
 //! document/vector suites verify the Rust-side extension directly.
@@ -20,7 +20,6 @@ pub(crate) use std::time::Duration;
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod document;
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod kv;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod vector;
