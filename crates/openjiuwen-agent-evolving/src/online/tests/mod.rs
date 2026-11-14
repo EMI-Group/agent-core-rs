@@ -1,11 +1,14 @@
-//! Unit tests of the online RL task state machine.
+//! Unit tests of the online RL state machines.
 //!
 //! Every test runs against [`MemoryOnlineStore`] with a [`FixedClock`], so the
 //! whole suite is offline, deterministic, and one test per behaviour of the
-//! transition tables documented in [`super::task`] / [`super::capture`].
+//! transition tables documented in [`super::task`] / [`super::capture`] /
+//! [`super::sample`] / [`super::training`].
 //!
 //! This module owns the store, spec, task lifecycle and reward tests; the
-//! capture and turn tests live in the `capture` child module.
+//! capture and turn tests live in the `capture` child module, and the ledger,
+//! executor, training-run and LoRA-repository suites in `sample`, `executor`,
+//! `training`, `training_stop` and `lora`.
 
 use std::sync::Arc;
 
@@ -19,6 +22,12 @@ use super::task::{
 };
 
 mod capture;
+mod executor;
+mod lora;
+mod sample;
+mod support;
+mod training;
+mod training_stop;
 
 const STAMP: &str = "2026-01-01T00:00:00+00:00";
 const SESSION: &str = "sess-1";

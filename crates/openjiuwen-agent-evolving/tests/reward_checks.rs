@@ -5,14 +5,15 @@
 //! Nothing here spawns an interpreter, a browser or a network request.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use openjiuwen_agent_evolving::{
-    default_pack, score_criterion, to_reward_signal, CheckRunner, CheckTool, CriterionKind,
-    CriterionStatus, EvidenceAgent, EvidenceCriterion, EvidenceGathered, EvidenceTask, ExecResult,
-    FakeCommandRunner, ModelRewardJudge, RewardCheck,
+    default_pack, score_criterion, to_reward_signal, CheckRunner, CheckTool, CommandRunner,
+    CriterionKind, CriterionStatus, EvidenceAgent, EvidenceCriterion, EvidenceGathered,
+    EvidenceTask, ExecResult, FakeCommandRunner, ModelRewardJudge, RewardCheck,
 };
 use openjiuwen_common::error::Error;
 use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
 use openjiuwen_test_support::{ScriptedModel, ScriptedTurn};
 use serde_json::json;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -120,10 +121,10 @@ async fn read_pattern_without_hits_reports_no_line_matches() {
 #[tokio::test]
 async fn read_pattern_stops_after_the_hit_cap() {
     let dir = TempDir::new().expect("temp dir");
-    let text: String = (1..=10).fold(String::new(), |mut text, number| {
-        text.push_str(&format!("hit {number}\n"));
-        text
-    });
+    let mut text = String::new();
+    for number in 1..=10 {
+        writeln!(text, "hit {number}").expect("writing to a String cannot fail");
+    }
     write(&dir, "notes.txt", &text);
     let outcome = CheckRunner::new(dir.path(), Arc::new(FakeCommandRunner::new()))
         .with_max_hits(2)
@@ -223,7 +224,7 @@ async fn an_unidentifiable_check_is_skipped_instead_of_run() {
     assert!(!outcome.ok);
     assert!(outcome.skipped.is_some());
     assert!(outcome.error.is_none());
-    assert!(outcome.result.is_empty());
+    assert_eq!(outcome.result, "");
 
     let outcome = runner(&dir)
         .run(&RewardCheck::new().with_tool(CheckTool::Read))
@@ -331,10 +332,12 @@ async fn evidence_gathering_and_judging_feed_a_reward_pack() {
         .expect("aggregate");
     let correctness = summary.per_dimension.get("correctness").expect("scored");
     assert!(approx(correctness.normalised, 0.75));
-    assert!(approx(summary.total, 0.45));
+    // The default pack skips undeclared/missing dimensions, so the total is the
+    // present dimension renormalised over its own weight: 0.75, not 0.6 * 0.75.
+    assert!(approx(summary.total, 0.75));
     assert!(summary.missing.contains(&String::from("efficiency")));
     assert!(summary.missing.contains(&String::from("clarity")));
-    assert!(!summary.passed);
+    assert!(summary.passed, "0.75 clears the default 0.6 passing score");
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 # tests
 
 ## Intent
-Offline integration suites for the crate's public API: one binary per module area, 17 in total, plus the inline unit tests beside each module.
+Offline integration suites for the crate's public API: one binary per module area, 21 in total, plus the inline unit tests beside each module.
 Nothing here touches a network, the environment, or wall-clock time.
 
 ## Constraints
