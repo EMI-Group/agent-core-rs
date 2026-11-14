@@ -64,6 +64,7 @@ Retrieval is available in two flavours: lexical (token overlap over the bank) an
 - `./parse.rs` → `TipParser`
 - `./induce.rs` → `TipInducer`
 - `./dream.rs` → `Dreamer`, `DreamReport` and the deterministic clustering
-- `./dream_llm.rs` → model-backed merge/purge prompts, verdict parsing and fallbacks
+- `./dream_llm.rs` → model-backed merge/purge passes, cosine or Jaccard clustering and merge application
+- `./dream_prompt.rs` → merge/purge prompt builders, verdict records and the tolerant answer parsers
 - `./consult.rs` → `consult`, `render_tips`
 - `./engine.rs` → `TtseEngine`, its embedding hooks and persistence
