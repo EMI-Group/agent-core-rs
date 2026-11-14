@@ -289,7 +289,7 @@ impl fmt::Debug for DreamLeaseGuard {
             .field("lease", &*self.lease.read())
             .field("lost", &self.is_lost())
             .field("lost_reason", &*self.lost_reason.lock())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
