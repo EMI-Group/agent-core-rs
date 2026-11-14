@@ -104,7 +104,7 @@ pub struct RecordCheckpoint {
     pub request_id: String,
     /// Execution the checkpoint belongs to.
     pub execution_id: String,
-    /// Number of completed ReAct iterations at the boundary.
+    /// Number of completed `ReAct` iterations at the boundary.
     pub iteration_seq: u64,
     /// Which kind of boundary this is.
     pub kind: CheckpointKind,
@@ -118,7 +118,7 @@ pub struct RecordCheckpoint {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointKind {
-    /// A completed ReAct iteration.
+    /// A completed `ReAct` iteration.
     #[default]
     ReactIteration,
     /// The start of a request, before any iteration completed.
