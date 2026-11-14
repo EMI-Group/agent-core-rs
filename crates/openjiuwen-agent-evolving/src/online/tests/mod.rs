@@ -8,7 +8,7 @@
 //! This module owns the store, spec, task lifecycle and reward tests; the
 //! capture and turn tests live in the `capture` child module, and the ledger,
 //! executor, training-run and LoRA-repository suites in `sample`, `executor`,
-//! `training` and `lora`.
+//! `training`, `training_stop` and `lora`.
 
 use std::sync::Arc;
 
@@ -25,7 +25,9 @@ mod capture;
 mod executor;
 mod lora;
 mod sample;
+mod support;
 mod training;
+mod training_stop;
 
 const STAMP: &str = "2026-01-01T00:00:00+00:00";
 const SESSION: &str = "sess-1";

@@ -99,7 +99,9 @@
 //! [`Result`](crate::online::Result) (an alias of `Result<_, OnlineError>`) so the HTTP layer can
 //! answer with the Python envelope without inspecting messages.
 
+pub mod activation;
 pub mod capture;
+pub mod checkpoint;
 pub mod error;
 pub mod executor;
 pub mod lora;
@@ -133,7 +135,9 @@ pub(crate) mod json {
     }
 }
 
+pub use activation::{LoraActivation, LoraActivator, NoopLoraActivator, UnsupportedLoraActivator};
 pub use capture::{CaptureMeta, CaptureStatus, PublishState, TurnTransition};
+pub use checkpoint::{TrainingCheckpoint, TRAINING_CHECKPOINT_VERSION};
 pub use error::{OnlineError, Result};
 pub use executor::{
     artifact_name, artifact_version, is_artifact_name, LocalArtifactDescriptor,
@@ -150,7 +154,5 @@ pub use task::{
     EPOCH_STAMP,
 };
 pub use training::{
-    LoraActivation, LoraActivator, NoopLoraActivator, RunStage, RunStatus, TrainingCheckpoint,
-    TrainingRunRecord, TrainingRunner, TrainingRunnerConfig, UnsupportedLoraActivator,
-    SERVICE_RESTARTED, TRAINING_CHECKPOINT_VERSION,
+    RunStage, RunStatus, TrainingRunRecord, TrainingRunner, TrainingRunnerConfig, SERVICE_RESTARTED,
 };
