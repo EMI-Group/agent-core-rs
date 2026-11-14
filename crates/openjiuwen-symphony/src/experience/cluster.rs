@@ -71,7 +71,7 @@ pub fn cluster_traces(records: &[TraceRecord]) -> Vec<ClusteredQuery> {
                 .then_with(|| left.timestamp.total_cmp(&right.timestamp))
                 .then_with(|| left.query.cmp(&right.query))
         });
-        clusters.extend(cluster_group(skill_ids, group));
+        clusters.extend(cluster_group(&skill_ids, group));
     }
     clusters.sort_by(|left, right| {
         left.skill_ids
@@ -91,7 +91,7 @@ struct GroupCluster<'a> {
 }
 
 /// Clusters one skill group by normalized-query similarity.
-fn cluster_group(skill_ids: Vec<String>, group: Vec<&TraceRecord>) -> Vec<ClusteredQuery> {
+fn cluster_group(skill_ids: &[String], group: Vec<&TraceRecord>) -> Vec<ClusteredQuery> {
     let mut local: Vec<GroupCluster<'_>> = Vec::new();
     for record in group {
         let tokens = query_terms(&record.query);
@@ -108,12 +108,12 @@ fn cluster_group(skill_ids: Vec<String>, group: Vec<&TraceRecord>) -> Vec<Cluste
     }
     local
         .into_iter()
-        .map(|cluster| populate_cluster(skill_ids.clone(), cluster.members))
+        .map(|cluster| populate_cluster(skill_ids, &cluster.members))
         .collect()
 }
 
 /// Builds the public cluster record: pattern, members, examples, and success count.
-fn populate_cluster(skill_ids: Vec<String>, members: Vec<&TraceRecord>) -> ClusteredQuery {
+fn populate_cluster(skill_ids: &[String], members: &[&TraceRecord]) -> ClusteredQuery {
     let mut member_ids: Vec<String> = members
         .iter()
         .map(|member| member.trace_id.clone())
@@ -122,7 +122,7 @@ fn populate_cluster(skill_ids: Vec<String>, members: Vec<&TraceRecord>) -> Clust
     member_ids.dedup();
 
     let mut query_examples: Vec<String> = Vec::new();
-    for member in &members {
+    for member in members {
         let query = member.query.trim();
         if !query.is_empty() && !query_examples.iter().any(|known| known == query) {
             query_examples.push(query.to_string());
@@ -132,10 +132,10 @@ fn populate_cluster(skill_ids: Vec<String>, members: Vec<&TraceRecord>) -> Clust
     let success_count =
         u32::try_from(members.iter().filter(|member| member.success).count()).unwrap_or(u32::MAX);
     ClusteredQuery {
-        pattern: centroid_query(&members),
+        pattern: centroid_query(members),
         members: member_ids,
         query_examples,
-        skill_ids,
+        skill_ids: skill_ids.to_vec(),
         success_count,
     }
 }

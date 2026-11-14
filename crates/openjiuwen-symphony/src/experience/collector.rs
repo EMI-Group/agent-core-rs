@@ -3,29 +3,26 @@
 //! Python's `ExperienceBaseBuilder` runs cluster → LLM distill → write. The Rust port
 //! keeps the buffering, the validity filter, the example cap, and the similar-pattern
 //! merge, and replaces the LLM distillation with the deterministic centroid query that
-//! [`cluster_traces`](crate::experience::cluster_traces) already computes:
+//! [`cluster_traces`] already computes:
 //!
 //! 1. Drop traces that are not usable evidence — not successful, no skills, or a blank
 //!    query (Python's `_filter_valid_traces`/`add` apply the same three conditions).
-//! 2. Cluster the survivors with [`cluster_traces`], producing one
-//!    [`ExperienceItem`](crate::experience::ExperienceItem) per cluster: the centroid
-//!    query as the pattern, at most [`QUERY_EXAMPLES_COUNT`] example queries, the shared
-//!    skill set, and the cluster's success count.
+//! 2. Cluster the survivors with [`cluster_traces`], producing one [`ExperienceItem`]
+//!    per cluster: the centroid query as the pattern, at most [`QUERY_EXAMPLES_COUNT`]
+//!    example queries, the shared skill set, and the cluster's success count.
 //! 3. Merge each new item into an existing pending item when it has the same skill set
 //!    and a normalized-pattern token similarity of at least
 //!    [`PATTERN_MERGE_THRESHOLD`] (Python's `_merge_similar_patterns`, single-linkage
-//!    greedy). A merge reuses the shared
-//!    [`merge_item`](crate::experience::ExperienceItem) rule, so counters add up and
+//!    greedy). A merge reuses the shared `merge_item` rule, so counters add up and
 //!    examples union.
 //! 4. Buffer the items and flush through the sink once
 //!    [`PENDING_FLUSH_THRESHOLD`] items are pending, or when the caller calls
 //!    [`ExperienceCollector::flush`].
 //!
-//! The sink is an [`ExperienceSink`], implemented for
-//! [`ExperienceBank`](crate::experience::ExperienceBank) and
-//! [`ExperienceIndex`](crate::experience::ExperienceIndex), so the collector feeds either
-//! catalog without duplicating the write path. Everything is deterministic: no RNG, no
-//! clock, and items keep zeroed timestamps.
+//! The sink is an [`ExperienceSink`], implemented for [`ExperienceBank`] and
+//! [`ExperienceIndex`], so the collector feeds either catalog without duplicating the
+//! write path. Everything is deterministic: no RNG, no clock, and items keep zeroed
+//! timestamps.
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -47,15 +44,14 @@ pub const QUERY_EXAMPLES_COUNT: usize = 5;
 /// The normalized-pattern similarity at which two items merge (`0.9` in Python).
 ///
 /// The similarity is the token Jaccard index over
-/// [`crate::search::tokenize`](crate::search::tokenize), the same measure clustering uses;
+/// [`crate::search::tokenize`], the same measure clustering uses;
 /// Python compares embeddings, which needs the model stack this port deliberately does
 /// not require.
 pub const PATTERN_MERGE_THRESHOLD: f64 = 0.9;
 
 /// A catalog the collector can write distilled items into.
 ///
-/// Implemented for [`ExperienceBank`](crate::experience::ExperienceBank) and
-/// [`ExperienceIndex`](crate::experience::ExperienceIndex); a test or a custom catalog
+/// Implemented for [`ExperienceBank`] and [`ExperienceIndex`]; a test or a custom catalog
 /// can implement it too.
 #[async_trait]
 pub trait ExperienceSink: Send + Sync {
@@ -307,7 +303,7 @@ mod tests {
     fn invalid_traces_are_dropped_before_clustering() {
         let mut failure = record("t3", "a query", &["a"]);
         failure.success = false;
-        let records = vec![
+        let records = [
             record("t1", "summarize the report", &["summarizer"]),
             record("t2", "no skills here", &[]),
             record("t4", "   ", &["summarizer"]),

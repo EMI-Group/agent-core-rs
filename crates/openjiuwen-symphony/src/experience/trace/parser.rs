@@ -252,7 +252,6 @@ fn fold_assistant_event(event: &Value, segment: &mut Segment) {
     let event_type = record_str(event, "event_type");
     let normalized = event_type.strip_prefix(CHAT_PREFIX).unwrap_or(event_type);
     match normalized {
-        "reasoning" => {}
         "delta" => segment
             .delta_text
             .push_str(extract_text(event.get("content")).trim()),

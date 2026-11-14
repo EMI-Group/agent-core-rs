@@ -8,6 +8,8 @@ Ranking is embedding-optional: a configured `Embedding` ranks by cosine similari
 A second catalog, `ExperienceIndex`, is the persisted embedding index: it keeps one vector per item, writes Python's `index_dir` layout (a manifest, a JSONL scalar file, and a JSON vector matrix), rehydrates the vectors on open instead of re-embedding, and verifies the manifest before it trusts a row.
 Dedupe is an intentional difference from Python: Python appends blindly and keys on `id`, while this crate merges on the normalized query pattern plus the sorted skill set, so repeated observations reinforce one record instead of fragmenting the catalog.
 The faiss experience index is no longer deferred: only IVF/faiss *training* stays behind `Error::Unsupported` (`open_with_algorithm` with an `ivf*` name), because exact flat cosine search returns the same neighbours without a GPU stack.
+The input half of Python's pipeline is implemented too: `trace/` parses agent-runtime session exports into `TraceRecord`s and caches them incrementally, `cluster.rs` groups records by skill set and query topic, and `collector.rs` distils each cluster into an item and writes it through an `ExperienceSink` into a bank or the persisted index.
+Python's LLM distillation is replaced by the cluster's centroid query and a deterministic token-similarity merge, so ingestion works offline with no model configured.
 
 ## API Surface
 
@@ -143,6 +145,113 @@ impl ExperienceIndex {
 Persistence: `<dir>/meta.json` (the manifest), `<dir>/scalar/metadata.jsonl` (one item JSON per line, no embedding field), `<dir>/vector/embeddings.json` (`{"dimension","ids","rows"}`), each written temp-sibling + rename in the order vectors → scalar → meta; `persist()` on an in-memory index refreshes the manifest without writing files.
 Load is all-or-nothing and loud: an empty/absent directory is an empty index with `next_ordinal = 1`; a partial file set is `Error::External`, and a version, algorithm, digest, count, dimension, duplicate-id, row-length, or unknown-id problem is `Error::Validation` naming the offending file. Ids resume past the highest `exp_NNNN`; stored vectors are reused, never re-embedded.
 
+## Ingestion Surface (trace, cluster, collector)
+
+```rust
+pub struct TraceRecord {
+    pub trace_id: String,      // "{session_id}/{request_id}"
+    pub session_id: String, pub request_id: String,
+    pub query: String,         // first non-blank user text of the segment
+    pub final_output: String,  // last chat.final, else accumulated chat.delta
+    pub skills: Vec<String>,   // sorted, deduped
+    pub success: bool,         // no error event and no metadata failure marker
+    pub duration_ms: u64,      // max duration_ms (or duration seconds) on the segment
+    pub tool_calls: Vec<TraceToolCall>, pub errors: Vec<String>,
+    pub timestamp: f64,        // first numeric event timestamp in epoch seconds; metadata only
+}
+impl TraceRecord { pub fn is_experience_candidate(&self) -> bool; }  // success && skills && query
+pub struct TraceToolCall { pub name: String, pub arguments: Value, pub result: Option<String> }
+
+pub struct SessionPaths { /* root */ }
+impl SessionPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self;
+    pub fn root(&self) -> &Path;
+    pub fn sessions_dir(&self) -> PathBuf;          // <root>/sessions
+    pub fn session_dir(&self, session_id: &str) -> PathBuf;
+    pub fn trace_store_dir(&self) -> PathBuf;       // <root>/trace_store
+    pub fn records_path(&self) -> PathBuf;          // <root>/trace_store/records.jsonl
+    pub fn processed_index_path(&self) -> PathBuf;  // <root>/trace_store/processed_index.json
+}
+pub struct TraceStore;
+impl TraceStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self;                 // no I/O
+    pub async fn open(root: impl Into<PathBuf>) -> Result<Self>;  // creates trace_store/
+    pub fn root(&self) -> &Path;
+    pub fn paths(&self) -> &SessionPaths;
+    pub fn trace_store_dir(&self) -> PathBuf;
+    pub fn records_path(&self) -> PathBuf;
+    pub fn processed_index_path(&self) -> PathBuf;
+    pub async fn parse_all_sessions(&self) -> Result<Vec<TraceRecord>>;  // only new sessions; idempotent
+    pub async fn load_all_records(&self) -> Result<Vec<TraceRecord>>;
+    pub async fn clear(&self) -> Result<()>;
+}
+pub const SESSIONS_DIR: &str = "sessions";
+pub const TRACE_STORE_DIR: &str = "trace_store";
+pub const RECORDS_FILE: &str = "records.jsonl";
+pub const PROCESSED_INDEX_FILE: &str = "processed_index.json";
+
+pub const CLUSTER_SIMILARITY_THRESHOLD: f64 = 0.6;
+pub struct ClusteredQuery {
+    pub pattern: String, pub members: Vec<String>, pub query_examples: Vec<String>,
+    pub skill_ids: Vec<String>, pub success_count: u32,
+}
+pub fn cluster_traces(records: &[TraceRecord]) -> Vec<ClusteredQuery>;
+
+pub const PENDING_FLUSH_THRESHOLD: usize = 20;
+pub const QUERY_EXAMPLES_COUNT: usize = 5;
+pub const PATTERN_MERGE_THRESHOLD: f64 = 0.9;
+#[async_trait] pub trait ExperienceSink: Send + Sync { async fn accept(&self, items: Vec<ExperienceItem>) -> Result<usize>; }
+// implemented for ExperienceBank and ExperienceIndex
+pub struct CollectorStats { pub accepted: usize, pub dropped: usize, pub merged: usize, pub flushed: usize }
+pub struct ExperienceCollector;
+impl ExperienceCollector {
+    pub fn new(sink: Arc<dyn ExperienceSink>) -> Self;
+    pub fn for_bank(bank: Arc<ExperienceBank>) -> Self;
+    pub fn for_index(index: Arc<ExperienceIndex>) -> Self;
+    pub fn sink(&self) -> &Arc<dyn ExperienceSink>;
+    pub async fn add(&self, records: &[TraceRecord]) -> Result<usize>;  // items produced; auto-flushes at 20
+    pub async fn flush(&self) -> Result<usize>;                         // 0 when empty
+    pub fn pending(&self) -> usize;
+    pub fn stats(&self) -> CollectorStats;
+}
+```
+
+### Parsing rules
+
+`<root>/sessions/<session_id>/{metadata.json,history.json}` is the input; `heartbeat_*` sibling directories are skipped.
+A missing session directory or metadata file yields no records; malformed metadata is warned about and the session is skipped; a missing or corrupt `history.json` is treated as an empty history (warning).
+The flat event stream is folded into one record per `request_id`; a missing/blank `request_id` segment is dropped because it has no identity.
+Recognized assistant events are `chat.reasoning`, `chat.delta`, `chat.final`, `chat.tool_call`, `chat.tool_result`, `chat.error`, and the same names without the `chat.` prefix; unknown types are dropped.
+`query` is the first non-blank user text (Python keeps the last), `final_output` is the last `chat.final` else the concatenated deltas.
+Skills come from `skill_tool.arguments.skill_name` and `symphony_compose_graph` (`arguments.candidate_skill_ids`, else `raw_output.plan.steps[].skill_id`/`name`, including a top-level `raw_output` on the tool-result event); they are sorted and deduped.
+`success` is false when an error event was seen or the metadata carries `success: false`, a failed `status`/`state`, or a non-empty `error`/`error_type`/`error_detail`.
+Tool payloads are decoded as JSON first, then by a small Python-literal reader (single- or double-quoted strings, `{...}`, `[...]`, numbers, `True`/`False`/`None`); an undecodable payload becomes `Value::Null` and the record survives (`ast.literal_eval` has no Rust equivalent).
+A `tool_result` attaches to the most recent open tool call with the same `tool_name`; otherwise it is recorded as its own call.
+
+### Store rules
+
+`parse_all_sessions` filters session ids through `processed_index.json`, parses the rest, sorts them by `(timestamp, trace_id)`, skips records whose `trace_id` is already in `records.jsonl`, appends the survivors, and only then updates the index — so a crash between the two writes cannot duplicate a record.
+A session that yields no records still becomes processed (Python behavior).
+Both files are replaced atomically through `write_atomic` (temp sibling plus rename); existing record bytes keep their insertion order, and newly appended records are ordered by `(timestamp, trace_id)`.
+`load_all_records` preserves file order and warns about/skips blank, malformed, and trace-id-less lines; a corrupt processed index degrades to an empty set with a warning.
+`clear` removes both files (missing ones are fine) and keeps the `trace_store/` directory.
+
+### Clustering rules
+
+Stage 1 groups records by sorted, deduped skill set (a skill-less record forms its own group).
+Stage 2 visits a group in trace-id order and assigns each record to the first cluster whose seed query reaches `CLUSTER_SIMILARITY_THRESHOLD` token Jaccard similarity (from `crate::search::tokenize`), else starts a new cluster — deterministic, no RNG.
+The centroid pattern is the member whose token set is closest (Jaccard) to the mean set of tokens present in at least half of the members; ties keep the earliest trace id.
+`members` is sorted and deduped, `query_examples` holds distinct non-blank queries in member order, `success_count` counts successful members.
+Clusters include failures; the collector filters them out before clustering. Output is sorted by `(skill_ids, pattern, members)`.
+
+### Collector rules
+
+`add` drops traces that are not `is_experience_candidate` (not successful, no skills, blank query), clusters the rest, and builds one item per cluster with the centroid pattern, up to `QUERY_EXAMPLES_COUNT` examples, the shared skills, and the success count (at least 1).
+A new item merges into the first pending item with the same skill set and a normalized-pattern token similarity of at least `PATTERN_MERGE_THRESHOLD`, using the shared `merge_item` rule (counters add, examples union); `stats.merged` counts merges.
+`add` returns the number of items produced (merges included) and auto-flushes once `PENDING_FLUSH_THRESHOLD` items are buffered; `flush` writes the buffer through the sink, returns 0 when empty, and is idempotent.
+A failed sink write requeues the items ahead of newer pending items, so evidence is never silently dropped.
+Everything is clock-free: items keep `created_at`/`last_hit_at` at `0.0`.
+
 ## Intentional differences (persisted index)
 
 - `vector/embeddings.json` replaces `vector/faiss_index.bin` + `vector/embeddings.npy`: an exact flat index is the matrix itself, and an offline build has neither numpy nor faiss.
@@ -160,9 +269,23 @@ Load is all-or-nothing and loud: an empty/absent directory is an empty index wit
 - Every public item is documented; no `unsafe`, no `println!`, no panics on user input.
 - `sqlite` is the only feature and it only enables `SqliteExperienceStore` via `openjiuwen-foundation/sqlite`.
 
+## Test Strategy
+- Unit tests live beside the modules (`trace/models.rs`, `trace/parser.rs`, `trace/store.rs`, `cluster.rs`, `collector.rs`); cross-module behavior lives in `crates/openjiuwen-symphony/tests/`.
+- `tests/experience.rs` — generated/explicit ids, dedupe merging, lexical and cosine ranking, skill filters, JSONL/SQLite persistence, id-counter continuity.
+- `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, and the IVF/unknown-algorithm errors.
+- `tests/experience_trace.rs` — two-session fixture with exact records, idempotent re-parse and append order, malformed/missing/heartbeat session tolerance, single-quoted tool payloads, `clear`, skill-set/topic clustering and centroid ties, collector drops/auto-flush/similarity merge/stats, the end-to-end `TraceStore` → `cluster_traces` → collector → `ExperienceBank::search` run, and the persisted `ExperienceIndex` sink with `HashEmbedding`.
+- Everything is offline and deterministic: `tempfile` roots, explicit numeric timestamps, `HashEmbedding`, no clock-dependent assertions, no hash-map iteration order in outputs.
+
 ## Routing Table
 
 - `./mod.rs` → module docs, re-exports, `ExperienceItem`, id constants, normalization/dedupe helpers
 - `./bank.rs` → `ExperienceBank`, `AddOutcome`, generated ids, merge rules, search entry points
 - `./ranking.rs` → `ExperienceHit`, `ExperienceRanking`, `SearchOptions`, lexical/cosine scorers, `cosine_similarity`
 - `./store.rs` → `ExperienceStore`, memory/JSON-file/SQLite backends, `DEFAULT_KEY_PREFIX`
+- `./cluster.rs` → `ClusteredQuery`, `cluster_traces`, token Jaccard, centroid selection
+- `./collector.rs` → `ExperienceCollector`, `ExperienceSink`, `CollectorStats`, buffer/merge/flush rules
+- `./trace/` → session parsing and the incremental trace cache
+  - `./trace/models.rs` → `TraceRecord`, `TraceToolCall`, experience-candidate rule
+  - `./trace/parser.rs` → metadata/history reading, event folding, skill extraction, lenient literals
+  - `./trace/store.rs` → `TraceStore`, `SessionPaths`, atomic `records.jsonl`/`processed_index.json`
+- `../tests/experience_trace.rs` → ingestion, clustering, and collector behavior

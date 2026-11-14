@@ -60,12 +60,14 @@
 //!
 //! # Ingestion: trace → cluster → collector
 //!
-//! `trace/` parses agent-runtime session exports into [`TraceRecord`]s and caches them
-//! next to the sessions; `cluster.rs` groups those records by skill set and query topic;
-//! `collector.rs` turns each cluster into an [`ExperienceItem`] and writes it into an
-//! [`ExperienceBank`] or an [`ExperienceIndex`]. Python's LLM distillation is replaced by
-//! the cluster's centroid query and a deterministic token-similarity merge, so the whole
-//! input half works offline.
+//! `trace/` parses agent-runtime session exports into
+//! [`TraceRecord`](crate::experience::TraceRecord)s and caches them next to the sessions;
+//! `cluster.rs` groups those records by skill set and query topic; `collector.rs` turns
+//! each cluster into an [`ExperienceItem`](crate::experience::ExperienceItem) and writes
+//! it into an [`ExperienceBank`](crate::experience::ExperienceBank) or an
+//! [`ExperienceIndex`](crate::experience::ExperienceIndex). Python's LLM distillation is
+//! replaced by the cluster's centroid query and a deterministic token-similarity merge, so
+//! the whole input half works offline.
 #![allow(clippy::module_name_repetitions)]
 
 mod bank;

@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use openjiuwen_retrieval::HashEmbedding;
 use openjiuwen_symphony::experience::{
     cluster_traces, ExperienceBank, ExperienceCollector, ExperienceIndex, ExperienceRanking,
-    ExperienceSink, TraceRecord, TraceStore, TraceToolCall, CLUSTER_SIMILARITY_THRESHOLD,
-    PATTERN_MERGE_THRESHOLD, PENDING_FLUSH_THRESHOLD, QUERY_EXAMPLES_COUNT,
+    ExperienceSink, TraceRecord, TraceStore, TraceToolCall, PENDING_FLUSH_THRESHOLD,
+    QUERY_EXAMPLES_COUNT,
 };
 
 /// Writes one session directory (`metadata.json` and, when given, `history.json`).
@@ -385,7 +385,6 @@ async fn clustering_groups_by_skill_set_then_similarity() {
 
     // Deterministic: the same input always yields the same output.
     assert_eq!(clusters, cluster_traces(&records));
-    assert!(CLUSTER_SIMILARITY_THRESHOLD > 0.0 && CLUSTER_SIMILARITY_THRESHOLD < 1.0);
 }
 
 #[tokio::test]
@@ -465,7 +464,6 @@ async fn collector_merges_similar_patterns_with_the_same_skills() {
     );
     assert_eq!(collector.pending(), 1);
     assert_eq!(collector.stats().merged, 1);
-    assert!(PATTERN_MERGE_THRESHOLD <= 0.9);
 
     assert_eq!(collector.flush().await.expect("flush"), 1);
     let items = bank.list();
