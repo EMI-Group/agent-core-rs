@@ -4,3 +4,60 @@
 //! the per-type compressors (HTML, JSON array, log, diff, search results,
 //! source file, plain text), query-term extraction, the compression pipeline
 //! and its optional debug dump.
+//!
+//! A pass is pure apart from the explicit dump: [`RuleCompressionPipeline`]
+//! detects the content type of one tool message through [`RuleContentRouter`],
+//! runs the matching compressor, and returns the message with the compressed
+//! text plus the `rule_compressed_*` metadata keys. Nothing here calls a model,
+//! touches the network, or depends on the wall clock (an injected clock drives
+//! timestamps and dump names).
+//!
+//! Acceptance is uniform: a compressor returns its input with `modified = false`
+//! unless the candidate saves at least `RuleContext::min_savings_ratio` (10 %)
+//! of the measured tokens and, where Python enforces it, fits `max_tokens`.
+//! Character counts use Python's `len(text) // 3` token estimate, so the gates
+//! reproduce the reference thresholds without a tokenizer.
+//!
+//! Intentional differences from Python, all documented per module:
+//!
+//! - matching is ASCII and hand-rolled (no `regex` crate), so log-line and
+//!   timestamp sniffing ignore non-ASCII case folding;
+//! - `json_repair` is replaced by a bounded repair (fence, trailing text,
+//!   trailing commas, single quotes);
+//! - the HTML extractor is a small tokenizer/renderer instead of `BeautifulSoup`
+//!   plus `trafilatura`, and `source_file` keeps Python's shape but adds the
+//!   structure digest Python's no-op compressor never had;
+//! - the dump directory has no workspace fallback, because the pipeline has no
+//!   `ModelContext`.
+pub mod common;
+pub mod compressors;
+pub mod dump;
+pub mod pipeline;
+pub mod query_terms;
+pub mod router;
+pub mod types;
+pub use common::{
+    count_tokens, extract_file_path_argument, file_name, fits_budget_and_saves, is_error_text,
+    is_source_file_path, meets_savings_ratio, strip_display_line_prefixes,
+    strip_display_line_prefixes_preserving_body_whitespace,
+};
+pub use compressors::{
+    parse_search_match, DiffCompressor, HTMLExtractionResult, HTMLExtractor, HTMLExtractorConfig,
+    HtmlCompressor, HtmlOutputFormat, JsonArrayCompressor, LogCompressor, LogLevel, LogLine,
+    PlainTextCompressor, RuleCompressor, SearchMatch, SearchResultsCompressor,
+    SourceFileCompressor,
+};
+pub use dump::{
+    dump_file_name, resolve_dump_dir, safe_filename_part, write_dump, DumpRecord,
+    RULE_COMPRESSION_DUMP_DIR_ENV,
+};
+pub use pipeline::{
+    RuleClock, RuleCompressionPipeline, ADD_PASS, RULE_COMPRESSED_AT_KEY,
+    RULE_COMPRESSION_DETAILS_KEY, RULE_COMPRESSION_DUMP_PATH_KEY, RULE_COMPRESSION_PASS_KEY,
+    RULE_COMPRESSION_TYPE_KEY, TTL_PASS,
+};
+pub use query_terms::extract_query_terms;
+pub use router::{repair_json_array, ContentRouter, RuleContentRouter};
+pub use types::{
+    ContentType, RuleCompressionResult, RuleContext, TokenCountPolicy, CHARACTERS_PER_TOKEN,
+};

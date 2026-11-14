@@ -825,6 +825,7 @@ fn summary_config() -> MessageSummaryOffloaderConfig {
         protected_tool_names: vec!["read_file".to_owned()],
         summary_max_tokens: 900,
         content_max_chars_for_compression: 300,
+        ..MessageSummaryOffloaderConfig::default()
     }
 }
 
@@ -973,6 +974,7 @@ fn summary_offloader_config_round_trips() {
         protected_tool_names: vec!["view".to_owned()],
         summary_max_tokens: 128,
         content_max_chars_for_compression: 5_000,
+        ..MessageSummaryOffloaderConfig::default()
     })
     .unwrap();
     let parsed: MessageSummaryOffloaderConfig = serde_json::from_str(&json).unwrap();
