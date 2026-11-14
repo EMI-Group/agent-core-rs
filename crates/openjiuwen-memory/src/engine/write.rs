@@ -180,7 +180,10 @@ impl super::MemoryEngine {
     /// Deletes every record matching `filter`, returning how many were removed.
     ///
     /// Only memory records are cleared; variables and conversation messages are owned
-    /// by the facade and are untouched. An empty `filter.kinds` means every memory kind.
+    /// by the facade and are untouched. An empty `filter.kinds` means every memory kind,
+    /// which excludes the [`MemoryType::Variable`](crate::record::MemoryType::Variable)
+    /// projections: they are removed only by a filter that names the kind explicitly
+    /// (their KV entries stay either way).
     ///
     /// # Errors
     ///
@@ -200,6 +203,9 @@ impl super::MemoryEngine {
         let mut removed = 0;
         for record in records {
             options.check()?;
+            if !super::includes_record(filter, &record) {
+                continue;
+            }
             if self.storage().delete_record(&record).await? {
                 removed += 1;
             }
@@ -209,11 +215,19 @@ impl super::MemoryEngine {
 
     /// Lists every record matching `filter`, newest first, without scoring.
     ///
+    /// An empty `filter.kinds` lists every memory kind except
+    /// [`MemoryType::Variable`](crate::record::MemoryType::Variable) projections, which
+    /// belong to the variable namespace and appear only when the filter names the kind.
+    ///
     /// # Errors
     ///
     /// Returns the storage error when the listing fails.
     pub async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>> {
-        self.storage().list_records(filter).await
+        let records = self.storage().list_records(filter).await?;
+        Ok(records
+            .into_iter()
+            .filter(|record| super::includes_record(filter, record))
+            .collect())
     }
 
     /// Builds the record a [`NewMemory`] input describes.

@@ -28,6 +28,7 @@ use openjiuwen_foundation::prompt::tokens::{ApproxTokenCounter, TokenCounter};
 use openjiuwen_retrieval::embedding::Embedding;
 
 use crate::config::MemoryEngineConfig;
+use crate::record::{MemoryFilter, MemoryRecord, MemoryType};
 use crate::store::{MemoryStorage, MemoryStores, MessageStore};
 
 use locks::WriteLocks;
@@ -202,9 +203,29 @@ impl MemoryEngine {
     }
 }
 
+/// Returns `true` when `filter` names [`MemoryType::Variable`] among its kinds.
+///
+/// [`MemoryType::Variable`] is Python's separate variable namespace, not ordinary
+/// memory, so the record listing, statistics, and clear paths of the engine exclude the
+/// variable projections unless a caller asks for the kind explicitly.
+pub(super) fn includes_variables(filter: &MemoryFilter) -> bool {
+    filter.kinds.contains(&MemoryType::Variable)
+}
+
+/// Returns `true` when `record` is visible to the unfiltered record paths under `filter`.
+///
+/// Ordinary records are always visible; a [`MemoryType::Variable`] projection is visible
+/// only to a `filter` whose `kinds` name [`MemoryType::Variable`] explicitly (see
+/// [`includes_variables`]). The prefix-scan storage listing is unchanged: this predicate
+/// narrows the records `list`/`stats`/`clear` act on.
+pub(super) fn includes_record(filter: &MemoryFilter, record: &MemoryRecord) -> bool {
+    includes_variables(filter) || record.kind != MemoryType::Variable
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::MemoryScope;
 
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
@@ -232,5 +253,41 @@ mod tests {
             matches!(result, Err(openjiuwen_common::error::Error::Config(_))),
             "invalid config must be rejected"
         );
+    }
+
+    fn record(kind: MemoryType) -> MemoryRecord {
+        MemoryRecord {
+            id: "id".to_owned(),
+            content: "content".to_owned(),
+            kind,
+            importance: 0.5,
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed time"),
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed time"),
+            last_access: None,
+            access_count: 0,
+            metadata: std::collections::BTreeMap::new(),
+            embedding: None,
+            source: None,
+            scope: MemoryScope::new("alice", "ws"),
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_variable_filter_sees_a_variable_projection() {
+        let unfiltered = MemoryFilter::for_scope(&MemoryScope::new("alice", "ws"));
+        assert!(!includes_variables(&unfiltered));
+        for kind in [
+            MemoryType::SemanticMemory,
+            MemoryType::UserProfile,
+            MemoryType::Unknown,
+        ] {
+            assert!(includes_record(&unfiltered, &record(kind)), "{kind:?}");
+        }
+        assert!(!includes_record(&unfiltered, &record(MemoryType::Variable)));
+
+        let explicit = unfiltered.clone().kind(MemoryType::Variable);
+        assert!(includes_variables(&explicit));
+        assert!(includes_record(&explicit, &record(MemoryType::Variable)));
+        assert!(includes_record(&explicit, &record(MemoryType::Summary)));
     }
 }

@@ -4,8 +4,18 @@
 //! (`user_var/{user}/{scope}/{name}` and `session_var/{user}/{scope}/{session}/{name}`).
 //! This module keeps that entry — it stays the authoritative value every Python-shaped
 //! reader consults — and adds a first-class [`MemoryType::Variable`] record projection,
-//! so a variable is listed, counted, and (when a caller explicitly asks for the kind)
-//! recalled like any other record.
+//! so a variable carries record metadata and (when a caller names the kind) is listed,
+//! counted, and recalled like any other record.
+//!
+//! # The projection is not ordinary memory
+//!
+//! [`MemoryType::Variable`] is Python's separate variable namespace: `list`, `stats`, and
+//! `clear` see the projection only when their [`MemoryFilter::kinds`] names the kind
+//! explicitly, so an unfiltered listing/count/clear never includes (or deletes) it.
+//! [`MemoryEngine::variable_records`](super::MemoryEngine::variable_records) always lists
+//! the scope's projections, and only
+//! [`MemoryEngine::delete_variable_everywhere`](super::MemoryEngine::delete_variable_everywhere)
+//! removes a projection together with its KV entry.
 //!
 //! # Deterministic ids
 //!
@@ -325,7 +335,7 @@ mod tests {
     use super::VariableWrite;
     use crate::config::MemoryEngineConfig;
     use crate::record::{
-        AddOptions, MemoryFilter, MemoryScope, MemoryType, NewMemory, SearchOptions,
+        AddOptions, CallOptions, MemoryFilter, MemoryScope, MemoryType, NewMemory, SearchOptions,
     };
     use crate::store::MemoryStores;
 
@@ -608,7 +618,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_and_stats_include_the_projection() {
+    async fn an_unfiltered_clear_skips_the_projection_and_its_kv_entry() {
+        let engine = engine();
+        let scope = scope();
+        let write = engine
+            .write_variable(&scope, "theme", "dark", &AddOptions::default())
+            .await
+            .expect("write");
+        engine
+            .add(
+                &scope,
+                NewMemory::semantic("ordinary"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("add");
+
+        let removed = engine
+            .clear(&MemoryFilter::for_scope(&scope), &CallOptions::default())
+            .await
+            .expect("clear");
+        assert_eq!(removed, 1, "only the ordinary record is removed");
+        assert_eq!(variable_record_count(&engine, &scope).await, 1);
+        assert_eq!(
+            engine
+                .storage()
+                .get_variable(&scope, None, "theme")
+                .await
+                .expect("kv"),
+            Some("dark".to_owned())
+        );
+        assert_eq!(
+            engine.variable_records(&scope).await.expect("records")[0].id,
+            write.record_id
+        );
+        assert_eq!(
+            engine
+                .list(&MemoryFilter::for_scope(&scope))
+                .await
+                .expect("list")
+                .len(),
+            0,
+            "the ordinary listing is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_variable_clear_removes_only_the_projection() {
+        let engine = engine();
+        let scope = scope();
+        engine
+            .write_variable(&scope, "theme", "dark", &AddOptions::default())
+            .await
+            .expect("write");
+        engine
+            .add(
+                &scope,
+                NewMemory::semantic("ordinary"),
+                &AddOptions::default(),
+            )
+            .await
+            .expect("add");
+
+        let filter = MemoryFilter::for_scope(&scope).kind(MemoryType::Variable);
+        let removed = engine
+            .clear(&filter, &CallOptions::default())
+            .await
+            .expect("clear");
+        assert_eq!(removed, 1, "the named projection is removed");
+        assert_eq!(variable_record_count(&engine, &scope).await, 0);
+        assert_eq!(
+            engine
+                .storage()
+                .get_variable(&scope, None, "theme")
+                .await
+                .expect("kv"),
+            Some("dark".to_owned()),
+            "the KV entry belongs to delete_variable_everywhere"
+        );
+        assert_eq!(
+            engine
+                .list(&MemoryFilter::for_scope(&scope))
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the ordinary record survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_list_and_stats_skip_the_projection() {
         let engine = engine();
         let scope = scope();
         let write = engine
@@ -623,19 +723,34 @@ mod tests {
             )
             .await
             .expect("add");
+
         let listed = engine
             .list(&MemoryFilter::for_scope(&scope))
             .await
             .expect("list");
-        assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|record| record.id == write.record_id));
+        assert_eq!(listed.len(), 1, "only the ordinary record is listed");
+        assert!(listed
+            .iter()
+            .all(|record| record.kind != MemoryType::Variable));
         let stats = engine
             .stats(&MemoryFilter::for_scope(&scope))
             .await
             .expect("stats");
-        assert_eq!(stats.total, 2);
-        assert_eq!(stats.by_kind.get("variable"), Some(&1));
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.by_kind.get("variable"), None);
         assert_eq!(stats.by_kind.get("semantic_memory"), Some(&1));
+
+        let variable_filter = MemoryFilter::for_scope(&scope).kind(MemoryType::Variable);
+        let listed = engine.list(&variable_filter).await.expect("list variables");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, write.record_id);
+        let stats = engine
+            .stats(&variable_filter)
+            .await
+            .expect("stats variables");
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.by_kind.get("variable"), Some(&1));
+        assert_eq!(stats.by_kind.get("semantic_memory"), None);
     }
 
     #[tokio::test]
@@ -701,14 +816,16 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, write.record_id);
         assert_eq!(records[0].content, "theme=dark");
+        let ordinary = engine
+            .list(&MemoryFilter::for_scope(&scope))
+            .await
+            .expect("list");
         assert_eq!(
-            engine
-                .list(&MemoryFilter::for_scope(&scope))
-                .await
-                .expect("list")
-                .len(),
-            2
+            ordinary.len(),
+            1,
+            "the ordinary listing does not show the projection"
         );
+        assert_eq!(ordinary[0].kind, MemoryType::SemanticMemory);
     }
 
     #[tokio::test]

@@ -17,6 +17,10 @@ use crate::store::MemoryStorage;
 impl super::MemoryEngine {
     /// Computes aggregate statistics of every record matching `filter`.
     ///
+    /// [`MemoryType::Variable`](crate::record::MemoryType::Variable) projections are
+    /// excluded unless `filter.kinds` names the kind: they are Python's separate variable
+    /// namespace, not ordinary memory, so an unfiltered count never includes them.
+    ///
     /// # Errors
     ///
     /// Returns the storage error when the listing fails.
@@ -30,6 +34,8 @@ impl super::MemoryEngine {
 /// Kinds are keyed by [`crate::record::MemoryType::as_str`] so callers can forward the
 /// counts without a second mapping; timestamps are the record creation times, and
 /// `total_tokens` is the summed token count of every matching content.
+/// A [`crate::record::MemoryType::Variable`] projection counts only when `filter.kinds`
+/// names the kind explicitly (see [`super::includes_record`]).
 pub(crate) async fn compute_stats(
     storage: &MemoryStorage,
     filter: &MemoryFilter,
@@ -40,14 +46,19 @@ pub(crate) async fn compute_stats(
     let mut total_tokens = 0usize;
     let mut oldest: Option<DateTime<Utc>> = None;
     let mut newest: Option<DateTime<Utc>> = None;
+    let mut total = 0usize;
     for record in &records {
+        if !super::includes_record(filter, record) {
+            continue;
+        }
+        total += 1;
         *by_kind.entry(record.kind.as_str().to_owned()).or_insert(0) += 1;
         total_tokens = total_tokens.saturating_add(counter.count_text(&record.content));
         oldest = Some(oldest.map_or(record.timestamp, |current| current.min(record.timestamp)));
         newest = Some(newest.map_or(record.timestamp, |current| current.max(record.timestamp)));
     }
     Ok(MemoryStats {
-        total: records.len(),
+        total,
         by_kind,
         oldest,
         newest,
