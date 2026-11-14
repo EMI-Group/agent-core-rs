@@ -13,9 +13,9 @@
 //! [`crate::record::MemoryRecord`] so team memory can flow through the same recall and
 //! prompt paths as long-term memory — a view derived from the store, never a second copy
 //! of it.
+pub mod document;
 pub mod extractor;
 pub mod hooks;
-pub mod markdown;
 pub mod model;
 pub mod observe;
 pub mod projection;
