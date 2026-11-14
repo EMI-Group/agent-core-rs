@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use openjiuwen_common::error::{Error, Result};
 use regex::Regex;
 
-use crate::rails::sha256::sha256_hex;
+use openjiuwen_sysop::util::sha256_hex;
 
 /// Characters that may never appear in a portable Context path segment.
 ///

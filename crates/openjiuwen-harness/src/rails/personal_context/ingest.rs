@@ -50,7 +50,7 @@ use openjiuwen_common::error::{Error, Result};
 
 use super::search::page_heading_fields;
 use super::source::{display_title, normalize_source_locator, source_id_for_locator};
-use crate::rails::sha256::sha256_hex;
+use openjiuwen_sysop::util::sha256_hex;
 
 /// Default per-file byte cap: files larger than 2 MiB are skipped.
 pub const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -646,10 +646,7 @@ mod tests {
             report.documents[0].content_hash,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(
-            report.documents[0].content_hash,
-            crate::rails::sha256::sha256_hex(b"abc")
-        );
+        assert_eq!(report.documents[0].content_hash, sha256_hex(b"abc"));
         assert_eq!(report.documents[0].size_bytes, 3);
     }
 

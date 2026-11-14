@@ -441,7 +441,7 @@ mod tests {
 
     use super::*;
     use crate::rails::personal_context::source::source_id_for_locator;
-    use crate::rails::sha256::sha256_hex;
+    use openjiuwen_sysop::util::sha256_hex;
 
     /// The seven vendor kinds, in declaration order.
     fn vendor_kinds() -> [SourceKind; 7] {
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(source.locator, canonical.to_string_lossy());
         assert_eq!(source.content, "# Daily Note\n\nremember the milk");
         assert_eq!(source.revision, source.content_hash);
-        assert_eq!(source.content_hash, sha256_hex(body));
+        assert_eq!(source.content_hash, sha256_hex(body.as_bytes()));
         assert_eq!(source.content_hash.len(), 64);
         assert_eq!(source.metadata["relative_path"], "note.md");
         assert_eq!(source.metadata["service"], "notes");

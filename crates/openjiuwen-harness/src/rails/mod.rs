@@ -46,8 +46,9 @@ pub use evolution::{
 pub use heartbeat::{
     build_heartbeat_section, default_heartbeat_clock, heartbeat_prompt, HeartbeatClock,
     HeartbeatEvent, HeartbeatRail, HeartbeatRailConfig, HeartbeatReason,
-    DEFAULT_HEARTBEAT_EVENT_CAPACITY, DEFAULT_HEARTBEAT_INTERVAL_MS, HEARTBEAT_RUN_KIND,
-    HEARTBEAT_SECTION, HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY,
+    DEFAULT_HEARTBEAT_EVENT_CAPACITY, DEFAULT_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_HEARTBEAT_SESSION_CAPACITY, HEARTBEAT_RUN_KIND, HEARTBEAT_SECTION,
+    HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY,
 };
 pub use kv_cache::{
     affinity_enabled, is_sticky_subagent_type, resolve_sub_session_id,
