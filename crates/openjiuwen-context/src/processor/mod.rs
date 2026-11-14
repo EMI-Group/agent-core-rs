@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ContextConfig;
 use crate::events::ContextEvent;
 use crate::offload::{OffloadScope, OffloadStore};
+use crate::processor::compressor::reinjection::SnapshotRegistry;
 use crate::recall::RecallArchiveStore;
 use crate::session_memory::SessionMemoryStore;
 use crate::window::drop_orphan_tool_results;
@@ -308,6 +309,8 @@ pub struct PipelineDeps {
     pub recall: Option<Arc<dyn RecallArchiveStore>>,
     /// Session-memory notes full compaction reinjects.
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
+    /// Host-rendered state sections full compaction reinjects after a pass.
+    pub reinjection: Option<Arc<SnapshotRegistry>>,
 }
 
 impl std::fmt::Debug for PipelineDeps {
@@ -317,6 +320,7 @@ impl std::fmt::Debug for PipelineDeps {
             .field("has_model", &self.model.is_some())
             .field("has_recall", &self.recall.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
+            .field("has_reinjection", &self.reinjection.is_some())
             .finish()
     }
 }
@@ -330,6 +334,7 @@ impl PipelineDeps {
             model: None,
             recall: None,
             session_memory: None,
+            reinjection: None,
         }
     }
 
@@ -354,6 +359,13 @@ impl PipelineDeps {
         session_memory: Option<Arc<dyn SessionMemoryStore>>,
     ) -> Self {
         self.session_memory = session_memory;
+        self
+    }
+
+    /// Sets the registry of state sections full compaction may reinject.
+    #[must_use]
+    pub fn with_reinjection(mut self, reinjection: Option<Arc<SnapshotRegistry>>) -> Self {
+        self.reinjection = reinjection;
         self
     }
 }
@@ -410,7 +422,8 @@ impl ContextPipeline {
     ///
     /// This is [`ContextPipeline::from_configs`] plus the seams that are not
     /// part of a [`ProcessorConfig`]: [`FullCompactProcessor`] receives
-    /// [`PipelineDeps::session_memory`] and [`PipelineDeps::model`], and
+    /// [`PipelineDeps::session_memory`], [`PipelineDeps::reinjection`] and
+    /// [`PipelineDeps::model`], and
     /// [`MessageSummaryOffloader`] receives [`PipelineDeps::model`]. The recall
     /// store is not held by a processor; it reaches them through
     /// [`ProcessorContext::recall`] when the pipeline runs.
@@ -473,11 +486,15 @@ impl ContextPipeline {
                 ProcessorConfig::FullCompact(config) => {
                     // The session-memory notes are preferred over a model
                     // summary; without notes the model or offline path runs.
-                    processors.push(Arc::new(FullCompactProcessor::new(
+                    let mut processor = FullCompactProcessor::new(
                         config.clone(),
                         deps.model.clone(),
                         deps.session_memory.clone(),
-                    )));
+                    );
+                    if let Some(registry) = deps.reinjection.as_ref() {
+                        processor = processor.with_reinjection(Arc::clone(registry));
+                    }
+                    processors.push(Arc::new(processor));
                 }
                 ProcessorConfig::MicroCompact(config) => {
                     config.validate()?;
