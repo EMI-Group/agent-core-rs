@@ -620,7 +620,8 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 ## Constraints
 
 - Cargo: `edition 2021`, `rust-version 1.85`, `publish = false`, `#![forbid(unsafe_code)]`; `default = []` and the sole feature `sqlite` only enables the SQLite backends (`store::KvAssetStore::sqlite` and `experience::SqliteExperienceStore`) via `openjiuwen-foundation/sqlite`.
-- Cargo dependencies additionally include `serde_yaml_ng` (front-matter parsing and rendered YAML manifests) and `bytes` (object-store artifact payloads); both are workspace dependencies.
+- Cargo dependencies additionally include `serde_yaml_ng` (front-matter parsing and rendered YAML manifests), `bytes` (object-store artifact payloads) and `base64` (Azure SharedKey signatures); all three are workspace dependencies, and `wiremock` is the dev-dependency behind the GCS/Azure emulator suites.
+- Cloud transports use `openjiuwen_common::http` (never raw `reqwest`); no `hmac` and no XML crate exists offline, so SharedKey HMAC-SHA256 and the Azure list XML scanner are hand rolled and unit-tested (RFC 4231 vectors).
 - The umbrella crate `openjiuwen` re-exports this crate as `openjiuwen::symphony`; `crate_name()` returns `"openjiuwen-symphony"`.
 - Only files under `crates/openjiuwen-symphony/` may change; the root manifest, sibling crates, and `docs/` are read-only from this node.
 - Depend downward only: `openjiuwen-common`, `openjiuwen-foundation`, `openjiuwen-graph`, `openjiuwen-retrieval`, `openjiuwen-session`, and the `openjiuwen-core` umbrella.
@@ -644,8 +645,11 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **Experience ranking is embedding-optional.** The bank persists items, not vectors; an `Embedding` re-derives them at search time, and without one a deterministic lexical score keeps the bank usable offline.
 - **Experience dedupe is a Rust-only improvement.** Python keys on `id`; here the normalized pattern plus sorted skill set is the merge key, so repeated observations reinforce one record.
 - **Flow distillation is structural, not narrative.** Evidence groups on its cycle-broken successful-edge signature, versions are content-addressed and immutable, and a model can only write prose.
-- **A SkillPack is a frozen, reviewable artifact.** Only an `active` + `verified` linear chain can be packed; the package id hashes canonical materials; a static seven-check review decides the verdict without a model or network.
-- **Object storage is the third artifact backend, not a new abstraction.** `ObjectGraphArtifactStore` reuses the revision envelope and key layout of `FileGraphArtifactStore`, so in-memory, local, and S3-compatible stores are interchangeable.
+- **A SkillPack is a frozen, reviewable artifact.** Only an `active` + `verified` linear chain can be packed; the package id hashes canonical materials; a static ten-check review decides the verdict without a model or network.
+- **Redaction happens where text enters an artifact**, not at render time — one sanitize call per path, so no double redaction and no leak through a copy; the review's `secrets` check re-runs the redactor as the last line of defence.
+- **Evaluation separates scored from scoreless verdicts.** `MetricScore::score` is optional and `status` is explicit, so latency stays an `Observed` measurement and a missing case a `NotApplicable` rather than a zero.
+- **Object storage is the third artifact backend, not a new abstraction.** `ObjectGraphArtifactStore` reuses the revision envelope and key layout of `FileGraphArtifactStore`, so in-memory, local, S3-compatible, GCS and Azure Blob stores are interchangeable.
+- **GCS and Azure Blob are Rust-only transports.** Python's `shared/storage.py` is a boto3 helper for `s3`/`obs` only and has no cloud-native transport at all; the crate adds the GCS JSON API and the Blob REST API over `openjiuwen_common::http`, with hand-rolled HMAC-SHA256 SharedKey signing and a hand-rolled XML scanner because no XML or `hmac` crate is available offline.
 - **File and artifact writes are atomic everywhere.** Flow stores, experience JSON documents, experience-index artifacts, and graph artifacts write a temp sibling and rename; an object store writes the revision before the pointer.
 - **Timestamps never decide behavior.** `reviewed_at`, `created_at`, and `last_hit_at` are metadata; ordering always comes from sorted ids or content hashes.
 - **Semantic search uses embeddings** via `openjiuwen_retrieval::{Embedding, InMemoryVectorStore}` (with `HashEmbedding` for deterministic tests), additively over the shared `SearchHit` type.
@@ -657,41 +661,47 @@ The other typed deferrals live with their implementations: `ExperienceIndex`'s `
 - **Evolution feedback is an EMA on observed edge weight**, reducing Python's append-only evidence and merged revisions to one observable weight update.
 - **`FlowEngine::close` is a no-op**: every ingestion, recipe version, and package is written eagerly and atomically.
 - **A generated version bumps past pinned ids**, so an explicit `v2` never makes a later generated publish fail; an illegal version is a validation error on read as well as write.
-- **Static evaluation remains the offline default.** The suite ships deterministic completeness/schema metrics, and `llm::LlmJudgeMetric` implements Python's LLM-judged metric with a static rubric as its fallback.
+- **One judge implementation.** `evaluation::LlmJudgedMetric` is a thin delegating wrapper over `llm::LlmJudgeMetric`, so the prompt, the single repair retry and the deterministic rubric live in one place; `with_llm_judge()` therefore scores offline instead of recording a fail-soft error.
+- **Trace ingestion is deterministic, not statistical.** Python clusters traces with faiss k-means and distils patterns with a model; the port groups by skill set and token Jaccard, picks a centroid query deterministically, and merges similar patterns at a documented threshold — no RNG, no clock.
+- **The matcher cache is opt-in and signature-keyed.** Without `OntologyMatcher::with_cache` the code path is unchanged; with it, the key covers the candidate, both fingerprint digests and `matcher_signature()` (prompt/version constants, model identity, threshold), and cache failures degrade to a model call rather than stale matches.
+- **Static evaluation remains the offline default.** The suite ships deterministic card and trace metrics, and every LLM-backed metric carries a static rubric as its fallback.
 
 ## Deferred Scope
 
-GPU/ML-dependent and vendor-transport areas are typed deferrals; each keeps an `Error::Unsupported` entry point.
-The following pure-logic Python areas are not ported yet — the capability is absent rather than stubbed:
+Two kinds of gaps remain: typed `Error::Unsupported` entry points (GPU/ML stacks and vendor credential flows) and pure-logic Python areas that are not ported yet (absent, not stubbed).
+
+| Typed deferral | Why deferred |
+|---|---|
+| `experience/` — faiss IVF index training | Needs faiss' k-means/inverted lists (a native ML stack); `ExperienceIndex` implements the exact flat cosine index instead, so `ivf`/`ivfpq` names return `Error::Unsupported` while every item stays searchable |
+| `retrieval/` — `transformers`/`vLLM` logit-based branch selection | GPU inference stack; the LLM tree walk over `CompletionModel` and its lexical fallback are implemented |
+| GCS service-account keys (`GcsObjectStore::from_service_account_file`) | Signing an RS256 JWT needs an RSA signer the offline workspace does not ship; OAuth bearer tokens, anonymous access and emulators work |
+| Azure AD client credentials (`AzureBlobStore::from_client_credentials`) | An identity-endpoint token exchange plus a token cache is out of scope; SharedKey, SAS and anonymous cover the artifact path |
+
+Pure-logic Python areas not ported:
 
 - `observation/` — graph-evolution input contract, append-only evidence log, qualification/rebind and merged overlays (`runtime::submit_evolution` takes a `PlanExecution` and applies only an EMA).
-- `evaluation/{base,evaluators,suite}.py` — `StructureConformance`, `SuccessRate`, `Latency` (p50/p95), `Accuracy`, `Trace`, `CapabilitySelection`, `CompositionEffectiveness` and LLM-judged description/classification metrics, plus case/window selection and metric aggregation.
-- `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors, prompt snapshot, incremental notice state).
-- `flow/{privacy,codegen,render}.py` — credential/PII redaction, Swarmflow `run.py` generation (packs carry only `SKILL.md` and `dependencies.yaml`), single-skill `SkillAdapter` rendering, and the `code_safety`/`secrets`/`artifact_paths` review checks.
+- `discovery/{directory_toolkit,toolkit}.py` — the model-facing `skill_index` operations (directory view, list/search/read, request validation, pagination cursors); `SkillFs` provides `visible_skill_names`, `prompt_snapshot` and the persistable `SkillNoticeState` cursor.
+- `flow/{codegen,render}.py` — Swarmflow `run.py` generation (packs carry `SKILL.md`, `dependencies.yaml`, the review report and the embedded graph) and single-skill `SkillAdapter` rendering; credential redaction and the `code_safety`/`secrets`/`artifact_paths` review checks are implemented.
 - `orchestration/{mutations,mutation_service,artifacts}.py` — request digests, a persistent mutation journal, source-revision CAS and provider change-set validation (the runtime keeps an in-memory `request_id` ledger instead).
-- `experience/{trace,cluster,collector}.py` — session-trace parsing, query clustering and the collector/merge pipeline over the bank.
-- `orchestration/graph/matcher/cache.py` — persistent consensus-match cache; `shared/identity.sanitize_metadata` and endpoint hashing.
+- `orchestration/graph/matcher/{protocol,model}.py` — the `matches_by_candidate`/`diagnostics_by_candidate` helpers and the cache's file lock/pending-merge batching; the persistent match cache, identity digests, endpoint hashing and `sanitize_metadata` are implemented.
 - `shared/fingerprint/normalization.py` — IO-name vocabulary, alias merging and normalization audit records.
 - `retrieval/search/runtime/{lexical,selector,disclosure}.py` and `retrieval/build/io/*` — field-weighted lexical scoring, prebuilt-index loading and prompt disclosure rendering.
+- `retrieval/build/**` and `agent/retrieval_toolkit.py` — LLM-driven index construction over the progressive retriever (~9k lines, overlapping `llm::TreeRetriever`).
+- `experience/cluster.py`'s faiss k-means and LLM pattern distillation — replaced by deterministic token-Jaccard clustering and the collector's similarity merge.
 
-| Python area | Why deferred |
-|---|---|
-| `experience/` — faiss IVF index training | Needs faiss' k-means/inverted lists (a GPU/ML stack); `ExperienceIndex` implements the exact flat cosine index instead, so `ivf`/`ivfpq` names return `Error::Unsupported` while every item remains searchable |
-| `retrieval/` — `transformers`/`vLLM` logit-based branch selection | GPU inference stack; the LLM tree walk over `CompletionModel` and its lexical fallback are implemented |
-| `shared/storage.py` — GCS and Azure Blob artifact transports | No in-crate transport; typed `Error::Unsupported` variants of `object_artifact::ArtifactTransport`, while S3-compatible and local object stores are implemented |
-
-S3/OBS-compatible graph artifacts, SKILL.md scanning and the `SkillFs` catalog, flow distillation and `SkillPack` packaging/review, the experience bank, and LLM matching/scoring/retrieval/fingerprint/judging are all implemented with deterministic offline fallbacks.
-Deferred areas are proven, not just documented: `tests/deferred.rs` asserts every remaining stub returns `Error::Unsupported`, and `tests/object_artifact.rs` asserts the GCS/Azure transports are typed unsupported errors.
+Implemented with deterministic offline substitutes: S3/OBS, GCS and Azure Blob artifacts; SKILL.md scanning, the `SkillFs` catalog, prompt snapshot and notice cursor; flow distillation, redaction, ten-check review and `SkillPack` packaging; the experience bank, persisted index, trace ingestion, clustering and collector; evaluation static/trace metrics and windows; LLM matching (with cache), scoring, retrieval, fingerprinting and judging.
+Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the stub shape, and `tests/{artifact_gcs,artifact_azure,experience_index}.rs` assert the remaining GPU/vendor boundaries.
 
 ## Error Strategy
 
-- `Error::Validation` — malformed user input: blank ids/names/patterns/trace ids, illegal graph edge, bad version or meta name, draft/unverified/non-chain recipe, blank bucket, unknown artifact transport detail, runtime in the wrong state.
+- `Error::Validation` — malformed user input: blank ids/names/patterns/trace ids, illegal graph edge, bad version or meta name, draft/unverified/non-chain recipe, blank bucket, unknown artifact transport detail, runtime in the wrong state, a corrupted experience-index file, a malformed match cache.
 - `Error::NotFound` — explicit lookups that must exist (packing an unknown recipe); registry, store, and catalog reads return `Option`.
 - `Error::Graph` — plan execution failures, wrapping the failing step id and the runner error message.
-- `Error::Unsupported` — the remaining deferred ML/GPU stubs, execution without a configured runner, and the GCS/Azure artifact transports.
+- `Error::Unsupported` — the remaining GPU/ML and vendor-credential boundaries: `vLLM` logit selection, faiss IVF training, GCS service-account signing, Azure AD client credentials, and execution without a configured runner.
 - `Error::Llm` — model call or unusable-reply failures surfaced when `FallbackMode::Error` is configured; the deterministic mode converts them into the stage's documented fallback instead.
 - `Error::Validation`/`Error::Retrieval` — argument and backend failures propagated from `openjiuwen-retrieval`; they are never swallowed.
 - Artifact/store/flow I/O failures map to `Error::Config` (invalid root or endpoint) or `Error::External` (I/O); malformed individual records are warned and skipped rather than aborting a scan.
+- A match-cache read/write failure is warned and degrades to a model call; it never yields stale matches and never hides the model result.
 
 ## Test Strategy
 
@@ -705,14 +715,20 @@ Deferred areas are proven, not just documented: `tests/deferred.rs` asserts ever
 - `tests/executor.rs` — compile + execute with a fake runner, per-step state keys, input overlay, `max_steps`, `fail_fast=false`, `UnsupportedRunner`.
 - `tests/runtime.rs` — lifecycle idempotency, invoke, build revisions, mutation idempotency, evolution EMA, lazy semantic re-embedding, stopped-runtime errors, snapshot.
 - `tests/discovery.rs` — immediate/recursive scans, front-matter diagnostics, content-hash stability, inventory fingerprint, catalog search/excerpts, disabled skills, symlinks, settings.
+- `tests/skill_prompt.rs` — visible-name ordering/filtering, pinned snapshot text (plain/category/empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated`/fingerprint bookkeeping, fingerprint stability, and added/removed/changed notices with the exact reminder wording, ordering, idempotence and serde persistence.
 - `tests/experience.rs` — generated/explicit ids, dedupe merging, lexical and cosine ranking, skill filters, JSONL/SQLite persistence, id-counter continuity.
 - `tests/experience_index.rs` — `ExperienceIndex` add/search/dedupe, `top_k`/threshold ordering, skill-id flattening, `exist`, digest/count/dimension corruption, empty-directory open, persist round-trip and idempotence, reopen id continuity, and the IVF/unknown-algorithm errors.
-- `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, narrative fallback.
+- `tests/experience_trace.rs` — section fixtures → exact `TraceRecord`s, idempotent re-parse, malformed-session tolerance, single-quoted payloads, clustering/centroid determinism, collector drop/auto-flush/merge/stats, end-to-end bank search, and the persisted index sink.
+- `tests/flow.rs` — trace normalization, ingest rejection/idempotency, grouping/quality, versioning, rehydration, `SkillPack` render/save/load, review verdicts, install preparation, narrative fallback, and the ten-check review including `code_safety`/`secrets`/`artifact_paths`.
+- `tests/redaction.rs` — every redaction entry point, idempotence, non-ASCII input, the JSON depth cap and key order, and a flow run whose model emits a key and a PEM block (recipe and pack materials must contain `<redacted>` and no secret).
+- `tests/evaluation.rs` — static card metrics, structure conformance, mixed success rates, `Observed` latency, hand-computed percentile interpolation, window boundaries, aggregation precedence and confidence tiers, `cache_signature` stability, the offline/model-backed judge, and serde round-trips.
 - `tests/llm.rs` — every stage with a scripted model and with no model: tree walk/fallback, ontology consensus, scoring, fingerprint, judge repair, round-trips, error mode.
-- `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, unsupported transports, blank bucket, malformed `current.json`.
-- `tests/deferred.rs` — every remaining stub returns `Error::Unsupported` and `error::is_unsupported` recognizes it.
-- Tests are offline and deterministic: `tempfile` for filesystem stores, `HashEmbedding` for semantic search, no network, no clock-dependent assertions.
-- `cargo fmt -p openjiuwen-symphony`, `cargo test -p openjiuwen-symphony`, and `cargo clippy -p openjiuwen-symphony --all-targets -- -D warnings` plus `--features sqlite` compile checks must pass.
+- `tests/matcher_cache.rs` — identity digests, endpoint normalization, `sanitize_metadata`, cache round-trip and byte-stable layout, replay with zero model calls, `force` bypass, signature/model invalidation, malformed cache, and degradation.
+- `tests/object_artifact.rs` — numbered revisions, `current` pointer/status, reopen persistence, object keys, pinned-version skipping, blank bucket, malformed `current.json`.
+- `tests/artifact_gcs.rs` / `tests/artifact_azure.rs` — full publish → read → status → versions round-trips against a stateful wiremock cloud emulator, plus auth-header assertions (bearer / `SharedKey` / SAS / anonymous), pagination, prefix sorting, 404 semantics and endpoint failure mapping.
+- `tests/deferred.rs` — the remaining `vLLM` stub and the `ivf*` algorithm deferral return `Error::Unsupported`, and `error::is_unsupported` recognizes them.
+- Tests are offline and deterministic: `tempfile` for filesystem stores, `HashEmbedding` for semantic search, `wiremock` for the cloud transports, no live network, no clock-dependent assertions.
+- `cargo fmt -p openjiuwen-symphony`, `cargo test -p openjiuwen-symphony`, and `cargo clippy -p openjiuwen-symphony --all-targets --all-features -- -D warnings` plus `--features sqlite` compile checks must pass.
 
 ## Routing Table
 
@@ -731,17 +747,21 @@ Deferred areas are proven, not just documented: `tests/deferred.rs` asserts ever
   - `./src/search/semantic.rs` → `SemanticIndex` over `openjiuwen-retrieval`
 - `./src/graph.rs` → `CapabilityGraph`, nodes/edges, JGF v2 conversion
 - `./src/artifact.rs` → `GraphArtifactStore`, immutable revisions, `current` pointer
-- `./src/object_artifact.rs` → `ObjectGraphArtifactStore` over `ObjectStore` (in-memory/local/S3), `ArtifactTransport`
-- `./src/discovery/` → SKILL.md discovery and the lexical skill catalog; see [`src/discovery/CONTEXT.md`](src/discovery/CONTEXT.md)
-- `./src/experience/` → the experience bank and the persisted `ExperienceIndex`; see [`src/experience/CONTEXT.md`](src/experience/CONTEXT.md)
+- `./src/object_artifact.rs` → `ObjectGraphArtifactStore` over `ObjectStore` (in-memory/local/S3/GCS/Azure), `ArtifactTransport`, `open`
+  - `./src/object_artifact/gcs.rs` → `GcsConfig`, `GcsObjectStore` (GCS JSON API)
+  - `./src/object_artifact/azure/` → `AzureBlobConfig`, `AzureBlobAuth`, `AzureBlobStore` (Blob REST + SharedKey signing, SAS, paths, XML)
+  - `./src/object_artifact/http.rs` → shared non-2xx error mapping and the hand-rolled HMAC-SHA256
+- `./src/discovery/` → SKILL.md discovery, the lexical skill catalog, prompt snapshot, notice cursor; see [`src/discovery/CONTEXT.md`](src/discovery/CONTEXT.md)
+- `./src/experience/` → the experience bank, the persisted `ExperienceIndex`, trace ingestion, clustering and collector; see [`src/experience/CONTEXT.md`](src/experience/CONTEXT.md)
 - `./src/flow/` → trace distillation, recipes, SkillPacks, review; see [`src/flow/CONTEXT.md`](src/flow/CONTEXT.md)
-- `./src/llm/` → LLM-guided stages with deterministic fallbacks; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
+- `./src/redaction/` → credential/PII redaction: scanner, sensitive-name matching, JSON redaction
+- `./src/llm/` → LLM-guided stages with deterministic fallbacks, model/metadata identity, match cache; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
 - `./src/orchestration/` → planning and execution
   - `./src/orchestration/plan.rs` → `OrchestrationPlan`, `PlanStep`, `PlanStatus`, JGF projection, stages
   - `./src/orchestration/candidates.rs` → `CandidateGenerator`, relation candidates
   - `./src/orchestration/planner.rs` → `Planner`, `PlanConfig`, `SemanticScorer`, language helpers
   - `./src/orchestration/executor.rs` → `PlanExecutor`, `CapabilityRunner`, plan → `openjiuwen-graph`
-- `./src/evaluation.rs` → fail-soft evaluation suite and static metrics
+- `./src/evaluation/` → fail-soft evaluation: shared contract, static and trace metrics, suite aggregation, windows; see [`src/evaluation/CONTEXT.md`](src/evaluation/CONTEXT.md)
 - `./src/runtime.rs` → `SymphonyRuntime`, config, lifecycle, mutations, evolution
-- `./src/deferred.rs` → the remaining `Error::Unsupported` ML/GPU stubs
-- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `planner`, `executor`, `runtime`, `discovery`, `experience`, `experience_index`, `flow`, `llm`, `object_artifact`, `deferred`
+- `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
+- `./tests/` → behavior suites: `models`, `registry`, `search`, `graph`, `artifact`, `object_artifact`, `artifact_gcs`, `artifact_azure`, `planner`, `executor`, `runtime`, `discovery`, `skill_prompt`, `experience`, `experience_index`, `experience_trace`, `flow`, `redaction`, `evaluation`, `llm`, `matcher_cache`, `deferred`
