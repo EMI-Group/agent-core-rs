@@ -63,6 +63,8 @@ pub mod deferred;
 pub mod evaluator;
 /// Docker + git evaluation harness over an injectable command runner.
 pub mod evaluator_pipeline;
+/// Online RL task registry: task/capture state machine over a primitive store seam.
+pub mod online;
 /// Candidates, the optimizer baseline, and checkpoints/stores/manager.
 pub mod optimizer;
 /// Pure evolution events, observer trait, and harness rail adapter.
