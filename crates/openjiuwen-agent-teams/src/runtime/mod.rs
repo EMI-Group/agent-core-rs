@@ -15,6 +15,7 @@
 //! | [`routing`] | [`TeamModelRouter`]: pool + router selection and the effective member spec |
 //! | [`spec_meta`] | the metadata keys the build path reads (spawn, workspace, org, attach, KV, checkpoint) |
 //! | `checkpoints` | per-member checkpoint identity and store resolution (leader and teammates) |
+//! | `memory_bind` | team-memory resolution and the lifecycle hooks (session, join/leave, flush/export) |
 //! | `observer` | the member observer feeding status, rounds, chunks and signals |
 //! | [`observability_bind`] | [`TeamSignals`]: observability hooks + monitor fan-out |
 //! | [`org_bind`] | [`OrgBinding`]: chart, delegation router, org task pool and mailbox |
@@ -55,6 +56,8 @@ pub mod initial_input;
 pub mod leader;
 /// Process-wide and local runtime management.
 pub mod manager;
+/// Team-memory resolution and the lifecycle hooks the runtime drives.
+pub(crate) mod memory_bind;
 /// Observability hooks and the optional monitor sink, fanned out from one place.
 pub mod observability_bind;
 /// The member observer that drives status, rounds, chunks and signals.

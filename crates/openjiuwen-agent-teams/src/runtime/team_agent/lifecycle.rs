@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use super::super::initial_input::parse_initial_input;
 use super::super::leader;
+use super::super::memory_bind;
 use super::TeamAgent;
 use crate::constants::USER_PSEUDO_MEMBER_NAME;
 use crate::interaction::{DeliverResult, HumanAgentMessage, InteractPayload};
@@ -46,6 +47,14 @@ impl TeamAgent {
     /// Performs the actual start work, in order, so [`Self::start`] can roll the flag back.
     async fn run_start(&self) -> Result<()> {
         self.inner.backend.messager().start().await?;
+        // Team memory is advisory for the run: the session is installed before the leader takes its
+        // first turn, and a rejected session is logged instead of failing the start.
+        memory_bind::session_started(
+            self.inner.backend.memory().as_ref(),
+            self.team_name(),
+            self.session_id(),
+        )
+        .await;
         self.inner.member.start(None).await?;
         self.start_attach().await?;
         self.inner.signals.team_started(Some(self.session_id()));
@@ -63,6 +72,9 @@ impl TeamAgent {
     /// be blocked by them. The member's row settles on the `shutdown` retire target, and every
     /// workspace still retained by the team (the leader's plus every remaining member's, including
     /// rows already shut down) is released exactly once.
+    /// Team memory is closed out last: every still-live member gets its handoff note, then the
+    /// buffered turns are flushed and `TEAM_MEMORY.md` is exported when the configuration exports on
+    /// stop. Each of those is best-effort, so a memory failure never keeps the harness alive.
     ///
     /// # Errors
     ///
@@ -74,6 +86,7 @@ impl TeamAgent {
         if let Some(host) = attach_host {
             host.shutdown().await;
         }
+        self.leave_live_members().await;
         if let Some(runtime) = self.inner.member.runtime() {
             if let Err(error) = runtime.stop().await {
                 warn!(team = self.team_name(), error = %error, "failed to stop the leader runtime");
@@ -100,6 +113,7 @@ impl TeamAgent {
             released, "kv-cache affinity entries released"
         );
         self.release_all_workspaces().await;
+        memory_bind::finish(self.inner.backend.memory().as_ref(), self.team_name()).await;
         self.inner.signals.team_finished();
         debug!(team = self.team_name(), "team agent stopped");
         Ok(())
@@ -256,6 +270,10 @@ impl TeamAgent {
 
     /// Returns the roster projection with the team state and its task board.
     ///
+    /// A caller that reads the snapshot's directory sees a current `TEAM_MEMORY.md`: the document
+    /// is exported best-effort here (a failure is logged), so a snapshot never fails on memory and
+    /// its shape is unchanged.
+    ///
     /// # Errors
     ///
     /// Propagates store failures while reading the board.
@@ -270,6 +288,24 @@ impl TeamAgent {
                 self.inner.backend.snapshot()
             });
         snapshot.state = self.state();
+        memory_bind::export_document(self.inner.backend.memory().as_ref(), self.team_name()).await;
         snapshot
+    }
+
+    /// Hands a handoff note to team memory for every roster row that is still live.
+    ///
+    /// "Live" is [`memory_bind::is_live`]: a row that started at least once and has not departed
+    /// yet. A row that never started never joined, so it has nothing to leave.
+    async fn leave_live_members(&self) {
+        let memory = self.inner.backend.memory();
+        let Some(wiring) = memory.as_ref() else {
+            return;
+        };
+        for member in self.inner.backend.members() {
+            if !memory_bind::is_live(member.status()) {
+                continue;
+            }
+            memory_bind::member_left(Some(wiring), self.team_name(), member.member_name()).await;
+        }
     }
 }

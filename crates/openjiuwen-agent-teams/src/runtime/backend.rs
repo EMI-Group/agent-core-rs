@@ -38,6 +38,7 @@ use openjiuwen_common::utils::id::uuid_hex;
 
 use crate::constants::{BROADCAST_TARGET, DEFAULT_LEADER_MEMBER_NAME, MAX_MESSAGE_CONTENT_CHARS};
 use crate::member::{MemberActivityRegistry, MemberSpawner, TeamMember};
+use crate::memory::TeamMemoryWiring;
 use crate::messager::Messager;
 use crate::monitor::{BackpressurePolicy, MonitorEvent, MonitorReceiver};
 use crate::schema::{
@@ -47,6 +48,8 @@ use crate::schema::{
 use crate::storage::{MessageRecord, TeamInfoRecord, TeamStore};
 use crate::taskboard::{TaskBoard, TaskMutation};
 use crate::workspace::WorkspaceProvider;
+use chrono::Utc;
+use tracing::warn;
 
 use super::health::TeamHealth;
 use super::observability_bind::TeamSignals;
@@ -82,6 +85,8 @@ pub struct TeamBackend {
     signals: RwLock<Option<TeamSignals>>,
     /// The organisation binding, when the spec configures one.
     org: RwLock<Option<Arc<OrgBinding>>>,
+    /// The team-memory wiring, when the built team runs with memory.
+    memory: RwLock<Option<Arc<TeamMemoryWiring>>>,
 }
 
 impl TeamBackend {
@@ -115,6 +120,7 @@ impl TeamBackend {
             members: RwLock::new(BTreeMap::new()),
             signals: RwLock::new(None),
             org: RwLock::new(None),
+            memory: RwLock::new(None),
         }
     }
     /// Installs the team signals, leaving every other field untouched.
@@ -140,6 +146,15 @@ impl TeamBackend {
     #[must_use]
     pub fn org(&self) -> Option<Arc<OrgBinding>> {
         self.org.read().clone()
+    }
+    /// Installs the team-memory wiring the run's coordination messages are handed to.
+    pub fn install_memory(&self, memory: Arc<TeamMemoryWiring>) {
+        *self.memory.write() = Some(memory);
+    }
+    /// Returns the team-memory wiring, when the team runs with memory.
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<TeamMemoryWiring>> {
+        self.memory.read().clone()
     }
     /// Emits one monitor event best-effort (no-op without an installed sink).
     pub fn emit_monitor(&self, event: MonitorEvent) {
@@ -460,6 +475,7 @@ impl TeamBackend {
         });
         self.store.insert_message(record.clone()).await?;
         self.publish_event(TeamTopic::Message, &event, from).await?;
+        self.record_turn(from, None, content).await;
         Ok(record)
     }
 
@@ -475,6 +491,7 @@ impl TeamBackend {
         });
         self.store.insert_message(record.clone()).await?;
         self.publish_event(TeamTopic::Message, &event, from).await?;
+        self.record_turn(from, Some(to), content).await;
         Ok(record)
     }
 
@@ -494,6 +511,30 @@ impl TeamBackend {
             self.direct_row(from, &target, content).await?;
         }
         Ok(first_row)
+    }
+
+    /// Hands one delivered coordination message to the team-memory turn buffer.
+    ///
+    /// This is the single turn seam of the runtime: every mailbox write goes through
+    /// [`Self::send_message`], which ends in one [`Self::broadcast_row`] or one
+    /// [`Self::direct_row`] per addressee, so exactly one turn is buffered per delivered message —
+    /// `to: None` for a broadcast and the addressee for a direct row. Memory tools write to the
+    /// memory store, never to the mailbox, so they buffer nothing.
+    ///
+    /// The hook is advisory: a failure is logged and never fails the send, and a team without
+    /// memory buffers nothing.
+    async fn record_turn(&self, from: &str, to: Option<&str>, content: &str) {
+        let Some(memory) = self.memory() else {
+            return;
+        };
+        if let Err(error) = memory.on_turn_message(from, to, content, Utc::now()).await {
+            warn!(
+                team = self.team_name(),
+                from,
+                %error,
+                "failed to buffer a coordination message in team memory"
+            );
+        }
     }
 }
 

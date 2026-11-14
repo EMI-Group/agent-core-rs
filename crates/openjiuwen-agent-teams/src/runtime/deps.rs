@@ -1,8 +1,8 @@
 //! The dependencies a team runtime is built from.
 //!
 //! [`TeamBuildDeps`] is the single injection point of the runtime: a harness factory that
-//! materializes one harness per member, the persisted-state store, the workspace provider and the
-//! team language. The Python reference reaches the same objects through module-level imports and
+//! materializes one harness per member, the persisted-state store, the workspace provider, the
+//! team language, and the optional team-shared checkpoint store and team-memory wiring. The Python reference reaches the same objects through module-level imports and
 //! `TeamAgent.__init__` keyword arguments; this port threads them explicitly so a test can build a
 //! runtime without touching the environment or the filesystem.
 //!
@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::harness::{MemberCheckpointStore, MemberHarnessFactory, NativeMemberFactory};
 use crate::kv_cache::TeamKvCacheAffinity;
+use crate::memory::TeamMemoryWiring;
 use crate::observability::ObservabilityHooks;
 use crate::schema::Language;
 use crate::storage::{InMemoryTeamStore, TeamStore};
@@ -75,6 +76,15 @@ pub struct TeamBuildDeps {
     /// written back here before the spawner is built, so the leader and every teammate share one
     /// destination instead of each opening its own.
     pub checkpoints: Option<Arc<dyn MemberCheckpointStore>>,
+    /// Team-memory wiring: the one the build path resolved or the host injected.
+    ///
+    /// `None` makes the build path resolve the wiring from
+    /// [`metadata["memory"]`](crate::schema::TeamAgentSpec::metadata) (see
+    /// [`TeamMemoryWiring`] and the `src/runtime/memory_bind` module). A team that configures
+    /// neither runs without memory, and a `{"enabled": false}` block allocates no wiring at all.
+    /// The resolved wiring is written back here before the leader harness is built, so the leader
+    /// and every spawned teammate mount their tools from the same team scope.
+    pub memory: Option<Arc<TeamMemoryWiring>>,
 }
 
 impl TeamBuildDeps {
@@ -185,6 +195,27 @@ impl TeamBuildDeps {
         self.checkpoints.is_some()
     }
 
+    /// Injects the team-memory wiring the leader and every member mount their tools from.
+    ///
+    /// The build path treats an injected wiring as the team's memory and only falls back to
+    /// [`metadata["memory"]`](crate::schema::TeamAgentSpec::metadata) when none was supplied, so a
+    /// host that owns the memory of several teams can hand in one wiring per team.
+    #[must_use]
+    pub fn with_memory(self, memory: Arc<TeamMemoryWiring>) -> Self {
+        Self {
+            memory: Some(memory),
+            ..self
+        }
+    }
+
+    /// Returns `true` when a host injected the team-memory wiring.
+    ///
+    /// A team with no injected wiring and no `metadata["memory"]` block runs without memory.
+    #[must_use]
+    pub fn has_injected_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
     /// Resolves the declared language to its wire value, falling back to `cn`.
     ///
     /// Python parity: `resolve_language`, which treats an absent or unknown value as the default
@@ -209,6 +240,7 @@ impl Default for TeamBuildDeps {
             kv_cache: None,
             routing: None,
             checkpoints: None,
+            memory: None,
         }
     }
 }
@@ -230,6 +262,10 @@ impl fmt::Debug for TeamBuildDeps {
             .field(
                 "checkpoints",
                 &self.checkpoints.as_ref().map(|store| store.name()),
+            )
+            .field(
+                "memory",
+                &self.memory.as_ref().map(|memory| memory.team_id()),
             )
             .finish()
     }
@@ -284,6 +320,8 @@ mod tests {
             "the default has no checkpoint store"
         );
         assert!(!deps.has_injected_checkpoints());
+        assert!(deps.memory.is_none(), "the default has no memory wiring");
+        assert!(!deps.has_injected_memory());
     }
 
     #[test]
@@ -374,6 +412,26 @@ mod tests {
         assert!(format!("{deps:?}").contains("checkpoints: Some(\"memory\")"));
     }
 
+    #[tokio::test]
+    async fn with_memory_overrides_only_the_memory() {
+        let base = TeamBuildDeps::default();
+        let dir = tempfile::tempdir().unwrap();
+        let wiring =
+            TeamMemoryWiring::open("team-1", crate::memory::MemoryConfig::default(), dir.path())
+                .await
+                .unwrap();
+        let deps = base.clone().with_memory(Arc::clone(&wiring));
+        let injected = deps.memory.as_ref().expect("the wiring was injected");
+        assert!(Arc::ptr_eq(injected, &wiring));
+        assert_eq!(injected.team_id(), "team-1");
+        assert!(deps.has_injected_memory());
+        assert!(!base.has_injected_memory());
+        assert!(Arc::ptr_eq(&deps.harness_factory, &base.harness_factory));
+        assert!(Arc::ptr_eq(&deps.store, &base.store));
+        assert!(Arc::ptr_eq(&deps.workspace, &base.workspace));
+        assert!(deps.checkpoints.is_none());
+        assert!(format!("{deps:?}").contains("memory: Some(\"team-1\")"));
+    }
     #[test]
     fn resolved_language_accepts_wire_values_and_falls_back() {
         let cases = [
@@ -404,5 +462,6 @@ mod tests {
         assert!(debug.contains("store_injected: false"), "{debug}");
         assert!(debug.contains("language: None"), "{debug}");
         assert!(debug.contains("checkpoints: None"), "{debug}");
+        assert!(debug.contains("memory: None"), "{debug}");
     }
 }
