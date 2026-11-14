@@ -48,6 +48,7 @@ Everything is offline and deterministic: members are in-process closures, sessio
 - `./routing.rs` → `GroupRegistry`, `broadcast_targets`, `broadcast_to_group` (metadata stamp, skipped members, isolated failures, one group event), `RoutingTable` resolution and serde.
 - `./inbox.rs` → `InboxFilter` rules, `InboxFilterRegistry` default-accept, and runtime P2P/pub-sub enforcement.
 - `./communicable.rs` → `CommunicableAgent` binding lifecycle and an in-process messaging round trip.
+- `./api_surface_extensions.rs` → compile-time pinning of the additive root re-exports (`GroupRegistry`, `broadcast_targets`, `GROUP_METADATA_KEY`, `GroupBroadcast`/`GroupDelivery`, `RoutingTable`, `InboxFilter`/`InboxFilterRegistry`, `CommunicableAgent`), the new `TeamRuntime`/`MessageBus` methods, and the serde/`schemars` contracts of the new data types.
 - `./ability.rs` → `P2PAbilityManager` batch dispatch: P2P vs local routing, input-order results, per-call failures, parallel cap.
 
 ## Test Strategy
