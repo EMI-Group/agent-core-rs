@@ -235,18 +235,17 @@ impl Dreamer {
         for tips in by_category.values() {
             let mut ids: Vec<String> = tips.iter().map(|tip| tip.tip_id.clone()).collect();
             ids.sort();
-            let mut found = match index {
-                Some(index) => embedding_clusters(index, &ids, threshold),
-                None => {
-                    let token_sets: Vec<Vec<String>> = ids
-                        .iter()
-                        .map(|tip_id| {
-                            bank.get(tip_id)
-                                .map_or_else(Vec::new, |tip| tokenize(&tip.rule))
-                        })
-                        .collect();
-                    connected_clusters(&ids, &token_sets, threshold)
-                }
+            let mut found = if let Some(index) = index {
+                embedding_clusters(index, &ids, threshold)
+            } else {
+                let token_sets: Vec<Vec<String>> = ids
+                    .iter()
+                    .map(|tip_id| {
+                        bank.get(tip_id)
+                            .map_or_else(Vec::new, |tip| tokenize(&tip.rule))
+                    })
+                    .collect();
+                connected_clusters(&ids, &token_sets, threshold)
             };
             found.retain(|cluster| cluster.len() >= min_size);
             clusters.extend(found);
@@ -351,13 +350,13 @@ pub fn parse_merge_verdict(text: &str, cluster_size: usize) -> Option<MergeVerdi
                 }
             });
         } else if upper.starts_with("CANONICAL") {
-            canonical = payload(trimmed).unwrap_or("").to_owned();
+            payload(trimmed).unwrap_or("").clone_into(&mut canonical);
         } else if upper.starts_with("MERGE_INDICES") {
             merge_indices = index_list(payload(trimmed).unwrap_or(""), cluster_size);
         } else if upper.starts_with("KEEP_INDICES") {
             keep_indices = index_list(payload(trimmed).unwrap_or(""), cluster_size);
         } else if upper.starts_with("REASON") {
-            reason = payload(trimmed).unwrap_or(trimmed).to_owned();
+            payload(trimmed).unwrap_or(trimmed).clone_into(&mut reason);
         }
     }
     let thinking = thinking.join("\n").trim().to_owned();
@@ -472,7 +471,7 @@ pub fn parse_purge_verdicts(text: &str, batch_size: usize) -> Vec<PurgeVerdict> 
                     }
                 });
             } else if upper.starts_with("REASON") {
-                reason = payload(part).unwrap_or("").to_owned();
+                payload(part).unwrap_or("").clone_into(&mut reason);
             }
         }
         let (Some(index), Some(verdict)) = (index, decision) else {
@@ -482,7 +481,7 @@ pub fn parse_purge_verdicts(text: &str, batch_size: usize) -> Vec<PurgeVerdict> 
             continue;
         }
         if reason.is_empty() {
-            reason = "ok".to_owned();
+            "ok".clone_into(&mut reason);
         }
         verdicts.push(PurgeVerdict {
             index,
@@ -544,12 +543,12 @@ fn purge_candidates(bank: &TipBank, checked: &BTreeSet<String>) -> Vec<(String, 
 fn embedding_clusters(index: &EmbeddingIndex, ids: &[String], threshold: f64) -> Vec<Vec<String>> {
     let vectors: Vec<Option<&[f32]>> = ids.iter().map(|tip_id| index.vector(tip_id)).collect();
     let mut parents: Vec<usize> = (0..ids.len()).collect();
-    for left in 0..ids.len() {
-        let Some(left_vector) = vectors[left] else {
+    for (left, left_vector) in vectors.iter().enumerate() {
+        let Some(left_vector) = *left_vector else {
             continue;
         };
-        for right in (left + 1)..ids.len() {
-            let Some(right_vector) = vectors[right] else {
+        for (right, right_vector) in vectors.iter().enumerate().skip(left + 1) {
+            let Some(right_vector) = *right_vector else {
                 continue;
             };
             if cosine(left_vector, right_vector) < threshold {
@@ -755,7 +754,7 @@ fn apply_merge(bank: &mut TipBank, cluster: &[String], verdict: &MergeVerdict) -
             if let Some(record) = bank.get_mut(&representative) {
                 record.rule = canonical;
                 record.tip_id = new_id;
-                record.source = "dream".to_owned();
+                "dream".clone_into(&mut record.source);
                 record.updated_tick = tick;
             }
         }
@@ -834,10 +833,10 @@ fn index_list(payload: &str, cluster_size: usize) -> Vec<usize> {
 
 /// Removes duplicates while preserving first-seen order.
 fn dedupe_indices(indices: Vec<usize>) -> Vec<usize> {
-    let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
     let mut deduped: Vec<usize> = Vec::new();
     for index in indices {
-        if seen.insert(index, ()).is_none() {
+        if seen.insert(index) {
             deduped.push(index);
         }
     }
@@ -943,7 +942,7 @@ mod tests {
         assert_eq!(verdicts[1].index, 1);
         assert_eq!(verdicts[1].verdict, PurgeDecision::Purge);
         assert_eq!(verdicts[1].reason, "tip_malformed");
-        assert!(parse_purge_verdicts("", 3).is_empty());
+        assert_eq!(parse_purge_verdicts("", 3).len(), 0);
     }
 
     #[test]
@@ -1032,7 +1031,7 @@ mod tests {
 
     #[async_trait]
     impl Embedding for ConstantEmbedding {
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "constant"
         }
 
@@ -1274,7 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_merge_budget_caps_the_number_of_prompts() {
-        let model = ScriptedModel::text(&merge_answer());
+        let model = ScriptedModel::text(merge_answer());
         let mut dreamer = Dreamer::new(dream_config()).with_max_llm_merges(0);
         dreamer = dreamer.with_model(
             Arc::new(model.clone()) as Arc<dyn Model>,

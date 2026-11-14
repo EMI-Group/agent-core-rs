@@ -688,7 +688,7 @@ mod tests {
             .consult_with("run the tests offline", RetrieveMode::Embed)
             .await
             .expect("consult by embedding");
-        assert!(!embedded.tips.is_empty());
+        assert_ne!(embedded.tips.len(), 0);
         assert_eq!(engine.consult_count(), 2);
     }
 

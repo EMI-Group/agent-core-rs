@@ -77,9 +77,11 @@ impl fmt::Debug for EmbeddingIndex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EmbeddingIndex")
+            .field("embedding", &self.embedding.model_name())
             .field("model_name", &self.model_name)
             .field("dimension", &self.dimension)
             .field("vectors", &self.vectors.len())
+            .field("texts", &self.texts.len())
             .field("path", &self.path)
             .finish()
     }
@@ -527,12 +529,11 @@ mod tests {
         assert!(matches[0].score > matches[1].score);
         assert!(matches[0].score <= 1.0 + 1e-9);
 
-        assert!(index.query("  ", 8).await.expect("blank query").is_empty());
-        assert!(index
-            .query("anything", 0)
-            .await
-            .expect("zero limit")
-            .is_empty());
+        assert_eq!(index.query("  ", 8).await.expect("blank query").len(), 0);
+        assert_eq!(
+            index.query("anything", 0).await.expect("zero limit").len(),
+            0
+        );
     }
 
     #[tokio::test]

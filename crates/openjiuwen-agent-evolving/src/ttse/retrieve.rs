@@ -308,7 +308,7 @@ mod tests {
 
     #[async_trait]
     impl Embedding for FixedEmbedding {
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "fixed"
         }
 
@@ -456,15 +456,21 @@ mod tests {
     #[tokio::test]
     async fn empty_inputs_are_empty() {
         let empty = TipBank::with_capacity(4);
-        assert!(rank(&empty, None, QUERY, 8, RetrieveMode::Hybrid)
-            .await
-            .expect("empty bank")
-            .is_empty());
+        assert_eq!(
+            rank(&empty, None, QUERY, 8, RetrieveMode::Hybrid)
+                .await
+                .expect("empty bank")
+                .len(),
+            0
+        );
         let bank = bank();
-        assert!(rank(&bank, None, QUERY, 0, RetrieveMode::Hybrid)
-            .await
-            .expect("zero limit")
-            .is_empty());
+        assert_eq!(
+            rank(&bank, None, QUERY, 0, RetrieveMode::Hybrid)
+                .await
+                .expect("zero limit")
+                .len(),
+            0
+        );
         let dumped = rank(&bank, None, "   ", 2, RetrieveMode::Hybrid)
             .await
             .expect("blank query");
