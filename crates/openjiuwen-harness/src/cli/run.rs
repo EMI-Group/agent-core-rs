@@ -33,6 +33,9 @@
 //! - **permission rules** — the permanent allow rules under the CLI home are
 //!   merged onto the built-in section and handed to the agent and to
 //!   [`CliPermissionHost`], which writes new "always allow" answers back.
+// Size note: ~520 lines of implementation plus an inline test module covering every
+// output format, prompt source and failure path; the resolution helpers live in `paths`,
+// `usage` and `options`.
 
 use std::sync::Arc;
 

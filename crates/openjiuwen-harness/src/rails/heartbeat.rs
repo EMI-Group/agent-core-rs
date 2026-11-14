@@ -30,6 +30,8 @@
 //! is exceeded (a capacity of `0` keeps every pair). Both live in this rail
 //! instance (never in process-global state) and are only read through short
 //! `parking_lot` critical sections.
+// Size note: ~560 lines of implementation plus an inline test module; the cadence logic
+// and the prompt section are small, the behavioural tests dominate.
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, OnceLock};

@@ -26,6 +26,8 @@
 //! default [`ExtractiveSummarizer`] produces that summary without a model; a host that wants an
 //! LLM-written summary injects its own [`WindowSummarizer`] through
 //! [`WindowAssembler::with_summarizer`].
+// Size note: ~830 lines of implementation plus an inline test module; the rendering
+// table, budget accounting and rollover planner are one cohesive unit.
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;

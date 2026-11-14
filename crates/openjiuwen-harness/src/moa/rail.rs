@@ -40,6 +40,8 @@
 //! entry also finds the failure recorded rather than silently dropped. No hook takes a lock
 //! across an `.await`: every lock guard lives in a synchronous statement and is dropped before
 //! the next suspension point.
+// Size note: ~600 lines of rail implementation plus its inline behavioural test suite;
+// consultation, ranking and aggregation live in the sibling modules.
 // The public names (`MoaRail`, `MOA_PROMPT_SECTION`, ...) mirror the Python contract and
 // intentionally repeat the module name.
 #![allow(clippy::module_name_repetitions)]

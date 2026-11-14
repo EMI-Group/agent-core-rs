@@ -9,6 +9,8 @@
 //! switching, input dispatch/phases, the persisted-state entry points, the outer
 //! task loop (follow-up rounds, steering, abort), stream frames, the single-run
 //! guard, rail-published prompt sections, and the factory assembly.
+// Size note: this file is the `agent` node's test suite only; its length is test cases,
+// not production code.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
