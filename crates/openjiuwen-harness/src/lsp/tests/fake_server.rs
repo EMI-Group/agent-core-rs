@@ -132,6 +132,17 @@ fn call_item(name: &str, uri: &str, line: u32) -> Value {
     })
 }
 
+/// Extracts the `item.uri` of a call-hierarchy request.
+fn item_uri(message: &Value) -> String {
+    message
+        .get("params")
+        .and_then(|params| params.get("item"))
+        .and_then(|item| item.get("uri"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Extracts the document URI from a text-document request.
 fn document_uri(message: &Value) -> String {
     message
@@ -344,54 +355,106 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
             }
             "textDocument/implementation" => {
                 let uri = document_uri(&message);
-                // A `LocationLink`, which the client must normalise like a `Location`.
-                response(
-                    id,
-                    json!([{
-                        "targetUri": uri,
-                        "targetRange": range(5, 0),
-                        "targetSelectionRange": range(5, 4),
-                        "originSelectionRange": range(0, 0),
-                    }]),
-                )
+                if uri.contains("unsupported") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: textDocument/implementation"),
+                    )
+                } else {
+                    // A `LocationLink`, which the client must normalise like a `Location`.
+                    response(
+                        id,
+                        json!([{
+                            "targetUri": uri,
+                            "targetRange": range(5, 0),
+                            "targetSelectionRange": range(5, 4),
+                            "originSelectionRange": range(0, 0),
+                        }]),
+                    )
+                }
             }
-            "textDocument/prepareCallHierarchy" => response(
-                id,
-                json!([
-                    {
-                        "name": "caller",
-                        "kind": 12,
-                        "detail": "fn caller()",
-                        "uri": "file:///workspace/src/caller.rs",
-                        "range": range(1, 0),
-                        "selectionRange": range(1, 3),
-                        "originSelectionRange": range(2, 0),
-                    },
-                    {
-                        // Nested `textDocument` shape: the parser must flatten it.
-                        "name": "callee",
-                        "kind": 12,
-                        "textDocument": { "uri": "file:///workspace/src/callee.rs" },
-                        "range": range(7, 0),
-                        "selectionRange": range(7, 3),
-                        "data": { "id": 7 },
-                    },
-                ]),
-            ),
-            "callHierarchy/incomingCalls" => response(
-                id,
-                json!([{
-                    "from": call_item("caller", "file:///workspace/src/caller.rs", 1),
-                    "fromRanges": [range(2, 4)],
-                }]),
-            ),
-            "callHierarchy/outgoingCalls" => response(
-                id,
-                json!([{
-                    "to": call_item("callee", "file:///workspace/src/callee.rs", 5),
-                    "fromRanges": [range(3, 2)],
-                }]),
-            ),
+            "textDocument/prepareCallHierarchy" => {
+                let uri = document_uri(&message);
+                if uri.contains("unsupported") {
+                    error(
+                        id,
+                        &LspError::new(
+                            -32601,
+                            "method not found: textDocument/prepareCallHierarchy",
+                        ),
+                    )
+                } else if uri.contains("noitems") {
+                    response(id, json!([]))
+                } else if uri.contains("nocalls") {
+                    // Preparation succeeds; the `callHierarchy/*` requests report -32601.
+                    response(
+                        id,
+                        json!([{
+                            "name": "no-calls",
+                            "kind": 12,
+                            "uri": uri,
+                            "range": range(4, 0),
+                            "selectionRange": range(4, 3),
+                        }]),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([
+                            {
+                                "name": "caller",
+                                "kind": 12,
+                                "detail": "fn caller()",
+                                "uri": "file:///workspace/src/caller.rs",
+                                "range": range(1, 0),
+                                "selectionRange": range(1, 3),
+                                "originSelectionRange": range(2, 0),
+                            },
+                            {
+                                // Nested `textDocument` shape: the parser must flatten it.
+                                "name": "callee",
+                                "kind": 12,
+                                "textDocument": { "uri": "file:///workspace/src/callee.rs" },
+                                "range": range(7, 0),
+                                "selectionRange": range(7, 3),
+                                "data": { "id": 7 },
+                            },
+                        ]),
+                    )
+                }
+            }
+            "callHierarchy/incomingCalls" => {
+                if item_uri(&message).contains("nocalls") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: callHierarchy/incomingCalls"),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([{
+                            "from": call_item("caller", "file:///workspace/src/caller.rs", 1),
+                            "fromRanges": [range(2, 4)],
+                        }]),
+                    )
+                }
+            }
+            "callHierarchy/outgoingCalls" => {
+                if item_uri(&message).contains("nocalls") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: callHierarchy/outgoingCalls"),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([{
+                            "to": call_item("callee", "file:///workspace/src/callee.rs", 5),
+                            "fromRanges": [range(3, 2)],
+                        }]),
+                    )
+                }
+            }
             "textDocument/diagnostic" => {
                 let previous = message
                     .get("params")

@@ -15,6 +15,8 @@ mod fake_server;
 mod framing;
 mod retry;
 mod tool;
+mod tool_lifecycle;
+mod tool_ops;
 mod transport;
 mod uri;
 mod wire;
