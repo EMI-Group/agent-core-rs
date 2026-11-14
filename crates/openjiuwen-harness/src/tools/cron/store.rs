@@ -1,14 +1,15 @@
-//! The persisted cron job list and the scheduler that owns it.
+//! The persisted cron job list, its run history and the scheduler that owns both.
 //!
-//! [`CronScheduler`] keeps every job in one JSON array at `<dir>/jobs.json`. It has no
-//! background task and no daemon thread: the host polls [`CronScheduler::due`] with its own
-//! clock, and each call returns the jobs whose turn has come while atomically advancing their
-//! `next_run_at`. All timestamps are passed in by the caller, so the scheduler never reads the
-//! wall clock itself and tests stay deterministic.
+//! [`CronScheduler`] keeps every job in one JSON array at `<dir>/jobs.json` and the bounded run
+//! history in `<dir>/runs.json`. It has no background task and no daemon thread: the host polls
+//! [`CronScheduler::due`] with its own clock, and each call returns the jobs whose turn has come
+//! while atomically advancing their `next_run_at`. All timestamps are passed in by the caller,
+//! so the scheduler never reads the wall clock itself and tests stay deterministic.
 //!
 //! Concurrency: one async lock per scheduler instance serializes every read-modify-write, and
-//! no process-global state exists. Two schedulers over the same directory share only the file;
+//! no process-global state exists. Two schedulers over the same directory share only the files;
 //! a caller that needs mutual exclusion across instances has to avoid two writers at once.
+//! Both files are written through a temporary file plus rename.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use tokio::sync::Mutex;
 
 use openjiuwen_common::error::{Error, Result};
 
+use super::history::{CronRun, CronRunHistory, CronRunTrigger};
 use super::schedule::CronSchedule;
 use crate::workspace::Workspace;
 
@@ -60,23 +62,81 @@ fn enabled_by_default() -> bool {
     true
 }
 
+/// A partial change to a stored job, applied by [`CronScheduler::update`].
+///
+/// Every field is optional: `None` leaves the stored value untouched, so a patch carries only
+/// what the caller wants to change. [`Self::enabled`] recomputes `next_run_at` when it turns a
+/// job *on* and holds the stored value when it turns one *off*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CronUpdate {
+    /// Replacement cron expression, re-parsed and validated before it is stored.
+    pub cron: Option<String>,
+    /// Replacement prompt text.
+    pub prompt: Option<String>,
+    /// Replacement human description.
+    pub description: Option<String>,
+    /// Replacement enabled flag.
+    pub enabled: Option<bool>,
+}
+
+impl CronUpdate {
+    /// A patch that only changes the enabled flag.
+    #[must_use]
+    pub fn enabled(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the patch would change anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cron.is_none()
+            && self.prompt.is_none()
+            && self.description.is_none()
+            && self.enabled.is_none()
+    }
+}
+
+/// Summary of the job list returned by [`CronScheduler::status`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronStatus {
+    /// Number of stored jobs, enabled or not.
+    pub total: usize,
+    /// Number of enabled jobs.
+    pub enabled: usize,
+    /// Number of disabled jobs.
+    pub disabled: usize,
+    /// Number of enabled jobs whose `next_run_at` has already passed at the queried instant.
+    pub due: usize,
+    /// Earliest pending occurrence among the enabled jobs.
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// Number of run-history records currently stored, across every job.
+    pub runs: usize,
+}
+
 /// The persisted cron job list of one scheduler directory.
 ///
 /// The scheduler is cheap to clone through [`Arc`] and holds a single async lock, so every
 /// mutation is a consistent load-modify-save sequence.
 pub struct CronScheduler {
-    /// Directory holding `jobs.json`.
+    /// Directory holding `jobs.json` and `runs.json`.
     dir: PathBuf,
     /// Serializes the load-modify-save sequences of this instance.
     lock: Mutex<()>,
+    /// The bounded run history recorded by `due` and `run_now`.
+    history: CronRunHistory,
 }
 
 impl CronScheduler {
-    /// Builds a scheduler persisting at `<dir>/jobs.json`.
+    /// Builds a scheduler persisting at `<dir>/jobs.json` and `<dir>/runs.json`.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Arc<Self> {
+        let dir = dir.into();
         Arc::new(Self {
-            dir: dir.into(),
+            history: CronRunHistory::new(dir.clone()),
+            dir,
             lock: Mutex::new(()),
         })
     }
@@ -93,7 +153,7 @@ impl CronScheduler {
         Self::new(dir)
     }
 
-    /// The directory holding the job file.
+    /// The directory holding the job and history files.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -105,6 +165,12 @@ impl CronScheduler {
         self.dir.join(JOBS_FILE)
     }
 
+    /// The absolute or workspace-relative path of `runs.json`.
+    #[must_use]
+    pub fn history_path(&self) -> PathBuf {
+        self.history.file()
+    }
+
     /// Loads every job, enabled or not; a missing file means "no jobs yet".
     ///
     /// # Errors
@@ -112,13 +178,22 @@ impl CronScheduler {
     /// Returns an error when the file exists but cannot be read or does not hold a JSON array
     /// of [`CronJob`] values.
     pub async fn list(&self) -> Result<Vec<CronJob>> {
-        let path = self.path();
-        let bytes = match tokio::fs::read(&path).await {
+        let bytes = match tokio::fs::read(self.path()).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Returns the job with `id`, or `None` when no such job exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the job file cannot be read.
+    pub async fn get(&self, id: &str) -> Result<Option<CronJob>> {
+        let _guard = self.lock.lock().await;
+        Ok(self.list().await?.into_iter().find(|job| job.id == id))
     }
 
     /// Creates a job from `schedule` and persists it.
@@ -154,12 +229,9 @@ impl CronScheduler {
         description: impl Into<String>,
         now: DateTime<Utc>,
     ) -> Result<CronJob> {
-        let next_run_at = schedule.next_after(now).ok_or_else(|| {
-            Error::validation(format!(
-                "cron expression never matches a future time: {:?}",
-                schedule.expression()
-            ))
-        })?;
+        let next_run_at = schedule
+            .next_after(now)
+            .ok_or_else(|| never_matches(schedule))?;
         let job = CronJob {
             id: uuid::Uuid::new_v4().to_string(),
             cron: schedule.expression().to_owned(),
@@ -177,11 +249,168 @@ impl CronScheduler {
         Ok(job)
     }
 
-    /// Removes the job with `id`, returning it, or `None` when no such job exists.
+    /// Applies `patch` to the job with `id`, returning the updated job.
+    ///
+    /// Changing the expression recomputes `next_run_at` from `now`, and enabling a job does the
+    /// same; disabling a job keeps its stored occurrence so the value is not lost. A missing job
+    /// yields `Ok(None)`, an empty patch yields the untouched job.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the job file cannot be read or written.
+    /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation) when a new
+    /// expression does not parse or can never match, and a storage error when the job file
+    /// cannot be read or written. A rejected patch leaves the stored job untouched.
+    pub async fn update(
+        &self,
+        id: &str,
+        patch: &CronUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CronJob>> {
+        let patch = patch.clone();
+        self.patch(id, move |_| patch, now).await
+    }
+
+    /// Sets the enabled flag of the job with `id`, returning the updated job.
+    ///
+    /// Enabling recomputes `next_run_at` from `now`; disabling keeps the stored value, so a job
+    /// that is re-enabled later always lands on a fresh future occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::update`].
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CronJob>> {
+        self.patch(id, move |_| CronUpdate::enabled(enabled), now)
+            .await
+    }
+
+    /// Flips the enabled flag of the job with `id`, returning the updated job.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::update`].
+    pub async fn toggle(&self, id: &str, now: DateTime<Utc>) -> Result<Option<CronJob>> {
+        self.patch(id, |job| CronUpdate::enabled(!job.enabled), now)
+            .await
+    }
+
+    /// Returns up to `count` occurrences of the job with `id` strictly after `now`.
+    ///
+    /// Preview never mutates state: the stored `next_run_at` and the enabled flag are left
+    /// exactly as they are, and a disabled job still previews its expression. A missing job
+    /// yields `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the stored expression no longer parses, and a storage
+    /// error when the job file cannot be read.
+    pub async fn preview(
+        &self,
+        id: &str,
+        count: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<DateTime<Utc>>>> {
+        let _guard = self.lock.lock().await;
+        let jobs = self.list().await?;
+        let Some(job) = jobs.iter().find(|job| job.id == id) else {
+            return Ok(None);
+        };
+        let schedule = CronSchedule::parse(&job.cron)?;
+        Ok(Some(schedule.next_occurrences(now, count)))
+    }
+
+    /// Records a manual execution of the job with `id` and advances its schedule.
+    ///
+    /// The prompt is **not** executed here: the host runs it when it sees the run record. The
+    /// stored job keeps its enabled flag (an explicit manual run is allowed on a disabled job)
+    /// and its `next_run_at` moves to the first occurrence strictly after `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the stored expression no longer parses or can never
+    /// match, and a storage error when either file cannot be read or written. The schedule is
+    /// persisted before the run record, so a history failure leaves an advanced job with no
+    /// record.
+    pub async fn run_now(&self, id: &str, now: DateTime<Utc>) -> Result<Option<CronRun>> {
+        let _guard = self.lock.lock().await;
+        let mut jobs = self.list().await?;
+        let Some(index) = jobs.iter().position(|job| job.id == id) else {
+            return Ok(None);
+        };
+        let schedule = CronSchedule::parse(&jobs[index].cron)?;
+        let next_run_at = schedule
+            .next_after(now)
+            .ok_or_else(|| never_matches(&schedule))?;
+        jobs[index].next_run_at = next_run_at;
+        let job_id = jobs[index].id.clone();
+        self.persist(&jobs).await?;
+        let run = CronRun::new(job_id, CronRunTrigger::Manual, now, now, next_run_at);
+        self.history.record(run.clone()).await?;
+        Ok(Some(run))
+    }
+
+    /// Returns the run history of one job, or of every job, newest first.
+    ///
+    /// `job_id == None` reads the whole file. `limit` caps the returned entries after sorting;
+    /// `0` means "no limit". The file itself is bounded (see the `history` module).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the history file cannot be read.
+    pub async fn runs(&self, job_id: Option<&str>, limit: usize) -> Result<Vec<CronRun>> {
+        let _guard = self.lock.lock().await;
+        let mut runs = self.history.load().await?;
+        if let Some(job_id) = job_id {
+            runs.retain(|run| run.job_id == job_id);
+        }
+        runs.reverse();
+        if limit > 0 {
+            runs.truncate(limit);
+        }
+        Ok(runs)
+    }
+
+    /// Summarizes the job list and the run history at `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when either file cannot be read.
+    pub async fn status(&self, now: DateTime<Utc>) -> Result<CronStatus> {
+        let _guard = self.lock.lock().await;
+        let jobs = self.list().await?;
+        let runs = self.history.load().await?;
+        let enabled = jobs.iter().filter(|job| job.enabled).count();
+        let due = jobs
+            .iter()
+            .filter(|job| job.enabled && job.next_run_at <= now)
+            .count();
+        let next_run_at = jobs
+            .iter()
+            .filter(|job| job.enabled)
+            .map(|job| job.next_run_at)
+            .min();
+        Ok(CronStatus {
+            total: jobs.len(),
+            enabled,
+            disabled: jobs.len() - enabled,
+            due,
+            next_run_at,
+            runs: runs.len(),
+        })
+    }
+
+    /// Removes the job with `id` and its run history, returning the job.
+    ///
+    /// Returns `None` when no such job exists. The history file is trimmed of the job's records
+    /// so `runs` never reports entries of a job that no longer exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when either file cannot be read or written.
     pub async fn cancel(&self, id: &str) -> Result<Option<CronJob>> {
         let _guard = self.lock.lock().await;
         let mut jobs = self.list().await?;
@@ -190,359 +419,159 @@ impl CronScheduler {
         };
         let removed = jobs.remove(index);
         self.persist(&jobs).await?;
+        self.history.remove_job(&removed.id).await?;
         Ok(Some(removed))
     }
 
-    /// Returns the jobs that are due at `now` and advances their next occurrence.
+    /// Returns the jobs that are due at `now`, advances them and records a run for each.
     ///
     /// A job is due when it is enabled and `next_run_at <= now`. Each returned value is the
     /// snapshot taken *before* the advance, so its `next_run_at` is the occurrence that just
-    /// fired; the persisted job keeps the first occurrence strictly after `now`. A job whose
-    /// stored expression no longer parses, or can never match again, is returned once and then
-    /// disabled, with a `tracing` warning naming the job, so a corrupt entry cannot fire
+    /// fired; the persisted job keeps the first occurrence strictly after `now`, and a
+    /// [`CronRun`] with [`CronRunTrigger::Scheduled`] is appended to the bounded history. A job
+    /// whose stored expression no longer parses, or can never match again, is returned once and
+    /// then disabled, with a `tracing` warning naming the job, so a corrupt entry cannot fire
     /// forever.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the job file cannot be read or written.
+    /// Returns a storage error when a file cannot be read or written. The job list is persisted
+    /// before the run records, so a history failure leaves advanced jobs with fewer records.
     pub async fn due(&self, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let _guard = self.lock.lock().await;
         let mut jobs = self.list().await?;
         let mut due = Vec::new();
+        let mut fired = Vec::new();
         for job in &mut jobs {
             if !job.enabled || job.next_run_at > now {
                 continue;
             }
-            let fired = job.clone();
+            let occurrence = job.next_run_at;
+            let snapshot = job.clone();
             let advanced = CronSchedule::parse(&job.cron).map(|schedule| schedule.next_after(now));
-            if let Ok(Some(next)) = advanced {
-                job.next_run_at = next;
-            } else {
-                tracing::warn!(
-                    job_id = %job.id,
-                    cron = %job.cron,
-                    "cron job can never run again; disabling it"
-                );
-                job.enabled = false;
+            match advanced {
+                Ok(Some(next)) => {
+                    job.next_run_at = next;
+                    fired.push(CronRun::new(
+                        job.id.clone(),
+                        CronRunTrigger::Scheduled,
+                        now,
+                        occurrence,
+                        next,
+                    ));
+                }
+                Ok(None) | Err(_) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        cron = %job.cron,
+                        "cron job can never run again; disabling it"
+                    );
+                    job.enabled = false;
+                    fired.push(CronRun::new(
+                        job.id.clone(),
+                        CronRunTrigger::Scheduled,
+                        now,
+                        occurrence,
+                        occurrence,
+                    ));
+                }
             }
-            due.push(fired);
+            due.push(snapshot);
         }
         if due.is_empty() {
             return Ok(due);
         }
         self.persist(&jobs).await?;
+        for run in fired {
+            self.history.record(run).await?;
+        }
         Ok(due)
+    }
+
+    /// Applies `patch` — computed from the current job — under the scheduler lock.
+    async fn patch(
+        &self,
+        id: &str,
+        make: impl FnOnce(&CronJob) -> CronUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CronJob>> {
+        let _guard = self.lock.lock().await;
+        let mut jobs = self.list().await?;
+        let Some(index) = jobs.iter().position(|job| job.id == id) else {
+            return Ok(None);
+        };
+        let patch = make(&jobs[index]);
+        apply_patch(&mut jobs[index], &patch, now)?;
+        let updated = jobs[index].clone();
+        self.persist(&jobs).await?;
+        Ok(Some(updated))
     }
 
     /// Replaces `jobs.json` through an atomic rename.
     async fn persist(&self, jobs: &[CronJob]) -> Result<()> {
-        let path = self.path();
-        tokio::fs::create_dir_all(&self.dir).await?;
         let rendered = serde_json::to_string_pretty(jobs)?;
-        let temporary = self
-            .dir
-            .join(format!("{JOBS_FILE}.tmp-{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temporary, rendered.as_bytes()).await?;
-        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-            // Windows cannot replace the target in place; remove it and retry once.
-            tracing::debug!(%error, path = %path.display(), "retrying cron rename");
-            let _ = tokio::fs::remove_file(&path).await;
-            if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return Err(error.into());
-            }
-        }
-        Ok(())
+        write_atomic(&self.dir, JOBS_FILE, &rendered).await
     }
+}
+
+/// Applies one patch to one job, validating a replacement expression.
+fn apply_patch(job: &mut CronJob, patch: &CronUpdate, now: DateTime<Utc>) -> Result<()> {
+    if let Some(cron) = &patch.cron {
+        let schedule = CronSchedule::parse(cron)?;
+        let next_run_at = schedule
+            .next_after(now)
+            .ok_or_else(|| never_matches(&schedule))?;
+        job.cron = schedule.expression().to_owned();
+        job.next_run_at = next_run_at;
+    }
+    if let Some(prompt) = &patch.prompt {
+        job.prompt.clone_from(prompt);
+    }
+    if let Some(description) = &patch.description {
+        job.description.clone_from(description);
+    }
+    if let Some(enabled) = patch.enabled {
+        job.enabled = enabled;
+        if enabled {
+            let schedule = CronSchedule::parse(&job.cron)?;
+            let next_run_at = schedule
+                .next_after(now)
+                .ok_or_else(|| never_matches(&schedule))?;
+            job.next_run_at = next_run_at;
+        }
+    }
+    Ok(())
+}
+
+/// The shared "this expression can never run" validation error.
+fn never_matches(schedule: &CronSchedule) -> Error {
+    Error::validation(format!(
+        "cron expression never matches a future time: {:?}",
+        schedule.expression()
+    ))
+}
+
+/// Writes `contents` to `<dir>/<file>` through a temporary file and an atomic rename.
+///
+/// Creates the directory when needed. A platform that cannot replace the target in place
+/// (Windows) gets one retry after removing the target, so the write stays all-or-nothing.
+pub(super) async fn write_atomic(dir: &Path, file: &str, contents: &str) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let path = dir.join(file);
+    let temporary = dir.join(format!("{file}.tmp-{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&temporary, contents.as_bytes()).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        tracing::debug!(%error, path = %path.display(), "retrying cron rename");
+        let _ = tokio::fs::remove_file(&path).await;
+        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use chrono::TimeZone;
-
-    use super::*;
-
-    /// Builds a UTC instant at the given wall-clock minute.
-    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
-            .unwrap()
-    }
-
-    /// A parsed `*/15 * * * *` schedule (quarter-hourly).
-    fn quarter_hourly() -> CronSchedule {
-        CronSchedule::parse("*/15 * * * *").unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_missing_file_is_an_empty_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        assert_eq!(scheduler.list().await.unwrap(), Vec::new());
-        assert_eq!(scheduler.path(), dir.path().join("jobs.json"));
-        assert_eq!(scheduler.dir(), dir.path());
-    }
-
-    #[tokio::test]
-    async fn create_persists_a_job() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let now = at(2024, 1, 1, 0, 0);
-
-        let job = scheduler
-            .create_with_description(&quarter_hourly(), "say hi", "greeting", now)
-            .await
-            .unwrap();
-
-        assert_eq!(job.cron, "*/15 * * * *");
-        assert_eq!(job.prompt, "say hi");
-        assert_eq!(job.description, "greeting");
-        assert_eq!(job.created_at, now);
-        assert_eq!(job.next_run_at, at(2024, 1, 1, 0, 15));
-        assert!(job.enabled);
-        assert_eq!(job.id.len(), 36, "a hyphenated uuid4 string");
-        assert_eq!(scheduler.list().await.unwrap(), vec![job]);
-    }
-
-    #[tokio::test]
-    async fn create_without_a_description_leaves_it_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let job = scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-        assert_eq!(job.description, "");
-    }
-
-    #[tokio::test]
-    async fn jobs_survive_a_second_scheduler_over_the_same_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = at(2024, 1, 1, 0, 0);
-        let job = CronScheduler::new(dir.path())
-            .create(&quarter_hourly(), "say hi", now)
-            .await
-            .unwrap();
-
-        let reopened = CronScheduler::new(dir.path());
-        assert_eq!(reopened.list().await.unwrap(), vec![job.clone()]);
-        assert!(reopened.cancel(&job.id).await.unwrap().is_some());
-        assert_eq!(
-            CronScheduler::new(dir.path()).list().await.unwrap(),
-            Vec::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn create_rejects_a_schedule_that_never_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let schedule = CronSchedule::parse("0 0 31 2 *").unwrap();
-        let error = scheduler
-            .create(&schedule, "never", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.message(),
-            "cron expression never matches a future time: \"0 0 31 2 *\""
-        );
-        assert_eq!(scheduler.list().await.unwrap(), Vec::new());
-    }
-
-    #[tokio::test]
-    async fn due_only_returns_jobs_whose_time_has_come() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let job = scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            scheduler.due(at(2024, 1, 1, 0, 14)).await.unwrap(),
-            Vec::new()
-        );
-
-        let due = scheduler.due(at(2024, 1, 1, 0, 15)).await.unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].id, job.id);
-        assert_eq!(
-            due[0].next_run_at,
-            at(2024, 1, 1, 0, 15),
-            "the fired occurrence"
-        );
-
-        let persisted = scheduler.list().await.unwrap();
-        assert_eq!(
-            persisted[0].next_run_at,
-            at(2024, 1, 1, 0, 30),
-            "the stored job advances to the next occurrence"
-        );
-        assert_eq!(
-            scheduler.due(at(2024, 1, 1, 0, 15)).await.unwrap(),
-            Vec::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn due_catches_up_with_the_latest_occurrence() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        let due = scheduler.due(at(2024, 1, 1, 3, 47)).await.unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].next_run_at, at(2024, 1, 1, 0, 15));
-        assert_eq!(
-            scheduler.list().await.unwrap()[0].next_run_at,
-            at(2024, 1, 1, 4, 0)
-        );
-    }
-
-    #[tokio::test]
-    async fn due_skips_disabled_jobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        let path = scheduler.path();
-        let mut jobs: Vec<CronJob> =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        jobs[0].enabled = false;
-        tokio::fs::write(&path, serde_json::to_vec(&jobs).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            scheduler.due(at(2024, 1, 1, 1, 0)).await.unwrap(),
-            Vec::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn due_disables_a_job_whose_expression_broke() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let job = scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        let path = scheduler.path();
-        let mut jobs: Vec<CronJob> =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        jobs[0].cron = "not a cron expression".to_owned();
-        tokio::fs::write(&path, serde_json::to_vec(&jobs).unwrap())
-            .await
-            .unwrap();
-
-        let due = scheduler.due(at(2024, 1, 1, 0, 15)).await.unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].id, job.id);
-
-        let persisted = scheduler.list().await.unwrap();
-        assert!(!persisted[0].enabled, "a broken job is disabled");
-        assert_eq!(
-            scheduler.due(at(2024, 1, 1, 1, 0)).await.unwrap(),
-            Vec::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn due_disables_a_job_that_never_matches_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        scheduler
-            .create(&quarter_hourly(), "say hi", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        let path = scheduler.path();
-        let mut jobs: Vec<CronJob> =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        jobs[0].cron = "0 0 31 2 *".to_owned();
-        tokio::fs::write(&path, serde_json::to_vec(&jobs).unwrap())
-            .await
-            .unwrap();
-
-        let due = scheduler.due(at(2024, 1, 1, 0, 15)).await.unwrap();
-        assert_eq!(due.len(), 1);
-        assert!(!scheduler.list().await.unwrap()[0].enabled);
-    }
-
-    #[tokio::test]
-    async fn cancel_removes_only_the_named_job() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        let first = scheduler
-            .create(&quarter_hourly(), "first", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-        let second = scheduler
-            .create(&quarter_hourly(), "second", at(2024, 1, 1, 0, 0))
-            .await
-            .unwrap();
-
-        let removed = scheduler.cancel(&first.id).await.unwrap().unwrap();
-        assert_eq!(removed, first);
-        assert!(scheduler.cancel(&first.id).await.unwrap().is_none());
-        assert!(scheduler.cancel("missing").await.unwrap().is_none());
-        assert_eq!(scheduler.list().await.unwrap(), vec![second]);
-    }
-
-    #[tokio::test]
-    async fn list_reports_corrupt_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        tokio::fs::write(scheduler.path(), b"{not json}")
-            .await
-            .unwrap();
-        assert!(scheduler.list().await.is_err());
-    }
-
-    #[test]
-    fn for_workspace_uses_the_cron_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::new(dir.path());
-        let scheduler = CronScheduler::for_workspace(&workspace);
-        assert_eq!(scheduler.dir(), dir.path().join("cron"));
-        assert_eq!(scheduler.path(), dir.path().join("cron").join("jobs.json"));
-    }
-
-    #[tokio::test]
-    async fn persisted_json_keeps_the_python_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = CronScheduler::new(dir.path());
-        scheduler
-            .create_with_description(
-                &quarter_hourly(),
-                "say hi",
-                "greeting",
-                at(2024, 1, 1, 0, 0),
-            )
-            .await
-            .unwrap();
-
-        let stored: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(scheduler.path()).await.unwrap()).unwrap();
-        let job = &stored[0];
-        for key in [
-            "id",
-            "cron",
-            "next_run_at",
-            "created_at",
-            "enabled",
-            "prompt",
-            "description",
-        ] {
-            assert!(job.get(key).is_some(), "missing key: {key}");
-        }
-        assert_eq!(job["next_run_at"], "2024-01-01T00:15:00Z");
-    }
-}
+#[path = "store_tests.rs"]
+mod tests;
