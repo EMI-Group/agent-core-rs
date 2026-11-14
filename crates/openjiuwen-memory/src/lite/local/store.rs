@@ -45,7 +45,7 @@ impl LocalCodingMemory {
         fact.scope = self.inner.scope.clone();
         fact.updated_at = Utc::now();
         let (guard, mut state) = self.lock_for_write().await?;
-        self.ensure_fresh(&mut state).await?;
+        self.ensure_fresh_locked(&mut state).await?;
         let _replaced = state.document.upsert_fact(&fact);
         self.persist(&mut state).await?;
         #[cfg(feature = "sqlite")]
@@ -85,7 +85,7 @@ impl LocalCodingMemory {
             )));
         }
         let (guard, mut state) = self.lock_for_write().await?;
-        self.ensure_fresh(&mut state).await?;
+        self.ensure_fresh_locked(&mut state).await?;
         let mut fact = state
             .document
             .fact(name)
@@ -109,7 +109,7 @@ impl LocalCodingMemory {
     /// Returns the lock, filesystem, index, or embedding error when the delete fails.
     pub async fn delete(&self, name: &str) -> Result<bool> {
         let (guard, mut state) = self.lock_for_write().await?;
-        self.ensure_fresh(&mut state).await?;
+        self.ensure_fresh_locked(&mut state).await?;
         if !state.document.remove(name) {
             return Ok(false);
         }
@@ -161,14 +161,10 @@ impl LocalCodingMemory {
     /// Returns the lock, filesystem, parse, index, or embedding error on failure.
     pub async fn reindex(&self) -> Result<usize> {
         let guard = FileLock::acquire(&self.inner.lock_path).await?;
-        let (document, stamp) = load_document(&self.inner.memory_path, &self.inner.scope).await?;
-        {
+        let indexed = {
             let mut state = self.inner.state.lock().await;
-            state.document = document;
-            state.stamp = stamp;
-        }
-        let _bumped = self.inner.reloads.fetch_add(1, Ordering::Relaxed);
-        let indexed = self.rebuild_index().await?;
+            self.reindex_locked(&mut state).await?
+        };
         drop(guard);
         self.refresh_embedding_index().await?;
         Ok(indexed)
@@ -194,8 +190,16 @@ impl LocalCodingMemory {
         Ok((guard, state))
     }
 
-    /// Reloads the document when the file stamp changed, returning whether it did.
+    /// Reloads the document when the authoritative file changed, returning whether it did.
+    ///
+    /// In the per-fact file layout the check covers the two index documents and the
+    /// `facts/` directory (see `crate::lite::local::facts_mode`); this variant holds no
+    /// file lock, so it may update the cached document and the derived index but it never
+    /// rewrites the projection.
     pub(super) async fn ensure_fresh(&self, state: &mut LocalState) -> Result<bool> {
+        if self.inner.fact_files {
+            return self.refresh_facts(state, false).await;
+        }
         let stamp = FileStamp::of(&self.inner.memory_path).await?;
         if stamp == state.stamp {
             return Ok(false);
@@ -209,8 +213,15 @@ impl LocalCodingMemory {
         Ok(true)
     }
 
-    /// Writes the cached document atomically and refreshes its stamp.
+    /// Writes the cached document and refreshes its stamp.
+    ///
+    /// In the per-fact file layout the document is projected instead: every fact file is
+    /// written (stale ones removed) and both index documents are re-rendered.
     async fn persist(&self, state: &mut LocalState) -> Result<()> {
+        if self.inner.fact_files {
+            let _count = self.export_locked(state).await?;
+            return Ok(());
+        }
         write_document(&self.inner.memory_path, &state.document).await?;
         state.stamp = FileStamp::of(&self.inner.memory_path).await?;
         Ok(())
@@ -221,7 +232,7 @@ impl LocalCodingMemory {
     /// Callers must have dropped the state guard and the file lock first: an embedding
     /// call may take arbitrarily long, and the document has to stay readable meanwhile.
     /// A store without an embedding model has no chunk index and does nothing here.
-    async fn refresh_embedding_index(&self) -> Result<()> {
+    pub(super) async fn refresh_embedding_index(&self) -> Result<()> {
         if !self.has_embedding() {
             return Ok(());
         }
@@ -243,7 +254,7 @@ impl LocalCodingMemory {
     /// Callers hold the state guard when they already own a document snapshot; taking
     /// the guard again here would deadlock the non-reentrant async mutex.
     #[allow(clippy::unused_async_trait_impl)] // inherent method; the lint misfires on the cfg split
-    async fn rebuild_index_from(&self, facts: &[CodingFact]) -> Result<usize> {
+    pub(super) async fn rebuild_index_from(&self, facts: &[CodingFact]) -> Result<usize> {
         #[cfg(feature = "sqlite")]
         {
             self.fts.rebuild(facts.iter()).await

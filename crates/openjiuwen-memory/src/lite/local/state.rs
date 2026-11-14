@@ -18,23 +18,55 @@ use openjiuwen_common::error::Result;
 
 use crate::config::CodingMemoryConfig;
 use crate::lite::embed::{ChunkingConfig, EmbeddingCache, EmbeddingIndex};
+use crate::lite::facts::{DirStamp, FactFiles};
 use crate::lite::markdown::MarkdownMemory;
+use crate::lite::sync::IntervalScheduler;
 use crate::lite::watch::MemoryWatcher;
 use crate::record::MemoryScope;
 
 use super::builder::LocalCodingMemoryBuilder;
 use super::layout::FileStamp;
+use super::sync_mode::IntervalTask;
 
 #[cfg(feature = "sqlite")]
 use crate::lite::fts::FtsIndex;
 
-/// The cached document plus the stamp it was loaded from.
+/// The cached document plus the stamps it was validated against.
+///
+/// In the default layout only [`LocalState::stamp`] (the `MEMORY.md` stamp) is used. With
+/// the per-fact file layout enabled, `state` also records the stamps of the two rendered
+/// index documents ([`LocalState::index_stamps`], indexed in
+/// [`IndexLevel::ALL`](crate::lite::facts::IndexLevel::ALL) order, so `MEMORY.md` first
+/// and `USER.md` second) and the stamp of the `facts/` directory
+/// ([`LocalState::facts_stamp`]); `projections_dirty` records that the cached document is
+/// ahead of the projection on disk because a refresh happened without the file lock.
 #[derive(Debug)]
 pub(super) struct LocalState {
     /// The parsed Markdown document.
     pub(super) document: MarkdownMemory,
     /// The stamp the document was loaded from (`None` when the file is absent).
     pub(super) stamp: Option<FileStamp>,
+    /// The stamps of the rendered index documents, in [`IndexLevel::ALL`] order.
+    ///
+    /// [`IndexLevel::ALL`]: crate::lite::facts::IndexLevel::ALL
+    pub(super) index_stamps: [Option<FileStamp>; 2],
+    /// The stamp of the `facts/` directory (`None` before it was recorded).
+    pub(super) facts_stamp: Option<DirStamp>,
+    /// Whether the on-disk projection trails the cached document.
+    pub(super) projections_dirty: bool,
+}
+
+impl LocalState {
+    /// Builds the state of a freshly loaded document.
+    pub(super) fn new(document: MarkdownMemory, stamp: Option<FileStamp>) -> Self {
+        Self {
+            document,
+            stamp,
+            index_stamps: [None; 2],
+            facts_stamp: None,
+            projections_dirty: false,
+        }
+    }
 }
 
 /// The shared inner state; each [`LocalCodingMemory`] handle holds an `Arc` of it so a
@@ -62,6 +94,18 @@ pub(super) struct Inner {
     pub(super) cache: EmbeddingCache,
     /// The chunked vector index, built lazily and refreshed on every mutation.
     pub(super) embeddings: Mutex<Option<EmbeddingIndex>>,
+    /// Whether the per-fact file layout (`facts/` plus `MEMORY.md`/`USER.md`) is enabled.
+    pub(super) fact_files: bool,
+    /// The per-fact file store of this root and scope.
+    pub(super) facts: FactFiles,
+    /// `<root>/USER.md`, the rendered index of the user-level facts.
+    pub(super) user_path: PathBuf,
+    /// The [`SyncTrigger::OnInterval`] gate, created from the first interval seen.
+    ///
+    /// [`SyncTrigger::OnInterval`]: crate::lite::sync::SyncTrigger::OnInterval
+    pub(super) interval: Mutex<Option<IntervalScheduler>>,
+    /// The opt-in background interval task, when one was started.
+    pub(super) interval_task: Mutex<Option<IntervalTask>>,
 }
 
 /// An active watcher plus the task that applies its events.
@@ -96,6 +140,7 @@ impl std::fmt::Debug for LocalCodingMemory {
             .field("memory_path", &self.inner.memory_path)
             .field("lock_path", &self.inner.lock_path)
             .field("scope", &self.inner.scope)
+            .field("fact_files", &self.inner.fact_files)
             .finish_non_exhaustive()
     }
 }

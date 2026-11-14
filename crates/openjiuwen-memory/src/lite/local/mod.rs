@@ -9,6 +9,8 @@
 //!
 //! # Layout
 //!
+//! The default layout keeps one document as the source of truth:
+//!
 //! ```text
 //! <root>/
 //!   MEMORY.md            the source of truth (fact sections + bodies)
@@ -16,10 +18,30 @@
 //!   .memory/index.lock   cross-process advisory lock file
 //! ```
 //!
+//! With [`LocalCodingMemoryBuilder::fact_files`](crate::lite::local::LocalCodingMemoryBuilder::fact_files)
+//! enabled, every fact is persisted to its own file and the two top-level documents are
+//! rendered, human-editable projections over them (see the `facts_mode` module):
+//!
+//! ```text
+//! <root>/
+//!   facts/<slug>-<hash>.md   one fact per file, authoritative for content
+//!   MEMORY.md                rendered index of the non-user facts
+//!   USER.md                  rendered index of the user-level facts
+//!   .memory/index.db         derived SQLite index, unchanged
+//!   .memory/index.lock       cross-process advisory lock, unchanged
+//! ```
+//!
+//! Both layouts share the same lock file, the same derived index, the same watcher, and the
+//! same search path; only the authoritative representation and the staleness check differ.
+//! The default layout is byte-for-byte what it was before the per-fact layout existed.
+//!
 //! # Consistency model
 //!
 //! - The Markdown file wins. Every derived index is derived state and may always be
 //!   rebuilt from it ([`LocalCodingMemory::reindex`](crate::lite::local::LocalCodingMemory::reindex)).
+//!   With the per-fact layout enabled the per-fact files are authoritative for content and
+//!   a changed index document wins over them, because editing an index by hand is the
+//!   caller's intent ([`LocalCodingMemory::import_index`](crate::lite::local::LocalCodingMemory::import_index)).
 //! - A mutation takes the file lock ([`FileLock`](crate::lite::lock::FileLock)), reloads the Markdown file when its
 //!   stamp (modification time plus length) differs from the cached one, applies the
 //!   change, writes the document atomically (temporary file plus rename), and updates
@@ -94,13 +116,20 @@
 //! - `search` — keyword/semantic scoring, ranking, and recency.
 //! - `embedding` — the chunked vector index lifecycle of the local store.
 //! - `watcher` — the debounced watcher lifecycle.
+//! - `facts_mode` — the opt-in per-fact file layout: `facts/<slug>-<hash>.md` plus the
+//!   `MEMORY.md`/`USER.md` rendered index split, and the import/export of either
+//!   representation.
+//! - `sync_mode` — the caller-driven sync surface: `sync_now`, the sync triggers, and the
+//!   opt-in background interval task.
 
 mod builder;
 mod embedding;
+mod facts_mode;
 mod layout;
 mod search;
 mod state;
 mod store;
+mod sync_mode;
 mod watcher;
 
 #[cfg(test)]

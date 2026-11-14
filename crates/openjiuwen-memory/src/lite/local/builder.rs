@@ -17,6 +17,7 @@ use openjiuwen_common::error::{Error, Result};
 
 use crate::config::CodingMemoryConfig;
 use crate::lite::embed::{ChunkingConfig, EmbeddingCache};
+use crate::lite::facts::{FactFiles, USER_FILE};
 use crate::lite::lock::FileLock;
 use crate::record::MemoryScope;
 
@@ -54,6 +55,8 @@ pub struct LocalCodingMemoryBuilder {
     embedding: Option<Arc<dyn Embedding>>,
     /// The chunk shape of the embedding index.
     chunking: ChunkingConfig,
+    /// Whether each fact is persisted to its own file under `facts/`.
+    fact_files: bool,
 }
 
 impl std::fmt::Debug for LocalCodingMemoryBuilder {
@@ -65,6 +68,7 @@ impl std::fmt::Debug for LocalCodingMemoryBuilder {
             .field("scope", &self.scope)
             .field("has_embedding", &self.embedding.is_some())
             .field("chunking", &self.chunking)
+            .field("fact_files", &self.fact_files)
             .finish()
     }
 }
@@ -80,6 +84,7 @@ impl LocalCodingMemoryBuilder {
             scope: MemoryScope::default(),
             embedding: None,
             chunking: ChunkingConfig::default(),
+            fact_files: false,
         }
     }
 
@@ -108,12 +113,29 @@ impl LocalCodingMemoryBuilder {
         self
     }
 
+    /// Enables the per-fact file layout (`false` by default).
+    ///
+    /// With the layout enabled each fact is persisted to its own Markdown file under
+    /// `<root>/facts/`, `MEMORY.md` is the rendered index of the non-user facts, and
+    /// `USER.md` the rendered index of the user-level facts. The default keeps the single
+    /// `MEMORY.md` source of truth byte for byte.
+    #[must_use]
+    pub fn fact_files(mut self, enabled: bool) -> Self {
+        self.fact_files = enabled;
+        self
+    }
+
     /// Opens (or initializes) the store.
     ///
     /// Creates the root and `.memory/` directories, takes the cross-process lock, loads
     /// (or writes) the `MEMORY.md` document, opens the derived FTS index, and rebuilds
     /// the derived indices from the document. With an embedding configured the chunk
     /// index is built once here, so the first semantic query needs no re-indexing pass.
+    ///
+    /// With [`LocalCodingMemoryBuilder::fact_files`] enabled the two representations are
+    /// reconciled first, under the same lock: the per-fact files are adopted when they hold
+    /// any fact, otherwise the loaded document is exported into them, and `MEMORY.md` plus
+    /// `USER.md` are always rendered.
     ///
     /// # Errors
     ///
@@ -129,6 +151,7 @@ impl LocalCodingMemoryBuilder {
             scope,
             embedding,
             chunking,
+            fact_files,
         } = self;
         let state_dir = root.join(STATE_DIR);
         tokio::fs::create_dir_all(&state_dir)
@@ -140,13 +163,13 @@ impl LocalCodingMemoryBuilder {
                 ))
             })?;
         let memory_path = root.join(MEMORY_FILE);
+        let user_path = root.join(USER_FILE);
         let lock_path = state_dir.join(LOCK_FILE);
         let guard = FileLock::acquire(&lock_path).await?;
         let (document, stamp) = load_document(&memory_path, &scope).await?;
-        if stamp.is_none() {
+        if !fact_files && stamp.is_none() {
             write_document(&memory_path, &document).await?;
         }
-        drop(guard);
         let stamp = FileStamp::of(&memory_path).await?;
         #[cfg(feature = "sqlite")]
         let fts = FtsIndex::open_path(&state_dir.join(INDEX_FILE)).await?;
@@ -159,18 +182,24 @@ impl LocalCodingMemoryBuilder {
         };
         #[cfg(not(feature = "sqlite"))]
         let cache = EmbeddingCache::in_memory();
+        let facts = FactFiles::new(&root, scope.clone());
         let inner = Arc::new(Inner {
             root,
             memory_path,
             lock_path,
             config,
             scope,
-            state: Mutex::new(LocalState { document, stamp }),
+            state: Mutex::new(LocalState::new(document, stamp)),
             reloads: AtomicU64::new(0),
             embedding,
             chunking,
             cache,
             embeddings: Mutex::new(None),
+            fact_files,
+            facts,
+            user_path,
+            interval: Mutex::new(None),
+            interval_task: Mutex::new(None),
         });
         let store = LocalCodingMemory {
             #[cfg(feature = "sqlite")]
@@ -178,6 +207,13 @@ impl LocalCodingMemoryBuilder {
             inner,
             watch: Arc::new(Mutex::new(None)),
         };
+        if fact_files {
+            // The two layouts have to be reconciled before anything else looks at the
+            // document: the fact files win when they hold facts, else the loaded
+            // `MEMORY.md` is projected into them (still under the shared file lock).
+            store.initialize_fact_files().await?;
+        }
+        drop(guard);
         let _indexed = store.rebuild_index().await?;
         if store.has_embedding() {
             let _stats = store.refresh_embeddings().await?;
