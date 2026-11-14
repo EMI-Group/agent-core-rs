@@ -201,7 +201,10 @@ impl fmt::Debug for AgentArtsMemoryProvider {
     }
 }
 
-/// Logs a failed rail call; the model sees the payload, the cause stays on `debug`.
+/// Logs a failed rail call whose payload the model never sees (the prefetch path).
+///
+/// The payload-producing path goes through [`rail::tool_failure`] instead, so the failure
+/// object and its diagnostic have one implementation.
 fn log_rail_failure(tool: &str, error: &Error) {
     tracing::debug!(
         target: LOG_TARGET,
@@ -327,10 +330,7 @@ implement_vendor_provider!(AgentArtsMemoryProvider, inner;
                 let count = results.len();
                 json!({ "results": results, "count": count })
             }
-            Err(error) => {
-                log_rail_failure(SEARCH_TOOL, &error);
-                rail::tool_error(error.to_string())
-            }
+            Err(error) => rail::tool_failure(SEARCH_TOOL, &error),
         }
     }
 );

@@ -164,17 +164,6 @@ impl fmt::Debug for LakeBaseMemoryProvider {
     }
 }
 
-/// The `{"error": …}` payload of a failed rail tool call, logged at `debug`.
-fn tool_failure(tool: &str, error: &openjiuwen_common::error::Error) -> Value {
-    tracing::debug!(
-        target: LOG_TARGET,
-        tool,
-        %error,
-        "the LakeBase rail tool call failed; the model sees the error payload"
-    );
-    json!({ "error": error.to_string() })
-}
-
 /// A JSON-Schema object parameter.
 fn object_property(description: &str) -> Value {
     json!({ "type": "object", "description": description })
@@ -182,12 +171,11 @@ fn object_property(description: &str) -> Value {
 
 /// A JSON-Schema string-array parameter restricted to the six vendor types.
 fn memory_types_property(description: &str) -> Value {
-    json!({
-        "type": "array",
-        "items": { "type": "string" },
-        "enum": MEMORY_TYPES,
-        "description": description,
-    })
+    let mut property = rail::string_array_property(description);
+    if let Value::Object(fields) = &mut property {
+        fields.insert("enum".to_owned(), json!(MEMORY_TYPES));
+    }
+    property
 }
 
 /// The six `LakeBase` rail tool specs, mirroring the Python adapter.
@@ -404,7 +392,7 @@ impl LakeBaseMemoryProvider {
         let scope = super::scope_from_options(self.config());
         match MemoryProvider::search(&self.inner, &scope, query, &options).await {
             Ok(hits) => search_payload(&hits),
-            Err(error) => tool_failure(SEARCH_TOOL, &error),
+            Err(error) => rail::tool_failure(SEARCH_TOOL, &error),
         }
     }
 
@@ -433,7 +421,7 @@ impl LakeBaseMemoryProvider {
                 }),
                 None => json!({ "error": "the `LakeBase` ingest answered without a memory" }),
             },
-            Err(error) => tool_failure(ADD_TOOL, &error),
+            Err(error) => rail::tool_failure(ADD_TOOL, &error),
         }
     }
 
@@ -460,7 +448,7 @@ impl LakeBaseMemoryProvider {
                     records.into_iter().skip(offset).take(limit).collect();
                 list_payload(&page, &spec::base_id(self.config()))
             }
-            Err(error) => tool_failure(LIST_TOOL, &error),
+            Err(error) => rail::tool_failure(LIST_TOOL, &error),
         }
     }
 
@@ -473,7 +461,7 @@ impl LakeBaseMemoryProvider {
         match MemoryProvider::get(&self.inner, &scope, &memory_id.to_string()).await {
             Ok(Some(record)) => get_payload(&record, &spec::base_id(self.config())),
             Ok(None) => json!({ "error": "not found" }),
-            Err(error) => tool_failure(GET_TOOL, &error),
+            Err(error) => rail::tool_failure(GET_TOOL, &error),
         }
     }
 
@@ -489,7 +477,7 @@ impl LakeBaseMemoryProvider {
                 "memory_id": memory_id,
                 "base_id": spec::base_id(self.config()),
             }),
-            Err(error) => tool_failure(DELETE_TOOL, &error),
+            Err(error) => rail::tool_failure(DELETE_TOOL, &error),
         }
     }
 
@@ -502,7 +490,7 @@ impl LakeBaseMemoryProvider {
                 "detail": health.detail,
                 "base_id": spec::base_id(self.config()),
             }),
-            Err(error) => tool_failure(STATS_TOOL, &error),
+            Err(error) => rail::tool_failure(STATS_TOOL, &error),
         }
     }
 }

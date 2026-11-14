@@ -28,6 +28,14 @@
 //! turns it into a [`tool_error`] object and logs it, mirroring the Python rail, which
 //! returns a JSON error instead of raising.
 //!
+//! # Failure payloads
+//!
+//! [`tool_failure`] is the single producer of a failed rail call's payload: it logs the
+//! cause at `debug` and returns `{"error": <message>}`. An adapter — a vendor one or a
+//! custom backend — calls it instead of re-implementing the log line and the payload, so
+//! every rail degrades identically. [`tool_error`] stays the bare builder for the
+//! argument-validation payloads that carry no backend error.
+//!
 //! [`MemoryProvider::get_tool_schemas`]: crate::external::MemoryProvider::get_tool_schemas
 //! [`MemoryProvider::handle_tool_call`]: crate::external::MemoryProvider::handle_tool_call
 //! [`MemoryProvider::prefetch`]: crate::external::MemoryProvider::prefetch
@@ -65,6 +73,9 @@ pub const DEFAULT_PREFETCH_MAX_TOKENS: usize = 512;
 
 /// The largest `top_k` a search tool call may request.
 pub const MAX_SEARCH_TOP_K: usize = 50;
+
+/// `tracing` target of this module's events, including [`tool_failure`]'s diagnostic.
+const LOG_TARGET: &str = "openjiuwen_memory::external::rail";
 
 /// How many records the `list_memories` tool returns at most, whatever the call asks for.
 pub const DEFAULT_LIST_LIMIT: usize = 50;
@@ -117,6 +128,19 @@ pub fn boolean_property(description: &str) -> Value {
 #[must_use]
 pub fn enum_property(description: &str, values: &[&str]) -> Value {
     json!({ "type": "string", "description": description, "enum": values })
+}
+
+/// A parameter holding an array of strings.
+///
+/// This is the plain shape; a vendor that accepts only a fixed vocabulary adds its `enum`
+/// to the returned object instead of duplicating the fragment.
+#[must_use]
+pub fn string_array_property(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": description,
+    })
 }
 
 /// The four vendor-neutral tool specs, in declaration order.
@@ -178,6 +202,24 @@ pub fn number_property(description: &str) -> Value {
 #[must_use]
 pub fn tool_error(message: impl Into<String>) -> Value {
     json!({ "error": message.into() })
+}
+
+/// The payload of a rail tool call whose backend failed: `{"error": message}`, logged.
+///
+/// A model-facing call never surfaces a Rust error — that would abort the conversation —
+/// so the cause goes to the `debug` channel and only its message reaches the model, which
+/// is exactly what the Python rail does when it answers with an exception string. Every
+/// adapter routes a failed rail call through here, so the payload shape and the diagnostic
+/// stay identical across vendors.
+#[must_use]
+pub fn tool_failure(tool: &str, error: &Error) -> Value {
+    tracing::debug!(
+        target: LOG_TARGET,
+        tool,
+        %error,
+        "memory rail tool call failed; the model sees the error payload"
+    );
+    tool_error(error.to_string())
 }
 
 /// The `{"result": value}` object a rail tool call returns on success.
@@ -470,6 +512,10 @@ mod tests {
         let enumerated = enum_property("a", &["x", "y"]);
         assert_eq!(enumerated["type"], json!("string"));
         assert_eq!(enumerated["enum"], json!(["x", "y"]));
+        let arrayed = string_array_property("a");
+        assert_eq!(arrayed["type"], json!("array"));
+        assert_eq!(arrayed["items"]["type"], json!("string"));
+        assert_eq!(arrayed["description"], json!("a"));
     }
 
     #[test]
@@ -520,6 +566,13 @@ mod tests {
             json!({ "result": { "a": 1 } })
         );
         assert_eq!(tool_ok_result("done"), json!({ "result": "done" }));
+
+        // The failure payload carries the message only; the cause stays on `debug`.
+        let failure = Error::validation("boom");
+        assert_eq!(
+            tool_failure("echo", &failure),
+            json!({ "error": failure.to_string() })
+        );
 
         let recalled = hit(MemoryType::SemanticMemory, "dark mode", 0.5);
         let results = search_results(std::slice::from_ref(&recalled));

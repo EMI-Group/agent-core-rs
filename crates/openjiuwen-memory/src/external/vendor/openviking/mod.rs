@@ -186,7 +186,7 @@ impl OpenVikingMemoryProvider {
         let call = RestCall::post(spec::FIND_PATH).with_body(Value::Object(body));
         let answer = match send_rail(&self.inner, Op::Search, &call).await {
             Ok(answer) => answer,
-            Err(error) => return tool_failure(SEARCH_TOOL, &error),
+            Err(error) => return rail::tool_failure(SEARCH_TOOL, &error),
         };
         let mut entries: Vec<(f32, Value)> = spec::find_items(&answer)
             .into_iter()
@@ -229,7 +229,7 @@ impl OpenVikingMemoryProvider {
         let call = RestCall::get(path).query("uri", uri);
         let answer = match send_rail(&self.inner, Op::Get, &call).await {
             Ok(answer) => answer,
-            Err(error) => return tool_failure(READ_TOOL, &error),
+            Err(error) => return rail::tool_failure(READ_TOOL, &error),
         };
         let content = spec::result_ref(&answer).map_or_else(String::new, |result| {
             result
@@ -260,7 +260,7 @@ impl OpenVikingMemoryProvider {
         let call = RestCall::get(endpoint).query("uri", path);
         let answer = match send_rail(&self.inner, Op::List, &call).await {
             Ok(answer) => answer,
-            Err(error) => return tool_failure(BROWSE_TOOL, &error),
+            Err(error) => return rail::tool_failure(BROWSE_TOOL, &error),
         };
         let Some(result) = spec::result_ref(&answer) else {
             return json!({ "path": path });
@@ -297,7 +297,7 @@ impl OpenVikingMemoryProvider {
         };
         let session_id = match self.require_session("store a memory") {
             Ok(session_id) => session_id,
-            Err(error) => return tool_failure(REMEMBER_TOOL, &error),
+            Err(error) => return rail::tool_failure(REMEMBER_TOOL, &error),
         };
         let text = match rail::string_arg(map, "category")
             .map(str::trim)
@@ -309,7 +309,7 @@ impl OpenVikingMemoryProvider {
         let body = json!({ "role": "user", "parts": [{ "type": "text", "text": text }] });
         match self.post_message(&session_id, body).await {
             Ok(_answer) => json!({ "status": "stored", "message": REMEMBER_MESSAGE }),
-            Err(error) => tool_failure(REMEMBER_TOOL, &error),
+            Err(error) => rail::tool_failure(REMEMBER_TOOL, &error),
         }
     }
 
@@ -325,7 +325,7 @@ impl OpenVikingMemoryProvider {
         let call = RestCall::post(spec::RESOURCES_PATH).with_body(json!({ "path": url }));
         let answer = match send_rail(&self.inner, Op::Add, &call).await {
             Ok(answer) => answer,
-            Err(error) => return tool_failure(ADD_RESOURCE_TOOL, &error),
+            Err(error) => return rail::tool_failure(ADD_RESOURCE_TOOL, &error),
         };
         let root_uri = spec::result_ref(&answer)
             .and_then(|result| result.get("root_uri"))
@@ -387,20 +387,6 @@ async fn send_rail(provider: &RestProvider, op: Op, call: &RestCall) -> Result<V
         return Err(provider.status_error(op, response.status, &response.url, &response.text()));
     }
     body_value(&response)
-}
-
-/// The `{"error": …}` payload of a failed rail tool call, logged at `debug`.
-///
-/// A model-facing call never surfaces an error as a Rust error — it would abort the
-/// conversation — so the cause is logged and returned in the payload.
-fn tool_failure(tool: &str, error: &Error) -> Value {
-    tracing::debug!(
-        target: LOG_TARGET,
-        tool,
-        %error,
-        "the OpenViking rail tool call failed; the model sees the error payload"
-    );
-    json!({ "error": error.to_string() })
 }
 
 /// Rounds a score to three decimals, as the Python tool does.

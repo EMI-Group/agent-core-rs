@@ -119,17 +119,6 @@ impl fmt::Debug for Mem0MemoryProvider {
     }
 }
 
-/// The `{"error": …}` payload of a failed rail tool call, logged at `debug`.
-fn tool_failure(tool: &str, error: &openjiuwen_common::error::Error) -> Value {
-    tracing::debug!(
-        target: LOG_TARGET,
-        tool,
-        %error,
-        "the mem0 rail tool call failed; the model sees the error payload"
-    );
-    json!({ "error": error.to_string() })
-}
-
 /// The three mem0 rail tool specs, mirroring the Python adapter.
 fn tool_schemas() -> Vec<Value> {
     vec![
@@ -248,7 +237,7 @@ implement_vendor_provider!(
                         json!({ "result": contents.join("\n"), "count": count })
                     }
                 }
-                Err(error) => tool_failure(tool, &error),
+                Err(error) => rail::tool_failure(tool, &error),
             },
             SEARCH_TOOL => {
                 let Some(query) = rail::string_arg(arguments, "query")
@@ -278,7 +267,7 @@ implement_vendor_provider!(
                         let count = results.len();
                         json!({ "results": results, "count": count })
                     }
-                    Err(error) => tool_failure(tool, &error),
+                    Err(error) => rail::tool_failure(tool, &error),
                 }
             }
             CONCLUDE_TOOL => {
@@ -298,7 +287,7 @@ implement_vendor_provider!(
                 .await
                 {
                     Ok(_outcome) => json!({ "result": "Fact stored." }),
-                    Err(error) => tool_failure(tool, &error),
+                    Err(error) => rail::tool_failure(tool, &error),
                 }
             }
             other => json!({ "error": format!("unknown tool: {other}") }),

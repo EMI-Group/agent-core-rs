@@ -396,10 +396,7 @@ impl JiuwenMemoryProvider {
                     .collect();
                 json!({ "results": results, "count": hits.len() })
             }
-            Err(error) => {
-                log_rail_failure(MEM2_SEARCH_TOOL, &error);
-                rail::tool_error(error.to_string())
-            }
+            Err(error) => rail::tool_failure(MEM2_SEARCH_TOOL, &error),
         }
     }
 
@@ -443,10 +440,7 @@ impl JiuwenMemoryProvider {
                     "tier": "",
                 }),
             },
-            Err(error) => {
-                log_rail_failure(MEM2_ADD_TOOL, &error);
-                rail::tool_error(error.to_string())
-            }
+            Err(error) => rail::tool_failure(MEM2_ADD_TOOL, &error),
         }
     }
 }
@@ -610,7 +604,10 @@ fn skipped_outcome(cx: &SpecContext<'_>, memory: &NewMemory) -> AddOutcome {
     }
 }
 
-/// Logs a failed rail call; the model sees the message, the cause stays on `debug`.
+/// Logs a failed rail call whose payload the model never sees (the prefetch path).
+///
+/// The payload-producing paths go through [`rail::tool_failure`] instead, so the failure
+/// object and its diagnostic have one implementation.
 fn log_rail_failure(tool: &str, error: &Error) {
     tracing::debug!(
         target: LOG_TARGET,
@@ -655,7 +652,7 @@ fn mem2_tool_schemas() -> Vec<Value> {
                 "infer": rail::boolean_property(
                     "Run LLM extraction + dedup on the content (default: false).",
                 ),
-                "tags": string_array_property("Optional labels for later filtering."),
+                "tags": rail::string_array_property("Optional labels for later filtering."),
             }),
             &["content"],
         ),
@@ -671,15 +668,6 @@ fn top_k_property() -> Value {
         fields.insert("maximum".to_owned(), json!(MAX_TOP_K));
     }
     property
-}
-
-/// A parameter holding an array of strings.
-fn string_array_property(description: &str) -> Value {
-    json!({
-        "type": "array",
-        "items": { "type": "string" },
-        "description": description,
-    })
 }
 
 #[cfg(test)]
