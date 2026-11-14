@@ -59,7 +59,6 @@ Every remote or vendor path is behind a source-provider seam and returns a typed
 
 ## Known Issues
 
-- The subtree carries `#![allow(dead_code, unreachable_pub)]` in `mod.rs` because `crate::rails` still declares `mod personal_context;` privately; the allows can be dropped once that module re-exports these items.
 - `resolve_context_relative_path` cannot detect non-NFC segments (no Unicode normalisation crate) and rejects only Unicode Cc control characters, not Cf.
 - Python's `casefold()` differs from Rust's `to_lowercase()` for a few ligatures, so tokenizer output can differ for those code points.
 - `SourceMetadataStore::upsert` writes `latest_hash` verbatim while `read` enforces 64 lowercase hex, so a caller must supply a real digest.

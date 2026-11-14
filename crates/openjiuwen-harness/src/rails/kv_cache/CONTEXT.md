@@ -38,7 +38,6 @@ Affinity is an optional optimisation: when off, nothing is stored, no child cach
 - Digests come from `crate::rails::sha256::{sha256_hex, sha256_prefix}`; `sha2` is not a dependency of the crate and must not be added.
 - State is per `KvCacheSubagentLifecycle` instance; no module-level singletons or caches.
 - Unknown subagent ids and provider failures never surface as panics: direct calls return `Err`/`Ok(None)`, the rail logs and swallows them.
-- The module carries `#![allow(unreachable_pub, dead_code, unused_imports)]` because `rails/mod.rs` (not editable from this subtree) still has to add the flat `pub use` re-exports; remove the allow when that lands.
 
 ## Routing Table
 
