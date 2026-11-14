@@ -11,10 +11,10 @@
 //! # Tool sets
 //!
 //! [`BuiltinTool::DEFAULT`] is the twenty tools [`ToolRegistry::new`] mounts; [`BuiltinTool::EXTENDED`]
-//! appends the thirteen extended tools (web, media metadata, cron, MCP resources and
-//! subscriptions, tool discovery, goals, LSP navigation and git worktrees) and
-//! [`BuiltinTool::ALL`] is an alias of it.
-//! [`tool_names`] names the default twenty, [`extended_tool_names`] the thirty-three.
+//! appends the fifteen extended tools (web, media metadata, cron, MCP resources and
+//! subscriptions, tool discovery, goals, LSP navigation, git worktrees and the worktree
+//! enter/exit pair) and [`BuiltinTool::ALL`] is an alias of it.
+//! [`tool_names`] names the default twenty, [`extended_tool_names`] the thirty-five.
 //!
 //! # Deferred tools
 //!
@@ -58,8 +58,8 @@ pub use support::{
 
 pub use ask_user::{AskOption, AskQuestion, AskUserArgs, AskUserTool, UserAsker};
 pub use cron::{
-    CronAction, CronArgs, CronJob, CronRun, CronRunTrigger, CronSchedule, CronScheduler, CronStatus,
-    CronTool, CronUpdate,
+    CronAction, CronArgs, CronJob, CronRun, CronRunTrigger, CronSchedule, CronScheduler,
+    CronStatus, CronTool, CronUpdate,
 };
 pub use discovery::{ToolIndex, ToolSearchArgs, ToolSearchHit, ToolSearchTool};
 pub use goal::{
@@ -172,6 +172,10 @@ pub enum BuiltinTool {
     Lsp,
     /// Create and manage git worktrees (`worktree`).
     Worktree,
+    /// Create or enter a worktree and record the worktree session (`enter_worktree`).
+    EnterWorktree,
+    /// Keep or remove the worktree of the active session (`exit_worktree`).
+    ExitWorktree,
 }
 
 impl BuiltinTool {
@@ -200,8 +204,8 @@ impl BuiltinTool {
         Self::CodingMemoryEdit,
     ];
 
-    /// Every built-in tool, in registry order: [`Self::DEFAULT`] then the thirteen extended tools.
-    pub const EXTENDED: [Self; 33] = [
+    /// Every built-in tool, in registry order: [`Self::DEFAULT`] then the fifteen extended tools.
+    pub const EXTENDED: [Self; 35] = [
         Self::Bash,
         Self::ReadFile,
         Self::WriteFile,
@@ -235,10 +239,12 @@ impl BuiltinTool {
         Self::SubmitGoalReport,
         Self::Lsp,
         Self::Worktree,
+        Self::EnterWorktree,
+        Self::ExitWorktree,
     ];
 
     /// Every built-in tool, in registry order; an alias of [`Self::EXTENDED`].
-    pub const ALL: [Self; 33] = Self::EXTENDED;
+    pub const ALL: [Self; 35] = Self::EXTENDED;
 
     /// The model-facing name of this tool.
     #[must_use]
@@ -277,11 +283,13 @@ impl BuiltinTool {
             Self::SubmitGoalReport => "submit_goal_report",
             Self::Lsp => "lsp",
             Self::Worktree => "worktree",
+            Self::EnterWorktree => "enter_worktree",
+            Self::ExitWorktree => "exit_worktree",
         }
     }
 
     /// The tool whose model-facing name is exactly `name`, if any; every one of the
-    /// thirty-three names in [`Self::ALL`] resolves.
+    /// thirty-five names in [`Self::ALL`] resolves.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
@@ -291,8 +299,8 @@ impl BuiltinTool {
     ///
     /// The file-write tools, `cron` (job-list mutations), `submit_goal_report` (goal-record
     /// mutations), `mcp_resource_subscription` (subscription-registry mutations plus provider
-    /// calls) and `worktree` (repository/registry mutations) are serialised; every other
-    /// built-in tool is parallel-safe.
+    /// calls) and `worktree`/`enter_worktree`/`exit_worktree` (repository, registry and
+    /// worktree-session mutations) are serialised; every other built-in tool is parallel-safe.
     #[must_use]
     pub const fn parallel_safe(self) -> bool {
         !matches!(
@@ -303,6 +311,8 @@ impl BuiltinTool {
                 | Self::SubmitGoalReport
                 | Self::McpResourceSubscription
                 | Self::Worktree
+                | Self::EnterWorktree
+                | Self::ExitWorktree
         )
     }
 }
@@ -352,6 +362,8 @@ pub fn extended_tool_names() -> &'static [&'static str] {
         "submit_goal_report",
         "lsp",
         "worktree",
+        "enter_worktree",
+        "exit_worktree",
     ]
 }
 
@@ -387,7 +399,7 @@ mod registry_tests {
     #[test]
     fn builtin_tool_sets_have_the_documented_shapes() {
         assert_eq!(BuiltinTool::DEFAULT.len(), 20);
-        assert_eq!(BuiltinTool::EXTENDED.len(), 33);
+        assert_eq!(BuiltinTool::EXTENDED.len(), 35);
         assert_eq!(BuiltinTool::ALL, BuiltinTool::EXTENDED);
         assert_eq!(&BuiltinTool::EXTENDED[..20], &BuiltinTool::DEFAULT[..]);
 
@@ -406,6 +418,8 @@ mod registry_tests {
         assert_eq!(extended[30], "submit_goal_report");
         assert_eq!(extended[31], "lsp");
         assert_eq!(extended[32], "worktree");
+        assert_eq!(extended[33], "enter_worktree");
+        assert_eq!(extended[34], "exit_worktree");
     }
 
     #[test]
@@ -440,6 +454,8 @@ mod registry_tests {
                     | BuiltinTool::SubmitGoalReport
                     | BuiltinTool::McpResourceSubscription
                     | BuiltinTool::Worktree
+                    | BuiltinTool::EnterWorktree
+                    | BuiltinTool::ExitWorktree
             );
             assert_eq!(tool.parallel_safe(), expected, "for {}", tool.name());
         }
@@ -450,6 +466,8 @@ mod registry_tests {
             "submit_goal_report",
             "mcp_resource_subscription",
             "worktree",
+            "enter_worktree",
+            "exit_worktree",
         ] {
             assert!(
                 !BuiltinTool::from_name(name).unwrap().parallel_safe(),
