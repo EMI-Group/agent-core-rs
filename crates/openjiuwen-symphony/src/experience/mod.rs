@@ -57,12 +57,24 @@
 //! `bank.rs` holds the store-backed catalog, `index/` the persisted embedding catalog,
 //! `store.rs` the persistence seam and its backends, and `ranking.rs` the hit type, ranking
 //! configuration, and scoring helpers.
+//!
+//! # Ingestion: trace → cluster → collector
+//!
+//! `trace/` parses agent-runtime session exports into [`TraceRecord`]s and caches them
+//! next to the sessions; `cluster.rs` groups those records by skill set and query topic;
+//! `collector.rs` turns each cluster into an [`ExperienceItem`] and writes it into an
+//! [`ExperienceBank`] or an [`ExperienceIndex`]. Python's LLM distillation is replaced by
+//! the cluster's centroid query and a deterministic token-similarity merge, so the whole
+//! input half works offline.
 #![allow(clippy::module_name_repetitions)]
 
 mod bank;
+pub mod cluster;
+pub mod collector;
 mod index;
 mod ranking;
 mod store;
+pub mod trace;
 
 use std::collections::BTreeSet;
 
@@ -71,6 +83,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use bank::{AddOutcome, ExperienceBank};
+pub use cluster::{cluster_traces, ClusteredQuery, CLUSTER_SIMILARITY_THRESHOLD};
+pub use collector::{
+    CollectorStats, ExperienceCollector, ExperienceSink, PATTERN_MERGE_THRESHOLD,
+    PENDING_FLUSH_THRESHOLD, QUERY_EXAMPLES_COUNT,
+};
 pub use index::{ExperienceIndex, ExperienceIndexMeta};
 pub use index::{FLAT_VECTOR_ALGORITHM, MANIFEST_VERSION};
 pub use ranking::{
@@ -81,6 +98,7 @@ pub use store::SqliteExperienceStore;
 pub use store::{
     ExperienceStore, JsonFileExperienceStore, MemoryExperienceStore, DEFAULT_KEY_PREFIX,
 };
+pub use trace::{SessionPaths, TraceRecord, TraceStore, TraceToolCall};
 
 /// The prefix of every generated experience id (`exp_0001`, `exp_0002`, ...).
 pub const ID_PREFIX: &str = "exp_";
