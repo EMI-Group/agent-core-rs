@@ -18,7 +18,14 @@ The module never touches storage — callers apply a `ConsolidationPlan` through
 `conflict`: `ConflictKind { Redundant, Conflicting, Unrelated (default) }`, `ConflictVerdict { kind, target_id, reason, merged_content, degraded }`, `#[async_trait] trait ConflictClassifier`, `RuleClassifier { config }`.
 `llm_classifier`: `LlmClassifier { model, config, fallback }` (`new`, `with_fallback`, `config`), name `"llm"`.
 `orchestrator`: `MemoryAnalyzer` (`rule`, `from_config`, `from_engine`, `with_extractor`, `config`, `extractor_name`, `analyze`, `classifier`, `consolidate`), `ConsolidationPlan { actions }` (+ `adds()`), `ConsolidationAction { Add { fact_index }, Merge { fact_index, target_id, merged_content }, Replace { fact_index, target_id }, Skip { fact_index, target_id } }` serialized with an `action` tag.
-`mod.rs` re-exports every public item above; nothing else in the module is public.
+`stage` (staged pipeline): the composeable multi-stage port of Python's `long_term_memory_extractor` 6-step prompt, described in `stage/CONTEXT.md`.
+- `#[async_trait] trait ExtractionStage { name(); async run(&self, &StageInput, &CallOptions) -> Result<StageOutput> }`, `StageInput` (conversation, config, plan, facts, reasoning, candidates, verdicts, decision), `StageOutput` (per-stage patches + `degraded`, applied by `StageOutput::apply`).
+- Plan stage: `PlanIntent`, `PlanOperation`, `ExtractionPlan { intent, topic, operations, focus_turns, rationale, degraded }`, `RulePlanStage` (default), `LlmPlanStage`, `parse_plan_response`, `PLAN_SYSTEM_PROMPT`/`PLAN_JSON_SCHEMA`, `SUMMARY_TOKEN_THRESHOLD`.
+- Reasoning stage: `FactReasoning { fact_index, rationale, basis }`, `ReasoningBasis`, `RuleReasoningStage` (default, configurable metadata key), `LlmReasoningStage`, `parse_reasoning_response`, `REASONING_SYSTEM_PROMPT`/`REASONING_JSON_SCHEMA`, `DEFAULT_REASONING_KEY = "rationale"`.
+- Proactive stage: `ProactiveSignal`, `ProactiveDecision { write, reason, signals, fact_indexes, importance, degraded }`, `ProactiveConfig`, `RuleProactiveStage` (default), `LlmProactiveStage`, `parse_proactive_response`, `PROACTIVE_SYSTEM_PROMPT`/`PROACTIVE_JSON_SCHEMA`.
+- Pipeline: `StagedAnalyzer` (`new`, `from_config`, `from_engine`, `with_stage_config`, `with_overrides`, `with_dedupe`, `with_stages`, `analyze`, `analyze_against`, `consolidate`, `effective_config`), `StageConfig { plan, reasoning, proactive, proactive_config, reasoning_key }`, `StageKind { Rule (default), Llm }`, `StagedResult { result, plan, decision, reasoning, verdicts, stages }` (+ `facts`, `writable_facts`, `should_write`, `rationale`, `is_degraded`), `ExtractStage`, `ConflictStage`, `FactVerdict`.
+- Per-scope overrides: `ScopeAnalyzerOverrides` (`new`, `with_model`, `with_embedding`, `with_extractor`, `with_classifier`, `with_min_importance`, `with_max_facts`, `with_default_importance`, `with_stages`, getters, `is_empty`, `validate`, `effective_config`); `Debug` reports handle names only.
+`mod.rs` re-exports every public item above (including the whole `stage` surface); nothing else in the module is public.
 
 ## Rule Inventory
 
@@ -51,6 +58,21 @@ When the budget is spent the deterministic implementation runs and the degradati
 The first failure reason is the one reported, so a retry storm never hides the original cause.
 `MemoryAnalyzer::from_config` with `ExtractorKind::Llm` and no model, or `ClassifierKind::Llm` and no model, builds the rule implementation — a documented degradation, never a silent no-op and never an `Error::Unsupported`.
 No degraded path returns an empty result silently: a fallback always yields the rule facts/verdicts plus the recorded reason.
+The staged variants follow the same contract: `LlmPlanStage` records `llm plan fell back to rules: <reason>` on `ExtractionPlan::degraded`, `LlmReasoningStage` records `llm reasoning fell back to rules: <reason>` (or `llm reasoning answered N of M facts; rule rationales filled the rest` when it merged a partial answer), and `LlmProactiveStage` records `llm proactive decision fell back to rules: <reason>` on `ProactiveDecision::degraded`.
+`StagedResult::is_degraded()` is true when the extraction result, the plan, the decision, or any stage output carries a reason, so a caller can surface one flag.
+
+## Staged Pipeline
+
+`StagedAnalyzer` runs an ordered `Vec<Arc<dyn ExtractionStage>>` over one mutable `StageInput`; each stage returns a `StageOutput` patch that `StageOutput::apply` merges into the state.
+Default sequence: `plan` → `extract` → `reasoning` → `proactive` → `conflict`; `with_stages` replaces the whole sequence with caller-supplied stages (composable, not additive).
+- plan (`RulePlanStage`, name `"plan"`): picks the `PlanIntent`, `PlanOperation` set, `focus_turns` and a rationale. Intent order: correction marker → directive marker → variable assignment → preference → identity → project → general; operations are `ResolveReferences` (history or pronoun), `NormalizeTime` (relative-time phrase), `ExtractFacts` (always), `ExtractVariables` (assignment present), `ExtractSummary` (`SUMMARY_TOKEN_THRESHOLD = 64` tokens), `HandleDirectives` (correction/update marker). `focus_turns` is the last `min(history depth, 2)` turns plus any correction/directive turn; `selected_turns` falls back to every turn when the plan has no focus.
+- extract (`ExtractStage`): delegates to the wrapped `MemoryAnalyzer`, honours `plan.extracts_facts()` (no facts when false), narrows the conversation to `selected_turns`, then applies the `min_importance` and `max_facts` filters.
+- reasoning (`RuleReasoningStage`, name `"reasoning"`): one `FactReasoning` per fact, in fact order, basis derived from the fact tags (`explicit`/`identity`/`preference`/`project`/`variable`/`statement`, `planned` when the plan is actionable, `unknown` otherwise). Attaches the rationale under `DEFAULT_REASONING_KEY = "rationale"` (configurable) plus `metadata["plan_intent"]`; a blank key is `Error::Validation`.
+- proactive (`RuleProactiveStage`, name `"proactive"`): see `ProactiveConfig` — `importance_threshold = 0.7`, `min_transcript_chars = 12`, `repetition_threshold = 0.6` (token Jaccard against history), `enabled = true`. A write needs a promoting signal (`ExplicitDirective`, `Correction`, `Decision`, `Preference`), a repetition hit, or a fact at/above the threshold; the skip reason always names the strongest fact's importance and the threshold.
+- conflict (`ConflictStage`): one `FactVerdict` per (fact, candidate) pair over the capped `max_candidates`, reusing the injected `ConflictClassifier` and `DedupeConfig`.
+
+`ScopeAnalyzerOverrides` carries per-scope handles (`model`, `embedding`), `ExtractorKind`/`ClassifierKind`, `min_importance`/`max_facts`/`default_importance`, and a full `StageConfig`; `effective_config(&AnalyzerConfig)` merges them and `StagedAnalyzer::build_stages` rebuilds the stage sequence from the effective config, so an override of `extractor`/`classifier`/stage kinds really changes which implementation runs. The embedding handle is carried only — the analyzer never embeds.
+Per-scope *resolution* (storing the overrides, choosing the per-call pipeline, feeding `embedding` to the write path) lives in `crate::facade`/`crate::engine`, documented under `ScopeAnalyzerOverrides`' "# Wiring still required outside this module".
 
 ## Config Defaults
 
@@ -67,16 +89,32 @@ No `unwrap`/`expect`/`panic!` outside `#[cfg(test)]`; `tracing` only (target `op
 Every public item is documented and every public data type is `serde`-serializable, `snake_case`, and tolerant of unknown fields.
 Text handling is char-boundary safe (`truncate_chars`), so huge or multi-byte input is bounded rather than sliced blindly.
 Async work stays on tokio and holds no lock across `.await`; the module is stateless apart from the compiled regexes and `Arc<dyn Model>`/`Arc<dyn FactExtractor>` fields.
-Files stay around ≤1000 lines and split by responsibility: config, fact model, rule extraction, LLM extraction, parsing, prompts, conflicts, LLM classification, orchestration.
+Files stay around ≤1000 lines and split by responsibility: config, fact model, rule extraction, LLM extraction, parsing, prompts, conflicts, LLM classification, orchestration, and inside `stage/`: the seam and state, plan, reasoning, proactive, pipeline, overrides.
+Stage prompts embed their JSON schema inline (a `const` cannot be interpolated into `concat!`), and stage parsers reuse `parse::payload` for fence/slice tolerance.
 
 ## Deferred
 
-Vendor LLM extraction quality tuning (provider-specific prompts, few-shot exemplars, model-specific schemas) — the shared prompt keeps the Python intent.
-Proactive memory (Python's proactive analyzer that decides *when* to remember) and the `process/extract` LLM analyzer's plan/reasoning stages.
-Per-scope model and embedding override resolution; the analyzer takes one injected `Arc<dyn Model>`.
+Vendor LLM extraction quality tuning (provider-specific prompts, few-shot exemplars, model-specific schemas) — the shared prompt keeps the Python intent, the staged prompts keep its shape.
+Python's `process/extract` prompt fidelity beyond the shapes: subject locking and absolute-date rewriting are detected by the plan (`resolve_references`, `normalize_time`) but are not applied to the fact text, and the plan/reasoning stages do not re-run extraction with a second prompt.
+Per-scope override *resolution* (storing overrides per `scope_id`, selecting the pipeline, feeding the embedding into the write path) — the analyzer-side types exist (`ScopeAnalyzerOverrides`), the wiring belongs to `crate::facade`/`crate::engine`.
 Python's variable-manager write path (`MemoryType::Variable` records) — variables are captured as `semantic_memory` facts carrying `variable`/`value` metadata.
 `dreaming/` background consolidation, team/`agent_teams` memory analysis, and schema migrations for extracted facts.
 Constraint/conflict *resolution* beyond the plan (`Replace`/`Merge`/`Skip` decisions are returned, not executed) — the engine applies them.
+Proactive memory is a decision only: the stage never writes, schedules, or dedupes, and no Python `mem_instruct` UPDATE/DELETE/ADD operation is emitted.
+
+## Routing Table
+
+- `./config.rs` → `AnalyzerConfig`, `ExtractorKind`, `ClassifierKind`, importance tiers, `from_extraction`/`from_engine`
+- `./fact.rs` → `ConversationTurn`, `ExtractionInput`, `ExtractedFact`, `ExtractionResult`, `FactExtractor`
+- `./rule.rs` → regex inventory and `RuleExtractor`
+- `./llm.rs` → `LlmExtractor` (retry, fallback, degradation)
+- `./conflict.rs` → `ConflictKind`, `ConflictVerdict`, `ConflictClassifier`, `RuleClassifier`
+- `./llm_classifier.rs` → `LlmClassifier`
+- `./orchestrator.rs` → `MemoryAnalyzer`, `ConsolidationPlan`/`ConsolidationAction`
+- `./parse.rs` → `parse_fact_response`, `parse_conflict_response`
+- `./prompt.rs` → extraction/conflict prompts, schemas, conversation rendering
+- `./stage/` → staged pipeline: `ExtractionStage` seam, plan/reasoning/proactive stages and their LLM variants, `StagedAnalyzer`, `ScopeAnalyzerOverrides` (`stage/CONTEXT.md`)
+- `./mod.rs` → module declaration, public re-exports, lint policy
 
 ## Test Strategy
 
@@ -86,5 +124,6 @@ LLM extraction covers fenced-JSON success, malformed output falling back with `d
 Parsing covers array/object wrappers, alias fields, clamping, malformed entries and the Python conflict item shape.
 Conflict classification covers all three conflicting signals, redundancy, unrelated, and verdict ordering; the LLM classifier covers parse success plus malformed → fallback with `degraded` on every verdict.
 `consolidate` is covered for every `DedupePolicy` and for `dedupe.enabled == false`.
-Every public data type has a serde round-trip and an unknown-field-tolerance test.
-Gates: `cargo fmt -p openjiuwen-memory`, `cargo check -p openjiuwen-memory --offline`, `cargo test -p openjiuwen-memory --offline --lib analyzer`, `cargo clippy -p openjiuwen-memory --all-targets --offline -- -D warnings`.
+The staged pipeline is covered in `stage/` (47 unit tests): plan selection across representative transcripts (correction/directive/variable/preference/identity/project/general, operation sets, focus turns, disabled analyzer, `selected_turns` fallback), ordered reasoning with metadata attachment and configurable/validated key, proactive write-vs-skip decisions with their reason strings (directive, correction, decision, preference, repetition, short transcript, empty facts, disabled), model-backed stage success, unparseable output → deterministic fallback with `degraded`, cancellation → `Error::Cancelled` with `call_count() == 0`, prompt/schema embedding, serde round trips and unknown-field tolerance for every stage type.
+`stage/pipeline.rs` additionally covers end-to-end parity with `MemoryAnalyzer` (same facts for the same input), plan-skipped extraction, conflict classification against existing records, override threshold dropping low-importance facts, an override switching the effective extractor to the model-backed stage, `StageKind::Llm` without a model degrading to the rule stages, a custom stage sequence replacing the built-in one, cancelled pipelines making zero model calls, `consolidate` parity, `StagedResult` JSON round-trip, and `StageConfig` validation.
+Gates: `cargo fmt -p openjiuwen-memory`, `cargo check -p openjiuwen-memory --offline`, `cargo test -p openjiuwen-memory --offline --lib analyzer`, `cargo clippy -p openjiuwen-memory --all-targets --all-features --offline -- -D warnings`, `cargo doc -p openjiuwen-memory --no-deps`.
