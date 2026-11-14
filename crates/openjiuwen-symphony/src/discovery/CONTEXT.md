@@ -6,6 +6,7 @@ SKILL.md discovery and the lexical skill catalog, mapping to Python `openjiuwen.
 A scan turns a directory of skill folders into ordinary `CapabilityDescriptor`s, so discovered skills flow straight into the registry, graph, and planner without a plugin protocol.
 The module ports both Python scan modes (immediate-child and bounded recursive), reports per-skill problems as diagnostics instead of failing the scan, and derives a stable, order-independent inventory fingerprint.
 Skill search reuses the crate's own BM25 `LexicalIndex` rather than duplicating retrieval semantics.
+The model-facing surface is completed by a deterministic prompt snapshot, the visible skill-name list, and an incremental skill-notice cursor with Python's reminder wording.
 Everything here is offline, deterministic, and filesystem-only.
 
 ## API Surface
@@ -107,6 +108,9 @@ impl SkillFs {
     pub fn diagnostics(&self) -> &[SkillDiagnostic];
     pub fn read_body(&self, worker_id: &str) -> Option<&str>;
     pub fn selection_cards(&self) -> Vec<SelectionCard>;
+    pub fn visible_skill_names(&self) -> Vec<String>;
+    pub fn prompt_snapshot(&self, options: &PromptSnapshotOptions) -> PromptSnapshot;
+    pub fn notice_state(&self) -> SkillNoticeState;
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<SkillHit>>;   // 0 = unlimited
 }
 pub struct SkillHit { pub worker_id: String, pub name: String, pub description: String, pub score: f32, pub matched_terms: Vec<String>, pub excerpt: String }
@@ -120,6 +124,67 @@ pub const EXCERPT_LEAD: usize = 60;
 An empty or all-punctuation query is a filter-only request returning every record in `worker_id` order with score `0.0` and an empty excerpt.
 
 An excerpt is the whitespace-collapsed window of `EXCERPT_WIDTH` characters (`EXCERPT_LEAD` kept before the term) around the earliest matched term of whichever of the description and body matches more terms, with `…` on a truncated side.
+
+### Prompt snapshot and visible skills
+
+```rust
+pub const DEFAULT_PROMPT_MAX_CHARS: usize = 12_000;   // DiscoverySettings.max_output_chars default
+pub const PROMPT_HEADER: &str = "# Skills";
+pub const PROMPT_EMPTY_TEXT: &str = "# Skills\n\nNo skills are available for this task.";
+pub const UNCATEGORIZED_CATEGORY: &str = "Uncategorized";
+pub const PROMPT_TRUNCATION_MARKER: &str = "[truncated]";
+
+pub struct PromptSnapshotOptions { pub max_chars: usize, pub include_categories: bool, pub worker_id: Option<String> }
+impl Default for PromptSnapshotOptions;              // 12_000, false, None
+impl PromptSnapshotOptions {
+    pub fn new(max_chars: usize) -> Self;
+    pub fn with_categories(self, include_categories: bool) -> Self;
+    pub fn with_worker_id(self, worker_id: impl Into<String>) -> Self;
+}
+
+pub struct PromptSnapshot { pub rendered: String, pub included: Vec<String>, pub omitted: Vec<String>, pub truncated: bool, pub fingerprint: String }
+impl Default for PromptSnapshot;                      // PROMPT_EMPTY_TEXT, empty lists, fingerprint of []
+```
+
+`visible_skill_names` returns the enabled worker ids in Python's prompt order `(worker_id.casefold(), worker_id)`; skills dropped by `SkillScanConfig::disabled_skills` never reach the catalog, so they are absent.
+
+The rendered text is Python's markdown skill section:
+
+- header line `# Skills`, then a blank line before the body;
+- one line per skill: `- <worker_id>: <whitespace-collapsed description>` (Python's exact `prompt_snapshot` line);
+- `include_categories` groups lines under `## <category>` headings separated by blank lines, with the descriptor's `classification` (front-matter `category`) as the label and `Uncategorized` when blank; categories sort by `(casefold, label)` and skills within a category by prompt order;
+- an empty (or fully filtered) scope renders `PROMPT_EMPTY_TEXT`, never an empty string;
+- when `max_chars` leaves part of the scope out, the last fitting line may be shortened on a `char` boundary to its first characters plus `...`, and the snapshot ends with a blank line and `[truncated]`. Lines are never split inside a code point, and a category heading is only emitted when at least one of its skills fits.
+
+`included` is render order; `omitted` is the prompt order of in-scope worker ids the budget left out (worker ids excluded by `worker_id` are out of scope, not omitted). `fingerprint` is `inventory_fingerprint` over the included records, so equal included content yields the same digest regardless of render order or category layout. `max_chars == 0` omits every skill but still renders the header and `[truncated]`.
+
+`notice_state` seeds a [`SkillNoticeState`](notice.rs) with the current inventory as baseline; callers may construct it directly from `SkillFs::inventory()`.
+
+### Incremental skill notices
+
+```rust
+pub const SKILL_INDEX_TOOL_NAME: &str = "skill_index";
+pub const DEFAULT_NOTICE_MAX_CHARS: usize = 4_000;
+pub const NOTICE_DESCRIPTION_CHARS: usize = 300;
+
+pub struct SkillNoticeState { pub seen: BTreeMap<String, String>, pub max_chars: usize, pub discovery_tool_name: String }
+impl Default for SkillNoticeState;                    // empty seen, 4_000, "skill_index"
+impl SkillNoticeState {
+    pub fn new(inventory: &SkillInventory) -> Self;   // baseline, consumes no delta
+    pub fn with_max_chars(self, max_chars: usize) -> Self;
+    pub fn with_discovery_tool_name(self, tool_name: impl Into<String>) -> Self;
+    pub async fn consume(&mut self, inventory: &SkillInventory) -> SkillNotice;
+}
+pub struct SkillNotice { pub added: Vec<String>, pub removed: Vec<String>, pub changed: Vec<String>, pub reminder: Option<String> }
+```
+
+`SkillNoticeState` is Python's `initialize_incremental_skill_notice_state` / `_NoticeState` as plain, serde-persistable data (one cursor owned by the caller instead of the process-global per-session map).
+
+`seen` maps each worker id to `inventory_fingerprint` of its record, so a description edit is detected even when a caller supplies no content hash.
+
+`consume` diffs against `seen` and updates it to the new inventory, so a second call with the same inventory reports no changes. `added`, `removed` and `changed` all sort by `(worker_id.casefold(), worker_id)`.
+
+`reminder` follows Python's `_render_reminder` literally: for additions it renders `<system-reminder>` / `The following skills are newly available for use with the Skill tool:` / blank line / `- <name>: <description>` rows sorted by `name.casefold()` / `</system-reminder>`, with whitespace collapsed, `<`/`>` escaped, and descriptions shortened to `NOTICE_DESCRIPTION_CHARS` (`textwrap.shorten`, `...` placeholder). When the block exceeds `max_chars` it becomes `<system-reminder>` / `<N> new skills are available. Use \`<tool_name>\` to search the current catalog.` / `</system-reminder>`. Python's reminder only announces additions, so `reminder` is `None` when nothing was added even if skills were removed or changed; those deltas stay in the notice fields.
 
 ```rust
 pub struct DiscoverySettings { pub max_results: usize, pub max_output_chars: usize, pub candidate_budget_ratio: f64, pub context_window_tokens: usize, pub use_existing_index: bool }
@@ -135,12 +200,19 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 
 ## Constraints
 
-- Offline and deterministic: no network, no wall-clock ordering; skill and record ordering comes from ids or BM25 scores.
+- Offline and deterministic: no network, no wall-clock ordering; skill and record ordering comes from ids, Python's casefold prompt order, or BM25 scores.
 - A single bad skill never aborts a scan; diagnostics are the failure report and only an unusable root is `Err`.
 - Blocking filesystem work uses tokio's `fs`; no `unsafe`, no `println!`, no panics on user input.
 - Every public item is documented; files stay around or under 1000 lines and split by responsibility.
 - Descriptors produced here must round-trip through serde and remain valid `CapabilityDescriptor`s.
 - Front-matter keys outside the documented set are dropped, never leaked into metadata or retrieval text.
+- Prompt rendering never splits a code point and never renders an empty string; notice ordering is casefold-then-exact and clock-free.
+
+## Tests
+
+- `tests/discovery.rs` — scans, front matter, diagnostics, descriptors, inventory, catalog search, excerpts, settings.
+- `tests/skill_prompt.rs` — visible-name ordering and disabled-skill exclusion, exact pinned snapshot text (plain, category sections, empty), multi-byte `max_chars` truncation with `included`/`omitted`/`truncated` and fingerprint bookkeeping, `worker_id` filtering, fingerprint stability/content sensitivity, added/removed/changed notices with the exact Python reminder, reminder fallback and custom tool name, deterministic ordering, idempotent second consume, serde persistence, and `SkillFs::notice_state`.
+- Unit tests beside `catalog.rs` pin the plain/category/empty renderings; unit tests beside `notice.rs` pin the reminder wording, the `textwrap.shorten` behavior, and state round-tripping.
 
 ## Routing Table
 
@@ -148,5 +220,7 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 - `./frontmatter.rs` → `parse_front_matter`, `FrontMatterStatus`/`FrontMatterOutcome`, tag/IO/boolean coercion, capability-type normalization
 - `./scanner.rs` → `SkillFolderScanner`, `SkillScanConfig`, descriptor derivation, diagnostics, scan constants
 - `./models.rs` → `SkillRecord`, `SkillInventory`, `sort_records`, inventory fingerprint, `DEFAULT_SOURCE`
-- `./catalog.rs` → `SkillFs`, `SkillHit`, `SelectionCard`, BM25 search, excerpts
+- `./catalog.rs` → `SkillFs`, `SkillHit`, `SelectionCard`, BM25 search, excerpts, `visible_skill_names`, `prompt_snapshot`
+- `./notice.rs` → `SkillNoticeState`, `SkillNotice`, incremental reminder rendering, notice constants
 - `./settings.rs` → `DiscoverySettings`, token budget, settings defaults
+

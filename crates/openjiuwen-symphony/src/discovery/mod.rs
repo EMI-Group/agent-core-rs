@@ -15,8 +15,12 @@
 //!   [`SkillRecord`](crate::discovery::SkillRecord) and the fingerprinted
 //!   [`SkillInventory`](crate::discovery::SkillInventory);
 //! - [`catalog`](crate::discovery::catalog) — [`SkillFs`](crate::discovery::SkillFs),
-//!   the installed-skill catalog with BM25 search and excerpted
-//!   [`SkillHit`](crate::discovery::SkillHit)s;
+//!   the installed-skill catalog with BM25 search, excerpted
+//!   [`SkillHit`](crate::discovery::SkillHit)s, visible skill names, and the rendered
+//!   [`PromptSnapshot`](crate::discovery::PromptSnapshot);
+//! - [`notice`](crate::discovery::notice) —
+//!   [`SkillNoticeState`](crate::discovery::SkillNoticeState), the persistable cursor
+//!   that diffs a later inventory and renders Python's incremental skill reminder;
 //! - [`settings`](crate::discovery::settings) —
 //!   [`DiscoverySettings`](crate::discovery::DiscoverySettings), the result/output/token
 //!   budget for one discovery round.
@@ -41,16 +45,25 @@
 pub mod catalog;
 pub mod frontmatter;
 pub mod models;
+pub mod notice;
 pub mod scanner;
 pub mod settings;
 
-pub use catalog::{SelectionCard, SkillFs, SkillHit, EXCERPT_LEAD, EXCERPT_WIDTH};
+pub use catalog::{
+    PromptSnapshot, PromptSnapshotOptions, SelectionCard, SkillFs, SkillHit,
+    DEFAULT_PROMPT_MAX_CHARS, EXCERPT_LEAD, EXCERPT_WIDTH, PROMPT_EMPTY_TEXT, PROMPT_HEADER,
+    PROMPT_TRUNCATION_MARKER, UNCATEGORIZED_CATEGORY,
+};
 pub use frontmatter::{
     boolean_value, io_values, normalize_capability_type, parse_front_matter, tag_values,
     FrontMatterOutcome, FrontMatterStatus, ALTERNATE_DELIMITER, DELIMITER,
 };
 pub use models::{
     inventory_fingerprint, sort_records, SkillInventory, SkillRecord, DEFAULT_SOURCE,
+};
+pub use notice::{
+    SkillNotice, SkillNoticeState, DEFAULT_NOTICE_MAX_CHARS, NOTICE_DESCRIPTION_CHARS,
+    SKILL_INDEX_TOOL_NAME,
 };
 pub use scanner::{
     DiagnosticSeverity, ScannedSkill, SkillDiagnostic, SkillDiscovery, SkillFolderScanner,
