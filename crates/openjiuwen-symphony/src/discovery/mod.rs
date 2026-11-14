@@ -43,11 +43,13 @@
 //! ```
 
 pub mod catalog;
+pub mod directory_toolkit;
 pub mod frontmatter;
 pub mod models;
 pub mod notice;
 pub mod scanner;
 pub mod settings;
+pub mod toolkit;
 
 pub use catalog::{
     PromptSnapshot, PromptSnapshotOptions, SelectionCard, SkillFs, SkillHit,
