@@ -20,7 +20,6 @@
 
 use std::sync::OnceLock;
 
-
 pub mod artifacts;
 pub mod native;
 

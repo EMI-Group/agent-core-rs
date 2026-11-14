@@ -2,9 +2,19 @@
 //!
 //! Ports the *contract* of Python's
 //! `openjiuwen.core.context_engine.processor.offloader.message_summary_offloader`:
-//! a message that is too large to stay in the window is summarised, the original
-//! is written to the [`OffloadStore`], and the message keeps the summary plus an
+//! a message that is too large to stay in the window is rule-compressed first,
+//! then (when it is still too large) summarised, the original is written to the
+//! [`OffloadStore`], and the message keeps the summary plus an
 //! [`OFFLOADED_INFO_TAG`] block telling the agent how to reload the original.
+//!
+//! Tier 1 is [`RuleCompressionPipeline`] — deterministic, model-free and offline.
+//! It runs only on the same candidates as the summary path (role, size,
+//! protection and marker gates unchanged), only when the message carries no
+//! `rule_compressed_at` metadata, and only when its text exceeds
+//! [`MessageSummaryOffloaderConfig::rule_compression_max_chars`]. Tier 2 then
+//! handles whatever survives: a rule-compressed body that already fits the
+//! character budget is kept as is, and a larger one is summarised and offloaded
+//! exactly like before.
 //!
 //! The summary comes from the configured [`Model`] when one is available — the
 //! processor's own model first, then the engine's — and from a deterministic
@@ -32,6 +42,9 @@ use crate::processor::offloader::{
     is_already_offloaded, is_protected_tool_message, offloaded_event, persist_offload,
     role_allowed, MessageOffloadRole,
 };
+use crate::processor::rule_compression::{
+    RuleCompressionPipeline, ADD_PASS, RULE_COMPRESSED_AT_KEY,
+};
 use crate::processor::summarize;
 use crate::processor::{ContextProcessor, ProcessorContext, ProcessorState};
 use crate::tokens::{count_message, count_messages};
@@ -58,6 +71,16 @@ pub struct MessageSummaryOffloaderConfig {
     pub summary_max_tokens: u32,
     /// Character budget of the offline summary fallback.
     pub content_max_chars_for_compression: usize,
+    /// Whether oversized tool results are rule-compressed before summary offloading.
+    pub enable_rule_compression: bool,
+    /// Character budget of the rule-compression tier: the size above which it
+    /// runs and the size it compresses towards.
+    pub rule_compression_max_chars: usize,
+    /// Whether every rule compression is dumped to disk for debugging.
+    pub enable_rule_compression_dump: bool,
+    /// Directory of those dumps; `None` falls back to
+    /// `OPENJIUWEN_RULE_COMPRESSION_DUMP_DIR`.
+    pub rule_compression_dump_dir: Option<String>,
 }
 
 impl Default for MessageSummaryOffloaderConfig {
@@ -68,6 +91,10 @@ impl Default for MessageSummaryOffloaderConfig {
             protected_tool_names: vec!["read_file".to_owned()],
             summary_max_tokens: 900,
             content_max_chars_for_compression: 200_000,
+            enable_rule_compression: true,
+            rule_compression_max_chars: 20_000,
+            enable_rule_compression_dump: false,
+            rule_compression_dump_dir: None,
         }
     }
 }
@@ -83,6 +110,8 @@ pub struct MessageSummaryOffloader {
     pub store: Arc<dyn OffloadStore>,
     /// Cross-run counters, persisted through the context checkpoint.
     pub state: ProcessorState,
+    /// Tier 1: the deterministic, model-free rule compressor.
+    pub pipeline: RuleCompressionPipeline,
 }
 
 impl std::fmt::Debug for MessageSummaryOffloader {
@@ -106,11 +135,16 @@ impl MessageSummaryOffloader {
         model: Option<Arc<dyn Model>>,
         store: Arc<dyn OffloadStore>,
     ) -> Self {
+        let pipeline = RuleCompressionPipeline::new().with_dump(
+            config.enable_rule_compression_dump,
+            config.rule_compression_dump_dir.clone(),
+        );
         Self {
             config,
             model,
             store,
             state: ProcessorState::default(),
+            pipeline,
         }
     }
 
@@ -138,6 +172,41 @@ impl MessageSummaryOffloader {
             return false;
         }
         count_message(cx.counter, message) > self.config.large_message_threshold
+    }
+
+    /// Whether the message already carries a rule-compression stamp.
+    fn is_rule_compressed(message: &BaseMessage) -> bool {
+        message.metadata.contains_key(RULE_COMPRESSED_AT_KEY)
+    }
+
+    /// Runs the tier-1 rule compressor on the message at `index`.
+    ///
+    /// Returns the indices entry replaced in `messages` and whether tier 2 may
+    /// keep the result as is (it fits the character budget).
+    fn rule_compress(&self, messages: &mut [BaseMessage], index: usize) -> (bool, bool) {
+        if !self.config.enable_rule_compression || Self::is_rule_compressed(&messages[index]) {
+            return (false, false);
+        }
+        let max_chars = self.config.rule_compression_max_chars.max(1);
+        let replaced = match self
+            .pipeline
+            .compress_in_messages(messages, index, ADD_PASS, max_chars, false)
+        {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                tracing::warn!("[RuleCompression] tier 1 failed for message {index}: {error}");
+                return (false, false);
+            }
+        };
+        if !Self::is_rule_compressed(&replaced) {
+            return (false, false);
+        }
+        let fits = replaced
+            .content
+            .as_text()
+            .is_none_or(|text| text.chars().count() <= max_chars);
+        messages[index] = replaced;
+        (true, fits)
     }
 
     /// Summarises `text`, falling back to the offline summary.
@@ -201,9 +270,19 @@ impl ContextProcessor for MessageSummaryOffloader {
         let tokens_before = count_messages(cx.counter, messages);
         let mut changed: Vec<usize> = Vec::new();
         let mut last_handle: Option<String> = None;
+        let mut rule_compressed = 0_usize;
+        let mut offloaded_count = 0_usize;
         for index in candidates {
             if cx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
+            }
+            let (tier1, fits) = self.rule_compress(messages, index);
+            if tier1 {
+                rule_compressed += 1;
+                if fits {
+                    changed.push(index);
+                    continue;
+                }
             }
             let original = messages[index].clone();
             let text = original.content.as_text().unwrap_or_default();
@@ -216,10 +295,12 @@ impl ContextProcessor for MessageSummaryOffloader {
             ));
             changed.push(index);
             last_handle = Some(handle);
+            offloaded_count += 1;
         }
         let tokens_after = count_messages(cx.counter, messages);
-        self.state.add("offloaded", changed.len() as u64);
-        self.state.add("summaries", changed.len() as u64);
+        self.state.add("offloaded", offloaded_count as u64);
+        self.state.add("summaries", offloaded_count as u64);
+        self.state.add("rule_compressed", rule_compressed as u64);
         self.state
             .record_tokens("last_tokens_before", tokens_before);
         self.state.record_tokens("last_tokens_after", tokens_after);
