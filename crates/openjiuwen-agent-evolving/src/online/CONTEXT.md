@@ -14,7 +14,7 @@ The module is store-agnostic on purpose, so the in-memory store used offline and
 - `store.rs` — `OnlineStore` seam (`get`, `set`, `set_if_absent`, `del`, `set_add`, `set_remove`, `set_members`, plus the defaulted `set_contains`), `MemoryOnlineStore` (`new`, `Default`, `keys`, `snapshot`), and the `keys` namespace module.
 - `task.rs` — `RewardMode`, `TaskStatus`, `FinishReason`, `TaskSpec` (+ `validate`, `policy_model`), `TaskRecord` (+ `matches_spec`, `from_json`, `to_json`), `Clock`/`FixedClock`/`EPOCH_STAMP`, and `TaskRegistry` (`new`, `with_clock`, `store`, `start`, `get`, `finish`, `abort`, `active_task_for_session`, `record_reward`).
 - `capture.rs` — `CaptureMeta`, `CaptureStatus`, `PublishState`, `TurnTransition`, and the `TaskRegistry` capture/turn methods (`begin_capture`, `commit_capture`, `discard_capture`, `claim_turn_publish`, `complete_turn_publish`, `fail_turn_publish`, `advance_turn`, `open_capture_count`, `pending_sample_ids`).
-- `tests.rs` — 46 unit tests covering every row of both transition tables, the reward rules, and the written key layout.
+- `tests/` — 46 unit tests: `tests/mod.rs` covers the store, specs, task lifecycle and rewards; `tests/capture.rs` covers captures, turn publication and the written key layout.
 
 ## State Machines
 
@@ -79,5 +79,5 @@ Nothing here calls `SystemTime`, `Instant`, or `rand`; fingerprints and identifi
 - `./store.rs` → `OnlineStore` seam, `MemoryOnlineStore`, `keys`
 - `./task.rs` → task identity, record, clock, lifecycle and terminal reward
 - `./capture.rs` → capture reservations, commit/discard, turn publication and handover
-- `./tests.rs` → the unit suite (compiled only under `cfg(test)`)
+- `./tests/` → the unit suite (compiled only under `cfg(test)`): `./tests/mod.rs` and `./tests/capture.rs`
 - `./mod.rs` → module docs, re-exports, JSON helpers
