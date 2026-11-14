@@ -21,8 +21,8 @@ Provider SPI (`provider.rs`):
 
 Rail helpers (`rail.rs`, pure, no I/O):
 - Tool names/limits: `ADD_MEMORY_TOOL`, `SEARCH_MEMORY_TOOL`, `LIST_MEMORIES_TOOL`, `DELETE_MEMORY_TOOL`, `DEFAULT_PREFETCH_TOP_K = 5`, `DEFAULT_PREFETCH_MAX_TOKENS = 512`.
-- Schema builders: `tool_schema`, `string_property`, `integer_property`, `number_property`, `boolean_property`, `enum_property`, `default_tool_schemas`.
-- Payload shaping: `tool_error`, `tool_result`, `tool_ok_result`, `hit_json`, `record_json`, `search_results`, `memory_listing`, `stored_result`, `deleted_result`, `render_bullets`.
+- Schema builders: `tool_schema`, `string_property`, `integer_property`, `number_property`, `boolean_property`, `enum_property`, `string_array_property`, `default_tool_schemas`.
+- Payload shaping: `tool_failure` (the single producer of a failed rail call's `{"error": …}` payload plus one debug log), `tool_error`, `tool_result`, `tool_ok_result`, `hit_json`, `record_json`, `search_results`, `memory_listing`, `stored_result`, `deleted_result`, `render_bullets`.
 - Argument parsing: `parse_search_args`, `parse_add_args`, `parse_kind`, `args_object` (tolerant of a non-object), `string_arg`, `integer_arg`, `number_arg`, `is_available`.
 
 Local provider (`local.rs`): `EngineProvider` over `Arc<MemoryEngine>` (`new`, `with_name`, `engine`, `is_initialized`), `LocalProviderFactory`; overrides `is_available`, `is_initialized`, and a non-empty `system_prompt_block`.
