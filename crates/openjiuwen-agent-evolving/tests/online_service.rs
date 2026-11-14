@@ -482,27 +482,6 @@ async fn capture_validation_rejects_bad_shapes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(envelope(&body).0, "invalid_completion");
 }
-             "capture_id": "capture-1",
-                "agent_turn_id": "turn-1",
-                "request": chat_request(false),
-                "response": chat_response("hello"),
-            }),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = service
-        .send(post_json(
-            "/internal/v1/completions:before",
-            &json!({
-                "rl_task_id": "task-1",
-                "capture_id": "capture-2",
-                "agent_turn_id": "turn-2",
-                "request": chat_request(false),
-            }),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::OK);
-}
 
 #[tokio::test]
 async fn internal_finish_and_abort_validate_reasons() {
