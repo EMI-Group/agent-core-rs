@@ -248,62 +248,12 @@ async fn capture_before_after_and_discard() {
             "/internal/v1/completions:before",
             &json!({
                 "rl_task_id": "task-1",
-   #[tokio::test]
-async fn capture_discard_semantics() {
-    let service = Service::new();
-    service.start_task("task-1", "terminal").await;
-    let before = json!({
-        "rl_task_id": "task-1",
-        "capture_id": "capture-1",
-        "request": chat_request(false),
-    });
-    let (status, _) = service
-        .send(post_json("/internal/v1/completions:before", &before))
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = service
-        .send(post_json(
-            "/internal/v1/completions:after",
-            &json!({
-                "rl_task_id": "task-1",
                 "capture_id": "capture-1",
-                "request": chat_request(false),
-                "response": chat_response("hello"),
+                "request": {
+                    "model": POLICY_MODEL,
+                    "messages": [{"role": "user", "content": "different"}],
+                },
             }),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    // A policy mismatch is a conflict of the capture, not of the request shape.
-    let (status, body) = service
-        .send(post_json(
-            "/internal/v1/completions:before",
-            &json!({
-                "rl_task_id": "task-1",
-                "capture_id": "capture-2",
-                "request": {"model": "other-model", "messages": []},
-            }),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(envelope(&body).0, "completion_conflict");
-    // An abandoned capture discards idempotently, including an unknown id.
-    let discard = json!({
-        "rl_task_id": "task-1",
-        "capture_id": "capture-2",
-    });
-    let (status, _) = service
-        .send(post_json("/internal/v1/completions:discard", &discard))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = service
-        .send(post_json("/internal/v1/completions:discard", &discard))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    // A committed capture cannot be discarded.
-    let (status, body) = service
-        .send(post_json(
-            "/internal/v1/completions:discard",
-            &json!({"rl_task_id": "task-1", "capture_id": "capture-1"}),
         ))
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
