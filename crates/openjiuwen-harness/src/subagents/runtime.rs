@@ -31,9 +31,11 @@ use self::transcript::{TranscriptEntry, TranscriptSummary};
 use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
+pub mod activity;
 pub mod clock;
 mod evict;
 mod instance;
+pub mod lifecycle;
 mod persist_api;
 pub mod persistence;
 pub mod quota;
