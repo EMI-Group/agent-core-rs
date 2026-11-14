@@ -33,6 +33,7 @@ fn request_for_inherits_the_configured_model_name() {
         client_tools: Arc::new(crate::policy::ClientToolRegistry::new()),
         resilience: crate::policy::ToolResiliencePolicy::new(),
         final_check: None,
+        kv_cache_hook: None,
         memory_provider: None,
         usage_telemetry: Arc::new(UsageTelemetry::new()),
     };

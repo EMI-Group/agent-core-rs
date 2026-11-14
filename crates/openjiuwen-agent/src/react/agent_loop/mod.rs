@@ -13,7 +13,10 @@
 //!   the system prompt, prepare the window with `ContextEngine::prepare`, emit a
 //!   `context.usage` frame, fire `BeforeModelCall`, call the model through
 //!   [`call_model_streaming`](crate::react::model_step::call_model_streaming),
-//!   and fire `AfterModelCall`;
+//!   and fire `AfterModelCall`; the call itself is wrapped in best-effort
+//!   KV-cache affinity ([`kv_cache`]): the request scope is prepared, its
+//!   inference admitted, its prefix recorded, and the provider's input tokens
+//!   reported afterwards, without ever changing the run's outcome;
 //! - execute the model's tool calls in model order through
 //!   [`execute_calls_with`](crate::abilities::execute::execute_calls_with),
 //!   firing `BeforeToolCall`/`AfterToolCall` around each call and appending the
@@ -29,6 +32,8 @@
 //! - persist contexts with `ContextEngine::save_contexts` and interruption state
 //!   under `__react_agent_interruption__`;
 //! - terminate with `termination_reason` `max_iterations` or `token_budget`.
+mod kv_cache;
+
 use crate::abilities::execute::execute_calls_with;
 use crate::abilities::{ToolCallResult, ToolExecutionOptions};
 use crate::callbacks::CallbackFramework;
@@ -121,6 +126,8 @@ pub(crate) struct AgentRuntime {
     pub(crate) resilience: ToolResiliencePolicy,
     /// Check run before a final model request, when installed.
     pub(crate) final_check: Option<Arc<dyn FinalRequestCheck>>,
+    /// KV-cache hook the model calls record their prefix affinity through.
+    pub(crate) kv_cache_hook: Option<Arc<crate::kv_cache::KVCacheModelCallHook>>,
     /// External long-term-memory provider, when the agent has one installed.
     pub(crate) memory_provider: Option<Arc<dyn MemoryProvider>>,
     /// Buffer the post-call usage snapshots; shared with the agent.
@@ -178,6 +185,7 @@ impl AgentRuntime {
             client_tools: agent.client_tools(),
             resilience: agent.tool_resilience(),
             final_check: agent.final_request_check(),
+            kv_cache_hook: agent.kv_cache_hook(),
             memory_provider: agent.memory_provider(),
             usage_telemetry: agent.usage_telemetry(),
         };
@@ -577,9 +585,16 @@ async fn run_inner(
                 .await;
             }
             let mut sink = DeltaSink::new(publisher, Some(session));
+            // Best-effort prefix affinity: prepared per attempt, so a retried
+            // call records its own scope and never leaves a lease dangling.
+            let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
             match call_model_streaming(&model, &messages, request.clone(), &mut sink).await {
-                Ok(reply) => break reply,
+                Ok(reply) => {
+                    kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
+                    break reply;
+                }
                 Err(error) => {
+                    kv_cache::finish(cache, false, None).await;
                     reset_ctx(ctx, RailEvent::OnModelException);
                     ctx.iteration = iteration;
                     ctx.extra
@@ -843,8 +858,10 @@ async fn run_inner(
     let mut messages = prepared.messages;
     messages.push(BaseMessage::user(FINAL_ANSWER_NUDGE));
     let request = request_for(runtime, &[]);
+    let cache = kv_cache::prepare(runtime, session, &messages, &request).await;
     match call_model(&runtime.model, &messages, request.clone()).await {
         Ok(reply) => {
+            kv_cache::finish(cache, true, Some(reply.usage.input_tokens)).await;
             UsageCall {
                 runtime,
                 session,
@@ -872,6 +889,7 @@ async fn run_inner(
             Ok(output)
         }
         Err(error) => {
+            kv_cache::finish(cache, false, None).await;
             output.finalization_error = Some(error.to_string());
             Ok(output)
         }

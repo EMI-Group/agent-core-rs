@@ -39,7 +39,10 @@
 //! preparation plus an `llm_route` frame when a rail swapped the model.
 //! `exposure` owns the model-facing projection computed once per run: tools
 //! the exposure policy or MCP allowlist denies never reach the model, while
-//! execution still sees the full tool map.
+//! execution still sees the full tool map. A KV-cache hook
+//! ([`ReActAgent::enable_kv_cache`] / [`ReActAgent::set_kv_cache_hook`]) adds
+//! best-effort prefix affinity around every model call, and is absent by
+//! default.
 //!
 //! [`Agent::stream`] runs the same loop in a spawned task and yields
 //! [`AgentChunk`] frames: model deltas, one usage frame per call, context and
@@ -63,6 +66,7 @@ use crate::abilities::{AbilityManager, AddAbilityResult};
 use crate::agent::Agent;
 use crate::callbacks::{AgentCallback, AgentCallbackEvent, CallbackFramework};
 use crate::card::AgentCard;
+use crate::kv_cache::{KVCacheModelCallHook, KVCacheRuntimeConfig};
 use crate::memory_provider::{provider_tools, ProviderMemoryRail, PROVIDER_RAIL_NAME};
 use crate::output::{AgentChunk, AgentOutput};
 use crate::policy::{
@@ -138,6 +142,7 @@ pub struct ReActAgent {
     client_tools: parking_lot::RwLock<Arc<ClientToolRegistry>>,
     resilience: parking_lot::RwLock<ToolResiliencePolicy>,
     final_check: parking_lot::RwLock<Option<Arc<dyn FinalRequestCheck>>>,
+    kv_cache_hook: parking_lot::RwLock<Option<Arc<KVCacheModelCallHook>>>,
     memory_provider: parking_lot::RwLock<Option<Arc<dyn MemoryProvider>>>,
 }
 
@@ -174,6 +179,7 @@ impl ReActAgent {
             client_tools: parking_lot::RwLock::new(Arc::new(ClientToolRegistry::new())),
             resilience: parking_lot::RwLock::new(ToolResiliencePolicy::new()),
             final_check: parking_lot::RwLock::new(None),
+            kv_cache_hook: parking_lot::RwLock::new(None),
             memory_provider: parking_lot::RwLock::new(None),
         }
     }
@@ -520,6 +526,62 @@ impl ReActAgent {
         self.final_check.read().clone()
     }
 
+    /// Installs a KV-cache model-call hook, or detaches it with `None`.
+    ///
+    /// The hook is best-effort affinity bookkeeping, never a correctness
+    /// requirement: with one installed, every model call of a run opens the
+    /// request's cache scope, admits its inference, records the request prefix,
+    /// and reports the provider's input tokens afterwards; a cache failure is
+    /// logged and never changes the run's output.
+    ///
+    /// [`ReActAgent::enable_kv_cache`] builds a hook that only records prefixes.
+    /// To also get provider-side prefetch/offload/evict actions, build the hook
+    /// with [`KVCacheModelCallHook::with_action_runtime`] and install it here;
+    /// a bare hook's lifecycle calls are no-ops.
+    ///
+    /// Like the other seams, a running loop keeps the hook snapshot it started
+    /// with, so a replacement affects later invocations.
+    pub fn set_kv_cache_hook(&self, hook: Option<Arc<KVCacheModelCallHook>>) {
+        *self.kv_cache_hook.write() = hook;
+    }
+
+    /// Returns the installed KV-cache hook; `None` by default, which means a run
+    /// does no cache bookkeeping at all.
+    #[must_use]
+    pub fn kv_cache_hook(&self) -> Option<Arc<KVCacheModelCallHook>> {
+        self.kv_cache_hook.read().clone()
+    }
+
+    /// Installs a KV-cache hook built from `config`.
+    ///
+    /// The runtime comes from [`KVCacheRuntimeConfig::build_runtime`], and the
+    /// hook records prefixes according to [`KVCacheRuntimeConfig::affinity`] —
+    /// with the default config affinity is disabled, so the installed hook is
+    /// inert and a run touches no cache state. Provider-side prefetch/offload is
+    /// a separate seam: use [`ReActAgent::set_kv_cache_hook`] with a hook built
+    /// through [`KVCacheModelCallHook::with_action_runtime`] for it.
+    ///
+    /// The runtime is built before anything is stored, so a failure leaves a
+    /// previously installed hook (and its recorded prefixes) untouched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed error of
+    /// [`KVCacheBackend::runtime`](crate::kv_cache::KVCacheBackend::runtime):
+    /// the deferred `Redis` and `Distributed` backends answer
+    /// `Error::Unsupported` naming the backend.
+    pub fn enable_kv_cache(&self, config: KVCacheRuntimeConfig) -> Result<()> {
+        let runtime = config.build_runtime()?;
+        let hook = KVCacheModelCallHook::new(runtime, config.affinity);
+        *self.kv_cache_hook.write() = Some(Arc::new(hook));
+        Ok(())
+    }
+
+    /// Detaches the KV-cache hook; later runs do no cache bookkeeping.
+    pub fn clear_kv_cache(&self) {
+        *self.kv_cache_hook.write() = None;
+    }
+
     /// Installs an external long-term-memory provider.
     ///
     /// Three things happen, in this order:
@@ -728,6 +790,7 @@ impl Agent for ReActAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::{KVCacheAffinityConfig, KVCacheBackend};
     use futures::StreamExt;
     use openjiuwen_common::error::ErrorKind;
     use openjiuwen_foundation::BaseMessage;
@@ -918,6 +981,37 @@ mod tests {
         assert_eq!(agent.client_tools().names(), Vec::<String>::new());
         assert!(agent.tool_resilience().is_empty());
         assert!(agent.final_request_check().is_none());
+        assert!(agent.kv_cache_hook().is_none());
+    }
+
+    #[test]
+    fn kv_cache_seam_round_trips_and_keeps_the_hook_on_a_deferred_backend() {
+        let agent = agent();
+        let hook = Arc::new(KVCacheModelCallHook::new(
+            KVCacheRuntimeConfig::default()
+                .with_affinity(KVCacheAffinityConfig::enabled())
+                .build_runtime()
+                .unwrap(),
+            KVCacheAffinityConfig::enabled(),
+        ));
+        agent.set_kv_cache_hook(Some(Arc::clone(&hook)));
+        let installed = agent.kv_cache_hook().expect("the hook is installed");
+        assert!(Arc::ptr_eq(&hook, &installed));
+        assert!(installed.capabilities().affinity);
+
+        // A deferred backend fails before anything is stored, so the installed
+        // hook (and its recorded prefixes) survives the attempt.
+        let error = agent
+            .enable_kv_cache(KVCacheRuntimeConfig::default().with_backend(KVCacheBackend::Redis))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(Arc::ptr_eq(
+            &hook,
+            &agent.kv_cache_hook().expect("the old hook survives")
+        ));
+
+        agent.clear_kv_cache();
+        assert!(agent.kv_cache_hook().is_none());
     }
 
     #[test]

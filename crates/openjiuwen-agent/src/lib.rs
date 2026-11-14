@@ -25,11 +25,18 @@
 //!   invoke, model, tool, and iteration steps.
 //! - [`InterruptRequest`] / [`InterruptionState`] — a paused run is an output,
 //!   not an error; resuming is a normal invoke with interactive input.
+//! - [`KVCacheModelCallHook`] — best-effort prefix affinity around the model
+//!   calls of a run, installed with [`ReActAgent::enable_kv_cache`] or
+//!   [`ReActAgent::set_kv_cache_hook`]; absent by default.
 //!
 //! # Modules
 //!
 //! - [`agent`] — the [`Agent`] trait every runnable agent implements.
 //! - [`card`] — [`AgentCard`], the registry-safe identity of an agent.
+//! - [`controller`] — the controller stack: events, intents, the task store, the
+//!   background scheduler, and the turn loop that routes work to executors.
+//! - [`kv_cache`] — KV-cache prefix identities, the in-process runtimes, and the
+//!   model-call affinity hook.
 //! - [`input`] — [`AgentInput`] parsing of the caller's JSON payload.
 //! - [`output`] — [`AgentOutput`], [`AgentChunk`], and the interrupt frame model.
 //! - [`prompt`] — [`SystemPromptBuilder`] and its ordered [`PromptSection`]s.
@@ -75,11 +82,20 @@ pub use abilities::{
 };
 pub use agent::Agent;
 pub use card::AgentCard;
+pub use controller::{
+    BaseController, Controller, ControllerConfig, GroupRouter, TaskManager, TaskQueue,
+    TaskSchedulerLoop, TaskSchedulerState,
+};
 pub use input::{AgentInput, InputQuery};
 pub use interrupt::{
     approval_value, match_answers, parse_approval, reject_feedback, InterruptAnswer, InterruptKind,
     InterruptRequest, InterruptionState, MatchedAnswers, AUTO_CONFIRM_STATE_KEY,
     DEFAULT_REJECT_FEEDBACK, INTERRUPTION_STATE_KEY,
+};
+pub use kv_cache::{
+    InProcessKVCacheRuntime, InProcessKvCacheActionProvider, KVCacheAffinityConfig, KVCacheEntry,
+    KVCacheIdentity, KVCacheModelCallHook, KVCacheRuntimeConfig, KVCacheRuntimeProtocol,
+    KvCacheActionProvider, KvCacheActionRuntime, KvCacheAdmission, KvCacheInferenceLease,
 };
 pub use llm_agent::{
     create_llm_agent_config, ConstrainConfig, LlmAgent, LlmAgentConfig, ModelConfig, ModelInfo,
