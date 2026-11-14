@@ -296,7 +296,7 @@ pub trait McpResourceSubscriptionProvider: Send + Sync {
 /// The per-host registry of MCP resource subscriptions.
 ///
 /// One instance per host (there is no process-global state): it holds the provider, the buffer
-/// capacity and one [`SubscriptionState`] per subscribed URI. Without a provider every
+/// capacity and one `SubscriptionState` per subscribed URI. Without a provider every
 /// `subscribe` answers [`NO_PROVIDER_REASON`]; `unsubscribe`, `list`, `poll` and `events` keep
 /// working on subscriptions the host opened through [`Self::sink`] (out-of-band updates).
 pub struct McpResourceSubscriptions {
@@ -507,8 +507,7 @@ impl McpResourceSubscriptions {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] when `uri` is not subscribed, and
-    /// [`Error::Cancelled`](openjiuwen_common::error::Error::Cancelled) once the subscription was
-    /// closed.
+    /// [`Error::Cancelled`] once the subscription was closed.
     pub async fn recv(&self, uri: &str) -> Result<McpResourceEvent> {
         let state = self.state(uri)?;
         let mut observer = state.observer.lock().await;

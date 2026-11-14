@@ -13,7 +13,10 @@ use openjiuwen_sysop::{LocalWorkConfig, SysOperation};
 use crate::lsp::{LspTool, LspToolConfig};
 use crate::permission::PermissionEngine;
 use crate::workspace::Workspace;
-use crate::worktree::{WorktreeManager, WorktreeTool};
+use crate::worktree::{
+    EnterWorktreeTool, ExitWorktreeTool, MemoryWorktreeSessionStore, WorktreeManager,
+    WorktreeSessionStore, WorktreeTool,
+};
 
 use super::{
     cron, discovery, goal, mcp_resources, mcp_subscription_tool, mcp_subscriptions, media, web,
@@ -98,6 +101,8 @@ pub struct ToolRegistry {
     worktree_manager: Option<Arc<WorktreeManager>>,
     /// Repository-root override of the default worktree manager; `None` uses the workspace root.
     worktree_root: Option<PathBuf>,
+    /// The worktree session store shared by `enter_worktree` and `exit_worktree`.
+    worktree_sessions: Arc<dyn WorktreeSessionStore>,
     /// Tools held back from [`ToolRegistry::build`]/[`ToolRegistry::cards`] until discovered.
     deferred: Vec<BuiltinTool>,
     /// The tools this registry builds, in registry order.
@@ -146,6 +151,7 @@ impl ToolRegistry {
             lsp_config: None,
             worktree_manager: None,
             worktree_root: None,
+            worktree_sessions: Arc::new(MemoryWorktreeSessionStore::new()),
             deferred: Vec::new(),
             tools: BuiltinTool::DEFAULT.to_vec(),
         }
@@ -276,6 +282,17 @@ impl ToolRegistry {
         self
     }
 
+    /// Wires the session store shared by `enter_worktree` and `exit_worktree`.
+    ///
+    /// Without one both tools share an in-process [`MemoryWorktreeSessionStore`], which is what a
+    /// single agent needs; a host that keeps the active worktree per session, per team member or
+    /// on disk implements [`WorktreeSessionStore`] and wires it here.
+    #[must_use]
+    pub fn with_worktree_session_store(mut self, store: Arc<dyn WorktreeSessionStore>) -> Self {
+        self.worktree_sessions = store;
+        self
+    }
+
     /// Holds `tools` back as deferred tools, replacing any previous deferred list.
     ///
     /// They are not mounted by [`Self::build`] and not listed by [`Self::cards`]; the model finds
@@ -387,6 +404,8 @@ impl ToolRegistry {
                 )),
                 BuiltinTool::Lsp => Arc::new(self.lsp_tool()),
                 BuiltinTool::Worktree => Arc::new(self.worktree_tool(language)),
+                BuiltinTool::EnterWorktree => Arc::new(self.enter_worktree_tool(language)),
+                BuiltinTool::ExitWorktree => Arc::new(self.exit_worktree_tool(language)),
             })
             .collect()
     }
@@ -462,15 +481,43 @@ impl ToolRegistry {
     /// Nothing is checked at construction time: a workspace outside a git repository surfaces the
     /// manager's typed git error as a `success=false` payload when the tool runs.
     fn worktree_tool(&self, language: &str) -> WorktreeTool {
-        let manager = self
-            .worktree_manager
-            .clone()
-            .unwrap_or_else(|| Arc::new(WorktreeManager::new(self.worktree_repo_root())));
-        let tool = WorktreeTool::new(manager, language);
+        let tool = WorktreeTool::new(self.shared_worktree_manager(), language);
         match self.env.permission() {
             Some(engine) => tool.with_permission(Arc::clone(engine)),
             None => tool,
         }
+    }
+
+    /// Builds `enter_worktree` over the shared manager and worktree session store.
+    ///
+    /// Like `worktree`, the default manager is rooted at [`Self::worktree_repo_root`] and nothing
+    /// is checked at construction time: outside a git repository the manager's typed git failure
+    /// becomes a `success=false` payload naming the problem.
+    fn enter_worktree_tool(&self, language: &str) -> EnterWorktreeTool {
+        let tool = EnterWorktreeTool::new(self.shared_worktree_manager(), language)
+            .with_sessions(Arc::clone(&self.worktree_sessions));
+        match self.env.permission() {
+            Some(engine) => tool.with_permission(Arc::clone(engine)),
+            None => tool,
+        }
+    }
+
+    /// Builds `exit_worktree` over the shared manager and worktree session store.
+    fn exit_worktree_tool(&self, language: &str) -> ExitWorktreeTool {
+        let tool = ExitWorktreeTool::new(self.shared_worktree_manager(), language)
+            .with_sessions(Arc::clone(&self.worktree_sessions));
+        match self.env.permission() {
+            Some(engine) => tool.with_permission(Arc::clone(engine)),
+            None => tool,
+        }
+    }
+
+    /// The worktree manager shared by the three worktree tools: the wired manager, else one
+    /// rooted at [`Self::worktree_repo_root`].
+    fn shared_worktree_manager(&self) -> Arc<WorktreeManager> {
+        self.worktree_manager
+            .clone()
+            .unwrap_or_else(|| Arc::new(WorktreeManager::new(self.worktree_repo_root())))
     }
 
     /// The repository root of the default worktree manager.
@@ -585,6 +632,8 @@ impl ToolRegistry {
             BuiltinTool::SubmitGoalReport => goal::SubmitGoalReportTool::card_for(language),
             BuiltinTool::Lsp => LspTool::card_for(language),
             BuiltinTool::Worktree => WorktreeTool::card_for(language),
+            BuiltinTool::EnterWorktree => EnterWorktreeTool::card_for(language),
+            BuiltinTool::ExitWorktree => ExitWorktreeTool::card_for(language),
         }
     }
 
@@ -729,8 +778,8 @@ impl ToolRegistry {
 
     /// The worktree manager wired into the `worktree` tool, when one is configured.
     ///
-    /// `None` means the tool is built over a manager rooted at [`Self::worktree_root`] or the
-    /// workspace root.
+    /// `None` means the three worktree tools are built over a manager rooted at
+    /// [`Self::worktree_root`] or the workspace root.
     #[must_use]
     pub fn worktree_manager(&self) -> Option<&Arc<WorktreeManager>> {
         self.worktree_manager.as_ref()
@@ -740,6 +789,12 @@ impl ToolRegistry {
     #[must_use]
     pub fn worktree_root(&self) -> Option<&Path> {
         self.worktree_root.as_deref()
+    }
+
+    /// The worktree session store shared by `enter_worktree` and `exit_worktree`.
+    #[must_use]
+    pub fn worktree_session_store(&self) -> &Arc<dyn WorktreeSessionStore> {
+        &self.worktree_sessions
     }
 
     /// The todo directory override, when one was set.

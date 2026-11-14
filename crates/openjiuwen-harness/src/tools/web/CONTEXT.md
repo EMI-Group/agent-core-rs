@@ -4,7 +4,7 @@
 
 The web tool surface of the `DeepAgent`: `fetch_webpage` (HTTP GET → charset decode → HTML-to-text) and `web_search` (a query → ranked `{title, url, snippet}` results), plus the in-crate HTML-to-text extractor and URL normaliser both rely on.
 Ports `openjiuwen/harness/tools/web/` (`fetch_webpage.py`, `_http.py`, `_decode.py`, `free_search.py`, `paid_search.py`) as the model-facing contract and its injectable seams; provider, quality and budget internals are not transliterated.
-`openjiuwen_harness::tools::web` is public (`tools/mod.rs` declares `pub mod web;`); the tools are wired into a host through their own constructors, never through `ToolRegistry`.
+`openjiuwen_harness::tools::web` is public (`tools/mod.rs` declares `pub mod web;`); `ToolRegistry` mounts the two tools as the extended builtins `fetch_webpage`/`web_search`, and a host may also construct them directly with their own seams.
 
 ## API Surface
 
@@ -39,18 +39,19 @@ Ports `openjiuwen/harness/tools/web/` (`fetch_webpage.py`, `_http.py`, `_decode.
 
 - `#[async_trait] pub trait SearchBackend: Send + Sync { async fn search(&self, query: &str, max_results: usize) -> Result<Vec<SearchResult>>; }`.
 - `SearchResult { title, url, snippet }` (serde, snake_case) with `SearchResult::new`.
-- `HttpSearchBackend::new(endpoint)`, `with_fetcher(endpoint, Arc<dyn HttpFetcher>)`, `with_timeout(Duration)`, `with_max_bytes(usize)`, `endpoint()`; `{query}` template or `?q=…&max_results=…` append.
+- `ENDPOINT_ENV` (`OPENJIUWEN_WEB_SEARCH_ENDPOINT`, blank counts as unset), `CONFIG_GUIDANCE` and `not_configured_reason()` (always starts with the historical `web search backend is not configured` prefix, then names the variable, the `{query}` placeholder, `HttpSearchBackend::new`, `WebSearchTool::with_endpoint` and `ToolRegistry::with_search_backend`).
+- `HttpSearchBackend::new(endpoint)`, `with_fetcher(endpoint, Arc<dyn HttpFetcher>)`, `from_env()`, `from_lookup(impl Fn(&str) -> Option<String>)`, `is_configured()`, `with_timeout(Duration)`, `with_max_bytes(usize)`, `endpoint()`; `{query}` template or `?q=…&max_results=…` append. `from_env`/`from_lookup` return `Error::Unsupported` carrying `not_configured_reason()` when the value is missing or blank, and `search` does the same for a blank endpoint without issuing a request.
 - `parse_search_response(text) -> Result<Vec<SearchResult>>`; `FakeSearchBackend` (`new`, `with_results`, `failing`, `set_results`, `set_failure`, `calls() -> Vec<FakeSearchCall>`, `last_call()`) and `FakeSearchCall { query, max_results }`.
-- `WebSearchTool::new(backend: Option<Arc<dyn SearchBackend>>, language: impl Into<String>)`, `card_for(language: &str) -> ToolCard`, `impl Tool`; `WebSearchArgs { query, max_results }`.
+- `WebSearchTool::new(backend: Option<Arc<dyn SearchBackend>>, language: impl Into<String>)`, `with_endpoint(endpoint, language)` (one-call `HttpSearchBackend` construction), `card_for(language: &str) -> ToolCard`, `impl Tool`; `WebSearchArgs { query, max_results }`.
 - Success payload: `data = {"success": true, "results": [{title, url, snippet}]}`.
-- Failures: `query cannot be empty`, `web search backend is not configured`, `web search failed: <error>`.
+- Failures: `query cannot be empty`, `not_configured_reason()` rendered bare (no backend, a blank endpoint, or a provider that reports `Error::Unsupported`), and `web search failed: <kind>: <message>` for a configured provider that failed at runtime.
 
 ## Constraints
 
 - Both tools implement `openjiuwen_foundation::Tool`; expected failures are `success=false` payloads, `Err` is reserved for cancellation (`ToolContext::check_cancelled`) and malformed argument types.
 - No direct network access from a tool: `fetch_webpage` goes through `HttpFetcher`, `web_search` through `SearchBackend`; tests never touch the network beyond loopback.
 - `fetch_webpage` consults `ToolEnv::deny_reason("fetch_webpage", args)` before any request, which folds the permission engine and network guard (pipeline C) for the fetch-tool aliases; `web_search` does not (a query is not a URL).
-- Card descriptions come from `crate::tools::descriptions::description(name, language)` exactly like `shell.rs`; the `fetch_webpage`/`web_search` rows are still empty, so nothing here asserts non-empty text.
+- Card descriptions come from `crate::tools::descriptions::description(name, language)` exactly like `shell.rs`; both rows are populated in English and Chinese.
 - No new dependencies: HTML parsing, entity decoding, URL resolution and percent-encoding are in-crate; `reqwest` is the workspace-pinned build (rustls, `json`, `stream`).
 - No panics on model input, no `unwrap`/`expect` outside tests, no `unsafe`, `tracing` only (no stdout/stderr), files ≲1000 lines.
 - Deterministic tests only: `tempfile` workspaces, loopback `TcpListener` servers, injected fetchers, injected timeouts.
@@ -58,6 +59,7 @@ Ports `openjiuwen/harness/tools/web/` (`fetch_webpage.py`, `_http.py`, `_decode.
 ## Design decisions
 
 - **Deviation — seams instead of engines**: Python selects vendors (DuckDuckGo/Bing scrapers, paid SDKs) and passes results through LLM quality/assessment/budget stages; Rust exposes one injectable backend per capability and renders whatever it returns.
+- **Deviation — configuration gap is typed**: Python raises when no search provider is available; here the gap is `Error::Unsupported(not_configured_reason())`, reported bare by the tool, while `OPENJIUWEN_WEB_SEARCH_ENDPOINT` (or `HttpSearchBackend::new`/`WebSearchTool::with_endpoint`) opens a working JSON search endpoint without a host implementation.
 - **Deviation — no JS rendering / reader proxy**: the extractor sees the served bytes, so a JavaScript shell yields the shell's text; the Jina reader fallback is not ported.
 - **Deviation — charset coverage**: UTF-8/ASCII, Latin-1/Windows-1252 and UTF-16 decode exactly; every other label decodes as lossy UTF-8 instead of a full codec registry.
 - **Deviation — `max_bytes` argument**: Python has only the `MCP_FETCH_WEBPAGE_MAX_BYTES` environment cap; the tool accepts a per-call `max_bytes` (clamped to `1..=8 MiB`) so oversized-body behaviour is testable offline.
@@ -72,8 +74,8 @@ Ports `openjiuwen/harness/tools/web/` (`fetch_webpage.py`, `_http.py`, `_decode.
 - `html.rs` unit tests: script/style/comment removal, first-title capture, block newlines, whitespace collapse, `<pre>` preservation, entity decoding (named, decimal, hex, unknown, numeric zero), malformed/unclosed markup, doctype/CDATA/PI skipping, quoted `>` in attributes, and URL resolution/rejection cases.
 - `decode.rs` unit tests: header charset (quoted and bare), meta sniffing (both declaration forms), BOM precedence, lossy UTF-8, Latin-1/Windows-1252, UTF-16 LE/BE and unknown-label fallback.
 - `fetch.rs` unit tests: card schema/`required`, limit clamping, URL validation and scheme rejection, HTML/JSON/text rendering, binary rejection, header charset, HTTP and transport failures, missing fetcher, argument errors, permission denial (fetcher not called), content and body truncation, prompt/caption echo, request headers/timeout/byte cap.
-- `search.rs` unit tests: card schema, result-count clamping, percent encoding, object/array payload parsing, alternate field names, malformed payloads, request URL building (template and query append), HTTP and JSON failures, payload shape, backend failure, missing backend, fake-backend call recording.
-- `tests.rs` cross-module suite (62 tests total across the subtree): loopback HTML extraction with title, JSON pretty-printing, header and meta charsets, redirect following, byte-cap truncation, real `reqwest` timeout, connection-refused failure payload, timeout payload, net-guard denial, fake search round-trip, missing backend, and an HTTP search backend round-trip asserting the exact request line.
+- `search.rs` unit tests: card schema, result-count clamping, percent encoding, object/array payload parsing, alternate field names, malformed payloads, request URL building (template and query append), HTTP and JSON failures, payload shape, backend failure, missing backend, fake-backend call recording, `not_configured_reason` content, `from_lookup` trimming plus unset/blank rejection, a blank endpoint issuing no request, and the tool rendering a configuration gap differently from a runtime failure.
+- `tests.rs` cross-module suite (74 tests total across the subtree): loopback HTML extraction with title, JSON pretty-printing, header and meta charsets, redirect following, byte-cap truncation, real `reqwest` timeout, connection-refused failure payload, timeout payload, net-guard denial, fake search round-trip, missing backend, the `not_configured_reason` payload naming `OPENJIUWEN_WEB_SEARCH_ENDPOINT`, an endpoint configured through `from_lookup` against a loopback server, `WebSearchTool::with_endpoint` with a blank endpoint, and an HTTP search backend round-trip asserting the exact request line.
 - `test_support.rs` supplies the shared `StubFetcher` (canned response/failure, call count, last request), `fetch_response`, `http_response` and a loopback `TestServer` aborted on drop; all helpers are `#[cfg(test)]`.
 - Definition of done: `cargo fmt -p openjiuwen-harness`, `cargo test -p openjiuwen-harness --offline`, `cargo test -p openjiuwen-harness --no-default-features --offline`, `cargo clippy -p openjiuwen-harness --all-targets --offline -- -D warnings` clean.
 
