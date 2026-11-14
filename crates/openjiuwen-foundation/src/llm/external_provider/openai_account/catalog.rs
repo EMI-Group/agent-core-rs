@@ -160,7 +160,7 @@ impl OpenAiAccountModelCatalog {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
-        self.base_url = base_url.trim().trim_end_matches('/').to_owned();
+        base_url.trim().trim_end_matches('/').clone_into(&mut self.base_url);
         self
     }
 

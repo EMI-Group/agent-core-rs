@@ -2,7 +2,7 @@
 //!
 //! Ports `openjiuwen/extensions/external_provider/` — the Python extension that
 //! plugs a provider whose credentials live outside the SDK (currently the
-//! `OpenAIAccount` ChatGPT account provider) into two shared seams:
+//! `OpenAIAccount` `ChatGPT` account provider) into two shared seams:
 //!
 //! - [`ExternalAuthProvider`] — status, logout, and access-token resolution;
 //! - [`ProviderModelCatalog`] — model discovery with live → cache → defaults

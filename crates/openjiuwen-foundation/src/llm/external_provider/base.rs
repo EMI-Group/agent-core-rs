@@ -92,6 +92,11 @@ mod epoch_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
 
     /// Writes the timestamp as a (fractional) number of seconds since the epoch.
+    ///
+    /// `&Option<T>` is forced by serde's `#[serde(with = "…")]` contract, which
+    /// passes the field by reference, so the `ref_option` suggestion does not
+    /// apply here.
+    #[allow(clippy::ref_option)]
     pub(super) fn serialize<S>(
         value: &Option<DateTime<Utc>>,
         serializer: S,
