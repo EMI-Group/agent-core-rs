@@ -27,8 +27,8 @@
 //!
 //! # Errors
 //!
-//! An unknown sandbox type is [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported), naming the supported types.
-//! A duplicate registration is the kernel's [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp).
+//! An unknown sandbox type is [`ErrorKind::Unsupported`], naming the supported types.
+//! A duplicate registration is the kernel's [`ErrorKind::SysOp`].
 //!
 //! # Example
 //!
@@ -164,7 +164,7 @@ fn deferred_error(sandbox_type: &str) -> Error {
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported) when
+/// Returns [`ErrorKind::Unsupported`] when
 /// `sandbox_type` is not one of [`REMOTE_SANDBOX_TYPES`], with a message naming them.
 pub fn remote_provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
     remote::provider_set(sandbox_type)
@@ -178,7 +178,7 @@ pub fn remote_provider_set(sandbox_type: &str) -> Result<SandboxProviderSet> {
 ///
 /// Propagates [`remote_provider_set`]'s `Unsupported` error for an unknown sandbox type and
 /// [`register`]'s errors (a duplicate registration is
-/// [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp)).
+/// [`ErrorKind::SysOp`]).
 pub fn register_remote(registry: &SandboxProviderRegistry, sandbox_type: &str) -> Result<()> {
     register(registry, sandbox_type, remote_provider_set(sandbox_type)?)
 }
@@ -191,7 +191,7 @@ pub fn register_remote(registry: &SandboxProviderRegistry, sandbox_type: &str) -
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) when a type is
+/// Returns [`ErrorKind::SysOp`] when a type is
 /// already registered in `registry`.
 pub fn register_remote_providers(registry: &SandboxProviderRegistry) -> Result<()> {
     for sandbox_type in REMOTE_SANDBOX_TYPES {
@@ -207,7 +207,7 @@ pub fn register_remote_providers(registry: &SandboxProviderRegistry) -> Result<(
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp) when a
+/// Returns [`ErrorKind::SysOp`] when a
 /// factory is already registered for `sandbox_type` (Python raises on duplicates) and
 /// propagates any kernel registration error.
 pub fn register(
@@ -278,7 +278,7 @@ pub fn is_deferred(sandbox_type: &str) -> bool {
 /// # Errors
 ///
 /// Propagates [`register`]'s errors (duplicate registration is
-/// [`ErrorKind::SysOp`](openjiuwen_common::error::ErrorKind::SysOp)).
+/// [`ErrorKind::SysOp`]).
 pub fn register_gateway_provider(
     registry: &SandboxProviderRegistry,
     sandbox_type: &str,
@@ -327,15 +327,15 @@ pub fn register_gateway_provider(
 ///
 /// `aio` has no container-delete API — the AIO gateway owns the container
 /// lifetime and reaps idle containers — so it answers
-/// [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// [`ErrorKind::Unsupported`]
 /// naming the gateway instead of inventing an endpoint.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::Unsupported`](openjiuwen_common::error::ErrorKind::Unsupported)
+/// Returns [`ErrorKind::Unsupported`]
 /// for the `aio` sandbox type and for any name outside
 /// [`REMOTE_SANDBOX_TYPES`], and
-/// [`ErrorKind::Validation`](openjiuwen_common::error::ErrorKind::Validation)
+/// [`ErrorKind::Validation`]
 /// for a [`SandboxSelector`] that names nothing to release.
 /// A container whose delete fails is reported in [`TeardownReport::failed`]
 /// rather than failing the whole call.
