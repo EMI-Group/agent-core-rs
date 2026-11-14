@@ -351,6 +351,46 @@ Its stream bypasses the bus: it calls the root agent's `stream` with `{conversat
 The event bus, auto-subscription, Python literals, resource seam, member checkpoints, transport seam and `P2PAbilityManager` are documented at module depth in `./src/CONTEXT.md`.
 In one line each: `events` delivers typed `TeamEvent`s in sequence order to filtered, unsubscribable listeners; `autosubscribe` derives deterministic per-member patterns from the card (broadcast topic, `{topic}.*`, directed `{topic}.{member}`, `subscribe:` tags) and applies them in `Merge`/`Replace`/`Disabled` mode with explicit per-agent overrides; `pyrepr` is the `ast.literal_eval`/`str()` fallback used by signal extraction and tool-result rendering; `resources` is the all-defaulted `TeamResourceMgr` seam `resolve_*` falls back to; `member_checkpoint` scopes one shared checkpointer per `(team_session_id, agent_id)` under the `agent` namespace; `transport` is the `TeamTransport` seam with in-process and Redis backends (`Pulsar` = `Unsupported`); `ability` dispatches a supervisor's calls as P2P agent calls or local executor calls, in input order, bounded by a semaphore.
 
+### Rust extensions beyond the Python surface (`routing.rs`, `inbox.rs`, `communicable.rs`)
+
+```rust
+pub const GROUP_METADATA_KEY: &str = "group";
+pub struct GroupRegistry { .. }
+impl GroupRegistry {
+    pub fn new() -> Self;
+    pub fn register_group(&self, group_id: impl Into<String>, members: impl IntoIterator<Item = String>) -> Result<usize>;
+    pub fn add_member(&self, group_id: &str, agent_id: &str) -> Result<bool>;   // true when newly added
+    pub fn remove_member(&self, group_id: &str, agent_id: &str) -> bool;
+    pub fn unregister_group(&self, group_id: &str) -> bool;
+    pub fn group_members(&self, group_id: &str) -> Vec<String>;                 // sorted
+    pub fn groups(&self) -> Vec<String>;  pub fn groups_of(&self, agent_id: &str) -> Vec<String>;
+    pub fn group_count(&self) -> usize;   pub fn member_count(&self) -> usize;  pub fn clear(&self) -> usize;
+}
+pub fn broadcast_targets(members: impl IntoIterator<Item = String>, sender: Option<&str>,
+                         include_sender: bool) -> Vec<String>;                  // sorted, deduped, sender excluded by default
+pub struct GroupDelivery { pub agent_id: String, pub outcome: Result<Value> }   // not serializable
+pub struct GroupBroadcast { pub group: String, pub recipients: Vec<String>, pub skipped: Vec<String>,
+                            pub deliveries: Vec<GroupDelivery> }
+impl GroupBroadcast { pub fn succeeded(&self) -> usize; pub fn failed(&self) -> usize;
+                      pub fn value_of(&self, agent_id: &str) -> Option<&Value>;
+                      pub fn into_results(self) -> BTreeMap<String, Result<Value>>; }
+pub struct RoutingTable { pub team_id: String, pub groups: BTreeMap<String, Vec<String>>,
+                          pub topics: BTreeMap<String, Vec<String>>, pub agents: BTreeMap<String, Vec<String>> }
+impl RoutingTable { pub fn route(&self, destination: &str) -> Vec<String>;      // group first, then topic patterns
+                    pub fn destinations(&self, agent_id: &str) -> Vec<String>; }
+pub struct InboxFilter { .. }        // sender allow/deny, topic patterns, required metadata, require_session
+impl InboxFilter { pub fn new() -> Self; pub fn allow_senders(..) -> Self; pub fn deny_senders(..) -> Self;
+                   pub fn allow_topics(..) -> Self; pub fn require_metadata(key, value) -> Self;
+                   pub fn require_session(self) -> Self; pub fn accepts(&self, envelope: &MessageEnvelope) -> bool; }
+pub struct InboxFilterRegistry { .. } // set/remove/get/accepts/agents/len/clear; an agent without a filter accepts everything
+pub struct CommunicableAgent { .. }   // Python mixin counterpart: bind_runtime/is_bound/runtime/agent_id/unbind
+                                      // plus send/publish/subscribe/unsubscribe (unbound => Validation)
+```
+`TeamRuntime` also gained group/inbox forwarders (`groups`, `inbox_filters`, `register_group`, `unregister_group`, `group_members`, `groups_of`, `set_inbox_filter`, `remove_inbox_filter`, `inbox_filter`, `routing_table`), `broadcast_to_group(message, group_id, sender, session_id, timeout)`, and the Python-parity introspection `is_running`, `list_subscriptions`, `list_agent_subscriptions`, `get_subscription_count`.
+`MessageBus` gained `remove_all_subscriptions`, `list_subscriptions`, `list_agent_subscriptions`, `get_subscription_count`; `TeamTransport` gained three defaulted introspection methods (`list_subscriptions`, `agent_subscriptions`, `subscription_count`) overridden by both backends.
+Group broadcast is one P2P `send` per member (concurrently, failures isolated) with `metadata["group"]` stamped on every envelope; the sender is excluded unless the caller opts in, and unregistered members are skipped and reported.
+An inbox filter is enforced in `TeamRuntime::dispatch_p2p` (rejection is a `Validation` error at the sender) and `dispatch_pubsub` (rejection is logged and the delivery skipped).
+
 ### Errors
 
 `openjiuwen_common::error::{Error, Result}` everywhere. Empty sender/recipient/subscription args and `max_agents` violations are `Validation`; unknown members are `NotFound`; deadlines are `Timeout`; missing strategy configuration (supervisor/root not registered) is `Config`; a strategy-free team, a `Pulsar` transport, or an unimplemented strategy is `Unsupported`; an empty P2P response is `Error::External(TeamError::EmptyResponse)`.
@@ -386,6 +426,10 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - **Member checkpoint identity is `(team_session_id, agent_id)` at the `agent` namespace**: the team session id comes from the child session's parent, the agent id from its metadata, so two members sharing one `MemoryCheckpointer` cannot overwrite each other and a resumed team run restores each member's own state. Checkpoint ids are append-only (`{key}:{sequence:06}`), so history is total-ordered per member.
 - **Transport is the seam, the message bus is one implementation**: `TeamTransport` abstracts `send`/`publish`/subscriptions so `InProcessTransport` (message-bus FIFO workers) and `RedisTransport` (RESP2 lists + pollers) are interchangeable; `Pulsar` is a typed `Unsupported`. The runtime delegates and never depends on a backend detail.
 - **Python-repr rendering is opt-in per call site**: `pyrepr` parses and renders Python literals only where Python itself does `ast.literal_eval`/`str()` (handoff signal extraction, tool-result rendering), so ordinary JSON handling stays serde-based and lossless.
+- **Redis delivery is Streams consumer groups, not lists**: `RPOP` was destructive and per-instance, so two processes could not share a team and a crash lost a request; `XADD`/`XREADGROUP`/`XACK` gives a durable per-agent inbox with at-least-once delivery, and `XAUTOCLAIM` is the reconnect path (a worker acks only after its reply write succeeded).
+- **Cross-process subscriptions are a Redis SET family** (`subs`, `subs:{pattern}`) that each instance writes through on `add_subscription`/`remove_subscription` and refreshes on an interval into `remote ∪ owned`, because `TeamTransport::subscribers` is synchronous: the local registry must answer from a snapshot, never from a network call, and a local write must never be dropped by a racing refresh.
+- **Group routing is a registry plus a snapshot view**: `GroupRegistry` holds membership only, `RoutingTable` is an assembled read model over groups plus the transport's topic registry, and `broadcast_to_group` is a fan-out of ordinary P2P sends (so it reuses validation, deadlines, events and per-member failure isolation instead of adding a second delivery path).
+- **Inbox filters live in the runtime dispatcher, not in a handler wrapper**: the transport already delivers to `RuntimeHandler`, so filtering there covers both backends, keeps the `MessageHandler` trait unchanged, and lets a rejection surface as a `Validation` error at the sender for P2P while pub/sub stays fire-and-forget.
 
 ## Routing Table
 
@@ -410,7 +454,11 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `./src/ability.rs` → `P2PAbilityManager`, `AbilityCall`, `AbilityResult`, `AbilityExecutor`
 - `./src/handoff/` → handoff config/signal/tool/orchestrator/container/interrupt and `HandoffStrategy` (`handoff/CONTEXT.md`)
 - `./src/hierarchical/` → msgbus supervisor team, supervisor factory, agents-as-tools team, `P2PAbilityManager` (`hierarchical/CONTEXT.md`)
-- `./src/transport/` → `TeamTransport` seam, `TransportKind`/`TransportConfig`, in-process and Redis backends, `Pulsar` `Unsupported`
+- `./src/routing.rs` → `GroupRegistry`, `broadcast_targets`, `GroupBroadcast`/`GroupDelivery`, `RoutingTable`, `GROUP_METADATA_KEY`
+- `./src/inbox.rs` → `InboxFilter`, `InboxFilterRegistry` (per-agent acceptance rules)
+- `./src/communicable.rs` → `CommunicableAgent`, the runtime-bound send/publish/subscribe facade
+- `./src/runtime/routing.rs` → the runtime's group/inbox forwarders, `broadcast_to_group`, `routing_table`
+- `./src/transport/` → `TeamTransport` seam, `TransportKind`/`TransportConfig`, in-process and Redis backends (`redis/` split into config, streams commands, worker, registry, backend), `Pulsar` `Unsupported`
 - `./tests/` → crate integration suites (`tests/CONTEXT.md`)
 
 ## Test Strategy
@@ -430,7 +478,11 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `tests/pyrepr.rs` covers the two call sites: recovering a handoff payload from a `str()`-rendered tool message (`json.loads` first, `ast.literal_eval` second) and rendering a tool result for a model prompt.
 - `tests/resources.rs` covers `LocalResourceMgr` and the `TeamResourceMgr` trait object: first-registration-wins, sorted id listings, registration-ordered agent ids, the revision counter, and `clear`.
 - `tests/member_checkpoint.rs` is the headline identity scenario: two members of one team sharing a single `MemoryCheckpointer`, each saving different state, then a second team session object with the same id and fresh children restoring exactly its own state.
-- `tests/transport.rs` runs the in-process backend over a recording handler and the Redis backend over a loopback fake RESP2 server (`TcpListener` on `127.0.0.1:0`): key names, P2P round-trip, pub/sub fan-out, deadlines, duplicate `watch_agent`, `Pulsar`/missing-config errors, shutdown.
+- `tests/transport.rs` covers the in-process backend over a recording handler (ordering, fan-out, subscribers, deadlines, introspection) plus backend selection (`Pulsar` `Unsupported`, Redis without settings is `Config`).
+- `tests/transport_redis.rs` runs the Redis backend over a loopback fake RESP server (`TcpListener` on `127.0.0.1:0`) with a stream-aware state machine (entries, per-group cursors, pending lists, SET registry): cross-instance P2P round-trip, one delivery per group, socket-drop reconnect that claims and acks a pending entry, poison-entry ack, pub/sub fan-out to two transports, registry refresh convergence both ways, `-ERR` resilience, `stop` cleanup, `Cluster`/`Sentinel` `Unsupported`, timeout text, and an assertion that no `RPUSH`/`RPOP`/`LLEN` is ever issued.
+- `tests/routing.rs` covers `GroupRegistry` semantics and validation, `broadcast_targets` sender exclusion, `broadcast_to_group` end-to-end (metadata stamp, skipped members, isolated failures, one group event, `NotFound`/`Validation`), and `RoutingTable` resolution plus serde round-trip.
+- `tests/inbox.rs` covers every `InboxFilter` rule, registry default-accept, and runtime enforcement (P2P rejection at the sender, pub/sub drop, delivery restored after removal).
+- `tests/communicable.rs` covers the unbound validation message, bind/rebind/unbind, and an in-process `send`/`publish`/`subscribe` round trip.
 - `tests/ability.rs` covers agent-tool routing over P2P, local executor routing, input-order results, the parallel cap, the error results (`"P2P dispatch to '<name>' failed: ..."`, missing executor), and the empty batch.
 - `tests/runtime_integration.rs` covers the runtime seams together: event emission, resource-manager fallback, member-scoped checkpoints across a resume, the outbound transport, and `AgentTool` task events.
 - `tests/handoff_events.rs` covers one `handoff_started` per hop, `handoff_completed` with `interrupted`, the `handoff` error event, and silence when the runtime was dropped.
@@ -439,12 +491,18 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 
 ## Deferred Python Behavior
 
-- `Pulsar` transport — `build_transport` returns `Error::Unsupported` naming Pulsar; no Pulsar client exists in the workspace and none may be added offline.
-- Redis delivery is poll-based and per-transport-instance: two processes do not share a subscription registry, and an agent's inbox is only consumed after `RedisTransport::watch_agent` (the `RPOP` is destructive, so the poller owns the queue).
-- Redis cluster/Sentinel topologies and Redis Streams consumer groups — the backend speaks plain RESP2 to a single node.
+- `Pulsar` transport — `build_transport` returns `Error::Unsupported` naming Pulsar and the missing protobuf-framed client; no Pulsar client exists in the workspace and none may be added offline.
+- Redis cluster/Sentinel topologies — `RedisTopology::{Cluster, Sentinel}` is a typed `Error::Unsupported` (`build_transport` and `start`), because the workspace has no cluster/Sentinel-capable RESP client; `RedisTransportConfig::topology` defaults to `Single`.
+- Redis delivery is polled (`XREADGROUP` without `BLOCK`): an idle inbox costs one round trip per `poll_interval_ms`, and a reply costs one `XREAD` per `poll_interval_ms` until it arrives.
+- Reclaiming pending entries needs Redis ≥ 6.2 (`XAUTOCLAIM`); on an older server a request left pending by a crashed consumer is never retried (no `XPENDING`/`XCLAIM` fallback).
+- No Streams housekeeping (`XTRIM`/`MAXLEN`): acked entries stay in their stream until an operator trims, so a long-lived team grows its inbox keys.
+- Cross-process routing is eventually consistent: `publish` fans out from the instance's local registry, refreshed from the Redis `subs` sets every `registry_interval_ms`, so a publish immediately after a remote `add_subscription` can miss that subscriber for one interval.
+- A crashed process leaves its registry entries behind (harmless: pub/sub `XADD`s land in a stream nobody consumes); only a clean `stop` removes them.
 - Python's `drunner` distributed factories, reply-topic routing and `RemoteAgent` — `TeamTransport` is the seam a distributed backend implements.
 - The team event bus is in-process: events are delivered to local listeners and recorded in local history, not published over a transport.
 - Python's process-global `Runner.resource_mgr` lookup — the seam is the `TeamResourceMgr` trait the runner implements and injects; this crate never reads a global registry, and an unconfigured runtime resolves from its own instance-scoped stores.
+- Python has no group, broadcast or per-agent inbox-filter layer in `core.multi_agent`; `routing` and `inbox` are additive Rust extensions modelled on the `agent_teams` broadcast contract (sender excluded, sorted recipients, per-member results), not ports.
+- Python has no `agent_reasoner` behaviour to port: the reference file is empty and the area belongs to `openjiuwen-agent` (deferred there).
 - `TeamConfig` re-wiring after `configure` (Python only applies it at default-runtime construction) — the config snapshot at construction is authoritative.
 - `SupervisorAgent`'s exact ReAct config surface (prompt template names, context engine wiring) — only card, model, system prompt, max iterations, parallel cap.
 - No round-robin/selector/scheduled strategies exist in Python's `core.multi_agent`; custom strategies plug in through `TeamStrategy`.
@@ -476,3 +534,11 @@ Members' errors propagate unchanged over P2P; pub/sub delivery failures and hand
 - `set_transport` requires a transport whose `team_id()` equals the runtime's; the default is the in-process transport wrapping the runtime's own `MessageBus`, so `MessageBus` and transport are one object until a caller swaps it in.
 - `RedisTransport` keys embed the team id (`{prefix}:{team}:...`) but not the session id; a shared prefix across teams is safe, a shared prefix across *deployments* is not.
 - `pyrepr` deviates from CPython only in cosmetics: strings always render single-quoted and floats without exponent padding; it parses literals, it never evaluates names or calls.
+- Redis delivery is at-least-once: a worker acks a stream entry only after its reply `XADD` succeeded, so a reply-write failure re-delivers the request. There is no dedupe; a member invoked by such a retry must tolerate it.
+- A Redis worker creates its group with `XGROUP CREATE ... MKSTREAM` before its first `XREADGROUP`; a `BUSYGROUP` error is expected and ignored. `XAUTOCLAIM` (Redis ≥ 6.2) runs on worker start and after a read-error recovery, so pending entries of a dead consumer are redelivered.
+- `RedisTransport::stop` clears this instance's registry entries and `start` re-publishes them: a caller swapping transports must `start` after `stop`, or cross-process routes stay invisible.
+- `RedisTransport::refresh_subscriptions` (public, and run every `registry_interval_ms` while started) is the deterministic hook tests use; a `publish` immediately after a remote `add_subscription` can miss it until a refresh elapsed.
+- Group broadcast excludes the sender unless `broadcast_targets(.., include_sender = true)` is used, stamps `metadata["group"]`, and reports unregistered members in `GroupBroadcast::skipped`; a member failure stays inside `deliveries` and never aborts the batch.
+- `RoutingTable::route` resolves a group id first, then matches topic patterns through `subscription::topic_matches`; it is a snapshot of one moment, not a live view.
+- An inbox-filter rejection is a `Validation` error at the P2P sender and a logged drop for pub/sub; `dispatch_p2p` emits no `message_received` for a rejected envelope, so a listener sees only deliveries a member actually received.
+- `src/runtime.rs` sits at the edge of the size baseline (~980 lines); new runtime behaviour belongs in a `src/runtime/<area>.rs` submodule (as `seams.rs` and `routing.rs` do), not in the core file.
