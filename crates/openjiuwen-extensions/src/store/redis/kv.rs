@@ -481,6 +481,3 @@ pub(crate) fn is_unknown_command(error: &Error, command: &str) -> bool {
     let message = error.message().to_ascii_lowercase();
     message.contains("unknown command") && message.contains(&command.to_ascii_lowercase())
 }
-
-#[cfg(test)]
-mod tests;

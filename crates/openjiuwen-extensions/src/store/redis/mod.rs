@@ -448,7 +448,7 @@ fn validate_url(url: &str) -> Result<()> {
 }
 
 /// Builds the client options from a normalized configuration.
-fn connection_options(config: &RedisStoreConfig) -> Result<ConnectionOptions> {
+pub(crate) fn connection_options(config: &RedisStoreConfig) -> Result<ConnectionOptions> {
     let mut options = match config.url.as_deref() {
         Some(url) => ConnectionOptions::from_url(url)?,
         None => ConnectionOptions::default(),

@@ -14,6 +14,7 @@ pub(crate) use super::kv::{
     decode_value, escape_glob, expiry_millis, is_unknown_command, BYTES_TAG, TEXT_TAG,
 };
 pub(crate) use super::*;
+pub(crate) use openjiuwen_core::foundation::store::{KvStore, KvValue};
 pub(crate) use std::collections::BTreeMap;
 pub(crate) use std::time::Duration;
 
