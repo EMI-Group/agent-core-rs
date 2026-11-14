@@ -22,11 +22,6 @@
 //! provider call is made, and every lifecycle error is logged and swallowed so
 //! cache bookkeeping can never abort a run. Cache state is per tracker instance;
 //! there are no module-level singletons.
-// The items below are the public surface of `crate::rails`; the parent module
-// re-exports them flat, but this subtree may not edit that file. Until that
-// re-export lands nothing in-crate reaches these items, so keep the
-// reachability, dead-code and unused-import lints quiet.
-#![allow(unreachable_pub, dead_code, unused_imports)]
 mod policy;
 mod provider;
 mod rail;

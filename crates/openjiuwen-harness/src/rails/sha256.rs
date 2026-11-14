@@ -1,6 +1,6 @@
 //! SHA-256 digests for stable harness-side identifiers.
 //!
-//! Python derives PersonalContext source ids (`src_<32 hex>`), source-link
+//! Python derives `PersonalContext` source ids (`src_<32 hex>`), source-link
 //! identities and KVC sub-session scopes from SHA-256, so a Rust port that must
 //! produce the same ids needs the same digest. The workspace pins `sha2` in
 //! `[workspace.dependencies]`, but `openjiuwen-harness` does not declare it and
@@ -10,7 +10,6 @@
 //! This is an identifier digest, not a security primitive: it makes ids stable
 //! and collision-resistant across runs, and it is never used to authenticate,
 //! sign or encrypt anything. Secrets never enter it.
-#![allow(dead_code)]
 
 const K: [u32; 64] = [
     0x428a_2f98,
@@ -90,6 +89,7 @@ const INITIAL_STATE: [u32; 8] = [
     0x5be0_cd19,
 ];
 
+#[allow(clippy::many_single_char_names)]
 fn compress(state: &mut [u32; 8], block: &[u8]) {
     let mut schedule = [0u32; 64];
     for (slot, chunk) in schedule.iter_mut().zip(block.chunks_exact(4)) {
@@ -154,7 +154,16 @@ pub(crate) fn sha256_hex(input: impl AsRef<[u8]>) -> String {
         compress(&mut state, block);
     }
 
-    state.iter().map(|word| format!("{word:08x}")).collect()
+    state
+        .iter()
+        .fold(String::with_capacity(64), |mut digest, word| {
+            const NIBBLES: [u8; 16] = *b"0123456789abcdef";
+            for shift in (0..32).step_by(4).rev() {
+                let nibble = usize::try_from((word >> shift) & 0xF).unwrap_or_default();
+                digest.push(char::from(NIBBLES[nibble]));
+            }
+            digest
+        })
 }
 
 /// Returns the first `hex_chars` characters of the hex digest of `input`.
@@ -176,8 +185,7 @@ mod tests {
     /// FIPS 180-4 / NIST examples.
     const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    const TWO_BLOCKS: &str =
-        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
+    const TWO_BLOCKS: &str = "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
 
     #[test]
     fn matches_the_published_vectors() {

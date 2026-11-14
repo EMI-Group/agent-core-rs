@@ -22,6 +22,8 @@
 //! `_owns_search_tool` and the ability-manager plumbing) is not ported; the
 //! [`PersonalContextRail::search`] method is the equivalent capability a host
 //! can wrap in a model-facing tool.
+//! Size note: the ported rail body plus its behavioural test suite make this file long;
+//! production code stays under ~1000 lines.
 // Size note: ~620 lines of implementation plus an inline test module; the
 // switch, description, contiguity and wrapper parity assertions stay beside the
 // code they verify.

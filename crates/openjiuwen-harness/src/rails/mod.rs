@@ -26,7 +26,7 @@ mod evolution;
 mod heartbeat;
 mod kv_cache;
 mod memory;
-mod personal_context;
+pub mod personal_context;
 mod registry;
 mod security;
 mod sha256;
@@ -43,9 +43,30 @@ pub use evolution::{
     EvolutionRailAdapter, EvolutionSnapshot, IterationRecorder, MetricsClock, MetricsEvolutionRail,
     MetricsEvolutionRailConfig, NoopEvolutionRail, ProposalLog, EVOLUTION_SNAPSHOT_VERSION,
 };
+pub use heartbeat::{
+    build_heartbeat_section, default_heartbeat_clock, heartbeat_prompt, HeartbeatClock,
+    HeartbeatEvent, HeartbeatRail, HeartbeatRailConfig, HeartbeatReason,
+    DEFAULT_HEARTBEAT_EVENT_CAPACITY, DEFAULT_HEARTBEAT_INTERVAL_MS, HEARTBEAT_RUN_KIND,
+    HEARTBEAT_SECTION, HEARTBEAT_SECTION_PRIORITY, RUN_KIND_EXTRA_KEY,
+};
+pub use kv_cache::{
+    affinity_enabled, is_sticky_subagent_type, resolve_sub_session_id,
+    resolve_subagent_parent_cache_id, scope_sub_session_id, KvCacheAction, KvCacheAffinityConfig,
+    KvCacheLifecycleRail, KvCacheLineage, KvCacheProviderRegistry, KvCacheSubagent,
+    KvCacheSubagentLifecycle, KvCacheSubagentSession, KvCacheSubagentState, RuntimeSessionLineage,
+    UnsupportedKvCacheBackend, AFFINITY_PARENT_SESSION_ID_ENV, STICKY_SUBAGENT_TYPE,
+};
 pub use memory::{
     LongTermMemoryAdapter, MemoryRail, MemoryRailConfig, MemoryRecall, MemoryWriteBack,
     RecalledMemory, TurnRecord, DEFAULT_MEMORY_SOURCE,
+};
+pub use personal_context::{
+    messages_are_contiguous, normalize_source_locator, resolve_context_relative_path, search,
+    source_id_for_locator, ContextEntry, FetchRequest, FetchedSource, IngestReport,
+    IngestedDocument, LocalDirectoryConfig, LocalFilesProvider, PersonalContextRail,
+    PersonalContextRailConfig, PersonalContextStatus, PersonalContextStore, SearchDocument,
+    SearchHit, SourceKind, SourceLink, SourceLinkBook, SourceMetadata, SourceMetadataStore,
+    SourceProvider, SourceProviderRegistry, UnsupportedSourceProvider,
 };
 pub use registry::{HarnessRailAdapter, HarnessRailRegistry};
 pub use security::SecurityRail;

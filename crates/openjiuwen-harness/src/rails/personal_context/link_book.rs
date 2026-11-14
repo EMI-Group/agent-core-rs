@@ -28,6 +28,8 @@
 //! reference forms (absolute, scheme-relative, root-relative, empty and
 //! dot-segment relative) rather than the full `RFC 3986` algorithm, and `HTML`
 //! unescaping covers the five entities that extracted anchors contain.
+//! Size note: the link-document rendering and the persistence/serde plumbing plus the ported
+//! Python parity suite make this file long; production code stays under ~1000 lines.
 // Size note: ~915 lines of implementation plus an inline test module; the parity
 // tests stay beside the code they verify.
 use std::collections::BTreeMap;

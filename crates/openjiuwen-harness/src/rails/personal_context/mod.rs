@@ -22,10 +22,6 @@
 //! - `provider` — source-provider seam, vendor `Unsupported` providers, registry
 //! - `store` — persisted entry index and ingest/search facade
 //! - `rail` — [`PersonalContextRail`] prompt-section injection
-// The subtree is reached through `crate::rails`, whose module declaration is
-// private until that module re-exports these items; the allows keep
-// `-D warnings` green during that window.
-#![allow(dead_code, unreachable_pub, unused_imports)]
 
 mod atomic;
 mod ingest;
