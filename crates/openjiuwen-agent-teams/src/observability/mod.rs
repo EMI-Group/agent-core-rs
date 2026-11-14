@@ -55,15 +55,14 @@
 //! observed team-memory operation, and only with `otel` does it also carry a sink
 //! (`MemorySpanObserver::with_sink`).
 //!
-//! The `otlp` feature adds a *second* team-memory bridge,
-//! [`OtlpMemoryObserver`], which forwards every
-//! event into the real `OTel` pipeline through `openjiuwen-extensions`'
+//! The `otlp` feature adds a *second*, feature-gated team-memory bridge, `OtlpMemoryObserver`,
+//! which forwards every event into the real `OTel` pipeline through `openjiuwen-extensions`'
 //! `OtelTraceSink` (the feature pulls that crate in as an optional dependency).
 //!
 //! # Deferrals
 //!
 //! - Real OTLP export is wired for the team-memory bridge only: with `otlp`,
-//!   [`OtlpMemoryObserver`] drives the `openjiuwen-extensions` exporter
+//!   `OtlpMemoryObserver` drives the `openjiuwen-extensions` exporter
 //!   (`OTLP/HTTP`, memory, console, …). Everything else in this crate — the member/round/task
 //!   spans, the hook fan-out and [`MemorySpanObserver`] — stays on the in-memory/`tracing` seam,
 //!   which is why [`OTLP_EXPORT_AVAILABLE`] describes the *baseline* build and remains `false`.
