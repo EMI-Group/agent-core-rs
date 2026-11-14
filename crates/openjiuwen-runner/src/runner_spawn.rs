@@ -204,7 +204,7 @@ impl Runner {
         let detail = json!({"backend": backend.as_str(), "pid": child.pid()});
         Arc::new(MonitoredSpawnedAgent::track(
             child,
-            Arc::clone(self.monitor()),
+            self.monitor(),
             session_id,
             detail,
         ))

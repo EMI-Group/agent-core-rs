@@ -31,11 +31,11 @@ use openjiuwen_agent::Agent;
 use openjiuwen_common::error::ErrorKind;
 use openjiuwen_multiagent::{handoff_team, BaseTeam, HandoffTeamConfig, Team};
 use openjiuwen_runner::config::TeamPoolConfig;
-use openjiuwen_runner::hitl::{DeliverResult, InteractPayload};
-use openjiuwen_runner::monitor::{RunEvent, RunKind, RunPhase};
+use openjiuwen_runner::hitl::{DeliverResult, InteractPayload, InteractionHub};
+use openjiuwen_runner::monitor::{RunEvent, RunKind, RunMonitor, RunPhase};
 use openjiuwen_runner::pool::PoolKey;
 use openjiuwen_runner::run::{AgentRef, RunOptions, TeamRef};
-use openjiuwen_runner::{Runner, RunnerConfig};
+use openjiuwen_runner::{InMemoryMessageQueue, MessageQueue, Runner, RunnerConfig};
 use openjiuwen_session::interaction::InteractionResponse;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -106,8 +106,8 @@ fn team_ref(team: Arc<BaseTeam>) -> TeamRef {
 #[tokio::test]
 async fn the_accessors_expose_the_seams_the_run_paths_report_into() {
     let runner = Runner::new();
-    let monitor = Arc::clone(runner.monitor());
-    let hub = Arc::clone(runner.hitl());
+    let monitor = runner.monitor();
+    let hub = runner.hitl();
 
     // The hub mirrors its transitions into the runner's own monitor, so a host
     // renders one consistent view of both seams.
@@ -158,7 +158,7 @@ async fn the_accessors_expose_the_seams_the_run_paths_report_into() {
         hub.is_empty(),
         "the hub registration is removed on completion"
     );
-    assert!(Arc::ptr_eq(runner.monitor(), &monitor));
+    assert!(Arc::ptr_eq(&runner.monitor(), &monitor));
 }
 
 // ports team_runner.py::run_agent_team (the kind the status record carries)
@@ -580,4 +580,159 @@ async fn the_debug_view_reports_counts_without_payloads() {
 
     runner.stop().await.unwrap();
     assert!(run.is_finished());
+}
+
+// ---------------------------------------------------------------------------
+// Replaceable seams
+// ---------------------------------------------------------------------------
+
+// The monitor is installable after construction: every later run reports into
+// the installed instance, and the hub's mirroring follows the swap.
+#[tokio::test]
+async fn set_monitor_retargets_subsequent_agent_and_team_runs() {
+    let runner = Runner::new();
+    let retired = runner.monitor();
+    let mut retired_events = retired.subscribe();
+
+    let dashboard = Arc::new(RunMonitor::new());
+    let mut events = dashboard.subscribe();
+    let previous = runner.set_monitor(Arc::clone(&dashboard));
+    assert!(
+        Arc::ptr_eq(&previous, &retired),
+        "the setter returns the previously installed monitor"
+    );
+    assert!(Arc::ptr_eq(&runner.monitor(), &dashboard));
+
+    // The installed hub is re-pointed, so its transitions mirror into the new
+    // monitor too.
+    let hub_monitor = runner.hitl().monitor().expect("the hub mirrors a monitor");
+    assert!(
+        Arc::ptr_eq(&hub_monitor, &dashboard),
+        "the hub follows the installed monitor"
+    );
+
+    runner
+        .run_agent(
+            agent_ref(scripted_agent("assistant", "done")),
+            json!({"query": "hi"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (team, _calls) = fixture("direct-seam-crew");
+    runner
+        .run_agent_team(
+            team_ref(team),
+            json!({"query": "hi", "conversation_id": "direct-seam"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (pooled, _calls) = fixture("pooled-seam-crew");
+    runner
+        .start_agent_team(
+            team_ref(pooled),
+            json!({"query": "hi", "conversation_id": "pooled-seam"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    let emitted = published(&mut events);
+    let mut kinds: Vec<RunKind> = emitted.iter().map(|event| event.kind).collect();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        vec![RunKind::Agent, RunKind::Team],
+        "the direct agent, the direct team, and the pooled team all report here"
+    );
+    assert_eq!(
+        emitted
+            .iter()
+            .filter(|event| event.phase.is_terminal())
+            .count(),
+        3,
+        "three runs finished on the installed monitor: {emitted:?}"
+    );
+    assert!(
+        published(&mut retired_events).is_empty(),
+        "the retired monitor sees no new transition"
+    );
+    assert!(retired.list_active().is_empty());
+    assert!(dashboard.list_active().is_empty(), "every run finished");
+}
+
+// The hub is installable after construction and used as given: the new
+// registrations land on it, the retired hub keeps its own.
+#[tokio::test]
+async fn set_hitl_installs_a_host_owned_hub() {
+    let runner = Runner::new();
+    let previous = runner.hitl();
+    let host_hub = Arc::new(InteractionHub::new());
+
+    let retired = runner.set_hitl(Arc::clone(&host_hub));
+    assert!(Arc::ptr_eq(&retired, &previous));
+    assert!(Arc::ptr_eq(&runner.hitl(), &host_hub));
+    assert!(
+        host_hub.monitor().is_none(),
+        "the setter does not attach the runner's monitor implicitly"
+    );
+
+    let (team, gate) = blocked_team("swapped-crew");
+    let run = runner
+        .start_agent_team(
+            team_ref(team),
+            json!({"query": "hi", "conversation_id": "swapped-session"}),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    until(|| host_hub.list_active().len() == 1).await;
+    assert_eq!(host_hub.list_active()[0].run_id, run.run_id());
+    assert!(
+        previous.is_empty(),
+        "live registrations are not migrated to the installed hub"
+    );
+
+    // The facade's HITL shortcuts address the installed hub.
+    assert_eq!(
+        runner.interact_agent_team(
+            "swapped-crew",
+            "swapped-session",
+            InteractPayload::text("x")
+        ),
+        DeliverResult::Accepted
+    );
+
+    gate.notify_one();
+    run.wait().await.unwrap();
+    assert!(
+        host_hub.is_empty(),
+        "the registration is removed on completion"
+    );
+}
+
+// The queue is installable after construction; `start` still owns the slot.
+#[tokio::test]
+async fn set_message_queue_installs_a_host_owned_queue() {
+    let runner = Runner::new();
+    let previous = runner.message_queue();
+    let broker: Arc<dyn MessageQueue> = InMemoryMessageQueue::with_capacity(8);
+
+    let retired = runner.set_message_queue(Arc::clone(&broker));
+    assert!(Arc::ptr_eq(&retired, &previous));
+    assert!(Arc::ptr_eq(&runner.message_queue(), &broker));
+    assert!(!runner.is_started());
+
+    // `start` rebuilds the queue from the configuration, replacing the installed
+    // one with the configured backend.
+    runner.start().await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&runner.message_queue(), &broker),
+        "start installs the configured backend"
+    );
+    runner.stop().await.unwrap();
 }
