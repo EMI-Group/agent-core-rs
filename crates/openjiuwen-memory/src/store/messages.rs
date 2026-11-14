@@ -2,13 +2,18 @@
 //!
 //! Python keeps messages in SQL tables (`manage/mem_model/message_manager.py`);
 //! this module keeps the same flat rows in one document collection
-//! (`keys::MESSAGES_COLLECTION`). A row carries its scope (`user_id`, `scope_id`,
+//! (`messages`, or whatever the prefix layout names). A row carries its scope (`user_id`, `scope_id`,
 //! optional `session_id`), the wire role, the plain-text view of the content, and an
 //! RFC 3339 timestamp, so history can be replayed without the foundation prompt types.
 //!
-//! Ids are deterministic (`msg_{fnv64(content + role + millis):016x}_{millis}`), which
-//! reproduces the Python `msg_{sha256(...)}_{ms}` shape without a crypto dependency:
-//! re-appending the same message in the same millisecond replaces the same row.
+//! Ids are deterministic ([`derived_message_id`]:
+//! `msg_{fnv64(content + role + millis):016x}_{millis}`), which reproduces the Python
+//! `msg_{sha256(...)}_{ms}` shape without a crypto dependency: re-appending the same
+//! message in the same millisecond replaces the same row.
+//!
+//! The collection name comes from the [`KvPrefixRegistry`] (`messages` by default), so a
+//! deployment can rename it exactly like the KV families; existing rows then stay reachable
+//! through [`MessageStore::with_prefixes`].
 
 use std::sync::Arc;
 
@@ -23,6 +28,7 @@ use crate::record::{MemoryFilter, MemoryScope};
 
 use super::json::plain_text;
 use super::keys;
+use super::prefix::KvPrefixRegistry;
 
 /// The 64-bit FNV-1a offset basis.
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -71,20 +77,36 @@ pub struct StoredMessage {
 /// The store is cheap to clone through its `Arc<dyn DocumentStore>` and holds no state
 /// of its own; every operation is a single document-store call.
 pub(crate) struct MessageStore {
-    /// The document store holding the `messages` collection.
+    /// The document store holding the message collection.
     document: Arc<dyn DocumentStore>,
+    /// The prefix layout supplying the collection name.
+    prefixes: KvPrefixRegistry,
 }
 
 impl MessageStore {
-    /// Builds a message store over `document`.
+    /// Builds a message store over `document` with the default collection name.
     pub(crate) fn new(document: Arc<dyn DocumentStore>) -> Self {
-        Self { document }
+        Self::with_prefixes(document, KvPrefixRegistry::default())
+    }
+
+    /// Builds a message store over `document` with an explicit prefix layout.
+    pub(crate) fn with_prefixes(
+        document: Arc<dyn DocumentStore>,
+        prefixes: KvPrefixRegistry,
+    ) -> Self {
+        Self { document, prefixes }
+    }
+
+    /// The name of the collection the history is read from and written to.
+    fn collection(&self) -> &str {
+        keys::messages_collection_in(&self.prefixes)
     }
 
     /// Appends `messages` to the history of `scope`, stamping every row with `timestamp`.
     ///
-    /// Each row is upserted into [`keys::MESSAGES_COLLECTION`] and the built
-    /// [`StoredMessage`]s are returned in input order. An empty input writes nothing.
+    /// Each row is upserted into the collection named by the prefix layout (`messages` by
+    /// default) and the built [`StoredMessage`]s are returned in input order. An empty input
+    /// writes nothing.
     pub(crate) async fn append(
         &self,
         scope: &MemoryScope,
@@ -94,14 +116,13 @@ impl MessageStore {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
-        let millis = timestamp.timestamp_millis();
         let rfc3339 = timestamp.to_rfc3339();
         let mut stored = Vec::with_capacity(messages.len());
         let mut documents = Vec::with_capacity(messages.len());
         for message in messages {
             let content = plain_text(&message.content);
             let role = message.role.as_str().to_owned();
-            let id = message_id(&content, &role, millis);
+            let id = derived_message_id(&content, &role, timestamp);
             let message = StoredMessage {
                 id: id.clone(),
                 user_id: scope.user_id.clone(),
@@ -123,9 +144,7 @@ impl MessageStore {
             documents.push(document);
             stored.push(message);
         }
-        self.document
-            .upsert(keys::MESSAGES_COLLECTION, documents)
-            .await?;
+        self.document.upsert(self.collection(), documents).await?;
         Ok(stored)
     }
 
@@ -148,10 +167,7 @@ impl MessageStore {
             offset: 0,
             order_by: vec![(FIELD_TIMESTAMP.to_owned(), SortOrder::Desc)],
         };
-        let documents = self
-            .document
-            .query(keys::MESSAGES_COLLECTION, &query)
-            .await?;
+        let documents = self.document.query(self.collection(), &query).await?;
         let mut messages = Vec::with_capacity(documents.len());
         for document in documents {
             match serde_json::from_value::<StoredMessage>(document.to_value()) {
@@ -178,14 +194,17 @@ impl MessageStore {
             filter: message_filter(filter),
             ..Query::default()
         };
-        self.document
-            .delete(keys::MESSAGES_COLLECTION, &query)
-            .await
+        self.document.delete(self.collection(), &query).await
     }
 }
 
 /// The deterministic id of one message: `msg_{fnv64(content + role + millis):016x}_{millis}`.
-fn message_id(content: &str, role: &str, millis: i64) -> String {
+///
+/// The derivation is public to the crate so a legacy-row import and [`MessageStore::append`]
+/// can never drift apart: the same content, wire role, and millisecond always yield the same
+/// id, which is what makes re-appending replace the existing row.
+pub(crate) fn derived_message_id(content: &str, role: &str, timestamp: DateTime<Utc>) -> String {
+    let millis = timestamp.timestamp_millis();
     let digest = fnv1a_64(format!("{content}{role}{millis}").as_bytes());
     format!("msg_{digest:016x}_{millis}")
 }
@@ -267,10 +286,11 @@ fn message_filter(filter: &MemoryFilter) -> Value {
 #[cfg(test)]
 #[allow(clippy::assert_is_empty)] // `assert!(x.is_empty())` reads better in history tests
 mod tests {
+    use super::super::prefix::KvFamily;
     use super::*;
     use chrono::TimeZone;
     use openjiuwen_foundation::prompt::{BaseMessage, ContentPart, ImageUrl, MessageContent};
-    use openjiuwen_foundation::store::InMemoryDocumentStore;
+    use openjiuwen_foundation::store::{InMemoryDocumentStore, Query};
 
     fn store() -> MessageStore {
         MessageStore::new(Arc::new(InMemoryDocumentStore::new()))
@@ -302,21 +322,20 @@ mod tests {
 
     #[test]
     fn message_ids_are_deterministic_and_content_specific() {
-        let first = message_id("hello", "user", 1);
-        assert_eq!(first, message_id("hello", "user", 1));
-        assert_ne!(first, message_id("hello", "assistant", 1));
-        assert_ne!(first, message_id("other", "user", 1));
-        assert_ne!(first, message_id("hello", "user", 2));
+        let first = derived_message_id("hello", "user", time(0));
+        assert_eq!(first, derived_message_id("hello", "user", time(0)));
+        assert_ne!(first, derived_message_id("hello", "assistant", time(0)));
+        assert_ne!(first, derived_message_id("other", "user", time(0)));
+        assert_ne!(first, derived_message_id("hello", "user", time(1)));
         assert!(first.starts_with("msg_"));
         let (_, suffix) = first.rsplit_once('_').expect("millis suffix");
-        assert_eq!(suffix, "1");
+        assert_eq!(suffix, time(0).timestamp_millis().to_string());
     }
 
     #[tokio::test]
     async fn append_builds_rows_with_the_plain_text_and_role() {
         let store = store();
         let timestamp = time(0);
-        let millis = timestamp.timestamp_millis();
         let stored = store
             .append(
                 &scope(),
@@ -336,8 +355,14 @@ mod tests {
         assert_eq!(stored[0].session_id.as_deref(), Some("s1"));
         assert_eq!(stored[0].timestamp, timestamp);
         assert_eq!(stored[1].role, "assistant");
-        assert_eq!(stored[0].id, message_id("rules", "system", millis));
-        assert_eq!(stored[1].id, message_id("answer", "assistant", millis));
+        assert_eq!(
+            stored[0].id,
+            derived_message_id("rules", "system", timestamp)
+        );
+        assert_eq!(
+            stored[1].id,
+            derived_message_id("answer", "assistant", timestamp)
+        );
         let document = store
             .document
             .get(keys::MESSAGES_COLLECTION, &stored[0].id)
@@ -477,5 +502,41 @@ mod tests {
         // is detectable without the async store call.
         let result = serde_json::from_value::<StoredMessage>(serde_json::json!({"id": 1}));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_collection_name_is_written_and_read_back() {
+        let document = Arc::new(InMemoryDocumentStore::new());
+        let prefixes = KvPrefixRegistry::new()
+            .with_current(KvFamily::Messages, "chat_history")
+            .expect("valid prefix");
+        let store = MessageStore::with_prefixes(document.clone(), prefixes);
+        let scope = scope();
+        store
+            .append(&scope, &[BaseMessage::user("hello")], time(0))
+            .await
+            .expect("append");
+        assert_eq!(store.collection(), "chat_history");
+        let query = Query {
+            filter: scope_filter(&scope),
+            ..Query::default()
+        };
+        assert!(document
+            .query(keys::MESSAGES_COLLECTION, &query)
+            .await
+            .expect("query default collection")
+            .is_empty());
+        let history = store.recent(&scope, 10).await.expect("recent");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[0].id, derived_message_id("hello", "user", time(0)));
+        assert_eq!(
+            store
+                .delete_for(&MemoryFilter::for_scope(&scope))
+                .await
+                .expect("delete"),
+            1
+        );
+        assert!(store.recent(&scope, 10).await.expect("recent").is_empty());
     }
 }

@@ -5,7 +5,7 @@
 Persistence for memory records, embeddings, variables, scope configs, and message history on top of the `openjiuwen-foundation` storage traits.
 Python stores records in KV + vectors in per-type collections + messages in SQL tables; this module keeps the same logical layout on `KvStore`, `VectorStore`, `DocumentStore`, and `GraphStore`.
 No ranking, no extraction, no engine policy live here: only key derivation, serialization, store calls, the versioned SQLite schema runner, and legacy key-layout read compatibility.
-`migration` owns the forward-only schema-version table and the builtin SQLite baseline; `legacy` owns the read-only fallback to the pre-registry key prefixes; `storage` is a thin caller over both.
+`migration` owns the forward-only schema-version table and the builtin SQLite baseline; `prefix` owns the runtime `KvPrefixRegistry` (current prefix + historical aliases per memory family); `legacy` owns the read-only fallback to the alias prefixes; `storage` is a thin caller over all three.
 
 ## API Surface
 
@@ -15,6 +15,7 @@ pub const RECORD_PREFIX: &str = "UMD";                     // Python KV namespac
 pub const VARIABLE_PREFIX: &str = "user_var";
 pub const SESSION_VARIABLE_PREFIX: &str = "session_var";
 pub const SCOPE_CONFIG_PREFIX: &str = "memory_scope_config";
+pub const SCOPE_USER_MAPPING_PREFIX: &str = "scope_user_mapping";
 pub const MESSAGES_COLLECTION: &str = "messages";
 
 pub fn record_key(scope: &MemoryScope, id: &str) -> String;     // "UMD/{user}/{scope}/{id}"
@@ -42,9 +43,68 @@ pub fn legacy_alternatives(key: &str) -> Vec<String>;   // legacy candidates of 
 pub fn current_equivalent(key: &str) -> Option<String>; // inverse, for diagnostics
 pub fn legacy_prefix(current_prefix: &str) -> Option<&'static str>;
 pub fn current_prefix(legacy_prefix: &str) -> Option<&'static str>;
+
+// Registry-aware builders: same shapes, sourced from the caller's prefix layout.
+pub fn record_key_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, id: &str) -> String;
+pub fn record_prefix_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope) -> String;
+pub fn record_prefix_for_in(prefixes: &KvPrefixRegistry, user_id: &str) -> String;
+pub fn record_prefix_for_scope_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> String;
+pub fn variable_key_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, name: &str) -> String;
+pub fn variable_prefix_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope) -> String;
+pub fn session_variable_key_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, session_id: &str, name: &str) -> String;
+pub fn session_variable_prefix_in(prefixes: &KvPrefixRegistry, scope: &MemoryScope, session_id: &str) -> String;
+pub fn scope_config_key_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> String;
+pub fn scope_config_prefix_in(prefixes: &KvPrefixRegistry) -> String;                                   // "<scope_config current>/"
+pub fn scope_user_mapping_key_in(prefixes: &KvPrefixRegistry, scope_id: &str, user_id: &str) -> String; // "<current>/{scope_id}/{user_id}"
+pub fn scope_user_mapping_prefix_in(prefixes: &KvPrefixRegistry, scope_id: &str) -> String;             // "<current>/{scope_id}/"
+pub fn messages_collection_in(prefixes: &KvPrefixRegistry) -> &str;
+pub fn legacy_alternatives_in(prefixes: &KvPrefixRegistry, key: &str) -> Vec<String>;
+pub fn current_equivalent_in(prefixes: &KvPrefixRegistry, key: &str) -> Option<String>;
 ```
 `vector_collection` follows Python `uid_{user}_gid_{scope}_mtype_{kind}` with each segment sanitized; an unchanged safe segment keeps its readable form, otherwise a 8-hex FNV-1a suffix is appended to avoid collisions. Collection names must satisfy `LocalFileVectorStore` (`[A-Za-z0-9._-]`, no `.`/`..`).
 The legacy builders keep the current field order and `/` separator and differ only in the first segment, so `legacy_alternatives` is a single first-segment rewrite that works for both point keys and prefixes; one private `(current, legacy)` table backs all four mapping helpers so the directions cannot drift.
+The `*_in` builders are the same shapes with the head taken from a `KvPrefixRegistry`; the plain builders are the default-registry form, and a test pins both to the same output.
+`legacy_alternatives_in` emits one candidate per alias of the key's family (registration order, never the segment of `key` itself); `current_equivalent_in` maps an alias head back to the current prefix and returns `None` when the head is already current, unknown, or absent.
+The plain `legacy_alternatives`/`current_equivalent` and the `(current, legacy)` pair table are the default-registry instances of the same rules; `keys::vector_collection` stays prefix-independent because vector collections are not a KV family.
+
+### `prefix.rs`
+```rust
+pub enum StorageArea { Kv, Document }
+pub enum KvFamily { Records, UserVariables, SessionVariables, ScopeConfig, ScopeUserMapping, Messages }
+impl KvFamily {
+    pub const ALL: [KvFamily; 6];
+    pub const fn label(self) -> &'static str;  // "records", "user_variables", "session_variables", "scope_config", "scope_user_mapping", "messages"
+    pub const fn area(self) -> StorageArea;    // Document only for Messages
+}
+pub struct FamilyPrefixes { pub current: String, pub aliases: Vec<String> }
+pub struct KvPrefixRegistry { /* BTreeMap<KvFamily, FamilyPrefixes> */ }
+impl Default for KvPrefixRegistry;  // new() == default
+impl KvPrefixRegistry {
+    pub fn new() -> Self;
+    pub fn register_current(&mut self, family: KvFamily, prefix: impl Into<String>) -> Result<()>;
+    pub fn register_legacy(&mut self, family: KvFamily, prefix: impl Into<String>) -> Result<()>;
+    pub fn with_current(self, family: KvFamily, prefix: impl Into<String>) -> Result<Self>;
+    pub fn with_legacy(self, family: KvFamily, prefix: impl Into<String>) -> Result<Self>;
+    pub fn current(&self, family: KvFamily) -> &str;
+    pub fn aliases(&self, family: KvFamily) -> &[String];
+    pub fn family_prefixes(&self, family: KvFamily) -> &FamilyPrefixes;
+    pub fn prefixes(&self, family: KvFamily) -> impl Iterator<Item = &str> + '_; // current, then aliases in order
+    pub fn all_prefixes(&self) -> Vec<String>;                                  // ALL order, current then aliases, de-duplicated
+    pub fn families(&self) -> impl Iterator<Item = KvFamily> + '_;
+    pub fn family_of(&self, key: &str) -> Option<KvFamily>;                     // first `/`-segment match, current or alias
+    pub fn contains_prefix(&self, family: KvFamily, prefix: &str) -> bool;
+    pub fn validate(&self) -> Result<()>;
+    pub fn to_json(&self) -> Result<String>;
+    pub fn from_json(text: &str) -> Result<Self>;                               // decode, then validate()
+}
+```
+The registry is a value passed to the code that needs it, never Python's process-global `kv_prefix_registry` singleton.
+`Default`/`new` reproduce today's layout from the `keys` constants and the one `(current, legacy)` pair table: `records` `UMD`/`user_mem`, `user_variables` `user_var`/`user_variable`, `session_variables` `session_var`/`session_variable`, `scope_config` `memory_scope_config`/`scope_config`, `scope_user_mapping` (no alias), `messages` (no alias, a document collection).
+A prefix is one key/collection segment: `validate_prefix` rejects empty/whitespace-only, over 128 characters, and any `/`, `\` or NUL with `Error::Validation` naming the family and the value.
+`register_current` demotes the previous current prefix to the front of `aliases` (de-duplicated, and removed when it becomes current again), so data written under it stays readable; `register_legacy` appends an alias unless it is the current prefix or already present; both are `Ok(())` no-ops when nothing changes.
+`validate` requires every `KvFamily` to be present and rejects an alias equal to the current prefix or a duplicated alias; `from_json` decodes and validates, so a decoded registry is always usable for key derivation.
+`family_of` matches only the first `/`-separated segment, so `user_variable/...` is never mistaken for the `user_var` namespace, and unknown or empty keys give `None`.
+The lock seam is `kv_lock`, not `lock`, because `lite::lock` already owns the crate-root `lock` name.
 
 ### `mod.rs`
 ```rust
@@ -68,9 +128,11 @@ impl MemoryStores {
 
 ### `storage.rs` (crate-internal)
 ```rust
-pub(crate) struct MemoryStorage { /* stores: MemoryStores */ }
+pub(crate) struct MemoryStorage { /* stores: MemoryStores, prefixes: KvPrefixRegistry */ }
 impl MemoryStorage {
-    pub(crate) fn new(stores: MemoryStores) -> Self;
+    pub(crate) fn new(stores: MemoryStores) -> Self;                                       // default prefix layout
+    pub(crate) fn with_prefixes(stores: MemoryStores, prefixes: KvPrefixRegistry) -> Self; // explicit layout
+    pub(crate) fn prefixes(&self) -> &KvPrefixRegistry;
 
     pub(crate) async fn put_record(&self, record: &MemoryRecord) -> Result<()>;
     pub(crate) async fn get_record(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>>;
@@ -94,8 +156,9 @@ impl MemoryStorage {
 ```
 Semantics:
 - `put_record` serializes `record` with `embedding: None` (the embedding column is authoritative) to the record key. The scope is already flattened in the JSON.
-- `get_record` reads the current key first and falls back to the legacy layout only when it is absent (`legacy::read_text`); a missing key is `None`, a stored non-text/malformed value for the key actually read is `Error::Validation`.
-- `list_records` chooses the narrowest prefix from `filter.user_id`/`scope_id` (user+scope when both, user when only user, whole `UMD/` when neither), then delegates to `legacy::list_records`: it scans the current prefix and then each legacy prefix, parses each value, ignores malformed entries with `tracing::warn!` (a corrupt record never fails a listing), lets the current layout win on a duplicate record key, applies `MemoryFilter::matches`, and sorts by `(timestamp desc, id asc)`.
+Every key derivation goes through the `keys::*_in` builders and the `legacy::*_in` helpers with `self.prefixes`; vector collection names stay prefix-independent.
+- `get_record` reads the current key first and falls back to the alias layout only when it is absent (`legacy::read_text_in`); a missing key is `None`, a stored non-text/malformed value for the key actually read is `Error::Validation`.
+- `list_records` chooses the narrowest prefix from `filter.user_id`/`scope_id` (user+scope when both, user when only user, whole `UMD/` when neither), then delegates to `legacy::list_records_in`: it scans the current prefix and then each legacy prefix, parses each value, ignores malformed entries with `tracing::warn!` (a corrupt record never fails a listing), lets the current layout win on a duplicate record key, applies `MemoryFilter::matches`, and sorts by `(timestamp desc, id asc)`.
 - `delete_record` deletes the KV key and every legacy alternative plus the vector id; returns whether either KV key existed.
 - Embeddings: the vector collection schema is `id VARCHAR(256) PRIMARY KEY` + `embedding FLOAT_VECTOR(dim)`; `index_embedding` ensures the collection exists (create on first use), deletes the id if present, then `add_docs` (foundation is insert-only). `delete_embedding` tolerates a missing collection.
 - `search_embeddings` checks `collection_exists`; a missing collection yields an empty vector. Scores are foundation-normalized `[0,1]`.
@@ -111,15 +174,17 @@ pub struct StoredMessage {
     pub session_id: Option<String>, pub role: String, pub content: String,
     pub timestamp: DateTime<Utc>,
 }
-pub(crate) struct MessageStore { /* document */ }
+pub(crate) struct MessageStore { /* document: Arc<dyn DocumentStore>, prefixes: KvPrefixRegistry */ }
 impl MessageStore {
-    pub(crate) fn new(document: Arc<dyn DocumentStore>) -> Self;
+    pub(crate) fn new(document: Arc<dyn DocumentStore>) -> Self;                                        // default collection name
+    pub(crate) fn with_prefixes(document: Arc<dyn DocumentStore>, prefixes: KvPrefixRegistry) -> Self;
     pub(crate) async fn append(&self, scope: &MemoryScope, messages: &[BaseMessage], timestamp: DateTime<Utc>) -> Result<Vec<StoredMessage>>;
     pub(crate) async fn recent(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<StoredMessage>>; // newest first, then reversed to chronological
     pub(crate) async fn delete_for(&self, filter: &MemoryFilter) -> Result<usize>;
 }
 ```
-`id` is deterministic: `msg_{fnv64(content + role + millis):016x}_{millis}` (Python's `msg_{sha256(...)}_{ms}` shape, no crypto dependency). Collection `messages`; documents are the flat `StoredMessage` JSON. `recent` queries `user_id`/`scope_id`/optional `session_id`, orders by `timestamp` desc, limit, then reverses. `content` is the plain-text view of `BaseMessage::content`; non-text parts are JSON-rendered into content. `role` uses the `Role` serde name (`system`/`user`/`assistant`/`tool`).
+`derived_message_id(content, role, timestamp)` is crate-visible and is the single source of the deterministic id `msg_{fnv64(content + role + millis):016x}_{millis}` (Python's `msg_{sha256(...)}_{ms}` shape, no crypto dependency); `append` calls it and a later legacy-row import must reuse it.
+The collection name comes from `keys::messages_collection_in(&self.prefixes)` (`messages` by default), so a renamed document family is written and read consistently. Documents are the flat `StoredMessage` JSON. `recent` queries `user_id`/`scope_id`/optional `session_id`, orders by `timestamp` desc, limit, then reverses. `content` is the plain-text view of `BaseMessage::content`; non-text parts are JSON-rendered into content. `role` uses the `Role` serde name (`system`/`user`/`assistant`/`tool`).
 
 ### `migration/` (`registry.rs` + `runner.rs`)
 ```rust
@@ -157,12 +222,18 @@ The registry half compiles without the `sqlite` feature; the runner and report t
 
 ### `legacy.rs` (crate-private)
 ```rust
-pub(crate) async fn read_text(kv: &dyn KvStore, key: String) -> Result<Option<(String, String)>>;
-pub(crate) async fn list_records(kv: &dyn KvStore, prefix: &str, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;
-pub(crate) async fn list_variables(kv: &dyn KvStore, prefix: &str) -> Result<BTreeMap<String, String>>;
-pub(crate) async fn delete_with_legacy(kv: &dyn KvStore, key: &str) -> Result<bool>;
+pub(crate) async fn read_text(kv: &dyn KvStore, key: String) -> Result<Option<(String, String)>>;                                  // default registry
+pub(crate) async fn list_records(kv: &dyn KvStore, prefix: &str, filter: &MemoryFilter) -> Result<Vec<MemoryRecord>>;             // default registry
+pub(crate) async fn list_variables(kv: &dyn KvStore, prefix: &str) -> Result<BTreeMap<String, String>>;                           // default registry
+pub(crate) async fn delete_with_legacy(kv: &dyn KvStore, key: &str) -> Result<bool>;                                             // default registry
+// Registry-aware forms; `storage` always passes its own layout.
+pub(crate) async fn read_text_in(kv: &dyn KvStore, key: String, prefixes: &KvPrefixRegistry) -> Result<Option<(String, String)>>;
+pub(crate) async fn list_records_in(kv: &dyn KvStore, prefix: &str, filter: &MemoryFilter, prefixes: &KvPrefixRegistry) -> Result<Vec<MemoryRecord>>;
+pub(crate) async fn list_variables_in(kv: &dyn KvStore, prefix: &str, prefixes: &KvPrefixRegistry) -> Result<BTreeMap<String, String>>;
+pub(crate) async fn delete_with_legacy_in(kv: &dyn KvStore, key: &str, prefixes: &KvPrefixRegistry) -> Result<bool>;
 ```
-All legacy fallback mechanics live here so `storage.rs` stays a thin caller: current key/prefix first, then `keys::legacy_alternatives`, current layout wins on collisions, malformed listing entries warn-and-skip, and every legacy hit logs `tracing::debug!` with target `openjiuwen_memory::store`.
+The plain functions delegate to the `_in` forms with `KvPrefixRegistry::default()`, so there is exactly one implementation of the fallback rules.
+All legacy fallback mechanics live here so `storage.rs` stays a thin caller: current key/prefix first, then every `keys::legacy_alternatives_in` candidate, current layout wins on collisions (dedupe keys use `keys::record_key_in`), malformed listing entries warn-and-skip, and every alias hit logs `tracing::debug!` with target `openjiuwen_memory::store`.
 
 ## Migration Model
 
@@ -196,12 +267,13 @@ Python v0.1.20 registers **no** legacy prefix (`UserMemStore.LEGACY_PREFIXES` an
 
 - Python's per-backend migrators and their version markers: `SQLMigrator` (Alembic add/rename/retype column operations), `VectorMigrator` (collection-metadata versions, per-collection sequences), `MessageMigrator` (message-store schema version), `IndexVersionMigrator` (MemoryDoc field rename/add/remove/transform), and the `OperationRegistry` DTO layer.
 - Migration backup/restore: Python snapshots every registered KV prefix into a `MEMORY_MIGRATION_KV_SCHEMA_VERSION_BACKUP_{ms}` blob and restores it on failure; here each migration is transactional instead, so no backup keyspace exists.
-- `KvPrefixRegistry` as a runtime registry: the Rust equivalent is the compile-time `keys` mapping table; there is no process-global prefix registration or dynamic discovery.
+- Process-global prefix registration and dynamic discovery: the runtime `KvPrefixRegistry` is an injected value (no singleton, no `sys.modules`-style discovery), and `keys` remains the compile-time default table.
 - Distributed KV lock, AES at-rest storage codec (`codec/aes_storage_codec.py`), and `scope_user_mapping` (Python's scope→user index) are not ported.
 - Data migration of legacy message/document rows: legacy fallback covers the KV record/variable/scope-config families only; existing message documents under a legacy collection name are not read or rewritten.
 
 ## Constraints
 
+- A prefix is one segment (non-empty, <=128 characters, no `/`, `\` or NUL); `KvPrefixRegistry::validate` and every registration reject anything else with `Error::Validation`.
 - Memory data goes only through foundation storage calls; the `migration` module is the single exception — it issues schema DDL/version rows directly through `sqlx` under feature `sqlite`, and still has no filesystem access of its own beyond `migrate_sqlite`'s parent-directory creation.
 - Migrations are forward-only, contiguous from v1, one transaction per migration, and never a no-op placeholder; bad registration is `Error::Validation`, a failed step propagates the storage error with context.
 - Legacy keys are read-only: writes always use the current layout, current wins over legacy, and deletes remove both.
@@ -214,8 +286,8 @@ Python v0.1.20 registers **no** legacy prefix (`UserMemStore.LEGACY_PREFIXES` an
 ## Routing Table
 
 - `./mod.rs` → `MemoryStores` and backend constructors
-- `./keys.rs` → KV key and vector collection naming, current↔legacy prefix mapping (`legacy_alternatives`, `current_equivalent`)
-- `./prefix.rs` → empty placeholder for the runtime key-prefix registry over the logical memory families
+- `./keys.rs` → KV key and vector collection naming, plain and registry-aware (`*_in`) builders, current↔alias prefix mapping (`legacy_alternatives[_in]`, `current_equivalent[_in]`)
+- `./prefix.rs` → `KvFamily`, `StorageArea`, `FamilyPrefixes`, `KvPrefixRegistry` (defaults, registration/demotion, lookup, validation, JSON round trip)
 - `./backup.rs` → empty placeholder for backup/restore of the memory KV keyspace
 - `./lock.rs` → empty placeholder for the distributed KV lock seam
 - `./mapping.rs` → empty placeholder for the persisted scope↔user mapping keys
@@ -230,8 +302,10 @@ Python v0.1.20 registers **no** legacy prefix (`UserMemStore.LEGACY_PREFIXES` an
 
 ## Test Strategy
 
-- Unit tests beside each file: key shapes and legacy↔current mapping round-trips, sanitization/collision resistance, record JSON round-trip, malformed-record tolerance, vector collection naming.
-- `legacy.rs` tests seed a legacy key directly in a public `MemoryStores` bundle and read/delete through `MemoryStorage`: legacy record read, current-wins, listing dedupe, user vs session variable namespaces, scope config, delete-removes-both.
+- Unit tests beside each file: key shapes and legacy↔current mapping round-trips, registry defaults/registration/demotion/validation/JSON round trip, registry-aware builder equivalence, sanitization/collision resistance, record JSON round-trip, malformed-record tolerance, vector collection naming.
+- `legacy.rs` tests seed a legacy key directly in a public `MemoryStores` bundle and read/delete through `MemoryStorage`: legacy record read, current-wins, listing dedupe, user vs session variable namespaces, scope config, delete-removes-both; plus direct `read_text`/`delete_with_legacy` coverage and a custom registry whose renamed family reads/deletes every alias.
+- `storage.rs` tests cover `with_prefixes`: a renamed `user_variables` family writes the new layout, reads values written under the old prefixes, merges both namespaces current-first on listing, deletes both; a renamed `records` family round-trips and lists.
+- `messages.rs` tests cover a renamed `messages` collection: `append` writes it, `recent`/`delete_for` read/delete it, and the default collection stays untouched.
 - `migration/registry.rs` tests every registry validation rule (duplicate version, gap, start at v1, backwards step, empty name/description/SQL, duplicate name) plus the builtin plan and appends.
 - `migration/runner.rs` tests (feature `sqlite`, `tempfile`): fresh DB status/run/status, idempotent second run, a failing migration rolls back both its DDL and its version row, a pre-populated foundation database migrates cleanly, `migrate_sqlite` idempotency, an out-of-range recorded version left alone, and report JSON round trips.
 - Integration tests `tests/crud.rs`, `tests/scoping.rs`, `tests/sqlite.rs` exercise the public facade against these stores; `tests/recall.rs` covers vector candidate retrieval.
