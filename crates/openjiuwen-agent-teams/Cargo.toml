@@ -15,6 +15,7 @@ openjiuwen-core.workspace = true
 openjiuwen-common.workspace = true
 openjiuwen-foundation.workspace = true
 openjiuwen-multiagent.workspace = true
+openjiuwen-memory.workspace = true
 openjiuwen-session.workspace = true
 openjiuwen-agent.workspace = true
 serde.workspace = true

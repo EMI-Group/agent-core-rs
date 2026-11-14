@@ -69,6 +69,7 @@ pub mod interaction;
 pub mod kv_cache;
 pub mod mcp;
 pub mod member;
+pub mod memory;
 pub mod messager;
 pub mod models;
 pub mod monitor;

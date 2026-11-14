@@ -1743,6 +1743,7 @@ dependencies = [
  "openjiuwen-foundation",
  "openjiuwen-harness",
  "openjiuwen-harness-protocol",
+ "openjiuwen-memory",
  "openjiuwen-multiagent",
  "openjiuwen-session",
  "openjiuwen-test-support",
