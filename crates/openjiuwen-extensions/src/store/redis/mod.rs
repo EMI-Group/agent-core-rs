@@ -5,9 +5,11 @@
 //! - [`RedisStore`] — the key-value store of
 //!   `openjiuwen/extensions/store/kv/redis_store.py`, which is the only `Redis`
 //!   store the Python tree ships.
-//! - [`RedisDocumentStore`] — JSON documents with the kernel [`DocumentStore`]
+//! - [`RedisDocumentStore`] — JSON documents with the kernel
+//!   [`DocumentStore`](crate::store::DocumentStore)
 //!   filter/order/paging contract.
-//! - [`RedisVectorStore`] — embeddings with the kernel [`VectorStore`] contract.
+//! - [`RedisVectorStore`] — embeddings with the kernel
+//!   [`VectorStore`](crate::store::VectorStore) contract.
 //!
 //! The document and vector backends have **no Python counterpart** (the Python
 //! `extensions/store` package holds only the `Redis` key-value store, `GaussDB` and

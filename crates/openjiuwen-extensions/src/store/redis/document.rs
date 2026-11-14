@@ -3,13 +3,13 @@
 //! The Python `extensions/store` package has no document store (its `db/`
 //! backend is `GaussDB`/`SQLAlchemy`), so this backend is a Rust-side extension of
 //! the family: it implements the kernel
-//! [`DocumentStore`](openjiuwen_core::foundation::store::DocumentStore) contract
+//! [`DocumentStore`] contract
 //! on the key layout documented in [`super`]:
 //!
 //! - `openjiuwen:doc:collections` — every collection name,
 //! - `openjiuwen:doc:ids:{collection}` — the ids stored in one collection,
 //! - `openjiuwen:doc:doc:{collection}:{id}` — one serialized
-//!   [`Document`](openjiuwen_core::foundation::store::Document).
+//!   [`Document`].
 //!
 //! # Delegation
 //!
@@ -31,7 +31,7 @@
 //! key at all, because `Redis` has no empty sets; `SMEMBERS` on a missing key is
 //! empty, so a freshly created collection reads as empty.
 //!
-//! There is no TTL: the [`DocumentStore`](openjiuwen_core::foundation::store::DocumentStore)
+//! There is no TTL: the [`DocumentStore`]
 //! contract has no expiry knob, so an expiry is not invented here. Writes are
 //! not transactional across keys, so an interrupted batch can leave the id set
 //! and the document keys temporarily inconsistent; the store tolerates that on

@@ -2,7 +2,7 @@
 //!
 //! The Python `extensions/store` package ships only the Elasticsearch vector
 //! store, so this backend is a Rust-side extension of the family: it implements
-//! the kernel [`VectorStore`](openjiuwen_core::foundation::store::VectorStore)
+//! the kernel [`VectorStore`]
 //! contract on the key layout documented in [`super`]:
 //!
 //! - `openjiuwen:vec:collections` — every collection name,
@@ -17,7 +17,7 @@
 //! No `RediSearch` module is available offline (and adding one is not an option
 //! for a self-contained build), so similarity ranking is brute force on the
 //! client. Every operation hydrates a throwaway
-//! [`InMemoryVectorStore`](openjiuwen_core::foundation::store::InMemoryVectorStore)
+//! [`InMemoryVectorStore`]
 //! from `Redis` and delegates to it, then persists the effect:
 //!
 //! - `add_docs` lets the reference validate the batch, fill `default_value`s and

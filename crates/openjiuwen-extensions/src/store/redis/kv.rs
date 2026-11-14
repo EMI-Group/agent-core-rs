@@ -4,7 +4,7 @@
 //! wraps `redis.asyncio`. The workspace vendors no `Redis` driver, so this
 //! backend speaks RESP through [`crate::redis`] instead: [`RedisStoreConfig`]
 //! keeps the Python configuration surface, [`RedisStore::new`] validates it
-//! synchronously, and the shared [`RedisConnection`] opens one client on first
+//! synchronously, and the shared `RedisConnection` opens one client on first
 //! use. [`RedisStore::connect`] opens the connection eagerly and verifies it
 //! with `PING`, so a bad URL or an unreachable host fails before the caller
 //! stores anything.
