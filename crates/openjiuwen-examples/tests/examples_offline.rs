@@ -42,6 +42,12 @@ const REQUIRED_EXAMPLES: &[&str] = &[
     "18_team_attach",
     "19_symphony_skills",
     "20_prompt_tuning",
+    "21_native_tokenizers",
+    "22_context_telemetry",
+    "23_memory_dreaming",
+    "24_runner_spawn_registry",
+    "25_harness_moa_persistent",
+    "26_online_training_service",
 ];
 
 /// The one example that only exists when the `a2a` feature is enabled.
