@@ -21,11 +21,12 @@
 //! ```
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::llm::Model;
-use openjiuwen_foundation::prompt::{BaseMessage, TokenCounter};
+use openjiuwen_foundation::prompt::{BaseMessage, TokenCounter, Usage};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +36,11 @@ use crate::offload::{OffloadScope, OffloadStore};
 use crate::processor::compressor::reinjection::SnapshotRegistry;
 use crate::recall::RecallArchiveStore;
 use crate::session_memory::SessionMemoryStore;
+use crate::stats::compute_stats;
+use crate::telemetry::{
+    with_operation, CompressionStatePhase, CompressionStateStatus, ContextCompressionUsage,
+    ContextProcessorStateInput, ContextProcessorStateRecorder,
+};
 use crate::window::drop_orphan_tool_results;
 
 pub mod compressor;
@@ -311,6 +317,11 @@ pub struct PipelineDeps {
     pub session_memory: Option<Arc<dyn SessionMemoryStore>>,
     /// Host-rendered state sections full compaction reinjects after a pass.
     pub reinjection: Option<Arc<SnapshotRegistry>>,
+    /// Recorder every processor pass of the built pipeline reports to.
+    ///
+    /// `None` leaves the pipeline uninstrumented: no history is cloned and no
+    /// telemetry is produced.
+    pub recorder: Option<Arc<ContextProcessorStateRecorder>>,
 }
 
 impl std::fmt::Debug for PipelineDeps {
@@ -321,6 +332,7 @@ impl std::fmt::Debug for PipelineDeps {
             .field("has_recall", &self.recall.is_some())
             .field("has_session_memory", &self.session_memory.is_some())
             .field("has_reinjection", &self.reinjection.is_some())
+            .field("has_recorder", &self.recorder.is_some())
             .finish()
     }
 }
@@ -335,6 +347,7 @@ impl PipelineDeps {
             recall: None,
             session_memory: None,
             reinjection: None,
+            recorder: None,
         }
     }
 
@@ -368,12 +381,123 @@ impl PipelineDeps {
         self.reinjection = reinjection;
         self
     }
+
+    /// Sets the recorder the built pipeline reports every processor pass to.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Arc<ContextProcessorStateRecorder>>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+}
+
+// Why a recorded pass was reached, in Python's `ContextProcessorStateInput`
+// reason spellings. They are private: a record carries the string, never a flag.
+/// The processor pass began.
+const REASON_TRIGGERED: &str = "processor_triggered";
+/// The processor reported a change, or changed the history without one.
+const REASON_COMPLETED: &str = "processor_completed";
+/// The processor ran and changed nothing.
+const REASON_NOOP: &str = "processor_noop";
+/// The processor had an empty history to work on.
+const REASON_SKIPPED: &str = "processor_skipped";
+/// The processor raised an error.
+const REASON_ERROR: &str = "processor_error";
+/// The processor stopped because the run was cancelled.
+const REASON_CANCELLED: &str = "user_cancel";
+
+/// Accumulates the model usage of the processor pass that is currently running.
+///
+/// The pipeline binds one collector per instrumented pass; the shared
+/// compaction summariser
+/// ([`summarize`](crate::processor::summarize)) reports what each model call
+/// cost, and the pass's terminal record carries the total as
+/// `compression_usage`. Outside an instrumented pass the task-local is unbound,
+/// so a summariser call records nothing and the record leaves
+/// `compression_usage` as `None` — usage is never fabricated.
+#[derive(Debug, Default)]
+struct PassUsage {
+    usage: std::sync::Mutex<Option<ContextCompressionUsage>>,
+}
+
+impl PassUsage {
+    /// Adds one model call's usage; an empty usage is not a measurement and is
+    /// ignored.
+    fn record(&self, usage: &Usage, model_name: &str) {
+        if usage.is_empty() {
+            return;
+        }
+        let mut total = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match total.as_mut() {
+            Some(total) => total.record(usage),
+            None => *total = Some(ContextCompressionUsage::from_usage(usage, model_name)),
+        }
+    }
+
+    /// The total recorded so far, `None` when no call reported a usage.
+    fn snapshot(&self) -> Option<ContextCompressionUsage> {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+tokio::task_local! {
+    /// Collector of the instrumented pass the current task runs in.
+    static PASS_USAGE: Arc<PassUsage>;
+}
+
+/// Reports the usage of one processor model call to the running pass.
+///
+/// Called by the shared compaction summariser. The call is a no-op when no
+/// instrumented pass is in scope, so an uninstrumented pipeline pays only a
+/// failed task-local lookup.
+pub(crate) fn record_model_usage(usage: &Usage, model_name: &str) {
+    let _ = PASS_USAGE.try_with(|pass| pass.record(usage, model_name));
+}
+
+/// The state as a pass that returned successfully leaves it.
+///
+/// Mirrors Python's `status = "completed" if event is not None else "noop"` and
+/// additionally treats an undeclared history change as a completion, so a
+/// processor that rewrites without reporting cannot hide the change. An empty
+/// history a processor left alone means it had nothing to do, which is the one
+/// case recorded as [`CompressionStateStatus::Skipped`].
+fn finished_status(
+    event: Option<&ContextEvent>,
+    before: &[BaseMessage],
+    after: &[BaseMessage],
+) -> CompressionStateStatus {
+    if event.is_some() || before != after {
+        return CompressionStateStatus::Completed;
+    }
+    if before.is_empty() {
+        return CompressionStateStatus::Skipped;
+    }
+    CompressionStateStatus::Noop
+}
+
+/// Why a finished pass reached `status`, in Python's reason spellings.
+const fn finished_reason(status: CompressionStateStatus) -> &'static str {
+    match status {
+        CompressionStateStatus::Completed => REASON_COMPLETED,
+        CompressionStateStatus::Skipped => REASON_SKIPPED,
+        CompressionStateStatus::Failed => REASON_ERROR,
+        CompressionStateStatus::Cancelled => REASON_CANCELLED,
+        CompressionStateStatus::Started
+        | CompressionStateStatus::Noop
+        | CompressionStateStatus::Paused => REASON_NOOP,
+    }
 }
 
 /// An ordered list of processors.
 #[derive(Clone, Default)]
 pub struct ContextPipeline {
     processors: Vec<Arc<dyn ContextProcessor>>,
+    recorder: Option<Arc<ContextProcessorStateRecorder>>,
 }
 
 impl std::fmt::Debug for ContextPipeline {
@@ -385,15 +509,22 @@ impl std::fmt::Debug for ContextPipeline {
             .collect();
         f.debug_struct("ContextPipeline")
             .field("processors", &names)
+            .field("recording", &self.recorder.is_some())
             .finish()
     }
 }
 
 impl ContextPipeline {
     /// Creates a pipeline over `processors`, in execution order.
+    ///
+    /// The pipeline records nothing; attach a recorder with
+    /// [`ContextPipeline::with_recorder`].
     #[must_use]
     pub fn new(processors: Vec<Arc<dyn ContextProcessor>>) -> Self {
-        Self { processors }
+        Self {
+            processors,
+            recorder: None,
+        }
     }
 
     /// Builds the pipeline described by `configs`.
@@ -532,7 +663,27 @@ impl ContextPipeline {
                 }
             }
         }
-        Ok(Self::new(processors))
+        Ok(Self {
+            processors,
+            recorder: deps.recorder.clone(),
+        })
+    }
+
+    /// Attaches the recorder every processor pass of this pipeline reports to.
+    ///
+    /// `None` (the default) disables recording: the pipeline then runs exactly
+    /// as it did before telemetry existed — no history snapshot, no statistics,
+    /// and no compaction-operation scope around a processor.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Arc<ContextProcessorStateRecorder>>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// The recorder attached to this pipeline, if any.
+    #[must_use]
+    pub fn recorder(&self) -> Option<&Arc<ContextProcessorStateRecorder>> {
+        self.recorder.as_ref()
     }
 
     /// The processors, in execution order.
@@ -614,6 +765,12 @@ impl ContextPipeline {
     /// dropped (a processor may have removed the assistant message that owned
     /// one) and the repair is logged.
     ///
+    /// The pass is recorded in phase [`CompressionStatePhase::ActiveCompress`],
+    /// because this pipeline is the compaction seam (Python's
+    /// `active_compress`). A caller that runs the same pipeline for another
+    /// context-engine entry point passes the phase explicitly through
+    /// [`ContextPipeline::run_in_phase`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Cancelled`] when the cancellation token is set, and the
@@ -623,13 +780,66 @@ impl ContextPipeline {
         messages: &mut Vec<BaseMessage>,
         cx: &ProcessorContext<'_>,
     ) -> Result<Vec<ContextEvent>> {
+        self.run_in_phase(messages, cx, CompressionStatePhase::ActiveCompress)
+            .await
+    }
+
+    /// Runs every processor in order, recording each pass in `phase`.
+    ///
+    /// This is [`ContextPipeline::run`] with the phase Python derives from the
+    /// engine entry point (`add_messages`, `get_context_window`,
+    /// `active_compress`).
+    ///
+    /// When a recorder is attached every processor pass is bracketed by two
+    /// records — `started` before the processor runs, then `completed` / `noop` /
+    /// `skipped` / `failed` / `cancelled` — and the processor runs inside a
+    /// [`with_operation`] scope, so a model call it makes carries the pass's
+    /// operation id. Each record carries the processor name, the phase, the
+    /// operation id, the configured model name, the context window the
+    /// percentages are measured against, the before/after metrics and
+    /// [`ContextStats`](crate::stats::ContextStats), the pass duration, the
+    /// model usage the pass reported, and the event summary when the processor
+    /// produced one. The compression trigger threshold is not part of the
+    /// record's wire schema, so it is not reported. Recording never fails a
+    /// pass: a sink or stream error is logged and swallowed by the recorder.
+    ///
+    /// Status mapping, following Python's
+    /// `status = "completed" if event is not None else "noop"`: a processor that
+    /// returns an event, or changes the history without one, is `completed`; one
+    /// that leaves a non-empty history unchanged is `noop`; one that is handed an
+    /// empty history and changes nothing is `skipped` (it had nothing to work
+    /// on); an error is `failed`, and [`Error::Cancelled`] is `cancelled`. A
+    /// cancellation noticed before a pass starts records nothing and returns
+    /// immediately, matching Python's loop guard.
+    ///
+    /// Without a recorder the pipeline is byte-identical to the uninstrumented
+    /// one: the history is never cloned and no task-local scope is entered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Cancelled`] when the cancellation token is set, and the
+    /// failing processor's error otherwise (after recording it).
+    pub async fn run_in_phase(
+        &self,
+        messages: &mut Vec<BaseMessage>,
+        cx: &ProcessorContext<'_>,
+        phase: CompressionStatePhase,
+    ) -> Result<Vec<ContextEvent>> {
         let mut events = Vec::new();
-        for processor in &self.processors {
-            if cx.cancellation.is_cancelled() {
-                return Err(Error::Cancelled);
+        match self.recorder.as_deref() {
+            Some(recorder) => {
+                self.run_recorded(recorder, messages, cx, phase, &mut events)
+                    .await?;
             }
-            if let Some(event) = processor.process(messages, cx).await? {
-                events.push(event);
+            None => {
+                for processor in &self.processors {
+                    if cx.cancellation.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    if let Some(event) = processor.process(messages, cx).await? {
+                        events.push(event);
+                    }
+                }
             }
         }
         let dropped = drop_orphan_tool_results(messages);
@@ -641,6 +851,120 @@ impl ContextPipeline {
         }
         Ok(events)
     }
+
+    /// The instrumented loop of [`ContextPipeline::run_in_phase`].
+    ///
+    /// Every pass clones the working history once (the recorder needs the before
+    /// image to measure and diff), emits a `started` record, runs the processor
+    /// inside the operation scope with a usage collector bound, and emits the
+    /// terminal record before returning or propagating the error.
+    async fn run_recorded(
+        &self,
+        recorder: &ContextProcessorStateRecorder,
+        messages: &mut Vec<BaseMessage>,
+        cx: &ProcessorContext<'_>,
+        phase: CompressionStatePhase,
+        events: &mut Vec<ContextEvent>,
+    ) -> Result<()> {
+        let context_max = context_max(cx);
+        let model = cx.model.map(|model| model.model_name().to_owned());
+        for processor in &self.processors {
+            if cx.cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let before = messages.clone();
+            let stats_before = compute_stats(&before, cx.counter);
+            let operation_id = uuid::Uuid::new_v4().simple().to_string();
+            let started_at = SystemTime::now();
+            let started = ContextProcessorStateInput::new(
+                operation_id.clone(),
+                CompressionStateStatus::Started,
+                phase,
+                processor.name(),
+                &before,
+            )
+            .with_stats(stats_before.clone(), None)
+            .with_timing(started_at, None)
+            .with_reason(REASON_TRIGGERED);
+            recorder
+                .emit(with_pass_context(started, model.as_deref(), context_max))
+                .await;
+
+            let usage = Arc::new(PassUsage::default());
+            let outcome = with_operation(
+                operation_id.clone(),
+                PASS_USAGE.scope(Arc::clone(&usage), processor.process(messages, cx)),
+            )
+            .await;
+            let ended_at = SystemTime::now();
+            let stats_after = compute_stats(messages, cx.counter);
+            let status = match &outcome {
+                Ok(event) => finished_status(event.as_ref(), &before, messages),
+                Err(Error::Cancelled) => CompressionStateStatus::Cancelled,
+                Err(_) => CompressionStateStatus::Failed,
+            };
+            let terminal = ContextProcessorStateInput::new(
+                operation_id,
+                status,
+                phase,
+                processor.name(),
+                &before,
+            )
+            .with_after(messages.as_slice())
+            .with_stats(stats_before, Some(stats_after))
+            .with_timing(started_at, Some(ended_at))
+            .with_reason(finished_reason(status));
+            let mut terminal = with_pass_context(terminal, model.as_deref(), context_max);
+            if let Some(usage) = usage.snapshot() {
+                terminal = terminal.with_usage(usage);
+            }
+            match outcome {
+                Ok(event) => {
+                    if let Some(summary) = event.as_ref().and_then(|event| event.summary.as_deref())
+                    {
+                        terminal = terminal.with_compact_summary(summary);
+                    }
+                    recorder.emit(terminal).await;
+                    if let Some(event) = event {
+                        events.push(event);
+                    }
+                }
+                Err(error) => {
+                    if status == CompressionStateStatus::Failed {
+                        terminal = terminal.with_error(error.to_string());
+                    }
+                    recorder.emit(terminal).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The context window the record percentages are measured against.
+///
+/// The configured window is preferred, falling back to the pass budget when the
+/// configuration declares none; a window that does not fit in the record's
+/// `u32` field is reported as unknown rather than truncated.
+fn context_max(cx: &ProcessorContext<'_>) -> Option<u32> {
+    let tokens = cx.config.max_context_tokens.unwrap_or(cx.budget);
+    u32::try_from(tokens).ok()
+}
+
+/// Applies the optional model name and context window to `input`.
+fn with_pass_context<'a>(
+    mut input: ContextProcessorStateInput<'a>,
+    model: Option<&str>,
+    context_max: Option<u32>,
+) -> ContextProcessorStateInput<'a> {
+    if let Some(model) = model {
+        input = input.with_model(model);
+    }
+    if let Some(context_max) = context_max {
+        input = input.with_context_max(context_max);
+    }
+    input
 }
 
 /// Serializable description of one processor.
