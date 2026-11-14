@@ -304,15 +304,31 @@ impl ParsedField {
             && self.values.len() == kind.universe()
     }
 
-    /// Consumes the field into plain, sorted vectors.
-    fn into_parts(self) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<(u32, u32)>) {
-        (
-            self.values.into_iter().collect(),
-            self.last_day_offsets.into_iter().collect(),
-            self.last_weekdays.into_iter().collect(),
-            self.nth_weekdays.into_iter().collect(),
-        )
+    /// Consumes the field into its owned, sorted value vectors.
+    fn into_parts(self) -> FieldParts {
+        FieldParts {
+            values: self.values.into_iter().collect(),
+            last_day_offsets: self.last_day_offsets.into_iter().collect(),
+            last_weekdays: self.last_weekdays.into_iter().collect(),
+            nth_weekdays: self.nth_weekdays.into_iter().collect(),
+        }
     }
+}
+
+/// The owned, sorted form of a [`ParsedField`] — what [`CronSchedule::parse`] stores.
+///
+/// The parser works on [`BTreeSet`]s so duplicates and ordering are handled while parts are
+/// being added; this struct is the plain `Vec` view the schedule keeps afterwards.
+#[derive(Debug, Default)]
+struct FieldParts {
+    /// Plain values, normalized and deduplicated.
+    values: Vec<u32>,
+    /// Day-of-month `L` / `L-n` tokens, as offsets from the last day of the month.
+    last_day_offsets: Vec<u32>,
+    /// Day-of-week `nL` tokens, as weekday numbers.
+    last_weekdays: Vec<u32>,
+    /// Day-of-week `d#n` tokens, as `(weekday, nth)` pairs.
+    nth_weekdays: Vec<(u32, u32)>,
 }
 
 /// Parses one comma-separated part of a field into `out`.
@@ -434,7 +450,8 @@ fn parse_clock_part(
                 return Err(field_error(kind, raw));
             }
             // Quartz wrap-around range: `22-2` is 22, 23, 0, 1.
-            return insert_wrapped(kind, start, end, step.unwrap_or(1), out);
+            insert_wrapped(kind, start, end, step.unwrap_or(1), out);
+            return Ok(());
         }
         (start, end)
     } else {
@@ -453,19 +470,12 @@ fn parse_clock_part(
 }
 
 /// Inserts a wrap-around range (`start > end`) into `out`, stepping along the unrolled values.
-fn insert_wrapped(
-    kind: FieldKind,
-    start: u32,
-    end: u32,
-    step: u32,
-    out: &mut ParsedField,
-) -> Result<()> {
+fn insert_wrapped(kind: FieldKind, start: u32, end: u32, step: u32, out: &mut ParsedField) {
     let unrolled: Vec<u32> = (start..=kind.max()).chain(kind.min()..=end).collect();
     let stride = usize::try_from(step).unwrap_or(1);
     for value in unrolled.into_iter().step_by(stride) {
         out.values.insert(kind.normalize(value));
     }
-    Ok(())
 }
 
 /// Parses one whole field (a comma-separated list of parts).
@@ -486,6 +496,110 @@ fn parse_day_field(kind: FieldKind, raw: &str, form: Form) -> Result<Option<Pars
         return Ok(None);
     }
     parse_field(kind, raw, form).map(Some)
+}
+
+/// Parses a required field into its sorted, deduplicated values.
+fn parse_values(kind: FieldKind, text: &str, form: Form) -> Result<Vec<u32>> {
+    Ok(parse_field(kind, text, form)?.values.into_iter().collect())
+}
+
+/// Parses an optional field (`second`, `year`) into its sorted, deduplicated values.
+fn parse_optional_values(
+    kind: FieldKind,
+    text: Option<&str>,
+    form: Form,
+) -> Result<Option<Vec<u32>>> {
+    text.map(|text| parse_values(kind, text, form)).transpose()
+}
+
+/// The raw texts of one expression's fields, in their named slots.
+#[derive(Debug, Clone, Copy)]
+struct FieldTexts<'a> {
+    /// The expression form implied by the field count.
+    form: Form,
+    /// The Quartz `second` field, absent in the classic form.
+    second: Option<&'a str>,
+    /// The `minute` field.
+    minute: &'a str,
+    /// The `hour` field.
+    hour: &'a str,
+    /// The `day-of-month` field, which may be `?` in a Quartz expression.
+    day_of_month: &'a str,
+    /// The `month` field.
+    month: &'a str,
+    /// The `day-of-week` field, which may be `?` in a Quartz expression.
+    day_of_week: &'a str,
+    /// The Quartz `year` field, present only in the seven-field form.
+    year: Option<&'a str>,
+}
+
+impl<'a> FieldTexts<'a> {
+    /// Splits `expanded` into its named slots, rejecting an unsupported field count.
+    ///
+    /// `expression` is the trimmed source text, echoed verbatim in the error message.
+    fn split(expanded: &'a str, expression: &str) -> Result<Self> {
+        let fields: Vec<&'a str> = expanded.split_whitespace().collect();
+        match fields.as_slice() {
+            [minute, hour, day_of_month, month, day_of_week] => Ok(Self {
+                form: Form::Classic,
+                second: None,
+                minute: *minute,
+                hour: *hour,
+                day_of_month: *day_of_month,
+                month: *month,
+                day_of_week: *day_of_week,
+                year: None,
+            }),
+            [second, minute, hour, day_of_month, month, day_of_week] => Ok(Self {
+                form: Form::Quartz,
+                second: Some(*second),
+                minute: *minute,
+                hour: *hour,
+                day_of_month: *day_of_month,
+                month: *month,
+                day_of_week: *day_of_week,
+                year: None,
+            }),
+            [second, minute, hour, day_of_month, month, day_of_week, year] => Ok(Self {
+                form: Form::Quartz,
+                second: Some(*second),
+                minute: *minute,
+                hour: *hour,
+                day_of_month: *day_of_month,
+                month: *month,
+                day_of_week: *day_of_week,
+                year: Some(*year),
+            }),
+            _ => Err(Error::validation(format!(
+                "invalid cron expression: expected {CLASSIC_FIELDS} fields \
+                 (minute hour day-of-month month day-of-week) or {QUARTZ_FIELDS}/\
+                 {QUARTZ_YEAR_FIELDS} Quartz fields (second minute hour day-of-month month \
+                 day-of-week [year]), got {}: {expression:?}",
+                fields.len()
+            ))),
+        }
+    }
+}
+
+/// Enforces the Quartz rule that exactly one of the two day fields is `?`.
+///
+/// `expression` is the trimmed source text, echoed verbatim in the error message.
+fn require_single_day_field(
+    day_of_month: Option<&ParsedField>,
+    day_of_week: Option<&ParsedField>,
+    expression: &str,
+) -> Result<()> {
+    match (day_of_month.is_some(), day_of_week.is_some()) {
+        (true, true) => Err(Error::validation(format!(
+            "invalid cron expression: both day-of-month and day-of-week are \
+             specified (one must be \"?\" in a Quartz expression): {expression:?}"
+        ))),
+        (false, false) => Err(Error::validation(format!(
+            "invalid cron expression: both day-of-month and day-of-week are \"?\" \
+             (exactly one must be specified in a Quartz expression): {expression:?}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// A parsed cron expression, reusable for any number of next-occurrence queries.
@@ -539,82 +653,20 @@ impl CronSchedule {
             return Err(Error::validation("cron expression cannot be empty"));
         }
         let expanded = expand_shorthand(trimmed)?;
-        let fields: Vec<&str> = expanded.split_whitespace().collect();
-        let form = match fields.len() {
-            CLASSIC_FIELDS => Form::Classic,
-            QUARTZ_FIELDS | QUARTZ_YEAR_FIELDS => Form::Quartz,
-            count => {
-                return Err(Error::validation(format!(
-                    "invalid cron expression: expected {CLASSIC_FIELDS} fields \
-                     (minute hour day-of-month month day-of-week) or {QUARTZ_FIELDS}/\
-                     {QUARTZ_YEAR_FIELDS} Quartz fields (second minute hour day-of-month month \
-                     day-of-week [year]), got {count}: {trimmed:?}"
-                )));
-            }
-        };
+        let fields = FieldTexts::split(expanded, trimmed)?;
+        let form = fields.form;
 
-        let (second_text, minute_text, hour_text, dom_text, month_text, dow_text, year_text) =
-            match fields.as_slice() {
-                [minute, hour, dom, month, dow] => (None, *minute, *hour, *dom, *month, *dow, None),
-                [second, minute, hour, dom, month, dow] => {
-                    (Some(*second), *minute, *hour, *dom, *month, *dow, None)
-                }
-                [second, minute, hour, dom, month, dow, year] => (
-                    Some(*second),
-                    *minute,
-                    *hour,
-                    *dom,
-                    *month,
-                    *dow,
-                    Some(*year),
-                ),
-                _ => {
-                    return Err(Error::validation(format!(
-                        "invalid cron expression: unexpected field layout: {trimmed:?}"
-                    )));
-                }
-            };
-
-        let day_of_month = parse_day_field(FieldKind::DayOfMonth, dom_text, form)?;
-        let day_of_week = parse_day_field(FieldKind::DayOfWeek, dow_text, form)?;
+        let day_of_month = parse_day_field(FieldKind::DayOfMonth, fields.day_of_month, form)?;
+        let day_of_week = parse_day_field(FieldKind::DayOfWeek, fields.day_of_week, form)?;
         if form.is_quartz() {
-            match (day_of_month.is_some(), day_of_week.is_some()) {
-                (true, true) => {
-                    return Err(Error::validation(format!(
-                        "invalid cron expression: both day-of-month and day-of-week are \
-                         specified (one must be \"?\" in a Quartz expression): {trimmed:?}"
-                    )));
-                }
-                (false, false) => {
-                    return Err(Error::validation(format!(
-                        "invalid cron expression: both day-of-month and day-of-week are \"?\" \
-                         (exactly one must be specified in a Quartz expression): {trimmed:?}"
-                    )));
-                }
-                _ => {}
-            }
+            require_single_day_field(day_of_month.as_ref(), day_of_week.as_ref(), trimmed)?;
         }
 
-        let seconds = second_text
-            .map(|text| parse_field(FieldKind::Second, text, form))
-            .transpose()?
-            .map(|parsed| parsed.values.into_iter().collect::<Vec<u32>>());
-        let minutes = parse_field(FieldKind::Minute, minute_text, form)?
-            .values
-            .into_iter()
-            .collect();
-        let hours = parse_field(FieldKind::Hour, hour_text, form)?
-            .values
-            .into_iter()
-            .collect();
-        let months = parse_field(FieldKind::Month, month_text, form)?
-            .values
-            .into_iter()
-            .collect();
-        let years = year_text
-            .map(|text| parse_field(FieldKind::Year, text, form))
-            .transpose()?
-            .map(|parsed| parsed.values.into_iter().collect::<Vec<u32>>());
+        let seconds = parse_optional_values(FieldKind::Second, fields.second, form)?;
+        let minutes = parse_values(FieldKind::Minute, fields.minute, form)?;
+        let hours = parse_values(FieldKind::Hour, fields.hour, form)?;
+        let months = parse_values(FieldKind::Month, fields.month, form)?;
+        let years = parse_optional_values(FieldKind::Year, fields.year, form)?;
 
         let day_of_month_restricted = day_of_month
             .as_ref()
@@ -622,22 +674,21 @@ impl CronSchedule {
         let day_of_week_restricted = day_of_week
             .as_ref()
             .is_some_and(|field| !field.covers(FieldKind::DayOfWeek));
-        let (days_of_month, last_day_offsets, _, _) = day_of_month.unwrap_or_default().into_parts();
-        let (weekdays, _, last_weekdays, nth_weekdays) =
-            day_of_week.unwrap_or_default().into_parts();
+        let parts = day_of_month.unwrap_or_default().into_parts();
+        let weekday_parts = day_of_week.unwrap_or_default().into_parts();
 
         Ok(Self {
             expression: trimmed.to_owned(),
             seconds,
             minutes,
             hours,
-            days_of_month,
+            days_of_month: parts.values,
             months,
-            weekdays,
+            weekdays: weekday_parts.values,
             years,
-            last_day_offsets,
-            last_weekdays,
-            nth_weekdays,
+            last_day_offsets: parts.last_day_offsets,
+            last_weekdays: weekday_parts.last_weekdays,
+            nth_weekdays: weekday_parts.nth_weekdays,
             day_of_month_restricted,
             day_of_week_restricted,
         })
@@ -747,9 +798,7 @@ impl CronSchedule {
         let Some(years) = &self.years else {
             return true;
         };
-        u32::try_from(candidate.year())
-            .ok()
-            .is_some_and(|year| years.contains(&year))
+        u32::try_from(candidate.year()).is_ok_and(|year| years.contains(&year))
     }
 
     /// Whether `candidate`'s date satisfies the day-of-month/day-of-week pair.
