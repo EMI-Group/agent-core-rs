@@ -35,9 +35,19 @@
 //! [`Runner::set_message_queue`] replace the monitor, the hub, and the queue for
 //! every run started afterwards and return the instance they displaced (the
 //! `runner_seams` module, beside this file).
+//!
+//! Dreaming is installed the same way and has a lifecycle of its own: a host
+//! hands over a [`DreamService`] with [`Runner::set_dreaming_service`], drives it
+//! with [`Runner::start_dreaming`]/[`Runner::stop_dreaming`], and reads
+//! [`Runner::dreaming_status`]. [`Runner::start`] never starts it —
+//! consolidation is independent of the queue and the checkpointer — while
+//! [`Runner::stop`] does stop a running service, bounded and log-only on failure
+//! so the runner's shutdown result stays the queue's. Those accessors live in the
+//! crate's `runner_dreaming` module, beside this file.
 
 use crate::callback::{bind_guardrails, CallbackFramework, CallbackId};
 use crate::config::RunnerConfig;
+use crate::dreaming::DreamService;
 use crate::error;
 use crate::hitl::{DeliverResult, InteractPayload, InteractionHub, RunTarget};
 use crate::monitor::{RunMonitor, RunStatus};
@@ -129,6 +139,9 @@ pub struct Runner {
     /// The team runtime pool; rebuilt from the live configuration by
     /// [`Runner::start`] and [`Runner::stop`].
     team_pool: RwLock<TeamPool>,
+    /// The installed dreaming service (no orchestrator by default); installed by
+    /// [`Runner::set_dreaming_service`], stopped by [`Runner::stop`].
+    pub(crate) dreaming: RwLock<Option<Arc<DreamService>>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -146,6 +159,7 @@ impl std::fmt::Debug for Runner {
             .field("checkpointer", &self.checkpointer().is_some())
             .field("guardrails", &self.guardrails().is_some())
             .field("pooled_teams", &self.team_pool().len())
+            .field("dreaming", &self.dreaming_service().is_some())
             .field("active_runs", &self.monitor().list_active().len())
             .finish_non_exhaustive()
     }
@@ -205,6 +219,7 @@ impl Runner {
             monitor: RwLock::new(monitor),
             hitl: RwLock::new(hitl),
             team_pool: RwLock::new(team_pool),
+            dreaming: RwLock::new(None),
         })
     }
 
@@ -357,6 +372,11 @@ impl Runner {
     /// The spawn seam is not part of the lifecycle: the installed spawner and
     /// registry survive `start`/`stop` and keep routing spawns.
     ///
+    /// Dreaming is not part of it either: an installed
+    /// [`crate::dreaming::DreamService`] is left exactly as it is — start it with
+    /// [`Runner::start_dreaming`], because a memory-consolidation loop obeys its
+    /// own schedule rather than the queue's.
+    ///
     /// Rebuilding the pool **retires** the previous one: its live pooled team runs
     /// are stopped (bounded by `TeamPoolConfig::stop_timeout`) and a fresh open
     /// pool takes its place. Pooled runs do not require `start`, so a run admitted
@@ -434,11 +454,18 @@ impl Runner {
     /// reported through `tracing` only, so the queue's result stays the return
     /// value.
     ///
+    /// The installed dreaming service is stopped too, before the pool sweep and
+    /// before the started early return — best effort, never affecting the result
+    /// — while [`Runner::start`] never starts one: consolidation has a lifecycle
+    /// of its own. The service stays installed, so a later
+    /// [`Runner::start_dreaming`] runs it again.
+    ///
     /// # Errors
     ///
     /// Returns the queue's error when it fails to stop.
     pub async fn stop(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.stop_dreaming_quietly().await;
         self.sweep_team_pool().await;
         if !self.started.swap(false, Ordering::AcqRel) {
             tracing::debug!(target: LOG_TARGET, runner_id = %self.runner_id, "runner already stopped");

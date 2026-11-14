@@ -62,6 +62,7 @@
 
 pub mod callback;
 pub mod config;
+pub mod dreaming;
 pub mod error;
 pub mod hitl;
 pub mod monitor;
@@ -70,6 +71,7 @@ pub mod pool;
 pub mod resources;
 pub mod run;
 pub mod runner;
+mod runner_dreaming;
 mod runner_seams;
 mod runner_spawn;
 pub mod spawn;
@@ -140,6 +142,17 @@ pub use run::{
     AgentRef, RunOptions, RunServices, TeamRef, WorkflowRef,
 };
 pub use runner::Runner;
+// --- dreaming driver ---
+pub use dreaming::{DreamService, DreamServiceStatus, DEFAULT_DREAMING_STOP_TIMEOUT};
+/// The memory-crate dreaming types a host needs to build and inspect a
+/// [`DreamService`]: the orchestrator and its schedule, the planner and its
+/// consolidator seam, the queue (in-memory plus the repository trait), the job
+/// and outcome model, and the no-op consolidator.
+pub use openjiuwen_memory::dreaming::{
+    DreamConfig, DreamConsolidator, DreamJob, DreamKind, DreamMetrics, DreamOrchestrator,
+    DreamOrchestratorConfig, DreamOrchestratorStatus, DreamOutcome, DreamPlanner, DreamRepository,
+    DreamRunSummary, DreamState, DreamTrigger, InMemoryDreamRepository, NoopConsolidator,
+};
 // --- spawn seam and its backends ---
 pub use spawn::{
     create_remote_client, frame_bytes, parse_frame_line, read_frame, AgentSpawner, DeferredSpawner,
