@@ -72,10 +72,14 @@ use crate::policy::{
 use crate::prompt::{PromptSection, SystemPromptBuilder, IDENTITY_PRIORITY};
 use crate::rails::{AgentRail, RailRegistry};
 use crate::steering::SteeringQueue;
+use crate::usage::{UsageTelemetry, MAIN_CONTEXT_ID};
 use agent_loop::AgentRuntime;
 use futures::stream::{BoxStream, StreamExt};
 use openjiuwen_common::error::{Error, ErrorKind, Result};
-use openjiuwen_context::{ContextConfig, ContextEngine};
+use openjiuwen_context::{
+    ContextConfig, ContextEngine, ContextProcessorStateRecorder, ContextUsageAnalyzer,
+    ContextUsageSnapshot, ContextWindowTokenReport,
+};
 use openjiuwen_foundation::{Model, ModelRequestConfig, Tool, ToolCard};
 use openjiuwen_memory::{ConversationTurn, MemoryProvider};
 use openjiuwen_session::Session;
@@ -124,6 +128,9 @@ pub struct ReActAgent {
     rails: parking_lot::RwLock<Arc<RailRegistry>>,
     prompt_builder: parking_lot::RwLock<SystemPromptBuilder>,
     engine: parking_lot::RwLock<Arc<ContextEngine>>,
+    usage_analyzer: parking_lot::RwLock<Option<Arc<ContextUsageAnalyzer>>>,
+    context_recorder: parking_lot::RwLock<Option<Arc<ContextProcessorStateRecorder>>>,
+    usage_telemetry: Arc<UsageTelemetry>,
     callbacks: parking_lot::RwLock<Arc<CallbackFramework>>,
     steering: SteeringQueue,
     exposure: parking_lot::RwLock<ToolExposurePolicy>,
@@ -157,6 +164,9 @@ impl ReActAgent {
             engine: parking_lot::RwLock::new(Arc::new(
                 ContextEngine::new(ContextConfig::default()),
             )),
+            usage_analyzer: parking_lot::RwLock::new(None),
+            context_recorder: parking_lot::RwLock::new(None),
+            usage_telemetry: Arc::new(UsageTelemetry::new()),
             callbacks: parking_lot::RwLock::new(Arc::new(CallbackFramework::new())),
             steering: SteeringQueue::new(),
             exposure: parking_lot::RwLock::new(ToolExposurePolicy::allow_all()),
@@ -176,6 +186,11 @@ impl ReActAgent {
     /// rebuilt from the system-role entries of
     /// [`ReActAgentConfig::prompt_template`]: their rendered contents are
     /// joined with a blank line into one identity section.
+    ///
+    /// A usage analyzer or context recorder installed with
+    /// [`ReActAgent::set_usage_analyzer`]/[`ReActAgent::set_context_recorder`]
+    /// survives the rebuild: the replacement engine carries them again, so
+    /// configuring an agent after instrumenting it keeps the instrumentation.
     pub fn configure(&self, config: ReActAgentConfig) {
         let identity = config
             .prompt_template
@@ -189,9 +204,25 @@ impl ReActAgent {
             builder.add_section(PromptSection::new("identity", identity, IDENTITY_PRIORITY));
         }
         self.request_config.write().clone_from(&config.model_config);
-        *self.engine.write() = Arc::new(ContextEngine::new(config.context_engine_config.clone()));
         *self.prompt_builder.write() = builder;
         *self.config.write() = config;
+        self.rebuild_engine();
+    }
+
+    /// Rebuilds the context engine from the current configuration, analyzer and
+    /// recorder.
+    ///
+    /// The engine is replaced, not mutated, so a running loop keeps the engine
+    /// it snapshotted and the replacement starts with no contexts.
+    fn rebuild_engine(&self) {
+        let config = self.config.read().context_engine_config.clone();
+        let analyzer = self.usage_analyzer.read().clone();
+        let recorder = self.context_recorder.read().clone();
+        *self.engine.write() = Arc::new(
+            ContextEngine::new(config)
+                .with_usage_analyzer(analyzer)
+                .with_recorder(recorder),
+        );
     }
 
     /// Returns a copy of the current configuration.
@@ -286,6 +317,104 @@ impl ReActAgent {
     #[must_use]
     pub fn context_engine(&self) -> Arc<ContextEngine> {
         Arc::clone(&*self.engine.read())
+    }
+
+    /// Installs (or removes) the context usage analyzer of later windows.
+    ///
+    /// Like [`ReActAgent::configure`], this **replaces** the context engine:
+    /// the new engine carries `analyzer` (plus any installed recorder), and the
+    /// old engine's contexts — and therefore its recorded conversation
+    /// history — are dropped. Call it between invocations, not during one;
+    /// every run snapshots the engine it started with.
+    ///
+    /// With an analyzer installed, `ContextEngine::prepare` attaches a measured
+    /// `usage` block to every prepared window and the loop publishes a
+    /// post-call `context.usage` frame plus a [`UsageTelemetry`] snapshot after
+    /// every successful model call; without one, windows are still prepared and
+    /// the pre-call frame is still emitted, but its `usage` block is `null`.
+    pub fn set_usage_analyzer(&self, analyzer: Option<Arc<ContextUsageAnalyzer>>) {
+        *self.usage_analyzer.write() = analyzer;
+        self.rebuild_engine();
+    }
+
+    /// Returns the installed context usage analyzer, if any.
+    #[must_use]
+    pub fn usage_analyzer(&self) -> Option<Arc<ContextUsageAnalyzer>> {
+        self.usage_analyzer.read().clone()
+    }
+
+    /// Installs (or removes) the context processor state recorder.
+    ///
+    /// The recorder observes compression states inside the processors; it is
+    /// engine-owned state like the analyzer, so this rebuilds the context
+    /// engine (dropping its contexts) exactly like
+    /// [`ReActAgent::set_usage_analyzer`]. The recorder is independent of the
+    /// analyzer: either, both, or neither may be installed.
+    pub fn set_context_recorder(&self, recorder: Option<Arc<ContextProcessorStateRecorder>>) {
+        *self.context_recorder.write() = recorder;
+        self.rebuild_engine();
+    }
+
+    /// Returns the installed context processor state recorder, if any.
+    #[must_use]
+    pub fn context_recorder(&self) -> Option<Arc<ContextProcessorStateRecorder>> {
+        self.context_recorder.read().clone()
+    }
+
+    /// Returns the handle of this agent's usage telemetry buffer.
+    ///
+    /// Every clone shares one buffer, so a host can keep the handle and drain it
+    /// while invocations run. A non-streaming [`Agent::invoke`] publishes no
+    /// frames, which makes this the way to read the post-call measurements of a
+    /// plain invocation.
+    #[must_use]
+    pub fn usage_telemetry(&self) -> Arc<UsageTelemetry> {
+        Arc::clone(&self.usage_telemetry)
+    }
+
+    /// Returns the most recent post-call usage snapshot, without draining it.
+    #[must_use]
+    pub fn last_usage(&self) -> Option<ContextUsageSnapshot> {
+        self.usage_telemetry.last()
+    }
+
+    /// Removes and returns every buffered post-call usage snapshot.
+    ///
+    /// The snapshots are ordered oldest first, one per successful model call
+    /// since the previous drain; without an analyzer nothing was recorded.
+    #[must_use]
+    pub fn drain_usage_events(&self) -> Vec<ContextUsageSnapshot> {
+        self.usage_telemetry.drain()
+    }
+
+    /// Builds the frozen token report of the run context of `session`.
+    ///
+    /// The context is this agent's `"main"` context for the session, created on
+    /// demand, so the report works before the first invocation and after it
+    /// alike. `provider_input_tokens` makes the provider total authoritative: the
+    /// report's `context_window.tokens` becomes that total and the category parts
+    /// are reconciled to it, exactly like the emitted `context.usage` snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when no [`ContextUsageAnalyzer`] is installed (the engine
+    /// refuses to measure without one) and the engine's own error when the
+    /// context cannot be created.
+    pub async fn usage_report(
+        &self,
+        session: &Arc<dyn Session>,
+        provider_input_tokens: Option<u64>,
+    ) -> Result<ContextWindowTokenReport> {
+        let engine = self.context_engine();
+        let context = match engine.get_context(session.id(), MAIN_CONTEXT_ID).await {
+            Some(context) => context,
+            None => {
+                engine
+                    .create_context(MAIN_CONTEXT_ID, Some(Arc::clone(session)))
+                    .await?
+            }
+        };
+        engine.usage_report(&context, provider_input_tokens).await
     }
 
     /// Replaces the whole callback registry.
@@ -500,7 +629,11 @@ impl Agent for ReActAgent {
         )
         .await?;
         let owned = run.is_owned();
-        let result = agent_loop::run(self, input, Arc::clone(run.session()), None, owned).await;
+        // Boxed so the loop's large future does not inflate this trait method's
+        // own future (`clippy::large_futures`); the allocation happens once per
+        // invocation, next to the ones the run already makes.
+        let loop_future = agent_loop::run(self, input, Arc::clone(run.session()), None, owned);
+        let result = Box::pin(loop_future).await;
         run.finish().await;
         result
     }

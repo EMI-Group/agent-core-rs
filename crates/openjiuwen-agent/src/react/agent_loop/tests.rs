@@ -34,6 +34,7 @@ fn request_for_inherits_the_configured_model_name() {
         resilience: crate::policy::ToolResiliencePolicy::new(),
         final_check: None,
         memory_provider: None,
+        usage_telemetry: Arc::new(UsageTelemetry::new()),
     };
     assert_eq!(request_for(&runtime, &[]).model_name, "gpt-4o");
 }
