@@ -27,6 +27,7 @@
 //! | [`models`] | model pool, router and per-member allocation |
 //! | [`kv_cache`] | KV-cache affinity identity and cleanup hooks |
 //! | [`observability`] | `OTel` hook seam (no-op without the `otel` feature) |
+//! | [`memory`] | team-memory wiring: lifecycle hooks, member tools, `TEAM_MEMORY.md` export/import |
 //! | [`monitor`] | plain-text status stream for a live team |
 //! | [`attach`] | cross-process attach over Unix domain sockets |
 //!
@@ -37,6 +38,7 @@
 //! | `mcp` | yes | the `openjiuwen-team-mcp` stdio server and its tool catalogue |
 //! | `sqlite` | no | `SqliteTeamStore`, the persistent `TeamStore` backend |
 //! | `otel` | no | structured `OTel` hooks and the in-memory span sink in [`observability`] |
+//! | `otlp` | no | `OtlpMemoryObserver`: forwards team-memory events to `openjiuwen-extensions`' `OTel` sink |
 //! | `distributed` | no | transport seams (ZeroMQ/Pulsar) that reject at construction |
 //! | `live-tests` | no | opt-in live-network test gate |
 //!
@@ -47,8 +49,8 @@
 //!
 //! Genuinely deferred, each reached through a seam that returns
 //! [`openjiuwen_common::error::Error::Unsupported`]: ZeroMQ/Pulsar transports, PostgreSQL/MySQL
-//! stores, remote distributed workspace transport, OTLP span export, the TUI,
-//! authentication/TLS on attach, and vendor CLI harness translation.
+//! stores, remote distributed workspace transport, OTLP span export beyond the team-memory bridge
+//! (behind `otlp`), the TUI, authentication/TLS on attach, and vendor CLI harness translation.
 //!
 //! ```
 //! use openjiuwen_agent_teams::{is_reserved_name, parse_mention, DEFAULT_LEADER_MEMBER_NAME};

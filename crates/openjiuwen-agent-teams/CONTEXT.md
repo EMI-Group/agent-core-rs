@@ -80,14 +80,15 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 ## Constraints
 
 - Only `crates/openjiuwen-agent-teams/**` is edited; root manifest, sibling crates and `docs/` are out of scope.
-- Dependency direction: this crate depends on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-core`/`openjiuwen-multiagent`/`openjiuwen-agent`/`openjiuwen-session`, `openjiuwen-common` and `openjiuwen-foundation`; nothing may depend on this crate, and there are no `openjiuwen-cli`/`openjiuwen` imports.
+- Dependency direction: this crate depends on `openjiuwen-harness`, `openjiuwen-harness-protocol`, `openjiuwen-core`/`openjiuwen-multiagent`/`openjiuwen-agent`/`openjiuwen-session`/`openjiuwen-memory`, `openjiuwen-common` and `openjiuwen-foundation`, plus the optional `openjiuwen-extensions` behind `otlp`; nothing may depend on this crate, and there are no `openjiuwen-cli`/`openjiuwen` imports.
 - Async-first tokio; `#[async_trait]` for object-safe async seams; locks never held across `.await` (`parking_lot` for short sections, `tokio::sync` for awaitable coordination); cancellation via `tokio_util::sync::CancellationToken`.
 - Errors: `openjiuwen_common::error::{Error, Result}` only; user input never panics; `Error::validation` for user-supplied names and knobs, `Error::config` for missing build inputs, `Error::not_found` for unknown members/tasks, and `Error::Unsupported` naming the Python capability for anything deferred.
 - Serde on every public data type (snake_case, unknown fields tolerated); Cards crossing the wire are `openjiuwen_agent::AgentCard`.
 - `tracing` only: no `println!`/`eprintln!` in library code, and the only stdout writes are the CLI's rendered lines and the `team-member serve` frame stream (its diagnostics go to stderr).
 - No `unsafe`. No undocumented global mutable state: the process-global expert catalog and the process-global runtime registry (team name → runtime manager) are the two documented singletons; tests construct local instances.
 - Files around ≤1000 lines; split by responsibility; a legitimately long file carries a top-of-file note.
-- Every feature combination builds offline: default `mcp`, plus the opt-in `sqlite`, `otel`, `distributed` and `live-tests`; `--no-default-features` builds without `rmcp`/`sqlx`.
+- Every feature combination builds offline: default `mcp`, plus the opt-in `sqlite`, `otel`, `otlp`, `distributed` and `live-tests`; `--no-default-features` builds without `rmcp`/`sqlx`.
+- `otlp` is the one optional dependency on a same-or-higher framework crate: `openjiuwen-extensions` (layer 5) with its own `otel` feature, so it pulls the `opentelemetry` stack; `crates/openjiuwen-extensions` has no dependency on this crate, so the edge is acyclic and the SDK stays out of every default build.
 - Tests are offline and deterministic: scripted harnesses or a loopback mock model, temp directories, in-process transport, real sockets/binaries only where a suite says so, bounded waits, no `#[ignore]`.
 
 ## Behaviour parity notes (wire-visible)
@@ -112,12 +113,13 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
   - `kv_cache` → `{"enabled": bool, "max_entries": n}` (absent means enabled).
   - `attach` → `"/path/team.sock"` or `{"socket"|"path": "…", "required": bool}`; `OPENJIUWEN_TEAM_SOCKET` is the fallback and an explicit metadata socket wins.
   - `checkpoint` → `{"enabled", "on_turn", "on_state", "on_stop", "resume"}` policy, optionally wrapped as `{"policy": {…}, "store": "memory"|"file", "dir": "…"}`; absent means an enabled policy with a team-shared in-memory store, and a malformed value warns and keeps the default.
+  - `memory` → `{"enabled", "store", "extractor", "export_on_stop", "import_on_build", "trace", "hooks"}`; absent or `{"enabled": false}` allocates no wiring at all, and a malformed value warns and keeps the default (on: in-memory store, rule extractor, export and import on, tracing on).
 
 ## Deferred (documented, `Error::Unsupported` through seams)
 
 - Transports: ZeroMQ/pyzmq, hybrid WebSocket publishing and Pulsar — `Messager` seam plus `create_messager` rejection.
 - Storage: PostgreSQL and MySQL `TeamStore` backends; distributed workspace transport (only the `RemoteDispatch` seam and its protocol types ship).
-- OTLP span export and the `opentelemetry` SDK: the `otel` feature is the in-memory/tracing seam, and the real exporter lives in `openjiuwen-extensions`.
+- OTLP span export for everything except the team-memory bridge: the `otel` feature is the in-memory/tracing seam, `otlp` forwards team-memory events into `openjiuwen-extensions`' `OtelTraceSink`, and the member/round/task spans stay on the in-memory seam.
 - Monitor TUI and DB-backed monitor readers: the text stream is the contract and presentation belongs to the CLI front-end.
 - Attach security: filesystem permissions only (a `0600` socket in an owner-only directory), no token, `SO_PEERCRED` check, TLS or named-pipe transport.
 - Vendor CLI harness translation: `claudecode`/`codex`/`dsh` stay `Unsupported` in `openjiuwen-harness-providers`; this crate ships the generic stdio child and a scriptable external-CLI adapter.
@@ -157,20 +159,20 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 
 ## Test Strategy
 
-- Unit tests live beside their modules (`#[cfg(test)]`): `cargo test -p openjiuwen-agent-teams --lib` reports 1411 in the default build, 1409 with `--no-default-features`, 1430 with `--features sqlite` and 1439 with `--all-features`, concentrated in `runtime`, `member`, `skill`, `org`, `schema`, `attach`, `workspace`, `taskboard`, `monitor`, `storage`, `models`, `interaction`, `kv_cache`, `observability`, `harness`, `messager`, `mcp` and `experts`.
+- Unit tests live beside their modules (`#[cfg(test)]`): `cargo test -p openjiuwen-agent-teams --lib` reports 1528 in the default build, 1526 with `--no-default-features`, 1547 with `--features sqlite`, 1545 with `--features otel`, 1544 with `--features otlp` and 1581 with `--all-features`, concentrated in `runtime`, `member`, `skill`, `org`, `schema`, `attach`, `workspace`, `taskboard`, `monitor`, `storage`, `models`, `interaction`, `kv_cache`, `observability`, `memory`, `harness`, `messager`, `mcp` and `experts`.
 - Checkpoint and health suites: `src/runtime/wiring_tests/checkpoints.rs` drives the metadata-driven checkpoint wiring, `src/harness/checkpoint_store/` carries the store/policy unit tests, and `src/runtime/health.rs` covers the health projection.
-- Doctests: 37 run plus one `ignore` block (`cargo test --doc`), and two `no_run` examples that compile but are not run; 13 `text` blocks are not doctests.
+- Doctests: 38 run plus one `ignore` block (`cargo test --doc`), and two `no_run` examples that compile but are not run; 13 `text` blocks are not doctests.
 - Integration suites in `./tests/` drive the public API only: 219 tests over 15 binaries (215 in the default build, 219 with `--features sqlite`) — `spec_build` (12), `team_run` (9), `member_and_mail` (14), `task_flow` (32), `hitl` (33), `protocol_adapter` (13), `cli` (39), `mcp` (21), `expert_catalog` (12), `bins` (6), `full_team_sqlite` (4), `member_process_kind` (5), `attach_e2e` (6), `org_flow` (9) and `workspace_isolation` (4).
 - `full_team_sqlite` compiles only with `--features sqlite`; `attach_e2e` is `#![cfg(unix)]`; `bins`/`member_process_kind` launch the real binaries through `CARGO_BIN_EXE_*`; `workspace_isolation` needs `git` on `PATH`.
 - Fakes live in `./tests/support/` plus `openjiuwen-test-support` as a dev-dependency; nothing in the suite needs the network.
-- Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite`, `--all-features` and `--features otel` configurations, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
+- Definition of done (all green): `cargo fmt -p openjiuwen-agent-teams`, `cargo test -p openjiuwen-agent-teams` in the default, `--no-default-features`, `--features sqlite`, `--features otel`, `--features otlp` and `--all-features` configurations, `cargo clippy -p openjiuwen-agent-teams --all-targets -- -D warnings`, and `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free.
 
 ## Notes for Agents
 
 - Python `TeamAgent` is one class for both roles. Keep that: `TeamAgent` carries a `TeamRole`; the leader owns dispatch, teammates poll the board.
 - Python `spec.build()` mutates the spec (fills `language`); the Rust `build_with` takes `&self`, does not mutate, and `TeamBuildDeps::language` is `Option<String>` resolved ahead of the spec.
 - `HarnessState` comes from `openjiuwen_harness_protocol`; re-export it, never define a second enum.
-- The runtime reads seven optional `TeamAgentSpec::metadata` keys (`spawn`, `fork`, `workspace`, `organization`, `kv_cache`, `attach`, `checkpoint`); their shapes, degradation rules and wiring points are tabulated in `src/runtime/CONTEXT.md` §"Metadata-driven wiring".
+- The runtime reads eight optional `TeamAgentSpec::metadata` keys (`spawn`, `fork`, `workspace`, `organization`, `kv_cache`, `attach`, `checkpoint`, `memory`); their shapes, degradation rules and wiring points are tabulated in `src/runtime/CONTEXT.md` §"Metadata-driven wiring" and §"Memory wiring".
 - `TeamBuildDeps` carries only injection hooks (`with_checkpoint_store`, `with_observability_hook`, `with_kv_cache`, `with_routing`); `monitor_stream` is the monitor knob, and organisation/attach come from metadata.
 - Workspace lifecycle: `build_with` allocates the leader's workspace and `spawn_member` one per teammate, both retained on the handle; `shutdown_member` releases that member's workspace and `stop()` releases everything still retained, each workspace exactly once.
 - `team-member serve` lives in `src/skill/serve.rs` over the frames in `src/member/protocol.rs`; `StdioMemberRuntime` launches it with the identity in `OPENJIUWEN_TEAM_NAME`/`OPENJIUWEN_MEMBER_NAME`/`OPENJIUWEN_SESSION_ID`/`OPENJIUWEN_MEMBER_WORKSPACE`, and `serve_with_context` drives the same loop over any pipe pair.
@@ -179,6 +181,12 @@ Public data types are `#[serde(rename_all = "snake_case", default)]`, tolerate u
 - `TeamAgentSpec::model_pool` allocation is recorded on `MemberRecord::model_ref` and passed to the harness factory through the routed `DeepAgentSpec`, so a pool entry selects the member's endpoint.
 - Cross-node deviations from Python, each owned by its child node: `SpecBuild` is `#[async_trait]` and `build_with` takes `&self` without mutating the spec; the worktree name suffix is a FNV-1a digest instead of `sha256(..)[:10]` and member state lives at `<base>/<team>/sessions/<sid>/…`; `Team::add_agent` writes its row on the current runtime and a team runs one at a time; `HarnessMemberRuntime::send` drops the transport-level `SendReceipt`; `TaskStatus` transitions are narrower than Python's (no `in_progress→pending`, `planning→pending`).
 - Module-level `//!` docs resolve intra-doc links in the *parent* module's scope, so a module doc needs a fully-qualified target (`[`X`](crate::schema::X)`) for anything the parent does not import; item-level `///` docs resolve in the item's module. Keep `cargo doc -p openjiuwen-agent-teams --no-deps` warning-free (no `#[allow(rustdoc::…)]`, link private items as plain code spans).
+- Team memory is opt-in per spec: `metadata["memory"]` (or `TeamBuildDeps::with_memory`) allocates one `TeamMemoryWiring` per team, exposed as `TeamAgent::memory()`; no key means no wiring, no hook and no write.
+- Memory hook failures are advisory: `start`, `spawn_member`, `shutdown_member`, `stop` and `send_message` log a `warn!` and continue, while `TeamMemoryWiring::open` failing during the build does fail the build.
+- Only in-process members mount the team-memory tools: the toolkit rides `MemberHarnessContext::with_memory_toolkit`, which a `process`/`external_cli`/`ssh` child cannot receive, so those members have no `team_memory_*` tool surface.
+- Team memory is written by the lifecycle hooks and buffered turns, and read back through the `TEAM_MEMORY.md` document: `stop` flushes then exports, `snapshot` exports best-effort, and both gate on `export_on_stop`.
+- The team-memory observer precedence is `enabled` → `trace` → caller-supplied `observer` → the built-in `MemorySpanObserver`; `trace: false` attaches nothing even when an observer was injected.
+- Child-process members checkpoint through `OPENJIUWEN_MEMBER_CHECKPOINTS`/`OPENJIUWEN_MEMBER_CHECKPOINT_DIR`, exported by `member::spawn` from the resolved `CheckpointConfig` and read by `skill::ServeContext`.
 - Offline runs need either an injected factory (the test pattern) or `NativeMemberFactory::new(resolver)` with a resolver returning a scripted `openjiuwen_foundation::llm::Model`; `TeamAgentSpec::build()` over `TeamBuildDeps::default()` fails with `ErrorKind::Config` when no provider/model is configured.
 - The `live-tests` feature is declared in `Cargo.toml` and read by no test or module in this crate: nothing here needs the network.
 - `NativeCheckpoint` is produced at every member turn/state boundary the policy enables and on `stop`, persisted through the resolved `MemberCheckpointStore`, and restored on the next `start` for the same identity.
