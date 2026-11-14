@@ -30,6 +30,10 @@ use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
+use crate::processor::compressor::adaptive::{
+    render_block, select_for_processor, AdaptiveConfig, AdaptiveOutcome, AdaptiveStrategy,
+    CompressionStrategy,
+};
 use crate::processor::compressor::{
     archive_replaced_messages, group_completed_rounds, rollback_recall_archive, summarize,
     summarize_offline, MemoryBlockKind,
@@ -63,6 +67,13 @@ pub struct DialogueCompressorConfig {
     pub compression_target_tokens: usize,
     /// Instruction replacing the built-in summary prompt when set.
     pub custom_compression_prompt: Option<String>,
+    /// Adaptive strategy selection for this pass.
+    ///
+    /// Off by default, which keeps the compressor's behaviour unchanged. When
+    /// enabled the compressor first asks the adaptive seam whether this is the
+    /// pass the history needs; see
+    /// [`AdaptiveConfig`].
+    pub adaptive: AdaptiveConfig,
 }
 
 impl Default for DialogueCompressorConfig {
@@ -74,6 +85,7 @@ impl Default for DialogueCompressorConfig {
             keep_last_round: true,
             compression_target_tokens: 1_800,
             custom_compression_prompt: None,
+            adaptive: AdaptiveConfig::default(),
         }
     }
 }
@@ -116,6 +128,7 @@ impl DialogueCompressorConfig {
                 )));
             }
         }
+        self.adaptive.validate()?;
         Ok(())
     }
 }
@@ -173,6 +186,19 @@ impl DialogueCompressor {
         count_messages(cx.counter, messages) > self.config.tokens_threshold
     }
 
+    /// The adaptive strategy seam for this pass, when it is enabled.
+    ///
+    /// The decision model is the request's model when it has one, the
+    /// compressor's own model otherwise, so a pipeline and a standalone
+    /// compressor both work without extra wiring.
+    fn adaptive_strategy(&self, cx: &ProcessorContext<'_>) -> Option<AdaptiveStrategy> {
+        if !self.config.adaptive.enabled {
+            return None;
+        }
+        let model = cx.model.cloned().or_else(|| self.model.clone());
+        Some(self.config.adaptive.strategy(model))
+    }
+
     /// The exclusive index beyond which no message may be compressed.
     ///
     /// With [`DialogueCompressorConfig::keep_last_round`] the region from the
@@ -203,6 +229,23 @@ impl DialogueCompressor {
             .map(|round| round.start + 1..round.end)
             .collect()
     }
+
+    /// Runs this pass' adaptive selection, if adaptive mode is configured.
+    async fn adaptive_outcome(
+        &self,
+        messages: &[BaseMessage],
+        cx: &ProcessorContext<'_>,
+    ) -> Result<AdaptiveOutcome> {
+        select_for_processor(
+            self.adaptive_strategy(cx),
+            self.name(),
+            CompressionStrategy::DialogueSummary,
+            messages,
+            cx,
+            self.state.counter("compressions"),
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -230,6 +273,11 @@ impl ContextProcessor for DialogueCompressor {
         }
 
         let tokens_before = count_messages(cx.counter, messages);
+        let decision = match self.adaptive_outcome(messages, cx).await? {
+            AdaptiveOutcome::Proceed(decision) => decision,
+            AdaptiveOutcome::Skip => return Ok(None),
+            AdaptiveOutcome::Recommend(event) => return Ok(Some(event)),
+        };
         let max_chars = self
             .config
             .compression_target_tokens
@@ -262,10 +310,14 @@ impl ContextProcessor for DialogueCompressor {
             // of the block, so it is rendered before the benefit gate measures it.
             let marker = archive_replaced_messages(cx, &span_messages).await;
             let before = count_messages(cx.counter, &span_messages);
-            let mut block = MemoryBlockKind::Dialogue.render(&summary);
-            if let Some(marker) = &marker {
-                block = marker.append(block);
-            }
+            let block = render_block(
+                MemoryBlockKind::Dialogue,
+                &self.config.adaptive,
+                decision.as_ref(),
+                &span_messages,
+                &summary,
+                marker.as_ref(),
+            );
             let replacement = BaseMessage::user(block);
             let after = count_message(cx.counter, &replacement);
             if before == 0 || after >= before {

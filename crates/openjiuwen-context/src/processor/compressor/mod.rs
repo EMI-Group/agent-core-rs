@@ -41,6 +41,11 @@ use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use crate::processor::ProcessorContext;
 use crate::recall::{archive_from_messages, recall_marker, COMPRESSION_RECALL_MARKER_PREFIX};
 
+pub use self::adaptive::{
+    render_memory_block_from_plan, render_memory_block_from_plan_with_marker, AdaptiveConfig,
+    AdaptiveContext, AdaptiveStrategy, AdaptiveStrategyConfig, CompressionStrategy,
+    MemoryBlockPlan, StrategyDecision, StrategyInput, StrategyParse, StrategySource,
+};
 pub use self::compact::{
     FullCompactProcessor, FullCompactProcessorConfig, FULL_COMPACT_BOUNDARY,
     FULL_COMPACT_BOUNDARY_TEXT, FULL_COMPACT_SUMMARY_INTRO,

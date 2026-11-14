@@ -35,6 +35,10 @@ use openjiuwen_foundation::prompt::{BaseMessage, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ContextEvent, ContextEventKind};
+use crate::processor::compressor::adaptive::{
+    render_block, select_for_processor, AdaptiveConfig, AdaptiveOutcome, AdaptiveStrategy,
+    CompressionStrategy, StrategyDecision,
+};
 use crate::processor::compressor::{
     append_recall_markers, archive_replaced_messages, find_last_completed_round_end,
     iter_summary_merge_ranges, rollback_recall_archive, split_recall_markers, summarize,
@@ -70,6 +74,13 @@ pub struct CurrentRoundCompressorConfig {
     pub prior_context_window_size: usize,
     /// Instruction replacing the built-in summary prompt when set.
     pub custom_compression_prompt: Option<String>,
+    /// Adaptive strategy selection for this pass.
+    ///
+    /// Off by default, which keeps the compressor's behaviour unchanged. When
+    /// enabled the compressor first asks the adaptive seam whether this is the
+    /// pass the history needs; see
+    /// [`AdaptiveConfig`].
+    pub adaptive: AdaptiveConfig,
 }
 
 impl Default for CurrentRoundCompressorConfig {
@@ -82,6 +93,7 @@ impl Default for CurrentRoundCompressorConfig {
             summary_merge_min_blocks: 3,
             prior_context_window_size: 10,
             custom_compression_prompt: None,
+            adaptive: AdaptiveConfig::default(),
         }
     }
 }
@@ -112,6 +124,7 @@ impl CurrentRoundCompressorConfig {
                 self.summary_merge_min_blocks
             )));
         }
+        self.adaptive.validate()?;
         Ok(())
     }
 }
@@ -154,6 +167,18 @@ impl CurrentRoundCompressor {
         }
         messages.len() >= self.config.messages_to_keep
             && count_messages(cx.counter, messages) > self.config.tokens_threshold
+    }
+
+    /// The adaptive strategy seam for this pass, when it is enabled.
+    ///
+    /// The decision model is the request's model when it has one, the
+    /// compressor's own model otherwise.
+    fn adaptive_strategy(&self, cx: &ProcessorContext<'_>) -> Option<AdaptiveStrategy> {
+        if !self.config.adaptive.enabled {
+            return None;
+        }
+        let model = cx.model.cloned().or_else(|| self.model.clone());
+        Some(self.config.adaptive.strategy(model))
     }
 
     /// The compressible span: everything between the last user message and the
@@ -240,6 +265,85 @@ impl CurrentRoundCompressor {
         changed.extend(run.map(|index| Self::map_to_original(index, stage_one)));
         Some(merged_body)
     }
+    /// Runs this pass' adaptive selection, if adaptive mode is configured.
+    async fn adaptive_outcome(
+        &self,
+        messages: &[BaseMessage],
+        cx: &ProcessorContext<'_>,
+    ) -> Result<AdaptiveOutcome> {
+        select_for_processor(
+            self.adaptive_strategy(cx),
+            self.name(),
+            CompressionStrategy::CurrentRound,
+            messages,
+            cx,
+            self.state.counter("compressions"),
+        )
+        .await
+    }
+    /// Replaces the in-flight span with one current-round memory block.
+    ///
+    /// Returns the replaced range and its summary when the block is smaller than
+    /// what it replaces, and leaves the history untouched (rolling back any
+    /// recall archive written for it) otherwise.
+    async fn compress_span(
+        &self,
+        messages: &mut Vec<BaseMessage>,
+        span: Range<usize>,
+        decision: Option<&StrategyDecision>,
+        cx: &ProcessorContext<'_>,
+    ) -> Result<Option<(Range<usize>, String)>> {
+        let span_messages = messages[span.clone()].to_vec();
+        let before = count_messages(cx.counter, &span_messages);
+        if before < self.config.min_selected_tokens_for_compression {
+            return Ok(None);
+        }
+        let max_chars = self
+            .config
+            .compression_target_tokens
+            .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+        let max_tokens = u32::try_from(self.config.compression_target_tokens).unwrap_or(u32::MAX);
+        let system_prompt = self
+            .config
+            .custom_compression_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_COMPRESSION_PROMPT);
+        let model = cx.model.or(self.model.as_ref());
+        let transcript = summarize_offline(&span_messages, max_chars);
+        if cx.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let summary = summarize(model, system_prompt, &transcript, max_tokens, || {
+            transcript.clone()
+        })
+        .await
+        .trim()
+        .to_owned();
+        let marker = archive_replaced_messages(cx, &span_messages).await;
+        let block = render_block(
+            MemoryBlockKind::CurrentRound,
+            &self.config.adaptive,
+            decision,
+            &span_messages,
+            &summary,
+            marker.as_ref(),
+        );
+        let replacement = BaseMessage::user(block);
+        let after = count_message(cx.counter, &replacement);
+        if after >= before {
+            tracing::debug!(
+                before,
+                after,
+                "current-round compressor left the span in place: no compression benefit"
+            );
+            if let Some(marker) = &marker {
+                rollback_recall_archive(cx, marker).await;
+            }
+            return Ok(None);
+        }
+        messages.splice(span.clone(), std::iter::once(replacement));
+        Ok(Some((span, summary)))
+    }
 }
 
 #[async_trait]
@@ -268,17 +372,11 @@ impl ContextProcessor for CurrentRoundCompressor {
             return Ok(None);
         }
         let tokens_before = count_messages(cx.counter, messages);
-        let max_chars = self
-            .config
-            .compression_target_tokens
-            .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-        let max_tokens = u32::try_from(self.config.compression_target_tokens).unwrap_or(u32::MAX);
-        let system_prompt = self
-            .config
-            .custom_compression_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_COMPRESSION_PROMPT);
-        let model = cx.model.or(self.model.as_ref());
+        let decision = match self.adaptive_outcome(messages, cx).await? {
+            AdaptiveOutcome::Proceed(decision) => decision,
+            AdaptiveOutcome::Skip => return Ok(None),
+            AdaptiveOutcome::Recommend(event) => return Ok(Some(event)),
+        };
 
         let mut changed: Vec<usize> = Vec::new();
         let mut summaries: Vec<String> = Vec::new();
@@ -286,41 +384,13 @@ impl ContextProcessor for CurrentRoundCompressor {
         let mut merged = false;
 
         if let Some(span) = self.span(messages, boundary) {
-            let span_messages = messages[span.clone()].to_vec();
-            let before = count_messages(cx.counter, &span_messages);
-            if before >= self.config.min_selected_tokens_for_compression {
-                let transcript = summarize_offline(&span_messages, max_chars);
-                if cx.cancellation.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                let summary = summarize(model, system_prompt, &transcript, max_tokens, || {
-                    transcript.clone()
-                })
-                .await
-                .trim()
-                .to_owned();
-                let marker = archive_replaced_messages(cx, &span_messages).await;
-                let mut block = MemoryBlockKind::CurrentRound.render(&summary);
-                if let Some(marker) = &marker {
-                    block = marker.append(block);
-                }
-                let replacement = BaseMessage::user(block);
-                let after = count_message(cx.counter, &replacement);
-                if after < before {
-                    messages.splice(span.clone(), std::iter::once(replacement));
-                    changed.extend(span.clone());
-                    summaries.push(summary);
-                    stage_one = Some(span);
-                } else {
-                    tracing::debug!(
-                        before,
-                        after,
-                        "current-round compressor left the span in place: no compression benefit"
-                    );
-                    if let Some(marker) = &marker {
-                        rollback_recall_archive(cx, marker).await;
-                    }
-                }
+            if let Some((span, summary)) = self
+                .compress_span(messages, span, decision.as_ref(), cx)
+                .await?
+            {
+                changed.extend(span.clone());
+                summaries.push(summary);
+                stage_one = Some(span);
             }
         }
 

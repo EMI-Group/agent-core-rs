@@ -430,6 +430,7 @@ fn config_round_trips_through_json_and_validates() {
         keep_last_round: false,
         compression_target_tokens: 400,
         custom_compression_prompt: Some("summarise".to_owned()),
+        ..DialogueCompressorConfig::default()
     };
     assert!(config.validate().is_ok());
     let json = serde_json::to_string(&config).unwrap();
