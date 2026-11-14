@@ -230,8 +230,7 @@ impl ExternalProviderConfig {
     /// Returns the refresh skew as a [`Duration`], or `fallback` when unset.
     #[must_use]
     pub fn refresh_skew_or(&self, fallback: Duration) -> Duration {
-        self.refresh_skew
-            .map_or(fallback, Duration::from_secs)
+        self.refresh_skew.map_or(fallback, Duration::from_secs)
     }
 }
 
@@ -296,7 +295,10 @@ impl fmt::Debug for ModelCatalogRequest {
         // placeholder, so the token can be listed without leaking it.
         formatter
             .debug_struct("ModelCatalogRequest")
-            .field("auth_manager", &self.auth_manager.as_ref().map(|_| "<provider>"))
+            .field(
+                "auth_manager",
+                &self.auth_manager.as_ref().map(|_| "<provider>"),
+            )
             .field("access_token", &self.access_token)
             .field("force_refresh", &self.force_refresh)
             .finish()

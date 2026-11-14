@@ -281,7 +281,10 @@ impl OpenAiAccountModelCatalog {
             }
         }
         Ok(forward_compat_models(
-            DEFAULT_MODELS.iter().map(|model| (*model).to_owned()).collect(),
+            DEFAULT_MODELS
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
         ))
     }
 
@@ -384,7 +387,11 @@ impl OpenAiAccountModelCatalog {
         if let Some(parent) = self.cache_path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                    cache_io_error("creating the parent directory of", self.cache_path.as_path(), error)
+                    cache_io_error(
+                        "creating the parent directory of",
+                        self.cache_path.as_path(),
+                        error,
+                    )
                 })?;
             }
         }
@@ -669,9 +676,10 @@ fn expand_tilde(path: &Path) -> PathBuf {
 
 /// Returns the sibling `tmp` path used for the atomic replace.
 fn temporary_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map_or_else(|| MODELS_CACHE_FILENAME.to_owned(), |name| name.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || MODELS_CACHE_FILENAME.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     path.with_file_name(format!("{name}.tmp"))
 }
 

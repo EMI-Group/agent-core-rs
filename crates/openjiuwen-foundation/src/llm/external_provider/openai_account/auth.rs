@@ -34,9 +34,7 @@ use openjiuwen_common::config::env;
 use openjiuwen_common::error::{Error, ErrorKind, Result};
 use openjiuwen_common::security::SecretString;
 
-use crate::llm::oauth::{
-    FileTokenStore, OAuthToken, OpenAiOAuthClient, TokenStore, REFRESH_SKEW,
-};
+use crate::llm::oauth::{FileTokenStore, OAuthToken, OpenAiOAuthClient, TokenStore, REFRESH_SKEW};
 
 use super::super::base::{AuthStatus, ExternalAuthProvider, ExternalProviderConfig};
 use super::{BASE_URL_ENV, DEFAULT_BASE_URL};

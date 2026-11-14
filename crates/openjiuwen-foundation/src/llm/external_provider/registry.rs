@@ -152,7 +152,14 @@ impl ExternalProviderRegistry {
         let key = provider_key(provider)?;
         let display = provider.trim().to_owned();
         let mut registries = self.write();
-        register(&mut registries.auth, key, display, factory, "auth provider", replace)
+        register(
+            &mut registries.auth,
+            key,
+            display,
+            factory,
+            "auth provider",
+            replace,
+        )
     }
 
     /// Registers a model catalog factory, returning the factory it replaced.
@@ -191,13 +198,17 @@ impl ExternalProviderRegistry {
     pub fn get_auth_provider_factory(&self, provider: &str) -> Result<AuthProviderFactory> {
         let key = provider_key(provider)?;
         let registries = self.read();
-        registries.auth.get(&key).map(|entry| entry.factory.clone()).ok_or_else(|| {
-            unknown_provider(
-                "auth provider",
-                provider,
-                registries.auth.values().map(|entry| entry.display.as_str()),
-            )
-        })
+        registries
+            .auth
+            .get(&key)
+            .map(|entry| entry.factory.clone())
+            .ok_or_else(|| {
+                unknown_provider(
+                    "auth provider",
+                    provider,
+                    registries.auth.values().map(|entry| entry.display.as_str()),
+                )
+            })
     }
 
     /// Returns the model catalog factory registered for `provider`.
@@ -209,13 +220,20 @@ impl ExternalProviderRegistry {
     pub fn get_model_catalog_factory(&self, provider: &str) -> Result<ModelCatalogFactory> {
         let key = provider_key(provider)?;
         let registries = self.read();
-        registries.catalogs.get(&key).map(|entry| entry.factory.clone()).ok_or_else(|| {
-            unknown_provider(
-                "model catalog",
-                provider,
-                registries.catalogs.values().map(|entry| entry.display.as_str()),
-            )
-        })
+        registries
+            .catalogs
+            .get(&key)
+            .map(|entry| entry.factory.clone())
+            .ok_or_else(|| {
+                unknown_provider(
+                    "model catalog",
+                    provider,
+                    registries
+                        .catalogs
+                        .values()
+                        .map(|entry| entry.display.as_str()),
+                )
+            })
     }
 
     /// Creates a new auth provider instance for `provider`.
@@ -261,7 +279,12 @@ impl ExternalProviderRegistry {
     #[must_use]
     pub fn list_model_catalogs(&self) -> Vec<String> {
         let registries = self.read();
-        sorted_displays(registries.catalogs.values().map(|entry| entry.display.as_str()))
+        sorted_displays(
+            registries
+                .catalogs
+                .values()
+                .map(|entry| entry.display.as_str()),
+        )
     }
 
     /// Takes a read guard.
