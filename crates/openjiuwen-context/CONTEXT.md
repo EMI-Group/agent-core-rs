@@ -190,7 +190,10 @@ let recovered = engine
 - `./src/policy/` → window resolution (`window.rs`), OpenRouter cache/fetch (`openrouter.rs`), prompt-cache diffing (`change.rs`), public re-exports
 - `./src/usage/` → `context.usage` wire contract (`models.rs`), analyzer and measurement cache, provider usage normalization, session KV aggregator, window sizing helpers; details in `./src/usage/CONTEXT.md`
 - `./src/telemetry/` → `context.compression_state` contract, processor-state recorder, operation/correlation scope; details in `./src/telemetry/CONTEXT.md`
-- `./src/processor/mod.rs` → `ContextProcessor` trait, `ProcessorContext`, `ProcessorState`, `ProcessorConfig`, `PipelineDeps`, `ContextPipeline` (`run`/`run_in_phase`, recorder, checkpoint save/load)
+- `./src/processor/mod.rs` → module docs, submodule declarations and the public re-exports of the processor tree
+- `./src/processor/config.rs` → the extension surface: `ContextProcessor` trait, `ProcessorContext`, `ProcessorState`, `ProcessorConfig`
+- `./src/processor/pipeline.rs` → `PipelineDeps`, `ContextPipeline` (`from_configs`/`run`/`run_in_phase`), the recorder instrumentation and the checkpoint save/load
+- `./src/processor/tests.rs` → unit tests of ordering, events, error propagation, cancellation, orphan repair and config serde
 - `./src/processor/truncate.rs` → `TruncationProcessor` + config (round-aware eviction)
 - `./src/processor/summarize.rs` → `SummarizationProcessor` + config (LLM summarisation via `Model`)
 - `./src/processor/tool_result.rs` → `ToolResultProcessor` + config (per-result truncation and offload)
@@ -205,7 +208,7 @@ let recovered = engine
 - `./src/processor/compressor/round_level.rs` → `RoundLevelCompressor` (per-round blocks, recursive merge, aggressive pass, hard truncation)
 - `./src/processor/compressor/compact.rs` → `FullCompactProcessor` (boundary detection, kept tail, session-memory or LLM full compaction, state reinjection)
 - `./src/processor/compressor/micro_compact.rs` → `MicroCompactProcessor` (deterministic per-tool tool-result clearing)
-- `./src/processor/compressor/adaptive/` → `CompressionStrategy`, `AdaptiveStrategy` and its deterministic ladder (`mod.rs`), `MemoryBlockPlan`/JSON schema (`plan.rs`), decision prompts (`prompt.rs`)
+- `./src/processor/compressor/adaptive/` → re-exports and module docs (`mod.rs`), `CompressionStrategy`/`AdaptiveStrategy`/ladder/selection (`strategy.rs`), `AdaptiveConfig` (`config.rs`), block and recommendation rendering (`render.rs`), `MemoryBlockPlan`/JSON schema (`plan.rs`), decision prompts (`prompt.rs`), unit tests (`tests.rs`)
 - `./src/processor/compressor/reinjection/` → `ContextSnapshotProvider`, `SnapshotRegistry`, `<recovered_context>` rendering and trimming (`mod.rs`), provider tests (`tests.rs`)
 - `./src/tokenizers.rs` → module declaration and the tokenizer public re-exports; the implementation lives in the four modules below and in `artifacts`/`native`
 - `./src/tokenizers/spec.rs` → `ModelEncoding`, `TokenizerEngine`, `TokenizerSpec`, `CompatibleTokenizerSpec`, `TokenizerRegistry`, match kinds
