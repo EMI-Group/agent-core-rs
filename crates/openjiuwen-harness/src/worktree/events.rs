@@ -17,6 +17,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use super::sparse::SparseMode;
+
 /// Capacity of a [`BroadcastWorktreeEvents`] channel when none is configured.
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
 
@@ -67,6 +69,26 @@ pub enum WorktreeEvent {
         /// Number of registry records dropped.
         removed: usize,
     },
+    /// A sparse-checkout selection was applied to a worktree.
+    SparseConfigured {
+        /// Requested name.
+        name: String,
+        /// Absolute path of the worktree directory.
+        path: std::path::PathBuf,
+        /// Mode the selection was read in.
+        mode: SparseMode,
+        /// Repository-relative paths (or patterns) of the selection.
+        paths: Vec<String>,
+    },
+    /// Ephemeral worktrees were reaped by a cleanup pass.
+    Cleaned {
+        /// Whether the pass only reported the candidates.
+        dry_run: bool,
+        /// Paths actually removed (empty on a dry run).
+        removed: Vec<std::path::PathBuf>,
+        /// Number of worktrees the pass skipped.
+        skipped: usize,
+    },
     /// An operation failed; the error was already returned to the caller.
     Error {
         /// Operation that failed (`create`, `remove`, `lock`, …).
@@ -86,6 +108,8 @@ impl WorktreeEvent {
             Self::Locked { .. } => "locked",
             Self::Unlocked { .. } => "unlocked",
             Self::Pruned { .. } => "pruned",
+            Self::SparseConfigured { .. } => "sparse_configured",
+            Self::Cleaned { .. } => "cleaned",
             Self::Error { .. } => "error",
         }
     }
@@ -274,6 +298,51 @@ mod tests {
             message: "boom".to_owned(),
         })
         .await;
+    }
+
+    #[test]
+    fn sparse_and_cleanup_events_carry_their_payloads() {
+        let sparse = WorktreeEvent::SparseConfigured {
+            name: "feature".to_owned(),
+            path: PathBuf::from("/repo/.worktrees/feature"),
+            mode: SparseMode::Cone,
+            paths: vec!["src".to_owned(), "lib".to_owned()],
+        };
+        assert_eq!(sparse.kind(), "sparse_configured");
+        assert_eq!(sparse.to_string(), "worktree.sparse_configured");
+        assert_eq!(
+            serde_json::to_value(&sparse).unwrap(),
+            serde_json::json!({
+                "type": "sparse_configured",
+                "name": "feature",
+                "path": "/repo/.worktrees/feature",
+                "mode": "cone",
+                "paths": ["src", "lib"],
+            })
+        );
+        let decoded: WorktreeEvent =
+            serde_json::from_value(serde_json::to_value(&sparse).unwrap()).unwrap();
+        assert_eq!(decoded, sparse);
+
+        let cleaned = WorktreeEvent::Cleaned {
+            dry_run: true,
+            removed: vec![PathBuf::from("/repo/.worktrees/agent-1234567")],
+            skipped: 2,
+        };
+        assert_eq!(cleaned.kind(), "cleaned");
+        assert_eq!(cleaned.to_string(), "worktree.cleaned");
+        assert_eq!(
+            serde_json::to_value(&cleaned).unwrap(),
+            serde_json::json!({
+                "type": "cleaned",
+                "dry_run": true,
+                "removed": ["/repo/.worktrees/agent-1234567"],
+                "skipped": 2,
+            })
+        );
+        let decoded: WorktreeEvent =
+            serde_json::from_value(serde_json::to_value(&cleaned).unwrap()).unwrap();
+        assert_eq!(decoded, cleaned);
     }
 
     #[test]

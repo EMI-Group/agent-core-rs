@@ -25,13 +25,18 @@
 //!
 //! - [`GitRunner`] — the seam; [`ProcessGitRunner`] spawns `git`, tests inject a
 //!   scripted runner. A non-zero exit is a typed error carrying git's stderr.
-//! - [`WorktreeManager`] — `create`, `list`, `remove`, `prune`, `lock`,
-//!   `unlock`, `status`, `cleanup_stale`, plus the layout/registry accessors.
+//! - [`WorktreeManager`] — `create`/`create_with_options`, `list`, `remove`,
+//!   `prune`, `lock`, `unlock`, `status`, `cleanup_stale`, `cleanup`,
+//!   `apply_sparse`, `change_summary`, plus the layout/registry accessors. Every
+//!   mutating operation holds the repository lock for its critical section.
 //! - [`WorktreeEvent`] / [`WorktreeEventSink`] — lifecycle events with a
-//!   broadcast sink and a recording sink.
+//!   broadcast sink and a recording sink; sparse setup and cleanup passes are
+//!   reported too.
 //! - [`WorktreeLock`] — the repo-bucketed cross-process advisory lock
 //!   (Python's `lock.py`): one exclusive lock per repository root, a bounded
 //!   wait, and diagnostic `pid`/`acquired_at` metadata in the lock file.
+//!   [`WorktreeLockConfig`] tunes it (`disabled()` opts out, `with_timeout`
+//!   bounds the wait) and [`WorktreeManager::repo_lock`] builds it on demand.
 //! - [`WorktreeTool`] — the model-facing `worktree` tool (actions `create`,
 //!   `list`, `remove`, `lock`, `unlock`, `prune`, `status`), mounted by
 //!   [`crate::tools::ToolRegistry`] as
@@ -42,25 +47,35 @@
 //!   default, `--no-cone` patterns otherwise) with host-side path validation;
 //!   `git::sparse_checkout_set` and friends are the command helpers, and
 //!   [`WorktreeRecord::sparse`] persists the selection for re-entry.
+//!   [`WorktreeManager::with_sparse`] / [`WorktreeCreateOptions`] select it,
+//!   `create` applies it, and [`WorktreeManager::apply_sparse`] re-applies the
+//!   recorded selection.
 //! - [`WorktreeChangeSummary`] / [`change_summary`] / [`render_change_summary`]
 //!   — bounded change detection (`status`, `<base>..HEAD` diffstat and count,
-//!   unpushed probe) and its deterministic bilingual rendering.
+//!   unpushed probe) and its deterministic bilingual rendering;
+//!   [`WorktreeManager::change_summary`] runs it for one worktree, outside the
+//!   lock.
+//! - [`CleanupPolicy`] / [`CleanupReport`] / [`is_ephemeral_slug`] — the
+//!   fail-closed reaping of expired ephemeral worktrees (`teammate-…`,
+//!   `agent-…`), driven by [`WorktreeManager::cleanup`]; a dry run reports the
+//!   candidates without touching git or the registry.
 //!
 //! # Constraints
 //!
 //! - Offline and deterministic: no network, no wall-clock ordering in tests
-//!   (the registry timestamps are informational only), and the one test that
-//!   runs real git skips when `which::which("git")` fails.
+//!   (the registry timestamps are informational only, cleanup ages use an
+//!   injectable `now`), and the one test that runs real git skips when
+//!   `which::which("git")` fails.
 //! - Typed errors only: `openjiuwen_common::error::{Error, Result}`; the tool
 //!   turns expected failures into `success = false` payloads and never panics.
 //! - No `unsafe`, no `println!` (tracing only), no new dependencies.
-//! - Deferred (documented in this module's `CONTEXT.md`): automatic sparse
-//!   setup inside `create`/`status` (the helpers and the persisted record exist,
-//!   the manager wiring is pending), symlinked heavy directories,
-//!   include-pattern copying, hook-path configuration, lifecycle policies and
-//!   auto-cleanup timers, and the Python `enter_worktree`/`exit_worktree` tools
-//!   plus the rails integration.
+//! - Deferred (documented in this module's `CONTEXT.md`): post-creation setup
+//!   beyond sparse checkout (symlinked heavy directories, include-pattern
+//!   copying, hook-path configuration), lifecycle policies and auto-cleanup
+//!   timers, and the Python `enter_worktree`/`exit_worktree` tools plus the
+//!   rails integration.
 mod changes;
+mod cleanup;
 mod events;
 mod git;
 mod lock;
@@ -74,6 +89,11 @@ mod tool;
 pub use changes::{
     change_summary, parse_diff_stat, render_change_summary, status_paths, WorktreeChangeSummary,
     SUMMARY_MAX_CHARS, SUMMARY_MAX_FILES, SUMMARY_MAX_LINES,
+};
+
+pub use cleanup::{
+    is_ephemeral_slug, CleanupCandidate, CleanupPolicy, CleanupReport, CleanupSkip,
+    DEFAULT_CLEANUP_AFTER_DAYS, EPHEMERAL_PATTERNS,
 };
 
 pub use events::{
@@ -96,7 +116,7 @@ pub use lock::{
     WorktreeLockGuard, WorktreeLockMetadata, DEFAULT_LOCK_TIMEOUT, LOCK_CONTENTION_MARKER,
     LOCK_TIMEOUT_MARKER, STALE_LOCK_AGE,
 };
-pub use manager::{WorktreeManager, DEFAULT_BASE};
+pub use manager::{WorktreeCreateOptions, WorktreeManager, DEFAULT_BASE};
 pub use models::{
     WorktreeCreateResult, WorktreeInfo, WorktreeRecord, WorktreeState, WorktreeStatus,
 };

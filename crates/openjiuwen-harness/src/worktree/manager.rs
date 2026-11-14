@@ -2,8 +2,8 @@
 //!
 //! Port of `openjiuwen/harness/tools/worktree/{manager,cleanup,session}.py`,
 //! reduced to the operations this helper needs: create, list, remove, prune,
-//! lock, unlock and status. The manager is the single owner of the layout and of
-//! the safety rules:
+//! lock, unlock, status, sparse setup, change summaries and cleanup. The manager
+//! is the single owner of the layout and of the safety rules:
 //!
 //! - **Layout** — a worktree lives at `<repo-root>/.worktrees/<slug>`, matching
 //!   the prompt guidance the model receives. The slug is derived by
@@ -14,32 +14,80 @@
 //! - **Bookkeeping** — every created worktree is recorded in
 //!   `<workspace>/.worktree/index.json` ([`super::store`]) and reported through
 //!   [`WorktreeEventSink`], so `list()`/`status()` know what an earlier process
-//!   created and a host can react to lifecycle changes.
+//!   created and a host can react to lifecycle changes. Records keep the HEAD
+//!   commit and the sparse-checkout selection, so a re-entered worktree can be
+//!   restored and a change summary can count from where the branch started.
+//! - **Locking** — every mutating operation (`create`/`create_with_options`,
+//!   `remove`, `prune`, `cleanup_stale`, `cleanup`, `lock`, `unlock`,
+//!   `apply_sparse`) takes the repo-bucketed advisory lock of
+//!   [`super::lock`] for its critical section, exactly like Python's
+//!   `async with repo_lock(repo_root, timeout=config.repo_lock_timeout)`. The
+//!   guard is an OS advisory lock, not a blocking in-process mutex, so it is
+//!   safe to hold across the operation's git `.await` points; it is dropped
+//!   before lifecycle events are emitted. Read-only paths (`list`, `status`,
+//!   `change_summary`) stay outside the lock on purpose.
+//! - **Sparse checkout** — a configured selection is applied on creation as
+//!   `worktree add --no-checkout` → `sparse-checkout set` → `checkout HEAD`, and
+//!   a half-created worktree is removed again on failure; a recovered worktree
+//!   re-applies its recorded selection without touching its working tree
+//!   ([`WorktreeManager::apply_sparse`]).
+//! - **Cleanup** — [`cleanup`] reaps old ephemeral worktrees fail-closed;
+//!   [`WorktreeManager::cleanup`] runs it under the lock and reports the pass.
 //!
 //! The manager performs no caching: the registry is read and written per
-//! operation, so two managers over one workspace do not fight over a snapshot.
-//! Operations are not serialised, matching the Python helper's per-process lock
-//! being out of scope here (see the deferred list in `CONTEXT.md`).
+//! operation, so two managers over one workspace see each other's writes.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use openjiuwen_common::error::{Error, Result};
 
 use crate::permission::paths::normalize_lexically;
 
+use super::changes::{self, WorktreeChangeSummary};
+use super::cleanup::{self, CleanupPolicy, CleanupReport};
 use super::events::{
     BroadcastWorktreeEvents, NoopWorktreeEvents, SharedWorktreeEvents, WorktreeEvent,
     WorktreeEventSink,
 };
 use super::git::{self, GitRunner, ProcessGitRunner};
+use super::lock::{WorktreeLock, WorktreeLockConfig, WorktreeLockGuard};
 use super::models::{
     WorktreeCreateResult, WorktreeInfo, WorktreeRecord, WorktreeState, WorktreeStatus,
 };
 use super::slug;
+use super::sparse::SparseConfig;
 use super::store::{self, WorktreeIndex};
 
 /// Default base reference used when the caller supplies none.
 pub const DEFAULT_BASE: &str = "HEAD";
+
+/// Options of [`WorktreeManager::create_with_options`].
+///
+/// A per-call sparse selection overrides the manager-wide default configured
+/// with [`WorktreeManager::with_sparse`]; everything else defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeCreateOptions {
+    /// Sparse-checkout selection to apply, when any.
+    pub sparse: Option<SparseConfig>,
+}
+
+impl WorktreeCreateOptions {
+    /// Applies `sparse` to the worktree being created.
+    #[must_use]
+    pub fn with_sparse(mut self, sparse: SparseConfig) -> Self {
+        self.sparse = Some(sparse);
+        self
+    }
+
+    /// Whether no option deviates from the defaults.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.sparse.is_none()
+    }
+}
 
 /// A git worktree lifecycle manager.
 ///
@@ -52,6 +100,8 @@ pub struct WorktreeManager {
     owner: Option<String>,
     runner: Arc<dyn GitRunner>,
     events: SharedWorktreeEvents,
+    lock_config: WorktreeLockConfig,
+    sparse: Option<SparseConfig>,
 }
 
 impl std::fmt::Debug for WorktreeManager {
@@ -76,6 +126,8 @@ impl WorktreeManager {
             owner: None,
             runner: Arc::new(ProcessGitRunner::new()),
             events: Arc::new(NoopWorktreeEvents),
+            lock_config: WorktreeLockConfig::default(),
+            sparse: None,
         }
     }
 
@@ -89,6 +141,8 @@ impl WorktreeManager {
             owner: None,
             runner,
             events: Arc::new(NoopWorktreeEvents),
+            lock_config: WorktreeLockConfig::default(),
+            sparse: None,
         }
     }
 
@@ -120,6 +174,58 @@ impl WorktreeManager {
     pub fn with_broadcast_events(self, capacity: usize) -> (Self, Arc<BroadcastWorktreeEvents>) {
         let sink = Arc::new(BroadcastWorktreeEvents::new(capacity));
         (self.with_events(sink.clone()), sink)
+    }
+
+    /// Overrides the repository-lock policy (Python's `repo_lock` /
+    /// `repo_lock_timeout`).
+    #[must_use]
+    pub fn with_lock_config(mut self, lock_config: WorktreeLockConfig) -> Self {
+        self.lock_config = lock_config;
+        self
+    }
+
+    /// Sets the manager-wide sparse-checkout selection applied on creation and
+    /// re-applied when a worktree is recovered.
+    ///
+    /// The selection is not validated here; `create` re-validates it before any
+    /// git command ([`WorktreeCreateOptions::with_sparse`] overrides it per
+    /// call).
+    #[must_use]
+    pub fn with_sparse(mut self, sparse: SparseConfig) -> Self {
+        self.sparse = Some(sparse);
+        self
+    }
+
+    /// The repository-lock policy.
+    #[must_use]
+    pub fn lock_config(&self) -> &WorktreeLockConfig {
+        &self.lock_config
+    }
+
+    /// A repository lock for this manager, built from the current roots and
+    /// policy.
+    ///
+    /// Every handle over one repository root shares the sidecar lock file, so
+    /// building one per operation is both cheap and correct.
+    #[must_use]
+    pub fn repo_lock(&self) -> WorktreeLock {
+        WorktreeLock::new(
+            &self.repo_root,
+            &self.workspace_root,
+            self.lock_config.clone(),
+        )
+    }
+
+    /// The sidecar lock file of the repository lock.
+    #[must_use]
+    pub fn lock_path(&self) -> PathBuf {
+        self.repo_lock().lock_path()
+    }
+
+    /// The manager-wide sparse-checkout selection, when one is configured.
+    #[must_use]
+    pub fn sparse(&self) -> Option<&SparseConfig> {
+        self.sparse.as_ref()
     }
 
     /// The repository root the manager was built with.
@@ -199,18 +305,58 @@ impl WorktreeManager {
     /// [`DEFAULT_BASE`]. An existing branch is checked out instead of re-created.
     /// An existing worktree at the target path is recovered and reported with
     /// `existed = true`; a non-worktree directory at that path is refused.
+    /// Shorthand of [`Self::create_with_options`] with the default options.
     ///
     /// # Errors
     ///
     /// Returns the name-validation errors of [`Self::target_path`],
-    /// [`Error::validation`] for an occupied target, or the git error.
+    /// [`Error::validation`] for an occupied target, the lock error, or the git
+    /// error.
     pub async fn create(
         &self,
         name: &str,
         branch: Option<&str>,
         base: Option<&str>,
     ) -> Result<WorktreeCreateResult> {
-        match self.create_inner(name, branch, base).await {
+        self.create_with_options(name, branch, base, &WorktreeCreateOptions::default())
+            .await
+    }
+
+    /// Creates (or recovers) the worktree `name` with explicit `options`.
+    ///
+    /// The effective sparse selection is `options.sparse` when set, otherwise
+    /// the manager-wide [`Self::with_sparse`] selection; either way it is
+    /// validated before the first git command. With a selection, creation runs
+    /// `worktree add --no-checkout`, `sparse-checkout set` and `checkout HEAD`,
+    /// and a failed sparse step removes the half-created worktree again
+    /// ([`super::git::is_sparse_failure`] identifies that error). A recovered
+    /// worktree re-applies the selection recorded in the registry — without a
+    /// `checkout HEAD`, which would disturb the working tree — and the applied
+    /// selection is reported with [`WorktreeEvent::SparseConfigured`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the name-validation errors of [`Self::target_path`],
+    /// [`Error::validation`] for an occupied target or an invalid sparse
+    /// selection, the lock error, the git error, or the sparse-setup error.
+    pub async fn create_with_options(
+        &self,
+        name: &str,
+        branch: Option<&str>,
+        base: Option<&str>,
+        options: &WorktreeCreateOptions,
+    ) -> Result<WorktreeCreateResult> {
+        let sparse = options.sparse.clone().or_else(|| self.sparse.clone());
+        if let Some(sparse) = &sparse {
+            if let Err(error) = sparse.validate() {
+                self.report_failure("create", &error).await;
+                return Err(error);
+            }
+        }
+        let guard = self.acquire_repo_lock("create").await?;
+        let outcome = self.create_inner(name, branch, base, sparse.as_ref()).await;
+        drop(guard);
+        match outcome {
             Ok(result) => {
                 self.events
                     .emit(WorktreeEvent::Created {
@@ -221,6 +367,16 @@ impl WorktreeManager {
                         owner: self.owner.clone(),
                     })
                     .await;
+                if let Some(sparse) = &result.sparse {
+                    self.events
+                        .emit(WorktreeEvent::SparseConfigured {
+                            name: result.name.clone(),
+                            path: result.path.clone(),
+                            mode: sparse.mode,
+                            paths: sparse.paths.clone(),
+                        })
+                        .await;
+                }
                 Ok(result)
             }
             Err(error) => {
@@ -230,12 +386,14 @@ impl WorktreeManager {
         }
     }
 
-    /// Implementation of [`Self::create`], without event handling.
+    /// Implementation of [`Self::create_with_options`], without locking or event
+    /// handling.
     async fn create_inner(
         &self,
         name: &str,
         branch: Option<&str>,
         base: Option<&str>,
+        sparse: Option<&SparseConfig>,
     ) -> Result<WorktreeCreateResult> {
         let target = self.target_path(name)?;
         let repo = self.ensure_repository().await?;
@@ -248,7 +406,20 @@ impl WorktreeManager {
             .into_iter()
             .find(|info| same_path(&info.path, &target));
         if let Some(info) = existing {
-            let record = self.record_for(name, &slug, &target, Some(&branch), base.as_deref());
+            // Recovery never re-populates an existing working tree: only the
+            // selection recorded for this worktree is re-applied.
+            let recorded_sparse = WorktreeIndex::load(&self.index_path())?
+                .get(name)
+                .and_then(|record| record.sparse.clone());
+            let mut record = self.record_for(name, &slug, &target, Some(&branch), base.as_deref());
+            if let Some(head) = info.head.clone() {
+                record = record.with_head(head);
+            }
+            if let Some(sparse) = &recorded_sparse {
+                sparse.validate()?;
+                git::sparse_checkout_set(self.runner.as_ref(), &target, sparse).await?;
+                record = record.with_sparse(sparse.clone());
+            }
             self.store_record(&record)?;
             return Ok(WorktreeCreateResult {
                 name: name.to_owned(),
@@ -258,7 +429,7 @@ impl WorktreeManager {
                 base,
                 head: info.head,
                 existed: true,
-                sparse: None,
+                sparse: recorded_sparse,
             });
         }
 
@@ -268,22 +439,48 @@ impl WorktreeManager {
                 target.display()
             )));
         }
+        let base_ref = base.as_deref().unwrap_or(DEFAULT_BASE);
+        let branch_exists = git::branch_exists(self.runner.as_ref(), &repo, &branch).await?;
+        match (sparse.is_some(), branch_exists) {
+            (false, false) => {
+                git::worktree_add(self.runner.as_ref(), &repo, &target, &branch, base_ref).await?;
+            }
+            (false, true) => {
+                git::worktree_add_existing(self.runner.as_ref(), &repo, &target, &branch).await?;
+            }
+            (true, false) => {
+                git::worktree_add_no_checkout(
+                    self.runner.as_ref(),
+                    &repo,
+                    &target,
+                    &branch,
+                    base_ref,
+                )
+                .await?;
+            }
+            (true, true) => {
+                git::worktree_add_no_checkout_existing(
+                    self.runner.as_ref(),
+                    &repo,
+                    &target,
+                    &branch,
+                )
+                .await?;
+            }
+        }
 
-        if git::branch_exists(self.runner.as_ref(), &repo, &branch).await? {
-            git::worktree_add_existing(self.runner.as_ref(), &repo, &target, &branch).await?;
-        } else {
-            git::worktree_add(
-                self.runner.as_ref(),
-                &repo,
-                &target,
-                &branch,
-                base.as_deref().unwrap_or(DEFAULT_BASE),
-            )
-            .await?;
+        if let Some(sparse) = sparse {
+            self.apply_sparse_on_create(&repo, &target, sparse).await?;
         }
 
         let head = git::rev_parse(self.runner.as_ref(), &target, "HEAD").await?;
-        let record = self.record_for(name, &slug, &target, Some(&branch), base.as_deref());
+        let mut record = self.record_for(name, &slug, &target, Some(&branch), base.as_deref());
+        if let Some(head) = head.clone() {
+            record = record.with_head(head);
+        }
+        if let Some(sparse) = sparse {
+            record = record.with_sparse(sparse.clone());
+        }
         self.store_record(&record)?;
         Ok(WorktreeCreateResult {
             name: name.to_owned(),
@@ -293,10 +490,31 @@ impl WorktreeManager {
             base,
             head,
             existed: false,
-            sparse: None,
+            sparse: sparse.cloned(),
         })
     }
 
+    /// Applies `sparse` to the freshly added worktree at `target`.
+    ///
+    /// Runs `sparse-checkout set` then `checkout HEAD`; when either fails the
+    /// half-created worktree is removed again (best-effort, like Python) and a
+    /// sparse-specific error is returned.
+    async fn apply_sparse_on_create(
+        &self,
+        repo: &Path,
+        target: &Path,
+        sparse: &SparseConfig,
+    ) -> Result<()> {
+        let outcome = match git::sparse_checkout_set(self.runner.as_ref(), target, sparse).await {
+            Ok(()) => git::checkout_head(self.runner.as_ref(), target).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            let _ = git::worktree_remove(self.runner.as_ref(), repo, target, true).await;
+            return Err(git::sparse_failure_error(target, &error.to_string()));
+        }
+        Ok(())
+    }
     /// Lists the repository's worktrees, attaching registry records.
     ///
     /// Entries created by this helper carry their [`WorktreeRecord`] in
@@ -331,7 +549,10 @@ impl WorktreeManager {
     /// [`Error::validation`] when it is dirty and `force` is not set, or the git
     /// error.
     pub async fn remove(&self, name: &str, force: bool) -> Result<WorktreeInfo> {
-        match self.remove_inner(name, force).await {
+        let guard = self.acquire_repo_lock("remove").await?;
+        let outcome = self.remove_inner(name, force).await;
+        drop(guard);
+        match outcome {
             Ok(info) => {
                 self.events
                     .emit(WorktreeEvent::Removed {
@@ -387,7 +608,10 @@ impl WorktreeManager {
     ///
     /// Returns the git or registry error.
     pub async fn prune(&self) -> Result<usize> {
-        match self.prune_inner().await {
+        let guard = self.acquire_repo_lock("prune").await?;
+        let outcome = self.prune_inner().await;
+        drop(guard);
+        match outcome {
             Ok(removed) => {
                 self.events.emit(WorktreeEvent::Pruned { removed }).await;
                 Ok(removed)
@@ -410,10 +634,19 @@ impl WorktreeManager {
     ///
     /// # Errors
     ///
-    /// Returns the git or registry error.
+    /// Returns the lock, git or registry error.
     pub async fn cleanup_stale(&self) -> Result<usize> {
-        let repo = self.ensure_repository().await?;
-        self.cleanup_stale_in(&repo).await
+        let guard = self.acquire_repo_lock("cleanup_stale").await?;
+        let outcome = async {
+            let repo = self.ensure_repository().await?;
+            self.cleanup_stale_in(&repo).await
+        }
+        .await;
+        drop(guard);
+        if let Err(error) = &outcome {
+            self.report_failure("cleanup_stale", error).await;
+        }
+        outcome
     }
 
     /// Implementation of [`Self::cleanup_stale`] over an already-resolved root.
@@ -440,7 +673,10 @@ impl WorktreeManager {
     /// git error.
     pub async fn lock(&self, name: &str, reason: Option<&str>) -> Result<()> {
         let target = self.target_path(name)?;
-        match self.lock_inner(name, &target, reason).await {
+        let guard = self.acquire_repo_lock("lock").await?;
+        let outcome = self.lock_inner(name, &target, reason).await;
+        drop(guard);
+        match outcome {
             Ok(()) => {
                 self.events
                     .emit(WorktreeEvent::Locked {
@@ -473,7 +709,10 @@ impl WorktreeManager {
     /// git error.
     pub async fn unlock(&self, name: &str) -> Result<()> {
         let target = self.target_path(name)?;
-        match self.unlock_inner(name, &target).await {
+        let guard = self.acquire_repo_lock("unlock").await?;
+        let outcome = self.unlock_inner(name, &target).await;
+        drop(guard);
+        match outcome {
             Ok(()) => {
                 self.events
                     .emit(WorktreeEvent::Unlocked {
@@ -499,6 +738,9 @@ impl WorktreeManager {
 
     /// Reports the current state of the worktree `name`.
     ///
+    /// The sparse selection comes from the registry (an active record only), so
+    /// status never invokes git beyond listing and `status --porcelain`.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::not_found`] when git does not know the worktree, or the
@@ -518,6 +760,9 @@ impl WorktreeManager {
             })?;
         let changes = git::status_porcelain(self.runner.as_ref(), &info.path).await?;
         let index = WorktreeIndex::load(&self.index_path())?;
+        let record = index
+            .get(name)
+            .filter(|record| record.status == WorktreeState::Active);
         Ok(WorktreeStatus {
             name: name.to_owned(),
             path: info.path,
@@ -527,11 +772,116 @@ impl WorktreeManager {
             lock_reason: info.lock_reason,
             dirty: !changes.is_empty(),
             changed_files: changes.len(),
-            tracked: index
-                .get(name)
-                .is_some_and(|record| record.status == WorktreeState::Active),
-            sparse: None,
+            tracked: record.is_some(),
+            sparse: record.and_then(|record| record.sparse.clone()),
         })
+    }
+
+    /// Re-applies the sparse-checkout selection recorded for the worktree
+    /// `name`.
+    ///
+    /// Read-modify-write under the repository lock: git is the source of truth
+    /// for the worktree, the registry for the selection. `Ok(None)` means the
+    /// worktree has no recorded selection (or no record at all), so there is
+    /// nothing to apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::not_found`] when git does not know the worktree, the
+    /// sparse validation error, the lock error, or the git error.
+    pub async fn apply_sparse(&self, name: &str) -> Result<Option<SparseConfig>> {
+        let target = self.target_path(name)?;
+        let guard = self.acquire_repo_lock("apply_sparse").await?;
+        let outcome = self.apply_sparse_inner(name, &target).await;
+        drop(guard);
+        match outcome {
+            Ok(Some(sparse)) => {
+                self.events
+                    .emit(WorktreeEvent::SparseConfigured {
+                        name: name.to_owned(),
+                        path: target,
+                        mode: sparse.mode,
+                        paths: sparse.paths.clone(),
+                    })
+                    .await;
+                Ok(Some(sparse))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.report_failure("apply_sparse", &error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Implementation of [`Self::apply_sparse`], without locking or events.
+    async fn apply_sparse_inner(&self, name: &str, target: &Path) -> Result<Option<SparseConfig>> {
+        let repo = self.ensure_repository().await?;
+        let info = self.require_listed(name, &repo, target).await?;
+        let index = WorktreeIndex::load(&self.index_path())?;
+        let Some(sparse) = index.get(name).and_then(|record| record.sparse.clone()) else {
+            return Ok(None);
+        };
+        sparse.validate()?;
+        git::sparse_checkout_set(self.runner.as_ref(), &info.path, &sparse).await?;
+        Ok(Some(sparse))
+    }
+
+    /// Summarises the uncommitted and unpushed work in the worktree `name`.
+    ///
+    /// Read-only and deliberately outside the repository lock (Python's
+    /// `count_changes` is lock-free too). The base reference is the HEAD commit
+    /// recorded at creation, falling back to the recorded base when that is not
+    /// [`DEFAULT_BASE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::not_found`] when git does not know the worktree, the git
+    /// error of the `status`/`diff` calls, or the registry error.
+    pub async fn change_summary(&self, name: &str) -> Result<WorktreeChangeSummary> {
+        let target = self.target_path(name)?;
+        let repo = self.ensure_repository().await?;
+        let info = self.require_listed(name, &repo, &target).await?;
+        let index = WorktreeIndex::load(&self.index_path())?;
+        let base = index.get(name).and_then(|record| {
+            record
+                .head
+                .clone()
+                .or_else(|| record.base.clone().filter(|base| base != DEFAULT_BASE))
+        });
+        changes::change_summary(self.runner.as_ref(), &info.path, base.as_deref()).await
+    }
+
+    /// Reaps expired ephemeral worktrees under `policy`.
+    ///
+    /// Runs the cleanup pass under the repository lock and reports the pass with
+    /// [`WorktreeEvent::Cleaned`]. The pass is fail-closed: see the cleanup
+    /// module for the exact skip rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lock error, the git error of listing/removing worktrees or of
+    /// the final prune, or the registry error.
+    pub async fn cleanup(&self, policy: &CleanupPolicy) -> Result<CleanupReport> {
+        let guard = self.acquire_repo_lock("cleanup").await?;
+        let outcome = cleanup::run(self, policy).await;
+        drop(guard);
+        match outcome {
+            Ok(report) => {
+                self.events
+                    .emit(WorktreeEvent::Cleaned {
+                        dry_run: report.dry_run,
+                        removed: report.removed.clone(),
+                        skipped: report.skipped.len(),
+                    })
+                    .await;
+                Ok(report)
+            }
+            Err(error) => {
+                self.report_failure("cleanup", &error).await;
+                Err(error)
+            }
+        }
     }
 
     /// Builds the registry record of a worktree.
@@ -578,6 +928,22 @@ impl WorktreeManager {
                     target.display()
                 ))
             })
+    }
+
+    /// Takes the repository lock for `action`, reporting a failure event.
+    ///
+    /// The returned guard releases the advisory lock on drop; callers hold it
+    /// only for the operation's critical section and release it before emitting
+    /// lifecycle events.
+    async fn acquire_repo_lock(&self, action: &str) -> Result<WorktreeLockGuard> {
+        match self.repo_lock().acquire().await {
+            Ok(guard) => Ok(guard),
+            Err(error) => {
+                let error = Error::from(error);
+                self.report_failure(action, &error).await;
+                Err(error)
+            }
+        }
     }
 
     /// Emits a failure event; the error is still returned to the caller.

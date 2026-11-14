@@ -4,7 +4,8 @@ A real git-worktree helper for the DeepAgent harness, ported from `openjiuwen/ha
 It gives an agent (or a team member) an isolated checkout at `<repo-root>/.worktrees/<slug>` without cloning the repository.
 The model-facing `worktree` tool is the only model entry point; everything else is host API.
 ## API Surface
-`WorktreeManager` — `new(repo_root)`, `with_runner(repo_root, Arc<dyn GitRunner>)`, `with_workspace_root`, `with_owner`, `with_events`, `with_broadcast_events(capacity)`, `repo_root`, `workspace_root`, `owner`, `runner`, `worktrees_dir`, `index_path`, `target_path(name)`, `ensure_repository`, `create(name, branch, base) -> Result<WorktreeCreateResult>`, `list() -> Result<Vec<WorktreeInfo>>`, `remove(name, force) -> Result<WorktreeInfo>`, `prune() -> Result<usize>`, `cleanup_stale() -> Result<usize>`, `lock(name, reason)`, `unlock(name)`, `status(name) -> Result<WorktreeStatus>`.
+`WorktreeManager` — `new(repo_root)`, `with_runner(repo_root, Arc<dyn GitRunner>)`, `with_workspace_root`, `with_owner`, `with_events`, `with_broadcast_events(capacity)`, `with_lock_config(WorktreeLockConfig)`, `with_sparse(SparseConfig)`, `repo_root`, `workspace_root`, `owner`, `runner`, `lock_config()`, `repo_lock() -> WorktreeLock`, `lock_path() -> PathBuf`, `sparse()`, `worktrees_dir`, `index_path`, `target_path(name)`, `ensure_repository`, `create(name, branch, base) -> Result<WorktreeCreateResult>`, `create_with_options(name, branch, base, &WorktreeCreateOptions) -> Result<WorktreeCreateResult>`, `list() -> Result<Vec<WorktreeInfo>>`, `remove(name, force) -> Result<WorktreeInfo>`, `prune() -> Result<usize>`, `cleanup_stale() -> Result<usize>`, `cleanup(&CleanupPolicy) -> Result<CleanupReport>`, `lock(name, reason)`, `unlock(name)`, `status(name) -> Result<WorktreeStatus>`, `apply_sparse(name) -> Result<Option<SparseConfig>>`, `change_summary(name) -> Result<WorktreeChangeSummary>`.
+`WorktreeCreateOptions { sparse: Option<SparseConfig> }` (serde default) — `with_sparse(sparse)`, `is_default()`; a per-call selection overrides `WorktreeManager::with_sparse`.
 `GitRunner` (`#[async_trait]`) — `async fn run(&self, args: &[&str], cwd: &Path) -> Result<GitOutput>`; `run` resolves only on exit code 0.
 `ProcessGitRunner` — `new()`, `with_program(program)`, `program()`; spawns git with `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=""`, stdin null and checks `which::which` first.
 `GitOutput { stdout, stderr }`, `git_available()`, `parse_worktree_list(text) -> Vec<WorktreeInfo>`, `parse_status_porcelain(text) -> Vec<String>`.
@@ -17,7 +18,8 @@ Change summaries (`changes.rs`) — `WorktreeChangeSummary { changed_files, file
 Slug helpers — `validate_raw_name(raw)` (security gate), `slugify(raw)` (normaliser), `unique_slug(slug, taken)`, `branch_name(raw)`, `MAX_SLUG_LENGTH` (64), `DEFAULT_SLUG` ("worktree"), `BRANCH_PREFIX` ("worktree-"), `WORKTREES_DIR` (".worktrees").
 Models — `WorktreeInfo { path, branch, head, bare, detached, locked, lock_reason, prunable, recorded }` with `name()` / `is_detached()`; `WorktreeCreateResult { name, slug, path, branch, base, head, existed, sparse }`; `WorktreeStatus { name, path, branch, head, locked, lock_reason, dirty, changed_files, tracked, sparse }` with `is_clean()`; `WorktreeRecord { name, slug, path, branch, base, owner, status, created_at, sparse, head }` with `with_sparse` / `with_head`; `WorktreeState { Active, Removed }`.
 Registry — `WorktreeIndex { version, records }` with `load(path)`, `save(path)`, `get(name)`, `get_by_path`, `upsert`, `remove`, `records`, `retain_existing(paths)`, plus `index_path(workspace_root)`, `INDEX_DIR` (".worktree"), `INDEX_FILE` ("index.json"), `INDEX_VERSION` (1).
-Events — `WorktreeEvent::{Created, Removed, Locked, Unlocked, Pruned, Error}` (serde tag `type`, `kind()`); `WorktreeEventSink` (`async fn emit(&self, WorktreeEvent)`); `NoopWorktreeEvents`, `BroadcastWorktreeEvents` (`new(capacity)`, `subscribe()`, `receiver_count()`), `RecordingWorktreeEvents` (`events()`, `clear()`), `SharedWorktreeEvents`, `DEFAULT_EVENT_CAPACITY` (64).
+Events — `WorktreeEvent::{Created, Removed, Locked, Unlocked, Pruned, SparseConfigured { name, path, mode, paths }, Cleaned { dry_run, removed, skipped }, Error}` (serde tag `type`, `kind()`); `WorktreeEventSink` (`async fn emit(&self, WorktreeEvent)`); `NoopWorktreeEvents`, `BroadcastWorktreeEvents` (`new(capacity)`, `subscribe()`, `receiver_count()`), `RecordingWorktreeEvents` (`events()`, `clear()`), `SharedWorktreeEvents`, `DEFAULT_EVENT_CAPACITY` (64).
+Cleanup (`cleanup.rs`) — `CleanupPolicy { max_age_days, ephemeral_only, dry_run, current_worktree, now }` with `with_max_age_days`, `with_ephemeral_only`, `with_dry_run`, `with_current_worktree`, `with_now`, `reference_time()`, `max_age_secs()`; `CleanupCandidate { name, path, age_secs }`, `CleanupSkip { name, path, reason }`, `CleanupReport { dry_run, candidates, removed, skipped }` with `removed_count()`; `is_ephemeral_slug(slug)`, `EPHEMERAL_PATTERNS`, `DEFAULT_CLEANUP_AFTER_DAYS` (30).
 Tool — `WorktreeTool::new(manager: Arc<WorktreeManager>, language: &str) -> WorktreeTool`, `WorktreeTool::card_for(language) -> ToolCard`, `with_permission(engine: Arc<PermissionEngine>)`, `manager()`; `WorktreeArgs { action, name, branch, base, force, reason }` with `new(action)`, `with_name(name)`, `is_known_action()`; `TOOL_NAME` ("worktree"), `ACTIONS` (`create`, `list`, `remove`, `lock`, `unlock`, `prune`, `status`).
 ## Lock (`lock.rs`)
 
@@ -34,8 +36,17 @@ A worktree named `Feature Login!` becomes `slug = "Feature-Login"`, directory `<
 The registry is `<workspace-root>/.worktree/index.json` (default workspace root is the repo root), the directory `crate::workspace::Workspace` already uses for worktree links.
 `create` recovers an existing worktree at the target path (`existed = true`) and refuses a target directory that git does not list.
 `create` checks out an existing branch instead of re-creating it; `base` defaults to `HEAD`.
+`create_with_options`/`create` record the HEAD commit and the effective sparse selection in the registry record and in `WorktreeCreateResult`.
+A recovered worktree re-applies the selection recorded in the registry (never `checkout HEAD`, which would disturb uncommitted work) and reports `SparseConfigured`.
+`status` reports the sparse selection of the active registry record; `list` keeps attaching records through `WorktreeInfo::recorded`.
 `remove` refuses a dirty worktree without `force` and reports an unlisted worktree as `Error::not_found`.
 `prune` runs `git worktree prune` and then drops registry records whose directory git no longer lists.
+
+## Locking policy
+Every mutating operation — `create`/`create_with_options`, `remove`, `prune`, `cleanup_stale`, `cleanup`, `lock`, `unlock`, `apply_sparse` — takes the repo lock for its critical section, matching Python's `async with repo_lock(repo_root, timeout=config.repo_lock_timeout)`; lock acquisition issues no git command, so command sequences are unchanged.
+A lock failure becomes the typed `Error` (still recognised by `is_lock_timeout`/`is_lock_contention`) and is reported as `WorktreeEvent::Error` with the operation name.
+The guard is dropped before lifecycle events are emitted, and read-only paths (`list`, `status`, `change_summary`) stay outside the lock on purpose.
+`WorktreeLockConfig::disabled()` opts a manager out without changing any behaviour beyond the lock.
 
 ## Lock layout
 The lock is repo-bucketed: the hashed target is `repo_root`, so two worktrees of one repository share one lock and different repositories never contend.
@@ -46,7 +57,11 @@ Acquisition writes `pid=<u32>` and `acquired_at=<rfc3339>` into the sidecar best
 `flock` is released by the kernel when the holder exits, so a crashed holder never leaves a blocking stale lock; the metadata is what outlives it and `stale_metadata` reports it. The lock file is never broken or unlinked while another process may hold it.
 
 ## Sparse checkout and change summaries
-Sparse checkout is host API plus git helpers: `create` does not apply it yet, so a caller runs `worktree_add_no_checkout`, `sparse_checkout_set`, `checkout_head` itself and passes the selection to `WorktreeRecord::with_sparse`.
+A sparse creation runs `worktree add --no-checkout` (with `-b` for a new branch, without it for an existing one), then `sparse-checkout set`, then `checkout HEAD`.
+If either sparse step fails, the half-created worktree is removed with `worktree remove --force` (errors ignored) and the caller gets `sparse_failure_error` (`is_sparse_failure` holds).
+The effective selection is `WorktreeCreateOptions::sparse`, else the manager-wide `with_sparse`; it is validated before the first git command.
+`apply_sparse(name)` re-validates and re-applies the recorded selection under the lock, emits `SparseConfigured`, and answers `Ok(None)` when the worktree has no record or no selection.
+`WorktreeManager::change_summary` resolves the worktree through `worktree list`, uses the record `head` (falling back to `base` when that is not `HEAD`) as the diff base, and runs outside the lock.
 Cone mode is the default and maps to `git sparse-checkout set --cone -- <paths>`; `SparseMode::Patterns` maps to `--no-cone` with the entries passed through as git patterns.
 Sparse paths are repository-relative; `validate_sparse_path` refuses absolute paths, `~`, drive prefixes, `.`/`..` segments and NUL with `Error::security`, and empty/control input with `Error::validation`, before any normalisation happens.
 `SparseConfig::normalized` only trims, converts `\` to `/`, strips a trailing `/`, drops empty entries and collapses duplicates in first-seen order, so a hostile path is refused rather than rewritten.
@@ -54,6 +69,14 @@ Sparse paths are repository-relative; `validate_sparse_path` refuses absolute pa
 `change_summary` issues `status --porcelain`, then (only with a base) `diff --stat <base>..HEAD` and `rev-list --count <base>..HEAD`, then always `rev-list --max-count=1 HEAD --not --remotes`.
 A failing `status` or `diff` propagates the typed error; a failing or unparsable count degrades to `commits = 0` and a failing unpushed probe degrades to `unpushed = None` (fail-closed for cleanup).
 `render_change_summary` is deterministic and bilingual (`language == "en"` exactly, otherwise Chinese), reads no clock or environment, and stays within `SUMMARY_MAX_CHARS` with a trailing `...` when anything was truncated.
+
+## Cleanup policy
+`CleanupPolicy::default()` is thirty days, ephemeral-only, a real removal pass, no active worktree and the wall clock; `with_now` freezes the reference so tests stay deterministic.
+The pass only considers worktrees git lists under `.worktrees` (never the main worktree) whose directory mtime is at least `max_age_days * 86_400` seconds old; an unreadable mtime is a `cannot read worktree metadata` skip.
+Ephemeral slugs match `teammate-<8hex>`, `agent-<7hex>` or `agent-<team>-<member>-<8hex>` exactly; other slugs are skipped as `not an ephemeral worktree` unless `ephemeral_only` is off.
+The active worktree (`current_worktree`, compared lexically) is never reaped, a dirty worktree is skipped as `uncommitted changes`, and unpushed state is fail-closed: `Some(true)` is `unpushed commits`, `None` is `cannot verify unpushed commits`.
+A dry run reports the candidates and performs no removal, no prune and no registry write.
+A removal pass runs `worktree remove` per candidate (a failure becomes a skip carrying the git message), then drops registry records git no longer lists, then runs exactly one `worktree prune` when something was removed, and reports `WorktreeEvent::Cleaned`.
 ## Constraints
 Offline and deterministic by default: tests use `ScriptedGitRunner` (queued stdout/failures, recorded calls) and temp directories; the single real-git test skips when `which::which("git")` fails.
 No new dependencies, no `unsafe`, no `println!` (tracing only); errors are `openjiuwen_common::error::{Error, Result}`.
@@ -63,15 +86,14 @@ The registry document is written atomically (sibling `.tmp` + rename) and a miss
 The tool never returns `Err` for expected failures: it returns a `ToolPayload` with `success = false`; only cancellation propagates.
 The tool consults `crate::permission` path guards for the target path on mutating actions and blocks only on `PermissionLevel::Deny` (`ask`/`allow` pass, no engine fails open).
 The tool is mounted by `crate::tools::ToolRegistry` as `BuiltinTool::Worktree`, the last of the extended tools, built from a `WorktreeManager` plus the registry language and permission engine.
-`WorktreeLock` supplies the repo-scoped cross-process advisory lock, but `WorktreeManager` operations do not take it: callers wrap create/remove in `acquire` themselves, so unmodified managers over one workspace are still uncoordinated.
+`WorktreeManager` acquires the repo lock itself for every mutating operation, so two managers over one workspace are coordinated; `repo_lock()` is exposed for a caller that needs the lock around its own critical section.
 The lock guard is an OS advisory lock on a `Send` descriptor, not a `parking_lot`/`std` mutex, so it may be held across the manager's git `.await` points; no `parking_lot`/`std` lock is ever held across `.await`.
 Where `flock` is missing (non-Unix) or the lock is disabled, `acquire` returns an inactive guard and writes no metadata: exclusion is best-effort and `is_enabled()` is the check for a caller that needs it.
 ## Deferred
 Python's module-level `asyncio.Lock` bucket in `lock.py`: the OS advisory lock already excludes two handles in one process, so the bucket has no extra work to do.
 Python's `filelock`-specific lock file name (`openjiuwen-worktree.lock`) and its beside-the-repo fallback: this port uses the sysop sidecar naming and the workspace `.worktree` fallback.
-Automatic sparse setup inside `WorktreeManager::create`/`status` (the helpers, the `WorktreeRecord.sparse`/`head` fields and the `WorktreeCreateResult.sparse`/`WorktreeStatus.sparse` slots exist, but the manager still reports `sparse: None`).
 `symlink_directories`, `include_patterns` copying, `core.longpaths`, hook-path configuration.
-Lifecycle policies (`ephemeral`/`durable`/`auto`), `cleanup_after_days`, auto-cleanup on shutdown, event-log recovery of sessions.
+Lifecycle policies (`ephemeral`/`durable`/`auto`), auto-cleanup timers on shutdown, event-log recovery of sessions (age-based reaping itself lives in `cleanup::run`/`CleanupPolicy`).
 `enter_worktree`/`exit_worktree` tools, the worktree rails, backend hooks (`WorktreeBackend`), the change-summary rails (`DiffSummaryRail`) and the `vcs` module.
 ## Routing Table
 - `./git.rs` → `GitRunner` seam, `ProcessGitRunner`, porcelain parsers, typed git errors, command helpers
@@ -80,7 +102,8 @@ Lifecycle policies (`ephemeral`/`durable`/`auto`), `cleanup_after_days`, auto-cl
 - `./store.rs` → `WorktreeIndex` registry and atomic JSON writes
 - `./events.rs` → `WorktreeEvent`, `WorktreeEventSink`, noop/broadcast/recording sinks
 - `./lock.rs` → `WorktreeLock`, config, guard, metadata and typed contention/timeout errors
-- `./manager.rs` → `WorktreeManager` lifecycle, layout and refusal rules
+- `./manager.rs` → `WorktreeManager` lifecycle, layout, refusal rules, locking, sparse wiring, change summaries and cleanup entry point
+- `./cleanup.rs` → `CleanupPolicy`, candidate/skip/report models, ephemeral patterns and the fail-closed reaping pass
 - `./tool.rs` → `WorktreeTool` and `WorktreeArgs` (the model-facing `worktree` tool)
 - `./sparse.rs` → `SparseConfig`, `SparseMode`, path validation, normalisation and `MAX_SPARSE_PATHS`
 - `./changes.rs` → `WorktreeChangeSummary`, `change_summary`, bounding, porcelain/diffstat parsing and bilingual rendering

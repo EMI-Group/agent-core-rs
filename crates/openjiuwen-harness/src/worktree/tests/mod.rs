@@ -17,6 +17,7 @@ use openjiuwen_common::error::{Error, Result};
 use super::git::{GitOutput, GitRunner};
 
 mod changes;
+mod cleanup;
 mod lock;
 mod manager;
 mod sparse;
