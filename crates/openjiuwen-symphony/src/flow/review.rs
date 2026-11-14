@@ -2,9 +2,9 @@
 //!
 //! Ports Python `flow.review.PackageReviewGate.review_static` plus
 //! `flow.engine.SymphonyFlowEngine.review_and_prepare_install`, reduced to the
-//! seven checks the Rust objective keeps:
-//! `structure`, `dependencies`, `integrity`, `meta_naming`, `materials`,
-//! `permissions`, and `license`.
+//! ten checks the Rust objective keeps, in Python's order:
+//! `structure`, `dependencies`, `code_safety`, `secrets`, `artifact_paths`,
+//! `integrity`, `meta_naming`, `materials`, `permissions`, and `license`.
 //!
 //! The verdict is `approved` when every check passes, `needs_human_review` when
 //! the only failure is `meta_naming` (the name is cosmetic and fixable), and
@@ -22,6 +22,7 @@ use crate::flow::model::{canonical_json, is_valid_meta_name, sha256_short};
 use crate::flow::pack::{
     chain_order_from_steps, DependenciesDoc, SkillPack, SKILL_MD_FILENAME, TARGET_KIND_SKILL,
 };
+use crate::redaction::redact_private_json;
 
 /// The review schema version.
 pub const REVIEW_SCHEMA_VERSION: &str = "symphony.package_review.v1";
@@ -41,6 +42,9 @@ const FORBIDDEN_PERMISSIONS: [&str; 4] =
     ["credential_access", "filesystem_write", "process", "shell"];
 /// Licenses a generated package may declare.
 const ALLOWED_LICENSES: [&str; 4] = ["Apache-2.0", "BSD-3-Clause", "MIT", "Proprietary"];
+/// Tokens embedded script text may never contain (Python's `_FORBIDDEN_CODE_TOKENS`).
+const FORBIDDEN_CODE_TOKENS: [&str; 5] =
+    ["import os", "import sys", "subprocess", "eval(", "exec("];
 /// The review check that only warrants human review when it is the sole failure.
 const META_NAMING_CHECK: &str = "meta_naming";
 
@@ -68,7 +72,7 @@ pub struct ReviewResult {
     pub target_kind: String,
     /// `approved`, `rejected`, or `needs_human_review`.
     pub verdict: String,
-    /// The seven checks, in order.
+    /// The deterministic checks, in review order.
     pub checks: Vec<ReviewCheck>,
     /// The sha256 hex digest of the package's canonical materials.
     pub materials_hash: String,
@@ -131,7 +135,7 @@ impl Reviewer {
         Self
     }
 
-    /// Runs all seven static checks against `pack`.
+    /// Runs all ten static checks against `pack`.
     ///
     /// The result is fully deterministic apart from `reviewed_at`: `review_id`
     /// hashes the package id, target kind, verdict, checks, and materials hash.
@@ -141,6 +145,9 @@ impl Reviewer {
         let checks = vec![
             check_structure(pack),
             check_dependencies(pack),
+            check_code_safety(pack),
+            check_secrets(pack),
+            check_artifact_paths(pack),
             check_integrity(pack, &materials_hash),
             check_meta_naming(pack),
             check_materials(pack),
@@ -318,6 +325,87 @@ fn check_materials(pack: &SkillPack) -> ReviewCheck {
         reasons.push("package has no steps".to_string());
     }
     check("materials", reasons)
+}
+
+/// Checks that the package embeds no forbidden script text.
+///
+/// Mirrors Python's `_check_code_safety`: generated or embedded script text may
+/// not contain `import os`, `import sys`, `subprocess`, `eval(`, or `exec(`.
+/// The scan is case-insensitive and covers every rendered artifact, in artifact
+/// name order.
+fn check_code_safety(pack: &SkillPack) -> ReviewCheck {
+    let mut reasons = Vec::new();
+    for (name, text) in &pack.artifacts {
+        let lowered = text.to_lowercase();
+        for token in FORBIDDEN_CODE_TOKENS {
+            if lowered.contains(token) {
+                reasons.push(format!("forbidden token in {name}: {token}"));
+            }
+        }
+    }
+    check("code_safety", reasons)
+}
+
+/// Checks that no material still carries credential material.
+///
+/// Mirrors Python's `_check_secrets`: the package materials are passed through
+/// [`redact_private_json`] and the check fails when redaction changes them.
+fn check_secrets(pack: &SkillPack) -> ReviewCheck {
+    let materials = pack.materials();
+    let mut reasons = Vec::new();
+    if redact_private_json(&materials, &[]) != materials {
+        reasons.push("package contains unredacted credential material".to_string());
+    }
+    check("secrets", reasons)
+}
+
+/// Checks that every material path stays inside the package root.
+///
+/// Mirrors and extends Python's `_check_artifact_paths`: absolute paths, Windows
+/// drive or UNC prefixes, and `..` escapes are all rejected after path
+/// normalization, so an artifact can never be written outside the directory the
+/// pack claims.
+fn check_artifact_paths(pack: &SkillPack) -> ReviewCheck {
+    let mut reasons = Vec::new();
+    for name in pack.artifacts.keys() {
+        if let Some(reason) = escaping_material_path(name) {
+            reasons.push(reason);
+        }
+    }
+    check("artifact_paths", reasons)
+}
+
+/// Returns why `name` escapes the package root, or `None` when it is contained.
+fn escaping_material_path(name: &str) -> Option<String> {
+    if name.trim().is_empty() {
+        return Some("material path is blank".to_string());
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some(format!("material path `{name}` is absolute"));
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(format!("material path `{name}` has a drive prefix"));
+    }
+    let parts: Vec<&str> = name
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let mut depth = 0usize;
+    for part in parts {
+        if part == ".." {
+            if depth == 0 {
+                return Some(format!("material path `{name}` escapes the package root"));
+            }
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    if depth == 0 {
+        return Some(format!("material path `{name}` does not name a file"));
+    }
+    None
 }
 
 /// Checks that the declared permissions exclude the forbidden capabilities.
@@ -529,7 +617,26 @@ mod tests {
         let result = Reviewer::new().review(&demo_pack("demo-pack"));
         assert_eq!(result.verdict, VERDICT_APPROVED);
         assert_eq!(result.failed_checks().len(), 0);
-        assert_eq!(result.checks.len(), 7);
+        let names: Vec<&str> = result
+            .checks
+            .iter()
+            .map(|check| check.check.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "structure",
+                "dependencies",
+                "code_safety",
+                "secrets",
+                "artifact_paths",
+                "integrity",
+                "meta_naming",
+                "materials",
+                "permissions",
+                "license"
+            ]
+        );
         assert!(result.review_id.starts_with("review_"));
         assert_eq!(result.review_id.len(), "review_".len() + 12);
     }
@@ -576,5 +683,110 @@ mod tests {
             .failed_checks()
             .iter()
             .any(|check| check.check == "integrity"));
+    }
+
+    #[test]
+    fn embedded_script_tokens_fail_code_safety() {
+        for token in FORBIDDEN_CODE_TOKENS {
+            let mut pack = demo_pack("demo-pack");
+            pack.artifacts.insert(
+                crate::flow::pack::DEPENDENCIES_FILENAME.to_string(),
+                format!("#!/usr/bin/env python\n{token} payload\n"),
+            );
+            let result = Reviewer::new().review(&pack);
+            let safety = result
+                .checks
+                .iter()
+                .find(|check| check.check == "code_safety")
+                .expect("code_safety present");
+            assert_eq!(safety.result, CHECK_FAIL, "{token} should fail");
+            assert!(safety
+                .reasons
+                .iter()
+                .any(|reason| reason.contains(token) && reason.contains("dependencies.yaml")));
+        }
+
+        let mut clean = demo_pack("demo-pack");
+        clean.artifacts.insert(
+            SKILL_MD_FILENAME.to_string(),
+            "import os is fine".to_string(),
+        );
+        let result = Reviewer::new().review(&clean);
+        let safety = result
+            .checks
+            .iter()
+            .find(|check| check.check == "code_safety")
+            .expect("code_safety present");
+        assert_eq!(safety.result, CHECK_FAIL);
+    }
+
+    #[test]
+    fn unredacted_secrets_fail_the_secrets_check() {
+        let mut pack = demo_pack("demo-pack");
+        pack.steps[0].description = "call with api_key: sk-live-0123456789abcdef".to_string();
+        pack.recompute_identity();
+        let result = Reviewer::new().review(&pack);
+        let secrets = result
+            .checks
+            .iter()
+            .find(|check| check.check == "secrets")
+            .expect("secrets present");
+        assert_eq!(secrets.result, CHECK_FAIL);
+        assert!(secrets.reasons[0].contains("unredacted credential material"));
+
+        let clean = demo_pack("demo-pack");
+        let result = Reviewer::new().review(&clean);
+        let secrets = result
+            .checks
+            .iter()
+            .find(|check| check.check == "secrets")
+            .expect("secrets present");
+        assert_eq!(secrets.result, CHECK_PASS);
+    }
+
+    #[test]
+    fn material_paths_must_stay_inside_the_root() {
+        for name in [
+            "SKILL.md",
+            "nested/dir/file.md",
+            "./SKILL.md",
+            "a/../SKILL.md",
+            "nested\\file.md",
+        ] {
+            assert_eq!(escaping_material_path(name), None, "{name} is contained");
+        }
+        for name in [
+            "",
+            "   ",
+            "/etc/passwd",
+            "\\server\\share\\file",
+            "//server/share/file",
+            "C:/Windows/system32",
+            "c:file.md",
+            "../escape.md",
+            "nested/../../escape.md",
+            ".",
+            "./",
+        ] {
+            assert!(
+                escaping_material_path(name).is_some(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn escaping_material_paths_fail_the_check() {
+        let mut pack = demo_pack("demo-pack");
+        pack.artifacts
+            .insert("../escape.md".to_string(), "payload".to_string());
+        let result = Reviewer::new().review(&pack);
+        let paths = result
+            .checks
+            .iter()
+            .find(|check| check.check == "artifact_paths")
+            .expect("artifact_paths present");
+        assert_eq!(paths.result, CHECK_FAIL);
+        assert!(paths.reasons[0].contains("escapes the package root"));
     }
 }

@@ -38,6 +38,9 @@ use crate::flow::model::{
 };
 use crate::flow::pack::SkillPack;
 use crate::flow::store::FlowStore;
+use crate::redaction::{
+    redact_sensitive_json, redact_sensitive_text, sanitize_distilled_text, sanitize_with_queries,
+};
 
 /// The summary of one batch distillation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,13 +299,16 @@ impl FlowEngine {
         let nodes = merge_nodes(&group.records);
         let structure = build_structure(&group.edges, &nodes);
         let order = topological_order(&structure);
+        let source_queries = source_queries(&group.records);
         let template = template_texts(&group.records, &order, &nodes);
         let (texts, fallback) = self
-            .distill_texts(&group.records, &order, &nodes, template)
+            .distill_texts(&group.records, &order, &nodes, template, &source_queries)
             .await;
         let quality = compute_quality(&group.records, group.edges.len());
         let (status, grade) = resolve_status_grade(&quality);
         let version = existing.map_or(1, |recipe| recipe.version + 1);
+        let mut provenance = provenance(group, texts.source);
+        sanitize_provenance(&mut provenance);
         let recipe = ExperienceRecipe {
             schema_version: RECIPE_SCHEMA_VERSION.to_string(),
             recipe_id: format!("recipe_{}", group.signature),
@@ -314,7 +320,7 @@ impl FlowEngine {
             combination_structure: structure,
             execution_narrative: texts.narrative,
             quality,
-            provenance: provenance(group, texts.source),
+            provenance,
         };
         if existing.is_some_and(|previous| previous.content_identity() == recipe.content_identity())
         {
@@ -379,6 +385,7 @@ impl FlowEngine {
         order: &[String],
         nodes: &BTreeMap<String, TraceNode>,
         template: RecipeTexts,
+        source_queries: &[String],
     ) -> (RecipeTexts, bool) {
         let Some(model) = self.model.as_ref() else {
             return (template, false);
@@ -386,7 +393,7 @@ impl FlowEngine {
         let prompt = narrative_prompt(records, order, nodes);
         match model.complete(&prompt).await {
             Ok(reply) => {
-                if let Some(texts) = parse_model_texts(&reply, &template) {
+                if let Some(texts) = parse_model_texts(&reply, &template, source_queries) {
                     (texts, false)
                 } else {
                     warn!(
@@ -543,6 +550,11 @@ fn reachable(start: &str, target: &str, edges: &[(String, String, String)]) -> b
 }
 
 /// Merges nodes from the group's traces, first non-empty value winning.
+///
+/// Every trace-derived free-text field is redacted here, once, at the boundary
+/// where it enters the recipe (and later the `SkillPack`): node descriptions go
+/// through [`sanitize_distilled_text`] and IO port name/type/description through
+/// [`redact_sensitive_text`].
 fn merge_nodes(records: &[FlowTrace]) -> BTreeMap<String, TraceNode> {
     let mut merged: BTreeMap<String, TraceNode> = BTreeMap::new();
     for record in records {
@@ -565,7 +577,29 @@ fn merge_nodes(records: &[FlowTrace]) -> BTreeMap<String, TraceNode> {
             }
         }
     }
+    for node in merged.values_mut() {
+        sanitize_node(node);
+    }
     merged
+}
+
+/// Redacts one merged trace node's model-facing text in place.
+fn sanitize_node(node: &mut TraceNode) {
+    node.description = sanitize_distilled_text(&node.description, None);
+    for port in node.inputs.iter_mut().chain(node.outputs.iter_mut()) {
+        port.name = redact_sensitive_text(&port.name);
+        port.io_type = redact_sensitive_text(&port.io_type);
+        port.description = redact_sensitive_text(&port.description);
+    }
+}
+
+/// Returns the group's non-empty source queries, in record order.
+fn source_queries(records: &[FlowTrace]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| record.query.trim().to_string())
+        .filter(|query| !query.is_empty())
+        .collect()
 }
 
 /// Builds the recipe combination structure from the group's edges.
@@ -642,18 +676,20 @@ fn resolve_status_grade(quality: &RecipeQuality) -> (String, String) {
 }
 
 /// Builds the deterministic provenance metadata.
+///
+/// `sample_queries` are trace-derived free text, so they carry the sanitized
+/// queries rather than the raw ones; [`sanitize_provenance`] then runs the JSON
+/// redactor over the whole blob, which is the one raw metadata structure a
+/// recipe embeds.
 fn provenance(group: &StructureGroup, narrative_source: &str) -> BTreeMap<String, Value> {
     let trace_ids: Vec<Value> = group
         .records
         .iter()
         .map(|record| Value::String(record.trace_id.clone()))
         .collect();
-    let sample_queries: Vec<Value> = group
-        .records
-        .iter()
-        .filter(|record| !record.query.is_empty())
-        .take(5)
-        .map(|record| Value::String(record.query.clone()))
+    let sample_queries: Vec<Value> = distinct_queries(&group.records, 5)
+        .into_iter()
+        .map(Value::String)
         .collect();
     let mut provenance = BTreeMap::new();
     provenance.insert(
@@ -676,6 +712,15 @@ fn provenance(group: &StructureGroup, narrative_source: &str) -> BTreeMap<String
         Value::String(narrative_source.to_string()),
     );
     provenance
+}
+
+/// Redacts credential material from the recipe's provenance metadata blob.
+fn sanitize_provenance(provenance: &mut BTreeMap<String, Value>) {
+    let blob: serde_json::Map<String, Value> = provenance.clone().into_iter().collect();
+    if let Value::Object(redacted) = redact_sensitive_json(&Value::Object(blob)) {
+        provenance.clear();
+        provenance.extend(redacted);
+    }
 }
 
 /// Builds the deterministic template texts for one group.
@@ -729,18 +774,18 @@ fn template_texts(
 }
 
 /// Returns up to `limit` distinct non-empty queries in record order.
+///
+/// Queries are trace-derived free text, so each one is sanitized before it is
+/// used: this is the single boundary for the template example requests, the
+/// narrative prompt material, and the recipe provenance.
 fn distinct_queries(records: &[FlowTrace], limit: usize) -> Vec<String> {
     let mut queries = Vec::new();
     for record in records {
-        let query = record.query.trim();
-        if query.is_empty()
-            || queries
-                .iter()
-                .any(|existing: &String| existing.as_str() == query)
-        {
+        let query = sanitize_distilled_text(&record.query, None);
+        if query.is_empty() || queries.iter().any(|existing| existing == &query) {
             continue;
         }
-        queries.push(query.to_string());
+        queries.push(query);
         if queries.len() == limit {
             break;
         }
@@ -782,7 +827,16 @@ fn narrative_prompt(
 }
 
 /// Parses a model reply into texts, returning `None` when it is unusable.
-fn parse_model_texts(reply: &str, template: &RecipeTexts) -> Option<RecipeTexts> {
+///
+/// This is the one boundary where model-written prose enters a recipe: every
+/// accepted field is sanitized against the group's source queries, so a model
+/// that echoes a credential or a verbatim request cannot leak it into the
+/// distilled artifact.
+fn parse_model_texts(
+    reply: &str,
+    template: &RecipeTexts,
+    source_queries: &[String],
+) -> Option<RecipeTexts> {
     let object_text = extract_json_object(reply)?;
     let value: Value = serde_json::from_str(object_text).ok()?;
     let object = value.as_object()?;
@@ -794,18 +848,18 @@ fn parse_model_texts(reply: &str, template: &RecipeTexts) -> Option<RecipeTexts>
         return None;
     }
     let mut texts = template.clone();
-    texts.narrative = narrative.to_string();
+    texts.narrative = sanitize_with_queries(narrative, source_queries);
     texts.source = "llm";
     if let Some(description) = non_empty_string(object.get("task_description")) {
         texts.applicability.insert(
             "task_description".to_string(),
-            Value::String(description.to_string()),
+            Value::String(sanitize_with_queries(description, source_queries)),
         );
     }
     if let Some(trigger) = non_empty_string(object.get("trigger_conditions")) {
         texts.applicability.insert(
             "trigger_conditions".to_string(),
-            Value::String(trigger.to_string()),
+            Value::String(sanitize_with_queries(trigger, source_queries)),
         );
     }
     if let Some(examples) = object.get("example_requests").and_then(Value::as_array) {
@@ -815,7 +869,10 @@ fn parse_model_texts(reply: &str, template: &RecipeTexts) -> Option<RecipeTexts>
             .map(str::trim)
             .filter(|example| !example.is_empty())
             .take(5)
-            .map(|example| Value::String(example.to_string()))
+            .filter_map(|example| {
+                let sanitized = sanitize_with_queries(example, source_queries);
+                (!sanitized.is_empty()).then_some(Value::String(sanitized))
+            })
             .collect();
         if !examples.is_empty() {
             texts
@@ -824,8 +881,9 @@ fn parse_model_texts(reply: &str, template: &RecipeTexts) -> Option<RecipeTexts>
         }
     }
     if let Some(name) = non_empty_string(object.get("name")) {
+        let name = sanitize_with_queries(name, source_queries);
         if !name.contains('→') && !name.contains("->") {
-            texts.name = normalize_meta_name(name, &template.name);
+            texts.name = normalize_meta_name(&name, &template.name);
         }
     }
     Some(texts)
@@ -910,11 +968,12 @@ mod tests {
             &["a".to_string(), "b".to_string()],
             &BTreeMap::new(),
         );
-        assert!(parse_model_texts("no json", &template).is_none());
-        assert!(parse_model_texts("{\"name\": \"x\"}", &template).is_none());
+        assert!(parse_model_texts("no json", &template, &[]).is_none());
+        assert!(parse_model_texts("{\"name\": \"x\"}", &template, &[]).is_none());
         let parsed = parse_model_texts(
             "```json\n{\"execution_narrative\": \"模型叙述\"}\n```",
             &template,
+            &[],
         )
         .expect("parses");
         assert_eq!(parsed.narrative, "模型叙述");
