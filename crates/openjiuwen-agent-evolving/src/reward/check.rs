@@ -203,7 +203,7 @@ impl RewardCheck {
     }
 
     /// The tool this check runs: the explicit one, else the first field of
-    /// [`TOOL_BY_FIELD`] the check actually carries.
+    /// `TOOL_BY_FIELD` the check actually carries.
     ///
     /// A field counts as carried when it is a non-empty string (or, for
     /// `actions`, a non-empty list) — Python's truthiness test.

@@ -7,22 +7,21 @@
 //! (`reward/evidence_agent.py`) and the judged scoring layer (`reward/scoring.py`
 //! and the judge stage of `reward/pipeline.py`).
 //!
-//! - [`RewardSignal`] / [`RewardDimension`] — one measured dimension of quality.
-//! - [`RewardAggregator`] — weighted aggregation with explicit normalisation and
+//! - `RewardSignal` / `RewardDimension` — one measured dimension of quality.
+//! - `RewardAggregator` — weighted aggregation with explicit normalisation and
 //!   missing-dimension policy, deterministic and unit-testable.
-//! - [`RewardSummary`] / [`RewardPack`] — the persisted results and the pack that
+//! - `RewardSummary` / `RewardPack` — the persisted results and the pack that
 //!   describes which dimensions a run scores.
-//! - [`RewardCheck`] / [`CheckRunner`] — the `read` and `python` checks a model
-//!   asks for; browser and picture checks are deferred with a typed error.
-//! - [`EvidenceAgent`] — the model-driven loop that gathers check evidence.
-//! - [`ModelRewardJudge`] — per-criterion judging, the rubric arithmetic
-//!   ([`score_criterion`], [`FLOOR_FAIL_CAP`]) and [`to_reward_signal`], which
-//!   feeds a judged report into the existing pack.
+//! - `RewardCheck` / `CheckRunner` — the `read` and `python` checks a model asks
+//!   for; browser and picture checks are deferred with a typed error.
+//! - `EvidenceAgent` — the model-driven loop that gathers check evidence.
+//! - `ModelRewardJudge` — per-criterion judging, the rubric arithmetic
+//!   (`score_criterion`, `FLOOR_FAIL_CAP`) and `to_reward_signal`, which feeds a
+//!   judged report into the existing pack.
 //!
-//! The records and the arithmetic are pure data; only [`EvidenceAgent`] and
-//! [`ModelRewardJudge`] call a model, and both take it through the shared `Model`
+//! The records and the arithmetic are pure data; only `EvidenceAgent` and
+//! `ModelRewardJudge` call a model, and both take it through the shared `Model`
 //! seam so the offline tests can script it.
-
 mod check;
 mod evidence;
 mod model_check;
