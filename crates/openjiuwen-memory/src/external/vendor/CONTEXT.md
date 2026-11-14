@@ -30,7 +30,7 @@ This directory has no child directories.
 - `./mod.rs` → module docs, the delegation macro, the shared option/scope helpers, `vendor_factories()`, and the unit tests
 - `./mem0.rs` → `Mem0Spec` (`Token` auth), `Mem0MemoryProvider`, `SPEC`
 - `./jiuwen.rs` → `JiuwenSpec` (bearer auth, message history), `JiuwenMemoryProvider`, `SPEC`
-- `./lakebase.rs` → `LakeBaseSpec` (bearer auth, pagination), `LakeBaseMemoryProvider`, `SPEC`
+- `./lakebase/` → `LakeBaseSpec` (bearer auth, pagination, base paths, integer-id boundary, memory-type mapping), `LakeBaseMemoryProvider` with the six `lkb_*` rail tools, `SPEC`
 - `./openviking.rs` → `OpenVikingSpec` (`X-API-Key`, account/user/agent headers), `OpenVikingMemoryProvider`, `SPEC`
 - `./agentarts.rs` → `SdkOnlyProvider` and `AgentArtsMemoryProvider` (typed `Unsupported` only)
 
