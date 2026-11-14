@@ -13,6 +13,11 @@
 //!
 //! No credentials, no real server, and every wait is bounded well under ten
 //! seconds.
+//!
+//! The suite is deliberately one file: the fake server and the scenarios share
+//! one state machine (entries, cursors, pending lists and SET registry), so
+//! splitting them would duplicate the server or force it into `common/` where
+//! every other suite would compile it unused.
 
 mod common;
 
