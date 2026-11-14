@@ -1,9 +1,9 @@
 //! Suites for the background task scheduler.
 //!
-//! Everything here is offline and deterministic: every await is bounded, the
-//! only sleeps are short (a cooperative executor holds a task open just long
-//! enough for a pause/cancel to reach it), and the assertions read the
-//! [`TaskManager`] or a recording session rather than timing.
+//! Everything here is offline and deterministic: every await is bounded, a
+//! sleep only holds an execution open, and any hold an assertion depends on
+//! outlives the step it waits for by at least 10x (>= 500 ms), while the
+//! assertions read the [`TaskManager`] or a recording session, not timing.
 use super::*;
 use crate::controller::schema::TaskResult;
 use async_trait::async_trait;
@@ -425,7 +425,10 @@ async fn concurrency_gate_runs_in_parallel_when_unlimited() {
         schedule_interval_ms: 1,
         ..ControllerConfig::default()
     };
-    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_millis(100)));
+    // The hold has to outlive the gap between the two drivers starting (which
+    // is a spawn apart) by a wide margin, or a loaded machine could observe
+    // `peak == 1`. 500 ms against a sub-millisecond gap leaves ample room.
+    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_millis(500)));
     let fixture = Fixture::new(gated, vec![Arc::clone(&executor) as Arc<dyn TaskExecutor>]);
     fixture.add("t1", TASK_TYPE);
     fixture.add("t2", TASK_TYPE);
@@ -576,7 +579,11 @@ async fn pause_is_refused_when_the_executor_cannot_pause() {
 
 #[tokio::test]
 async fn pause_stops_a_cooperative_task_and_resubmitting_resumes_it() {
-    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_millis(300)));
+    // The pause has to reach the run before the hold elapses; 1 s against the
+    // millisecond-scale path that observes the execution and takes the pause
+    // is a 1000x margin. The resumed run sleeps the same hold once more, which
+    // keeps the suite at about a second.
+    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_secs(1)));
     let fixture = Fixture::new(
         config(),
         vec![Arc::clone(&executor) as Arc<dyn TaskExecutor>],
@@ -827,7 +834,10 @@ async fn in_flight_lists_running_task_ids_in_order() {
         schedule_interval_ms: 1,
         ..ControllerConfig::default()
     };
-    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_millis(200)));
+    // The assertions below require both runs to still be in flight when
+    // `scan_once` returns; the 2 s hold dwarfs that hand-over, and `stop`
+    // cancels the cooperative runs, so the margin costs nothing.
+    let executor = shared(TestExecutor::new(TASK_TYPE).with_hold(Duration::from_secs(2)));
     let fixture = Fixture::new(gated, vec![Arc::clone(&executor) as Arc<dyn TaskExecutor>]);
     fixture.add("t2", TASK_TYPE);
     fixture.add("t1", TASK_TYPE);

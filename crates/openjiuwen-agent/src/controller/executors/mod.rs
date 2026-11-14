@@ -505,6 +505,12 @@ mod tests {
     const FAILING_TASK_TYPE: &str = "failing";
     /// Task type of [`SlowExecutor`].
     const SLOW_TASK_TYPE: &str = "slow";
+    /// How long [`SlowExecutor`] sleeps before reporting `"late"`.
+    ///
+    /// 500 ms against the 10 ms test timeout is a 50x margin, so the timeout
+    /// always wins even when the machine is saturated; the timeout drops the
+    /// sleeping future, so the wide margin costs the test no runtime.
+    const SLOW_EXECUTOR_HOLD: Duration = Duration::from_millis(500);
 
     /// Executor that echoes the task's input text.
     struct EchoExecutor;
@@ -538,7 +544,11 @@ mod tests {
         }
     }
 
-    /// Executor that outlives the test's scheduler timeout.
+    /// Executor that outlives the test's scheduler timeout by a wide margin.
+    ///
+    /// It sleeps for [`SLOW_EXECUTOR_HOLD`] against a 10 ms scheduler timeout,
+    /// so a loaded machine cannot finish the sleep first; the timeout fires long
+    /// before the sleep elapses and cancels it, which keeps the test fast.
     struct SlowExecutor;
 
     #[async_trait]
@@ -548,7 +558,7 @@ mod tests {
         }
 
         async fn execute(&self, _task: &Task, _ctx: &TaskContext<'_>) -> Result<TaskResult> {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(SLOW_EXECUTOR_HOLD).await;
             Ok(TaskResult::text("late"))
         }
     }
@@ -713,10 +723,14 @@ mod tests {
     async fn scheduler_times_out_slow_executors() {
         let mut registry = TaskExecutorRegistry::new();
         registry.add(Arc::new(SlowExecutor));
-        let scheduler =
-            TaskScheduler::new(registry, 0).with_timeout(Some(Duration::from_millis(10)));
+        let timeout = Duration::from_millis(10);
+        let scheduler = TaskScheduler::new(registry, 0).with_timeout(Some(timeout));
 
-        assert_eq!(scheduler.timeout(), Some(Duration::from_millis(10)));
+        assert_eq!(scheduler.timeout(), Some(timeout));
+        assert!(
+            SLOW_EXECUTOR_HOLD >= timeout * 25,
+            "the executor must outlive the budget by a wide margin: {SLOW_EXECUTOR_HOLD:?} vs {timeout:?}"
+        );
         let runs = scheduler
             .dispatch(vec![task("t1", "slow", "do it")], &ctx())
             .await;
