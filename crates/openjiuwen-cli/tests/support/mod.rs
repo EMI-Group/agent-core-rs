@@ -191,6 +191,57 @@ impl Sandbox {
             .block_on(self.run(args))
     }
 
+    /// Runs the binary with extra `key=path` environment overrides, bounded by [`CHILD_WAIT`].
+    ///
+    /// The overrides sit on top of the isolated environment described in the
+    /// module docs, so the ambient-variable scrubbing still applies. This is how
+    /// a suite points `OPENJIUWEN_HOME` at a directory that does not exist (the
+    /// empty-watch-plan case) without giving up hermeticity.
+    pub(crate) async fn run_with_env(
+        &self,
+        args: &[impl AsRef<OsStr>],
+        env: &[(&str, &Path)],
+    ) -> Output {
+        let mut command = tokio::process::Command::from(self.command(args));
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawning `openjiuwen {}`: {err}", joined(args)));
+        match tokio::time::timeout(CHILD_WAIT, child.wait_with_output()).await {
+            Ok(output) => output
+                .unwrap_or_else(|err| panic!("waiting for `openjiuwen {}`: {err}", joined(args))),
+            Err(elapsed) => panic!(
+                "`openjiuwen {}` did not finish within {CHILD_WAIT:?}: {elapsed}",
+                joined(args)
+            ),
+        }
+    }
+
+    /// Spawns the binary with piped streams for a suite that drives it live.
+    ///
+    /// The child inherits the same isolated cwd/home, scrubbed environment and
+    /// `/dev/null` stdin as [`Sandbox::run`], plus `kill_on_drop`, so a failed
+    /// assertion cannot leak a long-running watcher into the rest of the test
+    /// run. The caller owns stdout/stderr and must bound its reads itself (see
+    /// `tests/watch.rs` for the readiness/exit pattern).
+    pub(crate) fn spawn(&self, args: &[impl AsRef<OsStr>]) -> tokio::process::Child {
+        let mut command = tokio::process::Command::from(self.command(args));
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawning `openjiuwen {}`: {err}", joined(args)))
+    }
+
     /// Builds the child command: isolated cwd/home, ambient state removed, stdin closed.
     fn command(&self, args: &[impl AsRef<OsStr>]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_openjiuwen"));
