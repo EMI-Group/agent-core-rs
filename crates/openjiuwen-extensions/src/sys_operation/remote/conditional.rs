@@ -63,16 +63,16 @@ pub(crate) async fn lock_path(provider: &str, path: &str) -> OwnedMutexGuard<()>
     let key = format!("{provider}|{path}");
     let lock = {
         let mut registry = path_locks().lock().unwrap_or_else(PoisonError::into_inner);
-        match registry.get(&key).and_then(Weak::upgrade) {
-            Some(lock) => lock,
-            None => {
-                if registry.len() >= PRUNE_THRESHOLD {
-                    registry.retain(|_, entry| entry.strong_count() > 0);
-                }
-                let lock = Arc::new(AsyncMutex::new(()));
-                registry.insert(key, Arc::downgrade(&lock));
-                lock
+        let existing = registry.get(&key).and_then(Weak::upgrade);
+        if let Some(lock) = existing {
+            lock
+        } else {
+            if registry.len() >= PRUNE_THRESHOLD {
+                registry.retain(|_, entry| entry.strong_count() > 0);
             }
+            let lock = Arc::new(AsyncMutex::new(()));
+            registry.insert(key, Arc::downgrade(&lock));
+            lock
         }
     };
     lock.lock_owned().await

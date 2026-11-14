@@ -25,8 +25,8 @@
 //!
 //! A backend instance that already resolved a container keeps its own copy of
 //! the id, exactly as Python's per-instance `_sandbox_id` does: after a teardown
-//! the next operation sees the container gone and recreates it (JiuwenBox and
-//! YuanRong both already handle that).
+//! the next operation sees the container gone and recreates it (`JiuwenBox`
+//! and `YuanRong` both already handle that).
 
 use openjiuwen_common::error::{Error, Result};
 
@@ -412,6 +412,6 @@ mod tests {
         let unsupported = TeardownReport::not_supported("aio", AIO_TEARDOWN_UNSUPPORTED);
         assert!(!unsupported.is_empty());
         assert_eq!(unsupported.sandbox_type, "aio");
-        assert!(unsupported.deleted.is_empty());
+        assert_eq!(unsupported.deleted, Vec::<String>::new());
     }
 }
