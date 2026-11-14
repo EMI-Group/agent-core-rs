@@ -30,6 +30,16 @@
 //! the group routing of [`BaseController::send_to_agent`] /
 //! [`BaseController::publish`].
 //!
+//! A host that only uses the public controller API reaches those seams without
+//! crate internals: [`BaseController::task_manager`] is the shared store,
+//! [`BaseController::scheduler_state`] / [`BaseController::wake_scheduler`] /
+//! [`BaseController::running_tasks`] are the background scheduler's view, and
+//! [`BaseController::with_group`] / [`BaseController::group_router`] wire and
+//! read the group router. The per-conversation
+//! [`TaskQueue`](super::queue::TaskQueue) is legacy-scoped: this controller
+//! dispatches each turn synchronously and tracks no per-conversation turn, so
+//! the queue lives only on the legacy wrapper.
+//!
 //! The turn pipeline lives in `turn` (event processing, intent routing, task
 //! dispatch, and aggregation) and the task persistence in `state`; this module
 //! holds the controller surface, its shared state, and the plain wiring.
@@ -57,6 +67,7 @@ use futures::stream::BoxStream;
 use openjiuwen_common::error::Result;
 use openjiuwen_session::Session;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -65,6 +76,45 @@ use tracing::{debug, warn};
 
 /// Key the controller task state is persisted under.
 pub const TASKS_STATE_KEY: &str = "__controller_tasks__";
+
+/// Host-facing state of a controller's background task scheduler.
+///
+/// The controller keeps two facts a host would otherwise have to combine: the
+/// running flag ([`BaseController::is_running`]) and the loop handle
+/// ([`BaseController::scheduler_loop`]). This state derives both into one value,
+/// so a host can tell "not started" from "live" from "winding down" without
+/// guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSchedulerState {
+    /// The controller is not marked running: it was never started, or it was
+    /// stopped.
+    Stopped,
+    /// The controller is marked running and a live [`TaskSchedulerLoop`] backs
+    /// it.
+    Running,
+    /// The controller is marked running but no live loop backs it: the loop was
+    /// requested outside a `tokio` runtime, or it is winding down.
+    Stopping,
+}
+
+impl TaskSchedulerState {
+    /// Returns the wire name: `"stopped"`, `"running"`, or `"stopping"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskSchedulerState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// The controller surface: an event in, a controller output out.
 #[async_trait]
@@ -442,6 +492,59 @@ impl BaseController {
         self.inner.scheduler_loop.read().clone()
     }
 
+    /// Returns the host-facing state of the background scheduler.
+    ///
+    /// Derived from [`is_running`](Self::is_running) (the controller's running
+    /// flag) and [`scheduler_loop`](Self::scheduler_loop) (the loop handle), so a
+    /// caller does not have to combine them. [`is_running`](Self::is_running)
+    /// keeps its own meaning: a loop started outside a `tokio` runtime leaves the
+    /// flag set without a live loop, which this reports as
+    /// [`TaskSchedulerState::Stopping`].
+    #[must_use]
+    pub fn scheduler_state(&self) -> TaskSchedulerState {
+        if !self.is_running() {
+            return TaskSchedulerState::Stopped;
+        }
+        match self.scheduler_loop() {
+            Some(scheduler) if scheduler.is_running() => TaskSchedulerState::Running,
+            _ => TaskSchedulerState::Stopping,
+        }
+    }
+
+    /// Wakes the background scheduler for an immediate scan, returning whether a
+    /// running loop was there to wake.
+    ///
+    /// Returns `false` when no loop is running (never started, already stopped,
+    /// or started outside a `tokio` runtime), so a caller that gates its own
+    /// follow-up work on the answer never assumes a scan happened.
+    #[must_use]
+    pub fn wake_scheduler(&self) -> bool {
+        let Some(scheduler) = self.scheduler_loop() else {
+            return false;
+        };
+        if !scheduler.is_running() {
+            return false;
+        }
+        scheduler.wake();
+        true
+    }
+
+    /// Ids of the tasks the background scheduler is currently running, in sorted
+    /// order.
+    ///
+    /// This is the live run view the controller owns: an empty list means no loop
+    /// is started, or nothing is in flight. It deliberately does not cover the
+    /// per-conversation [`TaskQueue`](super::queue::TaskQueue), which is
+    /// legacy-scoped — [`BaseController`] dispatches each turn synchronously and
+    /// tracks no per-conversation turn, so that queue lives only on
+    /// [`IntentDetectionController`](super::legacy::IntentDetectionController).
+    #[must_use]
+    pub fn running_tasks(&self) -> Vec<String> {
+        self.scheduler_loop()
+            .map(|scheduler| scheduler.in_flight())
+            .unwrap_or_default()
+    }
+
     /// Pauses the task `task_id`, returning whether it was paused.
     ///
     /// A started scheduler pauses a running task through the executor hooks and
@@ -590,6 +693,27 @@ impl BaseController {
         self.inner.group.read().clone()
     }
 
+    /// Returns the group router this controller routes through, if any.
+    ///
+    /// This is [`group`](Self::group) under the facade's name; both read the same
+    /// injected router.
+    #[must_use]
+    pub fn group_router(&self) -> Option<Arc<dyn GroupRouter>> {
+        self.group()
+    }
+
+    /// Injects `router` as the group this controller's agent belongs to and
+    /// returns the controller, for builder-style wiring.
+    ///
+    /// The router is stored exactly as [`set_group`](Self::set_group) stores it,
+    /// so clones made before the call keep the previous wiring and clones made
+    /// after share the new one.
+    #[must_use]
+    pub fn with_group(self, router: Arc<dyn GroupRouter>) -> Self {
+        self.set_group(router);
+        self
+    }
+
     /// Sends `event` to `agent_id` through the group's controller.
     ///
     /// # Errors
@@ -698,12 +822,63 @@ fn planner_for(config: &ControllerConfig, next_seq: u64) -> Planner {
 
 #[cfg(test)]
 mod accessor_tests {
-    use super::fixtures::{test_session, StubExecutor};
+    use super::fixtures::{controller_with_executor, test_session, StubExecutor};
     use super::*;
 
     #[test]
     fn state_key_matches_python() {
         assert_eq!(TASKS_STATE_KEY, "__controller_tasks__");
+    }
+
+    #[test]
+    fn scheduler_state_names_are_stable() {
+        assert_eq!(TaskSchedulerState::Stopped.as_str(), "stopped");
+        assert_eq!(TaskSchedulerState::Running.to_string(), "running");
+        assert_eq!(TaskSchedulerState::Stopping.as_str(), "stopping");
+        assert_eq!(
+            serde_json::to_value(TaskSchedulerState::Running).unwrap(),
+            serde_json::json!("running")
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_state_and_wake_follow_the_loop_lifecycle() {
+        let (controller, _calls) = controller_with_executor();
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Stopped);
+        assert!(!controller.wake_scheduler(), "no loop to wake");
+        assert_eq!(controller.running_tasks(), Vec::<String>::new());
+
+        controller.start();
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Running);
+        assert!(controller.wake_scheduler(), "the started loop is woken");
+        assert_eq!(
+            controller.running_tasks(),
+            Vec::<String>::new(),
+            "nothing is in flight"
+        );
+        controller.shutdown().await;
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Stopped);
+        assert!(!controller.wake_scheduler());
+
+        controller.start();
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Running);
+        controller.stop();
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Stopped);
+        assert!(!controller.wake_scheduler());
+    }
+
+    #[test]
+    fn scheduler_state_without_a_runtime_is_stopping() {
+        let (controller, _calls) = controller_with_executor();
+        controller.start();
+        assert!(controller.is_running(), "the flag flips outside a runtime");
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Stopping);
+        assert!(
+            !controller.wake_scheduler(),
+            "no spawned loop exists to wake"
+        );
+        controller.stop();
+        assert_eq!(controller.scheduler_state(), TaskSchedulerState::Stopped);
     }
 
     #[tokio::test]

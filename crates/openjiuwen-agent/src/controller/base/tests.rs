@@ -486,6 +486,43 @@ async fn group_routing_forwards_and_fails_without_a_group() {
 }
 
 #[tokio::test]
+async fn with_group_wires_the_router_builder_style() {
+    let event = Event::user_input("hi");
+    let recorder = Arc::new(RecordingRouter {
+        group_id: Some("group-1"),
+        ..RecordingRouter::default()
+    });
+    let controller =
+        BaseController::new(AgentCard::new("ctrl"), ControllerConfig::new()).with_group(recorder);
+    let router = controller
+        .group_router()
+        .expect("the builder injected a group");
+    assert_eq!(router.group_id(), Some("group-1"));
+    assert!(
+        controller.group().is_some(),
+        "group() and group_router() read the same router"
+    );
+
+    let value = controller
+        .send_to_agent("a1", &event, Some(test_session()))
+        .await
+        .expect("the injected router forwards the send");
+    assert_eq!(value, json!({"target": "a1"}));
+
+    controller.clear_group();
+    assert!(controller.group_router().is_none());
+    let error = controller
+        .send_to_agent("a1", &event, None)
+        .await
+        .expect_err("the cleared group is gone");
+    assert_eq!(error.kind(), ErrorKind::Config);
+    assert_eq!(
+        error.message(),
+        "ctrl: Cannot send_to_agent('a1'). Agent is not part of a group with a controller."
+    );
+}
+
+#[tokio::test]
 async fn reasoner_creates_a_task_the_loop_runs() {
     let (controller, calls) = controller_with_executor();
     controller.start();

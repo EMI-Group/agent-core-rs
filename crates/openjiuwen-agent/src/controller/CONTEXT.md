@@ -14,10 +14,14 @@ Two Python generations live here without sharing types: the current event-queue 
 ### Turn loop — `base/`
 
 - `Controller` — `card`, `invoke(inputs, session) -> Result<ControllerOutput>`, `stream(inputs, session) -> BoxStream<'static, Result<ControllerOutputChunk>>`.
-- `BaseController` (holds an `Arc<Inner>`, is `Clone`) — `new(card, config)`, `with_recognizer`, `card`/`config`/`set_config`, `push_event`/`drain_events`/`pending_events`, `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner`, `add_executor`/`add_default_executor`/`remove_executor`/`executor`/`task_types`/`registry`/`scheduler`, `task_manager`, `start`/`stop`/`shutdown`/`is_running`/`scheduler_loop`, `pause_task`/`cancel_task`, `bind_session`/`unbind_session`/`bound_sessions`, `save_state`/`load_state`, `reasoner`/`apply_task_ops`, `set_group`/`clear_group`/`group`/`send_to_agent`/`publish`, plus `impl TaskControl` (a resume flips `Paused` → `Submitted` and wakes the loop).
+- `BaseController` (holds an `Arc<Inner>`, is `Clone`) — `new(card, config)`, `with_recognizer`, `card`/`config`/`set_config`, `push_event`/`drain_events`/`pending_events`, `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner`, `add_executor`/`add_default_executor`/`remove_executor`/`executor`/`task_types`/`registry`/`scheduler`, `task_manager`, `start`/`stop`/`shutdown`/`is_running`/`scheduler_loop`, `scheduler_state`/`wake_scheduler`/`running_tasks`, `pause_task`/`cancel_task`, `bind_session`/`unbind_session`/`bound_sessions`, `save_state`/`load_state`, `reasoner`/`apply_task_ops`, `set_group`/`clear_group`/`group`/`group_router`/`with_group`/`send_to_agent`/`publish`, plus `impl TaskControl` (a resume flips `Paused` → `Submitted` and wakes the loop).
+- `TaskSchedulerState` — the host-facing scheduler view: `Stopped` (the running flag is false), `Running` (flag set and a live `TaskSchedulerLoop` backs it), `Stopping` (flag set, no live loop: started outside a runtime or winding down); `as_str()`/`Display` yield the snake_case wire names and the type is serde-serializable.
 - `EventHandler` / `EventHandlerOutcome` — `Intents(Vec<Intent>)`, `Output(Box<ControllerOutput>)`, `Ignored`; a handler replaces the built-in recognizer for an event and is what the `Reasoner`-driven path installs on.
 - `TASKS_STATE_KEY` — `"__controller_tasks__"`; the session state key holds `{"tasks": [...], "next_seq": n}` (a `TaskManagerState`).
 - The turn pipeline: drain the queue → handler/recognizer → `Planner` → registry lookup (task type from the intent, else the router's choice, else `default_task_type`) → `TaskScheduler` (sequential value-type dispatch) → `TaskManager::add_tasks` for the tasks that actually ran → aggregate.
+- Scheduler facade — `scheduler_state()` derives `Stopped`/`Running`/`Stopping` from `is_running()` plus `scheduler_loop()`, `wake_scheduler()` wakes a live loop and returns `false` without one, and `running_tasks()` lists the loop's in-flight task ids (empty without a loop).
+- The scheduling knobs are set through `ControllerConfig` builders: `with_max_concurrent_tasks`, `with_schedule_interval`, `with_task_timeout`; dependency gating has no config field because the loop reads `metadata["depends_on"]` per task.
+- The per-conversation `TaskQueue` is legacy-scoped: `BaseController` dispatches each turn synchronously and tracks no per-conversation turn, so the queue (and `has_running`/`running_conversations`/`interrupt`) lives only on `IntentDetectionController`.
 - Global aggregate precedence is `InputRequired` > `Completed` > `Failed`; completed texts are joined by `\n\n`, `default_response.text` fills an empty aggregate, and `data` is `{"tasks": [{"task_id", "status", "output"}...]}`.
 - `stream` emits one `processing` chunk, then the turn's frames, then one terminal `last_chunk` chunk unless `suppress_completion_signal` is set; a preempted/aborted turn is `Error::Cancelled`.
 
@@ -60,12 +64,14 @@ Two Python generations live here without sharing types: the current event-queue 
 - `GroupRouter` — `group_id`, `async send_to_agent(agent_id, &Event, Option<Arc<dyn Session>>) -> Result<Value>`, `async publish(&Event, Option<Arc<dyn Session>>) -> Result<Vec<Value>>`.
 - `GroupMethod::{SendToAgent(&str), Publish}` (`method_name`, `agent_id`, `Display`); `NOT_IN_GROUP = "Agent is not part of a group with a controller."`.
 - `BaseController::send_to_agent`/`publish` return `group::send_without_group`/`publish_without_group` (`Error::Config` naming the method and, for a send, the agent) when no router is installed; `require_group` is the shared guard.
+- `BaseController::group_router()` reads the same injected router as `group()`, and `with_group(router)` is the builder-style `set_group` so a controller can be wired in one expression.
 
 ### Per-conversation queue — `queue.rs`
 
 - `TaskQueue` — `register(conversation_id, Task, JoinHandle<()>, CancellationToken, target_id) -> RunningTask`, `async cancel_running(conversation_id) -> bool`, `unregister`, `find`, `has_running`, `running_conversations`, `len`, `is_empty`.
 - `RunningTask` is a detachable snapshot (`Clone` deliberately does not clone the join handle) carrying `conversation_id`, `task`, `target_id`, `started_at` (monotonic), `token`, `is_finished`.
 - `cancel_running` cancels the token and awaits the handle, mapping a cancelled `JoinError` to success and leaving the entry for its owner to unregister.
+- The queue is legacy-scoped: only `IntentDetectionController::task_queue()` (plus `has_running`/`running_conversations`/`interrupt`) exposes it, because `BaseController` dispatches synchronously and drives no per-conversation turn; `BaseController::running_tasks()` reports the background loop's in-flight runs instead.
 
 ### Legacy lineage — `legacy/`
 
