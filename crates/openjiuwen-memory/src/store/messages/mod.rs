@@ -188,7 +188,6 @@ impl MessageStore {
     /// `has_more == false`; a malformed `cursor` is [`Error::Validation`].
     ///
     /// [`Error::Validation`]: openjiuwen_common::error::Error::Validation
-    #[cfg_attr(not(test), allow(dead_code))] // no in-crate pagination caller yet
     pub(crate) async fn page(
         &self,
         scope: &MemoryScope,
@@ -772,11 +771,17 @@ mod tests {
             assert!(page.has_more);
             page.next_cursor.expect("cursor")
         };
+        // The token carries the position of the last returned row (`timestamp`, `id`), not
+        // an offset, so it stays valid against a store instance this process did not open.
+        assert!(cursor.starts_with("mc1."), "{cursor}");
         let reopened = MessageStore::new(Arc::new(
             LocalFileDocumentStore::new(&root)
                 .await
                 .expect("reopen documents"),
         ));
+        // Appending an older row after the first page shifts every offset by one; an
+        // offset-based resume would repeat `two`, a position-based one still yields `three`.
+        append_user(&reopened, &scope, "zero", -1).await;
         let page = reopened
             .page(&scope, 2, Some(&cursor), None)
             .await

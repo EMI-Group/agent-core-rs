@@ -580,7 +580,6 @@ impl MigrationPlanner {
 ///
 /// The first `FLOAT_VECTOR` field with a dimension wins, mirroring the store's own
 /// default-vector-field rule. `None` means the collection cannot be scanned.
-#[allow(dead_code)] // consumed by the `vector` and `index_version` migrators
 pub(crate) fn vector_field(schema: &CollectionSchema) -> Option<(&str, usize)> {
     schema
         .vector_fields()
@@ -589,7 +588,6 @@ pub(crate) fn vector_field(schema: &CollectionSchema) -> Option<(&str, usize)> {
 }
 
 /// Upper bound passed to the snapshot scan; the store truncates results to `top_k`.
-#[allow(dead_code)] // consumed by the `vector` and `index_version` migrators
 pub(crate) const SCAN_TOP_K: usize = usize::MAX;
 
 /// Every document of `collection`, with vector fields restored as JSON arrays.
@@ -604,7 +602,6 @@ pub(crate) const SCAN_TOP_K: usize = usize::MAX;
 /// A missing collection yields an empty vector. A collection whose schema declares no
 /// `FLOAT_VECTOR` field is `Error::Unsupported` naming the collection, because such a
 /// collection cannot be searched and therefore cannot be scanned.
-#[allow(dead_code)] // consumed by the `vector` and `index_version` migrators
 pub(crate) async fn scan_collection(
     store: &dyn VectorStore,
     collection: &str,

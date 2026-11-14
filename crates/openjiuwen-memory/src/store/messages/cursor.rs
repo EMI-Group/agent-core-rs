@@ -231,7 +231,9 @@ pub(super) fn page_filter(
 ) -> Value {
     let mut clauses = match scope_filter(scope) {
         Value::Object(clauses) => clauses,
-        _ => Map::new(),
+        // `scope_filter` always builds an object; if that ever changes, fail closed
+        // instead of returning an empty filter that would widen the page.
+        _ => return match_nothing(),
     };
     if let Some(filter) = filter {
         if let Value::Object(extra) = message_filter(filter) {

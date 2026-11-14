@@ -63,7 +63,7 @@ impl MemoryStorage {
     }
 
     /// The prefix layout every derived key uses.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the prefix-layout tests; no in-crate caller yet
+    #[cfg_attr(not(test), allow(dead_code))] // read by the prefix-layout tests only
     pub(crate) fn prefixes(&self) -> &KvPrefixRegistry {
         &self.prefixes
     }
@@ -325,7 +325,6 @@ impl MemoryStorage {
     /// module never interprets, defaults, or validates its shape. An existing payload is
     /// replaced. `scope_id` is validated like every other scope-keyed namespace, so it
     /// cannot escape the `memory_scope_overrides/{scope_id}` key.
-    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
     pub(crate) async fn set_scope_overrides(&self, scope_id: &str, value: Value) -> Result<()> {
         validate_scope_id(scope_id)?;
         let key = keys::scope_overrides_key(scope_id);
@@ -341,7 +340,6 @@ impl MemoryStorage {
     ///
     /// A missing key is not an error. A stored value that is not UTF-8 text or not valid
     /// JSON is [`Error::Validation`], never a silent default.
-    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
     pub(crate) async fn get_scope_overrides(&self, scope_id: &str) -> Result<Option<Value>> {
         validate_scope_id(scope_id)?;
         let key = keys::scope_overrides_key(scope_id);
@@ -362,7 +360,6 @@ impl MemoryStorage {
     }
 
     /// Deletes the analyzer-override payload of `scope_id`, returning whether it existed.
-    #[cfg_attr(not(test), allow(dead_code))] // no in-crate caller yet
     pub(crate) async fn delete_scope_overrides(&self, scope_id: &str) -> Result<bool> {
         validate_scope_id(scope_id)?;
         let key = keys::scope_overrides_key(scope_id);
@@ -377,7 +374,6 @@ impl MemoryStorage {
 /// The rules are the [`MemoryScope`] rules (non-empty, no `/`, `\` or NUL, at most 128
 /// characters), so an invalid id is [`Error::Validation`] rather than a key that
 /// collides with a neighbouring scope's namespace.
-#[cfg_attr(not(test), allow(dead_code))] // called by the scope-override methods only
 fn validate_scope_id(scope_id: &str) -> Result<()> {
     MemoryScope::new(crate::record::DEFAULT_ID, scope_id).validate()?;
     Ok(())
