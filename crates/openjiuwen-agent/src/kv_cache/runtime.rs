@@ -1,11 +1,12 @@
 //! In-process prefix runtime: record, lookup, `LRU`/`TTL` eviction, and the
 //! deterministic prefix hash.
 //!
-//! Ports the bookkeeping half of `openjiuwen/core/kv_cache/kv_cache_runtime.py`
-//! without the provider action state machine: this runtime keeps the prefixes an
-//! agent has already sent so the next model call can report how much of its
-//! request is reusable. Provider-side prefetch/offload is deferred (see
-//! [`crate::kv_cache::types::KVCacheBackend`]).
+//! Ports the bookkeeping half of `openjiuwen/core/kv_cache/kv_cache_runtime.py`:
+//! this runtime keeps the prefixes an agent has already sent so the next model
+//! call can report how much of its request is reusable. Provider-side
+//! prefetch/offload/evict runs through
+//! [`crate::kv_cache::action_runtime::KvCacheActionRuntime`] instead, and the
+//! prefix backends are selected by [`crate::kv_cache::types::KVCacheBackend`].
 //!
 //! All state sits behind one [`parking_lot::Mutex`] and no lock is held across an
 //! `await`, so the async protocol methods stay cancellation-safe.

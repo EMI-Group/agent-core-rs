@@ -14,12 +14,21 @@
 //! 4. dispatch the tasks to the registered [`TaskExecutor`]s, and
 //! 5. aggregate the runs into one [`ControllerOutput`].
 //!
-//! Task state survives between turns in the session under [`TASKS_STATE_KEY`],
-//! so a later controller instance restores it with
-//! [`BaseController::load_state`]. Unlike Python's background scheduler this
-//! port never spawns a scheduling loop: one `invoke` processes exactly the
-//! events queued when it started, and the `stream` seam wraps that turn in a
-//! channel.
+//! Task state lives in the shared [`TaskManager`] and survives between turns in
+//! the session under [`TASKS_STATE_KEY`], so a later controller instance
+//! restores it with [`BaseController::load_state`]. One `invoke` processes
+//! exactly the events queued when it started and dispatches its batch
+//! synchronously; [`BaseController::start`] additionally runs the
+//! [`TaskSchedulerLoop`] in the background, so work added straight to the
+//! manager (by a reasoner, a host, or a restored session) runs without another
+//! turn.
+//!
+//! The controller is also the kernel's seam for the surrounding controller
+//! stack: [`BaseController::pause_task`] / [`BaseController::cancel_task`] and
+//! the [`TaskControl`] impl behind the reasoner, the additive
+//! [`BaseController::reasoner`] / [`BaseController::apply_task_ops`] path, and
+//! the group routing of [`BaseController::send_to_agent`] /
+//! [`BaseController::publish`].
 //!
 //! The turn pipeline lives in `turn` (event processing, intent routing, task
 //! dispatch, and aggregation) and the task persistence in `state`; this module
@@ -34,10 +43,14 @@ mod tests;
 
 use super::config::ControllerConfig;
 use super::executors::{
-    TaskContext, TaskExecutor, TaskExecutorRegistry, TaskRouter, TaskScheduler,
+    SessionProvider, TaskContext, TaskExecutor, TaskExecutorRegistry, TaskRouter, TaskScheduler,
+    TaskSchedulerLoop,
 };
+use super::group::{require_group, GroupMethod, GroupRouter};
 use super::intent::{IntentRecognizer, Planner, RuleIntentRecognizer};
-use super::schema::{ControllerOutput, ControllerOutputChunk, Event, Intent, Task};
+use super::reasoner::{Reasoner, TaskControl, TaskOp, TaskOpOutcome};
+use super::schema::{ControllerOutput, ControllerOutputChunk, Event, Intent, TaskStatus};
+use super::task_manager::TaskManager;
 use crate::card::AgentCard;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -48,6 +61,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 /// Key the controller task state is persisted under.
 pub const TASKS_STATE_KEY: &str = "__controller_tasks__";
@@ -130,8 +144,8 @@ struct TurnState {
 pub(super) struct Inner {
     /// Identity of the controller.
     pub(super) card: AgentCard,
-    /// Behaviour knobs.
-    pub(super) config: RwLock<ControllerConfig>,
+    /// Behaviour knobs, shared with the background scheduler.
+    pub(super) config: Arc<RwLock<ControllerConfig>>,
     /// Recognizer used when no handler is set.
     pub(super) recognizer: RwLock<Arc<dyn IntentRecognizer>>,
     /// Optional event handler.
@@ -140,16 +154,22 @@ pub(super) struct Inner {
     pub(super) router: RwLock<Option<Arc<dyn TaskRouter>>>,
     /// Intent-to-task planner (owns the id sequence).
     pub(super) planner: RwLock<Planner>,
-    /// Executors keyed by task type.
-    pub(super) registry: RwLock<TaskExecutorRegistry>,
+    /// Executors keyed by task type, shared with the background scheduler.
+    pub(super) registry: Arc<RwLock<TaskExecutorRegistry>>,
     /// Bounded FIFO event queue.
     pub(super) events: RwLock<VecDeque<Event>>,
-    /// Tasks persisted across turns, keyed by task id.
-    pub(super) tasks: RwLock<BTreeMap<String, Task>>,
-    /// Sessions this controller is currently bound to, keyed by session id.
-    pub(super) sessions: RwLock<BTreeMap<String, Arc<dyn Session>>>,
+    /// Tasks persisted across turns and shared with the background scheduler.
+    pub(super) tasks: TaskManager,
+    /// Sessions this controller is currently bound to, shared with the
+    /// background scheduler's session lookup.
+    pub(super) sessions: Arc<RwLock<BTreeMap<String, Arc<dyn Session>>>>,
     /// Whether the controller loop is marked running.
     pub(super) running: RwLock<bool>,
+    /// The lazily started background task scheduler, once [`BaseController::start`]
+    /// ran inside a `tokio` runtime.
+    pub(super) scheduler_loop: RwLock<Option<Arc<TaskSchedulerLoop>>>,
+    /// The group this controller's agent belongs to, when injected.
+    pub(super) group: RwLock<Option<Arc<dyn GroupRouter>>>,
 }
 
 /// Event-queue + intent recognizer + planner + task scheduler, wired into one
@@ -179,19 +199,22 @@ impl BaseController {
         recognizer: Arc<dyn IntentRecognizer>,
     ) -> Self {
         let planner = planner_for(&config, 1);
+        let tasks = TaskManager::with_config(config.clone());
         Self {
             inner: Arc::new(Inner {
                 card,
-                config: RwLock::new(config),
+                config: Arc::new(RwLock::new(config)),
                 recognizer: RwLock::new(recognizer),
                 handler: RwLock::new(None),
                 router: RwLock::new(None),
                 planner: RwLock::new(planner),
-                registry: RwLock::new(TaskExecutorRegistry::new()),
+                registry: Arc::new(RwLock::new(TaskExecutorRegistry::new())),
                 events: RwLock::new(VecDeque::new()),
-                tasks: RwLock::new(BTreeMap::new()),
-                sessions: RwLock::new(BTreeMap::new()),
+                tasks,
+                sessions: Arc::new(RwLock::new(BTreeMap::new())),
                 running: RwLock::new(false),
+                scheduler_loop: RwLock::new(None),
+                group: RwLock::new(None),
             }),
         }
     }
@@ -215,6 +238,7 @@ impl BaseController {
     pub fn set_config(&self, config: ControllerConfig) {
         let next_seq = self.inner.planner.read().next_seq();
         *self.inner.planner.write() = planner_for(&config, next_seq);
+        self.inner.tasks.set_config(config.clone());
         *self.inner.config.write() = config;
     }
 
@@ -327,14 +351,147 @@ impl BaseController {
             .with_timeout(config.task_timeout_ms.map(Duration::from_millis))
     }
 
-    /// Marks the controller loop running.
-    pub fn start(&self) {
-        *self.inner.running.write() = true;
+    /// Returns a handle to the task store this controller and its background
+    /// scheduler share.
+    ///
+    /// The handle is cheap to clone and synchronous, so a host can inspect,
+    /// insert, or update tasks without going through a turn.
+    #[must_use]
+    pub fn task_manager(&self) -> TaskManager {
+        self.inner.tasks.clone()
     }
 
-    /// Marks the controller loop stopped.
+    /// Marks the controller loop running and starts the background task
+    /// scheduler.
+    ///
+    /// The scheduler is built lazily on the first call and started once: a
+    /// second `start` keeps the running loop instead of spawning another. A
+    /// stopped loop is replaced by a fresh one, because a
+    /// [`TaskSchedulerLoop`] is single-use.
+    ///
+    /// Outside a `tokio` runtime only the running flag flips (the scheduler is
+    /// a spawned task); the call never panics. The loop shares this
+    /// controller's task store, executor registry, configuration, and bound
+    /// sessions, so a task inserted with
+    /// [`task_manager`](Self::task_manager) runs without another turn.
+    pub fn start(&self) {
+        *self.inner.running.write() = true;
+        if tokio::runtime::Handle::try_current().is_err() {
+            debug!(
+                controller_id = self.card().id(),
+                "no tokio runtime: the controller runs without a background task scheduler"
+            );
+            return;
+        }
+        let mut slot = self.inner.scheduler_loop.write();
+        if slot
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.is_running())
+        {
+            return;
+        }
+        let scheduler = self.build_scheduler_loop();
+        scheduler.start();
+        *slot = Some(scheduler);
+    }
+
+    /// Marks the controller loop stopped and asks the background scheduler to
+    /// stop.
+    ///
+    /// The call is synchronous: inside a `tokio` runtime it spawns the
+    /// scheduler's [`stop`](TaskSchedulerLoop::stop) and returns, so a caller
+    /// that needs the in-flight runs finished uses
+    /// [`shutdown`](Self::shutdown) instead. The handle is cleared immediately,
+    /// so a later [`start`](Self::start) builds a fresh loop. Outside a runtime
+    /// there is nothing to await; a loop started by an earlier runtime is left
+    /// to that runtime's teardown and a warning is logged.
     pub fn stop(&self) {
         *self.inner.running.write() = false;
+        let scheduler = self.inner.scheduler_loop.write().take();
+        let Some(scheduler) = scheduler else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { scheduler.stop().await });
+        } else {
+            warn!(
+                controller_id = self.card().id(),
+                "no tokio runtime: the background task scheduler is left to its runtime"
+            );
+        }
+    }
+
+    /// Marks the controller loop stopped and awaits the background scheduler's
+    /// stop, including every in-flight run.
+    ///
+    /// Unlike [`stop`](Self::stop) this is async, so a caller that needs the
+    /// runs settled (a test, or a host shutting down) awaits it. Calling it on a
+    /// controller that never started a scheduler is a no-op.
+    pub async fn shutdown(&self) {
+        *self.inner.running.write() = false;
+        let scheduler = self.inner.scheduler_loop.write().take();
+        if let Some(scheduler) = scheduler {
+            scheduler.stop().await;
+        }
+    }
+
+    /// Returns the background scheduler, once [`start`](Self::start) ran inside
+    /// a `tokio` runtime.
+    #[must_use]
+    pub fn scheduler_loop(&self) -> Option<Arc<TaskSchedulerLoop>> {
+        self.inner.scheduler_loop.read().clone()
+    }
+
+    /// Pauses the task `task_id`, returning whether it was paused.
+    ///
+    /// A started scheduler pauses a running task through the executor hooks and
+    /// cancels its run (see [`TaskSchedulerLoop::pause_task`]). Without one the
+    /// call is manager-only: an unknown id returns `false`, a
+    /// [`TaskStatus::Submitted`] or [`TaskStatus::Working`] task becomes
+    /// [`TaskStatus::Paused`] and returns `true`, and every other status
+    /// returns `false`.
+    pub async fn pause_task(&self, task_id: &str) -> bool {
+        if let Some(scheduler) = self.scheduler_loop() {
+            return scheduler.pause_task(task_id).await;
+        }
+        let Some(task) = self.inner.tasks.task(task_id) else {
+            return false;
+        };
+        if !matches!(task.status, TaskStatus::Submitted | TaskStatus::Working) {
+            return false;
+        }
+        self.inner
+            .tasks
+            .update_task_status(task_id, TaskStatus::Paused, false, false, None);
+        true
+    }
+
+    /// Cancels the task `task_id`, returning whether it was cancelled.
+    ///
+    /// A started scheduler drives the two-phase cancel of
+    /// [`TaskSchedulerLoop::cancel_task`]. Without one the call is manager-only:
+    /// an unknown id returns `false`, a [`TaskStatus::Submitted`] task becomes
+    /// [`TaskStatus::Canceled`] and returns `true`, and a task that already
+    /// reached a terminal status returns `true` without changing (idempotent).
+    /// A [`TaskStatus::Working`] task needs the scheduler to be stopped, so it
+    /// returns `false` here.
+    pub async fn cancel_task(&self, task_id: &str) -> bool {
+        if let Some(scheduler) = self.scheduler_loop() {
+            return scheduler.cancel_task(task_id).await;
+        }
+        let Some(task) = self.inner.tasks.task(task_id) else {
+            return false;
+        };
+        if task.status.is_terminal() {
+            return true;
+        }
+        if task.status != TaskStatus::Submitted {
+            return false;
+        }
+        self.inner
+            .tasks
+            .update_task_status(task_id, TaskStatus::Canceled, false, false, None);
+        true
     }
 
     /// Whether the controller loop is marked running.
@@ -370,6 +527,163 @@ impl BaseController {
     #[must_use]
     pub fn bound_sessions(&self) -> Vec<String> {
         self.inner.sessions.read().keys().cloned().collect()
+    }
+
+    /// Builds the reasoner over the current configuration, with this controller
+    /// installed as its [`TaskControl`].
+    ///
+    /// The reasoner is the additive seam hosts use to turn intents into task
+    /// operations; the built-in turn keeps its own control-intent handling.
+    #[must_use]
+    pub fn reasoner(&self) -> Reasoner {
+        let control: Arc<dyn TaskControl> = Arc::new(self.clone());
+        Reasoner::new(self.config(), Some(control))
+    }
+
+    /// Applies `ops` to this controller's task store and wakes the background
+    /// scheduler.
+    ///
+    /// The planner is held for the batch (task ids stay unique across callers)
+    /// and restored afterwards, so the caller sees the outcomes of every op;
+    /// `session_id` scopes the minted ids, and `session` carries the
+    /// clarification state of an [`TaskOp::Unknown`].
+    pub async fn apply_task_ops(
+        &self,
+        ops: &[TaskOp],
+        session_id: &str,
+        session: Option<&Arc<dyn Session>>,
+    ) -> Vec<TaskOpOutcome> {
+        let reasoner = self.reasoner();
+        let manager = self.task_manager();
+        // `Reasoner::apply_task_ops` needs `&mut Planner` across awaits, so the
+        // planner is moved out of its lock for the batch and written back
+        // afterwards instead of holding a lock across an `await`.
+        let mut planner = std::mem::take(&mut *self.inner.planner.write());
+        let outcomes = reasoner
+            .apply_task_ops(ops, &manager, &mut planner, session_id, session)
+            .await;
+        *self.inner.planner.write() = planner;
+        if let Some(scheduler) = self.scheduler_loop() {
+            scheduler.wake();
+        }
+        outcomes
+    }
+
+    /// Injects the group this controller's agent belongs to.
+    ///
+    /// Python calls this from `BaseGroup.add_agent`; [`send_to_agent`](
+    /// Self::send_to_agent) and [`publish`](Self::publish) then route through
+    /// the group's controller.
+    pub fn set_group(&self, group: Arc<dyn GroupRouter>) {
+        *self.inner.group.write() = Some(group);
+    }
+
+    /// Removes the group reference, so routing fails with the typed
+    /// "not part of a group" error again.
+    pub fn clear_group(&self) {
+        *self.inner.group.write() = None;
+    }
+
+    /// Returns the group router this controller routes through, if any.
+    #[must_use]
+    pub fn group(&self) -> Option<Arc<dyn GroupRouter>> {
+        self.inner.group.read().clone()
+    }
+
+    /// Sends `event` to `agent_id` through the group's controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed configuration error of
+    /// [`group::send_without_group`](super::group::send_without_group) when no
+    /// group is installed, and whatever the group reports for an unknown target
+    /// or a failing routed turn.
+    pub async fn send_to_agent(
+        &self,
+        agent_id: &str,
+        event: &Event,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<Value> {
+        let group = self.group();
+        let router = require_group(
+            group.as_ref(),
+            self.group_owner(),
+            GroupMethod::SendToAgent(agent_id),
+        )?;
+        router.send_to_agent(agent_id, event, session).await
+    }
+
+    /// Publishes `event` to every subscriber through the group's controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed configuration error of
+    /// [`group::publish_without_group`](super::group::publish_without_group) when
+    /// no group is installed, and whatever the group reports for a publish it
+    /// cannot dispatch.
+    pub async fn publish(
+        &self,
+        event: &Event,
+        session: Option<Arc<dyn Session>>,
+    ) -> Result<Vec<Value>> {
+        let group = self.group();
+        let router = require_group(group.as_ref(), self.group_owner(), GroupMethod::Publish)?;
+        router.publish(event, session).await
+    }
+
+    /// Name the group errors are attributed to: the card name, or its id when
+    /// the name is empty.
+    fn group_owner(&self) -> &str {
+        let card = &self.inner.card;
+        if card.name().is_empty() {
+            card.id()
+        } else {
+            card.name()
+        }
+    }
+
+    /// Builds the background scheduler over the shared state.
+    fn build_scheduler_loop(&self) -> Arc<TaskSchedulerLoop> {
+        let sessions = Arc::clone(&self.inner.sessions);
+        let provider: SessionProvider =
+            Arc::new(move |session_id: &str| sessions.read().get(session_id).cloned());
+        Arc::new(TaskSchedulerLoop::new(
+            self.inner.tasks.clone(),
+            Arc::clone(&self.inner.registry),
+            Arc::clone(&self.inner.config),
+            self.inner.card.id().to_owned(),
+            provider,
+        ))
+    }
+}
+
+#[async_trait]
+impl TaskControl for BaseController {
+    async fn pause(&self, task_id: &str) -> bool {
+        self.pause_task(task_id).await
+    }
+
+    async fn cancel(&self, task_id: &str) -> bool {
+        self.cancel_task(task_id).await
+    }
+
+    /// Flips a [`TaskStatus::Paused`] task back to [`TaskStatus::Submitted`]
+    /// and wakes the scheduler.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn resume(&self, task_id: &str) -> bool {
+        let Some(task) = self.inner.tasks.task(task_id) else {
+            return false;
+        };
+        if task.status != TaskStatus::Paused {
+            return false;
+        }
+        self.inner
+            .tasks
+            .update_task_status(task_id, TaskStatus::Submitted, false, false, None);
+        if let Some(scheduler) = self.scheduler_loop() {
+            scheduler.wake();
+        }
+        true
     }
 }
 

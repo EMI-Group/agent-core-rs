@@ -2,35 +2,81 @@
 
 ## Intent
 
-The controller turn loop: a bounded event queue, intent recognition, planning, sequential task dispatch, output aggregation, and session-persisted task state.
-Ports the driver half of Python `openjiuwen/core/controller/base.py` (`invoke`, `stream`, `bind_session`, `add_task_executor`, `set_event_handler`, `_ensure_started`) onto a single-turn in-process loop.
+The controller turn loop — bounded event queue, intent recognition, planning, synchronous dispatch, aggregation, and session-persisted task state — plus the lifecycle, task control, reasoner application, and group routing that sit beside it.
+Ports the driver half of Python `openjiuwen/core/controller/base.py` (`invoke`, `stream`, `bind_session`, `add_task_executor`, `set_event_handler`, `_ensure_started`) onto one synchronous turn with an additive background scheduler.
 
 ## API Surface
 
-- `Controller` — `card`, `config`, `async invoke(inputs, session) -> Result<ControllerOutput>`, `stream(inputs, session) -> BoxStream<'static, Result<ControllerOutputChunk>>`.
-- `BaseController` — `Arc<Inner>` handle (`Clone`): `new`, `with_recognizer`, queue accessors, recognizer/handler/router/planner setters, executor registry accessors, `registry`/`scheduler`, `start`/`stop`/`is_running`, `bind_session`/`unbind_session`/`bound_sessions`, `save_state`/`load_state`/`tasks`.
-- `EventHandler` / `EventHandlerOutcome` — per-event override seam (`Intents`, `Output`, `Ignored`).
-- `TASKS_STATE_KEY` — `"__controller_tasks__"`; state is `{"tasks": [<Task>...], "next_seq": <u64>}`.
+- `Controller` (async trait) — `card()`, `config()`, `async invoke(inputs, Option<Arc<dyn Session>>) -> Result<ControllerOutput>`, `stream(inputs, Option<Arc<dyn Session>>) -> BoxStream<'static, Result<ControllerOutputChunk>>`.
+- `BaseController` (`Clone`, `Arc<Inner>`) — `new(card, config)`, `with_recognizer(card, config, recognizer)`, `card()`, `config()`, `set_config(config)`.
+- Event queue — `push_event(Event) -> bool` (`false` when full; `event_queue_size == 0` = unlimited), `drain_events() -> Vec<Event>`, `pending_events() -> usize`.
+- Seams — `set_intent_recognizer`/`intent_recognizer`, `set_event_handler`/`clear_event_handler`, `set_router`/`clear_router`, `set_planner(Planner)`.
+- Executors — `add_executor(task_type, executor) -> &Self` (chainable, re-keyed), `add_default_executor(executor) -> &Self`, `remove_executor`, `executor`, `task_types()` (sorted), `registry()` (snapshot), `scheduler()` (snapshot `TaskScheduler` with `max_tasks` and `task_timeout_ms`).
+- Task store — `task_manager() -> TaskManager` (shared handle), `async tasks() -> Vec<Task>` (every task in the shared store, all sessions, creation order).
+- Lifecycle — `start()`, `stop()`, `async shutdown()`, `is_running()`, `scheduler_loop() -> Option<Arc<TaskSchedulerLoop>>`.
+- Task control — `async pause_task(&str) -> bool`, `async cancel_task(&str) -> bool`, plus `impl TaskControl` (`pause`, `cancel`, `resume`).
+- Sessions — `async bind_session(Arc<dyn Session>) -> bool`, `async unbind_session(&str) -> Option<Arc<dyn Session>>`, `bound_sessions() -> Vec<String>`.
+- Reasoner — `reasoner() -> Reasoner` (the controller installed as `TaskControl`), `async apply_task_ops(&[TaskOp], session_id, Option<&Arc<dyn Session>>) -> Vec<TaskOpOutcome>`.
+- Group routing — `set_group(Arc<dyn GroupRouter>)`, `clear_group()`, `group()`, `async send_to_agent(agent_id, &Event, Option<Arc<dyn Session>>) -> Result<Value>`, `async publish(&Event, Option<Arc<dyn Session>>) -> Result<Vec<Value>>`.
+- `EventHandler` (async trait) — `name()`, `async handle(&Event, &TaskContext<'_>) -> Result<EventHandlerOutcome>`.
+- `EventHandlerOutcome` — `Intents(Vec<Intent>)`, `Output(Box<ControllerOutput>)`, `Ignored`.
+- `TASKS_STATE_KEY` — `"__controller_tasks__"`; the persisted value is a `TaskManagerState` (`{"tasks": [...], "next_seq": n}`) under that one session key.
 
 ## Constraints
 
-- `invoke` always resolves a session via `crate::run::resolve_session` (caller session borrowed, otherwise a fresh `AgentSession` is created and finished), loads state, runs one turn, saves state, unbinds the session.
-- Nothing in the turn returns `Err` for a missing executor, a failing executor, a timeout, or an unknown task target: those become failed tasks/outputs.
-- `stream` must emit a first `processing` chunk before running the turn, and exactly one terminal `last_chunk` chunk (unless `suppress_completion_signal`).
-- `Inner`/`TurnState` fields are `pub(super)` only so `state.rs`/`turn.rs` can share them; nothing leaks outside this module tree.
+- `invoke` resolves the session through `crate::run::resolve_session` (borrowed when supplied, otherwise a fresh `AgentSession` finished at the end), calls `start()`, binds the session, loads state when `enable_task_persistence`, pushes the inbound event, drains every queued event, runs the turn, saves state, checks the completion sentinel, unbinds the session, and finishes an owned session.
+- A turn never returns `Err` for a missing executor, a failing executor, a timeout, or an unknown task target: those become `Failed`/`InputRequired` outputs and task statuses.
+- `stream` emits a `processing` chunk first, the turn frames with `last_chunk` cleared and re-indexed, then exactly one terminal `last_chunk` chunk (unless `suppress_completion_signal`); a failed turn emits one `Err` item after the `processing` chunk and no terminal chunk.
+- `Inner`/`TurnState` fields stay `pub(super)`; nothing leaks outside `base`.
+- `save_state` writes per session and overwrites the snapshot's `next_seq` with `Planner::next_seq()`; `load_state` treats missing, unreadable, or unrestorable state as `None` (warn, clear that session's slice, sequence back to 1).
+- Nothing in `base` panics outside tests; the runtime assumptions are `stream`'s spawn and `start`'s loop spawn, and `start` degrades to a logged no-op outside a runtime.
 
 ## Notes for Agents
 
-- `base/turn.rs` owns all turn sequencing; `base/state.rs` owns persistence; `base/mod.rs` owns the public types and the accessors. Put new loop behaviour in `turn.rs`, new persisted fields in `state.rs`.
-- Aggregation precedence is `InputRequired` > `Completed` > `Failed`; completed texts join with `\n\n`; `default_response.text` fills an empty answer; `data.tasks` lists per-task status/text.
-- The router is consulted once per turn and only when at least two executors are registered.
-- Restored tasks carry `created_seq = 0` (it is not serialized); the planner sequence comes from the persisted `next_seq`.
-- `base/fixtures.rs` holds the shared test doubles (stub executors/handler/recognizer, session helper); `base/tests.rs` holds the routing/aggregation/streaming tests.
+### Turn pipeline
+
+- Events are processed in FIFO order; an `EventHandler`, when installed, sees every drained event and can supply intents, short-circuit with an output, or ignore the event (an `Err` from it fails the turn).
+- Without a handler, `Input`/`FollowUp` events go through the recognizer (or one default intent when `enable_intent_recognition = false`); the signal kinds (`task_interaction`, `task_completion`, `task_failed`) become a signal output directly.
+- Recognized intents are filtered by `ControllerConfig::accepts` (`intent_type_list`), truncated to `max_intents`, and an empty set for an input event falls back to the default intent.
+- `UnknownTask` short-circuits the event with a clarification output (status `InputRequired`, `data.clarification_prompt`), discarding any work accumulated for that event.
+- Planned intents are routed once per turn through the `TaskRouter` (only with at least two registered executors) and planned by `Planner` into `Submitted` tasks with ids `{session_id}_task_{seq}`.
+- `PauseTask`/`CancelTask` intents only flip the stored task's status (`Paused`/`Canceled`) and do not stop a task already running in the background loop; `ResumeTask` sets `Submitted`, claims the task, and re-dispatches it synchronously in the same turn.
+- Dispatch is the value-type `TaskScheduler` (sequential, `max_tasks`, `task_timeout_ms`); a task enters the `TaskManager` only after its batch ran, so the background loop never sees a turn's submitted tasks.
+- Aggregation precedence is `InputRequired` > `Completed` > `Failed`; completed texts join with `\n\n`, `default_response.text` fills an empty answer, and `data.tasks` lists `{task_id, status, output}`.
+- The last event's produced output wins; a turn with no output falls back to the default response with status `Completed`.
+
+### Lifecycle and task control
+
+- `start` flips `running`, reuses a live loop (idempotent) or builds and starts a fresh one from the shared manager, registry, config, card id, and a `SessionProvider` over the bound sessions; outside a runtime it logs and leaves the flag set.
+- `stop` clears the flag and fire-and-forgets `TaskSchedulerLoop::stop`; `shutdown` awaits it; `is_running` reports the flag, not the loop.
+- Every `invoke` calls `start()`, so a controller that ran once owns a running loop, and every turn ends with `unbind_session`, even for a session the caller bound.
+- With a started loop, `pause_task`/`cancel_task` delegate to the loop (executor hooks, token cancellation, awaited driver) and `TaskControl::resume` flips a `Paused` task to `Submitted` and wakes the loop.
+- Without a loop, `pause_task` flips `Submitted`/`Working` to `Paused` and refuses anything else; `cancel_task` cancels a `Submitted` task, returns `true` unchanged for a terminal one, and refuses a `Working` one; `resume` behaves as above but has no loop to wake.
+- `reasoner()` builds a `Reasoner` from the current config with the controller as its `TaskControl`; `apply_task_ops` takes the planner out of its lock for the batch, applies the ops, writes it back, and wakes the loop when one exists.
+- Group routing resolves the owner as the card name (or id when the name is empty) and fails with `Error::config("{owner}: Cannot {method}. Agent is not part of a group with a controller.")`; `send_to_agent` and `publish` forward the event and session unchanged.
+- The completion sentinel is not produced here: the turn only calls `TaskSchedulerLoop::ensure_completion_signal` when a loop exists.
+
+## Divergences from Python
+
+- Single-turn, in-process loop with a `VecDeque` drained by the turn that enqueued into it; no asyncio queue or pub/sub.
+- Tasks are persisted only after they ran, and the turn's `max_tasks` budget is enforced by the scheduler, not by the manager.
+- Control intents are manager-only status flips and bypass the loop's executor hooks.
+- `tasks()` is unscoped (whole shared store), unlike Python's session-scoped views.
+- Persistence is one session key holding the manager snapshot plus the planner sequence; the ordering key `created_seq` is never on the wire.
+- `stream` is the only path that writes turn frames to the session stream; `invoke` returns them on the output.
+
+## Test Strategy
+
+- 24 offline tests: `tests.rs` 17, `state.rs` 5, `mod.rs` 2.
+- `tests.rs` covers router selection and the single-executor shortcut, unregistered task types with the default response, stream shape, the three handler outcomes, signal events, `max_intents`, the started loop running a manager-inserted task, start/stop idempotency, shutdown of an in-flight run, manager-only pause/cancel fallbacks, loop-delegated pause/cancel/resume, group routing with typed errors, reasoner create → loop execution, and the sentinel written once per idle stretch.
+- `state.rs` covers persistence across turns and instances, pause/cancel status persistence, corrupt-state recovery, disabling persistence, and the exact snapshot wire shape.
+- `mod.rs` covers the state key and lifecycle/queue behaviour (binding, executor registry, queue capacity and FIFO drain).
+- `fixtures.rs` supplies `StubExecutor`, `CooperativeExecutor` (pause/cancel aware, token-driven), `StubHandler`, `CountingRecognizer`, `RecordingSession`, and the session/controller/control-turn helpers; `ScriptedModel` is used only by the router test.
 
 ## Routing Table
 
 - `./mod.rs` → `Controller`, `BaseController`, `EventHandler`, accessors, lifecycle, queue tests
-- `./turn.rs` → `impl Controller`, event processing, intent routing, dispatch, aggregation, streaming
+- `./turn.rs` → `impl Controller`, event processing, intent routing, dispatch, aggregation, streaming, sentinel call
 - `./state.rs` → `save_state`/`load_state`/`tasks`, the `__controller_tasks__` codec
-- `./tests.rs` → routing, persistence, streaming, handler, signal-event tests
+- `./tests.rs` → routing, persistence, streaming, handler, lifecycle, control, reasoner, group, sentinel tests
 - `./fixtures.rs` → shared test doubles
