@@ -173,14 +173,17 @@
 //!
 //! # OTLP export
 //!
-//! [`ExporterType::Otlp`] ships finished spans to a collector over OTLP/HTTP
-//! with JSON payloads. That is the only transport this crate speaks: gRPC with
-//! protobuf framing needs `opentelemetry-otlp`, `prost`, and `tonic`, which the
-//! offline build cannot reach, so [`OtlpProtocol::Grpc`] — the configuration
-//! default — answers
+//! [`ExporterType::Otlp`] ships finished spans to a collector over OTLP/HTTP,
+//! encoded either as JSON ([`OtlpProtocol::Http`], the default, payloads
+//! `application/json`) or as protobuf ([`OtlpProtocol::HttpProtobuf`],
+//! `application/x-protobuf`, backed by the crate's hand-written encoder). gRPC
+//! is the only unsupported transport: its framing needs `opentelemetry-otlp`,
+//! `prost`, and `tonic`, which the offline build cannot reach, so
+//! [`OtlpProtocol::Grpc`] — the configuration default — answers
 //! [`Error::Unsupported`](openjiuwen_common::error::Error::Unsupported) instead
-//! of being downgraded silently. Select the supported transport with
-//! [`OtlpProtocol::Http`] or `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`.
+//! of being downgraded silently. Select a transport with
+//! [`OtlpProtocol::Http`]/[`OtlpProtocol::HttpProtobuf`] or
+//! `OTEL_EXPORTER_OTLP_PROTOCOL=http/json|http/protobuf`.
 //!
 //! Every setting resolves in one order: the value on the configuration, then
 //! the `OPENJIUWEN_OTEL_*` variable, then the standard `OTEL_*` variable, then
@@ -226,9 +229,10 @@
 //!
 //! # Integrations
 //!
-//! [`ExporterType::Otlp`] with [`OtlpProtocol::Http`] is the transport the
-//! presets below share: finished spans leave the process as OTLP/HTTP JSON
-//! batches.
+//! [`ExporterType::Otlp`] with an OTLP/HTTP protocol
+//! ([`OtlpProtocol::Http`] for JSON, [`OtlpProtocol::HttpProtobuf`] for
+//! protobuf) is the transport the presets below share: finished spans leave the
+//! process as OTLP/HTTP batches in either encoding.
 //!
 //! - `grafana` — [`GrafanaCloudConfig`] turns a Grafana Cloud stack into the
 //!   gateway preset (`https://otlp-gateway-<zone>.grafana.net/otlp`) plus the
@@ -336,7 +340,7 @@ pub use agent_handler::OtelAgentHandler;
 #[cfg(feature = "otel")]
 pub use handle::init_otel_tracer_with_exporter;
 #[cfg(feature = "otel")]
-pub use otlp::OtlpHttpExporter;
+pub use otlp::{OtlpEncoding, OtlpHttpExporter};
 #[cfg(feature = "otel")]
 pub use provider::{tracing_layer, CaptureExporter};
 #[cfg(feature = "otel")]

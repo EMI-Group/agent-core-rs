@@ -22,10 +22,11 @@
 //!   configuration time; requests happen when a span batch is exported or
 //!   [`LangfuseClient::ingest`] is called.
 //!
-//! Only the **OTLP/HTTP JSON** transport is available offline in this
-//! workspace: `gRPC` and OTLP/protobuf need `tonic`/`prost`, which the local
-//! registry does not carry. Langfuse accepts OTLP/HTTP JSON on the same
-//! endpoint, and the REST ingestion API is plain JSON over HTTPS.
+//! Both OTLP/HTTP encodings are available offline in this workspace: JSON
+//! (the default) and protobuf through the crate's hand-written encoder. Only
+//! `gRPC` is deferred, because it needs `tonic`/`prost`, which the local
+//! registry does not carry. Langfuse accepts OTLP/HTTP on the same endpoint, and
+//! the REST ingestion API is plain JSON over HTTPS.
 //!
 //! ```
 //! use openjiuwen_extensions::otel::langfuse::LangfuseConfig;
