@@ -51,15 +51,38 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::llm::Model;
 use openjiuwen_retrieval::embedding::Embedding;
 
-use crate::analyzer::MemoryAnalyzer;
+use crate::analyzer::{ExtractedFact, MemoryAnalyzer};
 use crate::config::MemoryEngineConfig;
 use crate::engine::MemoryEngine;
 use crate::graph::GraphMemory;
 use crate::lite::CodingMemory;
+use crate::record::NewMemory;
 use crate::store::MemoryStores;
 
 /// The tracing target of facade diagnostics.
 const TARGET: &str = "openjiuwen_memory::facade";
+
+/// The crate-wide metadata key carrying a record's free-form tags (the `lite` convention).
+pub(super) const TAGS_KEY: &str = "tags";
+
+/// Converts an extracted fact into an engine write input, keeping its tags.
+///
+/// This is the facade's only `ExtractedFact` → [`NewMemory`] conversion, shared by
+/// [`LongTermMemory::remember`] and the variable-assignment write paths.
+/// [`ExtractedFact::to_new_memory`] already carries content, kind, importance, source,
+/// and metadata. Tags are not a [`NewMemory`] field, so they go under the crate's
+/// [`TAGS_KEY`] metadata key unless the fact supplies that key itself.
+pub(super) fn record_input(fact: &ExtractedFact) -> NewMemory {
+    let mut memory = fact.to_new_memory();
+    if !fact.tags.is_empty() && !memory.metadata.contains_key(TAGS_KEY) {
+        let tags = fact.tags.iter().cloned().map(serde_json::Value::String);
+        memory.metadata.insert(
+            TAGS_KEY.to_owned(),
+            serde_json::Value::Array(tags.collect()),
+        );
+    }
+    memory
+}
 
 /// The public entry point of long-term memory.
 ///
