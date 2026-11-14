@@ -7,7 +7,7 @@
 //! `GET`/`SET`, `set_if_absent` onto `SET NX`, and the set operations onto
 //! `SADD`/`SREM`/`SMEMBERS`).
 //!
-//! The key namespace every domain module shares is the [`keys`] module; the
+//! The key namespace every domain module shares is the `keys` module; the
 //! literal layout is documented once, in the [`crate::online`] module docs.
 
 use std::collections::{BTreeMap, BTreeSet};

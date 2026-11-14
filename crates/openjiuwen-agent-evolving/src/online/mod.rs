@@ -7,13 +7,13 @@
 //!
 //! # Store-agnostic by construction
 //!
-//! [`TaskRegistry`] holds no state of its own: every operation is a sequence of
-//! [`OnlineStore`] primitives (string get/set, conditional set, set add/remove/
+//! [`TaskRegistry`](crate::online::TaskRegistry) holds no state of its own: every operation is a sequence of
+//! [`OnlineStore`](crate::online::OnlineStore) primitives (string get/set, conditional set, set add/remove/
 //! members). That is deliberate — the in-memory store and the Redis store share
 //! one implementation of the state machine, so a behaviour proven offline holds
 //! on Redis, and no rule lives in two places. Python gets the same effect with
 //! WATCH/MULTI pipelines; Rust gets it with a linearizable per-key seam plus
-//! [`OnlineStore::set_if_absent`] on the create and claim paths.
+//! [`OnlineStore::set_if_absent`](crate::online::OnlineStore::set_if_absent) on the create and claim paths.
 //!
 //! # State machines
 //!
@@ -30,7 +30,7 @@
 //! ```
 //!
 //! Capture lifecycle and turn publication are documented beside their
-//! implementations in [`capture`]; the transition tables there are the
+//! implementations in [`capture`](crate::online::capture); the transition tables there are the
 //! authority on which transitions are legal and which error they raise.
 //!
 //! # Key layout
@@ -39,13 +39,13 @@
 //!
 //! | Key | Kind | Contents |
 //! |---|---|---|
-//! | `rl:v1:task:{id}` | string | serialized [`TaskRecord`] |
+//! | `rl:v1:task:{id}` | string | serialized [`TaskRecord`](crate::online::TaskRecord) |
 //! | `rl:v1:active_session:{session}` | string | the session's active task id |
 //! | `rl:v1:tasks:active` | set | task ids that may still be active (recovery index) |
 //! | `rl:v1:task:{id}:captures` | set | every capture id of the task |
 //! | `rl:v1:task:{id}:captures:open` | set | captures waiting for their response |
 //! | `rl:v1:task:{id}:captures:committed` | set | captures with a staged sample |
-//! | `rl:v1:task:{id}:capture:{cid}` | string | serialized [`CaptureMeta`] |
+//! | `rl:v1:task:{id}:capture:{cid}` | string | serialized [`CaptureMeta`](crate::online::CaptureMeta) |
 //! | `rl:v1:task:{id}:turn:{turn}:captures` | set | captures committed in one turn |
 //! | `rl:v1:task:{id}:turn:current` | string | the turn accepting captures |
 //! | `rl:v1:task:{id}:turn:transition` | string | the turn waiting to become current |
@@ -61,7 +61,7 @@
 //!
 //! # Determinism
 //!
-//! - Timestamps come from the injected [`Clock`]; [`FixedClock`] is the default,
+//! - Timestamps come from the injected [`Clock`](crate::online::Clock); [`FixedClock`](crate::online::FixedClock) is the default,
 //!   and nothing in this module calls `SystemTime`, `Instant` or `rand`.
 //! - Set reads are sorted, so a scan is ordered on both backends.
 //! - Fingerprints are caller-supplied strings; this module hashes nothing.
@@ -69,10 +69,10 @@
 //!
 //! # Errors
 //!
-//! Every failure is an [`OnlineError`], which carries the service envelope's
+//! Every failure is an [`OnlineError`](crate::online::OnlineError), which carries the service envelope's
 //! `code()` and `http_status()`; `From<OnlineError> for
 //! openjiuwen_common::error::Error` bridges into the kernel. Registry methods
-//! return [`Result`] (an alias of `Result<_, OnlineError>`) so the HTTP layer can
+//! return [`Result`](crate::online::Result) (an alias of `Result<_, OnlineError>`) so the HTTP layer can
 //! answer with the Python envelope without inspecting messages.
 
 pub mod capture;
