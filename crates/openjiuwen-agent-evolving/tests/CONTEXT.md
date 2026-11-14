@@ -29,3 +29,7 @@ Nothing here touches a network, the environment, or wall-clock time.
 - `./sharing.rs` → keyword extraction, deterministic bundle ids, stager gates, both backends and their ranking
 - `./ttse.rs` → config, tip schema and ids, bank dedupe/prune, classifier, success detection, parser, induction, dreaming, consultation, engine persistence
 - `./rl.rs` → packing, reward normalisation, policy/rollout seams, trainer loop, checkpoints, optimizer wiring
+- `./hub_remote.rs` → remote hub protocol v1 over loopback `wiremock`: bearer auth, publish/get/remove/list/search, 404 mapping, error envelope, retry, approval-gated stager publish, `ftp://` rejection
+- `./experience_drafting.rs` → model reply tolerance and defaults, repair retry, deterministic fallback, draft schema validation, orchestrator status matrix, auto-approval persistence
+- `./ttse_embeddings.rs` → `HashEmbedding` cold fill, cosine ranking, retrieval-mode fallbacks, index persistence and mismatch rejection, scripted merge/keep-distinct/malformed dreaming
+- `./reward_checks.rs` → read/python checks, browser and picture `Unsupported`, evidence gathering and judging over `ScriptedModel`, floor cap, unknown claims, garbage verdicts, reward-pack aggregation
