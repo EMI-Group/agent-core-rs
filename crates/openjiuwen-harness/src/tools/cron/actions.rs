@@ -130,7 +130,7 @@ impl CronAction {
 /// error; `action` is the only required field in the card schema.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CronArgs {
-    /// The action to perform, one of [`ACTION_NAMES`](self::ACTION_NAMES).
+    /// The action to perform, one of the ten action names (see the module table).
     #[serde(default)]
     pub action: String,
     /// A cron expression; `create` requires it, `update` replaces the stored one with it.
@@ -223,9 +223,8 @@ async fn list(scheduler: &CronScheduler) -> ToolPayload {
 
 /// Handles `action=cancel`.
 async fn cancel(scheduler: &CronScheduler, args: &CronArgs) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::Cancel) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::Cancel);
     };
     match scheduler.cancel(job_id).await {
         Ok(Some(job)) => ToolPayload::ok(json!({
@@ -239,9 +238,8 @@ async fn cancel(scheduler: &CronScheduler, args: &CronArgs) -> ToolPayload {
 
 /// Handles `action=get_job`.
 async fn get_job(scheduler: &CronScheduler, args: &CronArgs) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::GetJob) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::GetJob);
     };
     match scheduler.get(job_id).await {
         Ok(Some(job)) => {
@@ -255,9 +253,8 @@ async fn get_job(scheduler: &CronScheduler, args: &CronArgs) -> ToolPayload {
 
 /// Handles `action=update`.
 async fn update(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::Update) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::Update);
     };
     let patch = CronUpdate {
         cron: non_empty(&args.cron),
@@ -287,9 +284,8 @@ async fn update(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) 
 
 /// Handles `action=toggle`.
 async fn toggle(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::Toggle) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::Toggle);
     };
     let updated = match args.enabled {
         Some(enabled) => scheduler.set_enabled(job_id, enabled, now).await,
@@ -312,9 +308,8 @@ async fn toggle(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) 
 
 /// Handles `action=preview`.
 async fn preview(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::Preview) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::Preview);
     };
     let count = preview_count(args.count);
     match scheduler.preview(job_id, count, now).await {
@@ -341,9 +336,8 @@ async fn preview(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>)
 
 /// Handles `action=run`.
 async fn run(scheduler: &CronScheduler, args: &CronArgs, now: DateTime<Utc>) -> ToolPayload {
-    let job_id = match job_id(args, CronAction::Run) {
-        Ok(job_id) => job_id,
-        Err(payload) => return payload,
+    let Some(job_id) = job_id(args) else {
+        return missing_job_id(CronAction::Run);
     };
     match scheduler.run_now(job_id, now).await {
         Ok(Some(run)) => {
@@ -384,15 +378,13 @@ async fn status(scheduler: &CronScheduler, now: DateTime<Utc>) -> ToolPayload {
 }
 
 /// Reads the required `job_id` of an action, or builds the validation failure.
-fn job_id<'args>(args: &'args CronArgs, action: CronAction) -> Result<&'args str, ToolPayload> {
+fn job_id(args: &CronArgs) -> Option<&str> {
     let job_id = args.job_id.trim();
-    if job_id.is_empty() {
-        return Err(ToolPayload::fail(format!(
-            "job_id is required for action={}",
-            action.as_str()
-        )));
-    }
-    Ok(job_id)
+    (!job_id.is_empty()).then_some(job_id)
+}
+/// Builds the missing-`job_id` failure of an id-carrying action.
+fn missing_job_id(action: CronAction) -> ToolPayload {
+    ToolPayload::fail(format!("job_id is required for action={}", action.as_str()))
 }
 
 /// Clamps the `preview` count to `1..=20`, defaulting to 5.

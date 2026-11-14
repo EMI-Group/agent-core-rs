@@ -449,32 +449,29 @@ impl CronScheduler {
             let occurrence = job.next_run_at;
             let snapshot = job.clone();
             let advanced = CronSchedule::parse(&job.cron).map(|schedule| schedule.next_after(now));
-            match advanced {
-                Ok(Some(next)) => {
-                    job.next_run_at = next;
-                    fired.push(CronRun::new(
-                        job.id.clone(),
-                        CronRunTrigger::Scheduled,
-                        now,
-                        occurrence,
-                        next,
-                    ));
-                }
-                Ok(None) | Err(_) => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        cron = %job.cron,
-                        "cron job can never run again; disabling it"
-                    );
-                    job.enabled = false;
-                    fired.push(CronRun::new(
-                        job.id.clone(),
-                        CronRunTrigger::Scheduled,
-                        now,
-                        occurrence,
-                        occurrence,
-                    ));
-                }
+            if let Ok(Some(next)) = advanced {
+                job.next_run_at = next;
+                fired.push(CronRun::new(
+                    job.id.clone(),
+                    CronRunTrigger::Scheduled,
+                    now,
+                    occurrence,
+                    next,
+                ));
+            } else {
+                tracing::warn!(
+                    job_id = %job.id,
+                    cron = %job.cron,
+                    "cron job can never run again; disabling it"
+                );
+                job.enabled = false;
+                fired.push(CronRun::new(
+                    job.id.clone(),
+                    CronRunTrigger::Scheduled,
+                    now,
+                    occurrence,
+                    occurrence,
+                ));
             }
             due.push(snapshot);
         }
@@ -521,7 +518,7 @@ fn apply_patch(job: &mut CronJob, patch: &CronUpdate, now: DateTime<Utc>) -> Res
         let next_run_at = schedule
             .next_after(now)
             .ok_or_else(|| never_matches(&schedule))?;
-        job.cron = schedule.expression().to_owned();
+        schedule.expression().clone_into(&mut job.cron);
         job.next_run_at = next_run_at;
     }
     if let Some(prompt) = &patch.prompt {

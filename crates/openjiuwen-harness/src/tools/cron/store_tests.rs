@@ -1,6 +1,7 @@
 //! Unit tests of the persisted job list, its mutations and its run history.
 //!
 //! Every scenario runs offline over a `tempfile` directory with an injected clock.
+#![allow(clippy::assert_is_empty)]
 
 use chrono::TimeZone;
 

@@ -2,6 +2,7 @@
 //!
 //! Kept beside `schedule.rs` (through a `#[path]` module) because the assertions inspect the
 //! parsed field sets directly, which are private to the `schedule` module.
+#![allow(clippy::assert_is_empty)]
 
 use chrono::TimeZone;
 
