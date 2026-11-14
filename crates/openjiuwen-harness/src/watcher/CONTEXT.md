@@ -97,6 +97,9 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 ### `mod.rs` — builder
 
 - `WatcherConfig { debounce: Duration, event_capacity: usize, intake_capacity: usize, dispatch_capacity: usize }` — `Default` = 250 ms / 256 / 1024 / 256 (`DEFAULT_DEBOUNCE`, `DEFAULT_EVENT_CAPACITY`, `DEFAULT_INTAKE_CAPACITY`, `DEFAULT_DISPATCH_CAPACITY`); a zero capacity is raised to 1 before the channel is built.
+- `WatcherConfig: FromStr<Err = Error>` parses `debounce=…,event_capacity=…,intake_capacity=…,dispatch_capacity=…`: missing keys keep their `Default`, items/keys/values are whitespace-trimmed, durations take `ns`/`us`/`ms`/`s`/`m` with an optional decimal fraction (a bare number is milliseconds), capacities are unsigned integers (`0` included), and an empty spec, empty item, unknown or duplicate key, or unparseable value is `Error::validation` naming the offending token.
+- A spec without any `=` is the duration-only shorthand for `debounce=…` (`"250ms"`), so a single `--debounce` flag is one `parse()` call.
+- `WatcherConfig: Display` emits the canonical `debounce=250ms,event_capacity=256,intake_capacity=1024,dispatch_capacity=256` form (`format_watch_duration` picks the largest exact unit), so `parse().to_string()` round-trips and the rendered form is stable.
 - `WorkspaceWatcher::new()`, `with_config`, `debounce(Duration)`, `event_capacity(usize)`, `intake_capacity(usize)`, `dispatch_capacity(usize)`, `watch_target(WatchTarget)`, `watch_dir(kind, path)`, `watch_file(kind, path)`, `watch_plan(WatchPlan)`, `for_workspace(workspace, home, env)`, `on_reload<H: ReloadHandler + 'static>(H)`, `targets()`, `start() -> Result<WatcherHandle>`.
 - `start` validates the plan (an empty plan is `Error::config`), builds the OS watcher, and spawns two tasks: the intake task (owns the backend, debounces, publishes) and the reload dispatcher (drains its bounded queue and runs the handlers).
 
@@ -106,7 +109,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 - `WorkspaceWatcher`, `WatcherConfig`, `WatcherHandle` and `WatchUpdate` are re-exported flat from both `crate::watcher` and `crate::` (`src/lib.rs`), so `use openjiuwen_harness::watcher::…` and `use openjiuwen_harness::…` are equivalent.
 - `WorkspaceWatcher::start` consumes `self`, is `async`, and returns `Result<WatcherHandle>`; without the `notify` feature it returns a typed `Error::Unsupported`.
 - Construction is crate-private: `Subscription::new` and `WatcherHandle::new` are `pub(crate)`; a consumer only ever gets a `Subscription` from `WatcherHandle::subscribe`.
-- `WatcherConfig` derives `Debug, Clone, PartialEq, Eq` only — no `Serialize`/`Deserialize`; a host that persists watcher settings maps them itself.
+- `WatcherConfig` derives `Debug, Clone, PartialEq, Eq` only — no `Serialize`/`Deserialize`; a host that persists watcher settings maps them itself, and a host that carries them in a flag or env var uses `str::parse::<WatcherConfig>()` (`FromStr`) and `to_string()` (`Display`).
 - `Subscription::recv().await` is an inherent method, so consuming updates needs no `futures` import; only `StreamExt`/`BoxStream` usage does (the `futures::Stream` impl at `handle.rs:121` is public).
 - `pub mod watcher` is not feature-gated (`lib.rs:45`), so every type compiles without `notify`; enabling the backend is the single feature line `notify = ["dep:notify"]` (`Cargo.toml:63`) and pulls only already-locked, already-cached crates.
 
@@ -139,6 +142,7 @@ Coalescing table (`ChangeKind::merge(existing, incoming)`), applied per path ins
 
 ## Test Strategy
 
+- `mod.rs` unit tests (`config_tests`, feature-independent) cover the `FromStr`/`Display` pair: the full and partial specs, the duration-only shorthand, every unit suffix and fraction, whitespace trimming, zero capacities, the canonical rendering, the stable round-trip, and every error path (empty spec, empty item, item without a value, unknown key, duplicate key, unparseable capacity, unparseable duration).
 - `debounce.rs`, `event.rs` and `targets.rs` unit tests are pure and deterministic: merge table, per-path coalescing, deadline extension, ordered sequence numbers, pending-cap drops, target filtering precedence, rename mapping, plan discovery and validation errors, plus the `dropped` wire form of `DropStage`/`DroppedUpdates`.
 - `intake.rs` unit tests are deterministic and timer-free: shared counters across clones, first-drop announcement, throttle/coalescing inside one interval, the shutdown flush, an unsubscribed watcher still counting, and `push_raw` dropping the newest into a one-slot queue (a closed queue is not counted).
 - `handle.rs` unit tests cover ordering, lag accounting, fused streams, cooperative cancellation, idempotent shutdown, a failed intake task, a failed dispatcher task and the shared drop counters.
