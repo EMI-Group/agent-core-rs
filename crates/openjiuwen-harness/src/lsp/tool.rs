@@ -1,14 +1,44 @@
 //! The model-facing `lsp` tool.
 //!
-//! Ports `openjiuwen/harness/tools/lsp_tool/_tool.py` as a Rust [`Tool`]: one lazily started
-//! server per tool instance (one workspace root), read-only navigation actions, and a
+//! Ports `openjiuwen/harness/tools/lsp_tool/_tool.py` as a Rust [`Tool`]: lazily started
+//! language servers, read-only navigation actions, pull and push diagnostics, and a
 //! `success=false` payload for every failure. The tool never returns `Err` and never panics
 //! on model input.
 //!
-//! Actions: `hover`, `definition`, `references`, `completion`, `symbols` (document symbols)
-//! and `workspace_symbols`; `diagnostics` is accepted by the schema so the model gets a
-//! typed "not implemented" answer instead of a parse error.
+//! # Actions
+//!
+//! `hover`, `definition`, `references`, `completion`, `symbols` (document symbols),
+//! `workspace_symbols`, `diagnostics`, `implementation`, `prepare_call_hierarchy`,
+//! `incoming_calls` and `outgoing_calls`.
+//!
+//! # Server selection
+//!
+//! [`LspToolConfig`] resolves the server for one call through three layers, in order:
+//!
+//! 1. An explicit [`LspToolConfig::server`] always wins (single-server mode). Its key name is
+//!    [`LspServerConfig::name`] or `"default"`, and its root is
+//!    [`LspServerConfig::root`] or the canonical workspace root.
+//! 2. Otherwise [`LspToolConfig::servers`] is indexed by
+//!    [`DiscoveryIndex`](super::DiscoveryIndex) and the file's extension, priority and root
+//!    markers select the definition.
+//! 3. Otherwise, when a transport or transport factory was injected (the offline seam), a
+//!    default definition using [`LspToolConfig::language_id`] is synthesized. Without any of
+//!    the three the call fails with a typed "no LSP server configured" payload.
+//!
+//! `workspace_symbols` has no file to inspect, so it uses the explicit server, else
+//! [`DiscoveryIndex::resolve_by_language`](super::DiscoveryIndex::resolve_by_language) with
+//! [`LspToolConfig::language_id`], else the first discovered definition at the workspace root,
+//! else the injected/default path.
+//!
+//! # Lifecycle
+//!
+//! One [`ServerSupervisor`] is created lazily per [`ServerKey`](super::ServerKey) and reused
+//! for every later call, so a crashed server is restarted (once, with back-off) and the
+//! operation retried instead of leaking a process. [`LspTool::shutdown`] stops every server
+//! and makes later calls fail; [`LspTool::server_status`] exposes the observed lifecycle.
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,23 +50,24 @@ use tokio::sync::OnceCell;
 
 use openjiuwen_common::error::{Error, Result};
 use openjiuwen_foundation::tool::{Tool, ToolCard, ToolContext};
-use openjiuwen_sysop::workspace::{canonicalize_containing, is_within};
+use openjiuwen_sysop::workspace::canonicalize_containing;
 
-use crate::tools::{schema_for, tool_card, ToolPayload};
+use crate::tools::{schema_for, tool_card};
 
-use super::client::LspClient;
-use super::config::{
-    LspServerConfig, DEFAULT_MAX_FILE_SIZE, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STARTUP_TIMEOUT,
+use super::config::{LspServerConfig, DEFAULT_MAX_FILE_SIZE, DEFAULT_REQUEST_TIMEOUT};
+use super::diagnostics::{DiagnosticRegistry, DiagnosticsConfig};
+use super::discovery::{
+    builtin_server_configs, server_name, DiscoveryIndex, ResolvedServer, ServerKey,
 };
-use super::protocol::{client_capabilities, Location, Position};
-use super::render;
+use super::instance::{
+    BackoffTimer, RestartPolicy, ServerFactory, ServerStatus, ServerSupervisor, TokioTimer,
+};
 use super::transport::{LspTransport, StdioTransport};
-use super::uri::{path_to_uri, uri_to_path};
+use super::wire::Diagnostic;
 
-/// Largest `context_lines` value honoured, keeping excerpts short.
-const MAX_CONTEXT_LINES: u32 = 20;
-/// Largest number of definition locations that get a source excerpt.
-const MAX_CONTEXT_LOCATIONS: usize = 5;
+/// The typed message returned when no layer resolves a language server.
+pub(super) const NO_SERVER_CONFIGURED: &str =
+    "no LSP server configured for the lsp tool; set LspToolConfig::server or inject a transport";
 
 /// The navigation action requested from the language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -54,13 +85,21 @@ pub enum LspAction {
     Symbols,
     /// Workspace-wide symbol search with `query`.
     WorkspaceSymbols,
-    /// Diagnostics for the file (accepted but not implemented in this build).
+    /// Diagnostics for one file (push, then pull) or, without a path, every buffered file.
     Diagnostics,
+    /// Go to the implementation(s) of the symbol at a position.
+    Implementation,
+    /// Prepare the call-hierarchy items at a position.
+    PrepareCallHierarchy,
+    /// Incoming calls of the symbol at a position.
+    IncomingCalls,
+    /// Outgoing calls of the symbol at a position.
+    OutgoingCalls,
 }
 
 impl LspAction {
     /// Every action name, in schema order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::Hover,
         Self::Definition,
         Self::References,
@@ -68,6 +107,10 @@ impl LspAction {
         Self::Symbols,
         Self::WorkspaceSymbols,
         Self::Diagnostics,
+        Self::Implementation,
+        Self::PrepareCallHierarchy,
+        Self::IncomingCalls,
+        Self::OutgoingCalls,
     ];
 
     /// The `snake_case` name used in JSON.
@@ -81,6 +124,10 @@ impl LspAction {
             Self::Symbols => "symbols",
             Self::WorkspaceSymbols => "workspace_symbols",
             Self::Diagnostics => "diagnostics",
+            Self::Implementation => "implementation",
+            Self::PrepareCallHierarchy => "prepare_call_hierarchy",
+            Self::IncomingCalls => "incoming_calls",
+            Self::OutgoingCalls => "outgoing_calls",
         }
     }
 
@@ -88,6 +135,23 @@ impl LspAction {
     #[must_use]
     pub const fn requires_path(self) -> bool {
         !matches!(self, Self::WorkspaceSymbols | Self::Diagnostics)
+    }
+
+    /// The LSP method whose capability/error name describes the action.
+    pub(super) const fn method(self) -> &'static str {
+        match self {
+            Self::Hover => "textDocument/hover",
+            Self::Definition => "textDocument/definition",
+            Self::References => "textDocument/references",
+            Self::Completion => "textDocument/completion",
+            Self::Symbols => "textDocument/documentSymbol",
+            Self::WorkspaceSymbols => "workspace/symbol",
+            Self::Diagnostics => "textDocument/diagnostic",
+            Self::Implementation => "textDocument/implementation",
+            Self::PrepareCallHierarchy => "textDocument/prepareCallHierarchy",
+            Self::IncomingCalls => "callHierarchy/incomingCalls",
+            Self::OutgoingCalls => "callHierarchy/outgoingCalls",
+        }
     }
 }
 
@@ -119,14 +183,24 @@ pub struct LspArgs {
 }
 
 /// Configuration of one [`LspTool`].
+///
+/// Server selection follows [`LspToolConfig::server`], then [`LspToolConfig::servers`], then
+/// the injected transport; see the module docs for the exact precedence.
 #[derive(Debug, Clone)]
 pub struct LspToolConfig {
     /// Root that relative paths resolve against; defaults to the current directory.
     pub workspace_root: Option<PathBuf>,
     /// Description language; `"en"` selects English, anything else the Python default `"cn"`.
     pub language: String,
-    /// The server launched lazily on the first call; may be `None` when a transport is injected.
+    /// The one server used in single-server mode; it always wins over [`LspToolConfig::servers`].
     pub server: Option<LspServerConfig>,
+    /// Discovery definitions consulted per file when [`LspToolConfig::server`] is `None`.
+    ///
+    /// Populate it with [`LspToolConfig::with_servers`],
+    /// [`LspToolConfig::with_discovered_server`] or [`LspToolConfig::with_builtin_servers`].
+    pub servers: Vec<LspServerConfig>,
+    /// Crash-recovery budget and back-off shape for every started server.
+    pub restart_policy: RestartPolicy,
     /// `languageId` used for `didOpen` when no server config supplies one.
     pub language_id: String,
     /// Per-request timeout.
@@ -143,6 +217,8 @@ impl Default for LspToolConfig {
             workspace_root: None,
             language: "cn".to_owned(),
             server: None,
+            servers: Vec::new(),
+            restart_policy: RestartPolicy::default(),
             language_id: "plaintext".to_owned(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
@@ -166,10 +242,47 @@ impl LspToolConfig {
         self
     }
 
-    /// Returns this configuration with a language server to launch lazily.
+    /// Returns this configuration with an explicit server, enabling single-server mode.
     #[must_use]
     pub fn with_server(mut self, server: LspServerConfig) -> Self {
         self.server = Some(server);
+        self
+    }
+
+    /// Returns this configuration with `servers` as its discovery definitions.
+    ///
+    /// The list replaces any previous one; order breaks priority ties, as in
+    /// [`DiscoveryIndex`](super::DiscoveryIndex).
+    #[must_use]
+    pub fn with_servers<I>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = LspServerConfig>,
+    {
+        self.servers = servers.into_iter().collect();
+        self
+    }
+
+    /// Returns this configuration with `server` appended to its discovery definitions.
+    #[must_use]
+    pub fn with_discovered_server(mut self, server: LspServerConfig) -> Self {
+        self.servers.push(server);
+        self
+    }
+
+    /// Returns this configuration with every built-in definition appended.
+    ///
+    /// The definitions mirror Python's `servers/servers/*.py`; their commands are not probed,
+    /// so a missing binary surfaces as a typed launch failure on first use.
+    #[must_use]
+    pub fn with_builtin_servers(mut self) -> Self {
+        self.servers.extend(builtin_server_configs());
+        self
+    }
+
+    /// Returns this configuration with a different crash-recovery policy.
+    #[must_use]
+    pub const fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
+        self.restart_policy = policy;
         self
     }
 
@@ -202,16 +315,39 @@ impl LspToolConfig {
     }
 }
 
-/// The `lsp` tool: code navigation through a lazily started language server.
+/// The canonical workspace root plus the discovery table built from it.
+///
+/// Both are computed once per tool, so a later `LspToolConfig` mutation cannot desynchronize
+/// path containment from root inference.
+pub(super) struct WorkspaceIndex {
+    /// Canonical workspace root every resolved path must stay inside.
+    pub(super) root: PathBuf,
+    /// Extension/priority/root-marker table over the configured definitions.
+    discovery: DiscoveryIndex,
+}
+
+/// The `lsp` tool: code navigation, diagnostics and call hierarchy through language servers.
 pub struct LspTool {
     /// The model-facing card.
-    card: ToolCard,
-    /// Path resolution, language, timeouts and the optional server descriptor.
-    config: LspToolConfig,
-    /// An injected transport, consumed when the client is first built.
-    transport: parking_lot::Mutex<Option<Box<dyn LspTransport>>>,
-    /// The lazily initialized client; initialization failures are retried on the next call.
-    client: OnceCell<Arc<LspClient>>,
+    pub(super) card: ToolCard,
+    /// Path resolution, language, timeouts, server selection and restart policy.
+    pub(super) config: LspToolConfig,
+    /// An injected transport factory (the offline seam); `None` launches the resolved server.
+    factory: parking_lot::Mutex<Option<ServerFactory>>,
+    /// Push-diagnostic buffer shared with every client and with the host.
+    pub(super) diagnostics: Arc<DiagnosticRegistry>,
+    /// Back-off clock handed to every supervisor.
+    timer: Arc<dyn BackoffTimer>,
+    /// One supervisor per server instance, created lazily and reused.
+    supervisors: parking_lot::Mutex<BTreeMap<ServerKey, Arc<ServerSupervisor>>>,
+    /// Last pull-report result id per document URI.
+    pub(super) pull_result_ids: parking_lot::Mutex<HashMap<String, String>>,
+    /// Last full pull report's diagnostics per document URI, for `unchanged` answers.
+    pub(super) pull_items: parking_lot::Mutex<HashMap<String, Vec<Diagnostic>>>,
+    /// Canonical workspace root and discovery table, resolved on first use.
+    index: OnceCell<WorkspaceIndex>,
+    /// Set by [`LspTool::shutdown`]; forbids any later server start.
+    shutdown: AtomicBool,
 }
 
 impl LspTool {
@@ -222,18 +358,56 @@ impl LspTool {
         Self {
             card,
             config,
-            transport: parking_lot::Mutex::new(None),
-            client: OnceCell::new(),
+            factory: parking_lot::Mutex::new(None),
+            diagnostics: Arc::new(DiagnosticRegistry::new(DiagnosticsConfig::default())),
+            timer: Arc::new(TokioTimer),
+            supervisors: parking_lot::Mutex::new(BTreeMap::new()),
+            pull_result_ids: parking_lot::Mutex::new(HashMap::new()),
+            pull_items: parking_lot::Mutex::new(HashMap::new()),
+            index: OnceCell::new(),
+            shutdown: AtomicBool::new(false),
         }
     }
 
     /// Injects a transport instead of launching the configured server.
     ///
     /// This is the offline test seam: pass a [`ChannelTransport`](super::ChannelTransport)
-    /// whose peer stream is driven by an in-process fake server.
+    /// whose peer stream is driven by an in-process fake server. The transport is used by the
+    /// first server started; anything after that falls back to launching the resolved config.
     #[must_use]
     pub fn with_transport(self, transport: Box<dyn LspTransport>) -> Self {
-        *self.transport.lock() = Some(transport);
+        let slot = Arc::new(parking_lot::Mutex::new(Some(transport)));
+        let factory: ServerFactory = Arc::new(move |config: &LspServerConfig| {
+            if let Some(transport) = slot.lock().take() {
+                return Ok(transport);
+            }
+            Ok(Box::new(StdioTransport::spawn(config)?))
+        });
+        *self.factory.lock() = Some(factory);
+        self
+    }
+
+    /// Replaces the transport factory used to launch every server.
+    ///
+    /// Hosts use it to route servers through their own process launcher; tests use it to hand
+    /// out a fresh in-process fake per [`LspServerConfig`].
+    #[must_use]
+    pub fn with_transport_factory(self, factory: ServerFactory) -> Self {
+        *self.factory.lock() = Some(factory);
+        self
+    }
+
+    /// Shares `registry` for push diagnostics; by default the tool owns a private registry.
+    #[must_use]
+    pub fn with_diagnostics(mut self, registry: Arc<DiagnosticRegistry>) -> Self {
+        self.diagnostics = registry;
+        self
+    }
+
+    /// Replaces the back-off clock used between crash-recovery attempts.
+    #[must_use]
+    pub fn with_backoff_timer(mut self, timer: Arc<dyn BackoffTimer>) -> Self {
+        self.timer = timer;
         self
     }
 
@@ -251,278 +425,192 @@ impl LspTool {
         &self.config
     }
 
-    /// Returns the lazily built client, initializing the server on the first call.
-    async fn client(&self) -> Result<Arc<LspClient>> {
-        let client = self.client.get_or_try_init(|| self.build_client()).await?;
-        Ok(Arc::clone(client))
+    /// The push-diagnostic registry this tool feeds and reads.
+    #[must_use]
+    pub fn diagnostics(&self) -> Arc<DiagnosticRegistry> {
+        Arc::clone(&self.diagnostics)
     }
 
-    /// Builds and initializes the client from the injected transport or the server config.
-    async fn build_client(&self) -> Result<Arc<LspClient>> {
-        let transport: Box<dyn LspTransport> = if let Some(transport) = self.transport.lock().take()
-        {
-            transport
-        } else if let Some(server) = &self.config.server {
-            Box::new(StdioTransport::spawn(server)?)
-        } else {
-            return Err(Error::config(
-                "no LSP server configured for the lsp tool; set LspToolConfig::server or inject a transport",
-            ));
-        };
-        let client = Arc::new(LspClient::new(transport, self.config.request_timeout));
-        let root_uri = path_to_uri(&self.server_root());
-        let startup_timeout = self
-            .config
-            .server
-            .as_ref()
-            .map_or(DEFAULT_STARTUP_TIMEOUT, |server| server.startup_timeout);
-        match tokio::time::timeout(
-            startup_timeout,
-            client.initialize(&root_uri, client_capabilities()),
-        )
-        .await
-        {
-            Ok(result) => {
-                result?;
-                Ok(client)
-            }
-            Err(_) => Err(Error::timeout(format!(
-                "LSP server did not complete initialize within {} ms",
-                startup_timeout.as_millis()
-            ))),
+    /// A snapshot of every supervised server, ordered by [`ServerKey`](super::ServerKey).
+    #[must_use]
+    pub fn server_status(&self) -> Vec<ServerStatus> {
+        self.supervisors
+            .lock()
+            .values()
+            .map(|supervisor| supervisor.status())
+            .collect()
+    }
+
+    /// Stops every server, idempotently, and makes later calls fail.
+    ///
+    /// A host should await this before dropping a tool that launched real processes; dropping
+    /// the clients would otherwise only close their transports.
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let supervisors: Vec<Arc<ServerSupervisor>> =
+            self.supervisors.lock().values().cloned().collect();
+        for supervisor in supervisors {
+            supervisor.shutdown().await;
         }
     }
 
-    /// The root URI sent in `initialize`.
-    fn server_root(&self) -> PathBuf {
-        self.config
-            .server
-            .as_ref()
-            .and_then(|server| server.root.clone())
-            .or_else(|| self.config.workspace_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+    /// Resolves `path` (or a language-only request) to the server that should handle it.
+    ///
+    /// See the module docs for the precedence between the explicit server, the discovery
+    /// definitions and the injected transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when no layer resolves a server, and the workspace-root error
+    /// when the root cannot be determined.
+    pub(super) async fn resolve_server(&self, path: Option<&Path>) -> Result<ResolvedServer> {
+        let index = self.workspace_index().await.map_err(Error::config)?;
+        if let Some(server) = &self.config.server {
+            return Ok(explicit_server(server, &index.root));
+        }
+        let discovered = match path {
+            Some(path) => index.discovery.resolve(path),
+            None => {
+                workspace_symbols_server(&index.discovery, &index.root, &self.config.language_id)
+            }
+        };
+        if let Some(resolved) = discovered {
+            return Ok(resolved);
+        }
+        if self.has_factory() {
+            return Ok(default_server(&self.config.language_id, &index.root));
+        }
+        Err(Error::config(NO_SERVER_CONFIGURED))
     }
 
-    /// The `languageId` sent in `didOpen`.
-    fn language_id(&self) -> &str {
-        self.config
-            .server
-            .as_ref()
-            .map_or(self.config.language_id.as_str(), |server| {
-                server.language_id.as_str()
+    /// Returns the supervisor for `resolved`, creating it lazily and reusing it afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed "has been shut down" error after [`LspTool::shutdown`].
+    pub(super) fn supervisor(&self, resolved: &ResolvedServer) -> Result<Arc<ServerSupervisor>> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(Error::transport("LSP tool has been shut down"));
+        }
+        if let Some(existing) = self.supervisors.lock().get(&resolved.key) {
+            return Ok(Arc::clone(existing));
+        }
+        let supervisor = Arc::new(
+            ServerSupervisor::new(resolved.config.clone(), self.server_factory())
+                .with_diagnostics(Arc::clone(&self.diagnostics))
+                .with_timer(Arc::clone(&self.timer))
+                .with_restart_policy(self.config.restart_policy)
+                .with_request_timeout(self.config.request_timeout)
+                .with_workspace_root(resolved.key.root.clone()),
+        );
+        let mut supervisors = self.supervisors.lock();
+        let entry = supervisors
+            .entry(resolved.key.clone())
+            .or_insert_with(|| Arc::clone(&supervisor));
+        Ok(Arc::clone(entry))
+    }
+
+    /// The factory that launches one server: the injected one, else a stdio process.
+    fn server_factory(&self) -> ServerFactory {
+        if let Some(factory) = self.factory.lock().as_ref() {
+            return Arc::clone(factory);
+        }
+        Arc::new(|config: &LspServerConfig| {
+            Ok(Box::new(StdioTransport::spawn(config)?) as Box<dyn LspTransport>)
+        })
+    }
+
+    /// Whether a transport or transport factory was injected.
+    fn has_factory(&self) -> bool {
+        self.factory.lock().is_some()
+    }
+
+    /// Whether any layer (explicit, discovered or injected) can resolve a server.
+    pub(super) fn has_server_configuration(&self) -> bool {
+        self.config.server.is_some() || !self.config.servers.is_empty() || self.has_factory()
+    }
+
+    /// The `languageId` sent in `didOpen` for `resolved`.
+    pub(super) fn language_for(&self, resolved: &ResolvedServer) -> String {
+        let language_id = &resolved.config.language_id;
+        if language_id.is_empty() {
+            self.config.language_id.clone()
+        } else {
+            language_id.clone()
+        }
+    }
+
+    /// The canonical workspace root and discovery table, computed once.
+    pub(super) async fn workspace_index(&self) -> std::result::Result<&WorkspaceIndex, String> {
+        self.index
+            .get_or_try_init(|| async {
+                let root = match &self.config.workspace_root {
+                    Some(root) => root.clone(),
+                    None => std::env::current_dir()
+                        .map_err(|error| format!("cannot determine the workspace root: {error}"))?,
+                };
+                let root = canonicalize_containing(&root).await;
+                let discovery = DiscoveryIndex::new(root.clone(), self.config.servers.clone());
+                Ok(WorkspaceIndex { root, discovery })
             })
-    }
-
-    /// Validates the arguments and executes the requested action.
-    #[allow(clippy::too_many_lines)] // one dispatch table keeps the payload shapes together
-    async fn execute(&self, args: LspArgs) -> std::result::Result<ToolPayload, String> {
-        let action = args.action;
-        if action == LspAction::Diagnostics {
-            return Err(
-                "Unsupported action 'diagnostics': diagnostics are deferred in this build."
-                    .to_owned(),
-            );
-        }
-        let client = self
-            .client()
             .await
-            .map_err(|error| error.message().into_owned())?;
-        if action == LspAction::WorkspaceSymbols {
-            let query = args.query.as_deref().unwrap_or_default();
-            let symbols = client
-                .workspace_symbols(query)
-                .await
-                .map_err(|error| map_client_error(&error, "workspace/symbol"))?;
-            let result = render::render_workspace_symbols(&symbols);
-            return Ok(ToolPayload::ok(json!({
-                "action": action.as_str(),
-                "result": result,
-                "symbols": symbols,
-            })));
-        }
-        let (path, uri, source) = self.resolve_document(&args).await?;
-        client
-            .did_open(&uri, self.language_id(), &source)
-            .await
-            .map_err(|error| map_client_error(&error, "textDocument/didOpen"))?;
-        let position = Position::from_one_based(args.line.unwrap_or(1), args.column.unwrap_or(1))
-            .map_err(|error| error.message().into_owned())?;
-        let file_path = path.to_string_lossy().into_owned();
-        match action {
-            LspAction::Hover => {
-                let hover = client
-                    .hover(&uri, position)
-                    .await
-                    .map_err(|error| map_client_error(&error, "textDocument/hover"))?;
-                let result = render::render_hover(hover.as_ref());
-                Ok(ToolPayload::ok(json!({
-                    "action": "hover",
-                    "file_path": file_path,
-                    "result": result,
-                    "hover": hover,
-                })))
-            }
-            LspAction::Definition => {
-                let locations = client
-                    .definition(&uri, position)
-                    .await
-                    .map_err(|error| map_client_error(&error, "textDocument/definition"))?;
-                let mut result = render::render_definition(&locations);
-                let context = args
-                    .context_lines
-                    .unwrap_or(self.config.context_lines)
-                    .min(MAX_CONTEXT_LINES);
-                if context > 0 {
-                    let excerpt = self.context_excerpt(&locations, context).await;
-                    if !excerpt.is_empty() {
-                        result.push_str("\n\n");
-                        result.push_str(&excerpt);
-                    }
-                }
-                Ok(ToolPayload::ok(json!({
-                    "action": "definition",
-                    "file_path": file_path,
-                    "result": result,
-                    "locations": locations,
-                })))
-            }
-            LspAction::References => {
-                let locations = client
-                    .references(&uri, position, true)
-                    .await
-                    .map_err(|error| map_client_error(&error, "textDocument/references"))?;
-                let result = render::render_references(&locations);
-                Ok(ToolPayload::ok(json!({
-                    "action": "references",
-                    "file_path": file_path,
-                    "result": result,
-                    "locations": locations,
-                })))
-            }
-            LspAction::Completion => {
-                let items = client
-                    .completion(&uri, position)
-                    .await
-                    .map_err(|error| map_client_error(&error, "textDocument/completion"))?;
-                let result = render::render_completion(&items);
-                Ok(ToolPayload::ok(json!({
-                    "action": "completion",
-                    "file_path": file_path,
-                    "result": result,
-                    "items": items,
-                })))
-            }
-            LspAction::Symbols => {
-                let symbols = client
-                    .document_symbols(&uri)
-                    .await
-                    .map_err(|error| map_client_error(&error, "textDocument/documentSymbol"))?;
-                let result = render::render_symbols(&symbols);
-                Ok(ToolPayload::ok(json!({
-                    "action": "symbols",
-                    "file_path": file_path,
-                    "result": result,
-                    "symbols": symbols,
-                })))
-            }
-            LspAction::WorkspaceSymbols | LspAction::Diagnostics => {
-                Err(format!("Unsupported action '{}'.", action.as_str()))
-            }
-        }
     }
+}
 
-    /// Resolves the `path` argument and reads the document for synchronization.
-    async fn resolve_document(
-        &self,
-        args: &LspArgs,
-    ) -> std::result::Result<(PathBuf, String, String), String> {
-        let raw = args
-            .path
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| format!("path is required for '{}'", args.action.as_str()))?;
-        let path = self.resolve_path(raw).await?;
-        let source = self.read_source(&path).await?;
-        let uri = path_to_uri(&path);
-        Ok((path, uri, source))
+/// The explicit single-server mode: its config always wins over the discovery definitions.
+fn explicit_server(server: &LspServerConfig, workspace_root: &Path) -> ResolvedServer {
+    let root = server
+        .root
+        .clone()
+        .unwrap_or_else(|| workspace_root.to_path_buf());
+    let mut config = server.clone();
+    config.root = Some(root.clone());
+    let name = if server.name.is_empty() {
+        "default".to_owned()
+    } else {
+        server.name.clone()
+    };
+    ResolvedServer {
+        key: ServerKey { name, root },
+        config,
     }
+}
 
-    /// Resolves a model-supplied path inside the workspace root.
-    async fn resolve_path(&self, raw: &str) -> std::result::Result<PathBuf, String> {
-        let root = match &self.config.workspace_root {
-            Some(root) => root.clone(),
-            None => std::env::current_dir()
-                .map_err(|error| format!("cannot determine the workspace root: {error}"))?,
-        };
-        let root = canonicalize_containing(&root).await;
-        let path = Path::new(raw);
-        let candidate = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        };
-        let resolved = canonicalize_containing(&candidate).await;
-        if !is_within(&resolved, &root) {
-            return Err(format!("Path '{raw}' is outside the workspace root."));
-        }
-        let metadata = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(|_| format!("File not found: '{raw}'"))?;
-        if !metadata.is_file() {
-            return Err(format!("Not a file: '{raw}'"));
-        }
-        Ok(resolved)
+/// The synthesized definition used when only an injected transport is available.
+fn default_server(language_id: &str, workspace_root: &Path) -> ResolvedServer {
+    let name = if language_id.is_empty() {
+        "default".to_owned()
+    } else {
+        language_id.to_owned()
+    };
+    let root = workspace_root.to_path_buf();
+    let mut config = LspServerConfig::new(String::new())
+        .with_name(name.clone())
+        .with_language_id(language_id);
+    config.root = Some(root.clone());
+    ResolvedServer {
+        key: ServerKey { name, root },
+        config,
     }
+}
 
-    /// Reads a document, enforcing the configured size limit.
-    async fn read_source(&self, path: &Path) -> std::result::Result<String, String> {
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .map_err(|error| format!("Cannot stat '{}': {error}", path.display()))?;
-        if metadata.len() > self.config.max_file_size {
-            return Err(format!(
-                "File '{}' is too large for LSP operations ({} bytes; max {}).",
-                path.display(),
-                metadata.len(),
-                self.config.max_file_size
-            ));
-        }
-        tokio::fs::read_to_string(path)
-            .await
-            .map_err(|error| format!("Cannot read '{}': {error}", path.display()))
+/// Resolves a language-only (`workspace_symbols`) request without a file path.
+fn workspace_symbols_server(
+    index: &DiscoveryIndex,
+    workspace_root: &Path,
+    language_id: &str,
+) -> Option<ResolvedServer> {
+    if let Some(resolved) = index.resolve_by_language(language_id) {
+        return Some(resolved);
     }
-
-    /// Renders numbered source excerpts around the first few definition locations.
-    async fn context_excerpt(&self, locations: &[Location], context: u32) -> String {
-        let mut blocks = Vec::new();
-        for location in locations.iter().take(MAX_CONTEXT_LOCATIONS) {
-            let path = uri_to_path(&location.uri);
-            let Ok(text) = tokio::fs::read_to_string(&path).await else {
-                continue;
-            };
-            let lines: Vec<&str> = text.lines().collect();
-            if lines.is_empty() {
-                continue;
-            }
-            let target = usize::try_from(location.range.start.line).unwrap_or(0);
-            let context = usize::try_from(context).unwrap_or(0);
-            let first = target.saturating_sub(context);
-            let last = target
-                .saturating_add(context)
-                .min(lines.len().saturating_sub(1));
-            if first > last {
-                continue;
-            }
-            let first_line = u32::try_from(first).unwrap_or(u32::MAX - 1) + 1;
-            blocks.push(render::format_context_excerpt(
-                &path.to_string_lossy(),
-                first_line,
-                &lines[first..=last],
-            ));
-        }
-        blocks.join("\n")
-    }
+    let mut config = index.servers().first()?.clone();
+    let root = workspace_root.to_path_buf();
+    config.root = Some(root.clone());
+    let name = server_name(&config).to_owned();
+    Some(ResolvedServer {
+        key: ServerKey { name, root },
+        config,
+    })
 }
 
 #[async_trait]
@@ -563,23 +651,6 @@ impl Tool for LspTool {
     }
 }
 
-impl LspTool {
-    /// Runs one tool call, converting every failure into a `success=false` payload.
-    async fn run(&self, inputs: Value, ctx: &ToolContext) -> ToolPayload {
-        let args: LspArgs = match serde_json::from_value(inputs) {
-            Ok(args) => args,
-            Err(error) => return ToolPayload::fail(format!("Invalid input: {error}")),
-        };
-        if ctx.cancellation.is_cancelled() {
-            return ToolPayload::fail("LSP tool call was cancelled.");
-        }
-        match self.execute(args).await {
-            Ok(payload) => payload,
-            Err(message) => ToolPayload::fail(message),
-        }
-    }
-}
-
 /// Adds the explicit action enum to the generated schema.
 ///
 /// The generated schema references the Rust enum through `$defs`, which
@@ -603,7 +674,7 @@ fn install_action_enum(schema: &mut Value) {
 }
 
 /// Maps a client error to the model-facing message, naming unsupported methods clearly.
-fn map_client_error(error: &Error, method: &str) -> String {
+pub(super) fn map_client_error(error: &Error, method: &str) -> String {
     let message = error.message().into_owned();
     if message.contains("-32601") || message.to_ascii_lowercase().contains("method not found") {
         format!("Operation not supported by this language server: {method}")
@@ -612,14 +683,10 @@ fn map_client_error(error: &Error, method: &str) -> String {
     }
 }
 
-/// The tool description for `language`; only `"en"` selects English.
+/// The tool description for `language`, taken from the shared prompt table.
+///
+/// `crate::tools::descriptions` is the single source of truth, so the model-facing card and
+/// the prompt-side table cannot drift; only `"en"` selects English there.
 fn description(language: &str) -> &'static str {
-    if language == "en" {
-        "LSP (Language Server Protocol) code navigation: hover, definition, references, \
-         completion, document symbols and workspace symbols. Positions are one-based line and \
-         column. Returns short, typed text results."
-    } else {
-        "LSP（语言服务器协议）代码导航工具：hover、definition、references、completion、\
-         symbols（文档符号）和 workspace_symbols。行号和列号从 1 开始，返回简短的结构化文本结果。"
-    }
+    crate::tools::descriptions::description("lsp", language)
 }

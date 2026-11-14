@@ -1,4 +1,5 @@
-//! Cross-module cron suite: the tool, the scheduler and the expression engine end to end.
+//! Cross-module cron suite: the tool, the scheduler, the history and the expression engine end
+//! to end.
 //!
 //! Every scenario runs offline over a `tempfile` directory with an injected clock, so the
 //! suite is deterministic and needs no daemon.
@@ -14,7 +15,7 @@ use openjiuwen_common::error::Result;
 use openjiuwen_foundation::tool::Tool;
 use openjiuwen_foundation::tool::ToolContext;
 
-use super::{CronJob, CronSchedule, CronScheduler, CronTool};
+use super::{CronJob, CronRun, CronRunTrigger, CronSchedule, CronScheduler, CronStatus, CronTool};
 use crate::tools::support::ToolPayload;
 use crate::workspace::Workspace;
 
@@ -67,6 +68,16 @@ async fn end_to_end_create_list_due_cancel() -> Result<()> {
     );
     assert_eq!(scheduler.due(at(2024, 1, 1, 0, 15)).await?, Vec::new());
 
+    // The firing is recorded in the run history, visible through the tool.
+    let runs = tool.invoke_at(&json!({"action": "runs"}), created).await;
+    assert!(runs.success);
+    let data = runs.data.unwrap();
+    assert_eq!(data["count"], 1);
+    assert_eq!(data["runs"][0]["trigger"], "scheduled");
+    let run: CronRun = serde_json::from_value(data["runs"][0].clone()).unwrap();
+    assert_eq!(run.trigger, CronRunTrigger::Scheduled);
+    assert_eq!(run.occurrence, at(2024, 1, 1, 0, 15));
+
     // The next occurrence fires too, at its own time.
     let due = scheduler.due(at(2024, 1, 1, 0, 44)).await?;
     assert_eq!(due.len(), 1);
@@ -85,11 +96,112 @@ async fn end_to_end_create_list_due_cancel() -> Result<()> {
     let listed = tool.invoke_at(&json!({"action": "list"}), created).await;
     assert_eq!(listed.data.unwrap()["jobs"], json!([]));
     assert_eq!(scheduler.due(at(2024, 1, 1, 5, 0)).await?, Vec::new());
+    // Cancelling drops the job's history with it.
+    assert_eq!(scheduler.runs(None, 0).await?, Vec::new());
     Ok(())
 }
 
 #[tokio::test]
-async fn jobs_survive_a_second_scheduler_instance() -> Result<()> {
+async fn end_to_end_get_update_toggle_preview_run_status() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let scheduler = CronScheduler::new(dir.path());
+    let tool = CronTool::new(Arc::clone(&scheduler), "en");
+    let now = at(2024, 1, 1, 0, 0);
+
+    let job = create_job(&tool, "*/15 * * * *", "say hi", now).await;
+
+    let fetched = tool
+        .invoke_at(&json!({"action": "get_job", "job_id": job.id}), now)
+        .await;
+    assert!(fetched.success, "get_job failed: {:?}", fetched.error);
+    let got: CronJob = serde_json::from_value(fetched.data.unwrap()["job"].clone()).unwrap();
+    assert_eq!(got, job);
+
+    let updated = tool
+        .invoke_at(
+            &json!({
+                "action": "update",
+                "job_id": job.id,
+                "cron": "0 9 * * MON-FRI",
+                "prompt": "standup",
+            }),
+            now,
+        )
+        .await;
+    assert!(updated.success, "update failed: {:?}", updated.error);
+    let updated: CronJob = serde_json::from_value(updated.data.unwrap()["job"].clone()).unwrap();
+    assert_eq!(updated.cron, "0 9 * * MON-FRI");
+    assert_eq!(updated.next_run_at, at(2024, 1, 1, 9, 0));
+
+    let toggled = tool
+        .invoke_at(&json!({"action": "toggle", "job_id": job.id}), now)
+        .await;
+    assert!(toggled.success);
+    assert_eq!(toggled.data.unwrap()["job"]["enabled"], false);
+    assert_eq!(scheduler.due(at(2024, 1, 1, 9, 0)).await?, Vec::new());
+
+    let preview = tool
+        .invoke_at(
+            &json!({"action": "preview", "job_id": job.id, "count": 2}),
+            at(2024, 1, 5, 10, 0),
+        )
+        .await;
+    assert!(preview.success);
+    assert_eq!(
+        preview.data.unwrap()["occurrences"],
+        json!(["2024-01-08T09:00:00Z", "2024-01-09T09:00:00Z"])
+    );
+
+    let run = tool
+        .invoke_at(
+            &json!({"action": "run", "job_id": job.id}),
+            at(2024, 1, 5, 10, 0),
+        )
+        .await;
+    assert!(run.success, "run failed: {:?}", run.error);
+    let recorded: CronRun = serde_json::from_value(run.data.unwrap()["run"].clone()).unwrap();
+    assert_eq!(recorded.trigger, CronRunTrigger::Manual);
+    assert!(!scheduler.get(&job.id).await?.unwrap().enabled);
+
+    let status = tool.invoke_at(&json!({"action": "status"}), now).await;
+    assert!(status.success);
+    let status: CronStatus =
+        serde_json::from_value(status.data.unwrap()["status"].clone()).unwrap();
+    assert_eq!(status.total, 1);
+    assert_eq!(status.disabled, 1);
+    assert_eq!(status.runs, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_quartz_job_fires_at_second_granularity() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let scheduler = CronScheduler::new(dir.path());
+    let tool = CronTool::new(Arc::clone(&scheduler), "en");
+
+    // Every 10 seconds within the 09:00 minute of every weekday.
+    let job = create_job(&tool, "*/10 0 9 ? * MON-FRI", "tick", at(2024, 1, 1, 0, 0)).await;
+    assert_eq!(job.next_run_at, at(2024, 1, 1, 9, 0));
+
+    let due = scheduler.due(at(2024, 1, 1, 9, 0)).await?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(
+        scheduler.list().await?[0].next_run_at,
+        at(2024, 1, 1, 9, 0) + chrono::Duration::seconds(10)
+    );
+
+    // The last Friday of January 2024 is the 26th.
+    let last_friday = create_job(&tool, "0 0 0 ? * 5L", "retro", at(2024, 1, 1, 0, 0)).await;
+    assert_eq!(last_friday.next_run_at, at(2024, 1, 26, 0, 0));
+
+    // A year-restricted job keeps its occurrence beyond the five-year horizon.
+    let yearly = create_job(&tool, "0 0 12 1 1 ? 2030", "new year", at(2024, 1, 1, 0, 0)).await;
+    assert_eq!(yearly.next_run_at, at(2030, 1, 1, 12, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_and_history_survive_a_second_scheduler_instance() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let now = at(2024, 1, 1, 0, 0);
     let schedule = CronSchedule::parse("0 9 * * MON-FRI")?;
@@ -103,10 +215,12 @@ async fn jobs_survive_a_second_scheduler_instance() -> Result<()> {
     assert_eq!(jobs, vec![job.clone()]);
     assert_eq!(jobs[0].description, "morning standup");
 
-    // The reopened scheduler schedules the same job and can eventually cancel it.
+    // The reopened scheduler schedules the same job and records its firing.
     let due = reopened.due(at(2024, 1, 1, 9, 0)).await?;
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].id, job.id);
+    assert_eq!(CronScheduler::new(dir.path()).runs(None, 0).await?.len(), 1);
+
     assert!(reopened.cancel(&job.id).await?.is_some());
     assert_eq!(CronScheduler::new(dir.path()).list().await?, Vec::new());
     Ok(())
@@ -121,8 +235,20 @@ async fn invalid_cron_reports_a_failure_payload() {
     for (cron, expected) in [
         ("75 * * * *", "invalid minute field: \"75\""),
         ("0 0 31 2 *", "cron expression never matches a future time: \"0 0 31 2 *\""),
-        ("not a cron expression", "invalid cron expression: expected 5 fields (minute hour day-of-month month day-of-week), got 4: \"not a cron expression\""),
+        ("not a cron expression", "invalid cron expression: expected 5 fields (minute hour day-of-month month day-of-week) or 6/7 Quartz fields (second minute hour day-of-month month day-of-week [year]), got 4: \"not a cron expression\""),
         ("@sometimes", "unknown cron shorthand: \"@sometimes\""),
+        (
+            "0 0 12 1 * MON",
+            "invalid cron expression: both day-of-month and day-of-week are specified (one must be \"?\" in a Quartz expression): \"0 0 12 1 * MON\"",
+        ),
+        (
+            "0 0 0 15W * ?",
+            "unsupported cron token: \"15W\": \"W\" (nearest weekday) is not supported",
+        ),
+        (
+            "0 0 0 ? * 1#6",
+            "invalid day-of-week field: \"1#6\"",
+        ),
     ] {
         let payload = tool
             .invoke_at(&json!({"action": "create", "cron": cron, "prompt": "x"}), now)
@@ -179,14 +305,14 @@ async fn disabled_jobs_are_listed_but_never_due() -> Result<()> {
     let tool = CronTool::new(Arc::clone(&scheduler), "en");
     let job = create_job(&tool, "@daily", "nightly", at(2024, 1, 1, 0, 0)).await;
 
-    // Flip the persisted flag, the only way to disable a job in this port.
-    let path = scheduler.path();
-    let mut jobs: Vec<CronJob> =
-        serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-    jobs[0].enabled = false;
-    tokio::fs::write(&path, serde_json::to_vec(&jobs).unwrap())
-        .await
-        .unwrap();
+    let toggled = tool
+        .invoke_at(
+            &json!({"action": "toggle", "job_id": job.id}),
+            at(2024, 1, 1, 0, 0),
+        )
+        .await;
+    assert!(toggled.success);
+    assert_eq!(toggled.data.unwrap()["job"]["enabled"], false);
 
     let listed = tool
         .invoke_at(&json!({"action": "list"}), at(2024, 1, 2, 0, 0))

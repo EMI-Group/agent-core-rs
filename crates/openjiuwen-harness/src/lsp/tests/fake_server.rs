@@ -1,10 +1,11 @@
 //! An in-process fake language server used by every client and tool test.
 //!
 //! The fake reads framed JSON-RPC from one half of a [`tokio::io::duplex`] pair and answers
-//! canned hover/definition/references/completion/documentSymbol/workspaceSymbol results. It
-//! also sends one `workspace/configuration` request during `initialize` (many real servers do)
-//! and records every received message, so tests can assert ordering and versions without a
-//! real language server or an installed binary.
+//! canned hover/definition/references/completion/documentSymbol/workspaceSymbol,
+//! implementation, call-hierarchy and pull-diagnostic results. It also sends one
+//! `workspace/configuration` request during `initialize` (many real servers do), publishes
+//! diagnostics after every open/change, and records every received message, so tests can
+//! assert ordering and versions without a real language server or an installed binary.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,9 @@ pub(crate) fn capabilities() -> Value {
         "completionProvider": { "triggerCharacters": ["."] },
         "documentSymbolProvider": true,
         "workspaceSymbolProvider": true,
+        "implementationProvider": true,
+        "callHierarchyProvider": true,
+        "diagnosticProvider": { "interFileDependencies": false, "workspaceDiagnostics": false },
     })
 }
 
@@ -108,6 +112,37 @@ fn location(uri: &str, line: u32, character: u32) -> Value {
     })
 }
 
+/// Builds one range object.
+fn range(line: u32, character: u32) -> Value {
+    json!({
+        "start": { "line": line, "character": character },
+        "end": { "line": line, "character": character + 2 },
+    })
+}
+
+/// Builds one call-hierarchy item with a flat `uri`.
+fn call_item(name: &str, uri: &str, line: u32) -> Value {
+    json!({
+        "name": name,
+        "kind": 12,
+        "detail": format!("fn {name}()"),
+        "uri": uri,
+        "range": range(line, 0),
+        "selectionRange": range(line, 3),
+    })
+}
+
+/// Extracts the `item.uri` of a call-hierarchy request.
+fn item_uri(message: &Value) -> String {
+    message
+        .get("params")
+        .and_then(|params| params.get("item"))
+        .and_then(|item| item.get("uri"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Extracts the document URI from a text-document request.
 fn document_uri(message: &Value) -> String {
     message
@@ -129,6 +164,52 @@ fn error(id: Value, error: &LspError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
+/// Builds the `textDocument/publishDiagnostics` notification a document event triggers.
+///
+/// `didOpen` always publishes one warning so notification dispatch is testable; a `didChange`
+/// publishes an empty list only when the new text contains `clean`, giving tests both the
+/// "diagnostics found" and the "diagnostics resolved" paths.
+fn diagnostics_notification(method: &str, message: &Value) -> Option<Value> {
+    let params = message.get("params")?;
+    let document = params.get("textDocument")?;
+    let uri = document.get("uri").and_then(Value::as_str)?;
+    if method == "textDocument/didOpen" {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "version": 1,
+                "diagnostics": [{
+                    "range": range(0, 0),
+                    "severity": 2,
+                    "source": "fake",
+                    "code": "W001",
+                    "message": "fake warning",
+                }],
+            },
+        }));
+    }
+    let text = params
+        .get("contentChanges")
+        .and_then(Value::as_array)
+        .and_then(|changes| changes.first())
+        .and_then(|change| change.get("text"))
+        .and_then(Value::as_str)?;
+    if !text.contains("clean") {
+        return None;
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/publishDiagnostics",
+        "params": {
+            "uri": uri,
+            "version": document.get("version").cloned().unwrap_or(Value::Null),
+            "diagnostics": [],
+        },
+    }))
+}
+
 /// The server loop.
 async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
     let (read, mut write) = tokio::io::split(stream);
@@ -148,6 +229,11 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
         if method.is_empty() {
             // A response to our own `workspace/configuration` request.
             continue;
+        }
+        if let Some(notification) = diagnostics_notification(&method, &message) {
+            if write_message(&mut write, &notification).await.is_err() {
+                break;
+            }
         }
         let Some(id) = id else {
             if method == "exit" {
@@ -265,6 +351,141 @@ async fn run(stream: DuplexStream, received: Arc<Mutex<Vec<Value>>>) {
                             "containerName": "crate",
                         }]),
                     )
+                }
+            }
+            "textDocument/implementation" => {
+                let uri = document_uri(&message);
+                if uri.contains("unsupported") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: textDocument/implementation"),
+                    )
+                } else {
+                    // A `LocationLink`, which the client must normalise like a `Location`.
+                    response(
+                        id,
+                        json!([{
+                            "targetUri": uri,
+                            "targetRange": range(5, 0),
+                            "targetSelectionRange": range(5, 4),
+                            "originSelectionRange": range(0, 0),
+                        }]),
+                    )
+                }
+            }
+            "textDocument/prepareCallHierarchy" => {
+                let uri = document_uri(&message);
+                if uri.contains("unsupported") {
+                    error(
+                        id,
+                        &LspError::new(
+                            -32601,
+                            "method not found: textDocument/prepareCallHierarchy",
+                        ),
+                    )
+                } else if uri.contains("noitems") {
+                    response(id, json!([]))
+                } else if uri.contains("nocalls") {
+                    // Preparation succeeds; the `callHierarchy/*` requests report -32601.
+                    response(
+                        id,
+                        json!([{
+                            "name": "no-calls",
+                            "kind": 12,
+                            "uri": uri,
+                            "range": range(4, 0),
+                            "selectionRange": range(4, 3),
+                        }]),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([
+                            {
+                                "name": "caller",
+                                "kind": 12,
+                                "detail": "fn caller()",
+                                "uri": "file:///workspace/src/caller.rs",
+                                "range": range(1, 0),
+                                "selectionRange": range(1, 3),
+                                "originSelectionRange": range(2, 0),
+                            },
+                            {
+                                // Nested `textDocument` shape: the parser must flatten it.
+                                "name": "callee",
+                                "kind": 12,
+                                "textDocument": { "uri": "file:///workspace/src/callee.rs" },
+                                "range": range(7, 0),
+                                "selectionRange": range(7, 3),
+                                "data": { "id": 7 },
+                            },
+                        ]),
+                    )
+                }
+            }
+            "callHierarchy/incomingCalls" => {
+                if item_uri(&message).contains("nocalls") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: callHierarchy/incomingCalls"),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([{
+                            "from": call_item("caller", "file:///workspace/src/caller.rs", 1),
+                            "fromRanges": [range(2, 4)],
+                        }]),
+                    )
+                }
+            }
+            "callHierarchy/outgoingCalls" => {
+                if item_uri(&message).contains("nocalls") {
+                    error(
+                        id,
+                        &LspError::new(-32601, "method not found: callHierarchy/outgoingCalls"),
+                    )
+                } else {
+                    response(
+                        id,
+                        json!([{
+                            "to": call_item("callee", "file:///workspace/src/callee.rs", 5),
+                            "fromRanges": [range(3, 2)],
+                        }]),
+                    )
+                }
+            }
+            "textDocument/diagnostic" => {
+                let previous = message
+                    .get("params")
+                    .and_then(|params| params.get("previousResultId"))
+                    .and_then(Value::as_str);
+                match previous {
+                    Some("r1") => response(id, json!({ "kind": "unchanged", "resultId": "r1" })),
+                    Some(_) => response(
+                        id,
+                        json!({
+                            "kind": "full",
+                            "resultId": "r2",
+                            "items": [
+                                { "range": range(1, 0), "message": "stale report replaced" },
+                            ],
+                        }),
+                    ),
+                    None => response(
+                        id,
+                        json!({
+                            "kind": "full",
+                            "resultId": "r1",
+                            "items": [{
+                                "range": range(0, 0),
+                                "severity": 1,
+                                "source": "fake",
+                                "code": 2304,
+                                "message": "cannot find name",
+                            }],
+                        }),
+                    ),
                 }
             }
             other => error(

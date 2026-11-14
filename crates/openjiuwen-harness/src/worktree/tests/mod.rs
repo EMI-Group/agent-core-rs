@@ -3,6 +3,8 @@
 //! Everything here is deterministic: the manager is driven through a scripted
 //! [`GitRunner`] that returns queued output and records every invocation, and the
 //! one test that spawns the real `git` binary skips itself when git is absent.
+//! The `sparse` and `changes` suites assert sparse-checkout command construction
+//! and change-summary call order through the same runner.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -14,8 +16,14 @@ use openjiuwen_common::error::{Error, Result};
 
 use super::git::{GitOutput, GitRunner};
 
+mod changes;
+mod cleanup;
+mod lock;
 mod manager;
+mod rails;
+mod sparse;
 mod tool;
+mod tools;
 
 /// One recorded git invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

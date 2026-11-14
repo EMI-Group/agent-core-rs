@@ -12,9 +12,10 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 use super::clock::Clock;
+use super::lifecycle::{LifecycleStage, SubagentLifecycleEvent};
 use super::quota::SubagentActivity;
 use super::transcript::TranscriptEntry;
-use super::{Shared, SubagentStatus};
+use super::{lifecycle_api, Shared, SubagentStatus};
 
 /// One background turn worker; it runs queued queries of one instance serially.
 pub(super) struct TurnRunner {
@@ -61,7 +62,7 @@ impl TurnRunner {
                 tokio::time::timeout(self.turn_timeout, self.agent.invoke(inputs, None)).await;
             drop(permit);
             let (status, output, error) = map_turn_result(result, self.turn_timeout);
-            next_query = finish_turn(
+            let (next, ready) = finish_turn(
                 &self.shared,
                 self.clock.as_ref(),
                 &self.subagent_id,
@@ -70,6 +71,12 @@ impl TurnRunner {
                 output,
                 error,
             );
+            // `Ready` fires only once the instance is parked idle, and only after the state
+            // update above; the hook runs without the state lock held.
+            if let Some(event) = ready {
+                lifecycle_api::run_stage(&self.shared, LifecycleStage::Ready, [event]).await;
+            }
+            next_query = next;
         }
     }
 }
@@ -91,6 +98,9 @@ pub(super) fn begin_turn(shared: &Shared, clock: &dyn Clock, id: &str, generatio
                     SubagentStatus::Running.as_str(),
                     now_ms,
                 ));
+                let task_id = format!("{id}#{generation}");
+                instance.activity_stream.begin_turn(&task_id, now_ms);
+                instance.activity_stream.running(now_ms);
                 true
             }
             _ => false,
@@ -103,10 +113,12 @@ pub(super) fn begin_turn(shared: &Shared, clock: &dyn Clock, id: &str, generatio
     started
 }
 
-/// Stores the turn result and returns the next queued query, if any.
+/// Stores the turn result and returns the next queued query, if any, plus the `Ready` lifecycle
+/// snapshot when the worker parks the instance idle.
 ///
-/// A turn that leaves queued work keeps the instance `Running` (the same worker keeps going);
-/// the last turn parks it in the `Idle` activity phase whatever its final status.
+/// A turn that leaves queued work keeps the instance `Running` (the same worker keeps going and
+/// the next [`begin_turn`] publishes the new turn's `Running` frame); the last turn parks it in
+/// the `Idle` activity phase and publishes the terminal outcome frame whatever its final status.
 pub(super) fn finish_turn(
     shared: &Shared,
     clock: &dyn Clock,
@@ -115,7 +127,7 @@ pub(super) fn finish_turn(
     status: SubagentStatus,
     output: Option<String>,
     error: Option<String>,
-) -> Option<String> {
+) -> (Option<String>, Option<SubagentLifecycleEvent>) {
     let now_ms = clock.now_ms();
     let next = {
         let mut state = shared.state.lock();
@@ -126,7 +138,7 @@ pub(super) fn finish_turn(
             {
                 instance
             }
-            _ => return None,
+            _ => return (None, None),
         };
         instance.output = output;
         instance.error = error;
@@ -134,7 +146,7 @@ pub(super) fn finish_turn(
             instance.status = SubagentStatus::PendingInit;
             instance.touch(now_ms, SubagentActivity::Running);
             instance.record(TranscriptEntry::input(id, query.as_str(), now_ms));
-            Some(query)
+            (Some(query), None)
         } else {
             instance.status = status;
             instance.running = false;
@@ -151,8 +163,24 @@ pub(super) fn finish_turn(
                 other => TranscriptEntry::status(id, other.as_str(), now_ms),
             };
             instance.record(entry);
+            instance.activity_stream.idle(now_ms);
+            match status {
+                SubagentStatus::Completed => {
+                    let output = instance.output.clone().unwrap_or_default();
+                    instance.activity_stream.completed(&output, now_ms);
+                }
+                SubagentStatus::Errored => {
+                    let message = instance.error.clone().unwrap_or_default();
+                    instance.activity_stream.failed(&message, now_ms);
+                }
+                SubagentStatus::Interrupted => {
+                    instance.activity_stream.failed("interrupted", now_ms);
+                }
+                _ => {}
+            }
             tracing::debug!(target: "openjiuwen_harness::subagents", subagent_id = %id, status = status.as_str(), "subagent turn finished");
-            None
+            let ready = instance.lifecycle_event(LifecycleStage::Ready, None, now_ms);
+            (None, Some(ready))
         }
     };
     shared.notify.notify_waiters();

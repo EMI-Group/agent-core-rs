@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use openjiuwen_common::error::{Error, Result};
 
+use super::activity::{
+    DEFAULT_ACTIVITY_CAPACITY, DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS,
+};
 use super::transcript::{DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY};
 
 /// Default live-instance cap (Python `max_subagents`).
@@ -46,6 +49,19 @@ pub struct SubAgentQuota {
     pub transcript_capacity: usize,
     /// Broadcast capacity of one subagent transcript feed.
     pub transcript_channel_capacity: usize,
+    /// Record and publish activity frames for every instance (Python `enable_activity_stream`).
+    ///
+    /// When disabled, each instance still owns an [`ActivityStream`](super::activity::ActivityStream)
+    /// but it stores and publishes nothing, so
+    /// [`ActivityStream::is_enabled`](super::activity::ActivityStream::is_enabled) is `false` and
+    /// the activity accessors report an empty history.
+    pub enable_activity_stream: bool,
+    /// Ring-buffer cap and per-turn frame cap of one activity stream.
+    pub activity_capacity: usize,
+    /// Longest activity summary kept, in characters.
+    pub activity_text_max_len: usize,
+    /// Window a coalesced thinking frame waits for, in milliseconds.
+    pub activity_throttle_ms: i64,
 }
 
 impl Default for SubAgentQuota {
@@ -59,6 +75,10 @@ impl Default for SubAgentQuota {
             enable_lru_eviction: true,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             transcript_channel_capacity: DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
+            enable_activity_stream: true,
+            activity_capacity: DEFAULT_ACTIVITY_CAPACITY,
+            activity_text_max_len: DEFAULT_ACTIVITY_TEXT_MAX_LEN,
+            activity_throttle_ms: DEFAULT_ACTIVITY_THROTTLE_MS,
         }
     }
 }
@@ -117,6 +137,34 @@ impl SubAgentQuota {
     #[must_use]
     pub fn with_transcript_channel_capacity(mut self, capacity: usize) -> Self {
         self.transcript_channel_capacity = capacity;
+        self
+    }
+
+    /// Enables or disables activity recording and publishing.
+    #[must_use]
+    pub fn with_activity_stream(mut self, enable: bool) -> Self {
+        self.enable_activity_stream = enable;
+        self
+    }
+
+    /// Replaces the activity ring capacity and per-turn frame cap.
+    #[must_use]
+    pub fn with_activity_capacity(mut self, capacity: usize) -> Self {
+        self.activity_capacity = capacity;
+        self
+    }
+
+    /// Replaces the longest activity summary kept, in characters.
+    #[must_use]
+    pub fn with_activity_text_max_len(mut self, max_len: usize) -> Self {
+        self.activity_text_max_len = max_len;
+        self
+    }
+
+    /// Replaces the thinking-coalescing window, in milliseconds.
+    #[must_use]
+    pub fn with_activity_throttle_ms(mut self, throttle_ms: i64) -> Self {
+        self.activity_throttle_ms = throttle_ms;
         self
     }
 
@@ -298,6 +346,10 @@ mod tests {
         assert!(quota.enable_lru_eviction);
         assert_eq!(quota.transcript_capacity, 256);
         assert_eq!(quota.transcript_channel_capacity, 256);
+        assert!(quota.enable_activity_stream);
+        assert_eq!(quota.activity_capacity, 256);
+        assert_eq!(quota.activity_text_max_len, 2_000);
+        assert_eq!(quota.activity_throttle_ms, 500);
     }
 
     #[test]
@@ -310,7 +362,11 @@ mod tests {
             .with_max_depth(6)
             .with_lru_eviction(false)
             .with_transcript_capacity(7)
-            .with_transcript_channel_capacity(8);
+            .with_transcript_channel_capacity(8)
+            .with_activity_stream(false)
+            .with_activity_capacity(9)
+            .with_activity_text_max_len(10)
+            .with_activity_throttle_ms(11);
         assert_eq!(
             quota,
             SubAgentQuota {
@@ -322,6 +378,10 @@ mod tests {
                 enable_lru_eviction: false,
                 transcript_capacity: 7,
                 transcript_channel_capacity: 8,
+                enable_activity_stream: false,
+                activity_capacity: 9,
+                activity_text_max_len: 10,
+                activity_throttle_ms: 11,
             }
         );
     }

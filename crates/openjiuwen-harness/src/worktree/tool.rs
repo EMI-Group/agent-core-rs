@@ -150,31 +150,10 @@ impl WorktreeTool {
             .manager
             .target_path(name)
             .map_err(|error| ToolPayload::fail(error.to_string()))?;
-        if let Some(reason) = self.deny_reason(&target) {
+        if let Some(reason) = deny_reason(self.permission.as_ref(), TOOL_NAME, &target) {
             return Err(ToolPayload::fail(reason));
         }
         Ok(target)
-    }
-
-    /// The reason a `deny` decision rejects an operation on `target`.
-    ///
-    /// The guard is consulted with the write-tool argument shape, because a
-    /// worktree creation writes into the repository. `ask` and `allow` pass, and
-    /// an absent engine fails open — the same policy the built-in tools apply.
-    fn deny_reason(&self, target: &Path) -> Option<String> {
-        let engine = self.permission.as_ref()?;
-        let args = json!({ "file_path": target.to_string_lossy() });
-        let result = engine.check_permission("write_file", &args);
-        if result.permission == PermissionLevel::Deny {
-            Some(
-                result
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| format!("Permission denied: {TOOL_NAME}")),
-            )
-        } else {
-            None
-        }
     }
 
     /// Dispatches one invocation and returns the payload.
@@ -318,6 +297,33 @@ fn required_name(args: &WorktreeArgs) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
+}
+
+/// The reason a `deny` decision rejects an operation on `target`.
+///
+/// The guard is consulted with the write-tool argument shape, because a worktree
+/// operation writes into the repository. `ask` and `allow` pass, and an absent
+/// engine fails open — the same policy the built-in tools apply. `tool_name` only
+/// names the tool in the fallback reason, used when the engine supplies no
+/// reason of its own.
+pub(crate) fn deny_reason(
+    engine: Option<&Arc<PermissionEngine>>,
+    tool_name: &str,
+    target: &Path,
+) -> Option<String> {
+    let engine = engine?;
+    let args = json!({ "file_path": target.to_string_lossy() });
+    let result = engine.check_permission("write_file", &args);
+    if result.permission == PermissionLevel::Deny {
+        Some(
+            result
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("Permission denied: {tool_name}")),
+        )
+    } else {
+        None
+    }
 }
 
 /// The bilingual card description.

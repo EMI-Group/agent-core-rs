@@ -26,6 +26,7 @@ use tokio::process::Command;
 use openjiuwen_common::error::{Error, Result};
 
 use super::models::WorktreeInfo;
+use super::sparse::SparseConfig;
 
 /// Name of the git executable.
 pub const GIT_BINARY: &str = "git";
@@ -35,6 +36,10 @@ pub const NOT_INSTALLED_MARKER: &str = "git is not installed";
 
 /// Substring of the [`Error::config`] message used outside a repository.
 pub const NOT_A_REPOSITORY_MARKER: &str = "not a git repository";
+
+/// Substring of the [`Error::tool`] message used when sparse checkout setup
+/// fails after the worktree was created.
+pub const SPARSE_FAILURE_MARKER: &str = "sparse checkout failed";
 
 /// Whether a `git` executable is on `PATH`.
 #[must_use]
@@ -60,6 +65,25 @@ pub fn not_a_repository_error(cwd: &Path) -> Error {
 /// Builds the typed error of a failed git invocation.
 pub fn git_failure_error(args: &[&str], stderr: &str) -> Error {
     Error::tool(format!("git {} failed: {}", args.join(" "), stderr.trim()))
+}
+
+/// Builds the typed error of a failed sparse-checkout setup.
+///
+/// Python's backend removes the half-created worktree (`worktree remove
+/// --force`) and re-raises with this message; the Rust manager does the same and
+/// then returns this error, which [`is_sparse_failure`] recognises.
+pub fn sparse_failure_error(path: &Path, stderr: &str) -> Error {
+    Error::tool(format!(
+        "{SPARSE_FAILURE_MARKER}: `{}`: {}",
+        path.display(),
+        stderr.trim()
+    ))
+}
+
+/// Whether `error` reports a failed sparse-checkout setup.
+#[must_use]
+pub fn is_sparse_failure(error: &Error) -> bool {
+    error.to_string().contains(SPARSE_FAILURE_MARKER)
 }
 
 /// Whether `error` reports that git is not installed.
@@ -376,6 +400,59 @@ pub async fn worktree_add_existing(
         .map(|_| ())
 }
 
+/// Creates a worktree at `path` on a new `branch` based on `base` without
+/// checking files out.
+///
+/// The first half of the sparse-checkout flow: git records the worktree and the
+/// branch but populates nothing, so `sparse-checkout set` can then select the
+/// paths before a single `checkout HEAD` writes them ([`checkout_head`]).
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command.
+pub async fn worktree_add_no_checkout(
+    runner: &dyn GitRunner,
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    let args = [
+        "worktree",
+        "add",
+        "--no-checkout",
+        "-b",
+        branch,
+        path.as_str(),
+        base,
+    ];
+    runner.run(&args, repo).await.map(|_| ())
+}
+
+/// Checks out an existing `branch` at `path` without populating files.
+///
+/// The sparse-checkout counterpart of [`worktree_add_existing`].
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command.
+pub async fn worktree_add_no_checkout_existing(
+    runner: &dyn GitRunner,
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    runner
+        .run(
+            &["worktree", "add", "--no-checkout", path.as_str(), branch],
+            repo,
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Removes the worktree at `path`, optionally forcing a dirty worktree.
 ///
 /// # Errors
@@ -447,6 +524,125 @@ pub async fn worktree_unlock(runner: &dyn GitRunner, repo: &Path, path: &Path) -
 pub async fn status_porcelain(runner: &dyn GitRunner, cwd: &Path) -> Result<Vec<String>> {
     let output = runner.run(&["status", "--porcelain"], cwd).await?;
     Ok(parse_status_porcelain(&output.stdout))
+}
+
+/// Selects the sparse-checkout paths of `config` in the worktree at `cwd`.
+///
+/// Python runs `sparse-checkout set --cone -- <paths>` and then
+/// `checkout HEAD`; the two steps are split here so the caller controls the
+/// order (`checkout_head` is the second step). Cone mode passes `--cone`,
+/// pattern mode passes `--no-cone`.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] for an empty selection or an invalid path, and
+/// [`Error::tool`] when git rejects the command.
+pub async fn sparse_checkout_set(
+    runner: &dyn GitRunner,
+    cwd: &Path,
+    config: &SparseConfig,
+) -> Result<()> {
+    if config.is_empty() {
+        return Err(Error::validation(
+            "sparse checkout requires at least one path".to_owned(),
+        ));
+    }
+    config.validate()?;
+    let config = config.normalized();
+    let mut args = vec!["sparse-checkout", "set", config.mode.git_flag(), "--"];
+    args.extend(config.paths.iter().map(String::as_str));
+    runner.run(&args, cwd).await.map(|_| ())
+}
+
+/// Populates the worktree at `cwd` from `HEAD` after sparse checkout was set.
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command.
+pub async fn checkout_head(runner: &dyn GitRunner, cwd: &Path) -> Result<()> {
+    runner.run(&["checkout", "HEAD"], cwd).await.map(|_| ())
+}
+
+/// Re-applies the recorded sparse-checkout selection in the worktree at `cwd`.
+///
+/// This is what a re-entered worktree needs after the config was persisted but
+/// the checkout was not: it re-reads `.git/info/sparse-checkout` and updates the
+/// working tree.
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command (for example when sparse
+/// checkout was never enabled).
+pub async fn sparse_checkout_reapply(runner: &dyn GitRunner, cwd: &Path) -> Result<()> {
+    runner
+        .run(&["sparse-checkout", "reapply"], cwd)
+        .await
+        .map(|_| ())
+}
+
+/// Disables sparse checkout in the worktree at `cwd`, restoring a full checkout.
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command.
+pub async fn sparse_checkout_disable(runner: &dyn GitRunner, cwd: &Path) -> Result<()> {
+    runner
+        .run(&["sparse-checkout", "disable"], cwd)
+        .await
+        .map(|_| ())
+}
+
+/// Captures `git diff --stat`, either the working-tree diff or `<base>..HEAD`.
+///
+/// # Errors
+///
+/// Returns [`Error::tool`] when git rejects the command.
+pub async fn diff_stat(runner: &dyn GitRunner, cwd: &Path, base: Option<&str>) -> Result<String> {
+    let output = match base {
+        Some(base) => {
+            let range = format!("{base}..HEAD");
+            runner.run(&["diff", "--stat", range.as_str()], cwd).await?
+        }
+        None => runner.run(&["diff", "--stat"], cwd).await?,
+    };
+    Ok(output.stdout)
+}
+
+/// Counts the commits in `range` (`<base>..HEAD`), or `None` when unknown.
+///
+/// A git failure and an unparsable count both degrade to `None`, which callers
+/// read as "cannot determine" (fail-closed) rather than "zero".
+///
+/// # Errors
+///
+/// Never returns `Err` today: the `Result` keeps the signature uniform with the
+/// other helpers and leaves room for a future strict variant.
+pub async fn rev_list_count(
+    runner: &dyn GitRunner,
+    cwd: &Path,
+    range: &str,
+) -> Result<Option<u64>> {
+    match runner.run(&["rev-list", "--count", range], cwd).await {
+        Ok(output) => Ok(output.stdout.trim().parse::<u64>().ok()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether `cwd` has commits no remote contains.
+///
+/// `Some(true)` when `git rev-list --max-count=1 HEAD --not --remotes` printed a
+/// commit, `Some(false)` when it printed nothing, and `None` when the probe
+/// failed — the fail-closed value Python's cleanup uses to keep a worktree.
+///
+/// # Errors
+///
+/// Never returns `Err` today: probe failures degrade to `Ok(None)`.
+pub async fn has_unpushed_commits(runner: &dyn GitRunner, cwd: &Path) -> Result<Option<bool>> {
+    let args = ["rev-list", "--max-count=1", "HEAD", "--not", "--remotes"];
+    match runner.run(&args, cwd).await {
+        Ok(output) => Ok(Some(!output.stdout.trim().is_empty())),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

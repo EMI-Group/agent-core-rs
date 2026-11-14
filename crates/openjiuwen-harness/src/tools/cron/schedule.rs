@@ -1,34 +1,52 @@
-//! Five-field cron expression parsing and next-occurrence computation.
+//! Cron expression parsing and next-occurrence computation.
 //!
-//! The supported grammar is the classic 5-field form
-//! `minute hour day-of-month month day-of-week`:
+//! Two expression forms are accepted:
 //!
-//! - `*` — every value of the field,
-//! - `*/n` — every `n`-th value starting at the field minimum,
-//! - `a` — a single value,
-//! - `a-b` — an inclusive range,
-//! - `a-b/n` (and `a/n`, which Vixie cron reads as `a-max/n`) — a stepped range,
-//! - `1,15,30` — a comma-separated list of any of the above.
+//! - **5-field classic cron** — `minute hour day-of-month month day-of-week`,
+//! - **6- or 7-field Quartz** — `second minute hour day-of-month month day-of-week [year]`.
 //!
-//! Day-of-week accepts the three-letter names `SUN`..`SAT` (case-insensitive) besides the
-//! numbers `0..=7`, where both `0` and `7` mean Sunday. The shorthands `@hourly`, `@daily`,
-//! `@midnight`, `@weekly`, `@monthly`, `@yearly` and `@annually` expand to that grammar.
+//! Both forms share the value grammar: `*` (every value), `*/n` (every `n`-th value starting
+//! at the field minimum), `a` (a single value), `a-b` (an inclusive range), `a-b/n` and `a/n`
+//! (which reads as `a-max/n`) — all combinable in comma lists. Month names `JAN`..`DEC` and
+//! day-of-week names `SUN`..`SAT` are accepted case-insensitively wherever a number is; the
+//! numeric day-of-week range is `0..=7`, where both `0` and `7` mean Sunday. The shorthands
+//! `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly` and `@annually` expand to
+//! the 5-field form.
 //!
-//! # Day-of-month / day-of-week parity choice
+//! # The seconds and year fields
 //!
-//! Python's cron backend runs a 7-field Quartz engine, where the two day fields must not both
-//! be specified and the unspecified one is written `?`. Standard (Vixie) cron instead treats
-//! them with **OR semantics**: when *both* fields are restricted, a day matches if either the
-//! day-of-month or the day-of-week matches; when one is unrestricted (`*`), only the other
-//! decides. This module ports the standard semantics because the public expression grammar
-//! here is the 5-field one; `?` and the seconds/year fields are not accepted.
+//! A six-field expression starts with a seconds field (`0..=59`) and matches at second
+//! granularity; a five-field expression keeps its minute granularity. The optional seventh
+//! field restricts the year to `1970..=2099`.
 //!
-//! A field counts as unrestricted when its normalized value set covers the whole range
-//! (`*`, `*/1`, or `0-7` for day-of-week).
+//! # Day-of-month / day-of-week rules
+//!
+//! Classic cron combines the two day fields with **OR semantics**: when *both* are restricted,
+//! a day matches if either the day-of-month or the day-of-week matches; when one is
+//! unrestricted (`*`), only the other decides. A field counts as unrestricted when its
+//! normalized value set covers the whole range (`*`, `*/1`, or `0-7` for day-of-week).
+//!
+//! Quartz requires exactly one of the two day fields to be `?` ("no specific value"): the
+//! unspecified field is ignored and the specified one decides. Two `?` fields, or none, are a
+//! typed parse error. Because the rule leaves exactly one restricted field, the OR table above
+//! reduces to "the specified field decides".
+//!
+//! # Quartz extensions
+//!
+//! - `L` in day-of-month — the last day of the month; `L-n` — `n` days before it (`0..=30`).
+//! - `nL` in day-of-week — the last weekday `n` of the month; a bare `L` is Saturday (`6L`).
+//! - `d#n` in day-of-week — the `n`-th weekday `d` of the month (`n` in `1..=5`).
+//! - wrap-around ranges — `22-2` for hours (22, 23, 0, 1) and `FRI-MON` for weekdays.
+//! - `W` (nearest weekday, written `15W` or `LW`) is **not** implemented: it is rejected with
+//!   `unsupported cron token: "15W": "W" (nearest weekday) is not supported`, so a caller
+//!   never gets a silently different schedule.
+//! - every Quartz-only token is rejected in the 5-field form, which keeps its classic
+//!   contract (`0 0 * * FRI-MON` stays `invalid day-of-week field: "FRI-MON"`).
 //!
 //! # Bounded search
 //!
-//! [`CronSchedule::next_after`] scans at most [`SEARCH_HORIZON_DAYS`] days ahead and at most
+//! [`CronSchedule::next_after`] scans at most [`SEARCH_HORIZON_DAYS`] days ahead (extended to
+//! the end of the last accepted year when the expression names one) and at most
 //! [`MAX_SEARCH_STEPS`] loop iterations, so a schedule that can never match (for example
 //! `0 0 31 2 *`) returns `None` instead of looping forever. The horizon is a documented
 //! limitation: a leap-day schedule never needs more than four years, but the eight-year gap
@@ -40,42 +58,83 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 
 use openjiuwen_common::error::{Error, Result};
 
-/// Number of fields a cron expression must have.
-const FIELD_COUNT: usize = 5;
+/// Field count of the classic form (`minute hour day-of-month month day-of-week`).
+const CLASSIC_FIELDS: usize = 5;
+
+/// Field count of the six-field Quartz form (leading seconds, no year).
+const QUARTZ_FIELDS: usize = 6;
+
+/// Field count of the seven-field Quartz form (leading seconds plus a year).
+const QUARTZ_YEAR_FIELDS: usize = 7;
 
 /// How far ahead [`CronSchedule::next_after`] searches, in days (five years plus slack).
 const SEARCH_HORIZON_DAYS: i64 = 5 * 366 + 1;
 
 /// Safety cap on the scan iterations of [`CronSchedule::next_after`].
 ///
-/// Every rejected candidate jumps to the next minute, hour, day or month, so the cap is only
-/// a guard against a pathological loop; the five-year horizon is the semantic bound.
+/// Every rejected candidate jumps to the next matching second, minute, hour, day, month or
+/// year, so the cap is only a guard against a pathological loop; the horizon is the semantic
+/// bound.
 const MAX_SEARCH_STEPS: usize = 200_000;
 
-/// The five cron fields, each with its range, universe size and error label.
+/// Lowest year the Quartz `year` field accepts.
+const MIN_YEAR: u32 = 1970;
+
+/// Highest year the Quartz `year` field accepts.
+const MAX_YEAR: u32 = 2099;
+
+/// Largest `n` accepted by the `L-n` day-of-month token (a month has at most 31 days).
+const MAX_LAST_DAY_OFFSET: u32 = 30;
+
+/// Largest `n` accepted by the `d#n` day-of-week token (a month holds at most five of a day).
+const MAX_NTH_WEEKDAY: u32 = 5;
+
+/// The expression form, which decides the field layout and the extension rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// Five fields, minute granularity, Vixie day-field OR semantics, no extensions.
+    Classic,
+    /// Six or seven fields, second granularity, Quartz day-field rule and extensions.
+    Quartz,
+}
+
+impl Form {
+    /// Whether this form accepts the Quartz-only tokens.
+    const fn is_quartz(self) -> bool {
+        matches!(self, Self::Quartz)
+    }
+}
+
+/// The cron fields, each with its range, universe size and error label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldKind {
+    /// `second`, `0..=59` (Quartz only).
+    Second,
     /// `minute`, `0..=59`.
     Minute,
     /// `hour`, `0..=23`.
     Hour,
     /// `day-of-month`, `1..=31`.
     DayOfMonth,
-    /// `month`, `1..=12`.
+    /// `month`, `1..=12`, or `JAN`..`DEC`.
     Month,
-    /// `day-of-week`, `0..=7` with `7` normalized to Sunday.
+    /// `day-of-week`, `0..=7` with `7` normalized to Sunday, or `SUN`..`SAT`.
     DayOfWeek,
+    /// `year`, `1970..=2099` (Quartz only).
+    Year,
 }
 
 impl FieldKind {
     /// The field name used in validation messages.
     const fn label(self) -> &'static str {
         match self {
+            Self::Second => "second",
             Self::Minute => "minute",
             Self::Hour => "hour",
             Self::DayOfMonth => "day-of-month",
             Self::Month => "month",
             Self::DayOfWeek => "day-of-week",
+            Self::Year => "year",
         }
     }
 
@@ -83,29 +142,32 @@ impl FieldKind {
     const fn min(self) -> u32 {
         match self {
             Self::DayOfMonth | Self::Month => 1,
-            Self::Minute | Self::Hour | Self::DayOfWeek => 0,
+            Self::Year => MIN_YEAR,
+            Self::Second | Self::Minute | Self::Hour | Self::DayOfWeek => 0,
         }
     }
 
     /// The highest value the grammar accepts (before normalization).
     const fn max(self) -> u32 {
         match self {
-            Self::Minute => 59,
+            Self::Second | Self::Minute => 59,
             Self::Hour => 23,
             Self::DayOfMonth => 31,
             Self::Month => 12,
             Self::DayOfWeek => 7,
+            Self::Year => MAX_YEAR,
         }
     }
 
     /// How many distinct values a fully covered field holds after normalization.
     const fn universe(self) -> usize {
         match self {
-            Self::Minute => 60,
+            Self::Second | Self::Minute => 60,
             Self::Hour => 24,
             Self::DayOfMonth => 31,
             Self::Month => 12,
             Self::DayOfWeek => 7,
+            Self::Year => (MAX_YEAR - MIN_YEAR + 1) as usize,
         }
     }
 
@@ -118,15 +180,16 @@ impl FieldKind {
         }
     }
 
-    /// Parses one value of this field: a number, or a day-of-week name.
+    /// Parses one value of this field: a number, or a month / day-of-week name.
     fn parse_value(self, text: &str, raw: &str) -> Result<u32> {
-        let value = if matches!(self, Self::DayOfWeek) {
-            match weekday_from_name(text) {
-                Some(value) => value,
-                None => parse_number(text, self, raw)?,
-            }
-        } else {
-            parse_number(text, self, raw)?
+        let named = match self {
+            Self::DayOfWeek => weekday_from_name(text),
+            Self::Month => month_from_name(text),
+            _ => None,
+        };
+        let value = match named {
+            Some(value) => value,
+            None => parse_number(text, self, raw)?,
         };
         if value < self.min() || value > self.max() {
             return Err(field_error(self, raw));
@@ -138,6 +201,13 @@ impl FieldKind {
 /// Builds the validation error of an offending field, echoing the field text verbatim.
 fn field_error(kind: FieldKind, raw: &str) -> Error {
     Error::validation(format!("invalid {} field: {raw:?}", kind.label()))
+}
+
+/// Builds the error of a recognised-but-unsupported Quartz token.
+fn unsupported_token(part: &str, what: &str) -> Error {
+    Error::validation(format!(
+        "unsupported cron token: {part:?}: {what} is not supported"
+    ))
 }
 
 /// Parses a non-negative integer, reporting a malformed field on failure.
@@ -155,6 +225,28 @@ fn weekday_from_name(text: &str) -> Option<u32> {
         ("THU", 4),
         ("FRI", 5),
         ("SAT", 6),
+    ];
+    NAMES
+        .iter()
+        .find(|(name, _)| text.eq_ignore_ascii_case(name))
+        .map(|(_, value)| *value)
+}
+
+/// Maps a three-letter month name (case-insensitive) to `1` (January) .. `12` (December).
+fn month_from_name(text: &str) -> Option<u32> {
+    const NAMES: [(&str, u32); 12] = [
+        ("JAN", 1),
+        ("FEB", 2),
+        ("MAR", 3),
+        ("APR", 4),
+        ("MAY", 5),
+        ("JUN", 6),
+        ("JUL", 7),
+        ("AUG", 8),
+        ("SEP", 9),
+        ("OCT", 10),
+        ("NOV", 11),
+        ("DEC", 12),
     ];
     NAMES
         .iter()
@@ -182,13 +274,148 @@ fn expand_shorthand(expression: &str) -> Result<&str> {
     Ok(expanded)
 }
 
-/// Parses one comma-separated part of a field into `values`.
-fn parse_part(kind: FieldKind, part: &str, raw: &str, values: &mut BTreeSet<u32>) -> Result<()> {
+/// One parsed field: its plain values plus the Quartz specials of a day field.
+#[derive(Debug, Clone, Default)]
+struct ParsedField {
+    /// Plain values, normalized and deduplicated.
+    values: BTreeSet<u32>,
+    /// Day-of-month `L` / `L-n` tokens, as offsets from the last day of the month.
+    last_day_offsets: BTreeSet<u32>,
+    /// Day-of-week `nL` tokens, as weekday numbers.
+    last_weekdays: BTreeSet<u32>,
+    /// Day-of-week `d#n` tokens, as `(weekday, nth)` pairs.
+    nth_weekdays: BTreeSet<(u32, u32)>,
+}
+
+impl ParsedField {
+    /// Whether no value and no special token was found, which is always an error.
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+            && self.last_day_offsets.is_empty()
+            && self.last_weekdays.is_empty()
+            && self.nth_weekdays.is_empty()
+    }
+
+    /// Whether the field selects every value of its range and holds no special token.
+    fn covers(&self, kind: FieldKind) -> bool {
+        self.last_day_offsets.is_empty()
+            && self.last_weekdays.is_empty()
+            && self.nth_weekdays.is_empty()
+            && self.values.len() == kind.universe()
+    }
+
+    /// Consumes the field into plain, sorted vectors.
+    fn into_parts(self) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<(u32, u32)>) {
+        (
+            self.values.into_iter().collect(),
+            self.last_day_offsets.into_iter().collect(),
+            self.last_weekdays.into_iter().collect(),
+            self.nth_weekdays.into_iter().collect(),
+        )
+    }
+}
+
+/// Parses one comma-separated part of a field into `out`.
+fn parse_part(
+    kind: FieldKind,
+    part: &str,
+    raw: &str,
+    form: Form,
+    out: &mut ParsedField,
+) -> Result<()> {
+    if part.is_empty() {
+        return Err(field_error(kind, raw));
+    }
+    let upper = part.to_ascii_uppercase();
+    if upper.contains('W') {
+        return Err(unsupported_token(part, "\"W\" (nearest weekday)"));
+    }
+    if part.contains('?') {
+        return Err(unsupported_token(raw, "\"?\" (must be the whole field)"));
+    }
+    match kind {
+        FieldKind::DayOfWeek if upper.contains('#') => {
+            if form.is_quartz() {
+                return parse_nth_weekday(part, raw, out);
+            }
+            return Err(field_error(kind, raw));
+        }
+        FieldKind::DayOfWeek if upper.ends_with('L') => {
+            if form.is_quartz() {
+                return parse_last_weekday(part, raw, out);
+            }
+            return Err(field_error(kind, raw));
+        }
+        FieldKind::DayOfMonth if upper.starts_with('L') => {
+            if form.is_quartz() {
+                return parse_last_day(part, raw, out);
+            }
+            return Err(field_error(kind, raw));
+        }
+        _ => {}
+    }
+    parse_clock_part(kind, part, raw, form, out)
+}
+
+/// Parses the `d#n` day-of-week token: the `n`-th weekday `d` of the month.
+fn parse_nth_weekday(part: &str, raw: &str, out: &mut ParsedField) -> Result<()> {
+    let Some((day_text, nth_text)) = part.split_once('#') else {
+        return Err(field_error(FieldKind::DayOfWeek, raw));
+    };
+    let weekday = FieldKind::DayOfWeek.parse_value(day_text, raw)?;
+    let nth = parse_number(nth_text, FieldKind::DayOfWeek, raw)?;
+    if !(1..=MAX_NTH_WEEKDAY).contains(&nth) {
+        return Err(field_error(FieldKind::DayOfWeek, raw));
+    }
+    out.nth_weekdays
+        .insert((FieldKind::DayOfWeek.normalize(weekday), nth));
+    Ok(())
+}
+
+/// Parses the `nL` day-of-week token: the last weekday `n` of the month.
+///
+/// A bare `L` is Saturday, which is the Quartz reading of "the last day of the week".
+fn parse_last_weekday(part: &str, raw: &str, out: &mut ParsedField) -> Result<()> {
+    let prefix = &part[..part.len() - 1];
+    let weekday = if prefix.is_empty() {
+        6
+    } else {
+        FieldKind::DayOfWeek.normalize(FieldKind::DayOfWeek.parse_value(prefix, raw)?)
+    };
+    out.last_weekdays.insert(weekday);
+    Ok(())
+}
+
+/// Parses the `L` / `L-n` day-of-month token: the last day of the month, minus `n`.
+fn parse_last_day(part: &str, raw: &str, out: &mut ParsedField) -> Result<()> {
+    let rest = &part[1..];
+    let offset = if rest.is_empty() {
+        0
+    } else {
+        let Some(digits) = rest.strip_prefix('-') else {
+            return Err(field_error(FieldKind::DayOfMonth, raw));
+        };
+        let offset = parse_number(digits, FieldKind::DayOfMonth, raw)?;
+        if offset > MAX_LAST_DAY_OFFSET {
+            return Err(field_error(FieldKind::DayOfMonth, raw));
+        }
+        offset
+    };
+    out.last_day_offsets.insert(offset);
+    Ok(())
+}
+
+/// Parses one comma-separated numeric part of a field into `out`.
+fn parse_clock_part(
+    kind: FieldKind,
+    part: &str,
+    raw: &str,
+    form: Form,
+    out: &mut ParsedField,
+) -> Result<()> {
     let (base, step) = match part.split_once('/') {
         Some((base, step_text)) => {
-            let step = step_text
-                .parse::<u32>()
-                .map_err(|_| field_error(kind, raw))?;
+            let step = parse_number(step_text, kind, raw)?;
             if step == 0 {
                 return Err(field_error(kind, raw));
             }
@@ -203,7 +430,11 @@ fn parse_part(kind: FieldKind, part: &str, raw: &str, values: &mut BTreeSet<u32>
         let start = kind.parse_value(start_text, raw)?;
         let end = kind.parse_value(end_text, raw)?;
         if start > end {
-            return Err(field_error(kind, raw));
+            if !form.is_quartz() {
+                return Err(field_error(kind, raw));
+            }
+            // Quartz wrap-around range: `22-2` is 22, 23, 0, 1.
+            return insert_wrapped(kind, start, end, step.unwrap_or(1), out);
         }
         (start, end)
     } else {
@@ -215,22 +446,46 @@ fn parse_part(kind: FieldKind, part: &str, raw: &str, values: &mut BTreeSet<u32>
     let step = step.unwrap_or(1);
     let mut current = start;
     while current <= end {
-        values.insert(kind.normalize(current));
+        out.values.insert(kind.normalize(current));
         current += step;
     }
     Ok(())
 }
 
-/// Parses one whole field (a comma-separated list of parts) into a sorted, deduplicated set.
-fn parse_field(kind: FieldKind, raw: &str) -> Result<Vec<u32>> {
-    let mut values = BTreeSet::new();
-    for part in raw.split(',') {
-        parse_part(kind, part, raw, &mut values)?;
+/// Inserts a wrap-around range (`start > end`) into `out`, stepping along the unrolled values.
+fn insert_wrapped(
+    kind: FieldKind,
+    start: u32,
+    end: u32,
+    step: u32,
+    out: &mut ParsedField,
+) -> Result<()> {
+    let unrolled: Vec<u32> = (start..=kind.max()).chain(kind.min()..=end).collect();
+    let stride = usize::try_from(step).unwrap_or(1);
+    for value in unrolled.into_iter().step_by(stride) {
+        out.values.insert(kind.normalize(value));
     }
-    if values.is_empty() {
+    Ok(())
+}
+
+/// Parses one whole field (a comma-separated list of parts).
+fn parse_field(kind: FieldKind, raw: &str, form: Form) -> Result<ParsedField> {
+    let mut parsed = ParsedField::default();
+    for part in raw.split(',') {
+        parse_part(kind, part, raw, form, &mut parsed)?;
+    }
+    if parsed.is_empty() {
         return Err(field_error(kind, raw));
     }
-    Ok(values.into_iter().collect())
+    Ok(parsed)
+}
+
+/// Parses an optional day field, mapping Quartz `?` to "no specific value".
+fn parse_day_field(kind: FieldKind, raw: &str, form: Form) -> Result<Option<ParsedField>> {
+    if form.is_quartz() && raw == "?" {
+        return Ok(None);
+    }
+    parse_field(kind, raw, form).map(Some)
 }
 
 /// A parsed cron expression, reusable for any number of next-occurrence queries.
@@ -241,6 +496,8 @@ fn parse_field(kind: FieldKind, raw: &str) -> Result<Vec<u32>> {
 pub struct CronSchedule {
     /// The expression as supplied (trimmed), kept for persisted jobs and messages.
     expression: String,
+    /// Seconds of the minute; `Some` for the Quartz forms, `None` for minute granularity.
+    seconds: Option<Vec<u32>>,
     /// Minutes of the hour, sorted and deduplicated.
     minutes: Vec<u32>,
     /// Hours of the day, sorted and deduplicated.
@@ -251,6 +508,14 @@ pub struct CronSchedule {
     months: Vec<u32>,
     /// Days of the week (`0` = Sunday), sorted and deduplicated.
     weekdays: Vec<u32>,
+    /// Accepted years, sorted and deduplicated; `None` means every year.
+    years: Option<Vec<u32>>,
+    /// Day-of-month `L` / `L-n` tokens, as offsets from the last day of the month.
+    last_day_offsets: Vec<u32>,
+    /// Day-of-week `nL` tokens: the last such weekday of the month.
+    last_weekdays: Vec<u32>,
+    /// Day-of-week `d#n` tokens: the `n`-th such weekday of the month.
+    nth_weekdays: Vec<(u32, u32)>,
     /// Whether the day-of-month field restricts the days of a month.
     day_of_month_restricted: bool,
     /// Whether the day-of-week field restricts the days of a week.
@@ -258,14 +523,16 @@ pub struct CronSchedule {
 }
 
 impl CronSchedule {
-    /// Parses a 5-field cron expression or one of the supported `@` shorthands.
+    /// Parses a 5-field classic or 6/7-field Quartz expression, or a supported `@` shorthand.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`](openjiuwen_common::error::Error::Validation) when the
-    /// expression is empty, has the wrong number of fields, uses an unknown shorthand, or
-    /// holds a field value, range or step outside the grammar. Messages name the offending
-    /// field and echo its text, for example `invalid minute field: "75"`.
+    /// expression is empty, has the wrong number of fields, uses an unknown shorthand, breaks
+    /// the Quartz `?` rule, or holds a value, range, step or token outside the grammar.
+    /// Messages name the offending field and echo its text, for example
+    /// `invalid minute field: "75"`, or name an unsupported token, for example
+    /// `unsupported cron token: "15W": "W" (nearest weekday) is not supported`.
     pub fn parse(expression: &str) -> Result<Self> {
         let trimmed = expression.trim();
         if trimmed.is_empty() {
@@ -273,29 +540,104 @@ impl CronSchedule {
         }
         let expanded = expand_shorthand(trimmed)?;
         let fields: Vec<&str> = expanded.split_whitespace().collect();
-        if fields.len() != FIELD_COUNT {
-            return Err(Error::validation(format!(
-                "invalid cron expression: expected {FIELD_COUNT} fields (minute hour day-of-month month day-of-week), got {}: {trimmed:?}",
-                fields.len()
-            )));
+        let form = match fields.len() {
+            CLASSIC_FIELDS => Form::Classic,
+            QUARTZ_FIELDS | QUARTZ_YEAR_FIELDS => Form::Quartz,
+            count => {
+                return Err(Error::validation(format!(
+                    "invalid cron expression: expected {CLASSIC_FIELDS} fields \
+                     (minute hour day-of-month month day-of-week) or {QUARTZ_FIELDS}/\
+                     {QUARTZ_YEAR_FIELDS} Quartz fields (second minute hour day-of-month month \
+                     day-of-week [year]), got {count}: {trimmed:?}"
+                )));
+            }
+        };
+
+        let (second_text, minute_text, hour_text, dom_text, month_text, dow_text, year_text) =
+            match fields.as_slice() {
+                [minute, hour, dom, month, dow] => (None, *minute, *hour, *dom, *month, *dow, None),
+                [second, minute, hour, dom, month, dow] => {
+                    (Some(*second), *minute, *hour, *dom, *month, *dow, None)
+                }
+                [second, minute, hour, dom, month, dow, year] => (
+                    Some(*second),
+                    *minute,
+                    *hour,
+                    *dom,
+                    *month,
+                    *dow,
+                    Some(*year),
+                ),
+                _ => {
+                    return Err(Error::validation(format!(
+                        "invalid cron expression: unexpected field layout: {trimmed:?}"
+                    )));
+                }
+            };
+
+        let day_of_month = parse_day_field(FieldKind::DayOfMonth, dom_text, form)?;
+        let day_of_week = parse_day_field(FieldKind::DayOfWeek, dow_text, form)?;
+        if form.is_quartz() {
+            match (day_of_month.is_some(), day_of_week.is_some()) {
+                (true, true) => {
+                    return Err(Error::validation(format!(
+                        "invalid cron expression: both day-of-month and day-of-week are \
+                         specified (one must be \"?\" in a Quartz expression): {trimmed:?}"
+                    )));
+                }
+                (false, false) => {
+                    return Err(Error::validation(format!(
+                        "invalid cron expression: both day-of-month and day-of-week are \"?\" \
+                         (exactly one must be specified in a Quartz expression): {trimmed:?}"
+                    )));
+                }
+                _ => {}
+            }
         }
 
-        let minutes = parse_field(FieldKind::Minute, fields[0])?;
-        let hours = parse_field(FieldKind::Hour, fields[1])?;
-        let days_of_month = parse_field(FieldKind::DayOfMonth, fields[2])?;
-        let months = parse_field(FieldKind::Month, fields[3])?;
-        let weekdays = parse_field(FieldKind::DayOfWeek, fields[4])?;
+        let seconds = second_text
+            .map(|text| parse_field(FieldKind::Second, text, form))
+            .transpose()?
+            .map(|parsed| parsed.values.into_iter().collect::<Vec<u32>>());
+        let minutes = parse_field(FieldKind::Minute, minute_text, form)?
+            .values
+            .into_iter()
+            .collect();
+        let hours = parse_field(FieldKind::Hour, hour_text, form)?
+            .values
+            .into_iter()
+            .collect();
+        let months = parse_field(FieldKind::Month, month_text, form)?
+            .values
+            .into_iter()
+            .collect();
+        let years = year_text
+            .map(|text| parse_field(FieldKind::Year, text, form))
+            .transpose()?
+            .map(|parsed| parsed.values.into_iter().collect::<Vec<u32>>());
 
-        let day_of_month_restricted = days_of_month.len() < FieldKind::DayOfMonth.universe();
-        let day_of_week_restricted = weekdays.len() < FieldKind::DayOfWeek.universe();
+        let day_of_month_restricted = day_of_month
+            .as_ref()
+            .is_some_and(|field| !field.covers(FieldKind::DayOfMonth));
+        let day_of_week_restricted = day_of_week
+            .as_ref()
+            .is_some_and(|field| !field.covers(FieldKind::DayOfWeek));
+        let (days_of_month, last_day_offsets, _, _) = day_of_month.unwrap_or_default().into_parts();
+        let (weekdays, _, last_weekdays, nth_weekdays) =
+            day_of_week.unwrap_or_default().into_parts();
 
         Ok(Self {
             expression: trimmed.to_owned(),
+            seconds,
             minutes,
             hours,
             days_of_month,
             months,
             weekdays,
+            years,
+            last_day_offsets,
+            last_weekdays,
+            nth_weekdays,
             day_of_month_restricted,
             day_of_week_restricted,
         })
@@ -307,25 +649,41 @@ impl CronSchedule {
         &self.expression
     }
 
-    /// Returns the first minute strictly after `now` that satisfies the whole expression.
+    /// Whether the expression carries a seconds field, i.e. matches at second granularity.
+    #[must_use]
+    pub fn has_seconds(&self) -> bool {
+        self.seconds.is_some()
+    }
+
+    /// Returns the first instant strictly after `now` that satisfies the whole expression.
     ///
-    /// The search works at minute granularity in UTC, ignores the seconds and sub-second part
-    /// of `now`, and never returns `now` itself — a query at `09:00:00` for `0 9 * * *` yields
-    /// the next day's `09:00`. Returns `None` when the expression can never match (for example
-    /// `0 0 31 2 *`) or when the next match lies beyond the five-year search horizon.
+    /// A five-field expression searches at minute granularity in UTC and ignores the seconds
+    /// and sub-second part of `now`, so a query at `09:00:00` for `0 9 * * *` yields the next
+    /// day's `09:00`. A Quartz expression with a seconds field searches at second granularity.
+    /// The result is never `now` itself. Returns `None` when the expression can never match
+    /// (for example `0 0 31 2 *`) or when the next match lies beyond the search horizon.
     #[must_use]
     pub fn next_after(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let horizon = now.checked_add_signed(Duration::days(SEARCH_HORIZON_DAYS))?;
-        let mut candidate = now
-            .with_second(0)?
-            .with_nanosecond(0)?
-            .checked_add_signed(Duration::minutes(1))?;
+        let horizon = self.horizon(now)?;
+        let mut candidate = match self.seconds {
+            Some(_) => now
+                .with_nanosecond(0)?
+                .checked_add_signed(Duration::seconds(1))?,
+            None => now
+                .with_second(0)?
+                .with_nanosecond(0)?
+                .checked_add_signed(Duration::minutes(1))?,
+        };
         let mut steps = 0usize;
         loop {
             if candidate > horizon || steps >= MAX_SEARCH_STEPS {
                 return None;
             }
             steps += 1;
+            if !self.year_matches(&candidate) {
+                candidate = next_year_start(candidate)?;
+                continue;
+            }
             if !self.months.contains(&candidate.month()) {
                 candidate = next_month_start(candidate)?;
                 continue;
@@ -339,21 +697,68 @@ impl CronSchedule {
                 continue;
             }
             if !self.minutes.contains(&candidate.minute()) {
-                candidate = candidate.checked_add_signed(Duration::minutes(1))?;
+                candidate = next_minute_start(candidate)?;
                 continue;
+            }
+            if let Some(seconds) = &self.seconds {
+                if !seconds.contains(&candidate.second()) {
+                    candidate = candidate.checked_add_signed(Duration::seconds(1))?;
+                    continue;
+                }
             }
             return Some(candidate);
         }
     }
 
+    /// Returns up to `count` occurrences strictly after `now`, in ascending order.
+    ///
+    /// The list stops early when the expression can never match again, so a caller asking for
+    /// more occurrences than the schedule produces gets a shorter list. Nothing is mutated, and
+    /// callers clamp `count` (the `cron` tool stops at `PREVIEW_LIMIT`).
+    #[must_use]
+    pub fn next_occurrences(&self, now: DateTime<Utc>, count: usize) -> Vec<DateTime<Utc>> {
+        let mut occurrences = Vec::with_capacity(count.min(PREVIEW_LIMIT));
+        let mut cursor = now;
+        for _ in 0..count {
+            let Some(next) = self.next_after(cursor) else {
+                break;
+            };
+            occurrences.push(next);
+            cursor = next;
+        }
+        occurrences
+    }
+
+    /// The last instant [`Self::next_after`] is willing to consider.
+    fn horizon(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let base = now.checked_add_signed(Duration::days(SEARCH_HORIZON_DAYS))?;
+        let Some(years) = &self.years else {
+            return Some(base);
+        };
+        let last = i32::try_from(*years.last()?).ok()?;
+        let end = NaiveDate::from_ymd_opt(last, 12, 31)?
+            .and_hms_opt(23, 59, 59)?
+            .and_utc();
+        Some(base.max(end))
+    }
+
+    /// Whether the candidate's year is accepted.
+    fn year_matches(&self, candidate: &DateTime<Utc>) -> bool {
+        let Some(years) = &self.years else {
+            return true;
+        };
+        u32::try_from(candidate.year())
+            .ok()
+            .is_some_and(|year| years.contains(&year))
+    }
+
     /// Whether `candidate`'s date satisfies the day-of-month/day-of-week pair.
     ///
     /// Both restricted means OR (standard cron); one unrestricted means it alone decides.
+    /// Quartz leaves exactly one of the two unrestricted (`?`).
     fn day_matches(&self, candidate: &DateTime<Utc>) -> bool {
-        let dom = self.days_of_month.contains(&candidate.day());
-        let dow = self
-            .weekdays
-            .contains(&candidate.weekday().num_days_from_sunday());
+        let dom = self.day_of_month_matches(candidate);
+        let dow = self.day_of_week_matches(candidate);
         match (self.day_of_month_restricted, self.day_of_week_restricted) {
             (false, false) => true,
             (false, true) => dow,
@@ -361,12 +766,73 @@ impl CronSchedule {
             (true, true) => dom || dow,
         }
     }
+
+    /// Whether the candidate's day-of-month is selected, including the `L` / `L-n` tokens.
+    fn day_of_month_matches(&self, candidate: &DateTime<Utc>) -> bool {
+        if self.days_of_month.contains(&candidate.day()) {
+            return true;
+        }
+        if self.last_day_offsets.is_empty() {
+            return false;
+        }
+        let last = days_in_month(candidate.year(), candidate.month());
+        self.last_day_offsets
+            .contains(&(last.saturating_sub(candidate.day())))
+    }
+
+    /// Whether the candidate's weekday is selected, including the `nL` and `d#n` tokens.
+    fn day_of_week_matches(&self, candidate: &DateTime<Utc>) -> bool {
+        let weekday = candidate.weekday().num_days_from_sunday();
+        if self.weekdays.contains(&weekday) {
+            return true;
+        }
+        if self
+            .nth_weekdays
+            .iter()
+            .any(|(day, nth)| *day == weekday && nth_weekday_of_month(candidate.day()) == *nth)
+        {
+            return true;
+        }
+        if self.last_weekdays.contains(&weekday) {
+            let last = days_in_month(candidate.year(), candidate.month());
+            return candidate.day() + 7 > last;
+        }
+        false
+    }
 }
 
-/// Advances to the first minute of the next hour.
+/// Longest occurrence list a single call may ask for.
+///
+/// Kept here so [`CronSchedule::next_occurrences`] can size its output; the `cron` tool owns
+/// the model-facing clamp.
+pub(crate) const PREVIEW_LIMIT: usize = 20;
+
+/// Number of days in `month` of `year`, with the Gregorian leap rule.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if NaiveDate::from_ymd_opt(year, 2, 29).is_some() => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// The 1-based ordinal of `day` within its weekday for the month (`1..=5`).
+fn nth_weekday_of_month(day: u32) -> u32 {
+    (day.saturating_sub(1)) / 7 + 1
+}
+
+/// Advances to the first second of the next minute.
+fn next_minute_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let seconds = 60 - candidate.second();
+    candidate.checked_add_signed(Duration::seconds(i64::from(seconds)))
+}
+
+/// Advances to the first second of the next hour.
 fn next_hour_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let minutes = 60 - candidate.minute();
-    candidate.checked_add_signed(Duration::minutes(i64::from(minutes)))
+    let seconds = (60 - candidate.minute()) * 60 - candidate.second();
+    candidate.checked_add_signed(Duration::seconds(i64::from(seconds)))
 }
 
 /// Advances to midnight of the next day.
@@ -375,7 +841,7 @@ fn next_day_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
     Some(next.and_hms_opt(0, 0, 0)?.and_utc())
 }
 
-/// Advances to the first minute of the next month.
+/// Advances to the first second of the next month.
 fn next_month_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let (year, month) = if candidate.month() == 12 {
         (candidate.year().checked_add(1)?, 1)
@@ -389,342 +855,16 @@ fn next_month_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
     )
 }
 
+/// Advances to the first second of the next year.
+fn next_year_start(candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    Some(
+        NaiveDate::from_ymd_opt(candidate.year().checked_add(1)?, 1, 1)?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc(),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use chrono::TimeZone;
-
-    use super::*;
-
-    /// Builds a UTC instant at the given wall-clock minute.
-    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
-            .unwrap()
-    }
-
-    /// Parses `expression`, returning its validation message.
-    fn parse_error(expression: &str) -> String {
-        CronSchedule::parse(expression)
-            .unwrap_err()
-            .message()
-            .into_owned()
-    }
-
-    #[test]
-    fn parses_five_field_expression() {
-        let schedule = CronSchedule::parse("*/15 9 1,15 6 MON-FRI").unwrap();
-        assert_eq!(schedule.expression(), "*/15 9 1,15 6 MON-FRI");
-        assert_eq!(schedule.minutes, vec![0, 15, 30, 45]);
-        assert_eq!(schedule.hours, vec![9]);
-        assert_eq!(schedule.days_of_month, vec![1, 15]);
-        assert_eq!(schedule.months, vec![6]);
-        assert_eq!(schedule.weekdays, vec![1, 2, 3, 4, 5]);
-        assert!(schedule.day_of_month_restricted);
-        assert!(schedule.day_of_week_restricted);
-    }
-
-    #[test]
-    fn leading_and_trailing_whitespace_is_ignored() {
-        let schedule = CronSchedule::parse("  @daily  ").unwrap();
-        assert_eq!(schedule.expression(), "@daily");
-        assert_eq!(schedule.hours, vec![0]);
-        assert_eq!(schedule.minutes, vec![0]);
-    }
-
-    #[test]
-    fn expands_shorthands() {
-        let hourly = CronSchedule::parse("@hourly").unwrap();
-        assert_eq!(hourly.minutes, vec![0]);
-        assert_eq!(hourly.hours.len(), 24);
-        assert!(!hourly.day_of_month_restricted);
-        assert!(!hourly.day_of_week_restricted);
-
-        let daily = CronSchedule::parse("@daily").unwrap();
-        assert_eq!(daily.minutes, vec![0]);
-        assert_eq!(daily.hours, vec![0]);
-        assert!(!daily.day_of_month_restricted);
-        assert_eq!(CronSchedule::parse("@midnight").unwrap().hours, vec![0]);
-
-        let weekly = CronSchedule::parse("@weekly").unwrap();
-        assert_eq!(weekly.minutes, vec![0]);
-        assert_eq!(weekly.hours, vec![0]);
-        assert_eq!(weekly.weekdays, vec![0]);
-        assert!(weekly.day_of_week_restricted);
-
-        let monthly = CronSchedule::parse("@monthly").unwrap();
-        assert_eq!(monthly.days_of_month, vec![1]);
-        assert_eq!(monthly.months.len(), 12);
-
-        let yearly = CronSchedule::parse("@yearly").unwrap();
-        assert_eq!(yearly.days_of_month, vec![1]);
-        assert_eq!(yearly.months, vec![1]);
-        assert_eq!(CronSchedule::parse("@annually").unwrap().months, vec![1]);
-    }
-
-    #[test]
-    fn supports_steps_ranges_and_lists() {
-        let schedule = CronSchedule::parse("0-30/10 8,20 * * *").unwrap();
-        assert_eq!(schedule.minutes, vec![0, 10, 20, 30]);
-        assert_eq!(schedule.hours, vec![8, 20]);
-
-        // `a/n` is `a-max/n`, the Vixie reading of a start-only step.
-        let open_step = CronSchedule::parse("5/20 * * * *").unwrap();
-        assert_eq!(open_step.minutes, vec![5, 25, 45]);
-    }
-
-    #[test]
-    fn normalizes_and_deduplicates_values() {
-        let schedule = CronSchedule::parse("0,0,0 9 * * 7,7,0").unwrap();
-        assert_eq!(schedule.minutes, vec![0]);
-        assert_eq!(schedule.weekdays, vec![0]);
-        assert!(schedule.day_of_week_restricted);
-    }
-
-    #[test]
-    fn full_day_of_week_range_is_unrestricted() {
-        let schedule = CronSchedule::parse("0 0 * * 0-7").unwrap();
-        assert_eq!(schedule.weekdays, vec![0, 1, 2, 3, 4, 5, 6]);
-        assert!(!schedule.day_of_week_restricted);
-        assert!(!schedule.day_of_month_restricted);
-    }
-
-    #[test]
-    fn rejects_wrong_field_count() {
-        assert_eq!(
-            parse_error("* * * *"),
-            "invalid cron expression: expected 5 fields (minute hour day-of-month month day-of-week), got 4: \"* * * *\""
-        );
-        assert_eq!(
-            parse_error("0 0 0 1 1 1"),
-            "invalid cron expression: expected 5 fields (minute hour day-of-month month day-of-week), got 6: \"0 0 0 1 1 1\""
-        );
-        assert_eq!(parse_error("   "), "cron expression cannot be empty");
-    }
-
-    #[test]
-    fn rejects_unknown_shorthands() {
-        assert_eq!(parse_error("@every"), "unknown cron shorthand: \"@every\"");
-    }
-
-    #[test]
-    fn rejects_out_of_range_values() {
-        assert_eq!(parse_error("75 * * * *"), "invalid minute field: \"75\"");
-        assert_eq!(parse_error("0 24 * * *"), "invalid hour field: \"24\"");
-        assert_eq!(
-            parse_error("0 0 0 * *"),
-            "invalid day-of-month field: \"0\""
-        );
-        assert_eq!(
-            parse_error("0 0 32 * *"),
-            "invalid day-of-month field: \"32\""
-        );
-        assert_eq!(parse_error("0 0 * 13 *"), "invalid month field: \"13\"");
-        assert_eq!(parse_error("0 0 * * 8"), "invalid day-of-week field: \"8\"");
-        assert_eq!(
-            parse_error("0 0 * * MONDAY"),
-            "invalid day-of-week field: \"MONDAY\""
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_fields() {
-        assert_eq!(parse_error("*/0 * * * *"), "invalid minute field: \"*/0\"");
-        assert_eq!(parse_error("5-1 * * * *"), "invalid minute field: \"5-1\"");
-        assert_eq!(
-            parse_error("1,,2 * * * *"),
-            "invalid minute field: \"1,,2\""
-        );
-        assert_eq!(
-            parse_error("*/-1 * * * *"),
-            "invalid minute field: \"*/-1\""
-        );
-        assert_eq!(
-            parse_error("1/2/3 * * * *"),
-            "invalid minute field: \"1/2/3\""
-        );
-        assert_eq!(parse_error("a * * * *"), "invalid minute field: \"a\"");
-        assert_eq!(
-            parse_error("0 0 * * FRI-MON"),
-            "invalid day-of-week field: \"FRI-MON\""
-        );
-    }
-
-    #[test]
-    fn next_after_is_strictly_after_an_exact_minute() {
-        let schedule = CronSchedule::parse("0 9 * * *").unwrap();
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 9, 0)),
-            Some(at(2024, 1, 2, 9, 0))
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 8, 59)),
-            Some(at(2024, 1, 1, 9, 0))
-        );
-    }
-
-    #[test]
-    fn next_after_ignores_seconds_and_nanoseconds() {
-        let schedule = CronSchedule::parse("* * * * *").unwrap();
-        let now = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 30).unwrap() + Duration::nanoseconds(500);
-        assert_eq!(schedule.next_after(now), Some(at(2024, 1, 1, 0, 1)));
-    }
-
-    #[test]
-    fn next_after_steps_by_quarter_hour() {
-        let schedule = CronSchedule::parse("*/15 * * * *").unwrap();
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 0, 0)),
-            Some(at(2024, 1, 1, 0, 15))
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 0, 7)),
-            Some(at(2024, 1, 1, 0, 15))
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 0, 15)),
-            Some(at(2024, 1, 1, 0, 30))
-        );
-    }
-
-    #[test]
-    fn next_after_crosses_hours_days_and_months() {
-        let hourly = CronSchedule::parse("@hourly").unwrap();
-        assert_eq!(
-            hourly.next_after(at(2024, 1, 1, 0, 30)),
-            Some(at(2024, 1, 1, 1, 0))
-        );
-        assert_eq!(
-            hourly.next_after(at(2024, 1, 1, 23, 59)),
-            Some(at(2024, 1, 2, 0, 0))
-        );
-
-        let monthly = CronSchedule::parse("0 0 1 * *").unwrap();
-        assert_eq!(
-            monthly.next_after(at(2024, 1, 15, 0, 0)),
-            Some(at(2024, 2, 1, 0, 0))
-        );
-        assert_eq!(
-            monthly.next_after(at(2024, 12, 1, 0, 0)),
-            Some(at(2025, 1, 1, 0, 0))
-        );
-
-        let yearly = CronSchedule::parse("@yearly").unwrap();
-        assert_eq!(
-            yearly.next_after(at(2024, 6, 1, 0, 0)),
-            Some(at(2025, 1, 1, 0, 0))
-        );
-    }
-
-    #[test]
-    fn next_after_rolls_over_a_year_boundary() {
-        let schedule = CronSchedule::parse("0 0 31 12 *").unwrap();
-        assert_eq!(
-            schedule.next_after(at(2024, 12, 31, 0, 0)),
-            Some(at(2025, 12, 31, 0, 0))
-        );
-    }
-
-    #[test]
-    fn next_after_selects_weekdays_by_number_and_name() {
-        // 2024-01-01 is a Monday.
-        let weekdays = CronSchedule::parse("0 9 * * MON-FRI").unwrap();
-        assert_eq!(
-            weekdays.next_after(at(2024, 1, 1, 0, 0)),
-            Some(at(2024, 1, 1, 9, 0))
-        );
-        assert_eq!(
-            weekdays.next_after(at(2024, 1, 5, 10, 0)),
-            Some(at(2024, 1, 8, 9, 0)),
-            "Friday after 09:00 rolls over the weekend"
-        );
-        assert_eq!(
-            weekdays.next_after(at(2024, 1, 6, 10, 0)),
-            Some(at(2024, 1, 8, 9, 0)),
-            "Saturday rolls to Monday"
-        );
-
-        let sunday = CronSchedule::parse("0 0 * * SUN").unwrap();
-        assert_eq!(
-            sunday.next_after(at(2024, 1, 1, 0, 0)),
-            Some(at(2024, 1, 7, 0, 0))
-        );
-
-        let sunday_numeric = CronSchedule::parse("0 0 * * 7").unwrap();
-        assert_eq!(
-            sunday_numeric.next_after(at(2024, 1, 1, 0, 0)),
-            Some(at(2024, 1, 7, 0, 0))
-        );
-    }
-
-    #[test]
-    fn next_after_hits_the_leap_day() {
-        let schedule = CronSchedule::parse("0 0 29 2 *").unwrap();
-        assert_eq!(
-            schedule.next_after(at(2024, 2, 28, 0, 0)),
-            Some(at(2024, 2, 29, 0, 0))
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 3, 1, 0, 0)),
-            Some(at(2028, 2, 29, 0, 0)),
-            "the next leap day after March 2024 is in 2028"
-        );
-    }
-
-    #[test]
-    fn next_after_uses_or_semantics_for_both_day_fields() {
-        // 2024-01-05 is a Friday, 2024-01-13 is a Saturday: the Friday matches first.
-        let schedule = CronSchedule::parse("0 0 13 * FRI").unwrap();
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 1, 0, 0)),
-            Some(at(2024, 1, 5, 0, 0))
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 6, 0, 0)),
-            Some(at(2024, 1, 12, 0, 0)),
-            "the next Friday after 2024-01-05"
-        );
-        assert_eq!(
-            schedule.next_after(at(2024, 1, 12, 0, 1)),
-            Some(at(2024, 1, 13, 0, 0)),
-            "the 13th matches through the day-of-month branch"
-        );
-    }
-
-    #[test]
-    fn next_after_returns_none_for_impossible_expressions() {
-        assert_eq!(
-            CronSchedule::parse("0 0 31 2 *")
-                .unwrap()
-                .next_after(at(2024, 1, 1, 0, 0)),
-            None
-        );
-        assert_eq!(
-            CronSchedule::parse("0 0 30 2 *")
-                .unwrap()
-                .next_after(at(2024, 1, 1, 0, 0)),
-            None
-        );
-    }
-
-    #[test]
-    fn next_after_handles_a_far_future_year() {
-        let schedule = CronSchedule::parse("0 0 1 1 *").unwrap();
-        // Near the top of the representable calendar the five-year horizon itself overflows,
-        // so the search reports "no match" instead of panicking.
-        assert_eq!(schedule.next_after(at(262_140, 6, 1, 0, 0)), None);
-    }
-
-    #[test]
-    fn parses_weekday_names_case_insensitively() {
-        let lower = CronSchedule::parse("0 0 * * mon-fri").unwrap();
-        assert_eq!(lower.weekdays, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn equality_includes_the_source_spelling() {
-        let numeric = CronSchedule::parse("0 0 * * 0").unwrap();
-        let named = CronSchedule::parse("0 0 * * SUN").unwrap();
-        assert_eq!(numeric.weekdays, named.weekdays);
-        assert_ne!(numeric, named);
-    }
-}
+#[path = "schedule_tests.rs"]
+mod tests;

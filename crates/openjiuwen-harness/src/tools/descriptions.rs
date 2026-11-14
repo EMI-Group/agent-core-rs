@@ -1,8 +1,10 @@
 //! Model-facing description text of the built-in tools, in English and Chinese.
 //!
 //! The table covers the core twenty tools (the shell, filesystem, todo, `ask_user` and memory
-//! tools) plus the extended tool set (web, media metadata, cron, MCP resources, tool discovery,
-//! goal tracking, LSP navigation and git worktrees).
+//! tools) plus the extended tool set (web, media metadata, cron, MCP resources and subscriptions,
+//! tool discovery, goal tracking, LSP navigation and git worktrees).
+//! The `mcp_resource_subscription` row is Rust-only: Python has no subscription tool, so its text
+//! is written here for this crate (and marked as an extension in the tool module).
 //! Ports the bilingual description constants of `openjiuwen/harness/prompts/tools/`
 //! (`filesystem.py`, `bash.py`, `todo.py`, `ask_user.py`, `memory.py`, `coding_memory.py`,
 //! `web_tools.py`, `vision.py`, `audio.py`, `cron.py`, `mcp.py`, `tool_search.py`, `goal.py`,
@@ -573,6 +575,21 @@ static DESCRIPTIONS: &[(&str, &str, &str)] = &[
         ),
     ),
     (
+        "mcp_resource_subscription",
+        concat!(
+            "Open, close, list and drain subscriptions to the resources of a configured MCP server, so server-side updates become visible to you. ",
+            "Actions: `subscribe` (uri) opens a subscription and returns its counters; `unsubscribe` (uri) closes it; `list` shows the open subscriptions; `poll` (uri, optional limit) returns the buffered update events oldest first.\n",
+            "\n",
+            "Updates only accumulate while a subscription stays open, and the buffer is bounded: `poll` regularly, and read the resource with `read_mcp_resource` when you need the current content rather than the change history. A reason string states clearly when the server or the host cannot subscribe.",
+        ),
+        concat!(
+            "打开、关闭、列出并读取对已配置 MCP 服务器资源的订阅，使服务端的更新对你可见。",
+            "操作：`subscribe`（uri）建立订阅并返回计数器；`unsubscribe`（uri）关闭订阅；`list` 列出当前订阅；`poll`（uri，可选 limit）按从旧到新的顺序返回缓冲的更新事件。\n",
+            "\n",
+            "订阅保持打开期间更新才会累积，且缓冲区有上限：请定期 `poll`；需要当前内容而非变更历史时请用 `read_mcp_resource` 读取。服务器或宿主机无法订阅时会明确说明原因。",
+        ),
+    ),
+    (
         "tool_search",
         concat!(
             "Search registered and available deferred tools based on the user's intent. ",
@@ -656,8 +673,8 @@ pub fn description(name: &str, language: &str) -> &'static str {
 mod tests {
     use super::{description, DESCRIPTIONS, SUPPORTED_LANGUAGES};
 
-    /// The thirty-two model-facing tool names: the core registry order, then the extended set.
-    const TOOL_NAMES: [&str; 32] = [
+    /// The thirty-three model-facing tool names: the core registry order, then the extended set.
+    const TOOL_NAMES: [&str; 33] = [
         "bash",
         "read_file",
         "write_file",
@@ -685,6 +702,7 @@ mod tests {
         "cron",
         "list_mcp_resources",
         "read_mcp_resource",
+        "mcp_resource_subscription",
         "tool_search",
         "get_current_goal",
         "submit_goal_report",
@@ -810,6 +828,10 @@ mod tests {
             .starts_with("Read the content of a specific resource"));
         assert!(description("read_mcp_resource", "cn")
             .starts_with("读取已配置 MCP 服务器上某个资源的内容"));
+        assert!(description("mcp_resource_subscription", "en")
+            .starts_with("Open, close, list and drain subscriptions"));
+        assert!(description("mcp_resource_subscription", "cn")
+            .starts_with("打开、关闭、列出并读取对已配置 MCP 服务器资源的订阅"));
         assert!(description("tool_search", "en")
             .starts_with("Search registered and available deferred tools"));
         assert!(description("tool_search", "cn")

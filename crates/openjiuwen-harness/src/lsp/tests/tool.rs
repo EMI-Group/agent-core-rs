@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use openjiuwen_foundation::tool::{Tool, ToolContext};
 
 use crate::lsp::config::LspServerConfig;
-use crate::lsp::tool::{LspTool, LspToolConfig};
+use crate::lsp::tool::{LspAction, LspTool, LspToolConfig};
 use crate::lsp::transport::ChannelTransport;
 
 use super::fake_server::{self, FakeServer};
@@ -77,9 +77,25 @@ fn card_has_the_python_name_uuid_schema_and_bilingual_description() {
             "completion",
             "symbols",
             "workspace_symbols",
-            "diagnostics"
-        ]
+            "diagnostics",
+            "implementation",
+            "prepare_call_hierarchy",
+            "incoming_calls",
+            "outgoing_calls"
+        ],
+        "the card lists every action in ALL order"
     );
+    assert_eq!(LspAction::ALL.len(), 11);
+    assert!(!LspAction::Diagnostics.requires_path());
+    assert!(!LspAction::WorkspaceSymbols.requires_path());
+    for action in LspAction::ALL {
+        assert_eq!(
+            action.requires_path(),
+            !matches!(action, LspAction::WorkspaceSymbols | LspAction::Diagnostics),
+            "{} path requirement",
+            action.as_str()
+        );
+    }
     assert_eq!(schema["required"], json!(["action"]));
 
     assert_ne!(LspTool::card_for("cn").description, card.description);
@@ -269,14 +285,24 @@ async fn oversized_files_are_rejected_before_reading() {
 }
 
 #[tokio::test]
-async fn diagnostics_are_reported_as_deferred() {
+async fn diagnostics_report_pushed_warnings_after_a_document_event() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_source(dir.path(), "fn main() {}\n").await;
     let (tool, _server) = build_tool(dir.path(), Duration::from_secs(2));
+    let opened = call(
+        &tool,
+        json!({"action": "hover", "path": &path, "line": 1, "column": 1}),
+    )
+    .await;
+    assert_eq!(opened["success"], json!(true));
     let payload = call(&tool, json!({"action": "diagnostics", "path": path})).await;
-    assert_eq!(payload["success"], json!(false));
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["source"], json!("push"));
     assert!(
-        payload["error"].as_str().unwrap().contains("diagnostics"),
+        payload["data"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("fake warning"),
         "{payload}"
     );
 }
@@ -330,6 +356,26 @@ async fn a_missing_server_binary_is_a_payload_error() {
             .unwrap()
             .contains("failed to start LSP server"),
         "{payload}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_server_binary_still_breaks_workspace_symbols() {
+    let dir = tempfile::tempdir().unwrap();
+    write_source(dir.path(), "fn main() {}\n").await;
+    let config = LspToolConfig::default()
+        .with_workspace_root(dir.path())
+        .with_server(LspServerConfig::new(
+            "openjiuwen-definitely-missing-lsp-server",
+        ));
+    let tool = LspTool::new(config);
+    let payload = call(&tool, json!({"action": "workspace_symbols", "query": "x"})).await;
+    assert_eq!(payload["success"], json!(false));
+    let error = payload["error"].as_str().unwrap();
+    assert!(error.contains("failed to start LSP server"), "{payload}");
+    assert!(
+        error.contains("openjiuwen-definitely-missing-lsp-server"),
+        "the launch error names the command: {payload}"
     );
 }
 
