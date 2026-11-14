@@ -14,15 +14,17 @@
 //! - [`ModelTokenCounter`] and [`SelectedTokenizer`] implement the
 //!   [`TokenCounter`] seam used by the rest of the workspace.
 //!
-//! Native `tokenizer.json` artifacts are decoded in pure Rust by
-//! [`NativeTokenizer`], so [`load_native_tokenizer`] needs neither the
-//! `HuggingFace` `tokenizers` runtime nor network access; a `tiktoken` `.model`
-//! file is still reported as a typed [`Error::Unsupported`].
+//! Native artifacts are decoded in pure Rust by [`NativeTokenizer`], so
+//! [`load_native_tokenizer`] needs neither the `HuggingFace` `tokenizers`
+//! runtime nor network access. Both artifact kinds are supported: a
+//! `tokenizer.json` document and a `tiktoken` `.model` BPE vocabulary (see
+//! [`TiktokenModel`]).
 use std::sync::{Arc, OnceLock};
 
 pub mod artifacts;
 pub mod native;
 
+pub use native::tiktoken_model::{PretokenizePattern, TiktokenModel, TiktokenSpecials};
 pub use native::{byte_level_alphabet, NativeTokenizer, NativeTokenizerKind};
 
 use openjiuwen_common::error::{Error, Result};
@@ -1066,20 +1068,25 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
-/// Loads a native `tokenizer.json` artifact.
+/// Loads a native tokenizer artifact.
 ///
-/// The file is read once, here; the returned selection then counts entirely in
-/// memory, so this constructor is a one-off per context/model binding and never
-/// a hot path.
+/// Two artifact kinds are decoded in pure Rust: a `HuggingFace` `tokenizer.json`
+/// document and a `tiktoken` `.model` BPE vocabulary. The file is read once,
+/// here; the returned selection then counts entirely in memory, so this
+/// constructor is a one-off per context/model binding and never a hot path.
+///
+/// The kind is chosen by file extension (`.model` or `.json`), then by content
+/// sniffing: a document whose first meaningful line is `<base64-token> <rank>`
+/// is a `.model` vocabulary. Anything else is tried as `tokenizer.json` first
+/// and as a `.model` vocabulary second.
 ///
 /// # Errors
 ///
 /// - [`Error::NotFound`] when `path` does not exist;
-/// - [`Error::Validation`] when the file cannot be read or is not a valid
-///   `tokenizer.json`;
-/// - [`Error::Unsupported`] when the artifact declares a model type this crate
-///   does not decode, or when `path` is a `tiktoken` `.model` file (a different
-///   artifact format, not implemented here).
+/// - [`Error::Validation`] when neither loader can decode the file; the message
+///   carries both attempts for an unrecognised extension;
+/// - [`Error::Unsupported`] when the artifact declares a `tokenizer.json` model
+///   type this crate does not decode.
 pub fn load_native_tokenizer(path: impl AsRef<std::path::Path>) -> Result<SelectedTokenizer> {
     let path = path.as_ref();
     let display = path.display().to_string();
@@ -1088,15 +1095,7 @@ pub fn load_native_tokenizer(path: impl AsRef<std::path::Path>) -> Result<Select
             "native tokenizer artifact not found: {display}"
         )));
     }
-    if path
-        .extension()
-        .is_some_and(|extension| extension == "model")
-    {
-        return Err(Error::Unsupported(format!(
-            "{display} is a tiktoken `.model` artifact; only `tokenizer.json` artifacts are decoded here"
-        )));
-    }
-    let native = NativeTokenizer::load(path)?;
+    let native = load_native_artifact(path, &display)?;
     let tokenizer = Some(
         native
             .tokenizer_id()
@@ -1107,4 +1106,38 @@ pub fn load_native_tokenizer(path: impl AsRef<std::path::Path>) -> Result<Select
         None,
         tokenizer,
     ))
+}
+
+/// Decodes `path` as a `tokenizer.json`, a `tiktoken` `.model`, or both in turn.
+fn load_native_artifact(path: &std::path::Path, display: &str) -> Result<NativeTokenizer> {
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("model"))
+    {
+        return NativeTokenizer::from_tiktoken_model_file(path);
+    }
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return NativeTokenizer::load(path);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        // Let the `tokenizer.json` loader raise the typed read error.
+        return NativeTokenizer::load(path);
+    };
+    if native::tiktoken_model::looks_like_tiktoken_model(&text) {
+        return NativeTokenizer::from_tiktoken_model_file(path);
+    }
+    match NativeTokenizer::from_json_str(&text) {
+        Ok(native) => Ok(native),
+        Err(json_error) => match NativeTokenizer::from_tiktoken_model_file(path) {
+            Ok(native) => Ok(native),
+            Err(model_error) => Err(Error::Validation(format!(
+                "{display} is neither a decodable tokenizer.json ({json_error}) nor a tiktoken `.model` vocabulary ({model_error})"
+            ))),
+        },
+    }
 }

@@ -1,8 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Native `tokenizer.json` decoding: model pipelines, added tokens, decoders and the selection seam.
 
-use std::io::Write as _;
-
 use openjiuwen_common::error::Error;
 use openjiuwen_context::tokenizers::{
     byte_level_alphabet, load_native_tokenizer, NativeTokenizer, NativeTokenizerKind,
@@ -226,14 +224,19 @@ fn missing_artifacts_are_not_found() {
 }
 
 #[test]
-fn tiktoken_model_files_are_reported_as_unsupported() {
+fn tiktoken_model_files_load_as_a_native_selection() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("tiktoken.model");
-    let mut file = std::fs::File::create(&path).expect("create");
-    file.write_all(b"AA==\n").expect("write");
-    let error = load_native_tokenizer(&path).expect_err("tiktoken model file");
-    assert!(matches!(error, Error::Unsupported(_)));
-    assert!(error.to_string().contains(".model"));
+    // `YQ==` is the byte `a`, rank 0: a one-entry `.model` vocabulary.
+    std::fs::write(&path, b"YQ== 0\n").expect("write");
+    let selection = load_native_tokenizer(&path).expect(".model loads");
+    assert_eq!(selection.source(), TokenizerSource::NativeTokenizer);
+    assert!(!selection.estimated());
+    assert_eq!(selection.fallback_reason(), None);
+    // A `.model` artifact carries no name, so the path is used.
+    let display = path.display().to_string();
+    assert_eq!(selection.tokenizer(), Some(display.as_str()));
+    assert_eq!(selection.count_text("a"), 1);
 }
 
 #[test]
