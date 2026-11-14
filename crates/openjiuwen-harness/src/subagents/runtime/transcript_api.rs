@@ -16,6 +16,7 @@
 
 use openjiuwen_common::error::Result;
 
+use super::activity::ActivityKind;
 use super::transcript::{TranscriptEntry, TranscriptSubscription, TranscriptSummary};
 use super::{not_found, SubAgentRuntime};
 
@@ -87,7 +88,9 @@ impl SubAgentRuntime {
     ///
     /// Returns the sequence number assigned to the entry. The entry is stamped with the injected
     /// clock and published on [`SubAgentRuntime::subscribe_transcript`], so a monitoring caller
-    /// cannot tell runtime-recorded events from these.
+    /// cannot tell runtime-recorded events from these. A matching
+    /// [`ActivityKind::ToolCall`] frame is published on the instance's activity feed (suppressed
+    /// when activity recording is disabled or the stream is already terminal).
     ///
     /// # Errors
     ///
@@ -100,9 +103,24 @@ impl SubAgentRuntime {
         detail: &str,
         success: Option<bool>,
     ) -> Result<u64> {
-        self.append_transcript(id, |now_ms| {
-            TranscriptEntry::tool_call(id, tool_name, detail, success, now_ms)
-        })
+        let now_ms = self.clock.now_ms();
+        let mut state = self.shared.state.lock();
+        let Some(instance) = state.instances.get_mut(id) else {
+            return Err(not_found(id));
+        };
+        let mut entry = TranscriptEntry::tool_call(id, tool_name, detail, success, now_ms);
+        id.clone_into(&mut entry.subagent_id);
+        entry.at_ms = now_ms;
+        let seq = instance.record(entry);
+        // Keeps the activity stream in step with the transcript entry.
+        instance.activity_stream.record(
+            ActivityKind::ToolCall,
+            detail,
+            Some(tool_name),
+            success,
+            now_ms,
+        );
+        Ok(seq)
     }
 
     /// Appends a caller-supplied entry to `id`'s transcript.

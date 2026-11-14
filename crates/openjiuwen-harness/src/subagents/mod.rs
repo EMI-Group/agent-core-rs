@@ -25,7 +25,16 @@ use parking_lot::RwLock;
 
 pub use crate::schema::SubAgentConfig;
 pub use presets::{build_preset, general_purpose_config, SubAgentPreset, GENERAL_PURPOSE_NAME};
+pub use runtime::activity::{
+    ActivityEvent, ActivityKind, ActivityStream, ActivitySubscription, ActivitySummary,
+    ActivityThrottle, SubagentActivityFrame, DEFAULT_ACTIVITY_CAPACITY,
+    DEFAULT_ACTIVITY_TEXT_MAX_LEN, DEFAULT_ACTIVITY_THROTTLE_MS,
+};
 pub use runtime::clock::{rfc3339_from_ms, Clock, ManualClock, SystemClock};
+pub use runtime::lifecycle::{
+    CallbackLifecycleHook, LifecycleCallback, LifecycleFailure, LifecycleHooks, LifecycleReport,
+    LifecycleStage, SubagentLifecycleEvent, SubagentLifecycleHook,
+};
 pub use runtime::persistence::{
     load_bucket_file, max_persisted_records, save_bucket_file, PersistedSubAgentBuckets,
     PersistedSubAgentRecord, SUBAGENTS_KEY,

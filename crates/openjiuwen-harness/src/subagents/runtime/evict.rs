@@ -160,6 +160,7 @@ pub(super) fn evict_locked(
     let previous = instance.status;
     instance.close(now_ms, EVICTION_REASON);
     instance.record(TranscriptEntry::evicted(id, EVICTION_REASON, now_ms));
+    instance.activity_stream.evicted(EVICTION_REASON, now_ms);
     let live = live_count(state);
     tracing::debug!(
         target: "openjiuwen_harness::subagents",

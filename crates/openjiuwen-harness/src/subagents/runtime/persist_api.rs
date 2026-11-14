@@ -23,13 +23,14 @@ use serde::{Deserialize, Serialize};
 
 use super::evict;
 use super::instance::Instance;
+use super::lifecycle::LifecycleStage;
 use super::persistence::{
     load_bucket_file, max_persisted_records, save_bucket_file, PersistedSubAgentBuckets,
     PersistedSubAgentRecord,
 };
 use super::quota::SubagentActivity;
 use super::transcript::TranscriptEntry;
-use super::{not_found, ResumeReport, SubAgentId, SubAgentRuntime, SubagentStatus};
+use super::{lifecycle_api, not_found, ResumeReport, SubAgentId, SubAgentRuntime, SubagentStatus};
 
 /// Report of one restore (see [`SubAgentRuntime::load`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,13 +131,7 @@ impl SubAgentRuntime {
                 }
                 let seq = state.next_seq;
                 state.next_seq = state.next_seq.wrapping_add(1);
-                let instance = Instance::restore(
-                    seq,
-                    id.clone(),
-                    record,
-                    self.quota.transcript_capacity,
-                    self.quota.transcript_channel_capacity,
-                );
+                let instance = Instance::restore(seq, id.clone(), record, &self.quota);
                 if instance.is_live() {
                     live += 1;
                 }
@@ -203,7 +198,7 @@ impl SubAgentRuntime {
             None
         };
         let now_ms = self.clock.now_ms();
-        let report = {
+        let (report, ready_event) = {
             let mut state = self.shared.state.lock();
             let Some(instance) = state.instances.get_mut(id) else {
                 return Err(not_found(id));
@@ -221,13 +216,20 @@ impl SubAgentRuntime {
             instance.closed_reason = None;
             instance.touch(now_ms, SubagentActivity::Idle);
             instance.record(TranscriptEntry::status(id, "idle", now_ms));
-            ResumeReport {
-                status: instance.status,
-                restored: true,
-                message: None,
-            }
+            instance.activity_stream.resume(now_ms);
+            instance.activity_stream.idle(now_ms);
+            let event = instance.lifecycle_event(LifecycleStage::Ready, None, now_ms);
+            (
+                ResumeReport {
+                    status: instance.status,
+                    restored: true,
+                    message: None,
+                },
+                event,
+            )
         };
         self.shared.notify.notify_waiters();
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Ready, [ready_event]).await;
         tracing::debug!(
             target: "openjiuwen_harness::subagents",
             subagent_id = %id,

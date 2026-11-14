@@ -26,16 +26,19 @@ use tokio::sync::{Notify, Semaphore};
 use self::clock::Clock;
 use self::clock::SystemClock;
 use self::instance::Instance;
+use self::lifecycle::{LifecycleHooks, LifecycleStage, SubagentLifecycleEvent};
 use self::quota::{SpawnBudget, SubAgentQuota, SubagentActivity};
 use self::transcript::{TranscriptEntry, TranscriptSummary};
 use self::turn::TurnRunner;
 use super::{SubAgentConfig, SubAgentRegistry};
 
 pub mod activity;
+mod activity_api;
 pub mod clock;
 mod evict;
 mod instance;
 pub mod lifecycle;
+mod lifecycle_api;
 mod persist_api;
 pub mod persistence;
 pub mod quota;
@@ -238,6 +241,8 @@ struct Shared {
     factory: Arc<dyn SubAgentFactory>,
     parent_session_id: String,
     notify: Notify,
+    /// Hooks awaited at the lifecycle transitions (see [`lifecycle`]).
+    lifecycle: LifecycleHooks,
     state: Mutex<RuntimeState>,
 }
 
@@ -278,6 +283,7 @@ impl SubAgentRuntime {
                 factory,
                 parent_session_id: parent_session_id.into(),
                 notify: Notify::new(),
+                lifecycle: LifecycleHooks::new(),
                 state: Mutex::new(RuntimeState {
                     instances: BTreeMap::new(),
                     next_seq: 0,
@@ -397,6 +403,9 @@ impl SubAgentRuntime {
             depth = self.depth_of(&id).unwrap_or(1),
             "subagent spawned"
         );
+        if let Some(event) = self.lifecycle_event_for(&id, LifecycleStage::Spawn, None) {
+            lifecycle_api::run_stage(&self.shared, LifecycleStage::Spawn, [event]).await;
+        }
         self.start_turn(
             &id,
             generation,
@@ -529,6 +538,10 @@ impl SubAgentRuntime {
             if interrupt {
                 instance.pending.clear();
             }
+            if instance.running {
+                // The query stays queued behind the running turn (without an interrupt).
+                instance.activity_stream.queued(now_ms);
+            }
             instance.pending.push_back(query.to_owned());
             instance.record(TranscriptEntry::input(id, query, now_ms));
             if interrupted {
@@ -578,7 +591,7 @@ impl SubAgentRuntime {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn close(&self, id: &str) -> Result<SubagentStatus> {
         let now_ms = self.clock.now_ms();
-        let previous = {
+        let (previous, close_event) = {
             let mut state = self.shared.state.lock();
             let Some(instance) = state.instances.get_mut(id) else {
                 return Err(not_found(id));
@@ -591,9 +604,13 @@ impl SubAgentRuntime {
             let previous = instance.status;
             instance.close(now_ms, CLOSE_REASON_MANUAL);
             instance.record(TranscriptEntry::closed(id, CLOSE_REASON_MANUAL, now_ms));
-            previous
+            instance.activity_stream.closed(CLOSE_REASON_MANUAL, now_ms);
+            let event =
+                instance.lifecycle_event(LifecycleStage::Close, Some(CLOSE_REASON_MANUAL), now_ms);
+            (previous, event)
         };
         self.shared.notify.notify_waiters();
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, [close_event]).await;
         tracing::debug!(
             target: "openjiuwen_harness::subagents",
             subagent_id = %id,
@@ -608,9 +625,9 @@ impl SubAgentRuntime {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn cancel_all(&self) -> Vec<SubAgentId> {
         let now_ms = self.clock.now_ms();
-        let ids = {
+        let (ids, events) = {
             let mut state = self.shared.state.lock();
-            let mut closed: Vec<(u64, SubAgentId)> = Vec::new();
+            let mut closed: Vec<(u64, SubAgentId, SubagentLifecycleEvent)> = Vec::new();
             for (id, instance) in &mut state.instances {
                 if !instance.is_live() {
                     continue;
@@ -621,12 +638,24 @@ impl SubAgentRuntime {
                     CLOSE_REASON_PARENT_ENDED,
                     now_ms,
                 ));
-                closed.push((instance.seq, id.clone()));
+                instance
+                    .activity_stream
+                    .closed(CLOSE_REASON_PARENT_ENDED, now_ms);
+                let event = instance.lifecycle_event(
+                    LifecycleStage::Close,
+                    Some(CLOSE_REASON_PARENT_ENDED),
+                    now_ms,
+                );
+                closed.push((instance.seq, id.clone(), event));
             }
-            closed.sort_by_key(|(seq, _)| *seq);
-            closed.into_iter().map(|(_, id)| id).collect()
+            closed.sort_by_key(|(seq, _, _)| *seq);
+            let events: Vec<SubagentLifecycleEvent> =
+                closed.iter().map(|(_, _, event)| event.clone()).collect();
+            let ids = closed.into_iter().map(|(_, id, _)| id).collect();
+            (ids, events)
         };
         self.shared.notify.notify_waiters();
+        lifecycle_api::run_stage(&self.shared, LifecycleStage::Close, events).await;
         ids
     }
 
@@ -726,6 +755,21 @@ impl SubAgentRuntime {
         )
     }
 
+    /// Builds the lifecycle snapshot of a known instance, stamped from the runtime clock.
+    fn lifecycle_event_for(
+        &self,
+        id: &str,
+        stage: LifecycleStage,
+        reason: Option<&str>,
+    ) -> Option<SubagentLifecycleEvent> {
+        let now_ms = self.clock.now_ms();
+        let state = self.shared.state.lock();
+        state
+            .instances
+            .get(id)
+            .map(|instance| instance.lifecycle_event(stage, reason, now_ms))
+    }
+
     /// Returns the depth of a known instance.
     fn depth_of(&self, id: &str) -> Option<usize> {
         let state = self.shared.state.lock();
@@ -810,16 +854,7 @@ impl SubAgentRuntime {
             state.next_seq = state.next_seq.wrapping_add(1);
             state.instances.insert(
                 id.clone(),
-                Instance::new(
-                    seq,
-                    request,
-                    id.clone(),
-                    now_ms,
-                    depth,
-                    config,
-                    self.quota.transcript_capacity,
-                    self.quota.transcript_channel_capacity,
-                ),
+                Instance::new(seq, request, id.clone(), now_ms, depth, config, &self.quota),
             );
             seq
         };
