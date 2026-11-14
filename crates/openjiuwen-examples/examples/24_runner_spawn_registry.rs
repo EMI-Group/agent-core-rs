@@ -249,7 +249,10 @@ async fn parent() -> Result<()> {
              same binary",
         );
     }
-    banner::note(&format!("run mode: {}", mode.describe()));
+    banner::note(&format!(
+        "run mode: {} (neither backend needs a model: both answer without one)",
+        mode.describe()
+    ));
     banner::note(
         "two live backends: an in-process handler bound to this process, and an external command \
          that re-executes this binary as its JSON-per-line child",
