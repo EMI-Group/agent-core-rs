@@ -571,25 +571,63 @@ async fn factory_builds_a_live_redis_key_value_store() {
     assert_eq!(store.get("factory").await.unwrap(), Some(kv("ok")));
 }
 #[tokio::test]
-async fn factory_rejects_a_missing_url_and_unavailable_redis_stores() {
-    let error = expect_error(build_kv_store(&StoreBackend::Redis { url: None }).await);
-    assert_eq!(error.kind(), ErrorKind::Validation);
-    assert!(error.message().contains("url"), "unexpected: {error}");
-    let configured = StoreBackend::Redis {
-        url: Some("redis://127.0.0.1:6379/0".to_owned()),
-    };
-    // `RedisDocumentStore` and `RedisVectorStore` are live and reachable from
-    // `store::redis`; the factories are wired to them separately, so until that
-    // lands they keep answering `Unsupported` and naming the backend.
+async fn factory_rejects_a_missing_url_for_every_redis_store() {
+    let backend = StoreBackend::Redis { url: None };
     let errors = [
-        expect_error(build_document_store(&configured).await),
-        expect_error(build_vector_store(&configured).await),
+        expect_error(build_kv_store(&backend).await),
+        expect_error(build_document_store(&backend).await),
+        expect_error(build_vector_store(&backend).await),
     ];
     for error in errors {
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.kind(), ErrorKind::Validation);
         let message = error.message().to_ascii_lowercase();
+        assert!(message.contains("url"), "unexpected: {error}");
         assert!(message.contains("redis"), "unexpected: {error}");
     }
+}
+#[tokio::test]
+async fn factory_connects_the_document_and_vector_stores_eagerly() {
+    // The three stores share the `connect` contract: an unreachable peer fails
+    // with a transport error before the caller stores anything.
+    let url = closed_port_url().await;
+    let backend = StoreBackend::Redis { url: Some(url) };
+    let errors = [
+        expect_error(build_kv_store(&backend).await),
+        expect_error(build_document_store(&backend).await),
+        expect_error(build_vector_store(&backend).await),
+    ];
+    for error in errors {
+        assert_eq!(error.kind(), ErrorKind::Transport, "unexpected: {error}");
+    }
+}
+#[tokio::test]
+async fn factory_builds_live_redis_document_and_vector_stores() {
+    let fake = Server::start().await;
+    let backend = StoreBackend::Redis {
+        url: Some(fake.url()),
+    };
+    let documents = build_document_store(&backend).await.unwrap();
+    documents.create_collection("docs").await.unwrap();
+    assert_eq!(
+        documents.list_collections().await.unwrap(),
+        vec!["docs".to_owned()]
+    );
+    let vectors = build_vector_store(&backend).await.unwrap();
+    let schema = CollectionSchema::new(vec![
+        FieldSchema {
+            is_primary: true,
+            ..FieldSchema::new("id", VectorDataType::Varchar)
+        },
+        FieldSchema {
+            dim: Some(2),
+            ..FieldSchema::new("embedding", VectorDataType::FloatVector)
+        },
+    ]);
+    vectors
+        .create_collection("embeddings", schema)
+        .await
+        .unwrap();
+    assert!(vectors.collection_exists("embeddings").await.unwrap());
 }
 #[tokio::test]
 async fn tls_urls_are_unsupported_and_name_tls() {
