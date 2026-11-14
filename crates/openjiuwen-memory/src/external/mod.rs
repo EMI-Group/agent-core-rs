@@ -5,7 +5,12 @@
 //! remote service, a vendor SDK, or any custom backend.
 //!
 //! - [`crate::external::provider`] — the [`crate::external::MemoryProvider`] trait,
-//!   [`crate::external::ProviderCapabilities`], and [`crate::external::ProviderHealth`], with the full error and cancel-safety contract.
+//!   [`crate::external::ProviderCapabilities`], and [`crate::external::ProviderHealth`], with the full error and cancel-safety contract
+//!   and the tool-rail methods every provider inherits.
+//! - [`crate::external::rail`] — the pure half of the tool rail:
+//!   [`crate::external::tool_schema`], [`crate::external::default_tool_schemas`],
+//!   [`crate::external::parse_add_args`]/[`crate::external::parse_search_args`],
+//!   [`crate::external::render_bullets`], and the payload helpers.
 //! - [`crate::external::local`] — [`crate::external::EngineProvider`], the reference implementation
 //!   over the shared engine, plus [`crate::external::LocalProviderFactory`].
 //! - [`crate::external::registry`] — [`crate::external::ProviderKind`], [`crate::external::ProviderConfig`],
@@ -44,14 +49,23 @@
 //!
 //! The Python `openjiuwen.core.memory.external` SPI is tool-schema oriented
 //! (`get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`,
-//! `system_prompt_block`). The Rust SPI is record oriented (`add`, `search`, `get`,
-//! `update`, `delete`, `list`, `clear`, `health`) because it adapts this crate's
-//! `MemoryScope`/`MemoryRecord` types. The provider ids, the vendor set, and the lazy
-//! "missing SDK surfaces at first use" behaviour are preserved; the tool rail and the
-//! vendor transports remain deferred.
+//! `system_prompt_block`, `on_session_end`, `is_available`, `is_initialized`). This crate
+//! implements the record SPI (`add`, `search`, `get`, `update`, `delete`, `list`, `clear`,
+//! `health`) over this crate's `MemoryScope`/`MemoryRecord` types **and** the rail on top of
+//! it: every rail method is a provided trait method with a working default, so a backend
+//! inherits a four-tool rail (add/search/list/delete) and overrides only what a vendor wire
+//! format needs. The provider ids, the vendor set, and the lazy "missing SDK surfaces at
+//! first use" behaviour are preserved.
+//!
+//! The rail keeps Python's degradation rule — a model-facing tool call returns
+//! `{"error": …}` and `prefetch` returns an empty string instead of raising, logged through
+//! `tracing` — while the caller-facing `sync_turn`/`on_session_end` return the backend
+//! error. The vendor wire specs are a separate layer, so the five vendor adapters still
+//! report [`openjiuwen_common::error::Error::Unsupported`] until their transport lands.
 
 pub mod local;
 pub mod provider;
+pub mod rail;
 pub mod registry;
 pub mod rest;
 pub mod rest_json;
@@ -59,6 +73,12 @@ pub mod vendor;
 
 pub use local::{EngineProvider, LocalProviderFactory};
 pub use provider::{MemoryProvider, ProviderCapabilities, ProviderHealth};
+pub use rail::{
+    default_tool_schemas, parse_add_args, parse_kind, parse_search_args, render_bullets,
+    tool_error, tool_ok_result, tool_result, tool_schema, ADD_MEMORY_TOOL, DEFAULT_LIST_LIMIT,
+    DEFAULT_PREFETCH_MAX_TOKENS, DEFAULT_PREFETCH_TOP_K, DELETE_MEMORY_TOOL, LIST_MEMORIES_TOOL,
+    MAX_LIST_LIMIT, MAX_SEARCH_TOP_K, SEARCH_MEMORY_TOOL,
+};
 pub use registry::{ProviderConfig, ProviderFactory, ProviderKind, ProviderRegistry};
 pub use rest::{resolve_auth, AuthScheme, Op, RestCall, RestProvider, SpecContext, WireSpec};
 pub use vendor::{
