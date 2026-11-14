@@ -37,13 +37,30 @@
 //! of failing, so newer configuration
 //! files keep working on older builds.
 //!
-//! # Vendor stubs
+//! # Vendor transports
 //!
 //! [`crate::external::ProviderRegistry::with_vendor_stubs`] registers the five vendor
-//! factories. Their
-//! adapters construct successfully but every operation returns
-//! [`openjiuwen_common::error::Error::Unsupported`] naming the missing SDK or transport
-//! verbatim — no HTTP client, wire format, or vendor SDK is embedded in this crate.
+//! factories, and every adapter builds infallibly, so a handle is always obtainable; what
+//! that handle can do depends on the configuration it was given. Four of the five speak
+//! real HTTP through [`RestProvider`], and a [`WireSpec`] describes the request and
+//! response shape of each operation:
+//!
+//! - `mem0` — `POST /v1/memories/`, `POST /v1/memories/search/`, and `GET /v1/ping/`,
+//!   authenticated with `Authorization: Token`.
+//! - `jiuwen_memory` — `POST /v1/search`, `POST /v1/add`, and `GET /healthz`, bearer auth.
+//! - `lakebase` — `/memory/bases/{base_id}/…` ingest, recall, memories, and stats, bearer
+//!   auth.
+//! - `openviking` — `/api/v1/search/find`, `/api/v1/sessions/{id}/messages`,
+//!   `/api/v1/content/read`, `/api/v1/fs/ls`, and `/health`, authenticated with
+//!   `X-API-Key`.
+//! - `agentarts` — SDK-only: every operation is a typed
+//!   [`openjiuwen_common::error::Error::Unsupported`] naming
+//!   `agentarts.sdk.memory.MemoryClient`, whatever the configuration.
+//!
+//! A REST handle with no `endpoint` is inert: each operation returns the same typed
+//! `Unsupported` stating that no endpoint is configured, which is what lets
+//! `with_vendor_stubs` build usable-by-name providers from a configuration document that
+//! has not been filled in yet.
 //!
 //! # Parity note
 //!
@@ -60,8 +77,8 @@
 //! The rail keeps Python's degradation rule — a model-facing tool call returns
 //! `{"error": …}` and `prefetch` returns an empty string instead of raising, logged through
 //! `tracing` — while the caller-facing `sync_turn`/`on_session_end` return the backend
-//! error. The vendor wire specs are a separate layer, so the five vendor adapters still
-//! report [`openjiuwen_common::error::Error::Unsupported`] until their transport lands.
+//! error. The vendor wire specs are a separate layer: each REST adapter adds its own rail
+//! overrides (tool names, payloads, prompt block) on top of the shared record SPI.
 
 pub mod local;
 pub mod provider;

@@ -1,23 +1,28 @@
-//! Vendor memory-provider adapters, one module per vendor.
+//! Vendor memory-provider adapters, one directory per vendor.
 //!
-//! The five vendor adapters keep the public handle surface of the previous single-module
-//! layout — an infallible `new(&ProviderConfig)`, the `config`/`kind` accessors, a
-//! redacting `Debug`, and a [`MemoryProvider`] impl —
-//! while moving the vendor-specific HTTP shape into one file per vendor.
+//! The five vendor adapters keep one public handle surface — an infallible
+//! `new(&ProviderConfig)`, the `config`/`kind` accessors, a redacting `Debug`, and a
+//! [`MemoryProvider`] impl — while the vendor-specific HTTP shape lives beside it in
+//! `vendor/<vendor>/mod.rs`, with an optional `spec.rs` for the wire shape and a `tests.rs`
+//! for the adapter's offline suite.
 //!
 //! # Two backends
 //!
-//! - **Real REST** (`mem0`, `jiuwen_memory`, `lakebase`, `openviking`) — each file
-//!   defines a private `WireSpec` with the vendor's static shape (id, display name,
-//!   missing dependency, capability flags, default auth scheme, static headers, fallback
-//!   scope) and wraps it in a shared [`RestProvider`](super::rest::RestProvider). The
-//!   transport owns validation, authentication, retries, failover, status mapping, and
-//!   cancellation, so the vendor files stay declarative.
+//! - **Real REST** (`mem0`, `jiuwen_memory`, `lakebase`, `openviking`) — each vendor's
+//!   `WireSpec` carries its static shape (id, display name, missing dependency, capability
+//!   flags, default auth scheme, static headers, fallback scope) together with the wire
+//!   shape of every operation — a `*_call` request builder and a `*_result` decoder per
+//!   record verb — and wraps it in a shared [`RestProvider`](super::rest::RestProvider).
+//!   The transport owns validation, authentication, retries, failover, status mapping, and
+//!   cancellation, so the vendor files stay declarative. Each REST vendor also supplies
+//!   the rail overrides it needs (tool schemas, prompt block, dispatch, `prefetch`, and,
+//!   for `lakebase` and `openviking`, `sync_turn`) over that same record SPI.
 //! - **SDK-only** (`agentarts`) — the Python adapter drives
 //!   `agentarts.sdk.memory.MemoryClient` and never speaks raw HTTP, so this build has no
 //!   transport to fall back on: every operation is a typed
 //!   [`openjiuwen_common::error::Error::Unsupported`] naming the missing SDK, whether or
-//!   not an `endpoint` is configured.
+//!   not an `endpoint` is configured. It overrides no rail method; the provided defaults
+//!   reach the same typed error through the record SPI.
 //!
 //! # Endpoint-less handles
 //!
@@ -35,13 +40,14 @@
 
 /// Generates the [`MemoryProvider`] impl of one adapter.
 ///
-/// The twelve core methods forward to `self.$field` unchanged, so the adapter inherits the
-/// backend's semantics (the REST transport's validation, cancellation, and error typing,
-/// or the SDK-only helper's single typed `Unsupported`). The caller's extra items —
+/// The eleven required methods forward to `self.$field` unchanged, so the adapter inherits
+/// the backend's semantics (the REST transport's validation, cancellation, and error
+/// typing, or the SDK-only helper's single typed `Unsupported`). The caller's extra items —
 /// `$($rail:item)*` — are spliced into the same impl block, so a vendor file supplies only
 /// its overrides and never repeats the forwarding boilerplate. Rail overrides are written
-/// exactly like trait methods (they belong to the trait), so the list may be empty while
-/// the rail surface is still being added to the trait.
+/// exactly like trait methods (they belong to the trait); a vendor that needs none — the
+/// SDK-only `agentarts` adapter, whose every operation already fails — passes an empty
+/// list and inherits the provided defaults.
 macro_rules! implement_vendor_provider {
     ($adapter:ident, $field:ident; $($rail:item)*) => {
         #[async_trait::async_trait]
