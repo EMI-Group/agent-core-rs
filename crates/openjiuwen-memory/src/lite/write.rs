@@ -1,12 +1,13 @@
-//! Write modes (`create`/`append`/`merge`/`replace`/`skip`), the pure [`WritePlan`]
-//! decision, and the bounded conflict-retry checker.
+//! Write modes (`create`/`append`/`merge`/`replace`/`skip`), the pure
+//! [`WritePlan`](crate::lite::write::WritePlan) decision, and the bounded conflict-retry
+//! checker.
 //!
 //! Ports Python's `WriteMode` from `openjiuwen/core/memory/lite/conflict_types.py` and the
 //! `_MAX_CONFLICT_RETRIES = 2` loop from `coding_memory_tool_ops.py`, and extends both for
 //! the local Markdown store. Python's `WriteResult` maps onto
 //! [`WriteOutcome`](crate::lite::write::WriteOutcome): `success` is "the outcome is not
 //! `Skipped`", `path`/`type` live on the returned
-//! [`CodingFact`](crate::lite::CodingFact), and `conflict_detected`/`note` keep their
+//! [`CodingFact`], and `conflict_detected`/`note` keep their
 //! names.
 //!
 //! # Modes
@@ -41,13 +42,13 @@
 //! Python's retry loop degrades to a last-writer-wins write once `_MAX_CONFLICT_RETRIES` is
 //! exhausted, so a lost race can silently overwrite a concurrent edit. This port
 //! deliberately does not: an exhausted budget returns
-//! [`Error::Memory`](openjiuwen_common::error::Error::Memory) naming the operation and the
+//! [`Error::Memory`] naming the operation and the
 //! attempt count, so the caller decides whether to re-read and rewrite. A conflict is never
 //! reported as a skip or as a success, and `run` never writes on its own.
 //!
 //! # No global state
 //!
-//! The checker is an ordinary value holding only a [`WritePolicy`]; it is constructed per
+//! The checker is an ordinary value holding only a [`WritePolicy`](crate::lite::write::WritePolicy); it is constructed per
 //! store and injected, so tests and multi-store processes stay isolated. Nothing is
 //! registered process-globally and no background task, timer, or lock is owned here — the
 //! store's own file lock (or engine) serializes the actual mutation.
@@ -442,7 +443,7 @@ fn appended(existing: &CodingFact, incoming: &CodingFact, now: DateTime<Utc>) ->
         format!("{existing_body}\n\n{incoming_body}")
     };
     if let Some(description) = non_blank(&incoming.description) {
-        fact.description = description.to_owned();
+        description.clone_into(&mut fact.description);
     }
     if let Some(path) = non_blank_path(incoming.path.as_deref()) {
         fact.path = Some(path.to_owned());
