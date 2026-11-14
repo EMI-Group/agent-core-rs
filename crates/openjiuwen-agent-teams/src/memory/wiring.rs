@@ -20,7 +20,7 @@
 //! # Durability
 //!
 //! This crate does not enable the `openjiuwen-memory` `sqlite` feature, so no wiring can open a
-//! SQLite-backed store. A [`MemoryStoreConfig::File`] configuration therefore keeps the
+//! SQLite-backed store. A [`MemoryStoreConfig::File`](crate::memory::MemoryStoreConfig::File) configuration therefore keeps the
 //! in-memory facade and persists through the document: [`TeamMemoryWiring::export`] writes
 //! `TEAM_MEMORY.md`, and the next [`TeamMemoryWiring::open`] imports it. The file store's `dir`
 //! selects the document's directory; without one the document lives at
