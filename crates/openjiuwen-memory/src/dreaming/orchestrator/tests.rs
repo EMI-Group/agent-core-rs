@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::dreaming::{
     DreamConfig, DreamConsolidator, DreamFilter, DreamJob, DreamKind, DreamMetrics, DreamOutcome,
-    DreamState, DreamTrigger, InMemoryDreamRepository,
+    DreamState, DreamTrigger, InMemoryDreamRepository, SweepLockSkipKind, DREAM_SWEEP_LOCK_NAME,
 };
 use crate::record::MemoryScope;
+use crate::store::kv_lock::{DistributedKvLock, InProcessKvLock, LockOptions, UnsupportedKvLock};
 
 /// Upper bound for every await in this suite.
 const BOUND: StdDuration = StdDuration::from_secs(5);
@@ -722,4 +723,231 @@ fn config_serde_round_trips_with_the_lease_in_milliseconds() {
     assert_eq!(partial.max_interval_ms, 600_000);
     assert!(partial.lease.is_none());
     assert!(partial.retention.is_none());
+}
+
+#[tokio::test]
+async fn without_a_sweep_lock_a_tick_always_sweeps() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let orchestrator = orchestrator(&planner, &repository, DreamOrchestratorConfig::default());
+    assert!(orchestrator.sweep_lock().is_none());
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    let summary = orchestrator.tick(ts(10)).await.unwrap();
+
+    assert_eq!(summary.scanned, 1);
+    assert!(summary.lock_skip.is_none());
+    assert!(!summary.is_lock_skip());
+    let status = orchestrator.status();
+    assert_eq!((status.ticks, status.lock_skips), (1, 0));
+    assert!(status.last_skip_reason.is_none());
+    assert_eq!(
+        stored(&repository, "job-1").await.state,
+        DreamState::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_held_sweep_lock_skips_the_sweep_and_the_retention_pass() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let lock: Arc<dyn DistributedKvLock> = Arc::new(InProcessKvLock::new());
+    let held = lock
+        .acquire(DREAM_SWEEP_LOCK_NAME, &LockOptions::new("other-worker"))
+        .await
+        .unwrap();
+    let orchestrator = orchestrator(
+        &planner,
+        &repository,
+        DreamOrchestratorConfig::default().with_retention(DreamRetention::new(60)),
+    )
+    .with_sweep_lock(
+        Arc::clone(&lock),
+        LockOptions::new("worker-a").with_timeout(StdDuration::from_millis(50)),
+    );
+    assert!(orchestrator.sweep_lock().is_some());
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    complete_one(&repository, "finished").await;
+
+    // A clock past the retention window, so a tick that swept would purge `finished`.
+    let now = Utc::now() + ChronoDuration::days(1);
+    let summary = orchestrator.tick(now).await.unwrap();
+
+    assert_eq!(summary.scanned, 0);
+    assert!(summary.is_empty());
+    assert!(summary.is_lock_skip());
+    let skip = summary
+        .lock_skip
+        .clone()
+        .expect("the summary carries the skip marker");
+    assert_eq!(skip.kind, SweepLockSkipKind::Held);
+    assert!(skip.is_held());
+    assert_eq!(skip.lock, DREAM_SWEEP_LOCK_NAME);
+    assert_eq!(skip.backend, "in-process");
+    assert!(
+        skip.reason.contains(DREAM_SWEEP_LOCK_NAME),
+        "{}",
+        skip.reason
+    );
+
+    // Nothing was claimed, consolidated, or purged, and the skip is recorded without
+    // counting as a tick.
+    let pending = stored(&repository, "job-1").await;
+    assert_eq!(pending.state, DreamState::Pending);
+    assert_eq!(pending.attempts, 0);
+    assert_eq!(consolidator.calls(), Vec::<String>::new());
+    assert!(
+        repository.get("finished").await.unwrap().is_some(),
+        "a skipped tick must not run retention"
+    );
+    let status = orchestrator.status();
+    assert_eq!(status.lock_skips, 1);
+    assert_eq!(status.ticks, 0);
+    assert!(status.last_tick_at.is_none());
+    assert!(status.last_summary.is_none());
+    assert!(status.last_retention.is_none());
+    assert!(status.last_error.is_none());
+    let reason = status.last_skip_reason.expect("the reason is recorded");
+    assert!(reason.contains(DREAM_SWEEP_LOCK_NAME), "{reason}");
+    assert!(reason.contains("held"), "{reason}");
+
+    // Control: once the other worker releases, the same tick sweeps, purges, and clears
+    // nothing of the skip history.
+    held.release();
+    repository.enqueue(job("job-2")).await.unwrap();
+    let summary = orchestrator.tick(now).await.unwrap();
+    assert_eq!(
+        (summary.scanned, summary.succeeded),
+        (2, 2),
+        "both jobs were still pending for the first real sweep"
+    );
+    assert!(!summary.is_lock_skip());
+    let status = orchestrator.status();
+    assert_eq!(status.ticks, 1);
+    assert_eq!(status.lock_skips, 1);
+    let report = status
+        .last_retention
+        .expect("the retention pass was live once the lock was free");
+    assert!(report.deleted_expired >= 1, "{report:?}");
+    assert!(repository.get("finished").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_sweep_lock_is_released_at_the_end_of_every_tick() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let concrete = InProcessKvLock::new();
+    let lock: Arc<dyn DistributedKvLock> = Arc::new(concrete.clone());
+    let orchestrator = orchestrator(&planner, &repository, DreamOrchestratorConfig::default())
+        .with_sweep_lock(
+            lock,
+            LockOptions::new("worker-a").with_timeout(StdDuration::from_millis(50)),
+        );
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    let first = orchestrator.tick(ts(10)).await.unwrap();
+    assert_eq!(first.scanned, 1);
+    assert!(!first.is_lock_skip());
+    assert!(
+        concrete.held_names().is_empty(),
+        "the tick releases the sweep lock before returning"
+    );
+
+    repository.enqueue(job("job-2")).await.unwrap();
+    let second = orchestrator.tick(ts(11)).await.unwrap();
+    assert_eq!(second.scanned, 1, "the next tick acquires the lock again");
+    assert!(!second.is_lock_skip());
+    assert_eq!(orchestrator.status().lock_skips, 0);
+    assert!(orchestrator.status().last_skip_reason.is_none());
+}
+
+#[tokio::test]
+async fn an_unsupported_lock_backend_skips_with_a_typed_reason() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let orchestrator = orchestrator(&planner, &repository, DreamOrchestratorConfig::default())
+        .with_sweep_lock(
+            Arc::new(UnsupportedKvLock::redis()),
+            LockOptions::new("worker-a"),
+        );
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    let summary = orchestrator.tick(ts(10)).await.unwrap();
+
+    assert_eq!(summary.scanned, 0);
+    let skip = summary
+        .lock_skip
+        .expect("the summary carries the skip marker");
+    assert_eq!(skip.kind, SweepLockSkipKind::Unsupported);
+    assert!(skip.is_unsupported());
+    assert_eq!(skip.backend, "redis");
+    assert!(skip.reason.contains("redis"), "{}", skip.reason);
+    assert_eq!(
+        stored(&repository, "job-1").await.state,
+        DreamState::Pending
+    );
+    let status = orchestrator.status();
+    assert_eq!(status.lock_skips, 1);
+    assert_eq!(status.ticks, 0);
+}
+
+#[tokio::test]
+async fn unusable_sweep_lock_options_are_errors_rather_than_skips() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let orchestrator = orchestrator(&planner, &repository, DreamOrchestratorConfig::default())
+        .with_sweep_lock(Arc::new(InProcessKvLock::new()), LockOptions::new(""));
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    let error = orchestrator.tick(ts(10)).await.unwrap_err();
+    assert_validation(error, "owner");
+    assert_eq!(
+        stored(&repository, "job-1").await.state,
+        DreamState::Pending
+    );
+    let status = orchestrator.status();
+    assert_eq!(status.lock_skips, 0);
+    assert!(status.last_skip_reason.is_none());
+}
+
+#[tokio::test]
+async fn a_disabled_orchestrator_never_touches_the_sweep_lock() {
+    let repository = repo();
+    let consolidator = Arc::new(ScriptedConsolidator::new([Step::Succeeded]));
+    let planner = planner(&repository, &consolidator, DreamConfig::default());
+    let lock: Arc<dyn DistributedKvLock> = Arc::new(InProcessKvLock::new());
+    let held = lock
+        .acquire(DREAM_SWEEP_LOCK_NAME, &LockOptions::new("other-worker"))
+        .await
+        .unwrap();
+    let orchestrator = orchestrator(
+        &planner,
+        &repository,
+        DreamOrchestratorConfig::default().with_enabled(false),
+    )
+    .with_sweep_lock(
+        Arc::clone(&lock),
+        LockOptions::new("worker-a").with_timeout(StdDuration::from_millis(50)),
+    );
+
+    repository.enqueue(job("job-1")).await.unwrap();
+    let summary = orchestrator.tick(ts(10)).await.unwrap();
+
+    assert!(summary.is_empty());
+    assert!(!summary.is_lock_skip());
+    let status = orchestrator.status();
+    assert_eq!(status.lock_skips, 0);
+    assert_eq!(status.ticks, 0);
+    assert!(status.last_skip_reason.is_none());
+    assert_eq!(
+        stored(&repository, "job-1").await.state,
+        DreamState::Pending
+    );
+    drop(held);
 }
