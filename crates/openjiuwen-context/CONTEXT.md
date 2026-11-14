@@ -150,6 +150,7 @@ let recovered: RecoveryOutcome = engine
 - `./src/processor/compressor/compact.rs` → `FullCompactProcessor` (boundary detection, kept tail, session-memory or LLM full compaction)
 - `./src/processor/compressor/micro_compact.rs` → `MicroCompactProcessor` (deterministic per-tool tool-result clearing)
 - `./tests/engine.rs` → engine end-to-end suite (prepare/observe/compress/recovery/persistence)
+- `./tests/engine_usage.rs` → engine wiring: prepared `usage` block, window-resolution ladder, `usage_report`/`usage_snapshot`, recorder phases, KV-cache rollup, window diffing, compaction-operation correlation
 - `./tests/processors.rs` → pipeline ordering, truncation, tool-result offload, summarisation, event serde
 - `./tests/tokenizers.rs` → encoding mapping, registry matching, selector ladder, model-counter counts, config integration, native deferral
 - `./tests/offload.rs` → marker wire format, key isolation across all three stores, rehydration round-trips
@@ -171,6 +172,7 @@ let recovered: RecoveryOutcome = engine
 - Deterministic offline tests use `ApproxTokenCounter::with_chars_per_token(1)` (via `TokenCounterKind::Characters`) and `openjiuwen_test_support::ScriptedModel` as the `Model`; sessions are real `openjiuwen_session::AgentSession` instances.
 - Covered behaviors: window assembly with round/message budgets, leading-tool stripping, per-role stats, overflow detection, every processor, summary replacement with system/recent preservation, tool-pair preservation, offload/rehydrate round-trip, session isolation, `noop`/`compressed`/`busy`, overflow recovery refusal after streamed chunks, config serde round-trip, cancellation, `save_contexts`/`load_contexts` round-trip, corrupt-state tolerance.
 - Family-specific coverage: tokenizer mapping/registry/selector ladders and real BPE counts; compressor span math, envelopes, benefit gates, merge and truncation rungs, tool-pair validity, offline fallbacks and `ScriptedModel` paths; offloader trim/placeholder wire formats, keep boundaries, protection patterns, per-round budget order, tool window and managed-flag idempotence; recall chunk boundaries (CJK), BM25 ranking, archive isolation and budget skipping, marker preservation and rollback; session-memory reinjection and reload injection placement.
+- Engine-level wiring (usage population, window resolution, usage reports, recorder phases, KV-cache rollup, window diffing, model-call correlation) is covered by `tests/engine_usage.rs`; a configured `ContextUsageAnalyzer` fills `PreparedContext::usage`, `ContextUsageAnalyzer::default()` is the unconfigured approximate analyzer, and a missing analyzer makes `usage_report`/`usage_snapshot` return `Error::Config`.
 - `cargo test -p openjiuwen-context --offline` must pass; `cargo clippy -p openjiuwen-context --all-targets --offline -- -D warnings`, `cargo fmt -p openjiuwen-context -- --check`, and `cargo doc -p openjiuwen-context --no-deps --offline` must be clean.
 
 ## Deferred (Python `context_engine` features not ported)
