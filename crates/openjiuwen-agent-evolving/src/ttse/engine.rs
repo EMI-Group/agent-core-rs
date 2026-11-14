@@ -16,14 +16,17 @@ use std::sync::Arc;
 
 use openjiuwen_common::error::{Error, Result, ResultExt};
 use openjiuwen_core::foundation::llm::{Model, ModelRequestConfig};
+use openjiuwen_core::retrieval::embedding::Embedding;
 
 use crate::signal::EvolutionSignal;
 use crate::trajectory::Trajectory;
 use crate::ttse::bank::{AddOutcome, TipBank, TipBankStats};
 use crate::ttse::config::TtseConfig;
 use crate::ttse::dream::Dreamer;
+use crate::ttse::index::EmbeddingIndex;
 use crate::ttse::induce::TipInducer;
 use crate::ttse::models::{ConsultResult, DreamReport, TipRecord};
+use crate::ttse::retrieve::{self, RetrieveMode};
 use crate::ttse::success::SuccessDetector;
 
 /// The suffix appended to the store path for the in-flight write.
@@ -45,6 +48,8 @@ pub struct TtseEngine {
     inducer: TipInducer,
     /// The merge/prune pass.
     dreamer: Dreamer,
+    /// The optional embedding index backing semantic retrieval.
+    index: Option<EmbeddingIndex>,
     /// How many consultations this engine has served.
     consult_count: u64,
 }
@@ -57,6 +62,7 @@ impl fmt::Debug for TtseEngine {
             .field("bank", &self.bank)
             .field("inducer", &self.inducer)
             .field("dreamer", &self.dreamer)
+            .field("index", &self.index)
             .field("consult_count", &self.consult_count)
             .finish()
     }
@@ -78,19 +84,72 @@ impl TtseEngine {
             bank: TipBank::new(config.capacity, config.dedup_threshold),
             inducer: TipInducer::new(config.clone()),
             dreamer: Dreamer::new(config.clone()),
+            index: None,
             config,
             consult_count: 0,
         })
     }
 
-    /// Installs the model used by the induction prompt path.
+    /// Installs the model used by the induction prompt path and by dreaming.
     ///
-    /// The inducer is rebuilt from the engine config, so calling this twice
-    /// replaces the model instead of stacking calls.
+    /// The inducer and the dreamer are rebuilt from the engine config, so calling
+    /// this twice replaces the model instead of stacking calls. Dreaming through
+    /// the model is opt-in: [`TtseEngine::dream`] stays deterministic while
+    /// [`TtseEngine::dream_async`] uses it.
     #[must_use]
     pub fn with_model(mut self, model: Arc<dyn Model>, request: ModelRequestConfig) -> Self {
-        self.inducer = TipInducer::new(self.config.clone()).with_model(model, request);
+        self.inducer =
+            TipInducer::new(self.config.clone()).with_model(Arc::clone(&model), request.clone());
+        self.dreamer = Dreamer::new(self.config.clone()).with_model(model, request);
         self
+    }
+
+    /// Installs an embedding provider, creating an empty index over it.
+    ///
+    /// The index is cold: call [`TtseEngine::sync_index`] (or
+    /// [`TtseEngine::dream_async`], which syncs) before relying on semantic
+    /// retrieval. Without an index the retrieval modes fall back to the lexical
+    /// ranking.
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Arc<dyn Embedding>) -> Self {
+        self.index = Some(EmbeddingIndex::new(embedding));
+        self
+    }
+
+    /// Installs the embedding index persisted at `path`, creating an empty one
+    /// when the file is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbeddingIndex::open`]'s error: a stored index built by another model or
+    /// dimension is [`Error::Validation`], as is a malformed document.
+    pub fn with_embedding_index(
+        mut self,
+        path: impl Into<PathBuf>,
+        embedding: Arc<dyn Embedding>,
+    ) -> Result<Self> {
+        self.index = Some(EmbeddingIndex::open(path, embedding)?);
+        Ok(self)
+    }
+
+    /// The embedding index, when one is installed.
+    #[must_use]
+    pub fn embedding_index(&self) -> Option<&EmbeddingIndex> {
+        self.index.as_ref()
+    }
+
+    /// Cold-fills and refreshes the index against the bank.
+    ///
+    /// Returns how many vectors were embedded; `0` when no index is installed.
+    ///
+    /// # Errors
+    ///
+    /// The embedder's errors from [`EmbeddingIndex::sync`].
+    pub async fn sync_index(&mut self) -> Result<usize> {
+        match self.index.as_mut() {
+            Some(index) => index.sync(&self.bank).await,
+            None => Ok(0),
+        }
     }
 
     /// The configuration this engine applies.
@@ -206,9 +265,62 @@ impl TtseEngine {
         result
     }
 
+    /// Selects and renders the tips relevant to `query` through the retrieval
+    /// modes, using [`RetrieveMode::Hybrid`].
+    ///
+    /// This is [`TtseEngine::consult`] with the ranked retrieval path: the index
+    /// contributes a cosine branch, the bank a lexical one, and both are fused with
+    /// Reciprocal Rank Fusion. Hit bookkeeping and the
+    /// [`TtseConfig::inject_enabled`] switch behave exactly as in `consult`.
+    ///
+    /// # Errors
+    ///
+    /// The embedder's errors from [`retrieve::rank`].
+    pub async fn consult_async(&mut self, query: &str) -> Result<ConsultResult> {
+        self.consult_with(query, RetrieveMode::Hybrid).await
+    }
+
+    /// [`TtseEngine::consult_async`] with an explicit retrieval mode.
+    ///
+    /// # Errors
+    ///
+    /// The embedder's errors from [`retrieve::rank`].
+    pub async fn consult_with(&mut self, query: &str, mode: RetrieveMode) -> Result<ConsultResult> {
+        if !self.config.inject_enabled {
+            return Ok(ConsultResult::default());
+        }
+        self.consult_count = self.consult_count.saturating_add(1);
+        let result =
+            retrieve::consult_async(&self.bank, self.index.as_ref(), query, &self.config, mode)
+                .await?;
+        for tip in &result.tips {
+            self.bank.observe(&tip.tip_id, true);
+        }
+        Ok(result)
+    }
+
     /// Runs one dream pass over the bank and reports what changed.
     pub fn dream(&mut self) -> DreamReport {
         self.dreamer.dream(&mut self.bank)
+    }
+
+    /// Runs one dream pass, using the installed model when there is one.
+    ///
+    /// The index is synced first, so cosine clustering sees a vector for every tip,
+    /// and again afterwards, so merged-away tips leave the index. Without a model
+    /// this is [`TtseEngine::dream`].
+    ///
+    /// # Errors
+    ///
+    /// The embedder's errors from syncing the index.
+    pub async fn dream_async(&mut self) -> Result<DreamReport> {
+        self.sync_index().await?;
+        let report = self
+            .dreamer
+            .dream_with_model(&mut self.bank, self.index.as_ref())
+            .await?;
+        self.sync_index().await?;
+        Ok(report)
     }
 
     /// Aggregate counts over the stored tips.
@@ -254,6 +366,32 @@ impl TtseEngine {
             )));
         }
         Ok(())
+    }
+
+    /// Writes the bank to `path` and the embedding index next to it.
+    ///
+    /// The bank goes to `path`; the index goes to the path it was opened from or
+    /// bound to, or to `<path>.embedding.json` when it has none. A missing index
+    /// makes this [`TtseEngine::save`].
+    ///
+    /// # Errors
+    ///
+    /// [`TtseEngine::save`]'s errors, plus the index write errors.
+    pub async fn save_with_index(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        self.save(path).await?;
+        let Some(index) = self.index.as_ref() else {
+            return Ok(());
+        };
+        let index_path = index.path().map_or_else(
+            || {
+                let mut sibling = path.as_os_str().to_owned();
+                sibling.push(".embedding.json");
+                PathBuf::from(sibling)
+            },
+            Path::to_path_buf,
+        );
+        index.save(index_path).await
     }
 
     /// Reads a bank from `path`, using the default configuration otherwise.
