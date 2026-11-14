@@ -580,7 +580,7 @@ fn judged_input() -> EvaluationInput {
             .with_outputs(vec![
                 CapabilityIo::new("out", "string").with_description("output")
             ]),
-        target: None,
+        ..EvaluationInput::default()
     }
 }
 
@@ -590,7 +590,7 @@ async fn judge_metric_passes_a_positive_verdict() {
         .with_model(model(r#"{"score":1,"reason":"ok"}"#));
     let score = metric.evaluate(&judged_input()).await.unwrap();
     assert_eq!(score.metric, "quality");
-    assert_eq!(score.score, 1.0);
+    assert_eq!(score.score, Some(1.0));
     assert!(score.passed);
     assert_eq!(score.detail.as_deref(), Some("ok"));
 }
@@ -600,7 +600,7 @@ async fn judge_metric_fails_a_negative_verdict() {
     let metric = LlmJudgeMetric::new("quality", "card quality")
         .with_model(model(r#"{"score":0,"reason":"no examples"}"#));
     let score = metric.evaluate(&judged_input()).await.unwrap();
-    assert_eq!(score.score, 0.0);
+    assert_eq!(score.score, Some(0.0));
     assert!(!score.passed);
     assert_eq!(score.detail.as_deref(), Some("no examples"));
 }
@@ -610,7 +610,7 @@ async fn judge_metric_repairs_one_invalid_reply() {
     let model = scripted(&["not json", r#"{"score":1,"reason":"fixed"}"#]);
     let metric = LlmJudgeMetric::new("quality", "card quality").with_model(model.clone());
     let score = metric.evaluate(&judged_input()).await.unwrap();
-    assert_eq!(score.score, 1.0);
+    assert_eq!(score.score, Some(1.0));
     assert_eq!(score.detail.as_deref(), Some("fixed"));
     assert_eq!(model.call_count(), 2);
     assert!(model.prompts()[1].contains("rejected"));
@@ -620,7 +620,7 @@ async fn judge_metric_repairs_one_invalid_reply() {
 async fn judge_metric_falls_back_after_two_invalid_replies() {
     let metric = LlmJudgeMetric::new("quality", "card quality").with_model(model("not json"));
     let score = metric.evaluate(&judged_input()).await.unwrap();
-    assert_eq!(score.score, 1.0);
+    assert_eq!(score.score, Some(1.0));
     assert!(score.passed);
     let detail = score.detail.unwrap();
     assert!(detail.starts_with("deterministic_fallback:"), "{detail}");
@@ -638,7 +638,7 @@ async fn judge_metric_surfaces_failures_in_error_mode() {
 async fn judge_metric_without_a_model_uses_the_static_rubric() {
     let metric = LlmJudgeMetric::new("quality", "card quality");
     let score = metric.evaluate(&judged_input()).await.unwrap();
-    assert_eq!(score.score, 1.0);
+    assert_eq!(score.score, Some(1.0));
     assert!(score.passed);
     assert!(score
         .detail
