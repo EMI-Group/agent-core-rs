@@ -42,11 +42,15 @@ pub use runtime::persistence::{
 pub use runtime::quota::{
     select_lru_candidate, LruCandidate, SpawnBudget, SubAgentQuota, SubagentActivity,
 };
+pub use runtime::scheduler::{
+    EvictionSchedulerConfig, EvictionSchedulerHandle, EvictionSchedulerStats, SweepReport,
+    DEFAULT_EVICTION_INTERVAL, DEFAULT_IDLE_TTL_MS,
+};
 pub use runtime::transcript::{
     TranscriptBuffer, TranscriptChannel, TranscriptEntry, TranscriptKind, TranscriptSubscription,
     TranscriptSummary, DEFAULT_TRANSCRIPT_CAPACITY, DEFAULT_TRANSCRIPT_CHANNEL_CAPACITY,
 };
-pub use runtime::{activity, clock, lifecycle, persistence, quota, transcript};
+pub use runtime::{activity, clock, lifecycle, persistence, quota, scheduler, transcript};
 pub use runtime::{
     LoadReport, ResumeReport, SubAgentFactory, SubAgentId, SubAgentOutcome, SubAgentRuntime,
     SubAgentSpawnRequest, SubagentEviction, SubagentMetadata, SubagentStatus, EVICTION_REASON,
