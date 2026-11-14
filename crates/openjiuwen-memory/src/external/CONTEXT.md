@@ -1,12 +1,12 @@
-# openjiuwen-memory/src/external — memory-provider SPI, registry, vendor stubs
+# openjiuwen-memory/src/external — memory-provider SPI, tool rail, registry, vendor stubs
 
 ## Intent
 
 The pluggable external memory-provider seam for the Rust rewrite of openJiuwen, porting the *shape* of Python `openjiuwen.core.memory.external` (provider ids, vendor set, lazy "missing SDK surfaces at first use" behaviour) onto this crate's record types.
 The in-process engine (`crate::engine`) stays the default backend; a provider lets a deployment delegate the same record surface to a remote service, a vendor SDK, or a custom backend without changing callers.
-The Python SPI is tool-rail oriented (`get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`); the Rust SPI is record oriented (`add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`) because it adapts `MemoryScope`/`MemoryRecord`/`NewMemory`/`SearchOptions` directly.
+The Rust SPI is record oriented (`add`, `search`, `get`, `update`, `delete`, `list`, `clear`, `health`) because it adapts `MemoryScope`/`MemoryRecord`/`NewMemory`/`SearchOptions` directly, and it carries Python's tool rail (`get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`, `on_session_end`, `is_available`, `is_initialized`) as provided trait methods over that record surface.
 No network client exists in this crate: vendor transports are deferred and every vendor path is a typed `Error::Unsupported`, never a silent no-op.
-This directory has no child directories; the four modules are listed in the Routing Table.
+This directory has no child directories; the five modules are listed in the Routing Table.
 
 ## API Surface
 
@@ -17,8 +17,16 @@ Provider SPI (`provider.rs`):
 - `ProviderCapabilities { semantic_search, keyword_search, graph, variables, message_history, pagination, max_batch: Option<usize> }` — serde defaults are all `false`/`None`; `none()` is the default, `local(has_embedding)` is the engine's report (keyword recall + CRUD always, semantic recall only with an embedding model, graph/variables/messages/paging `false`).
 - `ProviderHealth { healthy, detail: Option<String>, checked_at: DateTime<Utc> }` — serde snake_case, `checked_at` defaults to "now"; `healthy()`, `degraded(detail)`, `with_detail(...)`.
 
+Tool rail (provided on the trait, `provider.rs` + `rail.rs`):
+- Provided methods (a backend overrides only what it needs): `is_available()` (`rail::is_available(&self.capabilities())`, no network call), `is_initialized()` (`false`), `default_scope()` (`MemoryScope::default()`), `get_tool_schemas()`, `handle_tool_call(tool, args)`, `prefetch(query)`, `sync_turn(user_msg, assistant_msg)`, `system_prompt_block()` (`""`), `on_session_end(messages)` (no-op).
+- `handle_tool_call` dispatches `add_memory` → `{"result":"stored","id","content"}`, `search_memory` → `{"results":[{"id","content","score","type"}],"count"}`, `list_memories` → `{"memories":[{"id","content","type","importance"}],"count"}`, `delete_memory` → `{"result":"deleted"|"not_found","id"}`, all against `default_scope()`; an unknown name answers `{"error":"unknown tool: <name>"}`.
+- `prefetch` renders one recall of `rail::DEFAULT_PREFETCH_TOP_K` hits through `prompt::render_snippets` within `rail::DEFAULT_PREFETCH_MAX_TOKENS`; a blank query or a failed recall returns `""`.
+- `sync_turn` writes one episodic memory (`"User: <user>\nAssistant: <assistant>"`, source `conversation`); a blank half returns `Ok(())` without a write.
+- `rail.rs` is the pure half (no I/O): `tool_schema`, `string_property`, `integer_property`, `number_property`, `boolean_property`, `enum_property`, `default_tool_schemas`, `tool_error`/`tool_result`/`tool_ok_result`, `hit_json`/`record_json`/`search_results`/`memory_listing`/`stored_result`/`deleted_result`, `render_bullets`, `parse_search_args`, `parse_add_args`, `parse_kind`, `args_object`, `string_arg`/`integer_arg`/`number_arg`, `is_available`.
+- Constants: `ADD_MEMORY_TOOL`, `SEARCH_MEMORY_TOOL`, `LIST_MEMORIES_TOOL`, `DELETE_MEMORY_TOOL`, `DEFAULT_PREFETCH_TOP_K = 5`, `DEFAULT_PREFETCH_MAX_TOKENS = 512`, `MAX_SEARCH_TOP_K = 50`, `DEFAULT_LIST_LIMIT = 50`, `MAX_LIST_LIMIT = 500`.
+
 Local provider (`local.rs`):
-- `EngineProvider` — adapts `Arc<MemoryEngine>`; `new(engine)` (name `local`), `with_name(engine, name)` (blank name falls back to `local`), `engine()`, `is_initialized()`. Every call forwards to the engine unchanged, so scope validation, dedupe, ranking, and cancellation keep engine semantics. `initialize()` is idempotent (`AtomicBool`); `health()` performs one `list` on the sentinel scope `("__health__", "__health__")` and reports `Ok(healthy/degraded)`.
+- `EngineProvider` — adapts `Arc<MemoryEngine>`; `new(engine)` (name `local`), `with_name(engine, name)` (blank name falls back to `local`), `engine()`, `is_initialized()`. Every call forwards to the engine unchanged, so scope validation, dedupe, ranking, and cancellation keep engine semantics. `initialize()` is idempotent (`AtomicBool`); `health()` performs one `list` on the sentinel scope `("__health__", "__health__")` and reports `Ok(healthy/degraded)`. Rail overrides: `is_available()` is always `true`, `is_initialized()` reads the same `AtomicBool`, and `system_prompt_block()` names `add_memory`/`search_memory` and states the memories live in this deployment's in-process backend; the schema, dispatch, prefetch, and sync defaults are inherited and use `MemoryScope::default()`.
 - `LocalProviderFactory` — `ProviderFactory` for `ProviderKind::Local` over a shared engine; `new(engine)`, `with_name(name)`, `engine()`; `build` falls back to the factory name when `ProviderConfig::name` is blank and rejects a different kind with `Error::Validation`.
 
 Registry (`registry.rs`):
@@ -41,6 +49,12 @@ Vendor stubs (`vendor.rs`):
 - Error kinds: `Validation` for caller input (scope, record, filter, options, oversized batch), `NotFound` for `update` of an unknown id, `Unsupported` for an absent capability, `Cancelled`/`Timeout` for call state, and the backend's own kind (`Transport`, `Memory`, …) for backend failure.
 - Capability-dependent `Unsupported`: `initialize` when the SDK/transport is absent; `search` when the requested `SearchMode` is not declared; `add` when the backend is read-only or a batch exceeds `max_batch`; `health` when nothing can be probed.
 - `health()` returns `Ok(ProviderHealth)` for a reachable-but-degraded backend (the local engine logs the probe failure and reports `healthy: false`); `Err(Unsupported)` is reserved for a provider with no backend to probe at all (the vendor stubs).
+
+Rail error policy:
+- A model-facing rail call never surfaces an error: `handle_tool_call` returns `{"error": <message>}` (unknown tool names and bad arguments included) and `prefetch` returns `""`; both log the cause at `debug` on target `openjiuwen_memory::external`, so nothing is swallowed silently.
+- The caller-facing `sync_turn` and `on_session_end` return `openjiuwen_common::error::Result<()>` unchanged, because the caller can decide what a failed turn write means.
+- `parse_search_args`/`parse_add_args` are the only fallible rail helpers: `Error::Validation` naming the parameter (`missing required parameter: query|content|id`, `unknown memory kind`, a non-object `metadata`, a non-finite `importance`).
+- `top_k` clamps to `1..=MAX_SEARCH_TOP_K`, `threshold` to `0.0..=1.0`, `importance` to `0.0..=1.0`, `limit` to `1..=MAX_LIST_LIMIT`, mirroring Python's `min(top_k, 50)` clamps.
 
 ## Registry Semantics
 
@@ -68,10 +82,12 @@ Vendor stubs (`vendor.rs`):
 - Secrets never reach `Debug`, `tracing`, or a `ProviderHealth` detail.
 - `tracing` only (target `openjiuwen_memory::external`); no `println!`/`eprintln!`.
 - Files stay around ≤1000 lines; all public items carry docs (`missing_docs` is denied by clippy `-D warnings`).
+- `rail.rs` performs no I/O and holds no state beyond one immutable empty argument map, so every schema, parse, and render helper is unit-testable offline.
 
 ## Routing Table
 
-- `./provider.rs` → `MemoryProvider` trait, `ProviderCapabilities`, `ProviderHealth`, SPI contract docs
+- `./provider.rs` → `MemoryProvider` trait (record SPI plus the provided tool-rail methods), `ProviderCapabilities`, `ProviderHealth`, SPI contract docs
+- `./rail.rs` → pure rail helpers: tool-schema builders, default four-tool set, argument parsing, payload shaping, Markdown rendering
 - `./local.rs` → `EngineProvider` over `Arc<MemoryEngine>`, `LocalProviderFactory`
 - `./registry.rs` → `ProviderKind`, `ProviderConfig` (redaction, millisecond timeout), `ProviderFactory`, `ProviderRegistry`
 - `./vendor.rs` → `AgentArts`/`Jiuwen`/`LakeBase`/`mem0`/`OpenViking` handles, shared `VendorProvider`, `vendor_factories()`
@@ -79,11 +95,12 @@ Vendor stubs (`vendor.rs`):
 
 ## Test Strategy
 
-- Unit tests live beside each module and are offline and deterministic: 32 tests under `external` (`cargo test -p openjiuwen-memory --lib external`).
-- `provider.rs` — capability defaults/`local()` flags and serde, health serde (RFC 3339 `checked_at`), object safety and `Send + Sync` of `Arc<dyn MemoryProvider>` via a null provider.
-- `local.rs` — full round trip against `LongTermMemory::in_memory` (add → search → get → update → list → delete → clear → health), shared state with the facade, capability/behavior consistency (keyword-only engine refuses `SearchMode::Semantic`), name fallback, factory build/kind mismatch, `Debug` without the engine.
+- Unit tests live beside each module and are offline and deterministic: 77 tests under `external::` (`cargo test -p openjiuwen-memory --lib external::`).
+- `provider.rs` — capability defaults/`local()` flags and serde, health serde (RFC 3339 `checked_at`), object safety and `Send + Sync` of `Arc<dyn MemoryProvider>` via a null provider, and the rail defaults through an unbacked provider: advertised tool set, `handle_tool_call` per tool plus unknown-tool and missing-argument errors, blank-query `prefetch`, blank-turn `sync_turn`, and the degrade-instead-of-raise path.
+- `local.rs` — full round trip against `LongTermMemory::in_memory` (add → search → get → update → list → delete → clear → health), shared state with the facade, capability/behavior consistency (keyword-only engine refuses `SearchMode::Semantic`), name fallback, factory build/kind mismatch, `Debug` without the engine, plus the rail overrides (always available, initialization tracking, non-empty system prompt block, `add_memory` → `prefetch` → `delete_memory` against the engine).
 - `registry.rs` — kind ids/aliases/unknown-`Custom`/serde, config defaults/builders/serde/timeout-millis, `Debug` and `redacted()` redaction, first-registration default, duplicate replace, `set_default` `NotFound`, factory replace, `build` purity vs `select`, vendor-stub and local convenience constructors, `Send + Sync` + clone-shared state.
 - `vendor.rs` — provider ids, kind/config accessors, every trait method returns `Unsupported` naming the SDK, redacting `Debug`, the five factories and their kind-mismatch `Validation`.
+- `rail.rs` — tool-spec shape (unique names, `parameters.type`, `required` arrays, one-sentence descriptions), property fragments, payload helpers, `render_bullets` shape, `parse_search_args`/`parse_add_args` bounds and rejection messages, and the tolerant argument accessors.
 - `mod.rs` — end-to-end: a registry serves the local engine and reports the `mem0` stub through `select`.
 - No test needs the network, credentials, wall-clock ordering, or an external service.
 - Gates: `cargo fmt -p openjiuwen-memory -- --check`, `cargo check -p openjiuwen-memory --offline`, `cargo test -p openjiuwen-memory --offline --lib external`, `cargo clippy -p openjiuwen-memory --all-targets --offline -- -D warnings`, `cargo doc -p openjiuwen-memory --no-deps` warning-free.
@@ -91,6 +108,7 @@ Vendor stubs (`vendor.rs`):
 ## Deferred (not implemented here)
 
 - Real vendor transports and SDKs (AgentArts, Jiuwen server/SDK, LakeBase REST, mem0, OpenViking) including payload shaping, retries, circuit breakers, and session mapping.
-- The Python tool-rail surface of `MemoryProvider`: `get_tool_schemas`, `handle_tool_call`, `prefetch`, `sync_turn`, `system_prompt_block`, `on_session_end`, and their `harness/rails/memory/*` consumers.
+- The `harness/rails/memory/*` consumers of the tool rail (agent-side prefetch, sync and session-end wiring): the rail itself is implemented on `MemoryProvider`, but nothing outside this crate drives it yet.
+- Vendor-specific rail shapes: a vendor's own tool names, prompt block, circuit breaker, and background prefetch warm-up (`queue_prefetch`) are not ported; the vendor adapters keep the record-only `Unsupported` surface.
 - Provider-side graph memory, variables, and message history (the SPI is record-only; those stay facade/engine concerns).
 - Scope-level provider selection/config, provider pooling/failover, and an HTTP/JSON provider implementation.
