@@ -679,14 +679,14 @@ Typed deferrals are proven, not just documented: `tests/deferred.rs` asserts the
   - `./src/flow/render.rs` → `SkillPackAdapter`, `SkillAdapter`, `RenderedArtifact`, `render_package`
 - `./src/redaction/` → credential/PII redaction: scanner, sensitive-name matching, JSON redaction
 - `./src/llm/` → LLM-guided stages with deterministic fallbacks, model/metadata identity, match cache; see [`src/llm/CONTEXT.md`](src/llm/CONTEXT.md)
-- `./src/orchestration/` → planning and execution
+- `./src/orchestration/` → planning, execution and the mutation contract; see [`src/orchestration/CONTEXT.md`](src/orchestration/CONTEXT.md)
   - `./src/orchestration/plan.rs` → `OrchestrationPlan`, `PlanStep`, `PlanStatus`, JGF projection, stages
   - `./src/orchestration/candidates.rs` → `CandidateGenerator`, relation candidates
   - `./src/orchestration/planner.rs` → `Planner`, `PlanConfig`, `SemanticScorer`, language helpers
   - `./src/orchestration/executor.rs` → `PlanExecutor`, `CapabilityRunner`, plan → `openjiuwen-graph`
-  - `./src/orchestration/mutation.rs` → `MutationRequest`, `request_digest`, `MutationJournal`, `validate_mutation_against_inventory`; see [`src/orchestration/CONTEXT.md`](src/orchestration/CONTEXT.md)
+  - `./src/orchestration/mutation.rs` → `MutationRequest`, `request_digest`, `MutationJournal`, `validate_mutation_against_inventory`
 - `./src/evaluation/` → fail-soft evaluation: shared contract, static and trace metrics, suite aggregation, windows; see [`src/evaluation/CONTEXT.md`](src/evaluation/CONTEXT.md)
-- `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution
+- `./src/runtime/` → `SymphonyRuntime`, config, lifecycle, evolution, mutations; see [`src/runtime/CONTEXT.md`](src/runtime/CONTEXT.md)
   - `./src/runtime/mod.rs` → lifecycle, planning/invocation, lazy semantic sync, evolution
   - `./src/runtime/mutations.rs` → the mutation path, `GraphMutationResult`, `MutationStatus`, journal-backed replay and source-revision CAS
 - `./src/deferred.rs` → the remaining GPU-only `Error::Unsupported` stub (`vLLM` logit selection)
